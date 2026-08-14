@@ -54,6 +54,8 @@ proptest! {
         prop_assert_eq!(db.edge_count(), oracle.edge_count());
         for n in 0..=255u8 {
             let key = format!("k{n}");
+            // "seed" is written by InsertNode; "p" is written by SetProp — both write paths are swept.
+            prop_assert_eq!(db.get_prop(&key, "seed"), oracle.get_prop(&key, "seed"));
             prop_assert_eq!(db.get_prop(&key, "p"), oracle.get_prop(&key, "p"));
             for t in 0..3u8 {
                 let etype = format!("e{t}");
