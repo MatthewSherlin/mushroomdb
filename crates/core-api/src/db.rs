@@ -28,7 +28,10 @@ impl<F: Fs> GraphDb<F> {
             labels: Vec::new(),
         };
         let bytes = db.fs.read(FileId::Wal)?;
-        let (records, _valid_len) = decode_all(&bytes);
+        let (records, valid_len) = decode_all(&bytes);
+        if valid_len < bytes.len() {
+            db.fs.write_atomic(FileId::Wal, &bytes[..valid_len])?;
+        }
         for rec in records {
             db.apply(&rec)?;
         }
@@ -55,13 +58,19 @@ impl<F: Fs> GraphDb<F> {
                 src_key,
                 dst_key,
             } => {
-                let src = self.ids.get(src_key).expect("validated before log");
-                let dst = self.ids.get(dst_key).expect("validated before log");
+                let src = self.ids.get(src_key).ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("wal replay references unknown key {src_key}"),
+                })?;
+                let dst = self.ids.get(dst_key).ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("wal replay references unknown key {dst_key}"),
+                })?;
                 let etype = self.syms.intern(edge_type);
                 self.topo.add_edge(etype, src, dst);
             }
             WalRecord::SetProp { key, field, value } => {
-                let id = self.ids.get(key).expect("validated before log");
+                let id = self.ids.get(key).ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("wal replay references unknown key {key}"),
+                })?;
                 self.props.set(id, field, value.clone());
             }
         }

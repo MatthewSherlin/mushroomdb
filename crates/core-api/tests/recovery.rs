@@ -56,3 +56,39 @@ fn state_survives_reopen() {
     );
     assert_eq!(db.edge_count(), 1);
 }
+
+#[test]
+fn post_crash_garbage_does_not_swallow_subsequent_writes() {
+    let dir = tmp("garbage");
+    // Session 1: write two nodes and an edge, then crash (drop without ceremony).
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("Person", "u1", vec![]).unwrap();
+        db.insert_node("Person", "u2", vec![]).unwrap();
+        db.insert_edge("KNOWS", "u1", "u2").unwrap();
+    }
+    // Simulate crash corruption: append garbage bytes to the WAL file.
+    {
+        use std::io::Write;
+        let wal_path = dir.join("wal.bin");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
+        f.write_all(b"\xDE\xAD\xBE\xEF").unwrap();
+    }
+    // Session 2: open (must recover valid prefix and truncate garbage), write new nodes.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        assert!(db.has_node("u1")); // original data survives
+        db.insert_node("Person", "u3", vec![]).unwrap();
+        db.insert_node("Person", "u4", vec![]).unwrap();
+    }
+    // Session 3: open again — u3 and u4 must be present (written after the garbage truncation).
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(db.has_node("u1"));
+    assert!(db.has_node("u2"));
+    assert!(db.has_node("u3"));
+    assert!(db.has_node("u4"));
+    assert_eq!(db.edge_count(), 1);
+}
