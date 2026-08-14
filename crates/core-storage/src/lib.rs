@@ -1,9 +1,11 @@
 pub mod columns;
+pub mod fs;
 pub mod idmap;
 pub mod interner;
 pub mod topology;
 pub mod types;
 pub use columns::ColumnStore;
+pub use fs::{FileId, Fs, RealFs};
 pub use idmap::IdMap;
 pub use interner::Interner;
 pub use topology::{Direction, Topology};
