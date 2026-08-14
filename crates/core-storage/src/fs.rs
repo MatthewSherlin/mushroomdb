@@ -24,6 +24,10 @@ pub trait Fs {
     fn write_atomic(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()>;
 }
 
+pub trait FsIntrospect {
+    fn total_appended(&self) -> usize;
+}
+
 #[derive(Debug)]
 pub struct RealFs {
     dir: PathBuf,

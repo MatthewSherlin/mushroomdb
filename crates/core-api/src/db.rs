@@ -1,4 +1,4 @@
-use core_storage::fs::{FileId, Fs, RealFs};
+use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{ColumnStore, Direction, GraphError, IdMap, Interner, Result, Topology, Value};
 
@@ -174,6 +174,19 @@ impl<F: Fs> GraphDb<F> {
 
     pub fn edge_count(&self) -> u64 {
         self.topo.edge_count()
+    }
+
+    /// Test-support: total bytes appended (SimFs only usage).
+    pub fn fs_total_appended(&self) -> usize
+    where
+        F: FsIntrospect,
+    {
+        self.fs.total_appended()
+    }
+
+    /// Consume the db, returning its fs (for crash simulation).
+    pub fn into_fs(self) -> F {
+        self.fs
     }
 
     pub fn snapshot(&mut self) -> Result<()> {
