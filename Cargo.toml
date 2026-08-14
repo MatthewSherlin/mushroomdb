@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/core-storage", "crates/core-api", "crates/sim-harness"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+crc32fast = "1"
+proptest = "1"
