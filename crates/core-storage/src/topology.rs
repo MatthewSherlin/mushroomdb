@@ -32,7 +32,9 @@ impl Topology {
             Err(pos) => {
                 dsts.insert(pos, dst);
                 let srcs = adj.inn.entry(dst).or_default();
-                let p = srcs.binary_search(&src).unwrap_err();
+                let p = srcs.binary_search(&src).expect_err(
+                    "invariant: inn must not contain src as neighbor of dst when out lacks dst",
+                );
                 srcs.insert(p, src);
                 self.edge_count += 1;
                 true
