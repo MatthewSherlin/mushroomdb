@@ -2,6 +2,7 @@ pub mod columns;
 pub mod fs;
 pub mod idmap;
 pub mod interner;
+pub mod snapshot;
 pub mod topology;
 pub mod types;
 pub mod wal;

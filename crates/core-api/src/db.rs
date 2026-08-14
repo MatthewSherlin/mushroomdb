@@ -27,6 +27,14 @@ impl<F: Fs> GraphDb<F> {
             props: ColumnStore::new(),
             labels: Vec::new(),
         };
+        let snap_bytes = db.fs.read(FileId::Snapshot)?;
+        if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
+            db.ids = state.ids;
+            db.syms = state.syms;
+            db.topo = state.topo;
+            db.props = state.props;
+            db.labels = state.labels;
+        }
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
         if valid_len < bytes.len() {
@@ -169,6 +177,16 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn snapshot(&mut self) -> Result<()> {
-        Ok(()) // implemented in task 10
+        let state = core_storage::snapshot::SnapshotState {
+            ids: self.ids.clone(),
+            syms: self.syms.clone(),
+            topo: self.topo.clone(),
+            props: self.props.clone(),
+            labels: self.labels.clone(),
+        };
+        self.fs
+            .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state))?;
+        self.fs.write_atomic(FileId::Wal, b"")?; // wal tail now starts empty
+        Ok(())
     }
 }
