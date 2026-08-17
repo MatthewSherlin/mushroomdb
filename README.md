@@ -27,7 +27,7 @@ fn tags(xs: &[&str]) -> Value {
 }
 
 fn main() {
-    let mut db = GraphDb::open(&std::env::temp_dir().join("graphdb-quickstart")).expect("open");
+    let mut db = GraphDb::open(&std::env::temp_dir().join(format!("graphdb-quickstart-{}", std::process::id()))).expect("open");
     db.insert_node("Org", "acme", vec![("skills".into(), tags(&["graph", "rust", "search"]))]).expect("acme");
     db.insert_node("Org", "beta", vec![("skills".into(), tags(&["sales", "ops"]))]).expect("beta");
     db.create_rule(RuleDef {
@@ -96,6 +96,11 @@ is the node key. Unknown label/type → zero rows.
 
 Not in this subset: variable-length paths, aggregations, `OPTIONAL
 MATCH`, writes via Cypher, functions, `DISTINCT`.
+
+Multi-`MATCH` patterns whose variables are not joined (e.g. `MATCH (a)
+MATCH (b) RETURN a, b`) produce a cross-join and will exhaust memory at
+large node counts — constrain patterns with shared variables or add a
+tight `LIMIT`.
 
 ## Coming later
 

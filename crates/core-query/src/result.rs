@@ -35,6 +35,7 @@ impl ResultSet {
         self.rows.is_empty()
     }
 
+    /// # Panics — if `i >= self.len()`.
     pub fn row(&self, i: usize) -> &[Option<Value>] {
         &self.rows[i]
     }

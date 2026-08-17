@@ -30,6 +30,9 @@ struct Projected {
 
 /// Execute a plan against a view. Row order before OrderBy is deterministic
 /// (scan order = dense ids; expand order = expand()'s sorted order).
+///
+/// Precondition: `OrderBy` items produced by `plan()` use `OrderTarget::Alias`
+/// only; other variants are accepted defensively but non-standard.
 pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<ResultSet, String> {
     check_params(plan, params)?;
 
@@ -153,7 +156,10 @@ fn collect_expr(
 fn scan_ids(view: &GraphView, label: Option<&str>) -> Vec<u32> {
     match label {
         Some(label) => view.nodes_with_label(label),
-        None => (0..view.ids.len() as u32).collect(),
+        // Real nodes always have labels; sentinel slots are gaps.
+        None => (0..view.ids.len() as u32)
+            .filter(|&id| view.label_of(id).is_some())
+            .collect(),
     }
 }
 
@@ -1108,6 +1114,26 @@ LIMIT 10";
         assert_eq!(col(&rs, "p.age"), vec![Some(i(30)), None]);
         let pat = run(&v, "MATCH (p:Person {age: 30}) RETURN p", &BTreeMap::new()).unwrap();
         assert_eq!(col(&pat, "p"), vec![Some(s("ada"))]);
+    }
+
+    #[test]
+    fn unlabeled_match_does_not_project_sentinel_ghost_key() {
+        let mut fx = Fx::new();
+        fx.add("Person", "ada", vec![]);
+        // Hostile fixture: IdMap slot exists (key_of would yield "ghost")
+        // but the label is the gap sentinel.
+        fx.ids.get_or_insert("ghost");
+        fx.labels.resize(fx.ids.len(), u32::MAX);
+        fx.add("Person", "bob", vec![]);
+        let v = fx.view();
+        let rs = run(&v, "MATCH (n) RETURN n", &BTreeMap::new()).expect("unlabeled scan");
+        assert_eq!(col(&rs, "n"), vec![Some(s("ada")), Some(s("bob"))]);
+        assert!(
+            !rows_of(&rs)
+                .iter()
+                .any(|row| row.iter().any(|c| *c == Some(s("ghost")))),
+            "sentinel slot must not project a ghost key"
+        );
     }
 
     #[test]
