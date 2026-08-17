@@ -1,9 +1,13 @@
 //! Parser robustness: `lex` + `parse` return `Ok` or `Err` and never panic.
 //!
-//! Two generators, 256 cases each (512 total):
-//!   (a) arbitrary byte strings, interpreted as UTF-8 lossy
+//! Three generators, 256 cases each (768 total):
+//!   (a) arbitrary byte strings, UTF-8 lossy — **lexer-robustness**. Most
+//!       inputs are illegal at lex time, so `lex_then_parse` never reaches
+//!       `parse`. That is intentional for this block.
 //!   (b) token-level shuffle / truncate / duplicate of a pool of valid queries
 //!       that together cover every grammar production
+//!   (c) arbitrary `Vec<Tok>` (every variant, length 0..40) fed straight to
+//!       `parse` — this is the parser-on-hostile-token-streams block.
 
 use core_query::cypher::{lex, parse, Tok};
 use proptest::prelude::*;
@@ -159,6 +163,71 @@ fn never_panics(src: &str) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+fn parse_never_panics(toks: &[Tok]) -> Result<(), TestCaseError> {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let _ = parse(toks);
+    }));
+    prop_assert!(outcome.is_ok(), "parse panicked on tokens {:?}", toks);
+    Ok(())
+}
+
+fn ident_like() -> impl Strategy<Value = String> {
+    proptest::collection::vec(prop::char::range('a', 'z'), 0..8)
+        .prop_map(|cs| cs.into_iter().collect())
+}
+
+fn str_like() -> impl Strategy<Value = String> {
+    proptest::collection::vec(any::<u8>(), 0..16)
+        .prop_map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Every unit `Tok` variant, uniformly.
+fn unit_tok() -> impl Strategy<Value = Tok> {
+    (0u8..29).prop_map(|i| match i {
+        0 => Tok::Match,
+        1 => Tok::Where,
+        2 => Tok::Return,
+        3 => Tok::Order,
+        4 => Tok::By,
+        5 => Tok::Skip,
+        6 => Tok::Limit,
+        7 => Tok::As,
+        8 => Tok::And,
+        9 => Tok::Or,
+        10 => Tok::Not,
+        11 => Tok::Asc,
+        12 => Tok::Desc,
+        13 => Tok::LParen,
+        14 => Tok::RParen,
+        15 => Tok::LBracket,
+        16 => Tok::RBracket,
+        17 => Tok::LBrace,
+        18 => Tok::RBrace,
+        19 => Tok::Colon,
+        20 => Tok::Comma,
+        21 => Tok::Dot,
+        22 => Tok::Eq,
+        23 => Tok::Ne,
+        24 => Tok::Lt,
+        25 => Tok::Le,
+        26 => Tok::Gt,
+        27 => Tok::Ge,
+        _ => Tok::Dash,
+    })
+}
+
+/// Sample from all 34 `Tok` variants, including random Ident/Str/Int/Float/Param.
+fn tok_strategy() -> impl Strategy<Value = Tok> {
+    prop_oneof![
+        29 => unit_tok(),
+        1 => ident_like().prop_map(Tok::Ident),
+        1 => str_like().prop_map(Tok::Str),
+        1 => any::<i64>().prop_map(Tok::Int),
+        1 => any::<f64>().prop_map(Tok::Float),
+        1 => ident_like().prop_map(Tok::Param),
+    ]
+}
+
 #[test]
 fn valid_pool_has_at_least_ten_and_each_parses() {
     assert!(
@@ -172,6 +241,8 @@ fn valid_pool_has_at_least_ten_and_each_parses() {
     }
 }
 
+// Block (a): lexer-robustness. Arbitrary bytes are almost always rejected
+// by `lex`, so this block rarely reaches `parse`. Parser coverage is (b)+(c).
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
     #[test]
@@ -191,5 +262,15 @@ proptest! {
     ) {
         let src = mutate_tokens(token_substrings(VALID[qi]), mode, &entropy);
         never_panics(&src)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+    #[test]
+    fn parse_never_panics_on_arbitrary_token_sequences(
+        toks in proptest::collection::vec(tok_strategy(), 0..40)
+    ) {
+        parse_never_panics(&toks)?;
     }
 }

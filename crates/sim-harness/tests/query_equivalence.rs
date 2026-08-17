@@ -7,6 +7,10 @@
 //!   (b) 1-hop undirected Cypher row set == `grouped_by_edge_type` bucket
 //!
 //! Any divergence is an engine bug. Do not weaken these assertions.
+//!
+//! The proptest may see empty==empty when Overlap does not fire on a given
+//! graph. Non-empty derived-edge equality is pinned by
+//! `overlap_rule_equality_on_nonempty_derived_sets`.
 
 use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
 use proptest::prelude::*;
@@ -114,11 +118,9 @@ fn row_key_set(rs: &core_api::ResultSet, col: &str) -> Result<BTreeSet<String>, 
     Ok(out)
 }
 
-fn etypes_in_play(rule_created: bool) -> Vec<&'static str> {
+fn etypes_in_play() -> Vec<&'static str> {
     let mut v: Vec<&str> = USER_ETYPES.to_vec();
-    if rule_created {
-        v.push(RULE_ETYPE);
-    }
+    v.push(RULE_ETYPE);
     v
 }
 
@@ -151,12 +153,13 @@ proptest! {
         if !rule_created {
             db.create_rule(scored_overlap())
                 .expect("single scored Overlap rule");
-            rule_created = true;
         }
-        prop_assert!(rule_created);
 
+        // Empty==empty is allowed here when Overlap does not fire. The
+        // derived-edge path is pinned non-vacuous by
+        // `overlap_rule_equality_on_nonempty_derived_sets`.
         let sample: Vec<String> = live.iter().take(8).cloned().collect();
-        let etypes = etypes_in_play(true);
+        let etypes = etypes_in_play();
 
         for key in &sample {
             let params = params_for(key);
@@ -250,4 +253,79 @@ proptest! {
             }
         }
     }
+}
+
+/// Guaranteed Overlap fire: L0/L1 share tags (Jaccard 1.0 ≥ 0.3). Asserts
+/// Cypher↔traversal equality on **non-empty** OV sets so a silent drop of
+/// all derived edges cannot pass.
+#[test]
+fn overlap_rule_equality_on_nonempty_derived_sets() {
+    let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+    db.insert_node(
+        "L0",
+        "src",
+        vec![
+            ("k".into(), Value::Str("src".into())),
+            ("p".into(), Value::Int(0)),
+            ("tags".into(), tags_of(0, 1)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "L1",
+        "mid",
+        vec![
+            ("k".into(), Value::Str("mid".into())),
+            ("p".into(), Value::Int(1)),
+            ("tags".into(), tags_of(2, 2)),
+        ],
+    )
+    .unwrap();
+    db.create_rule(scored_overlap()).unwrap();
+    db.insert_node(
+        "L1",
+        "dst",
+        vec![
+            ("k".into(), Value::Str("dst".into())),
+            ("p".into(), Value::Int(2)),
+            ("tags".into(), tags_of(0, 1)),
+        ],
+    )
+    .unwrap();
+    db.insert_edge("e0", "src", "dst").unwrap();
+
+    let params = params_for("src");
+    let directed = format!("MATCH (a {{k: $key}})-[r:{RULE_ETYPE}]->(b) RETURN b");
+    let cypher_out = row_key_set(&db.query(&directed, &params).expect("directed OV"), "b")
+        .expect("directed OV keys");
+    let trav_out: BTreeSet<String> = db
+        .neighbors("src", RULE_ETYPE, Direction::Out)
+        .expect("neighbors OV")
+        .into_iter()
+        .collect();
+    assert!(
+        !cypher_out.is_empty(),
+        "Overlap must produce a non-empty directed OV set; cypher={cypher_out:?} neighbors={trav_out:?}"
+    );
+    assert_eq!(cypher_out, trav_out);
+
+    let undirected = format!("MATCH (a {{k: $key}})-[r:{RULE_ETYPE}]-(b) RETURN b");
+    let cypher_both = row_key_set(&db.query(&undirected, &params).expect("undirected OV"), "b")
+        .expect("undirected OV keys");
+    let grouped = db.node_ref("src").expect("src").grouped_by_edge_type();
+    let bucket: BTreeSet<String> = grouped
+        .get(RULE_ETYPE)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    assert!(
+        !cypher_both.is_empty(),
+        "Overlap must produce a non-empty undirected OV set; cypher={cypher_both:?} grouped={bucket:?}"
+    );
+    assert_eq!(cypher_both, bucket);
+    assert!(
+        cypher_out.contains("dst"),
+        "derived OV must include dst; got {cypher_out:?}"
+    );
 }
