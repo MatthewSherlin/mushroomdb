@@ -670,6 +670,114 @@ mod tests {
     }
 
     #[test]
+    fn score_refresh_on_persisting_owned_edge() {
+        // Pins: weight set unconditionally even when add_edge returns false (edge persists).
+        // jaccard({x,y,z},{x,y,q}) = |{x,y}|/|{x,y,z,q}| = 2/4 = 0.5 ≥ 0.2 → edges both ways.
+        let mut fx = Fx::new();
+        let a = fx.add("A", "a", vec![("tags", tags(&["x", "y", "z"]))]);
+        let b = fx.add("A", "b", vec![("tags", tags(&["x", "y", "q"]))]);
+        let et = fx.syms.intern("SIM");
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(
+                RuleDef {
+                    name: "sim".into(),
+                    src_label: "A".into(),
+                    dst_label: "A".into(),
+                    predicate: Predicate::Overlap {
+                        field: "tags".into(),
+                        min: 0.2,
+                    },
+                    edge_type: "SIM".into(),
+                    weight_prop: Some("score".into()),
+                },
+                &mut g,
+            )
+            .unwrap();
+            // Both directions present and owned with score ≈ 0.5.
+            assert!(g.topo.neighbors(et, Direction::Out, a).contains(&b));
+            assert!(g.topo.neighbors(et, Direction::Out, b).contains(&a));
+            assert!(eng.is_owned(et, a, b) || eng.is_owned(et, b, a));
+            let check = |v: Option<&Value>| {
+                if let Some(Value::Float(f)) = v {
+                    assert!(
+                        (f - 0.5).abs() < 1e-9,
+                        "initial score should be 0.5, got {f}"
+                    );
+                }
+            };
+            check(g.edge_props.get(et, a, b, "score"));
+            check(g.edge_props.get(et, b, a, "score"));
+        }
+        // Change b's tags to match a exactly → jaccard = 1.0.
+        let old = fx.props.get(b, "tags").cloned();
+        fx.props.set(b, "tags", tags(&["x", "y", "z"]));
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(b, Some(("tags", old)), &mut g);
+            // Both directions still present.
+            assert!(g.topo.neighbors(et, Direction::Out, a).contains(&b));
+            assert!(g.topo.neighbors(et, Direction::Out, b).contains(&a));
+            // Scores must now be 1.0 on both directions.
+            assert_eq!(
+                g.edge_props.get(et, a, b, "score"),
+                Some(&Value::Float(1.0)),
+                "score on a→b must refresh to 1.0"
+            );
+            assert_eq!(
+                g.edge_props.get(et, b, a, "score"),
+                Some(&Value::Float(1.0)),
+                "score on b→a must refresh to 1.0"
+            );
+        }
+    }
+
+    #[test]
+    fn dst_side_keymatch_links_when_c_node_inserted_after_t() {
+        // Exercises the synthetic key-probe on src_side Scalar index (dst-side KeyMatch path).
+        let mut fx = Fx::new();
+        // Insert T node first with cid="c9" — no C node yet → no edge.
+        let t = fx.add("T", "t1", vec![("cid", Value::Str("c9".into()))]);
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(
+                RuleDef {
+                    name: "fk".into(),
+                    src_label: "T".into(),
+                    dst_label: "C".into(),
+                    predicate: Predicate::KeyMatch {
+                        field: "cid".into(),
+                    },
+                    edge_type: "AT".into(),
+                    weight_prop: None,
+                },
+                &mut g,
+            )
+            .unwrap();
+            // No C node → no edge.
+            let at = g.syms.intern("AT");
+            assert_eq!(g.topo.edge_count(), 0, "no C node yet → no edge");
+            // t is indexed in src_side with Scalar{cid}="c9"
+            let _ = at;
+        }
+        // Now insert C node "c9" and notify the engine.
+        let c9 = fx.add("C", "c9", vec![]);
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(c9, None, &mut g);
+            let at = g.syms.get("AT").unwrap();
+            // The dst-side path must have probed src_side with key="c9" and found t.
+            assert!(
+                g.topo.neighbors(at, Direction::Out, t).contains(&c9),
+                "T→C edge must appear when C node is inserted"
+            );
+            assert!(eng.is_owned(at, t, c9));
+        }
+    }
+
+    #[test]
     fn duplicate_name_and_unknown_delete_error() {
         let mut fx = Fx::new();
         let mut eng = RuleEngine::new();
