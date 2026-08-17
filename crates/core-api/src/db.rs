@@ -1,9 +1,11 @@
+use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{GraphMut, RuleDef, RuleEngine};
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{
     ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
 };
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One rule-owned edge between two nodes, with the rule name, edge type,
 /// direction (src_key → dst_key), and weight if the rule stores one.
@@ -337,6 +339,39 @@ impl<F: Fs> GraphDb<F> {
         self.ids.get(key).is_some()
     }
 
+    fn view(&self) -> GraphView<'_> {
+        GraphView {
+            ids: &self.ids,
+            syms: &self.syms,
+            labels: &self.labels,
+            props: &self.props,
+            topo: &self.topo,
+            edge_props: &self.edge_props,
+        }
+    }
+
+    pub fn node_ref(&self, key: &str) -> Option<NodeRef<'_, F>> {
+        let id = self.ids.get(key)?;
+        Some(NodeRef { db: self, id })
+    }
+
+    pub fn nodes_with_label(&self, label: &str) -> Vec<NodeRef<'_, F>> {
+        self.view()
+            .nodes_with_label(label)
+            .into_iter()
+            .map(|id| NodeRef { db: self, id })
+            .collect()
+    }
+
+    pub fn find_nodes(&self, label: &str, filter: &Filter) -> Vec<NodeRef<'_, F>> {
+        let view = self.view();
+        view.nodes_with_label(label)
+            .into_iter()
+            .filter(|&id| eval_filter(filter, &|field| view.prop(id, field).cloned()))
+            .map(|id| NodeRef { db: self, id })
+            .collect()
+    }
+
     /// Return all rule-owned edges between `key_a` and `key_b` (either direction),
     /// annotated with rule name, edge type, direction, and weight.
     /// Results are sorted by (rule, edge_type).
@@ -461,5 +496,78 @@ impl<F: Fs> GraphDb<F> {
             .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state))?;
         self.fs.write_atomic(FileId::Wal, b"")?; // wal tail now starts empty
         Ok(())
+    }
+}
+
+pub struct NodeRef<'a, F: Fs> {
+    db: &'a GraphDb<F>,
+    id: u32,
+}
+
+impl<'a, F: Fs> NodeRef<'a, F> {
+    pub fn key(&self) -> &str {
+        self.db.ids.key_of(self.id).expect("dense ids")
+    }
+
+    pub fn label(&self) -> &str {
+        let sym = self
+            .db
+            .labels
+            .get(self.id as usize)
+            .copied()
+            .filter(|&s| s != u32::MAX)
+            .expect("real nodes always have a label; u32::MAX sentinel cannot occur");
+        self.db.syms.resolve(sym).expect("interned label symbol")
+    }
+
+    pub fn prop(&self, field: &str) -> Option<&Value> {
+        self.db.props.get(self.id, field)
+    }
+
+    /// depth-N BFS as a ResultSet: columns ["key","label","depth"], BFS order.
+    pub fn neighborhood(&self, depth: u32, edge_types: Option<&[&str]>, dir: Dir) -> ResultSet {
+        let view = self.db.view();
+        let resolved: Option<Vec<u32>> = edge_types.map(|names| {
+            names
+                .iter()
+                .filter_map(|name| view.syms.get(name))
+                .collect()
+        });
+        let nb = neighborhood(&view, self.id, depth, resolved.as_deref(), dir);
+        let mut rs = ResultSet::new(vec!["key".into(), "label".into(), "depth".into()]);
+        for (nid, d) in nb.nodes {
+            let key = view.key_of(nid);
+            let label = view
+                .label_of(nid)
+                .expect("real nodes always have a label; u32::MAX sentinel cannot occur");
+            rs.push_row(vec![
+                Some(Value::Str(key.to_string())),
+                Some(Value::Str(label.to_string())),
+                Some(Value::Int(d as i64)),
+            ]);
+        }
+        rs
+    }
+
+    /// 1-hop, Both directions: edge-type name → sorted unique neighbor keys.
+    pub fn grouped_by_edge_type(&self) -> BTreeMap<String, Vec<String>> {
+        let view = self.db.view();
+        let mut groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for e in expand(&view, self.id, None, Dir::Both) {
+            let etype = view
+                .syms
+                .resolve(e.etype)
+                .expect("topology etype is interned")
+                .to_string();
+            let nbr = if e.src == self.id { e.dst } else { e.src };
+            groups
+                .entry(etype)
+                .or_default()
+                .insert(view.key_of(nbr).to_string());
+        }
+        groups
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect()
     }
 }

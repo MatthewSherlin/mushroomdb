@@ -7,4 +7,5 @@ license = "Apache-2.0"
 [dependencies]
 core-storage = { path = "../core-storage" }
 core-rules = { path = "../core-rules" }
+core-query = { path = "../core-query" }
 bincode = { workspace = true }
