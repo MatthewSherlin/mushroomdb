@@ -1,4 +1,5 @@
 pub mod columns;
+pub mod edge_props;
 pub mod fs;
 pub mod idmap;
 pub mod interner;
@@ -7,9 +8,10 @@ pub mod topology;
 pub mod types;
 pub mod wal;
 pub use columns::ColumnStore;
+pub use edge_props::EdgeProps;
 pub use fs::{FileId, Fs, RealFs};
 pub use idmap::IdMap;
 pub use interner::Interner;
 pub use topology::{Direction, Topology};
-pub use types::{GraphError, Result, Value};
+pub use types::{list_tokens, GraphError, Result, Value, ValueKey};
 pub use wal::{decode_all, encode_record, WalRecord};
