@@ -1,3 +1,4 @@
+pub mod cypher;
 pub mod filter;
 pub mod result;
 pub mod traverse;
