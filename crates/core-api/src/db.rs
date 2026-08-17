@@ -1,3 +1,4 @@
+use core_query::cypher::{execute, lex, parse, plan, Params};
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{GraphMut, RuleDef, RuleEngine};
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
@@ -370,6 +371,16 @@ impl<F: Fs> GraphDb<F> {
             .filter(|&id| eval_filter(filter, &|field| view.prop(id, field).cloned()))
             .map(|id| NodeRef { db: self, id })
             .collect()
+    }
+
+    /// Lex → parse → plan → execute `cypher` over a read-only view.
+    /// Every pipeline `Err(String)` becomes `GraphError::QueryError`.
+    pub fn query(&self, cypher: &str, params: &BTreeMap<String, Value>) -> Result<ResultSet> {
+        let tokens = lex(cypher).map_err(|e| GraphError::QueryError { detail: e })?;
+        let ast = parse(&tokens).map_err(|e| GraphError::QueryError { detail: e })?;
+        let ops = plan(&ast).map_err(|e| GraphError::QueryError { detail: e })?;
+        execute(&self.view(), &ops, &Params(params))
+            .map_err(|e| GraphError::QueryError { detail: e })
     }
 
     /// Return all rule-owned edges between `key_a` and `key_b` (either direction),

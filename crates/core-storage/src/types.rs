@@ -45,6 +45,7 @@ pub enum GraphError {
     RuleInvalid { detail: String },
     RuleOwned { detail: String },
     RuleNotFound { name: String },
+    QueryError { detail: String },
 }
 
 impl std::fmt::Display for GraphError {
@@ -57,6 +58,7 @@ impl std::fmt::Display for GraphError {
             GraphError::RuleInvalid { detail } => write!(f, "invalid rule: {detail}"),
             GraphError::RuleOwned { detail } => write!(f, "edge is rule-owned: {detail}"),
             GraphError::RuleNotFound { name } => write!(f, "rule not found: {name}"),
+            GraphError::QueryError { detail } => write!(f, "query error: {detail}"),
         }
     }
 }
