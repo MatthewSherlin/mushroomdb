@@ -215,12 +215,47 @@ impl<F: Fs> GraphDb<F> {
                 self.engine = eng;
                 result.map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
             }
-            // ── Mutation variants — full logic lands in Tasks 3/4/5 ───────────
-            WalRecord::RemoveProp { .. } => {
-                // Stub: implemented in Task 3.
+            WalRecord::RemoveProp { key, field } => {
+                // Recovery-safe: unknown key or already-absent field is a
+                // clean no-op. Crash-window replay over a snapshot that
+                // already applied this record must not Err.
+                let Some(id) = self.ids.get(key) else {
+                    return Ok(());
+                };
+                let old = self.props.get(id, field).cloned();
+                self.props.remove(id, field);
+                let mut eng = std::mem::take(&mut self.engine);
+                {
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
+                    eng.on_node_changed(id, Some((field, old)), &mut gm);
+                }
+                self.engine = eng;
             }
-            WalRecord::DeleteEdge { .. } => {
-                // Stub: implemented in Task 3.
+            WalRecord::DeleteEdge {
+                edge_type,
+                src_key,
+                dst_key,
+            } => {
+                // Recovery-safe: unknown keys, unknown etype, or already-
+                // absent edge is a clean no-op (remove_edge returns false).
+                let Some(src) = self.ids.get(src_key) else {
+                    return Ok(());
+                };
+                let Some(dst) = self.ids.get(dst_key) else {
+                    return Ok(());
+                };
+                let Some(etype) = self.syms.get(edge_type) else {
+                    return Ok(());
+                };
+                self.topo.remove_edge(etype, src, dst);
+                self.edge_props.remove_edge(etype, src, dst);
             }
             WalRecord::DeleteNode { .. } => {
                 // Stub: implemented in Task 4.
@@ -299,6 +334,61 @@ impl<F: Fs> GraphDb<F> {
             field: field.into(),
             value,
         })
+    }
+
+    /// Remove a property. Returns `Ok(false)` (and does not log) if the field
+    /// is already absent. Unknown or tombstoned keys are `Err(KeyNotFound)`.
+    pub fn remove_prop(&mut self, key: &str, field: &str) -> Result<bool> {
+        let Some(id) = self.ids.get(key) else {
+            return Err(GraphError::KeyNotFound { key: key.into() });
+        };
+        if self.props.get(id, field).is_none() {
+            return Ok(false);
+        }
+        self.log_then_apply(WalRecord::RemoveProp {
+            key: key.into(),
+            field: field.into(),
+        })?;
+        Ok(true)
+    }
+
+    /// Delete a user edge. Returns `Ok(false)` (and does not log) if the edge
+    /// is absent. Unknown keys are `Err(KeyNotFound)`. Rule-owned edges are
+    /// `Err(RuleOwned)` — delete or change the owning rule instead.
+    pub fn delete_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
+        for k in [src_key, dst_key] {
+            if self.ids.get(k).is_none() {
+                return Err(GraphError::KeyNotFound { key: k.into() });
+            }
+        }
+        let src = self.ids.get(src_key).unwrap();
+        let dst = self.ids.get(dst_key).unwrap();
+        if let Some(sym) = self.syms.get(edge_type) {
+            if self.engine.is_owned(sym, src, dst) {
+                return Err(GraphError::RuleOwned {
+                    detail: format!(
+                        "edge {edge_type} {src_key}→{dst_key} is rule-owned; \
+                         delete or change the owning rule"
+                    ),
+                });
+            }
+            if self
+                .topo
+                .neighbors(sym, Direction::Out, src)
+                .binary_search(&dst)
+                .is_err()
+            {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
+        self.log_then_apply(WalRecord::DeleteEdge {
+            edge_type: edge_type.into(),
+            src_key: src_key.into(),
+            dst_key: dst_key.into(),
+        })?;
+        Ok(true)
     }
 
     /// Validate and WAL-log a new rule, then backfill derived edges inside apply.
