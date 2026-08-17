@@ -1,5 +1,5 @@
 use crate::view::GraphView;
-use core_storage::{Direction, Interner};
+use core_storage::Direction;
 use std::collections::{BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +16,7 @@ pub struct EdgeRef {
     pub dst: u32,
 }
 
-/// Typed 1-hop expansion. `etypes=None` → all interned symbols (sorted id order).
+/// Typed 1-hop expansion. `etypes=None` → all edge types in the graph (sorted).
 /// Deterministic: etype asc, then neighbor asc; `Dir::Both` = Out then In.
 /// Dedupe only identical `EdgeRef` triples — Out and In of a pair are distinct.
 pub fn expand(view: &GraphView, id: u32, etypes: Option<&[u32]>, dir: Dir) -> Vec<EdgeRef> {
@@ -27,7 +27,7 @@ pub fn expand(view: &GraphView, id: u32, etypes: Option<&[u32]>, dir: Dir) -> Ve
             v.dedup();
             v
         }
-        None => interned_syms(view.syms),
+        None => view.topo.etypes().collect(),
     };
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -101,18 +101,6 @@ pub fn neighborhood(
         nodes,
         edges: edges.into_iter().collect(),
     }
-}
-
-fn interned_syms(syms: &Interner) -> Vec<u32> {
-    // Topology does not expose an etype iterator. Interner symbols are dense,
-    // shared with labels; label-only symbols yield empty neighbor lists.
-    let mut out = Vec::new();
-    let mut i = 0u32;
-    while syms.resolve(i).is_some() {
-        out.push(i);
-        i += 1;
-    }
-    out
 }
 
 fn push_unique(out: &mut Vec<EdgeRef>, seen: &mut BTreeSet<EdgeRef>, e: EdgeRef) {
@@ -244,6 +232,28 @@ mod tests {
         assert_eq!(
             expand(&v, g.b, Some(&[g.knows]), Dir::In),
             vec![e(g.knows, g.a, g.b)]
+        );
+    }
+
+    #[test]
+    fn expand_none_uses_topo_etypes_not_interned_symbols() {
+        let mut fx = Fx::new();
+        // Labels/fields interned between etypes: symbol space ≠ topology etypes.
+        let a = fx.add("Person", "a");
+        let b = fx.add("Person", "b");
+        let knows = fx.syms.intern("KNOWS");
+        let _age = fx.syms.intern("age");
+        let _company = fx.syms.intern("Company");
+        let likes = fx.syms.intern("LIKES");
+        fx.topo.add_edge(knows, a, b);
+        fx.topo.add_edge(likes, a, b);
+        assert!(fx.syms.get("Person").unwrap() < knows);
+        assert!(knows < fx.syms.get("age").unwrap());
+        assert!(fx.syms.get("age").unwrap() < likes);
+        let v = fx.view();
+        assert_eq!(
+            expand(&v, a, None, Dir::Out),
+            vec![e(knows, a, b), e(likes, a, b)]
         );
     }
 

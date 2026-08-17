@@ -61,6 +61,15 @@ impl Topology {
         self.edge_count
     }
 
+    /// Edge-type ids present in the graph, sorted ascending.
+    /// `by_type` stays a `HashMap` (smaller than a BTreeMap migrate; snapshot encoding unchanged);
+    /// this method collect+sorts keys so iteration is deterministic.
+    pub fn etypes(&self) -> impl Iterator<Item = u32> + '_ {
+        let mut ids: Vec<u32> = self.by_type.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter()
+    }
+
     pub fn remove_edge(&mut self, etype: u32, src: u32, dst: u32) -> bool {
         let Some(adj) = self.by_type.get_mut(&etype) else {
             return false;
@@ -117,5 +126,18 @@ mod tests {
         // re-add after remove works
         assert!(t.add_edge(0, 1, 2));
         assert_eq!(t.edge_count(), 2);
+    }
+
+    #[test]
+    fn etypes_empty_multiple_and_sorted() {
+        let empty = Topology::new();
+        assert_eq!(empty.etypes().collect::<Vec<_>>(), Vec::<u32>::new());
+
+        let mut t = Topology::new();
+        t.add_edge(3, 0, 1);
+        t.add_edge(1, 0, 1);
+        t.add_edge(3, 1, 2); // existing type, must not duplicate
+        t.add_edge(2, 0, 2);
+        assert_eq!(t.etypes().collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 }
