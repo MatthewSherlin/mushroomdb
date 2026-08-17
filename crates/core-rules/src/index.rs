@@ -19,12 +19,23 @@ pub enum CandidateSpec<'a> {
     Tokens { field: &'a str },
 }
 
+/// Returns the candidate strategy derived from `p`.
+///
+/// # Panics
+///
+/// Panics on `All([])`. Predicates must pass `RuleDef::validate()` first.
 pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
     match p {
         Predicate::KeyMatch { .. } => CandidateSpec::ByKey,
         Predicate::FieldEqual { field } => CandidateSpec::Scalar { field },
         Predicate::Overlap { field, .. } => CandidateSpec::Tokens { field },
-        Predicate::All(parts) => candidate_spec(&parts[0]),
+        Predicate::All(parts) => {
+            debug_assert!(
+                !parts.is_empty(),
+                "candidate_spec requires a validated predicate"
+            );
+            candidate_spec(&parts[0])
+        }
     }
 }
 

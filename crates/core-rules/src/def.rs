@@ -108,6 +108,10 @@ pub fn evaluate(pred: &Predicate, src: &NodeView, dst: &NodeView) -> Option<f64>
             (j >= *min).then_some(j)
         }
         Predicate::All(parts) => {
+            // validate() rejects empty All; this is defense-in-depth against skipped validation.
+            if parts.is_empty() {
+                return None;
+            }
             let mut score = f64::INFINITY;
             for part in parts {
                 score = score.min(evaluate(part, src, dst)?);
@@ -253,5 +257,21 @@ mod tests {
         let mut bad3 = ok;
         bad3.predicate = Predicate::All(vec![]);
         assert!(bad3.validate().is_err());
+    }
+
+    #[test]
+    fn evaluate_empty_all_returns_none() {
+        let empty: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        let sp = |f: &str| empty.get(f).cloned();
+        let dp = |f: &str| empty.get(f).cloned();
+        let src = NodeView {
+            key: "a",
+            props: &sp,
+        };
+        let dst = NodeView {
+            key: "b",
+            props: &dp,
+        };
+        assert_eq!(evaluate(&Predicate::All(vec![]), &src, &dst), None);
     }
 }
