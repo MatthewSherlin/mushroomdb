@@ -348,6 +348,27 @@ impl<F: Fs> GraphDb<F> {
                     self.apply(rec)?;
                 }
             }
+            WalRecord::RebuildRule { name } => {
+                // Replay-over-snapshot idempotency: the snapshot may already
+                // reflect a later delete_rule, so the rule is absent; skip.
+                if !self.engine.rules().any(|r| r.name == *name) {
+                    return Ok(());
+                }
+                let mut eng = std::mem::take(&mut self.engine);
+                let result = {
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
+                    eng.rebuild(name, &mut gm)
+                };
+                self.engine = eng;
+                result.map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
+            }
         }
         Ok(())
     }
@@ -559,27 +580,20 @@ impl<F: Fs> GraphDb<F> {
         self.engine.rules().cloned().collect()
     }
 
-    /// Recompute a rule's derived edges from scratch (repair tool; NOT WAL-logged).
+    /// Recompute a rule's derived edges from scratch. WAL-logged so un-trip
+    /// plus later mutations replay identically (rebuild is a pure function
+    /// of state).
     ///
     /// Only exit from the tripped latch: if the full desired set fits the
     /// budget, it is applied completely and `tripped` clears; if it still
     /// exceeds the budget, provenance is left untouched and `tripped` stays
     /// true. Counts as a fire evaluation (see [`RuleStats::fires`]).
+    /// Unknown rule → `RuleNotFound`, nothing logged.
     pub fn rebuild_rule(&mut self, name: &str) -> Result<()> {
-        let mut eng = std::mem::take(&mut self.engine);
-        let result = {
-            let mut gm = make_graph_mut(
-                &self.ids,
-                &mut self.syms,
-                &self.labels,
-                &self.props,
-                &mut self.topo,
-                &mut self.edge_props,
-            );
-            eng.rebuild(name, &mut gm)
-        };
-        self.engine = eng;
-        result.map_err(|_| GraphError::RuleNotFound { name: name.into() })
+        if !self.engine.rules().any(|r| r.name == name) {
+            return Err(GraphError::RuleNotFound { name: name.into() });
+        }
+        self.log_then_apply(WalRecord::RebuildRule { name: name.into() })
     }
 
     pub fn get_prop(&self, key: &str, field: &str) -> Option<&Value> {

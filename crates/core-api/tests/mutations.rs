@@ -663,6 +663,44 @@ fn tripped_freeze_then_rebuild_untrips_when_desired_fits() {
     );
 }
 
+/// Reviewer divergence: un-trip via rebuild then insert must replay
+/// identically. Without a WAL record, reopen stays frozen and the new
+/// node does not derive.
+#[test]
+fn untrip_rebuild_then_insert_survives_wal_replay() {
+    let dir = tmp("budget-untrip-replay");
+    let live;
+    let live_edges;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.create_rule(const_eq_rule(10)).unwrap();
+        insert_const_nodes(&mut db, 0, 4);
+        assert!(db.stats().rules[0].tripped);
+
+        db.set_prop("n2", "k", Value::Str("x2".into())).unwrap();
+        db.set_prop("n3", "k", Value::Str("x3".into())).unwrap();
+        assert!(db.stats().rules[0].tripped);
+        assert!(db.stats().rules[0].edges < 10);
+
+        db.rebuild_rule("eq").unwrap();
+        assert!(!db.stats().rules[0].tripped);
+
+        insert_const_nodes(&mut db, 4, 5);
+        live = db.stats();
+        live_edges = out_pairs(&db, &["n0", "n1", "n2", "n3", "n4"], "EQ");
+        assert!(!live.rules[0].tripped);
+        assert_eq!(live.rules[0].edges, 6);
+        assert_eq!(live_edges.len(), 6);
+    }
+
+    let reopened = GraphDb::open(&dir).unwrap();
+    assert_eq!(reopened.stats(), live);
+    assert_eq!(
+        out_pairs(&reopened, &["n0", "n1", "n2", "n3", "n4"], "EQ"),
+        live_edges
+    );
+}
+
 #[test]
 fn delete_rule_drops_rule_stats() {
     let dir = tmp("budget-delete-rule-stats");

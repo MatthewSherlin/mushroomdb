@@ -42,6 +42,11 @@ pub enum WalRecord {
     /// treats a frame whose payload deserialises to a nested `Batch` as corrupt
     /// (stops cleanly before that frame, returning the valid prefix).
     Batch(Vec<WalRecord>),
+    /// Recompute one rule from scratch (un-trip / repair). Appended after
+    /// `Batch`; bincode discriminant is 9. `Batch` stays at 8.
+    RebuildRule {
+        name: String,
+    },
 }
 
 /// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.
@@ -201,6 +206,14 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_rebuild_rule() {
+        let r = WalRecord::RebuildRule { name: "eq".into() };
+        let bytes = encode_record(&r);
+        let (recs, _) = decode_all(&bytes);
+        assert_eq!(recs, vec![r]);
+    }
+
+    #[test]
     fn batch_of_three_is_one_frame() {
         let inner = vec![
             WalRecord::DeleteNode { key: "a".into() },
@@ -260,6 +273,7 @@ mod tests {
     /// WAL variants must ONLY be appended — never reordered or inserted.
     /// The frame layout is `[len: u32 LE][crc32: u32 LE][bincode payload]`.
     /// The discriminant is the first 4 bytes of the payload (u32 LE).
+    /// `Batch` stays at discriminant 8; `RebuildRule` is 9.
     #[test]
     fn golden_bytes_pin_wire_format() {
         // ── Variant 0: InsertNode { label: "L", key: "k", props: [] } ──────────
@@ -308,6 +322,24 @@ mod tests {
             encode_record(&remove_prop),
             expected_remove_prop,
             "RemoveProp wire format changed — this breaks all existing WAL files"
+        );
+
+        // ── Variant 9: RebuildRule { name: "eq" } ─────────────────────────────
+        // Batch remains discriminant 8; this variant is appended after it.
+        let rebuild = WalRecord::RebuildRule { name: "eq".into() };
+        #[rustfmt::skip]
+        let expected_rebuild: &[u8] = &[
+            // header: len=14 LE, crc32 LE
+            14, 0, 0, 0, 242, 136, 144, 68,
+            // payload: discriminant=9 (RebuildRule)
+            9, 0, 0, 0,
+            // name "eq": len=2, b'e', b'q'
+            2, 0, 0, 0, 0, 0, 0, 0, 101, 113,
+        ];
+        assert_eq!(
+            encode_record(&rebuild),
+            expected_rebuild,
+            "RebuildRule wire format changed — append-only WAL variants"
         );
     }
 
