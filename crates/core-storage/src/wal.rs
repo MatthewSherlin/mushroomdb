@@ -18,6 +18,12 @@ pub enum WalRecord {
         field: String,
         value: Value,
     },
+    CreateRule {
+        def_bytes: Vec<u8>,
+    },
+    DeleteRule {
+        name: String,
+    },
 }
 
 pub fn encode_record(rec: &WalRecord) -> Vec<u8> {

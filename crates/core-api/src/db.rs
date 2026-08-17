@@ -1,6 +1,7 @@
+use core_rules::{GraphMut, RuleDef, RuleEngine};
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
-use core_storage::{ColumnStore, Direction, GraphError, IdMap, Interner, Result, Topology, Value};
+use core_storage::{ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value};
 
 pub struct GraphDb<F: Fs> {
     fs: F,
@@ -9,6 +10,8 @@ pub struct GraphDb<F: Fs> {
     topo: Topology,
     props: ColumnStore,
     labels: Vec<u32>, // node id -> label symbol
+    edge_props: EdgeProps,
+    engine: RuleEngine,
 }
 
 impl GraphDb<RealFs> {
@@ -26,6 +29,8 @@ impl<F: Fs> GraphDb<F> {
             topo: Topology::new(),
             props: ColumnStore::new(),
             labels: Vec::new(),
+            edge_props: EdgeProps::new(),
+            engine: RuleEngine::new(),
         };
         let snap_bytes = db.fs.read(FileId::Snapshot)?;
         if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
@@ -61,6 +66,20 @@ impl<F: Fs> GraphDb<F> {
                 for (field, value) in props {
                     self.props.set(id, field, value.clone());
                 }
+                // Fire rules for the newly inserted node.
+                let mut eng = std::mem::take(&mut self.engine);
+                {
+                    let mut gm = GraphMut {
+                        ids: &self.ids,
+                        syms: &mut self.syms,
+                        labels: &self.labels,
+                        props: &self.props,
+                        topo: &mut self.topo,
+                        edge_props: &mut self.edge_props,
+                    };
+                    eng.on_node_changed(id, None, &mut gm);
+                }
+                self.engine = eng;
             }
             WalRecord::InsertEdge {
                 edge_type,
@@ -80,7 +99,59 @@ impl<F: Fs> GraphDb<F> {
                 let id = self.ids.get(key).ok_or_else(|| GraphError::Corrupt {
                     detail: format!("wal replay references unknown key {key}"),
                 })?;
+                let old_value = self.props.get(id, field).cloned();
                 self.props.set(id, field, value.clone());
+                // Fire rules for the changed field.
+                let mut eng = std::mem::take(&mut self.engine);
+                {
+                    let mut gm = GraphMut {
+                        ids: &self.ids,
+                        syms: &mut self.syms,
+                        labels: &self.labels,
+                        props: &self.props,
+                        topo: &mut self.topo,
+                        edge_props: &mut self.edge_props,
+                    };
+                    eng.on_node_changed(id, Some((field, old_value)), &mut gm);
+                }
+                self.engine = eng;
+            }
+            WalRecord::CreateRule { def_bytes } => {
+                let def: RuleDef = bincode::deserialize(def_bytes).map_err(|e| {
+                    GraphError::Corrupt {
+                        detail: format!("CreateRule def_bytes deserialize failed: {e}"),
+                    }
+                })?;
+                let mut eng = std::mem::take(&mut self.engine);
+                let result = {
+                    let mut gm = GraphMut {
+                        ids: &self.ids,
+                        syms: &mut self.syms,
+                        labels: &self.labels,
+                        props: &self.props,
+                        topo: &mut self.topo,
+                        edge_props: &mut self.edge_props,
+                    };
+                    eng.create_rule(def, &mut gm)
+                };
+                self.engine = eng;
+                result.map_err(|e| GraphError::RuleInvalid { detail: e })?;
+            }
+            WalRecord::DeleteRule { name } => {
+                let mut eng = std::mem::take(&mut self.engine);
+                let result = {
+                    let mut gm = GraphMut {
+                        ids: &self.ids,
+                        syms: &mut self.syms,
+                        labels: &self.labels,
+                        props: &self.props,
+                        topo: &mut self.topo,
+                        edge_props: &mut self.edge_props,
+                    };
+                    eng.delete_rule(name, &mut gm)
+                };
+                self.engine = eng;
+                result.map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
             }
         }
         Ok(())
@@ -117,6 +188,12 @@ impl<F: Fs> GraphDb<F> {
         let src = self.ids.get(src_key).unwrap();
         let dst = self.ids.get(dst_key).unwrap();
         if let Some(sym) = self.syms.get(edge_type) {
+            // Rule-owned guard: reject user edges that conflict with derived edges.
+            if self.engine.is_owned(sym, src, dst) {
+                return Err(GraphError::RuleOwned {
+                    detail: format!("edge {edge_type} {src_key}→{dst_key} is rule-owned"),
+                });
+            }
             if self
                 .topo
                 .neighbors(sym, Direction::Out, src)
@@ -143,6 +220,54 @@ impl<F: Fs> GraphDb<F> {
             field: field.into(),
             value,
         })
+    }
+
+    /// Validate and WAL-log a new rule, then backfill derived edges inside apply.
+    /// Validation and duplicate-name check run before logging so invalid rules
+    /// never enter the WAL.
+    pub fn create_rule(&mut self, def: RuleDef) -> Result<()> {
+        def.validate()
+            .map_err(|e| GraphError::RuleInvalid { detail: e })?;
+        if self.engine.rules().any(|r| r.name == def.name) {
+            return Err(GraphError::RuleInvalid {
+                detail: format!("rule {:?} already exists", def.name),
+            });
+        }
+        let def_bytes = bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
+            detail: format!("serialize rule: {e}"),
+        })?;
+        self.log_then_apply(WalRecord::CreateRule { def_bytes })
+    }
+
+    /// WAL-log rule deletion. Returns RuleNotFound if the rule does not exist.
+    pub fn delete_rule(&mut self, name: &str) -> Result<()> {
+        if !self.engine.rules().any(|r| r.name == name) {
+            return Err(GraphError::RuleNotFound { name: name.into() });
+        }
+        self.log_then_apply(WalRecord::DeleteRule { name: name.into() })
+    }
+
+    /// Return a snapshot of all registered rules.
+    pub fn rules(&self) -> Vec<RuleDef> {
+        self.engine.rules().cloned().collect()
+    }
+
+    /// Recompute a rule's derived edges from scratch (repair tool; NOT WAL-logged).
+    pub fn rebuild_rule(&mut self, name: &str) -> Result<()> {
+        let mut eng = std::mem::take(&mut self.engine);
+        let result = {
+            let mut gm = GraphMut {
+                ids: &self.ids,
+                syms: &mut self.syms,
+                labels: &self.labels,
+                props: &self.props,
+                topo: &mut self.topo,
+                edge_props: &mut self.edge_props,
+            };
+            eng.rebuild(name, &mut gm)
+        };
+        self.engine = eng;
+        result.map_err(|_| GraphError::RuleNotFound { name: name.into() })
     }
 
     pub fn get_prop(&self, key: &str, field: &str) -> Option<&Value> {

@@ -42,6 +42,9 @@ pub enum GraphError {
     DuplicateKey { key: String },
     Io(std::io::Error),
     Corrupt { detail: String },
+    RuleInvalid { detail: String },
+    RuleOwned { detail: String },
+    RuleNotFound { name: String },
 }
 
 impl std::fmt::Display for GraphError {
@@ -51,6 +54,9 @@ impl std::fmt::Display for GraphError {
             GraphError::DuplicateKey { key } => write!(f, "duplicate node key: {key}"),
             GraphError::Io(e) => write!(f, "io error: {e}"),
             GraphError::Corrupt { detail } => write!(f, "corrupt data: {detail}"),
+            GraphError::RuleInvalid { detail } => write!(f, "invalid rule: {detail}"),
+            GraphError::RuleOwned { detail } => write!(f, "edge is rule-owned: {detail}"),
+            GraphError::RuleNotFound { name } => write!(f, "rule not found: {name}"),
         }
     }
 }
