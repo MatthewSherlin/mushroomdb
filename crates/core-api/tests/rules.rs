@@ -1,4 +1,4 @@
-use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value};
+use core_api::{Direction, Explanation, GraphDb, GraphError, Predicate, RuleDef, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-{}-{}", name, std::process::id()));
@@ -82,4 +82,30 @@ fn derived_edges_are_not_wal_logged() {
     }).len() as u64;
     assert_eq!(after - before, node_only);
     assert_eq!(db.edge_count(), 1); // yet the derived edge exists
+}
+
+#[test]
+fn explain_reports_rule_provenance_and_weights() {
+    let dir = tmp("explain");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "o1", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+    db.create_rule(fk_rule()).unwrap();
+    db.create_rule(RuleDef {
+        name: "shared".into(), src_label: "Person".into(), dst_label: "Org".into(),
+        predicate: Predicate::Overlap { field: "tags".into(), min: 0.5 },
+        edge_type: "SIMILAR".into(), weight_prop: Some("score".into()),
+    }).unwrap();
+    db.insert_node("Person", "p1", vec![
+        ("org_id".into(), Value::Str("o1".into())),
+        ("tags".into(), Value::List(vec![Value::Str("x".into())])),
+    ]).unwrap();
+    let ex = db.explain("p1", "o1").unwrap();
+    assert_eq!(ex.len(), 2);
+    assert_eq!(ex[0].rule, "shared");
+    assert_eq!(ex[0].weight, Some(1.0));
+    assert_eq!(ex[1].rule, "works_at");
+    assert_eq!(ex[1].weight, None);
+    db.insert_node("Org", "o2", vec![]).unwrap();
+    assert!(db.explain("p1", "o2").unwrap().is_empty());
+    assert!(matches!(db.explain("p1", "ghost"), Err(GraphError::KeyNotFound { .. })));
 }

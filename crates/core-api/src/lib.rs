@@ -2,4 +2,4 @@ mod db;
 
 pub use core_rules::{Predicate, RuleDef};
 pub use core_storage::{Direction, GraphError, Result, Value};
-pub use db::GraphDb;
+pub use db::{Explanation, GraphDb};

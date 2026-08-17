@@ -244,6 +244,11 @@ impl RuleEngine {
         self.owned.contains(&(etype, src, dst))
     }
 
+    /// Read-only view of the provenance map: rule name → set of (etype_sym, src, dst).
+    pub fn provenance(&self) -> &BTreeMap<String, BTreeSet<(u32, u32, u32)>> {
+        &self.provenance
+    }
+
     /// Snapshot support: definitions + provenance out.  Indexes are NOT included
     /// (they are rebuilt on open via `reindex_all`).
     #[allow(clippy::type_complexity)]

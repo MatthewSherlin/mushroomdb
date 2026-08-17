@@ -1,4 +1,14 @@
 use core_rules::{GraphMut, RuleDef, RuleEngine};
+
+/// One rule-owned edge between two nodes, with the rule name, edge type,
+/// direction (src_key → dst_key), and weight if the rule stores one.
+pub struct Explanation {
+    pub rule: String,
+    pub edge_type: String,
+    pub src_key: String,
+    pub dst_key: String,
+    pub weight: Option<f64>,
+}
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value};
@@ -280,6 +290,55 @@ impl<F: Fs> GraphDb<F> {
 
     pub fn has_node(&self, key: &str) -> bool {
         self.ids.get(key).is_some()
+    }
+
+    /// Return all rule-owned edges between `key_a` and `key_b` (either direction),
+    /// annotated with rule name, edge type, direction, and weight.
+    /// Results are sorted by (rule, edge_type).
+    /// Returns `Err(KeyNotFound)` if either key is unknown.
+    pub fn explain(&self, key_a: &str, key_b: &str) -> Result<Vec<Explanation>> {
+        let id_a = self
+            .ids
+            .get(key_a)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key_a.into() })?;
+        let id_b = self
+            .ids
+            .get(key_b)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key_b.into() })?;
+
+        let mut results = Vec::new();
+
+        for (rule_name, prov_set) in self.engine.provenance() {
+            let Some(rule_def) = self.engine.rules().find(|r| &r.name == rule_name) else {
+                continue;
+            };
+            for &(etype, src, dst) in prov_set {
+                if !((src == id_a && dst == id_b) || (src == id_b && dst == id_a)) {
+                    continue;
+                }
+                let edge_type = match self.syms.resolve(etype) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let src_key = self.ids.key_of(src).unwrap_or("").to_string();
+                let dst_key = self.ids.key_of(dst).unwrap_or("").to_string();
+                let weight = rule_def.weight_prop.as_deref().and_then(|prop| {
+                    self.edge_props.get(etype, src, dst, prop).and_then(|v| {
+                        if let Value::Float(f) = v { Some(*f) } else { None }
+                    })
+                });
+                results.push(Explanation {
+                    rule: rule_name.clone(),
+                    edge_type,
+                    src_key,
+                    dst_key,
+                    weight,
+                });
+            }
+        }
+
+        results.sort_by(|a, b| a.rule.cmp(&b.rule).then(a.edge_type.cmp(&b.edge_type)));
+        Ok(results)
     }
 
     pub fn neighbors(&self, key: &str, edge_type: &str, dir: Direction) -> Result<Vec<String>> {
