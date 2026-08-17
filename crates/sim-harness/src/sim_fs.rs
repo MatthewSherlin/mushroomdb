@@ -7,26 +7,35 @@ use std::collections::HashMap;
 /// Two independent crash modes (at most one active per instance):
 ///
 /// **Byte mode** (`with_crash_after`): fires inside `append` when the cumulative
-/// bytes-written counter crosses the threshold; the torn `append` writes only a
-/// prefix (bytes up to the threshold survive), matching real OS behaviour.
+/// bytes-written counter crosses the threshold.  The torn `append` writes a prefix
+/// and sets `byte_crashed`.
+/// Failure surface: `append` and `sync` subsequently return `Err`.
+/// `read` and `write_atomic` are **not** affected by `byte_crashed`.
 ///
-/// **Op mode** (`with_crash_after_ops`): fires on the *n*-th Fs trait call
-/// (0-indexed, all four methods: append/sync/read/write_atomic).  The failing
-/// call leaves *no* side-effects: `write_atomic` preserves the old file content
-/// (rename-never-happened semantics, matching `RealFs`); `append` writes nothing
-/// (whole-call failure rather than a torn prefix — still realistic).
+/// **Op mode** (`with_crash_after_ops`): fires on the *n*-th Fs call (0-indexed,
+/// all four methods: append/sync/read/write_atomic).  The failing call leaves no
+/// side-effects and sets `op_crashed`.
+/// Failure surface: all four methods subsequently return `Err`.
+/// A failed `write_atomic` preserves old file content (rename-never-happened); a
+/// failed `append` writes nothing (whole-call failure).
+///
+/// `total_ops()` counts only calls that returned `Ok`.
+/// `surviving_state()` clears both crash latches.
 #[derive(Debug, Clone, Default)]
 pub struct SimFs {
     files: HashMap<&'static str, Vec<u8>>,
     // --- byte-mode fields ---
     crash_at: Option<usize>,
     appended: usize,
-    // --- op-mode fields (Cell because `read` takes &self) ---
+    /// Set when a torn append fires.  Blocks further `append` and `sync`.
+    /// Does NOT affect `read` or `write_atomic`.
+    byte_crashed: bool,
+    // --- op-mode fields (Cell so `read(&self)` can participate) ---
     crash_after_ops: Option<usize>,
-    /// Total completed Fs calls (all four methods).
+    /// Total Fs calls that returned `Ok` (all four methods).
     ops: Cell<usize>,
-    /// Shared crash latch: once set every subsequent call fails.
-    crashed: Cell<bool>,
+    /// Set when the op limit fires.  Blocks all four methods.
+    op_crashed: Cell<bool>,
 }
 
 fn name(f: FileId) -> &'static str {
@@ -51,9 +60,9 @@ impl SimFs {
 
     /// Op-level crash: crash on the `n_ops`-th Fs call (0-indexed, all four methods).
     ///
-    /// * Failed `write_atomic` — old file content is preserved (rename-never-happened).
-    /// * Failed `append` — no bytes are written (whole-call failure).
-    /// * After the crash, every subsequent call also fails (latch stays set).
+    /// * Failed `write_atomic` — old file content is preserved.
+    /// * Failed `append` — no bytes are written.
+    /// * After the crash, every subsequent call also fails.
     pub fn with_crash_after_ops(n_ops: usize) -> Self {
         Self {
             crash_after_ops: Some(n_ops),
@@ -66,48 +75,53 @@ impl SimFs {
         self.appended
     }
 
-    /// Total number of Fs calls that completed successfully (op-mode metric).
+    /// Total Fs calls that returned `Ok` (op-mode metric).
     pub fn total_ops(&self) -> usize {
         self.ops.get()
     }
 
-    /// Return a clean `SimFs` carrying the current file contents but no crash state,
-    /// simulating the durable bytes that survived the crash.
+    /// Return a clean `SimFs` with the same file contents and both crash latches reset.
     pub fn surviving_state(&self) -> SimFs {
         SimFs {
             files: self.files.clone(),
-            ..SimFs::default()
+            ..SimFs::default() // resets byte_crashed, op_crashed, ops, appended
         }
     }
 
-    /// Check the crash latch and, in op-crash mode, trigger a crash when the op
-    /// counter reaches the configured limit.  Increments `ops` on success.
-    ///
-    /// Uses `&self` (via `Cell`) so that `read(&self)` can participate.
+    /// Check the op-mode crash latch and limit.  Does NOT increment `ops`.
+    /// Uses `&self` so that `read(&self)` can participate.
     fn check_op_crash(&self) -> std::io::Result<()> {
-        if self.crashed.get() {
-            return Err(std::io::Error::other("simulated crash"));
+        if self.op_crashed.get() {
+            return Err(std::io::Error::other("simulated crash (op-mode latch)"));
         }
         if let Some(n) = self.crash_after_ops {
             if self.ops.get() >= n {
-                self.crashed.set(true);
+                self.op_crashed.set(true);
                 return Err(std::io::Error::other("simulated crash (op count)"));
             }
         }
-        self.ops.set(self.ops.get() + 1);
         Ok(())
+    }
+
+    /// Increment the op counter.  Called only after a method is confirmed to succeed.
+    fn tick_op(&self) {
+        self.ops.set(self.ops.get() + 1);
     }
 }
 
 impl Fs for SimFs {
     fn append(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
-        // Op-crash check fires *before* any bytes are written (whole-call failure semantics
-        // for op-mode crashes; byte-mode torn-prefix is handled separately below).
+        // Byte-mode latch: blocks further appends once a torn write has occurred.
+        if self.byte_crashed {
+            return Err(std::io::Error::other("simulated crash (byte-mode latch)"));
+        }
+        // Op-mode latch: fires before any bytes are written (whole-call failure).
         self.check_op_crash()?;
+        // Byte-crash logic: may write a torn prefix.
         let budget = self.crash_at.map(|at| at.saturating_sub(self.appended));
         let write_len = match budget {
             Some(b) if b < data.len() => {
-                self.crashed.set(true); // torn write: only a prefix reaches the file
+                self.byte_crashed = true; // torn write: only a prefix reaches the file
                 b
             }
             _ => data.len(),
@@ -117,33 +131,46 @@ impl Fs for SimFs {
             .or_default()
             .extend(&data[..write_len]);
         self.appended += write_len;
-        if self.crashed.get() {
+        if self.byte_crashed {
+            // Torn append failed: do NOT tick ops (call did not succeed).
             return Err(std::io::Error::other("simulated crash mid-append"));
         }
+        self.tick_op();
         Ok(())
     }
 
     fn sync(&mut self, _file: FileId) -> std::io::Result<()> {
-        self.check_op_crash()
+        // Byte-mode latch also blocks sync (same failure surface as append).
+        if self.byte_crashed {
+            return Err(std::io::Error::other("simulated crash (byte-mode latch)"));
+        }
+        self.check_op_crash()?;
+        self.tick_op();
+        Ok(())
     }
 
     fn read(&self, file: FileId) -> std::io::Result<Vec<u8>> {
+        // `read` is NEVER blocked by `byte_crashed` (byte-mode surface is append/sync only).
+        // Only op-mode crash applies here.
         self.check_op_crash()?;
-        Ok(self.files.get(name(file)).cloned().unwrap_or_default())
+        let data = self.files.get(name(file)).cloned().unwrap_or_default();
+        self.tick_op();
+        Ok(data)
     }
 
-    // In byte-crash mode: crash injection fires only during `append` (torn-prefix
-    // semantics). `write_atomic` is never reached by the byte-level threshold.
+    // Byte-mode: crash injection only fires during `append`; `byte_crashed` does NOT
+    // block `write_atomic` (byte-mode failure surface is append/sync only).
     //
-    // In op-crash mode: if `check_op_crash` returns Err, the file is NOT updated —
-    // old content stays intact (rename-never-happened semantics, matching the real
-    // `RealFs::write_atomic` which atomically replaces via a temp-file rename; a crash
-    // before the rename leaves the original file untouched).  This closes the Plan 1
-    // gap: DST now injects crashes *at* snapshot writes and WAL-truncation write_atomics
-    // via the op-count sweep.
+    // Op-mode: if `check_op_crash` returns Err, the file is NOT updated — old content
+    // stays intact (rename-never-happened semantics, matching RealFs where a crash before
+    // fsync+rename leaves the original file untouched).  This closes the Plan 1 gap:
+    // DST now injects crashes at snapshot writes and WAL-truncation write_atomics via the
+    // op-count sweep.
     fn write_atomic(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
+        // NOT blocked by `byte_crashed`.
         self.check_op_crash()?;
         self.files.insert(name(file), data.to_vec());
+        self.tick_op();
         Ok(())
     }
 }
@@ -164,15 +191,30 @@ mod tests {
         let mut fs = SimFs::with_crash_after(3);
         assert!(fs.append(FileId::Wal, b"ab").is_ok()); // 2 bytes in
         assert!(fs.append(FileId::Wal, b"cd").is_err()); // crashes after 1 more byte
-        assert!(fs.append(FileId::Wal, b"ef").is_err()); // dead stays dead
+        assert!(fs.append(FileId::Wal, b"ef").is_err()); // byte latch: dead
         let survivor = fs.surviving_state();
         assert_eq!(survivor.read(FileId::Wal).unwrap(), b"abc"); // torn
     }
 
     #[test]
+    fn byte_crash_does_not_block_read_or_write_atomic() {
+        // After a byte-crash, read returns file content and write_atomic still works.
+        let mut fs = SimFs::with_crash_after(2);
+        fs.append(FileId::Wal, b"ab").unwrap(); // ok: 2 bytes, exactly at threshold
+        assert!(fs.append(FileId::Wal, b"cd").is_err()); // tears at 0 more bytes
+        // read is NOT blocked by byte_crashed
+        assert_eq!(fs.read(FileId::Wal).unwrap(), b"ab");
+        // write_atomic is NOT blocked by byte_crashed
+        fs.write_atomic(FileId::Snapshot, b"snap").unwrap();
+        assert_eq!(fs.read(FileId::Snapshot).unwrap(), b"snap");
+        // sync IS blocked by byte_crashed
+        assert!(fs.sync(FileId::Wal).is_err());
+    }
+
+    #[test]
     fn op_crash_write_atomic_preserves_old_content() {
         // Ops 0-2 succeed; op 3 (second write_atomic) crashes.
-        // The old snapshot content must survive — rename-never-happened semantics.
+        // Old snapshot content must survive — rename-never-happened semantics.
         let mut fs = SimFs::with_crash_after_ops(3);
         fs.write_atomic(FileId::Snapshot, b"original").unwrap(); // op 0
         fs.append(FileId::Wal, b"entry").unwrap(); // op 1
@@ -181,6 +223,16 @@ mod tests {
         let survivor = fs.surviving_state();
         assert_eq!(survivor.read(FileId::Snapshot).unwrap(), b"original");
         assert_eq!(survivor.read(FileId::Wal).unwrap(), b"entry");
+    }
+
+    #[test]
+    fn op_crash_blocks_read() {
+        // After an op-crash, read also fails (op-mode failure surface is all four methods).
+        let mut fs = SimFs::with_crash_after_ops(1);
+        fs.append(FileId::Wal, b"x").unwrap(); // op 0: ok
+        assert!(fs.sync(FileId::Wal).is_err()); // op 1: crashes (op_crashed set)
+        // read is blocked by op_crashed
+        assert!(fs.read(FileId::Wal).is_err());
     }
 
     #[test]
@@ -193,5 +245,16 @@ mod tests {
         assert!(fs.write_atomic(FileId::Wal, b"z").is_err()); // latch: dead
         let survivor = fs.surviving_state();
         assert_eq!(survivor.read(FileId::Wal).unwrap(), b"x");
+    }
+
+    #[test]
+    fn torn_append_does_not_count_as_successful_op() {
+        // total_ops() counts only calls that returned Ok.
+        // The torn append returns Err — must not be counted.
+        let mut fs = SimFs::with_crash_after(3);
+        fs.append(FileId::Wal, b"ab").unwrap(); // op 0: 2 bytes ok
+        assert_eq!(fs.total_ops(), 1);
+        let _ = fs.append(FileId::Wal, b"cd"); // tears after 1 byte, returns Err
+        assert_eq!(fs.total_ops(), 1); // still 1 — torn call not counted
     }
 }
