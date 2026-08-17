@@ -8,3 +8,6 @@ license = "Apache-2.0"
 serde = { workspace = true }
 bincode = { workspace = true }
 crc32fast = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
