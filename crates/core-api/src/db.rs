@@ -3,6 +3,19 @@ use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value};
 
+/// Single construction point for a `GraphMut` view over the split-borrowed graph fields.
+/// Callers use `std::mem::take` on the engine before calling this, then restore it after.
+fn make_graph_mut<'a>(
+    ids: &'a IdMap,
+    syms: &'a mut Interner,
+    labels: &'a [u32],
+    props: &'a ColumnStore,
+    topo: &'a mut Topology,
+    edge_props: &'a mut EdgeProps,
+) -> GraphMut<'a> {
+    GraphMut { ids, syms, labels, props, topo, edge_props }
+}
+
 pub struct GraphDb<F: Fs> {
     fs: F,
     ids: IdMap,
@@ -69,14 +82,7 @@ impl<F: Fs> GraphDb<F> {
                 // Fire rules for the newly inserted node.
                 let mut eng = std::mem::take(&mut self.engine);
                 {
-                    let mut gm = GraphMut {
-                        ids: &self.ids,
-                        syms: &mut self.syms,
-                        labels: &self.labels,
-                        props: &self.props,
-                        topo: &mut self.topo,
-                        edge_props: &mut self.edge_props,
-                    };
+                    let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);
                     eng.on_node_changed(id, None, &mut gm);
                 }
                 self.engine = eng;
@@ -104,14 +110,7 @@ impl<F: Fs> GraphDb<F> {
                 // Fire rules for the changed field.
                 let mut eng = std::mem::take(&mut self.engine);
                 {
-                    let mut gm = GraphMut {
-                        ids: &self.ids,
-                        syms: &mut self.syms,
-                        labels: &self.labels,
-                        props: &self.props,
-                        topo: &mut self.topo,
-                        edge_props: &mut self.edge_props,
-                    };
+                    let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);
                     eng.on_node_changed(id, Some((field, old_value)), &mut gm);
                 }
                 self.engine = eng;
@@ -124,14 +123,7 @@ impl<F: Fs> GraphDb<F> {
                 })?;
                 let mut eng = std::mem::take(&mut self.engine);
                 let result = {
-                    let mut gm = GraphMut {
-                        ids: &self.ids,
-                        syms: &mut self.syms,
-                        labels: &self.labels,
-                        props: &self.props,
-                        topo: &mut self.topo,
-                        edge_props: &mut self.edge_props,
-                    };
+                    let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);
                     eng.create_rule(def, &mut gm)
                 };
                 self.engine = eng;
@@ -140,14 +132,7 @@ impl<F: Fs> GraphDb<F> {
             WalRecord::DeleteRule { name } => {
                 let mut eng = std::mem::take(&mut self.engine);
                 let result = {
-                    let mut gm = GraphMut {
-                        ids: &self.ids,
-                        syms: &mut self.syms,
-                        labels: &self.labels,
-                        props: &self.props,
-                        topo: &mut self.topo,
-                        edge_props: &mut self.edge_props,
-                    };
+                    let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);
                     eng.delete_rule(name, &mut gm)
                 };
                 self.engine = eng;
