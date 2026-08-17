@@ -332,3 +332,59 @@ fn duplicate_key_inside_batch_is_rejected() {
     assert_eq!(wal_len(&dir), before);
     assert!(!db.has_node("a"));
 }
+
+/// Pins the documented divergence from sequential semantics: batch validation
+/// cannot see edges a same-batch `create_rule` will derive, so `delete_edge`
+/// is dropped (no-op) instead of `Err(RuleOwned)`. If you make validation
+/// rule-aware, update this test.
+#[test]
+fn create_rule_then_delete_edge_in_same_batch_is_dropped_not_rule_owned() {
+    let dir = tmp("batch-rule-window");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("A", "a", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    db.insert_node("A", "b", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    let before = wal_len(&dir);
+
+    db.batch()
+        .create_rule(overlap_rule("rel", "REL"))
+        .delete_edge("REL", "a", "b")
+        .commit()
+        .unwrap();
+
+    // Delete was dropped: WAL Batch contains CreateRule only.
+    let wal = std::fs::read(dir.join("wal.bin")).unwrap();
+    let suffix = &wal[before as usize..];
+    let (recs, _) = decode_all(suffix);
+    assert_eq!(recs.len(), 1);
+    match &recs[0] {
+        WalRecord::Batch(inner) => {
+            assert_eq!(inner.len(), 1);
+            assert!(matches!(inner[0], WalRecord::CreateRule { .. }));
+        }
+        other => panic!("expected Batch, got {other:?}"),
+    }
+
+    assert_eq!(
+        db.neighbors("a", "REL", Direction::Out).unwrap(),
+        vec!["b".to_string()]
+    );
+    assert_eq!(
+        db.neighbors("b", "REL", Direction::Out).unwrap(),
+        vec!["a".to_string()]
+    );
+    let ex = db.explain("a", "b").unwrap();
+    assert!(!ex.is_empty());
+    assert!(ex.iter().any(|e| e.rule == "rel" && e.edge_type == "REL"));
+    match db.delete_edge("REL", "a", "b") {
+        Err(GraphError::RuleOwned { .. }) => {}
+        other => panic!("expected RuleOwned after commit, got {other:?}"),
+    }
+
+    let before_pairs = out_pairs(&db, &["a", "b"], "REL");
+    let before_count = db.edge_count();
+    db.rebuild_rule("rel").unwrap();
+    assert_eq!(db.edge_count(), before_count);
+    assert_eq!(out_pairs(&db, &["a", "b"], "REL"), before_pairs);
+}

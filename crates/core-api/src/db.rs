@@ -341,6 +341,14 @@ impl<F: Fs> GraphDb<F> {
     /// On success, one `WalRecord::Batch` frame is appended (one fsync)
     /// and each inner record is applied in order so rules fire per record.
     /// An empty batch, or a batch of only no-ops, writes zero WAL bytes.
+    ///
+    /// **Rule-window limitation:** batch validation cannot see edges that a
+    /// rule created earlier in the *same* batch will derive at apply time, so
+    /// a `delete_edge` / `insert_edge` in that window is silently no-oped
+    /// where sequential calls would return `Err(RuleOwned)`. State integrity
+    /// is unaffected (idempotent apply, provenance intact). Create rules in
+    /// their own batch, or sequentially, when later ops may touch derived
+    /// edges.
     pub fn batch(&mut self) -> BatchBuilder<'_, F> {
         BatchBuilder {
             db: self,
@@ -883,6 +891,9 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         let Some(et) = self.db.syms.get(edge_type) else {
             return false;
         };
+        // extra_rules is deliberately not consulted: a CreateRule earlier in
+        // this batch has not fired, so it contributes no provenance. That is
+        // the documented rule-window gap (see GraphDb::batch).
         if self.overlay.deleted_rules.is_empty() {
             return self.db.engine.is_owned(et, src, dst);
         }
@@ -1131,8 +1142,18 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
 
     /// Validate every queued op, then log one `Batch` frame and apply.
     /// Empty / all-noop batches return `Ok(())` without writing the WAL.
+    /// A second `commit()` after a successful one is an empty-batch no-op
+    /// (queued ops were taken).
     /// Takes `&mut self` so it chains after the queue methods (`b.insert_node(..).commit()`)
     /// and also works as `let mut b = db.batch(); b.insert_node(..); b.commit()`.
+    ///
+    /// **Rule-window limitation:** batch validation cannot see edges that a
+    /// rule created earlier in the *same* batch will derive at apply time, so
+    /// a `delete_edge` / `insert_edge` in that window is silently no-oped
+    /// where sequential calls would return `Err(RuleOwned)`. State integrity
+    /// is unaffected (idempotent apply, provenance intact). Create rules in
+    /// their own batch, or sequentially, when later ops may touch derived
+    /// edges.
     pub fn commit(&mut self) -> Result<()> {
         let ops = std::mem::take(&mut self.ops);
         self.db.commit_batch(ops)
