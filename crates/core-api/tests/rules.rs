@@ -16,6 +16,7 @@ fn fk_rule() -> RuleDef {
         },
         edge_type: "WORKS_AT".into(),
         weight_prop: None,
+        max_edges: None,
     }
 }
 
@@ -153,6 +154,7 @@ fn explain_reports_rule_provenance_and_weights() {
         },
         edge_type: "SIMILAR".into(),
         weight_prop: Some("score".into()),
+        max_edges: None,
     })
     .unwrap();
     db.insert_node(

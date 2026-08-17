@@ -8,6 +8,25 @@ use core_storage::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Database-wide counters plus per-rule budget/fire stats.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stats {
+    pub nodes_live: usize,
+    pub nodes_tombstoned: usize,
+    pub edges: u64,
+    pub snapshot_version: u16,
+    pub rules: Vec<RuleStats>,
+}
+
+/// One rule's provenance size, trip flag, and fire counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleStats {
+    pub name: String,
+    pub edges: u64,
+    pub tripped: bool,
+    pub fires: u64,
+}
+
 /// One rule-owned edge between two nodes, with the rule name, edge type,
 /// direction (src_key → dst_key), and weight if the rule stores one.
 #[derive(Debug, PartialEq)]
@@ -85,7 +104,12 @@ impl<F: Fs> GraphDb<F> {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            db.engine = RuleEngine::from_persist(defs, state.provenance);
+            db.engine = RuleEngine::from_persist(
+                defs,
+                state.provenance,
+                state.rule_tripped,
+                state.rule_fires,
+            );
             db.engine
                 .reindex_all(&db.ids, &db.syms, &db.labels, &db.props);
         }
@@ -697,6 +721,33 @@ impl<F: Fs> GraphDb<F> {
         self.topo.edge_count()
     }
 
+    /// Live/tombstone/edge counts plus per-rule provenance size, trip flag,
+    /// and fire counter. Rules are sorted by name.
+    pub fn stats(&self) -> Stats {
+        let rules: Vec<RuleStats> = self
+            .engine
+            .rules()
+            .map(|r| RuleStats {
+                name: r.name.clone(),
+                edges: self
+                    .engine
+                    .provenance()
+                    .get(&r.name)
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0),
+                tripped: self.engine.is_tripped(&r.name),
+                fires: self.engine.fire_count(&r.name),
+            })
+            .collect();
+        Stats {
+            nodes_live: self.ids.live_len(),
+            nodes_tombstoned: self.ids.len() - self.ids.live_len(),
+            edges: self.topo.edge_count(),
+            snapshot_version: core_storage::snapshot::VERSION,
+            rules,
+        }
+    }
+
     /// Test-support: total bytes appended (SimFs only usage).
     pub fn fs_total_appended(&self) -> usize
     where
@@ -711,7 +762,7 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn snapshot(&mut self) -> Result<()> {
-        let (rule_defs_typed, provenance) = self.engine.to_persist();
+        let (rule_defs_typed, provenance, rule_tripped, rule_fires) = self.engine.to_persist();
         let rule_defs = rule_defs_typed
             .iter()
             .map(|r| bincode::serialize(r).expect("RuleDef serialize cannot fail"))
@@ -725,6 +776,8 @@ impl<F: Fs> GraphDb<F> {
             edge_props: self.edge_props.clone(),
             rule_defs,
             provenance,
+            rule_tripped,
+            rule_fires,
         };
         self.fs
             .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state))?;

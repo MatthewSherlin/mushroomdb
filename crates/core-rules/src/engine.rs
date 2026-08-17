@@ -13,12 +13,17 @@ pub struct GraphMut<'a> {
     pub edge_props: &'a mut EdgeProps,
 }
 
+/// Used when `RuleDef.max_edges` is `None`.
+pub const DEFAULT_MAX_EDGES: u64 = 1_000_000;
+
 #[derive(Debug, Default)]
 pub struct RuleEngine {
     rules: BTreeMap<String, RuleDef>,
     indexes: BTreeMap<String, RuleIndex>,
     provenance: BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
     owned: BTreeSet<(u32, u32, u32)>,
+    tripped: BTreeMap<String, bool>,
+    fires: BTreeMap<String, u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,25 +168,42 @@ fn compute_desired(
     out
 }
 
-/// Diff-apply desired edge set against current provenance for edges touching `n`.
-fn diff_apply_for_node(
+fn edge_budget(def: &RuleDef) -> u64 {
+    def.max_edges.unwrap_or(DEFAULT_MAX_EDGES)
+}
+
+/// Diff-apply `desired` against provenance. `retract_touching = Some(n)` only
+/// retracts triples that involve `n` (incremental fire). `None` retracts any
+/// current provenance triple not in `desired` (backfill / rebuild).
+///
+/// Adding a new provenance edge that would exceed the rule budget is skipped
+/// and `*tripped` is set; never an error. Existing provenance edges are kept
+/// and may have weights refreshed. First-N is BTree (`(src, dst)`) order of
+/// `desired` after the retract pass.
+fn apply_desired(
     def: &RuleDef,
     desired: BTreeMap<(u32, u32), f64>,
-    n: u32,
+    retract_touching: Option<u32>,
     prov: &mut BTreeSet<(u32, u32, u32)>,
     owned: &mut BTreeSet<(u32, u32, u32)>,
+    tripped: &mut bool,
     g: &mut GraphMut<'_>,
 ) {
+    let budget = edge_budget(def);
     let et = g.syms.intern(&def.edge_type);
 
-    // Collect current provenance entries that involve n (as src or dst).
     let current: Vec<(u32, u32, u32)> = prov
         .iter()
-        .filter(|(t, s, d)| *t == et && (*s == n || *d == n))
+        .filter(|(t, s, d)| {
+            *t == et
+                && match retract_touching {
+                    None => true,
+                    Some(n) => *s == n || *d == n,
+                }
+        })
         .copied()
         .collect();
 
-    // Remove edges no longer desired.
     for (t, s, d) in current {
         if !desired.contains_key(&(s, d)) {
             g.topo.remove_edge(t, s, d);
@@ -191,21 +213,66 @@ fn diff_apply_for_node(
         }
     }
 
-    // Add or update edges.
     for ((s, d), score) in desired {
-        let newly = g.topo.add_edge(et, s, d);
-        if newly {
-            prov.insert((et, s, d));
-            owned.insert((et, s, d));
+        let triple = (et, s, d);
+        let already = prov.contains(&triple);
+        if !already {
+            if prov.len() as u64 >= budget {
+                *tripped = true;
+                continue;
+            }
+            let newly = g.topo.add_edge(et, s, d);
+            if newly {
+                prov.insert(triple);
+                owned.insert(triple);
+            }
         }
         // Only set weight_prop on edges this rule owns (newly added now, or
         // already in provenance). Pre-existing user edges are never owned, so
         // writing a weight to them would leave a ghost property after deletion.
-        let is_owned_here = newly || prov.contains(&(et, s, d));
+        let is_owned_here = already || prov.contains(&triple);
         if is_owned_here {
             if let Some(p) = &def.weight_prop {
                 g.edge_props.set(et, s, d, p, Value::Float(score));
             }
+        }
+    }
+}
+
+/// Union of `compute_desired(..., as_src)` over every live src-label node.
+/// BTree iteration of the result is the engine's deterministic first-N order
+/// for backfill and rebuild.
+fn compute_full_desired(
+    def: &RuleDef,
+    index: &RuleIndex,
+    g: &GraphMut<'_>,
+) -> BTreeMap<(u32, u32), f64> {
+    let mut desired = BTreeMap::new();
+    let src_sym = g.syms.get(&def.src_label);
+    for id in 0..g.ids.len() as u32 {
+        let label_sym = match g.labels.get(id as usize).copied() {
+            Some(s) if s != u32::MAX => s,
+            _ => continue,
+        };
+        if src_sym == Some(label_sym) {
+            desired.extend(compute_desired(def, index, id, true, g));
+        }
+    }
+    desired
+}
+
+/// Increment `fires` once per live node whose label matches either side.
+/// Backfill / rebuild counting: one tick per participating node evaluated.
+fn bump_fires_for_participants(def: &RuleDef, g: &GraphMut<'_>, fires: &mut u64) {
+    let src_sym = g.syms.get(&def.src_label);
+    let dst_sym = g.syms.get(&def.dst_label);
+    for id in 0..g.ids.len() as u32 {
+        let label_sym = match g.labels.get(id as usize).copied() {
+            Some(s) if s != u32::MAX => s,
+            _ => continue,
+        };
+        if src_sym == Some(label_sym) || dst_sym == Some(label_sym) {
+            *fires += 1;
         }
     }
 }
@@ -252,13 +319,30 @@ impl RuleEngine {
         &self.provenance
     }
 
-    /// Snapshot support: definitions + provenance out.  Indexes are NOT included
-    /// (they are rebuilt on open via `reindex_all`).
+    pub fn is_tripped(&self, name: &str) -> bool {
+        self.tripped.get(name).copied().unwrap_or(false)
+    }
+
+    pub fn fire_count(&self, name: &str) -> u64 {
+        self.fires.get(name).copied().unwrap_or(0)
+    }
+
+    /// Snapshot support: definitions + provenance + tripped/fires. Indexes
+    /// are NOT included (they are rebuilt on open via `reindex_all`).
     #[allow(clippy::type_complexity)]
-    pub fn to_persist(&self) -> (Vec<RuleDef>, BTreeMap<String, BTreeSet<(u32, u32, u32)>>) {
+    pub fn to_persist(
+        &self,
+    ) -> (
+        Vec<RuleDef>,
+        BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
+        BTreeMap<String, bool>,
+        BTreeMap<String, u64>,
+    ) {
         (
             self.rules.values().cloned().collect(),
             self.provenance.clone(),
+            self.tripped.clone(),
+            self.fires.clone(),
         )
     }
 
@@ -266,6 +350,8 @@ impl RuleEngine {
     pub fn from_persist(
         rules: Vec<RuleDef>,
         prov: BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
+        tripped: BTreeMap<String, bool>,
+        fires: BTreeMap<String, u64>,
     ) -> Self {
         let mut owned = BTreeSet::new();
         for set in prov.values() {
@@ -275,12 +361,22 @@ impl RuleEngine {
             .iter()
             .map(|r| (r.name.clone(), RuleIndex::default()))
             .collect();
-        let rules = rules.into_iter().map(|r| (r.name.clone(), r)).collect();
+        let rules: BTreeMap<String, RuleDef> =
+            rules.into_iter().map(|r| (r.name.clone(), r)).collect();
+        // Fill any missing keys so live rules always have entries.
+        let mut tripped = tripped;
+        let mut fires = fires;
+        for name in rules.keys() {
+            tripped.entry(name.clone()).or_insert(false);
+            fires.entry(name.clone()).or_insert(0);
+        }
         Self {
             rules,
             indexes,
             provenance: prov,
             owned,
+            tripped,
+            fires,
         }
     }
 
@@ -322,6 +418,8 @@ impl RuleEngine {
         self.rules.insert(name.clone(), def);
         self.indexes.insert(name.clone(), RuleIndex::default());
         self.provenance.entry(name.clone()).or_default();
+        self.tripped.insert(name.clone(), false);
+        self.fires.insert(name.clone(), 0);
 
         // Phase 1: index all existing nodes for this rule.
         let n_total = g.ids.len() as u32;
@@ -335,27 +433,15 @@ impl RuleEngine {
             index_node_for_rule(id, label_sym, &def, idx, g.syms, g.props);
         }
 
-        // Phase 2: compute desired edges for every participating node and diff-apply.
-        for id in 0..n_total {
-            let label_sym = match g.labels.get(id as usize).copied() {
-                Some(s) if s != u32::MAX => s,
-                _ => continue,
-            };
-            let as_src = g.syms.get(&def.src_label).is_some_and(|s| s == label_sym);
-            let as_dst = g.syms.get(&def.dst_label).is_some_and(|s| s == label_sym);
-            if !as_src && !as_dst {
-                continue;
-            }
-            let mut desired = BTreeMap::new();
-            if as_src {
-                desired.extend(compute_desired(&def, &self.indexes[&name], id, true, g));
-            }
-            if as_dst {
-                desired.extend(compute_desired(&def, &self.indexes[&name], id, false, g));
-            }
-            let prov = self.provenance.get_mut(&name).unwrap();
-            diff_apply_for_node(&def, desired, id, prov, &mut self.owned, g);
-        }
+        // Phase 2: full desired set in deterministic BTree order, cap at budget.
+        let desired = compute_full_desired(&def, &self.indexes[&name], g);
+        let prov = self.provenance.get_mut(&name).unwrap();
+        let tripped = self.tripped.get_mut(&name).unwrap();
+        apply_desired(&def, desired, None, prov, &mut self.owned, tripped, g);
+        // Fires: one tick per participating node evaluated (same unit as
+        // on_node_changed). Empty-graph create_rule therefore leaves fires=0.
+        let fires = self.fires.get_mut(&name).unwrap();
+        bump_fires_for_participants(&def, g, fires);
 
         Ok(())
     }
@@ -367,6 +453,8 @@ impl RuleEngine {
         }
         let def = self.rules.remove(name).unwrap();
         self.indexes.remove(name);
+        self.tripped.remove(name);
+        self.fires.remove(name);
         let prov = self.provenance.remove(name).unwrap_or_default();
         // intern so the symbol exists; edge_type was already interned at create time.
         let _et = g.syms.intern(&def.edge_type);
@@ -420,6 +508,7 @@ impl RuleEngine {
             if !fires {
                 continue;
             }
+            *self.fires.entry(rule_name.clone()).or_default() += 1;
 
             // --- Index maintenance ---
             if let Some((field, ref old_val)) = changed {
@@ -471,8 +560,9 @@ impl RuleEngine {
                     g,
                 ));
             }
-            let prov = self.provenance.entry(rule_name).or_default();
-            diff_apply_for_node(&def, desired, n, prov, &mut self.owned, g);
+            let prov = self.provenance.entry(rule_name.clone()).or_default();
+            let tripped = self.tripped.entry(rule_name).or_default();
+            apply_desired(&def, desired, Some(n), prov, &mut self.owned, tripped, g);
         }
     }
 
@@ -530,6 +620,7 @@ impl RuleEngine {
             return Err(format!("rule {:?} not found", name));
         }
         let def = self.rules[name].clone();
+        self.tripped.insert(name.to_string(), false);
 
         // Remove all provenance edges for this rule.
         let prov_set = self.provenance.remove(name).unwrap_or_default();
@@ -553,27 +644,13 @@ impl RuleEngine {
             index_node_for_rule(id, label_sym, &def, idx, g.syms, g.props);
         }
 
-        // Re-backfill.
-        for id in 0..n_total {
-            let label_sym = match g.labels.get(id as usize).copied() {
-                Some(s) if s != u32::MAX => s,
-                _ => continue,
-            };
-            let as_src = g.syms.get(&def.src_label).is_some_and(|s| s == label_sym);
-            let as_dst = g.syms.get(&def.dst_label).is_some_and(|s| s == label_sym);
-            if !as_src && !as_dst {
-                continue;
-            }
-            let mut desired = BTreeMap::new();
-            if as_src {
-                desired.extend(compute_desired(&def, &self.indexes[name], id, true, g));
-            }
-            if as_dst {
-                desired.extend(compute_desired(&def, &self.indexes[name], id, false, g));
-            }
-            let prov = self.provenance.get_mut(name).unwrap();
-            diff_apply_for_node(&def, desired, id, prov, &mut self.owned, g);
-        }
+        // Re-backfill from the full desired set (deterministic first-N).
+        let desired = compute_full_desired(&def, &self.indexes[name], g);
+        let prov = self.provenance.get_mut(name).unwrap();
+        let tripped = self.tripped.get_mut(name).unwrap();
+        apply_desired(&def, desired, None, prov, &mut self.owned, tripped, g);
+        let fires = self.fires.entry(name.to_string()).or_default();
+        bump_fires_for_participants(&def, g, fires);
 
         Ok(())
     }
@@ -645,6 +722,7 @@ mod tests {
             },
             edge_type: "REL".into(),
             weight_prop: Some("score".into()),
+            max_edges: None,
         }
     }
 
@@ -721,6 +799,7 @@ mod tests {
                     },
                     edge_type: "AT".into(),
                     weight_prop: None,
+                    max_edges: None,
                 },
                 &mut g,
             )
@@ -763,6 +842,7 @@ mod tests {
                     },
                     edge_type: "SIM".into(),
                     weight_prop: Some("score".into()),
+                    max_edges: None,
                 },
                 &mut g,
             )
@@ -824,6 +904,7 @@ mod tests {
                     },
                     edge_type: "AT".into(),
                     weight_prop: None,
+                    max_edges: None,
                 },
                 &mut g,
             )
@@ -925,6 +1006,7 @@ mod tests {
                     },
                     edge_type: "REL2".into(),
                     weight_prop: None,
+                    max_edges: None,
                 },
                 &mut g,
             )
@@ -941,6 +1023,7 @@ mod tests {
                     },
                     edge_type: "REL2".into(),
                     weight_prop: None,
+                    max_edges: None,
                 },
                 &mut g,
             )
@@ -988,5 +1071,112 @@ mod tests {
                 "b→a must be gone after both rules deleted"
             );
         }
+    }
+
+    fn const_eq_rule(max_edges: u64) -> RuleDef {
+        RuleDef {
+            name: "eq".into(),
+            src_label: "N".into(),
+            dst_label: "N".into(),
+            predicate: Predicate::FieldEqual { field: "k".into() },
+            edge_type: "EQ".into(),
+            weight_prop: None,
+            max_edges: Some(max_edges),
+        }
+    }
+
+    /// 4 nodes sharing field k="const" want 12 directed FieldEqual edges.
+    /// Budget 10 keeps the first 10 in deterministic (src,dst) order and trips.
+    /// A fifth insert still applies (no Err). Rebuild re-trips with the same
+    /// first-10 set. delete_rule drops tripped/fires.
+    #[test]
+    fn field_equal_budget_trips_at_exactly_10() {
+        let mut fx = Fx::new();
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(const_eq_rule(10), &mut g).unwrap();
+        }
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let id = fx.add(
+                "N",
+                &format!("n{i}"),
+                vec![("k", Value::Str("const".into()))],
+            );
+            ids.push(id);
+            let mut g = fx.g();
+            eng.on_node_changed(id, None, &mut g);
+        }
+        let et = fx.syms.get("EQ").unwrap();
+        let mut kept = BTreeSet::new();
+        for &s in &ids {
+            for &d in fx.topo.neighbors(et, Direction::Out, s) {
+                kept.insert((s, d));
+            }
+        }
+        assert_eq!(kept.len(), 10);
+        assert!(eng.is_tripped("eq"));
+        assert_eq!(eng.fire_count("eq"), 4);
+        assert_eq!(eng.provenance()["eq"].len(), 10);
+
+        // Fifth node: fire succeeds, no new edges.
+        let n4 = fx.add("N", "n4", vec![("k", Value::Str("const".into()))]);
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(n4, None, &mut g);
+        }
+        assert_eq!(fx.topo.edge_count(), 10);
+        assert!(eng.is_tripped("eq"));
+        assert_eq!(eng.fire_count("eq"), 5);
+
+        {
+            let mut g = fx.g();
+            eng.delete_rule("eq", &mut g).unwrap();
+        }
+        assert!(!eng.is_tripped("eq"));
+        assert_eq!(eng.fire_count("eq"), 0);
+        assert!(!eng.provenance().contains_key("eq"));
+    }
+
+    #[test]
+    fn rebuild_over_budget_keeps_deterministic_first_10() {
+        let mut fx = Fx::new();
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            ids.push(fx.add(
+                "N",
+                &format!("n{i}"),
+                vec![("k", Value::Str("const".into()))],
+            ));
+        }
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(const_eq_rule(10), &mut g).unwrap();
+        }
+        let et = fx.syms.get("EQ").unwrap();
+        let mut before = BTreeSet::new();
+        for &s in &ids {
+            for &d in fx.topo.neighbors(et, Direction::Out, s) {
+                before.insert((s, d));
+            }
+        }
+        assert_eq!(before.len(), 10);
+        assert!(eng.is_tripped("eq"));
+
+        {
+            let mut g = fx.g();
+            eng.rebuild("eq", &mut g).unwrap();
+        }
+        let mut after = BTreeSet::new();
+        for &s in &ids {
+            for &d in fx.topo.neighbors(et, Direction::Out, s) {
+                after.insert((s, d));
+            }
+        }
+        assert_eq!(after, before);
+        assert!(eng.is_tripped("eq"));
+        assert_eq!(eng.provenance()["eq"].len(), 10);
     }
 }

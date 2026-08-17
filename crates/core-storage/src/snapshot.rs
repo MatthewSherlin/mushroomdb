@@ -22,6 +22,11 @@ pub struct SnapshotState {
     /// core-storage independent of core-rules.
     pub rule_defs: Vec<Vec<u8>>,
     pub provenance: BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
+    /// Per-rule budget-trip flags. Appended this plan; VERSION stays 3
+    /// (`v3` = this plan's final snapshot shape; nothing shipped between).
+    pub rule_tripped: BTreeMap<String, bool>,
+    /// Per-rule fire counters. Same VERSION-3 append as `rule_tripped`.
+    pub rule_fires: BTreeMap<String, u64>,
 }
 
 pub fn encode(state: &SnapshotState) -> Vec<u8> {

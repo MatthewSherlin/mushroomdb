@@ -10,6 +10,14 @@ pub struct RuleDef {
     pub predicate: Predicate,
     pub edge_type: String,
     pub weight_prop: Option<String>,
+    /// Per-rule provenance cap. `None` uses the engine default (`1_000_000`).
+    ///
+    /// APPENDED field. bincode is positional, so this breaks decode of
+    /// `CreateRule` WAL records and snapshot `rule_defs` written before this
+    /// field existed. Pre-alpha no-migration ruling: accepted; no decoder
+    /// compat. `#[serde(default)]` cannot help — bincode does not skip
+    /// missing positional fields.
+    pub max_edges: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -239,6 +247,7 @@ mod tests {
             ]),
             edge_type: "E".into(),
             weight_prop: Some("score".into()),
+            max_edges: None,
         };
         assert!(ok.validate().is_ok());
         assert_eq!(

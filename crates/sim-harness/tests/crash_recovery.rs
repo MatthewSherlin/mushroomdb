@@ -73,6 +73,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         predicate: Predicate::KeyMatch { field: "f".into() },
         edge_type: "KM".into(),
         weight_prop: None,
+        max_edges: None,
     })?;
 
     // --- 6 L1 nodes ---
@@ -110,6 +111,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         },
         edge_type: "OV".into(),
         weight_prop: None,
+        max_edges: None,
     })?;
 
     // DUMMY rule created and immediately deleted.
@@ -120,6 +122,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         predicate: Predicate::FieldEqual { field: "f".into() },
         edge_type: "DUMMY".into(),
         weight_prop: None,
+        max_edges: None,
     })?;
     db.delete_rule("dummy")?;
 

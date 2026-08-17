@@ -1,4 +1,4 @@
-use core_api::{Dir, Direction, GraphDb, GraphError, Predicate, ResultSet, RuleDef, Value};
+use core_api::{Dir, Direction, GraphDb, GraphError, Predicate, ResultSet, RuleDef, Stats, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -22,6 +22,7 @@ fn overlap_rule(name: &str, etype: &str) -> RuleDef {
         },
         edge_type: etype.into(),
         weight_prop: Some("score".into()),
+        max_edges: None,
     }
 }
 
@@ -506,4 +507,146 @@ fn cypher_scan_traversal_grouped_explain_ignore_deleted_node() {
         db.explain("a", "b"),
         Err(GraphError::KeyNotFound { key }) if key == "a"
     ));
+}
+
+fn const_eq_rule(max_edges: u64) -> RuleDef {
+    RuleDef {
+        name: "eq".into(),
+        src_label: "N".into(),
+        dst_label: "N".into(),
+        predicate: Predicate::FieldEqual { field: "k".into() },
+        edge_type: "EQ".into(),
+        weight_prop: None,
+        max_edges: Some(max_edges),
+    }
+}
+
+fn insert_const_nodes(db: &mut GraphDb<core_storage::fs::RealFs>, start: usize, end: usize) {
+    for i in start..end {
+        db.insert_node(
+            "N",
+            &format!("n{i}"),
+            vec![("k".into(), Value::Str("const".into()))],
+        )
+        .unwrap();
+    }
+}
+
+/// Pathological FieldEqual-on-constant: 4 nodes produce 12 directed matches;
+/// budget 10 keeps the first 10 in deterministic order and trips. Later
+/// inserts must still succeed (never Err). WAL replay and snapshot+reopen
+/// reproduce the whole `Stats` value, including fires.
+#[test]
+fn field_equal_budget_trips_at_10_and_stats_survive_recovery() {
+    let dir = tmp("budget-stats-replay");
+    let live;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.create_rule(const_eq_rule(10)).unwrap();
+        insert_const_nodes(&mut db, 0, 4);
+
+        let keys = ["n0", "n1", "n2", "n3"];
+        let first10 = out_pairs(&db, &keys, "EQ");
+        assert_eq!(
+            first10.len(),
+            10,
+            "must trip at exactly 10 provenance edges"
+        );
+
+        let s = db.stats();
+        assert_eq!(s.nodes_live, 4);
+        assert_eq!(s.nodes_tombstoned, 0);
+        assert_eq!(s.edges, 10);
+        assert_eq!(s.snapshot_version, 3);
+        assert_eq!(s.rules.len(), 1);
+        assert_eq!(s.rules[0].name, "eq");
+        assert_eq!(s.rules[0].edges, 10);
+        assert!(s.rules[0].tripped, "budget breach must set tripped");
+        assert!(s.rules[0].fires > 0);
+
+        // Later inserts succeed (writes never Err on budget breach).
+        insert_const_nodes(&mut db, 4, 5);
+        let s = db.stats();
+        assert_eq!(s.rules[0].edges, 10);
+        assert!(s.rules[0].tripped);
+        assert_eq!(s.nodes_live, 5);
+        assert_eq!(s.edges, 10);
+        live = s;
+    }
+
+    let reopened = GraphDb::open(&dir).unwrap();
+    assert_eq!(reopened.stats(), live);
+    assert_eq!(
+        out_pairs(&reopened, &["n0", "n1", "n2", "n3", "n4"], "EQ").len(),
+        10
+    );
+    drop(reopened);
+
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        let before = db.stats();
+        db.snapshot().unwrap();
+        drop(db);
+        let after = GraphDb::open(&dir).unwrap();
+        assert_eq!(after.stats(), before);
+        assert_eq!(after.stats(), live);
+    }
+}
+
+/// Rebuild on a still-over-budget rule re-trips and keeps the same first-10
+/// edge set (`max_edges` is immutable per rule, so this is the un-trip path).
+#[test]
+fn rebuild_over_budget_retrips_same_first_10() {
+    let dir = tmp("budget-rebuild-set");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_rule(const_eq_rule(10)).unwrap();
+    insert_const_nodes(&mut db, 0, 4);
+    let keys = ["n0", "n1", "n2", "n3"];
+    let first10 = out_pairs(&db, &keys, "EQ");
+    assert_eq!(first10.len(), 10);
+    assert!(db.stats().rules[0].tripped);
+
+    db.rebuild_rule("eq").unwrap();
+    assert_eq!(out_pairs(&db, &keys, "EQ"), first10);
+    let s = db.stats();
+    assert!(s.rules[0].tripped);
+    assert_eq!(s.rules[0].edges, 10);
+}
+
+#[test]
+fn delete_rule_drops_rule_stats() {
+    let dir = tmp("budget-delete-rule-stats");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_rule(const_eq_rule(10)).unwrap();
+    insert_const_nodes(&mut db, 0, 2);
+    assert_eq!(db.stats().rules.len(), 1);
+    db.delete_rule("eq").unwrap();
+    assert!(db.stats().rules.is_empty());
+}
+
+#[test]
+fn stats_live_and_tombstoned_after_delete_node() {
+    let dir = tmp("stats-tombstone");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("A", "a", vec![]).unwrap();
+    db.insert_node("A", "b", vec![]).unwrap();
+    db.insert_edge("E", "a", "b").unwrap();
+    let s = db.stats();
+    assert_eq!(
+        s,
+        Stats {
+            nodes_live: 2,
+            nodes_tombstoned: 0,
+            edges: 1,
+            snapshot_version: 3,
+            rules: vec![],
+        }
+    );
+    db.delete_node("a").unwrap();
+    let s = db.stats();
+    assert_eq!(s.nodes_live, 1);
+    assert_eq!(s.nodes_tombstoned, 1);
+    assert_eq!(s.edges, 0);
+    assert!(db.has_node("b"));
+    assert!(!db.has_node("a"));
 }

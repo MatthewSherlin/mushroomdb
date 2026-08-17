@@ -24,6 +24,7 @@ fn rule_template(idx: u8) -> RuleDef {
             predicate: Predicate::KeyMatch { field: "f".into() },
             edge_type: "r_km".into(),
             weight_prop: None,
+            max_edges: None,
         },
         1 => RuleDef {
             name: "r_fe".into(),
@@ -32,6 +33,7 @@ fn rule_template(idx: u8) -> RuleDef {
             predicate: Predicate::FieldEqual { field: "f".into() },
             edge_type: "r_fe".into(),
             weight_prop: None,
+            max_edges: None,
         },
         2 => RuleDef {
             name: "r_ov".into(),
@@ -43,6 +45,7 @@ fn rule_template(idx: u8) -> RuleDef {
             },
             edge_type: "r_ov".into(),
             weight_prop: None,
+            max_edges: None,
         },
         3 => RuleDef {
             name: "r_all".into(),
@@ -57,6 +60,7 @@ fn rule_template(idx: u8) -> RuleDef {
             ]),
             edge_type: "r_all".into(),
             weight_prop: None,
+            max_edges: None,
         },
         // Template 4: shares edge_type "r_fe" with r_fe — exercises C1 (co-owned
         // edge type survival after rule deletion).  Different name and lower min
@@ -71,6 +75,7 @@ fn rule_template(idx: u8) -> RuleDef {
             },
             edge_type: "r_fe".into(),
             weight_prop: None,
+            max_edges: None,
         },
     }
 }
