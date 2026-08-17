@@ -2,12 +2,15 @@
 //! never panic, and mutated valid WAL streams decode as a prefix of the
 //! pristine record list.
 //!
-//! Three generators, 256 cases each (768 total):
+//! Four generators, 256 cases each (1024 total):
 //!   (a) arbitrary byte vectors (len 0..4096) → `wal::decode_all`
 //!   (b) arbitrary byte vectors (len 0..4096) → `snapshot::decode`
 //!   (c) bit-flip / truncate / splice mutations of a valid WAL stream
 //!       (several records including a `Batch` and a `RebuildRule`) and a
 //!       valid encoded `SnapshotState`
+//!   (d) mutate the raw v3 snapshot *payload*, then reattach a fresh valid
+//!       header (magic + version + CRC of the mutated payload) so
+//!       `bincode::deserialize` is actually reached
 
 use core_storage::snapshot::{self, SnapshotState};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
@@ -158,9 +161,10 @@ fn truncate_bytes(bytes: &[u8], entropy: &[u8]) -> Vec<u8> {
 
 /// Insert a run of entropy bytes at a position derived from entropy.
 fn splice_bytes(bytes: &[u8], entropy: &[u8]) -> Vec<u8> {
-    let pos = match entropy.first() {
-        Some(&e) => (e as usize) % (bytes.len() + 1),
-        None => 0,
+    let pos = match entropy {
+        [a, b, ..] => u16::from_le_bytes([*a, *b]) as usize % (bytes.len() + 1),
+        [a] => (*a as usize) % (bytes.len() + 1),
+        [] => 0,
     };
     let insert: &[u8] = if entropy.len() > 2 {
         &entropy[2..]
@@ -171,6 +175,16 @@ fn splice_bytes(bytes: &[u8], entropy: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&bytes[..pos]);
     out.extend_from_slice(insert);
     out.extend_from_slice(&bytes[pos..]);
+    out
+}
+
+/// Frame `payload` as a v3 snapshot: GDB1 + version 3 + crc32 of payload.
+fn wrap_snapshot_payload(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10 + payload.len());
+    out.extend(snapshot::MAGIC);
+    out.extend(snapshot::VERSION.to_le_bytes());
+    out.extend(crc32fast::hash(payload).to_le_bytes());
+    out.extend(payload);
     out
 }
 
@@ -290,5 +304,25 @@ proptest! {
         let snap = valid_snapshot_bytes();
         let mutated_snap = mutate(&snap, kind.wrapping_add(17), &entropy);
         check_snap_decode(&mutated_snap)?;
+    }
+}
+
+// Block (d): CRC-valid mutated payload → snapshot::decode reaches bincode.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+    #[test]
+    fn snapshot_decode_never_panics_on_crc_valid_mutated_payload(
+        kind in any::<u8>(),
+        entropy in proptest::collection::vec(any::<u8>(), 0..64)
+    ) {
+        let snap = valid_snapshot_bytes();
+        prop_assert!(
+            snap.len() >= 10,
+            "fixture snapshot must have a 10-byte header; got {}",
+            snap.len()
+        );
+        let mutated = mutate(&snap[10..], kind, &entropy);
+        let framed = wrap_snapshot_payload(&mutated);
+        check_snap_decode(&framed)?;
     }
 }
