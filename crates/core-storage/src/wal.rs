@@ -253,6 +253,64 @@ mod tests {
         encode_record(&outer); // must debug_assert-panic
     }
 
+    /// Pin the exact on-disk wire format for two variants: one pre-existing
+    /// (discriminant 0) and the first new variant added in Plan 4 (discriminant 5).
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    /// The frame layout is `[len: u32 LE][crc32: u32 LE][bincode payload]`.
+    /// The discriminant is the first 4 bytes of the payload (u32 LE).
+    #[test]
+    fn golden_bytes_pin_wire_format() {
+        // ── Variant 0: InsertNode { label: "L", key: "k", props: [] } ──────────
+        let insert_node = WalRecord::InsertNode {
+            label: "L".into(),
+            key: "k".into(),
+            props: vec![],
+        };
+        #[rustfmt::skip]
+        let expected_insert_node: &[u8] = &[
+            // header: len=30 LE, crc32 LE
+            30, 0, 0, 0, 114, 69, 253, 24,
+            // payload: discriminant=0 (InsertNode)
+            0, 0, 0, 0,
+            // label "L": len=1, b'L'
+            1, 0, 0, 0, 0, 0, 0, 0, 76,
+            // key "k": len=1, b'k'
+            1, 0, 0, 0, 0, 0, 0, 0, 107,
+            // props: len=0
+            0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(
+            encode_record(&insert_node),
+            expected_insert_node,
+            "InsertNode wire format changed — this breaks all existing WAL files"
+        );
+
+        // ── Variant 5: RemoveProp { key: "n1", field: "age" } ─────────────────
+        // This is the first Plan-4 mutation variant; pins the append boundary.
+        let remove_prop = WalRecord::RemoveProp {
+            key: "n1".into(),
+            field: "age".into(),
+        };
+        #[rustfmt::skip]
+        let expected_remove_prop: &[u8] = &[
+            // header: len=25 LE, crc32 LE
+            25, 0, 0, 0, 35, 214, 55, 239,
+            // payload: discriminant=5 (RemoveProp)
+            5, 0, 0, 0,
+            // key "n1": len=2, b'n', b'1'
+            2, 0, 0, 0, 0, 0, 0, 0, 110, 49,
+            // field "age": len=3, b'a', b'g', b'e'
+            3, 0, 0, 0, 0, 0, 0, 0, 97, 103, 101,
+        ];
+        assert_eq!(
+            encode_record(&remove_prop),
+            expected_remove_prop,
+            "RemoveProp wire format changed — this breaks all existing WAL files"
+        );
+    }
+
     #[test]
     fn nested_batch_decode_is_treated_as_corrupt() {
         // Manually encode a Batch whose payload contains a nested Batch by
