@@ -10,4 +10,5 @@ jobs:
         with: { toolchain: "1.92.0", components: "clippy, rustfmt" }
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --workspace --examples
       - run: cargo test --workspace
