@@ -100,8 +100,8 @@ fn snapshot_preserves_rules_provenance_and_scores() {
 }
 
 #[test]
-fn version_1_snapshot_is_rejected() {
-    let dir = tmp("snap-v1");
+fn version_2_snapshot_is_rejected() {
+    let dir = tmp("snap-v2");
     {
         let mut db = GraphDb::open(&dir).unwrap();
         db.insert_node("N", "a", vec![]).unwrap();
@@ -109,11 +109,11 @@ fn version_1_snapshot_is_rejected() {
     }
     let path = dir.join("snapshot.bin");
     let mut bytes = std::fs::read(&path).unwrap();
-    bytes[4] = 1;
-    bytes[5] = 0; // stamp VERSION=1
+    bytes[4] = 2;
+    bytes[5] = 0; // stamp VERSION=2
     std::fs::write(&path, bytes).unwrap();
     match GraphDb::open(&dir) {
-        Err(GraphError::Corrupt { detail }) => assert!(detail.contains("version 1"), "{detail}"),
+        Err(GraphError::Corrupt { detail }) => assert!(detail.contains("version 2"), "{detail}"),
         Ok(_) => panic!("expected Corrupt, got Ok"),
         Err(e) => panic!("expected Corrupt, got other error: {e:?}"),
     }

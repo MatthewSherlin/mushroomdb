@@ -28,12 +28,48 @@ impl ColumnStore {
     pub fn fields(&self) -> impl Iterator<Item = &str> {
         self.cols.keys().map(|s| s.as_str())
     }
+
+    /// Remove the value stored at `(node, field)` and return it, or `None` if absent.
+    /// Prunes the column's inner map entry when it becomes empty.
+    pub fn remove(&mut self, node: u32, field: &str) -> Option<Value> {
+        let col = self.cols.get_mut(field)?;
+        let old = col.remove(&node)?;
+        if col.is_empty() {
+            self.cols.remove(field);
+        }
+        Some(old)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::Value;
+
+    #[test]
+    fn remove_returns_old_value_and_none_on_absent() {
+        let mut c = ColumnStore::new();
+        c.set(0, "name", Value::Str("ada".into()));
+        assert_eq!(c.remove(0, "name"), Some(Value::Str("ada".into())));
+        assert_eq!(c.get(0, "name"), None);
+        // second remove: absent → None
+        assert_eq!(c.remove(0, "name"), None);
+        // completely absent field
+        assert_eq!(c.remove(99, "absent"), None);
+    }
+
+    #[test]
+    fn remove_prunes_empty_column_entry() {
+        let mut c = ColumnStore::new();
+        c.set(0, "x", Value::Int(1));
+        c.set(1, "x", Value::Int(2));
+        c.remove(0, "x");
+        // one entry still present → column not pruned
+        assert!(c.fields().any(|f| f == "x"));
+        c.remove(1, "x");
+        // now empty → column pruned
+        assert!(!c.fields().any(|f| f == "x"));
+    }
 
     #[test]
     fn set_get_overwrite_and_sparse_nodes() {

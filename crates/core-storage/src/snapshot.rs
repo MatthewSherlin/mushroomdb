@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAGIC: [u8; 4] = *b"GDB1";
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 #[derive(Serialize, Deserialize)]
 pub struct SnapshotState {

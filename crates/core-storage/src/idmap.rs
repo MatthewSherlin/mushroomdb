@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct IdMap {
     to_id: HashMap<String, u32>,
     to_key: Vec<String>,
+    /// Dense ids permanently retired by `delete`. Never reused.
+    tombstones: BTreeSet<u32>,
 }
 
 impl IdMap {
@@ -23,19 +25,43 @@ impl IdMap {
     }
 
     pub fn get(&self, key: &str) -> Option<u32> {
+        // to_id is cleared on delete so this naturally returns None for deleted keys.
         self.to_id.get(key).copied()
     }
 
     pub fn key_of(&self, id: u32) -> Option<&str> {
+        if self.tombstones.contains(&id) {
+            return None;
+        }
         self.to_key.get(id as usize).map(|s| s.as_str())
     }
 
+    /// Remove `key` from the live map, permanently tombstone its dense id, and
+    /// return that id. Returns `None` if the key is not present.
+    pub fn delete(&mut self, key: &str) -> Option<u32> {
+        let id = self.to_id.remove(key)?;
+        self.tombstones.insert(id);
+        Some(id)
+    }
+
+    /// Returns `true` if `id` has been retired by a prior `delete` call.
+    pub fn is_tombstoned(&self, id: u32) -> bool {
+        self.tombstones.contains(&id)
+    }
+
+    /// Number of total id slots ever allocated (live + tombstoned). Stable across
+    /// deletes and re-inserts — use `live_len` for the live count.
     pub fn len(&self) -> usize {
         self.to_key.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.to_key.is_empty()
+    }
+
+    /// Number of currently live (non-tombstoned) entries.
+    pub fn live_len(&self) -> usize {
+        self.to_id.len()
     }
 }
 
@@ -63,5 +89,66 @@ mod tests {
         let back: IdMap = bincode::deserialize(&bincode::serialize(&m).unwrap()).unwrap();
         assert_eq!(back.get("x"), Some(0));
         assert_eq!(back.len(), 1);
+    }
+
+    #[test]
+    fn delete_makes_key_invisible_and_id_tombstoned() {
+        let mut m = IdMap::new();
+        let id = m.get_or_insert("alice");
+        // delete returns the dead id
+        assert_eq!(m.delete("alice"), Some(id));
+        // key is gone
+        assert_eq!(m.get("alice"), None);
+        // id is tombstoned
+        assert!(m.is_tombstoned(id));
+        assert_eq!(m.key_of(id), None);
+        // deleting absent key → None
+        assert_eq!(m.delete("nobody"), None);
+    }
+
+    #[test]
+    fn reinsert_after_delete_gets_fresh_id() {
+        let mut m = IdMap::new();
+        let dead_id = m.get_or_insert("alice");
+        m.delete("alice");
+        let new_id = m.get_or_insert("alice");
+        assert_ne!(new_id, dead_id);
+        // old id still tombstoned
+        assert!(m.is_tombstoned(dead_id));
+        // new id is live
+        assert!(!m.is_tombstoned(new_id));
+        assert_eq!(m.get("alice"), Some(new_id));
+        assert_eq!(m.key_of(new_id), Some("alice"));
+    }
+
+    #[test]
+    fn live_len_tracks_live_entries() {
+        let mut m = IdMap::new();
+        m.get_or_insert("a");
+        m.get_or_insert("b");
+        assert_eq!(m.live_len(), 2);
+        m.delete("a");
+        assert_eq!(m.live_len(), 1);
+        // len() is total slots ever allocated
+        assert_eq!(m.len(), 2);
+        // re-insert "a" → new slot, live_len back to 2, len = 3
+        m.get_or_insert("a");
+        assert_eq!(m.live_len(), 2);
+        assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_tombstones() {
+        let mut m = IdMap::new();
+        m.get_or_insert("x");
+        let dead = m.get_or_insert("y");
+        m.delete("y");
+        let bytes = bincode::serialize(&m).unwrap();
+        let back: IdMap = bincode::deserialize(&bytes).unwrap();
+        assert!(back.is_tombstoned(dead));
+        assert_eq!(back.get("y"), None);
+        assert_eq!(back.key_of(dead), None);
+        assert_eq!(back.live_len(), 1);
+        assert_eq!(back.len(), 2);
     }
 }
