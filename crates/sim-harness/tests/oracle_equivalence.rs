@@ -7,7 +7,8 @@ use std::collections::BTreeSet;
 // Fixed rule template pool (4 templates, distinct names and edge types)
 // ---------------------------------------------------------------------------
 
-const RULE_NAMES: [&str; 4] = ["r_km", "r_fe", "r_ov", "r_all"];
+// r_ov2 shares edge_type "r_fe" with r_fe (C1 coverage: co-owned edge type survival).
+const RULE_NAMES: [&str; 5] = ["r_km", "r_fe", "r_ov", "r_all", "r_ov2"];
 const RULE_ETYPES: [&str; 4] = ["r_km", "r_fe", "r_ov", "r_all"];
 const USER_ETYPES: [&str; 3] = ["e0", "e1", "e2"];
 
@@ -15,7 +16,7 @@ const USER_ETYPES: [&str; 3] = ["e0", "e1", "e2"];
 const TAGS_ALPHA: [&str; 3] = ["a", "b", "c"];
 
 fn rule_template(idx: u8) -> RuleDef {
-    match idx % 4 {
+    match idx % 5 {
         0 => RuleDef {
             name: "r_km".into(),
             src_label: "L0".into(),
@@ -43,7 +44,7 @@ fn rule_template(idx: u8) -> RuleDef {
             edge_type: "r_ov".into(),
             weight_prop: None,
         },
-        _ => RuleDef {
+        3 => RuleDef {
             name: "r_all".into(),
             src_label: "L0".into(),
             dst_label: "L0".into(),
@@ -55,6 +56,20 @@ fn rule_template(idx: u8) -> RuleDef {
                 },
             ]),
             edge_type: "r_all".into(),
+            weight_prop: None,
+        },
+        // Template 4: shares edge_type "r_fe" with r_fe — exercises C1 (co-owned
+        // edge type survival after rule deletion).  Different name and lower min
+        // than r_fe's FieldEqual predicate, so it can derive edges r_fe cannot.
+        _ => RuleDef {
+            name: "r_ov2".into(),
+            src_label: "L0".into(),
+            dst_label: "L0".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.1,
+            },
+            edge_type: "r_fe".into(),
             weight_prop: None,
         },
     }
@@ -98,13 +113,13 @@ fn sweep_engine_edges(db: &GraphDb<SimFs>) -> BTreeSet<(String, String, String)>
 
 #[derive(Debug, Clone)]
 enum Op {
-    InsertNode(u8),          // key = "k{n}", label = "L{n%2}"
-    InsertEdge(u8, u8, u8),  // etype index 0-6 (0-2: user e{i}, 3-6: rule etypes); src k; dst k
-    SetProp(u8, u8),         // key, int value → writes "p"
-    SetF(u8, u8),            // key, target_key_index → writes "f" = "k{m}"
-    SetTags(u8, u8, u8),     // key, tok1, tok2 → writes "tags" as Value::List from 3-token alphabet
-    CreateRule(u8),          // picks from the 4 templates by index
-    DeleteRule(u8),          // picks from the 4 rule names by index
+    InsertNode(u8),         // key = "k{n}", label = "L{n%2}"
+    InsertEdge(u8, u8, u8), // etype index 0-6 (0-2: user e{i}, 3-6: rule etypes); src k; dst k
+    SetProp(u8, u8),        // key, int value → writes "p"
+    SetF(u8, u8),           // key, target_key_index → writes "f" = "k{m}"
+    SetTags(u8, u8, u8),    // key, tok1, tok2 → writes "tags" as Value::List from 3-token alphabet
+    CreateRule(u8),         // picks from the 4 templates by index
+    DeleteRule(u8),         // picks from the 4 rule names by index
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -145,7 +160,7 @@ proptest! {
                     // etype index 0..7: 0-2 are user etypes (e0/e1/e2), 3-6 are rule etypes.
                     let etype_idx = (*t as usize) % 7;
                     let etype: String = match etype_idx {
-                        0 | 1 | 2 => format!("e{etype_idx}"),
+                        0..=2 => format!("e{etype_idx}"),
                         3 => "r_km".into(),
                         4 => "r_fe".into(),
                         5 => "r_ov".into(),
@@ -251,7 +266,7 @@ proptest! {
                 }
 
                 Op::DeleteRule(n) => {
-                    let name = RULE_NAMES[(*n as usize) % 4];
+                    let name = RULE_NAMES[(*n as usize) % 5];
                     let db_ok = db.delete_rule(name).is_ok();
                     let or_ok = oracle.delete_rule(name);
                     prop_assert_eq!(

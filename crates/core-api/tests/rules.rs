@@ -1,4 +1,4 @@
-use core_api::{Direction, Explanation, GraphDb, GraphError, Predicate, RuleDef, Value};
+use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-{}-{}", name, std::process::id()));
@@ -7,9 +7,16 @@ fn tmp(name: &str) -> std::path::PathBuf {
 }
 
 fn fk_rule() -> RuleDef {
-    RuleDef { name: "works_at".into(), src_label: "Person".into(), dst_label: "Org".into(),
-              predicate: Predicate::KeyMatch { field: "org_id".into() },
-              edge_type: "WORKS_AT".into(), weight_prop: None }
+    RuleDef {
+        name: "works_at".into(),
+        src_label: "Person".into(),
+        dst_label: "Org".into(),
+        predicate: Predicate::KeyMatch {
+            field: "org_id".into(),
+        },
+        edge_type: "WORKS_AT".into(),
+        weight_prop: None,
+    }
 }
 
 #[test]
@@ -19,8 +26,16 @@ fn rules_fire_on_insert_and_survive_reopen() {
         let mut db = GraphDb::open(&dir).unwrap();
         db.insert_node("Org", "o1", vec![]).unwrap();
         db.create_rule(fk_rule()).unwrap();
-        db.insert_node("Person", "p1", vec![("org_id".into(), Value::Str("o1".into()))]).unwrap();
-        assert_eq!(db.neighbors("p1", "WORKS_AT", Direction::Out).unwrap(), vec!["o1"]);
+        db.insert_node(
+            "Person",
+            "p1",
+            vec![("org_id".into(), Value::Str("o1".into()))],
+        )
+        .unwrap();
+        assert_eq!(
+            db.neighbors("p1", "WORKS_AT", Direction::Out).unwrap(),
+            vec!["o1"]
+        );
         // derived edge is rule-owned
         assert!(matches!(
             db.insert_edge("WORKS_AT", "p1", "o1"),
@@ -30,7 +45,10 @@ fn rules_fire_on_insert_and_survive_reopen() {
     }
     // replay (no snapshot) must re-derive identical edges
     let db = GraphDb::open(&dir).unwrap();
-    assert_eq!(db.neighbors("p1", "WORKS_AT", Direction::Out).unwrap(), vec!["o1"]);
+    assert_eq!(
+        db.neighbors("p1", "WORKS_AT", Direction::Out).unwrap(),
+        vec!["o1"]
+    );
     assert_eq!(db.rules().len(), 1);
 }
 
@@ -41,9 +59,18 @@ fn prop_update_retracts_and_relinks() {
     db.insert_node("Org", "o1", vec![]).unwrap();
     db.insert_node("Org", "o2", vec![]).unwrap();
     db.create_rule(fk_rule()).unwrap();
-    db.insert_node("Person", "p1", vec![("org_id".into(), Value::Str("o1".into()))]).unwrap();
-    db.set_prop("p1", "org_id", Value::Str("o2".into())).unwrap();
-    assert_eq!(db.neighbors("p1", "WORKS_AT", Direction::Out).unwrap(), vec!["o2"]);
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![("org_id".into(), Value::Str("o1".into()))],
+    )
+    .unwrap();
+    db.set_prop("p1", "org_id", Value::Str("o2".into()))
+        .unwrap();
+    assert_eq!(
+        db.neighbors("p1", "WORKS_AT", Direction::Out).unwrap(),
+        vec!["o2"]
+    );
     assert_eq!(db.edge_count(), 1); // old edge retracted
 }
 
@@ -52,18 +79,32 @@ fn delete_rule_removes_only_derived_edges_and_bad_rules_rejected() {
     let dir = tmp("rules-delete");
     let mut db = GraphDb::open(&dir).unwrap();
     db.insert_node("Org", "o1", vec![]).unwrap();
-    db.insert_node("Person", "p1", vec![("org_id".into(), Value::Str("o1".into()))]).unwrap();
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![("org_id".into(), Value::Str("o1".into()))],
+    )
+    .unwrap();
     db.insert_edge("FRIEND", "p1", "o1").unwrap(); // unrelated user edge
     db.create_rule(fk_rule()).unwrap();
     assert_eq!(db.edge_count(), 2);
     db.delete_rule("works_at").unwrap();
     assert_eq!(db.edge_count(), 1);
-    assert!(matches!(db.delete_rule("works_at"), Err(GraphError::RuleNotFound { .. })));
+    assert!(matches!(
+        db.delete_rule("works_at"),
+        Err(GraphError::RuleNotFound { .. })
+    ));
     let mut bad = fk_rule();
     bad.edge_type = String::new();
-    assert!(matches!(db.create_rule(bad), Err(GraphError::RuleInvalid { .. })));
+    assert!(matches!(
+        db.create_rule(bad),
+        Err(GraphError::RuleInvalid { .. })
+    ));
     assert!(matches!(db.create_rule(fk_rule()), Ok(())));
-    assert!(matches!(db.create_rule(fk_rule()), Err(GraphError::RuleInvalid { .. }))); // dup name
+    assert!(matches!(
+        db.create_rule(fk_rule()),
+        Err(GraphError::RuleInvalid { .. })
+    )); // dup name
 }
 
 #[test]
@@ -73,13 +114,20 @@ fn derived_edges_are_not_wal_logged() {
     db.insert_node("Org", "o1", vec![]).unwrap();
     db.create_rule(fk_rule()).unwrap();
     let before = std::fs::metadata(dir.join("wal.bin")).unwrap().len();
-    db.insert_node("Person", "p1", vec![("org_id".into(), Value::Str("o1".into()))]).unwrap();
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![("org_id".into(), Value::Str("o1".into()))],
+    )
+    .unwrap();
     let after = std::fs::metadata(dir.join("wal.bin")).unwrap().len();
     // exactly one InsertNode record was appended — no edge records
     let node_only = core_storage::wal::encode_record(&core_storage::wal::WalRecord::InsertNode {
-        label: "Person".into(), key: "p1".into(),
+        label: "Person".into(),
+        key: "p1".into(),
         props: vec![("org_id".into(), Value::Str("o1".into()))],
-    }).len() as u64;
+    })
+    .len() as u64;
     assert_eq!(after - before, node_only);
     assert_eq!(db.edge_count(), 1); // yet the derived edge exists
 }
@@ -88,17 +136,34 @@ fn derived_edges_are_not_wal_logged() {
 fn explain_reports_rule_provenance_and_weights() {
     let dir = tmp("explain");
     let mut db = GraphDb::open(&dir).unwrap();
-    db.insert_node("Org", "o1", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+    db.insert_node(
+        "Org",
+        "o1",
+        vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+    )
+    .unwrap();
     db.create_rule(fk_rule()).unwrap();
     db.create_rule(RuleDef {
-        name: "shared".into(), src_label: "Person".into(), dst_label: "Org".into(),
-        predicate: Predicate::Overlap { field: "tags".into(), min: 0.5 },
-        edge_type: "SIMILAR".into(), weight_prop: Some("score".into()),
-    }).unwrap();
-    db.insert_node("Person", "p1", vec![
-        ("org_id".into(), Value::Str("o1".into())),
-        ("tags".into(), Value::List(vec![Value::Str("x".into())])),
-    ]).unwrap();
+        name: "shared".into(),
+        src_label: "Person".into(),
+        dst_label: "Org".into(),
+        predicate: Predicate::Overlap {
+            field: "tags".into(),
+            min: 0.5,
+        },
+        edge_type: "SIMILAR".into(),
+        weight_prop: Some("score".into()),
+    })
+    .unwrap();
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![
+            ("org_id".into(), Value::Str("o1".into())),
+            ("tags".into(), Value::List(vec![Value::Str("x".into())])),
+        ],
+    )
+    .unwrap();
     let ex = db.explain("p1", "o1").unwrap();
     assert_eq!(ex.len(), 2);
     assert_eq!(ex[0].rule, "shared");
@@ -107,5 +172,8 @@ fn explain_reports_rule_provenance_and_weights() {
     assert_eq!(ex[1].weight, None);
     db.insert_node("Org", "o2", vec![]).unwrap();
     assert!(db.explain("p1", "o2").unwrap().is_empty());
-    assert!(matches!(db.explain("p1", "ghost"), Err(GraphError::KeyNotFound { .. })));
+    assert!(matches!(
+        db.explain("p1", "ghost"),
+        Err(GraphError::KeyNotFound { .. })
+    ));
 }

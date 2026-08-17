@@ -198,11 +198,14 @@ fn diff_apply_for_node(
             prov.insert((et, s, d));
             owned.insert((et, s, d));
         }
-        // Set/update weight regardless: score may change on an already-owned
-        // edge, and a pre-existing user edge also receives weight_prop (but
-        // stays unowned — the rule did not create it).
-        if let Some(p) = &def.weight_prop {
-            g.edge_props.set(et, s, d, p, Value::Float(score));
+        // Only set weight_prop on edges this rule owns (newly added now, or
+        // already in provenance). Pre-existing user edges are never owned, so
+        // writing a weight to them would leave a ghost property after deletion.
+        let is_owned_here = newly || prov.contains(&(et, s, d));
+        if is_owned_here {
+            if let Some(p) = &def.weight_prop {
+                g.edge_props.set(et, s, d, p, Value::Float(score));
+            }
         }
     }
 }
@@ -292,16 +295,17 @@ impl RuleEngine {
         for idx in self.indexes.values_mut() {
             *idx = RuleIndex::default();
         }
+        // Collect rule names once outside the per-node loop to avoid repeated
+        // allocation and to satisfy the borrow checker without cloning inside.
+        let rule_names: Vec<String> = self.rules.keys().cloned().collect();
         for id in 0..ids.len() as u32 {
             let label_sym = match labels.get(id as usize).copied() {
                 Some(s) if s != u32::MAX => s,
                 _ => continue,
             };
-            // Collect rule names first to avoid borrow conflicts.
-            let rule_names: Vec<String> = self.rules.keys().cloned().collect();
-            for name in rule_names {
-                let def = self.rules[&name].clone();
-                let idx = self.indexes.get_mut(&name).unwrap();
+            for name in &rule_names {
+                let def = self.rules[name].clone();
+                let idx = self.indexes.get_mut(name).unwrap();
                 index_node_for_rule(id, label_sym, &def, idx, syms, props);
             }
         }
@@ -370,6 +374,21 @@ impl RuleEngine {
             g.topo.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
             self.owned.remove(&(t, s, d));
+        }
+        // Surviving rules that share the same edge_type may derive edges that
+        // were previously blocked (add_edge returned false because the deleted
+        // rule already owned them, so their provenance never recorded them).
+        // Rebuilding each such rule lets it claim those edges now that the
+        // deleted rule's entries have been removed from the topology.
+        let same_etype_survivors: Vec<String> = self
+            .rules
+            .values()
+            .filter(|r| r.edge_type == def.edge_type)
+            .map(|r| r.name.clone())
+            .collect();
+        for survivor in same_etype_survivors {
+            // rebuild returns Err only for unknown rules; survivor is live.
+            let _ = self.rebuild(&survivor, g);
         }
         Ok(())
     }
@@ -790,5 +809,95 @@ mod tests {
         eng.create_rule(overlap_rule(), &mut g).unwrap();
         assert!(eng.create_rule(overlap_rule(), &mut g).is_err());
         assert!(eng.delete_rule("nope", &mut g).is_err());
+    }
+
+    /// C1: two rules sharing the same edge_type both match a pair of nodes.
+    /// During backfill of R2, add_edge returns false for edges R1 already owns,
+    /// so R2's provenance lacks them.  Deleting R1 removes those edges from the
+    /// topology — but the rebuild-survivors step must then re-run R2 so it claims
+    /// them.  Deleting R2 afterward must actually remove the edge.
+    #[test]
+    fn coowned_edge_type_survives_first_delete_gone_after_second() {
+        let mut fx = Fx::new();
+        let a = fx.add("A", "a", vec![("tags", tags(&["x", "y"]))]);
+        let b = fx.add("A", "b", vec![("tags", tags(&["x", "y"]))]);
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            // R1: Overlap min=0.1 — derives a↔b (jaccard 1.0 ≥ 0.1).
+            eng.create_rule(
+                RuleDef {
+                    name: "r1".into(),
+                    src_label: "A".into(),
+                    dst_label: "A".into(),
+                    predicate: Predicate::Overlap {
+                        field: "tags".into(),
+                        min: 0.1,
+                    },
+                    edge_type: "REL2".into(),
+                    weight_prop: None,
+                },
+                &mut g,
+            )
+            .unwrap();
+            // R2: same edge_type, Overlap min=0.2 — also derives a↔b.
+            eng.create_rule(
+                RuleDef {
+                    name: "r2".into(),
+                    src_label: "A".into(),
+                    dst_label: "A".into(),
+                    predicate: Predicate::Overlap {
+                        field: "tags".into(),
+                        min: 0.2,
+                    },
+                    edge_type: "REL2".into(),
+                    weight_prop: None,
+                },
+                &mut g,
+            )
+            .unwrap();
+
+            let et = g.syms.intern("REL2");
+            // Both directions must exist (either rule claims them).
+            assert!(
+                g.topo.neighbors(et, Direction::Out, a).contains(&b),
+                "a→b must exist after both rules created"
+            );
+            assert!(
+                g.topo.neighbors(et, Direction::Out, b).contains(&a),
+                "b→a must exist after both rules created"
+            );
+
+            // Delete R1 — rebuild-survivors re-runs R2 which must reclaim the edges.
+            eng.delete_rule("r1", &mut g).unwrap();
+            assert!(
+                g.topo.neighbors(et, Direction::Out, a).contains(&b),
+                "a→b must survive R1 deletion (R2 rebuilds and claims it)"
+            );
+            assert!(
+                g.topo.neighbors(et, Direction::Out, b).contains(&a),
+                "b→a must survive R1 deletion (R2 rebuilds and claims it)"
+            );
+            // R2 now owns both directions.
+            assert!(
+                eng.is_owned(et, a, b),
+                "a→b must be owned by R2 after rebuild"
+            );
+            assert!(
+                eng.is_owned(et, b, a),
+                "b→a must be owned by R2 after rebuild"
+            );
+
+            // Delete R2 — no survivor left, edges must be gone.
+            eng.delete_rule("r2", &mut g).unwrap();
+            assert!(
+                !g.topo.neighbors(et, Direction::Out, a).contains(&b),
+                "a→b must be gone after both rules deleted"
+            );
+            assert!(
+                !g.topo.neighbors(et, Direction::Out, b).contains(&a),
+                "b→a must be gone after both rules deleted"
+            );
+        }
     }
 }

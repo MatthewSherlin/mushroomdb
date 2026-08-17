@@ -53,13 +53,13 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         &["alpha", "beta", "gamma"],
         &["zeta"],
     ];
-    for i in 0..6usize {
+    for (i, tag_set) in l0_tags.iter().enumerate() {
         db.insert_node(
             "L0",
             &format!("n{i}"),
             vec![
                 ("f".into(), Value::Str(format!("n{}", i + 6))),
-                ("tags".into(), tags(l0_tags[i])),
+                ("tags".into(), tags(tag_set)),
             ],
         )?;
     }
@@ -89,11 +89,11 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         &["psi", "omega"],           // n10  J(n9,n10)=1/3≈0.33 < 0.34
         &["mu"],                     // n11
     ];
-    for i in 0..6usize {
+    for (i, tag_set) in l1_tags.iter().enumerate() {
         db.insert_node(
             "L1",
             &format!("n{}", i + 6),
-            vec![("tags".into(), tags(l1_tags[i]))],
+            vec![("tags".into(), tags(tag_set))],
         )?;
     }
     // KM backfill: n0→n6, n1→n7, n2→n8, n3→n9, n4→n10, n5→n11.

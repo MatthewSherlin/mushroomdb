@@ -1,7 +1,13 @@
 use core_rules::{GraphMut, RuleDef, RuleEngine};
+use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
+use core_storage::wal::{decode_all, encode_record, WalRecord};
+use core_storage::{
+    ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
+};
 
 /// One rule-owned edge between two nodes, with the rule name, edge type,
 /// direction (src_key → dst_key), and weight if the rule stores one.
+#[derive(Debug, PartialEq)]
 pub struct Explanation {
     pub rule: String,
     pub edge_type: String,
@@ -9,9 +15,6 @@ pub struct Explanation {
     pub dst_key: String,
     pub weight: Option<f64>,
 }
-use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
-use core_storage::wal::{decode_all, encode_record, WalRecord};
-use core_storage::{ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value};
 
 /// Single construction point for a `GraphMut` view over the split-borrowed graph fields.
 /// Callers use `std::mem::take` on the engine before calling this, then restore it after.
@@ -23,7 +26,14 @@ fn make_graph_mut<'a>(
     topo: &'a mut Topology,
     edge_props: &'a mut EdgeProps,
 ) -> GraphMut<'a> {
-    GraphMut { ids, syms, labels, props, topo, edge_props }
+    GraphMut {
+        ids,
+        syms,
+        labels,
+        props,
+        topo,
+        edge_props,
+    }
 }
 
 pub struct GraphDb<F: Fs> {
@@ -73,7 +83,8 @@ impl<F: Fs> GraphDb<F> {
                 })
                 .collect::<Result<Vec<_>>>()?;
             db.engine = RuleEngine::from_persist(defs, state.provenance);
-            db.engine.reindex_all(&db.ids, &db.syms, &db.labels, &db.props);
+            db.engine
+                .reindex_all(&db.ids, &db.syms, &db.labels, &db.props);
         }
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
@@ -104,7 +115,14 @@ impl<F: Fs> GraphDb<F> {
                 // Fire rules for the newly inserted node.
                 let mut eng = std::mem::take(&mut self.engine);
                 {
-                    let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
                     eng.on_node_changed(id, None, &mut gm);
                 }
                 self.engine = eng;
@@ -132,17 +150,23 @@ impl<F: Fs> GraphDb<F> {
                 // Fire rules for the changed field.
                 let mut eng = std::mem::take(&mut self.engine);
                 {
-                    let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
                     eng.on_node_changed(id, Some((field, old_value)), &mut gm);
                 }
                 self.engine = eng;
             }
             WalRecord::CreateRule { def_bytes } => {
-                let def: RuleDef = bincode::deserialize(def_bytes).map_err(|e| {
-                    GraphError::Corrupt {
+                let def: RuleDef =
+                    bincode::deserialize(def_bytes).map_err(|e| GraphError::Corrupt {
                         detail: format!("CreateRule def_bytes deserialize failed: {e}"),
-                    }
-                })?;
+                    })?;
                 // Replay-over-snapshot idempotency: the rule was captured in the snapshot
                 // so the engine already has it; silently skip to avoid a spurious
                 // RuleInvalid error in the crash window between snapshot write and WAL
@@ -152,7 +176,14 @@ impl<F: Fs> GraphDb<F> {
                 }
                 let mut eng = std::mem::take(&mut self.engine);
                 let result = {
-                    let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
                     eng.create_rule(def, &mut gm)
                 };
                 self.engine = eng;
@@ -168,7 +199,14 @@ impl<F: Fs> GraphDb<F> {
                 }
                 let mut eng = std::mem::take(&mut self.engine);
                 let result = {
-                    let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
                     eng.delete_rule(name, &mut gm)
                 };
                 self.engine = eng;
@@ -277,7 +315,14 @@ impl<F: Fs> GraphDb<F> {
     pub fn rebuild_rule(&mut self, name: &str) -> Result<()> {
         let mut eng = std::mem::take(&mut self.engine);
         let result = {
-            let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);
+            let mut gm = make_graph_mut(
+                &self.ids,
+                &mut self.syms,
+                &self.labels,
+                &self.props,
+                &mut self.topo,
+                &mut self.edge_props,
+            );
             eng.rebuild(name, &mut gm)
         };
         self.engine = eng;
@@ -320,11 +365,23 @@ impl<F: Fs> GraphDb<F> {
                     Some(s) => s.to_string(),
                     None => continue,
                 };
-                let src_key = self.ids.key_of(src).unwrap_or("").to_string();
-                let dst_key = self.ids.key_of(dst).unwrap_or("").to_string();
+                let src_key = self
+                    .ids
+                    .key_of(src)
+                    .expect("provenance ids always resolvable")
+                    .to_string();
+                let dst_key = self
+                    .ids
+                    .key_of(dst)
+                    .expect("provenance ids always resolvable")
+                    .to_string();
                 let weight = rule_def.weight_prop.as_deref().and_then(|prop| {
                     self.edge_props.get(etype, src, dst, prop).and_then(|v| {
-                        if let Value::Float(f) = v { Some(*f) } else { None }
+                        if let Value::Float(f) = v {
+                            Some(*f)
+                        } else {
+                            None
+                        }
                     })
                 });
                 results.push(Explanation {

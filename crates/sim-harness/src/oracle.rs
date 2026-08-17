@@ -151,11 +151,7 @@ impl Oracle {
                         props: &dp,
                     };
                     if evaluate(&rule.predicate, &src_view, &dst_view).is_some() {
-                        out.insert((
-                            rule.edge_type.clone(),
-                            src_key.clone(),
-                            dst_key.clone(),
-                        ));
+                        out.insert((rule.edge_type.clone(), src_key.clone(), dst_key.clone()));
                     }
                 }
             }

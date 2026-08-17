@@ -202,7 +202,7 @@ mod tests {
         let mut fs = SimFs::with_crash_after(2);
         fs.append(FileId::Wal, b"ab").unwrap(); // ok: 2 bytes, exactly at threshold
         assert!(fs.append(FileId::Wal, b"cd").is_err()); // tears at 0 more bytes
-        // read is NOT blocked by byte_crashed
+                                                         // read is NOT blocked by byte_crashed
         assert_eq!(fs.read(FileId::Wal).unwrap(), b"ab");
         // write_atomic is NOT blocked by byte_crashed
         fs.write_atomic(FileId::Snapshot, b"snap").unwrap();
@@ -231,7 +231,7 @@ mod tests {
         let mut fs = SimFs::with_crash_after_ops(1);
         fs.append(FileId::Wal, b"x").unwrap(); // op 0: ok
         assert!(fs.sync(FileId::Wal).is_err()); // op 1: crashes (op_crashed set)
-        // read is blocked by op_crashed
+                                                // read is blocked by op_crashed
         assert!(fs.read(FileId::Wal).is_err());
     }
 

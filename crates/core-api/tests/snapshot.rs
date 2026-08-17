@@ -48,24 +48,54 @@ fn snapshot_preserves_rules_provenance_and_scores() {
     let dir = tmp("snap-rules");
     {
         let mut db = GraphDb::open(&dir).unwrap();
-        db.insert_node("A", "a", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+        db.insert_node(
+            "A",
+            "a",
+            vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+        )
+        .unwrap();
         db.create_rule(RuleDef {
-            name: "rel".into(), src_label: "A".into(), dst_label: "A".into(),
-            predicate: Predicate::Overlap { field: "tags".into(), min: 0.5 },
-            edge_type: "REL".into(), weight_prop: Some("score".into()),
-        }).unwrap();
-        db.insert_node("A", "b", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+            name: "rel".into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            },
+            edge_type: "REL".into(),
+            weight_prop: Some("score".into()),
+        })
+        .unwrap();
+        db.insert_node(
+            "A",
+            "b",
+            vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+        )
+        .unwrap();
         db.snapshot().unwrap();
         // post-snapshot wal-tail write
-        db.insert_node("A", "c", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+        db.insert_node(
+            "A",
+            "c",
+            vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+        )
+        .unwrap();
     }
     let mut db = GraphDb::open(&dir).unwrap();
     assert_eq!(db.rules().len(), 1);
     assert_eq!(db.edge_count(), 6); // a,b,c pairwise, both directions
-    // derived edges still owned after recovery (guard works)
-    assert!(matches!(db.insert_edge("REL", "a", "b"), Err(GraphError::RuleOwned { .. })));
+                                    // derived edges still owned after recovery (guard works)
+    assert!(matches!(
+        db.insert_edge("REL", "a", "b"),
+        Err(GraphError::RuleOwned { .. })
+    ));
     // and incremental firing still works after reopen (indexes were rebuilt)
-    db.insert_node("A", "d", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+    db.insert_node(
+        "A",
+        "d",
+        vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+    )
+    .unwrap();
     assert_eq!(db.edge_count(), 12);
 }
 
@@ -79,7 +109,8 @@ fn version_1_snapshot_is_rejected() {
     }
     let path = dir.join("snapshot.bin");
     let mut bytes = std::fs::read(&path).unwrap();
-    bytes[4] = 1; bytes[5] = 0; // stamp VERSION=1
+    bytes[4] = 1;
+    bytes[5] = 0; // stamp VERSION=1
     std::fs::write(&path, bytes).unwrap();
     match GraphDb::open(&dir) {
         Err(GraphError::Corrupt { detail }) => assert!(detail.contains("version 1"), "{detail}"),
@@ -96,13 +127,30 @@ fn crash_between_snapshot_and_wal_truncation_recovers() {
     let dir = tmp("crash-create-rule");
     {
         let mut db = GraphDb::open(&dir).unwrap();
-        db.insert_node("A", "a", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+        db.insert_node(
+            "A",
+            "a",
+            vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+        )
+        .unwrap();
         db.create_rule(RuleDef {
-            name: "rel".into(), src_label: "A".into(), dst_label: "A".into(),
-            predicate: Predicate::Overlap { field: "tags".into(), min: 0.5 },
-            edge_type: "REL".into(), weight_prop: None,
-        }).unwrap();
-        db.insert_node("A", "b", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+            name: "rel".into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            },
+            edge_type: "REL".into(),
+            weight_prop: None,
+        })
+        .unwrap();
+        db.insert_node(
+            "A",
+            "b",
+            vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+        )
+        .unwrap();
         // save pre-snapshot WAL (has InsertNode a, CreateRule rel, InsertNode b)
         let pre_snap_wal = std::fs::read(dir.join("wal.bin")).unwrap();
         db.snapshot().unwrap();
@@ -112,8 +160,13 @@ fn crash_between_snapshot_and_wal_truncation_recovers() {
     let mut db = GraphDb::open(&dir).unwrap();
     assert_eq!(db.rules().len(), 1);
     assert_eq!(db.edge_count(), 2); // a↔b both directions
-    // incremental firing still works after recovery
-    db.insert_node("A", "c", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+                                    // incremental firing still works after recovery
+    db.insert_node(
+        "A",
+        "c",
+        vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+    )
+    .unwrap();
     assert_eq!(db.edge_count(), 6); // a,b,c pairwise
 
     // === Phase 2: DeleteRule idempotency ===
@@ -124,10 +177,17 @@ fn crash_between_snapshot_and_wal_truncation_recovers() {
         let mut db = GraphDb::open(&dir2).unwrap();
         db.insert_node("A", "x", vec![]).unwrap();
         db.create_rule(RuleDef {
-            name: "gone".into(), src_label: "A".into(), dst_label: "A".into(),
-            predicate: Predicate::Overlap { field: "tags".into(), min: 0.5 },
-            edge_type: "GONE".into(), weight_prop: None,
-        }).unwrap();
+            name: "gone".into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            },
+            edge_type: "GONE".into(),
+            weight_prop: None,
+        })
+        .unwrap();
         // first snapshot: rule "gone" in engine
         db.snapshot().unwrap();
         // delete the rule; WAL now contains [DeleteRule "gone"]
