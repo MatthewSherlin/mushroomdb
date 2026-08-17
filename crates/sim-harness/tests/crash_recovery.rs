@@ -18,14 +18,7 @@ fn workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
 
 #[test]
 fn recovery_is_consistent_at_every_crash_offset() {
-    // First: run to completion to learn total bytes written.
-    let clean = SimFs::new();
-    {
-        let mut db = GraphDb::open_with(clean.clone()).unwrap();
-        workload(&mut db).unwrap();
-        // GraphDb owns the fs; re-derive final size via a fresh run below.
-    }
-    // Re-run capturing the fs to measure size.
+    // Run to completion to measure total bytes appended.
     let total = {
         let mut db = GraphDb::open_with(SimFs::new()).unwrap();
         workload(&mut db).unwrap();
@@ -60,5 +53,4 @@ fn recovery_is_consistent_at_every_crash_offset() {
             "crash_at={crash_at}"
         );
     }
-    let _ = clean; // silence unused in case of edits
 }

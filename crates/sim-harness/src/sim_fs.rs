@@ -77,6 +77,9 @@ impl Fs for SimFs {
         Ok(self.files.get(name(file)).cloned().unwrap_or_default())
     }
 
+    // Crash injection only fires during append; crashes mid-write_atomic (snapshot
+    // write, WAL truncation) are not modeled yet — deliberately deferred to a later
+    // plan's DST expansion.
     fn write_atomic(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
         self.check_crash()?;
         self.files.insert(name(file), data.to_vec());

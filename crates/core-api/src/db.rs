@@ -54,7 +54,8 @@ impl<F: Fs> GraphDb<F> {
                 let id = self.ids.get_or_insert(key);
                 let sym = self.syms.intern(label);
                 if self.labels.len() <= id as usize {
-                    self.labels.resize(id as usize + 1, sym);
+                    // gap slots are sentinels, never valid label symbols
+                    self.labels.resize(id as usize + 1, u32::MAX);
                 }
                 self.labels[id as usize] = sym;
                 for (field, value) in props {
@@ -160,12 +161,18 @@ impl<F: Fs> GraphDb<F> {
         let Some(sym) = self.syms.get(edge_type) else {
             return Ok(Vec::new());
         };
-        Ok(self
-            .topo
+        self.topo
             .neighbors(sym, dir, id)
             .iter()
-            .map(|&n| self.ids.key_of(n).expect("dense ids").to_string())
-            .collect())
+            .map(|&n| {
+                self.ids
+                    .key_of(n)
+                    .map(|k| k.to_string())
+                    .ok_or_else(|| GraphError::Corrupt {
+                        detail: format!("topology id {n} has no key"),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()
     }
 
     pub fn node_count(&self) -> usize {
