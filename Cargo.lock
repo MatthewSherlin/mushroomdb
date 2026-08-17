@@ -59,6 +59,7 @@ name = "core-query"
 version = "0.1.0"
 dependencies = [
  "core-storage",
+ "proptest",
  "serde",
 ]
 
