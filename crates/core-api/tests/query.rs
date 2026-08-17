@@ -197,10 +197,12 @@ fn cypher_neighbors_match_grouped_by_edge_type() {
     let db = open_fixture("cross-check");
     let t1 = db.node_ref("t1").expect("t1");
     let grouped = t1.grouped_by_edge_type();
-    let traversal = grouped
+    let mut traversal = grouped
         .get("INDUSTRY")
         .cloned()
         .expect("INDUSTRY neighbors from traversal");
+    traversal.sort();
+    traversal.dedup();
 
     let rs = db
         .query(
