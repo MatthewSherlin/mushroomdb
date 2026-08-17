@@ -52,6 +52,18 @@ impl<F: Fs> GraphDb<F> {
             db.topo = state.topo;
             db.props = state.props;
             db.labels = state.labels;
+            db.edge_props = state.edge_props;
+            let defs: Vec<RuleDef> = state
+                .rule_defs
+                .iter()
+                .map(|b| {
+                    bincode::deserialize(b).map_err(|e| GraphError::Corrupt {
+                        detail: format!("snapshot rule_def deserialize: {e}"),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            db.engine = RuleEngine::from_persist(defs, state.provenance);
+            db.engine.reindex_all(&db.ids, &db.syms, &db.labels, &db.props);
         }
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
@@ -300,12 +312,20 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn snapshot(&mut self) -> Result<()> {
+        let (rule_defs_typed, provenance) = self.engine.to_persist();
+        let rule_defs = rule_defs_typed
+            .iter()
+            .map(|r| bincode::serialize(r).expect("RuleDef serialize cannot fail"))
+            .collect();
         let state = core_storage::snapshot::SnapshotState {
             ids: self.ids.clone(),
             syms: self.syms.clone(),
             topo: self.topo.clone(),
             props: self.props.clone(),
             labels: self.labels.clone(),
+            edge_props: self.edge_props.clone(),
+            rule_defs,
+            provenance,
         };
         self.fs
             .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state))?;

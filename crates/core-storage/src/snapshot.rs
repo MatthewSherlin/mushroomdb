@@ -1,12 +1,14 @@
 use crate::columns::ColumnStore;
+use crate::edge_props::EdgeProps;
 use crate::idmap::IdMap;
 use crate::interner::Interner;
 use crate::topology::Topology;
 use crate::types::{GraphError, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAGIC: [u8; 4] = *b"GDB1";
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 #[derive(Serialize, Deserialize)]
 pub struct SnapshotState {
@@ -15,6 +17,11 @@ pub struct SnapshotState {
     pub topo: Topology,
     pub props: ColumnStore,
     pub labels: Vec<u32>,
+    pub edge_props: EdgeProps,
+    /// Bincoded `RuleDef` bytes — one entry per rule.  Raw bytes keep
+    /// core-storage independent of core-rules.
+    pub rule_defs: Vec<Vec<u8>>,
+    pub provenance: BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
 }
 
 pub fn encode(state: &SnapshotState) -> Vec<u8> {
