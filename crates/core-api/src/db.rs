@@ -241,14 +241,7 @@ impl<F: Fs> GraphDb<F> {
     pub fn rebuild_rule(&mut self, name: &str) -> Result<()> {
         let mut eng = std::mem::take(&mut self.engine);
         let result = {
-            let mut gm = GraphMut {
-                ids: &self.ids,
-                syms: &mut self.syms,
-                labels: &self.labels,
-                props: &self.props,
-                topo: &mut self.topo,
-                edge_props: &mut self.edge_props,
-            };
+            let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);
             eng.rebuild(name, &mut gm)
         };
         self.engine = eng;
