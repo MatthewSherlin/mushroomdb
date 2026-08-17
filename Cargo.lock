@@ -52,6 +52,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-rules"
+version = "0.1.0"
+dependencies = [
+ "core-storage",
+ "serde",
+]
+
+[[package]]
 name = "core-storage"
 version = "0.1.0"
 dependencies = [
