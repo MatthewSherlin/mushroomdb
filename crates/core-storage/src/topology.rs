@@ -60,6 +60,29 @@ impl Topology {
     pub fn edge_count(&self) -> u64 {
         self.edge_count
     }
+
+    pub fn remove_edge(&mut self, etype: u32, src: u32, dst: u32) -> bool {
+        let Some(adj) = self.by_type.get_mut(&etype) else {
+            return false;
+        };
+        let Some(dsts) = adj.out.get_mut(&src) else {
+            return false;
+        };
+        let Ok(pos) = dsts.binary_search(&dst) else {
+            return false;
+        };
+        dsts.remove(pos);
+        let srcs = adj
+            .inn
+            .get_mut(&dst)
+            .expect("invariant: inn bucket must exist when out contains dst");
+        let p = srcs
+            .binary_search(&src)
+            .expect("invariant: inn must contain src when out contained dst");
+        srcs.remove(p);
+        self.edge_count -= 1;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -78,5 +101,21 @@ mod tests {
         assert_eq!(t.neighbors(0, Direction::Out, 999), &[] as &[u32]);
         assert_eq!(t.degree(0, Direction::Out, 5), 2);
         assert_eq!(t.edge_count(), 3);
+    }
+
+    #[test]
+    fn remove_edge_updates_both_sides_and_count() {
+        let mut t = Topology::new();
+        t.add_edge(0, 1, 2);
+        t.add_edge(0, 1, 3);
+        assert!(t.remove_edge(0, 1, 2));
+        assert!(!t.remove_edge(0, 1, 2)); // idempotent-false
+        assert!(!t.remove_edge(9, 1, 2)); // unknown type
+        assert_eq!(t.neighbors(0, Direction::Out, 1), &[3]);
+        assert_eq!(t.neighbors(0, Direction::In, 2), &[] as &[u32]);
+        assert_eq!(t.edge_count(), 1);
+        // re-add after remove works
+        assert!(t.add_edge(0, 1, 2));
+        assert_eq!(t.edge_count(), 2);
     }
 }
