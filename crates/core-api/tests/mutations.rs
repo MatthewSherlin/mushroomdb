@@ -593,24 +593,74 @@ fn field_equal_budget_trips_at_10_and_stats_survive_recovery() {
     }
 }
 
-/// Rebuild on a still-over-budget rule re-trips and keeps the same first-10
-/// edge set (`max_edges` is immutable per rule, so this is the un-trip path).
+/// Rebuild on a still-over-budget rule is a provenance no-op (tripped latch
+/// stays set). Extra post-trip inserts do not change the frozen first-10.
 #[test]
-fn rebuild_over_budget_retrips_same_first_10() {
+fn rebuild_over_budget_is_noop_after_post_trip_inserts() {
     let dir = tmp("budget-rebuild-set");
     let mut db = GraphDb::open(&dir).unwrap();
     db.create_rule(const_eq_rule(10)).unwrap();
     insert_const_nodes(&mut db, 0, 4);
-    let keys = ["n0", "n1", "n2", "n3"];
-    let first10 = out_pairs(&db, &keys, "EQ");
+    let keys4 = ["n0", "n1", "n2", "n3"];
+    let first10 = out_pairs(&db, &keys4, "EQ");
     assert_eq!(first10.len(), 10);
     assert!(db.stats().rules[0].tripped);
 
+    insert_const_nodes(&mut db, 4, 5);
+    let keys5 = ["n0", "n1", "n2", "n3", "n4"];
+    let before = out_pairs(&db, &keys5, "EQ");
+    assert_eq!(before, first10);
+    assert!(db.stats().rules[0].tripped);
+
     db.rebuild_rule("eq").unwrap();
-    assert_eq!(out_pairs(&db, &keys, "EQ"), first10);
+    assert_eq!(out_pairs(&db, &keys5, "EQ"), before);
     let s = db.stats();
     assert!(s.rules[0].tripped);
     assert_eq!(s.rules[0].edges, 10);
+}
+
+/// Retracts while tripped can drop below budget; new matches stay frozen
+/// until rebuild, which un-trips only when the full desired set fits.
+#[test]
+fn tripped_freeze_then_rebuild_untrips_when_desired_fits() {
+    let dir = tmp("budget-freeze-untrip");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_rule(const_eq_rule(10)).unwrap();
+    insert_const_nodes(&mut db, 0, 4);
+    assert_eq!(db.stats().rules[0].edges, 10);
+    assert!(db.stats().rules[0].tripped);
+
+    db.set_prop("n2", "k", Value::Str("x2".into())).unwrap();
+    db.set_prop("n3", "k", Value::Str("x3".into())).unwrap();
+    let after_retract = db.stats().rules[0].edges;
+    assert!(after_retract < 10);
+    assert!(db.stats().rules[0].tripped);
+
+    insert_const_nodes(&mut db, 4, 5);
+    assert_eq!(db.stats().rules[0].edges, after_retract);
+    assert!(db.stats().rules[0].tripped);
+    assert!(db.neighbors("n4", "EQ", Direction::Out).unwrap().is_empty());
+
+    db.set_prop("n4", "k", Value::Str("x4".into())).unwrap();
+    db.rebuild_rule("eq").unwrap();
+    let s = db.stats();
+    assert!(
+        !s.rules[0].tripped,
+        "rebuild must clear tripped when desired fits"
+    );
+    assert_eq!(s.rules[0].edges, 2);
+    assert_eq!(
+        out_pairs(&db, &["n0", "n1"], "EQ"),
+        BTreeSet::from([("n0".into(), "n1".into()), ("n1".into(), "n0".into())])
+    );
+
+    insert_const_nodes(&mut db, 5, 6);
+    assert!(!db.stats().rules[0].tripped);
+    assert_eq!(db.stats().rules[0].edges, 6);
+    assert_eq!(
+        db.neighbors("n5", "EQ", Direction::Out).unwrap(),
+        vec!["n0", "n1"]
+    );
 }
 
 #[test]

@@ -176,10 +176,12 @@ fn edge_budget(def: &RuleDef) -> u64 {
 /// retracts triples that involve `n` (incremental fire). `None` retracts any
 /// current provenance triple not in `desired` (backfill / rebuild).
 ///
-/// Adding a new provenance edge that would exceed the rule budget is skipped
-/// and `*tripped` is set; never an error. Existing provenance edges are kept
-/// and may have weights refreshed. First-N is BTree (`(src, dst)`) order of
-/// `desired` after the retract pass.
+/// `tripped` is a one-way latch: once set, no new provenance edges are added
+/// (gate on the flag itself, not `prov.len()`), even if retracts have brought
+/// the set below budget. Retracts and weight refreshes on already-owned edges
+/// still run. Crossing the budget on a not-yet-tripped rule sets the latch
+/// and skips that add and every later add in this call. Never an error.
+/// First-N (pre-trip) is BTree `(src, dst)` order of `desired` after retract.
 fn apply_desired(
     def: &RuleDef,
     desired: BTreeMap<(u32, u32), f64>,
@@ -217,7 +219,7 @@ fn apply_desired(
         let triple = (et, s, d);
         let already = prov.contains(&triple);
         if !already {
-            if prov.len() as u64 >= budget {
+            if *tripped || prov.len() as u64 >= budget {
                 *tripped = true;
                 continue;
             }
@@ -319,10 +321,15 @@ impl RuleEngine {
         &self.provenance
     }
 
+    /// One-way latch: `true` after a budget breach until [`Self::rebuild`]
+    /// is the only exit (and only if the full desired set then fits).
     pub fn is_tripped(&self, name: &str) -> bool {
         self.tripped.get(name).copied().unwrap_or(false)
     }
 
+    /// Evaluations of this rule: one tick per `on_node_changed` fire, and
+    /// one tick per participating node on backfill **and rebuild** (even
+    /// when rebuild is a provenance no-op).
     pub fn fire_count(&self, name: &str) -> u64 {
         self.fires.get(name).copied().unwrap_or(0)
     }
@@ -614,25 +621,20 @@ impl RuleEngine {
         }
     }
 
-    /// Drop and recompute one rule's edges from scratch.  Returns Err if unknown.
+    /// Recompute one rule from scratch. Only exit from the tripped latch.
+    ///
+    /// If the full desired set fits in the budget, it is applied completely
+    /// and `tripped` is cleared. If it still exceeds the budget, existing
+    /// provenance is left completely untouched and `tripped` stays true
+    /// (rebuild-is-noop for at/over-cap rules). Always counts as a fire
+    /// evaluation per participating node. Returns Err if unknown.
     pub fn rebuild(&mut self, name: &str, g: &mut GraphMut<'_>) -> Result<(), String> {
         if !self.rules.contains_key(name) {
             return Err(format!("rule {:?} not found", name));
         }
         let def = self.rules[name].clone();
-        self.tripped.insert(name.to_string(), false);
 
-        // Remove all provenance edges for this rule.
-        let prov_set = self.provenance.remove(name).unwrap_or_default();
-        let _et = g.syms.intern(&def.edge_type);
-        for (t, s, d) in prov_set {
-            g.topo.remove_edge(t, s, d);
-            g.edge_props.remove_edge(t, s, d);
-            self.owned.remove(&(t, s, d));
-        }
-        self.provenance.insert(name.to_string(), BTreeSet::new());
-
-        // Reindex this rule from scratch.
+        // Reindex this rule from scratch (indexes only).
         *self.indexes.get_mut(name).unwrap() = RuleIndex::default();
         let n_total = g.ids.len() as u32;
         for id in 0..n_total {
@@ -644,11 +646,16 @@ impl RuleEngine {
             index_node_for_rule(id, label_sym, &def, idx, g.syms, g.props);
         }
 
-        // Re-backfill from the full desired set (deterministic first-N).
         let desired = compute_full_desired(&def, &self.indexes[name], g);
-        let prov = self.provenance.get_mut(name).unwrap();
-        let tripped = self.tripped.get_mut(name).unwrap();
-        apply_desired(&def, desired, None, prov, &mut self.owned, tripped, g);
+        if desired.len() as u64 > edge_budget(&def) {
+            // Still over cap: true no-op on provenance; latch stays set.
+            self.tripped.insert(name.to_string(), true);
+        } else {
+            self.tripped.insert(name.to_string(), false);
+            let prov = self.provenance.get_mut(name).unwrap();
+            let tripped = self.tripped.get_mut(name).unwrap();
+            apply_desired(&def, desired, None, prov, &mut self.owned, tripped, g);
+        }
         let fires = self.fires.entry(name.to_string()).or_default();
         bump_fires_for_participants(&def, g, fires);
 
@@ -1178,5 +1185,140 @@ mod tests {
         assert_eq!(after, before);
         assert!(eng.is_tripped("eq"));
         assert_eq!(eng.provenance()["eq"].len(), 10);
+    }
+
+    fn prov_pairs(eng: &RuleEngine, name: &str) -> BTreeSet<(u32, u32)> {
+        eng.provenance()
+            .get(name)
+            .map(|s| s.iter().map(|&(_, a, b)| (a, b)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Extra matching nodes after the trip must not change the frozen set,
+    /// and rebuild while still over budget is a true provenance no-op.
+    #[test]
+    fn rebuild_while_over_budget_is_provenance_noop() {
+        let mut fx = Fx::new();
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(const_eq_rule(10), &mut g).unwrap();
+        }
+        for i in 0..4 {
+            let id = fx.add(
+                "N",
+                &format!("n{i}"),
+                vec![("k", Value::Str("const".into()))],
+            );
+            let mut g = fx.g();
+            eng.on_node_changed(id, None, &mut g);
+        }
+        assert!(eng.is_tripped("eq"));
+        assert_eq!(eng.provenance()["eq"].len(), 10);
+
+        let n4 = fx.add("N", "n4", vec![("k", Value::Str("const".into()))]);
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(n4, None, &mut g);
+        }
+        let before = prov_pairs(&eng, "eq");
+        assert_eq!(before.len(), 10);
+        assert!(eng.is_tripped("eq"));
+
+        {
+            let mut g = fx.g();
+            eng.rebuild("eq", &mut g).unwrap();
+        }
+        assert_eq!(prov_pairs(&eng, "eq"), before);
+        assert!(eng.is_tripped("eq"));
+    }
+
+    /// Once tripped, retracts may drop provenance below budget, but new
+    /// matching nodes must not grow the set. Rebuild is the only exit: when
+    /// the full desired set now fits it is applied completely and tripped
+    /// clears; later inserts derive again.
+    #[test]
+    fn tripped_freeze_blocks_adds_until_rebuild_fits() {
+        let mut fx = Fx::new();
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(const_eq_rule(10), &mut g).unwrap();
+        }
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let id = fx.add(
+                "N",
+                &format!("n{i}"),
+                vec![("k", Value::Str("const".into()))],
+            );
+            ids.push(id);
+            let mut g = fx.g();
+            eng.on_node_changed(id, None, &mut g);
+        }
+        assert_eq!(eng.provenance()["eq"].len(), 10);
+        assert!(eng.is_tripped("eq"));
+
+        // Retract n2 and n3 below budget. Distinct values so they do not
+        // FieldEqual each other.
+        for (id, val) in [(ids[2], "x2"), (ids[3], "x3")] {
+            let old = fx.props.get(id, "k").cloned();
+            fx.props.set(id, "k", Value::Str(val.into()));
+            let mut g = fx.g();
+            eng.on_node_changed(id, Some(("k", old)), &mut g);
+        }
+        let after_retract = eng.provenance()["eq"].len();
+        assert!(after_retract < 10, "retracts must still run while tripped");
+        assert!(eng.is_tripped("eq"));
+
+        let n4 = fx.add("N", "n4", vec![("k", Value::Str("const".into()))]);
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(n4, None, &mut g);
+        }
+        assert_eq!(
+            eng.provenance()["eq"].len(),
+            after_retract,
+            "freeze: no new edges while tripped, even below budget"
+        );
+        assert!(eng.is_tripped("eq"));
+
+        // Drop n4 from the match set so remaining desired is n0↔n1 (2 edges).
+        let old = fx.props.get(n4, "k").cloned();
+        fx.props.set(n4, "k", Value::Str("x4".into()));
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(n4, Some(("k", old)), &mut g);
+        }
+
+        {
+            let mut g = fx.g();
+            eng.rebuild("eq", &mut g).unwrap();
+        }
+        let et = fx.syms.get("EQ").unwrap();
+        assert!(
+            !eng.is_tripped("eq"),
+            "rebuild must un-trip when desired fits"
+        );
+        assert_eq!(eng.provenance()["eq"].len(), 2);
+        assert!(fx
+            .topo
+            .neighbors(et, Direction::Out, ids[0])
+            .contains(&ids[1]));
+        assert!(fx
+            .topo
+            .neighbors(et, Direction::Out, ids[1])
+            .contains(&ids[0]));
+
+        // Subsequent inserts derive normally.
+        let n5 = fx.add("N", "n5", vec![("k", Value::Str("const".into()))]);
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(n5, None, &mut g);
+        }
+        assert!(!eng.is_tripped("eq"));
+        assert_eq!(eng.provenance()["eq"].len(), 6); // {n0,n1,n5} pairwise
+        assert!(fx.topo.neighbors(et, Direction::Out, n5).contains(&ids[0]));
+        assert!(fx.topo.neighbors(et, Direction::Out, ids[0]).contains(&n5));
     }
 }

@@ -18,7 +18,13 @@ pub struct Stats {
     pub rules: Vec<RuleStats>,
 }
 
-/// One rule's provenance size, trip flag, and fire counter.
+/// One rule's provenance size, trip latch, and fire counter.
+///
+/// `tripped` is a one-way latch: once set, the engine adds no new edges for
+/// that rule until [`GraphDb::rebuild_rule`] (and only if the full desired
+/// set then fits). `fires` counts `on_node_changed` evaluations plus
+/// backfill/rebuild participant ticks (rebuild counts even when it is a
+/// provenance no-op).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleStats {
     pub name: String,
@@ -554,6 +560,11 @@ impl<F: Fs> GraphDb<F> {
     }
 
     /// Recompute a rule's derived edges from scratch (repair tool; NOT WAL-logged).
+    ///
+    /// Only exit from the tripped latch: if the full desired set fits the
+    /// budget, it is applied completely and `tripped` clears; if it still
+    /// exceeds the budget, provenance is left untouched and `tripped` stays
+    /// true. Counts as a fire evaluation (see [`RuleStats::fires`]).
     pub fn rebuild_rule(&mut self, name: &str) -> Result<()> {
         let mut eng = std::mem::take(&mut self.engine);
         let result = {
@@ -721,8 +732,8 @@ impl<F: Fs> GraphDb<F> {
         self.topo.edge_count()
     }
 
-    /// Live/tombstone/edge counts plus per-rule provenance size, trip flag,
-    /// and fire counter. Rules are sorted by name.
+    /// Live/tombstone/edge counts plus per-rule provenance size, trip latch,
+    /// and fire counter (includes rebuild evaluations). Rules are sorted by name.
     pub fn stats(&self) -> Stats {
         let rules: Vec<RuleStats> = self
             .engine
