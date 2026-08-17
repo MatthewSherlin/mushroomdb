@@ -328,15 +328,112 @@ impl<F: Fs> GraphDb<F> {
         self.apply(&rec)
     }
 
+    /// Start an atomic batch.
+    ///
+    /// The returned [`BatchBuilder`] borrows `self` mutably until
+    /// [`BatchBuilder::commit`]. Builder methods queue ops only — no
+    /// validation, no WAL I/O. `commit` validates every queued op against
+    /// live state plus preceding ops in this batch (duplicate key inside
+    /// the batch is `Err`; an edge between two nodes created earlier in
+    /// the batch is valid; `delete_node` then insert of the same key is a
+    /// fresh identity). Validation never mutates the database. Any failure
+    /// leaves WAL bytes and in-memory state identical to before `commit`.
+    /// On success, one `WalRecord::Batch` frame is appended (one fsync)
+    /// and each inner record is applied in order so rules fire per record.
+    /// An empty batch, or a batch of only no-ops, writes zero WAL bytes.
+    pub fn batch(&mut self) -> BatchBuilder<'_, F> {
+        BatchBuilder {
+            db: self,
+            ops: Vec::new(),
+        }
+    }
+
+    fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<()> {
+        let recs = {
+            let mut preview = MutPreview::new(self);
+            let mut recs = Vec::with_capacity(ops.len());
+            for op in ops {
+                match op {
+                    BatchOp::InsertNode { label, key, props } => {
+                        preview.check_insert_node(&key)?;
+                        preview.note_insert_node(&key, &props);
+                        recs.push(WalRecord::InsertNode { label, key, props });
+                    }
+                    BatchOp::InsertEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        if preview.prepare_insert_edge(&edge_type, &src_key, &dst_key)? {
+                            preview.note_insert_edge(&edge_type, &src_key, &dst_key);
+                            recs.push(WalRecord::InsertEdge {
+                                edge_type,
+                                src_key,
+                                dst_key,
+                            });
+                        }
+                    }
+                    BatchOp::SetProp { key, field, value } => {
+                        preview.check_live_key(&key)?;
+                        preview.note_set_prop(&key, &field, &value);
+                        recs.push(WalRecord::SetProp { key, field, value });
+                    }
+                    BatchOp::RemoveProp { key, field } => {
+                        if preview.prepare_remove_prop(&key, &field)? {
+                            preview.note_remove_prop(&key, &field);
+                            recs.push(WalRecord::RemoveProp { key, field });
+                        }
+                    }
+                    BatchOp::DeleteEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        if preview.prepare_delete_edge(&edge_type, &src_key, &dst_key)? {
+                            preview.note_delete_edge(&edge_type, &src_key, &dst_key);
+                            recs.push(WalRecord::DeleteEdge {
+                                edge_type,
+                                src_key,
+                                dst_key,
+                            });
+                        }
+                    }
+                    BatchOp::DeleteNode { key } => {
+                        preview.check_live_key(&key)?;
+                        preview.note_delete_node(&key);
+                        recs.push(WalRecord::DeleteNode { key });
+                    }
+                    BatchOp::CreateRule(def) => {
+                        preview.check_create_rule(&def)?;
+                        let def_bytes =
+                            bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
+                                detail: format!("serialize rule: {e}"),
+                            })?;
+                        preview.note_create_rule(&def.name);
+                        recs.push(WalRecord::CreateRule { def_bytes });
+                    }
+                    BatchOp::DeleteRule { name } => {
+                        preview.check_delete_rule(&name)?;
+                        preview.note_delete_rule(&name);
+                        recs.push(WalRecord::DeleteRule { name });
+                    }
+                }
+            }
+            recs
+        };
+        if recs.is_empty() {
+            return Ok(());
+        }
+        self.log_then_apply(WalRecord::Batch(recs))
+    }
+
     pub fn insert_node(
         &mut self,
         label: &str,
         key: &str,
         props: Vec<(String, Value)>,
     ) -> Result<()> {
-        if self.ids.get(key).is_some() {
-            return Err(GraphError::DuplicateKey { key: key.into() });
-        }
+        MutPreview::new(self).check_insert_node(key)?;
         self.log_then_apply(WalRecord::InsertNode {
             label: label.into(),
             key: key.into(),
@@ -345,28 +442,8 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn insert_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
-        for k in [src_key, dst_key] {
-            if self.ids.get(k).is_none() {
-                return Err(GraphError::KeyNotFound { key: k.into() });
-            }
-        }
-        let src = self.ids.get(src_key).unwrap();
-        let dst = self.ids.get(dst_key).unwrap();
-        if let Some(sym) = self.syms.get(edge_type) {
-            // Rule-owned guard: reject user edges that conflict with derived edges.
-            if self.engine.is_owned(sym, src, dst) {
-                return Err(GraphError::RuleOwned {
-                    detail: format!("edge {edge_type} {src_key}→{dst_key} is rule-owned"),
-                });
-            }
-            if self
-                .topo
-                .neighbors(sym, Direction::Out, src)
-                .binary_search(&dst)
-                .is_ok()
-            {
-                return Ok(false); // duplicate: don't log
-            }
+        if !MutPreview::new(self).prepare_insert_edge(edge_type, src_key, dst_key)? {
+            return Ok(false);
         }
         self.log_then_apply(WalRecord::InsertEdge {
             edge_type: edge_type.into(),
@@ -377,9 +454,7 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn set_prop(&mut self, key: &str, field: &str, value: Value) -> Result<()> {
-        if self.ids.get(key).is_none() {
-            return Err(GraphError::KeyNotFound { key: key.into() });
-        }
+        MutPreview::new(self).check_live_key(key)?;
         self.log_then_apply(WalRecord::SetProp {
             key: key.into(),
             field: field.into(),
@@ -390,10 +465,7 @@ impl<F: Fs> GraphDb<F> {
     /// Remove a property. Returns `Ok(false)` (and does not log) if the field
     /// is already absent. Unknown or tombstoned keys are `Err(KeyNotFound)`.
     pub fn remove_prop(&mut self, key: &str, field: &str) -> Result<bool> {
-        let Some(id) = self.ids.get(key) else {
-            return Err(GraphError::KeyNotFound { key: key.into() });
-        };
-        if self.props.get(id, field).is_none() {
+        if !MutPreview::new(self).prepare_remove_prop(key, field)? {
             return Ok(false);
         }
         self.log_then_apply(WalRecord::RemoveProp {
@@ -407,31 +479,7 @@ impl<F: Fs> GraphDb<F> {
     /// is absent. Unknown keys are `Err(KeyNotFound)`. Rule-owned edges are
     /// `Err(RuleOwned)` — delete or change the owning rule instead.
     pub fn delete_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
-        for k in [src_key, dst_key] {
-            if self.ids.get(k).is_none() {
-                return Err(GraphError::KeyNotFound { key: k.into() });
-            }
-        }
-        let src = self.ids.get(src_key).unwrap();
-        let dst = self.ids.get(dst_key).unwrap();
-        if let Some(sym) = self.syms.get(edge_type) {
-            if self.engine.is_owned(sym, src, dst) {
-                return Err(GraphError::RuleOwned {
-                    detail: format!(
-                        "edge {edge_type} {src_key}→{dst_key} is rule-owned; \
-                         delete or change the owning rule"
-                    ),
-                });
-            }
-            if self
-                .topo
-                .neighbors(sym, Direction::Out, src)
-                .binary_search(&dst)
-                .is_err()
-            {
-                return Ok(false);
-            }
-        } else {
+        if !MutPreview::new(self).prepare_delete_edge(edge_type, src_key, dst_key)? {
             return Ok(false);
         }
         self.log_then_apply(WalRecord::DeleteEdge {
@@ -447,9 +495,7 @@ impl<F: Fs> GraphDb<F> {
     /// write; `apply` of a logged `DeleteNode` for an already-tombstoned key
     /// (crash window) is a clean no-op.
     pub fn delete_node(&mut self, key: &str) -> Result<()> {
-        if self.ids.get(key).is_none() {
-            return Err(GraphError::KeyNotFound { key: key.into() });
-        }
+        MutPreview::new(self).check_live_key(key)?;
         self.log_then_apply(WalRecord::DeleteNode { key: key.into() })
     }
 
@@ -457,13 +503,7 @@ impl<F: Fs> GraphDb<F> {
     /// Validation and duplicate-name check run before logging so invalid rules
     /// never enter the WAL.
     pub fn create_rule(&mut self, def: RuleDef) -> Result<()> {
-        def.validate()
-            .map_err(|e| GraphError::RuleInvalid { detail: e })?;
-        if self.engine.rules().any(|r| r.name == def.name) {
-            return Err(GraphError::RuleInvalid {
-                detail: format!("rule {:?} already exists", def.name),
-            });
-        }
+        MutPreview::new(self).check_create_rule(&def)?;
         let def_bytes = bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
             detail: format!("serialize rule: {e}"),
         })?;
@@ -472,9 +512,7 @@ impl<F: Fs> GraphDb<F> {
 
     /// WAL-log rule deletion. Returns RuleNotFound if the rule does not exist.
     pub fn delete_rule(&mut self, name: &str) -> Result<()> {
-        if !self.engine.rules().any(|r| r.name == name) {
-            return Err(GraphError::RuleNotFound { name: name.into() });
-        }
+        MutPreview::new(self).check_delete_rule(name)?;
         self.log_then_apply(WalRecord::DeleteRule { name: name.into() })
     }
 
@@ -684,6 +722,420 @@ impl<F: Fs> GraphDb<F> {
             .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state))?;
         self.fs.write_atomic(FileId::Wal, b"")?; // wal tail now starts empty
         Ok(())
+    }
+}
+
+/// Queued mutation for a [`BatchBuilder`].
+enum BatchOp {
+    InsertNode {
+        label: String,
+        key: String,
+        props: Vec<(String, Value)>,
+    },
+    InsertEdge {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+    },
+    SetProp {
+        key: String,
+        field: String,
+        value: Value,
+    },
+    RemoveProp {
+        key: String,
+        field: String,
+    },
+    DeleteEdge {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+    },
+    DeleteNode {
+        key: String,
+    },
+    CreateRule(RuleDef),
+    DeleteRule {
+        name: String,
+    },
+}
+
+/// Overlay of ops already accepted earlier in the same batch. Never written
+/// back to the database — validation only.
+#[derive(Default)]
+struct Overlay {
+    extra_keys: BTreeSet<String>,
+    deleted_keys: BTreeSet<String>,
+    extra_props: BTreeMap<(String, String), Value>,
+    removed_props: BTreeSet<(String, String)>,
+    extra_edges: BTreeSet<(String, String, String)>,
+    deleted_edges: BTreeSet<(String, String, String)>,
+    extra_rules: BTreeSet<String>,
+    deleted_rules: BTreeSet<String>,
+}
+
+/// Read-only view of live db state plus a batch overlay. Shared by single-op
+/// public methods (empty overlay) and `commit_batch`.
+struct MutPreview<'a, F: Fs> {
+    db: &'a GraphDb<F>,
+    overlay: Overlay,
+}
+
+impl<'a, F: Fs> MutPreview<'a, F> {
+    fn new(db: &'a GraphDb<F>) -> Self {
+        Self {
+            db,
+            overlay: Overlay::default(),
+        }
+    }
+
+    fn has_key(&self, key: &str) -> bool {
+        if self.overlay.extra_keys.contains(key) {
+            return true;
+        }
+        if self.overlay.deleted_keys.contains(key) {
+            return false;
+        }
+        self.db.ids.get(key).is_some()
+    }
+
+    fn has_prop(&self, key: &str, field: &str) -> bool {
+        if !self.has_key(key) {
+            return false;
+        }
+        let k = (key.to_string(), field.to_string());
+        if self.overlay.removed_props.contains(&k) {
+            return false;
+        }
+        if self.overlay.extra_props.contains_key(&k) {
+            return true;
+        }
+        // Fresh identity (first insert in this batch, or delete+reinsert):
+        // ignore props still sitting on the soon-to-be-tombstoned slot.
+        if self.overlay.extra_keys.contains(key) {
+            return false;
+        }
+        self.db.get_prop(key, field).is_some()
+    }
+
+    fn has_edge(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
+        let k = (
+            edge_type.to_string(),
+            src_key.to_string(),
+            dst_key.to_string(),
+        );
+        if self.overlay.deleted_edges.contains(&k) {
+            return false;
+        }
+        if self.overlay.extra_edges.contains(&k) {
+            return true;
+        }
+        // A key created in this batch (including reinsert) has no db edges.
+        if self.overlay.extra_keys.contains(src_key) || self.overlay.extra_keys.contains(dst_key) {
+            return false;
+        }
+        if self.overlay.deleted_keys.contains(src_key)
+            || self.overlay.deleted_keys.contains(dst_key)
+        {
+            return false;
+        }
+        let Some(src) = self.db.ids.get(src_key) else {
+            return false;
+        };
+        let Some(dst) = self.db.ids.get(dst_key) else {
+            return false;
+        };
+        let Some(sym) = self.db.syms.get(edge_type) else {
+            return false;
+        };
+        self.db
+            .topo
+            .neighbors(sym, Direction::Out, src)
+            .binary_search(&dst)
+            .is_ok()
+    }
+
+    fn has_rule(&self, name: &str) -> bool {
+        if self.overlay.extra_rules.contains(name) {
+            return true;
+        }
+        if self.overlay.deleted_rules.contains(name) {
+            return false;
+        }
+        self.db.engine.rules().any(|r| r.name == name)
+    }
+
+    fn is_rule_owned(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
+        if self.overlay.extra_keys.contains(src_key) || self.overlay.extra_keys.contains(dst_key) {
+            return false;
+        }
+        if self.overlay.deleted_keys.contains(src_key)
+            || self.overlay.deleted_keys.contains(dst_key)
+        {
+            return false;
+        }
+        let Some(src) = self.db.ids.get(src_key) else {
+            return false;
+        };
+        let Some(dst) = self.db.ids.get(dst_key) else {
+            return false;
+        };
+        let Some(et) = self.db.syms.get(edge_type) else {
+            return false;
+        };
+        if self.overlay.deleted_rules.is_empty() {
+            return self.db.engine.is_owned(et, src, dst);
+        }
+        for (rule, triples) in self.db.engine.provenance() {
+            if self.overlay.deleted_rules.contains(rule) {
+                continue;
+            }
+            if triples.contains(&(et, src, dst)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn check_insert_node(&self, key: &str) -> Result<()> {
+        if self.has_key(key) {
+            Err(GraphError::DuplicateKey { key: key.into() })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_live_key(&self, key: &str) -> Result<()> {
+        if self.has_key(key) {
+            Ok(())
+        } else {
+            Err(GraphError::KeyNotFound { key: key.into() })
+        }
+    }
+
+    fn prepare_insert_edge(&self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
+        for k in [src_key, dst_key] {
+            if !self.has_key(k) {
+                return Err(GraphError::KeyNotFound { key: k.into() });
+            }
+        }
+        if self.is_rule_owned(edge_type, src_key, dst_key) {
+            return Err(GraphError::RuleOwned {
+                detail: format!("edge {edge_type} {src_key}→{dst_key} is rule-owned"),
+            });
+        }
+        Ok(!self.has_edge(edge_type, src_key, dst_key))
+    }
+
+    fn prepare_remove_prop(&self, key: &str, field: &str) -> Result<bool> {
+        self.check_live_key(key)?;
+        Ok(self.has_prop(key, field))
+    }
+
+    fn prepare_delete_edge(&self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
+        for k in [src_key, dst_key] {
+            if !self.has_key(k) {
+                return Err(GraphError::KeyNotFound { key: k.into() });
+            }
+        }
+        if self.is_rule_owned(edge_type, src_key, dst_key) {
+            return Err(GraphError::RuleOwned {
+                detail: format!(
+                    "edge {edge_type} {src_key}→{dst_key} is rule-owned; \
+                     delete or change the owning rule"
+                ),
+            });
+        }
+        Ok(self.has_edge(edge_type, src_key, dst_key))
+    }
+
+    fn check_create_rule(&self, def: &RuleDef) -> Result<()> {
+        def.validate()
+            .map_err(|e| GraphError::RuleInvalid { detail: e })?;
+        if self.has_rule(&def.name) {
+            return Err(GraphError::RuleInvalid {
+                detail: format!("rule {:?} already exists", def.name),
+            });
+        }
+        Ok(())
+    }
+
+    fn check_delete_rule(&self, name: &str) -> Result<()> {
+        if self.has_rule(name) {
+            Ok(())
+        } else {
+            Err(GraphError::RuleNotFound { name: name.into() })
+        }
+    }
+
+    fn note_insert_node(&mut self, key: &str, props: &[(String, Value)]) {
+        self.overlay.deleted_keys.remove(key);
+        self.overlay.extra_keys.insert(key.to_string());
+        self.overlay.extra_props.retain(|(k, _), _| k != key);
+        self.overlay.removed_props.retain(|(k, _)| k != key);
+        for (field, value) in props {
+            self.overlay
+                .extra_props
+                .insert((key.to_string(), field.clone()), value.clone());
+        }
+    }
+
+    fn note_insert_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) {
+        let k = (
+            edge_type.to_string(),
+            src_key.to_string(),
+            dst_key.to_string(),
+        );
+        self.overlay.deleted_edges.remove(&k);
+        self.overlay.extra_edges.insert(k);
+    }
+
+    fn note_set_prop(&mut self, key: &str, field: &str, value: &Value) {
+        let k = (key.to_string(), field.to_string());
+        self.overlay.removed_props.remove(&k);
+        self.overlay.extra_props.insert(k, value.clone());
+    }
+
+    fn note_remove_prop(&mut self, key: &str, field: &str) {
+        let k = (key.to_string(), field.to_string());
+        self.overlay.extra_props.remove(&k);
+        self.overlay.removed_props.insert(k);
+    }
+
+    fn note_delete_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) {
+        let k = (
+            edge_type.to_string(),
+            src_key.to_string(),
+            dst_key.to_string(),
+        );
+        self.overlay.extra_edges.remove(&k);
+        self.overlay.deleted_edges.insert(k);
+    }
+
+    fn note_delete_node(&mut self, key: &str) {
+        self.overlay.extra_keys.remove(key);
+        self.overlay.deleted_keys.insert(key.to_string());
+        self.overlay.extra_props.retain(|(k, _), _| k != key);
+        self.overlay.removed_props.retain(|(k, _)| k != key);
+        self.overlay
+            .extra_edges
+            .retain(|(_, s, d)| s != key && d != key);
+        self.overlay
+            .deleted_edges
+            .retain(|(_, s, d)| s != key && d != key);
+    }
+
+    fn note_create_rule(&mut self, name: &str) {
+        self.overlay.deleted_rules.remove(name);
+        self.overlay.extra_rules.insert(name.to_string());
+    }
+
+    fn note_delete_rule(&mut self, name: &str) {
+        self.overlay.extra_rules.remove(name);
+        self.overlay.deleted_rules.insert(name.to_string());
+        // Treat the deleted rule's current provenance as gone so a later
+        // delete_edge of those triples is a no-op (matches sequential).
+        if let Some(triples) = self.db.engine.provenance().get(name) {
+            for &(et, s, d) in triples {
+                let Some(etype) = self.db.syms.resolve(et) else {
+                    continue;
+                };
+                let Some(src) = self.db.ids.key_of(s) else {
+                    continue;
+                };
+                let Some(dst) = self.db.ids.key_of(d) else {
+                    continue;
+                };
+                let k = (etype.to_string(), src.to_string(), dst.to_string());
+                self.overlay.extra_edges.remove(&k);
+                self.overlay.deleted_edges.insert(k);
+            }
+        }
+    }
+}
+
+/// Collects mutations and commits them as one WAL `Batch` frame.
+///
+/// Holds `&mut GraphDb` for its lifetime. Queue with the same method names
+/// as [`GraphDb`]; call [`commit`](Self::commit) to validate, log, and apply.
+/// See [`GraphDb::batch`] for validation and atomicity rules.
+pub struct BatchBuilder<'a, F: Fs> {
+    db: &'a mut GraphDb<F>,
+    ops: Vec<BatchOp>,
+}
+
+impl<'a, F: Fs> BatchBuilder<'a, F> {
+    pub fn insert_node(
+        &mut self,
+        label: &str,
+        key: &str,
+        props: Vec<(String, Value)>,
+    ) -> &mut Self {
+        self.ops.push(BatchOp::InsertNode {
+            label: label.into(),
+            key: key.into(),
+            props,
+        });
+        self
+    }
+
+    pub fn insert_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> &mut Self {
+        self.ops.push(BatchOp::InsertEdge {
+            edge_type: edge_type.into(),
+            src_key: src_key.into(),
+            dst_key: dst_key.into(),
+        });
+        self
+    }
+
+    pub fn set_prop(&mut self, key: &str, field: &str, value: Value) -> &mut Self {
+        self.ops.push(BatchOp::SetProp {
+            key: key.into(),
+            field: field.into(),
+            value,
+        });
+        self
+    }
+
+    pub fn remove_prop(&mut self, key: &str, field: &str) -> &mut Self {
+        self.ops.push(BatchOp::RemoveProp {
+            key: key.into(),
+            field: field.into(),
+        });
+        self
+    }
+
+    pub fn delete_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> &mut Self {
+        self.ops.push(BatchOp::DeleteEdge {
+            edge_type: edge_type.into(),
+            src_key: src_key.into(),
+            dst_key: dst_key.into(),
+        });
+        self
+    }
+
+    pub fn delete_node(&mut self, key: &str) -> &mut Self {
+        self.ops.push(BatchOp::DeleteNode { key: key.into() });
+        self
+    }
+
+    pub fn create_rule(&mut self, def: RuleDef) -> &mut Self {
+        self.ops.push(BatchOp::CreateRule(def));
+        self
+    }
+
+    pub fn delete_rule(&mut self, name: &str) -> &mut Self {
+        self.ops.push(BatchOp::DeleteRule { name: name.into() });
+        self
+    }
+
+    /// Validate every queued op, then log one `Batch` frame and apply.
+    /// Empty / all-noop batches return `Ok(())` without writing the WAL.
+    /// Takes `&mut self` so it chains after the queue methods (`b.insert_node(..).commit()`)
+    /// and also works as `let mut b = db.batch(); b.insert_node(..); b.commit()`.
+    pub fn commit(&mut self) -> Result<()> {
+        let ops = std::mem::take(&mut self.ops);
+        self.db.commit_batch(ops)
     }
 }
 
