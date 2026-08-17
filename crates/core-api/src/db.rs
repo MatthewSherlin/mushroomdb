@@ -215,6 +215,23 @@ impl<F: Fs> GraphDb<F> {
                 self.engine = eng;
                 result.map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
             }
+            // ── Mutation variants — full logic lands in Tasks 3/4/5 ───────────
+            WalRecord::RemoveProp { .. } => {
+                // Stub: implemented in Task 3.
+            }
+            WalRecord::DeleteEdge { .. } => {
+                // Stub: implemented in Task 3.
+            }
+            WalRecord::DeleteNode { .. } => {
+                // Stub: implemented in Task 4.
+            }
+            WalRecord::Batch(inner) => {
+                // Apply each inner record in order through the same apply path.
+                // Inner records are validated free of nested Batch by encode_record.
+                for rec in inner {
+                    self.apply(rec)?;
+                }
+            }
         }
         Ok(())
     }

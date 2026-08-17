@@ -24,9 +24,38 @@ pub enum WalRecord {
     DeleteRule {
         name: String,
     },
+    // ── Mutation variants (appended last — bincode is positional) ─────────────
+    RemoveProp {
+        key: String,
+        field: String,
+    },
+    DeleteEdge {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+    },
+    DeleteNode {
+        key: String,
+    },
+    /// One WAL frame = one atomic batch. Nested `Batch` inside a `Batch` is
+    /// invalid: `encode_record` debug-asserts against it, and `decode_all`
+    /// treats a frame whose payload deserialises to a nested `Batch` as corrupt
+    /// (stops cleanly before that frame, returning the valid prefix).
+    Batch(Vec<WalRecord>),
 }
 
+/// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.
+///
+/// # Panics (debug builds)
+/// Panics if `rec` is a `Batch` that contains a nested `Batch` — nested batches
+/// are semantically invalid.
 pub fn encode_record(rec: &WalRecord) -> Vec<u8> {
+    if let WalRecord::Batch(inner) = rec {
+        debug_assert!(
+            !inner.iter().any(|r| matches!(r, WalRecord::Batch(_))),
+            "nested Batch is invalid: a Batch may not contain another Batch"
+        );
+    }
     let payload = bincode::serialize(rec).expect("walrecord serialize cannot fail");
     let crc = crc32fast::hash(&payload);
     let mut out = Vec::with_capacity(8 + payload.len());
@@ -36,6 +65,14 @@ pub fn encode_record(rec: &WalRecord) -> Vec<u8> {
     out
 }
 
+/// Decode as many complete, valid WAL frames as possible from `bytes`.
+///
+/// Returns `(records, valid_len)` where `valid_len` is the byte offset of the
+/// first frame that was torn, corrupt, or undeserializable — callers can
+/// truncate the WAL file to `valid_len` to discard the invalid tail.
+///
+/// A `Batch` frame whose inner record list contains a nested `Batch` is treated
+/// as corrupt: decoding stops before that frame (the frame itself is not pushed).
 pub fn decode_all(bytes: &[u8]) -> (Vec<WalRecord>, usize) {
     let mut recs = Vec::new();
     let mut pos = 0usize;
@@ -54,6 +91,13 @@ pub fn decode_all(bytes: &[u8]) -> (Vec<WalRecord>, usize) {
             return (recs, pos); // corrupt tail
         }
         match bincode::deserialize::<WalRecord>(payload) {
+            Ok(WalRecord::Batch(inner)) => {
+                // Nested Batch inside a Batch is invalid; treat as corrupt frame.
+                if inner.iter().any(|r| matches!(r, WalRecord::Batch(_))) {
+                    return (recs, pos);
+                }
+                recs.push(WalRecord::Batch(inner));
+            }
             Ok(r) => recs.push(r),
             Err(_) => return (recs, pos),
         }
@@ -121,5 +165,121 @@ mod tests {
         let (recs, consumed) = decode_all(&[]);
         assert!(recs.is_empty());
         assert_eq!(consumed, 0);
+    }
+
+    // ── Task 2: new variant roundtrips ────────────────────────────────────────
+
+    #[test]
+    fn roundtrip_remove_prop() {
+        let r = WalRecord::RemoveProp {
+            key: "n1".into(),
+            field: "age".into(),
+        };
+        let bytes = encode_record(&r);
+        let (recs, _) = decode_all(&bytes);
+        assert_eq!(recs, vec![r]);
+    }
+
+    #[test]
+    fn roundtrip_delete_edge() {
+        let r = WalRecord::DeleteEdge {
+            edge_type: "KNOWS".into(),
+            src_key: "a".into(),
+            dst_key: "b".into(),
+        };
+        let bytes = encode_record(&r);
+        let (recs, _) = decode_all(&bytes);
+        assert_eq!(recs, vec![r]);
+    }
+
+    #[test]
+    fn roundtrip_delete_node() {
+        let r = WalRecord::DeleteNode { key: "x".into() };
+        let bytes = encode_record(&r);
+        let (recs, _) = decode_all(&bytes);
+        assert_eq!(recs, vec![r]);
+    }
+
+    #[test]
+    fn batch_of_three_is_one_frame() {
+        let inner = vec![
+            WalRecord::DeleteNode { key: "a".into() },
+            WalRecord::DeleteNode { key: "b".into() },
+            WalRecord::DeleteNode { key: "c".into() },
+        ];
+        let batch = WalRecord::Batch(inner.clone());
+        let frame = encode_record(&batch);
+
+        // Exactly ONE frame: one (u32 len + u32 crc) header at offset 0.
+        // Verify by calling decode_all on the raw bytes.
+        let (recs, consumed) = decode_all(&frame);
+        assert_eq!(consumed, frame.len(), "should consume the whole frame");
+        assert_eq!(recs.len(), 1, "one decoded record (the Batch)");
+        assert_eq!(recs[0], WalRecord::Batch(inner));
+    }
+
+    #[test]
+    fn torn_mid_batch_frame_drops_whole_batch() {
+        // Two plain records before the batch, then a batch frame that is torn.
+        let pre = sample();
+        let batch = WalRecord::Batch(vec![
+            WalRecord::DeleteNode { key: "a".into() },
+            WalRecord::DeleteNode { key: "b".into() },
+        ]);
+        let mut bytes = Vec::new();
+        for r in &pre {
+            bytes.extend(encode_record(r));
+        }
+        let batch_start = bytes.len();
+        bytes.extend(encode_record(&batch));
+
+        // Truncate 3 bytes inside the batch frame.
+        bytes.truncate(bytes.len() - 3);
+
+        let (recs, consumed) = decode_all(&bytes);
+        assert_eq!(recs, pre, "only pre-batch records survive");
+        assert_eq!(
+            consumed, batch_start,
+            "valid_len stops at batch frame start"
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "nested Batch")]
+    fn nested_batch_encode_panics_in_debug() {
+        let inner_batch = WalRecord::Batch(vec![WalRecord::DeleteNode { key: "z".into() }]);
+        let outer = WalRecord::Batch(vec![inner_batch]);
+        encode_record(&outer); // must debug_assert-panic
+    }
+
+    #[test]
+    fn nested_batch_decode_is_treated_as_corrupt() {
+        // Manually encode a Batch whose payload contains a nested Batch by
+        // serializing the raw bincode bytes, bypassing encode_record's assert.
+        let inner_batch = WalRecord::Batch(vec![WalRecord::DeleteNode { key: "z".into() }]);
+        let outer = WalRecord::Batch(vec![inner_batch]);
+
+        // Encode the payload without the debug assert by calling bincode directly.
+        let payload = bincode::serialize(&outer).unwrap();
+        let crc = crc32fast::hash(&payload);
+        let mut frame = Vec::with_capacity(8 + payload.len());
+        frame.extend((payload.len() as u32).to_le_bytes());
+        frame.extend(crc.to_le_bytes());
+        frame.extend(&payload);
+
+        // Prepend a valid record so we can verify the stop position.
+        let good = encode_record(&WalRecord::DeleteNode { key: "good".into() });
+        let good_len = good.len();
+        let mut bytes = good;
+        bytes.extend(&frame);
+
+        let (recs, consumed) = decode_all(&bytes);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0], WalRecord::DeleteNode { key: "good".into() });
+        assert_eq!(
+            consumed, good_len,
+            "stops cleanly before the nested-batch frame"
+        );
     }
 }
