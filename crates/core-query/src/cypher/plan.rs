@@ -64,12 +64,20 @@ pub enum PlanOp {
 /// Compile `q` into a logical plan. Errors are contextual `String`s; never panics.
 pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     let mut bound = BTreeSet::new();
+    let mut rel_bound = BTreeSet::new();
     let mut ops = Vec::new();
     let mut node_anon = 0u32;
     let mut rel_anon = 0u32;
 
     for pat in &q.matches {
-        compile_pattern(pat, &mut ops, &mut bound, &mut node_anon, &mut rel_anon);
+        compile_pattern(
+            pat,
+            &mut ops,
+            &mut bound,
+            &mut rel_bound,
+            &mut node_anon,
+            &mut rel_anon,
+        );
     }
 
     if let Some(expr) = &q.where_expr {
@@ -77,7 +85,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         ops.push(PlanOp::Filter { expr: expr.clone() });
     }
 
-    check_return_bound(&q.returns, &bound)?;
+    check_return_bound(&q.returns, &bound, &rel_bound)?;
     check_duplicate_aliases(&q.returns)?;
     check_duplicate_columns(&q.returns)?;
 
@@ -88,7 +96,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     if !q.order_by.is_empty() {
         let mut items = Vec::with_capacity(q.order_by.len());
         for item in &q.order_by {
-            items.push(rewrite_order_item(item, &q.returns, &bound)?);
+            items.push(rewrite_order_item(item, &q.returns, &bound, &rel_bound)?);
         }
         ops.push(PlanOp::OrderBy { items });
     }
@@ -107,6 +115,7 @@ fn compile_pattern(
     pat: &Pattern,
     ops: &mut Vec<PlanOp>,
     bound: &mut BTreeSet<String>,
+    rel_bound: &mut BTreeSet<String>,
     node_anon: &mut u32,
     rel_anon: &mut u32,
 ) {
@@ -135,6 +144,7 @@ fn compile_pattern(
     for (rel, dest) in &pat.chain {
         let rel_name = name_rel(rel, rel_anon, bound);
         bound.insert(rel_name.clone());
+        rel_bound.insert(rel_name.clone());
         let to = name_node(dest, node_anon, bound);
         ops.push(PlanOp::Expand {
             from,
@@ -210,13 +220,31 @@ fn require_bound(var: &str, bound: &BTreeSet<String>, clause: &str) -> Result<()
     }
 }
 
-fn check_return_bound(items: &[RetItem], bound: &BTreeSet<String>) -> Result<(), String> {
+fn reject_bare_rel(var: &str, rel_bound: &BTreeSet<String>) -> Result<(), String> {
+    if rel_bound.contains(var) {
+        Err(format!(
+            "cannot return relationship variable '{var}' bare; return its properties ({var}.field) instead"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_return_bound(
+    items: &[RetItem],
+    bound: &BTreeSet<String>,
+    rel_bound: &BTreeSet<String>,
+) -> Result<(), String> {
     for item in items {
-        let var = match &item.value {
-            RetVal::Var(v) => v,
-            RetVal::Prop { var, .. } => var,
-        };
-        require_bound(var, bound, "RETURN")?;
+        match &item.value {
+            RetVal::Var(v) => {
+                require_bound(v, bound, "RETURN")?;
+                reject_bare_rel(v, rel_bound)?;
+            }
+            RetVal::Prop { var, .. } => {
+                require_bound(var, bound, "RETURN")?;
+            }
+        }
     }
     Ok(())
 }
@@ -259,6 +287,7 @@ fn rewrite_order_item(
     item: &OrderItem,
     returns: &[RetItem],
     bound: &BTreeSet<String>,
+    rel_bound: &BTreeSet<String>,
 ) -> Result<OrderItem, String> {
     let column = match &item.target {
         OrderTarget::Alias(name) => {
@@ -273,6 +302,7 @@ fn rewrite_order_item(
         }
         OrderTarget::Var(v) => {
             require_bound(v, bound, "ORDER BY")?;
+            reject_bare_rel(v, rel_bound)?;
             match returns
                 .iter()
                 .find(|r| matches!(&r.value, RetVal::Var(x) if x == v))
@@ -775,5 +805,36 @@ LIMIT 10";
         let result = std::panic::catch_unwind(|| plan(&q));
         assert!(result.is_ok(), "plan panicked on hand-built Query");
         let _ = result.unwrap();
+    }
+
+    #[test]
+    fn bare_relationship_var_in_return_is_err() {
+        let err = assert_plan_err("MATCH (a)-[r:T]->(b) RETURN r", "r");
+        assert!(
+            err.to_ascii_lowercase().contains("relationship"),
+            "expected bare-rel RETURN guidance, got: {err}"
+        );
+    }
+
+    #[test]
+    fn relationship_prop_in_return_is_ok() {
+        plan_src("MATCH (a)-[r:T]->(b) RETURN r.w").expect("rel prop RETURN must plan");
+    }
+
+    #[test]
+    fn bare_relationship_var_in_order_by_is_err() {
+        // RETURN r.w is legal; ORDER BY r is a bare rel var (defense, not just
+        // "not in RETURN").
+        let err = assert_plan_err("MATCH (a)-[r:T]->(b) RETURN r.w ORDER BY r", "r");
+        assert!(
+            err.to_ascii_lowercase().contains("relationship"),
+            "expected bare-rel ORDER BY guidance, got: {err}"
+        );
+    }
+
+    #[test]
+    fn relationship_prop_in_order_by_is_ok() {
+        plan_src("MATCH (a)-[r:T]->(b) RETURN r.w ORDER BY r.w")
+            .expect("rel prop ORDER BY must plan");
     }
 }
