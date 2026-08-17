@@ -226,13 +226,27 @@ fn cypher_neighbors_match_grouped_by_edge_type() {
 }
 
 #[test]
-fn query_stage_prefixes_lex_and_execute() {
+fn query_stage_prefixes_lex_plan_and_execute() {
     let db = open_fixture("stage-prefix");
     match db.query("@", &BTreeMap::new()) {
         Err(GraphError::QueryError { detail }) => {
             assert!(
                 detail.starts_with("lex:"),
                 "lex errors must be prefixed lex:, got: {detail}"
+            );
+        }
+        other => panic!("expected QueryError, got {other:?}"),
+    }
+    // Lexes and parses; planning rejects the unbound RETURN variable.
+    match db.query("MATCH (a) RETURN b", &BTreeMap::new()) {
+        Err(GraphError::QueryError { detail }) => {
+            assert!(
+                detail.starts_with("plan:"),
+                "plan errors must be prefixed plan:, got: {detail}"
+            );
+            assert!(
+                detail.contains("b") && (detail.contains("unbound") || detail.contains("Unbound")),
+                "plan error must name the unbound variable, got: {detail}"
             );
         }
         other => panic!("expected QueryError, got {other:?}"),
