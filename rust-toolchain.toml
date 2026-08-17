@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned so local dev and CI run identical rustfmt/clippy — version skew between
+# the two makes `cargo fmt --check` fail in CI on a locally-clean tree.
+# Bump deliberately (update CI in the same commit).
+channel = "1.92.0"
+components = ["clippy", "rustfmt"]
