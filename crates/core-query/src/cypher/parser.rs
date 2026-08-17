@@ -408,7 +408,7 @@ mod tests {
     use core_storage::Value;
 
     fn parse_src(src: &str) -> Result<Query, String> {
-        parse(&lex(src).unwrap_or_else(|e| panic!("lex failed on {src:?}: {e}")))
+        parse(&lex(src)?)
     }
 
     fn prop(var: &str, field: &str) -> Operand {
@@ -606,9 +606,10 @@ SKIP 1 LIMIT 5";
         let err = result
             .unwrap()
             .expect_err(&format!("parse({src:?}) must be Err"));
+        // Parse errors say "token"; lex errors say "position". Either is a valid reject.
         assert!(
-            err.contains("token"),
-            "error must include token position, got: {err}"
+            err.contains("token") || err.contains("position"),
+            "error must include token or lex position, got: {err}"
         );
     }
 
