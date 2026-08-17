@@ -133,6 +133,13 @@ impl<F: Fs> GraphDb<F> {
                         detail: format!("CreateRule def_bytes deserialize failed: {e}"),
                     }
                 })?;
+                // Replay-over-snapshot idempotency: the rule was captured in the snapshot
+                // so the engine already has it; silently skip to avoid a spurious
+                // RuleInvalid error in the crash window between snapshot write and WAL
+                // truncation.
+                if self.engine.rules().any(|r| r.name == def.name) {
+                    return Ok(());
+                }
                 let mut eng = std::mem::take(&mut self.engine);
                 let result = {
                     let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);
@@ -142,6 +149,13 @@ impl<F: Fs> GraphDb<F> {
                 result.map_err(|e| GraphError::RuleInvalid { detail: e })?;
             }
             WalRecord::DeleteRule { name } => {
+                // Replay-over-snapshot idempotency: the snapshot already captured the
+                // post-delete state so the rule is absent; silently skip to avoid a
+                // spurious RuleNotFound error in the crash window between snapshot write
+                // and WAL truncation.
+                if !self.engine.rules().any(|r| r.name == *name) {
+                    return Ok(());
+                }
                 let mut eng = std::mem::take(&mut self.engine);
                 let result = {
                     let mut gm = make_graph_mut(&self.ids, &mut self.syms, &self.labels, &self.props, &mut self.topo, &mut self.edge_props);

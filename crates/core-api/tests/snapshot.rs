@@ -87,3 +87,58 @@ fn version_1_snapshot_is_rejected() {
         Err(e) => panic!("expected Corrupt, got other error: {e:?}"),
     }
 }
+
+#[test]
+fn crash_between_snapshot_and_wal_truncation_recovers() {
+    // === Phase 1: CreateRule idempotency ===
+    // Snapshot captures rule; crash leaves pre-snapshot WAL (with CreateRule) intact.
+    // Reopen must not fail with RuleInvalid on the duplicate CreateRule replay.
+    let dir = tmp("crash-create-rule");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("A", "a", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+        db.create_rule(RuleDef {
+            name: "rel".into(), src_label: "A".into(), dst_label: "A".into(),
+            predicate: Predicate::Overlap { field: "tags".into(), min: 0.5 },
+            edge_type: "REL".into(), weight_prop: None,
+        }).unwrap();
+        db.insert_node("A", "b", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+        // save pre-snapshot WAL (has InsertNode a, CreateRule rel, InsertNode b)
+        let pre_snap_wal = std::fs::read(dir.join("wal.bin")).unwrap();
+        db.snapshot().unwrap();
+        // simulate crash: restore pre-snapshot WAL before truncation took effect
+        std::fs::write(dir.join("wal.bin"), &pre_snap_wal).unwrap();
+    }
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.rules().len(), 1);
+    assert_eq!(db.edge_count(), 2); // a↔b both directions
+    // incremental firing still works after recovery
+    db.insert_node("A", "c", vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))]).unwrap();
+    assert_eq!(db.edge_count(), 6); // a,b,c pairwise
+
+    // === Phase 2: DeleteRule idempotency ===
+    // Snapshot captures state without a deleted rule; crash leaves WAL (with DeleteRule) intact.
+    // Reopen must not fail with RuleNotFound on the replay of a delete for an absent rule.
+    let dir2 = tmp("crash-delete-rule");
+    {
+        let mut db = GraphDb::open(&dir2).unwrap();
+        db.insert_node("A", "x", vec![]).unwrap();
+        db.create_rule(RuleDef {
+            name: "gone".into(), src_label: "A".into(), dst_label: "A".into(),
+            predicate: Predicate::Overlap { field: "tags".into(), min: 0.5 },
+            edge_type: "GONE".into(), weight_prop: None,
+        }).unwrap();
+        // first snapshot: rule "gone" in engine
+        db.snapshot().unwrap();
+        // delete the rule; WAL now contains [DeleteRule "gone"]
+        db.delete_rule("gone").unwrap();
+        let pre_snap_wal = std::fs::read(dir2.join("wal.bin")).unwrap();
+        // second snapshot: captures state WITHOUT "gone"; truncates WAL
+        db.snapshot().unwrap();
+        // simulate crash before WAL truncation
+        std::fs::write(dir2.join("wal.bin"), &pre_snap_wal).unwrap();
+    }
+    // reopen: snapshot has no "gone", WAL replays DeleteRule "gone" for missing rule → must not error
+    let db = GraphDb::open(&dir2).unwrap();
+    assert_eq!(db.rules().len(), 0); // "gone" is still gone
+}
