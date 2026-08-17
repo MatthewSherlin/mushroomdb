@@ -54,6 +54,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-query"
+version = "0.1.0"
+dependencies = [
+ "core-storage",
+ "serde",
+]
+
+[[package]]
 name = "core-rules"
 version = "0.1.0"
 dependencies = [
