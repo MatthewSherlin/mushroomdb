@@ -177,10 +177,14 @@ fn syntax_error_is_query_error_with_detail() {
         .expect_err("missing RETURN is a query error");
     match &err {
         GraphError::QueryError { detail } => {
+            assert!(
+                detail.starts_with("parse:"),
+                "syntax errors must be prefixed parse:, got: {detail}"
+            );
             let d = detail.to_ascii_lowercase();
             assert!(
-                d.contains("parse") || d.contains("token") || d.contains("return"),
-                "detail must name the failing stage / token, got: {detail}"
+                d.contains("token") || d.contains("return"),
+                "detail must name the failing token, got: {detail}"
             );
         }
         other => panic!("expected QueryError, got {other:?}"),
@@ -219,4 +223,31 @@ fn cypher_neighbors_match_grouped_by_edge_type() {
     cypher.sort();
     cypher.dedup();
     assert_eq!(traversal, cypher);
+}
+
+#[test]
+fn query_stage_prefixes_lex_and_execute() {
+    let db = open_fixture("stage-prefix");
+    match db.query("@", &BTreeMap::new()) {
+        Err(GraphError::QueryError { detail }) => {
+            assert!(
+                detail.starts_with("lex:"),
+                "lex errors must be prefixed lex:, got: {detail}"
+            );
+        }
+        other => panic!("expected QueryError, got {other:?}"),
+    }
+    match db.query("MATCH (t:Person {id: $tid}) RETURN t", &BTreeMap::new()) {
+        Err(GraphError::QueryError { detail }) => {
+            assert!(
+                detail.starts_with("execute:"),
+                "execute errors must be prefixed execute:, got: {detail}"
+            );
+            assert!(
+                detail.contains("tid"),
+                "missing-param execute error must name the parameter, got: {detail}"
+            );
+        }
+        other => panic!("expected QueryError, got {other:?}"),
+    }
 }

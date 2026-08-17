@@ -476,6 +476,54 @@ impl RuleEngine {
         }
     }
 
+    /// Retract every provenance edge touching `n` across all rules and drop
+    /// `n` from every rule index using its *current* props.
+    ///
+    /// Caller must invoke this while labels/props are still intact (before
+    /// tombstone). Rules are walked in BTree name order; touching edges in
+    /// BTree triple order. A second call on an already-retracted node is a
+    /// no-op (crash-window replay / absent state).
+    pub fn on_node_removed(&mut self, n: u32, g: &mut GraphMut<'_>) {
+        let n_label = g.labels.get(n as usize).copied();
+        let rule_names: Vec<String> = self.rules.keys().cloned().collect();
+
+        for rule_name in rule_names {
+            let def = self.rules[&rule_name].clone();
+            let src_sym = g.syms.get(&def.src_label);
+            let dst_sym = g.syms.get(&def.dst_label);
+            let as_src = src_sym.is_some() && n_label == src_sym;
+            let as_dst = dst_sym.is_some() && n_label == dst_sym;
+
+            {
+                let cur_getter = |f: &str| g.props.get(n, f).cloned();
+                let idx = self.indexes.get_mut(&rule_name).unwrap();
+                if as_src {
+                    let spec = src_lookup_spec(&def.predicate);
+                    idx.src_side.remove(&spec, n, &cur_getter);
+                }
+                if as_dst {
+                    let spec = candidate_spec(&def.predicate);
+                    idx.dst_side.remove(&spec, n, &cur_getter);
+                }
+            }
+
+            let Some(prov) = self.provenance.get_mut(&rule_name) else {
+                continue;
+            };
+            let touching: Vec<(u32, u32, u32)> = prov
+                .iter()
+                .filter(|(_, s, d)| *s == n || *d == n)
+                .copied()
+                .collect();
+            for (t, s, d) in touching {
+                g.topo.remove_edge(t, s, d);
+                g.edge_props.remove_edge(t, s, d);
+                prov.remove(&(t, s, d));
+                self.owned.remove(&(t, s, d));
+            }
+        }
+    }
+
     /// Drop and recompute one rule's edges from scratch.  Returns Err if unknown.
     pub fn rebuild(&mut self, name: &str, g: &mut GraphMut<'_>) -> Result<(), String> {
         if !self.rules.contains_key(name) {
@@ -798,6 +846,47 @@ mod tests {
                 "T→C edge must appear when C node is inserted"
             );
             assert!(eng.is_owned(at, t, c9));
+        }
+    }
+
+    #[test]
+    fn on_node_removed_retracts_both_sides_and_deindexes() {
+        let mut fx = Fx::new();
+        let a = fx.add("A", "a", vec![("tags", tags(&["x", "y"]))]);
+        let b = fx.add("A", "b", vec![("tags", tags(&["x", "y"]))]);
+        let et = fx.syms.intern("REL");
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(overlap_rule(), &mut g).unwrap();
+            assert!(g.topo.neighbors(et, Direction::Out, a).contains(&b));
+            assert!(g.topo.neighbors(et, Direction::Out, b).contains(&a));
+        }
+        {
+            let mut g = fx.g();
+            eng.on_node_removed(a, &mut g);
+            assert!(!g.topo.neighbors(et, Direction::Out, a).contains(&b));
+            assert!(!g.topo.neighbors(et, Direction::Out, b).contains(&a));
+            assert_eq!(g.edge_props.get(et, a, b, "score"), None);
+            assert_eq!(g.edge_props.get(et, b, a, "score"), None);
+            assert!(!eng.is_owned(et, a, b));
+            assert!(!eng.is_owned(et, b, a));
+        }
+        // Partner re-links to a NEW matching node; de-indexed a is not a candidate.
+        let c = fx.add("A", "c", vec![("tags", tags(&["x", "y"]))]);
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(c, None, &mut g);
+            assert!(g.topo.neighbors(et, Direction::Out, b).contains(&c));
+            assert!(g.topo.neighbors(et, Direction::Out, c).contains(&b));
+            assert!(!g.topo.neighbors(et, Direction::Out, c).contains(&a));
+            assert!(!g.topo.neighbors(et, Direction::Out, a).contains(&c));
+        }
+        // Second remove is a no-op (crash-window / already-retracted).
+        {
+            let mut g = fx.g();
+            eng.on_node_removed(a, &mut g);
+            assert!(g.topo.neighbors(et, Direction::Out, b).contains(&c));
         }
     }
 

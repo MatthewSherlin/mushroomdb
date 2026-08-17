@@ -130,4 +130,17 @@ mod tests {
         assert_eq!(v.label_of(1), None);
         assert_eq!(v.nodes_with_label("Person"), vec![kept, later]);
     }
+
+    #[test]
+    fn nodes_with_label_skips_tombstoned_id() {
+        let mut fx = Fx::new();
+        let ada = fx.add("Person", "ada", vec![]);
+        let bob = fx.add("Person", "bob", vec![]);
+        fx.ids.delete("ada");
+        fx.labels[ada as usize] = u32::MAX;
+        let v = fx.view();
+        assert_eq!(v.node_id("ada"), None);
+        assert_eq!(v.label_of(ada), None);
+        assert_eq!(v.nodes_with_label("Person"), vec![bob]);
+    }
 }

@@ -39,6 +39,17 @@ impl ColumnStore {
         }
         Some(old)
     }
+
+    /// Drop every field stored for `node`. Idempotent: a node with no remaining
+    /// props (or an id that was never written) is a no-op. Used by `DeleteNode`
+    /// after rule retraction and user-edge sweep. Field iteration order is not
+    /// observable — the resulting store is identical regardless of HashMap order.
+    pub fn remove_all(&mut self, node: u32) {
+        self.cols.retain(|_, col| {
+            col.remove(&node);
+            !col.is_empty()
+        });
+    }
 }
 
 #[cfg(test)]
@@ -69,6 +80,23 @@ mod tests {
         c.remove(1, "x");
         // now empty → column pruned
         assert!(!c.fields().any(|f| f == "x"));
+    }
+
+    #[test]
+    fn remove_all_clears_every_field_and_is_noop_on_absent() {
+        let mut c = ColumnStore::new();
+        c.set(0, "name", Value::Str("ada".into()));
+        c.set(0, "age", Value::Int(36));
+        c.set(1, "name", Value::Str("bob".into()));
+        c.remove_all(0);
+        assert_eq!(c.get(0, "name"), None);
+        assert_eq!(c.get(0, "age"), None);
+        assert_eq!(c.get(1, "name"), Some(&Value::Str("bob".into())));
+        // second call is a clean no-op (crash-window / already-cleared node)
+        c.remove_all(0);
+        assert_eq!(c.get(1, "name"), Some(&Value::Str("bob".into())));
+        c.remove_all(99);
+        assert_eq!(c.get(1, "name"), Some(&Value::Str("bob".into())));
     }
 
     #[test]

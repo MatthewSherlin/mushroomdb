@@ -28,6 +28,51 @@ struct Projected {
     rows: Vec<Vec<Option<Value>>>,
 }
 
+/// Production cap on the executor binding table after each `scan_label` /
+/// `expand`. Unjoined multi-MATCH cross-joins OOM without this.
+const MAX_INTERMEDIATE_ROWS: usize = 1_000_000;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MAX_INTERMEDIATE_ROWS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn max_intermediate_rows() -> usize {
+    #[cfg(test)]
+    {
+        TEST_MAX_INTERMEDIATE_ROWS
+            .with(|c| c.get())
+            .unwrap_or(MAX_INTERMEDIATE_ROWS)
+    }
+    #[cfg(not(test))]
+    {
+        MAX_INTERMEDIATE_ROWS
+    }
+}
+
+/// Test hook: run `f` with a smaller intermediate-row cap so the error path
+/// can fire without allocating a million rows. Restores the previous override
+/// (including across panics).
+#[cfg(test)]
+pub(crate) fn with_max_intermediate_rows<R>(cap: usize, f: impl FnOnce() -> R) -> R {
+    TEST_MAX_INTERMEDIATE_ROWS.with(|c| {
+        let prev = c.replace(Some(cap));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match result {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
+}
+
+fn row_cap_err(cap: usize) -> String {
+    format!(
+        "intermediate result exceeds {cap} rows; add a LIMIT or constrain patterns with shared variables"
+    )
+}
+
 /// Execute a plan against a view. Row order before OrderBy is deterministic
 /// (scan order = dense ids; expand order = expand()'s sorted order).
 ///
@@ -42,7 +87,7 @@ pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<Res
     for op in plan {
         match op {
             PlanOp::ScanLabel { var, label } => {
-                rows = scan_label(view, &rows, var, label.as_deref());
+                rows = scan_label(view, &rows, var, label.as_deref())?;
             }
             PlanOp::LookupProps { var, props } => {
                 rows = retain_node(view, &rows, var, None, props, params)?;
@@ -163,17 +208,26 @@ fn scan_ids(view: &GraphView, label: Option<&str>) -> Vec<u32> {
     }
 }
 
-fn scan_label(view: &GraphView, rows: &[Row], var: &str, label: Option<&str>) -> Vec<Row> {
+fn scan_label(
+    view: &GraphView,
+    rows: &[Row],
+    var: &str,
+    label: Option<&str>,
+) -> Result<Vec<Row>, String> {
     let ids = scan_ids(view, label);
     let mut out = Vec::new();
+    let cap = max_intermediate_rows();
     for row in rows {
         for &id in &ids {
+            if out.len() >= cap {
+                return Err(row_cap_err(cap));
+            }
             let mut next = row.clone();
             next.insert(var.to_string(), Cell::Node(id));
             out.push(next);
         }
     }
-    out
+    Ok(out)
 }
 
 fn require_cell<'a>(row: &'a Row, var: &str) -> Result<&'a Cell, String> {
@@ -312,6 +366,7 @@ fn exec_expand(
     let etypes = resolve_etypes(view, etype.as_deref());
     let exp_dir = map_dir(*dir);
     let mut out = Vec::new();
+    let cap = max_intermediate_rows();
     for row in rows {
         let from_id = require_node(row, from)?;
         let bound_to = match row.get(to) {
@@ -331,6 +386,9 @@ fn exec_expand(
             }
             if !node_matches(view, row, nbr, to_label.as_deref(), to_props, params)? {
                 continue;
+            }
+            if out.len() >= cap {
+                return Err(row_cap_err(cap));
             }
             let mut next = row.clone();
             if let Some(rv) = rel_var {
@@ -1178,5 +1236,63 @@ LIMIT 10";
             }));
             assert!(caught.is_ok(), "execute panicked on hostile plan: {plan:?}");
         }
+    }
+
+    #[test]
+    fn unlabeled_and_labeled_scans_skip_tombstoned_ids() {
+        let mut fx = Fx::new();
+        let ada = fx.add("Person", "ada", vec![]);
+        let bob = fx.add("Person", "bob", vec![]);
+        fx.edge("KNOWS", ada, bob, vec![]);
+        // Same state delete_node leaves: id retired, label sentinel, edges gone.
+        fx.ids.delete("ada");
+        fx.labels[ada as usize] = u32::MAX;
+        let knows = fx.syms.get("KNOWS").unwrap();
+        fx.topo.remove_edge(knows, ada, bob);
+        let v = fx.view();
+
+        let labeled = run(&v, "MATCH (p:Person) RETURN p", &BTreeMap::new()).unwrap();
+        assert_eq!(col(&labeled, "p"), vec![Some(s("bob"))]);
+        let unlabeled = run(&v, "MATCH (n) RETURN n", &BTreeMap::new()).unwrap();
+        assert_eq!(col(&unlabeled, "n"), vec![Some(s("bob"))]);
+        let hop = run(&v, "MATCH (x)-[:KNOWS]->(y) RETURN x, y", &BTreeMap::new()).unwrap();
+        assert!(
+            hop.is_empty(),
+            "expand cannot yield edges to a deleted node once topology is swept"
+        );
+    }
+
+    #[test]
+    fn intermediate_row_cap_errors_on_scan_and_expand() {
+        let cap_msg = |n: usize| {
+            format!(
+                "intermediate result exceeds {n} rows; add a LIMIT or constrain patterns with shared variables"
+            )
+        };
+
+        let mut scan_fx = Fx::new();
+        scan_fx.add("N", "a", vec![]);
+        scan_fx.add("N", "b", vec![]);
+        scan_fx.add("N", "c", vec![]);
+        let sv = scan_fx.view();
+        let scan_err = super::with_max_intermediate_rows(2, || {
+            run(&sv, "MATCH (n:N) RETURN n", &BTreeMap::new())
+        })
+        .expect_err("3-row scan must exceed cap 2");
+        assert_eq!(scan_err, cap_msg(2));
+
+        let mut exp_fx = Fx::new();
+        let src = exp_fx.add("Src", "s", vec![]);
+        let d1 = exp_fx.add("Dst", "d1", vec![]);
+        let d2 = exp_fx.add("Dst", "d2", vec![]);
+        exp_fx.edge("T", src, d1, vec![]);
+        exp_fx.edge("T", src, d2, vec![]);
+        let ev = exp_fx.view();
+        // Scan of :Src is 1 row (under cap); expand to two dests would be 2.
+        let exp_err = super::with_max_intermediate_rows(1, || {
+            run(&ev, "MATCH (x:Src)-[:T]->(y) RETURN x, y", &BTreeMap::new())
+        })
+        .expect_err("2-row expand must exceed cap 1");
+        assert_eq!(exp_err, cap_msg(1));
     }
 }

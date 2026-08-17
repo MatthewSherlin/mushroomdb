@@ -257,8 +257,59 @@ impl<F: Fs> GraphDb<F> {
                 self.topo.remove_edge(etype, src, dst);
                 self.edge_props.remove_edge(etype, src, dst);
             }
-            WalRecord::DeleteNode { .. } => {
-                // Stub: implemented in Task 4.
+            WalRecord::DeleteNode { key } => {
+                // Recovery-safe: already-tombstoned / unknown key is a clean
+                // no-op. Crash-window replay over a snapshot that already
+                // applied this record cannot recover the retired id from the
+                // key (`IdMap::get` is None), so every subsequent step is
+                // skipped. Each step is independently idempotent if invoked
+                // twice on a still-live id: retraction is a no-op on empty
+                // provenance, `remove_edge` returns false, `remove_all` is a
+                // no-op, `ids.delete` returns None, label sentinel is sticky.
+                let Some(n) = self.ids.get(key) else {
+                    return Ok(());
+                };
+
+                // (1) Retract derived edges + de-index while props/labels live.
+                let mut eng = std::mem::take(&mut self.engine);
+                {
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
+                    eng.on_node_removed(n, &mut gm);
+                }
+                self.engine = eng;
+
+                // (2) Sweep remaining user edges touching n, both directions,
+                // every etype. Collect then remove so neighbor slices stay valid.
+                let etypes: Vec<u32> = self.topo.etypes().collect();
+                let mut doomed = Vec::new();
+                for et in etypes {
+                    for &dst in self.topo.neighbors(et, Direction::Out, n) {
+                        doomed.push((et, n, dst));
+                    }
+                    for &src in self.topo.neighbors(et, Direction::In, n) {
+                        doomed.push((et, src, n));
+                    }
+                }
+                for (et, s, d) in doomed {
+                    self.topo.remove_edge(et, s, d);
+                    self.edge_props.remove_edge(et, s, d);
+                }
+
+                // (3) Drop every remaining prop (`ColumnStore::remove_all`).
+                self.props.remove_all(n);
+
+                // (4) Retire the dense id and stamp the label sentinel.
+                self.ids.delete(key);
+                if let Some(slot) = self.labels.get_mut(n as usize) {
+                    *slot = u32::MAX;
+                }
             }
             WalRecord::Batch(inner) => {
                 // Apply each inner record in order through the same apply path.
@@ -391,6 +442,17 @@ impl<F: Fs> GraphDb<F> {
         Ok(true)
     }
 
+    /// Delete a live node. Unknown or already-tombstoned keys are
+    /// `Err(KeyNotFound)` and are not logged. Validation runs before the WAL
+    /// write; `apply` of a logged `DeleteNode` for an already-tombstoned key
+    /// (crash window) is a clean no-op.
+    pub fn delete_node(&mut self, key: &str) -> Result<()> {
+        if self.ids.get(key).is_none() {
+            return Err(GraphError::KeyNotFound { key: key.into() });
+        }
+        self.log_then_apply(WalRecord::DeleteNode { key: key.into() })
+    }
+
     /// Validate and WAL-log a new rule, then backfill derived edges inside apply.
     /// Validation and duplicate-name check run before logging so invalid rules
     /// never enter the WAL.
@@ -481,13 +543,21 @@ impl<F: Fs> GraphDb<F> {
     }
 
     /// Lex → parse → plan → execute `cypher` over a read-only view.
-    /// Every pipeline `Err(String)` becomes `GraphError::QueryError`.
+    /// Every pipeline `Err(String)` becomes `GraphError::QueryError` with a
+    /// stage prefix (`lex:` / `parse:` / `plan:` / `execute:`).
     pub fn query(&self, cypher: &str, params: &BTreeMap<String, Value>) -> Result<ResultSet> {
-        let tokens = lex(cypher).map_err(|e| GraphError::QueryError { detail: e })?;
-        let ast = parse(&tokens).map_err(|e| GraphError::QueryError { detail: e })?;
-        let ops = plan(&ast).map_err(|e| GraphError::QueryError { detail: e })?;
-        execute(&self.view(), &ops, &Params(params))
-            .map_err(|e| GraphError::QueryError { detail: e })
+        let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
+            detail: format!("lex: {e}"),
+        })?;
+        let ast = parse(&tokens).map_err(|e| GraphError::QueryError {
+            detail: format!("parse: {e}"),
+        })?;
+        let ops = plan(&ast).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })
     }
 
     /// Return all rule-owned edges between `key_a` and `key_b` (either direction),
