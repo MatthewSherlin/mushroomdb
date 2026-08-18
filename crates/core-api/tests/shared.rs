@@ -79,6 +79,8 @@ fn concurrent_readers_sum_stats_while_writer_inserts() {
 
 #[test]
 fn reader_during_write_observes_before_or_after_only() {
+    // Readers are blocked by the write guard; this pins mutual exclusion
+    // (before = 0, after = BATCH), not a torn in-memory snapshot.
     let dir = tmp("shared-torn");
     let db = SharedDb::open(&dir).unwrap();
     const BATCH: usize = 40;
@@ -99,14 +101,14 @@ fn reader_during_write_observes_before_or_after_only() {
                     let n = db.read().stats().nodes_live;
                     assert!(
                         n == 0 || n == BATCH,
-                        "torn read through SharedDb API: nodes_live={n}"
+                        "mutual exclusion violated: expected 0 or {BATCH}, got {n}"
                     );
                     seen.push(n);
                     if writer_done.load(Ordering::Acquire) {
                         let n = db.read().stats().nodes_live;
                         assert!(
                             n == 0 || n == BATCH,
-                            "torn read through SharedDb API: nodes_live={n}"
+                            "mutual exclusion violated: expected 0 or {BATCH}, got {n}"
                         );
                         seen.push(n);
                         break;
