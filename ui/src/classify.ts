@@ -1,41 +1,26 @@
 /**
  * Edge attribution for the explorer.
  *
- * ## Endpoint composition (v1 — documented for the T3 report)
+ * Primary path: `GET /node/{key}/edges` → {@link classifyFromEdges}. User
+ * edges keep their real `edge_type`; `derived` comes from the wire. `/explain`
+ * is not used for classification (why-panel arithmetic only).
  *
- * The HTTP neighborhood is a node list only (`columns: key,label,depth`).
- * `grouped_by_edge_type` is a Rust API, not an HTTP route. `/stats` RuleStats
- * has `name/edges/tripped/fires` and **no** `edge_type`, so we cannot probe
- * `?edge_types=` from stats.
- *
- * Chosen composition (legal, no server changes):
- * 1. `GET /node/{key}/neighborhood?depth=1&dir=out` and `dir=in` (no
- *    `edge_types`) — the full 1-hop node sets, split by direction.
- * 2. `GET /explain?a={root}&b={neighbor}` once per unique neighbor — the only
- *    wire that names a derived etype and carries provenance.
- * 3. Neighbors with a matching-direction explanation become that
- *    `edge_type`. Neighbors with none become {@link USER_ETYPE} (`related`).
- *
- * TODO(plan-8 endpoint): a `/node/{key}/edges` (or neighborhood rows that
- * include etype) is required to name user edges. Until then they collapse
- * into the generic `related` relation.
- *
- * v1 root-label gap: neighborhood rows are neighbors only, so
- * `fromNeighborhood` leaves the queried root's label blank until a later
- * neighbor-expansion (or a watch `node_inserted`) supplies it. Blank-label
- * nodes paint muted and get no label chip. T7/Plan-8 can add a node-info
- * endpoint.
+ * Legacy path (pre-sweep servers): {@link classifyBothDirs} still composes
+ * neighborhood + `/explain`. Neighbors with no explanation become
+ * {@link USER_ETYPE} (`related`). Keep that synthesis only for the
+ * absent-endpoint fallback.
  */
-import type { Explanation, QueryResult } from "./api";
+import type { EdgeInfo, Explanation, QueryResult } from "./api";
 import { edgeId } from "./store";
 
-/** Generic bucket for user edges whose etype the HTTP surface cannot name. */
+/** Legacy-only bucket for unnamed user edges on pre-sweep servers. */
 export const USER_ETYPE = "related";
 
 export const EXPLAIN_CONCURRENCY = 8;
 
 export type EdgeProvenance = {
   id: string;
+  derived: boolean;
   explanation: Explanation | null;
 };
 
@@ -192,6 +177,39 @@ export function classifyBothDirs(args: {
   return { out: out.perEtype, in: inn.perEtype, provenance };
 }
 
+export function classifyFromEdges(
+  root: string,
+  edges: readonly EdgeInfo[],
+): ClassifiedEdges {
+  const out: Record<string, string[]> = {};
+  const inn: Record<string, string[]> = {};
+  const provenance: EdgeProvenance[] = [];
+  const seen = new Set<string>();
+  for (const e of edges) {
+    if (e.src_key !== root && e.dst_key !== root) {
+      continue;
+    }
+    const id = edgeId(e.edge_type, e.src_key, e.dst_key);
+    if (seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    if (e.src_key === root) {
+      addNeighbor(out, e.edge_type, e.dst_key);
+    }
+    if (e.dst_key === root && e.src_key !== root) {
+      addNeighbor(inn, e.edge_type, e.src_key);
+    }
+    provenance.push({
+      id,
+      derived: e.derived,
+      explanation: null,
+    });
+  }
+  provenance.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return { out, in: inn, provenance };
+}
+
 function classifyDir(
   root: string,
   keys: readonly string[],
@@ -214,6 +232,7 @@ function classifyDir(
         addNeighbor(perEtype, e.edge_type, nbr);
         provenance.push({
           id: edgeId(e.edge_type, e.src_key, e.dst_key),
+          derived: true,
           explanation: e,
         });
       }
@@ -222,7 +241,11 @@ function classifyDir(
     const src = dir === "out" ? root : nbr;
     const dst = dir === "out" ? nbr : root;
     addNeighbor(perEtype, USER_ETYPE, nbr);
-    provenance.push({ id: edgeId(USER_ETYPE, src, dst), explanation: null });
+    provenance.push({
+      id: edgeId(USER_ETYPE, src, dst),
+      derived: false,
+      explanation: null,
+    });
   }
   return { perEtype, provenance };
 }

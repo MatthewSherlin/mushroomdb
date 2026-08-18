@@ -2,7 +2,12 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiClient, ApiError } from "./api";
+import {
+  ApiClient,
+  ApiError,
+  isAbsentEndpoint,
+  isKeyNotFound,
+} from "./api";
 
 const tokens = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "tokens.css"),
@@ -149,6 +154,75 @@ describe("ApiClient", () => {
       "http://127.0.0.1:8080/node/a%2Fb/neighborhood?depth=2&dir=out&edge_types=KNOWS%2CLIKES",
     );
     expect(init.method).toBe("GET");
+  });
+
+  it("nodeInfo GETs /node/{key} and returns key/label/props", async () => {
+    const body = {
+      key: "p1",
+      label: "Person",
+      props: { name: "ada", years: 8, tags: ["x", "y"], ok: true },
+    };
+    fetchMock.mockResolvedValue(jsonResponse(200, body));
+
+    await expect(client.nodeInfo("a/b")).resolves.toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://127.0.0.1:8080/node/a%2Fb");
+    expect(init.method).toBe("GET");
+  });
+
+  it("nodeEdges GETs /node/{key}/edges and returns the edges array", async () => {
+    const body = {
+      edges: [
+        {
+          edge_type: "KNOWS",
+          src_key: "p1",
+          dst_key: "p2",
+          derived: false,
+        },
+        {
+          edge_type: "WORKS_AT",
+          src_key: "p1",
+          dst_key: "acme",
+          derived: true,
+        },
+      ],
+    };
+    fetchMock.mockResolvedValue(jsonResponse(200, body));
+
+    await expect(client.nodeEdges("p1")).resolves.toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://127.0.0.1:8080/node/p1/edges");
+    expect(init.method).toBe("GET");
+  });
+
+  it("404 with body prefix node key not found: is a key miss, not an absent endpoint", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(404, { error: "node key not found: ghost" }),
+    );
+    const err = await client.nodeInfo("ghost").then(
+      () => {
+        throw new Error("expected reject");
+      },
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    const apiErr = err as ApiError;
+    expect(apiErr.status).toBe(404);
+    expect(apiErr.error).toBe("node key not found: ghost");
+    expect(isKeyNotFound(apiErr)).toBe(true);
+    expect(isAbsentEndpoint(apiErr)).toBe(false);
+  });
+
+  it("404 without the key-not-found prefix is an absent-endpoint (legacy server)", async () => {
+    fetchMock.mockResolvedValue(textResponse(404, "Not Found"));
+    const err = await client.nodeEdges("p1").then(
+      () => {
+        throw new Error("expected reject");
+      },
+      (e: unknown) => e,
+    );
+    expect(isKeyNotFound(err)).toBe(false);
+    expect(isAbsentEndpoint(err)).toBe(true);
   });
 
   it("neighborhood omits unset options", async () => {

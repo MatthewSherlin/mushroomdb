@@ -78,6 +78,28 @@ export type NeighborhoodOpts = {
   edgeTypes?: string[];
 };
 
+/** Wire `NodeInfo`. `props` uses the same untagged Value JSON as `/query`. */
+export type NodeInfo = {
+  key: string;
+  label: string;
+  props: Record<string, JsonCell>;
+};
+
+/** Wire `EdgeInfo` from `GET /node/{key}/edges`. */
+export type EdgeInfo = {
+  edge_type: string;
+  src_key: string;
+  dst_key: string;
+  derived: boolean;
+};
+
+export type NodeEdges = {
+  edges: EdgeInfo[];
+};
+
+/** Discriminator for T1's 404 register. Exact prefix, including the colon. */
+export const KEY_NOT_FOUND_PREFIX = "node key not found:";
+
 export class ApiError extends Error {
   readonly status: number;
   readonly error: string | undefined;
@@ -91,6 +113,20 @@ export class ApiError extends Error {
     this.error = detail;
     this.body = body;
   }
+}
+
+export function isKeyNotFound(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.status === 404 &&
+    typeof err.error === "string" &&
+    err.error.startsWith(KEY_NOT_FOUND_PREFIX)
+  );
+}
+
+/** 404 that is not a key miss — missing route / old server / static fallback. */
+export function isAbsentEndpoint(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 404 && !isKeyNotFound(err);
 }
 
 export class ApiClient {
@@ -120,6 +156,20 @@ export class ApiClient {
   explain(a: string, b: string): Promise<Explanation[]> {
     const qs = new URLSearchParams({ a, b });
     return this.request<Explanation[]>("GET", `/explain?${qs.toString()}`);
+  }
+
+  nodeInfo(key: string): Promise<NodeInfo> {
+    return this.request<NodeInfo>(
+      "GET",
+      `/node/${encodeURIComponent(key)}`,
+    );
+  }
+
+  nodeEdges(key: string): Promise<NodeEdges> {
+    return this.request<NodeEdges>(
+      "GET",
+      `/node/${encodeURIComponent(key)}/edges`,
+    );
   }
 
   neighborhood(

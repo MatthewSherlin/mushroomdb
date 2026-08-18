@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { Explanation, PredicateSummary, QueryResult } from "./api";
+import { ApiError } from "./api";
 import { GraphStore, edgeId } from "./store";
 import {
   HAND_LINE,
@@ -15,6 +16,7 @@ import {
   formatOverlapLine,
   formatScore,
   highlightedIdsForRule,
+  loadNodeProps,
   markTokens,
   nodePropsQuery,
   overlapFromProps,
@@ -57,9 +59,10 @@ describe("module contract", () => {
     );
   });
 
-  it("documents the exact-key MATCH prop fetch (no node-props endpoint)", () => {
+  it("documents node_info as the primary props path and MATCH as legacy only", () => {
+    expect(src).toMatch(/GET \/node\/\{key\}/);
+    expect(src).toMatch(/Legacy/);
     expect(src).toMatch(/MATCH \(n \{id: \$key\}\)/);
-    expect(src).toMatch(/no node-props endpoint/i);
   });
 });
 
@@ -149,6 +152,92 @@ describe("formatScore", () => {
     expect(formatScore(1)).toBe("1");
     expect(formatScore(0.5)).toBe("0.5");
     expect(formatScore(1 / 3)).toBe("0.333");
+  });
+});
+
+describe("loadNodeProps", () => {
+  it("loads from node_info and filters the return to summary.fields", async () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", {
+      columns: ["key", "label", "depth"],
+      rows: [["b", "Person", 1]],
+    });
+    const queries: string[] = [];
+    const props = await loadNodeProps(
+      store,
+      {
+        nodeInfo: async (key) => ({
+          key,
+          label: "Person",
+          props: { skills: ["s01"], org_id: "org-07", extra: 1 },
+        }),
+        query: async (cypher) => {
+          queries.push(cypher);
+          return { columns: [], rows: [] };
+        },
+      },
+      "b",
+      ["skills", "org_id"],
+    );
+    expect(props).toEqual({ skills: ["s01"], org_id: "org-07" });
+    expect(store.nodes.get("b")?.props).toEqual({
+      skills: ["s01"],
+      org_id: "org-07",
+      extra: 1,
+    });
+    expect(store.nodes.get("b")?.label).toBe("Person");
+    expect(queries).toEqual([]);
+  });
+
+  it("falls back to the exact-key MATCH when /node/{key} is absent", async () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", {
+      columns: ["key", "label", "depth"],
+      rows: [["b", "Person", 1]],
+    });
+    const queries: string[] = [];
+    const props = await loadNodeProps(
+      store,
+      {
+        nodeInfo: async () => {
+          throw new ApiError(404, "Not Found");
+        },
+        query: async (cypher) => {
+          queries.push(cypher);
+          return {
+            columns: ["skills"],
+            rows: [[["s01"]]],
+          };
+        },
+      },
+      "b",
+    );
+    expect(props).toEqual({ skills: ["s01"] });
+    expect(queries[0]).toContain("MATCH (n {id: $key})");
+  });
+
+  it("does not MATCH when the 404 is a key miss", async () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", {
+      columns: ["key", "label", "depth"],
+      rows: [["b", "Person", 1]],
+    });
+    let queried = false;
+    const props = await loadNodeProps(
+      store,
+      {
+        nodeInfo: async () => {
+          throw new ApiError(404, { error: "node key not found: b" });
+        },
+        query: async () => {
+          queried = true;
+          return { columns: [], rows: [] };
+        },
+      },
+      "b",
+    );
+    expect(props).toEqual({});
+    expect(queried).toBe(false);
   });
 });
 
@@ -383,6 +472,28 @@ describe("ensureProvenance / highlightedIdsForRule", () => {
     expect(highlightedIdsForRule(store, "skill_fit")).toEqual([
       edgeId("FIT", "a", "b"),
     ]);
+  });
+
+  it("explains derived edges that have no explanation yet (endpoint flag only)", async () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", {
+      columns: ["key", "label", "depth"],
+      rows: [["b", "Person", 1]],
+    });
+    store.mergeNeighborhoodWithEdges("a", { FIT: ["b"] });
+    store.setDerived(edgeId("FIT", "a", "b"), true);
+
+    const calls: Array<[string, string]> = [];
+    await ensureProvenance(store, {
+      explain: async (x, y) => {
+        calls.push([x, y]);
+        return [exp({ src_key: "a", dst_key: "b" })];
+      },
+    });
+    expect(calls).toEqual([["a", "b"]]);
+    expect(store.edges.get(edgeId("FIT", "a", "b"))?.explanation?.rule).toBe(
+      "skill_fit",
+    );
   });
 });
 

@@ -178,6 +178,12 @@ describe("addHarvestedToCanvas", () => {
         return { columns: ["key", "label", "depth"], rows: [] };
       },
       explain: async () => [],
+      nodeInfo: async () => {
+        throw new ApiError(404, "Not Found");
+      },
+      nodeEdges: async () => {
+        throw new ApiError(404, "Not Found");
+      },
     };
 
     const keys = await addHarvestedToCanvas(
@@ -203,6 +209,12 @@ describe("addHarvestedToCanvas", () => {
         rows: [],
       }),
       explain: async () => [],
+      nodeInfo: async () => {
+        throw new ApiError(404, "Not Found");
+      },
+      nodeEdges: async () => {
+        throw new ApiError(404, "Not Found");
+      },
     };
 
     await addHarvestedToCanvas(
@@ -224,6 +236,12 @@ describe("addHarvestedToCanvas", () => {
         return { columns: ["key", "label", "depth"], rows: [] };
       },
       explain: async () => [],
+      nodeInfo: async () => {
+        throw new ApiError(404, "Not Found");
+      },
+      nodeEdges: async () => {
+        throw new ApiError(404, "Not Found");
+      },
     };
 
     const keys = await addHarvestedToCanvas(

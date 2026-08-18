@@ -7,9 +7,8 @@
  *
  * The HTTP `/node/{k}/neighborhood` endpoint returns nodes only
  * (`columns: ["key","label","depth"]`) — never edges. Edges for the canvas
- * therefore come from a follow-up. T3 fetches per-etype neighbor lists
- * (neighborhood `?edge_types=` + `dir`, or a grouped Cypher query) and
- * calls `mergeNeighborhoodWithEdges`.
+ * come from `GET /node/{k}/edges` (legacy: neighborhood + `/explain`,
+ * with user etypes collapsed to `related`) via `mergeNeighborhoodWithEdges`.
  *
  * - `fromNeighborhood(rootKey, result)` — ingest a neighborhood ResultSet.
  *   Adds/updates those nodes and ensures the root exists. Does **not** add
@@ -203,6 +202,30 @@ export class GraphStore {
       out.push(edge);
     }
     return out;
+  }
+
+  setDerived(id: string, derived: boolean): void {
+    const edge = this.edges.get(id);
+    if (edge === undefined) {
+      return;
+    }
+    edge.derived = derived;
+  }
+
+  applyNodeInfo(
+    key: string,
+    label: string,
+    props: Record<string, unknown>,
+  ): void {
+    const node = this.nodes.get(key);
+    if (node === undefined) {
+      return;
+    }
+    if (label !== "") {
+      node.label = label;
+    }
+    node.props = props;
+    this.dirty.delete(key);
   }
 
   setNodeProps(key: string, props: Record<string, unknown> | undefined): void {

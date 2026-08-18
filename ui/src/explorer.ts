@@ -44,10 +44,9 @@ export type ExplorerOptions = {
 /**
  * Thin cosmos.gl + chrome view over {@link GraphStore}.
  *
- * v1: the queried root's label stays blank until a later neighbor-expansion
- * (or a watch event) includes it — neighborhood rows omit the root and there
- * is no node-info endpoint. Blank-label nodes render muted paper and get no
- * label chip.
+ * Roots and query-added stubs get label/props from `GET /node/{key}`
+ * inside {@link expandNode}. Blank-label nodes still render muted paper
+ * with no chip if that fill misses (legacy server or unknown key).
  */
 export class Explorer {
   private readonly host: HTMLElement;

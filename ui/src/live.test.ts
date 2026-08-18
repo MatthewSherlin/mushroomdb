@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { ApiError } from "./api";
 import { GraphStore, edgeId } from "./store";
 import type { MutationEvent } from "./watch";
 import type { ExpandApi } from "./expand";
@@ -211,6 +212,12 @@ describe("resyncNeighborhoods / glowBornDerived", () => {
             predicate: null,
           },
         ];
+      },
+      nodeInfo: async () => {
+        throw new ApiError(404, "Not Found");
+      },
+      nodeEdges: async () => {
+        throw new ApiError(404, "Not Found");
       },
     };
   }

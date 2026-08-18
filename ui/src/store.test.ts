@@ -614,6 +614,29 @@ describe("setNodeProps", () => {
   });
 });
 
+describe("setDerived / applyNodeInfo", () => {
+  it("sets derived without attaching an explanation", () => {
+    const store = new GraphStore();
+    seedPair(store);
+    const id = edgeId("KNOWS", "a", "b");
+    store.setDerived(id, true);
+    expect(store.edges.get(id)?.derived).toBe(true);
+    expect(store.edges.get(id)?.explanation).toBeUndefined();
+  });
+
+  it("fills a blank root label and props from node_info", () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", neighborhood([["b", "Person", 1]]));
+    expect(store.nodes.get("a")?.label).toBe("");
+    store.applyNodeInfo("a", "Member", { years: 8 });
+    expect(store.nodes.get("a")).toEqual({
+      key: "a",
+      label: "Member",
+      props: { years: 8 },
+    });
+  });
+});
+
 function linkColor(
   snap: CosmosSnapshot,
   src: number,

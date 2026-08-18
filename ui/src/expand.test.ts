@@ -2,7 +2,14 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import type { Explanation, NeighborhoodOpts, QueryResult } from "./api";
+import type {
+  EdgeInfo,
+  Explanation,
+  NeighborhoodOpts,
+  NodeInfo,
+  QueryResult,
+} from "./api";
+import { ApiError } from "./api";
 import { GraphStore, edgeId } from "./store";
 import { USER_ETYPE } from "./classify";
 import { expandNode, loadDemoNeighborhood, type ExpandApi } from "./expand";
@@ -22,12 +29,21 @@ function fit(src: string, dst: string): Explanation {
   };
 }
 
-type Call = { op: "neighborhood" | "explain" | "query"; arg: string };
+type Call = {
+  op: "neighborhood" | "explain" | "query" | "nodeEdges" | "nodeInfo";
+  arg: string;
+};
+
+function absent(): ApiError {
+  return new ApiError(404, "Not Found");
+}
 
 function mockApi(spec: {
   neighborhood: Record<string, QueryResult>;
   explain?: Record<string, Explanation[]>;
   query?: QueryResult;
+  nodeEdges?: Record<string, EdgeInfo[]>;
+  nodeInfo?: Record<string, NodeInfo>;
 }): { api: ExpandApi; calls: Call[] } {
   const calls: Call[] = [];
   const api: ExpandApi = {
@@ -50,6 +66,28 @@ function mockApi(spec: {
       const token = `${a}|${b}`;
       calls.push({ op: "explain", arg: token });
       return spec.explain?.[token] ?? [];
+    },
+    nodeEdges: async (key) => {
+      calls.push({ op: "nodeEdges", arg: key });
+      if (spec.nodeEdges === undefined) {
+        throw absent();
+      }
+      const edges = spec.nodeEdges[key];
+      if (edges === undefined) {
+        throw new Error(`unexpected nodeEdges ${key}`);
+      }
+      return { edges };
+    },
+    nodeInfo: async (key) => {
+      calls.push({ op: "nodeInfo", arg: key });
+      if (spec.nodeInfo === undefined) {
+        throw absent();
+      }
+      const info = spec.nodeInfo[key];
+      if (info === undefined) {
+        throw new ApiError(404, { error: `node key not found: ${key}` });
+      }
+      return info;
     },
   };
   return { api, calls };
@@ -101,7 +139,11 @@ describe("expandNode", () => {
     expect(calls.filter((c) => c.op === "explain").map((c) => c.arg).sort()).toEqual(
       ["a|b", "a|c"],
     );
-    expect(calls.some((c) => c.arg.startsWith("ghost"))).toBe(false);
+    expect(
+      calls
+        .filter((c) => c.op === "neighborhood")
+        .some((c) => c.arg.startsWith("ghost")),
+    ).toBe(false);
   });
 
   it("does not invent a neighborhood call for a never-merged visible node", async () => {
@@ -113,7 +155,11 @@ describe("expandNode", () => {
       },
     });
     await expandNode(store, api, "a", 1);
-    expect(calls.every((c) => c.arg.startsWith("a|"))).toBe(true);
+    expect(
+      calls
+        .filter((c) => c.op === "neighborhood")
+        .every((c) => c.arg.startsWith("a|")),
+    ).toBe(true);
     expect(store.needsEdges("a")).toBe(false);
   });
 
@@ -202,6 +248,93 @@ describe("expandNode", () => {
     expect(store.needsEdges("c")).toBe(false);
     expect(store.edges.has(edgeId(USER_ETYPE, "b", "d"))).toBe(true);
     expect(store.edges.has(edgeId(USER_ETYPE, "c", "e"))).toBe(true);
+  });
+
+  it("attributes real user etypes and mixed derived from /node/{key}/edges, not explain", async () => {
+    const store = new GraphStore();
+    const { api, calls } = mockApi({
+      neighborhood: {
+        "a|1|out": nb([
+          ["b", "Person", 1],
+          ["c", "Org", 1],
+        ]),
+        "a|1|in": nb([]),
+      },
+      nodeEdges: {
+        a: [
+          {
+            edge_type: "KNOWS",
+            src_key: "a",
+            dst_key: "b",
+            derived: false,
+          },
+          {
+            edge_type: "FIT",
+            src_key: "a",
+            dst_key: "b",
+            derived: true,
+          },
+          {
+            edge_type: "WORKS_AT",
+            src_key: "a",
+            dst_key: "c",
+            derived: true,
+          },
+        ],
+      },
+    });
+
+    await expandNode(store, api, "a", 1);
+
+    expect(store.edges.get(edgeId("KNOWS", "a", "b"))?.derived).toBe(false);
+    expect(store.edges.get(edgeId("FIT", "a", "b"))?.derived).toBe(true);
+    expect(store.edges.get(edgeId("WORKS_AT", "a", "c"))?.derived).toBe(true);
+    expect(store.edges.has(edgeId(USER_ETYPE, "a", "b"))).toBe(false);
+    expect(calls.filter((c) => c.op === "explain")).toEqual([]);
+    expect(calls.filter((c) => c.op === "nodeEdges").map((c) => c.arg)).toEqual(
+      ["a"],
+    );
+  });
+
+  it("fills a blank root label and props via GET /node/{key}", async () => {
+    const store = new GraphStore();
+    const { api } = mockApi({
+      neighborhood: {
+        "a|1|out": nb([["b", "Person", 1]]),
+        "a|1|in": nb([]),
+      },
+      nodeEdges: { a: [] },
+      nodeInfo: {
+        a: { key: "a", label: "Member", props: { years: 8 } },
+        b: { key: "b", label: "Person", props: { name: "bob" } },
+      },
+    });
+
+    await expandNode(store, api, "a", 1);
+
+    expect(store.nodes.get("a")?.label).toBe("Member");
+    expect(store.nodes.get("a")?.props).toEqual({ years: 8 });
+  });
+
+  it("does not fall back to related when /edges 404 is a key miss", async () => {
+    const store = new GraphStore();
+    const { api, calls } = mockApi({
+      neighborhood: {
+        "ghost|1|out": nb([]),
+        "ghost|1|in": nb([]),
+      },
+      nodeEdges: {},
+    });
+    api.nodeEdges = async (key) => {
+      calls.push({ op: "nodeEdges", arg: key });
+      throw new ApiError(404, { error: `node key not found: ${key}` });
+    };
+
+    await expandNode(store, api, "ghost", 1);
+
+    expect(calls.filter((c) => c.op === "explain")).toEqual([]);
+    expect(store.edges.size).toBe(0);
+    expect(store.needsEdges("ghost")).toBe(false);
   });
 });
 

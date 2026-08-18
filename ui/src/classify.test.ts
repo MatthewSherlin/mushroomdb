@@ -2,12 +2,13 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import type { Explanation, QueryResult } from "./api";
+import type { EdgeInfo, Explanation, QueryResult } from "./api";
 import { edgeId } from "./store";
 import {
   EXPLAIN_CONCURRENCY,
   USER_ETYPE,
   classifyBothDirs,
+  classifyFromEdges,
   concatResults,
   explainNeighbors,
   firstNodeKey,
@@ -50,6 +51,55 @@ describe("module contract", () => {
 describe("USER_ETYPE", () => {
   it("is the generic related bucket for unnamed user edges", () => {
     expect(USER_ETYPE).toBe("related");
+  });
+});
+
+function edge(
+  edgeType: string,
+  src: string,
+  dst: string,
+  derived: boolean,
+): EdgeInfo {
+  return { edge_type: edgeType, src_key: src, dst_key: dst, derived };
+}
+
+describe("classifyFromEdges", () => {
+  it("keeps real user etypes and derived flags; no related synthesis", () => {
+    const got = classifyFromEdges("a", [
+      edge("KNOWS", "a", "c", false),
+      edge("FIT", "a", "b", true),
+      edge("WORKS_AT", "d", "a", false),
+    ]);
+    expect(got.out).toEqual({ FIT: ["b"], KNOWS: ["c"] });
+    expect(got.in).toEqual({ WORKS_AT: ["d"] });
+    expect(got.out[USER_ETYPE]).toBeUndefined();
+    expect(got.provenance).toEqual([
+      { id: edgeId("FIT", "a", "b"), derived: true, explanation: null },
+      { id: edgeId("KNOWS", "a", "c"), derived: false, explanation: null },
+      { id: edgeId("WORKS_AT", "d", "a"), derived: false, explanation: null },
+    ]);
+  });
+
+  it("keeps mixed user + derived etypes on the same pair", () => {
+    const got = classifyFromEdges("a", [
+      edge("KNOWS", "a", "b", false),
+      edge("FIT", "a", "b", true),
+    ]);
+    expect(got.out).toEqual({ KNOWS: ["b"], FIT: ["b"] });
+    expect(got.out[USER_ETYPE]).toBeUndefined();
+    expect(got.provenance).toEqual([
+      { id: edgeId("FIT", "a", "b"), derived: true, explanation: null },
+      { id: edgeId("KNOWS", "a", "b"), derived: false, explanation: null },
+    ]);
+  });
+
+  it("emits a self-loop once on the out side", () => {
+    const got = classifyFromEdges("a", [edge("LOOP", "a", "a", false)]);
+    expect(got.out).toEqual({ LOOP: ["a"] });
+    expect(got.in).toEqual({});
+    expect(got.provenance).toEqual([
+      { id: edgeId("LOOP", "a", "a"), derived: false, explanation: null },
+    ]);
   });
 });
 
@@ -206,13 +256,19 @@ describe("classifyBothDirs", () => {
     expect(got.out).toEqual({ FIT: ["b"], [USER_ETYPE]: ["c"] });
     expect(got.in).toEqual({ WORKS_AT: ["d"] });
     expect(got.provenance).toEqual([
-      { id: edgeId("FIT", "a", "b"), explanation: exp("FIT", "a", "b") },
+      {
+        id: edgeId("FIT", "a", "b"),
+        derived: true,
+        explanation: exp("FIT", "a", "b"),
+      },
       {
         id: edgeId("WORKS_AT", "d", "a"),
+        derived: true,
         explanation: exp("WORKS_AT", "d", "a"),
       },
       {
         id: edgeId(USER_ETYPE, "a", "c"),
+        derived: false,
         explanation: null,
       },
     ]);
@@ -254,6 +310,7 @@ describe("classifyBothDirs", () => {
     expect(got.provenance).toEqual([
       {
         id: edgeId("WORKS_AT", "d", "a"),
+        derived: true,
         explanation: exp("WORKS_AT", "d", "a"),
       },
     ]);

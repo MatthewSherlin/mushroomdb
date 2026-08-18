@@ -1,27 +1,31 @@
 /**
  * Why-panel view-model and provenance helpers.
  *
- * There is no node-props endpoint. Props are fetched with an exact-key
- * MATCH on the ingest default key field (`id`):
- *   MATCH (n {id: $key}) RETURN n.skills AS skills, …
- * Cached on the store via `setNodeProps`. Reused when already present.
+ * Primary props path: `GET /node/{key}` (NodeInfo). Cached on the store via
+ * `applyNodeInfo` / `setNodeProps`. Reused when already present.
+ *
+ * `/explain` is fetched lazily for arithmetic (`ensureProvenance`), not for
+ * classifying etypes. Classification comes from `/node/{key}/edges`.
+ *
+ * Legacy (pre-sweep servers): 404 without the `node key not found:` prefix
+ * falls back to the exact-key MATCH on ingest default `id`, projecting
+ * `summary.fields` or {@link PROP_FIELDS}.
  *
  * `/explain` carries `Explanation.predicate`. `buildWhyModel` dispatches
  * on `predicate.kind` when present. The prop-comparison inference chain
  * is the fallback for old servers (predicate null) and summaries the
  * panel cannot render.
- *
- * Props fetch projects `summary.fields` (first-seen union for `all`).
- * `PROP_FIELDS` is the fallback list only.
  */
 import type {
   Explanation,
   JsonCell,
+  NodeInfo,
   PredicateKind,
   PredicateSummary,
   QueryParam,
   QueryResult,
 } from "./api";
+import { isAbsentEndpoint, isKeyNotFound } from "./api";
 import { EXPLAIN_CONCURRENCY, mapPool } from "./classify";
 import { edgeId, type GraphEdge, type GraphNode, type GraphStore } from "./store";
 
@@ -31,6 +35,7 @@ export const RECOMPUTED_NOTE = "recomputed from current props";
 
 export const THRESHOLD_NOTE = `${RECOMPUTED_NOTE} — no longer within threshold`;
 
+/** Legacy MATCH projection when `/node/{key}` is absent. */
 const PROP_FIELDS = ["skills", "org_id", "project_id", "name", "tags"] as const;
 
 const WEIGHT_EPS = 1e-9;
@@ -153,6 +158,7 @@ export type PropsApi = {
     cypher: string,
     params?: Record<string, QueryParam>,
   ): Promise<QueryResult>;
+  nodeInfo(key: string): Promise<NodeInfo>;
 };
 
 export function fieldsFromPredicate(
@@ -194,14 +200,44 @@ export async function loadNodeProps(
     node?.props !== undefined &&
     (requested === undefined || requested.every((f) => f in node.props!))
   ) {
-    return node.props;
+    return pickFields(node.props, requested);
   }
+  try {
+    const info = await api.nodeInfo(key);
+    const merged = { ...(node?.props ?? {}), ...info.props };
+    store.applyNodeInfo(key, info.label, merged);
+    return pickFields(merged, requested);
+  } catch (err: unknown) {
+    if (isKeyNotFound(err)) {
+      return pickFields(node?.props ?? {}, requested);
+    }
+    if (!isAbsentEndpoint(err)) {
+      throw err;
+    }
+  }
+  // Legacy: pre-sweep servers have no /node/{key}. Exact-key MATCH on `id`.
   const { cypher, params } = nodePropsQuery(key, requested);
   const result = await api.query(cypher, params);
   const fetched = propsFromResult(result);
   const props = { ...(node?.props ?? {}), ...fetched };
   store.setNodeProps(key, props);
-  return props;
+  return pickFields(props, requested);
+}
+
+function pickFields(
+  props: Record<string, unknown>,
+  fields: readonly string[] | undefined,
+): Record<string, unknown> {
+  if (fields === undefined) {
+    return props;
+  }
+  const out: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (field in props) {
+      out[field] = props[field];
+    }
+  }
+  return out;
 }
 
 export function nodePropsQuery(
@@ -1007,7 +1043,9 @@ export async function ensureProvenance(
     // Intentional short-circuit: classified edges skip re-explain.
     // A new rule that would reclassify the pair is handled by
     // rule_created → markAllDirty → resync → expand, not this guard.
-    if (edge.derived !== undefined) {
+    // Skip known user edges and edges that already carry explain payload.
+    // derived===true without explanation still needs /explain for arithmetic.
+    if (edge.explanation !== undefined || edge.derived === false) {
       continue;
     }
     const a = edge.src < edge.dst ? edge.src : edge.dst;
@@ -1051,7 +1089,12 @@ function applyExplanations(
       continue;
     }
     const match = explanations.find((e) => e.edge_type === edge.etype);
-    store.setProvenance(edgeId(edge.etype, edge.src, edge.dst), match ?? null);
+    const id = edgeId(edge.etype, edge.src, edge.dst);
+    if (match !== undefined) {
+      store.setProvenance(id, match);
+    } else if (edge.derived !== true) {
+      store.setProvenance(id, null);
+    }
   }
 }
 
