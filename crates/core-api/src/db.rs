@@ -31,7 +31,11 @@ use std::collections::{BTreeMap, BTreeSet};
 /// **Derived edges:** rule-created or retracted edges are not individually
 /// evented — they are recoverable from the triggering mutation plus the live
 /// rule set. Only the triggering record is emitted.
+///
+/// **Wire form:** externally tagged snake_case JSON
+/// (`{"node_inserted":{"label":"A","key":"k"}}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MutationEvent {
     NodeInserted {
         label: String,
@@ -145,7 +149,7 @@ pub struct RuleStats {
 
 /// One rule-owned edge between two nodes, with the rule name, edge type,
 /// direction (src_key → dst_key), and weight if the rule stores one.
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Explanation {
     pub rule: String,
     pub edge_type: String,
@@ -519,6 +523,11 @@ impl<F: Fs> GraphDb<F> {
     /// (non-blocking `send`), or `Arc<Mutex<Vec<MutationEvent>>>`.
     pub fn set_event_sink(&mut self, sink: Box<dyn Fn(MutationEvent) + Send + Sync>) {
         self.event_sink = Some(sink);
+    }
+
+    /// Whether a post-commit event sink is currently installed.
+    pub fn has_event_sink(&self) -> bool {
+        self.event_sink.is_some()
     }
 
     fn emit(&self, ev: MutationEvent) {

@@ -1,5 +1,14 @@
 //! Thin HTTP wrapper over [`SharedDb`]. Every endpoint is a lock, a public
 //! core-api call, then a response — no business logic.
+//!
+//! # Single-sink design
+//!
+//! The HTTP router is the designated broadcast producer. [`router`] installs
+//! one `broadcast::Sender` as the [`core_api::GraphDb`] event sink. MCP and
+//! CLI mutations on the same [`SharedDb`] fire into that same sink (one
+//! producer, many `/watch` subscribers). A second [`router`] call replaces
+//! the sink and terminates every existing subscriber with
+//! [`tokio::sync::broadcast::error::RecvError::Closed`].
 
 use crate::json::{params_from_json, result_set_json};
 use crate::AppState;
@@ -9,7 +18,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use core_api::{AutoFk, Dir, GraphError, IngestOptions, SharedDb};
+use core_api::{json_to_rows, AutoFk, Dir, GraphError, IngestOptions, SharedDb};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -17,6 +26,10 @@ use std::net::SocketAddr;
 /// Build the HTTP router over `db`. Read endpoints take the read lock;
 /// `/ingest` takes the write lock. Guards are dropped before any `.await`.
 /// `GET /watch` upgrades to a WebSocket fed by the post-commit sink.
+///
+/// **Call at most once per [`SharedDb`].** A second call replaces the sink
+/// and terminates all existing `/watch` subscribers with
+/// [`tokio::sync::broadcast::error::RecvError::Closed`].
 ///
 /// Installing the watch sink replaces any previously installed
 /// [`core_api::GraphDb::set_event_sink`]. The sink only
@@ -30,6 +43,12 @@ use std::net::SocketAddr;
 /// Wrap these calls in `tokio::task::spawn_blocking` before exposing the
 /// server to concurrent multi-client load.
 pub fn router(db: SharedDb) -> Router {
+    debug_assert!(
+        !db.read().has_event_sink(),
+        "router() must be called at most once per SharedDb; a second call \
+         replaces the sink and terminates all existing /watch subscribers \
+         with RecvError::Closed"
+    );
     let (tx, _) = tokio::sync::broadcast::channel(1024);
     {
         let tx = tx.clone();
@@ -180,18 +199,20 @@ async fn ingest(State(state): State<AppState>, Json(body): Json<Js>) -> Response
         Some(r) => r,
         None => return err_response("missing rows"),
     };
-    let rows_json = match serde_json::to_string(rows) {
-        Ok(s) => s,
-        Err(e) => return err_response(e.to_string()),
+    let mut converted = match json_to_rows(rows) {
+        Ok(c) => c,
+        Err(e) => return graph_err(e),
     };
     let opts = match ingest_options(body.get("options")) {
         Ok(o) => o,
         Err(e) => return err_response(e),
     };
+    let taken = std::mem::take(&mut converted.rows);
     let report = {
         let mut g = state.db.write();
-        g.ingest_json(&label, &rows_json, &opts)
+        g.ingest(&label, taken, &opts)
     };
+    let report = report.map(|r| converted.into_report(r));
     match report {
         Ok(r) => match serde_json::to_value(&r) {
             Ok(v) => json_ok(v),
@@ -244,10 +265,20 @@ async fn neighborhood(
         s if s.eq_ignore_ascii_case("both") => Dir::Both,
         other => return err_response(format!("unknown dir: {other}")),
     };
+    let edge_type_names: Option<Vec<String>> = qs.get("edge_types").map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+    let etype_refs: Option<Vec<&str>> = edge_type_names
+        .as_ref()
+        .map(|v| v.iter().map(String::as_str).collect());
     let rs = {
         let g = state.db.read();
         match g.node_ref(&key) {
-            Some(n) => Ok(n.neighborhood(depth, None, dir)),
+            Some(n) => Ok(n.neighborhood(depth, etype_refs.as_deref(), dir)),
             None => Err(GraphError::KeyNotFound { key: key.clone() }),
         }
     };

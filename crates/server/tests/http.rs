@@ -184,7 +184,7 @@ async fn stats_round_trips_serialize() {
     assert_eq!(encoded["rules"][0]["fires"], json!(5));
 }
 
-/// Binding: POST /ingest delegates to ingest_json and returns IngestReport JSON.
+/// Binding: POST /ingest converts parsed rows and returns IngestReport JSON.
 #[tokio::test]
 async fn ingest_happy_path() {
     let (app, db) = open("ingest-ok");
@@ -324,6 +324,47 @@ async fn neighborhood_depth_and_dir() {
     let (_, body, _) = send(app, get("/node/b/neighborhood?depth=1&dir=in")).await;
     let incoming = parse_json(&body);
     assert_eq!(incoming["rows"], json!([["a", "Person", 1]]));
+}
+
+/// Binding: optional `edge_types` (comma-separated) filters like the MCP tool.
+#[tokio::test]
+async fn neighborhood_edge_types_filter() {
+    let (app, db) = open("nbhd-etypes");
+    {
+        let mut w = db.write();
+        w.insert_node("Person", "a", vec![]).unwrap();
+        w.insert_node("Person", "b", vec![]).unwrap();
+        w.insert_node("Person", "c", vec![]).unwrap();
+        w.insert_edge("KNOWS", "a", "b").unwrap();
+        w.insert_edge("LIKES", "a", "c").unwrap();
+    }
+
+    let (status, body, _) = send(app.clone(), get("/node/a/neighborhood?depth=1&dir=out")).await;
+    assert_eq!(status, StatusCode::OK);
+    let unfiltered = parse_json(&body);
+    assert_eq!(
+        unfiltered["rows"],
+        json!([["b", "Person", 1], ["c", "Person", 1]])
+    );
+
+    let (_, body, _) = send(
+        app.clone(),
+        get("/node/a/neighborhood?depth=1&dir=out&edge_types=KNOWS"),
+    )
+    .await;
+    let knows = parse_json(&body);
+    assert_eq!(knows["rows"], json!([["b", "Person", 1]]));
+
+    let (_, body, _) = send(
+        app,
+        get("/node/a/neighborhood?depth=1&dir=out&edge_types=KNOWS,LIKES"),
+    )
+    .await;
+    let both = parse_json(&body);
+    assert_eq!(
+        both["rows"],
+        json!([["b", "Person", 1], ["c", "Person", 1]])
+    );
 }
 
 /// Binding: unknown neighborhood key is 400.

@@ -289,11 +289,11 @@ fn mutation_event_serialize_is_externally_tagged() {
     };
     assert_eq!(
         serde_json::to_value(&ev).unwrap(),
-        serde_json::json!({"NodeInserted": {"label": "A", "key": "k"}})
+        serde_json::json!({"node_inserted": {"label": "A", "key": "k"}})
     );
     assert_eq!(
         serde_json::to_value(&MutationEvent::BatchApplied { ops: 3 }).unwrap(),
-        serde_json::json!({"BatchApplied": {"ops": 3}})
+        serde_json::json!({"batch_applied": {"ops": 3}})
     );
     assert_eq!(
         serde_json::to_value(&MutationEvent::Ingested {
@@ -301,6 +301,6 @@ fn mutation_event_serialize_is_externally_tagged() {
             inserted: 2,
         })
         .unwrap(),
-        serde_json::json!({"Ingested": {"label": "Person", "inserted": 2}})
+        serde_json::json!({"ingested": {"label": "Person", "inserted": 2}})
     );
 }

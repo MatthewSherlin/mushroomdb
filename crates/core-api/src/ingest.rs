@@ -136,18 +136,35 @@ fn object_to_row(
     Ok(row)
 }
 
-/// Parse JSON, convert rows, then delegate to [`run`].
-pub(crate) fn run_json<F: Fs>(
-    db: &mut GraphDb<F>,
-    label: &str,
-    json: &str,
-    opts: &IngestOptions,
-) -> Result<IngestReport> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| GraphError::IngestError {
-            detail: e.to_string(),
-        })?;
-    let arr = parsed.as_array().ok_or_else(|| GraphError::IngestError {
+/// Parsed JSON rows ready for [`crate::GraphDb::ingest`], plus bookkeeping so
+/// per-row shape errors keep their original JSON-array indices.
+pub struct JsonRows {
+    /// Rows that passed shape checks, in original order.
+    pub rows: Vec<BTreeMap<String, Value>>,
+    kept_indices: Vec<usize>,
+    shape_errors: Vec<(usize, String)>,
+}
+
+impl JsonRows {
+    /// Remap ingest row-error indices onto the original JSON array and append
+    /// the shape errors collected by [`json_to_rows`].
+    pub fn into_report(self, mut report: IngestReport) -> IngestReport {
+        for (idx, _) in &mut report.row_errors {
+            *idx = self.kept_indices[*idx];
+        }
+        report.row_errors.extend(self.shape_errors);
+        report.row_errors.sort_by_key(|(i, _)| *i);
+        report
+    }
+}
+
+/// Convert a parsed JSON value (must be an array of objects) into ingest rows.
+///
+/// Same conversion as [`crate::GraphDb::ingest_json`]: [`json_to_value`] per
+/// field; nested objects / mixed arrays become per-row errors. A top-level
+/// value that is not an array of objects is [`GraphError::IngestError`].
+pub fn json_to_rows(value: &serde_json::Value) -> Result<JsonRows> {
+    let arr = value.as_array().ok_or_else(|| GraphError::IngestError {
         detail: "top-level JSON must be an array of objects".into(),
     })?;
     if !arr.iter().all(|v| v.is_object()) {
@@ -171,14 +188,28 @@ pub(crate) fn run_json<F: Fs>(
             Err(msg) => shape_errors.push((i, msg)),
         }
     }
+    Ok(JsonRows {
+        rows,
+        kept_indices,
+        shape_errors,
+    })
+}
 
-    let mut report = run(db, label, rows, opts)?;
-    for (idx, _) in &mut report.row_errors {
-        *idx = kept_indices[*idx];
-    }
-    report.row_errors.extend(shape_errors);
-    report.row_errors.sort_by_key(|(i, _)| *i);
-    Ok(report)
+/// Parse JSON, convert rows, then delegate to [`run`].
+pub(crate) fn run_json<F: Fs>(
+    db: &mut GraphDb<F>,
+    label: &str,
+    json: &str,
+    opts: &IngestOptions,
+) -> Result<IngestReport> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| GraphError::IngestError {
+            detail: e.to_string(),
+        })?;
+    let mut converted = json_to_rows(&parsed)?;
+    let rows = std::mem::take(&mut converted.rows);
+    let report = run(db, label, rows, opts)?;
+    Ok(converted.into_report(report))
 }
 
 type PropMap = BTreeMap<String, Value>;

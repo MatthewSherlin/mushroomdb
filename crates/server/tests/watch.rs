@@ -11,10 +11,18 @@ use serde_json::Value as Json;
 use server::serve;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::Message;
 
 fn tmp(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("graphdb-watch-{}-{}", name, std::process::id()));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let d = std::env::temp_dir().join(format!(
+        "graphdb-watch-{name}-{}-{nanos}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
@@ -50,14 +58,17 @@ async fn next_text(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> Json {
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
-        .await
-        .expect("ws.next timed out after 10s")
-        .expect("ws closed")
-        .expect("ws err");
-    match msg {
-        Message::Text(t) => serde_json::from_str(t.as_str()).expect("json frame"),
-        other => panic!("expected text frame, got {other:?}"),
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+            .await
+            .expect("ws.next timed out after 10s")
+            .expect("ws closed")
+            .expect("ws err");
+        match msg {
+            Message::Text(t) => return serde_json::from_str(t.as_str()).expect("json frame"),
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
     }
 }
 

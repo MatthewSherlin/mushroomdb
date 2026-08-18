@@ -75,7 +75,7 @@ mod tests {
     #[test]
     fn event_frame_is_externally_tagged_json() {
         let text = watch_text(Ok(MutationEvent::NodeDeleted { key: "k".into() })).unwrap();
-        assert_eq!(text, r#"{"NodeDeleted":{"key":"k"}}"#);
+        assert_eq!(text, r#"{"node_deleted":{"key":"k"}}"#);
     }
 
     #[test]
