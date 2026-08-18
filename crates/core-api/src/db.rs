@@ -1,3 +1,4 @@
+use crate::ingest::{IngestOptions, IngestReport};
 use core_query::cypher::{execute, lex, parse, plan, Params};
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{GraphMut, RuleDef, RuleEngine};
@@ -405,6 +406,20 @@ impl<F: Fs> GraphDb<F> {
             db: self,
             ops: Vec::new(),
         }
+    }
+
+    /// Insert `rows` as nodes of `label`. One call is one atomic batch:
+    /// auto-declared KeyMatch rules (if any) first, then the accepted node
+    /// inserts, so incremental fire sees the new rules. Per-row key problems
+    /// are collected in [`IngestReport::row_errors`] and skipped; a commit
+    /// `Err` means nothing was applied.
+    pub fn ingest(
+        &mut self,
+        label: &str,
+        rows: Vec<BTreeMap<String, Value>>,
+        opts: &IngestOptions,
+    ) -> Result<IngestReport> {
+        crate::ingest::run(self, label, rows, opts)
     }
 
     fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<()> {
