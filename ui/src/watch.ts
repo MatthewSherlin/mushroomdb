@@ -96,6 +96,7 @@ export class WatchClient {
         this.attempt = 0;
         this.onConnected?.();
       }
+      // Pre-ack frames are dropped — the ack confirms the server is ready for this connection.
       return;
     }
     if (frame.kind === "event") {
