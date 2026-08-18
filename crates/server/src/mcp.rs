@@ -19,8 +19,10 @@
 //! # Error split
 //!
 //! Protocol errors are JSON-RPC `error` objects:
-//! - `-32700` parse — line is not a JSON object (including invalid UTF-8)
-//! - `-32601` method — missing / non-string / unknown `method` on a request
+//! - `-32700` parse — unparseable line (invalid JSON / invalid UTF-8)
+//! - `-32600` invalid request — parsed JSON that is not an object, or a
+//!   request with missing / non-string `method`
+//! - `-32601` method — unknown `method` on a request
 //! - `-32602` params — `tools/call` envelope invalid: `params` not an object,
 //!   missing / non-string `name`, `arguments` present but not an object,
 //!   or unknown tool name
@@ -69,7 +71,7 @@ fn handle_line(db: &SharedDb, line: &str, writer: &mut impl Write) -> io::Result
         Err(_) => return write_error(writer, None, -32700, "Parse error"),
     };
     let Some(obj) = msg.as_object() else {
-        return write_error(writer, None, -32700, "Parse error");
+        return write_error(writer, None, -32600, "Invalid Request");
     };
     let is_request = obj.contains_key("id");
     let id = obj.get("id").cloned();
@@ -77,7 +79,7 @@ fn handle_line(db: &SharedDb, line: &str, writer: &mut impl Write) -> io::Result
         Some(m) => m,
         None => {
             if is_request {
-                write_error(writer, id, -32601, "Method not found")?;
+                write_error(writer, id, -32600, "Invalid Request")?;
             }
             return Ok(());
         }
@@ -359,8 +361,8 @@ fn tools_list() -> Js {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "a": { "type": "string" },
-                        "b": { "type": "string" }
+                        "a": { "type": "string", "minLength": 1 },
+                        "b": { "type": "string", "minLength": 1 }
                     },
                     "required": ["a", "b"]
                 }

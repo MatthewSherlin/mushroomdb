@@ -6,8 +6,10 @@
 //! # Error split (protocol vs tool)
 //!
 //! Protocol errors are JSON-RPC `error` objects:
-//! - `-32700` — line is not a JSON object (parse)
-//! - `-32601` — unknown or missing `method` on a request
+//! - `-32700` — unparseable line (invalid JSON / invalid UTF-8)
+//! - `-32600` — parsed JSON that is not a request object, or a request
+//!   with missing / non-string `method`
+//! - `-32601` — unknown `method` on a request
 //! - `-32602` — `tools/call` *envelope* invalid: `params` not an object,
 //!   missing / non-string `name`, `arguments` present but not an object,
 //!   or unknown tool name
@@ -184,8 +186,14 @@ fn tools_list_returns_five_tools_with_schemas() {
     );
 
     let explain = by_name("explain");
-    assert!(explain["inputSchema"]["properties"].get("a").is_some());
-    assert!(explain["inputSchema"]["properties"].get("b").is_some());
+    assert_eq!(
+        explain["inputSchema"]["properties"]["a"],
+        json!({"type": "string", "minLength": 1})
+    );
+    assert_eq!(
+        explain["inputSchema"]["properties"]["b"],
+        json!({"type": "string", "minLength": 1})
+    );
     assert_eq!(explain["inputSchema"]["required"], json!(["a", "b"]));
 
     let stats = by_name("stats");
@@ -394,39 +402,102 @@ fn bad_tool_args_split_protocol_vs_tool() {
     let db = open("bad-args");
     seed_person(&db, "p1");
     let stdin = format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}{}",
         req(
             json!(1),
             "tools/call",
             Some(json!({"arguments": {"cypher": "RETURN 1"}})),
         ),
         call(2, "nope", json!({})),
+        req(json!(5), "tools/call", Some(json!(42))),
+        req(
+            json!(6),
+            "tools/call",
+            Some(json!({"name": "query", "arguments": "string"})),
+        ),
         call(3, "query", json!({})),
         call(4, "query", json!({"cypher": "MATCH (n)"})),
     );
     let (res, out) = exchange(db, &stdin);
     assert!(res.is_ok(), "{res:?}");
     let replies = parse_lines(&out);
-    assert_eq!(replies.len(), 4);
+    assert_eq!(replies.len(), 6);
 
     // Protocol: tools/call missing name.
     assert_eq!(replies[0]["error"]["code"], json!(-32602));
     // Protocol: unknown tool name.
     assert_eq!(replies[1]["error"]["code"], json!(-32602));
+    // Protocol: params is not an object.
+    assert_eq!(replies[2]["id"], 5);
+    assert_eq!(replies[2]["error"]["code"], json!(-32602));
+    // Protocol: arguments is not an object.
+    assert_eq!(replies[3]["id"], 6);
+    assert_eq!(replies[3]["error"]["code"], json!(-32602));
     // Tool-level: known tool, missing required argument.
-    assert_eq!(replies[2]["result"]["isError"], json!(true));
-    assert_eq!(replies[2]["result"]["content"][0]["type"], "text");
-    assert!(replies[2]["result"]["content"][0]["text"]
+    assert_eq!(replies[4]["result"]["isError"], json!(true));
+    assert_eq!(replies[4]["result"]["content"][0]["type"], "text");
+    assert!(replies[4]["result"]["content"][0]["text"]
         .as_str()
         .unwrap()
         .contains("cypher"));
     // Tool-level: GraphError (bad Cypher) is not a protocol error.
-    assert!(replies[3].get("error").is_none() || replies[3]["error"].is_null());
-    assert_eq!(replies[3]["result"]["isError"], json!(true));
-    let msg = replies[3]["result"]["content"][0]["text"]
+    assert!(replies[5].get("error").is_none() || replies[5]["error"].is_null());
+    assert_eq!(replies[5]["result"]["isError"], json!(true));
+    let msg = replies[5]["result"]["content"][0]["text"]
         .as_str()
         .expect("error text");
     assert!(msg.contains("parse:"), "expected parse: detail, got {msg}");
+}
+
+/// Binding: a parsed non-object line is -32600 Invalid Request, not parse error.
+#[test]
+fn non_object_json_is_invalid_request() {
+    let stdin = format!(
+        "[1]\n42\n\"hi\"\ntrue\n{}",
+        req(json!(1), "tools/list", None)
+    );
+    let (res, out) = exchange(open("non-object"), &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    assert_eq!(replies.len(), 5);
+    for r in &replies[..4] {
+        assert_eq!(r["id"], Js::Null);
+        assert_eq!(r["error"]["code"], json!(-32600));
+        assert_eq!(r["error"]["message"], "Invalid Request");
+    }
+    assert!(replies[4]["result"]["tools"].is_array());
+}
+
+/// Binding: missing or non-string method on a request is -32600, not -32601.
+#[test]
+fn missing_or_non_string_method_is_invalid_request() {
+    let stdin = format!(
+        "{}\n{}\n",
+        json!({"jsonrpc": "2.0", "id": 1}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": 42}),
+    );
+    let (res, out) = exchange(open("no-method"), &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["id"], 1);
+    assert_eq!(replies[0]["error"]["code"], json!(-32600));
+    assert_eq!(replies[0]["error"]["message"], "Invalid Request");
+    assert_eq!(replies[1]["id"], 2);
+    assert_eq!(replies[1]["error"]["code"], json!(-32600));
+    assert_eq!(replies[1]["error"]["message"], "Invalid Request");
+}
+
+/// Binding: `id: null` is a request; the response echoes `id: null`.
+#[test]
+fn id_null_request_echoes_null() {
+    let stdin = req(Js::Null, "tools/list", None);
+    let (res, out) = exchange(open("id-null"), &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0]["id"], Js::Null);
+    assert!(replies[0]["result"]["tools"].is_array());
 }
 
 /// Binding: a notification (no `id`) never writes a response.
