@@ -465,6 +465,8 @@ async fn node_info_json_shape() {
     assert_eq!(v["props"]["years"], json!(8));
     assert_eq!(v["props"]["rating"], json!(0.5));
     assert_eq!(v["props"]["tags"], json!(["x", "y"]));
+    // BTreeMap iteration is name-sorted; this assertion also depends on
+    // serde_json's preserve_order feature (object keys keep insertion order).
     let keys: Vec<&str> = v["props"]
         .as_object()
         .expect("props object")

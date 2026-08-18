@@ -237,6 +237,9 @@ impl From<&Predicate> for PredicateSummary {
 ///
 /// `props` is a [`BTreeMap`] so field order is deterministic (sorted by name)
 /// regardless of insert order or the columnar store's `HashMap` iteration.
+///
+/// Deliberately does not derive `Serialize`: `Value`'s serde form is
+/// internally tagged. Wire JSON is built by `value_to_json` in the server.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeInfo {
     pub key: String,
@@ -1025,6 +1028,9 @@ impl<F: Fs> GraphDb<F> {
                 .then(a.src_key.cmp(&b.src_key))
                 .then(a.dst_key.cmp(&b.dst_key))
         });
+        // Self-loops appear in both Out and In; sort makes the pair adjacent
+        // (sort key matches PartialEq for this case) so one pass drops the dup.
+        edges.dedup();
         Ok(edges)
     }
 

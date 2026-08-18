@@ -112,3 +112,20 @@ fn node_edges_marks_user_and_derived_and_sorts() {
         "expected KeyNotFound ghost, got {err:?}"
     );
 }
+
+#[test]
+fn node_edges_self_loop_is_emitted_once() {
+    let mut db = GraphDb::open(&tmp("self-loop")).unwrap();
+    db.insert_node("Member", "ada", vec![]).unwrap();
+    db.insert_edge("LOOP", "ada", "ada").unwrap();
+    let edges = db.node_edges("ada").expect("ada");
+    assert_eq!(
+        edges,
+        vec![EdgeInfo {
+            edge_type: "LOOP".into(),
+            src_key: "ada".into(),
+            dst_key: "ada".into(),
+            derived: false,
+        }]
+    );
+}
