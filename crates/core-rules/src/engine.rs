@@ -1323,4 +1323,145 @@ mod tests {
         assert!(fx.topo.neighbors(et, Direction::Out, n5).contains(&ids[0]));
         assert!(fx.topo.neighbors(et, Direction::Out, ids[0]).contains(&n5));
     }
+
+    fn numeric_rule() -> RuleDef {
+        RuleDef {
+            name: "nw".into(),
+            src_label: "C".into(),
+            dst_label: "C".into(),
+            predicate: Predicate::NumericWithin {
+                field: "year".into(),
+                tolerance: 2.0,
+            },
+            edge_type: "NEAR".into(),
+            weight_prop: Some("score".into()),
+            max_edges: None,
+        }
+    }
+
+    fn geo_rule() -> RuleDef {
+        RuleDef {
+            name: "geo".into(),
+            src_label: "City".into(),
+            dst_label: "City".into(),
+            predicate: Predicate::GeoRadius {
+                field: "loc".into(),
+                km: 400.0,
+            },
+            edge_type: "NEAR_GEO".into(),
+            weight_prop: Some("score".into()),
+            max_edges: None,
+        }
+    }
+
+    fn vec_rule() -> RuleDef {
+        RuleDef {
+            name: "vec".into(),
+            src_label: "Doc".into(),
+            dst_label: "Doc".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "SIM".into(),
+            weight_prop: Some("score".into()),
+            max_edges: None,
+        }
+    }
+
+    fn pair_edges(topo: &Topology, et: u32, a: u32, b: u32) -> bool {
+        topo.neighbors(et, Direction::Out, a).contains(&b)
+            && topo.neighbors(et, Direction::Out, b).contains(&a)
+    }
+
+    #[test]
+    fn numeric_within_incremental_crosses_bucket_and_clears_old_index() {
+        let mut fx = Fx::new();
+        let a = fx.add("C", "a", vec![("year", Value::Float(10.0))]);
+        let b = fx.add("C", "b", vec![("year", Value::Float(12.0))]);
+        let et = fx.syms.intern("NEAR");
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(numeric_rule(), &mut g).unwrap();
+            // |12−10| = 2 ≤ 2 → score 0.0 both ways
+            assert!(pair_edges(g.topo, et, a, b));
+        }
+
+        // 12.0 (bucket 6) → 16.1 (bucket 8): two buckets away, so the old
+        // value's ±1 probe no longer reaches b. Match breaks.
+        let old = fx.props.get(b, "year").cloned();
+        fx.props.set(b, "year", Value::Float(16.1));
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(b, Some(("year", old)), &mut g);
+            assert!(!pair_edges(g.topo, et, a, b));
+            assert_eq!(g.topo.edge_count(), 0);
+        }
+        let def = numeric_rule();
+        let spec = candidate_spec(&def.predicate);
+        let old_map: std::collections::HashMap<_, _> =
+            [("year".to_string(), Value::Float(12.0))].into();
+        let old_get = |f: &str| old_map.get(f).cloned();
+        let src_hits = eng.indexes["nw"].src_side.candidates(&spec, &old_get);
+        let dst_hits = eng.indexes["nw"].dst_side.candidates(&spec, &old_get);
+        assert!(!src_hits.contains(&b), "old src bucket must drop b");
+        assert!(!dst_hits.contains(&b), "old dst bucket must drop b");
+        assert!(src_hits.contains(&a));
+
+        // 16.1 → 11.9 (bucket 5): match returns.
+        let old = fx.props.get(b, "year").cloned();
+        fx.props.set(b, "year", Value::Float(11.9));
+        let mut g = fx.g();
+        eng.on_node_changed(b, Some(("year", old)), &mut g);
+        assert!(pair_edges(g.topo, et, a, b));
+    }
+
+    fn loc_val(lat: f64, lon: f64) -> Value {
+        Value::List(vec![Value::Float(lat), Value::Float(lon)])
+    }
+
+    fn emb_val(vals: &[f64]) -> Value {
+        Value::List(vals.iter().copied().map(Value::Float).collect())
+    }
+
+    #[test]
+    fn rebuild_is_noop_for_numeric_geo_and_vector() {
+        let mut fx = Fx::new();
+        let ca = fx.add("C", "ca", vec![("year", Value::Int(1998))]);
+        let cb = fx.add("C", "cb", vec![("year", Value::Float(2000.0))]);
+        let pa = fx.add("City", "paris", vec![("loc", loc_val(48.8566, 2.3522))]);
+        let lo = fx.add("City", "london", vec![("loc", loc_val(51.5074, -0.1278))]);
+        let da = fx.add("Doc", "d1", vec![("emb", emb_val(&[1.0, 0.0]))]);
+        let db = fx.add("Doc", "d2", vec![("emb", emb_val(&[1.0, 0.0]))]);
+
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(numeric_rule(), &mut g).unwrap();
+            eng.create_rule(geo_rule(), &mut g).unwrap();
+            eng.create_rule(vec_rule(), &mut g).unwrap();
+        }
+
+        let (near, ngeo, sim) = (
+            fx.syms.get("NEAR").unwrap(),
+            fx.syms.get("NEAR_GEO").unwrap(),
+            fx.syms.get("SIM").unwrap(),
+        );
+        assert!(pair_edges(&fx.topo, near, ca, cb));
+        assert!(pair_edges(&fx.topo, ngeo, pa, lo));
+        assert!(pair_edges(&fx.topo, sim, da, db));
+        let before = fx.topo.edge_count();
+
+        {
+            let mut g = fx.g();
+            eng.rebuild("nw", &mut g).unwrap();
+            eng.rebuild("geo", &mut g).unwrap();
+            eng.rebuild("vec", &mut g).unwrap();
+        }
+        assert_eq!(fx.topo.edge_count(), before);
+        assert!(pair_edges(&fx.topo, near, ca, cb));
+        assert!(pair_edges(&fx.topo, ngeo, pa, lo));
+        assert!(pair_edges(&fx.topo, sim, da, db));
+    }
 }
