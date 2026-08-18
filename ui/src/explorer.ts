@@ -1,17 +1,18 @@
 import { Graph } from "@cosmos.gl/graph";
 import { ApiClient, ApiError } from "./api";
 import { QueryConsole } from "./console";
-import { EXPLAIN_CONCURRENCY, mapPool } from "./classify";
 import { expandNode, loadDemoNeighborhood } from "./expand";
 import { GlowQueue, bornEdgeIds } from "./glow";
 import { Inspector } from "./inspector";
 import {
   FLASH_MS,
+  ResyncGate,
   applyLiveEvent,
   formatLaggedLine,
   formatTickerLine,
   nextDot,
-  resyncKeys,
+  resyncNeighborhoods,
+  triggersResync,
   watchUrl,
   type WatchDot as LiveDot,
 } from "./live";
@@ -82,12 +83,15 @@ export class Explorer {
   private flashTimer: number | undefined;
   private tail: Promise<void> = Promise.resolve();
   private dot: WatchDot = "idle";
+  private readonly resyncGate = new ResyncGate();
+  private readonly motionQuery: MediaQueryList;
 
   constructor(host: HTMLElement, options: ExplorerOptions) {
     this.host = host;
     this.api = options.api;
     this.store = options.store;
     this.onEdgeSelect = options.onEdgeSelect;
+    this.motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
 
     host.innerHTML = "";
     host.classList.add("shell");
@@ -174,7 +178,8 @@ export class Explorer {
         this.applyWatchEvent(event);
       },
       onLagged: (n) => {
-        this.run(() => this.resync(n));
+        this.ticker.push(formatLaggedLine(n));
+        this.requestResync();
       },
     });
     this.inspector = new Inspector(host, {
@@ -215,12 +220,15 @@ export class Explorer {
     this.inspector.closeIfEdgeMissing();
     this.ticker.push(formatTickerLine(event));
     this.advanceDot("event");
-    if (!prefersReducedMotion()) {
+    if (!this.prefersReducedMotion()) {
       const born = bornEdgeIds(before, this.store.edges.keys());
       if (born.length > 0) {
         this.glow.schedule(born, performance.now());
         this.armGlow();
       }
+    }
+    if (triggersResync(event)) {
+      this.requestResync();
     }
     this.paint();
   }
@@ -255,7 +263,7 @@ export class Explorer {
   }
 
   private advanceDot(action: Parameters<typeof nextDot>[1]): void {
-    this.setWatchStatus(nextDot(this.dot, action, prefersReducedMotion()));
+    this.setWatchStatus(nextDot(this.dot, action, this.prefersReducedMotion()));
     if (this.flashTimer !== undefined) {
       window.clearTimeout(this.flashTimer);
       this.flashTimer = undefined;
@@ -268,15 +276,32 @@ export class Explorer {
     }
   }
 
-  private async resync(skipped: number): Promise<void> {
-    this.ticker.push(formatLaggedLine(skipped));
-    this.store.lagged();
-    const keys = resyncKeys(this.store);
-    await mapPool(keys, EXPLAIN_CONCURRENCY, (key) =>
-      expandNode(this.store, this.api, key, 1),
+  private requestResync(): void {
+    this.resyncGate.request(async () => {
+      try {
+        await this.resync();
+      } catch (err: unknown) {
+        this.showError(err);
+      }
+    });
+  }
+
+  private async resync(): Promise<void> {
+    const born = await resyncNeighborhoods(
+      this.store,
+      this.api,
+      this.prefersReducedMotion(),
     );
+    if (born.length > 0) {
+      this.glow.schedule(born, performance.now());
+      this.armGlow();
+    }
     this.paint();
     this.scheduleFit();
+  }
+
+  private prefersReducedMotion(): boolean {
+    return this.motionQuery.matches;
   }
 
   private async loadDemo(): Promise<void> {
@@ -299,7 +324,7 @@ export class Explorer {
       return;
     }
     const run = (): void => {
-      graph.fitView(prefersReducedMotion() ? 0 : 280, 0.22);
+      graph.fitView(this.prefersReducedMotion() ? 0 : 280, 0.22);
     };
     void graph.ready.then(() => {
       run();
@@ -621,10 +646,6 @@ function setCurrent(btn: HTMLElement, on: boolean): void {
   } else {
     btn.removeAttribute("aria-current");
   }
-}
-
-function prefersReducedMotion(): boolean {
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
 
 function el(tag: string, className?: string): HTMLElement {

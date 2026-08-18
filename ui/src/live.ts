@@ -14,7 +14,10 @@
  *   **not** apply — no stub node, no unclassified edge. A later expand /
  *   lagged resync refetches the neighborhood.
  */
-import type { GraphStore } from "./store";
+import { EXPLAIN_CONCURRENCY, mapPool } from "./classify";
+import { expandNode, type ExpandApi } from "./expand";
+import { bornEdgeIds } from "./glow";
+import { edgeId, type GraphStore } from "./store";
 import type { MutationEvent } from "./watch";
 
 export const TICKER_CAP = 20;
@@ -141,4 +144,63 @@ export function applyLiveEvent(store: GraphStore, event: MutationEvent): void {
 
 export function resyncKeys(store: GraphStore): string[] {
   return [...store.nodes.keys()].sort();
+}
+
+export function triggersResync(event: MutationEvent): boolean {
+  return "ingested" in event || "node_inserted" in event;
+}
+
+export function derivedEdgeIds(store: GraphStore): string[] {
+  return store.derivedEdges().map((e) => edgeId(e.etype, e.src, e.dst));
+}
+
+export function glowBornDerived(
+  before: readonly string[],
+  after: readonly string[],
+  reducedMotion: boolean,
+): string[] {
+  if (reducedMotion) {
+    return [];
+  }
+  return bornEdgeIds(before, after);
+}
+
+/** Ingest / lagged bursts: one run at a time, at most one queued behind it. */
+export class ResyncGate {
+  private running = false;
+  private pending = false;
+
+  request(run: () => Promise<void>): void {
+    if (this.running) {
+      this.pending = true;
+      return;
+    }
+    void this.drain(run);
+  }
+
+  private async drain(run: () => Promise<void>): Promise<void> {
+    this.running = true;
+    try {
+      do {
+        this.pending = false;
+        await run();
+      } while (this.pending);
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
+export async function resyncNeighborhoods(
+  store: GraphStore,
+  api: ExpandApi,
+  reducedMotion: boolean,
+): Promise<string[]> {
+  store.lagged();
+  const before = derivedEdgeIds(store);
+  const keys = resyncKeys(store);
+  await mapPool(keys, EXPLAIN_CONCURRENCY, (key) =>
+    expandNode(store, api, key, 1),
+  );
+  return glowBornDerived(before, derivedEdgeIds(store), reducedMotion);
 }

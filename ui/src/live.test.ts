@@ -4,14 +4,20 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { GraphStore, edgeId } from "./store";
 import type { MutationEvent } from "./watch";
+import type { ExpandApi } from "./expand";
+import { USER_ETYPE } from "./classify";
 import {
   TICKER_CAP,
   TickerBuffer,
+  ResyncGate,
   applyLiveEvent,
   formatLaggedLine,
   formatTickerLine,
+  glowBornDerived,
   nextDot,
+  resyncNeighborhoods,
   resyncKeys,
+  triggersResync,
   watchUrl,
 } from "./live";
 
@@ -159,5 +165,102 @@ describe("resyncKeys", () => {
     const store = new GraphStore();
     store.fromNeighborhood("c", nb([["a", "Person", 1], ["b", "Org", 1]]));
     expect(resyncKeys(store)).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("triggersResync", () => {
+  it("treats ingested and node_inserted as resync triggers", () => {
+    expect(triggersResync({ ingested: { label: "Person", inserted: 1 } })).toBe(
+      true,
+    );
+    expect(
+      triggersResync({ node_inserted: { label: "Person", key: "p99" } }),
+    ).toBe(true);
+    expect(
+      triggersResync({
+        edge_inserted: { edge_type: "FIT", src: "a", dst: "b" },
+      }),
+    ).toBe(false);
+    expect(triggersResync({ prop_set: { key: "a", field: "n" } })).toBe(false);
+  });
+});
+
+describe("resyncNeighborhoods / glowBornDerived", () => {
+  function apiWithNewFit(): ExpandApi {
+    return {
+      query: async () => ({ columns: ["n"], rows: [] }),
+      neighborhood: async (key, opts = {}) => {
+        const dir = opts.dir ?? "both";
+        if (key === "a" && dir === "out") {
+          return nb([["c", "Project", 1]]);
+        }
+        return nb([]);
+      },
+      explain: async (x, y) => {
+        const pair = x === "a" && y === "c";
+        if (!pair) {
+          return [];
+        }
+        return [
+          {
+            rule: "skill_fit",
+            edge_type: "FIT",
+            src_key: "a",
+            dst_key: "c",
+            weight: 1,
+          },
+        ];
+      },
+    };
+  }
+
+  it("ingested-style resync surfaces a new derived edge and schedules glow", async () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", nb([["b", "Person", 1]]));
+    store.mergeNeighborhoodWithEdges("a", { [USER_ETYPE]: ["b"] });
+    store.setProvenance(edgeId(USER_ETYPE, "a", "b"), null);
+
+    const event: MutationEvent = {
+      ingested: { label: "Person", inserted: 1 },
+    };
+    expect(triggersResync(event)).toBe(true);
+
+    const glow = await resyncNeighborhoods(store, apiWithNewFit(), false);
+    expect(store.edges.get(edgeId("FIT", "a", "c"))?.derived).toBe(true);
+    expect(glow).toEqual([edgeId("FIT", "a", "c")]);
+  });
+
+  it("skips glow when prefers-reduced-motion is on", async () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", nb([["b", "Person", 1]]));
+    store.mergeNeighborhoodWithEdges("a", { [USER_ETYPE]: ["b"] });
+    const glow = await resyncNeighborhoods(store, apiWithNewFit(), true);
+    expect(store.edges.has(edgeId("FIT", "a", "c"))).toBe(true);
+    expect(glow).toEqual([]);
+    expect(
+      glowBornDerived([edgeId("FIT", "a", "c")], [edgeId("FIT", "a", "c")], true),
+    ).toEqual([]);
+  });
+});
+
+describe("ResyncGate", () => {
+  it("coalesces overlapping requests into one queued run behind the active one", async () => {
+    const gate = new ResyncGate();
+    let inflight = 0;
+    let max = 0;
+    let runs = 0;
+    const run = async (): Promise<void> => {
+      runs += 1;
+      inflight += 1;
+      max = Math.max(max, inflight);
+      await new Promise((r) => setTimeout(r, 25));
+      inflight -= 1;
+    };
+    gate.request(run);
+    gate.request(run);
+    gate.request(run);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(max).toBe(1);
+    expect(runs).toBe(2);
   });
 });
