@@ -8,6 +8,7 @@ html,
 body {
   margin: 0;
   height: 100%;
+  min-width: 1024px;
   background: var(--ink);
   color: var(--paper);
   font-family: "IBM Plex Sans", sans-serif;
@@ -21,6 +22,13 @@ body {
 :focus-visible {
   outline: 2px solid var(--signal);
   outline-offset: 2px;
+}
+
+@media (forced-colors: active) {
+  :focus-visible {
+    outline: 2px solid CanvasText;
+    outline-offset: 2px;
+  }
 }
 
 button {
@@ -347,12 +355,19 @@ button {
   background: transparent;
   border: 0;
   resize: none;
-  outline: none;
 }
 
 .console-input:focus-visible {
-  outline: none;
+  outline: 2px solid var(--signal);
+  outline-offset: -2px;
   box-shadow: inset 0 0 0 2px var(--signal);
+}
+
+@media (forced-colors: active) {
+  .console-input:focus-visible {
+    outline: 2px solid CanvasText;
+    box-shadow: none;
+  }
 }
 
 .hl-kw {
@@ -435,7 +450,7 @@ button {
   width: 16.5rem;
   background: var(--ink);
   border-right: 1px solid var(--structure);
-  transform: translateX(-100%);
+  transform: translateX(calc(-100% - 48px));
   transition: transform 200ms ease;
   pointer-events: none;
 }
@@ -574,6 +589,20 @@ button {
 .why-tok-shared {
   color: var(--gold);
   border-color: var(--gold);
+}
+
+@media (max-width: 1100px) {
+  .why {
+    width: 18rem;
+  }
+
+  .rules {
+    width: 14.5rem;
+  }
+
+  .ticker {
+    max-width: 16rem;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

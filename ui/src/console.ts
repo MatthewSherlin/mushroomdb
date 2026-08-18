@@ -2,10 +2,11 @@ import { ApiClient, type QueryResult } from "./api";
 import { highlightHtml } from "./cypher";
 import {
   addHarvestedToCanvas,
-  formatTable,
   harvestDecision,
   queryErrorText,
   resultAfterRun,
+  tableAfterRun,
+  type FormattedTable,
 } from "./query-result";
 import type { GraphStore } from "./store";
 
@@ -168,12 +169,13 @@ export class QueryConsole {
       this.result = resultAfterRun({ ok: true, value: result });
       this.errorEl.hidden = true;
       this.errorEl.textContent = "";
-      this.renderTable(result);
+      this.paintTable(tableAfterRun({ ok: true, value: result }));
       this.syncAdd();
     } catch (err: unknown) {
       this.result = resultAfterRun({ ok: false });
       this.errorEl.textContent = queryErrorText(err);
       this.errorEl.hidden = false;
+      this.paintTable(tableAfterRun({ ok: false }));
       this.syncAdd();
     } finally {
       this.busy = false;
@@ -203,8 +205,11 @@ export class QueryConsole {
     }
   }
 
-  private renderTable(result: QueryResult): void {
-    const shaped = formatTable(result);
+  private paintTable(shaped: FormattedTable | undefined): void {
+    if (shaped === undefined) {
+      this.tableWrap.replaceChildren();
+      return;
+    }
     const table = document.createElement("table");
     table.className = "console-table";
     const thead = document.createElement("thead");

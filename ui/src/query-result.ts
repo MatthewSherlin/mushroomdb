@@ -76,6 +76,14 @@ export function resultAfterRun(
   return outcome.ok ? outcome.value : undefined;
 }
 
+/** Failed Run clears the result table, not only the harvest. */
+export function tableAfterRun(
+  outcome: { ok: true; value: QueryResult } | { ok: false },
+): FormattedTable | undefined {
+  const next = resultAfterRun(outcome);
+  return next === undefined ? undefined : formatTable(next);
+}
+
 export function harvestDecision(
   result: QueryResult | undefined,
 ): HarvestDecision {

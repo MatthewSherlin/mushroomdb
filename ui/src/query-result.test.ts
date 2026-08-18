@@ -17,6 +17,7 @@ import {
   harvestableKeys,
   queryErrorText,
   resultAfterRun,
+  tableAfterRun,
 } from "./query-result";
 
 function result(columns: string[], rows: QueryResult["rows"]): QueryResult {
@@ -112,6 +113,15 @@ describe("harvestDecision", () => {
       keys: [],
       blocked: NO_RESULT_HINT,
     });
+  });
+
+  it("failed Run clears the result table", () => {
+    const prior = result(["n"], [["p1"]]);
+    expect(tableAfterRun({ ok: true, value: prior })).toEqual({
+      columns: ["n"],
+      rows: [["p1"]],
+    });
+    expect(tableAfterRun({ ok: false })).toBeUndefined();
   });
 });
 
