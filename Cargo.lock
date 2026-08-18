@@ -991,8 +991,10 @@ dependencies = [
  "arrow-ipc",
  "axum",
  "core-api",
+ "futures-util",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tower",
 ]
 

@@ -13,6 +13,13 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 /// Shared handle to an on-disk [`GraphDb`]. [`Clone`] is cheap and shares state.
+///
+/// # Event-sink deadlock
+///
+/// [`GraphDb::set_event_sink`] runs the hook inside `log_then_apply` while
+/// this write guard is still held. A sink must never call [`SharedDb::read`]
+/// or [`SharedDb::write`] on the same handle (the `RwLock` is not
+/// re-entrant). Broadcast/`mpsc` send is the intended use.
 #[derive(Clone)]
 pub struct SharedDb {
     inner: Arc<RwLock<GraphDb<RealFs>>>,

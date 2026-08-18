@@ -10,6 +10,115 @@ use core_storage::{
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// A post-commit mutation notification.
+///
+/// Emitted from `log_then_apply` after the WAL append, fsync, and
+/// in-memory `apply` all succeed. Never emitted for rejected operations
+/// (validation errors, [`GraphError::RuleOwned`], duplicate keys, no-op
+/// deletes/removes). Event payloads carry user keys and rule names, never
+/// internal ids.
+///
+/// **Replay:** [`GraphDb::open`] / [`GraphDb::open_with`] replay the WAL via
+/// `apply` only. Emission lives exclusively in `log_then_apply`, so
+/// recovery is silent even if a sink were installed (it cannot be: the
+/// sink is in-memory and set after open).
+///
+/// **Ordering:** a `Batch` WAL frame emits one event per inner record, then
+/// [`MutationEvent::BatchApplied`]. An ingest commit emits those same inner
+/// events, then [`MutationEvent::Ingested`] (not `BatchApplied`). An empty
+/// or all-noop batch writes no WAL and emits nothing (including no summary).
+///
+/// **Derived edges:** rule-created or retracted edges are not individually
+/// evented — they are recoverable from the triggering mutation plus the live
+/// rule set. Only the triggering record is emitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum MutationEvent {
+    NodeInserted {
+        label: String,
+        key: String,
+    },
+    PropSet {
+        key: String,
+        field: String,
+    },
+    PropRemoved {
+        key: String,
+        field: String,
+    },
+    EdgeInserted {
+        edge_type: String,
+        src: String,
+        dst: String,
+    },
+    EdgeDeleted {
+        edge_type: String,
+        src: String,
+        dst: String,
+    },
+    NodeDeleted {
+        key: String,
+    },
+    RuleCreated {
+        name: String,
+    },
+    RuleDeleted {
+        name: String,
+    },
+    RuleRebuilt {
+        name: String,
+    },
+    BatchApplied {
+        ops: usize,
+    },
+    Ingested {
+        label: String,
+        inserted: usize,
+    },
+}
+
+fn event_from_record(rec: &WalRecord) -> Option<MutationEvent> {
+    match rec {
+        WalRecord::InsertNode { label, key, .. } => Some(MutationEvent::NodeInserted {
+            label: label.clone(),
+            key: key.clone(),
+        }),
+        WalRecord::SetProp { key, field, .. } => Some(MutationEvent::PropSet {
+            key: key.clone(),
+            field: field.clone(),
+        }),
+        WalRecord::RemoveProp { key, field } => Some(MutationEvent::PropRemoved {
+            key: key.clone(),
+            field: field.clone(),
+        }),
+        WalRecord::InsertEdge {
+            edge_type,
+            src_key,
+            dst_key,
+        } => Some(MutationEvent::EdgeInserted {
+            edge_type: edge_type.clone(),
+            src: src_key.clone(),
+            dst: dst_key.clone(),
+        }),
+        WalRecord::DeleteEdge {
+            edge_type,
+            src_key,
+            dst_key,
+        } => Some(MutationEvent::EdgeDeleted {
+            edge_type: edge_type.clone(),
+            src: src_key.clone(),
+            dst: dst_key.clone(),
+        }),
+        WalRecord::DeleteNode { key } => Some(MutationEvent::NodeDeleted { key: key.clone() }),
+        WalRecord::CreateRule { def_bytes } => {
+            let def: RuleDef = bincode::deserialize(def_bytes).ok()?;
+            Some(MutationEvent::RuleCreated { name: def.name })
+        }
+        WalRecord::DeleteRule { name } => Some(MutationEvent::RuleDeleted { name: name.clone() }),
+        WalRecord::RebuildRule { name } => Some(MutationEvent::RuleRebuilt { name: name.clone() }),
+        WalRecord::Batch(_) => None,
+    }
+}
+
 /// Database-wide counters plus per-rule budget/fire stats.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Stats {
@@ -74,6 +183,7 @@ pub struct GraphDb<F: Fs> {
     labels: Vec<u32>, // node id -> label symbol
     edge_props: EdgeProps,
     engine: RuleEngine,
+    event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
 }
 
 impl GraphDb<RealFs> {
@@ -93,6 +203,7 @@ impl<F: Fs> GraphDb<F> {
             labels: Vec::new(),
             edge_props: EdgeProps::new(),
             engine: RuleEngine::new(),
+            event_sink: None,
         };
         let snap_bytes = db.fs.read(FileId::Snapshot)?;
         if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
@@ -376,10 +487,64 @@ impl<F: Fs> GraphDb<F> {
         Ok(())
     }
 
+    /// Durable write, then notify the event sink. Replay (`apply` during
+    /// `open`) never enters this function, so it is the replay-silent seam.
     fn log_then_apply(&mut self, rec: WalRecord) -> Result<()> {
+        self.log_then_apply_with(rec, None)
+    }
+
+    fn log_then_apply_with(
+        &mut self,
+        rec: WalRecord,
+        ingest: Option<(String, usize)>,
+    ) -> Result<()> {
         self.fs.append(FileId::Wal, &encode_record(&rec))?;
         self.fs.sync(FileId::Wal)?; // strict policy in plan 1
-        self.apply(&rec)
+        self.apply(&rec)?;
+        self.emit_committed(&rec, ingest);
+        Ok(())
+    }
+
+    /// Install a post-commit hook. Replaces any previous sink.
+    ///
+    /// The sink runs inside `log_then_apply` after a successful
+    /// durable commit, while the caller still holds `&mut self`. When this
+    /// database is behind a [`crate::SharedDb`], that means the **write
+    /// guard is held**. The sink must never call `read` / `write` (or any
+    /// other method) on the same `SharedDb` — the `RwLock` is not
+    /// re-entrant and doing so deadlocks. A tokio `broadcast::Sender::send`
+    /// is non-blocking and safe.
+    pub fn set_event_sink(&mut self, sink: Box<dyn Fn(MutationEvent) + Send + Sync>) {
+        self.event_sink = Some(sink);
+    }
+
+    fn emit(&self, ev: MutationEvent) {
+        if let Some(sink) = &self.event_sink {
+            sink(ev);
+        }
+    }
+
+    fn emit_committed(&self, rec: &WalRecord, ingest: Option<(String, usize)>) {
+        match rec {
+            WalRecord::Batch(inner) => {
+                for r in inner {
+                    if let Some(ev) = event_from_record(r) {
+                        self.emit(ev);
+                    }
+                }
+                match ingest {
+                    Some((label, inserted)) => {
+                        self.emit(MutationEvent::Ingested { label, inserted })
+                    }
+                    None => self.emit(MutationEvent::BatchApplied { ops: inner.len() }),
+                }
+            }
+            other => {
+                if let Some(ev) = event_from_record(other) {
+                    self.emit(ev);
+                }
+            }
+        }
     }
 
     /// Start an atomic batch.
@@ -442,7 +607,11 @@ impl<F: Fs> GraphDb<F> {
         crate::ingest::run_json(self, label, json, opts)
     }
 
-    fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<()> {
+    fn commit_logged_batch(
+        &mut self,
+        ops: Vec<BatchOp>,
+        ingest: Option<(String, usize)>,
+    ) -> Result<()> {
         let recs = {
             let mut preview = MutPreview::new(self);
             let mut recs = Vec::with_capacity(ops.len());
@@ -518,7 +687,11 @@ impl<F: Fs> GraphDb<F> {
         if recs.is_empty() {
             return Ok(());
         }
-        self.log_then_apply(WalRecord::Batch(recs))
+        self.log_then_apply_with(WalRecord::Batch(recs), ingest)
+    }
+
+    fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<()> {
+        self.commit_logged_batch(ops, None)
     }
 
     pub fn insert_node(
@@ -1358,6 +1531,14 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
     pub fn commit(&mut self) -> Result<()> {
         let ops = std::mem::take(&mut self.ops);
         self.db.commit_batch(ops)
+    }
+
+    /// Same as [`commit`](Self::commit) but tail the inner events with
+    /// [`MutationEvent::Ingested`] instead of [`MutationEvent::BatchApplied`].
+    pub(crate) fn commit_ingest(&mut self, label: &str, inserted: usize) -> Result<()> {
+        let ops = std::mem::take(&mut self.ops);
+        self.db
+            .commit_logged_batch(ops, Some((label.to_string(), inserted)))
     }
 }
 

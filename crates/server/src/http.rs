@@ -1,6 +1,7 @@
 //! Thin HTTP wrapper over [`SharedDb`]. Every endpoint is a lock, a public
 //! core-api call, then a response — no business logic.
 
+use crate::AppState;
 use arrow_bridge::to_ipc_bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
@@ -14,6 +15,11 @@ use std::net::SocketAddr;
 
 /// Build the HTTP router over `db`. Read endpoints take the read lock;
 /// `/ingest` takes the write lock. Guards are dropped before any `.await`.
+/// `GET /watch` upgrades to a WebSocket fed by the post-commit sink.
+///
+/// Installing the watch sink replaces any previously installed
+/// [`core_api::GraphDb::set_event_sink`]. The sink only
+/// `broadcast::Sender::send`s (non-blocking) and never re-enters `db`.
 ///
 /// # Blocking
 ///
@@ -23,13 +29,22 @@ use std::net::SocketAddr;
 /// Wrap these calls in `tokio::task::spawn_blocking` before exposing the
 /// server to concurrent multi-client load.
 pub fn router(db: SharedDb) -> Router {
+    let (tx, _) = tokio::sync::broadcast::channel(1024);
+    {
+        let tx = tx.clone();
+        db.write().set_event_sink(Box::new(move |ev| {
+            let _ = tx.send(ev);
+        }));
+    }
+    let state = AppState { db, watch: tx };
     Router::new()
         .route("/query", post(query))
         .route("/stats", get(stats))
         .route("/ingest", post(ingest))
         .route("/explain", get(explain))
         .route("/node/{key}/neighborhood", get(neighborhood))
-        .with_state(db)
+        .route("/watch", get(crate::ws::watch))
+        .with_state(state)
 }
 
 /// Bind `addr` (port 0 is ephemeral) and serve.
@@ -155,7 +170,7 @@ fn ingest_options(v: Option<&Js>) -> Result<IngestOptions, String> {
 }
 
 async fn query(
-    State(db): State<SharedDb>,
+    State(state): State<AppState>,
     Query(qs): Query<BTreeMap<String, String>>,
     Json(body): Json<Js>,
 ) -> Response {
@@ -170,7 +185,7 @@ async fn query(
     let format = qs.get("format").map(String::as_str).unwrap_or("");
 
     let rs = {
-        let g = db.read();
+        let g = state.db.read();
         g.query(&cypher, &params)
     };
     let rs = match rs {
@@ -193,9 +208,9 @@ async fn query(
     }
 }
 
-async fn stats(State(db): State<SharedDb>) -> Response {
+async fn stats(State(state): State<AppState>) -> Response {
     let snap = {
-        let g = db.read();
+        let g = state.db.read();
         g.stats()
     };
     match serde_json::to_value(&snap) {
@@ -204,7 +219,7 @@ async fn stats(State(db): State<SharedDb>) -> Response {
     }
 }
 
-async fn ingest(State(db): State<SharedDb>, Json(body): Json<Js>) -> Response {
+async fn ingest(State(state): State<AppState>, Json(body): Json<Js>) -> Response {
     let label = match body.get("label").and_then(Js::as_str) {
         Some(s) => s.to_string(),
         None => return err_response("missing label"),
@@ -222,7 +237,7 @@ async fn ingest(State(db): State<SharedDb>, Json(body): Json<Js>) -> Response {
         Err(e) => return err_response(e),
     };
     let report = {
-        let mut g = db.write();
+        let mut g = state.db.write();
         g.ingest_json(&label, &rows_json, &opts)
     };
     match report {
@@ -235,7 +250,7 @@ async fn ingest(State(db): State<SharedDb>, Json(body): Json<Js>) -> Response {
 }
 
 async fn explain(
-    State(db): State<SharedDb>,
+    State(state): State<AppState>,
     Query(qs): Query<BTreeMap<String, String>>,
 ) -> Response {
     let a = match qs.get("a") {
@@ -247,7 +262,7 @@ async fn explain(
         _ => return err_response("missing query param b"),
     };
     let out = {
-        let g = db.read();
+        let g = state.db.read();
         g.explain(&a, &b)
     };
     match out {
@@ -260,7 +275,7 @@ async fn explain(
 }
 
 async fn neighborhood(
-    State(db): State<SharedDb>,
+    State(state): State<AppState>,
     Path(key): Path<String>,
     Query(qs): Query<BTreeMap<String, String>>,
 ) -> Response {
@@ -278,7 +293,7 @@ async fn neighborhood(
         other => return err_response(format!("unknown dir: {other}")),
     };
     let rs = {
-        let g = db.read();
+        let g = state.db.read();
         match g.node_ref(&key) {
             Some(n) => Ok(n.neighborhood(depth, None, dir)),
             None => Err(GraphError::KeyNotFound { key: key.clone() }),

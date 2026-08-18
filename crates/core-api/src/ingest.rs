@@ -217,7 +217,7 @@ pub(crate) fn run<F: Fs>(
             props.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         batch.insert_node(label, key, prop_vec);
     }
-    batch.commit()?;
+    batch.commit_ingest(label, accepted.len())?;
 
     Ok(IngestReport {
         inserted: accepted.len(),
