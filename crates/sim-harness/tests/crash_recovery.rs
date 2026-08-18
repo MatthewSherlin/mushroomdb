@@ -1,7 +1,9 @@
-use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
+use core_api::{
+    AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, RuleStats, Stats, Value,
+};
 use core_storage::fs::Fs;
 use sim_harness::SimFs;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Original workload: 20 nodes + chain edges + one mid-workload snapshot.
 fn workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
@@ -23,8 +25,14 @@ fn workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
 
 /// Node keys used by `workload_with_rules`; constant for edge-set sweeps.
 const WORKLOAD_KEYS: &[&str] = &[
-    "n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9", "n10", "n11",
+    "n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9", "n10", "n11", "n12", "n13", "x0",
 ];
+
+/// Slot count after a complete `workload_with_rules` (12 original + batch
+/// n12/n13 + ingest x0; n6 is tombstoned but still a slot).
+const WORKLOAD_MAX_SLOTS: usize = 15;
+
+const WORKLOAD_ETYPES: &[&str] = &["E", "KM", "OV", "DUMMY", "ORG"];
 
 fn tags(items: &[&str]) -> Value {
     Value::List(items.iter().map(|s| Value::Str((*s).into())).collect())
@@ -43,6 +51,8 @@ fn tags(items: &[&str]) -> Value {
 ///   * snapshot() called while km and ov are both live.
 ///   * Three `set_prop` calls that retract and re-create KM edges (exercises the
 ///     prop-update rule-fire path post-snapshot).
+///   * Plan 4 tail: delete_edge, remove_prop, a 3-op batch, ingest+auto-FK,
+///     WAL-logged rebuild_rule, then delete_node of n6 (derived OV + KM).
 fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
     // --- 6 L0 nodes ---
     let l0_tags: &[&[&str]] = &[
@@ -137,6 +147,51 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
     // n2.f: "n8" → "n10" (retract n2→n8, create n2→n10; n4→n10 still exists)
     db.set_prop("n2", "f", Value::Str("n10".into()))?;
 
+    // --- Plan 4 mutations (post-snapshot WAL tail) ---
+    // User edge + delete_edge (not rule-owned).
+    db.insert_edge("E", "n0", "n1")?;
+    db.delete_edge("E", "n0", "n1")?;
+
+    // remove_prop of a dedicated field (does not disturb L0.f / L1.tags checks).
+    db.set_prop("n4", "tmp", Value::Int(1))?;
+    db.remove_prop("n4", "tmp")?;
+
+    // Small atomic batch: two nodes + a user edge.
+    db.batch()
+        .insert_node(
+            "L0",
+            "n12",
+            vec![
+                ("f".into(), Value::Str("n13".into())),
+                ("tags".into(), tags(&["batch"])),
+            ],
+        )
+        .insert_node("L1", "n13", vec![("tags".into(), tags(&["batch"]))])
+        .insert_edge("E", "n12", "n13")
+        .commit()?;
+
+    // Ingest as one Batch (auto-FK KeyMatch → n11 under L1).
+    let mut row = BTreeMap::new();
+    row.insert("id".into(), Value::Str("x0".into()));
+    row.insert("org_id".into(), Value::Str("n11".into()));
+    db.ingest(
+        "L2",
+        vec![row],
+        &IngestOptions {
+            key_field: "id".into(),
+            auto_fk: AutoFk::Auto {
+                suffix: "_id".into(),
+            },
+        },
+    )?;
+
+    // WAL-logged rebuild mid-stream (replay-consistent after T6).
+    db.rebuild_rule("km")?;
+
+    // delete_node of a node that currently owns derived OV edges (n6 ↔ n7, n6 ↔ n8)
+    // plus the KM inbound from n0 (n0.f is back on "n6").
+    db.delete_node("n6")?;
+
     Ok(())
 }
 
@@ -155,6 +210,90 @@ fn collect_rule_edges(db: &GraphDb<SimFs>, rule: &RuleDef) -> BTreeSet<(String, 
         }
     }
     set
+}
+
+fn collect_all_edges(db: &GraphDb<SimFs>) -> BTreeSet<(String, String, String)> {
+    let mut set = BTreeSet::new();
+    for key in WORKLOAD_KEYS {
+        if !db.has_node(key) {
+            continue;
+        }
+        for etype in WORKLOAD_ETYPES {
+            if let Ok(ns) = db.neighbors(key, etype, Direction::Out) {
+                for n in ns {
+                    set.insert((etype.to_string(), key.to_string(), n));
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Stats equality minus `fires`.
+///
+/// Parked T6 ruling: a crash between snapshot-write and WAL-truncation with a
+/// `RebuildRule` in the leftover WAL tail double-bumps the fires counter on
+/// replay. Edges / tripped / provenance-derived state are unaffected. Do not
+/// assert fires equality across that window — compare this projection instead.
+fn stats_minus_fires(stats: Stats) -> Stats {
+    Stats {
+        rules: stats
+            .rules
+            .into_iter()
+            .map(|r| RuleStats { fires: 0, ..r })
+            .collect(),
+        ..stats
+    }
+}
+
+fn assert_recovered_invariants(recovered: &mut GraphDb<SimFs>, label: &str) {
+    let n = recovered.node_count();
+    assert!(
+        n <= WORKLOAD_MAX_SLOTS,
+        "{label}: impossible node-slot count {n}"
+    );
+    for i in 0..6usize {
+        if recovered.has_node(&format!("n{i}")) {
+            assert!(
+                recovered.get_prop(&format!("n{i}"), "f").is_some(),
+                "{label}: L0 node n{i} exists but f prop is missing"
+            );
+        }
+    }
+    for i in 6..12usize {
+        if recovered.has_node(&format!("n{i}")) {
+            assert!(
+                recovered.get_prop(&format!("n{i}"), "tags").is_some(),
+                "{label}: L1 node n{i} exists but tags prop is missing"
+            );
+        }
+    }
+    // n6 is the planned delete_node target: if the delete landed, the key is gone.
+    // If it has not landed, n6 is still a live L1 with tags (checked above).
+
+    let edges_before = collect_all_edges(recovered);
+    let stats_before = stats_minus_fires(recovered.stats());
+    let rules = recovered.rules();
+    for rule in &rules {
+        let before = collect_rule_edges(recovered, rule);
+        recovered.rebuild_rule(&rule.name).unwrap();
+        let after = collect_rule_edges(recovered, rule);
+        assert_eq!(
+            before, after,
+            "{label}: rebuild_rule changed edges for rule {:?}",
+            rule.name
+        );
+    }
+    let edges_after = collect_all_edges(recovered);
+    assert_eq!(
+        edges_before, edges_after,
+        "{label}: rebuild_rule changed the full edge set"
+    );
+    assert_eq!(
+        stats_before,
+        stats_minus_fires(recovered.stats()),
+        "{label}: rebuild_rule changed stats (fires zeroed; parked T6 fires-skew)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -219,38 +358,9 @@ fn recovery_byte_sweep_rules() {
         // Invariant (a): open_with never panics or errors.
         let mut recovered = GraphDb::open_with(survivor).unwrap();
 
-        // Invariant (b): recovered state is internally consistent.
-        let n = recovered.node_count();
-        assert!(n <= 12, "crash_at={crash_at}: impossible node count {n}");
-        for i in 0..6usize {
-            if recovered.has_node(&format!("n{i}")) {
-                assert!(
-                    recovered.get_prop(&format!("n{i}"), "f").is_some(),
-                    "crash_at={crash_at}: L0 node n{i} exists but f prop is missing"
-                );
-            }
-        }
-        for i in 6..12usize {
-            if recovered.has_node(&format!("n{i}")) {
-                assert!(
-                    recovered.get_prop(&format!("n{i}"), "tags").is_some(),
-                    "crash_at={crash_at}: L1 node n{i} exists but tags prop is missing"
-                );
-            }
-        }
-
-        // Invariant (c): rebuild_rule is a no-op for every surviving rule.
-        let rules = recovered.rules();
-        for rule in &rules {
-            let before = collect_rule_edges(&recovered, rule);
-            recovered.rebuild_rule(&rule.name).unwrap();
-            let after = collect_rule_edges(&recovered, rule);
-            assert_eq!(
-                before, after,
-                "crash_at={crash_at}: rebuild_rule changed edges for rule {:?}",
-                rule.name
-            );
-        }
+        // Invariants (b)+(c): internally consistent + rebuild-is-noop.
+        // Stats compared with fires zeroed (parked T6 snapshot+RebuildRule skew).
+        assert_recovered_invariants(&mut recovered, &format!("crash_at={crash_at}"));
     }
 }
 
@@ -288,37 +398,8 @@ fn recovery_op_sweep_rules() {
         // Invariant (a): recovery never panics or errors.
         let mut recovered = GraphDb::open_with(survivor).unwrap();
 
-        // Invariant (b): recovered state is internally consistent.
-        let n = recovered.node_count();
-        assert!(n <= 12, "crash_op={crash_op}: impossible node count {n}");
-        for i in 0..6usize {
-            if recovered.has_node(&format!("n{i}")) {
-                assert!(
-                    recovered.get_prop(&format!("n{i}"), "f").is_some(),
-                    "crash_op={crash_op}: L0 node n{i} exists but f prop is missing"
-                );
-            }
-        }
-        for i in 6..12usize {
-            if recovered.has_node(&format!("n{i}")) {
-                assert!(
-                    recovered.get_prop(&format!("n{i}"), "tags").is_some(),
-                    "crash_op={crash_op}: L1 node n{i} exists but tags prop is missing"
-                );
-            }
-        }
-
-        // Invariant (c): rebuild_rule is a no-op for every surviving rule.
-        let rules = recovered.rules();
-        for rule in &rules {
-            let before = collect_rule_edges(&recovered, rule);
-            recovered.rebuild_rule(&rule.name).unwrap();
-            let after = collect_rule_edges(&recovered, rule);
-            assert_eq!(
-                before, after,
-                "crash_op={crash_op}: rebuild_rule changed edges for rule {:?}",
-                rule.name
-            );
-        }
+        // Invariants (b)+(c): internally consistent + rebuild-is-noop.
+        // Stats compared with fires zeroed (parked T6 snapshot+RebuildRule skew).
+        assert_recovered_invariants(&mut recovered, &format!("crash_op={crash_op}"));
     }
 }

@@ -1,7 +1,7 @@
 use crate::ingest::{IngestOptions, IngestReport};
 use core_query::cypher::{execute, lex, parse, plan, Params};
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
-use core_rules::{GraphMut, RuleDef, RuleEngine};
+use core_rules::{evaluate, GraphMut, NodeView, RuleDef, RuleEngine};
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{
@@ -553,8 +553,9 @@ impl<F: Fs> GraphDb<F> {
     }
 
     /// Delete a user edge. Returns `Ok(false)` (and does not log) if the edge
-    /// is absent. Unknown keys are `Err(KeyNotFound)`. Rule-owned edges are
-    /// `Err(RuleOwned)` — delete or change the owning rule instead.
+    /// is absent. Unknown keys are `Err(KeyNotFound)`. Rule-owned edges — in
+    /// provenance, or a pair a live rule would derive — are `Err(RuleOwned)`
+    /// (the rule would just put the edge back; delete or change the rule).
     pub fn delete_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
         if !MutPreview::new(self).prepare_delete_edge(edge_type, src_key, dst_key)? {
             return Ok(false);
@@ -1045,7 +1046,12 @@ impl<'a, F: Fs> MutPreview<'a, F> {
                 return Err(GraphError::KeyNotFound { key: k.into() });
             }
         }
-        if self.is_rule_owned(edge_type, src_key, dst_key) {
+        // Provenance-owned OR a live rule would derive this pair. User-first
+        // edges that a later rule matches are not in `owned`, but deleting
+        // them would leave a hole `rebuild_rule` immediately fills.
+        if self.is_rule_owned(edge_type, src_key, dst_key)
+            || self.would_derive(edge_type, src_key, dst_key)
+        {
             return Err(GraphError::RuleOwned {
                 detail: format!(
                     "edge {edge_type} {src_key}→{dst_key} is rule-owned; \
@@ -1054,6 +1060,78 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             });
         }
         Ok(self.has_edge(edge_type, src_key, dst_key))
+    }
+
+    /// True if any live rule (minus overlay-deleted names) would derive
+    /// `(edge_type, src, dst)` from current overlay-visible props/labels.
+    /// CreateRule names in `extra_rules` are ignored — same documented
+    /// same-batch rule-window as [`Self::is_rule_owned`].
+    fn would_derive(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
+        if src_key == dst_key {
+            return false;
+        }
+        let Some(src_label) = self.label_of(src_key) else {
+            return false;
+        };
+        let Some(dst_label) = self.label_of(dst_key) else {
+            return false;
+        };
+        for rule in self.db.engine.rules() {
+            if self.overlay.deleted_rules.contains(&rule.name) {
+                continue;
+            }
+            if rule.edge_type != edge_type {
+                continue;
+            }
+            if rule.src_label != src_label || rule.dst_label != dst_label {
+                continue;
+            }
+            let src_props = |f: &str| self.prop_value(src_key, f);
+            let dst_props = |f: &str| self.prop_value(dst_key, f);
+            let src_view = NodeView {
+                key: src_key,
+                props: &src_props,
+            };
+            let dst_view = NodeView {
+                key: dst_key,
+                props: &dst_props,
+            };
+            if evaluate(&rule.predicate, &src_view, &dst_view).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn label_of(&self, key: &str) -> Option<String> {
+        if self.overlay.deleted_keys.contains(key) {
+            return None;
+        }
+        // Fresh identities created in this batch have no stored label in the
+        // overlay; they cannot be provenance-owned yet either.
+        let id = self.db.ids.get(key)?;
+        let sym = self.db.labels.get(id as usize).copied()?;
+        if sym == u32::MAX {
+            return None;
+        }
+        self.db.syms.resolve(sym).map(str::to_string)
+    }
+
+    fn prop_value(&self, key: &str, field: &str) -> Option<Value> {
+        if !self.has_key(key) {
+            return None;
+        }
+        let k = (key.to_string(), field.to_string());
+        if self.overlay.removed_props.contains(&k) {
+            return None;
+        }
+        if let Some(v) = self.overlay.extra_props.get(&k) {
+            return Some(v.clone());
+        }
+        if self.overlay.extra_keys.contains(key) {
+            return None;
+        }
+        self.db.get_prop(key, field).cloned()
     }
 
     fn check_create_rule(&self, def: &RuleDef) -> Result<()> {

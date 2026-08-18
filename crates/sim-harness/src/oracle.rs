@@ -3,7 +3,7 @@ use core_rules::{evaluate, NodeView, RuleDef};
 use std::collections::{BTreeSet, HashMap};
 
 /// Obviously-correct reference. No ids, no interning, no persistence.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Oracle {
     nodes: HashMap<String, HashMap<String, Value>>, // key -> props
     labels: HashMap<String, String>,                // key -> label
@@ -159,6 +159,45 @@ impl Oracle {
         out
     }
 
+    /// Remove a live node and every user edge touching it. The key is gone
+    /// (`has_node` is false). Re-inserting the same key is a fresh identity:
+    /// a new slot is appended to `node_order` so remaining nodes keep their
+    /// dense-id ranks (the vacated slot is a tombstone). Derived edges are
+    /// not stored — `all_edges` recomputes from live nodes, so retraction is
+    /// automatic.
+    pub fn delete_node(&mut self, key: &str) -> bool {
+        if self.nodes.remove(key).is_none() {
+            return false;
+        }
+        self.labels.remove(key);
+        self.edges.retain(|(_, s, d)| s != key && d != key);
+        true
+    }
+
+    /// Delete a user edge. `None` = a key is missing (`KeyNotFound`).
+    /// `Some(None)` = a live rule would derive this pair (`RuleOwned`) —
+    /// mirrors the engine: the rule would just put the edge back.
+    /// `Some(Some(removed))` = user-edge outcome (`true` deleted, `false` absent).
+    pub fn delete_edge(&mut self, etype: &str, src: &str, dst: &str) -> Option<Option<bool>> {
+        if !self.nodes.contains_key(src) || !self.nodes.contains_key(dst) {
+            return None;
+        }
+        if self.is_derived_edge(etype, src, dst) {
+            return Some(None);
+        }
+        Some(Some(self.edges.remove(&(
+            etype.into(),
+            src.into(),
+            dst.into(),
+        ))))
+    }
+
+    /// Remove a property. `None` = unknown key; `Some(false)` = field already
+    /// absent; `Some(true)` = removed. Retraction falls out of `all_edges`.
+    pub fn remove_prop(&mut self, key: &str, field: &str) -> Option<bool> {
+        Some(self.nodes.get_mut(key)?.remove(field).is_some())
+    }
+
     /// Returns true if (etype, src_key, dst_key) would be derived by any live rule
     /// given current node props and labels.
     pub fn is_derived_edge(&self, etype: &str, src_key: &str, dst_key: &str) -> bool {
@@ -198,5 +237,71 @@ impl Oracle {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_rules::{Predicate, RuleDef};
+
+    fn fe_rule() -> RuleDef {
+        RuleDef {
+            name: "r".into(),
+            src_label: "L".into(),
+            dst_label: "L".into(),
+            predicate: Predicate::FieldEqual { field: "f".into() },
+            edge_type: "FE".into(),
+            weight_prop: None,
+            max_edges: None,
+        }
+    }
+
+    #[test]
+    fn delete_node_drops_edges_and_reinsert_is_fresh() {
+        let mut o = Oracle::new();
+        assert!(o.insert_node("L", "a", &[]));
+        assert!(o.insert_node("L", "b", &[]));
+        assert_eq!(o.insert_edge("E", "a", "b"), Some(true));
+        assert!(o.delete_node("a"));
+        assert!(!o.has_node("a"));
+        assert!(o.has_node("b"));
+        assert!(!o.has_user_edge("E", "a", "b"));
+        assert!(o.all_edges().is_empty());
+        // key gone → re-insert is a new identity; old user edges do not return
+        assert!(o.insert_node("L", "a", &[]));
+        assert!(o.has_node("a"));
+        assert!(!o.has_user_edge("E", "a", "b"));
+        assert_eq!(o.node_count(), 2);
+        assert_eq!(o.node_order.len(), 3);
+    }
+
+    #[test]
+    fn delete_edge_rule_owned_when_live_rule_would_derive() {
+        let mut o = Oracle::new();
+        let props = vec![("f".into(), Value::Int(1))];
+        assert!(o.insert_node("L", "a", &props));
+        assert!(o.insert_node("L", "b", &props));
+        assert!(o.create_rule(fe_rule()));
+        assert!(o.is_derived_edge("FE", "a", "b"));
+        assert_eq!(o.delete_edge("FE", "a", "b"), Some(None));
+        assert!(o
+            .all_edges()
+            .contains(&("FE".into(), "a".into(), "b".into())));
+    }
+
+    #[test]
+    fn remove_prop_retracts_via_recompute() {
+        let mut o = Oracle::new();
+        let props = vec![("f".into(), Value::Int(1))];
+        assert!(o.insert_node("L", "a", &props));
+        assert!(o.insert_node("L", "b", &props));
+        assert!(o.create_rule(fe_rule()));
+        assert_eq!(o.all_edges().len(), 2);
+        assert_eq!(o.remove_prop("a", "f"), Some(true));
+        assert_eq!(o.get_prop("a", "f"), None);
+        assert!(o.all_edges().is_empty());
+        assert_eq!(o.remove_prop("a", "f"), Some(false));
+        assert_eq!(o.remove_prop("missing", "f"), None);
     }
 }
