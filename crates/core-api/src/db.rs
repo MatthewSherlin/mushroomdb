@@ -7,10 +7,11 @@ use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{
     ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
 };
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Database-wide counters plus per-rule budget/fire stats.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Stats {
     pub nodes_live: usize,
     pub nodes_tombstoned: usize,
@@ -25,7 +26,7 @@ pub struct Stats {
 /// set then fits). `fires` counts `on_node_changed` evaluations plus
 /// backfill/rebuild participant ticks (rebuild counts even when it is a
 /// provenance no-op).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuleStats {
     pub name: String,
     pub edges: u64,
@@ -35,7 +36,7 @@ pub struct RuleStats {
 
 /// One rule-owned edge between two nodes, with the rule name, edge type,
 /// direction (src_key → dst_key), and weight if the rule stores one.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct Explanation {
     pub rule: String,
     pub edge_type: String,

@@ -1,0 +1,19 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+core-api = { path = "../core-api" }
+arrow-bridge = { path = "../arrow-bridge" }
+# ws enabled now so Task 5 can add GET /watch without a dep bump.
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# oneshot ServiceExt — axum re-exports tower types but not the util trait.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+arrow-ipc = { version = "59", default-features = false }
+arrow-array = { version = "59", default-features = false }

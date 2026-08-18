@@ -9,4 +9,5 @@ core-storage = { path = "../core-storage" }
 core-rules = { path = "../core-rules" }
 core-query = { path = "../core-query" }
 bincode = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }

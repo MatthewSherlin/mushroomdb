@@ -2,6 +2,7 @@ use crate::db::GraphDb;
 use core_rules::{Predicate, RuleDef};
 use core_storage::fs::Fs;
 use core_storage::{GraphError, Result, Value};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Options for [`GraphDb::ingest`].
@@ -42,7 +43,7 @@ impl Default for AutoFk {
 }
 
 /// One auto-FK field that was not turned into a rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FkSkip {
     pub field: String,
     pub reason: String,
@@ -50,7 +51,7 @@ pub struct FkSkip {
 
 /// Outcome of one [`GraphDb::ingest`] call. Row-level issues are collected here;
 /// a commit-level `Err` means nothing was applied.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IngestReport {
     pub inserted: usize,
     pub row_errors: Vec<(usize, String)>,
