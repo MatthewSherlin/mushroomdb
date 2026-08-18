@@ -179,3 +179,63 @@ fn explain_reports_rule_provenance_and_weights() {
         Err(GraphError::KeyNotFound { .. })
     ));
 }
+
+#[test]
+fn explain_predicate_summary_key_match_and_all() {
+    let dir = tmp("explain-pred");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "o1", vec![("ind".into(), Value::Str("arch".into()))])
+        .unwrap();
+    db.create_rule(fk_rule()).unwrap();
+    db.create_rule(RuleDef {
+        name: "both".into(),
+        src_label: "Person".into(),
+        dst_label: "Org".into(),
+        predicate: Predicate::All(vec![
+            Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+            Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            },
+        ]),
+        edge_type: "BOTH".into(),
+        weight_prop: Some("score".into()),
+        max_edges: None,
+    })
+    .unwrap();
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![
+            ("org_id".into(), Value::Str("o1".into())),
+            ("ind".into(), Value::Str("arch".into())),
+            ("tags".into(), Value::List(vec![Value::Str("x".into())])),
+        ],
+    )
+    .unwrap();
+    // Overlap needs tags on both sides
+    db.set_prop("o1", "tags", Value::List(vec![Value::Str("x".into())]))
+        .unwrap();
+
+    let ex = db.explain("p1", "o1").unwrap();
+    let km = ex.iter().find(|e| e.rule == "works_at").unwrap();
+    assert_eq!(km.predicate.kind, "key_match");
+    assert_eq!(km.predicate.fields, vec!["org_id".to_string()]);
+    assert!(km.predicate.parts.is_none());
+
+    let all = ex.iter().find(|e| e.rule == "both").unwrap();
+    assert_eq!(all.predicate.kind, "all");
+    assert_eq!(
+        all.predicate.fields,
+        vec!["ind".to_string(), "tags".to_string()]
+    );
+    let parts = all.predicate.parts.as_ref().expect("all has parts");
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].kind, "field_equal");
+    assert_eq!(parts[0].fields, vec!["ind".to_string()]);
+    assert_eq!(parts[1].kind, "overlap");
+    assert_eq!(parts[1].fields, vec!["tags".to_string()]);
+    assert_eq!(parts[1].min, Some(0.5));
+}

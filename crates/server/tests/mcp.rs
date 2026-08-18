@@ -288,6 +288,8 @@ fn tools_call_happy_path_for_each_tool() {
     assert_eq!(expl[0]["edge_type"], json!("WORKS_AT"));
     assert_eq!(expl[0]["src_key"], json!("p1"));
     assert_eq!(expl[0]["dst_key"], json!("acme"));
+    assert_eq!(expl[0]["predicate"]["kind"], json!("key_match"));
+    assert_eq!(expl[0]["predicate"]["fields"], json!(["org_id"]));
 
     let stats = content_json(&replies[3]);
     assert!(stats["nodes_live"].as_u64().unwrap() >= 3);
@@ -368,6 +370,8 @@ fn agent_memory_loop() {
     assert_eq!(expl[0]["src_key"], json!("p1"));
     assert_eq!(expl[0]["dst_key"], json!("acme"));
     assert_eq!(expl[0]["weight"], Js::Null);
+    assert_eq!(expl[0]["predicate"]["kind"], json!("key_match"));
+    assert_eq!(expl[0]["predicate"]["fields"], json!(["org_id"]));
 }
 
 /// Binding: a malformed line is -32700; the next valid request still works.

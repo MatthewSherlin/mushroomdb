@@ -4,8 +4,8 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use core_api::{
-    json_to_value, Explanation, FkSkip, IngestReport, Predicate, RuleDef, RuleStats, SharedDb,
-    Stats, Value,
+    json_to_value, Explanation, FkSkip, IngestReport, Predicate, PredicateSummary, RuleDef,
+    RuleStats, SharedDb, Stats, Value,
 };
 use serde_json::{json, Value as Json};
 use server::{router, router_with_ui, serve};
@@ -275,6 +275,62 @@ async fn explain_happy_path() {
     assert_eq!(v[0]["src_key"], json!("p1"));
     assert_eq!(v[0]["dst_key"], json!("o1"));
     assert_eq!(v[0]["weight"], Json::Null);
+    assert_eq!(v[0]["predicate"]["kind"], json!("key_match"));
+    assert_eq!(v[0]["predicate"]["fields"], json!(["org_id"]));
+}
+
+/// Binding: /explain JSON includes `predicate` with snake_case kind and parts.
+#[tokio::test]
+async fn explain_predicate_all_json_shape() {
+    let (app, db) = open("explain-all");
+    {
+        let mut w = db.write();
+        w.insert_node(
+            "Org",
+            "o1",
+            vec![
+                ("ind".into(), Value::Str("arch".into())),
+                ("tags".into(), Value::List(vec![Value::Str("x".into())])),
+            ],
+        )
+        .unwrap();
+        w.create_rule(RuleDef {
+            name: "both".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: Predicate::All(vec![
+                Predicate::FieldEqual {
+                    field: "ind".into(),
+                },
+                Predicate::Overlap {
+                    field: "tags".into(),
+                    min: 0.5,
+                },
+            ]),
+            edge_type: "BOTH".into(),
+            weight_prop: Some("score".into()),
+            max_edges: None,
+        })
+        .unwrap();
+        w.insert_node(
+            "Person",
+            "p1",
+            vec![
+                ("ind".into(), Value::Str("arch".into())),
+                ("tags".into(), Value::List(vec![Value::Str("x".into())])),
+            ],
+        )
+        .unwrap();
+    }
+
+    let (status, body, _) = send(app, get("/explain?a=p1&b=o1")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(v[0]["predicate"]["kind"], json!("all"));
+    assert_eq!(v[0]["predicate"]["fields"], json!(["ind", "tags"]));
+    assert_eq!(v[0]["predicate"]["parts"][0]["kind"], json!("field_equal"));
+    assert_eq!(v[0]["predicate"]["parts"][1]["kind"], json!("overlap"));
+    assert_eq!(v[0]["predicate"]["parts"][1]["min"], json!(0.5));
 }
 
 /// Binding: unknown explain key is 400 {"error": ...}.
@@ -465,6 +521,7 @@ fn wire_types_serialize() {
         src_key: "a".into(),
         dst_key: "b".into(),
         weight: Some(0.5),
+        predicate: PredicateSummary::from(&Predicate::KeyMatch { field: "fk".into() }),
     })
     .unwrap();
     assert_eq!(

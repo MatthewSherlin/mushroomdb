@@ -1,13 +1,13 @@
 use crate::ingest::{IngestOptions, IngestReport};
 use core_query::cypher::{execute, lex, parse, plan, Params};
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
-use core_rules::{evaluate, GraphMut, NodeView, RuleDef, RuleEngine};
+use core_rules::{evaluate, GraphMut, NodeView, Predicate, RuleDef, RuleEngine};
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{
     ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A post-commit mutation notification.
@@ -147,6 +147,92 @@ pub struct RuleStats {
     pub fires: u64,
 }
 
+/// Wire summary of a [`Predicate`]. JSON only — `Explanation` is never
+/// bincode-persisted (WAL/snapshots store `RuleDef` bytes, not this type).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredicateSummary {
+    pub kind: String,
+    pub fields: Vec<String>,
+    pub min: Option<f64>,
+    pub tolerance: Option<f64>,
+    pub km: Option<f64>,
+    pub parts: Option<Vec<PredicateSummary>>,
+}
+
+impl From<&Predicate> for PredicateSummary {
+    fn from(p: &Predicate) -> Self {
+        match p {
+            Predicate::KeyMatch { field } => PredicateSummary {
+                kind: "key_match".into(),
+                fields: vec![field.clone()],
+                min: None,
+                tolerance: None,
+                km: None,
+                parts: None,
+            },
+            Predicate::FieldEqual { field } => PredicateSummary {
+                kind: "field_equal".into(),
+                fields: vec![field.clone()],
+                min: None,
+                tolerance: None,
+                km: None,
+                parts: None,
+            },
+            Predicate::Overlap { field, min } => PredicateSummary {
+                kind: "overlap".into(),
+                fields: vec![field.clone()],
+                min: Some(*min),
+                tolerance: None,
+                km: None,
+                parts: None,
+            },
+            Predicate::NumericWithin { field, tolerance } => PredicateSummary {
+                kind: "numeric_within".into(),
+                fields: vec![field.clone()],
+                min: None,
+                tolerance: Some(*tolerance),
+                km: None,
+                parts: None,
+            },
+            Predicate::GeoRadius { field, km } => PredicateSummary {
+                kind: "geo_radius".into(),
+                fields: vec![field.clone()],
+                min: None,
+                tolerance: None,
+                km: Some(*km),
+                parts: None,
+            },
+            Predicate::VectorSimilar { field, min } => PredicateSummary {
+                kind: "vector_similar".into(),
+                fields: vec![field.clone()],
+                min: Some(*min),
+                tolerance: None,
+                km: None,
+                parts: None,
+            },
+            Predicate::All(inner) => {
+                let parts: Vec<PredicateSummary> = inner.iter().map(Self::from).collect();
+                let mut fields = Vec::new();
+                for part in &parts {
+                    for f in &part.fields {
+                        if !fields.contains(f) {
+                            fields.push(f.clone());
+                        }
+                    }
+                }
+                PredicateSummary {
+                    kind: "all".into(),
+                    fields,
+                    min: None,
+                    tolerance: None,
+                    km: None,
+                    parts: Some(parts),
+                }
+            }
+        }
+    }
+}
+
 /// One rule-owned edge between two nodes, with the rule name, edge type,
 /// direction (src_key → dst_key), and weight if the rule stores one.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -156,6 +242,7 @@ pub struct Explanation {
     pub src_key: String,
     pub dst_key: String,
     pub weight: Option<f64>,
+    pub predicate: PredicateSummary,
 }
 
 /// Single construction point for a `GraphMut` view over the split-borrowed graph fields.
@@ -929,6 +1016,7 @@ impl<F: Fs> GraphDb<F> {
                     src_key,
                     dst_key,
                     weight,
+                    predicate: PredicateSummary::from(&rule_def.predicate),
                 });
             }
         }
