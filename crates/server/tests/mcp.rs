@@ -135,9 +135,9 @@ fn handshake_initialize_then_initialized_is_silent() {
     );
 }
 
-/// Binding: tools/list returns exactly the five tools with the specified schemas.
+/// Binding: tools/list returns exactly the seven tools with the specified schemas.
 #[test]
-fn tools_list_returns_five_tools_with_schemas() {
+fn tools_list_returns_seven_tools_with_schemas() {
     let stdin = req(json!(1), "tools/list", None);
     let (res, out) = exchange(open("list"), &stdin);
     assert!(res.is_ok(), "{res:?}");
@@ -152,9 +152,17 @@ fn tools_list_returns_five_tools_with_schemas() {
         .collect();
     assert_eq!(
         names,
-        BTreeSet::from(["query", "ingest_json", "explain", "stats", "neighborhood"])
+        BTreeSet::from([
+            "query",
+            "ingest_json",
+            "explain",
+            "stats",
+            "neighborhood",
+            "node_info",
+            "node_edges"
+        ])
     );
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 7);
 
     let by_name = |n: &str| {
         tools
@@ -205,6 +213,16 @@ fn tools_list_returns_five_tools_with_schemas() {
     assert!(nb["inputSchema"]["properties"].get("edge_types").is_some());
     assert!(nb["inputSchema"]["properties"].get("direction").is_some());
     assert_eq!(nb["inputSchema"]["required"], json!(["key"]));
+
+    let info = by_name("node_info");
+    assert_eq!(info["inputSchema"]["type"], "object");
+    assert!(info["inputSchema"]["properties"].get("key").is_some());
+    assert_eq!(info["inputSchema"]["required"], json!(["key"]));
+
+    let edges = by_name("node_edges");
+    assert_eq!(edges["inputSchema"]["type"], "object");
+    assert!(edges["inputSchema"]["properties"].get("key").is_some());
+    assert_eq!(edges["inputSchema"]["required"], json!(["key"]));
 }
 
 /// Binding: tools/call happy path for each of the five tools against a seeded db.
@@ -297,6 +315,83 @@ fn tools_call_happy_path_for_each_tool() {
     let nb = content_json(&replies[4]);
     assert_eq!(nb["columns"], json!(["key", "label", "depth"]));
     assert_eq!(nb["rows"], json!([["p2", "Person", 1]]));
+}
+
+/// Binding: node_info / node_edges MCP payloads match the HTTP wire shapes.
+#[test]
+fn node_info_and_edges_tool_parity() {
+    let db = open("node-tools");
+    {
+        let mut w = db.write();
+        w.insert_node("Org", "acme", vec![]).unwrap();
+        w.create_rule(core_api::RuleDef {
+            name: "works_at".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: core_api::Predicate::KeyMatch {
+                field: "org_id".into(),
+            },
+            edge_type: "WORKS_AT".into(),
+            weight_prop: None,
+            max_edges: None,
+        })
+        .unwrap();
+        w.insert_node(
+            "Person",
+            "p1",
+            vec![
+                ("id".into(), Value::Str("p1".into())),
+                ("org_id".into(), Value::Str("acme".into())),
+            ],
+        )
+        .unwrap();
+        w.insert_node("Person", "p2", vec![]).unwrap();
+        w.insert_edge("KNOWS", "p1", "p2").unwrap();
+    }
+
+    let stdin = format!(
+        "{}{}{}",
+        call(1, "node_info", json!({"key": "p1"})),
+        call(2, "node_edges", json!({"key": "p1"})),
+        call(3, "node_info", json!({"key": "ghost"})),
+    );
+    let (res, out) = exchange(db, &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    assert_eq!(replies.len(), 3);
+
+    let info = content_json(&replies[0]);
+    assert_eq!(info["key"], json!("p1"));
+    assert_eq!(info["label"], json!("Person"));
+    assert_eq!(info["props"]["id"], json!("p1"));
+    assert_eq!(info["props"]["org_id"], json!("acme"));
+
+    let edges = content_json(&replies[1]);
+    assert_eq!(
+        edges,
+        json!({
+            "edges": [
+                {
+                    "edge_type": "KNOWS",
+                    "src_key": "p1",
+                    "dst_key": "p2",
+                    "derived": false
+                },
+                {
+                    "edge_type": "WORKS_AT",
+                    "src_key": "p1",
+                    "dst_key": "acme",
+                    "derived": true
+                }
+            ]
+        })
+    );
+
+    assert_eq!(replies[2]["result"]["isError"], json!(true));
+    let msg = replies[2]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert_eq!(msg, "node key not found: ghost");
 }
 
 /// Marquee: ingest through MCP → query through MCP → explain shows auto-FK provenance.

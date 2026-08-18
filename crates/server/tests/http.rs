@@ -431,6 +431,123 @@ async fn neighborhood_edge_types_filter() {
     );
 }
 
+/// Binding: GET /node/{key} is NodeInfo JSON with untagged Value props.
+#[tokio::test]
+async fn node_info_json_shape() {
+    let (app, db) = open("node-info");
+    {
+        let mut w = db.write();
+        w.insert_node(
+            "Person",
+            "p1",
+            vec![
+                ("years".into(), Value::Int(8)),
+                ("name".into(), Value::Str("ada".into())),
+                ("ok".into(), Value::Bool(true)),
+                ("rating".into(), Value::Float(0.5)),
+                (
+                    "tags".into(),
+                    Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]),
+                ),
+            ],
+        )
+        .unwrap();
+    }
+
+    let (status, body, ctype) = send(app, get("/node/p1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ctype.as_deref(), Some("application/json"));
+    let v = parse_json(&body);
+    assert_eq!(v["key"], json!("p1"));
+    assert_eq!(v["label"], json!("Person"));
+    assert_eq!(v["props"]["name"], json!("ada"));
+    assert_eq!(v["props"]["ok"], json!(true));
+    assert_eq!(v["props"]["years"], json!(8));
+    assert_eq!(v["props"]["rating"], json!(0.5));
+    assert_eq!(v["props"]["tags"], json!(["x", "y"]));
+    let keys: Vec<&str> = v["props"]
+        .as_object()
+        .expect("props object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["name", "ok", "rating", "tags", "years"]);
+}
+
+/// Binding: unknown GET /node/{key} is 404 {"error":"node key not found: ..."}.
+#[tokio::test]
+async fn node_info_unknown_key_is_404() {
+    let (app, _) = open("node-info-miss");
+    let (status, body, _) = send(app, get("/node/ghost")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let v = parse_json(&body);
+    assert_eq!(v, json!({"error": "node key not found: ghost"}));
+}
+
+/// Binding: GET /node/{key}/edges is {"edges":[EdgeInfo...]} with derived flags, sorted.
+#[tokio::test]
+async fn node_edges_json_shape_user_and_derived() {
+    let (app, db) = open("node-edges");
+    {
+        let mut w = db.write();
+        w.insert_node("Org", "acme", vec![]).unwrap();
+        w.create_rule(core_api::RuleDef {
+            name: "works_at".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: core_api::Predicate::KeyMatch {
+                field: "org_id".into(),
+            },
+            edge_type: "WORKS_AT".into(),
+            weight_prop: None,
+            max_edges: None,
+        })
+        .unwrap();
+        w.insert_node(
+            "Person",
+            "p1",
+            vec![("org_id".into(), Value::Str("acme".into()))],
+        )
+        .unwrap();
+        w.insert_node("Person", "p2", vec![]).unwrap();
+        w.insert_edge("KNOWS", "p1", "p2").unwrap();
+    }
+
+    let (status, body, ctype) = send(app, get("/node/p1/edges")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ctype.as_deref(), Some("application/json"));
+    let v = parse_json(&body);
+    assert_eq!(
+        v,
+        json!({
+            "edges": [
+                {
+                    "edge_type": "KNOWS",
+                    "src_key": "p1",
+                    "dst_key": "p2",
+                    "derived": false
+                },
+                {
+                    "edge_type": "WORKS_AT",
+                    "src_key": "p1",
+                    "dst_key": "acme",
+                    "derived": true
+                }
+            ]
+        })
+    );
+}
+
+/// Binding: unknown GET /node/{key}/edges is 404 {"error":"node key not found: ..."}.
+#[tokio::test]
+async fn node_edges_unknown_key_is_404() {
+    let (app, _) = open("node-edges-miss");
+    let (status, body, _) = send(app, get("/node/ghost/edges")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let v = parse_json(&body);
+    assert_eq!(v, json!({"error": "node key not found: ghost"}));
+}
+
 /// Binding: unknown neighborhood key is 400.
 #[tokio::test]
 async fn neighborhood_unknown_key_is_400() {

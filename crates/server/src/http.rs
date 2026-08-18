@@ -10,7 +10,7 @@
 //! the sink and terminates every existing subscriber with
 //! [`tokio::sync::broadcast::error::RecvError::Closed`].
 
-use crate::json::{params_from_json, result_set_json};
+use crate::json::{node_edges_json, node_info_json, params_from_json, result_set_json};
 use crate::AppState;
 use arrow_bridge::to_ipc_bytes;
 use axum::extract::{Path, Query, State};
@@ -64,6 +64,8 @@ pub fn router(db: SharedDb) -> Router {
         .route("/stats", get(stats))
         .route("/ingest", post(ingest))
         .route("/explain", get(explain))
+        .route("/node/{key}", get(node_info))
+        .route("/node/{key}/edges", get(node_edges))
         .route("/node/{key}/neighborhood", get(neighborhood))
         .route("/watch", get(crate::ws::watch))
         .with_state(state)
@@ -129,6 +131,14 @@ fn graph_err(e: GraphError) -> Response {
         other => other.to_string(),
     };
     err_response(detail)
+}
+
+fn key_not_found(key: String) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": GraphError::KeyNotFound { key }.to_string()})),
+    )
+        .into_response()
 }
 
 fn json_ok(value: Js) -> Response {
@@ -273,6 +283,29 @@ async fn explain(
             Ok(j) => json_ok(j),
             Err(e) => err_response(e.to_string()),
         },
+        Err(e) => graph_err(e),
+    }
+}
+
+async fn node_info(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    let info = {
+        let g = state.db.read();
+        g.node_info(&key)
+    };
+    match info {
+        Some(info) => json_ok(node_info_json(&info)),
+        None => key_not_found(key),
+    }
+}
+
+async fn node_edges(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    let out = {
+        let g = state.db.read();
+        g.node_edges(&key)
+    };
+    match out {
+        Ok(edges) => json_ok(node_edges_json(&edges)),
+        Err(GraphError::KeyNotFound { key }) => key_not_found(key),
         Err(e) => graph_err(e),
     }
 }

@@ -9,7 +9,7 @@
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
 //!   `serverInfo.name` `"graph-db"`
 //! - `notifications/initialized` — ignored
-//! - `tools/list` — the five tools below, each with a JSON Schema
+//! - `tools/list` — the seven tools below, each with a JSON Schema
 //! - `tools/call` — dispatch; success is
 //!   `{content:[{type:"text", text:<json string>}]}`
 //!
@@ -39,7 +39,7 @@
 //!
 //! EOF on `reader` returns `Ok(())`. Read/write I/O errors propagate.
 
-use crate::json::{params_from_json, result_set_json};
+use crate::json::{node_edges_json, node_info_json, params_from_json, result_set_json};
 use core_api::{AutoFk, Dir, GraphError, IngestOptions, SharedDb};
 use serde_json::{json, Value as Js};
 use std::io::{self, BufRead, Write};
@@ -149,6 +149,8 @@ fn dispatch_call(db: &SharedDb, params: Option<&Js>) -> CallOutcome {
         "explain" => tool_explain(db, args),
         "stats" => tool_stats(db),
         "neighborhood" => tool_neighborhood(db, args),
+        "node_info" => tool_node_info(db, args),
+        "node_edges" => tool_node_edges(db, args),
         _ => protocol_invalid(),
     }
 }
@@ -305,6 +307,36 @@ fn tool_neighborhood(db: &SharedDb, args: &Js) -> CallOutcome {
     }
 }
 
+fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
+    let Some(key) = args.get("key").and_then(Js::as_str) else {
+        return CallOutcome::ToolErr("missing key".into());
+    };
+    let info = {
+        let g = db.read();
+        g.node_info(key)
+    };
+    match info {
+        Some(info) => CallOutcome::ToolOk(node_info_json(&info)),
+        None => CallOutcome::ToolErr(graph_err_msg(GraphError::KeyNotFound {
+            key: key.to_string(),
+        })),
+    }
+}
+
+fn tool_node_edges(db: &SharedDb, args: &Js) -> CallOutcome {
+    let Some(key) = args.get("key").and_then(Js::as_str) else {
+        return CallOutcome::ToolErr("missing key".into());
+    };
+    let out = {
+        let g = db.read();
+        g.node_edges(key)
+    };
+    match out {
+        Ok(edges) => CallOutcome::ToolOk(node_edges_json(&edges)),
+        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+    }
+}
+
 fn graph_err_msg(e: GraphError) -> String {
     match e {
         GraphError::QueryError { detail } | GraphError::IngestError { detail } => detail,
@@ -391,6 +423,28 @@ fn tools_list() -> Js {
                             "type": "string",
                             "enum": ["out", "in", "both"]
                         }
+                    },
+                    "required": ["key"]
+                }
+            },
+            {
+                "name": "node_info",
+                "description": "Return a node's key, label, and properties.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string" }
+                    },
+                    "required": ["key"]
+                }
+            },
+            {
+                "name": "node_edges",
+                "description": "Return all edges incident on a node key.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string" }
                     },
                     "required": ["key"]
                 }

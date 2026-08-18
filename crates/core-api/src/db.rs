@@ -233,6 +233,29 @@ impl From<&Predicate> for PredicateSummary {
     }
 }
 
+/// Snapshot of a live node's key, label, and columnar properties.
+///
+/// `props` is a [`BTreeMap`] so field order is deterministic (sorted by name)
+/// regardless of insert order or the columnar store's `HashMap` iteration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeInfo {
+    pub key: String,
+    pub label: String,
+    pub props: BTreeMap<String, Value>,
+}
+
+/// One directed edge incident on a node, with provenance membership.
+///
+/// `derived` is true iff `(edge_type, src, dst)` is in the rule engine's
+/// Plan-8 `by_node` provenance index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EdgeInfo {
+    pub edge_type: String,
+    pub src_key: String,
+    pub dst_key: String,
+    pub derived: bool,
+}
+
 /// One rule-owned edge between two nodes, with the rule name, edge type,
 /// direction (src_key → dst_key), and weight if the rule stores one.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -926,6 +949,83 @@ impl<F: Fs> GraphDb<F> {
     pub fn node_ref(&self, key: &str) -> Option<NodeRef<'_, F>> {
         let id = self.ids.get(key)?;
         Some(NodeRef { db: self, id })
+    }
+
+    /// Live node's key, label, and columnar props. Unknown or tombstoned → `None`.
+    pub fn node_info(&self, key: &str) -> Option<NodeInfo> {
+        let n = self.node_ref(key)?;
+        Some(NodeInfo {
+            key: n.key().to_string(),
+            label: n.label().to_string(),
+            props: n.props(),
+        })
+    }
+
+    /// Every directed edge incident on `key`, both directions, every etype.
+    ///
+    /// Walk is `topology.etypes()` × `{Out, In}` × `neighbors()`. `derived` is
+    /// membership in [`RuleEngine::provenance_touching`] (O(degree) via the
+    /// Plan-8 `by_node` index). Sorted by `(edge_type, src_key, dst_key)`.
+    /// Unknown key → [`GraphError::KeyNotFound`].
+    pub fn node_edges(&self, key: &str) -> Result<Vec<EdgeInfo>> {
+        let id = self
+            .ids
+            .get(key)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+        let derived: BTreeSet<(u32, u32, u32)> = self
+            .engine
+            .provenance_touching(id)
+            .map(|(_rule, etype, src, dst)| (etype, src, dst))
+            .collect();
+        let mut edges = Vec::new();
+        for etype in self.topo.etypes() {
+            let edge_type = self
+                .syms
+                .resolve(etype)
+                .expect("topology etype is interned")
+                .to_string();
+            for dir in [Direction::Out, Direction::In] {
+                for &nbr in self.topo.neighbors(etype, dir, id) {
+                    let (src, dst, src_key, dst_key) = match dir {
+                        Direction::Out => (
+                            id,
+                            nbr,
+                            key.to_string(),
+                            self.ids
+                                .key_of(nbr)
+                                .ok_or_else(|| GraphError::Corrupt {
+                                    detail: format!("topology id {nbr} has no key"),
+                                })?
+                                .to_string(),
+                        ),
+                        Direction::In => (
+                            nbr,
+                            id,
+                            self.ids
+                                .key_of(nbr)
+                                .ok_or_else(|| GraphError::Corrupt {
+                                    detail: format!("topology id {nbr} has no key"),
+                                })?
+                                .to_string(),
+                            key.to_string(),
+                        ),
+                    };
+                    edges.push(EdgeInfo {
+                        edge_type: edge_type.clone(),
+                        src_key,
+                        dst_key,
+                        derived: derived.contains(&(etype, src, dst)),
+                    });
+                }
+            }
+        }
+        edges.sort_by(|a, b| {
+            a.edge_type
+                .cmp(&b.edge_type)
+                .then(a.src_key.cmp(&b.src_key))
+                .then(a.dst_key.cmp(&b.dst_key))
+        });
+        Ok(edges)
     }
 
     pub fn nodes_with_label(&self, label: &str) -> Vec<NodeRef<'_, F>> {
@@ -1672,6 +1772,17 @@ impl<'a, F: Fs> NodeRef<'a, F> {
 
     pub fn prop(&self, field: &str) -> Option<&Value> {
         self.db.props.get(self.id, field)
+    }
+
+    /// All stored fields for this node, sorted by field name.
+    pub fn props(&self) -> BTreeMap<String, Value> {
+        let mut out = BTreeMap::new();
+        for field in self.db.props.fields() {
+            if let Some(v) = self.db.props.get(self.id, field) {
+                out.insert(field.to_string(), v.clone());
+            }
+        }
+        out
     }
 
     /// depth-N BFS as a ResultSet: columns ["key","label","depth"], BFS order.

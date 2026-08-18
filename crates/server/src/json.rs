@@ -3,7 +3,7 @@
 //! Cells are untagged JSON scalars (the inverse of [`core_api::json_to_value`]),
 //! not `Value`'s internally-tagged serde form.
 
-use core_api::{json_to_value, ResultSet, Value};
+use core_api::{json_to_value, EdgeInfo, NodeInfo, ResultSet, Value};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
 
@@ -17,6 +17,30 @@ pub(crate) fn value_to_json(v: &Value) -> Js {
         Value::Bool(b) => json!(b),
         Value::List(xs) => Js::Array(xs.iter().map(value_to_json).collect()),
     }
+}
+
+pub(crate) fn node_info_json(info: &NodeInfo) -> Js {
+    let props: serde_json::Map<String, Js> = info
+        .props
+        .iter()
+        .map(|(k, v)| (k.clone(), value_to_json(v)))
+        .collect();
+    json!({
+        "key": info.key,
+        "label": info.label,
+        "props": props,
+    })
+}
+
+pub(crate) fn node_edges_json(edges: &[EdgeInfo]) -> Js {
+    json!({
+        "edges": edges.iter().map(|e| json!({
+            "edge_type": e.edge_type,
+            "src_key": e.src_key,
+            "dst_key": e.dst_key,
+            "derived": e.derived,
+        })).collect::<Vec<_>>()
+    })
 }
 
 pub(crate) fn result_set_json(rs: &ResultSet) -> Js {
