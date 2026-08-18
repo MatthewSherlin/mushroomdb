@@ -10,8 +10,9 @@ and does not time them.
 
 Dataset (`bench_db(10_000, 0xA5A5_5A5A_C0DE_4B1D)`): 1,666 Org + 3,333 Project + 5,001 Person
 nodes with sliding-window `skills`, numeric `year`, `[lat,lon]` `loc`, and dim-64 `emb`.
-People also carry `age` / `org_id` / `project_id`. Rule benches install KeyMatch
-`WORKS_AT` + `ON_PROJECT` and Overlap `FIT` unless noted.
+People also carry `age` / `org_id` / `project_id`. People `2..=1201` KeyMatch to hub
+`org-0001` (1,200 `WORKS_AT` triples); `person-0001` is kept off the hub. Rule benches
+install KeyMatch `WORKS_AT` + `ON_PROJECT` and Overlap `FIT` unless noted.
 
 Times are criterion median ± median absolute deviation (MAD).
 
@@ -25,6 +26,10 @@ Times are criterion median ± median absolute deviation (MAD).
 | `rule_incremental_fire` | 4.731 ms ± 0.337 ms | One `skills` update on a 10k-node db with 3 rules incl. overlap |
 | `rule_backfill_10k` | 49.050 ms ± 1.118 ms | `create_rule` Overlap backfill on an existing 10k-node db |
 | `explain_pair` | 45.089 µs ± 0.292 µs | `explain(person-0001, proj-0001)` provenance scan |
+| `explain_pair_dense` | 44.719 µs ± 0.869 µs | `explain(org-0001, person-0002)` — hub org participates in ≥1k provenance triples |
 | `vector_rule_update` | 12.032 ms ± 0.215 ms | One node's dim-64 embedding update under `VectorSimilar` |
+| `read_contention_1r0w` | 40.393 µs ± 0.793 µs | Solo `run_contention(db, 1, 16, 0)` via `SharedDb` |
 | `read_contention_4r1w` | 70.312 ms ± 4.902 ms | 4 neighborhood readers + 1 prop writer via `SharedDb` |
 | `read_contention_16r1w` | 81.218 ms ± 7.138 ms | 16 neighborhood readers + 1 prop writer via `SharedDb` |
+
+`read_contention_*` figures include thread-spawn + barrier sync; comparable only to other `run_contention` rows (including the new `1r0w`).

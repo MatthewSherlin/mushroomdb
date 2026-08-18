@@ -4,7 +4,8 @@
 //! `ingest_10k_nodes`, `neighborhood_depth1`, `neighborhood_depth2`,
 //! `cypher_scan_filter_project`, `cypher_two_hop_join`,
 //! `rule_incremental_fire`, `rule_backfill_10k`, `explain_pair`,
-//! `vector_rule_update`, `read_contention_4r1w`, `read_contention_16r1w`.
+//! `explain_pair_dense`, `vector_rule_update`, `read_contention_1r0w`,
+//! `read_contention_4r1w`, `read_contention_16r1w`.
 
 use core_api::{AutoFk, Dir, GraphDb, IngestOptions, Predicate, RuleDef, SharedDb, Value};
 use core_storage::RealFs;
@@ -19,6 +20,11 @@ use std::time::Duration;
 const N: usize = 10_000;
 const SEED: u64 = 0xA5A5_5A5A_C0DE_4B1D;
 const EMBED_DIM: usize = 64;
+/// People `2..=HUB_PEOPLE+1` KeyMatch to `org-0001`, so that org is the dst
+/// of ≥1k `WORKS_AT` provenance triples. `person-0001` stays off the hub
+/// so the existing neighborhood benches keep a small depth-2 frontier.
+const HUB_PEOPLE: usize = 1200;
+const HUB_ORG: usize = 1;
 const SCAN_FILTER: &str = "MATCH (n:Person) WHERE n.age > 40 RETURN n LIMIT 100";
 const TWO_HOP: &str =
     "MATCH (p:Person)-[:ON_PROJECT]->(proj:Project)<-[:ON_PROJECT]-(q:Person) RETURN p, proj, q LIMIT 100";
@@ -28,6 +34,16 @@ fn counts(nodes: usize) -> (usize, usize, usize) {
     let n_projects = nodes / 3;
     let n_people = nodes - n_orgs - n_projects;
     (n_orgs, n_projects, n_people)
+}
+
+fn person_org(i: usize, n_orgs: usize) -> usize {
+    if (2..=HUB_PEOPLE + 1).contains(&i) {
+        HUB_ORG
+    } else if i == 1 {
+        2.min(n_orgs.max(1))
+    } else {
+        (i - 1) % n_orgs.max(1) + 1
+    }
 }
 
 fn mix(seed: u64, a: u64, b: u64) -> u64 {
@@ -108,7 +124,7 @@ fn dataset_rows(nodes: usize, seed: u64) -> (Vec<PropRow>, Vec<PropRow>, Vec<Pro
         .collect();
     let people = (1..=n_people)
         .map(|i| {
-            let org = (i - 1) % n_orgs.max(1) + 1;
+            let org = person_org(i, n_orgs);
             let proj = (i - 1) % n_projects.max(1) + 1;
             row(vec![
                 ("id", Value::Str(format!("person-{i:04}"))),
@@ -336,6 +352,17 @@ fn explain_pair(c: &mut Criterion) {
             );
         });
     });
+    // Hub org is the dst of HUB_PEOPLE WORKS_AT triples (≥1k). Today's
+    // explain() still walks every rule's full provenance set; T2's
+    // reverse index is what makes the hub degree visible.
+    c.bench_function("explain_pair_dense", |b| {
+        b.iter(|| {
+            black_box(
+                db.explain(black_box("org-0001"), black_box("person-0002"))
+                    .expect("explain dense"),
+            );
+        });
+    });
 }
 
 fn vector_rule_update(c: &mut Criterion) {
@@ -411,6 +438,9 @@ fn run_contention(db: &SharedDb, n_readers: usize, reads: usize, writes: usize) 
 
 fn contention(c: &mut Criterion) {
     let db = shared_ruled();
+    c.bench_function("read_contention_1r0w", |b| {
+        b.iter(|| run_contention(&db, 1, 16, 0));
+    });
     c.bench_function("read_contention_4r1w", |b| {
         b.iter(|| run_contention(&db, 4, 16, 16));
     });
