@@ -7,8 +7,10 @@ import { GraphStore, edgeId } from "./store";
 import {
   HAND_LINE,
   RECOMPUTED_NOTE,
+  THRESHOLD_NOTE,
   buildWhyModel,
   ensureProvenance,
+  fieldsFromPredicate,
   formatKeyMatchLine,
   formatOverlapLine,
   formatScore,
@@ -440,6 +442,31 @@ describe("nodePropsQuery from summary.fields", () => {
     expect(q.cypher).toContain("n.skills AS skills");
     expect(q.cypher).toContain("n.org_id AS org_id");
   });
+
+  it("unions part fields when kind all has empty top-level fields", () => {
+    const summary = pred({
+      kind: "all",
+      fields: [],
+      parts: [
+        pred({
+          kind: "numeric_within",
+          fields: ["founded_year"],
+          tolerance: 2,
+        }),
+        pred({
+          kind: "geo_radius",
+          fields: ["location"],
+          km: 400,
+        }),
+      ],
+    });
+    const fields = fieldsFromPredicate(summary);
+    expect(fields).toEqual(["founded_year", "location"]);
+    const q = nodePropsQuery("org-01", fields);
+    expect(q.cypher).toBe(
+      "MATCH (n {id: $key}) RETURN n.founded_year AS founded_year, n.location AS location",
+    );
+  });
 });
 
 describe("buildWhyModel predicate summary dispatch", () => {
@@ -476,6 +503,39 @@ describe("buildWhyModel predicate summary dispatch", () => {
       field: "founded_year",
       line: "numeric_within(founded_year) = |1998 − 2000| = 2 ≤ 2",
     });
+  });
+
+  it("renders numeric > tolerance with a stale-threshold note", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "NEAR",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "close_year",
+          edge_type: "NEAR",
+          src_key: "a",
+          dst_key: "b",
+          weight: 0,
+          predicate: pred({
+            kind: "numeric_within",
+            fields: ["founded_year"],
+            tolerance: 2,
+          }),
+        }),
+      },
+      src: { key: "a", label: "Org", props: { founded_year: 1998 } },
+      dst: { key: "b", label: "Org", props: { founded_year: 2005 } },
+    });
+    expect(model.kind).toBe("numeric_within");
+    if (model.kind !== "numeric_within") {
+      return;
+    }
+    expect(model.line).toBe(
+      `numeric_within(founded_year) = |1998 − 2005| = 7 > 2 — ${THRESHOLD_NOTE}`,
+    );
+    expect(model.line).not.toContain("≤");
   });
 
   it("notes when recomputed numeric score disagrees with the server weight", () => {
@@ -597,6 +657,39 @@ describe("buildWhyModel predicate summary dispatch", () => {
       kind: "derived",
       line: "Derived by rule nearby",
     });
+  });
+
+  it("renders geo > radius with a stale-threshold note", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "NEAR",
+        src: "paris",
+        dst: "london",
+        derived: true,
+        explanation: exp({
+          rule: "nearby",
+          edge_type: "NEAR",
+          src_key: "paris",
+          dst_key: "london",
+          weight: 0.141,
+          predicate: pred({
+            kind: "geo_radius",
+            fields: ["location"],
+            km: 300,
+          }),
+        }),
+      },
+      src: { key: "paris", label: "Office", props: { location: paris } },
+      dst: { key: "london", label: "Office", props: { location: london } },
+    });
+    expect(model.kind).toBe("geo_radius");
+    if (model.kind !== "geo_radius") {
+      return;
+    }
+    expect(model.line).toBe(
+      `geo_radius(location) = 343.6 km > 300 km — ${THRESHOLD_NOTE}`,
+    );
+    expect(model.line).not.toContain("≤");
   });
 
   it("notes when recomputed geo score disagrees with the server weight", () => {
@@ -850,6 +943,59 @@ describe("buildWhyModel predicate summary dispatch", () => {
       "numeric_within(founded_year) = |1998 − 2000| = 2 ≤ 2",
       "vector_similar(embedding) = cos = 1 ≥ 0.9 · d=2",
       `min = 0 — ${RECOMPUTED_NOTE}`,
+    ]);
+  });
+
+  it("renders an honest large-vector line for a dims>64 part inside all", () => {
+    const big = Array.from({ length: 65 }, () => 1);
+    const model = buildWhyModel({
+      edge: {
+        etype: "NEAR",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "both",
+          edge_type: "NEAR",
+          src_key: "a",
+          dst_key: "b",
+          weight: 0,
+          predicate: pred({
+            kind: "all",
+            fields: ["founded_year", "embedding"],
+            parts: [
+              pred({
+                kind: "numeric_within",
+                fields: ["founded_year"],
+                tolerance: 2,
+              }),
+              pred({
+                kind: "vector_similar",
+                fields: ["embedding"],
+                min: 0.9,
+              }),
+            ],
+          }),
+        }),
+      },
+      src: {
+        key: "a",
+        label: "Doc",
+        props: { founded_year: 1998, embedding: big },
+      },
+      dst: {
+        key: "b",
+        label: "Doc",
+        props: { founded_year: 2000, embedding: big },
+      },
+    });
+    expect(model.kind).toBe("all");
+    if (model.kind !== "all") {
+      return;
+    }
+    expect(model.lines).toEqual([
+      "numeric_within(founded_year) = |1998 − 2000| = 2 ≤ 2",
+      "vector_similar(embedding) — cos not recomputed (large vector)",
     ]);
   });
 

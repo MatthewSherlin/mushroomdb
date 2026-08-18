@@ -29,6 +29,8 @@ export const HAND_LINE = "Created by hand";
 
 export const RECOMPUTED_NOTE = "recomputed from current props";
 
+export const THRESHOLD_NOTE = `${RECOMPUTED_NOTE} — no longer within threshold`;
+
 const PROP_FIELDS = ["skills", "org_id", "project_id", "name", "tags"] as const;
 
 const WEIGHT_EPS = 1e-9;
@@ -746,13 +748,13 @@ function numericRender(
     return undefined;
   }
   const delta = Math.abs(a - b);
-  const line = `numeric_within(${field}) = |${displayNum(a)} ${MINUS} ${displayNum(b)}| = ${displayNum(delta)} ≤ ${displayNum(tolerance)}`;
-  let score: number | undefined;
-  if (tolerance === 0) {
-    score = delta === 0 ? 1 : undefined;
-  } else if (delta <= tolerance) {
-    score = 1 - delta / tolerance;
+  const within = tolerance === 0 ? delta === 0 : delta <= tolerance;
+  const op = within ? "≤" : ">";
+  const line = `numeric_within(${field}) = |${displayNum(a)} ${MINUS} ${displayNum(b)}| = ${displayNum(delta)} ${op} ${displayNum(tolerance)}`;
+  if (!within) {
+    return { lines: [`${line} — ${THRESHOLD_NOTE}`], score: undefined };
   }
+  const score = tolerance === 0 ? 1 : 1 - delta / tolerance;
   return { lines: [withNote(line, score, serverWeight)], score };
 }
 
@@ -776,9 +778,13 @@ function geoRender(
   if (!Number.isFinite(d)) {
     return undefined;
   }
-  const line = `geo_radius(${field}) = ${d.toFixed(1)} km ≤ ${displayNum(km)} km`;
-  const score = d <= km ? 1 - d / km : undefined;
-  return { lines: [withNote(line, score, serverWeight)], score };
+  const within = d <= km;
+  const op = within ? "≤" : ">";
+  const line = `geo_radius(${field}) = ${d.toFixed(1)} km ${op} ${displayNum(km)} km`;
+  if (!within) {
+    return { lines: [`${line} — ${THRESHOLD_NOTE}`], score: undefined };
+  }
+  return { lines: [withNote(line, 1 - d / km, serverWeight)], score: 1 - d / km };
 }
 
 function vectorRender(
@@ -809,13 +815,22 @@ function vectorRender(
       return { lines: [withNote(line, cos, serverWeight)], score: cos };
     }
   }
-  if (echoWeight === null) {
-    return undefined;
+  if (echoWeight !== null) {
+    return {
+      lines: [`vector_similar(${field}) = cos ≈ ${formatScore(echoWeight)}${minClause}`],
+      score: undefined,
+    };
   }
-  return {
-    lines: [`vector_similar(${field}) = cos ≈ ${formatScore(echoWeight)}${minClause}`],
-    score: undefined,
-  };
+  const large =
+    (a !== undefined && a.length > VECTOR_MAX_DIM) ||
+    (b !== undefined && b.length > VECTOR_MAX_DIM);
+  if (large) {
+    return {
+      lines: [`vector_similar(${field}) — cos not recomputed (large vector)`],
+      score: undefined,
+    };
+  }
+  return undefined;
 }
 
 function keyMatchFromField(
