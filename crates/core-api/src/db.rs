@@ -15,7 +15,6 @@ pub struct Stats {
     pub nodes_live: usize,
     pub nodes_tombstoned: usize,
     pub edges: u64,
-    pub snapshot_version: u16,
     pub rules: Vec<RuleStats>,
 }
 
@@ -427,6 +426,21 @@ impl<F: Fs> GraphDb<F> {
         crate::ingest::run(self, label, rows, opts)
     }
 
+    /// Parse `json` as an array of objects and ingest via [`GraphDb::ingest`].
+    ///
+    /// JSON `null` fields are silently omitted (not stored, not a row error).
+    /// Nested objects and arrays-of-objects are a per-row error (row skipped).
+    /// Parse failures and a top-level value that is not an array of objects
+    /// return [`GraphError::IngestError`].
+    pub fn ingest_json(
+        &mut self,
+        label: &str,
+        json: &str,
+        opts: &IngestOptions,
+    ) -> Result<IngestReport> {
+        crate::ingest::run_json(self, label, json, opts)
+    }
+
     fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<()> {
         let recs = {
             let mut preview = MutPreview::new(self);
@@ -789,9 +803,13 @@ impl<F: Fs> GraphDb<F> {
             nodes_live: self.ids.live_len(),
             nodes_tombstoned: self.ids.len() - self.ids.live_len(),
             edges: self.topo.edge_count(),
-            snapshot_version: core_storage::snapshot::VERSION,
             rules,
         }
+    }
+
+    /// On-disk snapshot format version this binary writes and reads.
+    pub fn format_version() -> u16 {
+        core_storage::snapshot::VERSION
     }
 
     /// Test-support: total bytes appended (SimFs only usage).

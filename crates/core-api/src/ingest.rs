@@ -1,7 +1,7 @@
 use crate::db::GraphDb;
 use core_rules::{Predicate, RuleDef};
 use core_storage::fs::Fs;
-use core_storage::{Result, Value};
+use core_storage::{GraphError, Result, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Options for [`GraphDb::ingest`].
@@ -41,6 +41,13 @@ impl Default for AutoFk {
     }
 }
 
+/// One auto-FK field that was not turned into a rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FkSkip {
+    pub field: String,
+    pub reason: String,
+}
+
 /// Outcome of one [`GraphDb::ingest`] call. Row-level issues are collected here;
 /// a commit-level `Err` means nothing was applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +55,129 @@ pub struct IngestReport {
     pub inserted: usize,
     pub row_errors: Vec<(usize, String)>,
     pub rules_created: Vec<String>,
-    pub skipped_fk_fields: Vec<(String, String)>,
+    pub skipped_fk_fields: Vec<FkSkip>,
+}
+
+/// Convert a JSON value to a stored [`Value`].
+///
+/// JSON `null` returns `None` so the caller can skip the field (not an error).
+/// Integral numbers become [`Value::Int`]; other numbers become [`Value::Float`].
+/// Arrays of scalars become [`Value::List`]. Nested objects and arrays that are
+/// not arrays of scalars also return `None`; [`GraphDb::ingest_json`] treats
+/// those as a per-row error rather than a skipped field.
+pub fn json_to_value(v: serde_json::Value) -> Option<Value> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(Value::Bool(b)),
+        serde_json::Value::Number(n) => number_to_value(&n),
+        serde_json::Value::String(s) => Some(Value::Str(s)),
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match json_to_value(item) {
+                    Some(val) => out.push(val),
+                    None => return None,
+                }
+            }
+            Some(Value::List(out))
+        }
+        serde_json::Value::Object(_) => None,
+    }
+}
+
+fn number_to_value(n: &serde_json::Number) -> Option<Value> {
+    if let Some(i) = n.as_i64() {
+        return Some(Value::Int(i));
+    }
+    let f = n.as_f64()?;
+    if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+        Some(Value::Int(f as i64))
+    } else {
+        Some(Value::Float(f))
+    }
+}
+
+fn is_json_scalar(v: &serde_json::Value) -> bool {
+    matches!(
+        v,
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) | serde_json::Value::String(_)
+    )
+}
+
+fn field_shape_error(field: &str, v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(_) => Some(format!("nested object in field {field}")),
+        serde_json::Value::Array(items) => {
+            if items.iter().all(is_json_scalar) {
+                None
+            } else if items.iter().any(|x| x.is_object()) {
+                Some(format!("array of objects in field {field}"))
+            } else {
+                Some(format!("nested object in field {field}"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn object_to_row(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<BTreeMap<String, Value>, String> {
+    let mut row = BTreeMap::new();
+    for (k, v) in obj {
+        if let Some(err) = field_shape_error(k, v) {
+            return Err(err);
+        }
+        if let Some(val) = json_to_value(v.clone()) {
+            row.insert(k.clone(), val);
+        }
+    }
+    Ok(row)
+}
+
+/// Parse JSON, convert rows, then delegate to [`run`].
+pub(crate) fn run_json<F: Fs>(
+    db: &mut GraphDb<F>,
+    label: &str,
+    json: &str,
+    opts: &IngestOptions,
+) -> Result<IngestReport> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| GraphError::IngestError {
+            detail: e.to_string(),
+        })?;
+    let arr = parsed.as_array().ok_or_else(|| GraphError::IngestError {
+        detail: "top-level JSON must be an array of objects".into(),
+    })?;
+    if !arr.iter().all(|v| v.is_object()) {
+        return Err(GraphError::IngestError {
+            detail: "top-level JSON must be an array of objects".into(),
+        });
+    }
+
+    let mut rows = Vec::new();
+    let mut shape_errors = Vec::new();
+    let mut kept_indices = Vec::new();
+    for (i, item) in arr.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .expect("top-level checked as array of objects");
+        match object_to_row(obj) {
+            Ok(row) => {
+                kept_indices.push(i);
+                rows.push(row);
+            }
+            Err(msg) => shape_errors.push((i, msg)),
+        }
+    }
+
+    let mut report = run(db, label, rows, opts)?;
+    for (idx, _) in &mut report.row_errors {
+        *idx = kept_indices[*idx];
+    }
+    report.row_errors.extend(shape_errors);
+    report.row_errors.sort_by_key(|(i, _)| *i);
+    Ok(report)
 }
 
 type PropMap = BTreeMap<String, Value>;
@@ -128,7 +257,7 @@ fn infer_auto_fk<F: Fs>(
     suffix: &str,
     key_field: &str,
     accepted: &[(String, PropMap)],
-) -> (Vec<RuleDef>, Vec<(String, String)>) {
+) -> (Vec<RuleDef>, Vec<FkSkip>) {
     let existing_rule_names: BTreeSet<String> = db.rules().into_iter().map(|r| r.name).collect();
     let accepted_keys: BTreeSet<&str> = accepted.iter().map(|(k, _)| k.as_str()).collect();
 
@@ -163,7 +292,10 @@ fn infer_auto_fk<F: Fs>(
         }
 
         match labels.len() {
-            0 => skipped.push((field, "no matching target keys".into())),
+            0 => skipped.push(FkSkip {
+                field,
+                reason: "no matching target keys".into(),
+            }),
             1 => {
                 let dst_label = labels.into_iter().next().expect("len == 1");
                 // `auto_fk_<src_label_lowercase>_<field>` — scoped by source
@@ -187,7 +319,10 @@ fn infer_auto_fk<F: Fs>(
             }
             _ => {
                 let listed = labels.into_iter().collect::<Vec<_>>().join(", ");
-                skipped.push((field, format!("ambiguous target labels: {listed}")));
+                skipped.push(FkSkip {
+                    field,
+                    reason: format!("ambiguous target labels: {listed}"),
+                });
             }
         }
     }

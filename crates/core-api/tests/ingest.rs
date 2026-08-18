@@ -1,5 +1,5 @@
 use core_api::{
-    AutoFk, Direction, GraphDb, GraphError, IngestOptions, IngestReport, Predicate, Value,
+    AutoFk, Direction, FkSkip, GraphDb, GraphError, IngestOptions, IngestReport, Predicate, Value,
 };
 use core_storage::fs::{FileId, Fs, RealFs};
 use std::collections::BTreeMap;
@@ -162,7 +162,10 @@ fn ambiguous_fk_targets_are_skipped() {
     assert!(report.rules_created.is_empty());
     assert_eq!(
         report.skipped_fk_fields,
-        vec![("org_id".into(), "ambiguous target labels: Org, Team".into())]
+        vec![FkSkip {
+            field: "org_id".into(),
+            reason: "ambiguous target labels: Org, Team".into(),
+        }]
     );
     assert!(db.rules().is_empty());
     assert!(db
@@ -189,7 +192,10 @@ fn unmatched_fk_field_is_skipped() {
     assert!(report.rules_created.is_empty());
     assert_eq!(
         report.skipped_fk_fields,
-        vec![("dept_id".into(), "no matching target keys".into())]
+        vec![FkSkip {
+            field: "dept_id".into(),
+            reason: "no matching target keys".into(),
+        }]
     );
     assert!(db.rules().is_empty());
     assert!(db.has_node("p1"));
