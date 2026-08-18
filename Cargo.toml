@@ -6,6 +6,7 @@ members = [
     "crates/sim-harness",
     "crates/core-rules",
     "crates/core-query",
+    "crates/arrow-bridge",
 ]
 
 [workspace.dependencies]
