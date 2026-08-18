@@ -22,6 +22,11 @@ impl Default for IngestOptions {
 }
 
 /// Zero-config FK inference: declare a `KeyMatch` rule per `*_id` field, or skip.
+///
+/// Auto-declared rule names are `auto_fk_<src_label_lowercase>_<field>`
+/// (e.g. `auto_fk_person_org_id`, `auto_fk_device_org_id`) so two ingested
+/// labels sharing an FK field each get their own rule. A name collision is
+/// only the same `(label, field)` pair, where silent skip is correct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoFk {
     Auto { suffix: String },
@@ -161,7 +166,9 @@ fn infer_auto_fk<F: Fs>(
             0 => skipped.push((field, "no matching target keys".into())),
             1 => {
                 let dst_label = labels.into_iter().next().expect("len == 1");
-                let name = format!("auto_fk_{field}");
+                // `auto_fk_<src_label_lowercase>_<field>` — scoped by source
+                // label so Person.org_id and Device.org_id do not collide.
+                let name = format!("auto_fk_{}_{field}", src_label.to_lowercase());
                 if existing_rule_names.contains(&name) {
                     continue;
                 }

@@ -413,6 +413,9 @@ impl<F: Fs> GraphDb<F> {
     /// inserts, so incremental fire sees the new rules. Per-row key problems
     /// are collected in [`IngestReport::row_errors`] and skipped; a commit
     /// `Err` means nothing was applied.
+    ///
+    /// Auto-FK rule names are `auto_fk_<src_label_lowercase>_<field>` so
+    /// distinct source labels sharing an FK field each get their own rule.
     pub fn ingest(
         &mut self,
         label: &str,

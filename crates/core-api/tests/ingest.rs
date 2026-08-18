@@ -33,7 +33,7 @@ fn row_val(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
 }
 
 /// Binding: org_id rows auto-link to pre-existing Org nodes; rule is a real
-/// incremental KeyMatch (`auto_fk_org_id`, edge type `ORG`); explain works;
+/// incremental KeyMatch (`auto_fk_person_org_id`, edge type `ORG`); explain works;
 /// a later plain `insert_node` with the same FK also links.
 #[test]
 fn org_id_auto_links_and_later_insert_fires_rule() {
@@ -55,11 +55,17 @@ fn org_id_auto_links_and_later_insert_fires_rule() {
 
     assert_eq!(report.inserted, 2);
     assert!(report.row_errors.is_empty());
-    assert_eq!(report.rules_created, vec!["auto_fk_org_id".to_string()]);
+    assert_eq!(
+        report.rules_created,
+        vec!["auto_fk_person_org_id".to_string()]
+    );
     assert!(report.skipped_fk_fields.is_empty());
 
     let rules = db.rules();
-    let fk = rules.iter().find(|r| r.name == "auto_fk_org_id").unwrap();
+    let fk = rules
+        .iter()
+        .find(|r| r.name == "auto_fk_person_org_id")
+        .unwrap();
     assert_eq!(fk.src_label, "Person");
     assert_eq!(fk.dst_label, "Org");
     assert_eq!(fk.edge_type, "ORG");
@@ -92,7 +98,7 @@ fn org_id_auto_links_and_later_insert_fires_rule() {
 
     let ex = db.explain("p1", "acme").unwrap();
     assert_eq!(ex.len(), 1);
-    assert_eq!(ex[0].rule, "auto_fk_org_id");
+    assert_eq!(ex[0].rule, "auto_fk_person_org_id");
     assert_eq!(ex[0].edge_type, "ORG");
     assert_eq!(ex[0].src_key, "p1");
     assert_eq!(ex[0].dst_key, "acme");
@@ -111,9 +117,10 @@ fn org_id_auto_links_and_later_insert_fires_rule() {
     );
     let ex3 = db.explain("p3", "acme").unwrap();
     assert_eq!(ex3.len(), 1);
-    assert_eq!(ex3[0].rule, "auto_fk_org_id");
+    assert_eq!(ex3[0].rule, "auto_fk_person_org_id");
 
-    // Re-ingest with the rule already present: skip silently, still insert.
+    // Same-label re-ingest: name collision on (Person, org_id) skips creating
+    // a second rule; new rows still link incrementally.
     let again = db
         .ingest(
             "Person",
@@ -339,13 +346,16 @@ fn intra_ingest_fk_builds_self_label_rule() {
         .unwrap();
 
     assert_eq!(report.inserted, 2);
-    assert_eq!(report.rules_created, vec!["auto_fk_manager_id".to_string()]);
+    assert_eq!(
+        report.rules_created,
+        vec!["auto_fk_person_manager_id".to_string()]
+    );
     assert!(report.skipped_fk_fields.is_empty());
 
     let fk = db
         .rules()
         .into_iter()
-        .find(|r| r.name == "auto_fk_manager_id")
+        .find(|r| r.name == "auto_fk_person_manager_id")
         .unwrap();
     assert_eq!(fk.src_label, "Person");
     assert_eq!(fk.dst_label, "Person");
@@ -363,8 +373,75 @@ fn intra_ingest_fk_builds_self_label_rule() {
     );
     let ex = db.explain("p2", "p1").unwrap();
     assert_eq!(ex.len(), 1);
-    assert_eq!(ex[0].rule, "auto_fk_manager_id");
+    assert_eq!(ex[0].rule, "auto_fk_person_manager_id");
     assert_eq!(ex[0].edge_type, "MANAGER");
+}
+
+/// Spec amendment: rule names are `auto_fk_<src_label_lowercase>_<field>`, so
+/// Person.org_id and Device.org_id each get their own rule. Before this,
+/// the second ingest silently skipped (name collision) and Devices did not link.
+#[test]
+fn second_src_label_same_fk_field_creates_own_rule_and_links() {
+    let dir = tmp("ingest-two-src");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "acme", vec![]).unwrap();
+
+    let people = db
+        .ingest(
+            "Person",
+            vec![row(&[("id", "p1"), ("org_id", "acme")])],
+            &IngestOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        people.rules_created,
+        vec!["auto_fk_person_org_id".to_string()]
+    );
+    assert_eq!(
+        db.neighbors("p1", "ORG", Direction::Out).unwrap(),
+        vec!["acme".to_string()]
+    );
+
+    let devices = db
+        .ingest(
+            "Device",
+            vec![row(&[("id", "d1"), ("org_id", "acme")])],
+            &IngestOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(devices.inserted, 1);
+    assert_eq!(
+        devices.rules_created,
+        vec!["auto_fk_device_org_id".to_string()]
+    );
+    assert!(devices.skipped_fk_fields.is_empty());
+
+    let names: Vec<String> = db.rules().into_iter().map(|r| r.name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "auto_fk_device_org_id".to_string(),
+            "auto_fk_person_org_id".to_string(),
+        ]
+    );
+
+    let device_fk = db
+        .rules()
+        .into_iter()
+        .find(|r| r.name == "auto_fk_device_org_id")
+        .unwrap();
+    assert_eq!(device_fk.src_label, "Device");
+    assert_eq!(device_fk.dst_label, "Org");
+    assert_eq!(device_fk.edge_type, "ORG");
+
+    assert_eq!(
+        db.neighbors("d1", "ORG", Direction::Out).unwrap(),
+        vec!["acme".to_string()],
+        "Device.org_id must link; must not silently collide with Person.org_id"
+    );
+    let ex = db.explain("d1", "acme").unwrap();
+    assert_eq!(ex.len(), 1);
+    assert_eq!(ex[0].rule, "auto_fk_device_org_id");
 }
 
 /// WAL append that can be flipped to fail so ingest's single batch commit errors.
