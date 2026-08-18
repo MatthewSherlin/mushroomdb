@@ -29,10 +29,20 @@ const SAMPLE_EXPLAIN_B: &str = "proj-01";
 /// Parsed `graphdb` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Serve { db_dir: PathBuf, addr: SocketAddr },
-    Mcp { db_dir: PathBuf },
-    Stats { db_dir: PathBuf },
-    Demo { db_dir: PathBuf },
+    Serve {
+        db_dir: PathBuf,
+        addr: SocketAddr,
+        ui_dir: Option<PathBuf>,
+    },
+    Mcp {
+        db_dir: PathBuf,
+    },
+    Stats {
+        db_dir: PathBuf,
+    },
+    Demo {
+        db_dir: PathBuf,
+    },
     Help,
 }
 
@@ -76,7 +86,7 @@ pub fn usage() -> &'static str {
 graphdb — embedded graph database
 
 Usage:
-  graphdb serve <db-dir> [--addr 127.0.0.1:0]
+  graphdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>]
   graphdb mcp <db-dir>
   graphdb stats <db-dir>
   graphdb demo <db-dir>
@@ -107,6 +117,7 @@ fn default_addr() -> SocketAddr {
 fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut addr = default_addr();
+    let mut ui_dir = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -120,6 +131,16 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--addr=") {
             addr = val.parse().map_err(|_| format!("invalid address: {val}"))?;
             i += 1;
+        } else if a == "--ui" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --ui".to_string())?;
+            ui_dir = Some(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--ui=") {
+            ui_dir = Some(PathBuf::from(val));
+            i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -130,7 +151,26 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         }
     }
     let db_dir = db_dir.ok_or_else(|| "serve requires <db-dir>".to_string())?;
-    Ok(Command::Serve { db_dir, addr })
+    Ok(Command::Serve {
+        db_dir,
+        addr,
+        ui_dir,
+    })
+}
+
+/// `--ui <dir>` must be a directory that contains `index.html`.
+pub fn validate_ui_dir(dir: &Path) -> Result<PathBuf, String> {
+    if !dir.is_dir() {
+        return Err(format!("--ui directory does not exist: {}", dir.display()));
+    }
+    let index = dir.join("index.html");
+    if !index.is_file() {
+        return Err(format!(
+            "--ui directory is missing index.html: {}",
+            dir.display()
+        ));
+    }
+    Ok(dir.to_path_buf())
 }
 
 fn parse_one_dir(cmd: &str, args: &[&str]) -> Result<PathBuf, String> {
@@ -446,9 +486,14 @@ mod tests {
             Case {
                 args: &["serve", "/tmp/demo-db"],
                 check: |r| match r {
-                    Ok(Command::Serve { db_dir, addr }) => {
+                    Ok(Command::Serve {
+                        db_dir,
+                        addr,
+                        ui_dir,
+                    }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, default_bind());
+                        assert_eq!(ui_dir, None);
                     }
                     other => panic!("serve <dir> → Serve default addr, got {other:?}"),
                 },
@@ -456,9 +501,14 @@ mod tests {
             Case {
                 args: &["serve", "/tmp/demo-db", "--addr", "127.0.0.1:8080"],
                 check: |r| match r {
-                    Ok(Command::Serve { db_dir, addr }) => {
+                    Ok(Command::Serve {
+                        db_dir,
+                        addr,
+                        ui_dir,
+                    }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
+                        assert_eq!(ui_dir, None);
                     }
                     other => panic!("serve --addr after dir, got {other:?}"),
                 },
@@ -466,9 +516,14 @@ mod tests {
             Case {
                 args: &["serve", "/tmp/demo-db", "--addr=127.0.0.1:9090"],
                 check: |r| match r {
-                    Ok(Command::Serve { db_dir, addr }) => {
+                    Ok(Command::Serve {
+                        db_dir,
+                        addr,
+                        ui_dir,
+                    }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, "127.0.0.1:9090".parse().unwrap());
+                        assert_eq!(ui_dir, None);
                     }
                     other => panic!("serve --addr=VALUE, got {other:?}"),
                 },
@@ -572,6 +627,34 @@ mod tests {
                 },
             },
             Case {
+                args: &["serve", "/tmp/demo-db", "--ui", "/tmp/ui-dist"],
+                check: |r| match r {
+                    Ok(Command::Serve { ui_dir, .. }) => {
+                        assert_eq!(ui_dir, Some(PathBuf::from("/tmp/ui-dist")));
+                    }
+                    other => panic!("serve --ui <dir>, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["serve", "/tmp/demo-db", "--ui=/tmp/ui-eq"],
+                check: |r| match r {
+                    Ok(Command::Serve { ui_dir, .. }) => {
+                        assert_eq!(ui_dir, Some(PathBuf::from("/tmp/ui-eq")));
+                    }
+                    other => panic!("serve --ui=VALUE, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["serve", "/tmp/demo-db", "--ui"],
+                check: |r| {
+                    let e = r.expect_err("--ui missing value");
+                    assert!(
+                        e.to_lowercase().contains("ui"),
+                        "--ui missing value should mention ui, got {e}"
+                    );
+                },
+            },
+            Case {
                 args: &["serve", "/tmp/demo-db", "extra"],
                 check: |r| {
                     let e = r.expect_err("extra positional");
@@ -592,12 +675,36 @@ mod tests {
     #[test]
     fn usage_lists_every_subcommand() {
         let text = usage();
-        for word in ["serve", "mcp", "stats", "demo", "graphdb"] {
+        for word in ["serve", "mcp", "stats", "demo", "graphdb", "--ui"] {
             assert!(
                 text.contains(word),
                 "usage should mention {word}, got:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn validate_ui_dir_requires_index_html() {
+        let missing = tmp("ui-missing");
+        let err = super::validate_ui_dir(&missing).expect_err("missing dir");
+        assert!(
+            err.contains("does not exist"),
+            "missing dir error, got {err}"
+        );
+
+        let empty = tmp("ui-empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let err = super::validate_ui_dir(&empty).expect_err("no index");
+        assert!(
+            err.contains("index.html"),
+            "missing index.html error, got {err}"
+        );
+
+        let ok = tmp("ui-ok");
+        std::fs::create_dir_all(&ok).unwrap();
+        std::fs::write(ok.join("index.html"), "<!doctype html>").unwrap();
+        let got = super::validate_ui_dir(&ok).expect("valid ui dir");
+        assert_eq!(got, ok);
     }
 
     #[test]

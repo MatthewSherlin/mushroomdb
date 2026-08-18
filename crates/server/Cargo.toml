@@ -9,8 +9,9 @@ core-api = { path = "../core-api" }
 arrow-bridge = { path = "../arrow-bridge" }
 # ws enabled now so Task 5 can add GET /watch without a dep bump.
 axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
 serde_json = { workspace = true }
+tower-http = { version = "0.6", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
 # oneshot ServiceExt — axum re-exports tower types but not the util trait.

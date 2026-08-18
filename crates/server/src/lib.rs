@@ -16,4 +16,4 @@ struct AppState {
     watch: tokio::sync::broadcast::Sender<MutationEvent>,
 }
 
-pub use http::{router, serve};
+pub use http::{router, router_with_ui, serve, serve_with_ui};

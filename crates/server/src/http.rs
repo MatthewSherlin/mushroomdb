@@ -22,6 +22,8 @@ use core_api::{json_to_rows, AutoFk, Dir, GraphError, IngestOptions, SharedDb};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use tower_http::services::ServeDir;
 
 /// Build the HTTP router over `db`. Read endpoints take the read lock;
 /// `/ingest` takes the write lock. Guards are dropped before any `.await`.
@@ -67,6 +69,11 @@ pub fn router(db: SharedDb) -> Router {
         .with_state(state)
 }
 
+/// Same as [`router`], then `ServeDir` as the fallback so API routes win.
+pub fn router_with_ui(db: SharedDb, ui_dir: impl AsRef<std::path::Path>) -> Router {
+    router(db).fallback_service(ServeDir::new(ui_dir))
+}
+
 /// Bind `addr` (port 0 is ephemeral) and serve.
 ///
 /// Sends the resolved local address on `ready` once the listener is accepting.
@@ -76,13 +83,36 @@ pub async fn serve(
     addr: SocketAddr,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
 ) -> std::io::Result<()> {
+    serve_inner(db, addr, ready, None).await
+}
+
+/// [`serve`] plus a UI dist directory mounted behind the API routes.
+pub async fn serve_with_ui(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    ui_dir: PathBuf,
+) -> std::io::Result<()> {
+    serve_inner(db, addr, ready, Some(ui_dir)).await
+}
+
+async fn serve_inner(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    ui_dir: Option<PathBuf>,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     if ready.send(local).is_err() {
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    axum::serve(listener, router(db)).await
+    let app = match ui_dir {
+        Some(dir) => router_with_ui(db, dir),
+        None => router(db),
+    };
+    axum::serve(listener, app).await
 }
 
 fn err_response(detail: impl Into<String>) -> Response {

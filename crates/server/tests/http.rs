@@ -8,7 +8,7 @@ use core_api::{
     Stats, Value,
 };
 use serde_json::{json, Value as Json};
-use server::{router, serve};
+use server::{router, router_with_ui, serve};
 use std::io::Cursor;
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -378,6 +378,44 @@ async fn neighborhood_unknown_key_is_400() {
     assert!(
         err.contains("ghost"),
         "expected unknown key in detail, got {err}"
+    );
+}
+
+/// Binding: ServeDir is the fallback; `/stats` stays JSON.
+#[tokio::test]
+async fn ui_fallback_serves_static_and_stats_stays_json() {
+    let ui = tmp("ui-dist");
+    std::fs::create_dir_all(&ui).unwrap();
+    std::fs::write(
+        ui.join("index.html"),
+        "<!doctype html><title>graph-db</title>",
+    )
+    .unwrap();
+    std::fs::write(ui.join("hello.txt"), "hello-static").unwrap();
+
+    let db = SharedDb::open(&tmp("ui-api")).unwrap();
+    let app = router_with_ui(db, &ui);
+
+    let (st, body, _) = send(app.clone(), get("/hello.txt")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, b"hello-static");
+
+    let (st, body, _) = send(app.clone(), get("/")).await;
+    assert_eq!(st, StatusCode::OK);
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("graph-db"),
+        "GET / should serve index.html, got {html}"
+    );
+
+    let (st, body, ctype) = send(app, get("/stats")).await;
+    assert_eq!(st, StatusCode::OK);
+    let ctype = ctype.expect("stats content-type");
+    assert!(ctype.contains("json"), "/stats must stay JSON, got {ctype}");
+    let j = parse_json(&body);
+    assert!(
+        j.get("nodes_live").is_some(),
+        "/stats JSON must include nodes_live, got {j}"
     );
 }
 

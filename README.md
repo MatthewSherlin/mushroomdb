@@ -17,6 +17,7 @@ The front door is the `graphdb` CLI (crate `cli`, binary name `graphdb`):
 cargo run -p cli --bin graphdb -- demo ./demo-db
 cargo run -p cli --bin graphdb -- stats ./demo-db
 cargo run -p cli --bin graphdb -- serve ./demo-db
+cargo run -p cli --bin graphdb -- serve ./demo-db --ui ui/dist
 cargo run -p cli --bin graphdb -- mcp ./demo-db
 ```
 
@@ -148,9 +149,13 @@ demo refuses a non-empty directory: ./demo-db (directory must be empty — inclu
 
 ## Server
 
-`graphdb serve <db-dir> [--addr 127.0.0.1:0]` opens the store, binds
-(default is ephemeral port 0), prints the bound address **after** the
-listener is accepting, then serves. Real run against the demo dir:
+`graphdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>]` opens
+the store, binds (default is ephemeral port 0), prints the bound
+address **after** the listener is accepting, then serves. `--ui` must
+be a directory that contains `index.html`; `ServeDir` is the fallback
+so `/query`, `/stats`, `/explain`, `/node/…`, `/watch` still win.
+Without `--ui` the process is API-only (same as before). Real run
+against the demo dir:
 
 ```text
 $ cargo run -p cli --bin graphdb -- serve ./demo-db
@@ -177,11 +182,84 @@ Endpoints (thin wrappers over `core-api`):
 {"edges":170,"nodes_live":60,"nodes_tombstoned":0,"rules":[...]}
 ```
 
-## UI (in progress)
+## UI
+
+Vanilla TypeScript + Vite explorer in `ui/`. Build the dist, then serve
+it from the same origin as the API:
 
 ```text
+graphdb demo ./db
 cd ui && npm ci && npm run build
+graphdb serve ./db --ui ui/dist
 ```
+
+Captured from a clean `./db` with `./target/debug/graphdb` (after
+`cargo build -p cli --bin graphdb`):
+
+```text
+$ graphdb demo ./db
+== demo ==
+ingested 10 Orgs, 20 Projects, 30 People
+overlap rule: skill_fit (Person.skills ∩ Project.skills, min 0.5)
+
+== auto-FK rules ==
+  auto_fk_person_org_id
+  auto_fk_person_project_id
+  auto_fk_project_org_id
+
+== query ==
+MATCH (p:Person {id: 'person-01'})-[r:FIT]->(proj:Project)
+RETURN p, proj, r.score AS score
+ORDER BY score DESC, proj
+
+columns: p, proj, score
+  p=person-01  proj=proj-01  score=1.0
+  p=person-01  proj=proj-02  score=0.5
+  p=person-01  proj=proj-20  score=0.5
+
+== explain (person-01, proj-01) ==
+  rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=none
+  rule=skill_fit  type=FIT  person-01→proj-01  weight=1.0
+
+== serve ==
+  graphdb serve ./db
+```
+
+```text
+$ cd ui && npm ci && npm run build
+added 81 packages, and audited 82 packages in 822ms
+
+17 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+
+> graph-db-ui@0.0.0 build
+> vite build
+
+vite v8.2.1 building client environment for production...
+transforming...✓ 571 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                                  0.53 kB │ gzip:   0.32 kB
+dist/assets/index-CVKuRJb1.css                   8.74 kB │ gzip:   2.18 kB
+dist/assets/webgl-developer-tools-2CHz_Hb1.js   90.52 kB │ gzip:  25.02 kB
+dist/assets/webgl-device-Ds3GK4CD.js           100.98 kB │ gzip:  29.02 kB
+dist/assets/index-DCN7gYLy.js                  537.07 kB │ gzip: 140.63 kB
+
+✓ built in 219ms
+```
+
+```text
+$ graphdb serve ./db --ui ui/dist --addr 127.0.0.1:8080
+listening on http://127.0.0.1:8080
+```
+
+(`--addr` pins the port; omit it and the OS assigns one, printed on
+the listen line.) Open `http://127.0.0.1:8080/`. The empty-state
+"Load demo neighborhood" button runs `MATCH (n) RETURN n LIMIT 1`,
+which is **org-01** — query `person-01` explicitly for the scored
+FIT neighborhood. Launch-GIF click-path: [`docs/gif-script.md`](docs/gif-script.md).
 
 ## MCP
 
@@ -208,9 +286,10 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
 | Ingest | `ingest` / `ingest_json`; auto-FK `KeyMatch` on `*_id` |
 | Concurrency | `SharedDb` — many readers or one writer (`RwLock`); lock-free epoch readers are Plan 8 |
 | Arrow | `arrow-bridge`: `ResultSet` → RecordBatch / IPC stream |
-| Server | HTTP + `/watch` WebSocket (`graphdb serve`) |
+| Server | HTTP + `/watch` WebSocket (`graphdb serve`); optional `--ui` static fallback |
 | MCP | stdio JSON-RPC (`graphdb mcp`) — agent-memory tools |
 | CLI | `graphdb` — `serve` / `mcp` / `stats` / `demo` |
+| UI | `ui/` explorer; `graphdb serve <db> --ui ui/dist` |
 
 **Cypher subset (v1):** one or more `MATCH` clauses; node pattern
 `(var?:Label {k: literal or $param})`; relationships
@@ -236,10 +315,11 @@ tight `LIMIT`.
 - node and edge deletes
 - multi-statement transactions
 - lock-free epoch snapshot readers (replacing the `RwLock` facade)
-- UI (`graphdb ui`) + launch GIF
+- embed the UI into the binary
 - language bindings
 
 ## Docs
 
 - Design spec: [`docs/superpowers/specs/2026-08-14-graph-db-design.md`](docs/superpowers/specs/2026-08-14-graph-db-design.md)
 - Plans: [`docs/superpowers/plans/`](docs/superpowers/plans/) — Plan 1 durable core, Plan 2 rule engine, Plan 3 query layer
+- Launch GIF click-path: [`docs/gif-script.md`](docs/gif-script.md)
