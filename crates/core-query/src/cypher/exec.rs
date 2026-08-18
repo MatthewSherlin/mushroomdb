@@ -15,13 +15,33 @@ use std::collections::{BTreeMap, BTreeSet};
 /// execution start (the plan is walked before any rows are produced).
 pub struct Params<'a>(pub &'a BTreeMap<String, Value>);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum Cell {
     Node(u32),
     Rel(EdgeRef),
 }
 
-type Row = BTreeMap<String, Cell>;
+/// Binding-table row: one slot per interned variable. Cheaper to clone than
+/// `BTreeMap<String, Cell>` on every Expand/Scan (the two-hop hot path).
+type Row = Vec<Option<Cell>>;
+
+struct VarTable {
+    names: Vec<String>,
+}
+
+impl VarTable {
+    fn intern(&mut self, name: &str) -> usize {
+        if let Some(i) = self.names.iter().position(|n| n == name) {
+            return i;
+        }
+        self.names.push(name.to_string());
+        self.names.len() - 1
+    }
+
+    fn slot(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| n == name)
+    }
+}
 
 struct Projected {
     columns: Vec<String>,
@@ -81,28 +101,29 @@ fn row_cap_err(cap: usize) -> String {
 pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<ResultSet, String> {
     check_params(plan, params)?;
 
-    let mut rows: Vec<Row> = vec![BTreeMap::new()];
+    let vars = collect_vars(plan);
+    let mut rows: Vec<Row> = vec![vec![None; vars.names.len()]];
     let mut projected: Option<Projected> = None;
 
     for op in plan {
         match op {
             PlanOp::ScanLabel { var, label } => {
-                rows = scan_label(view, &rows, var, label.as_deref())?;
+                rows = scan_label(view, &vars, &rows, var, label.as_deref())?;
             }
             PlanOp::LookupProps { var, props } => {
-                rows = retain_node(view, &rows, var, None, props, params)?;
+                rows = retain_node(view, &vars, &rows, var, None, props, params)?;
             }
             PlanOp::JoinBound { var, label, props } => {
-                rows = retain_node(view, &rows, var, label.as_deref(), props, params)?;
+                rows = retain_node(view, &vars, &rows, var, label.as_deref(), props, params)?;
             }
             PlanOp::Expand { .. } => {
-                rows = exec_expand(view, &rows, op, params)?;
+                rows = exec_expand(view, &vars, &rows, op, params)?;
             }
             PlanOp::Filter { expr } => {
-                rows = exec_filter(view, &rows, expr, params)?;
+                rows = exec_filter(view, &vars, &rows, expr, params)?;
             }
             PlanOp::Project { items } => {
-                projected = Some(exec_project(view, &rows, items)?);
+                projected = Some(exec_project(view, &vars, &rows, items)?);
             }
             PlanOp::OrderBy { items } => {
                 let table = projected
@@ -198,6 +219,71 @@ fn collect_expr(
     }
 }
 
+fn collect_vars(plan: &[PlanOp]) -> VarTable {
+    let mut vars = VarTable { names: Vec::new() };
+    for op in plan {
+        match op {
+            PlanOp::ScanLabel { var, .. } => {
+                vars.intern(var);
+            }
+            PlanOp::LookupProps { var, props } | PlanOp::JoinBound { var, props, .. } => {
+                vars.intern(var);
+                for (_, operand) in props {
+                    intern_operand(&mut vars, operand);
+                }
+            }
+            PlanOp::Expand {
+                from,
+                rel_var,
+                to,
+                to_props,
+                ..
+            } => {
+                vars.intern(from);
+                vars.intern(to);
+                if let Some(r) = rel_var {
+                    vars.intern(r);
+                }
+                for (_, operand) in to_props {
+                    intern_operand(&mut vars, operand);
+                }
+            }
+            PlanOp::Filter { expr } => intern_expr(&mut vars, expr),
+            PlanOp::Project { items } => {
+                for item in items {
+                    match &item.value {
+                        RetVal::Var(name) | RetVal::Prop { var: name, .. } => {
+                            vars.intern(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    vars
+}
+
+fn intern_operand(vars: &mut VarTable, operand: &Operand) {
+    if let Operand::Prop { var, .. } = operand {
+        vars.intern(var);
+    }
+}
+
+fn intern_expr(vars: &mut VarTable, expr: &Expr) {
+    match expr {
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+            intern_expr(vars, lhs);
+            intern_expr(vars, rhs);
+        }
+        Expr::Not(inner) => intern_expr(vars, inner),
+        Expr::Cmp { lhs, rhs, .. } => {
+            intern_operand(vars, lhs);
+            intern_operand(vars, rhs);
+        }
+    }
+}
+
 fn scan_ids(view: &GraphView, label: Option<&str>) -> Vec<u32> {
     match label {
         Some(label) => view.nodes_with_label(label),
@@ -210,33 +296,41 @@ fn scan_ids(view: &GraphView, label: Option<&str>) -> Vec<u32> {
 
 fn scan_label(
     view: &GraphView,
+    vars: &VarTable,
     rows: &[Row],
     var: &str,
     label: Option<&str>,
 ) -> Result<Vec<Row>, String> {
     let ids = scan_ids(view, label);
-    let mut out = Vec::new();
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
     let cap = max_intermediate_rows();
+    let mut out = Vec::with_capacity(rows.len().saturating_mul(ids.len()).min(cap));
     for row in rows {
         for &id in &ids {
             if out.len() >= cap {
                 return Err(row_cap_err(cap));
             }
             let mut next = row.clone();
-            next.insert(var.to_string(), Cell::Node(id));
+            next[slot] = Some(Cell::Node(id));
             out.push(next);
         }
     }
     Ok(out)
 }
 
-fn require_cell<'a>(row: &'a Row, var: &str) -> Result<&'a Cell, String> {
-    row.get(var)
+fn require_cell<'a>(row: &'a Row, vars: &VarTable, var: &str) -> Result<&'a Cell, String> {
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    row.get(slot)
+        .and_then(|c| c.as_ref())
         .ok_or_else(|| format!("unbound variable `{var}`"))
 }
 
-fn require_node(row: &Row, var: &str) -> Result<u32, String> {
-    match require_cell(row, var)? {
+fn require_node(row: &Row, vars: &VarTable, var: &str) -> Result<u32, String> {
+    match require_cell(row, vars, var)? {
         Cell::Node(id) => Ok(*id),
         Cell::Rel(_) => Err(format!("variable `{var}` is not a node")),
     }
@@ -244,6 +338,7 @@ fn require_node(row: &Row, var: &str) -> Result<u32, String> {
 
 fn resolve_operand(
     view: &GraphView,
+    vars: &VarTable,
     row: &Row,
     operand: &Operand,
     params: &Params,
@@ -254,17 +349,18 @@ fn resolve_operand(
             Some(v) => Ok(Some(v.clone())),
             None => Err(format!("missing parameter `{name}`")),
         },
-        Operand::Prop { var, field } => resolve_prop(view, row, var, field),
+        Operand::Prop { var, field } => resolve_prop(view, vars, row, var, field),
     }
 }
 
 fn resolve_prop(
     view: &GraphView,
+    vars: &VarTable,
     row: &Row,
     var: &str,
     field: &str,
 ) -> Result<Option<Value>, String> {
-    match require_cell(row, var)? {
+    match require_cell(row, vars, var)? {
         Cell::Node(id) => Ok(view.prop(*id, field).cloned()),
         Cell::Rel(e) => Ok(view.edge_props.get(e.etype, e.src, e.dst, field).cloned()),
     }
@@ -272,6 +368,7 @@ fn resolve_prop(
 
 fn node_matches(
     view: &GraphView,
+    vars: &VarTable,
     row: &Row,
     id: u32,
     label: Option<&str>,
@@ -285,7 +382,7 @@ fn node_matches(
         }
     }
     for (field, operand) in props {
-        let Some(expected) = resolve_operand(view, row, operand, params)? else {
+        let Some(expected) = resolve_operand(view, vars, row, operand, params)? else {
             return Ok(false);
         };
         match view.prop(id, field) {
@@ -298,16 +395,17 @@ fn node_matches(
 
 fn retain_node(
     view: &GraphView,
+    vars: &VarTable,
     rows: &[Row],
     var: &str,
     label: Option<&str>,
     props: &[(String, Operand)],
     params: &Params,
 ) -> Result<Vec<Row>, String> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let id = require_node(row, var)?;
-        if node_matches(view, row, id, label, props, params)? {
+        let id = require_node(row, vars, var)?;
+        if node_matches(view, vars, row, id, label, props, params)? {
             out.push(row.clone());
         }
     }
@@ -337,8 +435,8 @@ fn neighbor(from: u32, e: &EdgeRef, dir: RelDir) -> u32 {
 }
 
 fn row_has_edge(row: &Row, e: &EdgeRef) -> bool {
-    row.values()
-        .any(|c| matches!(c, Cell::Rel(existing) if existing == e))
+    row.iter()
+        .any(|c| matches!(c, Some(Cell::Rel(existing)) if existing == e))
 }
 
 fn resolve_etypes(view: &GraphView, etype: Option<&str>) -> Option<Vec<u32>> {
@@ -347,6 +445,7 @@ fn resolve_etypes(view: &GraphView, etype: Option<&str>) -> Option<Vec<u32>> {
 
 fn exec_expand(
     view: &GraphView,
+    vars: &VarTable,
     rows: &[Row],
     op: &PlanOp,
     params: &Params,
@@ -365,11 +464,15 @@ fn exec_expand(
     };
     let etypes = resolve_etypes(view, etype.as_deref());
     let exp_dir = map_dir(*dir);
-    let mut out = Vec::new();
+    let to_slot = vars
+        .slot(to)
+        .ok_or_else(|| format!("unbound variable `{to}`"))?;
+    let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
     let cap = max_intermediate_rows();
+    let mut out = Vec::with_capacity(rows.len().saturating_mul(2).min(cap));
     for row in rows {
-        let from_id = require_node(row, from)?;
-        let bound_to = match row.get(to) {
+        let from_id = require_node(row, vars, from)?;
+        let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
             Some(Cell::Node(id)) => Some(*id),
             Some(Cell::Rel(_)) => return Err(format!("variable `{to}` is not a node")),
             None => None,
@@ -384,18 +487,18 @@ fn exec_expand(
                     continue;
                 }
             }
-            if !node_matches(view, row, nbr, to_label.as_deref(), to_props, params)? {
+            if !node_matches(view, vars, row, nbr, to_label.as_deref(), to_props, params)? {
                 continue;
             }
             if out.len() >= cap {
                 return Err(row_cap_err(cap));
             }
             let mut next = row.clone();
-            if let Some(rv) = rel_var {
-                next.insert(rv.clone(), Cell::Rel(e));
+            if let Some(slot) = rel_slot {
+                next[slot] = Some(Cell::Rel(e));
             }
             if bound_to.is_none() {
-                next.insert(to.clone(), Cell::Node(nbr));
+                next[to_slot] = Some(Cell::Node(nbr));
             }
             out.push(next);
         }
@@ -405,13 +508,14 @@ fn exec_expand(
 
 fn exec_filter(
     view: &GraphView,
+    vars: &VarTable,
     rows: &[Row],
     expr: &Expr,
     params: &Params,
 ) -> Result<Vec<Row>, String> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        if eval_expr(view, row, expr, params, 0)? {
+        if eval_expr(view, vars, row, expr, params, 0)? {
             out.push(row.clone());
         }
     }
@@ -420,6 +524,7 @@ fn exec_filter(
 
 fn eval_expr(
     view: &GraphView,
+    vars: &VarTable,
     row: &Row,
     expr: &Expr,
     params: &Params,
@@ -430,19 +535,19 @@ fn eval_expr(
     }
     match expr {
         Expr::And(lhs, rhs) => {
-            let l = eval_expr(view, row, lhs, params, depth + 1)?;
-            let r = eval_expr(view, row, rhs, params, depth + 1)?;
+            let l = eval_expr(view, vars, row, lhs, params, depth + 1)?;
+            let r = eval_expr(view, vars, row, rhs, params, depth + 1)?;
             Ok(l && r)
         }
         Expr::Or(lhs, rhs) => {
-            let l = eval_expr(view, row, lhs, params, depth + 1)?;
-            let r = eval_expr(view, row, rhs, params, depth + 1)?;
+            let l = eval_expr(view, vars, row, lhs, params, depth + 1)?;
+            let r = eval_expr(view, vars, row, rhs, params, depth + 1)?;
             Ok(l || r)
         }
-        Expr::Not(inner) => Ok(!eval_expr(view, row, inner, params, depth + 1)?),
+        Expr::Not(inner) => Ok(!eval_expr(view, vars, row, inner, params, depth + 1)?),
         Expr::Cmp { lhs, op, rhs } => {
-            let l = resolve_operand(view, row, lhs, params)?;
-            let r = resolve_operand(view, row, rhs, params)?;
+            let l = resolve_operand(view, vars, row, lhs, params)?;
+            let r = resolve_operand(view, vars, row, rhs, params)?;
             match (l, r) {
                 (Some(a), Some(b)) => Ok(eval_cmp(op, &a, &b)),
                 _ => Ok(false),
@@ -461,13 +566,18 @@ fn column_name(item: &RetItem) -> String {
     }
 }
 
-fn exec_project(view: &GraphView, rows: &[Row], items: &[RetItem]) -> Result<Projected, String> {
+fn exec_project(
+    view: &GraphView,
+    vars: &VarTable,
+    rows: &[Row],
+    items: &[RetItem],
+) -> Result<Projected, String> {
     let columns: Vec<String> = items.iter().map(column_name).collect();
     let mut out_rows = Vec::with_capacity(rows.len());
     for row in rows {
         let mut cells = Vec::with_capacity(items.len());
         for item in items {
-            cells.push(project_item(view, row, item)?);
+            cells.push(project_item(view, vars, row, item)?);
         }
         out_rows.push(cells);
     }
@@ -477,16 +587,21 @@ fn exec_project(view: &GraphView, rows: &[Row], items: &[RetItem]) -> Result<Pro
     })
 }
 
-fn project_item(view: &GraphView, row: &Row, item: &RetItem) -> Result<Option<Value>, String> {
+fn project_item(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    item: &RetItem,
+) -> Result<Option<Value>, String> {
     match &item.value {
         RetVal::Var(v) => {
-            let id = require_node(row, v)?;
+            let id = require_node(row, vars, v)?;
             match view.ids.key_of(id) {
                 Some(key) => Ok(Some(Value::Str(key.to_owned()))),
                 None => Err(format!("unknown node id {id}")),
             }
         }
-        RetVal::Prop { var, field } => resolve_prop(view, row, var, field),
+        RetVal::Prop { var, field } => resolve_prop(view, vars, row, var, field),
     }
 }
 

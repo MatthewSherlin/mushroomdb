@@ -9,7 +9,7 @@ pub enum Dir {
     Both,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EdgeRef {
     pub etype: u32,
     pub src: u32,
@@ -87,7 +87,7 @@ pub fn neighborhood(
             continue;
         }
         for e in expand(view, id, etypes, dir) {
-            edges.insert(e.clone());
+            edges.insert(e);
             let nbr = if e.src == id { e.dst } else { e.src };
             if visited.insert(nbr) {
                 let nd = d + 1;
@@ -104,7 +104,7 @@ pub fn neighborhood(
 }
 
 fn push_unique(out: &mut Vec<EdgeRef>, seen: &mut BTreeSet<EdgeRef>, e: EdgeRef) {
-    if seen.insert(e.clone()) {
+    if seen.insert(e) {
         out.push(e);
     }
 }
