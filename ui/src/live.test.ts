@@ -1,0 +1,163 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import { GraphStore, edgeId } from "./store";
+import type { MutationEvent } from "./watch";
+import {
+  TICKER_CAP,
+  TickerBuffer,
+  applyLiveEvent,
+  formatLaggedLine,
+  formatTickerLine,
+  nextDot,
+  resyncKeys,
+  watchUrl,
+} from "./live";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const src = readFileSync(join(here, "live.ts"), "utf8");
+
+function nb(rows: Array<[string, string, number]>) {
+  return { columns: ["key", "label", "depth"] as string[], rows };
+}
+
+describe("module contract", () => {
+  it("is a pure module: no DOM, canvas, or cosmos imports", () => {
+    expect(src).not.toMatch(
+      /from\s+["']@cosmos\.gl|document\.|window\.|HTMLCanvas|getContext\(/,
+    );
+  });
+
+  it("documents the partial-endpoint edge_inserted decision", () => {
+    expect(src).toMatch(/not fully expanded/i);
+    expect(src).toMatch(/markDirty/);
+  });
+});
+
+describe("TickerBuffer", () => {
+  it("keeps the last N lines in arrival order", () => {
+    const buf = new TickerBuffer(3);
+    buf.push("a");
+    buf.push("b");
+    buf.push("c");
+    buf.push("d");
+    expect(buf.lines()).toEqual(["b", "c", "d"]);
+    expect(buf.last()).toBe("d");
+  });
+
+  it("defaults to TICKER_CAP of 20", () => {
+    const buf = new TickerBuffer();
+    for (let i = 0; i < TICKER_CAP + 5; i++) {
+      buf.push(String(i));
+    }
+    expect(buf.lines()).toHaveLength(20);
+    expect(buf.lines()[0]).toBe("5");
+    expect(buf.last()).toBe("24");
+  });
+});
+
+describe("formatTickerLine", () => {
+  const cases: Array<[MutationEvent, string]> = [
+    [{ node_inserted: { label: "Person", key: "person-01" } }, "node inserted person-01"],
+    [{ prop_set: { key: "person-01", field: "skills" } }, "prop set person-01.skills"],
+    [{ prop_removed: { key: "person-01", field: "skills" } }, "prop removed person-01.skills"],
+    [
+      { edge_inserted: { edge_type: "FIT", src: "person-01", dst: "proj-01" } },
+      "edge inserted FIT person-01 → proj-01",
+    ],
+    [
+      { edge_deleted: { edge_type: "FIT", src: "person-01", dst: "proj-01" } },
+      "edge deleted FIT person-01 → proj-01",
+    ],
+    [{ node_deleted: { key: "person-01" } }, "node deleted person-01"],
+    [{ rule_created: { name: "skill_fit" } }, "rule created skill_fit"],
+    [{ rule_deleted: { name: "skill_fit" } }, "rule deleted skill_fit"],
+    [{ rule_rebuilt: { name: "skill_fit" } }, "rule rebuilt skill_fit"],
+    [{ batch_applied: { ops: 3 } }, "batch applied 3"],
+    [{ ingested: { label: "Person", inserted: 10 } }, "ingested Person 10"],
+  ];
+
+  it("is sentence case event name plus keys, no timestamp", () => {
+    for (const [event, line] of cases) {
+      expect(formatTickerLine(event)).toBe(line);
+    }
+    expect(formatLaggedLine(7)).toBe("lagged 7");
+    expect(formatTickerLine(cases[0]![0])).not.toMatch(/\d{2}:\d{2}/);
+  });
+});
+
+describe("nextDot", () => {
+  it("flashes gold on an event unless reduced motion or not connected", () => {
+    expect(nextDot("connected", "event", false)).toBe("flash");
+    expect(nextDot("connected", "event", true)).toBe("connected");
+    expect(nextDot("flash", "flash_end", false)).toBe("connected");
+    expect(nextDot("idle", "event", false)).toBe("idle");
+    expect(nextDot("connected", "reconnecting", false)).toBe("reconnecting");
+    expect(nextDot("reconnecting", "connected", false)).toBe("connected");
+    expect(nextDot("flash", "reconnecting", false)).toBe("reconnecting");
+  });
+});
+
+describe("watchUrl", () => {
+  it("uses ws or wss from the page location", () => {
+    expect(watchUrl({ protocol: "http:", host: "127.0.0.1:5173" })).toBe(
+      "ws://127.0.0.1:5173/watch",
+    );
+    expect(watchUrl({ protocol: "https:", host: "example.test" })).toBe(
+      "wss://example.test/watch",
+    );
+  });
+});
+
+describe("applyLiveEvent", () => {
+  it("adds an edge when both endpoints are visible and fully expanded", () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", nb([["b", "Person", 1]]));
+    store.mergeNeighborhoodWithEdges("a", { KNOWS: ["b"] });
+    expect(store.needsEdges("a")).toBe(false);
+    expect(store.needsEdges("b")).toBe(true);
+    store.fromNeighborhood("b", nb([["a", "Person", 1]]));
+    store.mergeNeighborhoodWithEdges("b", { KNOWS: ["a"] });
+
+    applyLiveEvent(store, {
+      edge_inserted: { edge_type: "NOTE", src: "a", dst: "b" },
+    });
+    expect(store.edges.has(edgeId("NOTE", "a", "b"))).toBe(true);
+  });
+
+  it("marks a visible but not-fully-expanded node dirty and does not fabricate the edge", () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", nb([["b", "Person", 1]]));
+    expect(store.needsEdges("a")).toBe(true);
+
+    applyLiveEvent(store, {
+      edge_inserted: { edge_type: "NOTE", src: "a", dst: "b" },
+    });
+    expect(store.edges.has(edgeId("NOTE", "a", "b"))).toBe(false);
+    expect(store.dirty.has("a")).toBe(true);
+    expect(store.dirty.has("b")).toBe(true);
+  });
+
+  it("marks only the visible endpoint dirty when the other is off-canvas", () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", nb([["b", "Person", 1]]));
+    store.mergeNeighborhoodWithEdges("a", { KNOWS: ["b"] });
+
+    applyLiveEvent(store, {
+      edge_inserted: { edge_type: "NOTE", src: "a", dst: "ghost" },
+    });
+    expect(store.nodes.has("ghost")).toBe(false);
+    expect(store.edges.has(edgeId("NOTE", "a", "ghost"))).toBe(false);
+    expect(store.dirty.has("a")).toBe(true);
+    expect(store.dirty.has("ghost")).toBe(false);
+  });
+});
+
+describe("resyncKeys", () => {
+  it("returns visible node keys in sorted order", () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("c", nb([["a", "Person", 1], ["b", "Org", 1]]));
+    expect(resyncKeys(store)).toEqual(["a", "b", "c"]);
+  });
+});

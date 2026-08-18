@@ -83,6 +83,7 @@ describe("WatchClient", () => {
   function start(
     extras: {
       onConnected?: () => void;
+      onReconnecting?: () => void;
       onEvent?: (event: MutationEvent) => void;
       onLagged?: (n: number) => void;
     } = {},
@@ -134,6 +135,17 @@ describe("WatchClient", () => {
     sockets[0].receive(JSON.stringify({ lagged: 7 }));
     expect(onLagged).toHaveBeenCalledTimes(1);
     expect(onLagged).toHaveBeenCalledWith(7);
+  });
+
+  it("emits reconnecting on unexpected close before the next ack", async () => {
+    const onConnected = vi.fn();
+    const onReconnecting = vi.fn();
+    start({ onConnected, onReconnecting });
+    sockets[0].open();
+    sockets[0].receive(JSON.stringify({ subscribed: true }));
+    sockets[0].close();
+    expect(onReconnecting).toHaveBeenCalledTimes(1);
+    expect(onConnected).toHaveBeenCalledTimes(1);
   });
 
   it("reconnects after an unexpected close and waits for ack again", async () => {

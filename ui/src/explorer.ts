@@ -1,9 +1,21 @@
 import { Graph } from "@cosmos.gl/graph";
 import { ApiClient, ApiError } from "./api";
 import { QueryConsole } from "./console";
+import { EXPLAIN_CONCURRENCY, mapPool } from "./classify";
 import { expandNode, loadDemoNeighborhood } from "./expand";
 import { GlowQueue, bornEdgeIds } from "./glow";
 import { Inspector } from "./inspector";
+import {
+  FLASH_MS,
+  applyLiveEvent,
+  formatLaggedLine,
+  formatTickerLine,
+  nextDot,
+  resyncKeys,
+  watchUrl,
+  type WatchDot as LiveDot,
+} from "./live";
+import { ActivityTicker } from "./ticker";
 import {
   flattenColors,
   flattenLinks,
@@ -13,14 +25,14 @@ import {
   visibleEdgeIds,
 } from "./paint";
 import { COLOR, GraphStore } from "./store";
-import type { MutationEvent } from "./watch";
+import { WatchClient, type MutationEvent } from "./watch";
 
 const CLICK_EXPAND_MS = 280;
 const POINT_SIZE = 7;
 const LINK_WIDTH = 1.15;
 const GLOW_WIDTH = 2.4;
 
-export type WatchDot = "idle" | "connected" | "reconnecting";
+export type WatchDot = LiveDot;
 
 export type ExplorerOptions = {
   api: ApiClient;
@@ -44,6 +56,8 @@ export class Explorer {
   private readonly glow = new GlowQueue();
   private readonly queryConsole: QueryConsole;
   private readonly inspector: Inspector;
+  private readonly ticker: ActivityTicker;
+  private readonly watch: WatchClient;
 
   private readonly rail: HTMLElement;
   private readonly exploreBtn: HTMLButtonElement;
@@ -65,7 +79,9 @@ export class Explorer {
   private hoverKey: string | undefined;
   private clickTimer: number | undefined;
   private glowTimer: number | undefined;
+  private flashTimer: number | undefined;
   private tail: Promise<void> = Promise.resolve();
+  private dot: WatchDot = "idle";
 
   constructor(host: HTMLElement, options: ExplorerOptions) {
     this.host = host;
@@ -145,6 +161,22 @@ export class Explorer {
         this.syncRail(open ? "console" : this.inspector.isRulesOpen ? "rules" : "explore");
       },
     });
+    this.ticker = new ActivityTicker(host);
+    this.watch = new WatchClient({
+      url: watchUrl(window.location),
+      onConnected: () => {
+        this.advanceDot("connected");
+      },
+      onReconnecting: () => {
+        this.advanceDot("reconnecting");
+      },
+      onEvent: (event) => {
+        this.applyWatchEvent(event);
+      },
+      onLagged: (n) => {
+        this.run(() => this.resync(n));
+      },
+    });
     this.inspector = new Inspector(host, {
       api: this.api,
       store: this.store,
@@ -173,13 +205,16 @@ export class Explorer {
   }
 
   setWatchStatus(state: WatchDot): void {
+    this.dot = state;
     this.statusDot.dataset.watch = state;
   }
 
   applyWatchEvent(event: MutationEvent): void {
     const before = [...this.store.edges.keys()];
-    this.store.apply(event);
+    applyLiveEvent(this.store, event);
     this.inspector.closeIfEdgeMissing();
+    this.ticker.push(formatTickerLine(event));
+    this.advanceDot("event");
     if (!prefersReducedMotion()) {
       const born = bornEdgeIds(before, this.store.edges.keys());
       if (born.length > 0) {
@@ -196,6 +231,12 @@ export class Explorer {
       window.clearTimeout(this.glowTimer);
       this.glowTimer = undefined;
     }
+    if (this.flashTimer !== undefined) {
+      window.clearTimeout(this.flashTimer);
+      this.flashTimer = undefined;
+    }
+    this.watch.close();
+    this.ticker.destroy();
     this.graph?.destroy();
     this.graph = undefined;
     this.queryConsole.destroy();
@@ -211,6 +252,31 @@ export class Explorer {
     setCurrent(this.exploreBtn, view === "explore");
     setCurrent(this.consoleBtn, view === "console");
     setCurrent(this.rulesBtn, view === "rules");
+  }
+
+  private advanceDot(action: Parameters<typeof nextDot>[1]): void {
+    this.setWatchStatus(nextDot(this.dot, action, prefersReducedMotion()));
+    if (this.flashTimer !== undefined) {
+      window.clearTimeout(this.flashTimer);
+      this.flashTimer = undefined;
+    }
+    if (this.dot === "flash") {
+      this.flashTimer = window.setTimeout(() => {
+        this.flashTimer = undefined;
+        this.advanceDot("flash_end");
+      }, FLASH_MS);
+    }
+  }
+
+  private async resync(skipped: number): Promise<void> {
+    this.ticker.push(formatLaggedLine(skipped));
+    this.store.lagged();
+    const keys = resyncKeys(this.store);
+    await mapPool(keys, EXPLAIN_CONCURRENCY, (key) =>
+      expandNode(this.store, this.api, key, 1),
+    );
+    this.paint();
+    this.scheduleFit();
   }
 
   private async loadDemo(): Promise<void> {

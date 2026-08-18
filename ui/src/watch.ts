@@ -31,6 +31,7 @@ export type WatchBackoff = {
 export type WatchClientOptions = {
   url: string;
   onConnected?: () => void;
+  onReconnecting?: () => void;
   onEvent?: (event: MutationEvent) => void;
   onLagged?: (skipped: number) => void;
   createWebSocket?: (url: string) => WatchSocket;
@@ -40,6 +41,7 @@ export type WatchClientOptions = {
 export class WatchClient {
   private readonly url: string;
   private readonly onConnected: (() => void) | undefined;
+  private readonly onReconnecting: (() => void) | undefined;
   private readonly onEvent: ((event: MutationEvent) => void) | undefined;
   private readonly onLagged: ((skipped: number) => void) | undefined;
   private readonly createWebSocket: (url: string) => WatchSocket;
@@ -55,6 +57,7 @@ export class WatchClient {
   constructor(options: WatchClientOptions) {
     this.url = options.url;
     this.onConnected = options.onConnected;
+    this.onReconnecting = options.onReconnecting;
     this.onEvent = options.onEvent;
     this.onLagged = options.onLagged;
     this.createWebSocket = options.createWebSocket ?? defaultWebSocket;
@@ -108,6 +111,9 @@ export class WatchClient {
 
   private readonly handleClose = (): void => {
     this.detach();
+    if (!this.closedByUser) {
+      this.onReconnecting?.();
+    }
     this.scheduleReconnect();
   };
 

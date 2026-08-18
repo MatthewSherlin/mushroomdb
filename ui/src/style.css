@@ -108,8 +108,48 @@ button {
   background: var(--signal);
 }
 
-.status-dot[data-watch="reconnecting"] {
+.status-dot[data-watch="reconnecting"],
+.status-dot[data-watch="flash"] {
   background: var(--gold);
+}
+
+.ticker {
+  position: absolute;
+  top: 48px;
+  left: 60px;
+  z-index: 4;
+  max-width: 22rem;
+}
+
+.ticker-toggle {
+  padding: 2px 0;
+  color: color-mix(in srgb, var(--paper) 55%, var(--ink));
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.ticker-last,
+.ticker-list {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: color-mix(in srgb, var(--paper) 70%, var(--ink));
+}
+
+.ticker-list {
+  max-height: 12rem;
+  overflow: auto;
+}
+
+.ticker-list li {
+  padding: 1px 0;
 }
 
 .stage {
