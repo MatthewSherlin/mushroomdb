@@ -1049,13 +1049,19 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         // Provenance-owned OR a live rule would derive this pair. User-first
         // edges that a later rule matches are not in `owned`, but deleting
         // them would leave a hole `rebuild_rule` immediately fills.
-        if self.is_rule_owned(edge_type, src_key, dst_key)
-            || self.would_derive(edge_type, src_key, dst_key)
-        {
+        if self.is_rule_owned(edge_type, src_key, dst_key) {
             return Err(GraphError::RuleOwned {
                 detail: format!(
                     "edge {edge_type} {src_key}→{dst_key} is rule-owned; \
                      delete or change the owning rule"
+                ),
+            });
+        }
+        if self.would_derive(edge_type, src_key, dst_key) {
+            return Err(GraphError::RuleOwned {
+                detail: format!(
+                    "edge {edge_type} {src_key}→{dst_key} is rule-owned; \
+                     delete or change the owning rule, or a live rule would re-derive it"
                 ),
             });
         }

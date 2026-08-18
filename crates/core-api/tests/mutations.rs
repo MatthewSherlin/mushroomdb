@@ -118,6 +118,10 @@ fn delete_rule_owned_edge_returns_rule_owned() {
                 detail.contains("delete") || detail.contains("change"),
                 "RuleOwned detail must guide the user to delete or change the rule: {detail}"
             );
+            assert!(
+                !detail.contains("or a live rule would re-derive it"),
+                "provenance-owned path must not use the would_derive suffix: {detail}"
+            );
         }
         other => panic!("expected RuleOwned, got {other:?}"),
     }

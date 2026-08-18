@@ -322,8 +322,10 @@ fn queue_batch_op(b: &mut core_api::BatchBuilder<'_, SimFs>, op: &Op) {
             tag_vals.dedup();
             b.set_prop(&format!("k{k}"), "tags", Value::List(tag_vals));
         }
-        Op::CreateRule(n) => {
-            b.create_rule(rule_template(*n));
+        Op::CreateRule(_) => {
+            // batch_inner_strategy never emits CreateRule (T5 same-batch
+            // rule-window); standalone CreateRule is applied outside this fn.
+            unreachable!("CreateRule is not a Batch inner op");
         }
         Op::DeleteRule(n) => {
             b.delete_rule(RULE_NAMES[(*n as usize) % 5]);
@@ -666,7 +668,12 @@ fn delete_edge_of_user_first_derived_pair_is_rule_owned() {
     assert!(oracle.is_derived_edge("r_fe", "k1", "k2"));
 
     match db.delete_edge("r_fe", "k1", "k2") {
-        Err(GraphError::RuleOwned { .. }) => {}
+        Err(GraphError::RuleOwned { detail }) => {
+            assert!(
+                detail.contains("or a live rule would re-derive it"),
+                "would_derive RuleOwned must distinguish from provenance: {detail}"
+            );
+        }
         other => panic!("expected RuleOwned, got {other:?}"),
     }
     assert_eq!(oracle.delete_edge("r_fe", "k1", "k2"), Some(None));

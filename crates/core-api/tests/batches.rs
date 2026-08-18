@@ -334,6 +334,48 @@ fn duplicate_key_inside_batch_is_rejected() {
     assert!(!db.has_node("a"));
 }
 
+/// User-first edge + later matching rule: `delete_edge` in a batch must
+/// reject the *whole* batch (`RuleOwned` via `would_derive`, not provenance).
+/// WAL bytes and the user edge stay put.
+#[test]
+fn batch_delete_edge_of_would_derive_pair_is_rejected() {
+    let dir = tmp("batch-would-derive");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("A", "u1", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    db.insert_node("A", "u2", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    assert!(db.insert_edge("KNOWS", "u1", "u2").unwrap());
+    db.create_rule(overlap_rule("knows", "KNOWS")).unwrap();
+    assert_eq!(
+        db.neighbors("u1", "KNOWS", Direction::Out).unwrap(),
+        vec!["u2".to_string()]
+    );
+
+    let before = wal_len(&dir);
+    let err = db
+        .batch()
+        .insert_node("A", "extra", vec![])
+        .delete_edge("KNOWS", "u1", "u2")
+        .commit()
+        .unwrap_err();
+    match err {
+        GraphError::RuleOwned { detail } => {
+            assert!(
+                detail.contains("or a live rule would re-derive it"),
+                "would_derive RuleOwned must distinguish from provenance: {detail}"
+            );
+        }
+        other => panic!("expected RuleOwned, got {other:?}"),
+    }
+    assert_eq!(wal_len(&dir), before);
+    assert!(!db.has_node("extra"));
+    assert_eq!(
+        db.neighbors("u1", "KNOWS", Direction::Out).unwrap(),
+        vec!["u2".to_string()]
+    );
+}
+
 /// Pins the documented divergence from sequential semantics: batch validation
 /// cannot see edges a same-batch `create_rule` will derive, so `delete_edge`
 /// is dropped (no-op) instead of `Err(RuleOwned)`. If you make validation
