@@ -218,7 +218,7 @@ pub fn read_stats(dir: &Path) -> Result<Stats, CliError> {
 ///
 /// Refuses if `dir` already exists and is not empty. Ingests 10 Orgs, 20
 /// Projects, 30 People via [`SharedDb`] / `ingest_json` (auto-FK on `*_id`)
-/// then declares one scored `Overlap` rule (`skill_fit`).
+/// then declares `skill_fit` plus the three Predicates II rules.
 pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
     refuse_non_empty(dir)?;
 
@@ -251,6 +251,42 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
                 min: 0.5,
             },
             edge_type: "FIT".into(),
+            weight_prop: Some("score".into()),
+            max_edges: None,
+        })?;
+        w.create_rule(RuleDef {
+            name: "founded_within".into(),
+            src_label: "Org".into(),
+            dst_label: "Org".into(),
+            predicate: Predicate::NumericWithin {
+                field: "founded_year".into(),
+                tolerance: 2.0,
+            },
+            edge_type: "FOUNDED_WITHIN".into(),
+            weight_prop: Some("score".into()),
+            max_edges: None,
+        })?;
+        w.create_rule(RuleDef {
+            name: "nearby_office".into(),
+            src_label: "Org".into(),
+            dst_label: "Org".into(),
+            predicate: Predicate::GeoRadius {
+                field: "office".into(),
+                km: 50.0,
+            },
+            edge_type: "NEARBY_OFFICE".into(),
+            weight_prop: Some("score".into()),
+            max_edges: None,
+        })?;
+        w.create_rule(RuleDef {
+            name: "similar_interests".into(),
+            src_label: "Person".into(),
+            dst_label: "Person".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "embedding".into(),
+                min: 0.8,
+            },
+            edge_type: "SIMILAR".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
         })?;
@@ -317,10 +353,55 @@ fn skill_window_json(start: usize, len: usize) -> String {
     format!("[{}]", parts.join(","))
 }
 
+/// Real city [lat, lon] for org `i` (1-based). Four clusters sit inside 50 km:
+/// NYC / Jersey City / Newark, SF / Oakland / Berkeley, London / Greenwich,
+/// Paris / Versailles.
+fn org_office(i: usize) -> (f64, f64) {
+    match i {
+        1 => (40.7128, -74.0060),  // New York
+        2 => (48.8566, 2.3522),    // Paris
+        3 => (51.5074, -0.1278),   // London
+        4 => (37.7749, -122.4194), // San Francisco
+        5 => (37.8044, -122.2711), // Oakland
+        6 => (37.8715, -122.2730), // Berkeley
+        7 => (40.7178, -74.0431),  // Jersey City
+        8 => (51.4769, 0.0005),    // Greenwich
+        9 => (48.8014, 2.1301),    // Versailles
+        10 => (40.7357, -74.1724), // Newark
+        _ => unreachable!("demo orgs are 1..=10"),
+    }
+}
+
+/// Dim-8 embedding for person `i`. Groups of three share a unit axis (cos = 1);
+/// two extra groups are (0.8, 0.6, …) and (0.6, 0.8, …) so cos = 0.8 / 0.96
+/// against the first two axes is hand-checkable.
+fn person_embedding_json(i: usize) -> String {
+    let mut v = [0.0_f64; 8];
+    match i {
+        9 | 19 | 29 => {
+            v[0] = 0.8;
+            v[1] = 0.6;
+        }
+        10 | 20 | 30 => {
+            v[0] = 0.6;
+            v[1] = 0.8;
+        }
+        _ => {
+            let axis = (i - 1) % 10;
+            debug_assert!(axis < 8);
+            v[axis] = 1.0;
+        }
+    }
+    let parts: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
+    format!("[{}]", parts.join(","))
+}
+
 fn org_json() -> String {
     json_array((1..=N_ORGS).map(|i| {
+        let year = 2010 + (i as i64 - 1);
+        let (lat, lon) = org_office(i);
         format!(
-            r#"{{"id":"org-{i:02}","name":"Org {i}","skills":{}}}"#,
+            r#"{{"id":"org-{i:02}","name":"Org {i}","founded_year":{year},"office":[{lat},{lon}],"skills":{}}}"#,
             skill_window_json(i, 3)
         )
     }))
@@ -341,7 +422,8 @@ fn person_json() -> String {
         let org = (i - 1) % N_ORGS + 1;
         let proj = (i - 1) % N_PROJECTS + 1;
         format!(
-            r#"{{"id":"person-{i:02}","name":"Person {i}","org_id":"org-{org:02}","project_id":"proj-{proj:02}","skills":{}}}"#,
+            r#"{{"id":"person-{i:02}","name":"Person {i}","org_id":"org-{org:02}","project_id":"proj-{proj:02}","embedding":{},"skills":{}}}"#,
+            person_embedding_json(i),
             skill_window_json(proj, 3)
         )
     }))
@@ -358,6 +440,15 @@ pub fn format_demo(dir: &Path, out: &DemoOutcome) -> String {
     let _ = writeln!(
         buf,
         "overlap rule: skill_fit (Person.skills ∩ Project.skills, min 0.5)"
+    );
+    let _ = writeln!(
+        buf,
+        "numeric rule: founded_within (Org.founded_year, tolerance 2)"
+    );
+    let _ = writeln!(buf, "geo rule: nearby_office (Org.office [lat,lon], 50 km)");
+    let _ = writeln!(
+        buf,
+        "vector rule: similar_interests (Person.embedding dim 8, min 0.8)"
     );
     let _ = writeln!(buf);
     let _ = writeln!(buf, "== auto-FK rules ==");
@@ -432,6 +523,7 @@ fn fmt_cell(cell: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
@@ -448,6 +540,56 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    fn directed_pairs(db: &SharedDb, etype: &str) -> BTreeSet<(String, String)> {
+        let g = db.read();
+        let mut out = BTreeSet::new();
+        for i in 1..=N_ORGS {
+            let src = format!("org-{i:02}");
+            if let Ok(nbrs) = g.neighbors(&src, etype, core_api::Direction::Out) {
+                for dst in nbrs {
+                    out.insert((src.clone(), dst));
+                }
+            }
+        }
+        for i in 1..=N_PEOPLE {
+            let src = format!("person-{i:02}");
+            if let Ok(nbrs) = g.neighbors(&src, etype, core_api::Direction::Out) {
+                for dst in nbrs {
+                    out.insert((src.clone(), dst));
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_weight(db: &SharedDb, a: &str, b: &str, rule: &str, want: f64) {
+        let hits: Vec<_> = db
+            .read()
+            .explain(a, b)
+            .expect("explain")
+            .into_iter()
+            .filter(|e| e.rule == rule && e.src_key == a && e.dst_key == b)
+            .collect();
+        assert_eq!(hits.len(), 1, "explain {a}/{b} rule={rule}: {hits:?}");
+        let got = hits[0].weight.expect("weighted");
+        assert!(
+            (got - want).abs() < 1e-12,
+            "{rule} {a}→{b}: got {got} want {want}"
+        );
+    }
+
+    fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+        const R: f64 = 6371.0088;
+        let phi1 = lat1.to_radians();
+        let phi2 = lat2.to_radians();
+        let dphi = (lat2 - lat1).to_radians();
+        let dlam = (lon2 - lon1).to_radians();
+        let a = ((dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlam / 2.0).sin().powi(2))
+            .clamp(0.0, 1.0);
+        let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+        R * c
     }
 
     fn default_bind() -> SocketAddr {
@@ -720,9 +862,16 @@ mod tests {
         // Auto-FK: 20 project→org + 30 person→org + 30 person→project = 80.
         // FIT: each of 30 people matches home (Jaccard 1.0) and two adjacent
         // projects (3-skill window shifted ±1 → Jaccard 2/4 = 0.5) = 30*3 = 90.
-        // Total edges: 80 + 90 = 170.
-        assert_eq!(out.stats.edges, 170);
-        assert_eq!(out.stats.rules.len(), 4, "3 auto-FK + 1 overlap");
+        // founded_within: |year_i − year_j| ≤ 2 on 2010+(i-1) → 17 pairs × 2 = 34.
+        // nearby_office: 4 city clusters (NYC/SF/London/Paris) → 8 pairs × 2 = 16.
+        // similar_interests: dim-8 groups → 57 pairs × 2 = 114.
+        // Total: 80 + 90 + 34 + 16 + 114 = 334.
+        assert_eq!(out.stats.edges, 334);
+        assert_eq!(
+            out.stats.rules.len(),
+            7,
+            "3 auto-FK + overlap + numeric + geo + vector"
+        );
         let fit = out
             .stats
             .rules
@@ -730,6 +879,27 @@ mod tests {
             .find(|r| r.name == "skill_fit")
             .expect("skill_fit");
         assert_eq!(fit.edges, 90, "30 people × 3 FIT edges");
+        let founded = out
+            .stats
+            .rules
+            .iter()
+            .find(|r| r.name == "founded_within")
+            .expect("founded_within");
+        assert_eq!(founded.edges, 34);
+        let nearby = out
+            .stats
+            .rules
+            .iter()
+            .find(|r| r.name == "nearby_office")
+            .expect("nearby_office");
+        assert_eq!(nearby.edges, 16);
+        let similar = out
+            .stats
+            .rules
+            .iter()
+            .find(|r| r.name == "similar_interests")
+            .expect("similar_interests");
+        assert_eq!(similar.edges, 114);
 
         let mut names: Vec<&str> = out.stats.rules.iter().map(|r| r.name.as_str()).collect();
         names.sort_unstable();
@@ -739,6 +909,9 @@ mod tests {
                 "auto_fk_person_org_id",
                 "auto_fk_person_project_id",
                 "auto_fk_project_org_id",
+                "founded_within",
+                "nearby_office",
+                "similar_interests",
                 "skill_fit",
             ]
         );
@@ -786,6 +959,79 @@ mod tests {
             "explain(person-01, proj-01) must find the derived edges"
         );
 
+        let db = SharedDb::open(&dir).expect("reopen demo");
+        assert_eq!(
+            directed_pairs(&db, "FOUNDED_WITHIN"),
+            [
+                ("org-01", "org-02"),
+                ("org-01", "org-03"),
+                ("org-02", "org-01"),
+                ("org-02", "org-03"),
+                ("org-02", "org-04"),
+                ("org-03", "org-01"),
+                ("org-03", "org-02"),
+                ("org-03", "org-04"),
+                ("org-03", "org-05"),
+                ("org-04", "org-02"),
+                ("org-04", "org-03"),
+                ("org-04", "org-05"),
+                ("org-04", "org-06"),
+                ("org-05", "org-03"),
+                ("org-05", "org-04"),
+                ("org-05", "org-06"),
+                ("org-05", "org-07"),
+                ("org-06", "org-04"),
+                ("org-06", "org-05"),
+                ("org-06", "org-07"),
+                ("org-06", "org-08"),
+                ("org-07", "org-05"),
+                ("org-07", "org-06"),
+                ("org-07", "org-08"),
+                ("org-07", "org-09"),
+                ("org-08", "org-06"),
+                ("org-08", "org-07"),
+                ("org-08", "org-09"),
+                ("org-08", "org-10"),
+                ("org-09", "org-07"),
+                ("org-09", "org-08"),
+                ("org-09", "org-10"),
+                ("org-10", "org-08"),
+                ("org-10", "org-09"),
+            ]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            directed_pairs(&db, "NEARBY_OFFICE"),
+            [
+                ("org-01", "org-07"),
+                ("org-01", "org-10"),
+                ("org-02", "org-09"),
+                ("org-03", "org-08"),
+                ("org-04", "org-05"),
+                ("org-04", "org-06"),
+                ("org-05", "org-04"),
+                ("org-05", "org-06"),
+                ("org-06", "org-04"),
+                ("org-06", "org-05"),
+                ("org-07", "org-01"),
+                ("org-07", "org-10"),
+                ("org-08", "org-03"),
+                ("org-09", "org-02"),
+                ("org-10", "org-01"),
+                ("org-10", "org-07"),
+            ]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect::<BTreeSet<_>>()
+        );
+        assert_weight(&db, "org-01", "org-02", "founded_within", 0.5);
+        let nyc_jc = 1.0 - haversine_km(40.7128, -74.0060, 40.7178, -74.0431) / 50.0;
+        assert_weight(&db, "org-01", "org-07", "nearby_office", nyc_jc);
+        assert_weight(&db, "person-01", "person-11", "similar_interests", 1.0);
+        assert_weight(&db, "person-01", "person-09", "similar_interests", 0.8);
+
         let err = run_demo(&dir).expect_err("second run into the same dir");
         let msg = err.to_string().to_lowercase();
         assert!(
@@ -810,7 +1056,7 @@ mod tests {
             "stats output should include live node count, got:\n{text}"
         );
         assert!(
-            text.contains("170"),
+            text.contains("334"),
             "stats output should include edge count, got:\n{text}"
         );
         assert!(

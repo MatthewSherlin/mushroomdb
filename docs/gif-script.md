@@ -104,6 +104,69 @@ Query `person-01` explicitly.
 
 Hold the last frame on the gold glow, then cut.
 
+## Addendum — Predicates II (numeric / geo / vector)
+
+Same served origin. The why panel reads `Explanation.predicate` and the
+two nodes' props; formulas match `crates/core-rules/src/def.rs`. Minus
+sign is U+2212 (`−`).
+
+### founded_within (numeric)
+
+Org years are `2010 + (i − 1)`. Open **org-01** (empty-state "Load demo
+neighborhood", or query `MATCH (n:Org {id: 'org-01'}) RETURN n`). Gold
+`FOUNDED_WITHIN` to org-02 and org-03. Click org-01 → org-02:
+
+```
+founded_within
+FOUNDED_WITHIN · 0.5
+org-01 → org-02
+numeric_within(founded_year) = |2010 − 2011| = 1 ≤ 2
+```
+
+Optional org-01 → org-03 (boundary, score 0):
+
+```
+numeric_within(founded_year) = |2010 − 2012| = 2 ≤ 2
+```
+
+### nearby_office (geo)
+
+Real city coordinates, 50 km. Click gold org-01 (New York) → org-07
+(Jersey City):
+
+```
+nearby_office
+NEARBY_OFFICE · 0.936
+org-01 → org-07
+geo_radius(office) = 3.2 km ≤ 50 km
+```
+
+`3.2` is haversine (R = 6371.0088) to 1 decimal km. Score
+`1 − 3.176/50 = 0.936` (`formatScore` trims to 3 decimals). Optional
+org-04 (San Francisco) → org-05 (Oakland):
+
+```
+geo_radius(office) = 13.4 km ≤ 50 km
+```
+
+### similar_interests (vector)
+
+Dim-8, min 0.8. Query `person-01` and click gold `SIMILAR` to
+person-11 (same unit axis, cos = 1):
+
+```
+similar_interests
+SIMILAR · 1
+person-01 → person-11
+vector_similar(embedding) = cos = 1 ≥ 0.8 · d=8
+```
+
+Optional person-01 → person-09 (`[1,0,…]` vs `[0.8, 0.6, 0,…]`, cos = 0.8):
+
+```
+vector_similar(embedding) = cos = 0.8 ≥ 0.8 · d=8
+```
+
 ## Timing notes
 
 - Wait for the status dot before any click (~1s after load).

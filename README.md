@@ -91,13 +91,16 @@ columns: p, o, score
 
 `graphdb demo <db-dir>` writes a **deterministic** generic dataset — 10
 Orgs, 20 Projects, 30 People — via `ingest_json`. Rows carry list-valued
-`skills` (a 3-token window `[s{home}, s{next}, s{next+1}]`) and FK fields
-(`org_id`, `project_id`). Auto-FK `KeyMatch` rules are declared during
-ingest; one scored `Overlap` rule (`skill_fit`, Jaccard ≥ 0.5 on
-`skills`) is created after. Each person fully matches their home project
-(score 1.0) and partially matches the two adjacent windows (score 0.5).
-The command refuses a non-empty directory — including hidden files
-(`.DS_Store` counts).
+`skills` (a 3-token window `[s{home}, s{next}, s{next+1}]`), FK fields
+(`org_id`, `project_id`), org `founded_year` / `office` `[lat,lon]`, and
+a dim-8 person `embedding`. Auto-FK `KeyMatch` rules are declared during
+ingest; four scored rules follow: `skill_fit` (Overlap, Jaccard ≥ 0.5),
+`founded_within` (numeric_within on `founded_year`, tolerance 2),
+`nearby_office` (geo_radius 50 km on real city coordinates), and
+`similar_interests` (vector_similar, cosine ≥ 0.8). Each person fully
+matches their home project (score 1.0) and partially matches the two
+adjacent windows (score 0.5). The command refuses a non-empty directory
+— including hidden files (`.DS_Store` counts).
 
 Captured from `cargo run -p cli --bin graphdb -- demo ./demo-db`:
 
@@ -105,6 +108,9 @@ Captured from `cargo run -p cli --bin graphdb -- demo ./demo-db`:
 == demo ==
 ingested 10 Orgs, 20 Projects, 30 People
 overlap rule: skill_fit (Person.skills ∩ Project.skills, min 0.5)
+numeric rule: founded_within (Org.founded_year, tolerance 2)
+geo rule: nearby_office (Org.office [lat,lon], 50 km)
+vector rule: similar_interests (Person.embedding dim 8, min 0.8)
 
 == auto-FK rules ==
   auto_fk_person_org_id
@@ -133,11 +139,14 @@ columns: p, proj, score
 
 ```text
 nodes: 60 live, 0 tombstoned
-edges: 170
-rules: 4
+edges: 334
+rules: 7
   auto_fk_person_org_id        edges=30  tripped=false
   auto_fk_person_project_id    edges=30  tripped=false
   auto_fk_project_org_id       edges=20  tripped=false
+  founded_within               edges=34  tripped=false
+  nearby_office                edges=16  tripped=false
+  similar_interests            edges=114  tripped=false
   skill_fit                    edges=90  tripped=false
 ```
 
@@ -179,7 +188,7 @@ Endpoints (thin wrappers over `core-api`):
 `GET /stats` on the demo dataset (same process as the listen line above):
 
 ```text
-{"edges":170,"nodes_live":60,"nodes_tombstoned":0,"rules":[...]}
+{"edges":334,"nodes_live":60,"nodes_tombstoned":0,"rules":[...]}
 ```
 
 ## UI
@@ -201,6 +210,9 @@ $ graphdb demo ./db
 == demo ==
 ingested 10 Orgs, 20 Projects, 30 People
 overlap rule: skill_fit (Person.skills ∩ Project.skills, min 0.5)
+numeric rule: founded_within (Org.founded_year, tolerance 2)
+geo rule: nearby_office (Org.office [lat,lon], 50 km)
+vector rule: similar_interests (Person.embedding dim 8, min 0.8)
 
 == auto-FK rules ==
   auto_fk_person_org_id
