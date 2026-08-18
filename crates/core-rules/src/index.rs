@@ -107,6 +107,7 @@ fn numeric_index_key(v: f64, tolerance: f64) -> Option<ValueKey> {
         return None;
     }
     if tolerance == 0.0 {
+        let v = if v == 0.0 { 0.0_f64 } else { v };
         return Some(ValueKey::FloatBits(v.to_bits()));
     }
     Some(ValueKey::Int(floor_to_i64(v / tolerance)))
@@ -125,25 +126,30 @@ fn numeric_probe_keys(v: f64, tolerance: f64) -> BTreeSet<ValueKey> {
     }
 }
 
-fn geo_cell(lat: f64, lon: f64, km: f64) -> Option<(i64, i64, f64)> {
+fn geo_cell(lat: f64, lon: f64, km: f64) -> Option<(i64, i64, f64, i64)> {
     if !km.is_finite() || km <= 0.0 {
         return None;
     }
     let cell_deg = (km / 111.0).max(1e-6);
     let gx = floor_to_i64(lat / cell_deg);
-    let gy = floor_to_i64(lon / cell_deg);
-    Some((gx, gy, cell_deg))
+    // Longitude wraps; lat does not (validated range, no pole crossing
+    // within the supported |lat|≲87 envelope — see cos clamp below).
+    let lon_cells = (360.0 / cell_deg).ceil() as i64;
+    let lon_cells = lon_cells.max(1);
+    let gy = floor_to_i64(lon / cell_deg).rem_euclid(lon_cells);
+    Some((gx, gy, cell_deg, lon_cells))
 }
 
 fn geo_index_key(lat: f64, lon: f64, km: f64) -> Option<ValueKey> {
-    let (gx, gy, _) = geo_cell(lat, lon, km)?;
+    let (gx, gy, _, _) = geo_cell(lat, lon, km)?;
     Some(ValueKey::Str(format!("{gx}|{gy}")))
 }
 
 fn geo_probe_keys(lat: f64, lon: f64, km: f64) -> BTreeSet<ValueKey> {
-    let Some((gx, gy, cell_deg)) = geo_cell(lat, lon, km) else {
+    let Some((gx, gy, cell_deg, lon_cells)) = geo_cell(lat, lon, km) else {
         return BTreeSet::new();
     };
+    // Cos clamp keeps the probe a superset up to |lat| ≈ 87.
     let cos_lat = lat.to_radians().cos().max(0.05);
     let n = ((km / (111.0 * cos_lat)) / cell_deg).ceil();
     let n = if n.is_finite() {
@@ -155,7 +161,7 @@ fn geo_probe_keys(lat: f64, lon: f64, km: f64) -> BTreeSet<ValueKey> {
     for dx in -1..=1 {
         for dy in -n..=n {
             let cx = gx.saturating_add(dx);
-            let cy = gy.saturating_add(dy);
+            let cy = gy.saturating_add(dy).rem_euclid(lon_cells);
             out.insert(ValueKey::Str(format!("{cx}|{cy}")));
         }
     }
@@ -428,6 +434,33 @@ mod tests {
     }
 
     #[test]
+    fn numeric_tol_zero_signed_zero_collides() {
+        let pred = Predicate::NumericWithin {
+            field: "year".into(),
+            tolerance: 0.0,
+        };
+        let spec = candidate_spec(&pred);
+        let neg = year(Value::Float(-0.0));
+        let pos = year(Value::Float(0.0));
+        let mut idx = SideIndex::default();
+        idx.insert(&spec, 1, &getter(&neg));
+        assert_eq!(
+            idx.candidates(&spec, &getter(&pos))
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        let mut idx2 = SideIndex::default();
+        idx2.insert(&spec, 2, &getter(&pos));
+        assert_eq!(
+            idx2.candidates(&spec, &getter(&neg))
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[test]
     fn geo_grid_same_cell_cross_cell_and_far_city() {
         let pred = Predicate::GeoRadius {
             field: "loc".into(),
@@ -479,6 +512,52 @@ mod tests {
         assert!(
             hits.contains(&2),
             "300 km east of Reykjavik must stay in the high-lat probe"
+        );
+    }
+
+    #[test]
+    fn geo_grid_antimeridian_wrap_and_evaluate_agree() {
+        let pred = Predicate::GeoRadius {
+            field: "loc".into(),
+            km: 400.0,
+        };
+        let spec = candidate_spec(&pred);
+        let east = loc(70.0, 179.9);
+        let west = loc(70.0, -179.9);
+
+        let mut idx = SideIndex::default();
+        idx.insert(&spec, 1, &getter(&east));
+        assert!(
+            idx.candidates(&spec, &getter(&west)).contains(&1),
+            "±180 pair at lat 70 must land in the wrapped probe"
+        );
+
+        let sp = |f: &str| east.get(f).cloned();
+        let dp = |f: &str| west.get(f).cloned();
+        let score = crate::def::evaluate(
+            &pred,
+            &crate::def::NodeView {
+                key: "e",
+                props: &sp,
+            },
+            &crate::def::NodeView {
+                key: "w",
+                props: &dp,
+            },
+        );
+        assert!(
+            score.is_some(),
+            "haversine must match across the antimeridian"
+        );
+
+        // Wrap must not alias distant longitudes into the Paris probe.
+        let paris = loc(48.8566, 2.3522);
+        let ny = loc(40.7128, -74.0060);
+        let mut idx2 = SideIndex::default();
+        idx2.insert(&spec, 4, &getter(&ny));
+        assert!(
+            !idx2.candidates(&spec, &getter(&paris)).contains(&4),
+            "New York still not in the Paris probe after wrap"
         );
     }
 
