@@ -1,6 +1,7 @@
 //! Thin HTTP wrapper over [`SharedDb`]. Every endpoint is a lock, a public
 //! core-api call, then a response — no business logic.
 
+use crate::json::{params_from_json, result_set_json};
 use crate::AppState;
 use arrow_bridge::to_ipc_bytes;
 use axum::extract::{Path, Query, State};
@@ -8,7 +9,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use core_api::{json_to_value, AutoFk, Dir, GraphError, IngestOptions, ResultSet, SharedDb, Value};
+use core_api::{AutoFk, Dir, GraphError, IngestOptions, SharedDb};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -83,55 +84,6 @@ fn graph_err(e: GraphError) -> Response {
 
 fn json_ok(value: Js) -> Response {
     (StatusCode::OK, Json(value)).into_response()
-}
-
-fn value_to_json(v: &Value) -> Js {
-    match v {
-        Value::Int(i) => json!(i),
-        Value::Float(f) => serde_json::Number::from_f64(*f)
-            .map(Js::Number)
-            .unwrap_or(Js::Null),
-        Value::Str(s) => json!(s),
-        Value::Bool(b) => json!(b),
-        Value::List(xs) => Js::Array(xs.iter().map(value_to_json).collect()),
-    }
-}
-
-fn result_set_json(rs: &ResultSet) -> Js {
-    let columns: Vec<&str> = rs.columns().iter().map(String::as_str).collect();
-    let rows: Vec<Vec<Js>> = (0..rs.len())
-        .map(|i| {
-            rs.row(i)
-                .iter()
-                .map(|cell| cell.as_ref().map(value_to_json).unwrap_or(Js::Null))
-                .collect()
-        })
-        .collect();
-    json!({ "columns": columns, "rows": rows })
-}
-
-/// Map JSON object values through [`json_to_value`]. Only JSON scalars
-/// (bool / number / string) are accepted as query params.
-fn params_from_json(v: Option<&Js>) -> Result<BTreeMap<String, Value>, String> {
-    let Some(v) = v else {
-        return Ok(BTreeMap::new());
-    };
-    let obj = v
-        .as_object()
-        .ok_or_else(|| "params must be an object".to_string())?;
-    let mut out = BTreeMap::new();
-    for (k, val) in obj {
-        if !matches!(val, Js::Bool(_) | Js::Number(_) | Js::String(_)) {
-            return Err(format!("param {k} is not a JSON scalar"));
-        }
-        match json_to_value(val.clone()) {
-            Some(mapped) => {
-                out.insert(k.clone(), mapped);
-            }
-            None => return Err(format!("param {k} is not a JSON scalar")),
-        }
-    }
-    Ok(out)
 }
 
 fn ingest_options(v: Option<&Js>) -> Result<IngestOptions, String> {
@@ -308,6 +260,8 @@ async fn neighborhood(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json::result_set_json;
+    use core_api::{ResultSet, Value};
 
     #[test]
     fn nan_float_cell_serializes_as_null() {

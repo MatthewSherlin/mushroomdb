@@ -1,9 +1,13 @@
 #![deny(clippy::await_holding_lock)]
 
 mod http;
+mod json;
+mod mcp;
 mod ws;
 
 use core_api::{MutationEvent, SharedDb};
+
+pub use mcp::run_mcp_stdio;
 
 /// Router state: the database plus the watch broadcast fan-out.
 #[derive(Clone)]
