@@ -2,9 +2,43 @@ use crate::def::Predicate;
 use core_storage::{list_tokens, Value, ValueKey};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+thread_local! {
+    static VECTOR_DIM_REJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+fn vector_dim_reject_enabled() -> bool {
+    #[cfg(test)]
+    {
+        VECTOR_DIM_REJECT.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+/// Force the ScanAll dim fast-reject on or off. Identity-proof hook.
+#[cfg(test)]
+pub fn with_vector_dim_reject<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    VECTOR_DIM_REJECT.with(|c| {
+        let prev = c.replace(enabled);
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct SideIndex {
     by_key: BTreeMap<ValueKey, BTreeSet<u32>>,
+    /// Per-node `(dim, L2 norm)` for `ScanAll` members. Maintained by the
+    /// same insert/remove choke-points as `by_key`. Cosine still reads live
+    /// props; only `dim` is a fast-reject.
+    vec_meta: BTreeMap<u32, (u32, f64)>,
 }
 
 #[derive(Debug, Default)]
@@ -83,6 +117,15 @@ fn as_numeric_list(v: &Value) -> Option<Vec<f64>> {
         return None;
     }
     items.iter().map(as_finite_f64).collect()
+}
+
+fn vec_dim_norm(v: &Value) -> Option<(u32, f64)> {
+    let xs = as_numeric_list(v)?;
+    let mut n2 = 0.0;
+    for x in &xs {
+        n2 += *x * *x;
+    }
+    Some((xs.len() as u32, n2.sqrt()))
 }
 
 fn floor_to_i64(x: f64) -> i64 {
@@ -234,6 +277,11 @@ impl SideIndex {
         for k in Self::index_keys(spec, get) {
             self.by_key.entry(k).or_default().insert(node);
         }
+        if let CandidateSpec::ScanAll { field } = spec {
+            if let Some(meta) = get(field).as_ref().and_then(vec_dim_norm) {
+                self.vec_meta.insert(node, meta);
+            }
+        }
     }
 
     pub fn remove(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
@@ -245,6 +293,21 @@ impl SideIndex {
                 }
             }
         }
+        if let CandidateSpec::ScanAll { field } = spec {
+            if get(field).as_ref().and_then(as_numeric_list).is_some() {
+                self.vec_meta.remove(&node);
+            }
+        }
+    }
+
+    /// Cached vector dimension for a `ScanAll` member, if present.
+    pub fn vec_dim(&self, node: u32) -> Option<u32> {
+        self.vec_meta.get(&node).map(|(d, _)| *d)
+    }
+
+    /// Cached `(dim, L2 norm)` for tests / debug. Cosine does not read this.
+    pub fn vec_meta(&self, node: u32) -> Option<(u32, f64)> {
+        self.vec_meta.get(&node).copied()
     }
 
     pub fn candidates(
@@ -256,6 +319,14 @@ impl SideIndex {
         for k in Self::probe_keys(spec, get) {
             if let Some(set) = self.by_key.get(&k) {
                 out.extend(set.iter().copied());
+            }
+        }
+        // Exact: VectorSimilar evaluate is None when dims differ.
+        if vector_dim_reject_enabled() {
+            if let CandidateSpec::ScanAll { field } = spec {
+                if let Some((dim, _)) = get(field).as_ref().and_then(vec_dim_norm) {
+                    out.retain(|id| self.vec_meta.get(id).is_none_or(|(d, _)| *d == dim));
+                }
             }
         }
         out
@@ -583,10 +654,35 @@ mod tests {
         idx.insert(&spec, 6, &getter(&missing));
 
         let hits = idx.candidates(&spec, &getter(&emb(&[1.0, 0.0])));
-        assert_eq!(hits.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            hits.into_iter().collect::<Vec<_>>(),
+            vec![1, 2],
+            "dim-2 probe must drop the dim-3 member"
+        );
+        assert_eq!(
+            idx.candidates(&spec, &getter(&emb(&[1.0, 2.0, 3.0])))
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        with_vector_dim_reject(false, || {
+            assert_eq!(
+                idx.candidates(&spec, &getter(&emb(&[1.0, 0.0])))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3],
+                "unfiltered ScanAll still returns every vector node"
+            );
+        });
+        assert_eq!(idx.vec_dim(1), Some(2));
+        assert_eq!(idx.vec_dim(3), Some(3));
+        assert!(idx.vec_meta(1).is_some());
+        assert!(idx.vec_dim(4).is_none());
         assert!(idx.candidates(&spec, &getter(&empty)).is_empty());
         assert!(idx.candidates(&spec, &getter(&text)).is_empty());
         assert!(idx.candidates(&spec, &getter(&missing)).is_empty());
+        idx.remove(&spec, 1, &getter(&emb(&[1.0, 0.0])));
+        assert!(idx.vec_dim(1).is_none());
     }
 
     #[test]

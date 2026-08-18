@@ -19,7 +19,9 @@ use std::time::Duration;
 
 const N: usize = 10_000;
 const SEED: u64 = 0xA5A5_5A5A_C0DE_4B1D;
-const EMBED_DIM: usize = 64;
+/// Mixed dims so `vector_rule_update`'s ScanAll dim-reject is live.
+/// `idx % 3` → 32 / 64 / 128; flip embeddings keep the same `idx` (same dim).
+const EMBED_DIMS: [usize; 3] = [32, 64, 128];
 /// People `2..=HUB_PEOPLE+1` KeyMatch to `org-0001`, so that org is the dst
 /// of ≥1k `WORKS_AT` provenance triples. `person-0001` stays off the hub
 /// so the existing neighborhood benches keep a small depth-2 frontier.
@@ -74,8 +76,9 @@ fn coords(i: usize) -> Value {
 }
 
 fn embedding(seed: u64, idx: u64) -> Value {
+    let dim = EMBED_DIMS[(idx % 3) as usize];
     Value::List(
-        (0..EMBED_DIM)
+        (0..dim)
             .map(|d| {
                 let bits = mix(seed, idx.wrapping_add(1), d as u64);
                 let mut f = (bits as f64) / (u64::MAX as f64) * 2.0 - 1.0;

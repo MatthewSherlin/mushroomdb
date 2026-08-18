@@ -3,6 +3,9 @@ use crate::index::{candidate_spec, CandidateSpec, RuleIndex};
 use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+pub use crate::index::with_vector_dim_reject;
+
 /// Borrowed mutable view of graph state the engine writes derived edges into.
 pub struct GraphMut<'a> {
     pub ids: &'a IdMap,
@@ -885,7 +888,7 @@ impl RuleEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::def::{Predicate, RuleDef};
+    use crate::def::{evaluate, NodeView, Predicate, RuleDef};
     use core_storage::{ColumnStore, Direction, EdgeProps, IdMap, Interner, Topology, Value};
 
     struct Fx {
@@ -1859,5 +1862,144 @@ mod tests {
         assert!(!eng.is_tripped("eq"), "rebuild un-trips when desired fits");
         assert_eq!(eng.provenance()["eq"].len(), 2);
         assert!(eng.by_node_consistent(), "consistent after un-trip rebuild");
+    }
+
+    fn mix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+        x ^ (x >> 31)
+    }
+
+    fn rand_emb(seed: u64, i: u32, dim: usize) -> Value {
+        let vals: Vec<f64> = (0..dim)
+            .map(|d| {
+                let bits = mix64(seed ^ ((i as u64 + 1).wrapping_mul(0x100000001)) ^ (d as u64));
+                let mut f = (bits as f64) / (u64::MAX as f64) * 2.0 - 1.0;
+                if f == 0.0 {
+                    f = 1.0;
+                }
+                f
+            })
+            .collect();
+        emb_val(&vals)
+    }
+
+    fn seed_docs(n: u32, seed: u64) -> (Fx, Vec<u32>) {
+        let dims = [2usize, 3, 4, 8];
+        let mut fx = Fx::new();
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let dim = dims[(i as usize) % dims.len()];
+            ids.push(fx.add(
+                "Doc",
+                &format!("d{i}"),
+                vec![("emb", rand_emb(seed, i, dim))],
+            ));
+        }
+        (fx, ids)
+    }
+
+    /// Identity proof: 500 mixed-dim vectors, derived edges with the dim
+    /// reject on vs forced off (and vs brute-force evaluate) are identical.
+    #[test]
+    fn vector_dim_reject_matches_unfiltered_and_oracle() {
+        const N: u32 = 500;
+        const SEED: u64 = 0xC0FF_EE00_D15C;
+        let def = vec_rule();
+
+        let (mut fx_on, ids) = seed_docs(N, SEED);
+        let mut eng_on = RuleEngine::new();
+        {
+            let mut g = fx_on.g();
+            eng_on.create_rule(def.clone(), &mut g).unwrap();
+        }
+        let on = prov_pairs(&eng_on, "vec");
+        assert!(!on.is_empty(), "seeded set must produce some edges");
+
+        let (mut fx_off, _) = seed_docs(N, SEED);
+        let mut eng_off = RuleEngine::new();
+        {
+            let mut g = fx_off.g();
+            with_vector_dim_reject(false, || {
+                eng_off.create_rule(def.clone(), &mut g).unwrap();
+            });
+        }
+        assert_eq!(on, prov_pairs(&eng_off, "vec"), "filter vs no-filter");
+
+        let mut brute = BTreeSet::new();
+        for &s in &ids {
+            for &d in &ids {
+                if s == d {
+                    continue;
+                }
+                let skey = fx_on.ids.key_of(s).unwrap();
+                let dkey = fx_on.ids.key_of(d).unwrap();
+                let sget = |f: &str| fx_on.props.get(s, f).cloned();
+                let dget = |f: &str| fx_on.props.get(d, f).cloned();
+                if evaluate(
+                    &def.predicate,
+                    &NodeView {
+                        key: skey,
+                        props: &sget,
+                    },
+                    &NodeView {
+                        key: dkey,
+                        props: &dget,
+                    },
+                )
+                .is_some()
+                {
+                    brute.insert((s, d));
+                }
+            }
+        }
+        assert_eq!(on, brute, "filter vs brute-force evaluate");
+    }
+
+    /// Dim change must flow through remove(old)+insert(new); edges match a
+    /// fresh engine built from the post-update props.
+    #[test]
+    fn vector_dim_change_updates_cache_and_matches_fresh_build() {
+        let mut fx = Fx::new();
+        let a = fx.add("Doc", "a", vec![("emb", emb_val(&[1.0, 0.0]))]);
+        let b = fx.add("Doc", "b", vec![("emb", emb_val(&[1.0, 0.0]))]);
+        let c = fx.add("Doc", "c", vec![("emb", emb_val(&[1.0, 0.0, 0.0]))]);
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(vec_rule(), &mut g).unwrap();
+        }
+        assert_eq!(eng.indexes["vec"].src_side.vec_dim(a), Some(2));
+        assert_eq!(eng.indexes["vec"].src_side.vec_dim(c), Some(3));
+        assert_eq!(prov_pairs(&eng, "vec"), BTreeSet::from([(a, b), (b, a)]));
+
+        let old = fx.props.get(b, "emb").cloned();
+        fx.props.set(b, "emb", emb_val(&[1.0, 0.0, 0.0]));
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(b, Some(("emb", old)), &mut g);
+        }
+        assert_eq!(eng.indexes["vec"].src_side.vec_dim(b), Some(3));
+        assert_eq!(eng.indexes["vec"].dst_side.vec_dim(b), Some(3));
+        let after = prov_pairs(&eng, "vec");
+        assert_eq!(after, BTreeSet::from([(b, c), (c, b)]));
+
+        // Separate graph: first engine already owns the b↔c edges in `fx.topo`.
+        let mut fresh_fx = Fx::new();
+        let fa = fresh_fx.add("Doc", "a", vec![("emb", emb_val(&[1.0, 0.0]))]);
+        let fb = fresh_fx.add("Doc", "b", vec![("emb", emb_val(&[1.0, 0.0, 0.0]))]);
+        let fc = fresh_fx.add("Doc", "c", vec![("emb", emb_val(&[1.0, 0.0, 0.0]))]);
+        let mut fresh = RuleEngine::new();
+        {
+            let mut g = fresh_fx.g();
+            fresh.create_rule(vec_rule(), &mut g).unwrap();
+        }
+        assert_eq!(
+            prov_pairs(&fresh, "vec"),
+            BTreeSet::from([(fb, fc), (fc, fb)])
+        );
+        assert_eq!(fresh.indexes["vec"].src_side.vec_dim(fb), Some(3));
+        assert_eq!(fresh.indexes["vec"].src_side.vec_dim(fa), Some(2));
     }
 }
