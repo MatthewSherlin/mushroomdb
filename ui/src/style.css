@@ -542,7 +542,11 @@ button {
 .why[data-kind="overlap"],
 .why[data-kind="key_match"],
 .why[data-kind="field_equal"],
-.why[data-kind="derived"] {
+.why[data-kind="derived"],
+.why[data-kind="numeric_within"],
+.why[data-kind="geo_radius"],
+.why[data-kind="vector_similar"],
+.why[data-kind="all"] {
   border-left-color: var(--gold);
 }
 

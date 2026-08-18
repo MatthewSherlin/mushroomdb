@@ -6,16 +6,22 @@
  *   MATCH (n {id: $key}) RETURN n.skills AS skills, …
  * Cached on the store via `setNodeProps`. Reused when already present.
  *
- * Predicate type is not on the wire (`Explanation` has rule/etype/weight
- * only; `RuleStats` has no edge_type). Arithmetic is reconstructed from
- * the two nodes' actual props + the explanation weight — not from names.
+ * `/explain` carries `Explanation.predicate`. `buildWhyModel` dispatches
+ * on `predicate.kind` when present. The prop-comparison inference chain
+ * is the fallback for old servers (predicate null) and summaries the
+ * panel cannot render.
  *
- * FieldEqual is derived the same way overlap learns its field: scan both
- * nodes' props. A shared scalar field with equal values (not a token list,
- * not an FK equal to the other key) is FieldEqual. There is no predicate
- * kind/field on `/stats` or `/explain`.
+ * Props fetch projects `summary.fields` (first-seen union for `all`).
+ * `PROP_FIELDS` is the fallback list only.
  */
-import type { Explanation, JsonCell, QueryParam, QueryResult } from "./api";
+import type {
+  Explanation,
+  JsonCell,
+  PredicateKind,
+  PredicateSummary,
+  QueryParam,
+  QueryResult,
+} from "./api";
 import { EXPLAIN_CONCURRENCY, mapPool } from "./classify";
 import { edgeId, type GraphEdge, type GraphNode, type GraphStore } from "./store";
 
@@ -95,6 +101,45 @@ export type WhyModel =
       line: string;
       srcKey: string;
       dstKey: string;
+    }
+  | {
+      kind: "numeric_within";
+      rule: string;
+      etype: string;
+      weight: number | null;
+      field: string;
+      line: string;
+      srcKey: string;
+      dstKey: string;
+    }
+  | {
+      kind: "geo_radius";
+      rule: string;
+      etype: string;
+      weight: number | null;
+      field: string;
+      srcKey: string;
+      dstKey: string;
+      line: string;
+    }
+  | {
+      kind: "vector_similar";
+      rule: string;
+      etype: string;
+      weight: number | null;
+      field: string;
+      line: string;
+      srcKey: string;
+      dstKey: string;
+    }
+  | {
+      kind: "all";
+      rule: string;
+      etype: string;
+      weight: number | null;
+      lines: string[];
+      srcKey: string;
+      dstKey: string;
     };
 
 export type ExplainApi = {
@@ -108,27 +153,64 @@ export type PropsApi = {
   ): Promise<QueryResult>;
 };
 
+export function fieldsFromPredicate(
+  predicate: PredicateSummary | null | undefined,
+): readonly string[] | undefined {
+  if (predicate == null) {
+    return undefined;
+  }
+  if (predicate.fields.length > 0) {
+    return predicate.fields;
+  }
+  if (predicate.parts === null) {
+    return undefined;
+  }
+  const out: string[] = [];
+  for (const part of predicate.parts) {
+    const inner = fieldsFromPredicate(part);
+    if (inner === undefined) {
+      continue;
+    }
+    for (const field of inner) {
+      if (!out.includes(field)) {
+        out.push(field);
+      }
+    }
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 export async function loadNodeProps(
   store: GraphStore,
   api: PropsApi,
   key: string,
+  fields?: readonly string[],
 ): Promise<Record<string, unknown>> {
   const node = store.nodes.get(key);
-  if (node?.props !== undefined) {
+  const requested = fields !== undefined && fields.length > 0 ? fields : undefined;
+  if (
+    node?.props !== undefined &&
+    (requested === undefined || requested.every((f) => f in node.props!))
+  ) {
     return node.props;
   }
-  const { cypher, params } = nodePropsQuery(key);
+  const { cypher, params } = nodePropsQuery(key, requested);
   const result = await api.query(cypher, params);
-  const props = propsFromResult(result);
+  const fetched = propsFromResult(result);
+  const props = { ...(node?.props ?? {}), ...fetched };
   store.setNodeProps(key, props);
   return props;
 }
 
-export function nodePropsQuery(key: string): {
+export function nodePropsQuery(
+  key: string,
+  fields?: readonly string[],
+): {
   cypher: string;
   params: Record<string, QueryParam>;
 } {
-  const ret = PROP_FIELDS.map((f) => `n.${f} AS ${f}`).join(", ");
+  const list = fields !== undefined && fields.length > 0 ? fields : PROP_FIELDS;
+  const ret = list.map((f) => `n.${f} AS ${f}`).join(", ");
   return {
     cypher: `MATCH (n {id: $key}) RETURN ${ret}`,
     params: { key },
@@ -308,9 +390,39 @@ export function buildWhyModel(args: {
   const explanation = edge.explanation;
   const srcProps = src.props ?? {};
   const dstProps = dst.props ?? {};
+  const summary = explanation.predicate;
+  if (summary != null) {
+    const fromWire = modelFromSummary(
+      edge,
+      src,
+      dst,
+      explanation,
+      summary,
+      srcProps,
+      dstProps,
+    );
+    if (fromWire !== undefined) {
+      return fromWire;
+    }
+    if (isKnownKind(summary.kind)) {
+      return derivedModel(edge, explanation, src, dst);
+    }
+  }
+  // Fallback: old servers omit predicate; unknown summaries fall through.
   // Scored explanations (overlap) carry a weight. Key-match / auto-FK
   // explanations have weight null — prefer the FK field so a coincidental
   // token overlap (Person.skills ∩ Org.skills) is not invented as arithmetic.
+  return inferWhyModel(edge, src, dst, explanation, srcProps, dstProps);
+}
+
+function inferWhyModel(
+  edge: GraphEdge,
+  src: GraphNode,
+  dst: GraphNode,
+  explanation: Explanation,
+  srcProps: Record<string, unknown>,
+  dstProps: Record<string, unknown>,
+): WhyModel {
   if (explanation.weight !== null) {
     const scored = overlapModel(edge, src, dst, explanation, srcProps, dstProps);
     if (scored !== undefined) {
@@ -347,6 +459,15 @@ export function buildWhyModel(args: {
   if (overlap !== undefined) {
     return overlap;
   }
+  return derivedModel(edge, explanation, src, dst);
+}
+
+function derivedModel(
+  edge: GraphEdge,
+  explanation: Explanation,
+  src: GraphNode,
+  dst: GraphNode,
+): Extract<WhyModel, { kind: "derived" }> {
   return {
     kind: "derived",
     rule: explanation.rule,
@@ -356,6 +477,482 @@ export function buildWhyModel(args: {
     srcKey: src.key,
     dstKey: dst.key,
   };
+}
+
+const KNOWN_KINDS: ReadonlySet<PredicateKind> = new Set([
+  "key_match",
+  "field_equal",
+  "overlap",
+  "all",
+  "numeric_within",
+  "geo_radius",
+  "vector_similar",
+]);
+
+const EARTH_RADIUS_KM = 6371.0088;
+const VECTOR_MAX_DIM = 64;
+const MINUS = "\u2212";
+
+type PartRender = {
+  lines: string[];
+  score: number | undefined;
+};
+
+function isKnownKind(kind: string): kind is PredicateKind {
+  return KNOWN_KINDS.has(kind as PredicateKind);
+}
+
+function modelFromSummary(
+  edge: GraphEdge,
+  src: GraphNode,
+  dst: GraphNode,
+  explanation: Explanation,
+  summary: PredicateSummary,
+  srcProps: Record<string, unknown>,
+  dstProps: Record<string, unknown>,
+): WhyModel | undefined {
+  switch (summary.kind) {
+    case "key_match": {
+      const hit = keyMatchFromField(summary.fields[0], src, dst);
+      if (hit === undefined) {
+        return undefined;
+      }
+      return {
+        kind: "key_match",
+        rule: explanation.rule,
+        etype: edge.etype,
+        weight: explanation.weight,
+        line: formatKeyMatchLine(hit),
+        srcKey: src.key,
+        dstKey: dst.key,
+      };
+    }
+    case "field_equal": {
+      const hit = fieldEqualFromField(summary.fields[0], srcProps, dstProps);
+      if (hit === undefined) {
+        return undefined;
+      }
+      return {
+        kind: "field_equal",
+        rule: explanation.rule,
+        etype: edge.etype,
+        weight: explanation.weight,
+        field: hit.field,
+        value: hit.value,
+        line: formatFieldEqualLine(hit),
+        srcKey: src.key,
+        dstKey: dst.key,
+      };
+    }
+    case "overlap": {
+      const field = summary.fields[0];
+      if (field === undefined) {
+        return undefined;
+      }
+      const sets = overlapFromProps(
+        { [field]: srcProps[field] },
+        { [field]: dstProps[field] },
+        explanation.weight,
+      );
+      if (sets === undefined) {
+        return undefined;
+      }
+      const shared = new Set(sets.shared);
+      return {
+        kind: "overlap",
+        rule: explanation.rule,
+        etype: edge.etype,
+        weight: explanation.weight,
+        field: sets.field,
+        line: formatOverlapLine(sets, explanation.weight),
+        srcTokens: markTokens(sets.src, shared),
+        dstTokens: markTokens(sets.dst, shared),
+        srcKey: src.key,
+        dstKey: dst.key,
+      };
+    }
+    case "numeric_within": {
+      const rendered = numericRender(summary, srcProps, dstProps, explanation.weight);
+      const field = summary.fields[0];
+      if (rendered === undefined || field === undefined) {
+        return undefined;
+      }
+      return {
+        kind: "numeric_within",
+        rule: explanation.rule,
+        etype: edge.etype,
+        weight: explanation.weight,
+        field,
+        line: rendered.lines[0]!,
+        srcKey: src.key,
+        dstKey: dst.key,
+      };
+    }
+    case "geo_radius": {
+      const rendered = geoRender(summary, srcProps, dstProps, explanation.weight);
+      const field = summary.fields[0];
+      if (rendered === undefined || field === undefined) {
+        return undefined;
+      }
+      return {
+        kind: "geo_radius",
+        rule: explanation.rule,
+        etype: edge.etype,
+        weight: explanation.weight,
+        field,
+        line: rendered.lines[0]!,
+        srcKey: src.key,
+        dstKey: dst.key,
+      };
+    }
+    case "vector_similar": {
+      const rendered = vectorRender(
+        summary,
+        srcProps,
+        dstProps,
+        explanation.weight,
+        explanation.weight,
+      );
+      const field = summary.fields[0];
+      if (rendered === undefined || field === undefined) {
+        return undefined;
+      }
+      return {
+        kind: "vector_similar",
+        rule: explanation.rule,
+        etype: edge.etype,
+        weight: explanation.weight,
+        field,
+        line: rendered.lines[0]!,
+        srcKey: src.key,
+        dstKey: dst.key,
+      };
+    }
+    case "all": {
+      const rendered = partLines(summary, src, dst, srcProps, dstProps);
+      if (rendered === undefined) {
+        return undefined;
+      }
+      const lines = [...rendered.lines];
+      if (
+        rendered.score !== undefined &&
+        explanation.weight !== null &&
+        Math.abs(rendered.score - explanation.weight) > WEIGHT_EPS
+      ) {
+        lines.push(`min = ${formatScore(rendered.score)} — ${RECOMPUTED_NOTE}`);
+      }
+      return {
+        kind: "all",
+        rule: explanation.rule,
+        etype: edge.etype,
+        weight: explanation.weight,
+        lines,
+        srcKey: src.key,
+        dstKey: dst.key,
+      };
+    }
+  }
+}
+
+function partLines(
+  summary: PredicateSummary,
+  src: GraphNode,
+  dst: GraphNode,
+  srcProps: Record<string, unknown>,
+  dstProps: Record<string, unknown>,
+): PartRender | undefined {
+  switch (summary.kind) {
+    case "all": {
+      if (summary.parts === null || summary.parts.length === 0) {
+        return undefined;
+      }
+      const lines: string[] = [];
+      const scores: number[] = [];
+      for (const part of summary.parts) {
+        const inner = partLines(part, src, dst, srcProps, dstProps);
+        if (inner === undefined) {
+          continue;
+        }
+        lines.push(...inner.lines);
+        if (inner.score !== undefined) {
+          scores.push(inner.score);
+        }
+      }
+      if (lines.length === 0) {
+        return undefined;
+      }
+      const score =
+        scores.length === summary.parts.length
+          ? Math.min(...scores)
+          : undefined;
+      return { lines, score };
+    }
+    case "numeric_within":
+      return numericRender(summary, srcProps, dstProps, null);
+    case "geo_radius":
+      return geoRender(summary, srcProps, dstProps, null);
+    case "vector_similar":
+      return vectorRender(summary, srcProps, dstProps, null, null);
+    case "overlap": {
+      const field = summary.fields[0];
+      if (field === undefined) {
+        return undefined;
+      }
+      const sets = overlapFromProps(
+        { [field]: srcProps[field] },
+        { [field]: dstProps[field] },
+      );
+      if (sets === undefined) {
+        return undefined;
+      }
+      return { lines: [formatOverlapLine(sets)], score: sets.score };
+    }
+    case "key_match": {
+      const hit = keyMatchFromField(summary.fields[0], src, dst);
+      if (hit === undefined) {
+        return undefined;
+      }
+      return { lines: [formatKeyMatchLine(hit)], score: 1 };
+    }
+    case "field_equal": {
+      const hit = fieldEqualFromField(summary.fields[0], srcProps, dstProps);
+      if (hit === undefined) {
+        return undefined;
+      }
+      return { lines: [formatFieldEqualLine(hit)], score: 1 };
+    }
+  }
+}
+
+function numericRender(
+  summary: PredicateSummary,
+  srcProps: Record<string, unknown>,
+  dstProps: Record<string, unknown>,
+  serverWeight: number | null,
+): PartRender | undefined {
+  const field = summary.fields[0];
+  const tolerance = summary.tolerance;
+  if (
+    field === undefined ||
+    tolerance === null ||
+    !Number.isFinite(tolerance) ||
+    tolerance < 0
+  ) {
+    return undefined;
+  }
+  const a = asFiniteF64(srcProps[field]);
+  const b = asFiniteF64(dstProps[field]);
+  if (a === undefined || b === undefined) {
+    return undefined;
+  }
+  const delta = Math.abs(a - b);
+  const line = `numeric_within(${field}) = |${displayNum(a)} ${MINUS} ${displayNum(b)}| = ${displayNum(delta)} ≤ ${displayNum(tolerance)}`;
+  let score: number | undefined;
+  if (tolerance === 0) {
+    score = delta === 0 ? 1 : undefined;
+  } else if (delta <= tolerance) {
+    score = 1 - delta / tolerance;
+  }
+  return { lines: [withNote(line, score, serverWeight)], score };
+}
+
+function geoRender(
+  summary: PredicateSummary,
+  srcProps: Record<string, unknown>,
+  dstProps: Record<string, unknown>,
+  serverWeight: number | null,
+): PartRender | undefined {
+  const field = summary.fields[0];
+  const km = summary.km;
+  if (field === undefined || km === null || !Number.isFinite(km) || km <= 0) {
+    return undefined;
+  }
+  const a = asLatLon(srcProps[field]);
+  const b = asLatLon(dstProps[field]);
+  if (a === undefined || b === undefined) {
+    return undefined;
+  }
+  const d = haversineKm(a[0], a[1], b[0], b[1]);
+  if (!Number.isFinite(d)) {
+    return undefined;
+  }
+  const line = `geo_radius(${field}) = ${d.toFixed(1)} km ≤ ${displayNum(km)} km`;
+  const score = d <= km ? 1 - d / km : undefined;
+  return { lines: [withNote(line, score, serverWeight)], score };
+}
+
+function vectorRender(
+  summary: PredicateSummary,
+  srcProps: Record<string, unknown>,
+  dstProps: Record<string, unknown>,
+  serverWeight: number | null,
+  echoWeight: number | null,
+): PartRender | undefined {
+  const field = summary.fields[0];
+  if (field === undefined) {
+    return undefined;
+  }
+  const min = summary.min;
+  const minClause = min !== null ? ` ≥ ${formatScore(min)}` : "";
+  const a = asNumericList(srcProps[field]);
+  const b = asNumericList(dstProps[field]);
+  const canRecompute =
+    a !== undefined &&
+    b !== undefined &&
+    a.length === b.length &&
+    a.length > 0 &&
+    a.length <= VECTOR_MAX_DIM;
+  if (canRecompute) {
+    const cos = cosine(a, b);
+    if (cos !== undefined) {
+      const line = `vector_similar(${field}) = cos = ${formatScore(cos)}${minClause} · d=${a.length}`;
+      return { lines: [withNote(line, cos, serverWeight)], score: cos };
+    }
+  }
+  if (echoWeight === null) {
+    return undefined;
+  }
+  return {
+    lines: [`vector_similar(${field}) = cos ≈ ${formatScore(echoWeight)}${minClause}`],
+    score: undefined,
+  };
+}
+
+function keyMatchFromField(
+  field: string | undefined,
+  src: GraphNode,
+  dst: GraphNode,
+): KeyMatchHit | undefined {
+  if (field === undefined) {
+    return undefined;
+  }
+  if ((src.props ?? {})[field] === dst.key) {
+    return { label: src.label, field, value: dst.key };
+  }
+  if ((dst.props ?? {})[field] === src.key) {
+    return { label: dst.label, field, value: src.key };
+  }
+  return undefined;
+}
+
+function fieldEqualFromField(
+  field: string | undefined,
+  srcProps: Record<string, unknown>,
+  dstProps: Record<string, unknown>,
+): FieldEqualHit | undefined {
+  if (field === undefined) {
+    return undefined;
+  }
+  const value = scalarText(srcProps[field]);
+  if (value === undefined || value !== scalarText(dstProps[field])) {
+    return undefined;
+  }
+  return { field, value };
+}
+
+function withNote(
+  line: string,
+  score: number | undefined,
+  serverWeight: number | null,
+): string {
+  if (
+    serverWeight !== null &&
+    score !== undefined &&
+    Math.abs(score - serverWeight) > WEIGHT_EPS
+  ) {
+    return `${line} — ${RECOMPUTED_NOTE}`;
+  }
+  return line;
+}
+
+function displayNum(n: number): string {
+  if (Number.isInteger(n)) {
+    return String(n);
+  }
+  return formatScore(n);
+}
+
+function asFiniteF64(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  return undefined;
+}
+
+function asLatLon(value: unknown): [number, number] | undefined {
+  if (!Array.isArray(value) || value.length !== 2) {
+    return undefined;
+  }
+  const lat = asFiniteF64(value[0]);
+  const lon = asFiniteF64(value[1]);
+  if (lat === undefined || lon === undefined) {
+    return undefined;
+  }
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+    return undefined;
+  }
+  return [lat, lon];
+}
+
+function asNumericList(value: unknown): number[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) {
+    return undefined;
+  }
+  const out: number[] = [];
+  for (const item of value) {
+    const n = asFiniteF64(item);
+    if (n === undefined) {
+      return undefined;
+    }
+    out.push(n);
+  }
+  return out;
+}
+
+function haversineKm(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number,
+): number {
+  const phi1 = toRad(lat1);
+  const phi2 = toRad(lat2);
+  const dphi = toRad(lat2 - lat1);
+  const dlam = toRad(lon2 - lon1);
+  const a = Math.min(
+    1,
+    Math.max(
+      0,
+      Math.sin(dphi / 2) ** 2 +
+        Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlam / 2) ** 2,
+    ),
+  );
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return EARTH_RADIUS_KM * c;
+}
+
+function cosine(a: number[], b: number[]): number | undefined {
+  let dot = 0;
+  let na2 = 0;
+  let nb2 = 0;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]!;
+    const y = b[i]!;
+    dot += x * y;
+    na2 += x * x;
+    nb2 += y * y;
+  }
+  const na = Math.sqrt(na2);
+  const nb = Math.sqrt(nb2);
+  if (!(na > 0 && nb > 0)) {
+    return undefined;
+  }
+  const cos = dot / (na * nb);
+  return Number.isFinite(cos) ? Math.min(cos, 1) : undefined;
+}
+
+function toRad(deg: number): number {
+  return (deg * Math.PI) / 180;
 }
 
 function overlapModel(

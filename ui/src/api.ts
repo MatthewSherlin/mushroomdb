@@ -21,12 +21,32 @@ export type Stats = {
   rules: RuleStats[];
 };
 
+export type PredicateKind =
+  | "key_match"
+  | "field_equal"
+  | "overlap"
+  | "all"
+  | "numeric_within"
+  | "geo_radius"
+  | "vector_similar";
+
+/** Wire `PredicateSummary`. Option fields are present-null, never omitted. */
+export type PredicateSummary = {
+  kind: PredicateKind;
+  fields: string[];
+  min: number | null;
+  tolerance: number | null;
+  km: number | null;
+  parts: PredicateSummary[] | null;
+};
+
 export type Explanation = {
   rule: string;
   edge_type: string;
   src_key: string;
   dst_key: string;
   weight: number | null;
+  predicate: PredicateSummary | null;
 };
 
 export type FkSkip = {

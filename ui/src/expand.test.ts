@@ -18,6 +18,7 @@ function fit(src: string, dst: string): Explanation {
     src_key: src,
     dst_key: dst,
     weight: 1,
+    predicate: null,
   };
 }
 

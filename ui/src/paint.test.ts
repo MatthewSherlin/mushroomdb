@@ -51,6 +51,7 @@ function seeded(): GraphStore {
     src_key: "a",
     dst_key: "c",
     weight: 1,
+    predicate: null,
   });
   return store;
 }

@@ -2,10 +2,11 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import type { Explanation, QueryResult } from "./api";
+import type { Explanation, PredicateSummary, QueryResult } from "./api";
 import { GraphStore, edgeId } from "./store";
 import {
   HAND_LINE,
+  RECOMPUTED_NOTE,
   buildWhyModel,
   ensureProvenance,
   formatKeyMatchLine,
@@ -29,6 +30,20 @@ function exp(over: Partial<Explanation> = {}): Explanation {
     src_key: "person-01",
     dst_key: "proj-01",
     weight: 1,
+    predicate: null,
+    ...over,
+  };
+}
+
+function pred(
+  over: Partial<PredicateSummary> & Pick<PredicateSummary, "kind">,
+): PredicateSummary {
+  return {
+    fields: [],
+    min: null,
+    tolerance: null,
+    km: null,
+    parts: null,
     ...over,
   };
 }
@@ -384,5 +399,491 @@ describe("whyEdgeMissing", () => {
       edge_deleted: { edge_type: "FIT", src: "a", dst: "b" },
     });
     expect(whyEdgeMissing(store, id)).toBe(true);
+  });
+});
+
+describe("nodePropsQuery from summary.fields", () => {
+  it("projects summary.fields instead of the fallback PROP_FIELDS list", () => {
+    const q = nodePropsQuery("org-01", ["founded_year", "location"]);
+    expect(q.cypher).toBe(
+      "MATCH (n {id: $key}) RETURN n.founded_year AS founded_year, n.location AS location",
+    );
+    expect(q.cypher).not.toContain("skills");
+    expect(q.params).toEqual({ key: "org-01" });
+  });
+
+  it("walks all.fields first-seen union for the per-edge fetch", () => {
+    const summary = pred({
+      kind: "all",
+      fields: ["founded_year", "embedding"],
+      parts: [
+        pred({
+          kind: "numeric_within",
+          fields: ["founded_year"],
+          tolerance: 2,
+        }),
+        pred({
+          kind: "vector_similar",
+          fields: ["embedding"],
+          min: 0.9,
+        }),
+      ],
+    });
+    const q = nodePropsQuery("a", summary.fields);
+    expect(q.cypher).toContain("n.founded_year AS founded_year");
+    expect(q.cypher).toContain("n.embedding AS embedding");
+    expect(q.cypher).not.toContain("n.skills");
+  });
+
+  it("falls back to PROP_FIELDS when no summary fields are supplied", () => {
+    const q = nodePropsQuery("person-01");
+    expect(q.cypher).toContain("n.skills AS skills");
+    expect(q.cypher).toContain("n.org_id AS org_id");
+  });
+});
+
+describe("buildWhyModel predicate summary dispatch", () => {
+  const paris = [48.8566, 2.3522];
+  const london = [51.5074, -0.1278];
+
+  it("renders numeric_within arithmetic including ≤ tolerance at score 0", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "NEAR",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "close_year",
+          edge_type: "NEAR",
+          src_key: "a",
+          dst_key: "b",
+          weight: 0,
+          predicate: pred({
+            kind: "numeric_within",
+            fields: ["founded_year"],
+            tolerance: 2,
+          }),
+        }),
+      },
+      src: { key: "a", label: "Org", props: { founded_year: 1998 } },
+      dst: { key: "b", label: "Org", props: { founded_year: 2000 } },
+    });
+    expect(model).toMatchObject({
+      kind: "numeric_within",
+      rule: "close_year",
+      weight: 0,
+      field: "founded_year",
+      line: "numeric_within(founded_year) = |1998 − 2000| = 2 ≤ 2",
+    });
+  });
+
+  it("notes when recomputed numeric score disagrees with the server weight", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "NEAR",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "close_year",
+          edge_type: "NEAR",
+          src_key: "a",
+          dst_key: "b",
+          weight: 0.5,
+          predicate: pred({
+            kind: "numeric_within",
+            fields: ["founded_year"],
+            tolerance: 2,
+          }),
+        }),
+      },
+      src: { key: "a", label: "Org", props: { founded_year: 1998 } },
+      dst: { key: "b", label: "Org", props: { founded_year: 2000 } },
+    });
+    expect(model.kind).toBe("numeric_within");
+    if (model.kind !== "numeric_within") {
+      return;
+    }
+    expect(model.line).toBe(
+      `numeric_within(founded_year) = |1998 − 2000| = 2 ≤ 2 — ${RECOMPUTED_NOTE}`,
+    );
+  });
+
+  it("falls back to the honest derived line when a numeric prop is missing", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "NEAR",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "close_year",
+          edge_type: "NEAR",
+          src_key: "a",
+          dst_key: "b",
+          weight: 0,
+          predicate: pred({
+            kind: "numeric_within",
+            fields: ["founded_year"],
+            tolerance: 2,
+          }),
+        }),
+      },
+      src: { key: "a", label: "Org", props: { name: "Ada" } },
+      dst: { key: "b", label: "Org", props: { founded_year: 2000 } },
+    });
+    expect(model).toMatchObject({
+      kind: "derived",
+      line: "Derived by rule close_year",
+    });
+  });
+
+  it("renders geo_radius haversine to 1 decimal km", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "NEAR",
+        src: "paris",
+        dst: "london",
+        derived: true,
+        explanation: exp({
+          rule: "nearby",
+          edge_type: "NEAR",
+          src_key: "paris",
+          dst_key: "london",
+          weight: 0.14110866279779188,
+          predicate: pred({
+            kind: "geo_radius",
+            fields: ["location"],
+            km: 400,
+          }),
+        }),
+      },
+      src: { key: "paris", label: "Office", props: { location: paris } },
+      dst: { key: "london", label: "Office", props: { location: london } },
+    });
+    expect(model.kind).toBe("geo_radius");
+    if (model.kind !== "geo_radius") {
+      return;
+    }
+    expect(model.line).toBe("geo_radius(location) = 343.6 km ≤ 400 km");
+    expect(model.line).not.toContain(RECOMPUTED_NOTE);
+  });
+
+  it("falls back to derived when either node lacks coordinates", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "NEAR",
+        src: "paris",
+        dst: "london",
+        derived: true,
+        explanation: exp({
+          rule: "nearby",
+          edge_type: "NEAR",
+          src_key: "paris",
+          dst_key: "london",
+          weight: 0.141,
+          predicate: pred({
+            kind: "geo_radius",
+            fields: ["location"],
+            km: 400,
+          }),
+        }),
+      },
+      src: { key: "paris", label: "Office", props: { location: paris } },
+      dst: { key: "london", label: "Office", props: { name: "London" } },
+    });
+    expect(model).toMatchObject({
+      kind: "derived",
+      line: "Derived by rule nearby",
+    });
+  });
+
+  it("notes when recomputed geo score disagrees with the server weight", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "NEAR",
+        src: "paris",
+        dst: "london",
+        derived: true,
+        explanation: exp({
+          rule: "nearby",
+          edge_type: "NEAR",
+          src_key: "paris",
+          dst_key: "london",
+          weight: 0.5,
+          predicate: pred({
+            kind: "geo_radius",
+            fields: ["location"],
+            km: 400,
+          }),
+        }),
+      },
+      src: { key: "paris", label: "Office", props: { location: paris } },
+      dst: { key: "london", label: "Office", props: { location: london } },
+    });
+    expect(model.kind).toBe("geo_radius");
+    if (model.kind !== "geo_radius") {
+      return;
+    }
+    expect(model.line).toBe(
+      `geo_radius(location) = 343.6 km ≤ 400 km — ${RECOMPUTED_NOTE}`,
+    );
+  });
+
+  it("renders vector_similar cosine with a dimension note", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "SIM",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "similar",
+          edge_type: "SIM",
+          src_key: "a",
+          dst_key: "b",
+          weight: 0.97,
+          predicate: pred({
+            kind: "vector_similar",
+            fields: ["embedding"],
+            min: 0.9,
+          }),
+        }),
+      },
+      src: { key: "a", label: "Doc", props: { embedding: [1, 0] } },
+      dst: {
+        key: "b",
+        label: "Doc",
+        props: { embedding: [0.97, Math.sqrt(1 - 0.97 ** 2)] },
+      },
+    });
+    expect(model.kind).toBe("vector_similar");
+    if (model.kind !== "vector_similar") {
+      return;
+    }
+    expect(model.line).toBe(
+      "vector_similar(embedding) = cos = 0.97 ≥ 0.9 · d=2",
+    );
+  });
+
+  it("renders vector ≥ boundary when cosine equals min", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "SIM",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "similar",
+          edge_type: "SIM",
+          src_key: "a",
+          dst_key: "b",
+          weight: 0.9,
+          predicate: pred({
+            kind: "vector_similar",
+            fields: ["embedding"],
+            min: 0.9,
+          }),
+        }),
+      },
+      src: { key: "a", label: "Doc", props: { embedding: [1, 0] } },
+      dst: {
+        key: "b",
+        label: "Doc",
+        props: { embedding: [0.9, Math.sqrt(1 - 0.9 ** 2)] },
+      },
+    });
+    expect(model.kind).toBe("vector_similar");
+    if (model.kind !== "vector_similar") {
+      return;
+    }
+    expect(model.line).toBe(
+      "vector_similar(embedding) = cos = 0.9 ≥ 0.9 · d=2",
+    );
+  });
+
+  it("echoes explanation weight when vector dims exceed 64", () => {
+    const big = Array.from({ length: 65 }, () => 1);
+    const model = buildWhyModel({
+      edge: {
+        etype: "SIM",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "similar",
+          edge_type: "SIM",
+          src_key: "a",
+          dst_key: "b",
+          weight: 0.97,
+          predicate: pred({
+            kind: "vector_similar",
+            fields: ["embedding"],
+            min: 0.9,
+          }),
+        }),
+      },
+      src: { key: "a", label: "Doc", props: { embedding: big } },
+      dst: { key: "b", label: "Doc", props: { embedding: big } },
+    });
+    expect(model.kind).toBe("vector_similar");
+    if (model.kind !== "vector_similar") {
+      return;
+    }
+    expect(model.line).toBe(
+      "vector_similar(embedding) = cos ≈ 0.97 ≥ 0.9",
+    );
+  });
+
+  it("echoes explanation weight when either vector is missing", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "SIM",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "similar",
+          edge_type: "SIM",
+          src_key: "a",
+          dst_key: "b",
+          weight: 0.97,
+          predicate: pred({
+            kind: "vector_similar",
+            fields: ["embedding"],
+            min: 0.9,
+          }),
+        }),
+      },
+      src: { key: "a", label: "Doc", props: { embedding: [1, 0] } },
+      dst: { key: "b", label: "Doc", props: { name: "b" } },
+    });
+    expect(model.kind).toBe("vector_similar");
+    if (model.kind !== "vector_similar") {
+      return;
+    }
+    expect(model.line).toBe(
+      "vector_similar(embedding) = cos ≈ 0.97 ≥ 0.9",
+    );
+  });
+
+  it("notes when recomputed cosine disagrees with the server weight", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "SIM",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "similar",
+          edge_type: "SIM",
+          src_key: "a",
+          dst_key: "b",
+          weight: 0.5,
+          predicate: pred({
+            kind: "vector_similar",
+            fields: ["embedding"],
+            min: 0.9,
+          }),
+        }),
+      },
+      src: { key: "a", label: "Doc", props: { embedding: [1, 0] } },
+      dst: { key: "b", label: "Doc", props: { embedding: [1, 0] } },
+    });
+    expect(model.kind).toBe("vector_similar");
+    if (model.kind !== "vector_similar") {
+      return;
+    }
+    expect(model.line).toBe(
+      `vector_similar(embedding) = cos = 1 ≥ 0.9 · d=2 — ${RECOMPUTED_NOTE}`,
+    );
+  });
+
+  it("stacks all parts and adds a min-score disagreement note", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "NEAR",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "both",
+          edge_type: "NEAR",
+          src_key: "a",
+          dst_key: "b",
+          weight: 1,
+          predicate: pred({
+            kind: "all",
+            fields: ["founded_year", "embedding"],
+            parts: [
+              pred({
+                kind: "numeric_within",
+                fields: ["founded_year"],
+                tolerance: 2,
+              }),
+              pred({
+                kind: "vector_similar",
+                fields: ["embedding"],
+                min: 0.9,
+              }),
+            ],
+          }),
+        }),
+      },
+      src: {
+        key: "a",
+        label: "Doc",
+        props: { founded_year: 1998, embedding: [1, 0] },
+      },
+      dst: {
+        key: "b",
+        label: "Doc",
+        props: { founded_year: 2000, embedding: [1, 0] },
+      },
+    });
+    expect(model.kind).toBe("all");
+    if (model.kind !== "all") {
+      return;
+    }
+    expect(model.lines).toEqual([
+      "numeric_within(founded_year) = |1998 − 2000| = 2 ≤ 2",
+      "vector_similar(embedding) = cos = 1 ≥ 0.9 · d=2",
+      `min = 0 — ${RECOMPUTED_NOTE}`,
+    ]);
+  });
+
+  it("prefers the wire kind over inference when skills also overlap", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "NEAR",
+        src: "a",
+        dst: "b",
+        derived: true,
+        explanation: exp({
+          rule: "close_year",
+          edge_type: "NEAR",
+          src_key: "a",
+          dst_key: "b",
+          weight: 0,
+          predicate: pred({
+            kind: "numeric_within",
+            fields: ["founded_year"],
+            tolerance: 2,
+          }),
+        }),
+      },
+      src: {
+        key: "a",
+        label: "Org",
+        props: { founded_year: 1998, skills: ["s01"] },
+      },
+      dst: {
+        key: "b",
+        label: "Org",
+        props: { founded_year: 2000, skills: ["s01"] },
+      },
+    });
+    expect(model.kind).toBe("numeric_within");
   });
 });

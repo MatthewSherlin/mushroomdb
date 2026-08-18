@@ -4,6 +4,7 @@ import type { GraphStore } from "./store";
 import {
   buildWhyModel,
   ensureProvenance,
+  fieldsFromPredicate,
   formatScore,
   highlightedIdsForRule,
   loadNodeProps,
@@ -145,8 +146,10 @@ export class Inspector {
       this.closeWhy();
       return;
     }
-    await loadNodeProps(this.store, this.api, src.key);
-    await loadNodeProps(this.store, this.api, dst.key);
+    const explained = this.store.edges.get(id);
+    const fields = fieldsFromPredicate(explained?.explanation?.predicate);
+    await loadNodeProps(this.store, this.api, src.key, fields);
+    await loadNodeProps(this.store, this.api, dst.key, fields);
     const fresh = this.store.edges.get(id);
     const srcNow = this.store.nodes.get(src.key);
     const dstNow = this.store.nodes.get(dst.key);
@@ -274,6 +277,10 @@ export class Inspector {
       bits.push(mono("why-line", model.line));
     } else if (model.kind === "field_equal") {
       bits.push(fieldEqualRow(model.field, model.value));
+    } else if (model.kind === "all") {
+      for (const line of model.lines) {
+        bits.push(mono("why-line", line));
+      }
     } else {
       bits.push(mono("why-line", model.line));
     }

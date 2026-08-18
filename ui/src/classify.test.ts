@@ -32,6 +32,7 @@ function exp(
     src_key: src,
     dst_key: dst,
     weight: 0.5,
+    predicate: null,
   };
 }
 

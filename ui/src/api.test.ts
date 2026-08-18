@@ -113,6 +113,14 @@ describe("ApiClient", () => {
         src_key: "person-01",
         dst_key: "proj-01",
         weight: 1.0,
+        predicate: {
+          kind: "overlap",
+          fields: ["skills"],
+          min: 0.3,
+          tolerance: null,
+          km: null,
+          parts: null,
+        },
       },
     ];
     fetchMock.mockResolvedValue(jsonResponse(200, body));
