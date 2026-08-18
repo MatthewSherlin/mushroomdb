@@ -14,6 +14,14 @@ use std::net::SocketAddr;
 
 /// Build the HTTP router over `db`. Read endpoints take the read lock;
 /// `/ingest` takes the write lock. Guards are dropped before any `.await`.
+///
+/// # Blocking
+///
+/// [`SharedDb`] uses a std [`std::sync::RwLock`]. Under a tokio multi-thread
+/// runtime, `db.read()` / `db.write()` park the caller's worker thread for
+/// the duration of contention. That is acceptable at embedded v1 scale.
+/// Wrap these calls in `tokio::task::spawn_blocking` before exposing the
+/// server to concurrent multi-client load.
 pub fn router(db: SharedDb) -> Router {
     Router::new()
         .route("/query", post(query))
@@ -35,7 +43,10 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
-    let _ = ready.send(local);
+    if ready.send(local).is_err() {
+        // Caller dropped the readiness receiver; still serve.
+        eprintln!("serve: readiness receiver dropped before bind notify");
+    }
     axum::serve(listener, router(db)).await
 }
 
@@ -62,7 +73,9 @@ fn json_ok(value: Js) -> Response {
 fn value_to_json(v: &Value) -> Js {
     match v {
         Value::Int(i) => json!(i),
-        Value::Float(f) => json!(f),
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(Js::Number)
+            .unwrap_or(Js::Null),
         Value::Str(s) => json!(s),
         Value::Bool(b) => json!(b),
         Value::List(xs) => Js::Array(xs.iter().map(value_to_json).collect()),
@@ -274,5 +287,18 @@ async fn neighborhood(
     match rs {
         Ok(rs) => json_ok(result_set_json(&rs)),
         Err(e) => graph_err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nan_float_cell_serializes_as_null() {
+        let mut rs = ResultSet::new(vec!["n".into()]);
+        rs.push_row(vec![Some(Value::Float(f64::NAN))]);
+        let j = result_set_json(&rs);
+        assert_eq!(j["rows"][0][0], Js::Null);
     }
 }
