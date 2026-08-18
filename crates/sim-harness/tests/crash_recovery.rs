@@ -231,10 +231,13 @@ fn collect_all_edges(db: &GraphDb<SimFs>) -> BTreeSet<(String, String, String)> 
 
 /// Stats equality minus `fires`.
 ///
-/// Parked T6 ruling: a crash between snapshot-write and WAL-truncation with a
-/// `RebuildRule` in the leftover WAL tail double-bumps the fires counter on
-/// replay. Edges / tripped / provenance-derived state are unaffected. Do not
-/// assert fires equality across that window — compare this projection instead.
+/// Parked T6 ruling: a crash between snapshot-write and WAL-truncation with
+/// leftover WAL tail can double-bump fires on replay of BOTH `RebuildRule`
+/// AND `DeleteRule` records (`DeleteRule` internally rebuilds same-etype
+/// survivors, bumping their fires) over a snapshot that already captured the
+/// increment. Edges / tripped / provenance-derived state are unaffected. DST
+/// zeroes fires for all cross-window comparisons — do not assert fires
+/// equality across that window.
 fn stats_minus_fires(stats: Stats) -> Stats {
     Stats {
         rules: stats

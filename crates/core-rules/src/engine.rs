@@ -581,6 +581,8 @@ impl RuleEngine {
     /// BTree triple order. A second call on an already-retracted node is a
     /// no-op (crash-window replay / absent state).
     pub fn on_node_removed(&mut self, n: u32, g: &mut GraphMut<'_>) {
+        // O(R x P) provenance scan: acceptable pre-alpha; at scale, index
+        // provenance by node (tracked for the performance plan).
         let n_label = g.labels.get(n as usize).copied();
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
 

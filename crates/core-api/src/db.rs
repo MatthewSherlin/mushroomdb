@@ -287,6 +287,8 @@ impl<F: Fs> GraphDb<F> {
                 };
                 self.topo.remove_edge(etype, src, dst);
                 self.edge_props.remove_edge(etype, src, dst);
+                // No rule callback: validated as not provenance-owned and not
+                // would_derive, so no rule needs to update its desired set.
             }
             WalRecord::DeleteNode { key } => {
                 // Recovery-safe: already-tombstoned / unknown key is a clean
