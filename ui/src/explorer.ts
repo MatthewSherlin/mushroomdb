@@ -179,6 +179,7 @@ export class Explorer {
   applyWatchEvent(event: MutationEvent): void {
     const before = [...this.store.edges.keys()];
     this.store.apply(event);
+    this.inspector.closeIfEdgeMissing();
     if (!prefersReducedMotion()) {
       const born = bornEdgeIds(before, this.store.edges.keys());
       if (born.length > 0) {
@@ -252,6 +253,7 @@ export class Explorer {
   }
 
   private paint(): void {
+    this.inspector.closeIfEdgeMissing();
     const now = performance.now();
     const snap = paintExplorer(
       this.store,

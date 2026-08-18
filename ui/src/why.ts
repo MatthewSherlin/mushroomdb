@@ -9,12 +9,19 @@
  * Predicate type is not on the wire (`Explanation` has rule/etype/weight
  * only; `RuleStats` has no edge_type). Arithmetic is reconstructed from
  * the two nodes' actual props + the explanation weight — not from names.
+ *
+ * FieldEqual is derived the same way overlap learns its field: scan both
+ * nodes' props. A shared scalar field with equal values (not a token list,
+ * not an FK equal to the other key) is FieldEqual. There is no predicate
+ * kind/field on `/stats` or `/explain`.
  */
 import type { Explanation, JsonCell, QueryParam, QueryResult } from "./api";
 import { EXPLAIN_CONCURRENCY, mapPool } from "./classify";
 import { edgeId, type GraphEdge, type GraphNode, type GraphStore } from "./store";
 
 export const HAND_LINE = "Created by hand";
+
+export const RECOMPUTED_NOTE = "recomputed from current props";
 
 const PROP_FIELDS = ["skills", "org_id", "project_id", "name", "tags"] as const;
 
@@ -70,10 +77,22 @@ export type WhyModel =
       dstKey: string;
     }
   | {
+      kind: "field_equal";
+      rule: string;
+      etype: string;
+      weight: number | null;
+      field: string;
+      value: string;
+      line: string;
+      srcKey: string;
+      dstKey: string;
+    }
+  | {
       kind: "derived";
       rule: string;
       etype: string;
       weight: number | null;
+      line: string;
       srcKey: string;
       dstKey: string;
     };
@@ -137,7 +156,7 @@ export function formatScore(n: number): string {
   if (Number.isInteger(n)) {
     return String(n);
   }
-  return n.toFixed(6).replace(/\.?0+$/, "");
+  return n.toFixed(3).replace(/\.?0+$/, "");
 }
 
 export function markTokens(
@@ -197,8 +216,19 @@ export function overlapFromProps(
   return candidates.reduce((a, b) => (a.score >= b.score ? a : b));
 }
 
-export function formatOverlapLine(sets: OverlapSets): string {
-  return `overlap(${sets.field}) = |{${sets.shared.join(", ")}}| / |{${sets.union.join(", ")}}| = ${formatScore(sets.score)}`;
+export function formatOverlapLine(
+  sets: OverlapSets,
+  serverWeight?: number | null,
+): string {
+  const base = `overlap(${sets.field}) = |{${sets.shared.join(", ")}}| / |{${sets.union.join(", ")}}| = ${formatScore(sets.score)}`;
+  if (
+    serverWeight !== undefined &&
+    serverWeight !== null &&
+    Math.abs(sets.score - serverWeight) > WEIGHT_EPS
+  ) {
+    return `${base} — ${RECOMPUTED_NOTE}`;
+  }
+  return base;
 }
 
 export function keyMatchFromProps(
@@ -207,25 +237,57 @@ export function keyMatchFromProps(
 ): KeyMatchHit | undefined {
   const srcHit = fkField(src.props, dst.key);
   if (srcHit !== undefined) {
-    return { label: src.label !== "" ? src.label : src.key, field: srcHit, value: dst.key };
+    return { label: src.label, field: srcHit, value: dst.key };
   }
   const dstHit = fkField(dst.props, src.key);
   if (dstHit !== undefined) {
-    return { label: dst.label !== "" ? dst.label : dst.key, field: dstHit, value: src.key };
+    return { label: dst.label, field: dstHit, value: src.key };
   }
   return undefined;
 }
 
 export function formatKeyMatchLine(hit: KeyMatchHit): string {
-  const prefix = typePrefix(hit.label);
-  const head = prefix !== "" ? `${prefix}.` : "";
+  const head = hit.label !== "" ? `${hit.label.toLowerCase()}.` : "";
   return `${head}${hit.field} = "${hit.value}" → ${hit.value}`;
 }
 
-/** Node label, or the alphabetic head of a `person-01` style key (blank-root gap). */
-export function typePrefix(labelOrKey: string): string {
-  const m = labelOrKey.match(/^([A-Za-z]+)/);
-  return m?.[1]?.toLowerCase() ?? "";
+export type FieldEqualHit = {
+  field: string;
+  value: string;
+};
+
+export function fieldEqualFromProps(
+  srcProps: Record<string, unknown>,
+  dstProps: Record<string, unknown>,
+): FieldEqualHit | undefined {
+  for (const field of Object.keys(srcProps).sort()) {
+    if (!(field in dstProps)) {
+      continue;
+    }
+    if (field === "name" || field === "id") {
+      continue;
+    }
+    if (tokenList(srcProps[field]) !== undefined || tokenList(dstProps[field]) !== undefined) {
+      continue;
+    }
+    const value = scalarText(srcProps[field]);
+    if (value === undefined || value !== scalarText(dstProps[field])) {
+      continue;
+    }
+    return { field, value };
+  }
+  return undefined;
+}
+
+export function formatFieldEqualLine(hit: FieldEqualHit): string {
+  return `field_equal(${hit.field}): "${hit.value}" = "${hit.value}"`;
+}
+
+export function whyEdgeMissing(
+  store: GraphStore,
+  edgeIdValue: string | undefined,
+): boolean {
+  return edgeIdValue !== undefined && !store.edges.has(edgeIdValue);
 }
 
 export function buildWhyModel(args: {
@@ -267,6 +329,20 @@ export function buildWhyModel(args: {
       dstKey: dst.key,
     };
   }
+  const eq = fieldEqualFromProps(srcProps, dstProps);
+  if (eq !== undefined) {
+    return {
+      kind: "field_equal",
+      rule: explanation.rule,
+      etype: edge.etype,
+      weight: explanation.weight,
+      field: eq.field,
+      value: eq.value,
+      line: formatFieldEqualLine(eq),
+      srcKey: src.key,
+      dstKey: dst.key,
+    };
+  }
   const overlap = overlapModel(edge, src, dst, explanation, srcProps, dstProps);
   if (overlap !== undefined) {
     return overlap;
@@ -276,6 +352,7 @@ export function buildWhyModel(args: {
     rule: explanation.rule,
     etype: edge.etype,
     weight: explanation.weight,
+    line: `Derived by rule ${explanation.rule}`,
     srcKey: src.key,
     dstKey: dst.key,
   };
@@ -300,7 +377,7 @@ function overlapModel(
     etype: edge.etype,
     weight: explanation.weight,
     field: overlap.field,
-    line: formatOverlapLine(overlap),
+    line: formatOverlapLine(overlap, explanation.weight),
     srcTokens: markTokens(overlap.src, shared),
     dstTokens: markTokens(overlap.dst, shared),
     srcKey: src.key,
@@ -391,6 +468,19 @@ function fkField(
     if (props[field] === target) {
       return field;
     }
+  }
+  return undefined;
+}
+
+function scalarText(value: unknown): string | undefined {
+  if (typeof value === "string" && value !== "") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === "boolean") {
+    return String(value);
   }
   return undefined;
 }

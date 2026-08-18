@@ -395,11 +395,14 @@ button {
   width: 16.5rem;
   background: var(--ink);
   border-right: 1px solid var(--structure);
+  transform: translateX(-100%);
+  transition: transform 200ms ease;
+  pointer-events: none;
 }
 
-.rules[hidden],
-.why[hidden] {
-  display: none;
+.rules.is-open {
+  transform: translateX(0);
+  pointer-events: auto;
 }
 
 .rules-list {
@@ -471,10 +474,19 @@ button {
   width: 22rem;
   background: var(--ink);
   border-left: 2px solid var(--structure);
+  transform: translateX(100%);
+  transition: transform 200ms ease;
+  pointer-events: none;
+}
+
+.why.is-open {
+  transform: translateX(0);
+  pointer-events: auto;
 }
 
 .why[data-kind="overlap"],
 .why[data-kind="key_match"],
+.why[data-kind="field_equal"],
 .why[data-kind="derived"] {
   border-left-color: var(--gold);
 }
@@ -531,5 +543,10 @@ button {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+
+  .why,
+  .rules {
+    transition: none;
   }
 }

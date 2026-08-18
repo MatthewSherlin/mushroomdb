@@ -7,6 +7,7 @@ import {
   formatScore,
   highlightedIdsForRule,
   loadNodeProps,
+  whyEdgeMissing,
   type TokenMark,
   type WhyModel,
 } from "./why";
@@ -36,6 +37,7 @@ export class Inspector {
   private readonly rulesError: HTMLElement;
 
   private whyOpen = false;
+  private whyEdgeId: string | undefined;
   private rulesOpen = false;
   private highlightedRule: string | undefined;
   private highlighted = new Set<string>();
@@ -47,8 +49,8 @@ export class Inspector {
     this.onOpenChange = options.onOpenChange;
 
     this.whyEl = el("aside", "why");
-    this.whyEl.hidden = true;
     this.whyEl.setAttribute("aria-label", "Why");
+    this.whyEl.setAttribute("aria-hidden", "true");
     const whyHead = el("div", "panel-head");
     const whyTitle = el("h2", "panel-title");
     whyTitle.textContent = "Why";
@@ -61,8 +63,8 @@ export class Inspector {
     this.whyEl.append(whyHead, this.whyBody);
 
     this.rulesEl = el("aside", "rules");
-    this.rulesEl.hidden = true;
     this.rulesEl.setAttribute("aria-label", "Rules");
+    this.rulesEl.setAttribute("aria-hidden", "true");
     const rulesHead = el("div", "panel-head");
     const rulesTitle = el("h2", "panel-title");
     rulesTitle.textContent = "Rules";
@@ -100,7 +102,8 @@ export class Inspector {
       return;
     }
     this.rulesOpen = false;
-    this.rulesEl.hidden = true;
+    this.rulesEl.classList.remove("is-open");
+    this.rulesEl.setAttribute("aria-hidden", "true");
     this.onOpenChange?.("rules", false);
   }
 
@@ -109,9 +112,18 @@ export class Inspector {
       return;
     }
     this.whyOpen = false;
-    this.whyEl.hidden = true;
+    this.whyEdgeId = undefined;
+    this.whyEl.classList.remove("is-open");
+    this.whyEl.setAttribute("aria-hidden", "true");
     this.whyEl.removeAttribute("data-kind");
     this.onOpenChange?.("why", false);
+  }
+
+  /** Close the why panel if its edge is gone. T6 wires watch events to this. */
+  closeIfEdgeMissing(): void {
+    if (whyEdgeMissing(this.store, this.whyEdgeId)) {
+      this.closeWhy();
+    }
   }
 
   async openWhy(id: string): Promise<void> {
@@ -121,7 +133,9 @@ export class Inspector {
       return;
     }
     this.whyOpen = true;
-    this.whyEl.hidden = false;
+    this.whyEdgeId = id;
+    this.whyEl.classList.add("is-open");
+    this.whyEl.setAttribute("aria-hidden", "false");
     this.onOpenChange?.("why", true);
 
     await ensureProvenance(this.store, this.api);
@@ -153,7 +167,8 @@ export class Inspector {
 
   private async openRules(): Promise<void> {
     this.rulesOpen = true;
-    this.rulesEl.hidden = false;
+    this.rulesEl.classList.add("is-open");
+    this.rulesEl.setAttribute("aria-hidden", "false");
     this.onOpenChange?.("rules", true);
     try {
       const stats = await this.api.stats();
@@ -249,9 +264,24 @@ export class Inspector {
       bits.push(tokenRow(model.dstKey, model.dstTokens));
     } else if (model.kind === "key_match") {
       bits.push(mono("why-line", model.line));
+    } else if (model.kind === "field_equal") {
+      bits.push(fieldEqualRow(model.field, model.value));
+    } else {
+      bits.push(mono("why-line", model.line));
     }
     this.whyBody.replaceChildren(...bits);
   }
+}
+
+function fieldEqualRow(field: string, value: string): HTMLElement {
+  const row = el("div", "why-line");
+  row.append(document.createTextNode(`field_equal(${field}): `));
+  const left = el("span", "why-tok why-tok-shared");
+  left.textContent = value;
+  const right = el("span", "why-tok why-tok-shared");
+  right.textContent = value;
+  row.append(left, document.createTextNode(" = "), right);
+  return row;
 }
 
 function tokenRow(key: string, tokens: readonly TokenMark[]): HTMLElement {
