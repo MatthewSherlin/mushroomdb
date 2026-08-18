@@ -1,0 +1,18 @@
+[package]
+name = "core-bench"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+autolib = false
+
+[dependencies]
+core-api = { path = "../core-api" }
+core-storage = { path = "../core-storage" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "engine"
+harness = false
