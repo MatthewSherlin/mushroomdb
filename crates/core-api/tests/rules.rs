@@ -1,4 +1,4 @@
-use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value};
+use core_api::{Direction, GraphDb, GraphError, Predicate, PredicateSummary, RuleDef, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-{}-{}", name, std::process::id()));
@@ -238,4 +238,131 @@ fn explain_predicate_summary_key_match_and_all() {
     assert_eq!(parts[1].kind, "overlap");
     assert_eq!(parts[1].fields, vec!["tags".to_string()]);
     assert_eq!(parts[1].min, Some(0.5));
+}
+
+#[test]
+fn predicate_summary_kind_table() {
+    struct Row {
+        pred: Predicate,
+        kind: &'static str,
+        fields: &'static [&'static str],
+        min: Option<f64>,
+        tolerance: Option<f64>,
+        km: Option<f64>,
+        n_parts: Option<usize>,
+    }
+    let cases = [
+        Row {
+            pred: Predicate::KeyMatch { field: "fk".into() },
+            kind: "key_match",
+            fields: &["fk"],
+            min: None,
+            tolerance: None,
+            km: None,
+            n_parts: None,
+        },
+        Row {
+            pred: Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+            kind: "field_equal",
+            fields: &["ind"],
+            min: None,
+            tolerance: None,
+            km: None,
+            n_parts: None,
+        },
+        Row {
+            pred: Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            },
+            kind: "overlap",
+            fields: &["tags"],
+            min: Some(0.5),
+            tolerance: None,
+            km: None,
+            n_parts: None,
+        },
+        Row {
+            pred: Predicate::All(vec![
+                Predicate::FieldEqual {
+                    field: "ind".into(),
+                },
+                Predicate::Overlap {
+                    field: "tags".into(),
+                    min: 0.4,
+                },
+            ]),
+            kind: "all",
+            fields: &["ind", "tags"],
+            min: None,
+            tolerance: None,
+            km: None,
+            n_parts: Some(2),
+        },
+        Row {
+            pred: Predicate::NumericWithin {
+                field: "year".into(),
+                tolerance: 2.0,
+            },
+            kind: "numeric_within",
+            fields: &["year"],
+            min: None,
+            tolerance: Some(2.0),
+            km: None,
+            n_parts: None,
+        },
+        Row {
+            pred: Predicate::GeoRadius {
+                field: "loc".into(),
+                km: 400.0,
+            },
+            kind: "geo_radius",
+            fields: &["loc"],
+            min: None,
+            tolerance: None,
+            km: Some(400.0),
+            n_parts: None,
+        },
+        Row {
+            pred: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            kind: "vector_similar",
+            fields: &["emb"],
+            min: Some(0.9),
+            tolerance: None,
+            km: None,
+            n_parts: None,
+        },
+    ];
+    for row in &cases {
+        let s = PredicateSummary::from(&row.pred);
+        assert_eq!(s.kind, row.kind, "{}", row.kind);
+        assert_eq!(
+            s.fields,
+            row.fields
+                .iter()
+                .map(|f| (*f).to_string())
+                .collect::<Vec<_>>(),
+            "{} fields",
+            row.kind
+        );
+        assert_eq!(s.min, row.min, "{} min", row.kind);
+        assert_eq!(s.tolerance, row.tolerance, "{} tolerance", row.kind);
+        assert_eq!(s.km, row.km, "{} km", row.kind);
+        match row.n_parts {
+            None => assert!(s.parts.is_none(), "{} parts", row.kind),
+            Some(n) => {
+                assert_eq!(
+                    s.parts.as_ref().map(Vec::len),
+                    Some(n),
+                    "{} parts",
+                    row.kind
+                )
+            }
+        }
+    }
 }

@@ -277,6 +277,14 @@ async fn explain_happy_path() {
     assert_eq!(v[0]["weight"], Json::Null);
     assert_eq!(v[0]["predicate"]["kind"], json!("key_match"));
     assert_eq!(v[0]["predicate"]["fields"], json!(["org_id"]));
+    let pred = v[0]["predicate"].as_object().expect("predicate object");
+    for key in ["min", "tolerance", "km", "parts"] {
+        assert!(
+            pred.contains_key(key),
+            "leaf JSON must present {key} as null, not omit it"
+        );
+        assert_eq!(pred[key], Json::Null);
+    }
 }
 
 /// Binding: /explain JSON includes `predicate` with snake_case kind and parts.
@@ -515,7 +523,7 @@ fn wire_types_serialize() {
         }],
     })
     .unwrap();
-    serde_json::to_value(&Explanation {
+    let expl = serde_json::to_value(&Explanation {
         rule: "r".into(),
         edge_type: "E".into(),
         src_key: "a".into(),
@@ -524,6 +532,13 @@ fn wire_types_serialize() {
         predicate: PredicateSummary::from(&Predicate::KeyMatch { field: "fk".into() }),
     })
     .unwrap();
+    assert_eq!(expl["predicate"]["kind"], json!("key_match"));
+    assert_eq!(expl["predicate"]["fields"], json!(["fk"]));
+    let pred = expl["predicate"].as_object().expect("predicate object");
+    for key in ["min", "tolerance", "km", "parts"] {
+        assert!(pred.contains_key(key), "wire summary must include {key}");
+        assert_eq!(pred[key], Json::Null);
+    }
     assert_eq!(
         json_to_value(json!("p1")),
         Some(Value::Str("p1".into())),
