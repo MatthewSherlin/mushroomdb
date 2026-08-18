@@ -83,16 +83,23 @@ describe("paintExplorer", () => {
     expect(painted.pointColors[0]).toEqual(COLOR.signal);
   });
 
-  it("overrides a born edge to gold unless the edge is selected", () => {
+  it("keeps a glowing user edge structure, not gold", () => {
     const store = seeded();
     const knows = edgeId("KNOWS", "a", "b");
-    const idle = paintExplorer(store, store.toCosmos(), new Set([knows]));
-    expect(colorOf(idle, 0, 1)).toEqual(COLOR.gold);
+    const painted = paintExplorer(store, store.toCosmos(), new Set([knows]));
+    expect(colorOf(painted, 0, 1)).toEqual(COLOR.structure);
+    expect(colorOf(painted, 0, 2)).toEqual(COLOR.gold);
+  });
+
+  it("overrides a glowing derived edge to gold unless the edge is selected", () => {
+    const store = seeded();
+    const fit = edgeId("FIT", "a", "c");
+    const idle = paintExplorer(store, store.toCosmos(), new Set([fit]));
     expect(colorOf(idle, 0, 2)).toEqual(COLOR.gold);
 
-    store.select({ kind: "edge", id: knows });
-    const selected = paintExplorer(store, store.toCosmos(), new Set([knows]));
-    expect(colorOf(selected, 0, 1)).toEqual(COLOR.signal);
+    store.select({ kind: "edge", id: fit });
+    const selected = paintExplorer(store, store.toCosmos(), new Set([fit]));
+    expect(colorOf(selected, 0, 2)).toEqual(COLOR.signal);
   });
 
   it("paints a highlighted rule's edges gold and dims the rest", () => {

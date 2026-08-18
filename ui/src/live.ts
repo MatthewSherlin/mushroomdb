@@ -147,7 +147,11 @@ export function resyncKeys(store: GraphStore): string[] {
 }
 
 export function triggersResync(event: MutationEvent): boolean {
-  return "ingested" in event || "node_inserted" in event;
+  return (
+    "ingested" in event ||
+    "node_inserted" in event ||
+    "edge_inserted" in event
+  );
 }
 
 export function derivedEdgeIds(store: GraphStore): string[] {

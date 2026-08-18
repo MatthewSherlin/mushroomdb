@@ -169,7 +169,7 @@ describe("resyncKeys", () => {
 });
 
 describe("triggersResync", () => {
-  it("treats ingested and node_inserted as resync triggers", () => {
+  it("treats ingested, node_inserted, and edge_inserted as resync triggers", () => {
     expect(triggersResync({ ingested: { label: "Person", inserted: 1 } })).toBe(
       true,
     );
@@ -180,7 +180,7 @@ describe("triggersResync", () => {
       triggersResync({
         edge_inserted: { edge_type: "FIT", src: "a", dst: "b" },
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(triggersResync({ prop_set: { key: "a", field: "n" } })).toBe(false);
   });
 });

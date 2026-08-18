@@ -57,7 +57,14 @@ export function paintExplorer(
       return color;
     }
     const id = edgeIds[i];
-    if (id !== undefined && (glowing.has(id) || highlighted.has(id))) {
+    if (id !== undefined && highlighted.has(id)) {
+      return COLOR.gold;
+    }
+    if (
+      id !== undefined &&
+      glowing.has(id) &&
+      store.edges.get(id)?.derived === true
+    ) {
       return COLOR.gold;
     }
     if (id !== undefined && highlighted.size > 0) {

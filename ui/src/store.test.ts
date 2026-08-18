@@ -602,20 +602,14 @@ describe("toCosmos", () => {
   });
 });
 
-describe("setNodeProps + clearDirty", () => {
-  it("stores props on a visible node and clearDirty drops marks", () => {
+describe("setNodeProps", () => {
+  it("stores props on a visible node and keeps them across fromNeighborhood", () => {
     const store = new GraphStore();
     seedPair(store);
     store.setNodeProps("b", { skills: ["s1"] });
     expect(store.nodes.get("b")?.props).toEqual({ skills: ["s1"] });
     store.fromNeighborhood("a", neighborhood([["b", "Person", 1]]));
     expect(store.nodes.get("b")?.props).toEqual({ skills: ["s1"] });
-    store.markDirty("a");
-    store.markDirty("b");
-    store.clearDirty(["a"]);
-    expect([...store.dirty]).toEqual(["b"]);
-    store.clearDirty();
-    expect(store.dirty.size).toBe(0);
   });
 });
 

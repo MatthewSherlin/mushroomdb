@@ -392,6 +392,9 @@ export async function ensureProvenance(
   const pending: Array<[string, string]> = [];
   const seen = new Set<string>();
   for (const edge of store.edges.values()) {
+    // Intentional short-circuit: classified edges skip re-explain.
+    // A new rule that would reclassify the pair is handled by
+    // rule_created → markAllDirty → resync → expand, not this guard.
     if (edge.derived !== undefined) {
       continue;
     }

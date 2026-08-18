@@ -225,16 +225,6 @@ export class GraphStore {
     this.dirty.add(key);
   }
 
-  clearDirty(keys?: Iterable<string>): void {
-    if (keys === undefined) {
-      this.dirty.clear();
-      return;
-    }
-    for (const key of keys) {
-      this.dirty.delete(key);
-    }
-  }
-
   apply(event: MutationEvent): void {
     if ("node_inserted" in event) {
       this.onNodeInserted(event.node_inserted);

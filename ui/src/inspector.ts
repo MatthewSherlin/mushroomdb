@@ -215,15 +215,23 @@ export class Inspector {
       this.onNeedPaint?.();
       return;
     }
-    await ensureProvenance(this.store, this.api);
-    this.highlightedRule = name;
-    const ids = highlightedIdsForRule(this.store, name);
-    this.highlighted = new Set(ids);
-    this.markRuleRows();
-    this.onNeedPaint?.();
-    const first = ids[0];
-    if (first !== undefined) {
-      await this.openWhy(first);
+    this.rulesError.hidden = true;
+    this.rulesError.textContent = "";
+    const error = await runRuleClick(async () => {
+      await ensureProvenance(this.store, this.api);
+      this.highlightedRule = name;
+      const ids = highlightedIdsForRule(this.store, name);
+      this.highlighted = new Set(ids);
+      this.markRuleRows();
+      this.onNeedPaint?.();
+      const first = ids[0];
+      if (first !== undefined) {
+        await this.openWhy(first);
+      }
+    });
+    if (error !== undefined) {
+      this.rulesError.textContent = error;
+      this.rulesError.hidden = false;
     }
   }
 
@@ -270,6 +278,18 @@ export class Inspector {
       bits.push(mono("why-line", model.line));
     }
     this.whyBody.replaceChildren(...bits);
+  }
+}
+
+/** Rule-click API failures become strip text; `undefined` means success. */
+export async function runRuleClick(
+  action: () => Promise<void>,
+): Promise<string | undefined> {
+  try {
+    await action();
+    return undefined;
+  } catch (err: unknown) {
+    return queryErrorText(err);
   }
 }
 
