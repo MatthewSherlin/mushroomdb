@@ -31,6 +31,9 @@ pub struct RuleEngine {
     /// Never serialized; rebuilt from `provenance` on persist-restore.
     by_node: BTreeMap<u32, BTreeSet<Touch>>,
     /// Intern table for rule names used as `Touch` rule_ids. Derived.
+    /// Additive-only: ids are never reused. `by_node` stores these ids, so
+    /// pruning-and-reusing a slot would alias leftover touches to a new name.
+    /// Bound: one slot per distinct rule name ever created in this process.
     rule_intern: BTreeMap<String, u32>,
     intern_rule: Vec<String>,
     tripped: BTreeMap<String, bool>,
@@ -183,6 +186,7 @@ fn edge_budget(def: &RuleDef) -> u64 {
     def.max_edges.unwrap_or(DEFAULT_MAX_EDGES)
 }
 
+/// Never recycles ids. See `RuleEngine::rule_intern` for why.
 fn intern_rule(intern: &mut BTreeMap<String, u32>, names: &mut Vec<String>, rule: &str) -> u32 {
     if let Some(&id) = intern.get(rule) {
         return id;
@@ -1799,5 +1803,61 @@ mod tests {
         assert_eq!(hits[0].0, "works_at");
         assert_eq!(hits[0].2, first);
         assert_eq!(hits[0].3, hub);
+    }
+
+    #[test]
+    fn by_node_consistent_across_budget_trip_and_rebuild() {
+        let mut fx = Fx::new();
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(const_eq_rule(10), &mut g).unwrap();
+        }
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let id = fx.add(
+                "N",
+                &format!("n{i}"),
+                vec![("k", Value::Str("const".into()))],
+            );
+            ids.push(id);
+            let mut g = fx.g();
+            eng.on_node_changed(id, None, &mut g);
+        }
+        assert_eq!(eng.provenance()["eq"].len(), 10);
+        assert!(eng.is_tripped("eq"));
+        assert!(eng.by_node_consistent(), "consistent after trip");
+
+        // Rebuild while desired still exceeds the cap: latch stays, no-op on
+        // provenance, reverse index must still match a rebuild-from-provenance.
+        {
+            let mut g = fx.g();
+            eng.rebuild("eq", &mut g).unwrap();
+        }
+        assert!(eng.is_tripped("eq"));
+        assert_eq!(eng.provenance()["eq"].len(), 10);
+        assert!(
+            eng.by_node_consistent(),
+            "consistent after over-cap rebuild"
+        );
+
+        // Drain below budget; tripped stays until rebuild.
+        for (id, val) in [(ids[2], "x2"), (ids[3], "x3")] {
+            let old = fx.props.get(id, "k").cloned();
+            fx.props.set(id, "k", Value::Str(val.into()));
+            let mut g = fx.g();
+            eng.on_node_changed(id, Some(("k", old)), &mut g);
+        }
+        assert!(eng.provenance()["eq"].len() < 10);
+        assert!(eng.is_tripped("eq"));
+        assert!(eng.by_node_consistent(), "consistent after drain");
+
+        {
+            let mut g = fx.g();
+            eng.rebuild("eq", &mut g).unwrap();
+        }
+        assert!(!eng.is_tripped("eq"), "rebuild un-trips when desired fits");
+        assert_eq!(eng.provenance()["eq"].len(), 2);
+        assert!(eng.by_node_consistent(), "consistent after un-trip rebuild");
     }
 }
