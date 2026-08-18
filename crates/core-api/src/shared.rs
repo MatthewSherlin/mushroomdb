@@ -19,7 +19,10 @@ use std::sync::{Arc, RwLock};
 /// [`GraphDb::set_event_sink`] runs the hook inside `log_then_apply` while
 /// this write guard is still held. A sink must never call [`SharedDb::read`]
 /// or [`SharedDb::write`] on the same handle (the `RwLock` is not
-/// re-entrant). Broadcast/`mpsc` send is the intended use.
+/// re-entrant). The sink is `Send + Sync`; `std::sync::mpsc::Sender`
+/// is not `Sync`. Intended examples: `std::sync::mpsc::SyncSender`,
+/// `tokio::sync::mpsc::Sender`, `tokio::sync::broadcast::Sender`, or
+/// `Arc<Mutex<Vec<_>>>`.
 #[derive(Clone)]
 pub struct SharedDb {
     inner: Arc<RwLock<GraphDb<RealFs>>>,

@@ -512,8 +512,11 @@ impl<F: Fs> GraphDb<F> {
     /// database is behind a [`crate::SharedDb`], that means the **write
     /// guard is held**. The sink must never call `read` / `write` (or any
     /// other method) on the same `SharedDb` — the `RwLock` is not
-    /// re-entrant and doing so deadlocks. A tokio `broadcast::Sender::send`
-    /// is non-blocking and safe.
+    /// re-entrant and doing so deadlocks. The sink is `Send + Sync`;
+    /// `std::sync::mpsc::Sender` is not `Sync` and will not type-check.
+    /// Intended examples: `std::sync::mpsc::SyncSender`,
+    /// `tokio::sync::mpsc::Sender`, `tokio::sync::broadcast::Sender`
+    /// (non-blocking `send`), or `Arc<Mutex<Vec<MutationEvent>>>`.
     pub fn set_event_sink(&mut self, sink: Box<dyn Fn(MutationEvent) + Send + Sync>) {
         self.event_sink = Some(sink);
     }

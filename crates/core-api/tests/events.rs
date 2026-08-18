@@ -1,4 +1,6 @@
-use core_api::{GraphDb, GraphError, IngestOptions, MutationEvent, Predicate, RuleDef, Value};
+use core_api::{
+    AutoFk, GraphDb, GraphError, IngestOptions, MutationEvent, Predicate, RuleDef, Value,
+};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -41,6 +43,12 @@ fn take(evs: &Arc<Mutex<Vec<MutationEvent>>>) -> Vec<MutationEvent> {
 fn row(id: &str) -> BTreeMap<String, Value> {
     let mut m = BTreeMap::new();
     m.insert("id".into(), Value::Str(id.into()));
+    m
+}
+
+fn person_org(id: &str, org_id: &str) -> BTreeMap<String, Value> {
+    let mut m = row(id);
+    m.insert("org_id".into(), Value::Str(org_id.into()));
     m
 }
 
@@ -220,6 +228,56 @@ fn reopen_replay_emits_nothing() {
             key: "a".into(),
             field: "n".into(),
         }]
+    );
+}
+
+/// Ingest with auto-FK: inner events are the CreateRule then each accepted
+/// insert; `Ingested.inserted` is the row count, not the WAL-op count
+/// (rule + rows). Derived KeyMatch edges are not individually evented.
+#[test]
+fn ingest_auto_fk_emits_rule_then_rows_then_ingested() {
+    let dir = tmp("ingest-fk");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "acme", vec![]).unwrap();
+    let evs = attach(&mut db);
+
+    let report = db
+        .ingest(
+            "Person",
+            vec![person_org("p1", "acme"), person_org("p2", "acme")],
+            &IngestOptions {
+                key_field: "id".into(),
+                auto_fk: AutoFk::Auto {
+                    suffix: "_id".into(),
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(report.inserted, 2);
+    assert_eq!(
+        report.rules_created,
+        vec!["auto_fk_person_org_id".to_string()]
+    );
+
+    assert_eq!(
+        take(&evs),
+        vec![
+            MutationEvent::RuleCreated {
+                name: "auto_fk_person_org_id".into(),
+            },
+            MutationEvent::NodeInserted {
+                label: "Person".into(),
+                key: "p1".into(),
+            },
+            MutationEvent::NodeInserted {
+                label: "Person".into(),
+                key: "p2".into(),
+            },
+            MutationEvent::Ingested {
+                label: "Person".into(),
+                inserted: 2,
+            },
+        ]
     );
 }
 
