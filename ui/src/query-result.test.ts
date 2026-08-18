@@ -16,6 +16,7 @@ import {
   harvestDecision,
   harvestableKeys,
   queryErrorText,
+  resultAfterRun,
 } from "./query-result";
 
 function result(columns: string[], rows: QueryResult["rows"]): QueryResult {
@@ -99,6 +100,17 @@ describe("harvestDecision", () => {
     expect(harvestDecision(result(["n"], [["p1"]]))).toEqual({
       keys: ["p1"],
       blocked: undefined,
+    });
+  });
+
+  it("failed Run drops the previous result so Add to canvas disables", () => {
+    const prior = result(["n"], [["p1"]]);
+    expect(harvestDecision(prior).blocked).toBeUndefined();
+    const after = resultAfterRun({ ok: false });
+    expect(after).toBeUndefined();
+    expect(harvestDecision(after)).toEqual({
+      keys: [],
+      blocked: NO_RESULT_HINT,
     });
   });
 });

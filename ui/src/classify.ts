@@ -103,12 +103,33 @@ export function concatResults(...results: QueryResult[]): QueryResult {
   return { columns, rows: results.flatMap((r) => r.rows) };
 }
 
+export type MapPoolError<T> = {
+  index: number;
+  item: T;
+  error: unknown;
+};
+
+/**
+ * Bounded concurrent map. Each item is independently try/caught: one
+ * rejection does not abort queued items or sibling workers.
+ *
+ * Failure surface: `{ results, errors }`.
+ * - `results[i]` is the fulfilled value, or `undefined` if item `i` rejected
+ *   (also `undefined` when `R` is `void` — inspect `errors` for those).
+ * - `errors` is `{ index, item, error }[]` sorted by index.
+ */
+export type MapPoolResult<T, R> = {
+  results: Array<R | undefined>;
+  errors: MapPoolError<T>[];
+};
+
 export async function mapPool<T, R>(
   items: readonly T[],
   limit: number,
   fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
+): Promise<MapPoolResult<T, R>> {
+  const results = new Array<R | undefined>(items.length);
+  const errors: MapPoolError<T>[] = [];
   let next = 0;
   const worker = async (): Promise<void> => {
     for (;;) {
@@ -117,12 +138,17 @@ export async function mapPool<T, R>(
       if (i >= items.length) {
         return;
       }
-      results[i] = await fn(items[i] as T);
+      try {
+        results[i] = await fn(items[i] as T);
+      } catch (error: unknown) {
+        errors.push({ index: i, item: items[i] as T, error });
+      }
     }
   };
   const n = Math.min(Math.max(limit, 1), items.length);
   await Promise.all(Array.from({ length: n }, () => worker()));
-  return results;
+  errors.sort((a, b) => a.index - b.index);
+  return { results, errors };
 }
 
 export async function explainNeighbors(
@@ -143,12 +169,12 @@ export async function explainNeighbors(
   // (src==a && dst==b) || (src==b && dst==a) at crates/core-api/src/db.rs:900.
   // explain(root, n) therefore returns in-edges {src_key:n, dst_key:root} as
   // well as out-edges. classifyDir does not flip or rewrite direction.
-  const values = await mapPool(unique, EXPLAIN_CONCURRENCY, (n) =>
+  const { results } = await mapPool(unique, EXPLAIN_CONCURRENCY, (n) =>
     explain(root, n),
   );
   const map = new Map<string, Explanation[]>();
   for (let i = 0; i < unique.length; i++) {
-    map.set(unique[i]!, values[i]!);
+    map.set(unique[i]!, results[i] ?? []);
   }
   return map;
 }

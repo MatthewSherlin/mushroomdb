@@ -58,4 +58,10 @@ describe("highlightHtml", () => {
     expect(html).toContain('<span class="hl-str">\'&lt;b&gt;\'</span>');
     expect(html).not.toContain("<b>");
   });
+
+  it("escapes double quotes in string tokens", () => {
+    const html = highlightHtml('RETURN "a"');
+    expect(html).toContain('<span class="hl-str">&quot;a&quot;</span>');
+    expect(html).not.toMatch(/hl-str">"/);
+  });
 });

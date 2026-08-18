@@ -69,6 +69,13 @@ export function harvestableKeys(result: QueryResult): string[] {
   return keys;
 }
 
+/** Failed Run discards the last result so Add-to-canvas cannot use stale keys. */
+export function resultAfterRun(
+  outcome: { ok: true; value: QueryResult } | { ok: false },
+): QueryResult | undefined {
+  return outcome.ok ? outcome.value : undefined;
+}
+
 export function harvestDecision(
   result: QueryResult | undefined,
 ): HarvestDecision {
@@ -124,10 +131,14 @@ export async function addHarvestedToCanvas(
     return [];
   }
   store.mergeQueryGraph(result.columns, result.rows);
-  await mapPool(keys, EXPLAIN_CONCURRENCY, (key) =>
+  const { errors } = await mapPool(keys, EXPLAIN_CONCURRENCY, (key) =>
     expandNode(store, api, key, 1),
   );
-  return keys;
+  if (errors.length === 0) {
+    return keys;
+  }
+  const failed = new Set(errors.map((e) => e.index));
+  return keys.filter((_, i) => !failed.has(i));
 }
 
 function stringCell(cell: JsonCell | undefined): string | undefined {

@@ -137,9 +137,28 @@ describe("mapPool", () => {
       inflight -= 1;
       return n * 2;
     });
-    expect(out).toEqual([2, 4, 6, 8, 10]);
+    expect(out.results).toEqual([2, 4, 6, 8, 10]);
+    expect(out.errors).toEqual([]);
     expect(max).toBeLessThanOrEqual(2);
     expect(started).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("keeps processing remaining items after a mid-batch rejection", async () => {
+    const seen: number[] = [];
+    const out = await mapPool([1, 2, 3, 4], 2, async (n) => {
+      seen.push(n);
+      await new Promise((r) => setTimeout(r, 10));
+      if (n === 2) {
+        throw new Error("boom");
+      }
+      return n * 10;
+    });
+    expect(seen.sort()).toEqual([1, 2, 3, 4]);
+    expect(out.results).toEqual([10, undefined, 30, 40]);
+    expect(out.errors).toHaveLength(1);
+    expect(out.errors[0]?.index).toBe(1);
+    expect(out.errors[0]?.item).toBe(2);
+    expect((out.errors[0]?.error as Error).message).toBe("boom");
   });
 });
 

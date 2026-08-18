@@ -5,6 +5,7 @@ import {
   formatTable,
   harvestDecision,
   queryErrorText,
+  resultAfterRun,
 } from "./query-result";
 import type { GraphStore } from "./store";
 
@@ -40,6 +41,11 @@ export class QueryConsole {
   private result: QueryResult | undefined;
   private busy = false;
   private open = false;
+  private readonly onResize = (): void => {
+    if (this.open) {
+      this.syncHeight();
+    }
+  };
 
   constructor(host: HTMLElement, options: QueryConsoleOptions) {
     this.host = host;
@@ -112,6 +118,7 @@ export class QueryConsole {
 
     this.syncHighlight();
     this.syncAdd();
+    window.addEventListener("resize", this.onResize);
   }
 
   get isOpen(): boolean {
@@ -145,6 +152,7 @@ export class QueryConsole {
   }
 
   destroy(): void {
+    window.removeEventListener("resize", this.onResize);
     this.close();
     this.root.remove();
   }
@@ -157,14 +165,16 @@ export class QueryConsole {
     this.runBtn.disabled = true;
     try {
       const result = await this.api.query(this.editor.value);
-      this.result = result;
+      this.result = resultAfterRun({ ok: true, value: result });
       this.errorEl.hidden = true;
       this.errorEl.textContent = "";
       this.renderTable(result);
       this.syncAdd();
     } catch (err: unknown) {
+      this.result = resultAfterRun({ ok: false });
       this.errorEl.textContent = queryErrorText(err);
       this.errorEl.hidden = false;
+      this.syncAdd();
     } finally {
       this.busy = false;
       this.runBtn.disabled = false;

@@ -43,6 +43,7 @@ export async function expandNode(
     store.fromNeighborhood(root, deep);
     await attachEdges(store, api, root);
     const hop1 = hopKeysAtDepth(deep, 1).filter((key) => key !== root);
+    // mapPool is best-effort: a failed hop-1 expand does not abort siblings.
     await mapPool(hop1, EXPLAIN_CONCURRENCY, (key) =>
       expandNode(store, api, key, 1),
     );
