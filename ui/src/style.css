@@ -201,7 +201,7 @@ button {
 .error-strip {
   position: absolute;
   right: 16px;
-  bottom: 16px;
+  bottom: calc(16px + var(--console-h, 0px));
   left: 16px;
   padding: 8px 10px;
   color: var(--paper);
@@ -213,6 +213,159 @@ button {
 
 .error-strip[hidden] {
   display: none;
+}
+
+.console {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 48px;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  height: 42vh;
+  min-height: 220px;
+  max-height: 70vh;
+  background: var(--ink);
+  border-top: 1px solid var(--structure);
+}
+
+.console[hidden] {
+  display: none;
+}
+
+.console-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--structure);
+}
+
+.console-btn {
+  padding: 5px 10px;
+  color: var(--paper);
+  background: transparent;
+  border: 1px solid var(--structure);
+  cursor: pointer;
+}
+
+.console-btn:hover:not(:disabled) {
+  color: var(--signal);
+  border-color: var(--signal);
+}
+
+.console-btn:disabled {
+  color: color-mix(in srgb, var(--paper) 45%, var(--ink));
+  cursor: not-allowed;
+}
+
+.console-hide {
+  margin-left: auto;
+}
+
+.console-hint {
+  margin: 0;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  color: color-mix(in srgb, var(--paper) 55%, var(--ink));
+}
+
+.console-editor {
+  position: relative;
+  flex: 0 0 8.5rem;
+  border-bottom: 1px solid var(--structure);
+}
+
+.console-hl,
+.console-input {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  tab-size: 2;
+  white-space: pre;
+  overflow: auto;
+}
+
+.console-hl {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  color: var(--paper);
+}
+
+.console-input {
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  height: 100%;
+  color: transparent;
+  caret-color: var(--paper);
+  background: transparent;
+  border: 0;
+  resize: none;
+  outline: none;
+}
+
+.console-input:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--signal);
+}
+
+.hl-kw {
+  color: var(--signal);
+}
+
+.hl-str,
+.hl-num {
+  color: var(--gold);
+}
+
+.hl-cmt {
+  color: var(--structure);
+}
+
+.console-error {
+  padding: 8px 12px;
+  color: var(--paper);
+  border-bottom: 1px solid var(--structure);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+}
+
+.console-error[hidden] {
+  display: none;
+}
+
+.console-table-wrap {
+  flex: 1 1 auto;
+  overflow: auto;
+}
+
+.console-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+}
+
+.console-table th,
+.console-table td {
+  padding: 5px 10px;
+  text-align: left;
+  border-bottom: 1px solid color-mix(in srgb, var(--structure) 45%, var(--ink));
+}
+
+.console-table th {
+  font-weight: 500;
+  color: color-mix(in srgb, var(--paper) 62%, var(--ink));
+}
+
+.console-table td {
+  color: var(--paper);
 }
 
 @media (prefers-reduced-motion: reduce) {

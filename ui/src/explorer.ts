@@ -1,5 +1,6 @@
 import { Graph } from "@cosmos.gl/graph";
 import { ApiClient, ApiError } from "./api";
+import { QueryConsole } from "./console";
 import { expandNode, loadDemoNeighborhood } from "./expand";
 import { GlowQueue, bornEdgeIds } from "./glow";
 import {
@@ -40,8 +41,11 @@ export class Explorer {
   private readonly store: GraphStore;
   private readonly onEdgeSelect: ((id: string) => void) | undefined;
   private readonly glow = new GlowQueue();
+  private readonly queryConsole: QueryConsole;
 
   private readonly rail: HTMLElement;
+  private readonly exploreBtn: HTMLButtonElement;
+  private readonly consoleBtn: HTMLButtonElement;
   private readonly wordmark: HTMLElement;
   private readonly statusDot: HTMLElement;
   private readonly stage: HTMLElement;
@@ -79,11 +83,20 @@ export class Explorer {
 
     this.rail = el("nav", "rail");
     this.rail.setAttribute("aria-label", "views");
+    this.exploreBtn = railButton("explore", "Explore", ICON_EXPLORE, true);
+    this.consoleBtn = railButton("console", "Console", ICON_CONSOLE, false);
+    this.consoleBtn.setAttribute("aria-expanded", "false");
     this.rail.append(
-      railButton("explore", "Explore", ICON_EXPLORE, true),
-      railButton("console", "Console", ICON_CONSOLE, false),
+      this.exploreBtn,
+      this.consoleBtn,
       railButton("rules", "Rules", ICON_RULES, false),
     );
+    this.exploreBtn.addEventListener("click", () => {
+      this.queryConsole.close();
+    });
+    this.consoleBtn.addEventListener("click", () => {
+      this.queryConsole.toggle();
+    });
 
     this.stage = el("div", "stage");
     this.canvasHost = el("div", "canvas-host") as HTMLDivElement;
@@ -115,6 +128,18 @@ export class Explorer {
       this.errorEl,
     );
     host.append(this.rail, this.wordmark, this.stage);
+
+    this.queryConsole = new QueryConsole(host, {
+      api: this.api,
+      store: this.store,
+      onCanvasChange: () => {
+        this.paint();
+        this.scheduleFit();
+      },
+      onOpenChange: (open) => {
+        this.syncConsoleRail(open);
+      },
+    });
 
     this.canvasHost.addEventListener(
       "dblclick",
@@ -153,7 +178,19 @@ export class Explorer {
     }
     this.graph?.destroy();
     this.graph = undefined;
+    this.queryConsole.destroy();
     this.host.replaceChildren();
+  }
+
+  private syncConsoleRail(open: boolean): void {
+    this.consoleBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) {
+      this.consoleBtn.setAttribute("aria-current", "page");
+      this.exploreBtn.removeAttribute("aria-current");
+    } else {
+      this.consoleBtn.removeAttribute("aria-current");
+      this.exploreBtn.setAttribute("aria-current", "page");
+    }
   }
 
   private async loadDemo(): Promise<void> {
