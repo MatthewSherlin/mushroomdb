@@ -80,8 +80,12 @@ a measured 25% hit on this 10k graph.
 
 The binding ratio is 1887× because the numerator includes 16 fsyncs and the
 denominator does not. Read-path degradation with writer work held fixed is
-+10.3% (`16r1w` vs `4r1w`), below the 25% bar. `parking_lot` cannot remove
-WAL fsync and is not justified.
++10.3% (`16r1w` vs `4r1w`), below the 25% bar. That +10.3% is **7.2 ms**
+and sits inside the `16r1w` MAD of **6.9 ms** — read-scaling overhead is
+statistically indistinguishable from noise. Do not treat +10.3% as a
+measured lock tax; re-measure the epoch-readers trigger on a harness that
+isolates per-read latency. `parking_lot` cannot remove WAL fsync and is
+not justified.
 
 Epoch snapshot readers stay the post-launch upgrade behind the same seam.
 
@@ -106,7 +110,18 @@ applies the mutation to the inactive side, then flips an `AtomicPtr` /
 | Consistency | A `read()` guard pins one replica for its lifetime, same as today. |
 
 Cost is honest: 2× RAM on a design that already targets ~5–15 GB at 10M
-nodes, and 2× CPU on every write. Fits pre-1.0 storage as it exists.
+nodes, and 2× CPU on every write. Two write strategies, both unfinished:
+
+- **Snapshot-copy** (apply once, clone onto the inactive side) is a full
+  in-memory graph clone — multi-GB at the 10M-node target, paid on every
+  publish.
+- **Apply-twice** (replay the mutation on each replica) can diverge unless
+  every write is applied deterministically and in the same order on both
+  sides. A missed fire, a non-deterministic rule walk, or a one-sided
+  error leaves the replicas permanently apart.
+
+Both must be solved by the post-launch design. Fits pre-1.0 storage as it
+exists only as a sketch, not as a drop-in.
 
 ### ArcSwap snapshot
 
