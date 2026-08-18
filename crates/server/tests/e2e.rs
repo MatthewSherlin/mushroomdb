@@ -2,9 +2,10 @@
 //! [`SharedDb`], plus a concurrency hammer.
 //!
 //! Demo fixture choice: rebuilt here via public core-api (`ingest_json` +
-//! `create_rule`). `cli → server` already exists; a `server` dev-dep on `cli`
-//! would be a crate cycle. Nothing is moved. The builders below are the
-//! demo-equivalent (10 Orgs / 20 Projects / 30 People, `skill_fit` Overlap).
+//! `create_rule`). Upstream source is `crates/cli/src/lib.rs` (`org_json` /
+//! `project_json` / `person_json` / `skill_fit`) — keep this copy in lockstep
+//! or the row pins below will drift. `cli → server` already exists; a
+//! `server` dev-dep on `cli` would be a crate cycle. Nothing is moved.
 
 use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow_ipc::reader::StreamReader;
@@ -99,7 +100,7 @@ fn person_json() -> String {
     }))
 }
 
-/// Demo-equivalent fixture via public core-api only (see module docs).
+/// Demo-equivalent of `cli::run_demo` (`crates/cli/src/lib.rs` is upstream).
 fn load_demo_equivalent(dir: &Path) -> SharedDb {
     let db = SharedDb::open(dir).expect("open demo dir");
     let opts = IngestOptions::default();
@@ -309,6 +310,27 @@ fn parse_json(bytes: &[u8]) -> Json {
         .unwrap_or_else(|e| panic!("json: {e}: {}", String::from_utf8_lossy(bytes)))
 }
 
+const WS_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn ws_next_text(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Json {
+    loop {
+        let msg = tokio::time::timeout(WS_TIMEOUT, ws.next())
+            .await
+            .expect("ws.next timed out after 10s")
+            .expect("ws closed")
+            .expect("ws err");
+        match msg {
+            Message::Text(t) => return serde_json::from_str(t.as_str()).expect("ws json"),
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
 /// Binding: one e2e — demo fixture → port 0 → real HTTP query (Arrow+JSON) →
 /// /watch for a clone insert → /stats → MCP pipe query on the same SharedDb
 /// while the HTTP server is live.
@@ -346,39 +368,21 @@ async fn end_to_end_demo_http_watch_mcp() {
     let rows = from_json["rows"].as_array().expect("rows array");
     assert_eq!(rows.len(), 3, "person-01 has three FIT edges");
     assert_eq!(rows[0], json!(["person-01", "proj-01", 1.0]));
-    assert_eq!(rows[1][0], json!("person-01"));
-    assert_eq!(rows[2][0], json!("person-01"));
-    let scores: Vec<f64> = rows
-        .iter()
-        .map(|r| r[2].as_f64().expect("score number"))
-        .collect();
-    assert_eq!(scores[0], 1.0);
-    assert_eq!(scores[1], 0.5);
-    assert_eq!(scores[2], 0.5);
-    for w in scores.windows(2) {
-        assert!(
-            w[0] >= w[1],
-            "scores must be non-increasing, got {scores:?}"
-        );
-    }
+    assert_eq!(rows[1], json!(["person-01", "proj-02", 0.5]));
+    assert_eq!(rows[2], json!(["person-01", "proj-20", 0.5]));
 
     let url = format!("ws://{addr}/watch");
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
+    let ack = ws_next_text(&mut ws).await;
+    assert_eq!(ack, json!({"subscribed": true}), "wait for subscribe ack");
 
     db.write()
         .insert_node("Live", "live-e2e", vec![])
         .expect("live insert");
 
-    let frame = loop {
-        let msg = ws.next().await.expect("ws closed").expect("ws err");
-        match msg {
-            Message::Text(t) => break serde_json::from_str::<Json>(t.as_str()).expect("ws json"),
-            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
-            other => panic!("expected text frame, got {other:?}"),
-        }
-    };
+    let frame = ws_next_text(&mut ws).await;
     let expected = serde_json::to_value(MutationEvent::NodeInserted {
         label: "Live".into(),
         key: "live-e2e".into(),

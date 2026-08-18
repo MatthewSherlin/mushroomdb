@@ -1,4 +1,11 @@
 //! `GET /watch` — post-commit mutation events as JSON text frames.
+//!
+//! After the WebSocket upgrade, the first text frame is always
+//! `{"subscribed":true}`. `broadcast::Sender::subscribe` runs in the HTTP
+//! handler *before* `on_upgrade` schedules the write task, and the ack is
+//! sent before that task calls `recv`. A client that has seen the ack
+//! cannot miss subsequent events. Lagged receivers then get a
+//! `{"lagged": n}` frame (`n` = skipped events) and continue.
 
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -7,11 +14,14 @@ use axum::response::IntoResponse;
 use core_api::MutationEvent;
 use tokio::sync::broadcast::error::RecvError;
 
+/// First frame after upgrade. The receiver already exists when this is sent.
+const SUBSCRIBED_ACK: &str = r#"{"subscribed":true}"#;
+
 /// Upgrade to a WebSocket and stream one JSON text frame per event.
 ///
-/// Subscribe happens here, before the 101 response, so a client whose
-/// handshake has completed will see every later commit. Lagged receivers
-/// get a `{"lagged": n}` frame (`n` = skipped events) and then continue.
+/// `subscribe()` runs here, before `on_upgrade`'s future is scheduled, so
+/// the receiver exists before the ack and before any later `recv`. The
+/// first frame after upgrade is `{"subscribed":true}`; mutation frames follow.
 pub async fn watch(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     let rx = state.watch.subscribe();
     ws.on_upgrade(move |socket| write_events(socket, rx))
@@ -21,6 +31,13 @@ async fn write_events(
     mut socket: WebSocket,
     mut rx: tokio::sync::broadcast::Receiver<MutationEvent>,
 ) {
+    if socket
+        .send(Message::Text(SUBSCRIBED_ACK.into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
     loop {
         let Some(text) = watch_text(rx.recv().await) else {
             break;
@@ -59,5 +76,10 @@ mod tests {
     fn event_frame_is_externally_tagged_json() {
         let text = watch_text(Ok(MutationEvent::NodeDeleted { key: "k".into() })).unwrap();
         assert_eq!(text, r#"{"NodeDeleted":{"key":"k"}}"#);
+    }
+
+    #[test]
+    fn subscribed_ack_is_true_object() {
+        assert_eq!(SUBSCRIBED_ACK, r#"{"subscribed":true}"#);
     }
 }

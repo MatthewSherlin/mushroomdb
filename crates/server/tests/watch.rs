@@ -2,9 +2,8 @@
 //!
 //! Client: `tokio-tungstenite` over a real TCP listener (`serve` on port 0).
 //! axum/tower `oneshot` cannot complete a WebSocket upgrade, so a live
-//! server is required. Subscribe happens in the upgrade handler before the
-//! 101 response; `connect_async` returning means the client will see
-//! subsequent writes — no sleep.
+//! server is required. The first frame after upgrade is `{"subscribed":true}`
+//! (receiver already exists). Tests wait for that ack before writing.
 
 use core_api::{MutationEvent, SharedDb, Value};
 use futures_util::StreamExt;
@@ -34,9 +33,15 @@ async fn connect(
     addr: SocketAddr,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let url = format!("ws://{addr}/watch");
-    let (ws, _) = tokio_tungstenite::connect_async(url)
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
+    let ack = next_text(&mut ws).await;
+    assert_eq!(
+        ack,
+        serde_json::json!({"subscribed": true}),
+        "first frame must be the subscribe ack"
+    );
     ws
 }
 
@@ -45,7 +50,11 @@ async fn next_text(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> Json {
-    let msg = ws.next().await.expect("ws closed").expect("ws err");
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+        .await
+        .expect("ws.next timed out after 10s")
+        .expect("ws closed")
+        .expect("ws err");
     match msg {
         Message::Text(t) => serde_json::from_str(t.as_str()).expect("json frame"),
         other => panic!("expected text frame, got {other:?}"),
