@@ -107,6 +107,34 @@ fn ingest_json_nested_object_is_row_error() {
     );
 }
 
+/// Binding: `[1, null]` is a per-row error with a distinct mixed/null message.
+#[test]
+fn ingest_json_array_with_null_is_mixed_element_row_error() {
+    let dir = tmp("ingest-json-mixed-arr");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    let report = db
+        .ingest_json(
+            "Person",
+            r#"[{"id":"p1","tags":[1,null]},{"id":"p2"}]"#,
+            &IngestOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(report.inserted, 1);
+    assert!(db.has_node("p2"));
+    assert!(!db.has_node("p1"));
+    assert_eq!(report.row_errors.len(), 1);
+    assert_eq!(report.row_errors[0].0, 0);
+    assert!(
+        report.row_errors[0]
+            .1
+            .contains("mixed or null element in array field tags"),
+        "got {:?}",
+        report.row_errors[0]
+    );
+}
+
 /// Binding: parse/shape failures are GraphError::IngestError, not applied.
 #[test]
 fn ingest_json_top_level_not_array_is_ingest_error() {

@@ -113,7 +113,7 @@ fn field_shape_error(field: &str, v: &serde_json::Value) -> Option<String> {
             } else if items.iter().any(|x| x.is_object()) {
                 Some(format!("array of objects in field {field}"))
             } else {
-                Some(format!("nested object in field {field}"))
+                Some(format!("mixed or null element in array field {field}"))
             }
         }
         _ => None,

@@ -6,6 +6,6 @@ license = "Apache-2.0"
 
 [dependencies]
 core-query = { path = "../core-query" }
-arrow-array = "59"
-arrow-schema = "59"
-arrow-ipc = "59"
+arrow-array = { version = "59", default-features = false }
+arrow-schema = { version = "59", default-features = false }
+arrow-ipc = { version = "59", default-features = false }
