@@ -37,7 +37,8 @@ pub struct SideIndex {
     by_key: BTreeMap<ValueKey, BTreeSet<u32>>,
     /// Per-node `(dim, L2 norm)` for `ScanAll` members. Maintained by the
     /// same insert/remove choke-points as `by_key`. Cosine still reads live
-    /// props; only `dim` is a fast-reject.
+    /// props; only `dim` is a fast-reject. `norm` is groundwork for a future
+    /// exact norm-bound reject (Plan 9+); drop to dim-only if still unused then.
     vec_meta: BTreeMap<u32, (u32, f64)>,
 }
 

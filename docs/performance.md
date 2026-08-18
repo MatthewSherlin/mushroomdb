@@ -17,6 +17,13 @@ KeyMatch `WORKS_AT` + `ON_PROJECT` and Overlap `FIT` unless noted.
 
 Times are criterion median ± median absolute deviation (MAD).
 
+**post-T3 is a new baseline shape.** T3 reshaped embeddings from all dim-64 to
+mixed 32/64/128 (`idx % 3`) so the ScanAll dim reject is live. post-T3 column
+values are **not** clean T2→T3 comparisons; later tasks compare against
+post-T3. Shifts on `rule_incremental_fire` (−19.7%) and
+`cypher_scan_filter_project` (−7.4%) are from the smaller average embedding
+plus the dim reject, not pure engine wins.
+
 `explain_pair_dense` T2 shape: bench-only 20k-person KeyMatch hub (one Org + 20k
 People, one `WORKS_AT` rule). The T1 1.2k hub inside the 10k 3-rule graph was
 ~45 µs — same as the sparse pair; the BTree walk was cheap at that size. T2
