@@ -90,10 +90,13 @@ columns: p, o, score
 
 `graphdb demo <db-dir>` writes a **deterministic** generic dataset — 10
 Orgs, 20 Projects, 30 People — via `ingest_json`. Rows carry list-valued
-`skills` and FK fields (`org_id`, `project_id`). Auto-FK `KeyMatch` rules
-are declared during ingest; one scored `Overlap` rule (`skill_fit`,
-Jaccard ≥ 0.5 on `skills`) is created after. The command refuses a
-non-empty directory.
+`skills` (a 3-token window `[s{home}, s{next}, s{next+1}]`) and FK fields
+(`org_id`, `project_id`). Auto-FK `KeyMatch` rules are declared during
+ingest; one scored `Overlap` rule (`skill_fit`, Jaccard ≥ 0.5 on
+`skills`) is created after. Each person fully matches their home project
+(score 1.0) and partially matches the two adjacent windows (score 0.5).
+The command refuses a non-empty directory — including hidden files
+(`.DS_Store` counts).
 
 Captured from `cargo run -p cli --bin graphdb -- demo ./demo-db`:
 
@@ -108,17 +111,14 @@ overlap rule: skill_fit (Person.skills ∩ Project.skills, min 0.5)
   auto_fk_project_org_id
 
 == query ==
-MATCH (p:Person)-[r:FIT]->(proj:Project)
+MATCH (p:Person {id: 'person-01'})-[r:FIT]->(proj:Project)
 RETURN p, proj, r.score AS score
-ORDER BY p
-LIMIT 5
+ORDER BY score DESC, proj
 
 columns: p, proj, score
   p=person-01  proj=proj-01  score=1.0
-  p=person-02  proj=proj-02  score=1.0
-  p=person-03  proj=proj-03  score=1.0
-  p=person-04  proj=proj-04  score=1.0
-  p=person-05  proj=proj-05  score=1.0
+  p=person-01  proj=proj-02  score=0.5
+  p=person-01  proj=proj-20  score=0.5
 
 == explain (person-01, proj-01) ==
   rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=none
@@ -132,18 +132,18 @@ columns: p, proj, score
 
 ```text
 nodes: 60 live, 0 tombstoned
-edges: 110
+edges: 170
 rules: 4
-  auto_fk_person_org_id        edges=30  fires=40  tripped=false
-  auto_fk_person_project_id    edges=30  fires=50  tripped=false
-  auto_fk_project_org_id       edges=20  fires=30  tripped=false
-  skill_fit                    edges=30  fires=50  tripped=false
+  auto_fk_person_org_id        edges=30  tripped=false
+  auto_fk_person_project_id    edges=30  tripped=false
+  auto_fk_project_org_id       edges=20  tripped=false
+  skill_fit                    edges=90  tripped=false
 ```
 
 A second `demo` into the same directory exits 1:
 
 ```text
-demo refuses a non-empty directory: ./demo-db (pick an empty path or remove it first)
+demo refuses a non-empty directory: ./demo-db (directory must be empty — including hidden files)
 ```
 
 ## Server
@@ -174,7 +174,7 @@ Endpoints (thin wrappers over `core-api`):
 `GET /stats` on the demo dataset (same process as the listen line above):
 
 ```text
-{"edges":110,"nodes_live":60,"nodes_tombstoned":0,"rules":[...]}
+{"edges":170,"nodes_live":60,"nodes_tombstoned":0,"rules":[...]}
 ```
 
 ## MCP

@@ -15,11 +15,13 @@ pub const N_PROJECTS: usize = 20;
 pub const N_PEOPLE: usize = 30;
 
 /// Sample query printed by `graphdb demo` and executed against the fresh store.
+///
+/// Scoped to one person so `ORDER BY score DESC` is visibly ranked (a global
+/// `LIMIT 5` would be five 1.0 home-project hits).
 pub const SAMPLE_QUERY: &str = "\
-MATCH (p:Person)-[r:FIT]->(proj:Project)
+MATCH (p:Person {id: 'person-01'})-[r:FIT]->(proj:Project)
 RETURN p, proj, r.score AS score
-ORDER BY p
-LIMIT 5";
+ORDER BY score DESC, proj";
 
 const SAMPLE_EXPLAIN_A: &str = "person-01";
 const SAMPLE_EXPLAIN_B: &str = "proj-01";
@@ -158,8 +160,8 @@ pub fn format_stats(stats: &Stats) -> String {
     for r in &stats.rules {
         let _ = writeln!(
             out,
-            "  {:<28} edges={}  fires={}  tripped={}",
-            r.name, r.edges, r.fires, r.tripped
+            "  {:<28} edges={}  tripped={}",
+            r.name, r.edges, r.tripped
         );
     }
     out
@@ -239,7 +241,8 @@ fn refuse_non_empty(dir: &Path) -> Result<(), CliError> {
         let mut entries = std::fs::read_dir(dir)?;
         if entries.next().is_some() {
             return Err(CliError(format!(
-                "demo refuses a non-empty directory: {} (pick an empty path or remove it first)",
+                "demo refuses a non-empty directory: {} \
+                 (directory must be empty — including hidden files)",
                 dir.display()
             )));
         }
@@ -261,18 +264,34 @@ fn json_array(rows: impl IntoIterator<Item = String>) -> String {
     out
 }
 
+/// Wrap a 1-based project index into `1..=N_PROJECTS`.
+fn wrap_proj(i: usize) -> usize {
+    (i - 1) % N_PROJECTS + 1
+}
+
+/// Sliding window of `len` skill tokens starting at project `start`.
+fn skill_window_json(start: usize, len: usize) -> String {
+    let parts: Vec<String> = (0..len)
+        .map(|k| format!(r#""s{:02}""#, wrap_proj(start + k)))
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
 fn org_json() -> String {
-    json_array(
-        (1..=N_ORGS)
-            .map(|i| format!(r#"{{"id":"org-{i:02}","name":"Org {i}","skills":["s{i:02}"]}}"#)),
-    )
+    json_array((1..=N_ORGS).map(|i| {
+        format!(
+            r#"{{"id":"org-{i:02}","name":"Org {i}","skills":{}}}"#,
+            skill_window_json(i, 3)
+        )
+    }))
 }
 
 fn project_json() -> String {
     json_array((1..=N_PROJECTS).map(|i| {
         let org = (i - 1) % N_ORGS + 1;
         format!(
-            r#"{{"id":"proj-{i:02}","name":"Project {i}","org_id":"org-{org:02}","skills":["s{i:02}"]}}"#
+            r#"{{"id":"proj-{i:02}","name":"Project {i}","org_id":"org-{org:02}","skills":{}}}"#,
+            skill_window_json(i, 3)
         )
     }))
 }
@@ -282,7 +301,8 @@ fn person_json() -> String {
         let org = (i - 1) % N_ORGS + 1;
         let proj = (i - 1) % N_PROJECTS + 1;
         format!(
-            r#"{{"id":"person-{i:02}","name":"Person {i}","org_id":"org-{org:02}","project_id":"proj-{proj:02}","skills":["s{proj:02}"]}}"#
+            r#"{{"id":"person-{i:02}","name":"Person {i}","org_id":"org-{org:02}","project_id":"proj-{proj:02}","skills":{}}}"#,
+            skill_window_json(proj, 3)
         )
     }))
 }
@@ -444,6 +464,16 @@ mod tests {
                 },
             },
             Case {
+                args: &["serve", "/tmp/demo-db", "--addr=127.0.0.1:9090"],
+                check: |r| match r {
+                    Ok(Command::Serve { db_dir, addr }) => {
+                        assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
+                        assert_eq!(addr, "127.0.0.1:9090".parse().unwrap());
+                    }
+                    other => panic!("serve --addr=VALUE, got {other:?}"),
+                },
+            },
+            Case {
                 args: &["mcp", "/tmp/demo-db"],
                 check: |r| match r {
                     Ok(Command::Mcp { db_dir }) => {
@@ -580,11 +610,19 @@ mod tests {
             "10 orgs + 20 projects + 30 people"
         );
         assert_eq!(out.stats.nodes_tombstoned, 0);
-        assert_eq!(
-            out.stats.edges, 110,
-            "20 project→org + 30 person→org + 30 person→project + 30 FIT"
-        );
+        // Auto-FK: 20 project→org + 30 person→org + 30 person→project = 80.
+        // FIT: each of 30 people matches home (Jaccard 1.0) and two adjacent
+        // projects (3-skill window shifted ±1 → Jaccard 2/4 = 0.5) = 30*3 = 90.
+        // Total edges: 80 + 90 = 170.
+        assert_eq!(out.stats.edges, 170);
         assert_eq!(out.stats.rules.len(), 4, "3 auto-FK + 1 overlap");
+        let fit = out
+            .stats
+            .rules
+            .iter()
+            .find(|r| r.name == "skill_fit")
+            .expect("skill_fit");
+        assert_eq!(fit.edges, 90, "30 people × 3 FIT edges");
 
         let mut names: Vec<&str> = out.stats.rules.iter().map(|r| r.name.as_str()).collect();
         names.sort_unstable();
@@ -614,9 +652,28 @@ mod tests {
             "sample Cypher query must return rows"
         );
         assert!(
-            !out.sample_query.is_empty(),
-            "demo must expose the sample query text"
+            out.sample_query.contains("ORDER BY score DESC"),
+            "sample query must rank by score, got {}",
+            out.sample_query
         );
+        let scores: Vec<f64> = (0..out.sample_result.len())
+            .map(|i| match out.sample_result.get(i, "score") {
+                Some(Value::Float(f)) => *f,
+                other => panic!("score col should be Float, got {other:?}"),
+            })
+            .collect();
+        let distinct: std::collections::BTreeSet<u64> =
+            scores.iter().map(|s| s.to_bits()).collect();
+        assert!(
+            distinct.len() >= 2,
+            "sample results must be visibly ranked, got {scores:?}"
+        );
+        for w in scores.windows(2) {
+            assert!(
+                w[0] >= w[1],
+                "scores must be non-increasing, got {scores:?}"
+            );
+        }
         assert!(
             !out.explanations.is_empty(),
             "explain(person-01, proj-01) must find the derived edges"
@@ -627,6 +684,10 @@ mod tests {
         assert!(
             msg.contains("not empty") || msg.contains("non-empty") || msg.contains("non empty"),
             "refuse message must mention non-empty dir, got {err}"
+        );
+        assert!(
+            msg.contains("hidden"),
+            "refuse message must mention hidden files, got {err}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -642,7 +703,7 @@ mod tests {
             "stats output should include live node count, got:\n{text}"
         );
         assert!(
-            text.contains("110"),
+            text.contains("170"),
             "stats output should include edge count, got:\n{text}"
         );
         assert!(
