@@ -2,7 +2,7 @@ use core_api::{
     AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, RuleStats, Stats, Value,
 };
 use core_storage::fs::Fs;
-use sim_harness::SimFs;
+use sim_harness::{Oracle, SimFs};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Original workload: 20 nodes + chain edges + one mid-workload snapshot.
@@ -26,16 +26,31 @@ fn workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
 /// Node keys used by `workload_with_rules`; constant for edge-set sweeps.
 const WORKLOAD_KEYS: &[&str] = &[
     "n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9", "n10", "n11", "n12", "n13", "x0",
+    "y0", "y1", "y2", "y3", "y4", "g0", "g1", "g2", "g3", "g4", "v0", "v1", "v2",
 ];
 
-/// Slot count after a complete `workload_with_rules` (12 original + batch
-/// n12/n13 + ingest x0; n6 is tombstoned but still a slot).
-const WORKLOAD_MAX_SLOTS: usize = 15;
+/// Slot count after a complete `workload_with_rules` (n0–n11 + batch n12/n13
+/// + ingest x0 + 5Y + 5G + 3V; n6 is tombstoned but still a slot).
+const WORKLOAD_MAX_SLOTS: usize = 28;
 
-const WORKLOAD_ETYPES: &[&str] = &["E", "KM", "OV", "DUMMY", "ORG"];
+const WORKLOAD_ETYPES: &[&str] = &["E", "KM", "OV", "DUMMY", "ORG", "NW", "NZ", "GEO", "VEC"];
+
+const WORKLOAD_LABELS: &[&str] = &["L0", "L1", "L2", "Y", "G", "V"];
+
+const WORKLOAD_FIELDS: &[&str] = &[
+    "f", "tags", "year", "loc", "emb", "tmp", "org_id", "id", "i",
+];
 
 fn tags(items: &[&str]) -> Value {
     Value::List(items.iter().map(|s| Value::Str((*s).into())).collect())
+}
+
+fn loc(lat: f64, lon: f64) -> Value {
+    Value::List(vec![Value::Float(lat), Value::Float(lon)])
+}
+
+fn emb(xs: &[f64]) -> Value {
+    Value::List(xs.iter().copied().map(Value::Float).collect())
 }
 
 /// Deterministic workload with rules (no randomness, no wall-clock time):
@@ -136,7 +151,80 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
     })?;
     db.delete_rule("dummy")?;
 
-    // Snapshot while km and ov rules are both live (no dummy rule).
+    // --- Plan 7 predicates (before snapshot so rule_defs persist) ---
+    // Numeric: 10.0 / 11.9 same-or-adjacent bucket (tol 2); 12.0 adjacent;
+    // y3=-0.0 and y4=+0.0 for the tol=0 signed-zero pair.
+    db.insert_node("Y", "y0", vec![("year".into(), Value::Float(10.0))])?;
+    db.insert_node("Y", "y1", vec![("year".into(), Value::Float(11.9))])?;
+    db.insert_node("Y", "y2", vec![("year".into(), Value::Float(12.0))])?;
+    db.insert_node("Y", "y3", vec![("year".into(), Value::Float(-0.0))])?;
+    db.insert_node("Y", "y4", vec![("year".into(), Value::Float(0.0))])?;
+    db.create_rule(RuleDef {
+        name: "nw".into(),
+        src_label: "Y".into(),
+        dst_label: "Y".into(),
+        predicate: Predicate::NumericWithin {
+            field: "year".into(),
+            tolerance: 2.0,
+        },
+        edge_type: "NW".into(),
+        weight_prop: None,
+        max_edges: None,
+    })?;
+    db.create_rule(RuleDef {
+        name: "nz".into(),
+        src_label: "Y".into(),
+        dst_label: "Y".into(),
+        predicate: Predicate::NumericWithin {
+            field: "year".into(),
+            tolerance: 0.0,
+        },
+        edge_type: "NZ".into(),
+        weight_prop: None,
+        max_edges: None,
+    })?;
+
+    // Geo: Paris/London cross-cell; ±180 at lat 70 (antimeridian wrap); NYC far.
+    db.insert_node("G", "g0", vec![("loc".into(), loc(48.8566, 2.3522))])?;
+    db.insert_node("G", "g1", vec![("loc".into(), loc(51.5074, -0.1278))])?;
+    db.insert_node("G", "g2", vec![("loc".into(), loc(70.0, 179.9))])?;
+    db.insert_node("G", "g3", vec![("loc".into(), loc(70.0, -179.9))])?;
+    db.insert_node("G", "g4", vec![("loc".into(), loc(40.7128, -74.0060))])?;
+    db.create_rule(RuleDef {
+        name: "geo".into(),
+        src_label: "G".into(),
+        dst_label: "G".into(),
+        predicate: Predicate::GeoRadius {
+            field: "loc".into(),
+            km: 400.0,
+        },
+        edge_type: "GEO".into(),
+        weight_prop: None,
+        max_edges: None,
+    })?;
+
+    // Vector: [1,0] vs near-threshold 0.95; orthogonal [0,1] does not match.
+    db.insert_node("V", "v0", vec![("emb".into(), emb(&[1.0, 0.0]))])?;
+    db.insert_node(
+        "V",
+        "v1",
+        vec![("emb".into(), emb(&[0.95, (1.0_f64 - 0.95 * 0.95).sqrt()]))],
+    )?;
+    db.insert_node("V", "v2", vec![("emb".into(), emb(&[0.0, 1.0]))])?;
+    db.create_rule(RuleDef {
+        name: "vec".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.9,
+        },
+        edge_type: "VEC".into(),
+        weight_prop: None,
+        max_edges: None,
+    })?;
+
+    // Snapshot while km, ov, and Plan-7 rules are live (no dummy rule).
     db.snapshot()?;
 
     // set_prop calls post-snapshot: retract + re-create KM edges.
@@ -187,6 +275,12 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
 
     // WAL-logged rebuild mid-stream (replay-consistent after T6).
     db.rebuild_rule("km")?;
+
+    // Plan 7 incremental: y2 crosses two numeric buckets (12.0 → 16.1);
+    // v1 moves below the cosine min (no longer matches v0, still misses v2).
+    db.set_prop("y2", "year", Value::Float(16.1))?;
+    db.set_prop("v1", "emb", emb(&[0.5, 0.5]))?;
+    db.rebuild_rule("nw")?;
 
     // delete_node of a node that currently owns derived OV edges (n6 ↔ n7, n6 ↔ n8)
     // plus the KM inbound from n0 (n0.f is back on "n6").
@@ -249,6 +343,52 @@ fn stats_minus_fires(stats: Stats) -> Stats {
     }
 }
 
+/// Rebuild an independent oracle from recovered live state and compare
+/// brute-force `evaluate` edges to the engine. User edges of type `E` are
+/// copied in; every other etype is derived solely via `Oracle::all_edges`.
+fn oracle_from_db(db: &GraphDb<SimFs>) -> Oracle {
+    let mut o = Oracle::new();
+    for label in WORKLOAD_LABELS {
+        for n in db.nodes_with_label(label) {
+            let key = n.key().to_string();
+            let mut props = Vec::new();
+            for field in WORKLOAD_FIELDS {
+                if let Some(v) = n.prop(field) {
+                    props.push(((*field).to_string(), v.clone()));
+                }
+            }
+            assert!(
+                o.insert_node(label, &key, &props),
+                "duplicate key {key} while rebuilding oracle"
+            );
+        }
+    }
+    for rule in db.rules() {
+        assert!(o.create_rule(rule), "oracle rejected a recovered live rule");
+    }
+    for key in WORKLOAD_KEYS {
+        if !db.has_node(key) {
+            continue;
+        }
+        if let Ok(ns) = db.neighbors(key, "E", Direction::Out) {
+            for n in ns {
+                let _ = o.insert_edge("E", key, &n);
+            }
+        }
+    }
+    o
+}
+
+fn assert_oracle_equiv(db: &GraphDb<SimFs>, label: &str) {
+    let oracle = oracle_from_db(db);
+    let engine = collect_all_edges(db);
+    let expected = oracle.all_edges();
+    assert_eq!(
+        engine, expected,
+        "{label}: recovered edges != brute-force evaluate oracle"
+    );
+}
+
 fn assert_recovered_invariants(recovered: &mut GraphDb<SimFs>, label: &str) {
     let n = recovered.node_count();
     assert!(
@@ -271,8 +411,34 @@ fn assert_recovered_invariants(recovered: &mut GraphDb<SimFs>, label: &str) {
             );
         }
     }
+    for key in ["y0", "y1", "y2", "y3", "y4"] {
+        if recovered.has_node(key) {
+            assert!(
+                recovered.get_prop(key, "year").is_some(),
+                "{label}: {key} exists but year prop is missing"
+            );
+        }
+    }
+    for key in ["g0", "g1", "g2", "g3", "g4"] {
+        if recovered.has_node(key) {
+            assert!(
+                recovered.get_prop(key, "loc").is_some(),
+                "{label}: {key} exists but loc prop is missing"
+            );
+        }
+    }
+    for key in ["v0", "v1", "v2"] {
+        if recovered.has_node(key) {
+            assert!(
+                recovered.get_prop(key, "emb").is_some(),
+                "{label}: {key} exists but emb prop is missing"
+            );
+        }
+    }
     // n6 is the planned delete_node target: if the delete landed, the key is gone.
     // If it has not landed, n6 is still a live L1 with tags (checked above).
+
+    assert_oracle_equiv(recovered, label);
 
     let edges_before = collect_all_edges(recovered);
     let stats_before = stats_minus_fires(recovered.stats());
@@ -352,6 +518,10 @@ fn recovery_byte_sweep_rules() {
         db.into_fs().total_appended()
     };
     assert!(total_bytes > 0, "workload must append at least one byte");
+    eprintln!(
+        "DST byte-offset sweep: 0..={total_bytes} ({} crash points)",
+        total_bytes + 1
+    );
 
     for crash_at in 0..=total_bytes {
         let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();
@@ -383,6 +553,10 @@ fn recovery_op_sweep_rules() {
         db.into_fs().total_ops()
     };
     assert!(total_ops > 0, "workload must make at least one Fs call");
+    eprintln!(
+        "DST op-count sweep: 0..={total_ops} ({} crash points)",
+        total_ops + 1
+    );
 
     for crash_op in 0..=total_ops {
         // open_with may itself fail when crash_op fires on an early read call.

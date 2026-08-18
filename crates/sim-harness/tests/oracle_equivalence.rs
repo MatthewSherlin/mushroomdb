@@ -8,15 +8,20 @@ use std::collections::BTreeSet;
 // ---------------------------------------------------------------------------
 
 // r_ov2 shares edge_type "r_fe" with r_fe (C1 coverage: co-owned edge type survival).
-const RULE_NAMES: [&str; 5] = ["r_km", "r_fe", "r_ov", "r_all", "r_ov2"];
-const RULE_ETYPES: [&str; 4] = ["r_km", "r_fe", "r_ov", "r_all"];
+const N_TEMPLATES: usize = 9;
+const RULE_NAMES: [&str; 9] = [
+    "r_km", "r_fe", "r_ov", "r_all", "r_ov2", "r_nw", "r_nz", "r_geo", "r_vec",
+];
+const RULE_ETYPES: [&str; 8] = [
+    "r_km", "r_fe", "r_ov", "r_all", "r_nw", "r_nz", "r_geo", "r_vec",
+];
 const USER_ETYPES: [&str; 3] = ["e0", "e1", "e2"];
 
 /// 3-token alphabet used by SetTags.
 const TAGS_ALPHA: [&str; 3] = ["a", "b", "c"];
 
 fn rule_template(idx: u8) -> RuleDef {
-    match idx % 5 {
+    match idx as usize % N_TEMPLATES {
         0 => RuleDef {
             name: "r_km".into(),
             src_label: "L0".into(),
@@ -65,7 +70,7 @@ fn rule_template(idx: u8) -> RuleDef {
         // Template 4: shares edge_type "r_fe" with r_fe — exercises C1 (co-owned
         // edge type survival after rule deletion).  Different name and lower min
         // than r_fe's FieldEqual predicate, so it can derive edges r_fe cannot.
-        _ => RuleDef {
+        4 => RuleDef {
             name: "r_ov2".into(),
             src_label: "L0".into(),
             dst_label: "L0".into(),
@@ -77,7 +82,104 @@ fn rule_template(idx: u8) -> RuleDef {
             weight_prop: None,
             max_edges: None,
         },
+        5 => RuleDef {
+            name: "r_nw".into(),
+            src_label: "L0".into(),
+            dst_label: "L0".into(),
+            predicate: Predicate::NumericWithin {
+                field: "year".into(),
+                tolerance: 2.0,
+            },
+            edge_type: "r_nw".into(),
+            weight_prop: None,
+            max_edges: None,
+        },
+        6 => RuleDef {
+            name: "r_nz".into(),
+            src_label: "L0".into(),
+            dst_label: "L0".into(),
+            predicate: Predicate::NumericWithin {
+                field: "year".into(),
+                tolerance: 0.0,
+            },
+            edge_type: "r_nz".into(),
+            weight_prop: None,
+            max_edges: None,
+        },
+        7 => RuleDef {
+            name: "r_geo".into(),
+            src_label: "L1".into(),
+            dst_label: "L1".into(),
+            predicate: Predicate::GeoRadius {
+                field: "loc".into(),
+                km: 400.0,
+            },
+            edge_type: "r_geo".into(),
+            weight_prop: None,
+            max_edges: None,
+        },
+        _ => RuleDef {
+            name: "r_vec".into(),
+            src_label: "L0".into(),
+            dst_label: "L0".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "r_vec".into(),
+            weight_prop: None,
+            max_edges: None,
+        },
     }
+}
+
+fn loc_list(lat: f64, lon: f64) -> Value {
+    Value::List(vec![Value::Float(lat), Value::Float(lon)])
+}
+
+fn emb_list(xs: &[f64]) -> Value {
+    Value::List(xs.iter().copied().map(Value::Float).collect())
+}
+
+/// Bucket-crossing years plus signed zero. Indexed by `n/2` so both L0
+/// (even n) values include −0.0 and +0.0.
+fn year_val(n: u8) -> Value {
+    match (n / 2) % 6 {
+        0 => Value::Float(-0.0),
+        1 => Value::Float(0.0),
+        2 => Value::Float(10.0),
+        3 => Value::Float(11.9),
+        4 => Value::Float(12.0),
+        _ => Value::Float(16.1),
+    }
+}
+
+fn loc_val(n: u8) -> Value {
+    match n % 5 {
+        0 => loc_list(48.8566, 2.3522),
+        1 => loc_list(51.5074, -0.1278),
+        2 => loc_list(70.0, 179.9),
+        3 => loc_list(70.0, -179.9),
+        _ => loc_list(40.7128, -74.0060),
+    }
+}
+
+fn emb_val(n: u8) -> Value {
+    match n % 4 {
+        0 => emb_list(&[1.0, 0.0]),
+        1 => emb_list(&[0.95, (1.0_f64 - 0.95 * 0.95).sqrt()]),
+        2 => emb_list(&[0.0, 1.0]),
+        _ => emb_list(&[0.5, 0.5]),
+    }
+}
+
+fn insert_node_props(n: u8) -> Vec<(String, Value)> {
+    vec![
+        ("seed".to_string(), Value::Int(n as i64)),
+        ("year".to_string(), year_val(n)),
+        ("loc".to_string(), loc_val(n)),
+        ("emb".to_string(), emb_val(n)),
+    ]
 }
 
 fn all_etypes() -> Vec<String> {
@@ -116,7 +218,7 @@ fn sweep_engine_edges(db: &GraphDb<SimFs>) -> BTreeSet<(String, String, String)>
 // Op enum and strategy
 // ---------------------------------------------------------------------------
 
-const PROP_FIELDS: [&str; 4] = ["seed", "p", "f", "tags"];
+const PROP_FIELDS: [&str; 7] = ["seed", "p", "f", "tags", "year", "loc", "emb"];
 
 #[derive(Debug, Clone)]
 enum Op {
@@ -129,7 +231,10 @@ enum Op {
     DeleteRule(u8),         // picks from the 5 rule names by index
     DeleteNode(u8),         // key = "k{n}"
     DeleteEdge(u8, u8, u8), // etype index, src k, dst k
-    RemoveProp(u8, u8),     // key, field-selector → PROP_FIELDS[sel % 4]
+    RemoveProp(u8, u8),     // key, field-selector → PROP_FIELDS[sel % 7]
+    SetYear(u8, u8),        // key, year-selector → bucket / signed-zero values
+    SetLoc(u8, u8),         // key, loc-selector → Paris/London/±180/NYC
+    SetEmb(u8, u8),         // key, emb-selector → near-threshold / orthogonal
     /// 2–4 leaf ops committed as one engine `batch()`. Nested Batch is never
     /// generated. CreateRule is omitted from the inner pool so we do not hit
     /// the documented same-batch rule-window (validation cannot see edges a
@@ -138,12 +243,16 @@ enum Op {
 }
 
 fn etype_of(t: u8) -> String {
-    match (t as usize) % 7 {
-        0..=2 => format!("e{}", (t as usize) % 7),
+    match (t as usize) % 11 {
+        0..=2 => format!("e{}", (t as usize) % 3),
         3 => "r_km".into(),
         4 => "r_fe".into(),
         5 => "r_ov".into(),
-        _ => "r_all".into(),
+        6 => "r_all".into(),
+        7 => "r_nw".into(),
+        8 => "r_nz".into(),
+        9 => "r_geo".into(),
+        _ => "r_vec".into(),
     }
 }
 
@@ -164,6 +273,9 @@ fn leaf_op_strategy() -> impl Strategy<Value = Op> {
         any::<u8>().prop_map(Op::DeleteNode),
         (any::<u8>(), any::<u8>(), any::<u8>()).prop_map(|(t, s, d)| Op::DeleteEdge(t, s, d)),
         (any::<u8>(), any::<u8>()).prop_map(|(k, f)| Op::RemoveProp(k, f)),
+        (any::<u8>(), any::<u8>()).prop_map(|(k, v)| Op::SetYear(k, v)),
+        (any::<u8>(), any::<u8>()).prop_map(|(k, v)| Op::SetLoc(k, v)),
+        (any::<u8>(), any::<u8>()).prop_map(|(k, v)| Op::SetEmb(k, v)),
     ]
 }
 
@@ -178,6 +290,9 @@ fn batch_inner_strategy() -> impl Strategy<Value = Op> {
         any::<u8>().prop_map(Op::DeleteNode),
         (any::<u8>(), any::<u8>(), any::<u8>()).prop_map(|(t, s, d)| Op::DeleteEdge(t, s, d)),
         (any::<u8>(), any::<u8>()).prop_map(|(k, f)| Op::RemoveProp(k, f)),
+        (any::<u8>(), any::<u8>()).prop_map(|(k, v)| Op::SetYear(k, v)),
+        (any::<u8>(), any::<u8>()).prop_map(|(k, v)| Op::SetLoc(k, v)),
+        (any::<u8>(), any::<u8>()).prop_map(|(k, v)| Op::SetEmb(k, v)),
     ]
 }
 
@@ -196,7 +311,7 @@ fn apply_oracle_leaf(oracle: &mut Oracle, op: &Op) -> Result<(), String> {
         Op::InsertNode(n) => {
             let key = format!("k{n}");
             let label = format!("L{}", n % 2);
-            let props = vec![("seed".to_string(), Value::Int(*n as i64))];
+            let props = insert_node_props(*n);
             if oracle.insert_node(&label, &key, &props) {
                 Ok(())
             } else {
@@ -254,11 +369,14 @@ fn apply_oracle_leaf(oracle: &mut Oracle, op: &Op) -> Result<(), String> {
             if oracle.create_rule(rule_template(*n)) {
                 Ok(())
             } else {
-                Err(format!("oracle create_rule({}) rejected", n % 5))
+                Err(format!(
+                    "oracle create_rule({}) rejected",
+                    n % N_TEMPLATES as u8
+                ))
             }
         }
         Op::DeleteRule(n) => {
-            let name = RULE_NAMES[(*n as usize) % 5];
+            let name = RULE_NAMES[(*n as usize) % N_TEMPLATES];
             if oracle.delete_rule(name) {
                 Ok(())
             } else {
@@ -293,6 +411,30 @@ fn apply_oracle_leaf(oracle: &mut Oracle, op: &Op) -> Result<(), String> {
             )),
             Some(_) => Ok(()),
         },
+        Op::SetYear(k, v) => {
+            let key = format!("k{k}");
+            if oracle.set_prop(&key, "year", year_val(*v)) {
+                Ok(())
+            } else {
+                Err(format!("oracle set_year({key}) KeyNotFound"))
+            }
+        }
+        Op::SetLoc(k, v) => {
+            let key = format!("k{k}");
+            if oracle.set_prop(&key, "loc", loc_val(*v)) {
+                Ok(())
+            } else {
+                Err(format!("oracle set_loc({key}) KeyNotFound"))
+            }
+        }
+        Op::SetEmb(k, v) => {
+            let key = format!("k{k}");
+            if oracle.set_prop(&key, "emb", emb_val(*v)) {
+                Ok(())
+            } else {
+                Err(format!("oracle set_emb({key}) KeyNotFound"))
+            }
+        }
         Op::Batch(_) => Err("nested Batch is invalid".into()),
     }
 }
@@ -302,8 +444,7 @@ fn queue_batch_op(b: &mut core_api::BatchBuilder<'_, SimFs>, op: &Op) {
         Op::InsertNode(n) => {
             let key = format!("k{n}");
             let label = format!("L{}", n % 2);
-            let props = vec![("seed".to_string(), Value::Int(*n as i64))];
-            b.insert_node(&label, &key, props);
+            b.insert_node(&label, &key, insert_node_props(*n));
         }
         Op::InsertEdge(t, s, d) => {
             b.insert_edge(&etype_of(*t), &format!("k{s}"), &format!("k{d}"));
@@ -328,7 +469,7 @@ fn queue_batch_op(b: &mut core_api::BatchBuilder<'_, SimFs>, op: &Op) {
             unreachable!("CreateRule is not a Batch inner op");
         }
         Op::DeleteRule(n) => {
-            b.delete_rule(RULE_NAMES[(*n as usize) % 5]);
+            b.delete_rule(RULE_NAMES[(*n as usize) % N_TEMPLATES]);
         }
         Op::DeleteNode(n) => {
             b.delete_node(&format!("k{n}"));
@@ -338,6 +479,15 @@ fn queue_batch_op(b: &mut core_api::BatchBuilder<'_, SimFs>, op: &Op) {
         }
         Op::RemoveProp(k, f) => {
             b.remove_prop(&format!("k{k}"), field_of(*f));
+        }
+        Op::SetYear(k, v) => {
+            b.set_prop(&format!("k{k}"), "year", year_val(*v));
+        }
+        Op::SetLoc(k, v) => {
+            b.set_prop(&format!("k{k}"), "loc", loc_val(*v));
+        }
+        Op::SetEmb(k, v) => {
+            b.set_prop(&format!("k{k}"), "emb", emb_val(*v));
         }
         Op::Batch(_) => {}
     }
@@ -359,7 +509,7 @@ proptest! {
                 Op::InsertNode(n) => {
                     let key = format!("k{n}");
                     let label = format!("L{}", n % 2);
-                    let props = vec![("seed".to_string(), Value::Int(*n as i64))];
+                    let props = insert_node_props(*n);
                     let db_ok = db.insert_node(&label, &key, props.clone()).is_ok();
                     let or_ok = oracle.insert_node(&label, &key, &props);
                     prop_assert_eq!(db_ok, or_ok);
@@ -462,12 +612,12 @@ proptest! {
                         db_ok,
                         or_ok,
                         "create_rule result mismatch for template {}",
-                        n % 4
+                        n % N_TEMPLATES as u8
                     );
                 }
 
                 Op::DeleteRule(n) => {
-                    let name = RULE_NAMES[(*n as usize) % 5];
+                    let name = RULE_NAMES[(*n as usize) % N_TEMPLATES];
                     let db_ok = db.delete_rule(name).is_ok();
                     let or_ok = oracle.delete_rule(name);
                     prop_assert_eq!(
@@ -574,6 +724,30 @@ proptest! {
                     }
                 }
 
+                Op::SetYear(k, v) => {
+                    let key = format!("k{k}");
+                    let val = year_val(*v);
+                    let db_ok = db.set_prop(&key, "year", val.clone()).is_ok();
+                    let or_ok = oracle.set_prop(&key, "year", val);
+                    prop_assert_eq!(db_ok, or_ok);
+                }
+
+                Op::SetLoc(k, v) => {
+                    let key = format!("k{k}");
+                    let val = loc_val(*v);
+                    let db_ok = db.set_prop(&key, "loc", val.clone()).is_ok();
+                    let or_ok = oracle.set_prop(&key, "loc", val);
+                    prop_assert_eq!(db_ok, or_ok);
+                }
+
+                Op::SetEmb(k, v) => {
+                    let key = format!("k{k}");
+                    let val = emb_val(*v);
+                    let db_ok = db.set_prop(&key, "emb", val.clone()).is_ok();
+                    let or_ok = oracle.set_prop(&key, "emb", val);
+                    prop_assert_eq!(db_ok, or_ok);
+                }
+
                 Op::Batch(sub) => {
                     // Engine: one atomic Batch frame. Oracle has no WAL — apply
                     // sequential user-level ops only when commit succeeds
@@ -604,10 +778,10 @@ proptest! {
         // count and stays high after delete; compare the T6 live stat.
         prop_assert_eq!(db.stats().nodes_live, oracle.node_count());
 
-        // Prop sweeps: seed (InsertNode), p (SetProp), f (SetF), tags (SetTags).
+        // Prop sweeps: seed/year/loc/emb (InsertNode), p, f, tags, plus Set*.
         for n in 0..=255u8 {
             let key = format!("k{n}");
-            for field in &["seed", "p", "f", "tags"] {
+            for field in &["seed", "p", "f", "tags", "year", "loc", "emb"] {
                 prop_assert_eq!(
                     db.get_prop(&key, field),
                     oracle.get_prop(&key, field),
@@ -619,8 +793,8 @@ proptest! {
         }
 
         // Req 5: engine full edge set (user ∪ derived) == oracle.all_edges().
-        // Engine edge set is built by sweeping neighbors for all 256 keys × all 7 edge
-        // types (e0/e1/e2 + r_km/r_fe/r_ov/r_all) × both directions, then deduplicating
+        // Engine edge set is built by sweeping neighbors for all 256 keys × all
+        // user+rule etypes × both directions, then deduplicating
         // Out/In entries into a single (etype, src, dst) set.
         let engine_edges = sweep_engine_edges(&db);
         let oracle_edges = oracle.all_edges();

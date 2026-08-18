@@ -120,10 +120,11 @@ impl Oracle {
 
     /// Returns user edges ∪ brute-force derived edges as (etype, src_key, dst_key) triples.
     ///
-    /// The oracle reuses `core_rules::evaluate` as shared scoring truth because
-    /// INCREMENTALITY is the property under test, not scoring. The oracle's independence
-    /// comes from recomputing all derived edges from scratch on every call, making it
-    /// immune to any incremental-update bugs in the engine.
+    /// Full O(n²) label-pair scan calling `core_rules::def::evaluate` directly.
+    /// Shares nothing with `candidate_spec` / `SideIndex` — incrementality is
+    /// the property under test, not scoring. New Plan-7 predicates
+    /// (`NumericWithin`, `GeoRadius`, `VectorSimilar`) are covered automatically
+    /// because `evaluate` is the sole match authority.
     pub fn all_edges(&self) -> BTreeSet<(String, String, String)> {
         let mut out = self.edges.clone();
         for rule in &self.rules {
@@ -303,5 +304,104 @@ mod tests {
         assert!(o.all_edges().is_empty());
         assert_eq!(o.remove_prop("a", "f"), Some(false));
         assert_eq!(o.remove_prop("missing", "f"), None);
+    }
+
+    fn loc(lat: f64, lon: f64) -> Value {
+        Value::List(vec![Value::Float(lat), Value::Float(lon)])
+    }
+
+    fn emb(xs: &[f64]) -> Value {
+        Value::List(xs.iter().copied().map(Value::Float).collect())
+    }
+
+    #[test]
+    fn numeric_within_cross_type_and_signed_zero() {
+        let mut o = Oracle::new();
+        o.insert_node("Y", "a", &[("year".into(), Value::Int(1998))]);
+        o.insert_node("Y", "b", &[("year".into(), Value::Float(2000.0))]);
+        o.insert_node("Y", "z0", &[("year".into(), Value::Float(-0.0))]);
+        o.insert_node("Y", "z1", &[("year".into(), Value::Float(0.0))]);
+        assert!(o.create_rule(RuleDef {
+            name: "nw".into(),
+            src_label: "Y".into(),
+            dst_label: "Y".into(),
+            predicate: Predicate::NumericWithin {
+                field: "year".into(),
+                tolerance: 3.0,
+            },
+            edge_type: "NW".into(),
+            weight_prop: None,
+            max_edges: None,
+        }));
+        assert!(o.create_rule(RuleDef {
+            name: "nz".into(),
+            src_label: "Y".into(),
+            dst_label: "Y".into(),
+            predicate: Predicate::NumericWithin {
+                field: "year".into(),
+                tolerance: 0.0,
+            },
+            edge_type: "NZ".into(),
+            weight_prop: None,
+            max_edges: None,
+        }));
+        let edges = o.all_edges();
+        assert!(edges.contains(&("NW".into(), "a".into(), "b".into())));
+        assert!(edges.contains(&("NZ".into(), "z0".into(), "z1".into())));
+        assert!(edges.contains(&("NZ".into(), "z1".into(), "z0".into())));
+        assert!(!edges.contains(&("NZ".into(), "a".into(), "b".into())));
+    }
+
+    #[test]
+    fn geo_radius_cell_straddle_and_antimeridian() {
+        let mut o = Oracle::new();
+        o.insert_node("G", "paris", &[("loc".into(), loc(48.8566, 2.3522))]);
+        o.insert_node("G", "london", &[("loc".into(), loc(51.5074, -0.1278))]);
+        o.insert_node("G", "east", &[("loc".into(), loc(70.0, 179.9))]);
+        o.insert_node("G", "west", &[("loc".into(), loc(70.0, -179.9))]);
+        o.insert_node("G", "nyc", &[("loc".into(), loc(40.7128, -74.0060))]);
+        assert!(o.create_rule(RuleDef {
+            name: "geo".into(),
+            src_label: "G".into(),
+            dst_label: "G".into(),
+            predicate: Predicate::GeoRadius {
+                field: "loc".into(),
+                km: 400.0,
+            },
+            edge_type: "GEO".into(),
+            weight_prop: None,
+            max_edges: None,
+        }));
+        let edges = o.all_edges();
+        assert!(edges.contains(&("GEO".into(), "paris".into(), "london".into())));
+        assert!(edges.contains(&("GEO".into(), "east".into(), "west".into())));
+        assert!(!edges.contains(&("GEO".into(), "paris".into(), "nyc".into())));
+    }
+
+    #[test]
+    fn vector_similar_near_threshold() {
+        let mut o = Oracle::new();
+        o.insert_node("V", "a", &[("emb".into(), emb(&[1.0, 0.0]))]);
+        o.insert_node(
+            "V",
+            "b",
+            &[("emb".into(), emb(&[0.95, (1.0_f64 - 0.95 * 0.95).sqrt()]))],
+        );
+        o.insert_node("V", "c", &[("emb".into(), emb(&[0.0, 1.0]))]);
+        assert!(o.create_rule(RuleDef {
+            name: "vec".into(),
+            src_label: "V".into(),
+            dst_label: "V".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "VEC".into(),
+            weight_prop: None,
+            max_edges: None,
+        }));
+        let edges = o.all_edges();
+        assert!(edges.contains(&("VEC".into(), "a".into(), "b".into())));
+        assert!(!edges.contains(&("VEC".into(), "a".into(), "c".into())));
     }
 }
