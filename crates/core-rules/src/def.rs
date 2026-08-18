@@ -504,13 +504,23 @@ mod tests {
             km: 400.0,
         };
         let score = eval!(&inside, ("p", paris) => ("l", london)).unwrap();
-        // 1 − 343.5/400 ≈ 0.141
-        assert!((score - 0.141).abs() < 0.005);
+        // 1 − 343.5/400 = 0.14125; ±0.001 pins haversine to ~±0.4 km
+        assert!((score - 0.14125).abs() < 0.001);
         let outside = Predicate::GeoRadius {
             field: "loc".into(),
             km: 300.0,
         };
         assert_eq!(eval!(&outside, ("p", paris) => ("l", london)), None);
+    }
+
+    #[test]
+    fn geo_radius_identical_coordinates_score_one() {
+        let (a, b) = geo_pair((48.8566, 2.3522), (48.8566, 2.3522));
+        let p = Predicate::GeoRadius {
+            field: "loc".into(),
+            km: 400.0,
+        };
+        assert_eq!(eval!(&p, ("a", a) => ("b", b)), Some(1.0));
     }
 
     #[test]
