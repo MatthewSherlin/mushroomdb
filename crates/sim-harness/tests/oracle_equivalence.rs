@@ -91,7 +91,7 @@ fn rule_template(idx: u8) -> RuleDef {
                 tolerance: 2.0,
             },
             edge_type: "r_nw".into(),
-            weight_prop: None,
+            weight_prop: Some("score".into()),
             max_edges: None,
         },
         6 => RuleDef {
@@ -193,6 +193,25 @@ fn all_etypes() -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Edge set sweep helper
 // ---------------------------------------------------------------------------
+
+fn engine_weight(db: &GraphDb<SimFs>, src: &str, dst: &str, etype: &str) -> Option<f64> {
+    db.explain(src, dst)
+        .ok()?
+        .into_iter()
+        .find(|e| e.edge_type == etype && e.src_key == src && e.dst_key == dst)
+        .and_then(|e| e.weight)
+}
+
+fn assert_weights_match(db: &GraphDb<SimFs>, oracle: &Oracle) -> Result<(), String> {
+    for ((et, s, d), want) in oracle.derived_weights() {
+        if let Some(got) = engine_weight(db, &s, &d, &et) {
+            if (got - want).abs() >= 1e-9 {
+                return Err(format!("weight {et} {s}->{d}: engine {got} oracle {want}"));
+            }
+        }
+    }
+    Ok(())
+}
 
 fn sweep_engine_edges(db: &GraphDb<SimFs>) -> BTreeSet<(String, String, String)> {
     let mut out = BTreeSet::new();
@@ -803,6 +822,9 @@ proptest! {
             &oracle_edges,
             "final edge set mismatch (engine vs oracle)"
         );
+        if let Err(msg) = assert_weights_match(&db, &oracle) {
+            prop_assert!(false, "{msg}");
+        }
 
         // Req 6: rebuild-is-noop invariant.
         // For every live rule, rebuild it and re-sweep; the edge set must not change.

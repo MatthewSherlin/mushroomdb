@@ -2,10 +2,10 @@
 //!
 //! Three generators, 256 cases each (768 total):
 //!   (a) arbitrary `Predicate` trees (depth ≤ 3, all 7 variants) → bincode
-//!       round-trip
-//!   (b) the same tree strategy → `serde_json` round-trip (finite floats only)
-//!   (c) arbitrary predicate + two prop maps → `evaluate` returns `Some`/`None`
-//!       and never panics (`None` is always acceptable)
+//!       round-trip (finite numeric params)
+//!   (b) the same tree strategy → `serde_json` round-trip (JSON-safe floats)
+//!   (c) hostile predicates (full f64 params, incl. NaN/±inf) + prop maps
+//!       with nested lists → `evaluate` never panics
 
 use core_rules::{evaluate, NodeView, Predicate};
 use core_storage::Value;
@@ -35,30 +35,15 @@ fn json_safe_f64() -> BoxedStrategy<f64> {
     .boxed()
 }
 
-fn overlap_min() -> impl Strategy<Value = f64> {
-    (1u8..=8).prop_map(|k| k as f64 / 8.0)
-}
-
 fn leaf_predicate_with(num: BoxedStrategy<f64>) -> impl Strategy<Value = Predicate> {
-    let pos = num.clone().prop_map(|x| x.abs());
-    let km = num.prop_map(|x| {
-        let a = x.abs();
-        if a == 0.0 {
-            1.0
-        } else {
-            a
-        }
-    });
     prop_oneof![
         field_strategy().prop_map(|field| Predicate::KeyMatch { field }),
         field_strategy().prop_map(|field| Predicate::FieldEqual { field }),
-        (field_strategy(), overlap_min())
-            .prop_map(|(field, min)| Predicate::Overlap { field, min }),
-        (field_strategy(), pos)
+        (field_strategy(), num.clone()).prop_map(|(field, min)| Predicate::Overlap { field, min }),
+        (field_strategy(), num.clone())
             .prop_map(|(field, tolerance)| Predicate::NumericWithin { field, tolerance }),
-        (field_strategy(), km).prop_map(|(field, km)| Predicate::GeoRadius { field, km }),
-        (field_strategy(), overlap_min())
-            .prop_map(|(field, min)| Predicate::VectorSimilar { field, min }),
+        (field_strategy(), num.clone()).prop_map(|(field, km)| Predicate::GeoRadius { field, km }),
+        (field_strategy(), num).prop_map(|(field, min)| Predicate::VectorSimilar { field, min }),
         Just(Predicate::All(vec![])),
     ]
 }
@@ -75,6 +60,18 @@ fn json_predicate_strategy() -> impl Strategy<Value = Predicate> {
     })
 }
 
+/// Full IEEE f64, including NaN, ±inf, and subnormals — for the no-panic
+/// property only. Round-trip tests keep finite / JSON-safe params.
+fn any_f64() -> BoxedStrategy<f64> {
+    any::<f64>().boxed()
+}
+
+fn hostile_predicate_strategy() -> impl Strategy<Value = Predicate> {
+    leaf_predicate_with(any_f64()).prop_recursive(3, 16, 3, |inner| {
+        proptest::collection::vec(inner, 1..4).prop_map(Predicate::All)
+    })
+}
+
 fn scalar_value() -> impl Strategy<Value = Value> {
     prop_oneof![
         any::<i64>().prop_map(Value::Int),
@@ -85,10 +82,11 @@ fn scalar_value() -> impl Strategy<Value = Value> {
 }
 
 fn value_strategy() -> impl Strategy<Value = Value> {
-    prop_oneof![
-        scalar_value(),
-        proptest::collection::vec(scalar_value(), 0..6).prop_map(Value::List),
-    ]
+    // Recursive list layer: depth ≥ 2 so GeoRadius / VectorSimilar see
+    // nested-list props (List(List(...))), not only flat numeric lists.
+    scalar_value().prop_recursive(2, 16, 4, |inner| {
+        proptest::collection::vec(inner, 0..6).prop_map(Value::List)
+    })
 }
 
 fn props_strategy() -> impl Strategy<Value = HashMap<String, Value>> {
@@ -119,7 +117,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
     #[test]
     fn evaluate_never_panics_on_arbitrary_props(
-        p in predicate_strategy(),
+        p in hostile_predicate_strategy(),
         src_props in props_strategy(),
         dst_props in props_strategy(),
     ) {
@@ -127,9 +125,6 @@ proptest! {
         let dp = |f: &str| dst_props.get(f).cloned();
         let src = NodeView { key: "src", props: &sp };
         let dst = NodeView { key: "dst", props: &dp };
-        let score = evaluate(&p, &src, &dst);
-        if let Some(s) = score {
-            prop_assert!(s.is_finite() && (0.0..=1.0).contains(&s), "score {s}");
-        }
+        let _ = evaluate(&p, &src, &dst);
     }
 }

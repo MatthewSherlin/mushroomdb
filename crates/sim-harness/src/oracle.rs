@@ -1,6 +1,6 @@
 use core_api::{Direction, Value};
 use core_rules::{evaluate, NodeView, RuleDef};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Obviously-correct reference. No ids, no interning, no persistence.
 #[derive(Debug, Default, Clone)]
@@ -153,6 +153,49 @@ impl Oracle {
                     };
                     if evaluate(&rule.predicate, &src_view, &dst_view).is_some() {
                         out.insert((rule.edge_type.clone(), src_key.clone(), dst_key.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Brute-force scores for rules that store a `weight_prop`. Same O(n²)
+    /// `evaluate` scan as `all_edges` — no index sharing.
+    pub fn derived_weights(&self) -> BTreeMap<(String, String, String), f64> {
+        let mut out = BTreeMap::new();
+        for rule in &self.rules {
+            if rule.weight_prop.is_none() {
+                continue;
+            }
+            for (src_key, src_props) in &self.nodes {
+                let src_label = self.labels.get(src_key).map_or("", |l| l.as_str());
+                if src_label != rule.src_label {
+                    continue;
+                }
+                for (dst_key, dst_props) in &self.nodes {
+                    if src_key == dst_key {
+                        continue;
+                    }
+                    let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
+                    if dst_label != rule.dst_label {
+                        continue;
+                    }
+                    let sp = |f: &str| src_props.get(f).cloned();
+                    let dp = |f: &str| dst_props.get(f).cloned();
+                    let src_view = NodeView {
+                        key: src_key,
+                        props: &sp,
+                    };
+                    let dst_view = NodeView {
+                        key: dst_key,
+                        props: &dp,
+                    };
+                    if let Some(score) = evaluate(&rule.predicate, &src_view, &dst_view) {
+                        out.insert(
+                            (rule.edge_type.clone(), src_key.clone(), dst_key.clone()),
+                            score,
+                        );
                     }
                 }
             }
