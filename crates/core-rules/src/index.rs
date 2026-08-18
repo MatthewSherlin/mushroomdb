@@ -29,6 +29,10 @@ pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
         Predicate::KeyMatch { .. } => CandidateSpec::ByKey,
         Predicate::FieldEqual { field } => CandidateSpec::Scalar { field },
         Predicate::Overlap { field, .. } => CandidateSpec::Tokens { field },
+        // TODO(plan-7 T2): replace Scalar placeholder with NumericBucket / GeoGrid / ScanAll.
+        Predicate::NumericWithin { field, .. }
+        | Predicate::GeoRadius { field, .. }
+        | Predicate::VectorSimilar { field, .. } => CandidateSpec::Scalar { field },
         Predicate::All(parts) => {
             debug_assert!(
                 !parts.is_empty(),
