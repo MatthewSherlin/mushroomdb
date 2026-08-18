@@ -24,7 +24,8 @@
  * - `mergeQueryGraph(columns, rows)` — ingest `/query?format=json`. The
  *   server serializes `RETURN n` as the node key string. A `key`+`label`
  *   pair is bound when those columns exist; otherwise every string cell in
- *   a non-dotted column is a key. Does not add edges.
+ *   a non-dotted column is a key (`label`/`depth` reserved, not harvested).
+ *   Does not add edges.
  *
  * Binding invariant: after any merge, every edge's `src` and `dst` exist as
  * nodes. Edge identity is `etype|src|dst` — rematch never duplicates.
@@ -159,7 +160,12 @@ export class GraphStore {
     for (const row of rows) {
       for (let i = 0; i < columns.length; i++) {
         const col = columns[i];
-        if (col === undefined || col.includes(".")) {
+        if (
+          col === undefined ||
+          col.includes(".") ||
+          col === "label" ||
+          col === "depth"
+        ) {
           continue;
         }
         const key = stringCell(row[i]);

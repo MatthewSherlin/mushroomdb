@@ -192,6 +192,17 @@ describe("mergeQueryGraph", () => {
     expect(store.nodes.get("p1")?.label).toBe("Person");
     expect(store.nodes.size).toBe(1);
   });
+
+  it("does not harvest a label cell as a node key beside a node variable", () => {
+    // Heuristic: a `key` column binds `label`; otherwise every string cell
+    // in a non-dotted column is a key. T4 must project `key`+`label` or
+    // only node variables — a sibling `label` next to `n` is not a key.
+    // Limit: this does not bind `Org` as p1's label (no `key` column).
+    const store = new GraphStore();
+    store.mergeQueryGraph(["n", "label"], [["p1", "Org"]]);
+    expect(store.nodes.has("p1")).toBe(true);
+    expect(store.nodes.has("Org")).toBe(false);
+  });
 });
 
 describe("endpoint invariant", () => {
@@ -372,16 +383,23 @@ describe("watch apply", () => {
       },
     },
     {
-      name: "edge_deleted ignored unless both endpoints are visible",
+      name: "edge_deleted no-ops when an endpoint is already gone",
       setup: (s) => {
         seedPair(s);
-        s.nodes.delete("b");
+        // Legal path: node_deleted drops b and the incident edge. The
+        // subsequent edge_deleted then hits the both-endpoints-visible
+        // guard with a consistent graph (no dangling edge).
+        s.apply({ node_deleted: { key: "b" } });
       },
       event: {
         edge_deleted: { edge_type: "KNOWS", src: "a", dst: "b" },
       },
       check: (s) => {
-        expect(s.edges.has(edgeId("KNOWS", "a", "b"))).toBe(true);
+        expect(s.nodes.has("b")).toBe(false);
+        expect(s.edges.has(edgeId("KNOWS", "a", "b"))).toBe(false);
+        expect(s.nodes.has("a")).toBe(true);
+        expect(s.edges.size).toBe(0);
+        assertEndpoints(s);
       },
     },
     {
