@@ -94,6 +94,20 @@ describe("paintExplorer", () => {
     const selected = paintExplorer(store, store.toCosmos(), new Set([knows]));
     expect(colorOf(selected, 0, 1)).toEqual(COLOR.signal);
   });
+
+  it("paints a highlighted rule's edges gold and dims the rest", () => {
+    const store = seeded();
+    const fit = edgeId("FIT", "a", "c");
+    const painted = paintExplorer(
+      store,
+      store.toCosmos(),
+      new Set(),
+      new Set([fit]),
+    );
+    expect(colorOf(painted, 0, 2)).toEqual(COLOR.gold);
+    expect(colorOf(painted, 0, 1)).not.toEqual(COLOR.gold);
+    expect(colorOf(painted, 0, 1)).not.toEqual(COLOR.signal);
+  });
 });
 
 describe("formatHoverCard", () => {

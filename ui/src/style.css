@@ -368,6 +368,162 @@ button {
   color: var(--paper);
 }
 
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--structure);
+}
+
+.panel-title {
+  margin: 0;
+  flex: 1;
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: var(--paper);
+}
+
+.rules {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 48px;
+  z-index: 7;
+  width: 16.5rem;
+  background: var(--ink);
+  border-right: 1px solid var(--structure);
+}
+
+.rules[hidden],
+.why[hidden] {
+  display: none;
+}
+
+.rules-list {
+  overflow: auto;
+  height: calc(100% - 44px);
+  padding: 8px;
+}
+
+.rules-item {
+  position: relative;
+  display: block;
+  width: 100%;
+  margin: 0 0 6px;
+  padding: 8px 10px;
+  text-align: left;
+  color: var(--paper);
+  background: transparent;
+  border: 1px solid var(--structure);
+  cursor: pointer;
+}
+
+.rules-item[aria-current="true"] {
+  border-color: var(--signal);
+}
+
+.rules-name,
+.rules-meta,
+.why-rule,
+.why-etype,
+.why-ends,
+.why-line,
+.why-set-key,
+.why-tok {
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.rules-name,
+.why-rule {
+  font-size: 12px;
+  color: var(--paper);
+}
+
+.rules-meta,
+.why-etype,
+.why-set-key {
+  margin-top: 3px;
+  font-size: 11px;
+  color: color-mix(in srgb, var(--paper) 55%, var(--ink));
+}
+
+.rules-tripped {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 1px 6px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--gold);
+  border: 1px solid var(--gold);
+}
+
+.why {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 7;
+  width: 22rem;
+  background: var(--ink);
+  border-left: 2px solid var(--structure);
+}
+
+.why[data-kind="overlap"],
+.why[data-kind="key_match"],
+.why[data-kind="derived"] {
+  border-left-color: var(--gold);
+}
+
+.why-body {
+  overflow: auto;
+  padding: 14px 14px 20px;
+}
+
+.why-ends {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--paper);
+}
+
+.why-line {
+  margin-top: 16px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--paper);
+}
+
+.why-hand {
+  color: color-mix(in srgb, var(--paper) 62%, var(--ink));
+}
+
+.why-set {
+  margin-top: 16px;
+}
+
+.why-tokens {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.why-tok {
+  padding: 2px 6px;
+  font-size: 11px;
+  color: var(--paper);
+  border: 1px solid var(--structure);
+}
+
+.why-tok-shared {
+  color: var(--gold);
+  border-color: var(--gold);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

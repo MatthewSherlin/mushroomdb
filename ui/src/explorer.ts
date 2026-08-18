@@ -3,6 +3,7 @@ import { ApiClient, ApiError } from "./api";
 import { QueryConsole } from "./console";
 import { expandNode, loadDemoNeighborhood } from "./expand";
 import { GlowQueue, bornEdgeIds } from "./glow";
+import { Inspector } from "./inspector";
 import {
   flattenColors,
   flattenLinks,
@@ -42,10 +43,12 @@ export class Explorer {
   private readonly onEdgeSelect: ((id: string) => void) | undefined;
   private readonly glow = new GlowQueue();
   private readonly queryConsole: QueryConsole;
+  private readonly inspector: Inspector;
 
   private readonly rail: HTMLElement;
   private readonly exploreBtn: HTMLButtonElement;
   private readonly consoleBtn: HTMLButtonElement;
+  private readonly rulesBtn: HTMLButtonElement;
   private readonly wordmark: HTMLElement;
   private readonly statusDot: HTMLElement;
   private readonly stage: HTMLElement;
@@ -85,17 +88,19 @@ export class Explorer {
     this.rail.setAttribute("aria-label", "views");
     this.exploreBtn = railButton("explore", "Explore", ICON_EXPLORE, true);
     this.consoleBtn = railButton("console", "Console", ICON_CONSOLE, false);
+    this.rulesBtn = railButton("rules", "Rules", ICON_RULES, false);
     this.consoleBtn.setAttribute("aria-expanded", "false");
-    this.rail.append(
-      this.exploreBtn,
-      this.consoleBtn,
-      railButton("rules", "Rules", ICON_RULES, false),
-    );
+    this.rulesBtn.setAttribute("aria-expanded", "false");
+    this.rail.append(this.exploreBtn, this.consoleBtn, this.rulesBtn);
     this.exploreBtn.addEventListener("click", () => {
       this.queryConsole.close();
+      this.inspector.closeRules();
     });
     this.consoleBtn.addEventListener("click", () => {
       this.queryConsole.toggle();
+    });
+    this.rulesBtn.addEventListener("click", () => {
+      this.inspector.toggleRules();
     });
 
     this.stage = el("div", "stage");
@@ -137,7 +142,21 @@ export class Explorer {
         this.scheduleFit();
       },
       onOpenChange: (open) => {
-        this.syncConsoleRail(open);
+        this.syncRail(open ? "console" : this.inspector.isRulesOpen ? "rules" : "explore");
+      },
+    });
+    this.inspector = new Inspector(host, {
+      api: this.api,
+      store: this.store,
+      onNeedPaint: () => {
+        this.paint();
+      },
+      onOpenChange: (which, open) => {
+        if (which === "rules") {
+          this.syncRail(
+            open ? "rules" : this.queryConsole.isOpen ? "console" : "explore",
+          );
+        }
       },
     });
 
@@ -179,18 +198,18 @@ export class Explorer {
     this.graph?.destroy();
     this.graph = undefined;
     this.queryConsole.destroy();
+    this.inspector.destroy();
     this.host.replaceChildren();
   }
 
-  private syncConsoleRail(open: boolean): void {
-    this.consoleBtn.setAttribute("aria-expanded", open ? "true" : "false");
-    if (open) {
-      this.consoleBtn.setAttribute("aria-current", "page");
-      this.exploreBtn.removeAttribute("aria-current");
-    } else {
-      this.consoleBtn.removeAttribute("aria-current");
-      this.exploreBtn.setAttribute("aria-current", "page");
-    }
+  private syncRail(view: "explore" | "console" | "rules"): void {
+    const consoleOpen = this.queryConsole.isOpen;
+    const rulesOpen = this.inspector.isRulesOpen;
+    this.consoleBtn.setAttribute("aria-expanded", consoleOpen ? "true" : "false");
+    this.rulesBtn.setAttribute("aria-expanded", rulesOpen ? "true" : "false");
+    setCurrent(this.exploreBtn, view === "explore");
+    setCurrent(this.consoleBtn, view === "console");
+    setCurrent(this.rulesBtn, view === "rules");
   }
 
   private async loadDemo(): Promise<void> {
@@ -238,6 +257,7 @@ export class Explorer {
       this.store,
       this.store.toCosmos(),
       new Set(this.glow.active(now)),
+      this.inspector.highlightIds,
     );
     const empty = snap.pointKeys.length === 0;
     this.emptyEl.hidden = !empty;
@@ -256,8 +276,11 @@ export class Explorer {
     const graph = this.ensureGraph();
     const glowing = new Set(this.glow.active(now));
     const edgeIds = visibleEdgeIds(this.store);
+    const highlighted = this.inspector.highlightIds;
     const widths = new Float32Array(
-      edgeIds.map((id) => (glowing.has(id) ? GLOW_WIDTH : LINK_WIDTH)),
+      edgeIds.map((id) =>
+        glowing.has(id) || highlighted.has(id) ? GLOW_WIDTH : LINK_WIDTH,
+      ),
     );
     const sizes = new Float32Array(snap.pointKeys.length);
     sizes.fill(POINT_SIZE);
@@ -341,6 +364,7 @@ export class Explorer {
       },
       onBackgroundClick: () => {
         this.store.select(null);
+        this.inspector.closeWhy();
         this.paint();
       },
       onPointMouseOver: (index) => {
@@ -377,6 +401,7 @@ export class Explorer {
       return;
     }
     this.store.select({ kind: "node", id: key });
+    this.inspector.closeWhy();
     this.paint();
     if (event !== undefined && event.detail >= 2) {
       this.clearClick();
@@ -397,6 +422,7 @@ export class Explorer {
     }
     this.store.select({ kind: "edge", id });
     this.onEdgeSelect?.(id);
+    this.run(() => this.inspector.openWhy(id));
     this.paint();
   }
 
@@ -518,6 +544,14 @@ export class Explorer {
   private clearError(): void {
     this.errorEl.hidden = true;
     this.errorEl.textContent = "";
+  }
+}
+
+function setCurrent(btn: HTMLElement, on: boolean): void {
+  if (on) {
+    btn.setAttribute("aria-current", "page");
+  } else {
+    btn.removeAttribute("aria-current");
   }
 }
 

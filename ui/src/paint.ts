@@ -35,6 +35,7 @@ export function paintExplorer(
   store: GraphStore,
   snap: CosmosSnapshot,
   glowing: ReadonlySet<string>,
+  highlighted: ReadonlySet<string> = new Set(),
 ): CosmosSnapshot {
   const selectedNode =
     store.selection?.kind === "node" ? store.selection.id : undefined;
@@ -50,13 +51,17 @@ export function paintExplorer(
   });
 
   const edgeIds = visibleEdgeIds(store);
+  const dim = mixRgb(COLOR.structure, COLOR.ink, 0.55);
   const linkColors = snap.linkColors.map((color, i) => {
     if (sameRgba(color, COLOR.signal)) {
       return color;
     }
     const id = edgeIds[i];
-    if (id !== undefined && glowing.has(id)) {
+    if (id !== undefined && (glowing.has(id) || highlighted.has(id))) {
       return COLOR.gold;
+    }
+    if (id !== undefined && highlighted.size > 0) {
+      return dim;
     }
     return color;
   });
