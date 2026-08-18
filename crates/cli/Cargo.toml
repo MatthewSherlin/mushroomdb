@@ -1,0 +1,14 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "graphdb"
+path = "src/main.rs"
+
+[dependencies]
+core-api = { path = "../core-api" }
+server = { path = "../server" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

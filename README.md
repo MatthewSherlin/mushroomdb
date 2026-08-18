@@ -11,6 +11,17 @@ transactions. Toolchain is pinned to **1.92.0**
 
 ## Quickstart
 
+The front door is the `graphdb` CLI (crate `cli`, binary name `graphdb`):
+
+```text
+cargo run -p cli --bin graphdb -- demo ./demo-db
+cargo run -p cli --bin graphdb -- stats ./demo-db
+cargo run -p cli --bin graphdb -- serve ./demo-db
+cargo run -p cli --bin graphdb -- mcp ./demo-db
+```
+
+No-args and `--help` print usage. There is also a Rust-API walkthrough:
+
 ```text
 cargo run -p core-api --example quickstart
 ```
@@ -34,6 +45,7 @@ fn main() {
         name: "skill_fit".into(), src_label: "Person".into(), dst_label: "Org".into(),
         predicate: Predicate::Overlap { field: "skills".into(), min: 0.5 },
         edge_type: "FIT".into(), weight_prop: Some("score".into()),
+        max_edges: None,
     }).expect("rule");
     db.insert_node("Person", "ada", vec![("skills".into(), tags(&["graph", "rust", "search"]))]).expect("ada");
     db.insert_node("Person", "bob", vec![("skills".into(), tags(&["graph", "rust"]))]).expect("bob");
@@ -74,6 +86,110 @@ columns: p, o, score
   rule=skill_fit  type=FIT  ada→acme  weight=1.0
 ```
 
+## Demo
+
+`graphdb demo <db-dir>` writes a **deterministic** generic dataset — 10
+Orgs, 20 Projects, 30 People — via `ingest_json`. Rows carry list-valued
+`skills` and FK fields (`org_id`, `project_id`). Auto-FK `KeyMatch` rules
+are declared during ingest; one scored `Overlap` rule (`skill_fit`,
+Jaccard ≥ 0.5 on `skills`) is created after. The command refuses a
+non-empty directory.
+
+Captured from `cargo run -p cli --bin graphdb -- demo ./demo-db`:
+
+```text
+== demo ==
+ingested 10 Orgs, 20 Projects, 30 People
+overlap rule: skill_fit (Person.skills ∩ Project.skills, min 0.5)
+
+== auto-FK rules ==
+  auto_fk_person_org_id
+  auto_fk_person_project_id
+  auto_fk_project_org_id
+
+== query ==
+MATCH (p:Person)-[r:FIT]->(proj:Project)
+RETURN p, proj, r.score AS score
+ORDER BY p
+LIMIT 5
+
+columns: p, proj, score
+  p=person-01  proj=proj-01  score=1.0
+  p=person-02  proj=proj-02  score=1.0
+  p=person-03  proj=proj-03  score=1.0
+  p=person-04  proj=proj-04  score=1.0
+  p=person-05  proj=proj-05  score=1.0
+
+== explain (person-01, proj-01) ==
+  rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=none
+  rule=skill_fit  type=FIT  person-01→proj-01  weight=1.0
+
+== serve ==
+  graphdb serve ./demo-db
+```
+
+`graphdb stats ./demo-db` after that demo:
+
+```text
+nodes: 60 live, 0 tombstoned
+edges: 110
+rules: 4
+  auto_fk_person_org_id        edges=30  fires=40  tripped=false
+  auto_fk_person_project_id    edges=30  fires=50  tripped=false
+  auto_fk_project_org_id       edges=20  fires=30  tripped=false
+  skill_fit                    edges=30  fires=50  tripped=false
+```
+
+A second `demo` into the same directory exits 1:
+
+```text
+demo refuses a non-empty directory: ./demo-db (pick an empty path or remove it first)
+```
+
+## Server
+
+`graphdb serve <db-dir> [--addr 127.0.0.1:0]` opens the store, binds
+(default is ephemeral port 0), prints the bound address **after** the
+listener is accepting, then serves. Real run against the demo dir:
+
+```text
+$ cargo run -p cli --bin graphdb -- serve ./demo-db
+listening on http://127.0.0.1:59196
+```
+
+(Port `59196` is whatever the OS assigned for `:0`; pass
+`--addr 127.0.0.1:8080` to pin one.)
+
+Endpoints (thin wrappers over `core-api`):
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/query` | body `{"cypher","params?"}` → Arrow IPC (`application/vnd.apache.arrow.stream`); `?format=json` → `{"columns","rows"}` |
+| `GET` | `/stats` | `Stats` JSON |
+| `POST` | `/ingest` | body `{"label","rows","options?"}` → `IngestReport` JSON |
+| `GET` | `/explain` | `?a=&b=` → `Explanation` array |
+| `GET` | `/node/{key}/neighborhood` | `?depth=&dir=` |
+| `GET` | `/watch` | WebSocket; one JSON text frame per post-commit `MutationEvent` |
+
+`GET /stats` on the demo dataset (same process as the listen line above):
+
+```text
+{"edges":110,"nodes_live":60,"nodes_tombstoned":0,"rules":[...]}
+```
+
+## MCP
+
+`graphdb mcp <db-dir>` runs a newline-delimited JSON-RPC 2.0 loop on
+stdio (no `Content-Length` framing). Methods: `initialize`,
+`notifications/initialized`, `tools/list`, `tools/call`. Tools: `query`,
+`ingest_json`, `explain`, `stats`, `neighborhood`.
+
+```text
+$ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+    | cargo run -p cli --bin graphdb -- mcp ./demo-db
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"graph-db"}}}
+```
+
 ## What works today
 
 | Area | Today |
@@ -83,6 +199,12 @@ columns: p, o, score
 | Linking rules | Declared `RuleDef`: `KeyMatch`, `FieldEqual`, `Overlap` (Jaccard), `All`. Incremental on `insert_node` / `set_prop`. Derived edges are not WAL-logged; replay re-fires the same `apply` path. Provenance via `explain`. `weight_prop` stores the score on the edge |
 | Traversal | `node_ref`, `nodes_with_label`, `find_nodes` (`Filter`/`CmpOp`), `NodeRef::neighborhood`, `NodeRef::grouped_by_edge_type`, `neighbors` |
 | Cypher | `GraphDb::query` — subset below |
+| Ingest | `ingest` / `ingest_json`; auto-FK `KeyMatch` on `*_id` |
+| Concurrency | `SharedDb` — many readers or one writer (`RwLock`); lock-free epoch readers are Plan 8 |
+| Arrow | `arrow-bridge`: `ResultSet` → RecordBatch / IPC stream |
+| Server | HTTP + `/watch` WebSocket (`graphdb serve`) |
+| MCP | stdio JSON-RPC (`graphdb mcp`) — agent-memory tools |
+| CLI | `graphdb` — `serve` / `mcp` / `stats` / `demo` |
 
 **Cypher subset (v1):** one or more `MATCH` clauses; node pattern
 `(var?:Label {k: literal or $param})`; relationships
@@ -104,12 +226,11 @@ tight `LIMIT`.
 
 ## Coming later
 
-- numeric / geo rule predicates
+- numeric / geo / vector rule predicates
 - node and edge deletes
 - multi-statement transactions
-- concurrent snapshot readers
-- Arrow result sets
-- server + UI
+- lock-free epoch snapshot readers (replacing the `RwLock` facade)
+- UI (`graphdb ui`) + launch GIF
 - language bindings
 
 ## Docs

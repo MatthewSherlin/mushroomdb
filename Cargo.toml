@@ -8,6 +8,7 @@ members = [
     "crates/core-query",
     "crates/arrow-bridge",
     "crates/server",
+    "crates/cli",
 ]
 
 [workspace.dependencies]
