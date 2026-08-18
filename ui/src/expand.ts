@@ -5,11 +5,13 @@ import type {
   QueryResult,
 } from "./api";
 import {
+  EXPLAIN_CONCURRENCY,
   classifyBothDirs,
   concatResults,
   explainNeighbors,
   firstNodeKey,
   hopKeysAtDepth,
+  mapPool,
   neighborKeys,
 } from "./classify";
 import type { GraphStore } from "./store";
@@ -40,12 +42,10 @@ export async function expandNode(
     const deep = await api.neighborhood(root, { depth: 2, dir: "both" });
     store.fromNeighborhood(root, deep);
     await attachEdges(store, api, root);
-    for (const key of hopKeysAtDepth(deep, 1)) {
-      if (key === root) {
-        continue;
-      }
-      await expandNode(store, api, key, 1);
-    }
+    const hop1 = hopKeysAtDepth(deep, 1).filter((key) => key !== root);
+    await mapPool(hop1, EXPLAIN_CONCURRENCY, (key) =>
+      expandNode(store, api, key, 1),
+    );
     return;
   }
 

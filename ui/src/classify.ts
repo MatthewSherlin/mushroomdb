@@ -92,6 +92,14 @@ export function firstNodeKey(result: QueryResult): string | undefined {
 
 export function concatResults(...results: QueryResult[]): QueryResult {
   const columns = results[0]?.columns ?? [];
+  for (let i = 1; i < results.length; i++) {
+    const next = results[i]!.columns;
+    if (next.length !== columns.length || next.some((c, j) => c !== columns[j])) {
+      throw new Error(
+        `concatResults: column mismatch (${columns.join(",")} vs ${next.join(",")})`,
+      );
+    }
+  }
   return { columns, rows: results.flatMap((r) => r.rows) };
 }
 
@@ -131,6 +139,10 @@ export async function explainNeighbors(
     seen.add(key);
     unique.push(key);
   }
+  // /explain is bidirectional: the server matches
+  // (src==a && dst==b) || (src==b && dst==a) at crates/core-api/src/db.rs:900.
+  // explain(root, n) therefore returns in-edges {src_key:n, dst_key:root} as
+  // well as out-edges. classifyDir does not flip or rewrite direction.
   const values = await mapPool(unique, EXPLAIN_CONCURRENCY, (n) =>
     explain(root, n),
   );

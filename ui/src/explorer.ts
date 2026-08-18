@@ -40,7 +40,6 @@ export class Explorer {
   private readonly store: GraphStore;
   private readonly onEdgeSelect: ((id: string) => void) | undefined;
   private readonly glow = new GlowQueue();
-  private readonly reducedMotion: boolean;
 
   private readonly rail: HTMLElement;
   private readonly wordmark: HTMLElement;
@@ -66,7 +65,6 @@ export class Explorer {
     this.api = options.api;
     this.store = options.store;
     this.onEdgeSelect = options.onEdgeSelect;
-    this.reducedMotion = prefersReducedMotion();
 
     host.innerHTML = "";
     host.classList.add("shell");
@@ -137,7 +135,7 @@ export class Explorer {
   applyWatchEvent(event: MutationEvent): void {
     const before = [...this.store.edges.keys()];
     this.store.apply(event);
-    if (!this.reducedMotion) {
+    if (!prefersReducedMotion()) {
       const born = bornEdgeIds(before, this.store.edges.keys());
       if (born.length > 0) {
         this.glow.schedule(born, performance.now());
@@ -178,7 +176,7 @@ export class Explorer {
       return;
     }
     const run = (): void => {
-      graph.fitView(this.reducedMotion ? 0 : 280, 0.22);
+      graph.fitView(prefersReducedMotion() ? 0 : 280, 0.22);
     };
     void graph.ready.then(() => {
       run();
@@ -328,14 +326,22 @@ export class Explorer {
     return graph;
   }
 
-  private onPointClick(index: number, event: MouseEvent): void {
+  private onPointClick(index: number | undefined, event?: MouseEvent): void {
+    if (
+      index === undefined ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index >= this.lastKeys.length
+    ) {
+      return;
+    }
     const key = this.lastKeys[index];
     if (key === undefined) {
       return;
     }
     this.store.select({ kind: "node", id: key });
     this.paint();
-    if (event.detail >= 2) {
+    if (event !== undefined && event.detail >= 2) {
       this.clearClick();
       this.run(() => this.expand(key, 2));
       return;

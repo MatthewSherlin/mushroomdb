@@ -113,6 +113,15 @@ describe("concatResults", () => {
       ["c", "Org", 1],
     ]);
   });
+
+  it("throws when a later result's columns differ", () => {
+    expect(() =>
+      concatResults(
+        { columns: ["key", "label", "depth"], rows: [["b", "Person", 1]] },
+        { columns: ["key", "label"], rows: [["c", "Org"]] },
+      ),
+    ).toThrow(/column mismatch/i);
+  });
 });
 
 describe("mapPool", () => {
@@ -211,6 +220,23 @@ describe("classifyBothDirs", () => {
     });
     expect(got.out).toEqual({ FIT: ["b"], TEAM: ["b"] });
     expect(got.out[USER_ETYPE]).toBeUndefined();
+  });
+
+  it("classifies an in-neighbor whose explanation arrives as {src_key: nbr, dst_key: root}", () => {
+    const got = classifyBothDirs({
+      root: "a",
+      outKeys: [],
+      inKeys: ["d"],
+      explanations: new Map([["d", [exp("WORKS_AT", "d", "a")]]]),
+    });
+    expect(got.in).toEqual({ WORKS_AT: ["d"] });
+    expect(got.out).toEqual({});
+    expect(got.provenance).toEqual([
+      {
+        id: edgeId("WORKS_AT", "d", "a"),
+        explanation: exp("WORKS_AT", "d", "a"),
+      },
+    ]);
   });
 
   it("classifies a mutual neighbor independently per direction", () => {

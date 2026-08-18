@@ -150,6 +150,58 @@ describe("expandNode", () => {
     expect(nbCalls).toContain("b|1|out");
     expect(nbCalls).toContain("b|1|in");
   });
+
+  it("depth 2: expands hop-1 neighbors concurrently under the pool cap", async () => {
+    const store = new GraphStore();
+    const { api } = mockApi({
+      neighborhood: {
+        "a|2|both": nb([
+          ["b", "Person", 1],
+          ["c", "Org", 1],
+          ["d", "Org", 2],
+          ["e", "Org", 2],
+        ]),
+        "a|1|out": nb([
+          ["b", "Person", 1],
+          ["c", "Org", 1],
+        ]),
+        "a|1|in": nb([]),
+        "b|1|out": nb([["d", "Org", 1]]),
+        "b|1|in": nb([["a", "Person", 1]]),
+        "c|1|out": nb([["e", "Org", 1]]),
+        "c|1|in": nb([["a", "Person", 1]]),
+      },
+      explain: {
+        "a|b": [fit("a", "b")],
+        "a|c": [fit("a", "c")],
+        "b|d": [],
+        "b|a": [fit("a", "b")],
+        "c|e": [],
+        "c|a": [fit("a", "c")],
+      },
+    });
+
+    let inflight = 0;
+    let max = 0;
+    const origNb = api.neighborhood;
+    api.neighborhood = async (key, opts) => {
+      if (key !== "a") {
+        inflight += 1;
+        max = Math.max(max, inflight);
+        await new Promise((r) => setTimeout(r, 20));
+        inflight -= 1;
+      }
+      return origNb(key, opts);
+    };
+
+    await expandNode(store, api, "a", 2);
+
+    expect(max).toBeGreaterThan(2);
+    expect(store.needsEdges("b")).toBe(false);
+    expect(store.needsEdges("c")).toBe(false);
+    expect(store.edges.has(edgeId(USER_ETYPE, "b", "d"))).toBe(true);
+    expect(store.edges.has(edgeId(USER_ETYPE, "c", "e"))).toBe(true);
+  });
 });
 
 describe("loadDemoNeighborhood", () => {
