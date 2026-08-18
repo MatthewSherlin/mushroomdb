@@ -1,0 +1,22 @@
+{
+  "name": "graph-db-ui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@cosmos.gl/graph": "^3.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.10"
+  }
+}

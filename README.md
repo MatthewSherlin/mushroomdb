@@ -177,6 +177,12 @@ Endpoints (thin wrappers over `core-api`):
 {"edges":170,"nodes_live":60,"nodes_tombstoned":0,"rules":[...]}
 ```
 
+## UI (in progress)
+
+```text
+cd ui && npm ci && npm run build
+```
+
 ## MCP
 
 `graphdb mcp <db-dir>` runs a newline-delimited JSON-RPC 2.0 loop on
