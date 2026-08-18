@@ -979,46 +979,53 @@ impl<F: Fs> GraphDb<F> {
 
         let mut results = Vec::new();
 
-        for (rule_name, prov_set) in self.engine.provenance() {
-            let Some(rule_def) = self.engine.rules().find(|r| &r.name == rule_name) else {
+        // Walk the smaller incident set so explain is O(min(deg(a), deg(b)))
+        // rather than O(total provenance).
+        let scan = if self.engine.provenance_touching_len(id_a)
+            <= self.engine.provenance_touching_len(id_b)
+        {
+            id_a
+        } else {
+            id_b
+        };
+        for (rule_name, etype, src, dst) in self.engine.provenance_touching(scan) {
+            if !((src == id_a && dst == id_b) || (src == id_b && dst == id_a)) {
+                continue;
+            }
+            let Some(rule_def) = self.engine.rules().find(|r| r.name == rule_name) else {
                 continue;
             };
-            for &(etype, src, dst) in prov_set {
-                if !((src == id_a && dst == id_b) || (src == id_b && dst == id_a)) {
-                    continue;
-                }
-                let edge_type = match self.syms.resolve(etype) {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                let src_key = self
-                    .ids
-                    .key_of(src)
-                    .expect("provenance ids always resolvable")
-                    .to_string();
-                let dst_key = self
-                    .ids
-                    .key_of(dst)
-                    .expect("provenance ids always resolvable")
-                    .to_string();
-                let weight = rule_def.weight_prop.as_deref().and_then(|prop| {
-                    self.edge_props.get(etype, src, dst, prop).and_then(|v| {
-                        if let Value::Float(f) = v {
-                            Some(*f)
-                        } else {
-                            None
-                        }
-                    })
-                });
-                results.push(Explanation {
-                    rule: rule_name.clone(),
-                    edge_type,
-                    src_key,
-                    dst_key,
-                    weight,
-                    predicate: PredicateSummary::from(&rule_def.predicate),
-                });
-            }
+            let edge_type = match self.syms.resolve(etype) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let src_key = self
+                .ids
+                .key_of(src)
+                .expect("provenance ids always resolvable")
+                .to_string();
+            let dst_key = self
+                .ids
+                .key_of(dst)
+                .expect("provenance ids always resolvable")
+                .to_string();
+            let weight = rule_def.weight_prop.as_deref().and_then(|prop| {
+                self.edge_props.get(etype, src, dst, prop).and_then(|v| {
+                    if let Value::Float(f) = v {
+                        Some(*f)
+                    } else {
+                        None
+                    }
+                })
+            });
+            results.push(Explanation {
+                rule: rule_name.to_string(),
+                edge_type,
+                src_key,
+                dst_key,
+                weight,
+                predicate: PredicateSummary::from(&rule_def.predicate),
+            });
         }
 
         results.sort_by(|a, b| a.rule.cmp(&b.rule).then(a.edge_type.cmp(&b.edge_type)));

@@ -342,6 +342,34 @@ fn rules(c: &mut Criterion) {
     });
 }
 
+/// Bench-only 20k-triple hub: one Org + 20k People all KeyMatch to it.
+/// The 10k `bench_db` hub (1.2k triples) made the full provenance walk
+/// indistinguishable from the sparse pair (~45 µs); this variant exists
+/// so O(total-provenance) vs O(degree) is measurable.
+const HUB_DENSE: usize = 20_000;
+
+fn bench_db_hub_dense() -> GraphDb<RealFs> {
+    let mut db = GraphDb::open(&tmp_dir()).expect("open dense hub");
+    let opts = ingest_opts();
+    db.ingest(
+        "Org",
+        vec![row(vec![("id", Value::Str("org-0001".into()))])],
+        &opts,
+    )
+    .expect("org");
+    let people: Vec<_> = (1..=HUB_DENSE)
+        .map(|i| {
+            row(vec![
+                ("id", Value::Str(format!("person-{i:05}"))),
+                ("org_id", Value::Str("org-0001".into())),
+            ])
+        })
+        .collect();
+    db.ingest("Person", people, &opts).expect("people");
+    db.create_rule(rule_works_at()).expect("works_at");
+    db
+}
+
 fn explain_pair(c: &mut Criterion) {
     let db = bench_db_ruled(N, SEED);
     c.bench_function("explain_pair", |b| {
@@ -352,13 +380,12 @@ fn explain_pair(c: &mut Criterion) {
             );
         });
     });
-    // Hub org is the dst of HUB_PEOPLE WORKS_AT triples (≥1k). Today's
-    // explain() still walks every rule's full provenance set; T2's
-    // reverse index is what makes the hub degree visible.
+    let dense = bench_db_hub_dense();
     c.bench_function("explain_pair_dense", |b| {
         b.iter(|| {
             black_box(
-                db.explain(black_box("org-0001"), black_box("person-0002"))
+                dense
+                    .explain(black_box("org-0001"), black_box("person-00002"))
                     .expect("explain dense"),
             );
         });

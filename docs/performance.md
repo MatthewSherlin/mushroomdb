@@ -16,20 +16,27 @@ install KeyMatch `WORKS_AT` + `ON_PROJECT` and Overlap `FIT` unless noted.
 
 Times are criterion median ± median absolute deviation (MAD).
 
-| Bench | Median ± MAD | Description |
-|---|---|---|
-| `ingest_10k_nodes` | 411.491 ms ± 3.313 ms | Ingest 10k people/orgs/projects (no rules) into a fresh store |
-| `neighborhood_depth1` | 1.165 µs ± 0.020 µs | BFS depth-1 neighborhood of `person-0001` |
-| `neighborhood_depth2` | 4.283 µs ± 0.026 µs | BFS depth-2 neighborhood of `person-0001` |
-| `cypher_scan_filter_project` | 1.417 ms ± 0.111 ms | `MATCH (n:Person) WHERE n.age > 40 RETURN n LIMIT 100` over 10k |
-| `cypher_two_hop_join` | 4.898 ms ± 0.131 ms | `MATCH (p:Person)-[:ON_PROJECT]->(proj:Project)<-[:ON_PROJECT]-(q:Person) RETURN p, proj, q LIMIT 100` |
-| `rule_incremental_fire` | 4.731 ms ± 0.337 ms | One `skills` update on a 10k-node db with 3 rules incl. overlap |
-| `rule_backfill_10k` | 49.050 ms ± 1.118 ms | `create_rule` Overlap backfill on an existing 10k-node db |
-| `explain_pair` | 45.089 µs ± 0.292 µs | `explain(person-0001, proj-0001)` provenance scan |
-| `explain_pair_dense` | 44.719 µs ± 0.869 µs | `explain(org-0001, person-0002)` — hub org participates in ≥1k provenance triples |
-| `vector_rule_update` | 12.032 ms ± 0.215 ms | One node's dim-64 embedding update under `VectorSimilar` |
-| `read_contention_1r0w` | 40.393 µs ± 0.793 µs | Solo `run_contention(db, 1, 16, 0)` via `SharedDb` |
-| `read_contention_4r1w` | 70.312 ms ± 4.902 ms | 4 neighborhood readers + 1 prop writer via `SharedDb` |
-| `read_contention_16r1w` | 81.218 ms ± 7.138 ms | 16 neighborhood readers + 1 prop writer via `SharedDb` |
+`explain_pair_dense` T2 shape: bench-only 20k-person KeyMatch hub (one Org + 20k
+People, one `WORKS_AT` rule). The T1 1.2k hub inside the 10k 3-rule graph was
+~45 µs — same as the sparse pair; the BTree walk was cheap at that size. T2
+before on the 20k shape was 25.752 µs ± 0.217 µs.
+
+| Bench | T1 | post-T2 | Description |
+|---|---|---|---|
+| `ingest_10k_nodes` | 411.491 ms ± 3.313 ms | 407.802 ms ± 1.604 ms | Ingest 10k people/orgs/projects (no rules) into a fresh store |
+| `neighborhood_depth1` | 1.165 µs ± 0.020 µs | 1.145 µs ± 0.014 µs | BFS depth-1 neighborhood of `person-0001` |
+| `neighborhood_depth2` | 4.283 µs ± 0.026 µs | 4.179 µs ± 0.059 µs | BFS depth-2 neighborhood of `person-0001` |
+| `cypher_scan_filter_project` | 1.417 ms ± 0.111 ms | 1.375 ms ± 0.029 ms | `MATCH (n:Person) WHERE n.age > 40 RETURN n LIMIT 100` over 10k |
+| `cypher_two_hop_join` | 4.898 ms ± 0.131 ms | 4.902 ms ± 0.131 ms | `MATCH (p:Person)-[:ON_PROJECT]->(proj:Project)<-[:ON_PROJECT]-(q:Person) RETURN p, proj, q LIMIT 100` |
+| `rule_incremental_fire` | 4.731 ms ± 0.337 ms | 4.472 ms ± 0.243 ms | One `skills` update on a 10k-node db with 3 rules incl. overlap |
+| `rule_backfill_10k` | 49.050 ms ± 1.118 ms | 51.328 ms ± 0.710 ms | `create_rule` Overlap backfill on an existing 10k-node db |
+| `explain_pair` | 45.089 µs ± 0.292 µs | 598.838 ns ± 8.688 ns | `explain(person-0001, proj-0001)` |
+| `explain_pair_dense` | 44.719 µs ± 0.869 µs† | 291.900 ns ± 4.356 ns | `explain(org-0001, person-00002)` on the 20k-triple hub |
+| `vector_rule_update` | 12.032 ms ± 0.215 ms | 11.277 ms ± 0.229 ms | One node's dim-64 embedding update under `VectorSimilar` |
+| `read_contention_1r0w` | 40.393 µs ± 0.793 µs | 37.629 µs ± 1.054 µs | Solo `run_contention(db, 1, 16, 0)` via `SharedDb` |
+| `read_contention_4r1w` | 70.312 ms ± 4.902 ms | 70.033 ms ± 4.926 ms | 4 neighborhood readers + 1 prop writer via `SharedDb` |
+| `read_contention_16r1w` | 81.218 ms ± 7.138 ms | 73.753 ms ± 1.640 ms | 16 neighborhood readers + 1 prop writer via `SharedDb` |
+
+† T1 number is the 1.2k-hub-in-10k-graph shape. Same-shape T2 before (20k hub) is 25.752 µs ± 0.217 µs → post-T2 291.900 ns (88×).
 
 `read_contention_*` figures include thread-spawn + barrier sync; comparable only to other `run_contention` rows (including the new `1r0w`).

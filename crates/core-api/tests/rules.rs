@@ -181,6 +181,37 @@ fn explain_reports_rule_provenance_and_weights() {
 }
 
 #[test]
+fn explain_high_degree_hub_returns_only_the_pair() {
+    use core_api::{AutoFk, IngestOptions};
+    use std::collections::BTreeMap;
+    let dir = tmp("explain-hub");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let opts = IngestOptions {
+        key_field: "id".into(),
+        auto_fk: AutoFk::Off,
+    };
+    let mut org = BTreeMap::new();
+    org.insert("id".into(), Value::Str("hub".into()));
+    db.ingest("Org", vec![org], &opts).unwrap();
+    let people: Vec<_> = (0..1000)
+        .map(|i| {
+            let mut row = BTreeMap::new();
+            row.insert("id".into(), Value::Str(format!("p{i}")));
+            row.insert("org_id".into(), Value::Str("hub".into()));
+            row
+        })
+        .collect();
+    db.ingest("Person", people, &opts).unwrap();
+    db.create_rule(fk_rule()).unwrap();
+    let ex = db.explain("hub", "p0").unwrap();
+    assert_eq!(ex.len(), 1);
+    assert_eq!(ex[0].rule, "works_at");
+    assert_eq!(ex[0].src_key, "p0");
+    assert_eq!(ex[0].dst_key, "hub");
+    assert!(db.explain("p0", "p1").unwrap().is_empty());
+}
+
+#[test]
 fn explain_predicate_summary_key_match_and_all() {
     let dir = tmp("explain-pred");
     let mut db = GraphDb::open(&dir).unwrap();

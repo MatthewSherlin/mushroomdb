@@ -16,12 +16,23 @@ pub struct GraphMut<'a> {
 /// Used when `RuleDef.max_edges` is `None`.
 pub const DEFAULT_MAX_EDGES: u64 = 1_000_000;
 
+/// `(etype, src, dst)` as stored in `provenance` / `owned`.
+type Triple = (u32, u32, u32);
+/// Reverse-index entry: `(rule_id, etype, src, dst)`. `rule_id` is interned.
+type Touch = (u32, u32, u32, u32);
+
 #[derive(Debug, Default)]
 pub struct RuleEngine {
     rules: BTreeMap<String, RuleDef>,
     indexes: BTreeMap<String, RuleIndex>,
-    provenance: BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
-    owned: BTreeSet<(u32, u32, u32)>,
+    provenance: BTreeMap<String, BTreeSet<Triple>>,
+    owned: BTreeSet<Triple>,
+    /// Derived reverse index: node → provenance triples that touch it.
+    /// Never serialized; rebuilt from `provenance` on persist-restore.
+    by_node: BTreeMap<u32, BTreeSet<Touch>>,
+    /// Intern table for rule names used as `Touch` rule_ids. Derived.
+    rule_intern: BTreeMap<String, u32>,
+    intern_rule: Vec<String>,
     tripped: BTreeMap<String, bool>,
     fires: BTreeMap<String, u64>,
 }
@@ -172,6 +183,120 @@ fn edge_budget(def: &RuleDef) -> u64 {
     def.max_edges.unwrap_or(DEFAULT_MAX_EDGES)
 }
 
+fn intern_rule(intern: &mut BTreeMap<String, u32>, names: &mut Vec<String>, rule: &str) -> u32 {
+    if let Some(&id) = intern.get(rule) {
+        return id;
+    }
+    let id = names.len() as u32;
+    intern.insert(rule.to_string(), id);
+    names.push(rule.to_string());
+    id
+}
+
+type ByNodeRebuild = (
+    BTreeMap<u32, BTreeSet<Touch>>,
+    BTreeMap<String, u32>,
+    Vec<String>,
+);
+
+fn rebuild_by_node(provenance: &BTreeMap<String, BTreeSet<Triple>>) -> ByNodeRebuild {
+    let mut by_node = BTreeMap::new();
+    let mut intern = BTreeMap::new();
+    let mut names = Vec::new();
+    for (rule, set) in provenance {
+        let rid = intern_rule(&mut intern, &mut names, rule);
+        for &triple in set {
+            touch_insert(&mut by_node, rid, triple);
+        }
+    }
+    (by_node, intern, names)
+}
+
+fn touch_insert(by_node: &mut BTreeMap<u32, BTreeSet<Touch>>, rid: u32, triple: Triple) {
+    let (t, s, d) = triple;
+    let entry = (rid, t, s, d);
+    by_node.entry(s).or_default().insert(entry);
+    if s != d {
+        by_node.entry(d).or_default().insert(entry);
+    }
+}
+
+fn touch_remove(by_node: &mut BTreeMap<u32, BTreeSet<Touch>>, rid: u32, triple: Triple) {
+    let (t, s, d) = triple;
+    let entry = (rid, t, s, d);
+    if let Some(set) = by_node.get_mut(&s) {
+        set.remove(&entry);
+        if set.is_empty() {
+            by_node.remove(&s);
+        }
+    }
+    if s != d {
+        if let Some(set) = by_node.get_mut(&d) {
+            set.remove(&entry);
+            if set.is_empty() {
+                by_node.remove(&d);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn resolve_by_node(
+    by_node: &BTreeMap<u32, BTreeSet<Touch>>,
+    names: &[String],
+) -> BTreeMap<u32, BTreeSet<(String, Triple)>> {
+    by_node
+        .iter()
+        .map(|(&n, set)| {
+            let resolved = set
+                .iter()
+                .map(|&(rid, t, s, d)| (names[rid as usize].clone(), (t, s, d)))
+                .collect();
+            (n, resolved)
+        })
+        .collect()
+}
+
+/// Mutable provenance + derived reverse index. Every insert/remove goes
+/// through [`ProvSets::insert`] / [`ProvSets::remove`].
+struct ProvSets<'a> {
+    set: &'a mut BTreeSet<Triple>,
+    owned: &'a mut BTreeSet<Triple>,
+    by_node: &'a mut BTreeMap<u32, BTreeSet<Touch>>,
+    rule_intern: &'a mut BTreeMap<String, u32>,
+    intern_rule: &'a mut Vec<String>,
+}
+
+impl ProvSets<'_> {
+    fn insert(&mut self, rule: &str, triple: Triple) -> bool {
+        if !self.set.insert(triple) {
+            return false;
+        }
+        self.owned.insert(triple);
+        let rid = intern_rule(self.rule_intern, self.intern_rule, rule);
+        touch_insert(self.by_node, rid, triple);
+        true
+    }
+
+    fn remove(&mut self, rule: &str, triple: Triple) -> bool {
+        if !self.set.remove(&triple) {
+            return false;
+        }
+        self.owned.remove(&triple);
+        let rid = intern_rule(self.rule_intern, self.intern_rule, rule);
+        touch_remove(self.by_node, rid, triple);
+        true
+    }
+
+    fn contains(&self, triple: &Triple) -> bool {
+        self.set.contains(triple)
+    }
+
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
 /// Diff-apply `desired` against provenance. `retract_touching = Some(n)` only
 /// retracts triples that involve `n` (incremental fire). `None` retracts any
 /// current provenance triple not in `desired` (backfill / rebuild).
@@ -186,32 +311,37 @@ fn apply_desired(
     def: &RuleDef,
     desired: BTreeMap<(u32, u32), f64>,
     retract_touching: Option<u32>,
-    prov: &mut BTreeSet<(u32, u32, u32)>,
-    owned: &mut BTreeSet<(u32, u32, u32)>,
+    prov: &mut ProvSets<'_>,
     tripped: &mut bool,
     g: &mut GraphMut<'_>,
 ) {
     let budget = edge_budget(def);
     let et = g.syms.intern(&def.edge_type);
 
-    let current: Vec<(u32, u32, u32)> = prov
-        .iter()
-        .filter(|(t, s, d)| {
-            *t == et
-                && match retract_touching {
-                    None => true,
-                    Some(n) => *s == n || *d == n,
-                }
-        })
-        .copied()
-        .collect();
+    let current: Vec<Triple> = match retract_touching {
+        None => prov
+            .set
+            .iter()
+            .filter(|(t, _, _)| *t == et)
+            .copied()
+            .collect(),
+        Some(n) => {
+            let rid = prov.rule_intern.get(&def.name).copied();
+            prov.by_node
+                .get(&n)
+                .into_iter()
+                .flatten()
+                .filter(|(r, t, _, _)| Some(*r) == rid && *t == et)
+                .map(|(_, t, s, d)| (*t, *s, *d))
+                .collect()
+        }
+    };
 
     for (t, s, d) in current {
         if !desired.contains_key(&(s, d)) {
             g.topo.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
-            prov.remove(&(t, s, d));
-            owned.remove(&(t, s, d));
+            prov.remove(&def.name, (t, s, d));
         }
     }
 
@@ -225,8 +355,7 @@ fn apply_desired(
             }
             let newly = g.topo.add_edge(et, s, d);
             if newly {
-                prov.insert(triple);
-                owned.insert(triple);
+                prov.insert(&def.name, triple);
             }
         }
         // Only set weight_prop on edges this rule owns (newly added now, or
@@ -321,6 +450,23 @@ impl RuleEngine {
         &self.provenance
     }
 
+    /// O(degree) reverse-index lookup: every provenance triple that touches `node`.
+    pub fn provenance_touching(
+        &self,
+        node: u32,
+    ) -> impl Iterator<Item = (&str, u32, u32, u32)> + '_ {
+        self.by_node
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .map(|&(rid, t, s, d)| (self.intern_rule[rid as usize].as_str(), t, s, d))
+    }
+
+    /// Number of provenance triples incident on `node`.
+    pub fn provenance_touching_len(&self, node: u32) -> usize {
+        self.by_node.get(&node).map_or(0, BTreeSet::len)
+    }
+
     /// One-way latch: `true` after a budget breach until [`Self::rebuild`]
     /// is the only exit (and only if the full desired set then fits).
     pub fn is_tripped(&self, name: &str) -> bool {
@@ -334,8 +480,9 @@ impl RuleEngine {
         self.fires.get(name).copied().unwrap_or(0)
     }
 
-    /// Snapshot support: definitions + provenance + tripped/fires. Indexes
-    /// are NOT included (they are rebuilt on open via `reindex_all`).
+    /// Snapshot support: definitions + provenance + tripped/fires. Candidate
+    /// indexes and the `by_node` reverse index are NOT included (derived:
+    /// `reindex_all` / `rebuild_by_node` on open).
     #[allow(clippy::type_complexity)]
     pub fn to_persist(
         &self,
@@ -377,11 +524,15 @@ impl RuleEngine {
             tripped.entry(name.clone()).or_insert(false);
             fires.entry(name.clone()).or_insert(0);
         }
+        let (by_node, rule_intern, intern_rule) = rebuild_by_node(&prov);
         Self {
             rules,
             indexes,
             provenance: prov,
             owned,
+            by_node,
+            rule_intern,
+            intern_rule,
             tripped,
             fires,
         }
@@ -442,9 +593,21 @@ impl RuleEngine {
 
         // Phase 2: full desired set in deterministic BTree order, cap at budget.
         let desired = compute_full_desired(&def, &self.indexes[&name], g);
-        let prov = self.provenance.get_mut(&name).unwrap();
         let tripped = self.tripped.get_mut(&name).unwrap();
-        apply_desired(&def, desired, None, prov, &mut self.owned, tripped, g);
+        apply_desired(
+            &def,
+            desired,
+            None,
+            &mut ProvSets {
+                set: self.provenance.get_mut(&name).unwrap(),
+                owned: &mut self.owned,
+                by_node: &mut self.by_node,
+                rule_intern: &mut self.rule_intern,
+                intern_rule: &mut self.intern_rule,
+            },
+            tripped,
+            g,
+        );
         // Fires: one tick per participating node evaluated (same unit as
         // on_node_changed). Empty-graph create_rule therefore leaves fires=0.
         let fires = self.fires.get_mut(&name).unwrap();
@@ -462,13 +625,22 @@ impl RuleEngine {
         self.indexes.remove(name);
         self.tripped.remove(name);
         self.fires.remove(name);
-        let prov = self.provenance.remove(name).unwrap_or_default();
+        let mut leftover = self.provenance.remove(name).unwrap_or_default();
         // intern so the symbol exists; edge_type was already interned at create time.
         let _et = g.syms.intern(&def.edge_type);
-        for (t, s, d) in prov {
+        let triples: Vec<Triple> = leftover.iter().copied().collect();
+        let mut sets = ProvSets {
+            set: &mut leftover,
+            owned: &mut self.owned,
+            by_node: &mut self.by_node,
+            rule_intern: &mut self.rule_intern,
+            intern_rule: &mut self.intern_rule,
+        };
+        for triple in triples {
+            let (t, s, d) = triple;
             g.topo.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
-            self.owned.remove(&(t, s, d));
+            sets.remove(name, triple);
         }
         // Surviving rules that share the same edge_type may derive edges that
         // were previously blocked (add_edge returned false because the deleted
@@ -567,9 +739,21 @@ impl RuleEngine {
                     g,
                 ));
             }
-            let prov = self.provenance.entry(rule_name.clone()).or_default();
-            let tripped = self.tripped.entry(rule_name).or_default();
-            apply_desired(&def, desired, Some(n), prov, &mut self.owned, tripped, g);
+            let tripped = self.tripped.entry(rule_name.clone()).or_default();
+            apply_desired(
+                &def,
+                desired,
+                Some(n),
+                &mut ProvSets {
+                    set: self.provenance.entry(rule_name).or_default(),
+                    owned: &mut self.owned,
+                    by_node: &mut self.by_node,
+                    rule_intern: &mut self.rule_intern,
+                    intern_rule: &mut self.intern_rule,
+                },
+                tripped,
+                g,
+            );
         }
     }
 
@@ -581,8 +765,6 @@ impl RuleEngine {
     /// BTree triple order. A second call on an already-retracted node is a
     /// no-op (crash-window replay / absent state).
     pub fn on_node_removed(&mut self, n: u32, g: &mut GraphMut<'_>) {
-        // O(R x P) provenance scan: acceptable pre-alpha; at scale, index
-        // provenance by node (tracked for the performance plan).
         let n_label = g.labels.get(n as usize).copied();
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
 
@@ -605,20 +787,28 @@ impl RuleEngine {
                     idx.dst_side.remove(&spec, n, &cur_getter);
                 }
             }
+        }
 
-            let Some(prov) = self.provenance.get_mut(&rule_name) else {
-                continue;
-            };
-            let touching: Vec<(u32, u32, u32)> = prov
-                .iter()
-                .filter(|(_, s, d)| *s == n || *d == n)
-                .copied()
-                .collect();
-            for (t, s, d) in touching {
-                g.topo.remove_edge(t, s, d);
-                g.edge_props.remove_edge(t, s, d);
-                prov.remove(&(t, s, d));
-                self.owned.remove(&(t, s, d));
+        let touching: Vec<(String, Triple)> = self
+            .by_node
+            .get(&n)
+            .into_iter()
+            .flatten()
+            .map(|&(rid, t, s, d)| (self.intern_rule[rid as usize].clone(), (t, s, d)))
+            .collect();
+        for (rule_name, triple) in touching {
+            let (t, s, d) = triple;
+            g.topo.remove_edge(t, s, d);
+            g.edge_props.remove_edge(t, s, d);
+            if let Some(set) = self.provenance.get_mut(&rule_name) {
+                ProvSets {
+                    set,
+                    owned: &mut self.owned,
+                    by_node: &mut self.by_node,
+                    rule_intern: &mut self.rule_intern,
+                    intern_rule: &mut self.intern_rule,
+                }
+                .remove(&rule_name, triple);
             }
         }
     }
@@ -654,14 +844,33 @@ impl RuleEngine {
             self.tripped.insert(name.to_string(), true);
         } else {
             self.tripped.insert(name.to_string(), false);
-            let prov = self.provenance.get_mut(name).unwrap();
             let tripped = self.tripped.get_mut(name).unwrap();
-            apply_desired(&def, desired, None, prov, &mut self.owned, tripped, g);
+            apply_desired(
+                &def,
+                desired,
+                None,
+                &mut ProvSets {
+                    set: self.provenance.get_mut(name).unwrap(),
+                    owned: &mut self.owned,
+                    by_node: &mut self.by_node,
+                    rule_intern: &mut self.rule_intern,
+                    intern_rule: &mut self.intern_rule,
+                },
+                tripped,
+                g,
+            );
         }
         let fires = self.fires.entry(name.to_string()).or_default();
         bump_fires_for_participants(&def, g, fires);
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn by_node_consistent(&self) -> bool {
+        let (rebuilt, intern, names) = rebuild_by_node(&self.provenance);
+        resolve_by_node(&self.by_node, &self.intern_rule) == resolve_by_node(&rebuilt, &names)
+            && intern.len() == names.len()
     }
 }
 
@@ -1463,5 +1672,132 @@ mod tests {
         assert!(pair_edges(&fx.topo, near, ca, cb));
         assert!(pair_edges(&fx.topo, ngeo, pa, lo));
         assert!(pair_edges(&fx.topo, sim, da, db));
+    }
+
+    fn fk_rule() -> RuleDef {
+        RuleDef {
+            name: "works_at".into(),
+            src_label: "T".into(),
+            dst_label: "C".into(),
+            predicate: Predicate::KeyMatch {
+                field: "cid".into(),
+            },
+            edge_type: "AT".into(),
+            weight_prop: None,
+            max_edges: None,
+        }
+    }
+
+    #[test]
+    fn by_node_matches_rebuild_after_mutation_storm() {
+        let mut fx = Fx::new();
+        let hub = fx.add("C", "hub", vec![]);
+        let other = fx.add("C", "other", vec![]);
+        let mut people = Vec::new();
+        for i in 0..40 {
+            let cid = if i < 30 { "hub" } else { "other" };
+            people.push(fx.add(
+                "T",
+                &format!("t{i}"),
+                vec![("cid", Value::Str(cid.into())), ("tags", tags(&["x", "y"]))],
+            ));
+        }
+        let mut overlap = overlap_rule();
+        overlap.src_label = "T".into();
+        overlap.dst_label = "T".into();
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(fk_rule(), &mut g).unwrap();
+            eng.create_rule(overlap, &mut g).unwrap();
+        }
+        assert!(eng.by_node_consistent());
+        assert_eq!(eng.provenance_touching_len(hub), 30);
+
+        // Incremental: re-home half the hub people, flip tags, then restore.
+        for (i, &id) in people.iter().enumerate().take(15) {
+            let old = fx.props.get(id, "cid").cloned();
+            fx.props.set(id, "cid", Value::Str("other".into()));
+            let mut g = fx.g();
+            eng.on_node_changed(id, Some(("cid", old)), &mut g);
+            assert!(
+                eng.by_node_consistent(),
+                "inconsistent after cid update {i}"
+            );
+        }
+        for &id in people.iter().take(8) {
+            let old = fx.props.get(id, "tags").cloned();
+            fx.props.set(id, "tags", tags(&["q"]));
+            let mut g = fx.g();
+            eng.on_node_changed(id, Some(("tags", old)), &mut g);
+        }
+        assert!(eng.by_node_consistent());
+
+        // Delete-node cleanup uses the reverse index.
+        {
+            let mut g = fx.g();
+            eng.on_node_removed(people[0], &mut g);
+        }
+        fx.labels[people[0] as usize] = u32::MAX;
+        assert!(eng.by_node_consistent());
+        assert_eq!(eng.provenance_touching_len(people[0]), 0);
+
+        {
+            let mut g = fx.g();
+            eng.rebuild("works_at", &mut g).unwrap();
+            eng.rebuild("rel", &mut g).unwrap();
+        }
+        assert!(eng.by_node_consistent());
+
+        {
+            let mut g = fx.g();
+            eng.delete_rule("rel", &mut g).unwrap();
+        }
+        assert!(eng.by_node_consistent());
+        assert_eq!(eng.provenance_touching(people[1]).count(), 1);
+
+        // Persist-restore rebuilds the reverse index from provenance.
+        let (defs, prov, tripped, fires) = eng.to_persist();
+        let restored = RuleEngine::from_persist(defs, prov, tripped, fires);
+        assert!(restored.by_node_consistent());
+        assert_eq!(
+            restored.provenance_touching_len(hub),
+            eng.provenance_touching_len(hub)
+        );
+        assert_eq!(
+            restored.provenance_touching_len(other),
+            eng.provenance_touching_len(other)
+        );
+    }
+
+    #[test]
+    fn provenance_touching_high_degree_hub() {
+        let mut fx = Fx::new();
+        let hub = fx.add("C", "hub", vec![]);
+        let mut first = None;
+        for i in 0..256 {
+            let id = fx.add(
+                "T",
+                &format!("t{i}"),
+                vec![("cid", Value::Str("hub".into()))],
+            );
+            if first.is_none() {
+                first = Some(id);
+            }
+        }
+        let first = first.unwrap();
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(fk_rule(), &mut g).unwrap();
+        }
+        assert!(eng.by_node_consistent());
+        assert_eq!(eng.provenance_touching_len(hub), 256);
+        assert_eq!(eng.provenance_touching_len(first), 1);
+        let hits: Vec<_> = eng.provenance_touching(first).collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "works_at");
+        assert_eq!(hits[0].2, first);
+        assert_eq!(hits[0].3, hub);
     }
 }
