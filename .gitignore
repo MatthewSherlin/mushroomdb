@@ -1,5 +1,12 @@
 target/
 .superpowers/
+bindings/python/.venv/
+bindings/python/.pytest_cache/
+bindings/python/**/__pycache__/
+*.pyc
+*.so
+*.dylib
+*.pyd
 ui/node_modules/
 ui/dist/
 ui/playwright-report/

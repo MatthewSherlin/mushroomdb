@@ -10,6 +10,20 @@ members = [
     "crates/server",
     "crates/cli",
     "crates/core-bench",
+    "bindings/python",
+]
+# Keep the default (rust-only) gate free of pyo3. `cargo test --workspace`
+# still sees bindings/python; CI rust job is unchanged and must keep passing.
+default-members = [
+    "crates/core-storage",
+    "crates/core-api",
+    "crates/sim-harness",
+    "crates/core-rules",
+    "crates/core-query",
+    "crates/arrow-bridge",
+    "crates/server",
+    "crates/cli",
+    "crates/core-bench",
 ]
 
 [workspace.dependencies]

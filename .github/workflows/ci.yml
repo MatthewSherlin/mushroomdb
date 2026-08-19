@@ -69,3 +69,20 @@ jobs:
             ui/playwright-report
             ui/test-results
           if-no-files-found: ignore
+
+  python:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bindings/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.92.0" }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m venv .venv
+      - run: .venv/bin/pip install -U pip maturin pytest
+      - run: .venv/bin/maturin develop
+      - run: .venv/bin/pytest

@@ -1,0 +1,17 @@
+[package]
+name = "mushroomdb"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Python bindings for mushroomdb"
+publish = false
+
+[lib]
+name = "mushroomdb"
+crate-type = ["cdylib"]
+
+[dependencies]
+core-api = { path = "../../crates/core-api" }
+core-storage = { path = "../../crates/core-storage" }
+pyo3 = { version = "0.26", features = ["extension-module"] }
+serde_json = { workspace = true }

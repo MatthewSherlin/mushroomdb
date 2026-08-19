@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "mushroomdb"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "Embedded mushroomdb Python bindings"
+
+[tool.maturin]
+module-name = "mushroomdb"
+manifest-path = "Cargo.toml"
+features = ["pyo3/extension-module"]
