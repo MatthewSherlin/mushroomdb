@@ -179,6 +179,20 @@ def test_ingest_batch_with_edges(tmp_path):
     db.close()
 
 
+def test_ingest_batch_duplicate_edge_not_counted(tmp_path):
+    """Resubmitting an existing edge must not increment edges_inserted.
+    Mirrors HTTP /ingest duplicate-edge semantics from P9 T7."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    # Create two nodes first via single inserts, then test edge-only batches.
+    db.insert_node("m", "N", {})
+    db.insert_node("n", "N", {})
+    r1 = db.ingest_batch([], [{"edge_type": "REL", "src": "m", "dst": "n"}])
+    assert r1["edges_inserted"] == 1  # new edge — counted
+    r2 = db.ingest_batch([], [{"edge_type": "REL", "src": "m", "dst": "n"}])
+    assert r2["edges_inserted"] == 0  # duplicate — not counted
+    db.close()
+
+
 # ---------------------------------------------------------------------------
 # stats
 # ---------------------------------------------------------------------------

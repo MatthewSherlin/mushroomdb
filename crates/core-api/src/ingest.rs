@@ -255,7 +255,7 @@ pub(crate) fn run<F: Fs>(
     for (etype, src, dst) in edges {
         batch.insert_edge(etype, src, dst);
     }
-    let edges_inserted = batch.commit_ingest(label, accepted.len())?;
+    let (_, edges_inserted) = batch.commit_ingest(label, accepted.len())?;
 
     Ok(IngestReport {
         inserted: accepted.len(),

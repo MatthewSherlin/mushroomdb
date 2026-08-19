@@ -748,7 +748,7 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         ops: Vec<BatchOp>,
         ingest: Option<(String, usize)>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, usize)> {
         let recs = {
             let mut preview = MutPreview::new(self);
             let mut recs = Vec::with_capacity(ops.len());
@@ -822,18 +822,22 @@ impl<F: Fs> GraphDb<F> {
             recs
         };
         if recs.is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
+        let nodes_inserted = recs
+            .iter()
+            .filter(|r| matches!(r, WalRecord::InsertNode { .. }))
+            .count();
         let edges_inserted = recs
             .iter()
             .filter(|r| matches!(r, WalRecord::InsertEdge { .. }))
             .count();
         self.log_then_apply_with(WalRecord::Batch(recs), ingest)?;
-        Ok(edges_inserted)
+        Ok((nodes_inserted, edges_inserted))
     }
 
-    fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<()> {
-        self.commit_logged_batch(ops, None).map(|_| ())
+    fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<(usize, usize)> {
+        self.commit_logged_batch(ops, None)
     }
 
     pub fn insert_node(
@@ -1758,14 +1762,19 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
     /// is unaffected (idempotent apply, provenance intact). Create rules in
     /// their own batch, or sequentially, when later ops may touch derived
     /// edges.
-    pub fn commit(&mut self) -> Result<()> {
+    /// Validate every queued op and commit atomically.
+    ///
+    /// Returns `(nodes_inserted, edges_inserted)` — the counts of node and edge
+    /// WAL records actually written (duplicate edges are silent no-ops and are
+    /// NOT counted). Both are 0 when the batch is empty or all-noop.
+    pub fn commit(&mut self) -> Result<(usize, usize)> {
         let ops = std::mem::take(&mut self.ops);
         self.db.commit_batch(ops)
     }
 
     /// Same as [`commit`](Self::commit) but tail the inner events with
     /// [`MutationEvent::Ingested`] instead of [`MutationEvent::BatchApplied`].
-    pub(crate) fn commit_ingest(&mut self, label: &str, inserted: usize) -> Result<usize> {
+    pub(crate) fn commit_ingest(&mut self, label: &str, inserted: usize) -> Result<(usize, usize)> {
         let ops = std::mem::take(&mut self.ops);
         self.db
             .commit_logged_batch(ops, Some((label.to_string(), inserted)))

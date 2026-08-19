@@ -100,6 +100,13 @@ impl GraphDb {
     ///
     /// Returns a dict matching `IngestReport` shape:
     /// `{inserted, edges_inserted, row_errors, rules_created, skipped_fk_fields}`.
+    /// `edges_inserted` counts only newly written edges; duplicate edges that
+    /// already exist are silent no-ops and are NOT counted.
+    ///
+    /// **Performance note**: for large datasets keep each call to ≤10 000 nodes.
+    /// A single call with 100 000+ nodes serialises one giant WAL frame whose
+    /// fsync cost dominates and negates the batching benefit.  Chunk at the
+    /// call site (e.g. `for chunk in batched(nodes, 10_000)`).
     #[pyo3(signature = (nodes, edges=None))]
     fn ingest_batch(
         &self,
@@ -155,11 +162,8 @@ impl GraphDb {
             }
         }
 
-        let n_nodes = node_ops.len();
-        let n_edges = edge_ops.len();
-
-        // Commit atomically via BatchBuilder.
-        self.with_mut(|db| {
+        // Commit atomically via BatchBuilder; capture the actual WAL counts.
+        let (nodes_inserted, edges_inserted) = self.with_mut(|db| {
             let mut batch = db.batch();
             for (label, key, props) in node_ops {
                 batch.insert_node(&label, &key, props);
@@ -170,10 +174,10 @@ impl GraphDb {
             batch.commit()
         })?;
 
-        // Build synthetic IngestReport-shaped dict.
+        // Build IngestReport-shaped dict with accurate counts.
         let d = PyDict::new(py);
-        d.set_item("inserted", n_nodes)?;
-        d.set_item("edges_inserted", n_edges)?;
+        d.set_item("inserted", nodes_inserted)?;
+        d.set_item("edges_inserted", edges_inserted)?;
         d.set_item("row_errors", PyList::empty(py))?;
         d.set_item("rules_created", PyList::empty(py))?;
         d.set_item("skipped_fk_fields", PyList::empty(py))?;
