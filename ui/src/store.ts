@@ -19,7 +19,9 @@
  * - `mergeNeighborhoodWithEdges(root, perEtypeNeighbors, dir?)` — for each
  *   etype → neighbor keys: ensure stub nodes exist, then add directed edges.
  *   `dir: "out"` (default) stores `etype|root|nbr`; `dir: "in"` stores
- *   `etype|nbr|root`. Re-merge is idempotent. Clears `needsEdges(root)`.
+ *   `etype|nbr|root`. A typed (non-`related`) merge drops any legacy
+ *   `related` edge between the same endpoints, both orientations. Re-merge
+ *   is idempotent. Clears `needsEdges(root)`.
  * - `mergeQueryGraph(columns, rows)` — ingest `/query?format=json`. The
  *   server serializes `RETURN n` as the node key string. A `key`+`label`
  *   pair is bound when those columns exist; otherwise every string cell in
@@ -137,6 +139,10 @@ export class GraphStore {
         const src = dir === "out" ? root : nbr;
         const dst = dir === "out" ? nbr : root;
         this.upsertEdge(etype, src, dst);
+        // USER_ETYPE ("related") — typed merge supersedes the legacy ghost.
+        if (etype !== "related") {
+          this.dropLegacyRelated(src, dst);
+        }
       }
     }
     this.edgesReady.add(root);
@@ -414,9 +420,7 @@ export class GraphStore {
     if (!this.nodes.has(ev.src) || !this.nodes.has(ev.dst)) {
       return;
     }
-    const id = edgeId(ev.edge_type, ev.src, ev.dst);
-    this.edges.delete(id);
-    this.clearSelectionIfEdge(id);
+    this.removeEdge(edgeId(ev.edge_type, ev.src, ev.dst));
   }
 
   private onNodeDeleted(key: string): void {
@@ -425,13 +429,28 @@ export class GraphStore {
     this.edgesReady.delete(key);
     for (const [id, edge] of [...this.edges.entries()]) {
       if (edge.src === key || edge.dst === key) {
-        this.edges.delete(id);
-        this.clearSelectionIfEdge(id);
+        this.removeEdge(id);
       }
     }
     if (this.selection?.kind === "node" && this.selection.id === key) {
       this.selection = null;
     }
+  }
+
+  /** Drop legacy `related` ghosts both ways — synthesis was directionless. */
+  private dropLegacyRelated(src: string, dst: string): void {
+    this.removeEdge(edgeId("related", src, dst));
+    if (src !== dst) {
+      this.removeEdge(edgeId("related", dst, src));
+    }
+  }
+
+  private removeEdge(id: string): void {
+    if (!this.edges.has(id)) {
+      return;
+    }
+    this.edges.delete(id);
+    this.clearSelectionIfEdge(id);
   }
 
   private clearSelectionIfEdge(id: string): void {

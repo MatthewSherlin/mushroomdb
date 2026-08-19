@@ -4,7 +4,9 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { Explanation, QueryResult } from "./api";
 import type { MutationEvent } from "./watch";
+import { USER_ETYPE } from "./classify";
 import { COLOR, GraphStore, edgeId, type CosmosSnapshot } from "./store";
+import { whyEdgeMissing } from "./why";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const tokens = readFileSync(join(here, "tokens.css"), "utf8");
@@ -153,6 +155,34 @@ describe("fromNeighborhood + mergeNeighborhoodWithEdges", () => {
     store.fromNeighborhood("a", neighborhood([["b", "Person", 1]]));
     store.mergeNeighborhoodWithEdges("x", { KNOWS: ["b"] });
     expect(store.nodes.get("b")?.label).toBe("Person");
+  });
+
+  it("typed merge drops legacy related ghosts both ways and clears ghost selection", () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", neighborhood([["b", "Person", 1]]));
+    store.mergeNeighborhoodWithEdges("a", { [USER_ETYPE]: ["b"] });
+    store.mergeNeighborhoodWithEdges("b", { [USER_ETYPE]: ["a"] }, "out");
+    const ghostAb = edgeId(USER_ETYPE, "a", "b");
+    const ghostBa = edgeId(USER_ETYPE, "b", "a");
+    expect(store.edges.has(ghostAb)).toBe(true);
+    expect(store.edges.has(ghostBa)).toBe(true);
+    store.select({ kind: "edge", id: ghostAb });
+
+    store.mergeNeighborhoodWithEdges("a", { WORKS_AT: ["b"] });
+
+    expect(store.edges.has(ghostAb)).toBe(false);
+    expect(store.edges.has(ghostBa)).toBe(false);
+    expect([...store.edges.keys()]).toEqual([edgeId("WORKS_AT", "a", "b")]);
+    expect(store.selection).toBeNull();
+    expect(whyEdgeMissing(store, ghostAb)).toBe(true);
+  });
+
+  it("merging related itself does not drop an existing related edge", () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", neighborhood([["b", "Person", 1]]));
+    store.mergeNeighborhoodWithEdges("a", { [USER_ETYPE]: ["b"] });
+    store.mergeNeighborhoodWithEdges("a", { [USER_ETYPE]: ["b"] });
+    expect([...store.edges.keys()]).toEqual([edgeId(USER_ETYPE, "a", "b")]);
   });
 
   it("clears the root's dirty mark on fromNeighborhood", () => {

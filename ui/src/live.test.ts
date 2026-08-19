@@ -249,6 +249,78 @@ describe("resyncNeighborhoods / glowBornDerived", () => {
       glowBornDerived([edgeId("FIT", "a", "c")], [edgeId("FIT", "a", "c")], true),
     ).toEqual([]);
   });
+
+  function apiWithTypedEdges(): { api: ExpandApi; explainCalls: { n: number } } {
+    const explainCalls = { n: 0 };
+    const api: ExpandApi = {
+      query: async () => ({ columns: ["n"], rows: [] }),
+      neighborhood: async (key, opts = {}) => {
+        const dir = opts.dir ?? "both";
+        if (key === "a" && (dir === "out" || dir === "both")) {
+          return nb([["b", "Person", 1]]);
+        }
+        return nb([]);
+      },
+      explain: async () => {
+        explainCalls.n += 1;
+        return [];
+      },
+      nodeInfo: async () => {
+        throw new ApiError(404, "Not Found");
+      },
+      nodeEdges: async (key) => {
+        if (key === "a" || key === "b") {
+          return {
+            edges: [
+              {
+                edge_type: "WORKS_AT",
+                src_key: "a",
+                dst_key: "b",
+                derived: false,
+              },
+              {
+                edge_type: "FIT",
+                src_key: "a",
+                dst_key: "b",
+                derived: true,
+              },
+            ],
+          };
+        }
+        return { edges: [] };
+      },
+    };
+    return { api, explainCalls };
+  }
+
+  it("new-server resync classifies from nodeEdges, not explain", async () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", nb([["b", "Person", 1]]));
+    const { api, explainCalls } = apiWithTypedEdges();
+    await resyncNeighborhoods(store, api, true);
+    expect(store.edges.get(edgeId("WORKS_AT", "a", "b"))?.derived).toBe(false);
+    expect(store.edges.get(edgeId("FIT", "a", "b"))?.derived).toBe(true);
+    expect(store.edges.has(edgeId(USER_ETYPE, "a", "b"))).toBe(false);
+    expect(explainCalls.n).toBe(0);
+  });
+
+  it("resync supersedes a live related ghost with the typed endpoint edge", async () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", nb([["b", "Person", 1]]));
+    store.mergeNeighborhoodWithEdges("a", { [USER_ETYPE]: ["b"] });
+    const ghost = edgeId(USER_ETYPE, "a", "b");
+    store.setProvenance(ghost, null);
+    store.select({ kind: "edge", id: ghost });
+
+    const { api } = apiWithTypedEdges();
+    await resyncNeighborhoods(store, api, true);
+
+    expect(store.edges.has(ghost)).toBe(false);
+    expect(store.edges.has(edgeId(USER_ETYPE, "b", "a"))).toBe(false);
+    expect(store.edges.has(edgeId("WORKS_AT", "a", "b"))).toBe(true);
+    expect(store.edges.has(edgeId("FIT", "a", "b"))).toBe(true);
+    expect(store.selection).toBeNull();
+  });
 });
 
 describe("ResyncGate", () => {
