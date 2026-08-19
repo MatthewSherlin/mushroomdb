@@ -276,15 +276,28 @@ fn cosine(a: &[f64], b: &[f64]) -> Option<f64> {
 /// cos_max = (dot_so_far + ckpts_a[c+1] × ckpts_b[c+1]) / (norm_a × norm_b)
 /// ```
 ///
-/// where `ckpts_x[i]` = L2 norm of `x[i * dim / 8 ..]`.  If `cos_max < min`,
-/// the pair is provably below threshold and `None` is returned immediately
-/// (exact reject — Cauchy-Schwarz is tight).  If all checkpoints pass, the
-/// full dot product has been accumulated and the cosine is returned normally.
+/// where `ckpts_x[i]` = L2 norm of `x[i * dim / 8 ..]`.  If `cos_max <
+/// min − eps` (with `eps = dim × f64::EPSILON × 4`), the pair is provably
+/// below threshold and `None` is returned immediately (exact reject in exact
+/// arithmetic; the epsilon guard absorbs IEEE 754 rounding in suffix-norm
+/// accumulation at dim-scale — approximately 3.4 × 10⁻¹³ at dim = 1536).
+/// If all checkpoints pass, the full dot product has been accumulated and the
+/// cosine is returned normally.
 ///
-/// The caller is responsible for ensuring `ckpts_a`/`ckpts_b` are fresh for
-/// the live vectors (see `SideIndex::fresh_ckpts_for`).  Stale checkpoints
-/// can only cause false **accepts** (not false rejects), so the function is
-/// always safe to call; freshness only affects performance.
+/// # Correctness requirement — checkpoints must be fresh
+///
+/// `ckpts_a`/`ckpts_b` **must be fresh** for the live vectors (see
+/// `SideIndex::fresh_ckpts_for`).  A permuted vector that shares `(dim, norm)`
+/// with the indexed one passes a pure norm-based gate yet carries a different
+/// suffix energy distribution — stale checkpoints can produce a **false
+/// reject** (under-tight suffix bound), violating the exactness invariant.
+///
+/// The real coherence guarantee is structural: checkpoint rebuilds flow
+/// through the same mutation choke-points as `vec_meta` (insert/remove in
+/// `on_node_changed`), making live/cache divergence unreachable in
+/// single-writer operation.  `fresh_ckpts_for`'s dim/norm/anchor comparison
+/// is defense-in-depth — belt-and-suspenders against bugs in those
+/// choke-points, not a standalone proof.
 ///
 /// # Arguments
 /// * `norm_a`, `norm_b` — precomputed L2 norms (must match `ckpts_x[0]`).
@@ -307,6 +320,12 @@ pub fn cosine_early_exit(
         return None;
     }
 
+    // Epsilon guard: suffix-norm accumulation rounds suffix_sq slightly low,
+    // making cos_max_fl potentially below the true Cauchy-Schwarz bound.  At
+    // dim=1536 the error floor is ~dim × f64::EPSILON ≈ 3.4×10⁻¹³.  4× margin
+    // keeps the guard conservative without meaningfully expanding the pass-through
+    // zone (a few extra evaluate() calls near threshold, never a false reject).
+    let eps = dim as f64 * f64::EPSILON * 4.0;
     let mut dot = 0.0f64;
 
     for ci in 0..8usize {
@@ -316,12 +335,12 @@ pub fn cosine_early_exit(
             dot += a[k] * b[k];
         }
         // After processing this chunk (not the last), compute the upper bound
-        // for the remaining suffix using Cauchy-Schwarz.
+        // for the remaining suffix using Cauchy-Schwarz.  Guard: bail only
+        // when the bound is below min - eps to absorb float-rounding slack.
         if ci < 7 {
             let bound = ckpts_a[ci + 1] * ckpts_b[ci + 1];
             let cos_max = (dot + bound) / denom;
-            // Reject only when the bound is finite and strictly below min.
-            if cos_max.is_finite() && cos_max < min {
+            if cos_max.is_finite() && cos_max < min - eps {
                 return None;
             }
         }

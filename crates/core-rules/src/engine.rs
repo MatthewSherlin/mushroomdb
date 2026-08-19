@@ -236,7 +236,7 @@ fn compute_desired(
                         } else {
                             (vm.as_slice(), ckpts_m, norm_m, vn.as_slice(), ckpts_n, *norm_n)
                         };
-                        match crate::def::cosine_early_exit(va, vb, &ckpts_a, ckpts_b, na, nb, *min)
+                        match crate::def::cosine_early_exit(va, vb, ckpts_a, ckpts_b, na, nb, *min)
                         {
                             None => continue,          // exact reject
                             Some(score) => {
@@ -2827,6 +2827,119 @@ mod tests {
         assert!(
             gate_result.is_some(),
             "freshness gate must accept the matching live vector"
+        );
+    }
+
+    /// Razor test: dim=1536 pair with true cosine within 1e-12 of `min`.
+    ///
+    /// Purpose: with energy spread uniformly across all 1536 elements, each
+    /// checkpoint boundary contributes a tiny slice of dot product.  Float
+    /// rounding of suffix-norm accumulation can shift `cos_max` by O(dim × ε)
+    /// ≈ 3.4 × 10⁻¹³ at dim=1536, inside the 1e-12 margin tested here.  The
+    /// epsilon guard in `cosine_early_exit` absorbs this; ON/OFF/oracle must
+    /// agree on all edges.
+    #[test]
+    fn vector_early_exit_razor_dim1536() {
+        const MIN: f64 = 0.85;
+        const DIM: usize = 1536;
+        // target cosine = min + 5e-13: inside the dim-scale float-error zone.
+        let target = MIN + 5e-13;
+        let inv_sqrt = 1.0 / (DIM as f64).sqrt();
+
+        // a: unit-norm uniform vector — energy spread equally across all chunks.
+        let a: Vec<f64> = vec![inv_sqrt; DIM];
+
+        // b = target * a + sqrt(1 - target^2) * e_perp
+        // e_perp = [1, -1, 0, ..., 0] / sqrt(2) is perpendicular to uniform a:
+        //   dot(a, e_perp) = inv_sqrt * (1 - 1) / sqrt(2) = 0  ✓
+        // norm(b) = sqrt(target^2 + (1-target^2)) = 1            ✓
+        // cos(a, b) = dot(a, b) = target * dot(a, a) = target    ✓
+        let perp_scale = (1.0 - target * target).sqrt() / (2.0f64).sqrt();
+        let mut b: Vec<f64> = vec![target * inv_sqrt; DIM];
+        b[0] += perp_scale;
+        b[1] -= perp_scale;
+
+        let def = RuleDef {
+            name: "razor".into(),
+            src_label: "Doc".into(),
+            dst_label: "Doc".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: MIN,
+            },
+            edge_type: "SIM".into(),
+            weight_prop: None,
+            max_edges: None,
+        };
+
+        // Three independent fixtures with the same razor pair.
+        let mut build_fx = || {
+            let mut fx = Fx::new();
+            let na = fx.add("Doc", "razor_a", vec![("emb", emb_val2(&a))]);
+            let nb = fx.add("Doc", "razor_b", vec![("emb", emb_val2(&b))]);
+            (fx, na, nb)
+        };
+
+        let (mut fx_on, na, nb) = build_fx();
+        let (mut fx_off, _, _) = build_fx();
+        let (fx_oracle, _, _) = build_fx();
+
+        // ON
+        let mut eng_on = RuleEngine::new();
+        {
+            let mut g = fx_on.g();
+            eng_on.create_rule(def.clone(), &mut g).unwrap();
+        }
+        let edges_on = prov_pairs(&eng_on, "razor");
+        assert!(
+            edges_on.contains(&(na, nb)),
+            "razor pair razor_a→razor_b must be present with early-exit ON (cos={target:.15}, min={MIN})"
+        );
+        assert!(
+            edges_on.contains(&(nb, na)),
+            "razor pair razor_b→razor_a must be present with early-exit ON"
+        );
+
+        // OFF
+        let mut eng_off = RuleEngine::new();
+        {
+            let mut g = fx_off.g();
+            with_vector_early_exit(false, || {
+                eng_off.create_rule(def.clone(), &mut g).unwrap();
+            });
+        }
+        let edges_off = prov_pairs(&eng_off, "razor");
+        assert_eq!(
+            edges_on, edges_off,
+            "razor dim=1536: early-exit ON vs OFF must produce identical edges"
+        );
+
+        // Brute-force oracle.
+        let ids = [na, nb];
+        let mut oracle = BTreeSet::new();
+        for &s in &ids {
+            for &d in &ids {
+                if s == d {
+                    continue;
+                }
+                let skey = fx_oracle.ids.key_of(s).unwrap();
+                let dkey = fx_oracle.ids.key_of(d).unwrap();
+                let sg = |f: &str| fx_oracle.props.get(s, f).cloned();
+                let dg = |f: &str| fx_oracle.props.get(d, f).cloned();
+                if evaluate(
+                    &def.predicate,
+                    &NodeView { key: skey, props: &sg },
+                    &NodeView { key: dkey, props: &dg },
+                )
+                .is_some()
+                {
+                    oracle.insert((s, d));
+                }
+            }
+        }
+        assert_eq!(
+            edges_on, oracle,
+            "razor dim=1536: early-exit ON vs brute-force oracle must be identical"
         );
     }
 }

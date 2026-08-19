@@ -63,8 +63,8 @@ pub struct SideIndex {
     by_key: BTreeMap<ValueKey, BTreeSet<u32>>,
     /// Per-node `(dim, L2 norm)` for `ScanAll` members. Maintained by the
     /// same insert/remove choke-points as `by_key`. Cosine still reads live
-    /// props; `dim` is a fast-reject; `norm` is the freshness gate for the
-    /// checkpointed Cauchy-Schwarz early-exit (Plan 11 T3).
+    /// props; `dim` is a fast-reject; `norm` is the primary freshness gate for
+    /// the checkpointed Cauchy-Schwarz early-exit (Plan 11 T3).
     vec_meta: BTreeMap<u32, (u32, f64)>,
     /// Per-node checkpointed suffix norms for the Cauchy-Schwarz early-exit.
     /// `ckpts[i]` = L2 norm of `xs[i * dim / 8 ..]`.
@@ -73,6 +73,13 @@ pub struct SideIndex {
     /// with `vec_meta` by the same choke-points.
     /// Memory: 8 × 8 = 64 bytes per indexed vector (6.4 MB at 100k vectors).
     vec_checkpoints: BTreeMap<u32, [f64; 8]>,
+    /// Per-node first element (`xs[0]`) for heuristic permutation detection.
+    /// A permuted vector can share `(dim, norm)` with the indexed one but
+    /// differs at `xs[0]` in virtually all realistic cases, so comparing this
+    /// one extra f64 (8 bytes per vector) breaks same-norm permutation aliasing
+    /// cheaply.  This is heuristic hardening — not a proof — but eliminates
+    /// the energy-distribution construction identified in the Plan 11 T3 review.
+    vec_anchor: BTreeMap<u32, f64>,
 }
 
 #[derive(Debug, Default)]
@@ -347,6 +354,8 @@ impl SideIndex {
                 let norm = n2.sqrt();
                 self.vec_meta.insert(node, (xs.len() as u32, norm));
                 self.vec_checkpoints.insert(node, compute_ckpts(&xs));
+                // xs is non-empty (as_numeric_list rejects empty lists).
+                self.vec_anchor.insert(node, xs[0]);
             }
         }
     }
@@ -364,6 +373,7 @@ impl SideIndex {
             if get(field).as_ref().and_then(as_numeric_list).is_some() {
                 self.vec_meta.remove(&node);
                 self.vec_checkpoints.remove(&node);
+                self.vec_anchor.remove(&node);
             }
         }
     }
@@ -383,21 +393,32 @@ impl SideIndex {
         self.vec_checkpoints.get(&node)
     }
 
-    /// Returns `(cached_norm, &checkpoints)` if the cached `(dim, norm)`
-    /// exactly matches `live`'s `(dim, norm)`.
+    /// Returns `(cached_norm, &checkpoints)` if the cached state matches the
+    /// live vector under all three freshness checks.
     ///
-    /// # Stale-cache gate (exactness invariant)
+    /// # Stale-cache gate
     ///
-    /// The checkpoints are computed from the indexed vector at insert time.
-    /// If the live prop differs from the indexed one, the checkpoints are
-    /// stale and could produce a FALSE REJECT (under-approximation, forbidden).
-    /// The exact-equality guard on `(dim, norm)` prevents this: if the live
-    /// vector has changed, its norm will differ, and we return `None`,
-    /// forcing a fall-through to the brute-force `evaluate()` path.
+    /// Stale checkpoints (from a vector that differs from `live`) can produce
+    /// **false rejects** — the Cauchy-Schwarz suffix bound may be under-tight
+    /// for the live vector's actual energy distribution.  Three guards defend
+    /// against this in ascending selectivity order:
     ///
-    /// In normal operation the index choke-points (insert/remove in
-    /// `on_node_changed`) ensure the cache is always coherent with live props
-    /// by evaluation time.  The guard is belt-and-suspenders.
+    /// 1. **Dim check** — `cached_dim == live.len()`.  Different lengths →
+    ///    immediate fallback.
+    /// 2. **Norm check** — recomputes L2 norm with the same sequential
+    ///    accumulation used at insert time so bits are identical for an unchanged
+    ///    vector.  Changed norm → fallback.
+    /// 3. **Anchor check** — compares `xs[0]` against the cached first element.
+    ///    A permuted vector can share `(dim, norm)` with the indexed one but
+    ///    differ at `xs[0]`, breaking the most realistic same-norm aliasing
+    ///    attack.  This is **heuristic hardening**, not a proof: a permutation
+    ///    that preserves `xs[0]` would still pass, but is vanishingly unlikely
+    ///    in practice.
+    ///
+    /// The real coherence guarantee is structural: checkpoint rebuilds flow
+    /// through the same insert/remove choke-points as `vec_meta`, so in
+    /// normal single-writer operation the cache is always coherent.  These
+    /// gates are belt-and-suspenders against bugs in those choke-points.
     pub(crate) fn fresh_ckpts_for<'a>(
         &'a self,
         node: u32,
@@ -418,6 +439,14 @@ impl SideIndex {
         };
         if norm != live_norm {
             return None; // stale — fall back to brute-force evaluate()
+        }
+        // Heuristic anchor check: first element breaks same-norm permutation
+        // aliasing in virtually all realistic cases.  dim > 0 guaranteed (dim
+        // was stored from non-empty xs; live.len() == dim > 0).
+        let live_anchor = live[0];
+        let &cached_anchor = self.vec_anchor.get(&node)?;
+        if live_anchor != cached_anchor {
+            return None;
         }
         let ckpts = self.vec_checkpoints.get(&node)?;
         Some((norm, ckpts))
