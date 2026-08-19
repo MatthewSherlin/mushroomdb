@@ -3,7 +3,12 @@
 Cross-label: a rule binds one (src_label, dst_label) pair. Industry and
 specialty (and location, because jobs carry geo) are declared twice —
 Talent→Company and Talent→Job. Size / design-style / semantic are
-Talent→Company only. That is 9 rule instances.
+Talent→Company only. That is 9 primary rule instances.
+
+A tenth instance, `similar_size_strict_tc` (tolerance=0), is added as a
+negative-case oracle: the verbatim fixture bucket space {2, 3} means
+tolerance=1 is vacuously all-match; tolerance=0 produces exactly the 5
+same-bucket pairs and provably excludes the 5 cross-bucket pairs.
 
 `field_equal(industry)` is binary (score 1.0). marketplace scores industry
 `both` at 0.8 — documented composition gap, not chased.
@@ -95,5 +100,15 @@ SIX_RULES: list[dict[str, Any]] = [
         "Company",
         {"VectorSimilar": {"field": "embedding", "min": 0.85}},
         "SEMANTIC_MATCH",
+    ),
+    # Negative-case oracle: tolerance=0 fires only on exact-bucket pairs.
+    # With verbatim fixture buckets {2, 3} the 5 cross-bucket pairs are provably
+    # absent, giving a genuine false-positive guard for numeric_within.
+    _rule(
+        "similar_size_strict_tc",
+        "Talent",
+        "Company",
+        {"NumericWithin": {"field": "size_bucket", "tolerance": 0.0}},
+        "SIMILAR_SIZE_STRICT",
     ),
 ]
