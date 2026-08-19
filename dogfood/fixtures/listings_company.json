@@ -1,0 +1,38 @@
+[
+  {
+    "id": "listing-company-firma",
+    "attributes": {
+      "state": "published",
+      "title": "Firma Design Studio",
+      "createdAt": "2023-01-10T10:00:00.000Z",
+      "publicData": {
+        "email": "info@firma.com",
+        "industry": "architecture",
+        "primarySpecialty": "residential",
+        "companySize": "10-50",
+        "website": "https://firma.com"
+      }
+    },
+    "relationships": {
+      "author": {"data": {"id": "st-user-firma", "type": "user"}}
+    }
+  },
+  {
+    "id": "listing-company-firmb",
+    "attributes": {
+      "state": "published",
+      "title": "FirmB Interiors",
+      "createdAt": "2023-01-12T10:00:00.000Z",
+      "publicData": {
+        "email": "info@firmb.com",
+        "industry": "interior-design",
+        "primarySpecialty": "hospitality",
+        "companySize": "50-200",
+        "website": "https://firmb.com"
+      }
+    },
+    "relationships": {
+      "author": {"data": {"id": "st-user-firmb", "type": "user"}}
+    }
+  }
+]

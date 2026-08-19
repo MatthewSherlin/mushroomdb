@@ -1,0 +1,13 @@
+[
+  {
+    "id": "app-alice-firma",
+    "attributes": {
+      "createdAt": "2023-03-01T10:00:00.000Z",
+      "state": "pending"
+    },
+    "relationships": {
+      "listing": {"data": {"id": "listing-job-firma", "type": "listing"}},
+      "customer": {"data": {"id": "st-user-alice", "type": "user"}}
+    }
+  }
+]

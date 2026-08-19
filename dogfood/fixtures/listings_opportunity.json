@@ -1,0 +1,36 @@
+[
+  {
+    "id": "listing-job-firma",
+    "attributes": {
+      "state": "published",
+      "title": "Senior Architect",
+      "createdAt": "2023-02-01T10:00:00.000Z",
+      "publicData": {
+        "industry": "architecture",
+        "primarySpecialty": "residential",
+        "companySize": "10-50",
+        "company": "Firma Design Studio"
+      }
+    },
+    "relationships": {
+      "author": {"data": {"id": "st-user-firma", "type": "user"}}
+    }
+  },
+  {
+    "id": "listing-job-firmb",
+    "attributes": {
+      "state": "pendingApproval",
+      "title": "Interior Designer",
+      "createdAt": "2023-02-10T10:00:00.000Z",
+      "publicData": {
+        "industry": "interior-design",
+        "primarySpecialty": "hospitality",
+        "companySize": "50-200",
+        "company": "FirmB Interiors"
+      }
+    },
+    "relationships": {
+      "author": {"data": {"id": "st-user-firmb", "type": "user"}}
+    }
+  }
+]

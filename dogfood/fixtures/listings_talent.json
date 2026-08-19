@@ -1,0 +1,97 @@
+[
+  {
+    "id": "listing-talent-alice",
+    "attributes": {
+      "state": "published",
+      "title": "Alice Smith",
+      "createdAt": "2023-01-20T10:00:00.000Z",
+      "publicData": {
+        "email": "alice@example.com",
+        "industry": "architecture",
+        "primarySpecialty": "residential",
+        "experience": "8",
+        "availability": "actively-looking",
+        "openTo": "full-time"
+      }
+    },
+    "relationships": {
+      "author": {"data": {"id": "st-user-alice", "type": "user"}}
+    }
+  },
+  {
+    "id": "listing-talent-bob",
+    "attributes": {
+      "state": "published",
+      "title": "Bob Jones",
+      "createdAt": "2023-02-05T10:00:00.000Z",
+      "publicData": {
+        "email": "bob@example.com",
+        "industry": "interior-design",
+        "primarySpecialty": "hospitality",
+        "experience": "5",
+        "availability": "passively-looking",
+        "openTo": "full-time"
+      }
+    },
+    "relationships": {
+      "author": {"data": {"id": "st-user-bob", "type": "user"}}
+    }
+  },
+  {
+    "id": "listing-talent-carol",
+    "attributes": {
+      "state": "published",
+      "title": "Carol Chen",
+      "createdAt": "2023-02-15T10:00:00.000Z",
+      "publicData": {
+        "email": "carol@example.com",
+        "industry": "architecture",
+        "primarySpecialty": "commercial",
+        "experience": "3",
+        "availability": "actively-looking",
+        "openTo": "part-time"
+      }
+    },
+    "relationships": {
+      "author": {"data": {"id": "st-user-carol", "type": "user"}}
+    }
+  },
+  {
+    "id": "listing-talent-eve-1",
+    "attributes": {
+      "state": "published",
+      "title": "Eve Brown",
+      "createdAt": "2023-03-15T10:00:00.000Z",
+      "publicData": {
+        "email": "eve@example.com",
+        "industry": "interior-design",
+        "primarySpecialty": "residential",
+        "experience": "6",
+        "availability": "actively-looking",
+        "openTo": "full-time"
+      }
+    },
+    "relationships": {
+      "author": {"data": {"id": "st-user-eve", "type": "user"}}
+    }
+  },
+  {
+    "id": "listing-talent-eve-2",
+    "attributes": {
+      "state": "pendingApproval",
+      "title": "Eve Brown (updated)",
+      "createdAt": "2023-04-01T10:00:00.000Z",
+      "publicData": {
+        "email": "eve@example.com",
+        "industry": "architecture",
+        "primarySpecialty": "hospitality",
+        "experience": "7",
+        "availability": "passively-looking",
+        "openTo": "full-time"
+      }
+    },
+    "relationships": {
+      "author": {"data": {"id": "st-user-eve", "type": "user"}}
+    }
+  }
+]

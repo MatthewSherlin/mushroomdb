@@ -1,0 +1,9 @@
+[
+  {"id": "st-user-alice", "attributes": {"email": "Alice@example.com", "createdAt": "2023-01-15T10:00:00.000Z", "profile": {"firstName": "Alice", "lastName": "Smith"}, "state": "active"}},
+  {"id": "st-user-bob", "attributes": {"email": "bob@example.com", "createdAt": "2023-02-01T10:00:00.000Z", "profile": {"firstName": "Bob", "lastName": "Jones"}, "state": "active"}},
+  {"id": "st-user-carol", "attributes": {"email": "carol@example.com", "createdAt": "2023-02-10T10:00:00.000Z", "profile": {"firstName": "Carol", "lastName": "Chen"}, "state": "active"}},
+  {"id": "st-user-dave", "attributes": {"email": "dave@example.com", "createdAt": "2023-03-01T10:00:00.000Z", "profile": {"firstName": "Dave", "lastName": "Kim"}, "state": "active"}},
+  {"id": "st-user-eve", "attributes": {"email": "eve@example.com", "createdAt": "2023-03-10T10:00:00.000Z", "profile": {"firstName": "Eve", "lastName": "Brown"}, "state": "active"}},
+  {"id": "st-user-firma", "attributes": {"email": "info@firma.com", "createdAt": "2023-01-01T10:00:00.000Z", "profile": {"firstName": "Firm", "lastName": "A"}, "state": "active"}},
+  {"id": "st-user-firmb", "attributes": {"email": "info@firmb.com", "createdAt": "2023-01-05T10:00:00.000Z", "profile": {"firstName": "Firm", "lastName": "B"}, "state": "active"}}
+]
