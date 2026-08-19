@@ -59,4 +59,21 @@ export default defineConfig({
   },
   server: { proxy },
   preview: { proxy },
+  build: {
+    rolldownOptions: {
+      output: {
+        manualChunks(id: string) {
+          if (
+            id.includes("node_modules/@cosmos.gl") ||
+            id.includes("/@cosmos.gl/") ||
+            id.includes("node_modules/@luma.gl") ||
+            id.includes("node_modules/@math.gl") ||
+            id.includes("node_modules/@probe.gl")
+          ) {
+            return "cosmos";
+          }
+        },
+      },
+    },
+  },
 });

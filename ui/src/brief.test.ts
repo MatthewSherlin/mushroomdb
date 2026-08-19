@@ -65,6 +65,8 @@ describe("design brief guards", () => {
       ".why-line",
       ".why-tok",
       ".rules-tripped",
+      ".legend",
+      ".rail-label",
     ]) {
       expect(css, sel).toMatch(
         new RegExp(

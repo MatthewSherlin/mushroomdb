@@ -58,6 +58,7 @@ button {
 }
 
 .rail-btn {
+  position: relative;
   display: grid;
   place-items: center;
   width: 36px;
@@ -67,6 +68,28 @@ button {
   background: transparent;
   border: 1px solid transparent;
   cursor: pointer;
+}
+
+.rail-label {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 3px 7px;
+  color: var(--paper);
+  background: var(--ink);
+  border: 1px solid var(--structure);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.rail-btn:hover .rail-label,
+.rail-btn:focus-visible .rail-label {
+  opacity: 1;
 }
 
 .rail-btn svg {
@@ -244,6 +267,87 @@ button {
 .hover-label,
 .hover-props {
   color: color-mix(in srgb, var(--paper) 62%, var(--ink));
+}
+
+.canvas-tools {
+  position: absolute;
+  left: 12px;
+  bottom: calc(16px + var(--console-h, 0px));
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.canvas-tools[hidden] {
+  display: none;
+}
+
+.canvas-tools .rail-btn {
+  color: var(--structure);
+}
+
+.legend {
+  position: absolute;
+  right: 16px;
+  bottom: calc(16px + var(--console-h, 0px));
+  z-index: 4;
+  min-width: 11rem;
+  background: var(--ink);
+  border: 1px solid var(--structure);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+}
+
+.legend[hidden] {
+  display: none;
+}
+
+.legend-toggle {
+  display: flex;
+  width: 100%;
+  padding: 5px 8px;
+  color: color-mix(in srgb, var(--paper) 70%, var(--ink));
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-align: left;
+}
+
+.legend-toggle:hover {
+  color: var(--paper);
+}
+
+.legend-list {
+  margin: 0;
+  padding: 0 8px 8px;
+  list-style: none;
+}
+
+.legend-list[hidden] {
+  display: none;
+}
+
+.legend-item {
+  display: grid;
+  grid-template-columns: 8px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  color: var(--paper);
+}
+
+.legend-swatch {
+  width: 8px;
+  height: 8px;
+  background: var(--structure);
+}
+
+.legend-swatch[data-kind="derived"] {
+  background: var(--gold);
 }
 
 .error-strip {

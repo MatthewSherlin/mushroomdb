@@ -11,12 +11,20 @@ import {
   type Rgba,
 } from "./store";
 import {
+  FORCE_LAYOUT,
+  LABEL_TINTS,
   MUTED_PAPER,
+  POINT_SIZE_MAX,
+  POINT_SIZE_MIN,
+  edgeLegend,
   flattenColors,
   flattenLinks,
   formatHoverCard,
+  labelFill,
   nextPositions,
   paintExplorer,
+  pointSizes,
+  simulationOn,
 } from "./paint";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -65,15 +73,41 @@ describe("MUTED_PAPER", () => {
   });
 });
 
+describe("labelFill", () => {
+  it("uses only token mixes — no new hues — and keeps blanks muted", () => {
+    expect(labelFill("")).toEqual(MUTED_PAPER);
+    expect(LABEL_TINTS).toContainEqual(COLOR.paper);
+    for (const tint of LABEL_TINTS) {
+      expect(tint[3]).toBe(1);
+      const channels = tint.slice(0, 3);
+      const lo = Math.min(COLOR.ink[0], COLOR.paper[0], COLOR.structure[0], COLOR.gold[0], COLOR.signal[0]);
+      const hi = Math.max(COLOR.ink[0], COLOR.paper[0], COLOR.structure[0], COLOR.gold[0], COLOR.signal[0]);
+      expect(channels[0]!).toBeGreaterThanOrEqual(lo - 1e-6);
+      expect(channels[0]!).toBeLessThanOrEqual(hi + 1e-6);
+    }
+  });
+
+  it("gives Person, Org, and Project distinct fills so labels read without text", () => {
+    const person = labelFill("Person");
+    const org = labelFill("Org");
+    const project = labelFill("Project");
+    expect(person).not.toEqual(org);
+    expect(person).not.toEqual(project);
+    expect(org).not.toEqual(project);
+    expect(person).not.toEqual(MUTED_PAPER);
+    expect(labelFill("Person")).toEqual(person);
+  });
+});
+
 describe("paintExplorer", () => {
-  it("paints blank-label nodes muted paper and leaves labeled nodes paper", () => {
+  it("paints blank-label nodes muted paper and labeled nodes by label tint", () => {
     const store = seeded();
     const snap = store.toCosmos();
     const painted = paintExplorer(store, snap, new Set());
-    // keys sort a, b, c — a and c are blank-label stubs
+    // keys sort a, b, c — a and c are blank-label stubs; b is Person
     expect(painted.pointKeys).toEqual(["a", "b", "c"]);
     expect(painted.pointColors[0]).toEqual(MUTED_PAPER);
-    expect(painted.pointColors[1]).toEqual(COLOR.paper);
+    expect(painted.pointColors[1]).toEqual(labelFill("Person"));
     expect(painted.pointColors[2]).toEqual(MUTED_PAPER);
   });
 
@@ -82,6 +116,13 @@ describe("paintExplorer", () => {
     store.select({ kind: "node", id: "a" });
     const painted = paintExplorer(store, store.toCosmos(), new Set());
     expect(painted.pointColors[0]).toEqual(COLOR.signal);
+  });
+
+  it("keeps a selected labeled node signal, not its label tint", () => {
+    const store = seeded();
+    store.select({ kind: "node", id: "b" });
+    const painted = paintExplorer(store, store.toCosmos(), new Set());
+    expect(painted.pointColors[1]).toEqual(COLOR.signal);
   });
 
   it("keeps a glowing user edge structure, not gold", () => {
@@ -154,6 +195,93 @@ describe("nextPositions", () => {
     expect(Number.isFinite(bx)).toBe(true);
     expect(Number.isFinite(by)).toBe(true);
     expect([bx, by]).not.toEqual([10, 20]);
+  });
+});
+
+describe("pointSizes", () => {
+  it("maps degree onto a bounded 3–9px range; hubs are larger", () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("hub", neighborhood([
+      ["a", "Person", 1],
+      ["b", "Person", 1],
+      ["c", "Person", 1],
+    ]));
+    store.mergeNeighborhoodWithEdges("hub", { KNOWS: ["a", "b", "c"] });
+    store.fromNeighborhood("leaf", neighborhood([]));
+    const sized = pointSizes(store, ["a", "hub", "leaf"]);
+    expect(POINT_SIZE_MIN).toBe(3);
+    expect(POINT_SIZE_MAX).toBe(9);
+    expect(sized[1]!).toBe(POINT_SIZE_MAX);
+    expect(sized[2]!).toBe(POINT_SIZE_MIN);
+    expect(sized[0]!).toBeGreaterThanOrEqual(POINT_SIZE_MIN);
+    expect(sized[0]!).toBeLessThan(sized[1]!);
+  });
+
+  it("uses the mid size when every visible node has the same degree", () => {
+    const equal = new GraphStore();
+    equal.fromNeighborhood("a", neighborhood([["b", "Person", 1]]));
+    equal.mergeNeighborhoodWithEdges("a", { KNOWS: ["b"] });
+    const sizes = pointSizes(equal, ["a", "b"]);
+    expect(sizes[0]).toBe((POINT_SIZE_MIN + POINT_SIZE_MAX) / 2);
+    expect(sizes[1]).toBe((POINT_SIZE_MIN + POINT_SIZE_MAX) / 2);
+  });
+});
+
+describe("edgeLegend", () => {
+  it("lists visible etypes with gold/structure colors and counts from the store", () => {
+    const store = seeded();
+    const rows = edgeLegend(store);
+    expect(rows).toEqual([
+      { etype: "FIT", derived: true, count: 1, color: COLOR.gold },
+      { etype: "KNOWS", derived: false, count: 1, color: COLOR.structure },
+    ]);
+    store.mergeNeighborhoodWithEdges("a", { KNOWS: ["d"], FIT: ["e"] });
+    store.setProvenance(edgeId("FIT", "a", "e"), {
+      rule: "skill_fit",
+      edge_type: "FIT",
+      src_key: "a",
+      dst_key: "e",
+      weight: 1,
+      predicate: null,
+    });
+    expect(edgeLegend(store)).toEqual([
+      { etype: "FIT", derived: true, count: 2, color: COLOR.gold },
+      { etype: "KNOWS", derived: false, count: 2, color: COLOR.structure },
+    ]);
+  });
+
+  it("splits the same etype when both user and derived instances are visible", () => {
+    const store = new GraphStore();
+    store.fromNeighborhood("a", neighborhood([
+      ["b", "Person", 1],
+      ["c", "Person", 1],
+    ]));
+    store.mergeNeighborhoodWithEdges("a", { KNOWS: ["b", "c"] });
+    store.setProvenance(edgeId("KNOWS", "a", "c"), {
+      rule: "auto",
+      edge_type: "KNOWS",
+      src_key: "a",
+      dst_key: "c",
+      weight: 1,
+      predicate: null,
+    });
+    expect(edgeLegend(store)).toEqual([
+      { etype: "KNOWS", derived: false, count: 1, color: COLOR.structure },
+      { etype: "KNOWS", derived: true, count: 1, color: COLOR.gold },
+    ]);
+  });
+});
+
+describe("force layout params", () => {
+  it("turns simulation off under reduced motion and documents gravity/decay", () => {
+    expect(simulationOn(true)).toBe(false);
+    expect(simulationOn(false)).toBe(true);
+    expect(FORCE_LAYOUT.simulationGravity).toBeGreaterThan(0);
+    expect(FORCE_LAYOUT.simulationDecay).toBeGreaterThan(5000);
+    expect(FORCE_LAYOUT.simulationCenter).toBeGreaterThan(0);
+    expect(FORCE_LAYOUT.simulationLinkDistance).toBeGreaterThan(80);
+    expect(FORCE_LAYOUT.simulationFriction).toBeGreaterThan(0);
+    expect(FORCE_LAYOUT.simulationFriction).toBeLessThan(1);
   });
 });
 

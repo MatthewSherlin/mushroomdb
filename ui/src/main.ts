@@ -1,14 +1,15 @@
 import "./fonts.css";
 import "./tokens.css";
 import "./style.css";
-import { ApiClient } from "./api";
-import { Explorer } from "./explorer";
-import { GraphStore } from "./store";
 
 const host = document.querySelector("#app");
 if (!(host instanceof HTMLElement)) {
   throw new Error("missing #app");
 }
+
+const { Explorer } = await import("./explorer");
+const { ApiClient } = await import("./api");
+const { GraphStore } = await import("./store");
 
 new Explorer(host, {
   api: new ApiClient(),

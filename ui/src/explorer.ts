@@ -1,4 +1,4 @@
-import { Graph } from "@cosmos.gl/graph";
+import type { Graph } from "@cosmos.gl/graph";
 import { ApiClient, ApiError } from "./api";
 import { QueryConsole } from "./console";
 import { expandNode, loadDemoNeighborhood } from "./expand";
@@ -18,20 +18,25 @@ import {
 } from "./live";
 import { ActivityTicker } from "./ticker";
 import {
+  FORCE_LAYOUT,
   flattenColors,
   flattenLinks,
   formatHoverCard,
   nextPositions,
   paintExplorer,
+  pointSizes,
+  simulationOn,
   visibleEdgeIds,
+  edgeLegend,
 } from "./paint";
 import { COLOR, GraphStore } from "./store";
 import { WatchClient, type MutationEvent } from "./watch";
 
 const CLICK_EXPAND_MS = 280;
-const POINT_SIZE = 7;
+const POINT_SIZE = 6;
 const LINK_WIDTH = 1.15;
 const GLOW_WIDTH = 2.4;
+const ZOOM_STEP = 1.25;
 
 export type WatchDot = LiveDot;
 
@@ -71,11 +76,19 @@ export class Explorer {
   private readonly hoverEl: HTMLElement;
   private readonly labelsEl: HTMLElement;
   private readonly errorEl: HTMLElement;
+  private readonly toolsEl: HTMLElement;
+  private readonly legendEl: HTMLElement;
+  private readonly legendToggle: HTMLButtonElement;
+  private readonly legendList: HTMLElement;
 
   private graph: Graph | undefined;
+  private graphLoading = false;
   private lastKeys: string[] = [];
+  private lastPushedKeys: string[] = [];
   private lastPos = new Map<string, [number, number]>();
   private lastFitCount = -1;
+  private legendOpen = true;
+  private settleFitTimer: number | undefined;
   private hoverKey: string | undefined;
   private clickTimer: number | undefined;
   private glowTimer: number | undefined;
@@ -144,14 +157,58 @@ export class Explorer {
     this.errorEl = el("div", "error-strip");
     this.errorEl.hidden = true;
 
+    this.toolsEl = el("div", "canvas-tools");
+    this.toolsEl.setAttribute("aria-label", "Canvas");
+    this.toolsEl.hidden = true;
+    this.toolsEl.append(
+      toolButton("Zoom in", ICON_ZOOM_IN, () => {
+        this.zoomBy(ZOOM_STEP);
+      }),
+      toolButton("Zoom out", ICON_ZOOM_OUT, () => {
+        this.zoomBy(1 / ZOOM_STEP);
+      }),
+      toolButton("Fit", ICON_FIT, () => {
+        this.scheduleFit();
+      }),
+    );
+
+    this.legendEl = el("aside", "legend");
+    this.legendEl.setAttribute("aria-label", "Edge types");
+    this.legendEl.hidden = true;
+    this.legendToggle = el("button", "legend-toggle") as HTMLButtonElement;
+    this.legendToggle.type = "button";
+    this.legendToggle.textContent = "Edges";
+    this.legendToggle.setAttribute("aria-expanded", "true");
+    this.legendToggle.addEventListener("click", () => {
+      this.legendOpen = !this.legendOpen;
+      this.legendToggle.setAttribute(
+        "aria-expanded",
+        this.legendOpen ? "true" : "false",
+      );
+      this.legendList.hidden = !this.legendOpen;
+    });
+    this.legendList = el("ul", "legend-list");
+    this.legendEl.append(this.legendToggle, this.legendList);
+
     this.stage.append(
       this.canvasHost,
       this.labelsEl,
       this.emptyEl,
       this.hoverEl,
       this.errorEl,
+      this.toolsEl,
+      this.legendEl,
     );
     host.append(this.rail, this.wordmark, this.stage);
+
+    const onMotion = (): void => {
+      this.syncSimulation();
+    };
+    if (typeof this.motionQuery.addEventListener === "function") {
+      this.motionQuery.addEventListener("change", onMotion);
+    } else {
+      this.motionQuery.addListener(onMotion);
+    }
 
     this.queryConsole = new QueryConsole(host, {
       api: this.api,
@@ -251,10 +308,15 @@ export class Explorer {
       window.clearTimeout(this.flashTimer);
       this.flashTimer = undefined;
     }
+    if (this.settleFitTimer !== undefined) {
+      window.clearTimeout(this.settleFitTimer);
+      this.settleFitTimer = undefined;
+    }
     this.watch.close();
     this.ticker.destroy();
     this.graph?.destroy();
     this.graph = undefined;
+    this.graphLoading = false;
     this.queryConsole.destroy();
     this.inspector.destroy();
     this.host.replaceChildren();
@@ -326,13 +388,15 @@ export class Explorer {
     this.scheduleFit();
   }
 
-  private scheduleFit(): void {
+  private scheduleFit(durationMs?: number): void {
     const graph = this.graph;
     if (graph === undefined) {
       return;
     }
+    const duration =
+      durationMs ?? (this.prefersReducedMotion() ? 0 : 280);
     const run = (): void => {
-      graph.fitView(this.prefersReducedMotion() ? 0 : 280, 0.22);
+      graph.fitView(duration, 0.22, false);
     };
     void graph.ready.then(() => {
       run();
@@ -340,6 +404,25 @@ export class Explorer {
         window.requestAnimationFrame(run);
       });
     });
+  }
+
+  private armSettleFit(): void {
+    if (this.settleFitTimer !== undefined) {
+      window.clearTimeout(this.settleFitTimer);
+      this.settleFitTimer = undefined;
+    }
+    if (this.prefersReducedMotion()) {
+      return;
+    }
+    this.settleFitTimer = window.setTimeout(() => {
+      this.settleFitTimer = undefined;
+      this.freezeLayout();
+    }, 2800);
+  }
+
+  private freezeLayout(): void {
+    this.graph?.pause();
+    this.scheduleFit(0);
   }
 
   private run(fn: () => Promise<void>): void {
@@ -362,10 +445,13 @@ export class Explorer {
     );
     const empty = snap.pointKeys.length === 0;
     this.emptyEl.hidden = !empty;
+    this.toolsEl.hidden = empty;
+    this.paintLegend();
 
     if (empty) {
       this.labelsEl.replaceChildren();
       this.hoverEl.hidden = true;
+      this.legendEl.hidden = true;
       return;
     }
 
@@ -375,6 +461,9 @@ export class Explorer {
     this.lastKeys = snap.pointKeys;
 
     const graph = this.ensureGraph();
+    if (graph === undefined) {
+      return;
+    }
     const glowing = new Set(this.glow.active(now));
     const edgeIds = visibleEdgeIds(this.store);
     const highlighted = this.inspector.highlightIds;
@@ -383,10 +472,14 @@ export class Explorer {
         glowing.has(id) || highlighted.has(id) ? GLOW_WIDTH : LINK_WIDTH,
       ),
     );
-    const sizes = new Float32Array(snap.pointKeys.length);
-    sizes.fill(POINT_SIZE);
+    const sizes = pointSizes(this.store, snap.pointKeys);
+    const simulating = simulationOn(this.prefersReducedMotion());
+    const keysChanged = !sameKeys(this.lastPushedKeys, snap.pointKeys);
 
-    graph.setPointPositions(positions);
+    if (!simulating || keysChanged) {
+      graph.setPointPositions(positions, true);
+      this.lastPushedKeys = [...snap.pointKeys];
+    }
     graph.setPointColors(flattenColors(snap.pointColors));
     graph.setPointSizes(sizes);
     graph.setLinks(flattenLinks(snap.links));
@@ -411,6 +504,10 @@ export class Explorer {
     });
 
     graph.render();
+    if (simulating && keysChanged) {
+      graph.start(0.4);
+      this.armSettleFit();
+    }
     if (this.lastKeys.length !== this.lastFitCount) {
       this.lastFitCount = this.lastKeys.length;
       this.scheduleFit();
@@ -427,13 +524,29 @@ export class Explorer {
     this.syncLabels();
   }
 
-  private ensureGraph(): Graph {
+  private ensureGraph(): Graph | undefined {
     if (this.graph !== undefined) {
       return this.graph;
     }
+    if (!this.graphLoading) {
+      this.graphLoading = true;
+      void import("@cosmos.gl/graph")
+        .then(({ Graph }) => {
+          this.graph = this.createGraph(Graph);
+          this.paint();
+        })
+        .catch((err: unknown) => {
+          this.graphLoading = false;
+          this.showError(err);
+        });
+    }
+    return undefined;
+  }
+
+  private createGraph(GraphCtor: typeof import("@cosmos.gl/graph").Graph): Graph {
     const rgba = (c: readonly [number, number, number, number]) =>
       [c[0], c[1], c[2], c[3]] as [number, number, number, number];
-    const graph = new Graph(this.canvasHost, {
+    return new GraphCtor(this.canvasHost, {
       backgroundColor: rgba(COLOR.ink),
       pointDefaultColor: rgba(COLOR.paper),
       linkDefaultColor: rgba(COLOR.structure),
@@ -444,12 +557,23 @@ export class Explorer {
       renderHoveredPointRing: true,
       enableDrag: true,
       enableZoom: true,
-      enableSimulation: false,
+      enableSimulation: simulationOn(this.prefersReducedMotion()),
       attribution: "",
       randomSeed: 1,
       fitViewOnInit: false,
-      rescalePositions: true,
+      rescalePositions: false,
       transitionDuration: 0,
+      simulationDecay: FORCE_LAYOUT.simulationDecay,
+      simulationGravity: FORCE_LAYOUT.simulationGravity,
+      simulationCenter: FORCE_LAYOUT.simulationCenter,
+      simulationRepulsion: FORCE_LAYOUT.simulationRepulsion,
+      simulationLinkSpring: FORCE_LAYOUT.simulationLinkSpring,
+      simulationLinkDistance: FORCE_LAYOUT.simulationLinkDistance,
+      simulationFriction: FORCE_LAYOUT.simulationFriction,
+      simulationCollision: FORCE_LAYOUT.simulationCollision,
+      simulationLinkDistRandomVariationRange: [
+        ...FORCE_LAYOUT.simulationLinkDistRandomVariationRange,
+      ],
       scalePointsOnZoom: true,
       pointDefaultSize: POINT_SIZE,
       linkDefaultWidth: LINK_WIDTH,
@@ -479,13 +603,14 @@ export class Explorer {
         this.syncLabels();
         this.syncHover();
       },
+      onSimulationEnd: () => {
+        this.freezeLayout();
+      },
       onZoom: () => {
         this.syncLabels();
         this.syncHover();
       },
     });
-    this.graph = graph;
-    return graph;
   }
 
   private onPointClick(index: number | undefined, event?: MouseEvent): void {
@@ -631,6 +756,61 @@ export class Explorer {
     }
   }
 
+  private zoomBy(factor: number): void {
+    const graph = this.graph;
+    if (graph === undefined) {
+      return;
+    }
+    const reduced = this.prefersReducedMotion();
+    graph.setZoomLevel(
+      graph.getZoomLevel() * factor,
+      reduced ? 0 : 180,
+      false,
+    );
+  }
+
+  private syncSimulation(): void {
+    const graph = this.graph;
+    const on = simulationOn(this.prefersReducedMotion());
+    if (graph !== undefined) {
+      graph.setConfigPartial({
+        enableSimulation: on,
+        rescalePositions: false,
+      });
+      if (on) {
+        graph.start(0.45);
+      } else {
+        graph.stop();
+      }
+    }
+    this.lastPushedKeys = [];
+    this.lastFitCount = -1;
+    this.paint();
+  }
+
+  private paintLegend(): void {
+    const rows = edgeLegend(this.store);
+    this.legendEl.hidden = rows.length === 0;
+    if (rows.length === 0) {
+      this.legendList.replaceChildren();
+      return;
+    }
+    const items: HTMLElement[] = [];
+    for (const row of rows) {
+      const item = el("li", "legend-item");
+      const swatch = el("span", "legend-swatch");
+      swatch.dataset.kind = row.derived ? "derived" : "user";
+      const etype = el("span", "legend-etype");
+      etype.textContent = row.etype;
+      const count = el("span", "legend-count");
+      count.textContent = String(row.count);
+      item.append(swatch, etype, count);
+      items.push(item);
+    }
+    this.legendList.replaceChildren(...items);
+    this.legendList.hidden = !this.legendOpen;
+  }
+
   private showError(err: unknown): void {
     const message =
       err instanceof ApiError
@@ -646,6 +826,18 @@ export class Explorer {
     this.errorEl.hidden = true;
     this.errorEl.textContent = "";
   }
+}
+
+function sameKeys(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function setCurrent(btn: HTMLElement, on: boolean): void {
@@ -679,6 +871,25 @@ function railButton(
     btn.setAttribute("aria-current", "page");
   }
   btn.innerHTML = svg;
+  const tag = document.createElement("span");
+  tag.className = "rail-label";
+  tag.textContent = label;
+  tag.setAttribute("aria-hidden", "true");
+  btn.append(tag);
+  return btn;
+}
+
+function toolButton(
+  label: string,
+  svg: string,
+  onClick: () => void,
+): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "rail-btn";
+  btn.setAttribute("aria-label", label);
+  btn.innerHTML = svg;
+  btn.addEventListener("click", onClick);
   return btn;
 }
 
@@ -687,3 +898,9 @@ const ICON_EXPLORE = `<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="6"
 const ICON_CONSOLE = `<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 6.5 9 10l-4 3.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="square"/><path d="M10.5 14.5H15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="square"/></svg>`;
 
 const ICON_RULES = `<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 6h10M5 10h7M5 14h4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="square"/></svg>`;
+
+const ICON_ZOOM_IN = `<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10h10M10 5v10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="square"/></svg>`;
+
+const ICON_ZOOM_OUT = `<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10h10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="square"/></svg>`;
+
+const ICON_FIT = `<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8V4h4M16 8V4h-4M4 12v4h4M16 12v4h-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="square"/></svg>`;
