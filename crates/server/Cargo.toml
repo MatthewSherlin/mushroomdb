@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+[features]
+default = []
+embed-ui = ["dep:include_dir"]
+
 [dependencies]
 core-api = { path = "../core-api" }
 arrow-bridge = { path = "../arrow-bridge" }
@@ -12,6 +16,7 @@ axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
 serde_json = { workspace = true }
 tower-http = { version = "0.6", default-features = false, features = ["fs"] }
+include_dir = { version = "0.7", optional = true }
 
 [dev-dependencies]
 # oneshot ServiceExt — axum re-exports tower types but not the util trait.

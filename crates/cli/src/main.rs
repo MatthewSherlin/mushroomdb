@@ -1,6 +1,6 @@
 //! `mushroomdb` — thin dispatcher over [`cli`] lib functions.
 
-use cli::{format_demo, format_stats, parse_args, read_stats, run_demo, usage, Command};
+use cli::{format_demo, format_stats, parse_args, read_stats, run_demo, usage, Command, ServeUi};
 use core_api::SharedDb;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -14,19 +14,15 @@ fn main() -> ExitCode {
             print!("{}", usage());
             ExitCode::SUCCESS
         }
-        Ok(Command::Serve {
-            db_dir,
-            addr,
-            ui_dir,
-        }) => {
-            let ui_dir = match ui_dir {
-                Some(dir) => match cli::validate_ui_dir(&dir) {
-                    Ok(dir) => Some(dir),
+        Ok(Command::Serve { db_dir, addr, ui }) => {
+            let ui = match ui {
+                ServeUi::Filesystem(dir) => match cli::validate_ui_dir(&dir) {
+                    Ok(dir) => ServeUi::Filesystem(dir),
                     Err(e) => return fail(&e),
                 },
-                None => None,
+                other => other,
             };
-            exit(run_serve(db_dir, addr, ui_dir))
+            exit(run_serve(db_dir, addr, ui))
         }
         Ok(Command::Mcp { db_dir }) => exit(run_mcp(db_dir)),
         Ok(Command::Stats { db_dir }) => match read_stats(&db_dir) {
@@ -63,15 +59,25 @@ fn fail(msg: &str) -> ExitCode {
     ExitCode::from(1)
 }
 
-fn run_serve(db_dir: PathBuf, addr: SocketAddr, ui_dir: Option<PathBuf>) -> Result<(), String> {
+fn run_serve(db_dir: PathBuf, addr: SocketAddr, ui: ServeUi) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async {
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let serve = tokio::spawn(async move {
-            match ui_dir {
-                Some(ui) => server::serve_with_ui(db, addr, tx, ui).await,
-                None => server::serve(db, addr, tx).await,
+            match ui {
+                ServeUi::Filesystem(dir) => server::serve_with_ui(db, addr, tx, dir).await,
+                ServeUi::None => server::serve(db, addr, tx).await,
+                ServeUi::Embedded => {
+                    #[cfg(feature = "embed-ui")]
+                    {
+                        server::serve_with_embedded_ui(db, addr, tx).await
+                    }
+                    #[cfg(not(feature = "embed-ui"))]
+                    {
+                        server::serve(db, addr, tx).await
+                    }
+                }
             }
         });
         match rx.await {

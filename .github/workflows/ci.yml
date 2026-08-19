@@ -85,3 +85,38 @@ jobs:
       - run: .venv/bin/pip install -U pip maturin pytest
       - run: .venv/bin/maturin develop
       - run: .venv/bin/pytest
+
+  embed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.92.0" }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+        working-directory: ui
+      - run: npm run build
+        working-directory: ui
+      - run: cargo test -p server --features embed-ui
+      - run: cargo build -p cli --bin mushroomdb --features embed-ui --release
+      - name: demo + serve + curl index, stats, node
+        run: |
+          set -euo pipefail
+          DB=$(mktemp -d)
+          ./target/release/mushroomdb demo "$DB"
+          ./target/release/mushroomdb serve "$DB" --addr 127.0.0.1:18080 &
+          pid=$!
+          trap 'kill $pid' EXIT
+          ok=0
+          for i in $(seq 1 50); do
+            if curl -sf http://127.0.0.1:18080/stats >/dev/null; then ok=1; break; fi
+            sleep 0.1
+          done
+          test "$ok" = 1
+          curl -sf http://127.0.0.1:18080/ | grep -qi mushroomdb
+          curl -sf http://127.0.0.1:18080/stats | grep -q nodes_live
+          curl -sf http://127.0.0.1:18080/node/person-01 | grep -q person-01

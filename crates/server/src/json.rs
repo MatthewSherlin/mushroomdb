@@ -79,3 +79,33 @@ pub(crate) fn params_from_json(v: Option<&Js>) -> Result<BTreeMap<String, Value>
     }
     Ok(out)
 }
+
+/// User edges for POST /ingest and MCP `ingest_json`.
+///
+/// Shape: `[{edge_type, src, dst}]`. Missing fields are a 400 string;
+/// unknown endpoints fail later via `insert_edge` (`KeyNotFound` → 400).
+pub(crate) fn parse_ingest_edges(v: &Js) -> Result<Vec<(String, String, String)>, String> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| "edges must be an array".to_string())?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| format!("edges[{i}] must be an object"))?;
+        let edge_type = obj
+            .get("edge_type")
+            .and_then(Js::as_str)
+            .ok_or_else(|| format!("edges[{i}] missing edge_type"))?;
+        let src = obj
+            .get("src")
+            .and_then(Js::as_str)
+            .ok_or_else(|| format!("edges[{i}] missing src"))?;
+        let dst = obj
+            .get("dst")
+            .and_then(Js::as_str)
+            .ok_or_else(|| format!("edges[{i}] missing dst"))?;
+        out.push((edge_type.to_string(), src.to_string(), dst.to_string()));
+    }
+    Ok(out)
+}

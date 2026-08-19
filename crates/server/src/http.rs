@@ -10,7 +10,9 @@
 //! the sink and terminates every existing subscriber with
 //! [`tokio::sync::broadcast::error::RecvError::Closed`].
 
-use crate::json::{node_edges_json, node_info_json, params_from_json, result_set_json};
+use crate::json::{
+    node_edges_json, node_info_json, params_from_json, parse_ingest_edges, result_set_json,
+};
 use crate::AppState;
 use arrow_bridge::to_ipc_bytes;
 use axum::extract::{Path, Query, State};
@@ -18,7 +20,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use core_api::{json_to_rows, AutoFk, Dir, GraphError, IngestOptions, SharedDb};
+use core_api::{json_to_rows, AutoFk, Dir, GraphError, IngestOptions, RuleDef, SharedDb};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -63,6 +65,7 @@ pub fn router(db: SharedDb) -> Router {
         .route("/query", post(query))
         .route("/stats", get(stats))
         .route("/ingest", post(ingest))
+        .route("/rules", post(create_rule))
         .route("/explain", get(explain))
         .route("/node/{key}", get(node_info))
         .route("/node/{key}/edges", get(node_edges))
@@ -76,6 +79,54 @@ pub fn router_with_ui(db: SharedDb, ui_dir: impl AsRef<std::path::Path>) -> Rout
     router(db).fallback_service(ServeDir::new(ui_dir))
 }
 
+#[cfg(feature = "embed-ui")]
+static EMBEDDED_UI: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../ui/dist");
+
+/// [`router`] plus the `embed-ui` static tree as fallback.
+#[cfg(feature = "embed-ui")]
+pub fn router_with_embedded_ui(db: SharedDb) -> Router {
+    router(db).fallback(embedded_fallback)
+}
+
+#[cfg(feature = "embed-ui")]
+async fn embedded_fallback(uri: axum::http::Uri) -> Response {
+    let rel = if uri.path() == "/" || uri.path().is_empty() {
+        "index.html"
+    } else {
+        uri.path().trim_start_matches('/')
+    };
+    if rel.split('/').any(|seg| seg == "..") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match EMBEDDED_UI.get_file(rel) {
+        Some(file) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, embedded_ctype(rel))],
+            file.contents(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(feature = "embed-ui")]
+fn embedded_ctype(path: &str) -> &'static str {
+    if path.ends_with(".html") {
+        "text/html; charset=utf-8"
+    } else if path.ends_with(".js") {
+        "application/javascript; charset=utf-8"
+    } else if path.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if path.ends_with(".woff2") {
+        "font/woff2"
+    } else if path.ends_with(".txt") {
+        "text/plain; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    }
+}
+
 /// Bind `addr` (port 0 is ephemeral) and serve.
 ///
 /// Sends the resolved local address on `ready` once the listener is accepting.
@@ -85,7 +136,7 @@ pub async fn serve(
     addr: SocketAddr,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, None).await
+    serve_inner(db, addr, ready, UiFallback::None).await
 }
 
 /// [`serve`] plus a UI dist directory mounted behind the API routes.
@@ -95,14 +146,31 @@ pub async fn serve_with_ui(
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
     ui_dir: PathBuf,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, Some(ui_dir)).await
+    serve_inner(db, addr, ready, UiFallback::Dir(ui_dir)).await
+}
+
+/// [`serve`] plus the compiled-in UI (no-op fallback if `embed-ui` is off).
+#[cfg(feature = "embed-ui")]
+pub async fn serve_with_embedded_ui(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+) -> std::io::Result<()> {
+    serve_inner(db, addr, ready, UiFallback::Embedded).await
+}
+
+enum UiFallback {
+    None,
+    Dir(PathBuf),
+    #[cfg(feature = "embed-ui")]
+    Embedded,
 }
 
 async fn serve_inner(
     db: SharedDb,
     addr: SocketAddr,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
-    ui_dir: Option<PathBuf>,
+    ui: UiFallback,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -110,9 +178,11 @@ async fn serve_inner(
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    let app = match ui_dir {
-        Some(dir) => router_with_ui(db, dir),
-        None => router(db),
+    let app = match ui {
+        UiFallback::None => router(db),
+        UiFallback::Dir(dir) => router_with_ui(db, dir),
+        #[cfg(feature = "embed-ui")]
+        UiFallback::Embedded => router_with_embedded_ui(db),
     };
     axum::serve(listener, app).await
 }
@@ -253,11 +323,49 @@ async fn ingest(State(state): State<AppState>, Json(body): Json<Js>) -> Response
         g.ingest(&label, taken, &opts)
     };
     let report = report.map(|r| converted.into_report(r));
-    match report {
+    let mut report = match report {
         Ok(r) => match serde_json::to_value(&r) {
-            Ok(v) => json_ok(v),
-            Err(e) => err_response(e.to_string()),
+            Ok(v) => v,
+            Err(e) => return err_response(e.to_string()),
         },
+        Err(e) => return graph_err(e),
+    };
+    if let Some(raw) = body.get("edges") {
+        if !raw.is_null() {
+            let edges = match parse_ingest_edges(raw) {
+                Ok(e) => e,
+                Err(e) => return err_response(e),
+            };
+            let mut n = 0u64;
+            {
+                let mut g = state.db.write();
+                for (etype, src, dst) in edges {
+                    match g.insert_edge(&etype, &src, &dst) {
+                        Ok(_) => n += 1,
+                        Err(e) => return graph_err(e),
+                    }
+                }
+            }
+            if let Some(obj) = report.as_object_mut() {
+                obj.insert("edges_inserted".into(), json!(n));
+            }
+        }
+    }
+    json_ok(report)
+}
+
+async fn create_rule(State(state): State<AppState>, Json(body): Json<Js>) -> Response {
+    let def: RuleDef = match serde_json::from_value(body) {
+        Ok(d) => d,
+        Err(e) => return err_response(e.to_string()),
+    };
+    let name = def.name.clone();
+    let res = {
+        let mut g = state.db.write();
+        g.create_rule(def)
+    };
+    match res {
+        Ok(()) => json_ok(json!({"ok": true, "name": name})),
         Err(e) => graph_err(e),
     }
 }

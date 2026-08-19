@@ -26,13 +26,21 @@ ORDER BY score DESC, proj";
 const SAMPLE_EXPLAIN_A: &str = "person-01";
 const SAMPLE_EXPLAIN_B: &str = "proj-01";
 
+/// How `serve` should mount a UI. Precedence: `--ui dir` > embedded > `--no-ui`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeUi {
+    Filesystem(PathBuf),
+    Embedded,
+    None,
+}
+
 /// Parsed `mushroomdb` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Serve {
         db_dir: PathBuf,
         addr: SocketAddr,
-        ui_dir: Option<PathBuf>,
+        ui: ServeUi,
     },
     Mcp {
         db_dir: PathBuf,
@@ -86,7 +94,7 @@ pub fn usage() -> &'static str {
 mushroomdb — embedded graph database
 
 Usage:
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>]
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>] [--no-ui]
   mushroomdb mcp <db-dir>
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
@@ -117,7 +125,9 @@ fn default_addr() -> SocketAddr {
 fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut addr = default_addr();
-    let mut ui_dir = None;
+    let mut ui = ServeUi::Embedded;
+    let mut saw_ui = false;
+    let mut saw_no_ui = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -136,10 +146,16 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
                 .get(i + 1)
                 .copied()
                 .ok_or_else(|| "missing value for --ui".to_string())?;
-            ui_dir = Some(PathBuf::from(val));
+            ui = ServeUi::Filesystem(PathBuf::from(val));
+            saw_ui = true;
             i += 2;
         } else if let Some(val) = a.strip_prefix("--ui=") {
-            ui_dir = Some(PathBuf::from(val));
+            ui = ServeUi::Filesystem(PathBuf::from(val));
+            saw_ui = true;
+            i += 1;
+        } else if a == "--no-ui" {
+            ui = ServeUi::None;
+            saw_no_ui = true;
             i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
@@ -150,12 +166,11 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
             return Err(format!("unexpected extra argument: {a}"));
         }
     }
+    if saw_ui && saw_no_ui {
+        return Err("cannot combine --ui and --no-ui".to_string());
+    }
     let db_dir = db_dir.ok_or_else(|| "serve requires <db-dir>".to_string())?;
-    Ok(Command::Serve {
-        db_dir,
-        addr,
-        ui_dir,
-    })
+    Ok(Command::Serve { db_dir, addr, ui })
 }
 
 /// `--ui <dir>` must be a directory that contains `index.html`.
@@ -628,14 +643,10 @@ mod tests {
             Case {
                 args: &["serve", "/tmp/demo-db"],
                 check: |r| match r {
-                    Ok(Command::Serve {
-                        db_dir,
-                        addr,
-                        ui_dir,
-                    }) => {
+                    Ok(Command::Serve { db_dir, addr, ui }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, default_bind());
-                        assert_eq!(ui_dir, None);
+                        assert_eq!(ui, super::ServeUi::Embedded);
                     }
                     other => panic!("serve <dir> → Serve default addr, got {other:?}"),
                 },
@@ -643,14 +654,10 @@ mod tests {
             Case {
                 args: &["serve", "/tmp/demo-db", "--addr", "127.0.0.1:8080"],
                 check: |r| match r {
-                    Ok(Command::Serve {
-                        db_dir,
-                        addr,
-                        ui_dir,
-                    }) => {
+                    Ok(Command::Serve { db_dir, addr, ui }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
-                        assert_eq!(ui_dir, None);
+                        assert_eq!(ui, super::ServeUi::Embedded);
                     }
                     other => panic!("serve --addr after dir, got {other:?}"),
                 },
@@ -658,14 +665,10 @@ mod tests {
             Case {
                 args: &["serve", "/tmp/demo-db", "--addr=127.0.0.1:9090"],
                 check: |r| match r {
-                    Ok(Command::Serve {
-                        db_dir,
-                        addr,
-                        ui_dir,
-                    }) => {
+                    Ok(Command::Serve { db_dir, addr, ui }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, "127.0.0.1:9090".parse().unwrap());
-                        assert_eq!(ui_dir, None);
+                        assert_eq!(ui, super::ServeUi::Embedded);
                     }
                     other => panic!("serve --addr=VALUE, got {other:?}"),
                 },
@@ -771,8 +774,11 @@ mod tests {
             Case {
                 args: &["serve", "/tmp/demo-db", "--ui", "/tmp/ui-dist"],
                 check: |r| match r {
-                    Ok(Command::Serve { ui_dir, .. }) => {
-                        assert_eq!(ui_dir, Some(PathBuf::from("/tmp/ui-dist")));
+                    Ok(Command::Serve { ui, .. }) => {
+                        assert_eq!(
+                            ui,
+                            super::ServeUi::Filesystem(PathBuf::from("/tmp/ui-dist"))
+                        );
                     }
                     other => panic!("serve --ui <dir>, got {other:?}"),
                 },
@@ -780,8 +786,8 @@ mod tests {
             Case {
                 args: &["serve", "/tmp/demo-db", "--ui=/tmp/ui-eq"],
                 check: |r| match r {
-                    Ok(Command::Serve { ui_dir, .. }) => {
-                        assert_eq!(ui_dir, Some(PathBuf::from("/tmp/ui-eq")));
+                    Ok(Command::Serve { ui, .. }) => {
+                        assert_eq!(ui, super::ServeUi::Filesystem(PathBuf::from("/tmp/ui-eq")));
                     }
                     other => panic!("serve --ui=VALUE, got {other:?}"),
                 },
@@ -793,6 +799,25 @@ mod tests {
                     assert!(
                         e.to_lowercase().contains("ui"),
                         "--ui missing value should mention ui, got {e}"
+                    );
+                },
+            },
+            Case {
+                args: &["serve", "/tmp/demo-db", "--no-ui"],
+                check: |r| match r {
+                    Ok(Command::Serve { ui, .. }) => {
+                        assert_eq!(ui, super::ServeUi::None);
+                    }
+                    other => panic!("serve --no-ui, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["serve", "/tmp/demo-db", "--ui", "/tmp/x", "--no-ui"],
+                check: |r| {
+                    let e = r.expect_err("combine --ui and --no-ui");
+                    assert!(
+                        e.contains("--ui") && e.contains("--no-ui"),
+                        "conflict should name both flags, got {e}"
                     );
                 },
             },
@@ -817,7 +842,15 @@ mod tests {
     #[test]
     fn usage_lists_every_subcommand() {
         let text = usage();
-        for word in ["serve", "mcp", "stats", "demo", "mushroomdb", "--ui"] {
+        for word in [
+            "serve",
+            "mcp",
+            "stats",
+            "demo",
+            "mushroomdb",
+            "--ui",
+            "--no-ui",
+        ] {
             assert!(
                 text.contains(word),
                 "usage should mention {word}, got:\n{text}"

@@ -158,13 +158,13 @@ demo refuses a non-empty directory: ./demo-db (directory must be empty — inclu
 
 ## Server
 
-`mushroomdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>]` opens
-the store, binds (default is ephemeral port 0), prints the bound
-address **after** the listener is accepting, then serves. `--ui` must
-be a directory that contains `index.html`; `ServeDir` is the fallback
-so `/query`, `/stats`, `/explain`, `/node/…`, `/watch` still win.
-Without `--ui` the process is API-only (same as before). Real run
-against the demo dir:
+`mushroomdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>] [--no-ui]`
+opens the store, binds (default is ephemeral port 0), prints the bound
+address **after** the listener is accepting, then serves. Precedence:
+`--ui <dir>` (filesystem `ServeDir`) > embedded UI (release binary
+built with `--features embed-ui`) > `--no-ui` / feature-off API-only.
+API routes always win over static. `--ui` must contain `index.html`.
+Real run against the demo dir (API-only debug binary):
 
 ```text
 $ cargo run -p cli --bin mushroomdb -- serve ./demo-db
@@ -180,8 +180,11 @@ Endpoints (thin wrappers over `core-api`):
 |---|---|---|
 | `POST` | `/query` | body `{"cypher","params?"}` → Arrow IPC (`application/vnd.apache.arrow.stream`); `?format=json` → `{"columns","rows"}` |
 | `GET` | `/stats` | `Stats` JSON |
-| `POST` | `/ingest` | body `{"label","rows","options?"}` → `IngestReport` JSON |
+| `POST` | `/ingest` | body `{"label","rows","options?","edges?"}` — `edges` is `[{edge_type,src,dst}]`; unknown endpoints → 400 `node key not found` |
+| `POST` | `/rules` | `RuleDef` JSON (same schema as the Python bindings); validation → 400 with the engine message |
 | `GET` | `/explain` | `?a=&b=` → `Explanation` array |
+| `GET` | `/node/{key}` | node info |
+| `GET` | `/node/{key}/edges` | incident edges |
 | `GET` | `/node/{key}/neighborhood` | `?depth=&dir=` |
 | `GET` | `/watch` | WebSocket; one JSON text frame per post-commit `MutationEvent` |
 
@@ -193,17 +196,12 @@ Endpoints (thin wrappers over `core-api`):
 
 ## UI
 
-Vanilla TypeScript + Vite explorer in `ui/`. Build the dist, then serve
-it from the same origin as the API:
+Vanilla TypeScript + Vite explorer in `ui/`. The **release** binary
+(`cargo build -p cli --bin mushroomdb --features embed-ui --release`)
+serves the explorer from the same origin as the API with two commands.
 
-```text
-mushroomdb demo ./db
-cd ui && npm ci && npm run build
-mushroomdb serve ./db --ui ui/dist
-```
-
-Captured from a clean `./db` with `./target/debug/mushroomdb` (after
-`cargo build -p cli --bin mushroomdb`):
+Captured from `./target/release/mushroomdb` (embed-ui) against a fresh
+temp dir, then `serve --addr 127.0.0.1:18080`:
 
 ```text
 $ mushroomdb demo ./db
@@ -238,37 +236,19 @@ columns: p, proj, score
 ```
 
 ```text
-$ cd ui && npm ci && npm run build
-added 81 packages, and audited 82 packages in 822ms
-
-17 packages are looking for funding
-  run `npm fund` for details
-
-found 0 vulnerabilities
-
-> mushroomdb-ui@0.0.0 build
-> vite build
-
-vite v8.2.1 building client environment for production...
-transforming...✓ 571 modules transformed.
-rendering chunks...
-computing gzip size...
-dist/index.html                                  0.53 kB │ gzip:   0.31 kB
-dist/assets/index-B4DSmmtF.css                   9.19 kB │ gzip:   2.31 kB
-dist/assets/webgl-developer-tools-2CHz_Hb1.js   90.52 kB │ gzip:  25.02 kB
-dist/assets/webgl-device-Ds3GK4CD.js           100.98 kB │ gzip:  29.02 kB
-dist/assets/index-DmaLE0-K.js                  545.26 kB │ gzip: 142.84 kB
-
-✓ built in 114ms
+$ mushroomdb demo ./db && mushroomdb serve ./db --addr 127.0.0.1:18080
+listening on http://127.0.0.1:18080
 ```
 
-```text
-$ mushroomdb serve ./db --ui ui/dist --addr 127.0.0.1:8080
-listening on http://127.0.0.1:8080
-```
+`curl -s http://127.0.0.1:18080/` returns the explorer `<!doctype html>`
+(`<title>mushroomdb</title>`). `GET /stats` is
+`{"nodes_live":60,"nodes_tombstoned":0,"edges":334,...}`.
+`GET /node/person-01` is `{"key":"person-01","label":"Person",...}`.
 
-(`--addr` pins the port; omit it and the OS assigns one, printed on
-the listen line.) Open `http://127.0.0.1:8080/`. The empty-state
+(`--addr` pins the port; omit it and the OS assigns one.) `--ui ui/dist`
+still overrides the embed with a filesystem tree; `--no-ui` is API-only.
+A debug binary built without `embed-ui` is API-only unless `--ui` is
+given. Open `http://127.0.0.1:18080/`. The empty-state
 "Load demo neighborhood" button runs `MATCH (n) RETURN n LIMIT 1`,
 which is **org-01** — query `person-01` explicitly for the scored
 FIT neighborhood. Launch-GIF click-path: [`docs/gif-script.md`](docs/gif-script.md).
@@ -278,7 +258,8 @@ FIT neighborhood. Launch-GIF click-path: [`docs/gif-script.md`](docs/gif-script.
 `mushroomdb mcp <db-dir>` runs a newline-delimited JSON-RPC 2.0 loop on
 stdio (no `Content-Length` framing). Methods: `initialize`,
 `notifications/initialized`, `tools/list`, `tools/call`. Tools: `query`,
-`ingest_json`, `explain`, `stats`, `neighborhood`.
+`ingest_json` (optional `edges`), `create_rule`, `explain`, `stats`,
+`neighborhood`, `node_info`, `node_edges`.
 
 ```text
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
@@ -298,10 +279,10 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
 | Ingest | `ingest` / `ingest_json`; auto-FK `KeyMatch` on `*_id` |
 | Concurrency | `SharedDb` — many readers or one writer (`RwLock`); lock-free epoch readers are Plan 8 |
 | Arrow | `arrow-bridge`: `ResultSet` → RecordBatch / IPC stream |
-| Server | HTTP + `/watch` WebSocket (`mushroomdb serve`); optional `--ui` static fallback |
+| Server | HTTP + `/watch` WebSocket (`mushroomdb serve`); embedded UI (`embed-ui`) or `--ui` fallback |
 | MCP | stdio JSON-RPC (`mushroomdb mcp`) — agent-memory tools |
 | CLI | `mushroomdb` — `serve` / `mcp` / `stats` / `demo` |
-| UI | `ui/` explorer; `mushroomdb serve <db> --ui ui/dist` |
+| UI | `ui/` explorer; release `serve` embeds `ui/dist` |
 
 **Cypher subset (v1):** one or more `MATCH` clauses; node pattern
 `(var?:Label {k: literal or $param})`; relationships

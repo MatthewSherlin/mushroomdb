@@ -8,6 +8,8 @@ use core_api::{
     RuleStats, SharedDb, Stats, Value,
 };
 use serde_json::{json, Value as Json};
+#[cfg(feature = "embed-ui")]
+use server::router_with_embedded_ui;
 use server::{router, router_with_ui, serve};
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -615,6 +617,126 @@ async fn serve_readiness_returns_local_addr() {
     handle.abort();
 }
 
+/// Binding: POST /ingest optional `edges` uses insert_edge after rows.
+#[tokio::test]
+async fn ingest_edges_inserts_user_edge() {
+    let (app, db) = open("ingest-edges");
+    db.write().insert_node("Person", "a", vec![]).unwrap();
+    db.write().insert_node("Person", "b", vec![]).unwrap();
+
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/ingest",
+            json!({
+                "label": "Person",
+                "rows": [],
+                "edges": [{"edge_type": "KNOWS", "src": "a", "dst": "b"}]
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(v["edges_inserted"], json!(1));
+    let edges = db.read().node_edges("a").unwrap();
+    assert!(
+        edges.iter().any(|e| {
+            e.edge_type == "KNOWS" && e.src_key == "a" && e.dst_key == "b" && !e.derived
+        }),
+        "expected user KNOWS a→b, got {edges:?}"
+    );
+}
+
+/// Binding: unknown src/dst on ingest edges is 400 with the engine key message.
+#[tokio::test]
+async fn ingest_edges_unknown_endpoint_is_400() {
+    let (app, _) = open("ingest-edge-miss");
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/ingest",
+            json!({
+                "label": "Person",
+                "rows": [],
+                "edges": [{"edge_type": "KNOWS", "src": "ghost", "dst": "ghost"}]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v = parse_json(&body);
+    let err = v["error"].as_str().unwrap();
+    assert!(
+        err.contains("node key not found"),
+        "expected KeyNotFound register, got {err}"
+    );
+}
+
+/// Binding: POST /rules accepts RuleDef JSON; validation errors are 400 verbatim.
+#[tokio::test]
+async fn create_rule_http_and_validation() {
+    let (app, db) = open("rules-post");
+    db.write()
+        .insert_node("Org", "o1", vec![("founded_year".into(), Value::Int(2010))])
+        .unwrap();
+    db.write()
+        .insert_node("Org", "o2", vec![("founded_year".into(), Value::Int(2011))])
+        .unwrap();
+
+    let (status, body, _) = send(
+        app.clone(),
+        json_req(
+            "POST",
+            "/rules",
+            json!({
+                "name": "founded_within",
+                "src_label": "Org",
+                "dst_label": "Org",
+                "predicate": {"NumericWithin": {"field": "founded_year", "tolerance": 2.0}},
+                "edge_type": "FOUNDED_WITHIN",
+                "weight_prop": "score",
+                "max_edges": null
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        parse_json(&body),
+        json!({"ok": true, "name": "founded_within"})
+    );
+    assert!(db.read().rules().iter().any(|r| r.name == "founded_within"));
+
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/rules",
+            json!({
+                "name": "",
+                "src_label": "Org",
+                "dst_label": "Org",
+                "predicate": {"NumericWithin": {"field": "founded_year", "tolerance": 2.0}},
+                "edge_type": "FOUNDED_WITHIN",
+                "weight_prop": "score",
+                "max_edges": null
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v = parse_json(&body);
+    let err = v["error"].as_str().unwrap();
+    assert!(
+        err.contains("invalid rule:"),
+        "engine message verbatim, got {err}"
+    );
+}
+
 /// Binding: Serialize exists on the wire types (additive derives).
 #[test]
 fn wire_types_serialize() {
@@ -663,4 +785,30 @@ fn wire_types_serialize() {
         Some(Value::Str("p1".into())),
         "params reuse json_to_value"
     );
+}
+
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn embedded_ui_serves_index_and_stats_wins() {
+    let db = SharedDb::open(&tmp("embed-ui")).unwrap();
+    let app = router_with_embedded_ui(db);
+    let (st, body, ctype) = send(app.clone(), get("/")).await;
+    assert_eq!(st, StatusCode::OK);
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("mushroomdb") || html.contains("<!doctype") || html.contains("<!DOCTYPE"),
+        "embedded GET / should be index.html, got {html}"
+    );
+    let ctype = ctype.unwrap_or_default();
+    assert!(
+        ctype.contains("html"),
+        "index content-type html, got {ctype}"
+    );
+
+    let (st, body, ctype) = send(app, get("/stats")).await;
+    assert_eq!(st, StatusCode::OK);
+    let ctype = ctype.expect("stats content-type");
+    assert!(ctype.contains("json"), "/stats must stay JSON, got {ctype}");
+    let j = parse_json(&body);
+    assert!(j.get("nodes_live").is_some(), "/stats JSON, got {j}");
 }

@@ -8,6 +8,10 @@ license = "Apache-2.0"
 name = "mushroomdb"
 path = "src/main.rs"
 
+[features]
+default = []
+embed-ui = ["server/embed-ui"]
+
 [dependencies]
 core-api = { path = "../core-api" }
 server = { path = "../server" }

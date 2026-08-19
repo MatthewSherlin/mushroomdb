@@ -135,9 +135,9 @@ fn handshake_initialize_then_initialized_is_silent() {
     );
 }
 
-/// Binding: tools/list returns exactly the seven tools with the specified schemas.
+/// Binding: tools/list returns exactly the eight tools with the specified schemas.
 #[test]
-fn tools_list_returns_seven_tools_with_schemas() {
+fn tools_list_returns_eight_tools_with_schemas() {
     let stdin = req(json!(1), "tools/list", None);
     let (res, out) = exchange(open("list"), &stdin);
     assert!(res.is_ok(), "{res:?}");
@@ -159,10 +159,11 @@ fn tools_list_returns_seven_tools_with_schemas() {
             "stats",
             "neighborhood",
             "node_info",
-            "node_edges"
+            "node_edges",
+            "create_rule",
         ])
     );
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 8);
 
     let by_name = |n: &str| {
         tools
@@ -223,6 +224,15 @@ fn tools_list_returns_seven_tools_with_schemas() {
     assert_eq!(edges["inputSchema"]["type"], "object");
     assert!(edges["inputSchema"]["properties"].get("key").is_some());
     assert_eq!(edges["inputSchema"]["required"], json!(["key"]));
+
+    let cr = by_name("create_rule");
+    assert_eq!(cr["inputSchema"]["type"], "object");
+    assert!(cr["inputSchema"]["properties"].get("predicate").is_some());
+    assert_eq!(
+        cr["inputSchema"]["required"],
+        json!(["name", "src_label", "dst_label", "predicate", "edge_type"])
+    );
+    assert!(ingest["inputSchema"]["properties"].get("edges").is_some());
 }
 
 /// Binding: tools/call happy path for each of the five tools against a seeded db.
@@ -616,4 +626,55 @@ fn eof_exits_ok() {
     let res = run_mcp_stdio(open("eof"), &mut reader, &mut writer);
     assert!(res.is_ok(), "{res:?}");
     assert!(writer.into_inner().is_empty());
+}
+
+/// Binding: ingest_json edges + create_rule match the HTTP write surface.
+#[test]
+fn ingest_edges_and_create_rule_tools() {
+    let db = open("write-tools");
+    {
+        let mut w = db.write();
+        w.insert_node("Person", "a", vec![]).unwrap();
+        w.insert_node("Person", "b", vec![]).unwrap();
+        w.insert_node("Org", "o1", vec![("founded_year".into(), Value::Int(2010))])
+            .unwrap();
+        w.insert_node("Org", "o2", vec![("founded_year".into(), Value::Int(2011))])
+            .unwrap();
+    }
+    let stdin = format!(
+        "{}{}",
+        call(
+            1,
+            "ingest_json",
+            json!({
+                "label": "Person",
+                "rows_json": "[]",
+                "edges": [{"edge_type": "KNOWS", "src": "a", "dst": "b"}]
+            }),
+        ),
+        call(
+            2,
+            "create_rule",
+            json!({
+                "name": "founded_within",
+                "src_label": "Org",
+                "dst_label": "Org",
+                "predicate": {"NumericWithin": {"field": "founded_year", "tolerance": 2.0}},
+                "edge_type": "FOUNDED_WITHIN",
+                "weight_prop": "score",
+                "max_edges": null
+            }),
+        ),
+    );
+    let (res, out) = exchange(db.clone(), &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    assert_eq!(replies.len(), 2);
+    let ingest = content_json(&replies[0]);
+    assert_eq!(ingest["edges_inserted"], json!(1));
+    let created = content_json(&replies[1]);
+    assert_eq!(created, json!({"ok": true, "name": "founded_within"}));
+    let edges = db.read().node_edges("a").unwrap();
+    assert!(edges.iter().any(|e| e.edge_type == "KNOWS" && !e.derived));
+    assert!(db.read().rules().iter().any(|r| r.name == "founded_within"));
 }

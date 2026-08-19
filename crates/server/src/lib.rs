@@ -17,3 +17,5 @@ struct AppState {
 }
 
 pub use http::{router, router_with_ui, serve, serve_with_ui};
+#[cfg(feature = "embed-ui")]
+pub use http::{router_with_embedded_ui, serve_with_embedded_ui};

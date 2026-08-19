@@ -9,7 +9,7 @@
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
 //!   `serverInfo.name` `"mushroomdb"`
 //! - `notifications/initialized` — ignored
-//! - `tools/list` — the seven tools below, each with a JSON Schema
+//! - `tools/list` — the eight tools below, each with a JSON Schema
 //! - `tools/call` — dispatch; success is
 //!   `{content:[{type:"text", text:<json string>}]}`
 //!
@@ -39,8 +39,10 @@
 //!
 //! EOF on `reader` returns `Ok(())`. Read/write I/O errors propagate.
 
-use crate::json::{node_edges_json, node_info_json, params_from_json, result_set_json};
-use core_api::{AutoFk, Dir, GraphError, IngestOptions, SharedDb};
+use crate::json::{
+    node_edges_json, node_info_json, params_from_json, parse_ingest_edges, result_set_json,
+};
+use core_api::{AutoFk, Dir, GraphError, IngestOptions, RuleDef, SharedDb};
 use serde_json::{json, Value as Js};
 use std::io::{self, BufRead, Write};
 
@@ -146,6 +148,7 @@ fn dispatch_call(db: &SharedDb, params: Option<&Js>) -> CallOutcome {
     match name {
         "query" => tool_query(db, args),
         "ingest_json" => tool_ingest(db, args),
+        "create_rule" => tool_create_rule(db, args),
         "explain" => tool_explain(db, args),
         "stats" => tool_stats(db),
         "neighborhood" => tool_neighborhood(db, args),
@@ -208,11 +211,49 @@ fn tool_ingest(db: &SharedDb, args: &Js) -> CallOutcome {
         let mut g = db.write();
         g.ingest_json(label, rows_json, &opts)
     };
-    match report {
+    let mut report = match report {
         Ok(r) => match serde_json::to_value(&r) {
-            Ok(v) => CallOutcome::ToolOk(v),
-            Err(e) => CallOutcome::ToolErr(e.to_string()),
+            Ok(v) => v,
+            Err(e) => return CallOutcome::ToolErr(e.to_string()),
         },
+        Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+    };
+    if let Some(raw) = args.get("edges") {
+        if !raw.is_null() {
+            let edges = match parse_ingest_edges(raw) {
+                Ok(e) => e,
+                Err(e) => return CallOutcome::ToolErr(e),
+            };
+            let mut n = 0u64;
+            {
+                let mut g = db.write();
+                for (etype, src, dst) in edges {
+                    match g.insert_edge(&etype, &src, &dst) {
+                        Ok(_) => n += 1,
+                        Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+                    }
+                }
+            }
+            if let Some(obj) = report.as_object_mut() {
+                obj.insert("edges_inserted".into(), json!(n));
+            }
+        }
+    }
+    CallOutcome::ToolOk(report)
+}
+
+fn tool_create_rule(db: &SharedDb, args: &Js) -> CallOutcome {
+    let def: RuleDef = match serde_json::from_value(args.clone()) {
+        Ok(d) => d,
+        Err(e) => return CallOutcome::ToolErr(e.to_string()),
+    };
+    let name = def.name.clone();
+    let res = {
+        let mut g = db.write();
+        g.create_rule(def)
+    };
+    match res {
+        Ok(()) => CallOutcome::ToolOk(json!({"ok": true, "name": name})),
         Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
     }
 }
@@ -382,9 +423,30 @@ fn tools_list() -> Js {
                             "description": "JSON text of an array of objects."
                         },
                         "key_field": { "type": "string" },
-                        "auto_fk_suffix": { "type": "string" }
+                        "auto_fk_suffix": { "type": "string" },
+                        "edges": {
+                            "type": "array",
+                            "description": "Optional user edges [{edge_type, src, dst}]."
+                        }
                     },
                     "required": ["label", "rows_json"]
+                }
+            },
+            {
+                "name": "create_rule",
+                "description": "Create a derivation rule (RuleDef JSON).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "src_label": { "type": "string" },
+                        "dst_label": { "type": "string" },
+                        "predicate": { "type": "object" },
+                        "edge_type": { "type": "string" },
+                        "weight_prop": { "type": ["string", "null"] },
+                        "max_edges": { "type": ["integer", "null"] }
+                    },
+                    "required": ["name", "src_label", "dst_label", "predicate", "edge_type"]
                 }
             },
             {
