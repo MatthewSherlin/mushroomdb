@@ -33,6 +33,7 @@ jobs:
       - run: npm run build
 
   e2e:
+    needs: [test, ui]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,7 +78,8 @@ jobs:
         working-directory: bindings/python
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -123,6 +125,7 @@ jobs:
           curl -sf http://127.0.0.1:18080/node/person-01 | grep -q person-01
 
   docker:
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
