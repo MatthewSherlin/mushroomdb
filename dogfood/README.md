@@ -39,7 +39,7 @@ and `MATCHES_DESIGN_STYLE` produce empty edge sets (honest).
   hash of industry + small per-key jitter. Documented as synthetic — fixtures
   have no Meili/OpenAI vectors. Same-industry pairs cosine ≫ 0.85.
 
-## Rules (`rules.SIX_RULES`, 9 instances)
+## Rules (`rules.SIX_RULES`, 10 instances)
 
 mushroomdb binds `(src_label, dst_label)`. The six kinds become:
 
