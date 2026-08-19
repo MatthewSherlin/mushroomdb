@@ -18,7 +18,8 @@ RUN cargo build -p cli --bin mushroomdb --features embed-ui --release \
     && mkdir -p /data \
     && chown 65532:65532 /data
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+# debian12 nonroot
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
 COPY --from=build /src/target/release/mushroomdb /usr/local/bin/mushroomdb
 COPY --from=build --chown=65532:65532 /data /data
 USER nonroot

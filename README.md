@@ -129,7 +129,12 @@ curl -fsSL https://raw.githubusercontent.com/MatthewSherlin/graph-db/main/packag
 `install.sh` writes `~/.local/bin/mushroomdb` (no sudo). Both fetch the
 matching GitHub Release tarball and checksum-verify it. The launcher and
 script were tested against a locally served fake release asset, not a
-real tag. Homebrew formula template: `packaging/homebrew/mushroomdb.rb`.
+real tag.
+
+Homebrew: do **not** tap `packaging/homebrew/mushroomdb.rb` on `main` (it
+is a stub). After each `v*` tag, download the `mushroomdb.rb` **Release
+asset** (sha256s computed from that tag's tarballs) and copy it into the
+tap. See `packaging/homebrew/README.md`.
 
 ## Demo
 

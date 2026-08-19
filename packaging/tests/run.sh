@@ -106,6 +106,44 @@ test "$st" -ne 0
 grep -q "unsupported platform: win32-x64" "$WORKDIR/bad-npm.err"
 grep -q "darwin-arm64" "$WORKDIR/bad-npm.err"
 
+echo "== tampered asset: both installers refuse"
+printf x >> "$WORKDIR/rel/${ASSET}"
+TAMPER_DIR="$WORKDIR/prefix-tamper/bin"
+mkdir -p "$TAMPER_DIR"
+set +e
+MUSHROOMDB_VERSION="$VERSION" \
+  MUSHROOMDB_RELEASE_BASE="$BASE" \
+  MUSHROOMDB_INSTALL_DIR="$TAMPER_DIR" \
+  sh "$PKG/install.sh" >"$WORKDIR/tamper-sh.out" 2>"$WORKDIR/tamper-sh.err"
+st=$?
+set -e
+test "$st" -ne 0
+grep -qi checksum "$WORKDIR/tamper-sh.err"
+test ! -e "${TAMPER_DIR}/mushroomdb"
+
+rm -rf "$NPM/vendor"
+set +e
+MUSHROOMDB_RELEASE_BASE="$BASE" \
+  node "$NPM/install.js" >"$WORKDIR/tamper-npm.out" 2>"$WORKDIR/tamper-npm.err"
+st=$?
+set -e
+test "$st" -ne 0
+grep -qi checksum "$WORKDIR/tamper-npm.err"
+test ! -e "$NPM/vendor/mushroomdb"
+
+echo "== homebrew render.sh fills real sha256s"
+FAKE_SUMS="$WORKDIR/SHA256SUMS-four"
+{
+  echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mushroomdb-${TAG}-aarch64-apple-darwin.tar.gz"
+  echo "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  mushroomdb-${TAG}-x86_64-apple-darwin.tar.gz"
+  echo "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  mushroomdb-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
+  echo "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  mushroomdb-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+} > "$FAKE_SUMS"
+sh "$PKG/homebrew/render.sh" "$VERSION" "$FAKE_SUMS" "$WORKDIR/mushroomdb.rb"
+grep -q 'sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$WORKDIR/mushroomdb.rb"
+grep -q 'sha256 "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"' "$WORKDIR/mushroomdb.rb"
+grep -qv PUT_SHA256 "$WORKDIR/mushroomdb.rb"
+
 echo "== npm pack excludes the binary"
 (cd "$NPM" && npm pack --pack-destination "$WORKDIR" >/dev/null)
 TAR=$(ls "$WORKDIR"/mushroomdb-*.tgz)
