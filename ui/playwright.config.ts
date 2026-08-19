@@ -1,6 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
-const port = process.env.E2E_PORT ?? "4173";
+const port =
+  process.env.E2E_PORT ?? String(49152 + Math.floor(Math.random() * 16383));
+process.env.E2E_PORT = port;
 const baseURL = `http://127.0.0.1:${port}`;
 
 export default defineConfig({
@@ -36,5 +38,6 @@ export default defineConfig({
     reuseExistingServer: !process.env.CI,
     stdout: "pipe",
     stderr: "pipe",
+    env: { ...process.env, E2E_PORT: port },
   },
 });

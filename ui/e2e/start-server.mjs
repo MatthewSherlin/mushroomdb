@@ -9,7 +9,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, "..", "..");
 const bin = join(repo, "target", "debug", "mushroomdb");
 const dist = join(repo, "ui", "dist");
-const port = process.env.E2E_PORT ?? "4173";
+const port =
+  process.env.E2E_PORT ?? String(49152 + Math.floor(Math.random() * 16383));
+process.env.E2E_PORT = port;
 
 if (!existsSync(bin)) {
   console.error(`missing ${bin} — cargo build -p cli --bin mushroomdb`);
@@ -24,6 +26,26 @@ const db = mkdtempSync(join(tmpdir(), "mushroomdb-e2e-"));
 const demo = spawnSync(bin, ["demo", db], { stdio: "inherit" });
 if (demo.status !== 0) {
   process.exit(demo.status ?? 1);
+}
+// /ingest inserts nodes only. Seed a real user edge for the demo-flow spec.
+const seedBin = join(repo, "target", "debug", "examples", "insert_edge");
+if (!existsSync(seedBin)) {
+  const built = spawnSync(
+    "cargo",
+    ["build", "-p", "core-api", "--example", "insert_edge"],
+    { cwd: repo, stdio: "inherit" },
+  );
+  if (built.status !== 0) {
+    process.exit(built.status ?? 1);
+  }
+}
+const seed = spawnSync(
+  seedBin,
+  [db, "KNOWS", "person-01", "person-02"],
+  { stdio: "inherit" },
+);
+if (seed.status !== 0) {
+  process.exit(seed.status ?? 1);
 }
 
 const child = spawn(

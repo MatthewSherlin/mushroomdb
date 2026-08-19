@@ -39,10 +39,32 @@ export async function addPerson01FitToCanvas(page: Page): Promise<void> {
 }
 
 export async function openRule(page: Page, name: string): Promise<void> {
-  await page.getByRole("button", { name: "Rules" }).click();
-  await expect(page.locator(".rules.is-open")).toBeVisible();
+  const rules = page.locator(".rules");
+  if (!(await rules.evaluate((el) => el.classList.contains("is-open")))) {
+    await page.getByRole("button", { name: "Rules" }).click();
+  }
+  await expect(rules).toHaveClass(/is-open/);
   await page.locator(".rules-item", { hasText: name }).click();
   await expect(page.locator(".why.is-open")).toBeVisible();
 }
 
-export { FIT_QUERY };
+export async function person01Edges(
+  page: Page,
+): Promise<{ edge_type: string; src_key: string; dst_key: string; derived: boolean }[]> {
+  const res = await page.request.get("/node/person-01/edges");
+  expect(res.ok()).toBe(true);
+  const body = (await res.json()) as {
+    edges: {
+      edge_type: string;
+      src_key: string;
+      dst_key: string;
+      derived: boolean;
+    }[];
+  };
+  return body.edges;
+}
+
+const KNOWS_QUERY = `MATCH (a:Person {id: 'person-01'})-[r:KNOWS]->(b:Person)
+RETURN a, b`;
+
+export { FIT_QUERY, KNOWS_QUERY };

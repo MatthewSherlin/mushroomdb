@@ -1,8 +1,11 @@
 import { expect, test } from "@playwright/test";
 import {
   addPerson01FitToCanvas,
+  KNOWS_QUERY,
   loadDemoNeighborhood,
   openRule,
+  person01Edges,
+  runCypher,
   waitConnected,
 } from "./helpers";
 
@@ -30,8 +33,22 @@ test.describe("demo flow", () => {
     await expect(page.locator(".label-chip").filter({ hasText: "Person" }).first()).toBeVisible();
     await expect(page.locator(".label-chip").filter({ hasText: "Project" }).first()).toBeVisible();
 
-    // Demo has no hand-inserted edges; auto-FK ORG is a real etype (not
-    // the legacy `related` synthesis). Inspector is the headless surface.
+    // Seeded user edge (HTTP /ingest is nodes-only). derived:false is the
+    // canvas color contract (structure, not gold). Headless GPU link-pick is
+    // not used; the table + /edges payload are the same merge input as paint.
+    const edges = await person01Edges(page);
+    expect(edges).toContainEqual({
+      edge_type: "KNOWS",
+      src_key: "person-01",
+      dst_key: "person-02",
+      derived: false,
+    });
+    expect(edges.some((e) => e.edge_type === "related")).toBe(false);
+    await runCypher(page, KNOWS_QUERY);
+    await expect(page.locator(".console-table-wrap")).toContainText("person-01");
+    await expect(page.locator(".console-table-wrap")).toContainText("person-02");
+
+    // FK-derived ORG still covers auto-inference (not the user-edge path).
     await openRule(page, "auto_fk_person_org_id");
     await expect(page.locator(".why-etype")).toHaveText("ORG");
     await expect(page.locator(".why")).not.toContainText("related");

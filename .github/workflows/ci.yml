@@ -44,10 +44,17 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
       - run: cargo build -p cli --bin mushroomdb
+      - run: cargo build -p core-api --example insert_edge
       - run: npm ci
         working-directory: ui
       - run: npm run build
         working-directory: ui
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('ui/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
       - run: npx playwright install --with-deps chromium
         working-directory: ui
       - run: npm run test:e2e
