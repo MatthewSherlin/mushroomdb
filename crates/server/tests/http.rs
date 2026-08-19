@@ -617,7 +617,7 @@ async fn serve_readiness_returns_local_addr() {
     handle.abort();
 }
 
-/// Binding: POST /ingest optional `edges` uses insert_edge after rows.
+/// Binding: POST /ingest optional `edges` shares the node ingest batch.
 #[tokio::test]
 async fn ingest_edges_inserts_user_edge() {
     let (app, db) = open("ingest-edges");
@@ -674,6 +674,65 @@ async fn ingest_edges_unknown_endpoint_is_400() {
         err.contains("node key not found"),
         "expected KeyNotFound register, got {err}"
     );
+}
+
+/// Binding: a bad edge rejects the whole ingest; nodes from the same body
+/// are not persisted.
+#[tokio::test]
+async fn ingest_bad_edge_is_atomic() {
+    let (app, db) = open("ingest-atomic");
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/ingest",
+            json!({
+                "label": "Person",
+                "rows": [{"id": "newbie"}],
+                "edges": [{"edge_type": "KNOWS", "src": "newbie", "dst": "ghost"}]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v = parse_json(&body);
+    let err = v["error"].as_str().unwrap();
+    assert!(
+        err.contains("node key not found"),
+        "preview error, got {err}"
+    );
+    assert!(
+        !db.read().has_node("newbie"),
+        "newbie must not persist after a rejected mixed batch"
+    );
+}
+
+/// Binding: a duplicate user edge is a no-op and counts as 0 inserts.
+#[tokio::test]
+async fn ingest_duplicate_edge_counts_zero() {
+    let (app, db) = open("ingest-dup-edge");
+    {
+        let mut w = db.write();
+        w.insert_node("Person", "a", vec![]).unwrap();
+        w.insert_node("Person", "b", vec![]).unwrap();
+        w.insert_edge("KNOWS", "a", "b").unwrap();
+    }
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/ingest",
+            json!({
+                "label": "Person",
+                "rows": [],
+                "edges": [{"edge_type": "KNOWS", "src": "a", "dst": "b"}]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(v["edges_inserted"], json!(0));
 }
 
 /// Binding: POST /rules accepts RuleDef JSON; validation errors are 400 verbatim.
@@ -762,6 +821,7 @@ fn wire_types_serialize() {
             field: "org_id".into(),
             reason: "no matching target keys".into(),
         }],
+        edges_inserted: 0,
     })
     .unwrap();
     let expl = serde_json::to_value(&Explanation {

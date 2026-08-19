@@ -57,6 +57,9 @@ pub struct IngestReport {
     pub row_errors: Vec<(usize, String)>,
     pub rules_created: Vec<String>,
     pub skipped_fk_fields: Vec<FkSkip>,
+    /// User edges from the same request that were newly inserted (duplicates
+    /// are no-ops and do not count).
+    pub edges_inserted: usize,
 }
 
 /// Convert a JSON value to a stored [`Value`].
@@ -208,7 +211,7 @@ pub(crate) fn run_json<F: Fs>(
         })?;
     let mut converted = json_to_rows(&parsed)?;
     let rows = std::mem::take(&mut converted.rows);
-    let report = run(db, label, rows, opts)?;
+    let report = run(db, label, rows, opts, &[])?;
     Ok(converted.into_report(report))
 }
 
@@ -220,12 +223,13 @@ struct Classified {
 }
 
 /// Classify rows, optionally infer auto-FK rules, and commit one atomic batch
-/// (rules first, then node inserts).
+/// (rules first, then node inserts, then optional user edges).
 pub(crate) fn run<F: Fs>(
     db: &mut GraphDb<F>,
     label: &str,
     rows: Vec<BTreeMap<String, Value>>,
     opts: &IngestOptions,
+    edges: &[(String, String, String)],
 ) -> Result<IngestReport> {
     let Classified {
         accepted,
@@ -248,13 +252,17 @@ pub(crate) fn run<F: Fs>(
             props.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         batch.insert_node(label, key, prop_vec);
     }
-    batch.commit_ingest(label, accepted.len())?;
+    for (etype, src, dst) in edges {
+        batch.insert_edge(etype, src, dst);
+    }
+    let edges_inserted = batch.commit_ingest(label, accepted.len())?;
 
     Ok(IngestReport {
         inserted: accepted.len(),
         row_errors,
         rules_created,
         skipped_fk_fields,
+        edges_inserted,
     })
 }
 

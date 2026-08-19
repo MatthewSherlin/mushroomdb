@@ -714,7 +714,19 @@ impl<F: Fs> GraphDb<F> {
         rows: Vec<BTreeMap<String, Value>>,
         opts: &IngestOptions,
     ) -> Result<IngestReport> {
-        crate::ingest::run(self, label, rows, opts)
+        self.ingest_with_edges(label, rows, opts, &[])
+    }
+
+    /// [`ingest`] plus user edges in the **same** previewed WAL batch.
+    /// A failing edge rejects the whole request; nothing is applied.
+    pub fn ingest_with_edges(
+        &mut self,
+        label: &str,
+        rows: Vec<BTreeMap<String, Value>>,
+        opts: &IngestOptions,
+        edges: &[(String, String, String)],
+    ) -> Result<IngestReport> {
+        crate::ingest::run(self, label, rows, opts, edges)
     }
 
     /// Parse `json` as an array of objects and ingest via [`GraphDb::ingest`].
@@ -736,7 +748,7 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         ops: Vec<BatchOp>,
         ingest: Option<(String, usize)>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let recs = {
             let mut preview = MutPreview::new(self);
             let mut recs = Vec::with_capacity(ops.len());
@@ -810,13 +822,18 @@ impl<F: Fs> GraphDb<F> {
             recs
         };
         if recs.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
-        self.log_then_apply_with(WalRecord::Batch(recs), ingest)
+        let edges_inserted = recs
+            .iter()
+            .filter(|r| matches!(r, WalRecord::InsertEdge { .. }))
+            .count();
+        self.log_then_apply_with(WalRecord::Batch(recs), ingest)?;
+        Ok(edges_inserted)
     }
 
     fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<()> {
-        self.commit_logged_batch(ops, None)
+        self.commit_logged_batch(ops, None).map(|_| ())
     }
 
     pub fn insert_node(
@@ -1748,7 +1765,7 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
 
     /// Same as [`commit`](Self::commit) but tail the inner events with
     /// [`MutationEvent::Ingested`] instead of [`MutationEvent::BatchApplied`].
-    pub(crate) fn commit_ingest(&mut self, label: &str, inserted: usize) -> Result<()> {
+    pub(crate) fn commit_ingest(&mut self, label: &str, inserted: usize) -> Result<usize> {
         let ops = std::mem::take(&mut self.ops);
         self.db
             .commit_logged_batch(ops, Some((label.to_string(), inserted)))

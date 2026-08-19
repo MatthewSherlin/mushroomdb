@@ -42,7 +42,7 @@
 use crate::json::{
     node_edges_json, node_info_json, params_from_json, parse_ingest_edges, result_set_json,
 };
-use core_api::{AutoFk, Dir, GraphError, IngestOptions, RuleDef, SharedDb};
+use core_api::{json_to_rows, AutoFk, Dir, GraphError, IngestOptions, RuleDef, SharedDb};
 use serde_json::{json, Value as Js};
 use std::io::{self, BufRead, Write};
 
@@ -207,39 +207,37 @@ fn tool_ingest(db: &SharedDb, args: &Js) -> CallOutcome {
             None => return CallOutcome::ToolErr("auto_fk_suffix must be a string".into()),
         }
     }
-    let report = {
-        let mut g = db.write();
-        g.ingest_json(label, rows_json, &opts)
-    };
-    let mut report = match report {
-        Ok(r) => match serde_json::to_value(&r) {
-            Ok(v) => v,
-            Err(e) => return CallOutcome::ToolErr(e.to_string()),
+    let edges = match args.get("edges") {
+        None | Some(Js::Null) => Vec::new(),
+        Some(raw) => match parse_ingest_edges(raw) {
+            Ok(e) => e,
+            Err(e) => return CallOutcome::ToolErr(e),
         },
+    };
+    let parsed: Js = match serde_json::from_str(rows_json) {
+        Ok(v) => v,
+        Err(e) => {
+            return CallOutcome::ToolErr(graph_err_msg(GraphError::IngestError {
+                detail: e.to_string(),
+            }))
+        }
+    };
+    let mut converted = match json_to_rows(&parsed) {
+        Ok(c) => c,
         Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
     };
-    if let Some(raw) = args.get("edges") {
-        if !raw.is_null() {
-            let edges = match parse_ingest_edges(raw) {
-                Ok(e) => e,
-                Err(e) => return CallOutcome::ToolErr(e),
-            };
-            let mut n = 0u64;
-            {
-                let mut g = db.write();
-                for (etype, src, dst) in edges {
-                    match g.insert_edge(&etype, &src, &dst) {
-                        Ok(_) => n += 1,
-                        Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
-                    }
-                }
-            }
-            if let Some(obj) = report.as_object_mut() {
-                obj.insert("edges_inserted".into(), json!(n));
-            }
-        }
+    let taken = std::mem::take(&mut converted.rows);
+    let report = {
+        let mut g = db.write();
+        g.ingest_with_edges(label, taken, &opts, &edges)
+    };
+    match report.map(|r| converted.into_report(r)) {
+        Ok(r) => match serde_json::to_value(&r) {
+            Ok(v) => CallOutcome::ToolOk(v),
+            Err(e) => CallOutcome::ToolErr(e.to_string()),
+        },
+        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
     }
-    CallOutcome::ToolOk(report)
 }
 
 fn tool_create_rule(db: &SharedDb, args: &Js) -> CallOutcome {

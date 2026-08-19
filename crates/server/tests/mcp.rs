@@ -678,3 +678,34 @@ fn ingest_edges_and_create_rule_tools() {
     assert!(edges.iter().any(|e| e.edge_type == "KNOWS" && !e.derived));
     assert!(db.read().rules().iter().any(|r| r.name == "founded_within"));
 }
+
+/// Binding: ingest_json mixed batch is atomic — a bad edge persists no nodes.
+#[test]
+fn ingest_json_bad_edge_is_atomic() {
+    let db = open("mcp-atomic");
+    let stdin = call(
+        1,
+        "ingest_json",
+        json!({
+            "label": "Person",
+            "rows_json": "[{\"id\":\"newbie\"}]",
+            "edges": [{"edge_type": "KNOWS", "src": "newbie", "dst": "ghost"}]
+        }),
+    );
+    let (res, out) = exchange(db.clone(), &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0]["result"]["isError"], json!(true));
+    let msg = replies[0]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        msg.contains("node key not found"),
+        "preview error, got {msg}"
+    );
+    assert!(
+        !db.read().has_node("newbie"),
+        "newbie must not persist after a rejected mixed batch"
+    );
+}

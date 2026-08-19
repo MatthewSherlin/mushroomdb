@@ -120,6 +120,10 @@ fn embedded_ctype(path: &str) -> &'static str {
         "text/css; charset=utf-8"
     } else if path.ends_with(".woff2") {
         "font/woff2"
+    } else if path.ends_with(".svg") {
+        "image/svg+xml"
+    } else if path.ends_with(".ico") {
+        "image/x-icon"
     } else if path.ends_with(".txt") {
         "text/plain; charset=utf-8"
     } else {
@@ -318,40 +322,25 @@ async fn ingest(State(state): State<AppState>, Json(body): Json<Js>) -> Response
         Err(e) => return err_response(e),
     };
     let taken = std::mem::take(&mut converted.rows);
+    let edges = match body.get("edges") {
+        None | Some(Js::Null) => Vec::new(),
+        Some(raw) => match parse_ingest_edges(raw) {
+            Ok(e) => e,
+            Err(e) => return err_response(e),
+        },
+    };
     let report = {
         let mut g = state.db.write();
-        g.ingest(&label, taken, &opts)
+        g.ingest_with_edges(&label, taken, &opts, &edges)
     };
     let report = report.map(|r| converted.into_report(r));
-    let mut report = match report {
+    match report {
         Ok(r) => match serde_json::to_value(&r) {
-            Ok(v) => v,
-            Err(e) => return err_response(e.to_string()),
+            Ok(v) => json_ok(v),
+            Err(e) => err_response(e.to_string()),
         },
-        Err(e) => return graph_err(e),
-    };
-    if let Some(raw) = body.get("edges") {
-        if !raw.is_null() {
-            let edges = match parse_ingest_edges(raw) {
-                Ok(e) => e,
-                Err(e) => return err_response(e),
-            };
-            let mut n = 0u64;
-            {
-                let mut g = state.db.write();
-                for (etype, src, dst) in edges {
-                    match g.insert_edge(&etype, &src, &dst) {
-                        Ok(_) => n += 1,
-                        Err(e) => return graph_err(e),
-                    }
-                }
-            }
-            if let Some(obj) = report.as_object_mut() {
-                obj.insert("edges_inserted".into(), json!(n));
-            }
-        }
+        Err(e) => graph_err(e),
     }
-    json_ok(report)
 }
 
 async fn create_rule(State(state): State<AppState>, Json(body): Json<Js>) -> Response {

@@ -323,6 +323,7 @@ fn auto_fk_off_disables_inference() {
             row_errors: vec![],
             rules_created: vec![],
             skipped_fk_fields: vec![],
+            edges_inserted: 0,
         }
     );
     assert!(db.rules().is_empty());

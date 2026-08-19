@@ -136,6 +136,58 @@ async fn watch_receives_batch_inner_then_summary() {
     assert_eq!(frames, expected);
 }
 
+/// Binding: ingest_with_edges is one batch: inner events then Ingested.
+#[tokio::test]
+async fn watch_ingest_with_edges_emits_inner_then_ingested() {
+    use core_api::IngestOptions;
+    use std::collections::BTreeMap;
+
+    let db = SharedDb::open(&tmp("ingest-watch")).unwrap();
+    db.write().insert_node("Person", "b", vec![]).unwrap();
+    let addr = spawn_server(db.clone()).await;
+    let mut ws = connect(addr).await;
+
+    let mut row = BTreeMap::new();
+    row.insert("id".into(), Value::Str("a".into()));
+    db.write()
+        .ingest_with_edges(
+            "Person",
+            vec![row],
+            &IngestOptions {
+                auto_fk: core_api::AutoFk::Off,
+                ..IngestOptions::default()
+            },
+            &[("KNOWS".into(), "a".into(), "b".into())],
+        )
+        .unwrap();
+
+    let frames: Vec<Json> = vec![
+        next_text(&mut ws).await,
+        next_text(&mut ws).await,
+        next_text(&mut ws).await,
+    ];
+    let expected = vec![
+        MutationEvent::NodeInserted {
+            label: "Person".into(),
+            key: "a".into(),
+        },
+        MutationEvent::EdgeInserted {
+            edge_type: "KNOWS".into(),
+            src: "a".into(),
+            dst: "b".into(),
+        },
+        MutationEvent::Ingested {
+            label: "Person".into(),
+            inserted: 1,
+        },
+    ];
+    let expected: Vec<Json> = expected
+        .into_iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect();
+    assert_eq!(frames, expected);
+}
+
 /// Slow-consumer Lagged integration test is omitted: capacity is 1024, and
 /// filling the ring depends on the handler *not* draining while the TCP
 /// window fills — racy under load, and 1024 durable writes is slow. The

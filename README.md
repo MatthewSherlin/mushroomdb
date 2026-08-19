@@ -199,6 +199,8 @@ Endpoints (thin wrappers over `core-api`):
 Vanilla TypeScript + Vite explorer in `ui/`. The **release** binary
 (`cargo build -p cli --bin mushroomdb --features embed-ui --release`)
 serves the explorer from the same origin as the API with two commands.
+The `embed-ui` feature needs a built tree: `cd ui && npm ci && npm run build`
+(the crate's `build.rs` panics with that command if `ui/dist/index.html` is missing).
 
 Captured from `./target/release/mushroomdb` (embed-ui) against a fresh
 temp dir, then `serve --addr 127.0.0.1:18080`:
