@@ -74,6 +74,40 @@ def test_value_mapping_rejects_dict(tmp_path):
     db.close()
 
 
+def test_set_prop_and_scalar_list_round_trip(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("n", "L", {"ok": True, "rating": 0.5})
+    db.set_prop("n", "ok", False)
+    db.set_prop("n", "rating", 1.25)
+    db.set_prop("n", "tags", ["a", ["b", "c"]])
+    info = db.node_info("n")["props"]
+    assert info["ok"] is False
+    assert info["rating"] == pytest.approx(1.25)
+    assert info["tags"] == ["a", ["b", "c"]]
+    db.close()
+
+
+def test_create_rule_invalid_surfaces_engine_message(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    with pytest.raises(RuntimeError, match="invalid rule:"):
+        db.create_rule(
+            {
+                "name": "",
+                "src_label": "Org",
+                "dst_label": "Org",
+                "predicate": {
+                    "NumericWithin": {"field": "founded_year", "tolerance": 2.0}
+                },
+                "edge_type": "FOUNDED_WITHIN",
+                "weight_prop": "score",
+                "max_edges": None,
+            }
+        )
+    with pytest.raises((ValueError, RuntimeError), match="RuleDef"):
+        db.create_rule({"name": "missing-the-rest"})
+    db.close()
+
+
 def test_query_error_is_runtime_error_with_stage_prefix(tmp_path):
     db = GraphDb.open(str(tmp_path / "db"))
     with pytest.raises(RuntimeError, match=r"parse:"):

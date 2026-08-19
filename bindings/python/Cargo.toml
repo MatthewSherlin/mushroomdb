@@ -6,6 +6,10 @@ license = "Apache-2.0"
 description = "Python bindings for mushroomdb"
 publish = false
 
+# Standalone: do not join the repo workspace. Path deps on core-api still
+# compile through the root workspace they belong to.
+[workspace]
+
 [lib]
 name = "mushroomdb"
 crate-type = ["cdylib"]
@@ -14,4 +18,4 @@ crate-type = ["cdylib"]
 core-api = { path = "../../crates/core-api" }
 core-storage = { path = "../../crates/core-storage" }
 pyo3 = { version = "0.26", features = ["extension-module"] }
-serde_json = { workspace = true }
+serde_json = "1"

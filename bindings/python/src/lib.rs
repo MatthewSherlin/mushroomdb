@@ -63,6 +63,9 @@ impl GraphDb {
         self.with_ref(|db| db.neighbors(key, edge_type, dir))
     }
 
+    /// Unknown key: `None`, matching Rust `GraphDb::node_info` → `Option`.
+    /// Contrast `node_edges`, which raises `RuntimeError` for the same miss
+    /// because Rust returns `Result` (`GraphError::KeyNotFound`). Deliberate.
     fn node_info(&self, py: Python<'_>, key: &str) -> PyResult<Option<Py<PyDict>>> {
         let info = self.with_ref(|db| Ok(db.node_info(key)))?;
         match info {
@@ -71,6 +74,9 @@ impl GraphDb {
         }
     }
 
+    /// Unknown key: `RuntimeError` (`node key not found: …`), matching Rust
+    /// `GraphDb::node_edges` → `Result`. `node_info` stays `None` on the same
+    /// miss (`Option`). The asymmetry is the core API, not a Python invention.
     fn node_edges(&self, py: Python<'_>, key: &str) -> PyResult<Vec<Py<PyDict>>> {
         let edges = self.with_ref(|db| db.node_edges(key))?;
         edges

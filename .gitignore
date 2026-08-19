@@ -1,4 +1,5 @@
 target/
+bindings/python/target/
 .superpowers/
 bindings/python/.venv/
 bindings/python/.pytest_cache/
