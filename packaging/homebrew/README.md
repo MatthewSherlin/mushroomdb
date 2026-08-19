@@ -11,3 +11,5 @@ from that release's artifacts. After every tag:
 
 Do not `brew install` from `packaging/homebrew/` on `main` — the in-tree
 `mushroomdb.rb` stub refuses to load until replaced by the release asset.
+
+- Before the first multi-arch push: verify the distroless base digest is the multi-platform MANIFEST-LIST digest (not a single-arch manifest), or the arm64 image silently resolves differently.
