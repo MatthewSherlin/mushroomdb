@@ -4,7 +4,7 @@ use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
-pub use crate::index::with_vector_dim_reject;
+pub use crate::index::{with_vector_dim_reject, with_vector_early_exit};
 
 /// Borrowed mutable view of graph state the engine writes derived edges into.
 pub struct GraphMut<'a> {
@@ -138,6 +138,44 @@ fn compute_desired(
         }
     };
 
+    // Fast path: Cauchy-Schwarz suffix-norm early exit for VectorSimilar.
+    //
+    // Pre-fetch n's live vector ONCE outside the candidate loop so it is
+    // allocated only once per compute_desired call (not per candidate pair).
+    // m's vector is still fetched per pair — unavoidable without caching full
+    // vectors (which is the O(n·dim) trade-off the brief rules out).
+    //
+    // Freshness gate: `SideIndex::fresh_ckpts_for` returns `None` when the
+    // cached norm differs from the live norm, preventing stale checkpoints from
+    // producing a false reject (see doc comment on `fresh_ckpts_for`).
+    let n_early_exit_hint: Option<(Vec<f64>, f64, [f64; 8])> =
+        if let Predicate::VectorSimilar { field, .. } = &def.predicate {
+            if crate::index::vector_early_exit_enabled() {
+                let n_side = if on_src_side {
+                    &index.src_side
+                } else {
+                    &index.dst_side
+                };
+                if let Some(vn_v) = n_get(field) {
+                    if let Some(vn) = crate::index::as_numeric_list(&vn_v) {
+                        if let Some((norm_n, ckpts_n)) = n_side.fresh_ckpts_for(n, &vn) {
+                            Some((vn, norm_n, *ckpts_n))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
     let mut out = BTreeMap::new();
     for m in candidates {
         if m == n {
@@ -178,6 +216,39 @@ fn compute_desired(
                 n,
             )
         };
+
+        // Use the pre-fetched n hint if available; fetch m per-pair.
+        if let (
+            Some((ref vn, norm_n, ckpts_n)),
+            Predicate::VectorSimilar { field, min },
+        ) = (&n_early_exit_hint, &def.predicate)
+        {
+            let m_side = if on_src_side {
+                &index.dst_side
+            } else {
+                &index.src_side
+            };
+            if let Some(vm_v) = m_get(field) {
+                if let Some(vm) = crate::index::as_numeric_list(&vm_v) {
+                    if let Some((norm_m, ckpts_m)) = m_side.fresh_ckpts_for(m, &vm) {
+                        let (va, ckpts_a, na, vb, ckpts_b, nb) = if on_src_side {
+                            (vn.as_slice(), ckpts_n, *norm_n, vm.as_slice(), ckpts_m, norm_m)
+                        } else {
+                            (vm.as_slice(), ckpts_m, norm_m, vn.as_slice(), ckpts_n, *norm_n)
+                        };
+                        match crate::def::cosine_early_exit(va, vb, &ckpts_a, ckpts_b, na, nb, *min)
+                        {
+                            None => continue,          // exact reject
+                            Some(score) => {
+                                out.insert((s_id, d_id), score);
+                                continue; // full cosine already computed
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(score) = evaluate(&def.predicate, &s_view, &d_view) {
             out.insert((s_id, d_id), score);
         }
@@ -2527,6 +2598,235 @@ mod tests {
             "streaming_peak_transient_bound: baseline={baseline} peak={peak} \
              delta={peak_delta} bytes ({} KiB)",
             peak_delta / 1024
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3 (Plan 11): Checkpointed Cauchy-Schwarz suffix-norm early exit
+    // -----------------------------------------------------------------------
+
+    /// Helper: a near-threshold vector pair. Returns (a, b) where cos(a,b) is
+    /// just above the provided threshold (so the pair SHOULD match).
+    fn near_threshold_pair(dim: usize, min: f64) -> (Vec<f64>, Vec<f64>) {
+        // Construct b = cos_target * a + epsilon * perp, then normalise both.
+        // For simplicity: a = [1, 0, ..., 0], b = [cos_target, sin_small, 0, ...]
+        let cos_target = min + 1e-6; // just above min
+        let sin_small = (1.0 - cos_target * cos_target).sqrt();
+        let mut a = vec![0.0f64; dim];
+        a[0] = 1.0;
+        let mut b = vec![0.0f64; dim];
+        b[0] = cos_target;
+        if dim > 1 {
+            b[1] = sin_small;
+        }
+        (a, b)
+    }
+
+    fn emb_val2(xs: &[f64]) -> Value {
+        Value::List(xs.iter().copied().map(Value::Float).collect())
+    }
+
+    /// Build an identical test fixture twice so ON/OFF/oracle comparisons all
+    /// operate on the same graph topology.  Uses dims [2,4,8,16] with a
+    /// near-threshold pair at dim=8 to exercise the checkpoint boundaries.
+    fn make_early_exit_fixture(seed: u64, min: f64) -> (Fx, Vec<u32>, usize, usize) {
+        let dims = [2usize, 4, 8, 16];
+        let n = 100u32;
+        let mut fx = Fx::new();
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let dim = dims[(i as usize) % dims.len()];
+            let emb = rand_emb(seed, i, dim);
+            ids.push(fx.add("Doc", &format!("d{i}"), vec![("emb", emb)]));
+        }
+        // Near-threshold pair at dim=8, cos just above min → must match.
+        let (va, vb) = near_threshold_pair(8, min);
+        let nt_a = fx.add("Doc", "nt_a", vec![("emb", emb_val2(&va))]);
+        let nt_b = fx.add("Doc", "nt_b", vec![("emb", emb_val2(&vb))]);
+        ids.push(nt_a);
+        ids.push(nt_b);
+        (fx, ids, nt_a as usize, nt_b as usize)
+    }
+
+    /// Identity proof: derived edges are identical with early-exit ON, OFF,
+    /// and vs the brute-force oracle.  Tests mixed dims (2, 4, 8, 16) with
+    /// near-threshold cosines (cos ≈ min ± epsilon) to exercise exact rejects.
+    #[test]
+    fn vector_early_exit_identity_proof() {
+        const SEED: u64 = 0xEA_4E_5A;
+        const MIN: f64 = 0.85;
+
+        let def = RuleDef {
+            name: "vec".into(),
+            src_label: "Doc".into(),
+            dst_label: "Doc".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: MIN,
+            },
+            edge_type: "SIM".into(),
+            weight_prop: Some("score".into()),
+            max_edges: None,
+        };
+
+        // Build three identical fixtures (independent topo state, same data).
+        let (mut fx_on, ids, nt_a, nt_b) = make_early_exit_fixture(SEED, MIN);
+        let (mut fx_off, _, _, _) = make_early_exit_fixture(SEED, MIN);
+        let (fx_oracle, _, _, _) = make_early_exit_fixture(SEED, MIN);
+
+        let nt_a = nt_a as u32;
+        let nt_b = nt_b as u32;
+
+        // Run with early-exit ON (default).
+        let mut eng_on = RuleEngine::new();
+        {
+            let mut g = fx_on.g();
+            eng_on.create_rule(def.clone(), &mut g).unwrap();
+        }
+        let edges_on = prov_pairs(&eng_on, "vec");
+        assert!(!edges_on.is_empty(), "should produce some edges");
+
+        // Near-threshold pair must appear with early-exit ON.
+        assert!(
+            edges_on.contains(&(nt_a, nt_b)),
+            "near-threshold pair nt_a→nt_b must match with early-exit ON"
+        );
+        assert!(
+            edges_on.contains(&(nt_b, nt_a)),
+            "near-threshold pair nt_b→nt_a must match with early-exit ON"
+        );
+
+        // Run with early-exit OFF; must produce identical edge set.
+        let mut eng_off = RuleEngine::new();
+        {
+            let mut g = fx_off.g();
+            with_vector_early_exit(false, || {
+                eng_off.create_rule(def.clone(), &mut g).unwrap();
+            });
+        }
+        let edges_off = prov_pairs(&eng_off, "vec");
+        assert_eq!(
+            edges_on, edges_off,
+            "early-exit ON vs OFF must produce identical edges"
+        );
+
+        // Brute-force oracle: evaluate() on all (s,d) pairs.
+        let mut oracle = BTreeSet::new();
+        for &s in &ids {
+            for &d in &ids {
+                if s == d {
+                    continue;
+                }
+                let skey = fx_oracle.ids.key_of(s).unwrap();
+                let dkey = fx_oracle.ids.key_of(d).unwrap();
+                let sg = |f: &str| fx_oracle.props.get(s, f).cloned();
+                let dg = |f: &str| fx_oracle.props.get(d, f).cloned();
+                if evaluate(
+                    &def.predicate,
+                    &NodeView { key: skey, props: &sg },
+                    &NodeView { key: dkey, props: &dg },
+                )
+                .is_some()
+                {
+                    oracle.insert((s, d));
+                }
+            }
+        }
+        assert_eq!(
+            edges_on, oracle,
+            "early-exit ON vs brute-force oracle must be identical"
+        );
+    }
+
+    /// Coherence: checkpoints are rebuilt through the insert/remove choke-points
+    /// when a vector prop is updated.  Dim change, freshness gate exercised.
+    #[test]
+    fn vector_early_exit_checkpoint_coherence() {
+        let mut fx = Fx::new();
+        // Two dim=4 nodes that match under VectorSimilar min=0.9.
+        let a = fx.add("Doc", "a", vec![("emb", emb_val(&[1.0, 0.0, 0.0, 0.0]))]);
+        let b = fx.add("Doc", "b", vec![("emb", emb_val(&[1.0, 0.0, 0.0, 0.0]))]);
+        // dim=6 node that should NOT match dim=4 nodes.
+        let c = fx.add(
+            "Doc",
+            "c",
+            vec![("emb", emb_val(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]))],
+        );
+        let def = RuleDef {
+            name: "vec".into(),
+            src_label: "Doc".into(),
+            dst_label: "Doc".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "SIM".into(),
+            weight_prop: None,
+            max_edges: None,
+        };
+
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(def.clone(), &mut g).unwrap();
+        }
+
+        // Checkpoints must be populated for all three nodes.
+        assert!(
+            eng.indexes["vec"].src_side.vec_ckpts(a).is_some(),
+            "a must have src checkpoints"
+        );
+        assert!(
+            eng.indexes["vec"].dst_side.vec_ckpts(b).is_some(),
+            "b must have dst checkpoints"
+        );
+        assert!(
+            eng.indexes["vec"].src_side.vec_ckpts(c).is_some(),
+            "c must have src checkpoints (dim=6)"
+        );
+
+        // ckpts[0] must equal the full L2 norm.
+        let ckpts_a = *eng.indexes["vec"].src_side.vec_ckpts(a).unwrap();
+        let norm_a = eng.indexes["vec"].src_side.vec_meta(a).unwrap().1;
+        assert!(
+            (ckpts_a[0] - norm_a).abs() < 1e-12,
+            "ckpts[0] must equal the full L2 norm"
+        );
+
+        // Initial edges: a↔b only (c is different dim).
+        assert_eq!(prov_pairs(&eng, "vec"), BTreeSet::from([(a, b), (b, a)]));
+
+        // Update b to dim=6 (same as c) — choke-points must rebuild checkpoints.
+        let old_b = fx.props.get(b, "emb").cloned();
+        fx.props
+            .set(b, "emb", emb_val(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(b, Some(("emb", old_b)), &mut g);
+        }
+        // b's dim must now be 6 in both sides.
+        assert_eq!(eng.indexes["vec"].src_side.vec_dim(b), Some(6));
+        assert_eq!(eng.indexes["vec"].dst_side.vec_dim(b), Some(6));
+        // b must have new checkpoints for dim=6.
+        assert!(eng.indexes["vec"].src_side.vec_ckpts(b).is_some());
+        // Edges must now be b↔c (both dim=6, cos=1.0 > 0.9).
+        assert_eq!(prov_pairs(&eng, "vec"), BTreeSet::from([(b, c), (c, b)]));
+
+        // Freshness gate: fresh_ckpts_for returns None when live vector differs.
+        // Simulate by passing a different live vector to fresh_ckpts_for.
+        let wrong_live = vec![2.0f64, 0.0, 0.0, 0.0, 0.0, 0.0]; // same dim, different norm
+        let gate_result = eng.indexes["vec"].src_side.fresh_ckpts_for(b, &wrong_live);
+        assert!(
+            gate_result.is_none(),
+            "freshness gate must reject a mismatched-norm live vector"
+        );
+
+        // fresh_ckpts_for must succeed with the correct live vector.
+        let correct_live = vec![1.0f64, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let gate_result = eng.indexes["vec"].src_side.fresh_ckpts_for(b, &correct_live);
+        assert!(
+            gate_result.is_some(),
+            "freshness gate must accept the matching live vector"
         );
     }
 }

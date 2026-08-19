@@ -5,12 +5,24 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 thread_local! {
     static VECTOR_DIM_REJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static VECTOR_EARLY_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 fn vector_dim_reject_enabled() -> bool {
     #[cfg(test)]
     {
         VECTOR_DIM_REJECT.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+pub(crate) fn vector_early_exit_enabled() -> bool {
+    #[cfg(test)]
+    {
+        VECTOR_EARLY_EXIT.with(|c| c.get())
     }
     #[cfg(not(test))]
     {
@@ -32,14 +44,35 @@ pub fn with_vector_dim_reject<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
     })
 }
 
+/// Force the checkpointed Cauchy-Schwarz early-exit on or off. Identity-proof hook.
+#[cfg(test)]
+pub fn with_vector_early_exit<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    VECTOR_EARLY_EXIT.with(|c| {
+        let prev = c.replace(enabled);
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct SideIndex {
     by_key: BTreeMap<ValueKey, BTreeSet<u32>>,
     /// Per-node `(dim, L2 norm)` for `ScanAll` members. Maintained by the
     /// same insert/remove choke-points as `by_key`. Cosine still reads live
-    /// props; only `dim` is a fast-reject. `norm` is groundwork for a future
-    /// exact norm-bound reject (Plan 9+); drop to dim-only if still unused then.
+    /// props; `dim` is a fast-reject; `norm` is the freshness gate for the
+    /// checkpointed Cauchy-Schwarz early-exit (Plan 11 T3).
     vec_meta: BTreeMap<u32, (u32, f64)>,
+    /// Per-node checkpointed suffix norms for the Cauchy-Schwarz early-exit.
+    /// `ckpts[i]` = L2 norm of `xs[i * dim / 8 ..]`.
+    /// `ckpts[0]` = full L2 norm; `ckpts[7]` = norm of the last eighth.
+    /// Built at index-insert, torn out at index-remove — maintained in lockstep
+    /// with `vec_meta` by the same choke-points.
+    /// Memory: 8 × 8 = 64 bytes per indexed vector (6.4 MB at 100k vectors).
+    vec_checkpoints: BTreeMap<u32, [f64; 8]>,
 }
 
 #[derive(Debug, Default)]
@@ -86,7 +119,7 @@ pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
     }
 }
 
-fn as_finite_f64(v: &Value) -> Option<f64> {
+pub(crate) fn as_finite_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Int(i) => Some(*i as f64),
         Value::Float(f) if f.is_finite() => Some(*f),
@@ -110,7 +143,7 @@ fn as_latlon(v: &Value) -> Option<(f64, f64)> {
     }
 }
 
-fn as_numeric_list(v: &Value) -> Option<Vec<f64>> {
+pub(crate) fn as_numeric_list(v: &Value) -> Option<Vec<f64>> {
     let Value::List(items) = v else {
         return None;
     };
@@ -127,6 +160,33 @@ fn vec_dim_norm(v: &Value) -> Option<(u32, f64)> {
         n2 += *x * *x;
     }
     Some((xs.len() as u32, n2.sqrt()))
+}
+
+/// Checkpointed suffix norms for Cauchy-Schwarz early exit.
+///
+/// `ckpts[i]` = L2 norm of `xs[boundary(i)..]` where `boundary(i) = i * dim / 8`.
+/// `ckpts[0]` equals the full L2 norm; `ckpts[7]` is the last eighth's norm.
+/// Multiple checkpoints may share the same boundary for dim < 8 (correct but no-op).
+fn compute_ckpts(xs: &[f64]) -> [f64; 8] {
+    let dim = xs.len();
+    let mut ckpts = [0.0f64; 8];
+    if dim == 0 {
+        return ckpts;
+    }
+    // boundaries[i] = i * dim / 8 (integer division).
+    let boundaries: [usize; 8] = std::array::from_fn(|i| i * dim / 8);
+    let mut suffix_sq = 0.0f64;
+    // Walk right-to-left; ci is the highest checkpoint not yet recorded.
+    let mut ci = 7i32;
+    for j in (0..dim).rev() {
+        suffix_sq += xs[j] * xs[j];
+        // Assign all checkpoints whose boundary equals j.
+        while ci >= 0 && boundaries[ci as usize] == j {
+            ckpts[ci as usize] = suffix_sq.sqrt();
+            ci -= 1;
+        }
+    }
+    ckpts
 }
 
 fn floor_to_i64(x: f64) -> i64 {
@@ -279,8 +339,14 @@ impl SideIndex {
             self.by_key.entry(k).or_default().insert(node);
         }
         if let CandidateSpec::ScanAll { field } = spec {
-            if let Some(meta) = get(field).as_ref().and_then(vec_dim_norm) {
-                self.vec_meta.insert(node, meta);
+            if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
+                let mut n2 = 0.0f64;
+                for x in &xs {
+                    n2 += x * x;
+                }
+                let norm = n2.sqrt();
+                self.vec_meta.insert(node, (xs.len() as u32, norm));
+                self.vec_checkpoints.insert(node, compute_ckpts(&xs));
             }
         }
     }
@@ -297,6 +363,7 @@ impl SideIndex {
         if let CandidateSpec::ScanAll { field } = spec {
             if get(field).as_ref().and_then(as_numeric_list).is_some() {
                 self.vec_meta.remove(&node);
+                self.vec_checkpoints.remove(&node);
             }
         }
     }
@@ -306,9 +373,54 @@ impl SideIndex {
         self.vec_meta.get(&node).map(|(d, _)| *d)
     }
 
-    /// Cached `(dim, L2 norm)` for tests / debug. Cosine does not read this.
+    /// Cached `(dim, L2 norm)` for tests / debug.
     pub fn vec_meta(&self, node: u32) -> Option<(u32, f64)> {
         self.vec_meta.get(&node).copied()
+    }
+
+    /// Cached checkpoints for tests / debug.
+    pub fn vec_ckpts(&self, node: u32) -> Option<&[f64; 8]> {
+        self.vec_checkpoints.get(&node)
+    }
+
+    /// Returns `(cached_norm, &checkpoints)` if the cached `(dim, norm)`
+    /// exactly matches `live`'s `(dim, norm)`.
+    ///
+    /// # Stale-cache gate (exactness invariant)
+    ///
+    /// The checkpoints are computed from the indexed vector at insert time.
+    /// If the live prop differs from the indexed one, the checkpoints are
+    /// stale and could produce a FALSE REJECT (under-approximation, forbidden).
+    /// The exact-equality guard on `(dim, norm)` prevents this: if the live
+    /// vector has changed, its norm will differ, and we return `None`,
+    /// forcing a fall-through to the brute-force `evaluate()` path.
+    ///
+    /// In normal operation the index choke-points (insert/remove in
+    /// `on_node_changed`) ensure the cache is always coherent with live props
+    /// by evaluation time.  The guard is belt-and-suspenders.
+    pub(crate) fn fresh_ckpts_for<'a>(
+        &'a self,
+        node: u32,
+        live: &[f64],
+    ) -> Option<(f64, &'a [f64; 8])> {
+        let &(dim, norm) = self.vec_meta.get(&node)?;
+        if dim != live.len() as u32 {
+            return None;
+        }
+        // Compute the live norm with the same sequential accumulation used at
+        // insert time so the bits are identical when the vector is unchanged.
+        let live_norm = {
+            let mut n2 = 0.0f64;
+            for x in live {
+                n2 += x * x;
+            }
+            n2.sqrt()
+        };
+        if norm != live_norm {
+            return None; // stale — fall back to brute-force evaluate()
+        }
+        let ckpts = self.vec_checkpoints.get(&node)?;
+        Some((norm, ckpts))
     }
 
     pub fn candidates(
@@ -731,5 +843,110 @@ mod tests {
             candidate_spec(&all),
             CandidateSpec::ScanAll { field: "emb" }
         ));
+    }
+
+    /// Checkpoints are populated at insert, torn out at remove,
+    /// and ckpts[0] must equal the full L2 norm.
+    #[test]
+    fn checkpoint_populated_and_consistent_with_norm() {
+        let pred = Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.8,
+        };
+        let spec = candidate_spec(&pred);
+        let xs = [3.0f64, 4.0]; // norm = 5.0
+        let mut idx = SideIndex::default();
+        idx.insert(&spec, 1, &getter(&emb(&xs)));
+
+        let ckpts = idx.vec_ckpts(1).expect("checkpoints must exist after insert");
+        let (_, norm) = idx.vec_meta(1).unwrap();
+        assert!(
+            (ckpts[0] - norm).abs() < 1e-12,
+            "ckpts[0] must equal the full L2 norm; got {} vs {}",
+            ckpts[0],
+            norm
+        );
+        assert!(
+            (norm - 5.0).abs() < 1e-12,
+            "norm of [3,4] must be 5.0, got {norm}"
+        );
+
+        // Remove must tear out checkpoints.
+        idx.remove(&spec, 1, &getter(&emb(&xs)));
+        assert!(
+            idx.vec_ckpts(1).is_none(),
+            "checkpoints must be removed after remove()"
+        );
+    }
+
+    /// fresh_ckpts_for returns None when the live vector's norm differs
+    /// (freshness gate) and Some when it matches.
+    #[test]
+    fn fresh_ckpts_for_freshness_gate() {
+        let pred = Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.8,
+        };
+        let spec = candidate_spec(&pred);
+        let xs = [1.0f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut idx = SideIndex::default();
+        idx.insert(&spec, 7, &getter(&emb(&xs)));
+
+        // Correct live vector → gate passes.
+        let result = idx.fresh_ckpts_for(7, &xs);
+        assert!(result.is_some(), "fresh_ckpts_for must succeed with matching live vector");
+        let (norm, ckpts) = result.unwrap();
+        assert!((norm - 1.0).abs() < 1e-12);
+        assert!((ckpts[0] - 1.0).abs() < 1e-12);
+
+        // Wrong norm → gate rejects.
+        let wrong = [2.0f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; // norm = 2.0
+        assert!(
+            idx.fresh_ckpts_for(7, &wrong).is_none(),
+            "freshness gate must reject mismatched norm"
+        );
+
+        // Wrong dim → gate rejects.
+        let short = [1.0f64, 0.0];
+        assert!(
+            idx.fresh_ckpts_for(7, &short).is_none(),
+            "freshness gate must reject mismatched dim"
+        );
+
+        // Missing node → returns None.
+        assert!(idx.fresh_ckpts_for(99, &xs).is_none());
+    }
+
+    /// Checkpoints for a dim-16 vector: ckpts[i] must be non-increasing
+    /// (suffix norms decrease as the suffix shrinks).
+    #[test]
+    fn checkpoint_suffix_norms_non_increasing() {
+        let pred = Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.5,
+        };
+        let spec = candidate_spec(&pred);
+        let xs: Vec<f64> = (1..=16).map(|i| i as f64).collect();
+        let mut idx = SideIndex::default();
+        idx.insert(&spec, 42, &getter(&emb(&xs)));
+
+        let ckpts = *idx.vec_ckpts(42).unwrap();
+        for c in 0..7 {
+            assert!(
+                ckpts[c] >= ckpts[c + 1] - 1e-12,
+                "suffix norm must be non-increasing: ckpts[{c}]={} < ckpts[{}]={}",
+                ckpts[c],
+                c + 1,
+                ckpts[c + 1]
+            );
+        }
+        // ckpts[7] = suffix norm of the last 2 elements (14..=16).
+        let expected_last = ((15.0f64 * 15.0 + 16.0 * 16.0).sqrt());
+        assert!(
+            (ckpts[7] - expected_last).abs() < 1e-9,
+            "ckpts[7] should be norm of last segment; got {} vs {}",
+            ckpts[7],
+            expected_last
+        );
     }
 }

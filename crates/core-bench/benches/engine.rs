@@ -264,6 +264,7 @@ fn engine_benches(c: &mut Criterion) {
     rules(c);
     explain_pair(c);
     vector_rule_update(c);
+    vector_semantic_backfill(c);
     contention(c);
 }
 
@@ -415,6 +416,77 @@ fn vector_rule_update(c: &mut Criterion) {
 fn n_orgs_projects() -> usize {
     let (n_orgs, n_projects, _) = counts(N);
     n_orgs + n_projects
+}
+
+/// 5k-scale semantic-backfill probe.
+///
+/// Creates 500 "Doc" nodes each with a dim=1536 random embedding and
+/// immediately backfills a VectorSimilar rule at min=0.85.  At min=0.85 with
+/// uniformly random high-dimensional vectors the acceptance rate is near zero,
+/// so the early-exit fires after the first checkpoint (~192 elements) for
+/// almost every pair — the core win this bench is designed to capture.
+///
+/// 500 nodes is 1/10 of the 5k dogfood target; timing × 100 approximates the
+/// full 5k scenario (both backfill time and pairs count scale quadratically
+/// with n, so the actual 5k time scales by n²/n² = 1 — the multiplier is 10²
+/// = 100 for the pairs evaluated, but the linear overhead per-node also
+/// contributes).  Honest before/after numbers are captured here.
+///
+/// Binding name: `vector_semantic_backfill_500` — used in task-3 report.
+fn vector_semantic_backfill(c: &mut Criterion) {
+    const SEM_N: usize = 500;
+    const SEM_DIM: usize = 1536;
+
+    let rows: Vec<_> = (0..SEM_N)
+        .map(|i| {
+            // Produce a dim=1536 random embedding from the bench seed.
+            let emb_val = Value::List(
+                (0..SEM_DIM)
+                    .map(|d| {
+                        let bits = mix(SEED, i as u64 + 1, d as u64);
+                        let mut f = (bits as f64) / (u64::MAX as f64) * 2.0 - 1.0;
+                        if f == 0.0 {
+                            f = 1.0;
+                        }
+                        Value::Float(f)
+                    })
+                    .collect(),
+            );
+            row(vec![
+                ("id", Value::Str(format!("doc-{i:04}"))),
+                ("emb", emb_val),
+            ])
+        })
+        .collect();
+
+    let rule = RuleDef {
+        name: "sem_sim".into(),
+        src_label: "Doc".into(),
+        dst_label: "Doc".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.85,
+        },
+        edge_type: "SEM_SIM".into(),
+        weight_prop: None,
+        max_edges: None,
+    };
+
+    c.bench_function("vector_semantic_backfill_500", |b| {
+        b.iter_batched(
+            || {
+                let mut db = GraphDb::open(&tmp_dir()).expect("open");
+                db.ingest("Doc", rows.clone(), &ingest_opts())
+                    .expect("ingest docs");
+                db
+            },
+            |mut db| {
+                db.create_rule(rule.clone()).expect("create sem_sim");
+                black_box(db.edge_count());
+            },
+            BatchSize::PerIteration,
+        );
+    });
 }
 
 fn shared_ruled() -> SharedDb {

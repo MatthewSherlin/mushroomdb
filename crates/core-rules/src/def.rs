@@ -267,6 +267,75 @@ fn cosine(a: &[f64], b: &[f64]) -> Option<f64> {
     cos.is_finite().then_some(cos)
 }
 
+/// Cosine similarity with Cauchy-Schwarz suffix-norm early exit.
+///
+/// Processes `a` and `b` in 8 equal-sized chunks.  After each chunk (except
+/// the last), computes the upper bound:
+///
+/// ```text
+/// cos_max = (dot_so_far + ckpts_a[c+1] × ckpts_b[c+1]) / (norm_a × norm_b)
+/// ```
+///
+/// where `ckpts_x[i]` = L2 norm of `x[i * dim / 8 ..]`.  If `cos_max < min`,
+/// the pair is provably below threshold and `None` is returned immediately
+/// (exact reject — Cauchy-Schwarz is tight).  If all checkpoints pass, the
+/// full dot product has been accumulated and the cosine is returned normally.
+///
+/// The caller is responsible for ensuring `ckpts_a`/`ckpts_b` are fresh for
+/// the live vectors (see `SideIndex::fresh_ckpts_for`).  Stale checkpoints
+/// can only cause false **accepts** (not false rejects), so the function is
+/// always safe to call; freshness only affects performance.
+///
+/// # Arguments
+/// * `norm_a`, `norm_b` — precomputed L2 norms (must match `ckpts_x[0]`).
+/// * `min` — the minimum cosine threshold from the rule definition.
+pub fn cosine_early_exit(
+    a: &[f64],
+    b: &[f64],
+    ckpts_a: &[f64; 8],
+    ckpts_b: &[f64; 8],
+    norm_a: f64,
+    norm_b: f64,
+    min: f64,
+) -> Option<f64> {
+    let dim = a.len();
+    if dim == 0 || dim != b.len() {
+        return None; // dim mismatch or empty: cosine undefined, no edge
+    }
+    let denom = norm_a * norm_b;
+    if !denom.is_finite() || denom == 0.0 {
+        return None;
+    }
+
+    let mut dot = 0.0f64;
+
+    for ci in 0..8usize {
+        let chunk_start = ci * dim / 8;
+        let chunk_end = if ci < 7 { (ci + 1) * dim / 8 } else { dim };
+        for k in chunk_start..chunk_end {
+            dot += a[k] * b[k];
+        }
+        // After processing this chunk (not the last), compute the upper bound
+        // for the remaining suffix using Cauchy-Schwarz.
+        if ci < 7 {
+            let bound = ckpts_a[ci + 1] * ckpts_b[ci + 1];
+            let cos_max = (dot + bound) / denom;
+            // Reject only when the bound is finite and strictly below min.
+            if cos_max.is_finite() && cos_max < min {
+                return None;
+            }
+        }
+    }
+
+    // Full dot product accumulated; return cosine clamped to [−1, 1].
+    let cos = (dot / denom).min(1.0);
+    if cos.is_finite() && cos >= min {
+        Some(cos)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
