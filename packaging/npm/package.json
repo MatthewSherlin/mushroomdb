@@ -1,0 +1,31 @@
+{
+  "name": "mushroomdb",
+  "version": "0.1.0",
+  "description": "Launcher for the mushroomdb native binary (downloaded from GitHub Releases).",
+  "license": "Apache-2.0",
+  "bin": {
+    "mushroomdb": "bin/mushroomdb.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "install.js",
+    "bin/mushroomdb.js"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MatthewSherlin/graph-db.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

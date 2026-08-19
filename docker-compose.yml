@@ -1,0 +1,12 @@
+services:
+  mushroomdb:
+    build: .
+    image: mushroomdb:local
+    ports:
+      - "8080:8080"
+    volumes:
+      - mushroomdb-data:/data
+    # Image CMD: demo into /data if empty, then serve --addr 0.0.0.0:8080.
+
+volumes:
+  mushroomdb-data:

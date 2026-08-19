@@ -1,6 +1,9 @@
 //! `mushroomdb` — thin dispatcher over [`cli`] lib functions.
 
-use cli::{format_demo, format_stats, parse_args, read_stats, run_demo, usage, Command, ServeUi};
+use cli::{
+    format_demo, format_stats, maybe_run_demo_if_empty, parse_args, read_stats, run_demo, usage,
+    Command, ServeUi,
+};
 use core_api::SharedDb;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -14,7 +17,19 @@ fn main() -> ExitCode {
             print!("{}", usage());
             ExitCode::SUCCESS
         }
-        Ok(Command::Serve { db_dir, addr, ui }) => {
+        Ok(Command::Serve {
+            db_dir,
+            addr,
+            ui,
+            demo_if_empty,
+        }) => {
+            if demo_if_empty {
+                match maybe_run_demo_if_empty(&db_dir) {
+                    Ok(Some(out)) => print!("{}", format_demo(&db_dir, &out)),
+                    Ok(None) => {}
+                    Err(e) => return fail(&e.to_string()),
+                }
+            }
             let ui = match ui {
                 ServeUi::Filesystem(dir) => match cli::validate_ui_dir(&dir) {
                     Ok(dir) => ServeUi::Filesystem(dir),

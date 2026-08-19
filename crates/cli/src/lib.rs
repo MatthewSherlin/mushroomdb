@@ -41,6 +41,9 @@ pub enum Command {
         db_dir: PathBuf,
         addr: SocketAddr,
         ui: ServeUi,
+        /// If the db dir is missing or empty, run [`run_demo`] before serving.
+        /// Docker's default CMD uses this so a fresh volume is ready on first boot.
+        demo_if_empty: bool,
     },
     Mcp {
         db_dir: PathBuf,
@@ -94,7 +97,7 @@ pub fn usage() -> &'static str {
 mushroomdb — embedded graph database
 
 Usage:
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>] [--no-ui]
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>] [--no-ui] [--demo-if-empty]
   mushroomdb mcp <db-dir>
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
@@ -128,6 +131,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut ui = ServeUi::Embedded;
     let mut saw_ui = false;
     let mut saw_no_ui = false;
+    let mut demo_if_empty = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -157,6 +161,9 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
             ui = ServeUi::None;
             saw_no_ui = true;
             i += 1;
+        } else if a == "--demo-if-empty" {
+            demo_if_empty = true;
+            i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -170,7 +177,12 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         return Err("cannot combine --ui and --no-ui".to_string());
     }
     let db_dir = db_dir.ok_or_else(|| "serve requires <db-dir>".to_string())?;
-    Ok(Command::Serve { db_dir, addr, ui })
+    Ok(Command::Serve {
+        db_dir,
+        addr,
+        ui,
+        demo_if_empty,
+    })
 }
 
 /// `--ui <dir>` must be a directory that contains `index.html`.
@@ -321,24 +333,38 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
     })
 }
 
-fn refuse_non_empty(dir: &Path) -> Result<(), CliError> {
+fn dir_is_empty_or_absent(dir: &Path) -> Result<bool, CliError> {
     if dir.is_file() {
         return Err(CliError(format!(
             "demo refuses a non-empty directory: {} is a file",
             dir.display()
         )));
     }
-    if dir.exists() {
-        let mut entries = std::fs::read_dir(dir)?;
-        if entries.next().is_some() {
-            return Err(CliError(format!(
-                "demo refuses a non-empty directory: {} \
-                 (directory must be empty — including hidden files)",
-                dir.display()
-            )));
-        }
+    if !dir.exists() {
+        return Ok(true);
     }
-    Ok(())
+    Ok(std::fs::read_dir(dir)?.next().is_none())
+}
+
+fn refuse_non_empty(dir: &Path) -> Result<(), CliError> {
+    if dir_is_empty_or_absent(dir)? {
+        Ok(())
+    } else {
+        Err(CliError(format!(
+            "demo refuses a non-empty directory: {} \
+             (directory must be empty — including hidden files)",
+            dir.display()
+        )))
+    }
+}
+
+/// Run [`run_demo`] when `dir` is missing or empty; otherwise leave it alone.
+pub fn maybe_run_demo_if_empty(dir: &Path) -> Result<Option<DemoOutcome>, CliError> {
+    if dir_is_empty_or_absent(dir)? {
+        Ok(Some(run_demo(dir)?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn json_array(rows: impl IntoIterator<Item = String>) -> String {
@@ -643,10 +669,16 @@ mod tests {
             Case {
                 args: &["serve", "/tmp/demo-db"],
                 check: |r| match r {
-                    Ok(Command::Serve { db_dir, addr, ui }) => {
+                    Ok(Command::Serve {
+                        db_dir,
+                        addr,
+                        ui,
+                        demo_if_empty,
+                    }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, default_bind());
                         assert_eq!(ui, super::ServeUi::Embedded);
+                        assert!(!demo_if_empty);
                     }
                     other => panic!("serve <dir> → Serve default addr, got {other:?}"),
                 },
@@ -654,10 +686,16 @@ mod tests {
             Case {
                 args: &["serve", "/tmp/demo-db", "--addr", "127.0.0.1:8080"],
                 check: |r| match r {
-                    Ok(Command::Serve { db_dir, addr, ui }) => {
+                    Ok(Command::Serve {
+                        db_dir,
+                        addr,
+                        ui,
+                        demo_if_empty,
+                    }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
                         assert_eq!(ui, super::ServeUi::Embedded);
+                        assert!(!demo_if_empty);
                     }
                     other => panic!("serve --addr after dir, got {other:?}"),
                 },
@@ -665,10 +703,16 @@ mod tests {
             Case {
                 args: &["serve", "/tmp/demo-db", "--addr=127.0.0.1:9090"],
                 check: |r| match r {
-                    Ok(Command::Serve { db_dir, addr, ui }) => {
+                    Ok(Command::Serve {
+                        db_dir,
+                        addr,
+                        ui,
+                        demo_if_empty,
+                    }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, "127.0.0.1:9090".parse().unwrap());
                         assert_eq!(ui, super::ServeUi::Embedded);
+                        assert!(!demo_if_empty);
                     }
                     other => panic!("serve --addr=VALUE, got {other:?}"),
                 },
@@ -832,6 +876,29 @@ mod tests {
                     );
                 },
             },
+            Case {
+                args: &[
+                    "serve",
+                    "/data",
+                    "--addr",
+                    "0.0.0.0:8080",
+                    "--demo-if-empty",
+                ],
+                check: |r| match r {
+                    Ok(Command::Serve {
+                        db_dir,
+                        addr,
+                        demo_if_empty,
+                        ui,
+                    }) => {
+                        assert_eq!(db_dir, PathBuf::from("/data"));
+                        assert_eq!(addr, "0.0.0.0:8080".parse().unwrap());
+                        assert!(demo_if_empty);
+                        assert_eq!(ui, super::ServeUi::Embedded);
+                    }
+                    other => panic!("serve --demo-if-empty docker default, got {other:?}"),
+                },
+            },
         ];
 
         for case in &cases {
@@ -850,6 +917,7 @@ mod tests {
             "mushroomdb",
             "--ui",
             "--no-ui",
+            "--demo-if-empty",
         ] {
             assert!(
                 text.contains(word),
@@ -880,6 +948,33 @@ mod tests {
         std::fs::write(ok.join("index.html"), "<!doctype html>").unwrap();
         let got = super::validate_ui_dir(&ok).expect("valid ui dir");
         assert_eq!(got, ok);
+    }
+
+    #[test]
+    fn maybe_run_demo_if_empty_seeds_then_skips() {
+        let dir = tmp("boot-empty");
+        let first = super::maybe_run_demo_if_empty(&dir)
+            .expect("empty dir demos")
+            .expect("Some(DemoOutcome)");
+        assert_eq!(first.stats.nodes_live, 60);
+        let db = SharedDb::open(&dir).expect("reopen");
+        assert!(db.read().has_node("person-01"));
+        let second = super::maybe_run_demo_if_empty(&dir).expect("non-empty is ok");
+        assert!(
+            second.is_none(),
+            "second boot must not re-demo a populated volume"
+        );
+
+        let occupied = tmp("boot-occupied");
+        std::fs::create_dir_all(&occupied).unwrap();
+        std::fs::write(occupied.join("keep-me"), b"x").unwrap();
+        let skipped = super::maybe_run_demo_if_empty(&occupied).expect("occupied skip");
+        assert!(skipped.is_none());
+        assert_eq!(
+            std::fs::read(occupied.join("keep-me")).unwrap(),
+            b"x",
+            "existing volume contents must be untouched"
+        );
     }
 
     #[test]

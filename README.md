@@ -87,6 +87,50 @@ columns: p, o, score
   rule=skill_fit  type=FIT  ada→acme  weight=1.0
 ```
 
+## Install
+
+Pre-alpha. GitHub Release / npm / GHCR publish is **tag-gated** (`v*`);
+there is no published tag yet. The one-liners below are the intended
+front door after the first `v*` tag.
+
+### Docker (zero args beyond the port)
+
+Image CMD runs `mushroomdb serve /data --addr 0.0.0.0:8080 --demo-if-empty`
+(demo into the volume when empty, then serve). Explicit two-step:
+
+```text
+docker run --rm -v mushroomdb-data:/data mushroomdb:local demo /data
+docker run --rm -p 8080:8080 -v mushroomdb-data:/data mushroomdb:local \
+  serve /data --addr 0.0.0.0:8080
+```
+
+Local build + compose:
+
+```text
+docker build -t mushroomdb:local .
+docker run --rm -p 8080:8080 mushroomdb:local
+# or: docker compose up --build
+```
+
+Captured from `docker run --rm -p 18080:8080 mushroomdb:local` (zero extra args):
+`GET /stats` is `{"edges":334,"nodes_live":60,...}`; `GET /` is the explorer
+`<!doctype html>` / `<title>mushroomdb</title>`.
+
+After the first tagged release: `docker run --rm -p 8080:8080 ghcr.io/matthewsherlin/mushroomdb`
+(not pulled here — no tag, no GHCR image).
+
+### npm / curl (after the first `v*` tag)
+
+```text
+npx mushroomdb --help
+curl -fsSL https://raw.githubusercontent.com/MatthewSherlin/graph-db/main/packaging/install.sh | sh
+```
+
+`install.sh` writes `~/.local/bin/mushroomdb` (no sudo). Both fetch the
+matching GitHub Release tarball and checksum-verify it. The launcher and
+script were tested against a locally served fake release asset, not a
+real tag. Homebrew formula template: `packaging/homebrew/mushroomdb.rb`.
+
 ## Demo
 
 `mushroomdb demo <db-dir>` writes a **deterministic** generic dataset — 10
@@ -158,9 +202,11 @@ demo refuses a non-empty directory: ./demo-db (directory must be empty — inclu
 
 ## Server
 
-`mushroomdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>] [--no-ui]`
+`mushroomdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>] [--no-ui] [--demo-if-empty]`
 opens the store, binds (default is ephemeral port 0), prints the bound
-address **after** the listener is accepting, then serves. Precedence:
+address **after** the listener is accepting, then serves. `--demo-if-empty`
+runs `demo` first when the directory is missing or empty (Docker's default).
+Precedence:
 `--ui <dir>` (filesystem `ServeDir`) > embedded UI (release binary
 built with `--features embed-ui`) > `--no-ui` / feature-off API-only.
 API routes always win over static. `--ui` must contain `index.html`.
