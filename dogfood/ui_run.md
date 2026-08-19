@@ -35,12 +35,14 @@
 | 3d | 100k | Add to canvas: 500 query results → 1,000 rendered nodes | **1,965 ms** | Marginal |
 | 4 | 100k | Live ingest 50 nodes (POST /ingest) | **75 ms** | Smooth |
 | 4 (WS) | 100k | Ticker update after ingest (WS event) | confirmed | Smooth |
-| 5a | 100k | Zoom interaction at ~200 visible nodes (3 clicks + rAF) | **308 ms** | Acceptable |
-| 5b | 100k | Zoom interaction at ~1,000 visible nodes (3 clicks + rAF) | **589 ms** | Degraded |
+| 5a | 100k | Zoom interaction at ~200 visible nodes (3 clicks + rAF) | **308 ms** ¹ | Acceptable |
+| 5b | 100k | Zoom interaction at ~1,000 visible nodes (3 clicks + rAF) | **589 ms** ¹ | Degraded |
 | 2a | 2k | Why panel: INDUSTRY_ALIGNMENT | rendered correctly | Smooth |
 | 2b | 2k | Why panel: SPECIALTY_MATCH | rendered correctly | Smooth |
 | 2c | 2k | Why panel: LOCATION_FIT | rendered correctly | Smooth |
 | 2d | 2k | Why panel: SEMANTIC_MATCH | rendered correctly | Smooth |
+
+¹ swiftshader (software WebGL, headless Chromium) — worst-case lower bound; real-device GPU performance will be faster.
 
 ---
 
@@ -70,6 +72,8 @@ The 2k db has 12 rules, 1,228,422 derived edges. The rules panel loads all 12 en
 
 **Screenshots:** `t4-why-industry.png`, `t4-why-specialty.png`, `t4-why-location.png`, `t4-why-semantic.png`
 
+The semantic why panel (`t4-why-semantic.png`) shows a Talent→Company pairing (`talent-000000 → company-000013`); this is expected — `semantic_match_tc` is a Talent-to-Company rule (TC suffix) that fires when cosine similarity of the two nodes' embedding vectors meets the 0.85 threshold.
+
 ---
 
 ## Leg 3 — Console Query + Add to Canvas (100k DB)
@@ -92,8 +96,9 @@ The 2k db has 12 rules, 1,228,422 derived edges. The rules panel loads all 12 en
 - WS ticker updated: `"ingested Talent 50"` (received within 1 s)
 - Stats after: `nodes_live = 100,550`
 - `edges_inserted = 0` because the ingested nodes' `user_id` values ("user-ud-{i}") do not match any seeded User nodes — FK rule fires but finds no targets. This is correct behavior.
+- **Glow behavior:** the ingested nodes were not present on the canvas at ingest time (5 pre-existing Talent nodes were visible; the 50 new nodes had novel IDs not on canvas). The WS event was received and the ticker updated ("ingested Talent 50"), but no glow animation fired — glow only schedules on *born* derived edges for nodes *already on canvas* (`bornEdgeIds` diff). With no canvas overlap, glow is not expected. The glow path would require ingesting a node whose neighbor is already visible.
 
-**Verdict:** Live ingest pipeline is smooth. WS event delivery and ticker update work at 100k base-graph size.
+**Verdict:** Live ingest pipeline is smooth. WS event delivery and ticker update work at 100k base-graph size. Glow is correctly suppressed when ingested nodes have no canvas presence.
 
 ---
 
@@ -118,7 +123,7 @@ These measurements use swiftshader (software WebGL in headless Chromium). Real-d
 
 | # | Finding | Severity | Notes |
 |---|---|---|---|
-| F1 | Rules panel overlaps console: clicking "Run" in console fails if Rules panel is open | Medium | The `.rules` aside panel uses `pointer-events` intercepting `.console-btn[Run]`. UI layout bug — both panels stack in the same z-layer. Confirmed in playwright driver (30 s timeout before workaround). Repro: open both Console and Rules simultaneously. |
+| F1 | Rules panel overlaps console: clicking "Run" in console fails if Rules panel is open | Medium | The `.rules` aside panel uses `pointer-events` intercepting `.console-btn[Run]`. UI layout bug — both panels stack in the same z-layer. Confirmed in playwright driver (30 s timeout before workaround). Repro: open both Console and Rules simultaneously. **Visual evidence:** `t4-2k-error.png` captures this state — the Rules panel is open on the left (all 12 rules visible), the console is visible at the bottom with a partial query (`...90002'}) RETURN c`), and the Run button is inaccessible because the rules panel's pointer-event region covers it. |
 | F2 | Add-to-canvas for dense company nodes blocks UI for > 5 s | Medium | `addHarvestedToCanvas` calls `expandNode(depth=1)` for each added node. A company node with 400+ incoming INDUSTRY_ALIGNMENT edges triggers 400+ parallel neighborhood fetches. In the 2k db, adding company-000000 (400+ talent neighbors) left the "Add to canvas" button disabled for > 5 s. Not tested at 100k density. |
 | F3 | Ticker shows "no events" until first WS event after page load | Low | Expected behavior but visible gap between page-load "connected" state and first ticker line. |
 | F4 | label-chip count is 2× query LIMIT at 100k (FK-only graph) | Low / Informational | `addHarvestedToCanvas` depth-1 expansion doubles visible nodes. Expected by design; potentially surprising in marketplace context where each talent-→company expansion could add hundreds of nodes. |
@@ -142,18 +147,20 @@ These measurements use swiftshader (software WebGL in headless Chromium). Real-d
 
 ---
 
-## Screenshots (in `.superpowers/sdd/2026-08-19-plan-10-marketplace-dogfood/`)
+## Screenshots (13 total, in `.superpowers/sdd/2026-08-19-plan-10-marketplace-dogfood/`)
 
 | File | Description |
 |---|---|
 | `t4-100k-initial.png` | 100k db — initial empty-canvas state |
-| `t4-100k-canvas-100nodes.png` | 100k db — 200 nodes rendered (LIMIT 100 + expand) |
-| `t4-100k-canvas-500nodes.png` | 100k db — 1,000 nodes rendered (LIMIT 500 + expand) |
-| `t4-100k-live-ingest.png` | 100k db — after live ingest of 50 nodes, ticker shows event |
+| `t4-100k-canvas-100nodes.png` | 100k db — 200 nodes rendered (LIMIT 100 + depth-1 expand) |
+| `t4-100k-canvas-500nodes.png` | 100k db — 1,000 nodes rendered (LIMIT 500 + depth-1 expand) |
+| `t4-100k-live-ingest.png` | 100k db — after live ingest of 50 nodes, ticker shows "ingested Talent 50" |
 | `t4-2k-initial.png` | 2k db — initial empty-canvas state |
-| `t4-2k-canvas-prep.png` | 2k db — canvas with talent-000000 + 3 company neighbors (429 chips after full expansion) |
-| `t4-2k-rules-panel.png` | 2k db — Rules panel listing all 12 rules |
+| `t4-2k-canvas-prep.png` | 2k db — canvas with talent-000000 + 3 company neighbors (429 chips after full depth-1 expansion) |
+| `t4-2k-error.png` | 2k db — **F1 evidence**: Rules panel open left, console open bottom, Run button intercepted by rules panel pointer-events region |
+| `t4-2k-rules-panel.png` | 2k db — Rules panel listing all 12 rules (first driver run) |
+| `t4-2k-rules-panel-2.png` | 2k db — Rules panel listing all 12 rules (leg-2 focused run) |
 | `t4-why-industry.png` | 2k db — why panel: industry_alignment_tc (field_equal) |
 | `t4-why-specialty.png` | 2k db — why panel: specialty_match_tc (overlap) |
 | `t4-why-location.png` | 2k db — why panel: location_fit_tc (geo_radius) |
-| `t4-why-semantic.png` | 2k db — why panel: semantic_match_tc (vector_similar) |
+| `t4-why-semantic.png` | 2k db — why panel: semantic_match_tc (vector_similar, T→C pairing) |
