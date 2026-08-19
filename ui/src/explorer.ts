@@ -206,6 +206,15 @@ export class Explorer {
     );
 
     this.paint();
+    if (import.meta.env.DEV) {
+      const glowScheduled: string[] = [];
+      const inner = this.glow.schedule.bind(this.glow);
+      this.glow.schedule = (ids, now, durationMs) => {
+        glowScheduled.push(...ids);
+        inner(ids, now, durationMs);
+      };
+      window.__testHooks = { glowScheduled };
+    }
   }
 
   setWatchStatus(state: WatchDot): void {

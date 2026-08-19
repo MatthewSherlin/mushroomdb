@@ -49,6 +49,7 @@ export default defineConfig({
   plugins: [serveRootNodeModules()],
   test: {
     environment: "node",
+    exclude: ["**/node_modules/**", "**/dist/**", "**/e2e/**"],
   },
   // cosmos.gl imports `gl-bench`'s browser UMD build, which has no ESM default.
   resolve: {

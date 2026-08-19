@@ -17,6 +17,21 @@ describe("module contract", () => {
   });
 });
 
+describe("dev-only test hooks", () => {
+  it("installs window.__testHooks only inside an import.meta.env.DEV branch", () => {
+    const explorer = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "explorer.ts"),
+      "utf8",
+    );
+    expect(explorer).toMatch(/if \(import\.meta\.env\.DEV\) \{[\s\S]*__testHooks/);
+    const unguarded = explorer.replace(
+      /if \(import\.meta\.env\.DEV\) \{[\s\S]*?^\s{4}\}/m,
+      "",
+    );
+    expect(unguarded).not.toContain("__testHooks");
+  });
+});
+
 describe("bornEdgeIds", () => {
   it("returns ids present after apply but not before, sorted", () => {
     expect(bornEdgeIds(["KNOWS|a|b"], ["KNOWS|a|b", "FIT|a|c", "related|d|a"])).toEqual(

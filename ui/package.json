@@ -8,12 +8,14 @@
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest",
+    "test:e2e": "playwright test",
     "preview": "vite preview"
   },
   "dependencies": {
     "@cosmos.gl/graph": "^3.4.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/node": "^22",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",
