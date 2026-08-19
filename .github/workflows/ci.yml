@@ -90,6 +90,7 @@ jobs:
       - run: .venv/bin/pip install -U pip maturin pytest
       - run: .venv/bin/maturin develop
       - run: .venv/bin/pytest
+      - run: .venv/bin/python -m pytest ../../dogfood -q
 
   embed:
     runs-on: ubuntu-latest

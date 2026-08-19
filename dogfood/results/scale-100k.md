@@ -57,6 +57,7 @@ stack (different hardware, no network, synthetic embeddings).
   - `similar_size_strict_tc`: 6.740 s edges=700_000 tripped=False Δrss=54.50 MiB
 - **Count caveat:** `neighbors(talent, EDGE_TYPE)` is not label-filtered. Shared edge types (`INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH`, `LOCATION_FIT`) accumulate TC+TJ on later rows — `industry_alignment_tj` 1_726_250 = the 1M TC cap plus TJ. TC-only types (`SIMILAR_SIZE*`, `MATCHES_DESIGN_STYLE`) are exact. `tripped=True` is `count >= 1_000_000`.
 - **Extrapolation (pair-count factor 400.0):** projected_wall=489.66 min projected_Δrss=331.04 GiB
+- **Wall-time lower bound:** the pair-count scaling assumes a constant per-insertion cost; `BTreeMap` insertions are O(log n), so at 1.4B pairs the per-insertion cost is ~log(1.4B)/log(3.5M) ≈ 1.4× higher than at the 3.5M-pair probe. The 489-min figure is therefore an **underestimate**; log-factor–corrected wall is ~**685 min**. The conclusion (do not attempt) is unchanged.
 - **Finding:** Non-semantic create_rule at full scale projected wall=489.66 min Δrss=331.04 GiB (budgets 30.00 min / 8.00 GiB). Engine materializes the full desired cartesian before the 1M edge budget; attempting it would hang or OOM this 24 GiB machine.
 
 The engine's `create_rule` computes the **full desired set**
