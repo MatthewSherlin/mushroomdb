@@ -2226,41 +2226,52 @@ mod tests {
     /// kept `#[cfg(test)]`) + take first-budget entries in BTree (src,dst) order.
     /// Streaming path: `create_rule`, which now calls `apply_streaming_create`.
     ///
-    /// Both must produce byte-identical provenance for every randomised capped
-    /// scenario.  Property: for any 3-value-field FieldEqual rule over 12 nodes
-    /// with a budget that forces a cap, streaming first-N == BTree first-N.
+    /// Covers three `CandidateSpec` paths through `compute_desired`:
+    /// - `FieldEqual` → `CandidateSpec::Scalar` (bucket-by-value)
+    /// - `KeyMatch` → `CandidateSpec::ByKey` (direct FK lookup, src side: `CandidateSpec::Scalar`)
+    /// - `VectorSimilar` → `CandidateSpec::ScanAll` (HNSW / dim-filtered)
     #[test]
     fn streaming_order_identity_property_test() {
-        // Build a fixture with `n` nodes whose "k" field is one of 3 values
-        // distributed by the mix64 hash of (seed, node_index).
-        fn make_fixture(seed: u64, n: u32) -> Fx {
-            let mut fx = Fx::new();
-            for i in 0..n {
-                let h = mix64(seed ^ (i as u64 + 1));
-                let val = match h % 3 {
-                    0 => "a",
-                    1 => "b",
-                    _ => "c",
-                };
-                fx.add("N", &format!("n{i}"), vec![("k", Value::Str(val.into()))]);
-            }
-            fx
-        }
-
         // Reference: compute_full_desired → take first-budget (src,dst) pairs.
-        fn reference_first_n(
-            rule: &RuleDef,
-            index: &RuleIndex,
-            budget: u64,
-            g: &GraphMut<'_>,
-        ) -> BTreeSet<(u32, u32)> {
-            compute_full_desired(rule, index, g)
+        fn reference_first_n(rule: &RuleDef, fx: &mut Fx, budget: u64) -> BTreeSet<(u32, u32)> {
+            let mut idx = RuleIndex::default();
+            for id in 0..fx.ids.len() as u32 {
+                let label_sym = match fx.labels.get(id as usize).copied() {
+                    Some(s) if s != u32::MAX => s,
+                    _ => continue,
+                };
+                index_node_for_rule(id, label_sym, rule, &mut idx, &fx.syms, &fx.props);
+            }
+            let g = GraphMut {
+                ids: &fx.ids,
+                syms: &mut fx.syms,
+                labels: &fx.labels,
+                props: &fx.props,
+                topo: &mut fx.topo,
+                edge_props: &mut fx.eprops,
+            };
+            compute_full_desired(rule, &idx, &g)
                 .into_keys()
                 .take(budget as usize)
                 .collect()
         }
 
-        for seed in [0u64, 1, 42, 0xDEAD_BEEF, 0x1234_5678, 99, 12648430, 7] {
+        // Helper: run create_rule and return provenance (src,dst) pairs.
+        fn streaming_pairs(rule: RuleDef, fx: &mut Fx) -> BTreeSet<(u32, u32)> {
+            let name = rule.name.clone();
+            let mut eng = RuleEngine::new();
+            eng.create_rule(rule, &mut fx.g()).unwrap();
+            eng.provenance()
+                .get(&name)
+                .map(|s| s.iter().map(|&(_, a, b)| (a, b)).collect())
+                .unwrap_or_default()
+        }
+
+        // ----------------------------------------------------------------
+        // Case 1: FieldEqual (CandidateSpec::Scalar)
+        // N→N, 3-value "k" field distributed by mix64.
+        // ----------------------------------------------------------------
+        for seed in [0u64, 1, 42, 0xDEAD_BEEF, 0x1234_5678, 99, 12_648_430, 7] {
             for budget in [3u64, 5, 7, 10, 15] {
                 let rule = RuleDef {
                     name: "eq".into(),
@@ -2272,97 +2283,206 @@ mod tests {
                     max_edges: Some(budget),
                 };
 
-                // --- Reference ---
-                // Build index + compute full desired on a separate fixture.
-                let mut fx_ref = make_fixture(seed, 12);
-                let mut idx_ref = RuleIndex::default();
-                for id in 0..fx_ref.ids.len() as u32 {
-                    let label_sym = match fx_ref.labels.get(id as usize).copied() {
-                        Some(s) if s != u32::MAX => s,
-                        _ => continue,
-                    };
-                    index_node_for_rule(
-                        id,
-                        label_sym,
-                        &rule,
-                        &mut idx_ref,
-                        &fx_ref.syms,
-                        &fx_ref.props,
-                    );
-                }
-                let expected = {
-                    let g = GraphMut {
-                        ids: &fx_ref.ids,
-                        syms: &mut fx_ref.syms,
-                        labels: &fx_ref.labels,
-                        props: &fx_ref.props,
-                        topo: &mut fx_ref.topo,
-                        edge_props: &mut fx_ref.eprops,
-                    };
-                    reference_first_n(&rule, &idx_ref, budget, &g)
+                let mut fx_ref = {
+                    let mut fx = Fx::new();
+                    for i in 0..12u32 {
+                        let h = mix64(seed ^ (i as u64 + 1));
+                        let val = match h % 3 {
+                            0 => "a",
+                            1 => "b",
+                            _ => "c",
+                        };
+                        fx.add("N", &format!("n{i}"), vec![("k", Value::Str(val.into()))]);
+                    }
+                    fx
                 };
+                let expected = reference_first_n(&rule, &mut fx_ref, budget);
 
-                // --- Streaming (new path) ---
-                let mut fx_stream = make_fixture(seed, 12);
-                let mut eng = RuleEngine::new();
-                eng.create_rule(rule.clone(), &mut fx_stream.g()).unwrap();
-                let actual: BTreeSet<(u32, u32)> = eng
-                    .provenance()
-                    .get("eq")
-                    .map(|s| s.iter().map(|&(_, a, b)| (a, b)).collect())
-                    .unwrap_or_default();
+                let mut fx_stream = {
+                    let mut fx = Fx::new();
+                    for i in 0..12u32 {
+                        let h = mix64(seed ^ (i as u64 + 1));
+                        let val = match h % 3 {
+                            0 => "a",
+                            1 => "b",
+                            _ => "c",
+                        };
+                        fx.add("N", &format!("n{i}"), vec![("k", Value::Str(val.into()))]);
+                    }
+                    fx
+                };
+                let actual = streaming_pairs(rule, &mut fx_stream);
 
                 assert_eq!(
                     expected, actual,
-                    "seed={seed} budget={budget}: streaming first-N must match BTree first-N"
+                    "FieldEqual seed={seed} budget={budget}: streaming first-N must match BTree first-N"
                 );
             }
         }
-    }
 
-    /// Streaming memory-bound proof.
-    ///
-    /// A FieldEqual rule with 200 src nodes and 200 dst nodes (all same field
-    /// value → 40 000 desired pairs) with a cap of 1 000 should complete with
-    /// peak additional RSS well under 100 MiB (the old O(pairs) path would
-    /// materialise a ~40 000-entry BTreeMap before any cap).
-    ///
-    /// Marked `#[ignore]` because it forks `ps` and is environment-dependent.
-    /// Run explicitly: `cargo test -p core-rules streaming_memory_bound_proof -- --ignored`.
-    #[test]
-    #[ignore]
-    fn streaming_memory_bound_proof() {
-        fn rss_bytes() -> u64 {
-            // macOS: ps -o rss= -p <pid> returns kB.
-            let pid = std::process::id().to_string();
-            let out = std::process::Command::new("ps")
-                .args(["-o", "rss=", "-p", &pid])
-                .output()
-                .ok();
-            out.and_then(|o| String::from_utf8(o.stdout).ok())
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0)
-                * 1024
+        // ----------------------------------------------------------------
+        // Case 2: KeyMatch (CandidateSpec::ByKey on dst side,
+        //         CandidateSpec::Scalar on src side)
+        // T→C, src nodes carry a "cid" field that is the key of a C node.
+        // Each T maps to at most one C; global BTree order is T-id ascending.
+        // ----------------------------------------------------------------
+        for seed in [0u64, 1, 42, 0xDEAD_BEEF, 12_648_430, 7] {
+            for budget in [3u64, 6, 10, 14] {
+                // Build 2 C nodes and 16 T nodes; assign cid by mix64 hash.
+                let rule = RuleDef {
+                    name: "fk".into(),
+                    src_label: "T".into(),
+                    dst_label: "C".into(),
+                    predicate: Predicate::KeyMatch {
+                        field: "cid".into(),
+                    },
+                    edge_type: "AT".into(),
+                    weight_prop: None,
+                    max_edges: Some(budget),
+                };
+
+                let build = || {
+                    let mut fx = Fx::new();
+                    fx.add("C", "ca", vec![]);
+                    fx.add("C", "cb", vec![]);
+                    for i in 0..16u32 {
+                        let h = mix64(seed ^ (i as u64 + 7));
+                        let cid = if h.is_multiple_of(2) { "ca" } else { "cb" };
+                        fx.add("T", &format!("t{i}"), vec![("cid", Value::Str(cid.into()))]);
+                    }
+                    fx
+                };
+
+                let expected = reference_first_n(&rule, &mut build(), budget);
+                let actual = streaming_pairs(rule, &mut build());
+
+                assert_eq!(
+                    expected, actual,
+                    "KeyMatch seed={seed} budget={budget}: streaming first-N must match BTree first-N"
+                );
+            }
         }
 
+        // ----------------------------------------------------------------
+        // Case 3: VectorSimilar (CandidateSpec::ScanAll / HNSW)
+        // Doc→Doc, all nodes same 2-D embedding → all pairs match (cos=1.0).
+        // Exercises the HNSW candidate path; ordering comes from the
+        // BTreeMap inside compute_desired, so streaming must agree.
+        // ----------------------------------------------------------------
+        for budget in [3u64, 6, 10, 20] {
+            let rule = RuleDef {
+                name: "vec".into(),
+                src_label: "Doc".into(),
+                dst_label: "Doc".into(),
+                predicate: Predicate::VectorSimilar {
+                    field: "emb".into(),
+                    min: 0.5,
+                },
+                edge_type: "SIM".into(),
+                weight_prop: None,
+                max_edges: Some(budget),
+            };
+
+            // 12 Doc nodes, all same 2-D unit embedding → 12×11 = 132 pairs.
+            let build = || {
+                let mut fx = Fx::new();
+                for i in 0..12u32 {
+                    fx.add("Doc", &format!("d{i}"), vec![("emb", emb_val(&[1.0, 0.0]))]);
+                }
+                fx
+            };
+
+            let expected = reference_first_n(&rule, &mut build(), budget);
+            let actual = streaming_pairs(rule, &mut build());
+
+            assert_eq!(
+                expected, actual,
+                "VectorSimilar budget={budget}: streaming first-N must match BTree first-N"
+            );
+        }
+    }
+
+    /// Streaming peak-transient allocation bound.
+    ///
+    /// Measures the PEAK process RSS *during* `create_rule` by polling from a
+    /// background sampler thread at ~1 ms intervals.  Unlike a before/after
+    /// snapshot this captures transient allocations freed before the call
+    /// returns.
+    ///
+    /// **Why the OLD code would fail this test:**
+    /// The old `compute_full_desired` built a global `BTreeMap<(u32,u32),f64>`
+    /// for ALL 250 000 desired pairs (500 Talent × 500 Company, same field
+    /// value, FieldEqual) before applying the cap.  At ~26 bytes per BTree
+    /// entry (amortised node overhead on aarch64) that is ≈6.5 MiB transient
+    /// — held for the entire duration of `apply_desired`.  The peak sampler
+    /// would observe this spike; the 3 MiB threshold would be exceeded.
+    ///
+    /// **Why the NEW code passes:**
+    /// `apply_streaming_create` caps after ~1 000 evaluations (one pass over
+    /// the first few src nodes).  The largest in-flight allocation is one
+    /// per-src `BTreeMap` of ≤ 500 entries ≈ 13 KiB — never materialising
+    /// the full 250 000-pair map.  Peak transient delta is sub-100 KiB.
+    ///
+    /// Threshold 3 MiB: old ≈ 6.5 MiB (FAILS); new ≈ 13 KiB (PASSES).
+    ///
+    /// Marked `#[ignore]` (forks `ps`, environment-dependent).
+    /// Run: `cargo test -p core-rules streaming_peak_transient_bound -- --ignored --test-threads=1`
+    #[test]
+    #[ignore]
+    fn streaming_peak_transient_bound() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc,
+        };
+
+        // Sample process RSS every ~1 ms from a background thread.
+        // Returns the peak RSS observed while `f` executes.
+        fn peak_rss_during<F: FnOnce()>(f: F) -> u64 {
+            let done = Arc::new(AtomicBool::new(false));
+            let peak = Arc::new(AtomicU64::new(0));
+            let done2 = done.clone();
+            let peak2 = peak.clone();
+            let pid = std::process::id().to_string();
+
+            let handle = std::thread::spawn(move || {
+                while !done2.load(Ordering::Relaxed) {
+                    let rss = std::process::Command::new("ps")
+                        .args(["-o", "rss=", "-p", &pid])
+                        .output()
+                        .ok()
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(0)
+                        * 1024;
+                    peak2.fetch_max(rss, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+
+            f();
+
+            done.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+            peak.load(Ordering::Relaxed)
+        }
+
+        // 500 Talent × 500 Company, all FieldEqual on k="same"
+        // → 250 000 desired pairs, budget = 1 000.
         let mut fx = Fx::new();
-        // 200 Talent nodes with field "k"="same"
-        for i in 0..200u32 {
+        for i in 0..500u32 {
             fx.add(
                 "Talent",
                 &format!("t{i}"),
                 vec![("k", Value::Str("same".into()))],
             );
         }
-        // 200 Company nodes with field "k"="same" — FieldEqual src→dst
-        for i in 0..200u32 {
+        for i in 0..500u32 {
             fx.add(
                 "Company",
                 &format!("c{i}"),
                 vec![("k", Value::Str("same".into()))],
             );
         }
-
         let rule = RuleDef {
             name: "eq_tc".into(),
             src_label: "Talent".into(),
@@ -2373,24 +2493,40 @@ mod tests {
             max_edges: Some(1_000),
         };
 
-        let rss_before = rss_bytes();
-        let mut eng = RuleEngine::new();
-        eng.create_rule(rule, &mut fx.g()).unwrap();
-        let rss_after = rss_bytes();
-        let delta = rss_after.saturating_sub(rss_before);
+        // Baseline: RSS before any create_rule allocation.
+        let pid = std::process::id().to_string();
+        let baseline = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1024;
 
-        // 40 000 pairs at ~100 bytes each ≈ 4 MiB for the full map.
-        // The streaming path never builds it; delta should be << 100 MiB.
-        // (Measured: typically < 5 MiB on aarch64-apple-darwin.)
+        let mut eng = RuleEngine::new();
+        let peak = peak_rss_during(|| {
+            eng.create_rule(rule, &mut fx.g()).unwrap();
+        });
+
+        let peak_delta = peak.saturating_sub(baseline);
+
+        // Threshold 3 MiB.  Old O(pairs) path: 250k entries × ~26 bytes ≈ 6.5 MiB
+        // transient; would exceed threshold.  New streaming path: single per-src
+        // BTreeMap ≤ 500 entries ≈ 13 KiB; never approaches threshold.
         assert!(
-            delta < 100 * 1024 * 1024,
-            "peak RSS delta {delta} bytes exceeded 100 MiB; streaming likely broke"
+            peak_delta < 3 * 1024 * 1024,
+            "peak transient delta {} bytes ({} KiB) exceeded 3 MiB; \
+             streaming path may be building the full pairs map",
+            peak_delta,
+            peak_delta / 1024
         );
         assert_eq!(eng.provenance()["eq_tc"].len(), 1_000);
         assert!(eng.is_tripped("eq_tc"));
         eprintln!(
-            "streaming_memory_bound_proof: delta_rss={delta} bytes ({} KiB)",
-            delta / 1024
+            "streaming_peak_transient_bound: baseline={baseline} peak={peak} \
+             delta={peak_delta} bytes ({} KiB)",
+            peak_delta / 1024
         );
     }
 }
