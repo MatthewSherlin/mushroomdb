@@ -1,4 +1,4 @@
-//! `graphdb` — thin dispatcher over [`cli`] lib functions.
+//! `mushroomdb` — thin dispatcher over [`cli`] lib functions.
 
 use cli::{format_demo, format_stats, parse_args, read_stats, run_demo, usage, Command};
 use core_api::SharedDb;

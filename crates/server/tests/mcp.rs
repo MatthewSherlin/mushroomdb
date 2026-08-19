@@ -130,7 +130,7 @@ fn handshake_initialize_then_initialized_is_silent() {
         json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "graph-db"}
+            "serverInfo": {"name": "mushroomdb"}
         })
     );
 }
@@ -445,7 +445,7 @@ fn agent_memory_loop() {
         "initialize + 2 ingest + query + explain; initialized silent"
     );
 
-    assert_eq!(replies[0]["result"]["serverInfo"]["name"], "graph-db");
+    assert_eq!(replies[0]["result"]["serverInfo"]["name"], "mushroomdb");
 
     let org = content_json(&replies[1]);
     assert_eq!(org["inserted"], json!(1));

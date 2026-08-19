@@ -1,4 +1,4 @@
-//! `graphdb` CLI library: hand-rolled arg parsing and the demo dataset builder.
+//! `mushroomdb` CLI library: hand-rolled arg parsing and the demo dataset builder.
 //!
 //! The binary in `main.rs` stays thin — it dispatches on [`parse_args`] and
 //! prints what the lib functions return.
@@ -14,7 +14,7 @@ pub const N_ORGS: usize = 10;
 pub const N_PROJECTS: usize = 20;
 pub const N_PEOPLE: usize = 30;
 
-/// Sample query printed by `graphdb demo` and executed against the fresh store.
+/// Sample query printed by `mushroomdb demo` and executed against the fresh store.
 ///
 /// Scoped to one person so `ORDER BY score DESC` is visibly ranked (a global
 /// `LIMIT 5` would be five 1.0 home-project hits).
@@ -26,7 +26,7 @@ ORDER BY score DESC, proj";
 const SAMPLE_EXPLAIN_A: &str = "person-01";
 const SAMPLE_EXPLAIN_B: &str = "proj-01";
 
-/// Parsed `graphdb` invocation.
+/// Parsed `mushroomdb` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Serve {
@@ -83,14 +83,14 @@ impl From<std::io::Error> for CliError {
 /// Usage text for no-args / `--help` / `-h`.
 pub fn usage() -> &'static str {
     "\
-graphdb — embedded graph database
+mushroomdb — embedded graph database
 
 Usage:
-  graphdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>]
-  graphdb mcp <db-dir>
-  graphdb stats <db-dir>
-  graphdb demo <db-dir>
-  graphdb --help
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>]
+  mushroomdb mcp <db-dir>
+  mushroomdb stats <db-dir>
+  mushroomdb demo <db-dir>
+  mushroomdb --help
 "
 }
 
@@ -187,7 +187,7 @@ fn parse_one_dir(cmd: &str, args: &[&str]) -> Result<PathBuf, String> {
     db_dir.ok_or_else(|| format!("{cmd} requires <db-dir>"))
 }
 
-/// Pretty-print [`Stats`] for `graphdb stats` and the demo smoke test.
+/// Pretty-print [`Stats`] for `mushroomdb stats` and the demo smoke test.
 pub fn format_stats(stats: &Stats) -> String {
     let mut out = String::new();
     let _ = writeln!(
@@ -429,7 +429,7 @@ fn person_json() -> String {
     }))
 }
 
-/// Render a [`DemoOutcome`] the way `graphdb demo` prints it.
+/// Render a [`DemoOutcome`] the way `mushroomdb demo` prints it.
 pub fn format_demo(dir: &Path, out: &DemoOutcome) -> String {
     let mut buf = String::new();
     let _ = writeln!(buf, "== demo ==");
@@ -489,7 +489,7 @@ pub fn format_demo(dir: &Path, out: &DemoOutcome) -> String {
     }
     let _ = writeln!(buf);
     let _ = writeln!(buf, "== serve ==");
-    let _ = writeln!(buf, "  graphdb serve {}", dir.display());
+    let _ = writeln!(buf, "  mushroomdb serve {}", dir.display());
     buf
 }
 
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn usage_lists_every_subcommand() {
         let text = usage();
-        for word in ["serve", "mcp", "stats", "demo", "graphdb", "--ui"] {
+        for word in ["serve", "mcp", "stats", "demo", "mushroomdb", "--ui"] {
             assert!(
                 text.contains(word),
                 "usage should mention {word}, got:\n{text}"

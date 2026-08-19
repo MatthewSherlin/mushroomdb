@@ -97,7 +97,7 @@ export class Explorer {
 
     this.wordmark = el("div", "wordmark");
     const name = el("span", "wordmark-name");
-    name.textContent = "graph-db";
+    name.textContent = "mushroomdb";
     this.statusDot = el("span", "status-dot");
     this.statusDot.dataset.watch = "idle";
     this.statusDot.setAttribute("aria-label", "watch status");

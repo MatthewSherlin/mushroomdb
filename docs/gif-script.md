@@ -1,15 +1,15 @@
 # Launch GIF click-path
 
-Record against `graphdb serve --ui` (the built dist), not `vite` dev.
+Record against `mushroomdb serve --ui` (the built dist), not `vite` dev.
 Verified 2026-08-18 on `http://127.0.0.1:8080/` after the three-command
 flow in the README.
 
 ## Setup
 
 ```text
-graphdb demo ./db
+mushroomdb demo ./db
 cd ui && npm ci && npm run build
-graphdb serve ./db --ui ui/dist --addr 127.0.0.1:8080
+mushroomdb serve ./db --ui ui/dist --addr 127.0.0.1:8080
 ```
 
 Open `http://127.0.0.1:8080/`. Wordmark status dot goes `--signal`

@@ -7,7 +7,7 @@
 //! # Methods
 //!
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
-//!   `serverInfo.name` `"graph-db"`
+//!   `serverInfo.name` `"mushroomdb"`
 //! - `notifications/initialized` — ignored
 //! - `tools/list` — the seven tools below, each with a JSON Schema
 //! - `tools/call` — dispatch; success is
@@ -348,7 +348,7 @@ fn initialize_result() -> Js {
     json!({
         "protocolVersion": "2024-11-05",
         "capabilities": { "tools": {} },
-        "serverInfo": { "name": "graph-db" }
+        "serverInfo": { "name": "mushroomdb" }
     })
 }
 

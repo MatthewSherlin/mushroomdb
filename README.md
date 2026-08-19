@@ -1,4 +1,4 @@
-# graph-db
+# mushroomdb
 
 An embedded Rust property-graph database with native incremental linking
 rules. You declare a predicate once; every later write maintains the
@@ -11,14 +11,14 @@ transactions. Toolchain is pinned to **1.92.0**
 
 ## Quickstart
 
-The front door is the `graphdb` CLI (crate `cli`, binary name `graphdb`):
+The front door is the `mushroomdb` CLI (crate `cli`, binary name `mushroomdb`):
 
 ```text
-cargo run -p cli --bin graphdb -- demo ./demo-db
-cargo run -p cli --bin graphdb -- stats ./demo-db
-cargo run -p cli --bin graphdb -- serve ./demo-db
-cargo run -p cli --bin graphdb -- serve ./demo-db --ui ui/dist
-cargo run -p cli --bin graphdb -- mcp ./demo-db
+cargo run -p cli --bin mushroomdb -- demo ./demo-db
+cargo run -p cli --bin mushroomdb -- stats ./demo-db
+cargo run -p cli --bin mushroomdb -- serve ./demo-db
+cargo run -p cli --bin mushroomdb -- serve ./demo-db --ui ui/dist
+cargo run -p cli --bin mushroomdb -- mcp ./demo-db
 ```
 
 No-args and `--help` print usage. There is also a Rust-API walkthrough:
@@ -89,7 +89,7 @@ columns: p, o, score
 
 ## Demo
 
-`graphdb demo <db-dir>` writes a **deterministic** generic dataset — 10
+`mushroomdb demo <db-dir>` writes a **deterministic** generic dataset — 10
 Orgs, 20 Projects, 30 People — via `ingest_json`. Rows carry list-valued
 `skills` (a 3-token window `[s{home}, s{next}, s{next+1}]`), FK fields
 (`org_id`, `project_id`), org `founded_year` / `office` `[lat,lon]`, and
@@ -102,7 +102,7 @@ matches their home project (score 1.0) and partially matches the two
 adjacent windows (score 0.5). The command refuses a non-empty directory
 — including hidden files (`.DS_Store` counts).
 
-Captured from `cargo run -p cli --bin graphdb -- demo ./demo-db`:
+Captured from `cargo run -p cli --bin mushroomdb -- demo ./demo-db`:
 
 ```text
 == demo ==
@@ -132,10 +132,10 @@ columns: p, proj, score
   rule=skill_fit  type=FIT  person-01→proj-01  weight=1.0
 
 == serve ==
-  graphdb serve ./demo-db
+  mushroomdb serve ./demo-db
 ```
 
-`graphdb stats ./demo-db` after that demo:
+`mushroomdb stats ./demo-db` after that demo:
 
 ```text
 nodes: 60 live, 0 tombstoned
@@ -158,7 +158,7 @@ demo refuses a non-empty directory: ./demo-db (directory must be empty — inclu
 
 ## Server
 
-`graphdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>]` opens
+`mushroomdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>]` opens
 the store, binds (default is ephemeral port 0), prints the bound
 address **after** the listener is accepting, then serves. `--ui` must
 be a directory that contains `index.html`; `ServeDir` is the fallback
@@ -167,11 +167,11 @@ Without `--ui` the process is API-only (same as before). Real run
 against the demo dir:
 
 ```text
-$ cargo run -p cli --bin graphdb -- serve ./demo-db
-listening on http://127.0.0.1:59196
+$ cargo run -p cli --bin mushroomdb -- serve ./demo-db
+listening on http://127.0.0.1:50503
 ```
 
-(Port `59196` is whatever the OS assigned for `:0`; pass
+(Port `50503` is whatever the OS assigned for `:0`; pass
 `--addr 127.0.0.1:8080` to pin one.)
 
 Endpoints (thin wrappers over `core-api`):
@@ -197,16 +197,16 @@ Vanilla TypeScript + Vite explorer in `ui/`. Build the dist, then serve
 it from the same origin as the API:
 
 ```text
-graphdb demo ./db
+mushroomdb demo ./db
 cd ui && npm ci && npm run build
-graphdb serve ./db --ui ui/dist
+mushroomdb serve ./db --ui ui/dist
 ```
 
-Captured from a clean `./db` with `./target/debug/graphdb` (after
-`cargo build -p cli --bin graphdb`):
+Captured from a clean `./db` with `./target/debug/mushroomdb` (after
+`cargo build -p cli --bin mushroomdb`):
 
 ```text
-$ graphdb demo ./db
+$ mushroomdb demo ./db
 == demo ==
 ingested 10 Orgs, 20 Projects, 30 People
 overlap rule: skill_fit (Person.skills ∩ Project.skills, min 0.5)
@@ -234,7 +234,7 @@ columns: p, proj, score
   rule=skill_fit  type=FIT  person-01→proj-01  weight=1.0
 
 == serve ==
-  graphdb serve ./db
+  mushroomdb serve ./db
 ```
 
 ```text
@@ -246,24 +246,24 @@ added 81 packages, and audited 82 packages in 822ms
 
 found 0 vulnerabilities
 
-> graph-db-ui@0.0.0 build
+> mushroomdb-ui@0.0.0 build
 > vite build
 
 vite v8.2.1 building client environment for production...
 transforming...✓ 571 modules transformed.
 rendering chunks...
 computing gzip size...
-dist/index.html                                  0.53 kB │ gzip:   0.32 kB
-dist/assets/index-CVKuRJb1.css                   8.74 kB │ gzip:   2.18 kB
+dist/index.html                                  0.53 kB │ gzip:   0.31 kB
+dist/assets/index-B4DSmmtF.css                   9.19 kB │ gzip:   2.31 kB
 dist/assets/webgl-developer-tools-2CHz_Hb1.js   90.52 kB │ gzip:  25.02 kB
 dist/assets/webgl-device-Ds3GK4CD.js           100.98 kB │ gzip:  29.02 kB
-dist/assets/index-DCN7gYLy.js                  537.07 kB │ gzip: 140.63 kB
+dist/assets/index-DmaLE0-K.js                  545.26 kB │ gzip: 142.84 kB
 
-✓ built in 219ms
+✓ built in 114ms
 ```
 
 ```text
-$ graphdb serve ./db --ui ui/dist --addr 127.0.0.1:8080
+$ mushroomdb serve ./db --ui ui/dist --addr 127.0.0.1:8080
 listening on http://127.0.0.1:8080
 ```
 
@@ -275,15 +275,15 @@ FIT neighborhood. Launch-GIF click-path: [`docs/gif-script.md`](docs/gif-script.
 
 ## MCP
 
-`graphdb mcp <db-dir>` runs a newline-delimited JSON-RPC 2.0 loop on
+`mushroomdb mcp <db-dir>` runs a newline-delimited JSON-RPC 2.0 loop on
 stdio (no `Content-Length` framing). Methods: `initialize`,
 `notifications/initialized`, `tools/list`, `tools/call`. Tools: `query`,
 `ingest_json`, `explain`, `stats`, `neighborhood`.
 
 ```text
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-    | cargo run -p cli --bin graphdb -- mcp ./demo-db
-{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"graph-db"}}}
+    | cargo run -p cli --bin mushroomdb -- mcp ./demo-db
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mushroomdb"}}}
 ```
 
 ## What works today
@@ -298,10 +298,10 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
 | Ingest | `ingest` / `ingest_json`; auto-FK `KeyMatch` on `*_id` |
 | Concurrency | `SharedDb` — many readers or one writer (`RwLock`); lock-free epoch readers are Plan 8 |
 | Arrow | `arrow-bridge`: `ResultSet` → RecordBatch / IPC stream |
-| Server | HTTP + `/watch` WebSocket (`graphdb serve`); optional `--ui` static fallback |
-| MCP | stdio JSON-RPC (`graphdb mcp`) — agent-memory tools |
-| CLI | `graphdb` — `serve` / `mcp` / `stats` / `demo` |
-| UI | `ui/` explorer; `graphdb serve <db> --ui ui/dist` |
+| Server | HTTP + `/watch` WebSocket (`mushroomdb serve`); optional `--ui` static fallback |
+| MCP | stdio JSON-RPC (`mushroomdb mcp`) — agent-memory tools |
+| CLI | `mushroomdb` — `serve` / `mcp` / `stats` / `demo` |
+| UI | `ui/` explorer; `mushroomdb serve <db> --ui ui/dist` |
 
 **Cypher subset (v1):** one or more `MATCH` clauses; node pattern
 `(var?:Label {k: literal or $param})`; relationships
