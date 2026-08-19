@@ -7,9 +7,11 @@ if (!(host instanceof HTMLElement)) {
   throw new Error("missing #app");
 }
 
-const { Explorer } = await import("./explorer");
-const { ApiClient } = await import("./api");
-const { GraphStore } = await import("./store");
+const [{ Explorer }, { ApiClient }, { GraphStore }] = await Promise.all([
+  import("./explorer"),
+  import("./api"),
+  import("./store"),
+]);
 
 new Explorer(host, {
   api: new ApiClient(),

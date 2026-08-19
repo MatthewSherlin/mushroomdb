@@ -24,6 +24,7 @@ import {
   nextPositions,
   paintExplorer,
   pointSizes,
+  sameKeys,
   simulationOn,
 } from "./paint";
 
@@ -269,6 +270,21 @@ describe("edgeLegend", () => {
       { etype: "KNOWS", derived: false, count: 1, color: COLOR.structure },
       { etype: "KNOWS", derived: true, count: 1, color: COLOR.gold },
     ]);
+  });
+});
+
+describe("sameKeys", () => {
+  it("treats a reorder with the same membership as unchanged", () => {
+    expect(sameKeys(["a", "b", "c"], ["c", "a", "b"])).toBe(true);
+    expect(sameKeys(["a", "b"], ["a", "b"])).toBe(true);
+    expect(sameKeys([], [])).toBe(true);
+  });
+
+  it("detects added, removed, or swapped membership", () => {
+    expect(sameKeys(["a", "b"], ["a", "b", "c"])).toBe(false);
+    expect(sameKeys(["a", "b", "c"], ["a", "b"])).toBe(false);
+    expect(sameKeys(["a", "b"], ["a", "d"])).toBe(false);
+    expect(sameKeys(["a"], [])).toBe(false);
   });
 });
 

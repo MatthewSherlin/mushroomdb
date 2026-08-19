@@ -57,6 +57,23 @@ export function simulationOn(reducedMotion: boolean): boolean {
   return !reducedMotion;
 }
 
+/** Membership equality — order must not reheat the force layout. */
+export function sameKeys(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  const setB = new Set(b);
+  if (setB.size !== a.length) {
+    return false;
+  }
+  for (const key of a) {
+    if (!setB.has(key)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function labelFill(label: string): Rgba {
   if (label === "") {
     return MUTED_PAPER;

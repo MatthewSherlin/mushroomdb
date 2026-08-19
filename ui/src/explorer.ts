@@ -25,6 +25,7 @@ import {
   nextPositions,
   paintExplorer,
   pointSizes,
+  sameKeys,
   simulationOn,
   visibleEdgeIds,
   edgeLegend,
@@ -158,6 +159,7 @@ export class Explorer {
     this.errorEl.hidden = true;
 
     this.toolsEl = el("div", "canvas-tools");
+    this.toolsEl.setAttribute("role", "toolbar");
     this.toolsEl.setAttribute("aria-label", "Canvas");
     this.toolsEl.hidden = true;
     this.toolsEl.append(
@@ -826,18 +828,6 @@ export class Explorer {
     this.errorEl.hidden = true;
     this.errorEl.textContent = "";
   }
-}
-
-function sameKeys(a: readonly string[], b: readonly string[]): boolean {
-  if (a.length !== b.length) {
-    return false;
-  }
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) {
-      return false;
-    }
-  }
-  return true;
 }
 
 function setCurrent(btn: HTMLElement, on: boolean): void {

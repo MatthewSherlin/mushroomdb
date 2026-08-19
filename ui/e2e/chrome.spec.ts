@@ -26,9 +26,20 @@ test.describe("chrome", () => {
     await waitConnected(page);
     await loadDemoNeighborhood(page);
 
-    await expect(page.getByRole("button", { name: "Zoom in" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Zoom out" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Fit" })).toBeVisible();
+    const toolbar = page.getByRole("toolbar", { name: "Canvas" });
+    await expect(toolbar).toBeVisible();
+    const zoomIn = toolbar.getByRole("button", { name: "Zoom in" });
+    const zoomOut = toolbar.getByRole("button", { name: "Zoom out" });
+    const fit = toolbar.getByRole("button", { name: "Fit" });
+    await expect(zoomIn).toBeVisible();
+    await expect(zoomOut).toBeVisible();
+    await expect(fit).toBeVisible();
+    await zoomIn.focus();
+    await expect(zoomIn).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(zoomOut).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(fit).toBeFocused();
 
     const legend = page.locator(".legend");
     await expect(legend).toBeVisible();
