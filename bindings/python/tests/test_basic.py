@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import time
 
 from mushroomdb import GraphDb
 
@@ -124,3 +125,121 @@ def test_context_manager_closes(tmp_path):
         assert db.node_info("k")["label"] == "L"
     with pytest.raises(RuntimeError, match="closed"):
         db.node_info("k")
+
+
+# ---------------------------------------------------------------------------
+# ingest_batch
+# ---------------------------------------------------------------------------
+
+def test_ingest_batch_atomicity_bad_edge(tmp_path):
+    """A bad edge (non-existent dst) must reject the whole batch — zero nodes
+    persisted and a RuntimeError is raised."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    nodes = [{"key": f"n{i}", "label": "N", "props": {}} for i in range(5)]
+    bad_edges = [{"edge_type": "KNOWS", "src": "n0", "dst": "ghost"}]
+    with pytest.raises(RuntimeError):
+        db.ingest_batch(nodes, bad_edges)
+    # Nothing should be committed.
+    for i in range(5):
+        assert db.node_info(f"n{i}") is None
+    db.close()
+
+
+def test_ingest_batch_10k_round_trip(tmp_path):
+    """10 000-node single-call ingest returns a report and all nodes are
+    queryable afterwards."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    nodes = [{"key": f"node-{i:05d}", "label": "Thing", "props": {"n": i}} for i in range(10_000)]
+    report = db.ingest_batch(nodes)
+    assert isinstance(report, dict)
+    assert report["inserted"] == 10_000
+    assert report["edges_inserted"] == 0
+    assert report["row_errors"] == []
+    # Spot-check a few nodes.
+    for idx in (0, 1, 4999, 9999):
+        info = db.node_info(f"node-{idx:05d}")
+        assert info is not None
+        assert info["label"] == "Thing"
+        assert info["props"]["n"] == idx
+    db.close()
+
+
+def test_ingest_batch_with_edges(tmp_path):
+    """ingest_batch inserts nodes and edges atomically; report reflects both."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    nodes = [
+        {"key": "a", "label": "X", "props": {}},
+        {"key": "b", "label": "X", "props": {}},
+    ]
+    edges = [{"edge_type": "LINK", "src": "a", "dst": "b"}]
+    report = db.ingest_batch(nodes, edges)
+    assert report["inserted"] == 2
+    assert report["edges_inserted"] == 1
+    assert "b" in db.neighbors("a", "LINK", "out")
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# stats
+# ---------------------------------------------------------------------------
+
+def test_stats_shape(tmp_path):
+    """stats() returns a dict with the expected top-level keys."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("x", "L", {"v": 1})
+    s = db.stats()
+    assert isinstance(s, dict)
+    for key in ("nodes_live", "nodes_tombstoned", "edges", "rules"):
+        assert key in s, f"missing key: {key}"
+    assert s["nodes_live"] == 1
+    assert s["nodes_tombstoned"] == 0
+    assert isinstance(s["rules"], list)
+    db.close()
+
+
+def test_stats_rule_shape(tmp_path):
+    """Each entry in stats()['rules'] has name/edges/tripped/fires."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("p", "P", {"score": 10})
+    db.create_rule({
+        "name": "match_score",
+        "src_label": "P",
+        "dst_label": "P",
+        "predicate": {"NumericWithin": {"field": "score", "tolerance": 5.0}},
+        "edge_type": "SIMILAR",
+        "weight_prop": None,
+        "max_edges": None,
+    })
+    s = db.stats()
+    rule_names = [r["name"] for r in s["rules"]]
+    assert "match_score" in rule_names
+    for r in s["rules"]:
+        for k in ("name", "edges", "tripped", "fires"):
+            assert k in r
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# snapshot
+# ---------------------------------------------------------------------------
+
+def test_snapshot_and_reopen(tmp_path):
+    """snapshot() writes a durable checkpoint; reopening after snapshot yields
+    the same data without full WAL replay."""
+    path = str(tmp_path / "db")
+    db = GraphDb.open(path)
+    nodes = [{"key": f"s{i}", "label": "S", "props": {"i": i}} for i in range(1000)]
+    db.ingest_batch(nodes)
+    db.snapshot()
+    db.close()
+
+    # Reopen — should be fast (snapshot path, no WAL replay).
+    t0 = time.perf_counter()
+    db2 = GraphDb.open(path)
+    elapsed = time.perf_counter() - t0
+
+    assert db2.node_info("s0")["props"]["i"] == 0
+    assert db2.node_info("s999")["props"]["i"] == 999
+    # Reopen after snapshot should be sub-second for 1k nodes.
+    assert elapsed < 5.0, f"snapshot reopen took {elapsed:.2f}s — unexpectedly slow"
+    db2.close()

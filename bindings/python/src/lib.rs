@@ -92,6 +92,125 @@ impl GraphDb {
             .collect()
     }
 
+    /// Atomically ingest `nodes` (each `{key, label, props}`) and optional
+    /// `edges` (each `{edge_type, src, dst}`) in a single WAL commit.
+    ///
+    /// A bad edge (unknown endpoint, rule-owned, …) rejects the **entire**
+    /// batch — nothing is committed and `RuntimeError` is raised.
+    ///
+    /// Returns a dict matching `IngestReport` shape:
+    /// `{inserted, edges_inserted, row_errors, rules_created, skipped_fk_fields}`.
+    #[pyo3(signature = (nodes, edges=None))]
+    fn ingest_batch(
+        &self,
+        py: Python<'_>,
+        nodes: Bound<'_, PyList>,
+        edges: Option<Bound<'_, PyList>>,
+    ) -> PyResult<Py<PyDict>> {
+        // Parse nodes.
+        let mut node_ops: Vec<(String, String, Vec<(String, Value)>)> =
+            Vec::with_capacity(nodes.len());
+        for item in nodes.iter() {
+            let d = item.downcast::<PyDict>().map_err(|_| {
+                PyTypeError::new_err("each node must be a dict {key, label, props}")
+            })?;
+            let key: String = d
+                .get_item("key")?
+                .ok_or_else(|| PyValueError::new_err("node dict missing 'key'"))?
+                .extract()?;
+            let label: String = d
+                .get_item("label")?
+                .ok_or_else(|| PyValueError::new_err("node dict missing 'label'"))?
+                .extract()?;
+            let props_obj = d
+                .get_item("props")?
+                .ok_or_else(|| PyValueError::new_err("node dict missing 'props'"))?;
+            let props_dict = props_obj.downcast::<PyDict>().map_err(|_| {
+                PyTypeError::new_err("node 'props' must be a dict")
+            })?;
+            let props = dict_to_props(props_dict)?;
+            node_ops.push((label, key, props));
+        }
+
+        // Parse edges.
+        let mut edge_ops: Vec<(String, String, String)> = Vec::new();
+        if let Some(edge_list) = edges {
+            for item in edge_list.iter() {
+                let d = item.downcast::<PyDict>().map_err(|_| {
+                    PyTypeError::new_err("each edge must be a dict {edge_type, src, dst}")
+                })?;
+                let edge_type: String = d
+                    .get_item("edge_type")?
+                    .ok_or_else(|| PyValueError::new_err("edge dict missing 'edge_type'"))?
+                    .extract()?;
+                let src: String = d
+                    .get_item("src")?
+                    .ok_or_else(|| PyValueError::new_err("edge dict missing 'src'"))?
+                    .extract()?;
+                let dst: String = d
+                    .get_item("dst")?
+                    .ok_or_else(|| PyValueError::new_err("edge dict missing 'dst'"))?
+                    .extract()?;
+                edge_ops.push((edge_type, src, dst));
+            }
+        }
+
+        let n_nodes = node_ops.len();
+        let n_edges = edge_ops.len();
+
+        // Commit atomically via BatchBuilder.
+        self.with_mut(|db| {
+            let mut batch = db.batch();
+            for (label, key, props) in node_ops {
+                batch.insert_node(&label, &key, props);
+            }
+            for (edge_type, src, dst) in &edge_ops {
+                batch.insert_edge(edge_type, src, dst);
+            }
+            batch.commit()
+        })?;
+
+        // Build synthetic IngestReport-shaped dict.
+        let d = PyDict::new(py);
+        d.set_item("inserted", n_nodes)?;
+        d.set_item("edges_inserted", n_edges)?;
+        d.set_item("row_errors", PyList::empty(py))?;
+        d.set_item("rules_created", PyList::empty(py))?;
+        d.set_item("skipped_fk_fields", PyList::empty(py))?;
+        Ok(d.unbind())
+    }
+
+    /// Return database statistics: node/edge counts plus per-rule provenance
+    /// size, trip latch, and fire counter.  Shape matches the HTTP `/stats`
+    /// JSON response.
+    fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let s = self.with_ref(|db| Ok(db.stats()))?;
+        let d = PyDict::new(py);
+        d.set_item("nodes_live", s.nodes_live)?;
+        d.set_item("nodes_tombstoned", s.nodes_tombstoned)?;
+        d.set_item("edges", s.edges)?;
+        let rules_list = PyList::empty(py);
+        for r in &s.rules {
+            let rd = PyDict::new(py);
+            rd.set_item("name", &r.name)?;
+            rd.set_item("edges", r.edges)?;
+            rd.set_item("tripped", r.tripped)?;
+            rd.set_item("fires", r.fires)?;
+            rules_list.append(rd)?;
+        }
+        d.set_item("rules", rules_list)?;
+        Ok(d.unbind())
+    }
+
+    /// Write a durable snapshot and truncate the WAL tail.
+    ///
+    /// After `snapshot()`, the next `GraphDb.open()` on the same path loads
+    /// the snapshot directly and skips WAL replay, making reopen significantly
+    /// faster for large databases.
+    fn snapshot(&self) -> PyResult<()> {
+        self.with_mut(|db| db.snapshot())
+    }
+
     fn close(&self) -> PyResult<()> {
         let mut guard = lock(&self.inner.0)?;
         *guard = None;
