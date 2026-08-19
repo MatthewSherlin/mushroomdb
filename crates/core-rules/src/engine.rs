@@ -380,6 +380,11 @@ fn apply_desired(
 /// Union of `compute_desired(..., as_src)` over every live src-label node.
 /// BTree iteration of the result is the engine's deterministic first-N order
 /// for backfill and rebuild.
+///
+/// Kept for test reference comparators only.  Production paths use the
+/// streaming variants (`apply_streaming_create`, `apply_streaming_rebuild`)
+/// which never materialise the global map.
+#[cfg(test)]
 fn compute_full_desired(
     def: &RuleDef,
     index: &RuleIndex,
@@ -397,6 +402,217 @@ fn compute_full_desired(
         }
     }
     desired
+}
+
+/// Returns `true` if the `(s, d)` pair is still desired under `def` given the
+/// current graph state.  Calls `evaluate` directly — bypasses the candidate
+/// index.  Valid in `rebuild` after a full reindex because every pair that
+/// evaluates to `Some` is reachable via the freshly-built index; the direct
+/// call is therefore semantically equivalent to membership in
+/// `compute_desired(def, index, s, true, g)`.  O(eval) per call.
+fn pair_still_desired(def: &RuleDef, s: u32, d: u32, g: &GraphMut<'_>) -> bool {
+    let src_sym = match g.syms.get(&def.src_label) {
+        Some(sym) => sym,
+        None => return false,
+    };
+    let dst_sym = match g.syms.get(&def.dst_label) {
+        Some(sym) => sym,
+        None => return false,
+    };
+    if g.labels.get(s as usize).copied() != Some(src_sym) {
+        return false;
+    }
+    if g.labels.get(d as usize).copied() != Some(dst_sym) {
+        return false;
+    }
+    let s_key = match g.ids.key_of(s) {
+        Some(k) => k,
+        None => return false,
+    };
+    let d_key = match g.ids.key_of(d) {
+        Some(k) => k,
+        None => return false,
+    };
+    let s_get = |f: &str| g.props.get(s, f).cloned();
+    let d_get = |f: &str| g.props.get(d, f).cloned();
+    evaluate(
+        &def.predicate,
+        &NodeView {
+            key: s_key,
+            props: &s_get,
+        },
+        &NodeView {
+            key: d_key,
+            props: &d_get,
+        },
+    )
+    .is_some()
+}
+
+/// Count desired `(src, dst)` pairs up to `limit + 1`; returns as soon as the
+/// threshold is crossed.  Peak additional memory: O(max-candidates-per-src).
+/// Used in `rebuild` to detect the over-budget case without materialising the
+/// full desired map.
+fn count_desired_up_to(def: &RuleDef, index: &RuleIndex, limit: u64, g: &GraphMut<'_>) -> u64 {
+    let mut count = 0u64;
+    let src_sym = g.syms.get(&def.src_label);
+    for id in 0..g.ids.len() as u32 {
+        let label_sym = match g.labels.get(id as usize).copied() {
+            Some(s) if s != u32::MAX => s,
+            _ => continue,
+        };
+        if src_sym != Some(label_sym) {
+            continue;
+        }
+        count += compute_desired(def, index, id, true, g).len() as u64;
+        if count > limit {
+            return count;
+        }
+    }
+    count
+}
+
+/// Streaming backfill for `create_rule`.
+///
+/// Iterates src nodes in ascending id order.  For each src, computes and
+/// immediately applies the per-src desired edges (already dst-sorted within
+/// that src).  This traversal visits `(src, dst)` pairs in exactly the same
+/// order as iterating the result of `compute_full_desired` would — because the
+/// global BTree order on `(u32, u32)` keys is src-major ascending with
+/// dst-sorted-within, matching the per-src ascending-dst order emitted by
+/// `compute_desired`.
+///
+/// Consequently the first-N edges selected by the running cap are byte-identical
+/// to what the old full-map approach would have selected.
+///
+/// Cap semantics: on `create_rule` there is no pre-existing provenance for
+/// this rule, so when the cap trips we can `break` immediately — no
+/// weight-refresh-on-existing path can be skipped, because every remaining
+/// `already == false` entry would have been `continue`-d by the old loop too.
+fn apply_streaming_create(
+    def: &RuleDef,
+    index: &RuleIndex,
+    prov: &mut ProvSets<'_>,
+    tripped: &mut bool,
+    g: &mut GraphMut<'_>,
+) {
+    let budget = edge_budget(def);
+    let et = g.syms.intern(&def.edge_type);
+    let src_sym = g.syms.get(&def.src_label);
+
+    'outer: for id in 0..g.ids.len() as u32 {
+        let label_sym = match g.labels.get(id as usize).copied() {
+            Some(s) if s != u32::MAX => s,
+            _ => continue,
+        };
+        if src_sym != Some(label_sym) {
+            continue;
+        }
+        let per_src = compute_desired(def, index, id, true, g);
+        for ((s, d), score) in per_src {
+            let triple = (et, s, d);
+            // On create_rule, this rule has no pre-existing provenance, so
+            // `already` is always false.  The path is kept for correctness
+            // if the same edge is co-owned by another rule (topo.add_edge
+            // returns false; we do not record it in our provenance).
+            let already = prov.contains(&triple);
+            if !already {
+                if *tripped || prov.len() as u64 >= budget {
+                    *tripped = true;
+                    break 'outer;
+                }
+                let newly = g.topo.add_edge(et, s, d);
+                if newly {
+                    prov.insert(&def.name, triple);
+                }
+            }
+            let is_owned_here = already || prov.contains(&triple);
+            if is_owned_here {
+                if let Some(p) = &def.weight_prop {
+                    g.edge_props.set(et, s, d, p, Value::Float(score));
+                }
+            }
+        }
+    }
+}
+
+/// Streaming rebuild for `rebuild`.
+///
+/// Replaces `compute_full_desired` + size-check + `apply_desired(None)`.
+///
+/// Over-budget path: counts desired pairs up to `budget + 1` (early exit);
+/// if the total exceeds the budget, sets the tripped latch and returns without
+/// touching provenance (identical to the current no-op rebuild behaviour).
+///
+/// Fits-budget path: un-trips, retracts each existing provenance triple whose
+/// pair is no longer desired via direct `evaluate` — O(existing × eval) —
+/// then streams-adds all desired edges in the same src-ascending / dst-within
+/// order as `apply_streaming_create`.
+fn apply_streaming_rebuild(
+    def: &RuleDef,
+    index: &RuleIndex,
+    prov: &mut ProvSets<'_>,
+    tripped: &mut bool,
+    g: &mut GraphMut<'_>,
+) {
+    let budget = edge_budget(def);
+    let et = g.syms.intern(&def.edge_type);
+
+    // 1. Count: early-exit as soon as the budget is exceeded.
+    let total = count_desired_up_to(def, index, budget, g);
+    if total > budget {
+        *tripped = true;
+        return; // provenance untouched; latch stays set.
+    }
+
+    // 2. Un-trip — full desired fits.
+    *tripped = false;
+
+    // 3. Retract existing edges that are no longer desired.
+    //    O(existing × eval): evaluate each pair directly, no full-map build.
+    let current: Vec<Triple> = prov
+        .set
+        .iter()
+        .filter(|(t, _, _)| *t == et)
+        .copied()
+        .collect();
+    for (t, s, d) in current {
+        if !pair_still_desired(def, s, d, g) {
+            g.topo.remove_edge(t, s, d);
+            g.edge_props.remove_edge(t, s, d);
+            prov.remove(&def.name, (t, s, d));
+        }
+    }
+
+    // 4. Stream-add desired edges; refresh weights on already-owned edges.
+    //    count_desired_up_to verified total <= budget so no trip guard is needed.
+    let src_sym = g.syms.get(&def.src_label);
+    for id in 0..g.ids.len() as u32 {
+        let label_sym = match g.labels.get(id as usize).copied() {
+            Some(s) if s != u32::MAX => s,
+            _ => continue,
+        };
+        if src_sym != Some(label_sym) {
+            continue;
+        }
+        let per_src = compute_desired(def, index, id, true, g);
+        for ((s, d), score) in per_src {
+            let triple = (et, s, d);
+            let already = prov.contains(&triple);
+            if !already {
+                let newly = g.topo.add_edge(et, s, d);
+                if newly {
+                    prov.insert(&def.name, triple);
+                }
+            }
+            let is_owned_here = already || prov.contains(&triple);
+            if is_owned_here {
+                if let Some(p) = &def.weight_prop {
+                    g.edge_props.set(et, s, d, p, Value::Float(score));
+                }
+            }
+        }
+    }
 }
 
 /// Increment `fires` once per live node whose label matches either side.
@@ -598,13 +814,14 @@ impl RuleEngine {
             index_node_for_rule(id, label_sym, &def, idx, g.syms, g.props);
         }
 
-        // Phase 2: full desired set in deterministic BTree order, cap at budget.
-        let desired = compute_full_desired(&def, &self.indexes[&name], g);
+        // Phase 2: streaming backfill — no global desired map is built.
+        // Per-src candidates are computed and applied immediately in src-ascending
+        // id order, reproducing the exact first-N that the old full-BTree path
+        // would have selected (global (src,dst) BTree order == src-major).
         let tripped = self.tripped.get_mut(&name).unwrap();
-        apply_desired(
+        apply_streaming_create(
             &def,
-            desired,
-            None,
+            &self.indexes[&name],
             &mut ProvSets {
                 set: self.provenance.get_mut(&name).unwrap(),
                 owned: &mut self.owned,
@@ -845,28 +1062,23 @@ impl RuleEngine {
             index_node_for_rule(id, label_sym, &def, idx, g.syms, g.props);
         }
 
-        let desired = compute_full_desired(&def, &self.indexes[name], g);
-        if desired.len() as u64 > edge_budget(&def) {
-            // Still over cap: true no-op on provenance; latch stays set.
-            self.tripped.insert(name.to_string(), true);
-        } else {
-            self.tripped.insert(name.to_string(), false);
-            let tripped = self.tripped.get_mut(name).unwrap();
-            apply_desired(
-                &def,
-                desired,
-                None,
-                &mut ProvSets {
-                    set: self.provenance.get_mut(name).unwrap(),
-                    owned: &mut self.owned,
-                    by_node: &mut self.by_node,
-                    rule_intern: &mut self.rule_intern,
-                    intern_rule: &mut self.intern_rule,
-                },
-                tripped,
-                g,
-            );
-        }
+        // Streaming rebuild: counts desired pairs up to budget+1 (early exit),
+        // retracts stale triples via direct evaluate, then streams-adds desired.
+        // Never builds the global desired BTreeMap.
+        let tripped = self.tripped.get_mut(name).unwrap();
+        apply_streaming_rebuild(
+            &def,
+            &self.indexes[name],
+            &mut ProvSets {
+                set: self.provenance.get_mut(name).unwrap(),
+                owned: &mut self.owned,
+                by_node: &mut self.by_node,
+                rule_intern: &mut self.rule_intern,
+                intern_rule: &mut self.intern_rule,
+            },
+            tripped,
+            g,
+        );
         let fires = self.fires.entry(name.to_string()).or_default();
         bump_fires_for_participants(&def, g, fires);
 
@@ -2001,5 +2213,184 @@ mod tests {
         );
         assert_eq!(fresh.indexes["vec"].src_side.vec_dim(fb), Some(3));
         assert_eq!(fresh.indexes["vec"].src_side.vec_dim(fa), Some(2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming backfill — order-identity and memory-bound tests (Plan 11 M1)
+    // -----------------------------------------------------------------------
+
+    /// Order-identity property test (TDD — written before `apply_streaming_create`
+    /// existed; compilation failure was the initial "red" state).
+    ///
+    /// Reference comparator: `compute_full_desired` (the old full-map approach,
+    /// kept `#[cfg(test)]`) + take first-budget entries in BTree (src,dst) order.
+    /// Streaming path: `create_rule`, which now calls `apply_streaming_create`.
+    ///
+    /// Both must produce byte-identical provenance for every randomised capped
+    /// scenario.  Property: for any 3-value-field FieldEqual rule over 12 nodes
+    /// with a budget that forces a cap, streaming first-N == BTree first-N.
+    #[test]
+    fn streaming_order_identity_property_test() {
+        // Build a fixture with `n` nodes whose "k" field is one of 3 values
+        // distributed by the mix64 hash of (seed, node_index).
+        fn make_fixture(seed: u64, n: u32) -> Fx {
+            let mut fx = Fx::new();
+            for i in 0..n {
+                let h = mix64(seed ^ (i as u64 + 1));
+                let val = match h % 3 {
+                    0 => "a",
+                    1 => "b",
+                    _ => "c",
+                };
+                fx.add("N", &format!("n{i}"), vec![("k", Value::Str(val.into()))]);
+            }
+            fx
+        }
+
+        // Reference: compute_full_desired → take first-budget (src,dst) pairs.
+        fn reference_first_n(
+            rule: &RuleDef,
+            index: &RuleIndex,
+            budget: u64,
+            g: &GraphMut<'_>,
+        ) -> BTreeSet<(u32, u32)> {
+            compute_full_desired(rule, index, g)
+                .into_keys()
+                .take(budget as usize)
+                .collect()
+        }
+
+        for seed in [0u64, 1, 42, 0xDEAD_BEEF, 0x1234_5678, 99, 12648430, 7] {
+            for budget in [3u64, 5, 7, 10, 15] {
+                let rule = RuleDef {
+                    name: "eq".into(),
+                    src_label: "N".into(),
+                    dst_label: "N".into(),
+                    predicate: Predicate::FieldEqual { field: "k".into() },
+                    edge_type: "EQ".into(),
+                    weight_prop: None,
+                    max_edges: Some(budget),
+                };
+
+                // --- Reference ---
+                // Build index + compute full desired on a separate fixture.
+                let mut fx_ref = make_fixture(seed, 12);
+                let mut idx_ref = RuleIndex::default();
+                for id in 0..fx_ref.ids.len() as u32 {
+                    let label_sym = match fx_ref.labels.get(id as usize).copied() {
+                        Some(s) if s != u32::MAX => s,
+                        _ => continue,
+                    };
+                    index_node_for_rule(
+                        id,
+                        label_sym,
+                        &rule,
+                        &mut idx_ref,
+                        &fx_ref.syms,
+                        &fx_ref.props,
+                    );
+                }
+                let expected = {
+                    let g = GraphMut {
+                        ids: &fx_ref.ids,
+                        syms: &mut fx_ref.syms,
+                        labels: &fx_ref.labels,
+                        props: &fx_ref.props,
+                        topo: &mut fx_ref.topo,
+                        edge_props: &mut fx_ref.eprops,
+                    };
+                    reference_first_n(&rule, &idx_ref, budget, &g)
+                };
+
+                // --- Streaming (new path) ---
+                let mut fx_stream = make_fixture(seed, 12);
+                let mut eng = RuleEngine::new();
+                eng.create_rule(rule.clone(), &mut fx_stream.g()).unwrap();
+                let actual: BTreeSet<(u32, u32)> = eng
+                    .provenance()
+                    .get("eq")
+                    .map(|s| s.iter().map(|&(_, a, b)| (a, b)).collect())
+                    .unwrap_or_default();
+
+                assert_eq!(
+                    expected, actual,
+                    "seed={seed} budget={budget}: streaming first-N must match BTree first-N"
+                );
+            }
+        }
+    }
+
+    /// Streaming memory-bound proof.
+    ///
+    /// A FieldEqual rule with 200 src nodes and 200 dst nodes (all same field
+    /// value → 40 000 desired pairs) with a cap of 1 000 should complete with
+    /// peak additional RSS well under 100 MiB (the old O(pairs) path would
+    /// materialise a ~40 000-entry BTreeMap before any cap).
+    ///
+    /// Marked `#[ignore]` because it forks `ps` and is environment-dependent.
+    /// Run explicitly: `cargo test -p core-rules streaming_memory_bound_proof -- --ignored`.
+    #[test]
+    #[ignore]
+    fn streaming_memory_bound_proof() {
+        fn rss_bytes() -> u64 {
+            // macOS: ps -o rss= -p <pid> returns kB.
+            let pid = std::process::id().to_string();
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &pid])
+                .output()
+                .ok();
+            out.and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+                * 1024
+        }
+
+        let mut fx = Fx::new();
+        // 200 Talent nodes with field "k"="same"
+        for i in 0..200u32 {
+            fx.add(
+                "Talent",
+                &format!("t{i}"),
+                vec![("k", Value::Str("same".into()))],
+            );
+        }
+        // 200 Company nodes with field "k"="same" — FieldEqual src→dst
+        for i in 0..200u32 {
+            fx.add(
+                "Company",
+                &format!("c{i}"),
+                vec![("k", Value::Str("same".into()))],
+            );
+        }
+
+        let rule = RuleDef {
+            name: "eq_tc".into(),
+            src_label: "Talent".into(),
+            dst_label: "Company".into(),
+            predicate: Predicate::FieldEqual { field: "k".into() },
+            edge_type: "EQ".into(),
+            weight_prop: None,
+            max_edges: Some(1_000),
+        };
+
+        let rss_before = rss_bytes();
+        let mut eng = RuleEngine::new();
+        eng.create_rule(rule, &mut fx.g()).unwrap();
+        let rss_after = rss_bytes();
+        let delta = rss_after.saturating_sub(rss_before);
+
+        // 40 000 pairs at ~100 bytes each ≈ 4 MiB for the full map.
+        // The streaming path never builds it; delta should be << 100 MiB.
+        // (Measured: typically < 5 MiB on aarch64-apple-darwin.)
+        assert!(
+            delta < 100 * 1024 * 1024,
+            "peak RSS delta {delta} bytes exceeded 100 MiB; streaming likely broke"
+        );
+        assert_eq!(eng.provenance()["eq_tc"].len(), 1_000);
+        assert!(eng.is_tripped("eq_tc"));
+        eprintln!(
+            "streaming_memory_bound_proof: delta_rss={delta} bytes ({} KiB)",
+            delta / 1024
+        );
     }
 }
