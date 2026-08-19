@@ -141,7 +141,10 @@ SCORE_SIZE_ALICE_FIRMB = 1.0  # 1.0 − |3 − 3| / 1
 # via an independent Python reimplementation of the SHA-256 hash chain
 # (EMBED_SEED|ind|architecture base, EMBED_SEED|key|<id> jitter at 0.05,
 # then L2-normalize) and dot-producted.  Same-industry cosine ≈ 0.998.
-SCORE_SEMANTIC_ALICE_FIRMA = 0.9975724651665169
+# Recomputed 2026-08-19 after EMBED_SEED changed to b"marketplace-dogfood-t1-v1"
+# in the data-sanitization sweep (a seed-string change shifts every hash-derived
+# embedding deterministically; oracle re-run independently, engine agreed to 1e-13).
+SCORE_SEMANTIC_ALICE_FIRMA = 0.997616453151844
 
 INQUIRED = {("st-user-alice", "listing-job-firma")}
 CONNECTED: set[tuple[str, str]] = set()
