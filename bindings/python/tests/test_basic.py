@@ -212,7 +212,7 @@ def test_stats_shape(tmp_path):
 
 
 def test_stats_rule_shape(tmp_path):
-    """Each entry in stats()['rules'] has name/edges/tripped/fires."""
+    """Each entry in stats()['rules'] has name/edges/tripped/fires/approximate."""
     db = GraphDb.open(str(tmp_path / "db"))
     db.insert_node("p", "P", {"score": 10})
     db.create_rule({
@@ -223,13 +223,41 @@ def test_stats_rule_shape(tmp_path):
         "edge_type": "SIMILAR",
         "weight_prop": None,
         "max_edges": None,
+        "approximate": False,
     })
     s = db.stats()
     rule_names = [r["name"] for r in s["rules"]]
     assert "match_score" in rule_names
     for r in s["rules"]:
-        for k in ("name", "edges", "tripped", "fires"):
-            assert k in r
+        for k in ("name", "edges", "tripped", "fires", "approximate"):
+            assert k in r, f"missing key '{k}' in rule stats entry"
+    # exact rule: approximate must be False
+    match_rule = next(r for r in s["rules"] if r["name"] == "match_score")
+    assert match_rule["approximate"] is False
+    db.close()
+
+
+def test_stats_rule_approximate_true(tmp_path):
+    """stats()['rules'] exposes approximate=True for IVF-Flat rules."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    # Two nodes with vectors so the rule can index them.
+    db.insert_node("a", "Item", {"vec": [1.0, 0.0]})
+    db.insert_node("b", "Item", {"vec": [0.9, 0.1]})
+    db.create_rule({
+        "name": "approx_sim",
+        "src_label": "Item",
+        "dst_label": "Item",
+        "predicate": {"VectorSimilar": {"field": "vec", "min": 0.5}},
+        "edge_type": "NEAR",
+        "weight_prop": None,
+        "max_edges": None,
+        "approximate": True,
+    })
+    s = db.stats()
+    approx_rule = next((r for r in s["rules"] if r["name"] == "approx_sim"), None)
+    assert approx_rule is not None, "approx_sim rule not found in stats"
+    assert "approximate" in approx_rule, "missing 'approximate' key in rule stats"
+    assert approx_rule["approximate"] is True
     db.close()
 
 

@@ -200,6 +200,7 @@ impl GraphDb {
             rd.set_item("edges", r.edges)?;
             rd.set_item("tripped", r.tripped)?;
             rd.set_item("fires", r.fires)?;
+            rd.set_item("approximate", r.approximate)?;
             rules_list.append(rd)?;
         }
         d.set_item("rules", rules_list)?;

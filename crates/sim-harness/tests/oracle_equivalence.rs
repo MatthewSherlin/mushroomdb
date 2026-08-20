@@ -1242,14 +1242,14 @@ fn clustered_vec_1536(seed: u64, n_clusters: usize, cluster: usize, member: usiz
     // With 1536 dims and n_clusters ≤ 32, each cluster owns 48+ dims.
     let stride = DIM / n_clusters;
     let base = cluster * stride;
-    for d in base..((base + stride).min(DIM)) {
-        v[d] = 1.0;
+    for x in v[base..(base + stride).min(DIM)].iter_mut() {
+        *x = 1.0;
     }
     // Add small seeded noise to each dim.
-    for d in 0..DIM {
+    for (d, x) in v.iter_mut().enumerate() {
         let bits = lcg_mix(seed, cluster as u64 * 10_000 + member as u64, d as u64);
         let noise = (bits as f64) / (u64::MAX as f64) * 0.15 - 0.075; // ±7.5% noise
-        v[d] += noise;
+        *x += noise;
     }
     // Normalise.
     let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-12);

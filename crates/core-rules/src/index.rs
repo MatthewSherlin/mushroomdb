@@ -31,7 +31,7 @@ pub fn cluster_k(n: usize) -> usize {
 
 /// P = max(1, ceil(k / IVF_PROBE_DENOM)).
 pub fn probe_count(k: usize) -> usize {
-    ((k + IVF_PROBE_DENOM - 1) / IVF_PROBE_DENOM).max(1)
+    k.div_ceil(IVF_PROBE_DENOM).max(1)
 }
 
 /// Squared Euclidean distance between two equal-length slices.
@@ -117,8 +117,8 @@ pub fn kmeans_fit(vecs: &[(u32, Vec<f64>)], k: usize, seed: u64) -> Vec<Vec<f64>
     // If LCG didn't yield k distinct indices (pathological: n very small or
     // many collisions), fill sequentially.
     if init_idxs.len() < k {
-        for i in 0..n {
-            if !used[i] {
+        for (i, in_use) in used.iter().enumerate().take(n) {
+            if !in_use {
                 init_idxs.push(i);
                 if init_idxs.len() == k {
                     break;
@@ -1359,7 +1359,7 @@ mod tests {
             );
         }
         // ckpts[7] = suffix norm of the last 2 elements (14..=16).
-        let expected_last = ((15.0f64 * 15.0 + 16.0 * 16.0).sqrt());
+        let expected_last = (15.0f64 * 15.0 + 16.0 * 16.0).sqrt();
         assert!(
             (ckpts[7] - expected_last).abs() < 1e-9,
             "ckpts[7] should be norm of last segment; got {} vs {}",

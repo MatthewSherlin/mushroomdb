@@ -608,7 +608,11 @@ fn count_desired_up_to(def: &RuleDef, index: &RuleIndex, limit: u64, g: &GraphMu
 /// `compute_desired`.
 ///
 /// Consequently the first-N edges selected by the running cap are byte-identical
-/// to what the old full-map approach would have selected.
+/// to what the old full-map approach would have selected for EXACT rules
+/// (`def.approximate == false`).  For approximate rules the IVF candidate order
+/// is deterministic (replay-identical within the same fitted clusters) but is not
+/// equivalent to the old full-map path, which was never exercised for approximate
+/// rules.
 ///
 /// Cap semantics: on `create_rule` there is no pre-existing provenance for
 /// this rule, so when the cap trips we can `break` immediately — no
@@ -2975,7 +2979,7 @@ mod tests {
         };
 
         // Three independent fixtures with the same razor pair.
-        let mut build_fx = || {
+        let build_fx = || {
             let mut fx = Fx::new();
             let na = fx.add("Doc", "razor_a", vec![("emb", emb_val2(&a))]);
             let nb = fx.add("Doc", "razor_b", vec![("emb", emb_val2(&b))]);
