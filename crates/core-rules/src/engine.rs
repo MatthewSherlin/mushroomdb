@@ -24,6 +24,12 @@ type Triple = (u32, u32, u32);
 /// Reverse-index entry: `(rule_id, etype, src, dst)`. `rule_id` is interned.
 type Touch = (u32, u32, u32, u32);
 
+/// IVF state for one index side, exported for V4 snapshot persistence:
+/// `(centroids, node→cluster assignments, drift_counter)`.
+pub type SideIvfExport = (Vec<Vec<f64>>, BTreeMap<u32, usize>, u64);
+/// IVF state for both sides (src, dst) of one approximate rule.
+pub type RuleIvfExport = (SideIvfExport, SideIvfExport);
+
 #[derive(Debug, Default)]
 pub struct RuleEngine {
     rules: BTreeMap<String, RuleDef>,
@@ -890,6 +896,24 @@ impl RuleEngine {
         }
     }
 
+    /// Export IVF state for all approximate rules.  Passed to `snapshot()` in
+    /// `core-api` and stored in the V4 snapshot so `open()` can restore cluster
+    /// assignments without re-fitting k-means.
+    pub fn export_ivf_state(&self) -> BTreeMap<String, RuleIvfExport> {
+        let mut out = BTreeMap::new();
+        for (name, def) in &self.rules {
+            if def.approximate {
+                if let Some(idx) = self.indexes.get(name) {
+                    out.insert(
+                        name.clone(),
+                        (idx.src_side.export_ivf_state(), idx.dst_side.export_ivf_state()),
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// Rebuild all candidate indexes by scanning every node.  Call on open.
     pub fn reindex_all(
         &mut self,
@@ -919,6 +943,55 @@ impl RuleEngine {
         for name in &rule_names {
             if self.rules[name].approximate {
                 let idx = self.indexes.get_mut(name).unwrap();
+                idx.src_side.fit_ivf_clusters(name);
+                idx.dst_side.fit_ivf_clusters(name);
+            }
+        }
+    }
+
+    /// Like `reindex_all` but LOADS persisted IVF state for approximate rules
+    /// instead of re-fitting k-means.  This eliminates the cold-start re-fit
+    /// cost when opening a V4 snapshot.
+    ///
+    /// `ivf_state`: map from rule name to `(src_export, dst_export)` as
+    /// produced by `export_ivf_state` / stored in the V4 snapshot.
+    ///
+    /// For approximate rules absent from `ivf_state` (e.g. a rule added
+    /// after the snapshot), falls back to `fit_ivf_clusters`.
+    pub fn reindex_all_load_ivf(
+        &mut self,
+        ids: &IdMap,
+        syms: &Interner,
+        labels: &[u32],
+        props: &ColumnStore,
+        ivf_state: BTreeMap<String, RuleIvfExport>,
+    ) {
+        for idx in self.indexes.values_mut() {
+            *idx = RuleIndex::default();
+        }
+        let rule_names: Vec<String> = self.rules.keys().cloned().collect();
+        for id in 0..ids.len() as u32 {
+            let label_sym = match labels.get(id as usize).copied() {
+                Some(s) if s != u32::MAX => s,
+                _ => continue,
+            };
+            for name in &rule_names {
+                let def = self.rules[name].clone();
+                let idx = self.indexes.get_mut(name).unwrap();
+                index_node_for_rule(id, label_sym, &def, idx, syms, props);
+            }
+        }
+        // For approximate rules: restore persisted IVF state (no re-fit).
+        for name in &rule_names {
+            if !self.rules[name].approximate {
+                continue;
+            }
+            let idx = self.indexes.get_mut(name).unwrap();
+            if let Some(((sc, sa, sd), (dc, da, dd))) = ivf_state.get(name) {
+                idx.src_side.load_ivf_state(sc.clone(), sa.clone(), *sd);
+                idx.dst_side.load_ivf_state(dc.clone(), da.clone(), *dd);
+            } else {
+                // No persisted state for this rule: fall back to full re-fit.
                 idx.src_side.fit_ivf_clusters(name);
                 idx.dst_side.fit_ivf_clusters(name);
             }

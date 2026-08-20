@@ -857,6 +857,58 @@ impl SideIndex {
     pub fn ivf_cluster_of(&self, node: u32) -> Option<usize> {
         self.ivf_clusters.get(&node).copied()
     }
+
+    /// Export IVF state for snapshot persistence: (centroids, clusters, drift).
+    ///
+    /// The caller stores this in the V4 snapshot and passes it back to
+    /// `load_ivf_state` on the next open, avoiding a full k-means re-fit.
+    pub fn export_ivf_state(&self) -> (Vec<Vec<f64>>, BTreeMap<u32, usize>, u64) {
+        (
+            self.ivf_centroids.clone(),
+            self.ivf_clusters.clone(),
+            self.ivf_drift,
+        )
+    }
+
+    /// Restore IVF state from a V4 snapshot.
+    ///
+    /// This must be called AFTER the normal `insert()` pass (which populates
+    /// `ivf_raw`) but INSTEAD OF `fit_ivf_clusters`.  It:
+    ///   1. Removes any stale cluster-key entries from `by_key`.
+    ///   2. Installs the persisted centroids and drift counter.
+    ///   3. Rebuilds `by_key` cluster buckets from the persisted assignments.
+    ///
+    /// Nodes present in `ivf_raw` but absent from `clusters` (e.g. inserted
+    /// post-snapshot via WAL replay before this is called) are left unassigned;
+    /// `on_node_changed` will assign them to the nearest centroid incrementally.
+    pub fn load_ivf_state(
+        &mut self,
+        centroids: Vec<Vec<f64>>,
+        clusters: BTreeMap<u32, usize>,
+        drift: u64,
+    ) {
+        // Remove old cluster bucket entries from by_key.
+        for c in self.ivf_clusters.values() {
+            self.by_key.remove(&ValueKey::Int(*c as i64));
+        }
+        self.ivf_clusters.clear();
+
+        self.ivf_centroids = centroids;
+        self.ivf_drift = drift;
+
+        // Rebuild by_key from persisted assignments (only for nodes still in ivf_raw).
+        for (&node, &c) in &clusters {
+            if !self.ivf_raw.contains_key(&node) {
+                // Node was removed post-snapshot (WAL replay deleted it).  Skip.
+                continue;
+            }
+            self.ivf_clusters.insert(node, c);
+            self.by_key
+                .entry(ValueKey::Int(c as i64))
+                .or_default()
+                .insert(node);
+        }
+    }
 }
 
 #[cfg(test)]

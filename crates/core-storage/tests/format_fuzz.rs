@@ -126,6 +126,7 @@ fn valid_snapshot_bytes() -> Vec<u8> {
         provenance,
         rule_tripped,
         rule_fires,
+        ivf_state: Default::default(),
     };
     snapshot::encode(&state)
 }

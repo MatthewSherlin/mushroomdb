@@ -563,7 +563,7 @@ fn field_equal_budget_trips_at_10_and_stats_survive_recovery() {
         assert_eq!(s.nodes_live, 4);
         assert_eq!(s.nodes_tombstoned, 0);
         assert_eq!(s.edges, 10);
-        assert_eq!(GraphDb::<core_storage::fs::RealFs>::format_version(), 3);
+        assert_eq!(GraphDb::<core_storage::fs::RealFs>::format_version(), 4);
         assert_eq!(s.rules.len(), 1);
         assert_eq!(s.rules[0].name, "eq");
         assert_eq!(s.rules[0].edges, 10);

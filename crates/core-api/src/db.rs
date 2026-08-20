@@ -1,7 +1,7 @@
 use crate::ingest::{IngestOptions, IngestReport};
 use core_query::cypher::{execute, lex, parse, plan, Params};
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
-use core_rules::{evaluate, GraphMut, NodeView, Predicate, RuleDef, RuleEngine};
+use core_rules::{evaluate, GraphMut, NodeView, Predicate, RuleDef, RuleEngine, RuleIvfExport};
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{
@@ -358,8 +358,28 @@ impl<F: Fs> GraphDb<F> {
                 state.rule_tripped,
                 state.rule_fires,
             );
-            db.engine
-                .reindex_all(&db.ids, &db.syms, &db.labels, &db.props);
+            // V4 snapshot carries IVF state: restore it instead of re-fitting.
+            // This turns the cold-start multi-minute re-fit into microseconds.
+            let ivf_state: BTreeMap<String, RuleIvfExport> = state
+                .ivf_state
+                .into_iter()
+                .map(|(name, ps)| {
+                    (
+                        name,
+                        (
+                            (ps.src.centroids, ps.src.clusters, ps.src.drift),
+                            (ps.dst.centroids, ps.dst.clusters, ps.dst.drift),
+                        ),
+                    )
+                })
+                .collect();
+            db.engine.reindex_all_load_ivf(
+                &db.ids,
+                &db.syms,
+                &db.labels,
+                &db.props,
+                ivf_state,
+            );
         }
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
@@ -1256,6 +1276,28 @@ impl<F: Fs> GraphDb<F> {
             .iter()
             .map(|r| bincode::serialize(r).expect("RuleDef serialize cannot fail"))
             .collect();
+        // Collect IVF state for approximate rules (V4).
+        let raw_ivf = self.engine.export_ivf_state();
+        let ivf_state: BTreeMap<String, core_storage::snapshot::PerRuleIvfState> = raw_ivf
+            .into_iter()
+            .map(|(name, ((sc, sa, sd), (dc, da, dd)))| {
+                (
+                    name,
+                    core_storage::snapshot::PerRuleIvfState {
+                        src: core_storage::snapshot::SideIvfState {
+                            centroids: sc,
+                            clusters: sa,
+                            drift: sd,
+                        },
+                        dst: core_storage::snapshot::SideIvfState {
+                            centroids: dc,
+                            clusters: da,
+                            drift: dd,
+                        },
+                    },
+                )
+            })
+            .collect();
         let state = core_storage::snapshot::SnapshotState {
             ids: self.ids.clone(),
             syms: self.syms.clone(),
@@ -1267,6 +1309,7 @@ impl<F: Fs> GraphDb<F> {
             provenance,
             rule_tripped,
             rule_fires,
+            ivf_state,
         };
         self.fs
             .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state))?;
