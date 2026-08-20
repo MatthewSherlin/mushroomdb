@@ -1,0 +1,65 @@
+name: Feature request
+description: Propose a new capability or change to mushroomdb
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the roadmap in `README.md` and open issues before filing —
+        the item may already be tracked.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: |
+        Describe what you are trying to do and what is currently hard or
+        impossible. Concrete use cases are more useful than abstract requests.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        What you would like mushroomdb to do. API sketches, example command
+        invocations, or pseudocode are welcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you considered and why you prefer the proposal
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Storage / WAL / snapshots
+        - Rule engine / predicates
+        - Cypher query surface
+        - HTTP / MCP server
+        - Python bindings
+        - CLI
+        - UI explorer
+        - Performance / benchmarks
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and the roadmap in README.md
+          required: true
+        - label: This is a general-purpose feature (not specific to one domain or label name)
+          required: false
