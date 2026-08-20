@@ -128,7 +128,7 @@ docker run --rm -p 8080:8080 ghcr.io/matthewsherlin/mushroomdb
 npx mushroomdb --help
 
 # curl
-curl -fsSL https://raw.githubusercontent.com/MatthewSherlin/graph-db/main/packaging/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/MatthewSherlin/mushroomdb/main/packaging/install.sh | sh
 ```
 
 These are not available until the tag is pushed. See the Distribution

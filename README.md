@@ -296,7 +296,7 @@ npx mushroomdb --help
 ### curl / install.sh (after the first v* tag)
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/MatthewSherlin/graph-db/main/packaging/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/MatthewSherlin/mushroomdb/main/packaging/install.sh | sh
 ```
 
 Writes `~/.local/bin/mushroomdb` (no sudo). Fetches the matching GitHub

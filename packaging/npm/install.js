@@ -81,7 +81,7 @@ async function main() {
   const version = String(pkg.version).replace(/^v/, "");
   const tag = `v${version}`;
   const asset = `mushroomdb-${tag}-${target}.tar.gz`;
-  const repo = "MatthewSherlin/graph-db";
+  const repo = "MatthewSherlin/mushroomdb";
   const base =
     process.env.MUSHROOMDB_RELEASE_BASE ||
     `https://github.com/${repo}/releases/download/${tag}`;
