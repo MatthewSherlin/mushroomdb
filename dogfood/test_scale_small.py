@@ -14,9 +14,11 @@ import pytest
 
 from rules import APPROXIMATE_SEMANTIC_RULE, MATCHER_MAX_EDGES, SIX_RULES
 from scale_run import (
+    BIG3_SLICE_SIZE,
     DEFAULT_SCALE,
     DEFAULT_SEED,
     INGEST_BATCH,
+    N_PQ_QUERIES,
     N_SPARSE_USERS,
     RECALL_SAMPLE,
     SEMANTIC_PROBE_SCALE,
@@ -24,6 +26,7 @@ from scale_run import (
     build_parser,
     fk_rule_defs,
     non_semantic_rules,
+    run_big3_slice,
     run_experiment,
     semantic_rule,
     sparse_user_nodes,
@@ -126,6 +129,11 @@ def test_recall_sample_size():
     assert RECALL_SAMPLE == 1_000
 
 
+def test_big3_slice_size_and_pq_queries():
+    assert BIG3_SLICE_SIZE == 500
+    assert N_PQ_QUERIES == 100
+
+
 @pytest.fixture(scope="module")
 def small_run(tmp_path_factory):
     root = tmp_path_factory.mktemp("scale2k")
@@ -155,6 +163,7 @@ def test_2k_pipeline_phases_timed(small_run):
         "semantic_approx",
         "incremental",
         "big3",
+        "big3_slice",
         "explain",
         "reopen",
         "reopen_snap",
@@ -257,3 +266,36 @@ def test_2k_reopen_survives(small_run):
     assert db.node_info("company-000000") is not None
     why = db.explain("talent-000000", "user-000000")
     assert any(e["rule"] == "auto_fk_talent_user_id" for e in why)
+
+
+def test_2k_big3_slice_non_empty(small_run):
+    """Big-3 slice must return non-empty intersections (all rules fire for all pairs)."""
+    b3s = small_run["phases"]["big3_slice"]
+    assert b3s["status"] == "ok"
+    assert b3s["n"] > 0
+    assert b3s["mean_matches"] > 0, (
+        f"Big-3 slice intersection empty: first_ia={b3s.get('first_ia')} "
+        f"first_sm={b3s.get('first_sm')} first_lf={b3s.get('first_lf')}"
+    )
+    assert b3s["p50_s"] <= b3s["p95_s"]
+
+
+def test_2k_per_query_ann_recall_shape(small_run):
+    """Per-query ANN recall must be recorded with correct metric shape."""
+    import math
+    pqr = small_run["phases"]["semantic_approx"].get("pq_recall")
+    assert pqr is not None, "pq_recall missing from semantic_approx phase"
+    assert pqr["metric"] == "per_query_ann_recall"
+    assert pqr["scale"] == SEMANTIC_PROBE_SCALE
+    mean_r = pqr["mean_recall"]
+    assert math.isnan(mean_r) or 0.0 <= mean_r <= 1.0, f"mean_recall out of range: {mean_r}"
+
+
+def test_big3_slice_standalone():
+    """run_big3_slice() returns non-empty intersections in isolation."""
+    result = run_big3_slice(seed=12345, n_slice=50)
+    assert result["status"] == "ok"
+    assert result["mean_matches"] > 0, (
+        f"Big-3 slice standalone returned empty intersections: {result}"
+    )
+    assert result["first_intersection"] > 0
