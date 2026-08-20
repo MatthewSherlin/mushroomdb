@@ -336,6 +336,17 @@ fn compile_pattern(
                          bind both endpoints before shortestPath"
                     ));
                 }
+                // A minimum hop count > 1 is not supported for shortestPath —
+                // the BFS always returns the shortest (lowest-hop) path, so a
+                // min constraint would silently be ignored.  Reject explicitly.
+                if hops.min > 1 {
+                    return Err(format!(
+                        "shortestPath does not support a minimum hop count \
+                         (got min={}); use a plain variable-length pattern \
+                         if you need a minimum",
+                        hops.min
+                    ));
+                }
                 ops.push(PlanOp::ShortestPath {
                     from: from.clone(),
                     rel_var: Some(rel_name),
@@ -1150,5 +1161,18 @@ LIMIT 10";
         plan_src("MATCH (a)-[r:T*1..3]->(b) RETURN r.length").expect("r.length must plan");
         // bare r must be rejected
         assert_plan_err("MATCH (a)-[r:T*1..3]->(b) RETURN r", "r");
+    }
+
+    #[test]
+    fn shortest_path_min_gt_1_is_plan_err() {
+        // shortestPath with *2..5 must be rejected: min>1 is not supported
+        let err = assert_plan_err(
+            "MATCH (a:N) MATCH (b:N) MATCH shortestPath((a)-[r:T*2..5]->(b)) RETURN r.length",
+            "shortestPath",
+        );
+        assert!(
+            err.contains("minimum"),
+            "error must mention minimum hop count, got: {err}"
+        );
     }
 }

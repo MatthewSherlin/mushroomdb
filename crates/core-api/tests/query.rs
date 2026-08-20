@@ -697,12 +697,7 @@ fn var_expand_budget_exceeded_errors_cleanly() {
                 "budget error must name the limit, got: {detail}"
             );
         }
-        Ok(rs) => {
-            // If the graph is sparse enough that 1M rows are not exceeded,
-            // just verify it returned some rows (not a budget failure).
-            // This path should not occur with 10-node complete graph.
-            let _ = rs;
-        }
+        Ok(_) => panic!("expected budget error on 10-node complete graph *1..10, got Ok"),
         Err(e) => panic!("unexpected non-budget error: {e:?}"),
     }
 }
@@ -794,11 +789,64 @@ fn var_expand_frontier_budget_fires_before_output() {
                 "frontier budget error must name the limit, got: {detail}"
             );
         }
-        Ok(rs) => {
-            // If the graph does not expand enough to trip the budget, just verify
-            // termination.  This branch should not be reached with the 10-node clique.
-            let _ = rs;
-        }
+        Ok(_) => panic!("expected budget error on 10-node complete graph *5..10, got Ok"),
         Err(e) => panic!("unexpected non-budget error: {e:?}"),
+    }
+}
+
+/// Left-directed `<-[:T*1..2]-` var-expand: traverses edges in reverse.
+/// diamond_db has edges a→b, a→c, b→d, c→d.
+/// From d going left: d←b (depth 1), d←c (depth 1), d←b←a (depth 2), d←c←a (depth 2).
+/// MATCH (d:N {id: 'd'})<-[r:T*1..2]-(x) from d: 4 rows.
+#[test]
+fn var_expand_left_directed() {
+    let db = diamond_db("vp-left");
+    let rs = db
+        .query(
+            "MATCH (d:N {id: 'd'})<-[r:T*1..2]-(x) RETURN x",
+            &BTreeMap::new(),
+        )
+        .expect("left-directed *1..2 must succeed");
+    assert_eq!(rs.len(), 4, "left-directed from d: expected 4 rows, got {}", rs.len());
+}
+
+/// Undirected `-[:T*1..2]-` var-expand: traverses both orientations.
+/// diamond_db has a→b, a→c, b→d, c→d.
+/// From a undirected *1: reaches b, c (2 rows).
+/// From a undirected *2: reaches d (via b), d (via c) = 2 rows.
+/// Total: 4 rows from a with *1..2.
+/// (b→a and c→a reverse edges not present in the graph, so no additional reverse paths.)
+#[test]
+fn var_expand_undirected() {
+    let db = diamond_db("vp-undirected");
+    let rs = db
+        .query(
+            "MATCH (a:N {id: 'a'})-[r:T*1..2]-(x) RETURN x",
+            &BTreeMap::new(),
+        )
+        .expect("undirected *1..2 must succeed");
+    // Undirected from a: right-direction gives 4 rows (b, c at depth 1; d, d at depth 2).
+    // Left-direction from a: no incoming T edges to a, so 0 additional rows.
+    assert_eq!(rs.len(), 4, "undirected from a: expected 4 rows, got {}", rs.len());
+}
+
+/// shortestPath with min>1 must be rejected at planning time with a named error.
+#[test]
+fn shortest_path_min_gt_1_is_plan_error() {
+    let db = chain_db("sp-min-gt1");
+    let result = db.query(
+        "MATCH (a:N {id: 'a'}) MATCH (d:N {id: 'd'}) \
+         MATCH shortestPath((a)-[r:T*2..5]->(d)) RETURN r.length",
+        &BTreeMap::new(),
+    );
+    match result {
+        Err(GraphError::QueryError { ref detail }) => {
+            assert!(
+                detail.contains("shortestPath") && detail.contains("minimum"),
+                "error must name shortestPath and minimum, got: {detail}"
+            );
+        }
+        Ok(_) => panic!("shortestPath with min>1 must be rejected at planning time"),
+        Err(e) => panic!("unexpected error variant: {e:?}"),
     }
 }

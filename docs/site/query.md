@@ -114,7 +114,13 @@ RETURN r.length
 
 - Both endpoints must be bound before the `shortestPath` clause.  Unbound
   forms are rejected at planning time.
+- A minimum hop count greater than 1 (e.g., `*2..5`) is rejected at planning
+  time with the error `"shortestPath does not support a minimum hop count"`.
+  Use a plain variable-length pattern if you need a minimum.
 - BFS stops at the first path found (shortest hop count).
+- **Tie behavior:** When two or more paths reach the destination at the same
+  BFS depth, exactly one row is returned.  The choice is arbitrary (internal
+  storage order) and is not guaranteed to be stable across re-opens or inserts.
 - The `*..max` range cap still applies (max ≤ 10).
 - Returns zero rows when no path exists within the hop limit.
 

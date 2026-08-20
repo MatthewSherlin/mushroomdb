@@ -3450,4 +3450,78 @@ LIMIT 10";
         .expect("COUNT(*) on hop graph");
         assert_eq!(rs.row(0), &[Some(i(3))]);
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // pull_rows defense-in-depth: VarExpand and ShortestPath Err arms
+    // These arms exist so that adding PlanOp variants forces a compile-time
+    // decision in pull_rows.  Routing prevention is tested separately; these
+    // tests verify the arms themselves are not dead code.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pull_rows_var_expand_arm_returns_named_err() {
+        let fx = Fx::new();
+        let view = fx.view();
+        let vars = super::VarTable { names: vec!["a".into(), "b".into()] };
+        let project_items: Vec<crate::cypher::ast::RetItem> = vec![];
+        let empty_params = BTreeMap::new();
+        let params = super::Params(&empty_params);
+        let ctx = super::PullCtx {
+            view: &view,
+            vars: &vars,
+            project_items: &project_items,
+            params: &params,
+            bound: 100,
+        };
+        let ops = vec![PlanOp::VarExpand {
+            from: "a".into(),
+            rel_var: None,
+            etype: None,
+            dir: crate::cypher::RelDir::Right,
+            to: "b".into(),
+            min: 1,
+            max: 3,
+        }];
+        let mut row = vec![None; vars.names.len()];
+        let mut result = Vec::new();
+        let err = super::pull_rows(&ctx, &ops, &mut row, &mut result)
+            .expect_err("VarExpand must Err in pull_rows");
+        assert!(
+            err.contains("VarExpand") && err.contains("pull executor"),
+            "error must name VarExpand and pull executor, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pull_rows_shortest_path_arm_returns_named_err() {
+        let fx = Fx::new();
+        let view = fx.view();
+        let vars = super::VarTable { names: vec!["a".into(), "b".into()] };
+        let project_items: Vec<crate::cypher::ast::RetItem> = vec![];
+        let empty_params = BTreeMap::new();
+        let params = super::Params(&empty_params);
+        let ctx = super::PullCtx {
+            view: &view,
+            vars: &vars,
+            project_items: &project_items,
+            params: &params,
+            bound: 100,
+        };
+        let ops = vec![PlanOp::ShortestPath {
+            from: "a".into(),
+            rel_var: None,
+            etype: None,
+            dir: crate::cypher::RelDir::Right,
+            to: "b".into(),
+            max_hops: 5,
+        }];
+        let mut row = vec![None; vars.names.len()];
+        let mut result = Vec::new();
+        let err = super::pull_rows(&ctx, &ops, &mut row, &mut result)
+            .expect_err("ShortestPath must Err in pull_rows");
+        assert!(
+            err.contains("ShortestPath") && err.contains("pull executor"),
+            "error must name ShortestPath and pull executor, got: {err}"
+        );
+    }
 }
