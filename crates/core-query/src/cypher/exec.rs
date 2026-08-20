@@ -8,8 +8,8 @@ use crate::result::ResultSet;
 use crate::traverse::{expand, Dir, EdgeRef};
 use crate::value_ops::{cmp_optional, values_equal};
 use crate::view::GraphView;
-use core_storage::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use core_storage::{Value, ValueKey};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Test-only counter incremented each time the fused ScanLabel+Filter arm
 /// executes.  Lets property tests assert the fast path actually fires for
@@ -61,6 +61,13 @@ struct Projected {
 /// `expand`. Unjoined multi-MATCH cross-joins OOM without this.
 const MAX_INTERMEDIATE_ROWS: usize = 1_000_000;
 
+/// Cap on the number of distinct groups a `GroupAggregate` plan may produce.
+const MAX_GROUPS: usize = 1_000_000;
+
+/// Group-key type: one `Option<ValueKey>` per group-key RETURN item.
+/// `None` represents a null value; null keys group together (openCypher).
+type GroupKey = Vec<Option<ValueKey>>;
+
 #[cfg(test)]
 thread_local! {
     static TEST_MAX_INTERMEDIATE_ROWS: std::cell::Cell<Option<usize>> =
@@ -68,6 +75,9 @@ thread_local! {
     /// Accumulator for rows emitted by `exec_expand` during a bounded test run.
     /// `None` means the counter is inactive (no test is watching).
     static TEST_EXPAND_PRODUCED: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Override for `MAX_GROUPS` used in tests.
+    static TEST_MAX_GROUPS: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -82,6 +92,32 @@ fn max_intermediate_rows() -> usize {
     {
         MAX_INTERMEDIATE_ROWS
     }
+}
+
+fn max_groups() -> usize {
+    #[cfg(test)]
+    {
+        TEST_MAX_GROUPS.with(|c| c.get()).unwrap_or(MAX_GROUPS)
+    }
+    #[cfg(not(test))]
+    {
+        MAX_GROUPS
+    }
+}
+
+/// Test hook: run `f` with a smaller group cap so the group-count error path
+/// can fire without creating a million groups.
+#[cfg(test)]
+pub(crate) fn with_max_groups<R>(cap: usize, f: impl FnOnce() -> R) -> R {
+    TEST_MAX_GROUPS.with(|c| {
+        let prev = c.replace(Some(cap));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match result {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
 }
 
 /// Test hook: run `f` with a smaller intermediate-row cap so the error path
@@ -133,6 +169,22 @@ fn row_cap_err(cap: usize) -> String {
     )
 }
 
+fn group_cap_err() -> String {
+    format!(
+        "group count exceeds {} distinct keys; add a WHERE clause or constrain the grouping key",
+        max_groups()
+    )
+}
+
+fn value_key_to_value(k: &ValueKey) -> Value {
+    match k {
+        ValueKey::Int(n) => Value::Int(*n),
+        ValueKey::FloatBits(b) => Value::Float(f64::from_bits(*b)),
+        ValueKey::Str(s) => Value::Str(s.clone()),
+        ValueKey::Bool(b) => Value::Bool(*b),
+    }
+}
+
 /// Execute a plan against a view. Row order before OrderBy is deterministic
 /// (scan order = dense ids; expand order = expand()'s sorted order).
 ///
@@ -178,6 +230,13 @@ fn execute_inner(
     let has_var_expand = plan
         .iter()
         .any(|op| matches!(op, PlanOp::VarExpand { .. } | PlanOp::ShortestPath { .. }));
+
+    // GroupAggregate plans: streaming HashMap accumulator (O(groups) memory).
+    // Checked before the bounded path and before single-aggregate so they are
+    // never routed to pull.  Skipped for VarExpand plans (go to staged path).
+    if !has_var_expand && plan.iter().any(|op| matches!(op, PlanOp::GroupAggregate { .. })) {
+        return execute_group_aggregate(view, plan, params);
+    }
 
     // Aggregate plans: streaming accumulator path (O(1) memory, no budget).
     // Checked before the bounded path so aggregates are never routed to pull.
@@ -262,6 +321,36 @@ fn execute_inner(
                 } else {
                     apply_limit(&mut rows, *n);
                 }
+            }
+            // GroupAggregate plans without VarExpand are routed to
+            // execute_group_aggregate() before reaching the staged path.
+            // Plans that combine VarExpand with GroupAggregate fall through
+            // to here; group over the already-materialised rows.
+            PlanOp::GroupAggregate { keys, aggs } => {
+                let mut grp_groups: HashMap<GroupKey, Vec<AggAcc>> = HashMap::new();
+                let mut grp_key_order: Vec<GroupKey> = Vec::new();
+                for row in &rows {
+                    let mut gk: GroupKey = Vec::with_capacity(keys.len());
+                    for (_, item) in keys {
+                        let val = project_item(view, &vars, row, item)?;
+                        gk.push(val.as_ref().and_then(ValueKey::from_value));
+                    }
+                    if !grp_groups.contains_key(&gk) {
+                        if grp_groups.len() >= max_groups() {
+                            return Err(group_cap_err());
+                        }
+                        grp_key_order.push(gk.clone());
+                        grp_groups.insert(
+                            gk.clone(),
+                            aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+                        );
+                    }
+                    let accs = grp_groups.get_mut(&gk).unwrap();
+                    for (acc, (func, arg, _)) in accs.iter_mut().zip(aggs.iter()) {
+                        update_acc(view, &vars, row, func, arg, acc)?;
+                    }
+                }
+                projected = Some(build_group_projected(keys, aggs, grp_key_order, &mut grp_groups));
             }
             // Aggregate plans without VarExpand are routed to execute_aggregate()
             // before reaching the staged path.  Plans that combine VarExpand with
@@ -432,6 +521,27 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                     vars.intern(var);
                 }
             },
+            PlanOp::GroupAggregate { keys, aggs } => {
+                for (_, item) in keys {
+                    match &item.value {
+                        RetVal::Var(name) | RetVal::Prop { var: name, .. } => {
+                            vars.intern(name);
+                        }
+                        RetVal::Agg { .. } => {}
+                    }
+                }
+                for (_, arg, _) in aggs {
+                    match arg {
+                        AggArg::Star => {}
+                        AggArg::Var(v) => {
+                            vars.intern(v);
+                        }
+                        AggArg::Prop { var, .. } => {
+                            vars.intern(var);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1066,6 +1176,112 @@ fn execute_aggregate(
     Ok(rs)
 }
 
+/// Update a single accumulator for one matched row.
+///
+/// Shared by `agg_stream` (single-aggregate path) and `group_stream` (grouped
+/// aggregation).  The logic mirrors openCypher conventions: null / non-numeric
+/// values are silently skipped for SUM / AVG / MIN / MAX.
+fn update_acc(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    func: &AggFunc,
+    arg: &AggArg,
+    acc: &mut AggAcc,
+) -> Result<(), String> {
+    match (func, arg) {
+        (AggFunc::Count, AggArg::Star) => {
+            if let AggAcc::Count(n) = acc {
+                *n += 1;
+            }
+        }
+        (AggFunc::Count, AggArg::Var(v)) => {
+            let slot = vars.slot(v);
+            let is_bound = slot
+                .and_then(|s| row.get(s))
+                .and_then(|c| c.as_ref())
+                .is_some();
+            if is_bound {
+                if let AggAcc::Count(n) = acc {
+                    *n += 1;
+                }
+            }
+        }
+        (AggFunc::Count, AggArg::Prop { var, field }) => {
+            let val = resolve_prop(view, vars, row, var, field)?;
+            if val.is_some() {
+                if let AggAcc::Count(n) = acc {
+                    *n += 1;
+                }
+            }
+        }
+        (AggFunc::Sum, AggArg::Prop { var, field }) => {
+            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
+                if let Some(num) = numeric_val(&v) {
+                    if let AggAcc::Sum { val, has_value } = acc {
+                        *val += num;
+                        *has_value = true;
+                    }
+                }
+            }
+        }
+        (AggFunc::Avg, AggArg::Prop { var, field }) => {
+            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
+                if let Some(num) = numeric_val(&v) {
+                    if let AggAcc::Avg { sum, n } = acc {
+                        *sum += num;
+                        *n += 1;
+                    }
+                }
+            }
+        }
+        (AggFunc::Min, AggArg::Prop { var, field }) => {
+            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
+                if numeric_val(&v).is_some() {
+                    if let AggAcc::Min(current) = acc {
+                        *current = Some(match current.take() {
+                            None => v,
+                            Some(prev) => {
+                                if cmp_optional(Some(&prev), Some(&v), false)
+                                    == std::cmp::Ordering::Greater
+                                {
+                                    v
+                                } else {
+                                    prev
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        (AggFunc::Max, AggArg::Prop { var, field }) => {
+            if let Some(v) = resolve_prop(view, vars, row, var, field)? {
+                if numeric_val(&v).is_some() {
+                    if let AggAcc::Max(current) = acc {
+                        *current = Some(match current.take() {
+                            None => v,
+                            Some(prev) => {
+                                if cmp_optional(Some(&prev), Some(&v), true)
+                                    == std::cmp::Ordering::Greater
+                                {
+                                    v
+                                } else {
+                                    prev
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        // Remaining combinations are rejected by the planner (e.g., SUM(*))
+        // but handle defensively without panic.
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Recursively walk all matching rows through `ops`, updating `acc` for each
 /// terminal row.  No bound — visits every row the producers can emit.
 fn agg_stream(
@@ -1077,99 +1293,8 @@ fn agg_stream(
     let (op, rest) = match ops.split_first() {
         Some(pair) => pair,
         None => {
-            // Terminal row — update the accumulator.
-            match (ctx.func, ctx.arg) {
-                (AggFunc::Count, AggArg::Star) => {
-                    if let AggAcc::Count(n) = acc {
-                        *n += 1;
-                    }
-                }
-                (AggFunc::Count, AggArg::Var(v)) => {
-                    // Count non-null bindings for `v`.
-                    let slot = ctx.vars.slot(v);
-                    let is_bound = slot
-                        .and_then(|s| row.get(s))
-                        .and_then(|c| c.as_ref())
-                        .is_some();
-                    if is_bound {
-                        if let AggAcc::Count(n) = acc {
-                            *n += 1;
-                        }
-                    }
-                }
-                (AggFunc::Count, AggArg::Prop { var, field }) => {
-                    // Count rows where the property is present.
-                    let val = resolve_prop(ctx.view, ctx.vars, row, var, field)?;
-                    if val.is_some() {
-                        if let AggAcc::Count(n) = acc {
-                            *n += 1;
-                        }
-                    }
-                }
-                (AggFunc::Sum, AggArg::Prop { var, field }) => {
-                    if let Some(v) = resolve_prop(ctx.view, ctx.vars, row, var, field)? {
-                        if let Some(num) = numeric_val(&v) {
-                            if let AggAcc::Sum { val, has_value } = acc {
-                                *val += num;
-                                *has_value = true;
-                            }
-                        }
-                    }
-                }
-                (AggFunc::Avg, AggArg::Prop { var, field }) => {
-                    if let Some(v) = resolve_prop(ctx.view, ctx.vars, row, var, field)? {
-                        if let Some(num) = numeric_val(&v) {
-                            if let AggAcc::Avg { sum, n } = acc {
-                                *sum += num;
-                                *n += 1;
-                            }
-                        }
-                    }
-                }
-                (AggFunc::Min, AggArg::Prop { var, field }) => {
-                    if let Some(v) = resolve_prop(ctx.view, ctx.vars, row, var, field)? {
-                        if numeric_val(&v).is_some() {
-                            if let AggAcc::Min(current) = acc {
-                                *current = Some(match current.take() {
-                                    None => v,
-                                    Some(prev) => {
-                                        if cmp_optional(Some(&prev), Some(&v), false)
-                                            == std::cmp::Ordering::Greater
-                                        {
-                                            v
-                                        } else {
-                                            prev
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    }
-                }
-                (AggFunc::Max, AggArg::Prop { var, field }) => {
-                    if let Some(v) = resolve_prop(ctx.view, ctx.vars, row, var, field)? {
-                        if numeric_val(&v).is_some() {
-                            if let AggAcc::Max(current) = acc {
-                                *current = Some(match current.take() {
-                                    None => v,
-                                    Some(prev) => {
-                                        if cmp_optional(Some(&prev), Some(&v), true)
-                                            == std::cmp::Ordering::Greater
-                                        {
-                                            v
-                                        } else {
-                                            prev
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    }
-                }
-                // Remaining combinations are rejected by the planner (e.g., SUM(*))
-                // but handle defensively without panic.
-                _ => {}
-            }
+            // Terminal row — delegate to shared update_acc helper.
+            update_acc(ctx.view, ctx.vars, row, ctx.func, ctx.arg, acc)?;
             return Ok(());
         }
     };
@@ -1319,6 +1444,315 @@ fn agg_stream(
         PlanOp::Aggregate { .. } => {
             return Err(
                 "agg executor: nested Aggregate in producer slice — structurally malformed"
+                    .to_string(),
+            );
+        }
+        PlanOp::GroupAggregate { .. } => {
+            return Err(
+                "agg executor: GroupAggregate in producer slice — structurally malformed"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+// ─── GroupAggregate execution path ──────────────────────────────────────────
+//
+// GroupAggregate plans stream through ALL matching rows, computing a group-key
+// tuple per row and maintaining per-group accumulators in a HashMap.  Memory
+// is O(distinct groups); the 1 M intermediate-row budget does not apply.
+
+/// Context shared across all `group_stream` recursive calls.
+struct GroupStreamCtx<'a> {
+    view: &'a GraphView<'a>,
+    vars: &'a VarTable,
+    params: &'a Params<'a>,
+    keys: &'a [(String, RetItem)],
+    aggs: &'a [(AggFunc, AggArg, String)],
+}
+
+/// Build the `Projected` output table from a finished group map.
+fn build_group_projected(
+    keys: &[(String, RetItem)],
+    aggs: &[(AggFunc, AggArg, String)],
+    key_order: Vec<GroupKey>,
+    groups: &mut HashMap<GroupKey, Vec<AggAcc>>,
+) -> Projected {
+    let columns: Vec<String> = keys
+        .iter()
+        .map(|(col, _)| col.clone())
+        .chain(aggs.iter().map(|(_, _, col)| col.clone()))
+        .collect();
+    let mut rows: Vec<Vec<Option<Value>>> = Vec::with_capacity(key_order.len());
+    for gk in key_order {
+        let accs = groups.remove(&gk).unwrap_or_default();
+        let mut row: Vec<Option<Value>> = Vec::with_capacity(columns.len());
+        for key_val in &gk {
+            row.push(key_val.as_ref().map(value_key_to_value));
+        }
+        for acc in accs {
+            row.push(acc.finish());
+        }
+        rows.push(row);
+    }
+    Projected { columns, rows }
+}
+
+/// Streaming grouped-aggregate executor.
+///
+/// Locates the `GroupAggregate` op, builds the producer slice (everything
+/// before it), streams through all matching rows via `group_stream`, then
+/// applies any `OrderBy` / `Skip` / `Limit` ops that follow.
+fn execute_group_aggregate(
+    view: &GraphView,
+    plan: &[PlanOp],
+    params: &Params,
+) -> Result<ResultSet, String> {
+    let gagg_pos = plan
+        .iter()
+        .position(|op| matches!(op, PlanOp::GroupAggregate { .. }))
+        .ok_or_else(|| "internal: GroupAggregate op not found in plan".to_string())?;
+    let producers = &plan[..gagg_pos];
+    let (keys, aggs) = match &plan[gagg_pos] {
+        PlanOp::GroupAggregate { keys, aggs } => (keys, aggs),
+        _ => unreachable!(),
+    };
+    let tail = &plan[gagg_pos + 1..];
+    let vars = collect_vars(plan);
+    let initial_row: Row = vec![None; vars.names.len()];
+    let mut groups: HashMap<GroupKey, Vec<AggAcc>> = HashMap::new();
+    let mut key_order: Vec<GroupKey> = Vec::new();
+    let ctx = GroupStreamCtx {
+        view,
+        vars: &vars,
+        params,
+        keys,
+        aggs,
+    };
+    group_stream(&ctx, producers, &initial_row, &mut groups, &mut key_order)?;
+    let mut projected = build_group_projected(keys, aggs, key_order, &mut groups);
+    // Apply OrderBy / Skip / Limit from the tail of the plan.
+    for op in tail {
+        match op {
+            PlanOp::OrderBy { items } => exec_order_by(&mut projected, items)?,
+            PlanOp::Skip(n) => apply_skip(&mut projected.rows, *n),
+            PlanOp::Limit(n) => apply_limit(&mut projected.rows, *n),
+            _ => {} // Ignore unexpected ops defensively.
+        }
+    }
+    Ok(finish(projected))
+}
+
+/// Recursively walk all matching rows through `ops`, computing the group key
+/// and updating per-group accumulators at each terminal row.
+///
+/// `groups` maps group key → per-group accumulator vector.
+/// `key_order` tracks insertion order so output rows are deterministic when
+/// no ORDER BY is requested.
+fn group_stream(
+    ctx: &GroupStreamCtx<'_>,
+    ops: &[PlanOp],
+    row: &Row,
+    groups: &mut HashMap<GroupKey, Vec<AggAcc>>,
+    key_order: &mut Vec<GroupKey>,
+) -> Result<(), String> {
+    let (op, rest) = match ops.split_first() {
+        Some(pair) => pair,
+        None => {
+            // Terminal row: compute group key and update per-group accumulators.
+            let mut gk: GroupKey = Vec::with_capacity(ctx.keys.len());
+            for (_, item) in ctx.keys {
+                let val = project_item(ctx.view, ctx.vars, row, item)?;
+                gk.push(val.as_ref().and_then(ValueKey::from_value));
+            }
+            if !groups.contains_key(&gk) {
+                if groups.len() >= max_groups() {
+                    return Err(group_cap_err());
+                }
+                key_order.push(gk.clone());
+                let init: Vec<AggAcc> =
+                    ctx.aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect();
+                groups.insert(gk.clone(), init);
+            }
+            let accs = groups.get_mut(&gk).unwrap();
+            for (acc, (func, arg, _)) in accs.iter_mut().zip(ctx.aggs.iter()) {
+                update_acc(ctx.view, ctx.vars, row, func, arg, acc)?;
+            }
+            return Ok(());
+        }
+    };
+
+    match op {
+        PlanOp::ScanLabel { var, label } => {
+            let ids = scan_ids(ctx.view, label.as_deref());
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for &id in &ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                group_stream(ctx, rest, &next, groups, key_order)?;
+            }
+        }
+        PlanOp::Expand {
+            from,
+            rel_var,
+            etype,
+            dir,
+            to,
+            to_label,
+            to_props,
+        } => {
+            let etypes = resolve_etypes(ctx.view, etype.as_deref());
+            let exp_dir = map_dir(*dir);
+            let to_slot = ctx
+                .vars
+                .slot(to)
+                .ok_or_else(|| format!("unbound variable `{to}`"))?;
+            let rel_slot = rel_var.as_ref().and_then(|rv| ctx.vars.slot(rv));
+            let from_id = require_node(row, ctx.vars, from)?;
+            let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
+                Some(Cell::Node(id)) => Some(*id),
+                Some(Cell::Rel(_) | Cell::Path(_)) => {
+                    return Err(format!("variable `{to}` is not a node"))
+                }
+                None => None,
+            };
+            for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
+                if row_has_edge(row, &e) {
+                    continue;
+                }
+                let nbr = neighbor(from_id, &e, *dir);
+                if let Some(want) = bound_to {
+                    if nbr != want {
+                        continue;
+                    }
+                }
+                if !node_matches(
+                    ctx.view,
+                    ctx.vars,
+                    row,
+                    nbr,
+                    to_label.as_deref(),
+                    to_props,
+                    ctx.params,
+                )? {
+                    continue;
+                }
+                let mut next = row.clone();
+                if let Some(slot) = rel_slot {
+                    next[slot] = Some(Cell::Rel(e));
+                }
+                if bound_to.is_none() {
+                    next[to_slot] = Some(Cell::Node(nbr));
+                }
+                group_stream(ctx, rest, &next, groups, key_order)?;
+            }
+        }
+        PlanOp::Filter { expr } => {
+            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params, 0)? {
+                group_stream(ctx, rest, row, groups, key_order)?;
+            }
+        }
+        PlanOp::LookupProps { var, props } => {
+            let id = require_node(row, ctx.vars, var)?;
+            if node_matches(ctx.view, ctx.vars, row, id, None, props, ctx.params)? {
+                group_stream(ctx, rest, row, groups, key_order)?;
+            }
+        }
+        PlanOp::JoinBound { var, label, props } => {
+            let id = require_node(row, ctx.vars, var)?;
+            if node_matches(
+                ctx.view,
+                ctx.vars,
+                row,
+                id,
+                label.as_deref(),
+                props,
+                ctx.params,
+            )? {
+                group_stream(ctx, rest, row, groups, key_order)?;
+            }
+        }
+        PlanOp::VarExpand {
+            from,
+            rel_var,
+            etype,
+            dir,
+            to,
+            min,
+            max,
+        } => {
+            let new_rows = exec_var_expand(
+                ctx.view,
+                ctx.vars,
+                std::slice::from_ref(row),
+                from,
+                rel_var,
+                etype,
+                *dir,
+                to,
+                *min,
+                *max,
+            )?;
+            for nr in &new_rows {
+                group_stream(ctx, rest, nr, groups, key_order)?;
+            }
+        }
+        PlanOp::ShortestPath {
+            from,
+            rel_var,
+            etype,
+            dir,
+            to,
+            max_hops,
+        } => {
+            let new_rows = exec_shortest_path(
+                ctx.view,
+                ctx.vars,
+                std::slice::from_ref(row),
+                from,
+                rel_var,
+                etype,
+                *dir,
+                to,
+                *max_hops,
+            )?;
+            for nr in &new_rows {
+                group_stream(ctx, rest, nr, groups, key_order)?;
+            }
+        }
+        // These ops must not appear in the producer slice of a GroupAggregate plan.
+        PlanOp::Project { .. } => {
+            return Err(
+                "group executor: Project in producer slice — structurally malformed".to_string(),
+            );
+        }
+        PlanOp::OrderBy { .. } => {
+            return Err(
+                "group executor: OrderBy in producer slice — structurally malformed".to_string(),
+            );
+        }
+        PlanOp::Skip(n) => {
+            return Err(format!(
+                "group executor: Skip({n}) in producer slice — structurally malformed"
+            ));
+        }
+        PlanOp::Limit(n) => {
+            return Err(format!(
+                "group executor: Limit({n}) in producer slice — structurally malformed"
+            ));
+        }
+        PlanOp::Aggregate { .. } => {
+            return Err(
+                "group executor: Aggregate in producer slice — structurally malformed".to_string(),
+            );
+        }
+        PlanOp::GroupAggregate { .. } => {
+            return Err(
+                "group executor: nested GroupAggregate in producer slice — structurally malformed"
                     .to_string(),
             );
         }
@@ -1589,6 +2023,13 @@ fn pull_rows(
             return Err(
                 "pull executor: ShortestPath reached pull_rows — shortestPath plans \
                  must use the staged path (row_bound returns None)"
+                    .to_string(),
+            );
+        }
+        PlanOp::GroupAggregate { .. } => {
+            return Err(
+                "pull executor: GroupAggregate reached pull_rows — grouped aggregate plans \
+                 must use the execute_group_aggregate path (routed before pull in execute_inner)"
                     .to_string(),
             );
         }
@@ -3409,31 +3850,243 @@ LIMIT 10";
         plan(&ast).map_err(|e| format!("plan: {e}"))
     }
 
+    /// Updated from the v1 pin: grouped aggregation is now supported.
+    /// Verifies plan routing and that the only remaining plan-error is SUM(*).
     #[test]
-    fn grouped_aggregation_is_plan_error() {
-        // RETURN a, COUNT(*) — mixed aggregate + non-aggregate → plan error.
-        let err = plan_src("MATCH (a:N) RETURN a, COUNT(*)")
-            .expect_err("grouped aggregation must be plan error");
+    fn grouped_aggregation_plan_routing() {
+        use crate::cypher::plan::PlanOp;
+
+        // RETURN a, COUNT(*) — grouped aggregation now routes to GroupAggregate.
+        let ops = plan_src("MATCH (a:N) RETURN a, COUNT(*)")
+            .expect("grouped aggregation must now succeed");
         assert!(
-            err.to_ascii_lowercase().contains("grouped aggregation")
-                || err.to_ascii_lowercase().contains("not supported"),
-            "error must mention grouped aggregation limitation, got: {err}"
+            ops.iter().any(|op| matches!(op, PlanOp::GroupAggregate { .. })),
+            "grouped aggregation plan must contain GroupAggregate op, got: {ops:?}"
         );
 
-        // Multiple aggregates → plan error.
-        let err2 = plan_src("MATCH (a:N) RETURN COUNT(*), COUNT(a)")
-            .expect_err("multiple aggregates must be plan error");
+        // Multiple aggregates without group keys also routes to GroupAggregate.
+        let ops2 = plan_src("MATCH (a:N) RETURN COUNT(*), COUNT(a)")
+            .expect("multi-aggregate must now succeed");
         assert!(
-            err2.to_ascii_lowercase().contains("not supported"),
-            "error must mention limitation, got: {err2}"
+            ops2.iter().any(|op| matches!(op, PlanOp::GroupAggregate { .. })),
+            "multi-aggregate plan must contain GroupAggregate op, got: {ops2:?}"
         );
 
-        // SUM(*) → plan error (Star is invalid for SUM).
+        // SUM(*) is still a plan error: Star is invalid for SUM.
         let err3 = plan_src("MATCH (a:N) RETURN SUM(*)").expect_err("SUM(*) must be plan error");
         assert!(
             err3.to_ascii_lowercase().contains("sum") || err3.to_ascii_lowercase().contains("*"),
             "error must mention SUM or *, got: {err3}"
         );
+    }
+
+    // ─── Grouped aggregation execution tests ─────────────────────────────────
+
+    #[test]
+    fn grouped_single_key_count() {
+        // Graph: 3 nodes with "t" prop — two "X", one "Y".
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("t", s("X"))]);
+        fx.add("N", "b", vec![("t", s("X"))]);
+        fx.add("N", "c", vec![("t", s("Y"))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let rs = run(&v, "MATCH (n:N) RETURN n.t, COUNT(*) AS cnt", &params)
+            .expect("single-key grouped COUNT must succeed");
+        assert_eq!(
+            rs.columns(),
+            &["n.t".to_string(), "cnt".to_string()],
+            "columns must match RETURN clause"
+        );
+        assert_eq!(rs.len(), 2, "must produce exactly 2 groups (X and Y)");
+
+        // Find each group regardless of row order.
+        let find = |label: &Value| {
+            (0..rs.len()).find(|&i| rs.row(i)[0].as_ref() == Some(label))
+        };
+        let xi = find(&s("X")).expect("group X must exist");
+        let yi = find(&s("Y")).expect("group Y must exist");
+        assert_eq!(rs.row(xi)[1], Some(i(2)), "X group count must be 2");
+        assert_eq!(rs.row(yi)[1], Some(i(1)), "Y group count must be 1");
+    }
+
+    #[test]
+    fn grouped_two_keys_sum_avg() {
+        // Four nodes with two categorical props and a numeric value.
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("cat", s("A")), ("sub", s("1")), ("v", i(10))]);
+        fx.add("N", "b", vec![("cat", s("A")), ("sub", s("1")), ("v", i(20))]);
+        fx.add("N", "c", vec![("cat", s("A")), ("sub", s("2")), ("v", i(5))]);
+        fx.add("N", "d", vec![("cat", s("B")), ("sub", s("1")), ("v", i(100))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let rs = run(
+            &v,
+            "MATCH (n:N) RETURN n.cat, n.sub, SUM(n.v) AS total, AVG(n.v) AS avg_v",
+            &params,
+        )
+        .expect("two-key SUM + AVG must succeed");
+        assert_eq!(
+            rs.columns(),
+            &[
+                "n.cat".to_string(),
+                "n.sub".to_string(),
+                "total".to_string(),
+                "avg_v".to_string()
+            ]
+        );
+        assert_eq!(rs.len(), 3, "must produce 3 groups: (A,1), (A,2), (B,1)");
+
+        let find = |cat: &Value, sub: &Value| {
+            (0..rs.len()).find(|&i| {
+                rs.row(i)[0].as_ref() == Some(cat) && rs.row(i)[1].as_ref() == Some(sub)
+            })
+        };
+        let a1 = find(&s("A"), &s("1")).expect("group (A,1) must exist");
+        assert_eq!(rs.row(a1)[2], Some(f(30.0)), "(A,1) SUM must be 30.0");
+        assert_eq!(rs.row(a1)[3], Some(f(15.0)), "(A,1) AVG must be 15.0");
+
+        let a2 = find(&s("A"), &s("2")).expect("group (A,2) must exist");
+        assert_eq!(rs.row(a2)[2], Some(f(5.0)), "(A,2) SUM must be 5.0");
+
+        let b1 = find(&s("B"), &s("1")).expect("group (B,1) must exist");
+        assert_eq!(rs.row(b1)[2], Some(f(100.0)), "(B,1) SUM must be 100.0");
+        assert_eq!(rs.row(b1)[3], Some(f(100.0)), "(B,1) AVG must be 100.0");
+    }
+
+    #[test]
+    fn grouped_order_by_count_desc_limit() {
+        // 5 categories with different node counts: D=4, A=3, B=2, C=1, E=1.
+        let mut fx = Fx::new();
+        fx.add("N", "a1", vec![("cat", s("A"))]);
+        fx.add("N", "a2", vec![("cat", s("A"))]);
+        fx.add("N", "a3", vec![("cat", s("A"))]);
+        fx.add("N", "b1", vec![("cat", s("B"))]);
+        fx.add("N", "b2", vec![("cat", s("B"))]);
+        fx.add("N", "c1", vec![("cat", s("C"))]);
+        fx.add("N", "d1", vec![("cat", s("D"))]);
+        fx.add("N", "d2", vec![("cat", s("D"))]);
+        fx.add("N", "d3", vec![("cat", s("D"))]);
+        fx.add("N", "d4", vec![("cat", s("D"))]);
+        fx.add("N", "e1", vec![("cat", s("E"))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let rs = run(
+            &v,
+            "MATCH (n:N) RETURN n.cat, COUNT(*) AS cnt ORDER BY cnt DESC LIMIT 3",
+            &params,
+        )
+        .expect("ORDER BY count DESC LIMIT 3 must succeed");
+        assert_eq!(rs.len(), 3, "LIMIT 3 must return exactly 3 groups");
+        // Top 3: D(4), A(3), B(2) — descending order.
+        assert_eq!(rs.row(0)[1], Some(i(4)), "row 0 must be count 4");
+        assert_eq!(rs.row(0)[0], Some(s("D")), "row 0 must be category D");
+        assert_eq!(rs.row(1)[1], Some(i(3)), "row 1 must be count 3");
+        assert_eq!(rs.row(1)[0], Some(s("A")), "row 1 must be category A");
+        assert_eq!(rs.row(2)[1], Some(i(2)), "row 2 must be count 2");
+        assert_eq!(rs.row(2)[0], Some(s("B")), "row 2 must be category B");
+
+        // Also verify row_bound is None for this plan (LIMIT must not be pushed).
+        let plan_ops = plan_src("MATCH (n:N) RETURN n.cat, COUNT(*) AS cnt ORDER BY cnt DESC LIMIT 3")
+            .expect("plan must succeed");
+        assert_eq!(
+            crate::cypher::plan::row_bound(&plan_ops),
+            None,
+            "GroupAggregate plan with LIMIT must have row_bound = None"
+        );
+    }
+
+    #[test]
+    fn grouped_empty_input_yields_zero_groups() {
+        let fx = Fx::new(); // empty graph
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let rs = run(&v, "MATCH (n:N) RETURN n.t, COUNT(*) AS cnt", &params)
+            .expect("grouped aggregate on empty graph must succeed");
+        assert_eq!(rs.len(), 0, "empty input must yield zero groups");
+        assert_eq!(
+            rs.columns(),
+            &["n.t".to_string(), "cnt".to_string()],
+            "columns must still be present even with zero rows"
+        );
+    }
+
+    #[test]
+    fn grouped_null_key_groups_together() {
+        // openCypher semantics: NULL group keys group together.
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("t", s("X"))]);
+        fx.add("N", "b", vec![]); // no "t" prop → null key
+        fx.add("N", "c", vec![]); // null key — groups with b
+        fx.add("N", "d", vec![("t", s("Y"))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let rs = run(&v, "MATCH (n:N) RETURN n.t, COUNT(*) AS cnt", &params)
+            .expect("null-key grouped aggregate must succeed");
+        assert_eq!(rs.len(), 3, "must produce 3 groups: X, null, Y");
+
+        // Locate the null group: row where n.t column is None (null).
+        let null_row = (0..rs.len())
+            .find(|&i| rs.row(i)[0].is_none())
+            .expect("null group must be present");
+        assert_eq!(
+            rs.row(null_row)[1],
+            Some(i(2)),
+            "null group must count 2 rows (b and c)"
+        );
+
+        let x_row = (0..rs.len())
+            .find(|&i| rs.row(i)[0] == Some(s("X")))
+            .expect("X group must exist");
+        assert_eq!(rs.row(x_row)[1], Some(i(1)));
+
+        let y_row = (0..rs.len())
+            .find(|&i| rs.row(i)[0] == Some(s("Y")))
+            .expect("Y group must exist");
+        assert_eq!(rs.row(y_row)[1], Some(i(1)));
+    }
+
+    #[test]
+    fn grouped_cap_error_on_high_cardinality() {
+        // Use with_max_groups to cap at 2 groups, then run a query that would
+        // produce 3 groups → must return the named cap error.
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("t", s("A"))]);
+        fx.add("N", "b", vec![("t", s("B"))]);
+        fx.add("N", "c", vec![("t", s("C"))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let err = super::with_max_groups(2, || {
+            run(&v, "MATCH (n:N) RETURN n.t, COUNT(*) AS cnt", &params)
+        })
+        .expect_err("must error when group count exceeds cap");
+        assert!(
+            err.to_ascii_lowercase().contains("group count"),
+            "error must mention group count, got: {err}"
+        );
+    }
+
+    #[test]
+    fn multi_aggregate_no_keys() {
+        // RETURN COUNT(*), COUNT(n) — multiple aggregates, no group keys.
+        // Routes to GroupAggregate with empty keys.
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![]);
+        fx.add("N", "b", vec![]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let rs = run(&v, "MATCH (n:N) RETURN COUNT(*), COUNT(n)", &params)
+            .expect("multi-aggregate no keys must succeed");
+        assert_eq!(rs.len(), 1, "must produce exactly one result row");
+        assert_eq!(rs.row(0)[0], Some(i(2)), "COUNT(*) must be 2");
+        assert_eq!(rs.row(0)[1], Some(i(2)), "COUNT(n) must be 2");
     }
 
     #[test]

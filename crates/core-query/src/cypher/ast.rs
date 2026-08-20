@@ -101,9 +101,9 @@ pub enum RetVal {
         var: String,
         field: String,
     },
-    /// Single aggregate function call. v1 supports only one aggregate per
-    /// query (no grouping). Grouped aggregation (`RETURN a, COUNT(*)`) is
-    /// rejected at planning time with a clear limitation error.
+    /// Single aggregate function call.  When combined with non-aggregate items
+    /// in the same RETURN clause, the planner routes to `GroupAggregate`.
+    /// Multiple aggregate items are also supported via `GroupAggregate`.
     Agg {
         func: AggFunc,
         arg: AggArg,

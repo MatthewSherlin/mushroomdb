@@ -62,9 +62,6 @@ pub enum PlanOp {
     Limit(u64),
     /// Single aggregate over all matched rows (no grouping).
     ///
-    /// v1 limitation: exactly one aggregate per query.  Grouped aggregation
-    /// (`RETURN a, COUNT(*)`) is rejected with a plan-stage error.
-    ///
     /// Execution routes to a streaming accumulator path (O(1) memory).
     /// The 1 M intermediate-row budget does **not** apply: the accumulator
     /// holds a single running value regardless of how many source rows exist.
@@ -76,6 +73,25 @@ pub enum PlanOp {
         /// Projected column name — alias if provided, else the canonical
         /// function call string (`COUNT(*)`, `SUM(n.age)`, etc.).
         column: String,
+    },
+    /// Grouped aggregation: one or more group-key items and one or more aggregate
+    /// functions, computed per distinct group.
+    ///
+    /// The executor streams through all matching rows, computing one
+    /// `Option<ValueKey>` per group-key item; `None` represents a null value,
+    /// and null keys group together (openCypher semantics).
+    ///
+    /// Group count is capped at 1,000,000; exceeding the cap is an error.
+    ///
+    /// `ORDER BY` / `SKIP` / `LIMIT` ops that follow in the plan apply to the
+    /// finished group table (sort the groups, then slice).  `row_bound()` always
+    /// returns `None` for plans containing this op so that LIMIT is never pushed
+    /// into producers.
+    GroupAggregate {
+        /// Non-aggregate RETURN items: `(projected_column_name, ret_item)`.
+        keys: Vec<(String, RetItem)>,
+        /// Aggregate RETURN items: `(func, arg, projected_column_name)`.
+        aggs: Vec<(AggFunc, AggArg, String)>,
     },
     /// Variable-length path expansion: BFS from `from`, emitting one row per
     /// (start, end, depth) path found with `min ≤ depth ≤ max`.
@@ -153,6 +169,11 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
     if ops.iter().any(|op| matches!(op, PlanOp::Aggregate { .. })) {
         return None;
     }
+    // GroupAggregate plans are a sink over the full row stream; ORDER BY and LIMIT
+    // apply to the finished group table, never to producers.
+    if ops.iter().any(|op| matches!(op, PlanOp::GroupAggregate { .. })) {
+        return None;
+    }
     // VarExpand / ShortestPath always use the staged path so that the 1M row
     // budget applies and BFS state is cleanly managed stage-by-stage.
     if ops
@@ -211,27 +232,8 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         .filter(|r| matches!(&r.value, RetVal::Agg { .. }))
         .count();
 
-    if agg_count > 0 && agg_count < q.returns.len() {
-        // Mixed: some aggregates, some regular items — grouped aggregation.
-        return Err(
-            "grouped aggregation (RETURN with both aggregate functions and plain \
-             variables/properties) is not supported in v1; use a single aggregate \
-             function alone, e.g. `RETURN COUNT(*)`, or remove the aggregate"
-                .to_string(),
-        );
-    }
-
-    if agg_count > 1 {
-        // Multiple aggregates in one RETURN — also out of scope for v1.
-        return Err(
-            "multiple aggregate functions in a single RETURN is not supported in v1; \
-             use exactly one aggregate function per query"
-                .to_string(),
-        );
-    }
-
-    if agg_count == 1 {
-        // Single-aggregate path.
+    if agg_count == 1 && q.returns.len() == 1 {
+        // Single-aggregate fast path: streaming O(1) accumulator, no grouping.
         let item = &q.returns[0];
         let (func, arg) = match &item.value {
             RetVal::Agg { func, arg } => (func.clone(), arg.clone()),
@@ -253,6 +255,52 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         ops.push(PlanOp::Aggregate { func, arg, column });
         // ORDER BY and LIMIT/SKIP are ignored for single-aggregate queries
         // (always returns exactly one row).
+        return Ok(ops);
+    }
+
+    if agg_count > 0 {
+        // GroupAggregate: handles grouped (mix of key items and aggregates) as
+        // well as multi-aggregate-no-keys (all RETURN items are aggregates).
+        let mut keys: Vec<(String, RetItem)> = Vec::new();
+        let mut aggs: Vec<(AggFunc, AggArg, String)> = Vec::new();
+        for item in &q.returns {
+            match &item.value {
+                RetVal::Agg { func, arg } => {
+                    // Validate: SUM/AVG/MIN/MAX require a Prop arg, not Star.
+                    if let (
+                        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
+                        AggArg::Star,
+                    ) = (func, arg)
+                    {
+                        return Err(format!(
+                            "{name} does not accept '*'; use a property expression like `{name}(n.prop)`",
+                            name = func_name(func),
+                        ));
+                    }
+                    let column =
+                        item.alias.clone().unwrap_or_else(|| agg_column_name(func, arg));
+                    aggs.push((func.clone(), arg.clone(), column));
+                }
+                _ => {
+                    keys.push((column_name(item), item.clone()));
+                }
+            }
+        }
+        ops.push(PlanOp::GroupAggregate { keys, aggs });
+        // ORDER BY + SKIP + LIMIT apply to the finished group result table.
+        if !q.order_by.is_empty() {
+            let mut items = Vec::with_capacity(q.order_by.len());
+            for item in &q.order_by {
+                items.push(rewrite_order_item(item, &q.returns, &bound, &rel_bound)?);
+            }
+            ops.push(PlanOp::OrderBy { items });
+        }
+        if let Some(n) = q.skip {
+            ops.push(PlanOp::Skip(n));
+        }
+        if let Some(n) = q.limit {
+            ops.push(PlanOp::Limit(n));
+        }
         return Ok(ops);
     }
 

@@ -139,7 +139,28 @@ RETURN AVG(r.score)
 Supported functions: `COUNT(*)`, `COUNT(var)`, `SUM(var.field)`,
 `AVG(var.field)`, `MIN(var.field)`, `MAX(var.field)`.
 
-Grouped aggregation (`RETURN a, COUNT(*)`) is not supported.
+### Grouped aggregation
+
+One or more non-aggregate RETURN items act as group keys; one or more
+aggregate functions are computed per group:
+
+```cypher
+MATCH (n:Person)-[:KNOWS]->(m:Person)
+RETURN n.city, COUNT(*) AS friends
+ORDER BY friends DESC
+LIMIT 5
+```
+
+- Multiple group keys and multiple aggregates are supported in the same
+  RETURN clause.
+- `NULL` group-key values group together (openCypher semantics).
+- Empty input yields zero groups (no rows).
+- Group count is capped at 1,000,000 distinct keys per query.
+- `ORDER BY` + `LIMIT` sort the finished group table (top-k groups), not
+  the input rows; the LIMIT push-down optimisation is intentionally
+  disabled for grouped queries.
+- Multiple aggregates without any group-key items (e.g. `RETURN COUNT(*),
+  SUM(r.score)`) is also supported and returns exactly one row.
 
 ---
 
@@ -161,7 +182,7 @@ LIMIT 5
 |---|---|
 | Write clauses (CREATE / SET / DELETE) | Not supported |
 | Multi-statement transactions | Not supported |
-| Grouped aggregation | Not supported |
+| Grouped aggregation | Supported (multiple keys and multiple aggregates allowed; group count capped at 1,000,000) |
 | Variable-length paths: max hops | Capped at 10 |
 | shortestPath with unbound endpoints | Rejected at planning time |
 | Intermediate result budget | 1,000,000 rows |

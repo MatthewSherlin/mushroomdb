@@ -415,24 +415,23 @@ fn aggregate_wire_shape_and_semantics() {
         other => panic!("expected [Some(Int)], got {other:?}"),
     }
 
-    // Grouped aggregation is rejected with a plan-stage error.
-    let err = db
-        .query("MATCH (o:Org) RETURN o, COUNT(*)", &params)
-        .expect_err("grouped aggregation must fail");
-    match &err {
-        GraphError::QueryError { detail } => {
-            assert!(
-                detail.starts_with("plan:"),
-                "grouped aggregation error must be plan-prefixed, got: {detail}"
-            );
-            assert!(
-                detail.to_ascii_lowercase().contains("grouped aggregation")
-                    || detail.to_ascii_lowercase().contains("not supported"),
-                "error must name the limitation, got: {detail}"
-            );
-        }
-        other => panic!("expected QueryError, got {other:?}"),
-    }
+    // Grouped aggregation now succeeds: RETURN o, COUNT(*) must produce one row
+    // per distinct node o (each Org node is unique, so count is 1 per group).
+    let rs_grouped = db
+        .query("MATCH (o:Org) RETURN o, COUNT(*) AS n", &params)
+        .expect("grouped aggregation must now succeed");
+    // 7 Org nodes → 7 groups (each org appears exactly once).
+    assert_eq!(
+        rs_grouped.len(),
+        7,
+        "7 Org nodes must produce 7 groups; got {}",
+        rs_grouped.len()
+    );
+    assert_eq!(
+        rs_grouped.columns(),
+        &["o".to_string(), "n".to_string()],
+        "columns must be [o, n]"
+    );
 }
 
 // ── Variable-length path + shortestPath tests ─────────────────────────────
@@ -848,5 +847,155 @@ fn shortest_path_min_gt_1_is_plan_error() {
         }
         Ok(_) => panic!("shortestPath with min>1 must be rejected at planning time"),
         Err(e) => panic!("unexpected error variant: {e:?}"),
+    }
+}
+
+// ── Grouped aggregation integration tests ─────────────────────────────────
+
+/// Grouped aggregation returns the correct per-group counts from a real db.
+///
+/// Uses the `aggregate-wire` fixture (7 Org nodes) to verify that
+/// `RETURN label, COUNT(*)` produces one group per distinct label value.
+#[test]
+fn grouped_aggregate_counts_by_prop() {
+    let db = open_fixture("grouped-count");
+    let params = BTreeMap::new();
+
+    // All Org nodes — group by the "name" prop (each org has a unique name so
+    // we expect 7 groups each with count 1).
+    let rs = db
+        .query("MATCH (o:Org) RETURN o, COUNT(*) AS n", &params)
+        .expect("grouped COUNT must succeed");
+    assert_eq!(rs.len(), 7, "7 Org nodes must produce 7 groups");
+    assert_eq!(
+        rs.columns(),
+        &["o".to_string(), "n".to_string()],
+        "columns must be [o, n]"
+    );
+    // Each group has exactly one row — count per group is 1.
+    for i in 0..rs.len() {
+        assert_eq!(
+            rs.row(i)[1],
+            Some(Value::Int(1)),
+            "row {i}: each node appears in its own group, count must be 1"
+        );
+    }
+}
+
+/// ORDER BY + LIMIT on a grouped aggregate returns the top-k groups.
+#[test]
+fn grouped_aggregate_order_by_count_limit() {
+    let db = open_fixture("grouped-limit");
+    let empty = BTreeMap::new();
+
+    // Count Org-Person INDUSTRY edges per Org, top 3.
+    let rs = db
+        .query(
+            "MATCH (o:Org)-[:INDUSTRY]->(p:Person) \
+             RETURN o, COUNT(*) AS n \
+             ORDER BY n DESC LIMIT 3",
+            &empty,
+        )
+        .expect("grouped COUNT ORDER BY LIMIT must succeed");
+    assert!(rs.len() <= 3, "LIMIT 3 must return at most 3 rows");
+    // Rows must be in descending count order.
+    for i in 1..rs.len() {
+        let prev = rs.row(i - 1)[1].as_ref();
+        let curr = rs.row(i)[1].as_ref();
+        let ord = match (prev, curr) {
+            (Some(Value::Int(a)), Some(Value::Int(b))) => a.cmp(b),
+            _ => std::cmp::Ordering::Equal,
+        };
+        assert!(
+            ord != std::cmp::Ordering::Less,
+            "rows must be in descending order; row {i} has count > row {}",
+            i - 1
+        );
+    }
+}
+
+// ── Plan 12 carryover: V4-reopen pin for aggregate + grouped aggregate ─────
+
+/// Carryover requirement from Plan 12 final review (M-1):
+/// aggregate AND grouped-aggregate queries must return identical results
+/// against a V4-snapshotted db and against the never-closed reference.
+///
+/// Test shape: open a db, insert data, run both queries → reference results.
+/// Snapshot, reopen, run same queries → must match reference exactly.
+#[test]
+fn aggregate_and_grouped_aggregate_survive_v4_reopen() {
+    let dir = tmp("agg-reopen-pin");
+
+    // Build a simple graph: 5 N nodes with a "cat" prop (3 "A", 2 "B").
+    let build_db = |dir: &std::path::Path| {
+        let mut db = GraphDb::open(dir).unwrap();
+        for k in ["n1", "n2", "n3"] {
+            db.insert_node("N", k, vec![("cat".into(), Value::Str("A".into()))])
+                .unwrap();
+        }
+        for k in ["n4", "n5"] {
+            db.insert_node("N", k, vec![("cat".into(), Value::Str("B".into()))])
+                .unwrap();
+        }
+        db
+    };
+
+    let empty = BTreeMap::new();
+    let total_count_q = "MATCH (n:N) RETURN COUNT(*)";
+    let grouped_q = "MATCH (n:N) RETURN n.cat, COUNT(*) AS cnt ORDER BY n.cat";
+
+    // Reference: queries against the never-closed db.
+    let ref_db = build_db(&dir);
+    let ref_total = ref_db
+        .query(total_count_q, &empty)
+        .expect("reference COUNT(*) must succeed");
+    let ref_grouped = ref_db
+        .query(grouped_q, &empty)
+        .expect("reference grouped aggregate must succeed");
+
+    // Snapshot and reopen.
+    drop(ref_db); // close reference db — the snapshot was NOT taken yet,
+                  // so reopen reads from the WAL only.
+    {
+        // Reopen, take snapshot, close.
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.snapshot().unwrap();
+    }
+
+    // Reopen from snapshot.
+    let db2 = GraphDb::open(&dir).unwrap();
+    let after_total = db2
+        .query(total_count_q, &empty)
+        .expect("post-reopen COUNT(*) must succeed");
+    let after_grouped = db2
+        .query(grouped_q, &empty)
+        .expect("post-reopen grouped aggregate must succeed");
+
+    // Results must be identical.
+    assert_eq!(
+        ref_total.row(0),
+        after_total.row(0),
+        "COUNT(*) must match after V4 reopen: ref={:?} after={:?}",
+        ref_total.row(0),
+        after_total.row(0)
+    );
+    assert_eq!(
+        ref_grouped.len(),
+        after_grouped.len(),
+        "grouped aggregate row count must match after V4 reopen"
+    );
+    assert_eq!(
+        ref_grouped.columns(),
+        after_grouped.columns(),
+        "grouped aggregate columns must match after V4 reopen"
+    );
+    for i in 0..ref_grouped.len() {
+        assert_eq!(
+            ref_grouped.row(i),
+            after_grouped.row(i),
+            "grouped aggregate row {i} must match after V4 reopen: ref={:?} after={:?}",
+            ref_grouped.row(i),
+            after_grouped.row(i)
+        );
     }
 }

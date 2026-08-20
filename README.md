@@ -244,7 +244,7 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
 | No node or edge deletes | Not implemented. Nodes can be tombstoned but not removed; derived edges are retracted on property change. |
 | No multi-statement transactions | Single-write commits only. |
-| Cypher aggregations: no grouping | `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` on a single property are supported. Grouped aggregation (`RETURN a, COUNT(*)`) is not — the planner rejects it with a clear error. Multi-aggregate RETURN is also v1-limited. |
+| Cypher aggregations | `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` are supported both as single aggregates and as grouped aggregates (`RETURN a, COUNT(*)`). Multiple group keys and multiple aggregates per query are allowed. Group count is capped at 1,000,000 distinct keys. |
 | Variable-length paths: max hops capped at 10 | `-[r:TYPE*min..max]->` and `shortestPath` are supported. Max hops is hard-capped at 10; unbounded forms (`*min..`) are rejected at parse time. Intermediate results are capped at 1,000,000 rows. See [`docs/site/query.md`](docs/site/query.md). |
 
 ---
@@ -270,7 +270,7 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 | Medium | Node and edge deletes |
 | Medium | mmap-backed storage (RAM-independent at rest) |
 | Medium | Multi-statement transactions |
-| Medium | Expanded Cypher surface (grouped aggregations `RETURN a, COUNT(*)`) |
+| Medium | Expanded Cypher surface (subqueries, `WITH` clause, `CASE` expressions) |
 | Low | TypeScript bindings (napi-rs) |
 | Low | WASM playground |
 | Low | Time-travel queries |
