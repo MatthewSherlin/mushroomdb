@@ -887,6 +887,7 @@ impl SideIndex {
         clusters: BTreeMap<u32, usize>,
         drift: u64,
     ) {
+        // Precondition: ivf_clusters is empty when called from reindex_all_load_ivf (indexes reset to default); loop is defensive for any future direct-call path.
         // Remove old cluster bucket entries from by_key.
         for c in self.ivf_clusters.values() {
             self.by_key.remove(&ValueKey::Int(*c as i64));

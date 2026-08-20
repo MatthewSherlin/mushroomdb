@@ -565,3 +565,171 @@ fn v4_crash_between_snapshot_and_wal_truncation_with_approx_rule() {
         "expected ≥4 approx edges after crash+reopen (≥50% recall), got {total_approx}"
     );
 }
+
+/// Torn-write safety: truncating a V4 snapshot file to various byte counts must
+/// always return a Corrupt error, never a silently-wrong database.
+/// Covers both mid-header (bad-magic) and mid-payload (crc-mismatch) truncation.
+/// Exercises a snapshot that includes both an exact rule and an approximate/IVF rule,
+/// ensuring V4's ivf_state section is part of the torn region.
+#[test]
+fn v4_torn_snapshot_write_is_rejected() {
+    let dir = tmp("snap-v4-torn");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        // Exact rule: two nodes with overlapping tags → derived edges.
+        db.insert_node(
+            "A",
+            "a",
+            vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+        )
+        .unwrap();
+        db.insert_node(
+            "A",
+            "b",
+            vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+        )
+        .unwrap();
+        db.create_rule(RuleDef {
+            name: "exact".into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            },
+            edge_type: "REL".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+        })
+        .unwrap();
+        // Approximate/IVF rule: a few vector nodes → IVF state in snapshot.
+        let va_pts: &[(&str, [f64; 2])] = &[
+            ("va0", [1.0, 0.0]),
+            ("va1", [0.98, 0.2]),
+            ("va2", [0.0, 1.0]),
+            ("va3", [-0.2, (1.0_f64 - 0.04_f64).sqrt()]),
+        ];
+        for (k, v) in va_pts {
+            db.insert_node("VA", k, vec![("emb".into(), emb(v))]).unwrap();
+        }
+        db.create_rule(RuleDef {
+            name: "approx".into(),
+            src_label: "VA".into(),
+            dst_label: "VA".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "VAPPROX".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: true,
+        })
+        .unwrap();
+        db.snapshot().unwrap();
+    }
+
+    let path = dir.join("snapshot.bin");
+    let good = std::fs::read(&path).unwrap();
+    let n = good.len();
+    assert!(n > 20, "snapshot must be non-trivial; got {n} bytes");
+
+    // Truncation points: mid-header (5 B), just-past-header (10 B),
+    // early payload (n/3), mid-payload (n/2), one byte short (n-1).
+    // Any truncation must yield Err — never a silently-wrong open.
+    for &trunc in &[5usize, 10, n / 3, n / 2, n - 1] {
+        std::fs::write(&path, &good[..trunc]).unwrap();
+        assert!(
+            GraphDb::open(&dir).is_err(),
+            "expected Err for {trunc}-byte truncation of {n}-byte V4 snapshot",
+        );
+    }
+}
+
+/// Weight round-trip: an Overlap rule with weight_prop stores Jaccard scores as
+/// edge properties.  After snapshot → reopen the full derived-edge set including
+/// score values must be identical to a never-closed reference db.
+#[test]
+fn v4_weight_prop_round_trip() {
+    let dir = tmp("snap-v4-weight");
+    let ref_dir = tmp("snap-v4-weight-ref");
+
+    let node_data: &[(&str, &[&str])] = &[
+        ("a", &["x", "y"]),
+        ("b", &["x", "y", "z"]),
+        ("c", &["x"]),
+    ];
+
+    let make_tags = |tags: &[&str]| {
+        Value::List(tags.iter().map(|t| Value::Str(t.to_string())).collect())
+    };
+
+    let rule = || RuleDef {
+        name: "overlap_weighted".into(),
+        src_label: "A".into(),
+        dst_label: "A".into(),
+        predicate: Predicate::Overlap {
+            field: "tags".into(),
+            min: 0.5,
+        },
+        edge_type: "REL".into(),
+        weight_prop: Some("score".into()),
+        max_edges: None,
+        approximate: false,
+    };
+
+    // Build reference db — never closed, never snapshotted.
+    let mut ref_db = GraphDb::open(&ref_dir).unwrap();
+    for (k, tags) in node_data {
+        ref_db
+            .insert_node("A", k, vec![("tags".into(), make_tags(tags))])
+            .unwrap();
+    }
+    ref_db.create_rule(rule()).unwrap();
+
+    // Build snapshot db with same data, then snapshot and drop.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for (k, tags) in node_data {
+            db.insert_node("A", k, vec![("tags".into(), make_tags(tags))])
+                .unwrap();
+        }
+        db.create_rule(rule()).unwrap();
+        db.snapshot().unwrap();
+    }
+
+    // Reopen and compare full derived-edge set including score weights.
+    let snap_db = GraphDb::open(&dir).unwrap();
+    let keys: Vec<&str> = node_data.iter().map(|(k, _)| *k).collect();
+    for &src in &keys {
+        for &dst in &keys {
+            if src == dst {
+                continue;
+            }
+            let ref_expl = ref_db.explain(src, dst).unwrap();
+            let snap_expl = snap_db.explain(src, dst).unwrap();
+            assert_eq!(
+                ref_expl.len(),
+                snap_expl.len(),
+                "explanation count mismatch for {src}→{dst}"
+            );
+            for (r, s) in ref_expl.iter().zip(snap_expl.iter()) {
+                assert_eq!(
+                    r.weight, s.weight,
+                    "score weight mismatch for {src}→{dst} rule {}: ref={:?} snap={:?}",
+                    r.rule, r.weight, s.weight
+                );
+            }
+        }
+    }
+    // Sanity: all pairs of distinct nodes should share at least one directed edge with a score.
+    assert!(
+        snap_db
+            .explain("a", "b")
+            .unwrap()
+            .iter()
+            .any(|e| e.weight.is_some()),
+        "expected at least one weighted derived edge between a and b"
+    );
+}
