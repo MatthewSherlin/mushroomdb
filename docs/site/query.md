@@ -154,13 +154,18 @@ LIMIT 5
 - Multiple group keys and multiple aggregates are supported in the same
   RETURN clause.
 - `NULL` group-key values group together (openCypher semantics).
-- Empty input yields zero groups (no rows).
+- Empty input with no group-key items yields exactly one row (openCypher
+  semantics: `COUNT=0`, other aggregates `null`).
 - Group count is capped at 1,000,000 distinct keys per query.
 - `ORDER BY` + `LIMIT` sort the finished group table (top-k groups), not
   the input rows; the LIMIT push-down optimisation is intentionally
   disabled for grouped queries.
 - Multiple aggregates without any group-key items (e.g. `RETURN COUNT(*),
   SUM(r.score)`) is also supported and returns exactly one row.
+- Numeric group-key values are compared as floats: `1` (integer) and `1.0`
+  (float) land in the same group.  **Caveat:** integers whose absolute value
+  exceeds 2^53 may be incorrectly unified due to float-representation
+  rounding.
 
 ---
 

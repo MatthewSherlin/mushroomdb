@@ -185,6 +185,24 @@ fn value_key_to_value(k: &ValueKey) -> Value {
     }
 }
 
+/// Convert a group-key value to a `ValueKey` with numeric unification.
+///
+/// `Int(n)` and `Float(n as f64)` produce the same `FloatBits` key so that
+/// nodes with `score = 1` (Int) and `score = 1.0` (Float) land in the same
+/// group, matching openCypher's `1 = 1.0` equality rule.
+///
+/// Note: integers whose magnitude exceeds 2^53 lose precision when cast to
+/// `f64`, so two large integers that differ only beyond the float mantissa
+/// width could be incorrectly unified. This is a known limitation documented
+/// in `docs/site/query.md`.
+fn group_key_normalize(v: &Value) -> Option<ValueKey> {
+    match v {
+        Value::Int(n) => Some(ValueKey::FloatBits((*n as f64).to_bits())),
+        Value::Float(f) => Some(ValueKey::FloatBits(f.to_bits())),
+        _ => ValueKey::from_value(v),
+    }
+}
+
 /// Execute a plan against a view. Row order before OrderBy is deterministic
 /// (scan order = dense ids; expand order = expand()'s sorted order).
 ///
@@ -333,7 +351,7 @@ fn execute_inner(
                     let mut gk: GroupKey = Vec::with_capacity(keys.len());
                     for (_, item) in keys {
                         let val = project_item(view, &vars, row, item)?;
-                        gk.push(val.as_ref().and_then(ValueKey::from_value));
+                        gk.push(val.as_ref().and_then(group_key_normalize));
                     }
                     if !grp_groups.contains_key(&gk) {
                         if grp_groups.len() >= max_groups() {
@@ -349,6 +367,16 @@ fn execute_inner(
                     for (acc, (func, arg, _)) in accs.iter_mut().zip(aggs.iter()) {
                         update_acc(view, &vars, row, func, arg, acc)?;
                     }
+                }
+                // Same openCypher rule as execute_group_aggregate: no-key multi-agg on
+                // empty input must emit exactly one row with zero/null accumulators.
+                if keys.is_empty() && grp_key_order.is_empty() {
+                    let empty_key: GroupKey = vec![];
+                    grp_key_order.push(empty_key.clone());
+                    grp_groups.insert(
+                        empty_key,
+                        aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+                    );
                 }
                 projected = Some(build_group_projected(keys, aggs, grp_key_order, &mut grp_groups));
             }
@@ -1531,6 +1559,17 @@ fn execute_group_aggregate(
         aggs,
     };
     group_stream(&ctx, producers, &initial_row, &mut groups, &mut key_order)?;
+    // openCypher: aggregates with no group-key items on empty input must
+    // produce exactly one row (COUNT=0, SUM/AVG/etc.=null).  Seed the empty
+    // key when no terminal rows arrived and there are no grouping keys.
+    if keys.is_empty() && key_order.is_empty() {
+        let empty_key: GroupKey = vec![];
+        key_order.push(empty_key.clone());
+        groups.insert(
+            empty_key,
+            aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+        );
+    }
     let mut projected = build_group_projected(keys, aggs, key_order, &mut groups);
     // Apply OrderBy / Skip / Limit from the tail of the plan.
     for op in tail {
@@ -1564,7 +1603,7 @@ fn group_stream(
             let mut gk: GroupKey = Vec::with_capacity(ctx.keys.len());
             for (_, item) in ctx.keys {
                 let val = project_item(ctx.view, ctx.vars, row, item)?;
-                gk.push(val.as_ref().and_then(ValueKey::from_value));
+                gk.push(val.as_ref().and_then(group_key_normalize));
             }
             if !groups.contains_key(&gk) {
                 if groups.len() >= max_groups() {
@@ -4102,6 +4141,128 @@ LIMIT 10";
         )
         .expect("COUNT(*) on hop graph");
         assert_eq!(rs.row(0), &[Some(i(3))]);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // C-1 fix tests: empty-input no-keys multi-aggregate must return 1 row
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn multi_aggregate_no_keys_empty_graph() {
+        // C-1: RETURN COUNT(*), COUNT(n) on an empty graph must produce exactly
+        // one row (COUNT=0, COUNT=0), not zero rows.  Routes to GroupAggregate
+        // (keys=[], aggs=[Count, Count]).  Verifies parity with the single-agg
+        // fast path, which also returns one row on empty input.
+        let fx = Fx::new(); // empty — no nodes
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let rs = run(&v, "MATCH (n:N) RETURN COUNT(*), COUNT(n)", &params)
+            .expect("empty-graph multi-agg must succeed");
+        assert_eq!(rs.len(), 1, "must produce exactly 1 row on empty input");
+        assert_eq!(rs.row(0)[0], Some(i(0)), "COUNT(*) on empty graph must be 0");
+        assert_eq!(rs.row(0)[1], Some(i(0)), "COUNT(n) on empty graph must be 0");
+    }
+
+    #[test]
+    fn fast_path_and_group_path_agree_on_empty_input() {
+        // Equivalence pin: the single-agg fast path (Aggregate) and the
+        // multi-agg GroupAggregate path must agree on COUNT for empty input.
+        // Single-agg fast path: RETURN COUNT(*) → execute_aggregate.
+        // Group path: RETURN COUNT(*), COUNT(n) → execute_group_aggregate.
+        // Both must report COUNT = 0 on an empty graph.
+        let fx = Fx::new();
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let fast = run(&v, "MATCH (n:N) RETURN COUNT(*)", &params)
+            .expect("fast-path COUNT on empty graph");
+        assert_eq!(fast.len(), 1, "fast path: 1 row on empty input");
+        let fast_count = fast.row(0)[0].clone();
+
+        let grouped = run(&v, "MATCH (n:N) RETURN COUNT(*), COUNT(n)", &params)
+            .expect("group-path COUNT on empty graph");
+        assert_eq!(grouped.len(), 1, "group path: 1 row on empty input");
+        let group_count = grouped.row(0)[0].clone();
+
+        assert_eq!(
+            fast_count, group_count,
+            "fast path and group path must agree on COUNT(*) for empty input"
+        );
+
+        // Same check on non-empty input: both paths should see count = 2.
+        let mut fx2 = Fx::new();
+        fx2.add("N", "x", vec![]);
+        fx2.add("N", "y", vec![]);
+        let v2 = fx2.view();
+
+        let fast2 = run(&v2, "MATCH (n:N) RETURN COUNT(*)", &params)
+            .expect("fast-path COUNT on 2-node graph");
+        assert_eq!(fast2.row(0)[0], Some(i(2)), "fast path: COUNT(*) = 2");
+
+        let grouped2 = run(&v2, "MATCH (n:N) RETURN COUNT(*), COUNT(n)", &params)
+            .expect("group-path COUNT on 2-node graph");
+        assert_eq!(grouped2.row(0)[0], Some(i(2)), "group path: COUNT(*) = 2");
+        assert_eq!(grouped2.row(0)[1], Some(i(2)), "group path: COUNT(n) = 2");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // I-1 fix tests: Int/Float group-key unification
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn grouped_int_float_key_unification() {
+        // openCypher equality: 1 = 1.0.  Nodes with score=1 (Int) and score=1.0
+        // (Float) must land in the same group after group_key_normalize maps
+        // both to FloatBits.  Result: one group with count=2.
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("score", i(1))]);
+        fx.add("N", "b", vec![("score", f(1.0))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let rs = run(&v, "MATCH (n:N) RETURN n.score, COUNT(*) AS cnt", &params)
+            .expect("int/float unification must succeed");
+        assert_eq!(rs.len(), 1, "Int(1) and Float(1.0) must group together into 1 group");
+        assert_eq!(rs.row(0)[1], Some(i(2)), "unified group must have count=2");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // M-1: VarExpand + GroupAggregate staged-path integration test
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn var_expand_group_aggregate_staged_path() {
+        // Combines variable-length MATCH with a grouped RETURN — exercises the
+        // staged-path GroupAggregate arm that groups over materialised VarExpand
+        // rows.
+        //
+        // Graph: chain a -T-> b -T-> c  (3 nodes, 2 edges)
+        // MATCH (x)-[*1..2]->(y) RETURN y.key, COUNT(*)
+        //   1-hop results: (x=a, y=b), (x=b, y=c)       → b gets 1, c gets 1
+        //   2-hop results: (x=a, y=c)                    → c gets 1 more
+        //   So: b → 1, c → 2.
+        let mut fx = Fx::new();
+        let a = fx.add("N", "a", vec![("key", s("a"))]);
+        let b = fx.add("N", "b", vec![("key", s("b"))]);
+        let c = fx.add("N", "c", vec![("key", s("c"))]);
+        fx.edge("T", a, b, vec![]);
+        fx.edge("T", b, c, vec![]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let rs = run(
+            &v,
+            "MATCH (x:N)-[*1..2]->(y:N) RETURN y.key, COUNT(*) AS cnt ORDER BY y.key",
+            &params,
+        )
+        .expect("VarExpand + GroupAggregate must succeed");
+
+        assert_eq!(rs.len(), 2, "must have 2 destination groups: b and c");
+        assert_eq!(rs.row(0)[0], Some(s("b")), "first group key must be 'b'");
+        assert_eq!(rs.row(0)[1], Some(i(1)), "b is reached via 1 path");
+        assert_eq!(rs.row(1)[0], Some(s("c")), "second group key must be 'c'");
+        assert_eq!(rs.row(1)[1], Some(i(2)), "c is reached via 2 paths (1-hop and 2-hop)");
     }
 
     // ──────────────────────────────────────────────────────────────────────────
