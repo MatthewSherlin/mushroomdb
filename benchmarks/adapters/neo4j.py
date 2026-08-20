@@ -207,3 +207,38 @@ def cypher_two_hop() -> dict[str, Any]:
         "row_count": len(rows),
         "wall_s": wall,
     }
+
+
+def cold_start_to_first_query() -> dict[str, Any]:
+    """Connect to an already-running Neo4j server and run one depth-1 query.
+
+    This measures connect+authenticate+query latency only — server boot time
+    is excluded (server was already running).  Boot-to-ready is reported
+    separately in the run script via docker start timing.
+    """
+    drv = _check_or_skip()
+    t0 = time.perf_counter()
+    try:
+        with drv.session() as session:
+            rows = list(session.run("MATCH (n:Talent) RETURN n.key LIMIT 1"))
+        wall = time.perf_counter() - t0
+        row_count = len(rows)
+    except Exception as exc:
+        wall = time.perf_counter() - t0
+        row_count = 0
+        drv.close()
+        return {
+            "workload": "cold_start_to_first_query",
+            "engine": "neo4j",
+            "wall_s": wall,
+            "row_count": row_count,
+            "note": f"error: {exc}",
+        }
+    drv.close()
+    return {
+        "workload": "cold_start_to_first_query",
+        "engine": "neo4j",
+        "wall_s": wall,
+        "row_count": row_count,
+        "note": "connect-only (server already running); boot-to-ready reported separately",
+    }

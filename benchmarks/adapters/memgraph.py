@@ -119,12 +119,18 @@ def bulk_ingest(nodes: list[dict]) -> dict[str, Any]:
     from collections import defaultdict
     by_label: dict[str, list[dict]] = defaultdict(list)
     for n in nodes:
-        by_label[n["label"]].append({"key": n["key"]})
+        row: dict = {"key": n["key"], **n.get("props", {})}
+        by_label[n["label"]].append(row)
     for label, batch in by_label.items():
         for i in range(0, len(batch), chunk_size):
             chunk = batch[i : i + chunk_size]
             try:
-                _run_query(info, f"UNWIND $rows AS row CREATE (n:{label} {{key: row.key}})", {"rows": chunk})
+                # SET n = row stores all fields (key + props); n.key and n.size_bucket etc.
+                _run_query(
+                    info,
+                    f"UNWIND $rows AS row CREATE (n:{label}) SET n = row",
+                    {"rows": chunk},
+                )
                 inserted += len(chunk)
             except Exception:
                 pass
@@ -235,4 +241,41 @@ def cypher_two_hop() -> dict[str, Any]:
         "query": cypher,
         "row_count": row_count,
         "wall_s": wall,
+    }
+
+
+def cold_start_to_first_query() -> dict[str, Any]:
+    """Connect to an already-running Memgraph server and run one depth-1 query.
+
+    This measures connect+query latency only — server boot time is excluded.
+    Boot-to-ready is reported separately in the run script.
+    """
+    info = _check_or_skip()
+    t0 = time.perf_counter()
+    try:
+        rows = _run_query(info, "MATCH (n:Talent) RETURN n.key LIMIT 1")
+        wall = time.perf_counter() - t0
+        row_count = len(rows)
+    except Exception as exc:
+        wall = time.perf_counter() - t0
+        row_count = 0
+        kind, drv = info
+        if kind == "neo4j":
+            drv.close()
+        return {
+            "workload": "cold_start_to_first_query",
+            "engine": "memgraph",
+            "wall_s": wall,
+            "row_count": row_count,
+            "note": f"error: {exc}",
+        }
+    kind, drv = info
+    if kind == "neo4j":
+        drv.close()
+    return {
+        "workload": "cold_start_to_first_query",
+        "engine": "memgraph",
+        "wall_s": wall,
+        "row_count": row_count,
+        "note": "connect-only (server already running); boot-to-ready reported separately",
     }

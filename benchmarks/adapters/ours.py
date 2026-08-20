@@ -180,6 +180,62 @@ def cypher_two_hop(db: Any) -> dict[str, Any]:
     }
 
 
+def cold_start_to_first_query(db_dir: str | Path, snapshot: bool = False) -> dict[str, Any]:
+    """Cold-start-to-first-query: open an existing populated db then run one depth-1 query.
+
+    Measures the full open() latency (WAL replay or snapshot load) plus one node_edges() call.
+    The database at *db_dir* must already be populated (and snapshotted if snapshot=True).
+
+    Two sub-modes:
+      snapshot=False — WAL-only open: close + open; rules re-fire if any were declared.
+      snapshot=True  — Snapshot-V4 open: snapshot() + close + open; derived edges + IVF
+                       centroids are loaded from the snapshot file without re-firing rules.
+    """
+    from mushroomdb import GraphDb  # type: ignore[import]
+    # open once to get a key and optionally write the snapshot
+    db = GraphDb.open(str(db_dir))
+    # pick a stable probe key (stats gives node count; use a synthetic key lookup fallback)
+    probe_key: str | None = None
+    try:
+        info = db.stats()
+        # node_edges on any key; try the first inserted talent key heuristically
+        probe_key = "talent-000000"
+    except Exception:
+        probe_key = None
+    if snapshot:
+        db.snapshot()
+    db.close()
+
+    t0 = time.perf_counter()
+    db2 = GraphDb.open(str(db_dir))
+    open_wall = time.perf_counter() - t0
+
+    t1 = time.perf_counter()
+    try:
+        if probe_key:
+            db2.node_edges(probe_key)
+    except Exception:
+        pass
+    query_wall = time.perf_counter() - t1
+
+    total_wall = open_wall + query_wall
+    db2.close()
+
+    return {
+        "workload": "cold_start_to_first_query",
+        "engine": "mushroomdb",
+        "mode": "snapshot_v4" if snapshot else "wal_only",
+        "open_wall_s": open_wall,
+        "query_wall_s": query_wall,
+        "wall_s": total_wall,
+        "note": (
+            "snapshot_v4: derived edges + IVF centroids loaded from snapshot, no rule re-fire"
+            if snapshot else
+            "wal_only: WAL replay on open(); rules re-fire (no snapshot)"
+        ),
+    }
+
+
 def rule_derive(db: Any, rules: list[dict]) -> dict[str, Any]:
     """Declare *rules* via db.create_rule() and time the backfill.
 

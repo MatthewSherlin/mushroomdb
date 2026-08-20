@@ -232,6 +232,36 @@ class TestOursAdapter:
         )
         db.close()
 
+    def test_cold_start_wal_only(self, tmp_path, nodes):
+        """cold_start_to_first_query (WAL-only) opens a populated db and queries it."""
+        from adapters.ours import open_db, INGEST_CHUNK, cold_start_to_first_query
+        db_path = tmp_path / "cs_wal_db"
+        db = open_db(db_path)
+        for i in range(0, len(nodes), INGEST_CHUNK):
+            db.ingest_batch(nodes[i : i + INGEST_CHUNK])
+        db.close()
+        result = cold_start_to_first_query(db_path, snapshot=False)
+        assert result["workload"] == "cold_start_to_first_query"
+        assert result["engine"] == "mushroomdb"
+        assert result["mode"] == "wal_only"
+        assert result["wall_s"] >= 0
+        assert result["open_wall_s"] >= 0
+
+    def test_cold_start_snapshot_v4(self, tmp_path, nodes):
+        """cold_start_to_first_query (snapshot_v4) writes snapshot then reopens."""
+        from adapters.ours import open_db, INGEST_CHUNK, cold_start_to_first_query
+        db_path = tmp_path / "cs_snap_db"
+        db = open_db(db_path)
+        for i in range(0, len(nodes), INGEST_CHUNK):
+            db.ingest_batch(nodes[i : i + INGEST_CHUNK])
+        db.close()
+        result = cold_start_to_first_query(db_path, snapshot=True)
+        assert result["workload"] == "cold_start_to_first_query"
+        assert result["engine"] == "mushroomdb"
+        assert result["mode"] == "snapshot_v4"
+        assert result["wall_s"] >= 0
+        assert result["open_wall_s"] >= 0
+
     def test_stats_after_ingest(self, populated_db):
         """stats() reflects the ingested node count."""
         s = populated_db.stats()

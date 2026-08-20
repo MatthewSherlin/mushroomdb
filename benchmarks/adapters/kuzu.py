@@ -228,3 +228,36 @@ def cypher_two_hop(conn: Any) -> dict[str, Any]:
         "row_count": row_count,
         "wall_s": wall,
     }
+
+
+def cold_start_to_first_query(db_dir: str | Path) -> dict[str, Any]:
+    """Open a KùzuDB database and run one depth-1 query.
+
+    KùzuDB is embedded (like mushroomdb), so this measures database open + query.
+    """
+    _check_or_skip()
+    kuzu = _import_kuzu()
+    t0 = time.perf_counter()
+    try:
+        db = kuzu.Database(str(db_dir))
+        conn = kuzu.Connection(db)
+        result = conn.execute("MATCH (n:Talent) RETURN n.key LIMIT 1")
+        rows = result.get_as_df() if hasattr(result, "get_as_df") else []
+        wall = time.perf_counter() - t0
+        row_count = len(rows)
+    except Exception as exc:
+        wall = time.perf_counter() - t0
+        return {
+            "workload": "cold_start_to_first_query",
+            "engine": "kuzu",
+            "wall_s": wall,
+            "row_count": 0,
+            "note": f"error: {exc}",
+        }
+    return {
+        "workload": "cold_start_to_first_query",
+        "engine": "kuzu",
+        "wall_s": wall,
+        "row_count": row_count,
+        "note": "embedded db open + query (directly comparable to mushroomdb)",
+    }
