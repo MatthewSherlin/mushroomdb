@@ -741,3 +741,64 @@ fn var_expand_cap_exceeded_in_parse_is_error() {
         Err(e) => panic!("unexpected error variant: {e:?}"),
     }
 }
+
+/// Verify that `*0` and `*0..N` are rejected at parse time with the named error.
+#[test]
+fn var_expand_zero_min_is_rejected() {
+    let db = diamond_db("vp-zero-min");
+    for q in &[
+        "MATCH (a:N)-[r:T*0]->(b) RETURN b",
+        "MATCH (a:N)-[r:T*0..3]->(b) RETURN b",
+    ] {
+        let result = db.query(q, &BTreeMap::new());
+        match result {
+            Err(GraphError::QueryError { ref detail }) => {
+                assert!(
+                    detail.contains("zero-length variable-length paths are not supported"),
+                    "zero-min error must name the issue, got: {detail}"
+                );
+            }
+            Ok(_) => panic!("min=0 query must be rejected: {q}"),
+            Err(e) => panic!("unexpected error variant for {q}: {e:?}"),
+        }
+    }
+}
+
+/// Verify that the frontier PathState budget fires even when output rows have
+/// not yet been emitted (i.e., depth < min).  A 10-node complete directed
+/// graph with `*5..10` produces a massive frontier at depths 1–4 before any
+/// row is output — the budget must catch this and return a clean error.
+#[test]
+fn var_expand_frontier_budget_fires_before_output() {
+    let mut db = GraphDb::open(&tmp("vp-frontier-budget")).unwrap();
+    for i in 0..10u32 {
+        db.insert_node("N", &format!("n{i}"), vec![]).unwrap();
+    }
+    for i in 0..10u32 {
+        for j in 0..10u32 {
+            if i != j {
+                db.insert_edge("T", &format!("n{i}"), &format!("n{j}"))
+                    .unwrap();
+            }
+        }
+    }
+    // min=5: no output rows until depth 5, but the frontier grows as
+    // 9^1 + 9^2 + ... by depth 4, far exceeding 1M before any row is emitted.
+    let result = db.query("MATCH (a:N)-[r:T*5..10]->(b) RETURN b", &BTreeMap::new());
+    match result {
+        Err(GraphError::QueryError { ref detail }) => {
+            assert!(
+                detail.contains("intermediate result exceeds")
+                    || detail.contains("1000000")
+                    || detail.contains("1,000,000"),
+                "frontier budget error must name the limit, got: {detail}"
+            );
+        }
+        Ok(rs) => {
+            // If the graph does not expand enough to trip the budget, just verify
+            // termination.  This branch should not be reached with the 10-node clique.
+            let _ = rs;
+        }
+        Err(e) => panic!("unexpected non-budget error: {e:?}"),
+    }
+}

@@ -330,6 +330,11 @@ impl<'a> Parser<'a> {
         if min_n < 0 || max_n < 0 {
             return Err(self.err("hop counts must be non-negative"));
         }
+        if min_n == 0 {
+            return Err(self.err(
+                "zero-length variable-length paths are not supported; minimum hop count is 1",
+            ));
+        }
         if max_n > 10 {
             return Err(cap_err.to_string());
         }
@@ -1217,5 +1222,19 @@ LIMIT 10";
         assert_eq!(rel.dir, RelDir::Right);
         assert_eq!(rel.hops, Some(HopRange { min: 2, max: 4 }));
         assert_eq!(dest.var.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn var_length_zero_hop_minimum_is_err() {
+        // `*0` — exact form with min=0
+        assert_hop_err(
+            "MATCH (a)-[r:T*0]->(b) RETURN a",
+            "zero-length variable-length paths are not supported",
+        );
+        // `*0..3` — range form with min=0
+        assert_hop_err(
+            "MATCH (a)-[r:T*0..3]->(b) RETURN a",
+            "zero-length variable-length paths are not supported",
+        );
     }
 }

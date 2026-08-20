@@ -65,6 +65,13 @@ or with `max > 10` are rejected at parse time with the error:
 variable-length paths are capped at 10 hops
 ```
 
+**Minimum hop count ≥ 1.**  Zero-length paths (`*0`, `*0..N`) are not
+supported and are rejected at parse time with the error:
+
+```
+zero-length variable-length paths are not supported; minimum hop count is 1
+```
+
 ### Semantics
 
 - **BFS expansion** — each hop expands all neighbours of the current frontier.

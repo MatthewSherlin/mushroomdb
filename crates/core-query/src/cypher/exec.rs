@@ -739,6 +739,12 @@ fn exec_var_expand(
             edges: Vec::new(),
         }];
 
+        // Running count of all PathStates ever retained in the frontier (across all
+        // depths and all input rows).  Counted even during the pre-emission phase
+        // (depth < min) so that high-min queries on dense graphs cannot exhaust RAM
+        // before the budget fires.
+        let mut frontier_count: usize = 0;
+
         for depth in 1u8..=max {
             let mut next_frontier: Vec<PathState> = Vec::new();
             for state in &frontier {
@@ -770,7 +776,13 @@ fn exec_var_expand(
                     }
 
                     // Continue expanding if we haven't hit the max depth yet.
+                    // Count each retained PathState against the budget so that
+                    // high-min queries on dense graphs are caught before emission.
                     if depth < max {
+                        frontier_count += 1;
+                        if frontier_count >= cap {
+                            return Err(row_cap_err(cap));
+                        }
                         let mut new_edges = state.edges.clone();
                         new_edges.push(e);
                         next_frontier.push(PathState {
