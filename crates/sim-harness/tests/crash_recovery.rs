@@ -696,10 +696,17 @@ fn cypher_write_dst_byte_sweep() {
     fn cypher_workload<F: core_storage::fs::Fs>(
         db: &mut GraphDb<F>,
     ) -> core_api::Result<()> {
+        // Three single-op Batch frames:
         db.query_write("CREATE (a:Person {id: 'dst_alice'})", &no_params())?;
         db.query_write("CREATE (b:Person {id: 'dst_bob'})", &no_params())?;
         db.query_write(
             "MATCH (p:Person {id: 'dst_alice'}) SET p.score = 42",
+            &no_params(),
+        )?;
+        // One multi-op Batch frame: Batch([InsertNode(x), InsertNode(y), InsertEdge]).
+        // Crashing inside this frame must leave NONE of the three ops applied.
+        db.query_write(
+            "CREATE (x:Peer {id: 'dst_x'})-[:LINK]->(y:Peer {id: 'dst_y'})",
             &no_params(),
         )?;
         Ok(())
@@ -720,26 +727,42 @@ fn cypher_write_dst_byte_sweep() {
 
         let recovered = GraphDb::open_with(survivor).unwrap();
 
-        // If alice exists, her id prop must be present.
+        // Single-op frame invariants.
         if recovered.has_node("dst_alice") {
             assert!(
                 recovered.get_prop("dst_alice", "id").is_some(),
                 "crash_at={crash_at}: dst_alice exists but id prop missing"
             );
         }
-        // If bob exists, his id prop must be present.
         if recovered.has_node("dst_bob") {
             assert!(
                 recovered.get_prop("dst_bob", "id").is_some(),
                 "crash_at={crash_at}: dst_bob exists but id prop missing"
             );
         }
-        // If the SET landed, score must equal 42.
         if let Some(score) = recovered.get_prop("dst_alice", "score") {
             assert_eq!(
                 *score,
                 Value::Int(42),
                 "crash_at={crash_at}: dst_alice.score must be 42 when present"
+            );
+        }
+
+        // Multi-op Batch none-or-complete invariant:
+        // The Batch([InsertNode(x), InsertNode(y), InsertEdge]) frame is atomic.
+        // After any crash the recovered state must satisfy: either all three ops
+        // landed (both nodes present AND edge x→y exists) or none landed.
+        let x_exists = recovered.has_node("dst_x");
+        let y_exists = recovered.has_node("dst_y");
+        let edge_exists = recovered
+            .neighbors("dst_x", "LINK", Direction::Out)
+            .unwrap_or_default()
+            .contains(&"dst_y".to_string());
+        if x_exists || y_exists || edge_exists {
+            assert!(
+                x_exists && y_exists && edge_exists,
+                "crash_at={crash_at}: multi-op Batch must be none-or-complete: \
+                 x_exists={x_exists} y_exists={y_exists} edge_exists={edge_exists}"
             );
         }
     }

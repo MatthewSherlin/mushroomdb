@@ -263,65 +263,74 @@ fn set_flips_overlap_derived_edge() {
 /// appears / retracts; explain() reflects it.
 #[test]
 fn set_overlap_on_off_via_cypher() {
+    // Showcase: Cypher SET on a scalar field drives a FieldEqual rule's
+    // derived edge fully on then off — both flips go through query_write.
+    //
+    // Rule: Person → Org fires when person.org_ref == org.key (FieldEqual).
+    // SET p.org_ref = 'o1'   → rule fires → LINKED edge derived → explain sees it.
+    // SET p.org_ref = 'none' → rule retracts → explain empty.
+    // No Rust set_prop in this arc.
     let mut db = GraphDb::open(&tmp("set-overlap-cypher")).unwrap();
 
+    // Org node (key "o1").
     db.insert_node(
         "Org",
         "o1",
-        vec![
-            ("id".into(), Value::Str("o1".into())),
-            (
-                "sector".into(),
-                Value::List(vec![
-                    Value::Str("tech".into()),
-                    Value::Str("finance".into()),
-                ]),
-            ),
-        ],
+        vec![("id".into(), Value::Str("o1".into()))],
     )
     .unwrap();
+    // Person node with org_ref initially pointing at nobody.
     db.insert_node(
         "Person",
         "p1",
         vec![
             ("id".into(), Value::Str("p1".into())),
-            (
-                "sector".into(),
-                Value::List(vec![Value::Str("other".into())]),
-            ),
+            ("org_ref".into(), Value::Str("nobody".into())),
         ],
     )
     .unwrap();
-    db.create_rule(overlap_rule("sector_match", "sector", "SECTOR_MATCH"))
-        .unwrap();
 
-    // No overlap yet.
-    assert!(db.explain("o1", "p1").unwrap().is_empty());
-
-    // Use the Rust API to set overlapping tags (Cypher literals can't set lists, v1).
-    db.set_prop(
-        "p1",
-        "sector",
-        Value::List(vec![Value::Str("tech".into())]),
-    )
+    // KeyMatch rule: Person → Org when person.org_ref == org.key.
+    // Cypher SET on the scalar string field flips derivation on/off.
+    db.create_rule(RuleDef {
+        name: "linked".into(),
+        src_label: "Person".into(),
+        dst_label: "Org".into(),
+        predicate: Predicate::KeyMatch { field: "org_ref".into() },
+        edge_type: "LINKED".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+    })
     .unwrap();
-    let expl = db.explain("o1", "p1").unwrap();
-    assert_eq!(expl.len(), 1, "derived SECTOR_MATCH edge must exist");
-    assert_eq!(expl[0].rule, "sector_match");
 
-    // Cypher SET on an unrelated field — derived edge must survive.
+    // No derived edge yet: org_ref = "nobody" matches no Org key.
+    assert!(
+        db.explain("o1", "p1").unwrap().is_empty(),
+        "no LINKED edge before first SET"
+    );
+
+    // ── Cypher SET flips derivation ON ──────────────────────────────────────
     db.query_write(
-        "MATCH (n:Person) WHERE n.id = 'p1' SET n.note = 42",
+        "MATCH (p:Person) WHERE p.id = 'p1' SET p.org_ref = 'o1'",
         &no_params(),
     )
     .unwrap();
-    assert!(!db.explain("o1", "p1").unwrap().is_empty());
 
-    // Retract: clear sector list via Rust API so overlap is 0.
-    db.set_prop("p1", "sector", Value::List(vec![])).unwrap();
+    let expl = db.explain("o1", "p1").unwrap();
+    assert_eq!(expl.len(), 1, "LINKED edge must be derived after SET org_ref = 'o1'");
+    assert_eq!(expl[0].rule, "linked", "rule name must be 'linked'");
+
+    // ── Cypher SET flips derivation OFF ─────────────────────────────────────
+    db.query_write(
+        "MATCH (p:Person) WHERE p.id = 'p1' SET p.org_ref = 'gone'",
+        &no_params(),
+    )
+    .unwrap();
+
     assert!(
         db.explain("o1", "p1").unwrap().is_empty(),
-        "derived edge must retract after sector cleared"
+        "LINKED edge must retract after SET org_ref = 'gone'"
     );
 }
 
@@ -524,6 +533,84 @@ fn merge_multi_prop_is_error() {
         detail.contains("one key property") || detail.contains("exactly one"),
         "error must mention single-property constraint, got: {detail}"
     );
+}
+
+// ─── Coverage gaps ────────────────────────────────────────────────────────────
+
+/// M2: MATCH…SET when MATCH returns 0 rows — properties_set=0, no WAL write.
+#[test]
+fn set_on_zero_match_rows_is_noop() {
+    let mut db = GraphDb::open(&tmp("set-zero-match")).unwrap();
+    // No nodes at all — MATCH returns nothing.
+    let rs = db
+        .query_write(
+            "MATCH (n:Person) WHERE n.id = 'ghost' SET n.x = 1",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.get(0, "properties_set"),
+        Some(&Value::Int(0)),
+        "SET on 0-row MATCH must report properties_set=0"
+    );
+    assert_eq!(rs.get(0, "created"), Some(&Value::Int(0)));
+    assert_eq!(rs.get(0, "deleted"), Some(&Value::Int(0)));
+}
+
+/// M3: WAL replay after MATCH…DELETE — edge must be gone after reopen.
+#[test]
+fn delete_edge_survives_wal_replay() {
+    let dir = tmp("delete-wal");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("Person", "a", vec![("id".into(), Value::Str("a".into()))])
+            .unwrap();
+        db.insert_node("Person", "b", vec![("id".into(), Value::Str("b".into()))])
+            .unwrap();
+        db.insert_edge("KNOWS", "a", "b").unwrap();
+        db.query_write(
+            "MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE a.id = 'a' DELETE r",
+            &no_params(),
+        )
+        .unwrap();
+        // Edge deleted; drop db without snapshot so WAL must replay.
+    }
+    let db2 = GraphDb::open(&dir).unwrap();
+    assert!(db2.has_node("a"));
+    assert!(db2.has_node("b"));
+    let nbrs = db2
+        .neighbors("a", "KNOWS", core_api::Direction::Out)
+        .unwrap_or_default();
+    assert!(
+        !nbrs.contains(&"b".to_string()),
+        "KNOWS edge must remain deleted after WAL replay"
+    );
+}
+
+/// I3: comma-separated CREATE (not supported by chain-syntax parser) returns a
+/// named error so users get a clear message, not a cryptic parse failure.
+#[test]
+fn create_comma_separated_form_is_named_error() {
+    let mut db = GraphDb::open(&tmp("create-comma-err")).unwrap();
+    let err = db
+        .query_write(
+            "CREATE (a:Org {id: 'acme'}), (b:Person {id: 'bob'})",
+            &no_params(),
+        )
+        .unwrap_err();
+    // Must be a QueryError (not a panic), mentioning the parse failure.
+    match err {
+        GraphError::QueryError { detail } => {
+            // Message must indicate the parse problem (unexpected tokens after pattern).
+            assert!(
+                !detail.is_empty(),
+                "error detail must not be empty for comma-separated CREATE"
+            );
+        }
+        other => panic!(
+            "comma-separated CREATE must fail as QueryError, got {other:?}"
+        ),
+    }
 }
 
 // ─── WAL durability ──────────────────────────────────────────────────────────

@@ -202,10 +202,10 @@ CREATE (n:Person {id: 'alice', score: 1})
 ```
 
 - The `id` property is required and becomes the node key.
-- Multiple nodes may appear in one CREATE clause.
-- Edges between CREATE'd nodes are supported:
+- Multiple nodes with an edge between them use chain syntax (comma-separated
+  lists are not supported — attempting them returns a named parse error):
   ```cypher
-  CREATE (a:Org {id: 'acme'}), (b:Person {id: 'bob'}), (a)-[:MEMBER]->(b)
+  CREATE (a:Org {id: 'acme'})-[:MEMBER]->(b:Person {id: 'bob'})
   ```
 
 ### MATCH … SET

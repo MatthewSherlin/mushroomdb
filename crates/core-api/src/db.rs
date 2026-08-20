@@ -1452,7 +1452,9 @@ impl<F: Fs> GraphDb<F> {
         let mut created = 0i64;
         if !self.has_node(&key) {
             let props = vec![(stmt.key_field.clone(), stmt.key_value.clone())];
-            self.insert_node(&stmt.label, &key, props)?;
+            self.batch()
+                .insert_node(&stmt.label, &key, props)
+                .commit()?;
             created = 1;
         }
 
