@@ -1,0 +1,4 @@
+# Gitignore for benchmark results
+# Only sample-results.md is committed; all other run outputs are local.
+*.md
+!sample-results.md
