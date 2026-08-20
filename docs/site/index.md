@@ -37,7 +37,7 @@ DuckDB or SQLite. The optional `serve` command adds an HTTP API and a
 bundled graph explorer when you want them.
 
 The design spec and roadmap are in `README.md`. The full spec is at
-`docs/superpowers/specs/2026-08-14-graph-db-design.md`.
+`docs/design.md`.
 
 ---
 

@@ -3,7 +3,7 @@
 ## Before you start
 
 Read `README.md` and the design spec at
-`docs/superpowers/specs/2026-08-14-graph-db-design.md` so you understand the
+`docs/design.md` so you understand the
 architecture, the generality guarantee, and the wire discipline.
 
 ---

@@ -32,9 +32,9 @@ retracts the edge if the properties later diverge — without any manual work.
 The why panel in the bundled explorer shows exactly which rule fired, the
 field values that matched, and the computed score for every derived edge.
 
-![Why panel showing overlap rule arithmetic](docs/superpowers/plans/plan-6-evidence/03-why-overlap.png)
+![Why panel showing overlap rule arithmetic](docs/assets/03-why-overlap.png)
 
-![Neighborhood with derived edges highlighted](docs/superpowers/plans/plan-6-evidence/02-neighborhood-gold.png)
+![Neighborhood with derived edges highlighted](docs/assets/02-neighborhood-gold.png)
 
 ---
 
@@ -335,7 +335,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 - Quickstart: [`docs/site/quickstart.md`](docs/site/quickstart.md)
 - Rules reference: [`docs/site/rules.md`](docs/site/rules.md)
 - API reference: [`docs/site/api.md`](docs/site/api.md)
-- Design spec: [`docs/superpowers/specs/2026-08-14-graph-db-design.md`](docs/superpowers/specs/2026-08-14-graph-db-design.md)
+- Design spec: [`docs/design.md`](docs/design.md)
 - Benchmarks: [`benchmarks/results/head-to-head-10k.md`](benchmarks/results/head-to-head-10k.md)
 - Dogfood report: [`docs/dogfood-report.md`](docs/dogfood-report.md)
 
