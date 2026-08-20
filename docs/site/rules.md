@@ -275,7 +275,7 @@ the rule is marked `tripped`. No further edges are added until the rule is
 rebuilt with nodes removed. Use `max_edges: Some(k)` instead when you want
 per-source cardinality control.
 
-> **Breaking change (pre-alpha, since Plan 13 Task 1):** Prior to this release,
+> **Breaking change (pre-alpha, since 2026-08-20):** Prior to this release,
 > `max_edges: Some(k)` meant "stop at k total edges globally (global-budget
 > semantics, same as `None` but with a lower cap)." It now means "keep the
 > k best-matching destinations per source node (per-source top-k semantics)."
