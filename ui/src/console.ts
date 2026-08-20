@@ -193,8 +193,14 @@ export class QueryConsole {
     }
     this.busy = true;
     this.addBtn.disabled = true;
+    let denseHint = "";
     try {
-      await addHarvestedToCanvas(this.store, this.api, this.result);
+      await addHarvestedToCanvas(this.store, this.api, this.result, {
+        onProgress: (msg) => {
+          denseHint = msg;
+          this.hint.textContent = msg;
+        },
+      });
       this.onCanvasChange?.();
     } catch (err: unknown) {
       this.errorEl.textContent = queryErrorText(err);
@@ -202,6 +208,11 @@ export class QueryConsole {
     } finally {
       this.busy = false;
       this.syncAdd();
+      // Restore the dense-hub hint after syncAdd clears it so the user knows
+      // which nodes need a click to expand their neighborhoods.
+      if (denseHint !== "") {
+        this.hint.textContent = denseHint;
+      }
     }
   }
 

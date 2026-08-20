@@ -548,7 +548,12 @@ button {
 .rules {
   position: absolute;
   top: 0;
-  bottom: 0;
+  /* Layout rule: console drawer above rules panel — clip the rules panel's
+     bottom edge to the console's top so the side panel never overlaps the
+     console bar and cannot intercept Run / Add-to-canvas pointer events.
+     --console-h is set on the shell by QueryConsole.syncHeight() and cleared
+     on close; design-brief five-token quiet chrome is unchanged. */
+  bottom: var(--console-h, 0px);
   left: 48px;
   z-index: 7;
   width: 16.5rem;

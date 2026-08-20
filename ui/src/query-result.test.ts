@@ -8,6 +8,7 @@ import { GraphStore, edgeId } from "./store";
 import { USER_ETYPE } from "./classify";
 import type { ExpandApi } from "./expand";
 import {
+  DENSE_HUB_DEGREE_THRESHOLD,
   NO_HARVEST_HINT,
   NO_RESULT_HINT,
   addHarvestedToCanvas,
@@ -252,5 +253,111 @@ describe("addHarvestedToCanvas", () => {
     expect(keys).toEqual([]);
     expect(neighborhoods).toBe(0);
     expect(store.nodes.size).toBe(0);
+  });
+});
+
+describe("dense hub policy (F2)", () => {
+  function edgeList(count: number) {
+    return Array.from({ length: count }, (_, i) => ({
+      edge_type: "related",
+      src_key: `hub`,
+      dst_key: `spoke-${i}`,
+      derived: false,
+    }));
+  }
+
+  it("skips auto-expansion for nodes with degree > DENSE_HUB_DEGREE_THRESHOLD", async () => {
+    const store = new GraphStore();
+    let expandCalls = 0;
+    const denseEdges = edgeList(DENSE_HUB_DEGREE_THRESHOLD + 1);
+    const api: ExpandApi = {
+      query: async () => ({ columns: ["n"], rows: [] }),
+      neighborhood: async () => {
+        expandCalls += 1;
+        return { columns: ["key", "label", "depth"], rows: [] };
+      },
+      explain: async () => [],
+      nodeInfo: async () => ({ key: "hub", label: "Hub", props: {} }),
+      nodeEdges: async () => ({ edges: denseEdges }),
+    };
+
+    const keys = await addHarvestedToCanvas(store, api, result(["n"], [["hub"]]));
+
+    expect(keys).toEqual(["hub"]);
+    // dense hub: neighborhood (expand) was never called
+    expect(expandCalls).toBe(0);
+    // node is present in canvas (mergeQueryGraph added it)
+    expect(store.nodes.has("hub")).toBe(true);
+    // marked dirty for lazy expand-on-click
+    expect(store.dirty.has("hub")).toBe(true);
+  });
+
+  it("auto-expands nodes with degree exactly at the threshold (not above)", async () => {
+    const store = new GraphStore();
+    let expandCalls = 0;
+    const borderEdges = edgeList(DENSE_HUB_DEGREE_THRESHOLD);
+    const api: ExpandApi = {
+      query: async () => ({ columns: ["n"], rows: [] }),
+      neighborhood: async () => {
+        expandCalls += 1;
+        return { columns: ["key", "label", "depth"], rows: [] };
+      },
+      explain: async () => [],
+      nodeInfo: async () => ({ key: "hub", label: "Hub", props: {} }),
+      nodeEdges: async () => ({ edges: borderEdges }),
+    };
+
+    await addHarvestedToCanvas(store, api, result(["n"], [["hub"]]));
+
+    // degree == threshold → expanded normally
+    expect(expandCalls).toBeGreaterThan(0);
+    expect(store.dirty.has("hub")).toBe(false);
+  });
+
+  it("calls onProgress with skipped-count summary when dense hubs exist", async () => {
+    const store = new GraphStore();
+    const denseEdges = edgeList(DENSE_HUB_DEGREE_THRESHOLD + 10);
+    const api: ExpandApi = {
+      query: async () => ({ columns: ["n"], rows: [] }),
+      neighborhood: async () => ({ columns: ["key", "label", "depth"], rows: [] }),
+      explain: async () => [],
+      nodeInfo: async () => ({ key: "hub", label: "Hub", props: {} }),
+      nodeEdges: async () => ({ edges: denseEdges }),
+    };
+
+    const messages: string[] = [];
+    await addHarvestedToCanvas(store, api, result(["n"], [["hub"]]), {
+      onProgress: (msg) => {
+        messages.push(msg);
+      },
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatch(/1 dense node/);
+    expect(messages[0]).toMatch(/click to expand/);
+  });
+
+  it("falls through to full expand when nodeEdges endpoint is absent (old server)", async () => {
+    const store = new GraphStore();
+    let expandCalls = 0;
+    const api: ExpandApi = {
+      query: async () => ({ columns: ["n"], rows: [] }),
+      neighborhood: async () => {
+        expandCalls += 1;
+        return { columns: ["key", "label", "depth"], rows: [] };
+      },
+      explain: async () => [],
+      nodeInfo: async () => ({ key: "p1", label: "Person", props: {} }),
+      // 404 without "node key not found:" prefix → isAbsentEndpoint = true
+      nodeEdges: async () => {
+        throw new ApiError(404, "Not Found");
+      },
+    };
+
+    await addHarvestedToCanvas(store, api, result(["n"], [["p1"]]));
+
+    // absent endpoint → fell through to expandNode → neighborhood called
+    expect(expandCalls).toBeGreaterThan(0);
+    expect(store.dirty.has("p1")).toBe(false);
   });
 });

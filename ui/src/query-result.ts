@@ -7,12 +7,19 @@
  * (`n.name`) are never keys. Add-to-canvas is disabled when harvest is empty
  * so the UI never silently adds nothing.
  */
-import { ApiError, type JsonCell, type QueryResult } from "./api";
+import { ApiError, isAbsentEndpoint, isKeyNotFound, type JsonCell, type QueryResult } from "./api";
 import { EXPLAIN_CONCURRENCY, mapPool } from "./classify";
 import { expandNode, type ExpandApi } from "./expand";
 import type { GraphStore } from "./store";
 
 export const NO_RESULT_HINT = "Run a query first";
+
+/**
+ * Nodes with degree above this threshold are skipped during auto-expansion in
+ * {@link addHarvestedToCanvas} and marked dirty for lazy expand-on-click.
+ * Keeps Add-to-canvas responsive even when a result includes dense hubs.
+ */
+export const DENSE_HUB_DEGREE_THRESHOLD = 50;
 
 export const NO_HARVEST_HINT =
   "No node keys in this result — return a node variable or project key and label";
@@ -129,19 +136,50 @@ export function queryErrorText(err: unknown): string {
   return String(err);
 }
 
+export type AddHarvestedOpts = {
+  /** Called once after all keys are processed if any dense hubs were skipped. */
+  onProgress?: (msg: string) => void;
+};
+
 export async function addHarvestedToCanvas(
   store: GraphStore,
   api: ExpandApi,
   result: QueryResult,
+  opts?: AddHarvestedOpts,
 ): Promise<string[]> {
   const keys = harvestableKeys(result);
   if (keys.length === 0) {
     return [];
   }
   store.mergeQueryGraph(result.columns, result.rows);
-  const { errors } = await mapPool(keys, EXPLAIN_CONCURRENCY, (key) =>
-    expandNode(store, api, key, 1),
-  );
+  let skipped = 0;
+  const { errors } = await mapPool(keys, EXPLAIN_CONCURRENCY, async (key) => {
+    // Fetch degree first (cheap). Dense hubs (degree > DENSE_HUB_DEGREE_THRESHOLD)
+    // are marked dirty for lazy expand-on-click and skipped here so that Add
+    // never blocks >5 s when the result includes a hub with hundreds of edges.
+    let degree: number | undefined;
+    try {
+      const ne = await api.nodeEdges(key);
+      degree = ne.edges.length;
+    } catch (err: unknown) {
+      if (!isAbsentEndpoint(err) && !isKeyNotFound(err)) {
+        throw err;
+      }
+      // Absent endpoint (old server) or key miss — fall through to full expand.
+    }
+    if (degree !== undefined && degree > DENSE_HUB_DEGREE_THRESHOLD) {
+      // Mark dirty so watch-based lazy expansion can pick it up on click.
+      store.markDirty(key);
+      skipped += 1;
+      return;
+    }
+    await expandNode(store, api, key, 1);
+  });
+  if (skipped > 0) {
+    opts?.onProgress?.(
+      `${skipped} dense node${skipped === 1 ? "" : "s"} skipped (>${DENSE_HUB_DEGREE_THRESHOLD} edges) — click to expand`,
+    );
+  }
   if (errors.length === 0) {
     return keys;
   }
