@@ -84,11 +84,17 @@ pub enum Operand {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetVal {
     Var(String),
-    Prop { var: String, field: String },
+    Prop {
+        var: String,
+        field: String,
+    },
     /// Single aggregate function call. v1 supports only one aggregate per
     /// query (no grouping). Grouped aggregation (`RETURN a, COUNT(*)`) is
     /// rejected at planning time with a clear limitation error.
-    Agg { func: AggFunc, arg: AggArg },
+    Agg {
+        func: AggFunc,
+        arg: AggArg,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

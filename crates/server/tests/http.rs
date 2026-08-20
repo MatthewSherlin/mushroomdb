@@ -151,8 +151,16 @@ async fn query_count_star_format_json_wire_shape() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(ctype.as_deref(), Some("application/json"));
     let v = parse_json(&body);
-    assert_eq!(v["columns"], json!(["COUNT(*)"]), "column name must be COUNT(*)");
-    assert_eq!(v["rows"], json!([[3]]), "three Person nodes must be counted");
+    assert_eq!(
+        v["columns"],
+        json!(["COUNT(*)"]),
+        "column name must be COUNT(*)"
+    );
+    assert_eq!(
+        v["rows"],
+        json!([[3]]),
+        "three Person nodes must be counted"
+    );
 }
 
 /// Binding: bad Cypher is 400 {"error": detail} with a parse:-prefixed detail.

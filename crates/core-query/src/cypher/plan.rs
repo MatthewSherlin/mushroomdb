@@ -159,7 +159,11 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     check_duplicate_columns(&q.returns)?;
 
     // Detect aggregate vs non-aggregate items in RETURN.
-    let agg_count = q.returns.iter().filter(|r| matches!(&r.value, RetVal::Agg { .. })).count();
+    let agg_count = q
+        .returns
+        .iter()
+        .filter(|r| matches!(&r.value, RetVal::Agg { .. }))
+        .count();
 
     if agg_count > 0 && agg_count < q.returns.len() {
         // Mixed: some aggregates, some regular items — grouped aggregation.
@@ -188,14 +192,13 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
             _ => unreachable!(),
         };
         // Validate: SUM/AVG/MIN/MAX require a Prop arg, not Star.
-        match (&func, &arg) {
-            (AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max, AggArg::Star) => {
-                return Err(format!(
-                    "{name} does not accept '*'; use a property expression like `{name}(n.prop)`",
-                    name = func_name(&func),
-                ));
-            }
-            _ => {}
+        if let (AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max, AggArg::Star) =
+            (&func, &arg)
+        {
+            return Err(format!(
+                "{name} does not accept '*'; use a property expression like `{name}(n.prop)`",
+                name = func_name(&func),
+            ));
         }
         let column = item
             .alias

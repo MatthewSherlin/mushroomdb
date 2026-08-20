@@ -354,10 +354,7 @@ impl<'a> Parser<'a> {
             };
             if let Some(func) = func {
                 self.pos += 1; // consume the function name
-                self.expect(
-                    &Tok::LParen,
-                    "expected '(' after aggregate function name",
-                )?;
+                self.expect(&Tok::LParen, "expected '(' after aggregate function name")?;
                 let arg = if self.eat(&Tok::Star) {
                     AggArg::Star
                 } else {
@@ -863,7 +860,12 @@ LIMIT 10";
             vec![Tok::LBracket, Tok::RBracket, Tok::LBrace, Tok::RBrace],
             lex("MATCH (a)-[x:]->(b) RETURN a ORDER BY a LIMIT 1 extra").unwrap(),
             // Aggregate tokens: COUNT(*), SUM/AVG/MIN/MAX in various positions.
-            vec![Tok::Ident("COUNT".into()), Tok::LParen, Tok::Star, Tok::RParen],
+            vec![
+                Tok::Ident("COUNT".into()),
+                Tok::LParen,
+                Tok::Star,
+                Tok::RParen,
+            ],
             vec![
                 Tok::Ident("sum".into()),
                 Tok::LParen,
@@ -880,11 +882,7 @@ LIMIT 10";
                 Tok::Star,
                 Tok::RParen,
             ],
-            vec![
-                Tok::Ident("min".into()),
-                Tok::LParen,
-                Tok::RParen,
-            ],
+            vec![Tok::Ident("min".into()), Tok::LParen, Tok::RParen],
             vec![
                 Tok::Ident("max".into()),
                 Tok::LParen,

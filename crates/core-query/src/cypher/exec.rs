@@ -709,7 +709,10 @@ impl AggAcc {
     fn new(func: &AggFunc) -> Self {
         match func {
             AggFunc::Count => AggAcc::Count(0),
-            AggFunc::Sum => AggAcc::Sum { val: 0.0, has_value: false },
+            AggFunc::Sum => AggAcc::Sum {
+                val: 0.0,
+                has_value: false,
+            },
             AggFunc::Avg => AggAcc::Avg { sum: 0.0, n: 0 },
             AggFunc::Min => AggAcc::Min(None),
             AggFunc::Max => AggAcc::Max(None),
@@ -718,12 +721,24 @@ impl AggAcc {
 
     fn finish(self) -> Option<Value> {
         match self {
-            AggAcc::Count(n) => Some(Value::Int(n as i64)),
+            // Saturating cast: a graph with >i64::MAX matched rows is not a
+            // realistic concern today, but a silent wrapping cast would produce
+            // a wrong (negative) count. Clamping to i64::MAX is the least-
+            // surprising failure mode.
+            AggAcc::Count(n) => Some(Value::Int(i64::try_from(n).unwrap_or(i64::MAX))),
             AggAcc::Sum { val, has_value } => {
-                if has_value { Some(Value::Float(val)) } else { None }
+                if has_value {
+                    Some(Value::Float(val))
+                } else {
+                    None
+                }
             }
             AggAcc::Avg { sum, n } => {
-                if n > 0 { Some(Value::Float(sum / n as f64)) } else { None }
+                if n > 0 {
+                    Some(Value::Float(sum / n as f64))
+                } else {
+                    None
+                }
             }
             AggAcc::Min(v) => v,
             AggAcc::Max(v) => v,
@@ -2648,8 +2663,7 @@ LIMIT 10";
         assert_eq!(rs.row(0), &[Some(i(3))]);
 
         // Empty graph: COUNT(*) should return 0.
-        let rs_empty =
-            run(&v, "MATCH (n:Ghost) RETURN COUNT(*)", &params).expect("COUNT(*) empty");
+        let rs_empty = run(&v, "MATCH (n:Ghost) RETURN COUNT(*)", &params).expect("COUNT(*) empty");
         assert_eq!(rs_empty.row(0), &[Some(i(0))]);
     }
 
@@ -2730,6 +2744,88 @@ LIMIT 10";
         assert_eq!(max_rs.row(0), &[Some(i(9))]);
     }
 
+    /// M-2: MIN/MAX with mixed Int and Float props.  The cmp_optional ordering
+    /// places Int and Float by numeric value (cross-variant numeric comparison).
+    #[test]
+    fn min_max_mixed_int_float_props() {
+        let mut fx = Fx::new();
+        // Int 3, Float 1.5, Int 7, Float 2.0 — min=1.5 (Float), max=7 (Int).
+        fx.add("N", "a", vec![("v", i(3))]);
+        fx.add("N", "b", vec![("v", f(1.5))]);
+        fx.add("N", "c", vec![("v", i(7))]);
+        fx.add("N", "d", vec![("v", f(2.0))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let min_rs = run(&v, "MATCH (n:N) RETURN MIN(n.v)", &params).expect("MIN mixed");
+        // 1.5 < 2.0 < 3 < 7 — minimum is Float(1.5).
+        assert_eq!(min_rs.row(0), &[Some(f(1.5))]);
+
+        let max_rs = run(&v, "MATCH (n:N) RETURN MAX(n.v)", &params).expect("MAX mixed");
+        // Maximum is Int(7).
+        assert_eq!(max_rs.row(0), &[Some(i(7))]);
+    }
+
+    /// I-1: LIMIT, SKIP, and ORDER BY are silently dropped for aggregate
+    /// queries (always one result row).  Pin both boundary values.
+    #[test]
+    fn aggregate_limit_skip_order_by_are_no_ops() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![]);
+        fx.add("N", "b", vec![]);
+        fx.add("N", "c", vec![]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        // LIMIT 5 — aggregate always returns exactly 1 row regardless.
+        let rs_lim5 =
+            run(&v, "MATCH (n:N) RETURN COUNT(*) LIMIT 5", &params).expect("COUNT(*) LIMIT 5");
+        assert_eq!(
+            rs_lim5.len(),
+            1,
+            "aggregate with LIMIT 5 must still return 1 row"
+        );
+        assert_eq!(rs_lim5.row(0), &[Some(i(3))]);
+
+        // LIMIT 0 — even LIMIT 0 does not suppress the aggregate row.
+        let rs_lim0 =
+            run(&v, "MATCH (n:N) RETURN COUNT(*) LIMIT 0", &params).expect("COUNT(*) LIMIT 0");
+        assert_eq!(
+            rs_lim0.len(),
+            1,
+            "aggregate with LIMIT 0 must still return 1 row"
+        );
+        assert_eq!(rs_lim0.row(0), &[Some(i(3))]);
+
+        // SKIP 100 — does not discard the single result row.
+        let rs_skip =
+            run(&v, "MATCH (n:N) RETURN COUNT(*) SKIP 100", &params).expect("COUNT(*) SKIP 100");
+        assert_eq!(
+            rs_skip.len(),
+            1,
+            "aggregate with large SKIP must still return 1 row"
+        );
+
+        // ORDER BY is a no-op on a single-row result (but must not panic).
+        // Note: the planner drops ORDER BY for aggregates; verify that the plan
+        // compiles without error and returns the correct count.
+        let rs_ord = plan_src("MATCH (n:N) RETURN COUNT(*) ORDER BY n");
+        // ORDER BY on aggregate: planner drops ORDER BY, so this should plan OK.
+        // (The planner exits early after emitting Aggregate, so ORDER BY is ignored.)
+        assert!(
+            rs_ord.is_ok(),
+            "COUNT(*) ORDER BY should plan without error (ORDER BY dropped)"
+        );
+        let plan_ops = rs_ord.unwrap();
+        // Must not contain an OrderBy op — it was dropped.
+        assert!(
+            !plan_ops
+                .iter()
+                .any(|op| matches!(op, crate::cypher::plan::PlanOp::OrderBy { .. })),
+            "aggregate plan must not contain OrderBy"
+        );
+    }
+
     #[test]
     fn count_star_no_budget_cap_applies() {
         // COUNT(*) with a dense graph that would error the staged path.
@@ -2744,10 +2840,12 @@ LIMIT 10";
         let params = BTreeMap::new();
 
         // Staged path errors on 30 nodes > cap 10.
-        let cap_err = super::with_max_intermediate_rows(10, || {
-            run(&v, "MATCH (n:Dst) RETURN n", &params)
-        });
-        assert!(cap_err.is_err(), "staged path must error on 30 nodes with cap=10");
+        let cap_err =
+            super::with_max_intermediate_rows(10, || run(&v, "MATCH (n:Dst) RETURN n", &params));
+        assert!(
+            cap_err.is_err(),
+            "staged path must error on 30 nodes with cap=10"
+        );
 
         // COUNT(*) does not apply the cap — must complete and return 30.
         let agg_ok = super::with_max_intermediate_rows(10, || {
@@ -2788,8 +2886,7 @@ LIMIT 10";
         );
 
         // SUM(*) → plan error (Star is invalid for SUM).
-        let err3 = plan_src("MATCH (a:N) RETURN SUM(*)")
-            .expect_err("SUM(*) must be plan error");
+        let err3 = plan_src("MATCH (a:N) RETURN SUM(*)").expect_err("SUM(*) must be plan error");
         assert!(
             err3.to_ascii_lowercase().contains("sum") || err3.to_ascii_lowercase().contains("*"),
             "error must mention SUM or *, got: {err3}"

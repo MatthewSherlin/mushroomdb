@@ -37,8 +37,8 @@ pub enum Tok {
     Gt,
     Ge,
     Dash, // BINDING: the lexer emits `Dash`, `Lt`, `Gt` as separate tokens and the
-          // PARSER assembles rel-arrow shapes (`-[..]->`, `<-[..]-`, `-[..]-`);
-          // `<=`, `>=`, `<>` are single tokens (Le, Ge, Ne).
+    // PARSER assembles rel-arrow shapes (`-[..]->`, `<-[..]-`, `-[..]-`);
+    // `<=`, `>=`, `<>` are single tokens (Le, Ge, Ne).
     /// `*` — used in `COUNT(*)`.
     Star,
 }

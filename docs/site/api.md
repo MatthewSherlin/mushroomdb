@@ -77,6 +77,9 @@ values are silently skipped for SUM/AVG/MIN/MAX. Grouped aggregation
 (`RETURN a, COUNT(*)`) returns a `plan:` error — use the traversal API
 or filter to a single aggregate.
 
+`LIMIT`, `SKIP`, and `ORDER BY` are no-ops on aggregate queries in v1;
+the single result row is always returned regardless.
+
 **Multi-hop LIMIT:** `MATCH (a)-[:T]->(b)-[:T]->(c) RETURN a, b, c LIMIT 100`
 runs with O(LIMIT) memory via the pull-based executor. Dense patterns
 without `LIMIT` still error at 1,000,000 intermediate rows.
