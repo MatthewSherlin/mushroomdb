@@ -16,8 +16,10 @@ export const NO_RESULT_HINT = "Run a query first";
 
 /**
  * Nodes with degree above this threshold are skipped during auto-expansion in
- * {@link addHarvestedToCanvas} and marked dirty for lazy expand-on-click.
- * Keeps Add-to-canvas responsive even when a result includes dense hubs.
+ * {@link addHarvestedToCanvas}. They are placed on the canvas un-expanded
+ * (via mergeQueryGraph) so a single user click triggers expandNode directly.
+ * markDirty is also applied so the live-resync path picks them up if a watch
+ * event arrives before the user clicks.
  */
 export const DENSE_HUB_DEGREE_THRESHOLD = 50;
 
@@ -155,8 +157,10 @@ export async function addHarvestedToCanvas(
   let skipped = 0;
   const { errors } = await mapPool(keys, EXPLAIN_CONCURRENCY, async (key) => {
     // Fetch degree first (cheap). Dense hubs (degree > DENSE_HUB_DEGREE_THRESHOLD)
-    // are marked dirty for lazy expand-on-click and skipped here so that Add
-    // never blocks >5 s when the result includes a hub with hundreds of edges.
+    // are skipped here so Add never blocks >5 s for nodes with hundreds of edges.
+    // The node is already on canvas via mergeQueryGraph; a user click calls
+    // expandNode directly (see Explorer.onPointClick). markDirty additionally
+    // registers it for the live-resync path in case a watch event arrives first.
     let degree: number | undefined;
     try {
       const ne = await api.nodeEdges(key);
@@ -168,7 +172,9 @@ export async function addHarvestedToCanvas(
       // Absent endpoint (old server) or key miss — fall through to full expand.
     }
     if (degree !== undefined && degree > DENSE_HUB_DEGREE_THRESHOLD) {
-      // Mark dirty so watch-based lazy expansion can pick it up on click.
+      // markDirty: if a live-watch event arrives before the user clicks, the
+      // resync path will pick this node up. The primary expand path is the
+      // user's click → Explorer.onPointClick → expandNode (unconditional).
       store.markDirty(key);
       skipped += 1;
       return;

@@ -3,11 +3,16 @@
  *
  * F1: Rules slide-over (z-index 7) intercepted pointer events over the
  *     console's Run button (z-index 6) when both panels were open.
- *     Fix: console raised to z-index 8 (console drawer above rules panel).
+ *     Fix: .rules { bottom: var(--console-h, 0px) } clips the panel's
+ *     hit-test area to the console's top edge — z-order is unchanged
+ *     (rules 7, console 6); the side panel simply never overlaps the bar.
  *
  * F2: addHarvestedToCanvas called expandNode for every added node at depth-1,
  *     which blocked the UI >5 s for dense hubs (400+ edges).
- *     Fix: degree > 50 → skip auto-expansion, mark dirty, show progress hint.
+ *     Fix: degree > 50 → skip auto-expansion; node lands on canvas via
+ *     mergeQueryGraph and expands on the next user click (expandNode is
+ *     called unconditionally by Explorer.onPointClick). markDirty also fires
+ *     so the live-resync path picks it up if a watch event arrives first.
  */
 import { expect, test } from "@playwright/test";
 import { openConsole, waitConnected } from "./helpers";
