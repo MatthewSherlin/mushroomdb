@@ -158,8 +158,8 @@ and honesty notes: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/resu
 | Neighborhood depth-1 (p50) | 0.4 µs | 1.81 ms | 101 µs | 3.00 ms |
 | Neighborhood depth-1 (p95) | 2.2 µs | 14.47 ms | 405 µs | 6.71 ms |
 | Neighborhood depth-2 (p50) | 0.2 µs | 4.73 ms | 1.06 ms | 2.50 ms |
-| Cypher scan-filter-project | 2.20 ms | 87.36 ms | 2.03 ms ‡ | 12.56 ms |
-| Cypher two-hop join | **0.198 ms** | 85.57 ms ★ | 1.42 ms ★ | 2.01 ms ★ |
+| Cypher scan-filter-project (1.4k rows) | 2.20 ms | 87.36 ms | 0.37 ms ‡ | 12.56 ms |
+| Cypher two-hop join (200 rows) | **0.198 ms** | 5.68 ms ★ | 1.58 ms ★ | 2.17 ms ★ |
 | Cold-start (WAL-only / connect) | 3.24 s | 18.54 ms ▲ | 23.41 ms | 0.42 ms ▲ |
 | Cold-start (snapshot V4) | **1.01 s** | — | — | — |
 | Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
@@ -174,14 +174,15 @@ and honesty notes: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/resu
   v1 stored only `key`, causing scan-filter to return 0 rows. v2 correctly
   returns 1,400 rows. Bulk ingest time increased from 46 ms (key-only) to
   19.9 s (full props) — now semantically comparable to neo4j/mushroomdb.
-- ‡ KùzuDB scan-filter uses `WHERE n.key STARTS WITH 'talent'` (no full props
-  stored in kuzu adapter); returns all 7,000 Talent nodes, not the 1,400
-  matching `size_bucket = 3`. Not semantically equivalent.
-- ★ Neo4j / KùzuDB / Memgraph `cypher_two_hop` returns **0 rows** — no
-  INDUSTRY_ALIGNMENT edges exist (no auto-derivation). Timing measures an empty
-  traversal. mushroomdb derives these edges via rules and returns **200 rows**
-  in 0.198 ms. The v1 mushroomdb row was ERROR (fixed by Plan-12 pull executor
-  with LIMIT pushdown).
+- ‡ KùzuDB scan-filter (I2 fix): adapter now stores `size_bucket INT64`; uses
+  `WHERE n.size_bucket = 3` returning 1,400 rows (was `STARTS WITH 'talent'`
+  → 7,000 rows at 2.03 ms; retired).
+- ★ Two-hop join (I1 fix — fair comparison): mushroomdb's 1,000,000 derived
+  INDUSTRY_ALIGNMENT edges were bulk-loaded into each competitor as ordinary edges
+  (pre-materialization). All engines return **200 rows** from the same query.
+  Pre-mat one-time cost: neo4j 10.8 s, kuzu 0.17 s (COPY FROM CSV), memgraph 8.0 s.
+  mushroomdb derives the same edges in **0.924 s automatically** — no manual ETL.
+  The v1 mushroomdb row was ERROR (fixed by Plan-12 pull executor with LIMIT pushdown).
 - ▲ Neo4j / Memgraph `cold_start` = connect + first query (server already running).
   `boot-to-ready` reports container-start-to-ready: neo4j 6.6 s, memgraph 4.3 s.
   mushroomdb and KùzuDB are embedded — `cold_start` IS the full startup cost.
@@ -193,7 +194,7 @@ equivalent; this workload has no cross-engine baseline.
 
 100k cold-start (from `dogfood/results/scale-100k.md`, rebuilt 2026-08-20):
 WAL-only open: **8.86 min** (re-fires all 12 rules; IVF-Flat dominates).
-Snapshot V4 open: **11.15 s** (derived edges + IVF centroids loaded; no re-fire; **47.7× faster**).
+Snapshot V4 open: **11.15 s** (derived edges + IVF centroids loaded; no re-fire; **47.7× faster**; write cost: 36.1 s paid once at graceful shutdown).
 See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
 
 ---

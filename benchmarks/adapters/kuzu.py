@@ -72,14 +72,19 @@ def _open_db(db_dir: str | Path) -> tuple[Any, Any]:
 
 
 def _setup_schema(conn: Any) -> None:
-    """Create node tables for Talent, Company, Job."""
-    # KùzuDB requires schema creation before loading.
-    for label in ("Talent", "Company", "Job"):
+    """Create node tables for Talent, Company, Job with key fields for benchmarks.
+
+    KùzuDB requires typed schemas. We store `size_bucket` (INT64) on Talent and
+    Company so that `WHERE n.size_bucket = 3` works equivalently to neo4j/mushroomdb.
+    """
+    schemas = {
+        "Talent": "key STRING, size_bucket INT64, PRIMARY KEY(key)",
+        "Company": "key STRING, size_bucket INT64, PRIMARY KEY(key)",
+        "Job": "key STRING, PRIMARY KEY(key)",
+    }
+    for label, cols in schemas.items():
         try:
-            conn.execute(
-                f"CREATE NODE TABLE IF NOT EXISTS {label} "
-                f"(key STRING, PRIMARY KEY(key))"
-            )
+            conn.execute(f"CREATE NODE TABLE IF NOT EXISTS {label} ({cols})")
         except Exception:
             pass
     for rel, src, dst in [
@@ -97,7 +102,11 @@ def _setup_schema(conn: Any) -> None:
 
 
 def bulk_ingest(nodes: list[dict], db_dir: str | Path) -> dict[str, Any]:
-    """Ingest *nodes* into a KùzuDB at *db_dir*."""
+    """Ingest *nodes* into a KùzuDB at *db_dir*.
+
+    Stores key + size_bucket for Talent/Company nodes so that the scan-filter
+    predicate WHERE n.size_bucket = 3 is semantically equivalent to neo4j/mushroomdb.
+    """
     _check_or_skip()
     kuzu = _import_kuzu()
     db = kuzu.Database(str(db_dir))
@@ -106,23 +115,25 @@ def bulk_ingest(nodes: list[dict], db_dir: str | Path) -> dict[str, Any]:
     t0 = time.perf_counter()
     inserted = 0
     from collections import defaultdict
-    by_label: dict[str, list[str]] = defaultdict(list)
+    by_label: dict[str, list[dict]] = defaultdict(list)
     for n in nodes:
-        by_label[n["label"]].append(n["key"])
-    for label, keys in by_label.items():
-        try:
-            conn.execute(
-                f"CREATE NODE TABLE IF NOT EXISTS {label} "
-                f"(key STRING, PRIMARY KEY(key))"
-            )
-        except Exception:
-            pass
-        for key in keys:
+        row: dict = {"key": n["key"]}
+        if n["label"] in ("Talent", "Company"):
+            row["size_bucket"] = int(n.get("props", {}).get("size_bucket", 0) or 0)
+        by_label[n["label"]].append(row)
+    for label, rows in by_label.items():
+        for row in rows:
             try:
-                conn.execute(
-                    f"CREATE (n:{label} {{key: $k}})",
-                    {"k": key},
-                )
+                if label in ("Talent", "Company"):
+                    conn.execute(
+                        f"CREATE (n:{label} {{key: $k, size_bucket: $sb}})",
+                        {"k": row["key"], "sb": row["size_bucket"]},
+                    )
+                else:
+                    conn.execute(
+                        f"CREATE (n:{label} {{key: $k}})",
+                        {"k": row["key"]},
+                    )
                 inserted += 1
             except Exception:
                 pass
@@ -185,9 +196,13 @@ def neighborhood_depth2(conn: Any, sample_keys: list[str]) -> dict[str, Any]:
 
 
 def cypher_scan_filter(conn: Any) -> dict[str, Any]:
-    """Scan-filter-project: MATCH (n:Talent) WHERE n.size_bucket = 3 RETURN n.key"""
+    """Scan-filter-project: MATCH (n:Talent) WHERE n.size_bucket = 3 RETURN n.key
+
+    v2: uses the real size_bucket predicate (schema now stores size_bucket INT64),
+    semantically equivalent to neo4j/mushroomdb — returns the same 1,400 rows.
+    """
     _check_or_skip()
-    cypher = "MATCH (n:Talent) WHERE n.key STARTS WITH 'talent' RETURN n.key"
+    cypher = "MATCH (n:Talent) WHERE n.size_bucket = 3 RETURN n.key"
     t0 = time.perf_counter()
     try:
         result = conn.execute(cypher)
@@ -206,11 +221,16 @@ def cypher_scan_filter(conn: Any) -> dict[str, Any]:
 
 
 def cypher_two_hop(conn: Any) -> dict[str, Any]:
-    """Two-hop join via Cypher."""
+    """Two-hop join via Cypher: Talent→Company←Talent via INDUSTRY_ALIGNMENT.
+
+    Direction matches mushroomdb's query: both Talent nodes point *to* the same
+    Company hub.  Requires INDUSTRY_ALIGNMENT edges to be pre-loaded (see I1
+    bench notes — mushroomdb derives these automatically via create_rule).
+    """
     _check_or_skip()
     cypher = (
         "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)"
-        "-[:INDUSTRY_ALIGNMENT]->(t2:Talent) "
+        "<-[:INDUSTRY_ALIGNMENT]-(t2:Talent) "
         "RETURN t.key, c.key, t2.key LIMIT 200"
     )
     t0 = time.perf_counter()

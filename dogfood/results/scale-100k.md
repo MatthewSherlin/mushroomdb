@@ -30,7 +30,7 @@ hardware, no network, synthetic embeddings).
 | big3_slice | ok | 34.03 ms | 7.04 GiB | 1.68 GiB | 500T×500C metro/industry slice (all 3 rules fire uncapped) |
 | explain | ok | 90.33 ms | 7.04 GiB | 1.37 GiB | p50=112.1 µs p95=570.7 µs n=100 |
 | reopen | ok | 8.86 min | 8.48 GiB | 1.45 GiB | WAL reopen: rules re-fire on open() (derived edges not persisted) |
-| reopen_snap | ok | 47.252 s | 8.48 GiB | 3.68 GiB | snapshot reopen: snapshot() + close + open; rules still re-fire |
+| reopen_snap | ok | 47.252 s | 8.48 GiB | 3.68 GiB | snapshot V4: snapshot() + close + open; derived edges + IVF centroids loaded from snapshot; no rule re-fire. write=36.105 s + open=11.148 s |
 
 ## Semantic phases (phase 3)
 
@@ -96,16 +96,18 @@ new rule instance that may reach high-fanout at production scale.
 
 ## Reopen (cold-start)
 
-**Mechanism:** Derived edges are NOT persisted in the WAL or snapshot.
-On every `open()` the engine re-fires all declared rules from node data.
-The WAL stores only node inserts + rule declarations (~120 MiB delta).
-the snapshot stores only node data. Cold-start time therefore scales with
-rule count × rule computation complexity, independent of edge count.
-The dominant cost at this rule set is IVF-Flat re-derivation (~7.68 min).
-**Roadmap #1:** Derived-edge persistence / snapshot-including-derived.
+**WAL-only path:** On `open()` without a snapshot, the engine replays the WAL
+(node inserts + rule declarations) and re-fires all declared rules from node data.
+Cold-start time scales with rule count × rule computation complexity.
+The dominant cost is IVF-Flat re-derivation (~8.37 min at this rule set).
 
-- **WAL reopen:** 8.86 min (ok) — close + open; rules re-fire (9 streaming ~20s + IVF-Flat ~7.68 min = bottleneck)
-- **Snapshot reopen:** 47.252 s (snapshot=36.105 s + open=11.148 s) (ok) — snapshot() + close + open; rules ALSO re-fire (derived edges not in snapshot)
+**Snapshot V4 path (Plan-12 T4):** `snapshot()` writes derived edges + IVF centroids
+to the snapshot file (V4 format). On subsequent `open()`, these are loaded directly —
+no rule re-fire. The 11.148 s open time (vs 8.86 min WAL-only) reflects loading
+pre-materialized edges from disk, not rule recomputation.
+
+- **WAL reopen:** 8.86 min (ok) — close + open, no snapshot; re-fires all rules (non-semantic ~21 s + IVF-Flat ~8.37 min = bottleneck)
+- **Snapshot reopen:** 47.252 s total (snapshot write=36.105 s + open=11.148 s) (ok) — V4 snapshot: derived edges + IVF centroids loaded; no rule re-fire; **47.7× faster than WAL-only on the open() step**
 
 ## Oracle
 

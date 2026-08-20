@@ -42,17 +42,19 @@
   fields (key + props). `cypher_scan_filter` now correctly returns 1,400 rows (same as
   neo4j/mushroomdb) instead of 0. `bulk_ingest` time increased from 46 ms to 19.9 s
   because full property serialization now occurs.
-- **cypher_two_hop semantics:** mushroomdb derives INDUSTRY_ALIGNMENT edges via the
-  `bench_industry_tc` rule (FieldEqual on `industry`) and returns 200 rows (LIMIT reached).
-  Neo4j, KùzuDB, and Memgraph have no auto-derivation — they return 0 rows (INDUSTRY_ALIGNMENT
-  edges never created). Timing for competitors measures scanning an empty relationship type,
-  not a real two-hop join. The real apples-to-apples story: with auto-derivation, mushroomdb
-  runs the query in **0.20 ms**; without it, there is nothing to query. Competitor two-hop
-  times are included for completeness but are not semantically equivalent.
-- **kuzu cypher_scan_filter:** KùzuDB only stores the `key` field (no full props in the
-  ingest adapter). The adapter uses `WHERE n.key STARTS WITH 'talent'` as a workaround,
-  which matches all 7,000 Talent nodes. This is not semantically equivalent to
-  `WHERE n.size_bucket = 3` (which returns 1,400 rows).
+- **cypher_two_hop (I1 fix — fair comparison):** mushroomdb derives INDUSTRY_ALIGNMENT edges
+  automatically via the `bench_industry_tc` rule (FieldEqual on `industry`). For a fair
+  comparison, the 1,000,000 derived edges were exported and bulk-loaded into each competitor
+  engine as ordinary edges (pre-materialization). All four engines then ran the same query:
+  `MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)<-[:INDUSTRY_ALIGNMENT]-(t2:Talent)
+  RETURN t.key, c.key, t2.key LIMIT 200` — all return **200 rows**.
+  **Edge pre-materialization times (one-time cost):** neo4j 10.8 s, kuzu 0.17 s (COPY FROM CSV),
+  memgraph 8.0 s. mushroomdb derives the edges in 0.924 s automatically on rule declaration.
+  Competitors required manual ETL; mushroomdb's rule engine replaces this step entirely.
+- **kuzu cypher_scan_filter (I2 fix):** KùzuDB adapter updated to store `size_bucket INT64`
+  (full props). Scan-filter now uses `WHERE n.size_bucket = 3` — returns 1,400 rows
+  (identical to neo4j/mushroomdb/memgraph). Previous workaround (`STARTS WITH 'talent'`,
+  7,000 rows) is retired.
 - **cold_start asymmetry:** mushroomdb `cold_start` measures `GraphDb::open()` + first
   `node_edges()` call (full process cost). Neo4j / Memgraph `cold_start` measures
   connect+first query with the server **already running** — their server boot cost is
@@ -69,8 +71,8 @@
 | neighborhood_depth1 (p50) | 0.4 µs | 1.81 ms | 101 µs | 3.00 ms |
 | neighborhood_depth1 (p95) | 2.2 µs | 14.47 ms | 405 µs | 6.71 ms |
 | neighborhood_depth2 (p50) | 0.2 µs | 4.73 ms | 1.06 ms | 2.50 ms |
-| cypher scan-filter-project | 2.20 ms | 87.36 ms | 2.03 ms ‡ | 12.56 ms |
-| cypher two-hop join | **0.198 ms** | 85.57 ms ★ | 1.42 ms ★ | 2.01 ms ★ |
+| cypher scan-filter-project (1.4k rows) | 2.20 ms | 87.36 ms | 0.37 ms ‡ | 12.56 ms |
+| cypher two-hop join (200 rows) | **0.198 ms** | 5.68 ms ★ | 1.58 ms ★ | 2.17 ms ★ |
 | cold_start (WAL-only / connect) | 3.24 s | 18.54 ms ▲ | 23.41 ms | 0.42 ms ▲ |
 | cold_start (snapshot V4) | **1.01 s** | — | — | — |
 | server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
@@ -78,15 +80,16 @@
 † memgraph `bulk_ingest`: v2 fix stores full props (`SET n = row`); time reflects real
   property serialization. v1 was 46 ms (key only — semantically incomplete).
 
-‡ kuzu `cypher_scan_filter` uses `WHERE n.key STARTS WITH 'talent'` (adapter limitation:
-  only `key` stored; no `size_bucket`); returns all 7,000 Talent nodes, not the 1,400
-  matching `size_bucket = 3`. Not semantically equivalent.
+‡ kuzu `cypher_scan_filter`: I2 fix — adapter now stores `size_bucket INT64`; uses
+  `WHERE n.size_bucket = 3` returning 1,400 rows (was `STARTS WITH 'talent'` → 7,000 rows).
+  0.37 ms is best-of-5; same predicate semantics as neo4j/mushroomdb/memgraph.
 
-★ neo4j / kuzu / memgraph `cypher_two_hop`: returns **0 rows** — INDUSTRY_ALIGNMENT edges
-  do not exist (no auto-derivation engine). Timing measures scanning an empty relationship.
-  mushroomdb returns **200 rows** (LIMIT reached) in 0.198 ms after the bench_industry_tc
-  rule derives the edges. The v1 mushroomdb row was ERROR; this is now fixed (Plan-12 pull
-  executor with LIMIT pushdown).
+★ neo4j / kuzu / memgraph `cypher_two_hop` (I1 fix): all return **200 rows** after
+  1,000,000 INDUSTRY_ALIGNMENT edges were bulk-loaded as ordinary edges (pre-materialization).
+  One-time pre-mat cost: neo4j 10.8 s, kuzu 0.17 s (COPY FROM CSV), memgraph 8.0 s.
+  mushroomdb derives the same edges automatically in 0.924 s on rule declaration — no manual
+  ETL required. v1 entries showed 0 rows (empty scan); those have been superseded by this run.
+  mushroomdb v1 row was ERROR; fixed (Plan-12 pull executor with LIMIT pushdown).
 
 ▲ neo4j / memgraph `cold_start`: server already running; measures connect + first query
   only. `boot-to-ready` row reports the actual container-start-to-first-query-answered time

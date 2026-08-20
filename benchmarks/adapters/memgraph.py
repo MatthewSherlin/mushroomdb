@@ -218,11 +218,15 @@ def cypher_scan_filter() -> dict[str, Any]:
 
 
 def cypher_two_hop() -> dict[str, Any]:
-    """Two-hop join via Cypher."""
+    """Two-hop join via Cypher: Talent→Company←Talent via INDUSTRY_ALIGNMENT.
+
+    Direction matches mushroomdb's query. Requires INDUSTRY_ALIGNMENT edges
+    pre-loaded (mushroomdb derives them automatically via create_rule).
+    """
     info = _check_or_skip()
     cypher = (
         "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)"
-        "-[:INDUSTRY_ALIGNMENT]->(t2:Talent) "
+        "<-[:INDUSTRY_ALIGNMENT]-(t2:Talent) "
         "RETURN t.key, c.key, t2.key LIMIT 200"
     )
     t0 = time.perf_counter()
