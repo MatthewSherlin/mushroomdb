@@ -303,7 +303,8 @@ fn harness_industry_alignment_timing() {
             row
         })
         .collect();
-    db.ingest("Talent", talent_rows, &opts).expect("talent ingest");
+    db.ingest("Talent", talent_rows, &opts)
+        .expect("talent ingest");
 
     let company_rows: Vec<BTreeMap<String, Value>> = (0..N_COMPANY)
         .map(|i| {
@@ -316,7 +317,8 @@ fn harness_industry_alignment_timing() {
             row
         })
         .collect();
-    db.ingest("Company", company_rows, &opts).expect("company ingest");
+    db.ingest("Company", company_rows, &opts)
+        .expect("company ingest");
 
     // IA edges: Talent → Company when industry matches (FieldEqual).
     let rule = RuleDef {

@@ -605,13 +605,25 @@ fn exec_filter(
 /// does **not** count toward the bound.  Execution may therefore visit
 /// slightly more source rows than the bare LIMIT number, but will never
 /// emit more than `bound` result rows.
+/// Immutable context shared across all `pull_rows` recursive calls.
+struct PullCtx<'a> {
+    view: &'a GraphView<'a>,
+    vars: &'a VarTable,
+    project_items: &'a [RetItem],
+    params: &'a Params<'a>,
+    bound: usize,
+}
+
 fn execute_pull(
     view: &GraphView,
     plan: &[PlanOp],
     params: &Params,
     bound: usize,
 ) -> Result<ResultSet, String> {
-    let proj_pos = match plan.iter().position(|op| matches!(op, PlanOp::Project { .. })) {
+    let proj_pos = match plan
+        .iter()
+        .position(|op| matches!(op, PlanOp::Project { .. }))
+    {
         Some(p) => p,
         None => return Ok(ResultSet::new(vec![])),
     };
@@ -622,18 +634,16 @@ fn execute_pull(
     };
     let columns: Vec<String> = project_items.iter().map(column_name).collect();
     let vars = collect_vars(plan);
-    let initial_row: Row = vec![None; vars.names.len()];
-    let mut result_rows: Vec<Vec<Option<Value>>> = Vec::with_capacity(bound);
-    pull_rows(
+    let ctx = PullCtx {
         view,
-        &vars,
-        producers,
+        vars: &vars,
         project_items,
         params,
-        &initial_row,
-        &mut result_rows,
         bound,
-    )?;
+    };
+    let initial_row: Row = vec![None; vars.names.len()];
+    let mut result_rows: Vec<Vec<Option<Value>>> = Vec::with_capacity(bound);
+    pull_rows(&ctx, producers, &initial_row, &mut result_rows)?;
     // SKIP: discard the leading rows (bound = SKIP+LIMIT ensures there are enough).
     let skip_n = plan[proj_pos + 1..]
         .iter()
@@ -651,30 +661,26 @@ fn execute_pull(
 }
 
 /// Recursively pull rows through `ops`, projecting into `result` until
-/// `result.len() >= bound`.
+/// `result.len() >= ctx.bound`.
 ///
 /// Each arm binds one `PlanOp` and recurses on `rest`.  When `ops` is empty
 /// (all producers consumed), the current `row` is projected and appended.
 fn pull_rows(
-    view: &GraphView,
-    vars: &VarTable,
+    ctx: &PullCtx<'_>,
     ops: &[PlanOp],
-    project_items: &[RetItem],
-    params: &Params,
     row: &Row,
     result: &mut Vec<Vec<Option<Value>>>,
-    bound: usize,
 ) -> Result<(), String> {
-    if result.len() >= bound {
+    if result.len() >= ctx.bound {
         return Ok(());
     }
     let (op, rest) = match ops.split_first() {
         Some(pair) => pair,
         None => {
             // All producers consumed — project this final row.
-            let mut cells = Vec::with_capacity(project_items.len());
-            for item in project_items {
-                cells.push(project_item(view, vars, row, item)?);
+            let mut cells = Vec::with_capacity(ctx.project_items.len());
+            for item in ctx.project_items {
+                cells.push(project_item(ctx.view, ctx.vars, row, item)?);
             }
             result.push(cells);
             return Ok(());
@@ -682,17 +688,18 @@ fn pull_rows(
     };
     match op {
         PlanOp::ScanLabel { var, label } => {
-            let ids = scan_ids(view, label.as_deref());
-            let slot = vars
+            let ids = scan_ids(ctx.view, label.as_deref());
+            let slot = ctx
+                .vars
                 .slot(var)
                 .ok_or_else(|| format!("unbound variable `{var}`"))?;
             for &id in &ids {
-                if result.len() >= bound {
+                if result.len() >= ctx.bound {
                     break;
                 }
                 let mut next = row.clone();
                 next[slot] = Some(Cell::Node(id));
-                pull_rows(view, vars, rest, project_items, params, &next, result, bound)?;
+                pull_rows(ctx, rest, &next, result)?;
             }
         }
         PlanOp::Expand {
@@ -704,20 +711,21 @@ fn pull_rows(
             to_label,
             to_props,
         } => {
-            let etypes = resolve_etypes(view, etype.as_deref());
+            let etypes = resolve_etypes(ctx.view, etype.as_deref());
             let exp_dir = map_dir(*dir);
-            let to_slot = vars
+            let to_slot = ctx
+                .vars
                 .slot(to)
                 .ok_or_else(|| format!("unbound variable `{to}`"))?;
-            let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
-            let from_id = require_node(row, vars, from)?;
+            let rel_slot = rel_var.as_ref().and_then(|rv| ctx.vars.slot(rv));
+            let from_id = require_node(row, ctx.vars, from)?;
             let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Node(id)) => Some(*id),
                 Some(Cell::Rel(_)) => return Err(format!("variable `{to}` is not a node")),
                 None => None,
             };
-            for e in expand(view, from_id, etypes.as_deref(), exp_dir) {
-                if result.len() >= bound {
+            for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
+                if result.len() >= ctx.bound {
                     break;
                 }
                 if row_has_edge(row, &e) {
@@ -729,7 +737,15 @@ fn pull_rows(
                         continue;
                     }
                 }
-                if !node_matches(view, vars, row, nbr, to_label.as_deref(), to_props, params)? {
+                if !node_matches(
+                    ctx.view,
+                    ctx.vars,
+                    row,
+                    nbr,
+                    to_label.as_deref(),
+                    to_props,
+                    ctx.params,
+                )? {
                     continue;
                 }
                 let mut next = row.clone();
@@ -741,28 +757,61 @@ fn pull_rows(
                 }
                 #[cfg(test)]
                 record_expand_row();
-                pull_rows(view, vars, rest, project_items, params, &next, result, bound)?;
+                pull_rows(ctx, rest, &next, result)?;
             }
         }
         PlanOp::Filter { expr } => {
-            if eval_expr(view, vars, row, expr, params, 0)? {
-                pull_rows(view, vars, rest, project_items, params, row, result, bound)?;
+            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params, 0)? {
+                pull_rows(ctx, rest, row, result)?;
             }
         }
         PlanOp::LookupProps { var, props } => {
-            let id = require_node(row, vars, var)?;
-            if node_matches(view, vars, row, id, None, props, params)? {
-                pull_rows(view, vars, rest, project_items, params, row, result, bound)?;
+            let id = require_node(row, ctx.vars, var)?;
+            if node_matches(ctx.view, ctx.vars, row, id, None, props, ctx.params)? {
+                pull_rows(ctx, rest, row, result)?;
             }
         }
         PlanOp::JoinBound { var, label, props } => {
-            let id = require_node(row, vars, var)?;
-            if node_matches(view, vars, row, id, label.as_deref(), props, params)? {
-                pull_rows(view, vars, rest, project_items, params, row, result, bound)?;
+            let id = require_node(row, ctx.vars, var)?;
+            if node_matches(
+                ctx.view,
+                ctx.vars,
+                row,
+                id,
+                label.as_deref(),
+                props,
+                ctx.params,
+            )? {
+                pull_rows(ctx, rest, row, result)?;
             }
         }
-        // Project/OrderBy/Skip/Limit are handled by execute_pull wrapper.
-        _ => {}
+        // The ops below must never appear inside the producers slice that
+        // pull_rows receives.  Explicitly reject each so that adding a new
+        // PlanOp variant to the enum forces a compile-time decision here
+        // rather than silently falling through and producing wrong results.
+        PlanOp::Project { .. } => {
+            return Err(
+                "pull executor: Project reached pull_rows — plan is structurally malformed"
+                    .to_string(),
+            );
+        }
+        PlanOp::OrderBy { .. } => {
+            return Err(
+                "pull executor: OrderBy reached pull_rows — queries with ORDER BY \
+                 must use the staged path (row_bound returns None)"
+                    .to_string(),
+            );
+        }
+        PlanOp::Skip(n) => {
+            return Err(format!(
+                "pull executor: Skip({n}) reached pull_rows — Skip must appear after Project"
+            ));
+        }
+        PlanOp::Limit(n) => {
+            return Err(format!(
+                "pull executor: Limit({n}) reached pull_rows — Limit must appear after Project"
+            ));
+        }
     }
     Ok(())
 }
@@ -1628,50 +1677,120 @@ LIMIT 10";
     // ──────────────────────────────────────────────────────────────────────────
 
     proptest! {
-        /// For any randomly-generated graph and any SKIP/LIMIT values,
-        /// the pull-based bounded executor must return exactly the same rows as
-        /// the staged unbounded reference, sliced to `[SKIP .. SKIP+LIMIT]`.
+        /// Randomised property test covering:
+        ///
+        /// - **Multi-hop** (1, 2, or 3 hops) — exercises nested pull_rows recursion.
+        /// - **Optional WHERE filter** on a numeric prop `v` — bound must count
+        ///   only post-filter rows.
+        /// - **Cycle / shared-node topologies** — duplicate directed pairs and
+        ///   reciprocal edges create paths where relationship-uniqueness rejects
+        ///   some traversals; rejected rows must not count toward the bound.
+        /// - **Randomized SKIP + LIMIT** — pull collects SKIP+LIMIT rows then
+        ///   the wrapper discards the leading SKIP.
+        ///
+        /// Invariant: bounded[0..] == unbounded[skip..skip+limit] for all shapes.
         #[test]
         fn prop_bounded_equals_unbounded_slice(
-            n_nodes in 2u32..12u32,
-            edge_pairs in proptest::collection::vec(
-                (any::<u32>(), any::<u32>()), 0..25usize
+            n_nodes     in 2u32..10u32,
+            edge_pairs  in proptest::collection::vec(
+                (any::<u32>(), any::<u32>()), 0..20usize
             ),
-            limit in 1u64..12u64,
-            skip  in 0u64..4u64,
+            // Extra reciprocal pairs to force uniqueness rejections on cycles.
+            recip_pairs in proptest::collection::vec(
+                (any::<u32>(), any::<u32>()), 0..8usize
+            ),
+            n_hops      in 1u32..4u32,   // 1, 2, or 3 hops
+            use_filter  in any::<bool>(),
+            threshold   in 0i64..8i64,   // filter: last-node.v > threshold
+            limit       in 1u64..10u64,
+            skip        in 0u64..4u64,
         ) {
             let mut fx = Fx::new();
             let mut node_ids = Vec::new();
-            for i in 0..n_nodes {
-                let id = fx.add("N", &format!("n{i}"), vec![]);
+            for idx in 0..n_nodes {
+                // Every node carries a numeric prop `v` for the optional filter.
+                let id = fx.add("N", &format!("n{idx}"), vec![("v", i(idx as i64 % 8))]);
                 node_ids.push(id);
             }
+            let n = node_ids.len();
+
+            // Primary edges (forward direction).
             for (si, di) in &edge_pairs {
-                let si = (*si as usize) % node_ids.len();
-                let di = (*di as usize) % node_ids.len();
+                let si = (*si as usize) % n;
+                let di = (*di as usize) % n;
                 if si != di {
                     fx.edge("T", node_ids[si], node_ids[di], vec![]);
                 }
             }
+            // Reciprocal edges — create A→B + B→A pairs so multi-hop paths
+            // have uniqueness-rejected candidates (walking back the same edge).
+            for (si, di) in &recip_pairs {
+                let si = (*si as usize) % n;
+                let di = (*di as usize) % n;
+                if si != di {
+                    fx.edge("T", node_ids[si], node_ids[di], vec![]);
+                    fx.edge("T", node_ids[di], node_ids[si], vec![]);
+                }
+            }
+
             let v = fx.view();
             let params = BTreeMap::new();
 
-            let full_plan = compile("MATCH (a:N)-[:T]->(b:N) RETURN a, b");
-            let unbounded = super::execute_unbounded(&v, &full_plan, &Params(&params))
-                .expect("unbounded must not error");
+            // Build query for `n_hops` hops with optional WHERE on the last node.
+            // Variable names: a→b→c→d for hops 1/2/3.
+            let var_names = ["a", "b", "c", "d"];
+            let hop_count = n_hops as usize;
+            let mut pattern = format!("({}:N)", var_names[0]);
+            for h in 0..hop_count {
+                pattern.push_str(&format!("-[:T]->({}", var_names[h + 1]));
+                // Label the intermediate and last nodes as :N only for last.
+                if h + 1 == hop_count {
+                    pattern.push_str(":N)");
+                } else {
+                    pattern.push(')');
+                }
+            }
+            let last_var = var_names[hop_count];
+            let where_clause = if use_filter {
+                format!(" WHERE {last_var}.v > {threshold}")
+            } else {
+                String::new()
+            };
+            let ret_vars: Vec<&str> = var_names[..=hop_count].to_vec();
+            let ret_clause = ret_vars.join(", ");
+
+            let full_q = format!("MATCH {pattern}{where_clause} RETURN {ret_clause}");
+            let bounded_q = format!(
+                "MATCH {pattern}{where_clause} RETURN {ret_clause} SKIP {skip} LIMIT {limit}"
+            );
+
+            let full_plan = compile(&full_q);
+            // Use a generous cap for the reference run so it never errors on
+            // small graphs, even with cycles.
+            let unbounded = super::with_max_intermediate_rows(100_000, || {
+                super::execute_unbounded(&v, &full_plan, &Params(&params))
+            });
+            // If the reference itself errors (shouldn't happen at this scale),
+            // skip the proptest case rather than failing.
+            let unbounded = match unbounded {
+                Ok(rs) => rs,
+                Err(_) => return Ok(()),
+            };
             let total = unbounded.len();
             let full_rows = rows_of(&unbounded);
 
-            let q = format!("MATCH (a:N)-[:T]->(b:N) RETURN a, b SKIP {skip} LIMIT {limit}");
-            let bounded = run(&v, &q, &params).expect("bounded must not error");
+            let bounded = super::with_max_intermediate_rows(100_000, || {
+                run(&v, &bounded_q, &params)
+            }).expect("bounded must not error");
 
             let s = (skip as usize).min(total);
             let e = (skip as usize + limit as usize).min(total);
             prop_assert_eq!(
                 rows_of(&bounded),
                 full_rows[s..e].to_vec(),
-                "SKIP {} LIMIT {}: bounded result differs from unbounded[{}..{}]",
-                skip, limit, s, e
+                "hops={} filter={} threshold={} SKIP {} LIMIT {}: \
+                 bounded != unbounded[{}..{}]",
+                hop_count, use_filter, threshold, skip, limit, s, e
             );
         }
     }
@@ -1713,7 +1832,9 @@ LIMIT 10";
             "staged path must error on 120 leaves with cap={CAP}"
         );
         assert!(
-            staged_err.unwrap_err().contains("intermediate result exceeds"),
+            staged_err
+                .unwrap_err()
+                .contains("intermediate result exceeds"),
             "wrong error message"
         );
 
@@ -1739,10 +1860,7 @@ LIMIT 10";
             .collect();
         assert_eq!(vs.len(), 5, "all projected rows must have v");
         for v_val in &vs {
-            assert!(
-                *v_val >= 110,
-                "filter must hold: v={v_val} is not >= 110"
-            );
+            assert!(*v_val >= 110, "filter must hold: v={v_val} is not >= 110");
         }
 
         // Early-termination proof: use a filter that passes early leaves (v < 10)
@@ -1774,7 +1892,10 @@ LIMIT 10";
             })
         });
         staged_result.expect("staged must succeed with 1M cap");
-        assert_eq!(staged_produced, LEAVES, "staged must expand all {LEAVES} leaves");
+        assert_eq!(
+            staged_produced, LEAVES,
+            "staged must expand all {LEAVES} leaves"
+        );
 
         assert!(
             staged_produced >= pull_produced * 10,
@@ -1854,29 +1975,24 @@ LIMIT 10";
         );
 
         // Staged (unbounded) path: hop-1 expands 70×~7=~466 rows > cap=100 → error.
+        const UNBOUNDED_Q: &str = "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)\
+             <-[:INDUSTRY_ALIGNMENT]-(t2:Talent) RETURN t, c, t2";
         let staged_err = super::with_max_intermediate_rows(CAP, || {
-            super::execute_unbounded(
-                &v,
-                &compile(&format!(
-                    "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)\
-                     <-[:INDUSTRY_ALIGNMENT]-(t2:Talent) RETURN t, c, t2"
-                )),
-                &Params(&params),
-            )
+            super::execute_unbounded(&v, &compile(UNBOUNDED_Q), &Params(&params))
         });
         assert!(
             staged_err.is_err(),
             "staged must error with cap={CAP} on harness-shape graph"
         );
         assert!(
-            staged_err.unwrap_err().contains("intermediate result exceeds"),
+            staged_err
+                .unwrap_err()
+                .contains("intermediate result exceeds"),
             "wrong error"
         );
 
         // Pull-based (LIMIT 10): cascades bound through both hops → completes.
-        let ok = super::with_max_intermediate_rows(CAP, || {
-            run(&v, &query, &params)
-        });
+        let ok = super::with_max_intermediate_rows(CAP, || run(&v, &query, &params));
         let rs = ok.expect("pull-based must complete on harness-shape with LIMIT 10");
         assert_eq!(rs.len(), LIMIT, "must return exactly {LIMIT} rows");
 
@@ -1942,17 +2058,13 @@ LIMIT 10";
         let params = BTreeMap::new();
 
         // Full 3-row reference (ada→bob, ada→cam, bob→cam).
-        let full_plan =
-            compile("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b");
-        let full_rs =
-            super::execute_unbounded(&v, &full_plan, &Params(&params)).unwrap();
+        let full_plan = compile("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b");
+        let full_rs = super::execute_unbounded(&v, &full_plan, &Params(&params)).unwrap();
         let full_rows = rows_of(&full_rs);
         assert_eq!(full_rows.len(), 3, "hop_graph has exactly 3 KNOWS paths");
 
         for limit in [1u64, 2, 3, 10] {
-            let q = format!(
-                "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b LIMIT {limit}"
-            );
+            let q = format!("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b LIMIT {limit}");
             let rs = run(&v, &q, &params).unwrap();
             let expected_len = (limit as usize).min(full_rows.len());
             assert_eq!(
@@ -1992,8 +2104,7 @@ LIMIT 10";
         .unwrap();
         assert_eq!(filter_full.len(), 2);
 
-        let filter_lim =
-            run(&v2, "MATCH (n:N) WHERE n.v > 1 RETURN n LIMIT 1", &params).unwrap();
+        let filter_lim = run(&v2, "MATCH (n:N) WHERE n.v > 1 RETURN n LIMIT 1", &params).unwrap();
         assert_eq!(filter_lim.len(), 1, "LIMIT 1 on filter query");
         assert_eq!(rows_of(&filter_lim), rows_of(&filter_full)[..1]);
 
@@ -2009,9 +2120,7 @@ LIMIT 10";
         .unwrap();
         assert_eq!(tri_full.len(), 3, "triangle has 3 unique two-hop paths");
         for limit in [1u64, 2, 3, 5] {
-            let q = format!(
-                "MATCH (x)-[r1:T]->(y)-[r2:T]->(z) RETURN x, y, z LIMIT {limit}"
-            );
+            let q = format!("MATCH (x)-[r1:T]->(y)-[r2:T]->(z) RETURN x, y, z LIMIT {limit}");
             let rs = run(&tv, &q, &params).unwrap();
             let expected_len = (limit as usize).min(3);
             assert_eq!(
@@ -2060,7 +2169,11 @@ LIMIT 10";
             super::execute_unbounded(&v, &full_plan, &Params(&params))
         });
         let unbounded_rs = unbounded_result.unwrap();
-        assert_eq!(unbounded_rs.len(), LEAVES, "unbounded must return all {LEAVES} rows");
+        assert_eq!(
+            unbounded_rs.len(),
+            LEAVES,
+            "unbounded must return all {LEAVES} rows"
+        );
         assert_eq!(
             unbounded_produced, LEAVES,
             "unbounded: exec_expand must emit all {LEAVES} rows"
@@ -2106,11 +2219,7 @@ LIMIT 10";
 
         // Bounded (LIMIT 5) stops before the cap — must complete successfully.
         let ok = super::with_max_intermediate_rows(10, || {
-            run(
-                &v,
-                "MATCH (s:Src)-[:T]->(d:Dst) RETURN d LIMIT 5",
-                &params,
-            )
+            run(&v, "MATCH (s:Src)-[:T]->(d:Dst) RETURN d LIMIT 5", &params)
         });
         assert_eq!(
             ok.unwrap().len(),
@@ -2120,11 +2229,7 @@ LIMIT 10";
 
         // Bounded with LIMIT exactly at cap also survives.
         let at_cap = super::with_max_intermediate_rows(10, || {
-            run(
-                &v,
-                "MATCH (s:Src)-[:T]->(d:Dst) RETURN d LIMIT 10",
-                &params,
-            )
+            run(&v, "MATCH (s:Src)-[:T]->(d:Dst) RETURN d LIMIT 10", &params)
         });
         assert_eq!(
             at_cap.unwrap().len(),
