@@ -7,7 +7,7 @@ pub mod snapshot;
 pub mod topology;
 pub mod types;
 pub mod wal;
-pub use columns::ColumnStore;
+pub use columns::{ColumnHandle, ColumnStore};
 pub use edge_props::EdgeProps;
 pub use fs::{FileId, Fs, RealFs};
 pub use idmap::IdMap;

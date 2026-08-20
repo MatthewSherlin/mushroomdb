@@ -2,6 +2,22 @@ use crate::types::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// A pre-resolved column handle for efficient repeated node lookups.
+///
+/// Created by [`ColumnStore::column`]. Resolves the field name hash once so
+/// that callers can look up many node IDs without re-hashing the field string
+/// on every call — useful when iterating large label scans under a filter.
+pub struct ColumnHandle<'a>(Option<&'a HashMap<u32, Value>>);
+
+impl<'a> ColumnHandle<'a> {
+    /// Return the stored value for `node`, or `None` if the column is absent
+    /// or the node has no value for this field.
+    #[inline]
+    pub fn get(&self, node: u32) -> Option<&'a Value> {
+        self.0?.get(&node)
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ColumnStore {
     // field name -> node id -> value. Columnar layout (Vec + null bitmap)
@@ -23,6 +39,15 @@ impl ColumnStore {
 
     pub fn get(&self, node: u32, field: &str) -> Option<&Value> {
         self.cols.get(field)?.get(&node)
+    }
+
+    /// Return a pre-resolved column handle for `field`.
+    ///
+    /// Hashes the field name once so that repeated [`ColumnHandle::get`] calls
+    /// pay only the inner node-id lookup cost, not the outer string hash.
+    /// Returns a handle that always returns `None` when the field is absent.
+    pub fn column(&self, field: &str) -> ColumnHandle<'_> {
+        ColumnHandle(self.cols.get(field))
     }
 
     pub fn fields(&self) -> impl Iterator<Item = &str> {

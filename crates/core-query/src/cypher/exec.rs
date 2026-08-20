@@ -665,9 +665,9 @@ fn execute_pull(
         params,
         bound,
     };
-    let initial_row: Row = vec![None; vars.names.len()];
+    let mut initial_row: Row = vec![None; vars.names.len()];
     let mut result_rows: Vec<Vec<Option<Value>>> = Vec::with_capacity(bound);
-    pull_rows(&ctx, producers, &initial_row, &mut result_rows)?;
+    pull_rows(&ctx, producers, &mut initial_row, &mut result_rows)?;
     // SKIP: discard the leading rows (bound = SKIP+LIMIT ensures there are enough).
     let skip_n = plan[proj_pos + 1..]
         .iter()
@@ -1040,10 +1040,18 @@ fn agg_stream(
 ///
 /// Each arm binds one `PlanOp` and recurses on `rest`.  When `ops` is empty
 /// (all producers consumed), the current `row` is projected and appended.
+///
+/// `row` is a mutable scratch buffer: each arm that assigns a slot saves and
+/// restores it around the recursive call so the caller sees no net change.
+/// This eliminates the per-row `Vec` clone that the staged path requires.
+///
+/// ScanLabel iterates `view.labels` directly (lazy, no intermediate `Vec<u32>`)
+/// so the bound truncates the scan itself — scanning stops as soon as enough
+/// result rows have been collected.
 fn pull_rows(
     ctx: &PullCtx<'_>,
     ops: &[PlanOp],
-    row: &Row,
+    row: &mut Row,
     result: &mut Vec<Vec<Option<Value>>>,
 ) -> Result<(), String> {
     if result.len() >= ctx.bound {
@@ -1063,19 +1071,92 @@ fn pull_rows(
     };
     match op {
         PlanOp::ScanLabel { var, label } => {
-            let ids = scan_ids(ctx.view, label.as_deref());
             let slot = ctx
                 .vars
                 .slot(var)
                 .ok_or_else(|| format!("unbound variable `{var}`"))?;
-            for &id in &ids {
-                if result.len() >= ctx.bound {
-                    break;
-                }
-                let mut next = row.clone();
-                next[slot] = Some(Cell::Node(id));
-                pull_rows(ctx, rest, &next, result)?;
+            // Resolve the label to an interned symbol once. If the label is
+            // specified but unknown, there are no matching nodes — return early.
+            let want_sym = label.as_deref().and_then(|l| ctx.view.syms.get(l));
+            if label.is_some() && want_sym.is_none() {
+                return Ok(());
             }
+            // Save the slot value so we can restore it after the loop.
+            // Cell is Copy so this is a cheap register-level operation.
+            let prev = row[slot];
+
+            // Fast path: if the immediately following op is a simple
+            // `Prop op Lit` comparison on this scan variable, fuse the filter
+            // into the scan loop.  Pre-resolving the property column once
+            // (hashing the field name once instead of per-node) eliminates the
+            // outer HashMap string-hash on every candidate row.
+            let fused_filter = rest.first().and_then(|next_op| {
+                if let PlanOp::Filter {
+                    expr:
+                        Expr::Cmp {
+                            lhs: Operand::Prop {
+                                var: ref fv,
+                                field: ref f,
+                            },
+                            op: ref cmp_op_ref,
+                            rhs: Operand::Lit(ref lit),
+                        },
+                } = *next_op
+                {
+                    if fv == var {
+                        return Some((f.as_str(), cmp_op_ref, lit));
+                    }
+                }
+                None
+            });
+
+            if let Some((field, cmp_op_ref, lit)) = fused_filter {
+                // Fused scan+filter: column resolved once, comparison done
+                // inline — no recursive call into pull_rows for the Filter arm.
+                let col = ctx.view.props.column(field);
+                let rest_after_filter = &rest[1..];
+                for (i, &sym) in ctx.view.labels.iter().enumerate() {
+                    if result.len() >= ctx.bound {
+                        break;
+                    }
+                    if sym == u32::MAX {
+                        continue;
+                    }
+                    if let Some(ws) = want_sym {
+                        if sym != ws {
+                            continue;
+                        }
+                    }
+                    let id = i as u32;
+                    if let Some(v) = col.get(id) {
+                        if eval_cmp(cmp_op_ref, v, lit) {
+                            row[slot] = Some(Cell::Node(id));
+                            pull_rows(ctx, rest_after_filter, row, result)?;
+                        }
+                    }
+                }
+            } else {
+                // Generic path: iterate label array lazily, no Vec allocation,
+                // with early exit when the row bound is satisfied.
+                for (i, &sym) in ctx.view.labels.iter().enumerate() {
+                    if result.len() >= ctx.bound {
+                        break;
+                    }
+                    // Skip tombstone / gap slots (u32::MAX sentinel).
+                    if sym == u32::MAX {
+                        continue;
+                    }
+                    // Filter by label symbol when a label is requested.
+                    if let Some(ws) = want_sym {
+                        if sym != ws {
+                            continue;
+                        }
+                    }
+                    row[slot] = Some(Cell::Node(i as u32));
+                    pull_rows(ctx, rest, row, result)?;
+                }
+            }
+            row[slot] = prev; // restore caller's value
         }
         PlanOp::Expand {
             from,
@@ -1132,7 +1213,7 @@ fn pull_rows(
                 }
                 #[cfg(test)]
                 record_expand_row();
-                pull_rows(ctx, rest, &next, result)?;
+                pull_rows(ctx, rest, &mut next, result)?;
             }
         }
         PlanOp::Filter { expr } => {
