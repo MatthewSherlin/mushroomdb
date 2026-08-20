@@ -2761,16 +2761,21 @@ mod tests {
     ///
     /// For rules with `max_edges: Some(k)` (top-k per-source semantics),
     /// verifies that `create_rule` streaming backfill produces the same
-    /// per-source top-k set as a brute-force reference:
-    ///   reference: for each src, compute_desired → filter_src_top_k → collect.
+    /// per-source top-k set as an independent brute-force reference.
     ///
-    /// Covers three `CandidateSpec` paths through `compute_desired`:
+    /// The reference is intentionally independent of `filter_src_top_k`:
+    /// it sorts candidates inline (score DESC, dst-key ASC, take k) so a
+    /// comparator bug cannot self-agree between reference and actual.
+    ///
+    /// Covers all four `CandidateSpec` paths through `compute_desired`:
     /// - `FieldEqual` → `CandidateSpec::Scalar` (uniform score=1.0, tiebreak by key)
-    /// - `KeyMatch` → `CandidateSpec::ByKey` (unscored → key ASC order)
     /// - `NumericWithin` → `CandidateSpec::NumericBucket` (scored, variable top-k)
+    /// - `KeyMatch` → `CandidateSpec::ByKey` (FK probe, at most 1 dst per src)
+    /// - `VectorSimilar` / `approximate=false` → `CandidateSpec::ScanAll` (scored)
     #[test]
     fn streaming_topk_order_identity_property_test() {
-        // Reference: build index, compute_desired per src, filter_src_top_k.
+        // Reference: build index, compute_desired per src, then brute-force
+        // sort (score DESC, dst-key ASC, take k) — independent of filter_src_top_k.
         fn reference_topk(rule: &RuleDef, k: u64, fx: &mut Fx) -> BTreeSet<(u32, u32)> {
             let mut idx = RuleIndex::default();
             for id in 0..fx.ids.len() as u32 {
@@ -2800,8 +2805,17 @@ mod tests {
                     edge_props: &mut fx.eprops,
                 };
                 let per_src = compute_desired(rule, &idx, id, true, &g);
-                let top_k = filter_src_top_k(per_src, k, &fx.ids);
-                out.extend(top_k.into_keys());
+                // Independent brute-force sort: score DESC, dst-key ASC, take k.
+                let mut candidates: Vec<((u32, u32), f64)> = per_src.into_iter().collect();
+                candidates.sort_by(|&((_, da), sa), &((_, db), sb)| {
+                    sb.total_cmp(&sa).then_with(|| {
+                        let ka = fx.ids.key_of(da).unwrap_or("");
+                        let kb = fx.ids.key_of(db).unwrap_or("");
+                        ka.cmp(kb)
+                    })
+                });
+                candidates.truncate(k as usize);
+                out.extend(candidates.into_iter().map(|(k, _)| k));
             }
             out
         }
@@ -2899,6 +2913,108 @@ mod tests {
                 assert_eq!(
                     expected, actual,
                     "NumericWithin seed={seed} k={k}: streaming top-k must match brute-force top-k"
+                );
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Case 3: KeyMatch (CandidateSpec::ByKey)
+        // T→C FK rule: each T has a "cid" field whose value is the key of
+        // a C node.  Each src has at most 1 candidate, so filter_src_top_k
+        // is the identity — but the ByKey candidate path must be exercised.
+        // ----------------------------------------------------------------
+        for seed in [0u64, 1, 42, 7] {
+            for k in [1u64, 2] {
+                let rule = RuleDef {
+                    name: "fk".into(),
+                    src_label: "T".into(),
+                    dst_label: "C".into(),
+                    predicate: Predicate::KeyMatch { field: "cid".into() },
+                    edge_type: "AT".into(),
+                    weight_prop: None,
+                    max_edges: Some(k),
+                    approximate: false,
+                };
+
+                let build = || {
+                    let mut fx = Fx::new();
+                    // 4 C nodes.
+                    for i in 0..4u32 {
+                        fx.add("C", &format!("c{i}"), vec![]);
+                    }
+                    // 8 T nodes, each pointing at a C node determined by hash.
+                    for i in 0..8u32 {
+                        let h = mix64(seed ^ (i as u64 + 1));
+                        let cid = format!("c{}", h % 4);
+                        fx.add("T", &format!("t{i}"), vec![("cid", Value::Str(cid))]);
+                    }
+                    fx
+                };
+
+                let expected = reference_topk(&rule, k, &mut build());
+                let actual = streaming_pairs(rule, &mut build());
+
+                assert_eq!(
+                    expected, actual,
+                    "KeyMatch seed={seed} k={k}: streaming top-k must match brute-force top-k"
+                );
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Case 4: VectorSimilar approximate=false (CandidateSpec::ScanAll)
+        // V→V cosine-sim rule.  6 nodes in 2 clusters of 3; min=0.9 so only
+        // within-cluster pairs qualify.  top-k=2 filters the 2 best in cluster.
+        // ----------------------------------------------------------------
+        {
+            // cluster A: unit vectors near [1,0]; cluster B: near [0,1].
+            let cluster_a: &[(&str, f64, f64)] = &[
+                ("va0", 1.0_f64, 0.0_f64),
+                ("va1", 0.98_f64, 0.199_f64), // cos(~11.5°) ≈ 0.98
+                ("va2", 0.97_f64, 0.243_f64), // cos(~14°) ≈ 0.97
+            ];
+            let cluster_b: &[(&str, f64, f64)] = &[
+                ("vb0", 0.0_f64, 1.0_f64),
+                ("vb1", 0.1_f64, 0.995_f64),
+                ("vb2", 0.05_f64, 0.999_f64),
+            ];
+            for k in [1u64, 2] {
+                let rule = RuleDef {
+                    name: "vsim".into(),
+                    src_label: "V".into(),
+                    dst_label: "V".into(),
+                    predicate: Predicate::VectorSimilar {
+                        field: "emb".into(),
+                        min: 0.9,
+                    },
+                    edge_type: "VSIM".into(),
+                    weight_prop: Some("score".into()),
+                    max_edges: Some(k),
+                    approximate: false,
+                };
+
+                let build = || {
+                    let mut fx = Fx::new();
+                    let mut add_v = |key: &str, x: f64, y: f64| {
+                        let norm = (x * x + y * y).sqrt();
+                        let v = Value::List(vec![
+                            Value::Float(x / norm),
+                            Value::Float(y / norm),
+                        ]);
+                        fx.add("V", key, vec![("emb", v)]);
+                    };
+                    for &(k, x, y) in cluster_a.iter().chain(cluster_b.iter()) {
+                        add_v(k, x, y);
+                    }
+                    fx
+                };
+
+                let expected = reference_topk(&rule, k, &mut build());
+                let actual = streaming_pairs(rule, &mut build());
+
+                assert_eq!(
+                    expected, actual,
+                    "VectorSimilar/ScanAll k={k}: streaming top-k must match brute-force top-k"
                 );
             }
         }

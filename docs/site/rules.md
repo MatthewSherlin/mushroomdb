@@ -262,6 +262,30 @@ After a rule is declared, incremental firing on each new write is cheap
 (sub-millisecond for most predicates) because only the changed node's
 field wakes the rule.
 
+> **Ceiling note:** `max_edges: Some(k)` is the *only* ceiling for per-source
+> rules — there is no additional defensive cap. A rule with `k = 1_000_000`
+> on a graph with 100k source nodes can create up to 10¹¹ edges during
+> backfill. Choose k relative to the expected candidate-set size per source.
+
+### Global-budget semantics (`max_edges: None`)
+
+When `max_edges` is `None`, the rule uses a global runaway guard:
+materialization stops after `DEFAULT_MAX_EDGES` (1 000 000) total edges and
+the rule is marked `tripped`. No further edges are added until the rule is
+rebuilt with nodes removed. Use `max_edges: Some(k)` instead when you want
+per-source cardinality control.
+
+> **Breaking change (pre-alpha, since Plan 13 Task 1):** Prior to this release,
+> `max_edges: Some(k)` meant "stop at k total edges globally (global-budget
+> semantics, same as `None` but with a lower cap)." It now means "keep the
+> k best-matching destinations per source node (per-source top-k semantics)."
+> Any snapshot written before this change that contains a rule with
+> `max_edges: Some(k)` will silently switch to per-source top-k semantics
+> on the next open — which may cause up to `src_count × k` edges to be added
+> on the next write where previously the rule was frozen. The `tripped` flag
+> loaded from old snapshots is ignored by the new code path.
+> No migration is provided (pre-alpha policy).
+
 ---
 
 ## Known limitations
