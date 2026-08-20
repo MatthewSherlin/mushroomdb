@@ -1,12 +1,12 @@
-<p align="center">
-  <img src="docs/assets/mark-animated.svg" width="150" alt="mushroomdb" />
-</p>
+<img src="docs/assets/mark-animated.svg" align="left" width="132" alt="" />
 
 # mushroomdb
 
 An embedded Rust property-graph database with native incremental linking rules.
 You declare a predicate once; every later write maintains the matching edges
 (and retracts them when properties change). The graph builds itself.
+
+<br clear="left" />
 
 ---
 
