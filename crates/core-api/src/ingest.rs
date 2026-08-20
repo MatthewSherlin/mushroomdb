@@ -354,7 +354,7 @@ fn infer_auto_fk<F: Fs>(
                     },
                     edge_type: remainder.to_uppercase(),
                     weight_prop: None,
-            max_edges: None,
+                    max_edges: None,
                     approximate: false,
                 });
             }

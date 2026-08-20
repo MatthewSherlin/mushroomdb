@@ -763,9 +763,7 @@ mod tests {
             name: "bfe".into(),
             src_label: "A".into(),
             dst_label: "A".into(),
-            predicate: Predicate::FieldEqual {
-                field: "f".into(),
-            },
+            predicate: Predicate::FieldEqual { field: "f".into() },
             edge_type: "FE".into(),
             weight_prop: None,
             max_edges: None,
@@ -795,9 +793,7 @@ mod tests {
             src_label: "A".into(),
             dst_label: "A".into(),
             predicate: Predicate::All(vec![
-                Predicate::FieldEqual {
-                    field: "f".into(),
-                },
+                Predicate::FieldEqual { field: "f".into() },
                 Predicate::VectorSimilar {
                     field: "emb".into(),
                     min: 0.9,

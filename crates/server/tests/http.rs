@@ -185,6 +185,7 @@ async fn stats_round_trips_serialize() {
     assert_eq!(encoded["rules"][0]["edges"], json!(4));
     assert_eq!(encoded["rules"][0]["tripped"], json!(true));
     assert_eq!(encoded["rules"][0]["fires"], json!(5));
+    assert_eq!(encoded["rules"][0]["approximate"], json!(false));
 }
 
 /// Binding: POST /ingest converts parsed rows and returns IngestReport JSON.

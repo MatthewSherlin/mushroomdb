@@ -40,10 +40,7 @@ fn l2_sq(a: &[f64], b: &[f64]) -> f64 {
     if a.len() != b.len() {
         return f64::MAX;
     }
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum()
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
 }
 
 /// Index of the nearest centroid to `xs` by L2 distance (minimum squared).
@@ -260,7 +257,6 @@ pub struct SideIndex {
     vec_anchor: BTreeMap<u32, f64>,
 
     // --- IVF-Flat fields (Plan 11 T4; only populated for VectorClusters specs) ---
-
     /// Raw vectors stored for IVF fitting and assignment-on-insert.
     /// Populated at insert-time, torn out at remove-time.
     /// Memory: O(n × dim) per indexed side — present only for approximate rules.
@@ -282,17 +278,32 @@ pub struct RuleIndex {
 
 pub enum CandidateSpec<'a> {
     ByKey,
-    Scalar { field: &'a str },
-    Tokens { field: &'a str },
-    NumericBucket { field: &'a str, tolerance: f64 },
-    GeoGrid { field: &'a str, km: f64 },
-    ScanAll { field: &'a str },
+    Scalar {
+        field: &'a str,
+    },
+    Tokens {
+        field: &'a str,
+    },
+    NumericBucket {
+        field: &'a str,
+        tolerance: f64,
+    },
+    GeoGrid {
+        field: &'a str,
+        km: f64,
+    },
+    ScanAll {
+        field: &'a str,
+    },
     /// IVF-Flat approximate candidate selection (opt-in; `approximate: true`).
     ///
     /// k-means fitted over the indexed side's vectors; candidates are members
     /// of the P = `max(1, ceil(k/16))` nearest centroids to the query vector.
     /// NOT a superset of true positives — recall floor governs correctness.
-    VectorClusters { field: &'a str, min: f64 },
+    VectorClusters {
+        field: &'a str,
+        min: f64,
+    },
 }
 
 /// Returns the exact candidate strategy derived from `p`.
@@ -610,8 +621,12 @@ impl SideIndex {
 
     pub fn remove(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
         // VectorClusters: remove from ivf_raw and by_key cluster bucket.
+        // Removal shifts cluster membership (the centroid stays but its member set
+        // shrinks), which is a form of drift; increment the counter so callers can
+        // decide when to trigger a rebuild.
         if let CandidateSpec::VectorClusters { .. } = spec {
             if self.ivf_raw.remove(&node).is_some() {
+                self.ivf_drift = self.ivf_drift.saturating_add(1);
                 if let Some(c) = self.ivf_clusters.remove(&node) {
                     let key = ValueKey::Int(c as i64);
                     if let Some(s) = self.by_key.get_mut(&key) {
@@ -745,17 +760,22 @@ impl SideIndex {
 
     /// IVF candidate lookup: find the P nearest centroids to the query vector,
     /// return the union of their cluster members.
-    fn ivf_candidates(
-        &self,
-        field: &str,
-        get: &dyn Fn(&str) -> Option<Value>,
-    ) -> BTreeSet<u32> {
+    fn ivf_candidates(&self, field: &str, get: &dyn Fn(&str) -> Option<Value>) -> BTreeSet<u32> {
         let Some(xs) = get(field).as_ref().and_then(as_numeric_list) else {
             return BTreeSet::new();
         };
         if self.ivf_centroids.is_empty() {
             // Not yet fitted (e.g. empty side at create time, or no data).
-            return BTreeSet::new();
+            // Fall back to full scan so early crash-recovery states don't drop recall
+            // to zero when too few vectors were inserted for IVF to be meaningful.
+            return self.ivf_raw.keys().copied().collect();
+        }
+        // When n ≤ k (actual centroid count), every node is its own centroid;
+        // P probes only return the src's own cluster (which excludes itself),
+        // yielding zero candidates. Full scan is correct and O(n) for these
+        // tiny sets — this covers n < IVF_K_MIN and the exact n == k edge case.
+        if self.ivf_raw.len() <= self.ivf_centroids.len() {
+            return self.ivf_raw.keys().copied().collect();
         }
         let k = self.ivf_centroids.len();
         let p = probe_count(k);
@@ -767,10 +787,7 @@ impl SideIndex {
             .enumerate()
             .map(|(i, c)| (i, l2_sq(&xs, c)))
             .collect();
-        dists.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut out = BTreeSet::new();
         for (ci, _) in dists.iter().take(p) {
@@ -1254,7 +1271,9 @@ mod tests {
         let mut idx = SideIndex::default();
         idx.insert(&spec, 1, &getter(&emb(&xs)));
 
-        let ckpts = idx.vec_ckpts(1).expect("checkpoints must exist after insert");
+        let ckpts = idx
+            .vec_ckpts(1)
+            .expect("checkpoints must exist after insert");
         let (_, norm) = idx.vec_meta(1).unwrap();
         assert!(
             (ckpts[0] - norm).abs() < 1e-12,
@@ -1290,7 +1309,10 @@ mod tests {
 
         // Correct live vector → gate passes.
         let result = idx.fresh_ckpts_for(7, &xs);
-        assert!(result.is_some(), "fresh_ckpts_for must succeed with matching live vector");
+        assert!(
+            result.is_some(),
+            "fresh_ckpts_for must succeed with matching live vector"
+        );
         let (norm, ckpts) = result.unwrap();
         assert!((norm - 1.0).abs() < 1e-12);
         assert!((ckpts[0] - 1.0).abs() < 1e-12);

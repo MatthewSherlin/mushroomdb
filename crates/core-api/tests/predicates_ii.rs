@@ -26,7 +26,7 @@ fn numeric_rule() -> RuleDef {
         },
         edge_type: "FOUNDED_NEAR".into(),
         weight_prop: Some("score".into()),
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     }
 }
@@ -42,7 +42,7 @@ fn geo_rule() -> RuleDef {
         },
         edge_type: "OFFICE_NEAR".into(),
         weight_prop: Some("score".into()),
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     }
 }
@@ -58,7 +58,7 @@ fn vec_rule() -> RuleDef {
         },
         edge_type: "DOC_SIM".into(),
         weight_prop: Some("score".into()),
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     }
 }
@@ -387,7 +387,7 @@ fn vector_budget_trips_and_stays_frozen() {
         },
         edge_type: "DOC_SIM".into(),
         weight_prop: Some("score".into()),
-            max_edges: Some(4),
+        max_edges: Some(4),
         approximate: false,
     })
     .unwrap();
@@ -448,7 +448,7 @@ fn delete_numeric_coetype_survivor_keeps_edges() {
         },
         edge_type: "NEAR".into(),
         weight_prop: Some("score".into()),
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     })
     .unwrap();
@@ -461,7 +461,7 @@ fn delete_numeric_coetype_survivor_keeps_edges() {
         },
         edge_type: "NEAR".into(),
         weight_prop: Some("score".into()),
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     })
     .unwrap();

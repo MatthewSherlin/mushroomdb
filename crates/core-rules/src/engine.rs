@@ -47,21 +47,6 @@ pub struct RuleEngine {
 // Private helpers (free functions, not methods, to avoid whole-struct borrows)
 // ---------------------------------------------------------------------------
 
-/// For KeyMatch, src side is indexed as Scalar (FK field value → node bucket).
-/// For all other predicates, returns the same as candidate_spec.
-/// Index maintenance uses this for the src side; candidate_spec for the dst side.
-#[allow(dead_code)]
-fn src_lookup_spec(p: &Predicate) -> CandidateSpec<'_> {
-    match p {
-        Predicate::KeyMatch { field } => CandidateSpec::Scalar { field },
-        Predicate::All(parts) => {
-            debug_assert!(!parts.is_empty(), "validated predicate required");
-            src_lookup_spec(&parts[0])
-        }
-        other => candidate_spec(other),
-    }
-}
-
 /// Rule-aware candidate spec: exact `ScanAll` for `approximate=false`, IVF
 /// `VectorClusters` for `approximate=true` (VectorSimilar-rooted predicates).
 fn candidate_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
@@ -74,6 +59,9 @@ fn candidate_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
 
 /// Rule-aware src-side lookup spec. KeyMatch is still exact on the src side
 /// regardless of `approximate` (the approximation is on the dst candidate set).
+/// For KeyMatch, src side is indexed as Scalar (FK field value → node bucket).
+/// For all other predicates with `approximate=false`, delegates to `candidate_spec`;
+/// with `approximate=true`, delegates to `candidate_spec_approx`.
 fn src_lookup_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
     match &def.predicate {
         Predicate::KeyMatch { field } => CandidateSpec::Scalar { field },
@@ -199,22 +187,18 @@ fn compute_desired(
     // Freshness gate: `SideIndex::fresh_ckpts_for` returns `None` when the
     // cached norm differs from the live norm, preventing stale checkpoints from
     // producing a false reject (see doc comment on `fresh_ckpts_for`).
-    let n_early_exit_hint: Option<(Vec<f64>, f64, [f64; 8])> =
-        if !def.approximate {
-            if let Predicate::VectorSimilar { field, .. } = &def.predicate {
-                if crate::index::vector_early_exit_enabled() {
-                    let n_side = if on_src_side {
-                        &index.src_side
-                    } else {
-                        &index.dst_side
-                    };
-                    if let Some(vn_v) = n_get(field) {
-                        if let Some(vn) = crate::index::as_numeric_list(&vn_v) {
-                            if let Some((norm_n, ckpts_n)) = n_side.fresh_ckpts_for(n, &vn) {
-                                Some((vn, norm_n, *ckpts_n))
-                            } else {
-                                None
-                            }
+    let n_early_exit_hint: Option<(Vec<f64>, f64, [f64; 8])> = if !def.approximate {
+        if let Predicate::VectorSimilar { field, .. } = &def.predicate {
+            if crate::index::vector_early_exit_enabled() {
+                let n_side = if on_src_side {
+                    &index.src_side
+                } else {
+                    &index.dst_side
+                };
+                if let Some(vn_v) = n_get(field) {
+                    if let Some(vn) = crate::index::as_numeric_list(&vn_v) {
+                        if let Some((norm_n, ckpts_n)) = n_side.fresh_ckpts_for(n, &vn) {
+                            Some((vn, norm_n, *ckpts_n))
                         } else {
                             None
                         }
@@ -229,7 +213,10 @@ fn compute_desired(
             }
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
 
     let mut out = BTreeMap::new();
     for m in candidates {
@@ -273,10 +260,8 @@ fn compute_desired(
         };
 
         // Use the pre-fetched n hint if available; fetch m per-pair.
-        if let (
-            Some((ref vn, norm_n, ckpts_n)),
-            Predicate::VectorSimilar { field, min },
-        ) = (&n_early_exit_hint, &def.predicate)
+        if let (Some((ref vn, norm_n, ckpts_n)), Predicate::VectorSimilar { field, min }) =
+            (&n_early_exit_hint, &def.predicate)
         {
             let m_side = if on_src_side {
                 &index.dst_side
@@ -287,13 +272,27 @@ fn compute_desired(
                 if let Some(vm) = crate::index::as_numeric_list(&vm_v) {
                     if let Some((norm_m, ckpts_m)) = m_side.fresh_ckpts_for(m, &vm) {
                         let (va, ckpts_a, na, vb, ckpts_b, nb) = if on_src_side {
-                            (vn.as_slice(), ckpts_n, *norm_n, vm.as_slice(), ckpts_m, norm_m)
+                            (
+                                vn.as_slice(),
+                                ckpts_n,
+                                *norm_n,
+                                vm.as_slice(),
+                                ckpts_m,
+                                norm_m,
+                            )
                         } else {
-                            (vm.as_slice(), ckpts_m, norm_m, vn.as_slice(), ckpts_n, *norm_n)
+                            (
+                                vm.as_slice(),
+                                ckpts_m,
+                                norm_m,
+                                vn.as_slice(),
+                                ckpts_n,
+                                *norm_n,
+                            )
                         };
                         match crate::def::cosine_early_exit(va, vb, ckpts_a, ckpts_b, na, nb, *min)
                         {
-                            None => continue,          // exact reject
+                            None => continue, // exact reject
                             Some(score) => {
                                 out.insert((s_id, d_id), score);
                                 continue; // full cosine already computed
@@ -1385,7 +1384,7 @@ mod tests {
                     },
                     edge_type: "AT".into(),
                     weight_prop: None,
-            max_edges: None,
+                    max_edges: None,
                     approximate: false,
                 },
                 &mut g,
@@ -1429,7 +1428,7 @@ mod tests {
                     },
                     edge_type: "SIM".into(),
                     weight_prop: Some("score".into()),
-            max_edges: None,
+                    max_edges: None,
                     approximate: false,
                 },
                 &mut g,
@@ -1492,7 +1491,7 @@ mod tests {
                     },
                     edge_type: "AT".into(),
                     weight_prop: None,
-            max_edges: None,
+                    max_edges: None,
                     approximate: false,
                 },
                 &mut g,
@@ -1595,7 +1594,7 @@ mod tests {
                     },
                     edge_type: "REL2".into(),
                     weight_prop: None,
-            max_edges: None,
+                    max_edges: None,
                     approximate: false,
                 },
                 &mut g,
@@ -1613,7 +1612,7 @@ mod tests {
                     },
                     edge_type: "REL2".into(),
                     weight_prop: None,
-            max_edges: None,
+                    max_edges: None,
                     approximate: false,
                 },
                 &mut g,
@@ -2439,7 +2438,7 @@ mod tests {
                     predicate: Predicate::FieldEqual { field: "k".into() },
                     edge_type: "EQ".into(),
                     weight_prop: None,
-            max_edges: Some(budget),
+                    max_edges: Some(budget),
                     approximate: false,
                 };
 
@@ -2498,7 +2497,7 @@ mod tests {
                     },
                     edge_type: "AT".into(),
                     weight_prop: None,
-            max_edges: Some(budget),
+                    max_edges: Some(budget),
                     approximate: false,
                 };
 
@@ -2541,7 +2540,7 @@ mod tests {
                 },
                 edge_type: "SIM".into(),
                 weight_prop: None,
-            max_edges: Some(budget),
+                max_edges: Some(budget),
                 approximate: false,
             };
 
@@ -2816,8 +2815,14 @@ mod tests {
                 let dg = |f: &str| fx_oracle.props.get(d, f).cloned();
                 if evaluate(
                     &def.predicate,
-                    &NodeView { key: skey, props: &sg },
-                    &NodeView { key: dkey, props: &dg },
+                    &NodeView {
+                        key: skey,
+                        props: &sg,
+                    },
+                    &NodeView {
+                        key: dkey,
+                        props: &dg,
+                    },
                 )
                 .is_some()
                 {
@@ -2917,7 +2922,9 @@ mod tests {
 
         // fresh_ckpts_for must succeed with the correct live vector.
         let correct_live = vec![1.0f64, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let gate_result = eng.indexes["vec"].src_side.fresh_ckpts_for(b, &correct_live);
+        let gate_result = eng.indexes["vec"]
+            .src_side
+            .fresh_ckpts_for(b, &correct_live);
         assert!(
             gate_result.is_some(),
             "freshness gate must accept the matching live vector"
@@ -3023,8 +3030,14 @@ mod tests {
                 let dg = |f: &str| fx_oracle.props.get(d, f).cloned();
                 if evaluate(
                     &def.predicate,
-                    &NodeView { key: skey, props: &sg },
-                    &NodeView { key: dkey, props: &dg },
+                    &NodeView {
+                        key: skey,
+                        props: &sg,
+                    },
+                    &NodeView {
+                        key: dkey,
+                        props: &dg,
+                    },
                 )
                 .is_some()
                 {

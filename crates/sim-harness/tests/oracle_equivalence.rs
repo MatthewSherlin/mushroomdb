@@ -915,10 +915,7 @@ fn recall(
 #[test]
 fn approximate_wal_replay_identity() {
     let dir = {
-        let d = std::env::temp_dir().join(format!(
-            "graphdb-approx-replay-{}",
-            std::process::id()
-        ));
+        let d = std::env::temp_dir().join(format!("graphdb-approx-replay-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     };
@@ -951,11 +948,9 @@ fn approximate_wal_replay_identity() {
     for (i, v) in vecs.iter().enumerate() {
         let key = format!("v{i}");
         let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
-        let val = Value::List(vec![
-            Value::Float(v[0] / norm),
-            Value::Float(v[1] / norm),
-        ]);
-        db.insert_node("V", &key, vec![("emb".into(), val)]).unwrap();
+        let val = Value::List(vec![Value::Float(v[0] / norm), Value::Float(v[1] / norm)]);
+        db.insert_node("V", &key, vec![("emb".into(), val)])
+            .unwrap();
     }
 
     db.create_rule(RuleDef {
@@ -978,7 +973,10 @@ fn approximate_wal_replay_identity() {
     let mut edges_original = BTreeSet::new();
     for i in 0..n {
         let src = format!("v{i}");
-        for nb in db.neighbors(&src, "ASIM", Direction::Out).unwrap_or_default() {
+        for nb in db
+            .neighbors(&src, "ASIM", Direction::Out)
+            .unwrap_or_default()
+        {
             edges_original.insert(("ASIM".to_string(), src.clone(), nb));
         }
     }
@@ -989,14 +987,16 @@ fn approximate_wal_replay_identity() {
     let mut edges_replayed = BTreeSet::new();
     for i in 0..n {
         let src = format!("v{i}");
-        for nb in db2.neighbors(&src, "ASIM", Direction::Out).unwrap_or_default() {
+        for nb in db2
+            .neighbors(&src, "ASIM", Direction::Out)
+            .unwrap_or_default()
+        {
             edges_replayed.insert(("ASIM".to_string(), src.clone(), nb));
         }
     }
 
     assert_eq!(
-        edges_original,
-        edges_replayed,
+        edges_original, edges_replayed,
         "WAL replay must produce identical derived set for approximate rule"
     );
 }
@@ -1007,19 +1007,32 @@ fn approximate_wal_replay_identity() {
 fn approximate_recall_above_floor_quiesced() {
     // 20 2-D unit vectors matching the WAL replay test setup.
     let vecs: &[[f64; 2]] = &[
-        [1.0, 0.0], [0.98, 0.2], [0.96, 0.28], [0.97, 0.24],
-        [0.0, 1.0], [0.1, 0.995], [0.05, 0.999], [0.08, 0.997],
-        [-1.0, 0.0], [-0.98, 0.2], [-0.96, -0.28], [-0.97, 0.24],
-        [0.0, -1.0], [0.1, -0.995], [-0.05, -0.999], [-0.08, -0.997],
-        [0.7, 0.714], [0.71, 0.704], [-0.7, 0.714], [-0.71, -0.704],
+        [1.0, 0.0],
+        [0.98, 0.2],
+        [0.96, 0.28],
+        [0.97, 0.24],
+        [0.0, 1.0],
+        [0.1, 0.995],
+        [0.05, 0.999],
+        [0.08, 0.997],
+        [-1.0, 0.0],
+        [-0.98, 0.2],
+        [-0.96, -0.28],
+        [-0.97, 0.24],
+        [0.0, -1.0],
+        [0.1, -0.995],
+        [-0.05, -0.999],
+        [-0.08, -0.997],
+        [0.7, 0.714],
+        [0.71, 0.704],
+        [-0.7, 0.714],
+        [-0.71, -0.704],
     ];
     let min_sim = 0.9_f64;
 
     let dir = {
-        let d = std::env::temp_dir().join(format!(
-            "graphdb-approx-recall-q-{}",
-            std::process::id()
-        ));
+        let d =
+            std::env::temp_dir().join(format!("graphdb-approx-recall-q-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     };
@@ -1030,11 +1043,9 @@ fn approximate_recall_above_floor_quiesced() {
         let key = format!("v{i}");
         let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
         let nv = vec![v[0] / norm, v[1] / norm];
-        let val = Value::List(vec![
-            Value::Float(nv[0]),
-            Value::Float(nv[1]),
-        ]);
-        db.insert_node("V", &key, vec![("emb".into(), val)]).unwrap();
+        let val = Value::List(vec![Value::Float(nv[0]), Value::Float(nv[1])]);
+        db.insert_node("V", &key, vec![("emb".into(), val)])
+            .unwrap();
         normalized.push((format!("V{key}"), nv));
     }
 
@@ -1058,7 +1069,10 @@ fn approximate_recall_above_floor_quiesced() {
         let mut s = BTreeSet::new();
         for i in 0..vecs.len() {
             let src = format!("v{i}");
-            for nb in db.neighbors(&src, "ASIM", Direction::Out).unwrap_or_default() {
+            for nb in db
+                .neighbors(&src, "ASIM", Direction::Out)
+                .unwrap_or_default()
+            {
                 s.insert(("ASIM".to_string(), src.clone(), nb));
             }
         }
@@ -1072,7 +1086,9 @@ fn approximate_recall_above_floor_quiesced() {
             let norm_i = (vi[0] * vi[0] + vi[1] * vi[1]).sqrt();
             let ni = [vi[0] / norm_i, vi[1] / norm_i];
             for (j, vj) in vecs.iter().enumerate() {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 let norm_j = (vj[0] * vj[0] + vj[1] * vj[1]).sqrt();
                 let nj = [vj[0] / norm_j, vj[1] / norm_j];
                 let dot = ni[0] * nj[0] + ni[1] * nj[1];
@@ -1100,19 +1116,32 @@ fn approximate_recall_above_floor_quiesced() {
 #[test]
 fn approximate_recall_above_floor_after_rebuild() {
     let vecs: &[[f64; 2]] = &[
-        [1.0, 0.0], [0.98, 0.2], [0.96, 0.28], [0.97, 0.24],
-        [0.0, 1.0], [0.1, 0.995], [0.05, 0.999], [0.08, 0.997],
-        [-1.0, 0.0], [-0.98, 0.2], [-0.96, -0.28], [-0.97, 0.24],
-        [0.0, -1.0], [0.1, -0.995], [-0.05, -0.999], [-0.08, -0.997],
-        [0.7, 0.714], [0.71, 0.704], [-0.7, 0.714], [-0.71, -0.704],
+        [1.0, 0.0],
+        [0.98, 0.2],
+        [0.96, 0.28],
+        [0.97, 0.24],
+        [0.0, 1.0],
+        [0.1, 0.995],
+        [0.05, 0.999],
+        [0.08, 0.997],
+        [-1.0, 0.0],
+        [-0.98, 0.2],
+        [-0.96, -0.28],
+        [-0.97, 0.24],
+        [0.0, -1.0],
+        [0.1, -0.995],
+        [-0.05, -0.999],
+        [-0.08, -0.997],
+        [0.7, 0.714],
+        [0.71, 0.704],
+        [-0.7, 0.714],
+        [-0.71, -0.704],
     ];
     let min_sim = 0.9_f64;
 
     let dir = {
-        let d = std::env::temp_dir().join(format!(
-            "graphdb-approx-recall-r-{}",
-            std::process::id()
-        ));
+        let d =
+            std::env::temp_dir().join(format!("graphdb-approx-recall-r-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     };
@@ -1121,11 +1150,9 @@ fn approximate_recall_above_floor_after_rebuild() {
     for (i, v) in vecs.iter().enumerate() {
         let key = format!("v{i}");
         let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
-        let val = Value::List(vec![
-            Value::Float(v[0] / norm),
-            Value::Float(v[1] / norm),
-        ]);
-        db.insert_node("V", &key, vec![("emb".into(), val)]).unwrap();
+        let val = Value::List(vec![Value::Float(v[0] / norm), Value::Float(v[1] / norm)]);
+        db.insert_node("V", &key, vec![("emb".into(), val)])
+            .unwrap();
     }
 
     db.create_rule(RuleDef {
@@ -1151,7 +1178,10 @@ fn approximate_recall_above_floor_after_rebuild() {
         let mut s = BTreeSet::new();
         for i in 0..vecs.len() {
             let src = format!("v{i}");
-            for nb in db.neighbors(&src, "ASIM", Direction::Out).unwrap_or_default() {
+            for nb in db
+                .neighbors(&src, "ASIM", Direction::Out)
+                .unwrap_or_default()
+            {
                 s.insert(("ASIM".to_string(), src.clone(), nb));
             }
         }
@@ -1165,7 +1195,9 @@ fn approximate_recall_above_floor_after_rebuild() {
             let norm_i = (vi[0] * vi[0] + vi[1] * vi[1]).sqrt();
             let ni = [vi[0] / norm_i, vi[1] / norm_i];
             for (j, vj) in vecs.iter().enumerate() {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 let norm_j = (vj[0] * vj[0] + vj[1] * vj[1]).sqrt();
                 let nj = [vj[0] / norm_j, vj[1] / norm_j];
                 let dot = ni[0] * nj[0] + ni[1] * nj[1];
@@ -1183,6 +1215,248 @@ fn approximate_recall_above_floor_after_rebuild() {
         "rebuild recall {:.3} < floor {:.3} (approx={} exact={})",
         r,
         APPROX_RECALL_FLOOR_RECOVERY,
+        approx_edges.len(),
+        exact_edges.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// High-dimensional recall test (1536-D, 1024 clustered vectors)
+// ---------------------------------------------------------------------------
+
+/// Seeded LCG — same formula used in the engine bench `mix()`.
+fn lcg_mix(seed: u64, i: u64, j: u64) -> u64 {
+    let mut x = seed
+        .wrapping_add(i.wrapping_mul(6364136223846793005))
+        .wrapping_add(j.wrapping_mul(1442695040888963407));
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+    x ^= x >> 33;
+    x
+}
+
+/// Build a unit-normed 1536-D vector for cluster `c` node `n` with given seed.
+/// Strategy: start from a cluster centroid direction (dims 0..1535 where
+/// dim 0 has a large bias for cluster c), then perturb with noise, then normalise.
+fn clustered_vec_1536(seed: u64, n_clusters: usize, cluster: usize, member: usize) -> Vec<f64> {
+    const DIM: usize = 1536;
+    let mut v = vec![0.0f64; DIM];
+    // Cluster centroid: set the cluster's "primary" dimension to a large positive value.
+    // With 1536 dims and n_clusters ≤ 32, each cluster owns 48+ dims.
+    let stride = DIM / n_clusters;
+    let base = cluster * stride;
+    for d in base..((base + stride).min(DIM)) {
+        v[d] = 1.0;
+    }
+    // Add small seeded noise to each dim.
+    for d in 0..DIM {
+        let bits = lcg_mix(seed, cluster as u64 * 10_000 + member as u64, d as u64);
+        let noise = (bits as f64) / (u64::MAX as f64) * 0.15 - 0.075; // ±7.5% noise
+        v[d] += noise;
+    }
+    // Normalise.
+    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-12);
+    v.iter_mut().for_each(|x| *x /= norm);
+    v
+}
+
+/// Recall at real scale: 1024 nodes, 1536-D, 16 clusters × 64 nodes each.
+/// min_sim = 0.80 (within-cluster cosine is ~0.90+ for this generation scheme).
+/// Asserts recall ≥ APPROX_RECALL_FLOOR_QUIESCED = 0.90 (quiesced).
+///
+/// Marked `#[ignore]` because the O(n²) exact ground-truth over 1024×1536 dims
+/// is ~70s in debug. Run with `cargo test -- --include-ignored` for full DST.
+#[test]
+#[ignore]
+fn approximate_recall_above_floor_1536dim_1k() {
+    const N_CLUSTERS: usize = 16;
+    const PER_CLUSTER: usize = 64;
+    const N: usize = N_CLUSTERS * PER_CLUSTER; // 1024
+    const MIN_SIM: f64 = 0.80;
+    const SEED: u64 = 0xdead_beef_cafe_babe;
+
+    let dir = {
+        let d = std::env::temp_dir().join(format!("graphdb-approx-1536-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    };
+
+    // Build node vectors.
+    let vecs: Vec<Vec<f64>> = (0..N_CLUSTERS)
+        .flat_map(|c| (0..PER_CLUSTER).map(move |m| (c, m)))
+        .map(|(c, m)| clustered_vec_1536(SEED, N_CLUSTERS, c, m))
+        .collect();
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    for (i, v) in vecs.iter().enumerate() {
+        let key = format!("v{i:04}");
+        let val = Value::List(v.iter().copied().map(Value::Float).collect());
+        db.insert_node("V", &key, vec![("emb".into(), val)])
+            .unwrap();
+    }
+
+    db.create_rule(RuleDef {
+        name: "approx_sim".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: MIN_SIM,
+        },
+        edge_type: "ASIM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+    })
+    .unwrap();
+
+    // Collect approximate edge set.
+    let approx_edges: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for i in 0..N {
+            let src = format!("v{i:04}");
+            for nb in db
+                .neighbors(&src, "ASIM", Direction::Out)
+                .unwrap_or_default()
+            {
+                s.insert(("ASIM".to_string(), src.clone(), nb));
+            }
+        }
+        s
+    };
+
+    // Compute exact ground-truth (O(n²) — acceptable for n=1024 in tests).
+    let exact_edges: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for i in 0..N {
+            for j in 0..N {
+                if i == j {
+                    continue;
+                }
+                let dot: f64 = vecs[i].iter().zip(vecs[j].iter()).map(|(a, b)| a * b).sum();
+                if dot >= MIN_SIM {
+                    s.insert(("ASIM".to_string(), format!("v{i:04}"), format!("v{j:04}")));
+                }
+            }
+        }
+        s
+    };
+
+    let r = recall(&approx_edges, &exact_edges);
+    assert!(
+        r >= APPROX_RECALL_FLOOR_QUIESCED,
+        "1536-D 1k quiesced recall {:.3} < floor {:.3} (approx={} exact={})",
+        r,
+        APPROX_RECALL_FLOOR_QUIESCED,
+        approx_edges.len(),
+        exact_edges.len()
+    );
+}
+
+/// 5k-node IVF-Flat wall-clock probe with recall vs exact ground truth.
+///
+/// Shape: 5000 nodes × 1536-D, min_sim=0.85, approximate=true.
+/// Records: IVF backfill wall-clock, recall vs brute-force exact.
+/// `#[ignore]` — exact O(n²) ground truth is expensive; run explicitly with
+/// `cargo test --release -- --ignored approximate_recall_5k_timing --nocapture`.
+#[test]
+#[ignore]
+fn approximate_recall_5k_timing() {
+    use std::time::Instant;
+
+    const N_CLUSTERS: usize = 50;
+    const PER_CLUSTER: usize = 100;
+    const N: usize = N_CLUSTERS * PER_CLUSTER; // 5000
+    const MIN_SIM: f64 = 0.85;
+    const SEED: u64 = 0xcafe_f00d_dead_1234;
+
+    let dir = {
+        let d = std::env::temp_dir().join(format!("graphdb-approx-5k-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    };
+
+    // Build clustered 1536-D node vectors (same generator as 1k test).
+    let vecs: Vec<Vec<f64>> = (0..N_CLUSTERS)
+        .flat_map(|c| (0..PER_CLUSTER).map(move |m| (c, m)))
+        .map(|(c, m)| clustered_vec_1536(SEED, N_CLUSTERS, c, m))
+        .collect();
+
+    // Insert nodes (not timed — pure data setup).
+    let mut db = GraphDb::open(&dir).unwrap();
+    for (i, v) in vecs.iter().enumerate() {
+        let key = format!("v{i:04}");
+        let val = Value::List(v.iter().copied().map(Value::Float).collect());
+        db.insert_node("V", &key, vec![("emb".into(), val)])
+            .unwrap();
+    }
+
+    // Time the IVF-Flat backfill (k-means fit + candidate probing + edge derivation).
+    let t0 = Instant::now();
+    db.create_rule(RuleDef {
+        name: "approx_sim5k".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: MIN_SIM,
+        },
+        edge_type: "ASIM5K".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+    })
+    .unwrap();
+    let ivf_ms = t0.elapsed().as_millis();
+
+    // Collect approximate edges.
+    let approx_edges: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for i in 0..N {
+            let src = format!("v{i:04}");
+            for nb in db
+                .neighbors(&src, "ASIM5K", Direction::Out)
+                .unwrap_or_default()
+            {
+                s.insert(("ASIM5K".to_string(), src.clone(), nb));
+            }
+        }
+        s
+    };
+
+    // Exact O(n²) ground truth (slow — run only in release mode).
+    let t1 = Instant::now();
+    let exact_edges: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for i in 0..N {
+            for j in 0..N {
+                if i == j {
+                    continue;
+                }
+                let dot: f64 = vecs[i].iter().zip(vecs[j].iter()).map(|(a, b)| a * b).sum();
+                if dot >= MIN_SIM {
+                    s.insert(("ASIM5K".to_string(), format!("v{i:04}"), format!("v{j:04}")));
+                }
+            }
+        }
+        s
+    };
+    let exact_ms = t1.elapsed().as_millis();
+
+    let r = recall(&approx_edges, &exact_edges);
+    eprintln!(
+        "5k probe: IVF backfill {ivf_ms}ms | exact ground truth {exact_ms}ms | \
+         recall {r:.4} (approx={} exact={})",
+        approx_edges.len(),
+        exact_edges.len()
+    );
+    assert!(
+        r >= APPROX_RECALL_FLOOR_QUIESCED,
+        "5k recall {:.3} < floor {:.3} (approx={} exact={})",
+        r,
+        APPROX_RECALL_FLOOR_QUIESCED,
         approx_edges.len(),
         exact_edges.len()
     );

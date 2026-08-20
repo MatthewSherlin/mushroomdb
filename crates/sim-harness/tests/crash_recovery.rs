@@ -26,16 +26,68 @@ fn workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
 /// Node keys used by `workload_with_rules`; constant for edge-set sweeps.
 const WORKLOAD_KEYS: &[&str] = &[
     "n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9", "n10", "n11", "n12", "n13", "x0",
-    "y0", "y1", "y2", "y3", "y4", "g0", "g1", "g2", "g3", "g4", "v0", "v1", "v2",
+    "y0", "y1", "y2", "y3", "y4", "g0", "g1", "g2", "g3", "g4", "v0", "v1", "v2", "va0", "va1",
+    "va2", "va3",
 ];
 
+/// Recall floors for approximate vector rules (mirrors oracle_equivalence.rs constants).
+const APPROX_RECALL_FLOOR_RECOVERY: f64 = 0.85;
+
+/// Approximate cosine-similarity recall over the VA nodes for the vec_approx rule.
+fn approx_recall(db: &GraphDb<SimFs>) -> f64 {
+    // VA nodes: 4 2-D unit vectors in 2 clusters.
+    // Cluster A: va0=[1,0], va1=[0.98,0.2] — dot ≈ 0.98 ≥ 0.9.
+    // Cluster B: va2=[0,1], va3=[-0.2,0.98] — dot ≈ 0.98 ≥ 0.9; cross-cluster ≤ 0.2.
+    // Exact pairs: va0↔va1, va2↔va3 (4 directed edges).
+    let va_vecs: &[(&str, [f64; 2])] = &[
+        ("va0", [1.0, 0.0]),
+        ("va1", [0.98_f64, 0.2_f64]),
+        ("va2", [0.0, 1.0]),
+        ("va3", [-0.2_f64, (1.0_f64 - 0.04_f64).sqrt()]),
+    ];
+    let min_sim = 0.9_f64;
+
+    let mut exact_count = 0usize;
+    let mut hit_count = 0usize;
+
+    for (i, (sk, sv)) in va_vecs.iter().enumerate() {
+        if !db.has_node(sk) {
+            continue;
+        }
+        for (j, (dk, dv)) in va_vecs.iter().enumerate() {
+            if i == j || !db.has_node(dk) {
+                continue;
+            }
+            let dot = sv[0] * dv[0] + sv[1] * dv[1];
+            if dot >= min_sim {
+                exact_count += 1;
+                let in_approx = db
+                    .neighbors(sk, "VAPPROX", Direction::Out)
+                    .unwrap_or_default()
+                    .contains(&dk.to_string());
+                if in_approx {
+                    hit_count += 1;
+                }
+            }
+        }
+    }
+
+    if exact_count == 0 {
+        1.0
+    } else {
+        hit_count as f64 / exact_count as f64
+    }
+}
+
 /// Slot count after a complete `workload_with_rules` (n0–n11 + batch n12/n13
-/// + ingest x0 + 5Y + 5G + 3V; n6 is tombstoned but still a slot).
-const WORKLOAD_MAX_SLOTS: usize = 28;
+/// + ingest x0 + 5Y + 5G + 3V + 4VA; n6 is tombstoned but still a slot).
+const WORKLOAD_MAX_SLOTS: usize = 32;
 
-const WORKLOAD_ETYPES: &[&str] = &["E", "KM", "OV", "DUMMY", "ORG", "NW", "NZ", "GEO", "VEC"];
+const WORKLOAD_ETYPES: &[&str] = &[
+    "E", "KM", "OV", "DUMMY", "ORG", "NW", "NZ", "GEO", "VEC", "VAPPROX",
+];
 
-const WORKLOAD_LABELS: &[&str] = &["L0", "L1", "L2", "Y", "G", "V"];
+const WORKLOAD_LABELS: &[&str] = &["L0", "L1", "L2", "Y", "G", "V", "VA"];
 
 const WORKLOAD_FIELDS: &[&str] = &[
     "f", "tags", "year", "loc", "emb", "tmp", "org_id", "id", "i",
@@ -98,7 +150,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         predicate: Predicate::KeyMatch { field: "f".into() },
         edge_type: "KM".into(),
         weight_prop: None,
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     })?;
 
@@ -137,7 +189,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         },
         edge_type: "OV".into(),
         weight_prop: None,
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     })?;
 
@@ -149,7 +201,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         predicate: Predicate::FieldEqual { field: "f".into() },
         edge_type: "DUMMY".into(),
         weight_prop: None,
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     })?;
     db.delete_rule("dummy")?;
@@ -172,7 +224,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         },
         edge_type: "NW".into(),
         weight_prop: None,
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     })?;
     db.create_rule(RuleDef {
@@ -185,7 +237,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         },
         edge_type: "NZ".into(),
         weight_prop: None,
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     })?;
 
@@ -205,7 +257,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         },
         edge_type: "GEO".into(),
         weight_prop: None,
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     })?;
 
@@ -227,8 +279,33 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         },
         edge_type: "VEC".into(),
         weight_prop: None,
-            max_edges: None,
+        max_edges: None,
         approximate: false,
+    })?;
+
+    // Approximate vector rule (vec_approx): 4 VA nodes in 2 clusters.
+    // Cluster A: va0≈va1 (cos ≥ 0.9). Cluster B: va2≈va3 (cos ≥ 0.9).
+    // Cross-cluster cos ≤ 0.2 — no edges expected there.
+    db.insert_node("VA", "va0", vec![("emb".into(), emb(&[1.0, 0.0]))])?;
+    db.insert_node("VA", "va1", vec![("emb".into(), emb(&[0.98, 0.2]))])?;
+    db.insert_node("VA", "va2", vec![("emb".into(), emb(&[0.0, 1.0]))])?;
+    db.insert_node(
+        "VA",
+        "va3",
+        vec![("emb".into(), emb(&[-0.2, (1.0_f64 - 0.04_f64).sqrt()]))],
+    )?;
+    db.create_rule(RuleDef {
+        name: "vec_approx".into(),
+        src_label: "VA".into(),
+        dst_label: "VA".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.9,
+        },
+        edge_type: "VAPPROX".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
     })?;
 
     // Snapshot while km, ov, and Plan-7 rules are live (no dummy rule).
@@ -371,6 +448,12 @@ fn oracle_from_db(db: &GraphDb<SimFs>) -> Oracle {
         }
     }
     for rule in db.rules() {
+        // Approximate rules use IVF candidates, not brute-force exact evaluation.
+        // They are excluded from oracle-equivalence checks; recall is verified
+        // separately via `approx_recall()` in `assert_recovered_invariants`.
+        if rule.approximate {
+            continue;
+        }
         assert!(o.create_rule(rule), "oracle rejected a recovered live rule");
     }
     for key in WORKLOAD_KEYS {
@@ -388,7 +471,18 @@ fn oracle_from_db(db: &GraphDb<SimFs>) -> Oracle {
 
 fn assert_oracle_equiv(db: &GraphDb<SimFs>, label: &str) {
     let oracle = oracle_from_db(db);
-    let engine = collect_all_edges(db);
+    // Approximate-rule edges are excluded from the oracle (IVF recall is checked
+    // separately via approx_recall).  Filter the engine side to match.
+    let approx_etypes: BTreeSet<String> = db
+        .rules()
+        .iter()
+        .filter(|r| r.approximate)
+        .map(|r| r.edge_type.clone())
+        .collect();
+    let engine: BTreeSet<(String, String, String)> = collect_all_edges(db)
+        .into_iter()
+        .filter(|(et, _, _)| !approx_etypes.contains(et))
+        .collect();
     let expected = oracle.all_edges();
     assert_eq!(
         engine, expected,
@@ -444,6 +538,14 @@ fn assert_recovered_invariants(recovered: &mut GraphDb<SimFs>, label: &str) {
     }
     // n6 is the planned delete_node target: if the delete landed, the key is gone.
     // If it has not landed, n6 is still a live L1 with tags (checked above).
+    for key in ["va0", "va1", "va2", "va3"] {
+        if recovered.has_node(key) {
+            assert!(
+                recovered.get_prop(key, "emb").is_some(),
+                "{label}: {key} exists but emb prop is missing"
+            );
+        }
+    }
 
     assert_oracle_equiv(recovered, label);
 
@@ -470,6 +572,26 @@ fn assert_recovered_invariants(recovered: &mut GraphDb<SimFs>, label: &str) {
         stats_minus_fires(recovered.stats()),
         "{label}: rebuild_rule changed stats (fires zeroed; parked T6 fires-skew)"
     );
+
+    // Approximate-rule recall assertion: if vec_approx is live and VA nodes exist,
+    // recall must be ≥ APPROX_RECALL_FLOOR_RECOVERY at every crash-recovery state.
+    let approx_rule_live = recovered
+        .rules()
+        .iter()
+        .any(|r| r.name == "vec_approx" && r.approximate);
+    let va_nodes_exist = recovered.has_node("va0")
+        || recovered.has_node("va1")
+        || recovered.has_node("va2")
+        || recovered.has_node("va3");
+    if approx_rule_live && va_nodes_exist {
+        let r = approx_recall(recovered);
+        assert!(
+            r >= APPROX_RECALL_FLOOR_RECOVERY,
+            "{label}: approximate vec_approx recall {:.3} < floor {:.3}",
+            r,
+            APPROX_RECALL_FLOOR_RECOVERY
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

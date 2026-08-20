@@ -192,7 +192,7 @@ fn rule_works_at() -> RuleDef {
         },
         edge_type: "WORKS_AT".into(),
         weight_prop: None,
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     }
 }
@@ -207,7 +207,7 @@ fn rule_on_project() -> RuleDef {
         },
         edge_type: "ON_PROJECT".into(),
         weight_prop: None,
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     }
 }
@@ -223,7 +223,7 @@ fn rule_skill_fit() -> RuleDef {
         },
         edge_type: "FIT".into(),
         weight_prop: Some("score".into()),
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     }
 }
@@ -239,7 +239,7 @@ fn rule_vector_sim() -> RuleDef {
         },
         edge_type: "SIMILAR".into(),
         weight_prop: Some("score".into()),
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     }
 }
@@ -473,7 +473,7 @@ fn vector_semantic_backfill(c: &mut Criterion) {
         },
         edge_type: "SEM_SIM".into(),
         weight_prop: None,
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     };
 

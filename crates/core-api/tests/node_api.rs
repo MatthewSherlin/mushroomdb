@@ -29,7 +29,7 @@ fn open_mixed(name: &str) -> GraphDb<core_storage::fs::RealFs> {
         },
         edge_type: "FIT".into(),
         weight_prop: Some("score".into()),
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     })
     .unwrap();

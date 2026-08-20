@@ -16,7 +16,7 @@ fn fk_rule() -> RuleDef {
         },
         edge_type: "WORKS_AT".into(),
         weight_prop: None,
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     }
 }
@@ -155,7 +155,7 @@ fn explain_reports_rule_provenance_and_weights() {
         },
         edge_type: "SIMILAR".into(),
         weight_prop: Some("score".into()),
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     })
     .unwrap();
@@ -235,7 +235,7 @@ fn explain_predicate_summary_key_match_and_all() {
         ]),
         edge_type: "BOTH".into(),
         weight_prop: Some("score".into()),
-            max_edges: None,
+        max_edges: None,
         approximate: false,
     })
     .unwrap();
