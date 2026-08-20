@@ -214,3 +214,35 @@ Plan 11 (T1–T4) shipped four targeted engine + bindings changes. The dogfood r
 - **Incremental p50 rose** (15.50 ms vs 3.48 ms) proportionally to rules-per-event — expected.
 
 Source: `dogfood/results/scale-100k.md`, "Run 2 (post-Plan-11)."
+
+---
+
+## Addendum — Plan 12 post-run (2026-08-20)
+
+> **Update to the 7.91-min cold-start figure (Plan-11 Addendum, "Cold-start is the new top finding").**
+> The Plan-11 Addendum reported a 7.91-min WAL-only reopen and a nearly identical snapshot reopen
+> (7.58 min) because snapshot() did not persist derived edges. Plan-12 T4 implemented V4 snapshot
+> format: derived edges + IVF centroids are persisted in the snapshot file.
+> The old `dogfood/results/scale-100000-db` (pre-Plan-11 bincode) was unreadable; it was deleted
+> and rebuilt fresh via `dogfood/scale_run.py` on 2026-08-20 (seed=20260819).
+
+### 100k cold-start: WAL-only vs. V4 snapshot
+
+| Path | Wall | Notes |
+|---|---|---|
+| WAL-only (no snapshot) | **8.86 min** | Replays WAL; re-fires all 12 rules from node data. Non-semantic rules complete in ~21 s (T1 streaming). IVF-Flat re-derivation dominates (~8.37 min). Similar to Plan-11 7.91 min — IVF-Flat still the bottleneck. |
+| Snapshot V4 (T4 Plan-12) | **11.15 s** | snapshot() (36.1 s write, one-time cost) then open() loads derived edges + IVF centroids. No rule re-fire. **47.7× improvement** over WAL-only. |
+
+### Interpretation
+
+- **The 7.91-min figure is superseded.** WAL-only is now 8.86 min (slightly slower: more rules
+  declared in this run than Plan-11). Snapshot V4 brings it to **11 seconds**.
+- **snapshot() write cost: 36.1 s.** This is a one-time cost at graceful shutdown. Cold restart
+  from V4 snapshot then takes 11 s.
+- **Non-semantic backfill improved:** 9 rules in 21.2 s (T1 streaming, vs projected 489 min
+  pre-Plan-11). Only IVF-Flat re-derivation (8.37 min) now dominates WAL reopen.
+- **For the WAL-only path**, the bottleneck is IVF-Flat ANN index rebuild (~8 min at 100k × 1536 dim).
+  The V4 snapshot path eliminates this entirely. Production deployment should use `snapshot()` on
+  graceful shutdown to avoid the WAL-only penalty.
+
+Source: rebuilt `dogfood/results/scale-100k.md` (2026-08-20); `dogfood/results/scale-100000-db`.

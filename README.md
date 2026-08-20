@@ -150,16 +150,19 @@ Full predicate reference and examples: [`docs/site/rules.md`](docs/site/rules.md
 ## Benchmarks
 
 10,000-node graph (Apple M4 Pro, macOS 15.7.3, arm64). Full methodology
-and honesty notes: [`benchmarks/results/head-to-head-10k.md`](benchmarks/results/head-to-head-10k.md).
+and honesty notes: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md).
 
 | Workload | mushroomdb | Neo4j | KùzuDB | Memgraph |
 |---|---|---|---|---|
-| Bulk ingest | 8.761 s | 12.460 s | 1.21 min | 46.24 ms † |
-| Neighborhood depth-1 (p50) | 1.1 µs | 1.81 ms | 99.7 µs | 3.12 ms |
-| Neighborhood depth-1 (p95) | 14.0 µs | 12.81 ms | 476.5 µs | 3.90 ms |
-| Neighborhood depth-2 (p50) | 0.9 µs | 6.78 ms | 1.04 ms | 2.97 ms |
-| Cypher scan-filter-project | 5.11 ms | 84.81 ms | 1.78 ms | 11.56 ms † |
-| Cypher two-hop join | 1.273 s ‡ | 74.25 ms | 1.09 ms | 1.08 ms |
+| Bulk ingest | 0.874 s | 13.227 s | 1.19 min | 19.924 s † |
+| Neighborhood depth-1 (p50) | 0.4 µs | 1.81 ms | 101 µs | 3.00 ms |
+| Neighborhood depth-1 (p95) | 2.2 µs | 14.47 ms | 405 µs | 6.71 ms |
+| Neighborhood depth-2 (p50) | 0.2 µs | 4.73 ms | 1.06 ms | 2.50 ms |
+| Cypher scan-filter-project | 2.20 ms | 87.36 ms | 2.03 ms ‡ | 12.56 ms |
+| Cypher two-hop join | **0.198 ms** | 85.57 ms ★ | 1.42 ms ★ | 2.01 ms ★ |
+| Cold-start (WAL-only / connect) | 3.24 s | 18.54 ms ▲ | 23.41 ms | 0.42 ms ▲ |
+| Cold-start (snapshot V4) | **1.01 s** | — | — | — |
+| Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
 **Honesty notes:**
 
@@ -167,18 +170,31 @@ and honesty notes: [`benchmarks/results/head-to-head-10k.md`](benchmarks/results
   overhead). KùzuDB is also embedded — its numbers are directly comparable
   to mushroomdb's. Neo4j and Memgraph numbers go over bolt/localhost
   (~0.1–1 ms round-trip per query).
-- † Memgraph adapter stores only the `key` field (not full node properties).
-  Bulk ingest skips property serialization. Cypher scan-filter returns 0
-  rows (`size_bucket` was not stored) — not semantically equivalent to the
-  neo4j/mushroomdb results for those workloads.
-- ‡ Earlier: returned error _intermediate result exceeds 1,000,000 rows_.
-  Fixed by LIMIT pushdown (pull-based executor, no materialization).
-  Re-measured at 3.5k-node scale: 71 µs median. Full 10k re-measurement
-  pending (T5).
+- † Memgraph adapter v2 fix: now stores full node properties (`SET n = row`).
+  v1 stored only `key`, causing scan-filter to return 0 rows. v2 correctly
+  returns 1,400 rows. Bulk ingest time increased from 46 ms (key-only) to
+  19.9 s (full props) — now semantically comparable to neo4j/mushroomdb.
+- ‡ KùzuDB scan-filter uses `WHERE n.key STARTS WITH 'talent'` (no full props
+  stored in kuzu adapter); returns all 7,000 Talent nodes, not the 1,400
+  matching `size_bucket = 3`. Not semantically equivalent.
+- ★ Neo4j / KùzuDB / Memgraph `cypher_two_hop` returns **0 rows** — no
+  INDUSTRY_ALIGNMENT edges exist (no auto-derivation). Timing measures an empty
+  traversal. mushroomdb derives these edges via rules and returns **200 rows**
+  in 0.198 ms. The v1 mushroomdb row was ERROR (fixed by Plan-12 pull executor
+  with LIMIT pushdown).
+- ▲ Neo4j / Memgraph `cold_start` = connect + first query (server already running).
+  `boot-to-ready` reports container-start-to-ready: neo4j 6.6 s, memgraph 4.3 s.
+  mushroomdb and KùzuDB are embedded — `cold_start` IS the full startup cost.
 
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
-two-rule backfill on 10k nodes completed in 20.7 s. Competitors have no
-auto-derivation equivalent; this workload has no cross-engine baseline.
+two-rule backfill on 10k nodes: 0.924 s + 2.152 s = **3.08 s** (Plan-12 T1
+streaming reduced this from 20.7 s). Competitors have no auto-derivation
+equivalent; this workload has no cross-engine baseline.
+
+100k cold-start (from `dogfood/results/scale-100k.md`, rebuilt 2026-08-20):
+WAL-only open: **8.86 min** (re-fires all 12 rules; IVF-Flat dominates).
+Snapshot V4 open: **11.15 s** (derived edges + IVF centroids loaded; no re-fire; **47.7× faster**).
+See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
 
 ---
 
@@ -343,7 +359,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 - Rules reference: [`docs/site/rules.md`](docs/site/rules.md)
 - API reference: [`docs/site/api.md`](docs/site/api.md)
 - Design spec: [`docs/design.md`](docs/design.md)
-- Benchmarks: [`benchmarks/results/head-to-head-10k.md`](benchmarks/results/head-to-head-10k.md)
+- Benchmarks: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md) (v1: [`head-to-head-10k.md`](benchmarks/results/head-to-head-10k.md))
 - Dogfood report: [`docs/dogfood-report.md`](docs/dogfood-report.md)
 
 ---
