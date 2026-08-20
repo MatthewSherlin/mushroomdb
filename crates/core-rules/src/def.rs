@@ -1051,12 +1051,79 @@ mod tests {
         );
     }
 
+    /// Any([All([X, Y]), Z]) — score = max(min(X, Y), Z).
+    /// Tests two scenarios: one where the All branch wins, one where Z wins.
+    #[test]
+    fn nested_any_of_all_uses_max_over_min() {
+        // Predicate: Any([All([FieldEqual(gen), NumericWithin(yr, 4)]), NumericWithin(yr2, 10)])
+        let p = Predicate::Any(vec![
+            Predicate::All(vec![
+                Predicate::FieldEqual { field: "gen".into() },
+                Predicate::NumericWithin {
+                    field: "yr".into(),
+                    tolerance: 4.0,
+                },
+            ]),
+            Predicate::NumericWithin {
+                field: "yr2".into(),
+                tolerance: 10.0,
+            },
+        ]);
+
+        // Scenario A: All branch wins (0.75 > 0.5).
+        // gen match → FieldEqual = 1.0
+        // yr diff = 1, tol = 4  → score = 1 − 1/4 = 0.75
+        // All = min(1.0, 0.75) = 0.75
+        // yr2 diff = 5, tol = 10 → score = 1 − 5/10 = 0.5
+        // Any = max(0.75, 0.5) = 0.75
+        let a: HashMap<_, _> = [
+            ("gen".to_string(), Value::Str("pop".into())),
+            ("yr".to_string(), Value::Int(2000)),
+            ("yr2".to_string(), Value::Int(2000)),
+        ]
+        .into();
+        let b: HashMap<_, _> = [
+            ("gen".to_string(), Value::Str("pop".into())),
+            ("yr".to_string(), Value::Float(2001.0)),
+            ("yr2".to_string(), Value::Float(2005.0)),
+        ]
+        .into();
+        let s_a = eval!(&p, ("a", a) => ("b", b)).unwrap();
+        assert!(
+            (s_a - 0.75).abs() < 1e-9,
+            "Any-of-All scenario A: max(min(1.0,0.75), 0.5) must be 0.75, got {s_a}"
+        );
+
+        // Scenario B: Z branch wins (All = None because gen differs).
+        // gen mismatch → FieldEqual = None → All = None
+        // yr2 diff = 1, tol = 10 → score = 1 − 1/10 = 0.9
+        // Any = max(None, 0.9) = 0.9
+        let a2: HashMap<_, _> = [
+            ("gen".to_string(), Value::Str("pop".into())),
+            ("yr".to_string(), Value::Int(2000)),
+            ("yr2".to_string(), Value::Int(2000)),
+        ]
+        .into();
+        let c: HashMap<_, _> = [
+            ("gen".to_string(), Value::Str("rock".into())),
+            ("yr".to_string(), Value::Float(2001.0)),
+            ("yr2".to_string(), Value::Float(2001.0)),
+        ]
+        .into();
+        let s_b = eval!(&p, ("a", a2) => ("c", c)).unwrap();
+        assert!(
+            (s_b - 0.9).abs() < 1e-9,
+            "Any-of-All scenario B: max(None, 0.9) must be 0.9, got {s_b}"
+        );
+    }
+
     /// validate() rejects empty Any; depth cap 4 is enforced with a named error.
     #[test]
     fn any_validation_errors() {
-        // Empty Any → error
+        // Empty Any → named error (pinned text)
         let empty = sample_rule(Predicate::Any(vec![]));
-        assert!(empty.validate().is_err());
+        let err = empty.validate().unwrap_err();
+        assert_eq!(err, "any() must have at least one predicate");
 
         // Helper: build a singly-nested Any chain of the given depth.
         fn any_chain(depth: usize) -> Predicate {
@@ -1295,26 +1362,33 @@ mod wire_pins {
         // Any is discriminant 7 (appended after VectorSimilar=6).
         // Old WAL/snapshot records never contain discriminant 7, so old data
         // still round-trips via the existing variants 0–6.
-        // Encoding: discriminant(u32 le) + Vec<Predicate> (len u64 le + elements).
-        // This pin guards that Any is never reordered or renumbered.
+        //
+        // Exact-bytes pin for Any([FieldEqual{field:"f"}]) via pin():
+        //   name "r"        → [1,0,0,0,0,0,0,0, 114]
+        //   src_label "A"   → [1,0,0,0,0,0,0,0, 65]
+        //   dst_label "B"   → [1,0,0,0,0,0,0,0, 66]
+        //   disc 7 (Any)    → [7,0,0,0]
+        //   vec len 1       → [1,0,0,0,0,0,0,0]
+        //   disc 1 (FE)     → [1,0,0,0]
+        //   field "f"       → [1,0,0,0,0,0,0,0, 102]
+        //   edge_type "E"   → [1,0,0,0,0,0,0,0, 69]
+        //   weight/edges/approx → [0,0,0]
         let any_fe = pin(Predicate::Any(vec![Predicate::FieldEqual {
             field: "f".into(),
         }]));
-        let bytes = bincode::serialize(&any_fe).unwrap();
-        // Predicate discriminant 7 is at byte 28 (after RuleDef header fields).
-        // Locate the discriminant by checking that bytes[28..32] == [7,0,0,0].
-        // (Exact byte index depends on RuleDef field widths — verified below.)
-        // First, round-trip: Any must decode to itself.
-        let decoded: RuleDef = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(decoded, any_fe, "Any must round-trip via bincode");
-        // Discriminant 7 must appear somewhere in the serialised predicate bytes.
-        let contains_discrim_7 = bytes
-            .windows(4)
-            .any(|w| w == [7u8, 0, 0, 0]);
-        assert!(
-            contains_discrim_7,
-            "serialised Any must contain discriminant byte sequence [7,0,0,0]"
+        assert_eq!(
+            bincode::serialize(&any_fe).unwrap(),
+            vec![
+                1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0,
+                0, 66, 7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+                102, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0,
+            ],
+            "Any([FieldEqual{{f}}]) exact-bytes pin failed — discriminant or field layout changed"
         );
+        // Also verify round-trip.
+        let decoded: RuleDef =
+            bincode::deserialize(&bincode::serialize(&any_fe).unwrap()).unwrap();
+        assert_eq!(decoded, any_fe, "Any must round-trip via bincode");
         // Verify that RuleDefs with the old variants still decode after Any is appended.
         let old = bincode::serialize(&pin(Predicate::VectorSimilar {
             field: "emb".into(),
@@ -1364,3 +1438,4 @@ mod wire_pins {
         assert_eq!(approx.last(), Some(&1u8));
     }
 }
+

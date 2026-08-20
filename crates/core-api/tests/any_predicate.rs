@@ -313,6 +313,109 @@ fn any_retraction_when_sole_branch_breaks() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. Edge RETAINED when one branch breaks but the other still holds.
+// ---------------------------------------------------------------------------
+
+/// When branch A breaks (via set_prop) while branch B still matches:
+///   • the edge MUST be retained
+///   • the persisted weight must update from max(A,B) to B's score alone
+/// Then when branch B breaks too the edge must be retracted.
+///
+/// This directly exercises the incremental re-evaluation path where a branch
+/// flip changes the score without triggering retraction.
+#[test]
+fn any_edge_retained_when_one_branch_holds() {
+    let dir = tmp("retain-one");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Rule: Any(FieldEqual(ind) → 1.0, NumericWithin(year, 10) → variable)
+    // weight_prop set so we can inspect the score.
+    db.create_rule(RuleDef {
+        name: "ret2".into(),
+        src_label: "N".into(),
+        dst_label: "N".into(),
+        predicate: Predicate::Any(vec![
+            Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+            Predicate::NumericWithin {
+                field: "year".into(),
+                tolerance: 10.0,
+            },
+        ]),
+        edge_type: "R2".into(),
+        weight_prop: Some("score".into()),
+        max_edges: None,
+        approximate: false,
+    })
+    .unwrap();
+
+    // src: ind="arch", year=2000
+    // dst: ind="arch", year=2004
+    //   → FieldEqual fires (score 1.0)
+    //   → NumericWithin: diff=4, tol=10 → score = 1 − 4/10 = 0.6
+    //   → initial weight = max(1.0, 0.6) = 1.0
+    db.insert_node("N", "src", vec![
+        ("ind".into(), Value::Str("arch".into())),
+        ("year".into(), Value::Int(2000)),
+    ])
+    .unwrap();
+    db.insert_node("N", "dst", vec![
+        ("ind".into(), Value::Str("arch".into())),
+        ("year".into(), Value::Int(2004)),
+    ])
+    .unwrap();
+
+    // Verify initial edge and weight = 1.0
+    let out0 = db.neighbors("src", "R2", Direction::Out).unwrap_or_default();
+    assert!(
+        out0.contains(&"dst".to_string()),
+        "src→dst must exist initially; got {out0:?}"
+    );
+    let explain0 = db.explain("src", "dst").unwrap();
+    let e0 = explain0
+        .iter()
+        .find(|e| e.rule == "ret2")
+        .expect("explain entry for ret2");
+    let w0 = e0.weight.expect("weight present");
+    assert!(
+        (w0 - 1.0).abs() < 1e-9,
+        "initial weight must be max(1.0, 0.6) = 1.0; got {w0}"
+    );
+
+    // Break branch A: change dst.ind so FieldEqual no longer fires.
+    // Branch B (NumericWithin) still fires: year diff=4, score=0.6.
+    // Edge must be RETAINED with updated weight = 0.6.
+    db.set_prop("dst", "ind", Value::Str("law".into())).unwrap();
+
+    let out1 = db.neighbors("src", "R2", Direction::Out).unwrap_or_default();
+    assert!(
+        out1.contains(&"dst".to_string()),
+        "src→dst must be RETAINED after FieldEqual branch breaks (NumericWithin still holds); got {out1:?}"
+    );
+    let explain1 = db.explain("src", "dst").unwrap();
+    let e1 = explain1
+        .iter()
+        .find(|e| e.rule == "ret2")
+        .expect("explain entry for ret2 after branch-A break");
+    let w1 = e1.weight.expect("weight present after branch-A break");
+    assert!(
+        (w1 - 0.6).abs() < 1e-9,
+        "weight must update to branch-B score (0.6) after branch-A breaks; got {w1}"
+    );
+
+    // Break branch B too: change dst.year so NumericWithin no longer fires.
+    // Neither branch matches → edge must be retracted.
+    db.set_prop("dst", "year", Value::Int(2050)).unwrap();
+
+    let out2 = db.neighbors("src", "R2", Direction::Out).unwrap_or_default();
+    assert!(
+        !out2.contains(&"dst".to_string()),
+        "src→dst must be retracted after both branches break; got {out2:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 5. Any with max_edges (top-k): branch-score change causes evict/backfill.
 // ---------------------------------------------------------------------------
 
