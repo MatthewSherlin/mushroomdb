@@ -124,48 +124,17 @@ fn row_cap_err(cap: usize) -> String {
     )
 }
 
-/// Return the plan-op index where the row bound (skip+limit) should be applied,
-/// or `None` if there is no suitable stage.
-///
-/// The bound is placed at the *last* row-producing or row-filtering op that
-/// appears before `Project`. Applying it at the last such op means:
-///
-/// - When that op is an `Expand` (no `Filter` follows before `Project`): rows
-///   from the Expand correspond 1-to-1 with result rows (post uniqueness), so
-///   stopping at `row_bound` is exact.
-/// - When that op is a `Filter` (a `Filter` is the last op before `Project`):
-///   `Filter` counts post-filter rows, which is correct.
-/// - Earlier `Expand`/`ScanLabel` stages still run to their full capacity (the
-///   `MAX_INTERMEDIATE_ROWS` safety cap applies to them as before).
-fn bound_apply_index(ops: &[PlanOp]) -> Option<usize> {
-    let proj_pos = ops
-        .iter()
-        .position(|op| matches!(op, PlanOp::Project { .. }))?;
-    ops[..proj_pos]
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(i, op)| match op {
-            PlanOp::Filter { .. }
-            | PlanOp::LookupProps { .. }
-            | PlanOp::JoinBound { .. }
-            | PlanOp::Expand { .. }
-            | PlanOp::ScanLabel { .. } => Some(i),
-            _ => None,
-        })
-}
-
 /// Execute a plan against a view. Row order before OrderBy is deterministic
 /// (scan order = dense ids; expand order = expand()'s sorted order).
 ///
 /// Precondition: `OrderBy` items produced by `plan()` use `OrderTarget::Alias`
 /// only; other variants are accepted defensively but non-standard.
 ///
-/// When the plan has a `Limit` and no `OrderBy`, the effective row bound
-/// (`SKIP + LIMIT`) is pushed down to the last producer/filter stage before
-/// `Project` so that execution terminates early rather than materialising the
-/// full intermediate table. The `MAX_INTERMEDIATE_ROWS` cap remains the outer
-/// safety net for all unbounded queries.
+/// When the plan has a `Limit` and no `OrderBy`, the executor switches to a
+/// demand-driven (pull-based) strategy: all producer stages terminate as soon
+/// as `SKIP + LIMIT` final rows have been collected.  No intermediate table is
+/// ever fully materialised for the bounded path — the 1 M cap is the safety
+/// net for unbounded queries only.
 pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<ResultSet, String> {
     use crate::cypher::plan::row_bound;
     execute_inner(view, plan, params, row_bound(plan))
@@ -192,39 +161,33 @@ fn execute_inner(
 ) -> Result<ResultSet, String> {
     check_params(plan, params)?;
 
-    let bound_idx = if row_bound.is_some() {
-        bound_apply_index(plan)
-    } else {
-        None
-    };
+    // Bounded plans use the pull-based (demand-driven) executor so that ALL
+    // producer stages terminate as soon as `bound` final rows are collected.
+    if let Some(bound) = row_bound {
+        return execute_pull(view, plan, params, bound);
+    }
 
+    // Staged (unbounded) path — full materialisation with the 1 M safety cap.
     let vars = collect_vars(plan);
     let mut rows: Vec<Row> = vec![vec![None; vars.names.len()]];
     let mut projected: Option<Projected> = None;
 
-    for (op_idx, op) in plan.iter().enumerate() {
-        // effective_bound is Some only at the one stage that gets early-stop.
-        let effective_bound = if Some(op_idx) == bound_idx {
-            row_bound
-        } else {
-            None
-        };
+    for op in plan {
         match op {
             PlanOp::ScanLabel { var, label } => {
-                rows = scan_label(view, &vars, &rows, var, label.as_deref(), effective_bound)?;
+                rows = scan_label(view, &vars, &rows, var, label.as_deref())?;
             }
             PlanOp::LookupProps { var, props } => {
-                rows = retain_node(view, &vars, &rows, var, None, props, params, effective_bound)?;
+                rows = retain_node(view, &vars, &rows, var, None, props, params)?;
             }
             PlanOp::JoinBound { var, label, props } => {
-                rows =
-                    retain_node(view, &vars, &rows, var, label.as_deref(), props, params, effective_bound)?;
+                rows = retain_node(view, &vars, &rows, var, label.as_deref(), props, params)?;
             }
             PlanOp::Expand { .. } => {
-                rows = exec_expand(view, &vars, &rows, op, params, effective_bound)?;
+                rows = exec_expand(view, &vars, &rows, op, params)?;
             }
             PlanOp::Filter { expr } => {
-                rows = exec_filter(view, &vars, &rows, expr, params, effective_bound)?;
+                rows = exec_filter(view, &vars, &rows, expr, params)?;
             }
             PlanOp::Project { items } => {
                 projected = Some(exec_project(view, &vars, &rows, items)?);
@@ -404,7 +367,6 @@ fn scan_label(
     rows: &[Row],
     var: &str,
     label: Option<&str>,
-    row_bound: Option<usize>,
 ) -> Result<Vec<Row>, String> {
     let ids = scan_ids(view, label);
     let slot = vars
@@ -412,7 +374,7 @@ fn scan_label(
         .ok_or_else(|| format!("unbound variable `{var}`"))?;
     let cap = max_intermediate_rows();
     let mut out = Vec::with_capacity(rows.len().saturating_mul(ids.len()).min(cap));
-    'outer: for row in rows {
+    for row in rows {
         for &id in &ids {
             if out.len() >= cap {
                 return Err(row_cap_err(cap));
@@ -420,9 +382,6 @@ fn scan_label(
             let mut next = row.clone();
             next[slot] = Some(Cell::Node(id));
             out.push(next);
-            if row_bound.is_some_and(|b| out.len() >= b) {
-                break 'outer;
-            }
         }
     }
     Ok(out)
@@ -509,16 +468,12 @@ fn retain_node(
     label: Option<&str>,
     props: &[(String, Operand)],
     params: &Params,
-    row_bound: Option<usize>,
 ) -> Result<Vec<Row>, String> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let id = require_node(row, vars, var)?;
         if node_matches(view, vars, row, id, label, props, params)? {
             out.push(row.clone());
-            if row_bound.is_some_and(|b| out.len() >= b) {
-                break;
-            }
         }
     }
     Ok(out)
@@ -561,7 +516,6 @@ fn exec_expand(
     rows: &[Row],
     op: &PlanOp,
     params: &Params,
-    row_bound: Option<usize>,
 ) -> Result<Vec<Row>, String> {
     let PlanOp::Expand {
         from,
@@ -583,7 +537,7 @@ fn exec_expand(
     let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
     let cap = max_intermediate_rows();
     let mut out = Vec::with_capacity(rows.len().saturating_mul(2).min(cap));
-    'outer: for row in rows {
+    for row in rows {
         let from_id = require_node(row, vars, from)?;
         let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
             Some(Cell::Node(id)) => Some(*id),
@@ -616,12 +570,6 @@ fn exec_expand(
             out.push(next);
             #[cfg(test)]
             record_expand_row();
-            // Early termination: stop once we have enough rows for SKIP+LIMIT.
-            // Relationship-uniqueness rejections (row_has_edge) do not count
-            // toward this bound — only rows actually added to `out` do.
-            if row_bound.is_some_and(|b| out.len() >= b) {
-                break 'outer;
-            }
         }
     }
     Ok(out)
@@ -633,18 +581,190 @@ fn exec_filter(
     rows: &[Row],
     expr: &Expr,
     params: &Params,
-    row_bound: Option<usize>,
 ) -> Result<Vec<Row>, String> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         if eval_expr(view, vars, row, expr, params, 0)? {
             out.push(row.clone());
-            if row_bound.is_some_and(|b| out.len() >= b) {
-                break;
-            }
         }
     }
     Ok(out)
+}
+
+/// Demand-driven executor for bounded plans (LIMIT without ORDER BY).
+///
+/// Locates the `Project` op, extracts the producer slice, and drives
+/// `pull_rows` to collect up to `bound` (= SKIP + LIMIT) projected rows.
+/// The 1 M intermediate-row cap is **not** applied here — it is the safety
+/// net for the staged (unbounded) path only.
+///
+/// # PARTIAL-row caveat
+///
+/// `bound` counts *final projected* rows (post-filter, post-uniqueness).
+/// A source row that is dropped by a Filter or by relationship-uniqueness
+/// does **not** count toward the bound.  Execution may therefore visit
+/// slightly more source rows than the bare LIMIT number, but will never
+/// emit more than `bound` result rows.
+fn execute_pull(
+    view: &GraphView,
+    plan: &[PlanOp],
+    params: &Params,
+    bound: usize,
+) -> Result<ResultSet, String> {
+    let proj_pos = match plan.iter().position(|op| matches!(op, PlanOp::Project { .. })) {
+        Some(p) => p,
+        None => return Ok(ResultSet::new(vec![])),
+    };
+    let producers = &plan[..proj_pos];
+    let project_items = match &plan[proj_pos] {
+        PlanOp::Project { items } => items,
+        _ => unreachable!(),
+    };
+    let columns: Vec<String> = project_items.iter().map(column_name).collect();
+    let vars = collect_vars(plan);
+    let initial_row: Row = vec![None; vars.names.len()];
+    let mut result_rows: Vec<Vec<Option<Value>>> = Vec::with_capacity(bound);
+    pull_rows(
+        view,
+        &vars,
+        producers,
+        project_items,
+        params,
+        &initial_row,
+        &mut result_rows,
+        bound,
+    )?;
+    // SKIP: discard the leading rows (bound = SKIP+LIMIT ensures there are enough).
+    let skip_n = plan[proj_pos + 1..]
+        .iter()
+        .find_map(|op| match op {
+            PlanOp::Skip(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let skip_n = usize::try_from(skip_n).unwrap_or(usize::MAX);
+    let mut rs = ResultSet::new(columns);
+    for row in result_rows.into_iter().skip(skip_n) {
+        rs.push_row(row);
+    }
+    Ok(rs)
+}
+
+/// Recursively pull rows through `ops`, projecting into `result` until
+/// `result.len() >= bound`.
+///
+/// Each arm binds one `PlanOp` and recurses on `rest`.  When `ops` is empty
+/// (all producers consumed), the current `row` is projected and appended.
+fn pull_rows(
+    view: &GraphView,
+    vars: &VarTable,
+    ops: &[PlanOp],
+    project_items: &[RetItem],
+    params: &Params,
+    row: &Row,
+    result: &mut Vec<Vec<Option<Value>>>,
+    bound: usize,
+) -> Result<(), String> {
+    if result.len() >= bound {
+        return Ok(());
+    }
+    let (op, rest) = match ops.split_first() {
+        Some(pair) => pair,
+        None => {
+            // All producers consumed — project this final row.
+            let mut cells = Vec::with_capacity(project_items.len());
+            for item in project_items {
+                cells.push(project_item(view, vars, row, item)?);
+            }
+            result.push(cells);
+            return Ok(());
+        }
+    };
+    match op {
+        PlanOp::ScanLabel { var, label } => {
+            let ids = scan_ids(view, label.as_deref());
+            let slot = vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for &id in &ids {
+                if result.len() >= bound {
+                    break;
+                }
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                pull_rows(view, vars, rest, project_items, params, &next, result, bound)?;
+            }
+        }
+        PlanOp::Expand {
+            from,
+            rel_var,
+            etype,
+            dir,
+            to,
+            to_label,
+            to_props,
+        } => {
+            let etypes = resolve_etypes(view, etype.as_deref());
+            let exp_dir = map_dir(*dir);
+            let to_slot = vars
+                .slot(to)
+                .ok_or_else(|| format!("unbound variable `{to}`"))?;
+            let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
+            let from_id = require_node(row, vars, from)?;
+            let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
+                Some(Cell::Node(id)) => Some(*id),
+                Some(Cell::Rel(_)) => return Err(format!("variable `{to}` is not a node")),
+                None => None,
+            };
+            for e in expand(view, from_id, etypes.as_deref(), exp_dir) {
+                if result.len() >= bound {
+                    break;
+                }
+                if row_has_edge(row, &e) {
+                    continue;
+                }
+                let nbr = neighbor(from_id, &e, *dir);
+                if let Some(want) = bound_to {
+                    if nbr != want {
+                        continue;
+                    }
+                }
+                if !node_matches(view, vars, row, nbr, to_label.as_deref(), to_props, params)? {
+                    continue;
+                }
+                let mut next = row.clone();
+                if let Some(slot) = rel_slot {
+                    next[slot] = Some(Cell::Rel(e));
+                }
+                if bound_to.is_none() {
+                    next[to_slot] = Some(Cell::Node(nbr));
+                }
+                #[cfg(test)]
+                record_expand_row();
+                pull_rows(view, vars, rest, project_items, params, &next, result, bound)?;
+            }
+        }
+        PlanOp::Filter { expr } => {
+            if eval_expr(view, vars, row, expr, params, 0)? {
+                pull_rows(view, vars, rest, project_items, params, row, result, bound)?;
+            }
+        }
+        PlanOp::LookupProps { var, props } => {
+            let id = require_node(row, vars, var)?;
+            if node_matches(view, vars, row, id, None, props, params)? {
+                pull_rows(view, vars, rest, project_items, params, row, result, bound)?;
+            }
+        }
+        PlanOp::JoinBound { var, label, props } => {
+            let id = require_node(row, vars, var)?;
+            if node_matches(view, vars, row, id, label.as_deref(), props, params)? {
+                pull_rows(view, vars, rest, project_items, params, row, result, bound)?;
+            }
+        }
+        // Project/OrderBy/Skip/Limit are handled by execute_pull wrapper.
+        _ => {}
+    }
+    Ok(())
 }
 
 fn eval_expr(
@@ -787,6 +907,7 @@ mod tests {
     use crate::result::ResultSet;
     use crate::view::GraphView;
     use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
+    use proptest::prelude::*;
     use std::collections::BTreeMap;
 
     struct Fx {
@@ -1500,6 +1621,274 @@ LIMIT 10";
             hop.is_empty(),
             "expand cannot yield edges to a deleted node once topology is swept"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Randomised property test (I2): bounded == unbounded[SKIP..SKIP+LIMIT]
+    // ──────────────────────────────────────────────────────────────────────────
+
+    proptest! {
+        /// For any randomly-generated graph and any SKIP/LIMIT values,
+        /// the pull-based bounded executor must return exactly the same rows as
+        /// the staged unbounded reference, sliced to `[SKIP .. SKIP+LIMIT]`.
+        #[test]
+        fn prop_bounded_equals_unbounded_slice(
+            n_nodes in 2u32..12u32,
+            edge_pairs in proptest::collection::vec(
+                (any::<u32>(), any::<u32>()), 0..25usize
+            ),
+            limit in 1u64..12u64,
+            skip  in 0u64..4u64,
+        ) {
+            let mut fx = Fx::new();
+            let mut node_ids = Vec::new();
+            for i in 0..n_nodes {
+                let id = fx.add("N", &format!("n{i}"), vec![]);
+                node_ids.push(id);
+            }
+            for (si, di) in &edge_pairs {
+                let si = (*si as usize) % node_ids.len();
+                let di = (*di as usize) % node_ids.len();
+                if si != di {
+                    fx.edge("T", node_ids[si], node_ids[di], vec![]);
+                }
+            }
+            let v = fx.view();
+            let params = BTreeMap::new();
+
+            let full_plan = compile("MATCH (a:N)-[:T]->(b:N) RETURN a, b");
+            let unbounded = super::execute_unbounded(&v, &full_plan, &Params(&params))
+                .expect("unbounded must not error");
+            let total = unbounded.len();
+            let full_rows = rows_of(&unbounded);
+
+            let q = format!("MATCH (a:N)-[:T]->(b:N) RETURN a, b SKIP {skip} LIMIT {limit}");
+            let bounded = run(&v, &q, &params).expect("bounded must not error");
+
+            let s = (skip as usize).min(total);
+            let e = (skip as usize + limit as usize).min(total);
+            prop_assert_eq!(
+                rows_of(&bounded),
+                full_rows[s..e].to_vec(),
+                "SKIP {} LIMIT {}: bounded result differs from unbounded[{}..{}]",
+                skip, limit, s, e
+            );
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // C1 / C2: dense hop-1 with downstream filter
+    //
+    // The actual failing shape: 1 source → N leaves (N > cap), and a downstream
+    // Filter that passes only a small fraction.  The per-stage approach (Round 1)
+    // errors because hop-1 Expand runs to the full cap before the Filter sees
+    // anything.  The pull-based approach cascades the bound: once `limit` rows
+    // have passed the Filter, all upstream loops stop.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dense_hop1_with_filter_survives_pull() {
+        const LEAVES: usize = 120; // > CAP so staged always errors
+        const CAP: usize = 100;
+
+        let mut fx = Fx::new();
+        let src = fx.add("Src", "src", vec![]);
+        for idx in 0..LEAVES {
+            let leaf = fx.add("Leaf", &format!("l{idx}"), vec![("v", i(idx as i64))]);
+            fx.edge("T", src, leaf, vec![]);
+        }
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        // Staged (unbounded) path: expand produces 120 rows > cap=100 → error.
+        let staged_err = super::with_max_intermediate_rows(CAP, || {
+            super::execute_unbounded(
+                &v,
+                &compile("MATCH (s:Src)-[:T]->(l:Leaf) WHERE l.v >= 110 RETURN l, l.v"),
+                &Params(&params),
+            )
+        });
+        assert!(
+            staged_err.is_err(),
+            "staged path must error on 120 leaves with cap={CAP}"
+        );
+        assert!(
+            staged_err.unwrap_err().contains("intermediate result exceeds"),
+            "wrong error message"
+        );
+
+        // Pull-based (LIMIT 5): never materialises more than 5 rows → survives.
+        // WHERE l.v >= 110 means only leaves 110..119 pass (10 survivors), so
+        // 5 results are found well before all 120 leaves are expanded.
+        let ok = super::with_max_intermediate_rows(CAP, || {
+            run(
+                &v,
+                "MATCH (s:Src)-[:T]->(l:Leaf) WHERE l.v >= 110 RETURN l, l.v LIMIT 5",
+                &params,
+            )
+        });
+        let rs = ok.expect("pull-based must survive despite dense hop-1 exceeding cap");
+        assert_eq!(rs.len(), 5, "LIMIT 5 must return exactly 5 rows");
+
+        // Verify all returned rows have l.v >= 110 (correct filter application).
+        let vs: Vec<i64> = (0..rs.len())
+            .filter_map(|i| match rs.get(i, "l.v") {
+                Some(Value::Int(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vs.len(), 5, "all projected rows must have v");
+        for v_val in &vs {
+            assert!(
+                *v_val >= 110,
+                "filter must hold: v={v_val} is not >= 110"
+            );
+        }
+
+        // Early-termination proof: use a filter that passes early leaves (v < 10)
+        // so pull stops after visiting just 5 leaves, while staged visits all 120.
+        // Ratio: 120 / 5 = 24× — well above the 10× threshold.
+        let (pull_result, pull_produced) = super::with_expand_counter(|| {
+            super::with_max_intermediate_rows(1_000_000, || {
+                run(
+                    &v,
+                    "MATCH (s:Src)-[:T]->(l:Leaf) WHERE l.v < 10 RETURN l LIMIT 5",
+                    &params,
+                )
+            })
+        });
+        pull_result.expect("pull must succeed without cap");
+        // Pull visits leaves 0..4 (all pass v < 10, LIMIT 5 satisfied immediately).
+        assert!(
+            pull_produced <= 5,
+            "pull expand count {pull_produced} should be ≤ 5 (stops after 5 passing leaves)"
+        );
+
+        let (staged_result, staged_produced) = super::with_expand_counter(|| {
+            super::with_max_intermediate_rows(1_000_000, || {
+                super::execute_unbounded(
+                    &v,
+                    &compile("MATCH (s:Src)-[:T]->(l:Leaf) WHERE l.v < 10 RETURN l"),
+                    &Params(&params),
+                )
+            })
+        });
+        staged_result.expect("staged must succeed with 1M cap");
+        assert_eq!(staged_produced, LEAVES, "staged must expand all {LEAVES} leaves");
+
+        assert!(
+            staged_produced >= pull_produced * 10,
+            "staged ({staged_produced}) must be ≥ 10× pull ({pull_produced})"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Harness-shape two-hop dense test
+    //
+    // Replicates the exact failure shape from the public benchmark table at
+    // 1/100 scale (70 Talent + 20 Company with 3 industry categories).
+    // IA edges are added directly (bypassing the rule engine) to reproduce the
+    // dense edge structure that `Predicate::FieldEqual { field: "industry" }`
+    // generates at full scale.
+    //
+    // Query: MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)
+    //               <-[:INDUSTRY_ALIGNMENT]-(t2:Talent)
+    //        RETURN t, c, t2 LIMIT 10
+    //
+    // Before (staged with cap=100): hop-1 expands 70×~7=~466 rows > 100 → error
+    // After  (pull-based):          finds 10 results, stops, returns correctly
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn harness_shape_two_hop_dense_survives_pull() {
+        const N_TALENT: usize = 70;
+        const N_COMPANY: usize = 20;
+        const N_INDUSTRY: usize = 3;
+        const CAP: usize = 100;
+        const LIMIT: usize = 10;
+
+        let mut fx = Fx::new();
+
+        // Build Talent nodes with industry tag.
+        let mut talent_ids: Vec<u32> = Vec::new();
+        let mut talent_industry: Vec<usize> = Vec::new();
+        for i in 0..N_TALENT {
+            let ind = i % N_INDUSTRY;
+            let id = fx.add(
+                "Talent",
+                &format!("t{i}"),
+                vec![("industry", s(&ind.to_string()))],
+            );
+            talent_ids.push(id);
+            talent_industry.push(ind);
+        }
+
+        // Build Company nodes with industry tag.
+        let mut company_ids: Vec<u32> = Vec::new();
+        let mut company_industry: Vec<usize> = Vec::new();
+        for i in 0..N_COMPANY {
+            let ind = i % N_INDUSTRY;
+            let id = fx.add(
+                "Company",
+                &format!("c{i}"),
+                vec![("industry", s(&ind.to_string()))],
+            );
+            company_ids.push(id);
+            company_industry.push(ind);
+        }
+
+        // INDUSTRY_ALIGNMENT: Talent → Company when same industry.
+        for (ti, &tid) in talent_ids.iter().enumerate() {
+            for (ci, &cid) in company_ids.iter().enumerate() {
+                if talent_industry[ti] == company_industry[ci] {
+                    fx.edge("INDUSTRY_ALIGNMENT", tid, cid, vec![]);
+                }
+            }
+        }
+
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let query = format!(
+            "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)\
+             <-[:INDUSTRY_ALIGNMENT]-(t2:Talent) RETURN t, c, t2 LIMIT {LIMIT}"
+        );
+
+        // Staged (unbounded) path: hop-1 expands 70×~7=~466 rows > cap=100 → error.
+        let staged_err = super::with_max_intermediate_rows(CAP, || {
+            super::execute_unbounded(
+                &v,
+                &compile(&format!(
+                    "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)\
+                     <-[:INDUSTRY_ALIGNMENT]-(t2:Talent) RETURN t, c, t2"
+                )),
+                &Params(&params),
+            )
+        });
+        assert!(
+            staged_err.is_err(),
+            "staged must error with cap={CAP} on harness-shape graph"
+        );
+        assert!(
+            staged_err.unwrap_err().contains("intermediate result exceeds"),
+            "wrong error"
+        );
+
+        // Pull-based (LIMIT 10): cascades bound through both hops → completes.
+        let ok = super::with_max_intermediate_rows(CAP, || {
+            run(&v, &query, &params)
+        });
+        let rs = ok.expect("pull-based must complete on harness-shape with LIMIT 10");
+        assert_eq!(rs.len(), LIMIT, "must return exactly {LIMIT} rows");
+
+        // Each result row (t, c, t2) must have matching industry across all 3 variables.
+        // t and c share an IA edge (same industry); c and t2 share an IA edge too.
+        // Since we can't directly query industry from the ResultSet without projecting it,
+        // just verify the result is semantically plausible: 3 non-None columns per row.
+        for i in 0..rs.len() {
+            let row = rs.row(i);
+            assert_eq!(row.len(), 3, "each row must have 3 columns (t, c, t2)");
+            assert!(row.iter().all(|c| c.is_some()), "all cells must be Some");
+        }
     }
 
     #[test]

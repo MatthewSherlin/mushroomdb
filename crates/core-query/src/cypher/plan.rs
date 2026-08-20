@@ -74,15 +74,16 @@ pub enum PlanOp {
 ///
 /// # Decision table
 ///
-/// | Plan shape (tail before Project)           | push-down? | note                                    |
-/// |--------------------------------------------|------------|-----------------------------------------|
-/// | Scan / Expand → Project → Limit            | YES        | 1-to-1; bound applied at last Expand    |
-/// | Scan / Expand → Filter → Project → Limit   | PARTIAL    | bound applied at Filter; Expand runs    |
-/// | … → OrderBy → … Limit                      | NO         | sort requires all rows first             |
+/// | Plan shape (tail before Project)           | push-down? | note                                         |
+/// |--------------------------------------------|------------|----------------------------------------------|
+/// | Scan / Expand → Project → Limit            | YES        | pull-based; all stages stop at bound         |
+/// | Scan / Expand → Filter → Project → Limit   | YES        | pull-based; Filter + earlier stages all stop |
+/// | … → OrderBy → … Limit                      | NO         | sort requires all rows first                 |
 ///
-/// "PARTIAL" means the row count is still bounded (Filter stops after
-/// `SKIP+LIMIT` post-filter rows) — only the earlier `Expand`/`Scan` stages
-/// run to capacity (capped by `MAX_INTERMEDIATE_ROWS`).
+/// When `row_bound` returns `Some`, the executor uses a demand-driven
+/// (pull-based) strategy: **all** producer stages (Scan, Expand, Filter, …)
+/// terminate as soon as `bound` final rows have been collected.  No
+/// intermediate table is ever fully materialised for the bounded path.
 ///
 /// `SKIP + LIMIT` is used instead of plain `LIMIT` so that there are enough
 /// rows to apply the `SKIP` offset and still yield `LIMIT` final rows.

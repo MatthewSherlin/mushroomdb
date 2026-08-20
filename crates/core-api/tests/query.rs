@@ -1,4 +1,4 @@
-use core_api::{GraphDb, GraphError, Predicate, ResultSet, RuleDef, Value};
+use core_api::{GraphDb, GraphError, IngestOptions, Predicate, ResultSet, RuleDef, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -266,4 +266,107 @@ fn query_stage_prefixes_lex_plan_and_execute() {
         }
         other => panic!("expected QueryError, got {other:?}"),
     }
+}
+
+/// Timing test for the INDUSTRY_ALIGNMENT two-hop harness query.
+///
+/// Builds a 5k-scale Talent/Company graph with FieldEqual industry rule,
+/// then measures the pull-based executor's time for LIMIT 200.
+///
+/// This is `#[ignore]` because rule backfill takes ~2–5 s at this scale.
+/// Run explicitly:
+///   cargo test -p core-api --test query harness_industry_alignment_timing -- --ignored --nocapture
+#[test]
+#[ignore]
+fn harness_industry_alignment_timing() {
+    const N_TALENT: usize = 3_500;
+    const N_COMPANY: usize = 1_000;
+    const N_INDUSTRY: usize = 3;
+    const LIMIT: usize = 200;
+
+    let dir = tmp("ia-timing");
+    let mut db = GraphDb::open(&dir).expect("open");
+    let opts = IngestOptions {
+        key_field: "id".into(),
+        auto_fk: core_api::AutoFk::Off,
+    };
+
+    // Ingest Talent and Company nodes with an industry tag.
+    let talent_rows: Vec<BTreeMap<String, Value>> = (0..N_TALENT)
+        .map(|i| {
+            let mut row = BTreeMap::new();
+            row.insert("id".into(), Value::Str(format!("t{i:05}")));
+            row.insert(
+                "industry".into(),
+                Value::Str(format!("ind{}", i % N_INDUSTRY)),
+            );
+            row
+        })
+        .collect();
+    db.ingest("Talent", talent_rows, &opts).expect("talent ingest");
+
+    let company_rows: Vec<BTreeMap<String, Value>> = (0..N_COMPANY)
+        .map(|i| {
+            let mut row = BTreeMap::new();
+            row.insert("id".into(), Value::Str(format!("c{i:05}")));
+            row.insert(
+                "industry".into(),
+                Value::Str(format!("ind{}", i % N_INDUSTRY)),
+            );
+            row
+        })
+        .collect();
+    db.ingest("Company", company_rows, &opts).expect("company ingest");
+
+    // IA edges: Talent → Company when industry matches (FieldEqual).
+    let rule = RuleDef {
+        name: "INDUSTRY_ALIGNMENT".into(),
+        src_label: "Talent".into(),
+        dst_label: "Company".into(),
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
+        edge_type: "INDUSTRY_ALIGNMENT".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+    };
+    let t_rule = std::time::Instant::now();
+    db.create_rule(rule).expect("create IA rule");
+    let backfill_ms = t_rule.elapsed().as_millis();
+    println!("IA rule backfill: {backfill_ms} ms ({N_TALENT}T × {N_COMPANY}C)");
+
+    let params = BTreeMap::new();
+    let query = format!(
+        "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)\
+         <-[:INDUSTRY_ALIGNMENT]-(t2:Talent) RETURN t, c, t2 LIMIT {LIMIT}"
+    );
+
+    // Warm up (3 iterations).
+    for _ in 0..3 {
+        let rs = db.query(&query, &params).expect("warm-up query");
+        assert_eq!(rs.len(), LIMIT, "warm-up: expected {LIMIT} rows");
+    }
+
+    // Measure 20 iterations.
+    let mut times_us: Vec<u64> = Vec::new();
+    for _ in 0..20 {
+        let t0 = std::time::Instant::now();
+        let rs = db.query(&query, &params).expect("timed query");
+        times_us.push(t0.elapsed().as_micros() as u64);
+        assert_eq!(rs.len(), LIMIT, "expected {LIMIT} rows");
+    }
+
+    times_us.sort();
+    let min_us = times_us[0];
+    let median_us = times_us[times_us.len() / 2];
+    let p95_us = times_us[(times_us.len() as f64 * 0.95) as usize];
+    println!(
+        "INDUSTRY_ALIGNMENT two-hop LIMIT {LIMIT} at {N_TALENT}T+{N_COMPANY}C:\n\
+         \tmin={min_us} µs  median={median_us} µs  p95={p95_us} µs"
+    );
+
+    // Sanity: pull-based must complete with no error and return exactly LIMIT rows.
+    assert_eq!(times_us.len(), 20);
+    assert!(min_us < 500_000, "query should complete in <500 ms");
 }
