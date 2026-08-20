@@ -1094,10 +1094,11 @@ fn pull_rows(
                 if let PlanOp::Filter {
                     expr:
                         Expr::Cmp {
-                            lhs: Operand::Prop {
-                                var: ref fv,
-                                field: ref f,
-                            },
+                            lhs:
+                                Operand::Prop {
+                                    var: ref fv,
+                                    field: ref f,
+                                },
                             op: ref cmp_op_ref,
                             rhs: Operand::Lit(ref lit),
                         },
@@ -1156,7 +1157,12 @@ fn pull_rows(
                     pull_rows(ctx, rest, row, result)?;
                 }
             }
-            row[slot] = prev; // restore caller's value
+            // SAFETY: the `?` inside both scan loops propagates Err directly to
+            // `execute_pull`, which drops `initial_row` — the skipped restore is
+            // unobservable.  This invariant MUST stay true: no call site between
+            // here and `execute_pull` may catch an Err and re-use the row.
+            // Future refactors adding mid-stream error recovery must audit this site.
+            row[slot] = prev;
         }
         PlanOp::Expand {
             from,
@@ -2278,6 +2284,118 @@ LIMIT 10";
                 "hops={} filter={} threshold={} SKIP {} LIMIT {}: \
                  bounded != unbounded[{}..{}]",
                 hop_count, use_filter, threshold, skip, limit, s, e
+            );
+        }
+    }
+
+    proptest! {
+        /// Randomised property test pinning the fused ScanLabel+Filter fast path.
+        ///
+        /// Shape: `MATCH (n:N) WHERE n.v <op> <literal> RETURN n SKIP s LIMIT l`
+        ///
+        /// This shape places a `Filter { Cmp { Prop{n}, op, Lit } }` immediately
+        /// after `ScanLabel { var: n }` in the plan, which triggers the fused
+        /// detection in `pull_rows`.  The invariant is the same as
+        /// `prop_bounded_equals_unbounded_slice`: bounded == unbounded[s..s+l].
+        ///
+        /// Coverage:
+        ///  - All 6 CmpOps (=, <>, <, <=, >, >=)
+        ///  - Nodes that have the prop (Int or Float) and nodes that are missing it
+        ///  - Threshold values spanning match-all, match-none, and partial
+        ///  - Randomised SKIP and LIMIT
+        ///  - Boundary shape: compound AND (`WHERE n.v op lit AND n.v >= -999`)
+        ///    which is semantically equivalent but bypasses fused detection
+        ///    (Expr::And, not Expr::Cmp), exercising the generic fallback path
+        #[test]
+        fn prop_scan_filter_fused_equals_unbounded_slice(
+            n_nodes     in 0u32..20u32,
+            // Bit i set → node i has prop `v`.
+            prop_mask   in any::<u32>(),
+            // Bit i set → node i stores a Float value instead of Int.
+            float_mask  in any::<u32>(),
+            // Comparison threshold; range -1..8 spans all/none/partial matches
+            // against node values in 0..7.
+            threshold   in -1i64..8i64,
+            // Index into the 6 CmpOps (Eq=0, Ne=1, Lt=2, Le=3, Gt=4, Ge=5).
+            op_idx      in 0u32..6u32,
+            skip        in 0u64..5u64,
+            limit       in 1u64..8u64,
+        ) {
+            let op_str = match op_idx {
+                0 => "=",
+                1 => "<>",
+                2 => "<",
+                3 => "<=",
+                4 => ">",
+                _ => ">=",
+            };
+
+            let mut fx = Fx::new();
+            for idx in 0..n_nodes {
+                let has_prop = (prop_mask >> (idx % 32)) & 1 == 1;
+                let use_float = (float_mask >> (idx % 32)) & 1 == 1;
+                // Node values cycle in 0..7 so threshold spans all/none/partial.
+                let props: Vec<(&str, Value)> = if has_prop {
+                    if use_float {
+                        vec![("v", f(idx as f64 % 7.0))]
+                    } else {
+                        vec![("v", i(idx as i64 % 7))]
+                    }
+                } else {
+                    vec![]
+                };
+                fx.add("N", &format!("n{idx}"), props);
+            }
+
+            let v = fx.view();
+            let params = BTreeMap::new();
+
+            // ── Fused path ───────────────────────────────────────────────────
+            let full_q = format!(
+                "MATCH (n:N) WHERE n.v {op_str} {threshold} RETURN n"
+            );
+            let bounded_q = format!(
+                "MATCH (n:N) WHERE n.v {op_str} {threshold} RETURN n SKIP {skip} LIMIT {limit}"
+            );
+
+            let full_plan = compile(&full_q);
+            let unbounded = super::execute_unbounded(&v, &full_plan, &Params(&params));
+            let unbounded = match unbounded {
+                Ok(rs) => rs,
+                Err(_) => return Ok(()),
+            };
+            let total = unbounded.len();
+            let full_rows = rows_of(&unbounded);
+
+            let bounded = run(&v, &bounded_q, &params)
+                .expect("fused bounded must not error");
+
+            let s = (skip as usize).min(total);
+            let e = (skip as usize + limit as usize).min(total);
+            prop_assert_eq!(
+                rows_of(&bounded),
+                full_rows[s..e].to_vec(),
+                "fused path: op={} threshold={} n_nodes={} SKIP {} LIMIT {}: \
+                 bounded != unbounded[{}..{}]",
+                op_str, threshold, n_nodes, skip, limit, s, e
+            );
+
+            // ── Boundary: compound AND — misses fused detection → generic path ─
+            // `AND n.v >= -999` is always true for our Int/Float range 0..7,
+            // so the result set is identical — only the executor path differs.
+            let compound_q = format!(
+                "MATCH (n:N) WHERE n.v {} {} AND n.v >= -999 RETURN n \
+                 SKIP {} LIMIT {}",
+                op_str, threshold, skip, limit
+            );
+            let compound_bounded = run(&v, &compound_q, &params)
+                .expect("compound-AND bounded must not error");
+            prop_assert_eq!(
+                rows_of(&compound_bounded),
+                full_rows[s..e].to_vec(),
+                "compound-AND fallback: op={} threshold={} n_nodes={} SKIP {} LIMIT {}: \
+                 result differs from fused",
+                op_str, threshold, n_nodes, skip, limit
             );
         }
     }
