@@ -56,6 +56,10 @@ const MAX_INTERMEDIATE_ROWS: usize = 1_000_000;
 thread_local! {
     static TEST_MAX_INTERMEDIATE_ROWS: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    /// Accumulator for rows emitted by `exec_expand` during a bounded test run.
+    /// `None` means the counter is inactive (no test is watching).
+    static TEST_EXPAND_PRODUCED: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn max_intermediate_rows() -> usize {
@@ -87,10 +91,68 @@ pub(crate) fn with_max_intermediate_rows<R>(cap: usize, f: impl FnOnce() -> R) -
     })
 }
 
+/// Increment the test-only expand-row counter (no-op when counter is inactive).
+#[cfg(test)]
+fn record_expand_row() {
+    TEST_EXPAND_PRODUCED.with(|c| {
+        if let Some(prev) = c.get() {
+            c.set(Some(prev + 1));
+        }
+    });
+}
+
+/// Run `f` while counting every row emitted by `exec_expand`.
+/// Returns `(result_of_f, total_rows_produced)`.
+///
+/// Used by tests to assert early-termination: bounded execution must emit
+/// ≤ `row_bound + ε` rows, while an equivalent unbounded run emits ≥ 100×.
+#[cfg(test)]
+pub(crate) fn with_expand_counter<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    TEST_EXPAND_PRODUCED.with(|c| c.set(Some(0)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    let count = TEST_EXPAND_PRODUCED.with(|c| c.get().unwrap_or(0));
+    TEST_EXPAND_PRODUCED.with(|c| c.set(None));
+    match result {
+        Ok(v) => (v, count),
+        Err(p) => std::panic::resume_unwind(p),
+    }
+}
+
 fn row_cap_err(cap: usize) -> String {
     format!(
         "intermediate result exceeds {cap} rows; add a LIMIT or constrain patterns with shared variables"
     )
+}
+
+/// Return the plan-op index where the row bound (skip+limit) should be applied,
+/// or `None` if there is no suitable stage.
+///
+/// The bound is placed at the *last* row-producing or row-filtering op that
+/// appears before `Project`. Applying it at the last such op means:
+///
+/// - When that op is an `Expand` (no `Filter` follows before `Project`): rows
+///   from the Expand correspond 1-to-1 with result rows (post uniqueness), so
+///   stopping at `row_bound` is exact.
+/// - When that op is a `Filter` (a `Filter` is the last op before `Project`):
+///   `Filter` counts post-filter rows, which is correct.
+/// - Earlier `Expand`/`ScanLabel` stages still run to their full capacity (the
+///   `MAX_INTERMEDIATE_ROWS` safety cap applies to them as before).
+fn bound_apply_index(ops: &[PlanOp]) -> Option<usize> {
+    let proj_pos = ops
+        .iter()
+        .position(|op| matches!(op, PlanOp::Project { .. }))?;
+    ops[..proj_pos]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, op)| match op {
+            PlanOp::Filter { .. }
+            | PlanOp::LookupProps { .. }
+            | PlanOp::JoinBound { .. }
+            | PlanOp::Expand { .. }
+            | PlanOp::ScanLabel { .. } => Some(i),
+            _ => None,
+        })
 }
 
 /// Execute a plan against a view. Row order before OrderBy is deterministic
@@ -98,29 +160,71 @@ fn row_cap_err(cap: usize) -> String {
 ///
 /// Precondition: `OrderBy` items produced by `plan()` use `OrderTarget::Alias`
 /// only; other variants are accepted defensively but non-standard.
+///
+/// When the plan has a `Limit` and no `OrderBy`, the effective row bound
+/// (`SKIP + LIMIT`) is pushed down to the last producer/filter stage before
+/// `Project` so that execution terminates early rather than materialising the
+/// full intermediate table. The `MAX_INTERMEDIATE_ROWS` cap remains the outer
+/// safety net for all unbounded queries.
 pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<ResultSet, String> {
+    use crate::cypher::plan::row_bound;
+    execute_inner(view, plan, params, row_bound(plan))
+}
+
+/// Like `execute` but always disables LIMIT push-down (row_bound = None).
+///
+/// Used in tests as the reference implementation: the result must equal that of
+/// `execute` (which applies push-down) modulo the subset selected by SKIP/LIMIT.
+#[cfg(test)]
+pub(crate) fn execute_unbounded(
+    view: &GraphView,
+    plan: &[PlanOp],
+    params: &Params,
+) -> Result<ResultSet, String> {
+    execute_inner(view, plan, params, None)
+}
+
+fn execute_inner(
+    view: &GraphView,
+    plan: &[PlanOp],
+    params: &Params,
+    row_bound: Option<usize>,
+) -> Result<ResultSet, String> {
     check_params(plan, params)?;
+
+    let bound_idx = if row_bound.is_some() {
+        bound_apply_index(plan)
+    } else {
+        None
+    };
 
     let vars = collect_vars(plan);
     let mut rows: Vec<Row> = vec![vec![None; vars.names.len()]];
     let mut projected: Option<Projected> = None;
 
-    for op in plan {
+    for (op_idx, op) in plan.iter().enumerate() {
+        // effective_bound is Some only at the one stage that gets early-stop.
+        let effective_bound = if Some(op_idx) == bound_idx {
+            row_bound
+        } else {
+            None
+        };
         match op {
             PlanOp::ScanLabel { var, label } => {
-                rows = scan_label(view, &vars, &rows, var, label.as_deref())?;
+                rows = scan_label(view, &vars, &rows, var, label.as_deref(), effective_bound)?;
             }
             PlanOp::LookupProps { var, props } => {
-                rows = retain_node(view, &vars, &rows, var, None, props, params)?;
+                rows = retain_node(view, &vars, &rows, var, None, props, params, effective_bound)?;
             }
             PlanOp::JoinBound { var, label, props } => {
-                rows = retain_node(view, &vars, &rows, var, label.as_deref(), props, params)?;
+                rows =
+                    retain_node(view, &vars, &rows, var, label.as_deref(), props, params, effective_bound)?;
             }
             PlanOp::Expand { .. } => {
-                rows = exec_expand(view, &vars, &rows, op, params)?;
+                rows = exec_expand(view, &vars, &rows, op, params, effective_bound)?;
             }
             PlanOp::Filter { expr } => {
-                rows = exec_filter(view, &vars, &rows, expr, params)?;
+                rows = exec_filter(view, &vars, &rows, expr, params, effective_bound)?;
             }
             PlanOp::Project { items } => {
                 projected = Some(exec_project(view, &vars, &rows, items)?);
@@ -300,6 +404,7 @@ fn scan_label(
     rows: &[Row],
     var: &str,
     label: Option<&str>,
+    row_bound: Option<usize>,
 ) -> Result<Vec<Row>, String> {
     let ids = scan_ids(view, label);
     let slot = vars
@@ -307,7 +412,7 @@ fn scan_label(
         .ok_or_else(|| format!("unbound variable `{var}`"))?;
     let cap = max_intermediate_rows();
     let mut out = Vec::with_capacity(rows.len().saturating_mul(ids.len()).min(cap));
-    for row in rows {
+    'outer: for row in rows {
         for &id in &ids {
             if out.len() >= cap {
                 return Err(row_cap_err(cap));
@@ -315,6 +420,9 @@ fn scan_label(
             let mut next = row.clone();
             next[slot] = Some(Cell::Node(id));
             out.push(next);
+            if row_bound.is_some_and(|b| out.len() >= b) {
+                break 'outer;
+            }
         }
     }
     Ok(out)
@@ -401,12 +509,16 @@ fn retain_node(
     label: Option<&str>,
     props: &[(String, Operand)],
     params: &Params,
+    row_bound: Option<usize>,
 ) -> Result<Vec<Row>, String> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let id = require_node(row, vars, var)?;
         if node_matches(view, vars, row, id, label, props, params)? {
             out.push(row.clone());
+            if row_bound.is_some_and(|b| out.len() >= b) {
+                break;
+            }
         }
     }
     Ok(out)
@@ -449,6 +561,7 @@ fn exec_expand(
     rows: &[Row],
     op: &PlanOp,
     params: &Params,
+    row_bound: Option<usize>,
 ) -> Result<Vec<Row>, String> {
     let PlanOp::Expand {
         from,
@@ -470,7 +583,7 @@ fn exec_expand(
     let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
     let cap = max_intermediate_rows();
     let mut out = Vec::with_capacity(rows.len().saturating_mul(2).min(cap));
-    for row in rows {
+    'outer: for row in rows {
         let from_id = require_node(row, vars, from)?;
         let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
             Some(Cell::Node(id)) => Some(*id),
@@ -501,6 +614,14 @@ fn exec_expand(
                 next[to_slot] = Some(Cell::Node(nbr));
             }
             out.push(next);
+            #[cfg(test)]
+            record_expand_row();
+            // Early termination: stop once we have enough rows for SKIP+LIMIT.
+            // Relationship-uniqueness rejections (row_has_edge) do not count
+            // toward this bound — only rows actually added to `out` do.
+            if row_bound.is_some_and(|b| out.len() >= b) {
+                break 'outer;
+            }
         }
     }
     Ok(out)
@@ -512,11 +633,15 @@ fn exec_filter(
     rows: &[Row],
     expr: &Expr,
     params: &Params,
+    row_bound: Option<usize>,
 ) -> Result<Vec<Row>, String> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         if eval_expr(view, vars, row, expr, params, 0)? {
             out.push(row.clone());
+            if row_bound.is_some_and(|b| out.len() >= b) {
+                break;
+            }
         }
     }
     Ok(out)
@@ -1409,5 +1534,213 @@ LIMIT 10";
         })
         .expect_err("2-row expand must exceed cap 1");
         assert_eq!(exp_err, cap_msg(1));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // LIMIT push-down: semantics, early-termination proof, and budget survival
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Property test: bounded execution (execute with push-down) produces the
+    /// same rows as the reference unbounded path (execute_unbounded) sliced to
+    /// the first LIMIT rows.  Exercises several LIMIT and SKIP+LIMIT values,
+    /// including queries that have a Filter so the bound falls on Filter output,
+    /// and queries with relationship-uniqueness rejections.
+    #[test]
+    fn bounded_matches_unbounded_slice_various_limits() {
+        // ── single-hop, no Filter ──────────────────────────────────────────────
+        let fx = hop_graph();
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        // Full 3-row reference (ada→bob, ada→cam, bob→cam).
+        let full_plan =
+            compile("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b");
+        let full_rs =
+            super::execute_unbounded(&v, &full_plan, &Params(&params)).unwrap();
+        let full_rows = rows_of(&full_rs);
+        assert_eq!(full_rows.len(), 3, "hop_graph has exactly 3 KNOWS paths");
+
+        for limit in [1u64, 2, 3, 10] {
+            let q = format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b LIMIT {limit}"
+            );
+            let rs = run(&v, &q, &params).unwrap();
+            let expected_len = (limit as usize).min(full_rows.len());
+            assert_eq!(
+                rs.len(),
+                expected_len,
+                "LIMIT {limit}: expected {expected_len} rows, got {}",
+                rs.len()
+            );
+            assert_eq!(
+                rows_of(&rs),
+                full_rows[..expected_len],
+                "LIMIT {limit}: rows differ from reference slice"
+            );
+        }
+
+        // SKIP + LIMIT: bound = SKIP + LIMIT so slicing is correct.
+        let skip_rs = run(
+            &v,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b SKIP 1 LIMIT 2",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(rows_of(&skip_rs), full_rows[1..3]);
+
+        // ── with WHERE (bound falls on Filter, not Expand) ────────────────────
+        let mut fx2 = Fx::new();
+        fx2.add("N", "a", vec![("v", i(1))]);
+        fx2.add("N", "b", vec![("v", i(2))]);
+        fx2.add("N", "c", vec![("v", i(3))]);
+        let v2 = fx2.view();
+        // Full result in order: a(1), b(2), c(3).  After WHERE v > 1: b, c.
+        let filter_full = super::execute_unbounded(
+            &v2,
+            &compile("MATCH (n:N) WHERE n.v > 1 RETURN n"),
+            &Params(&params),
+        )
+        .unwrap();
+        assert_eq!(filter_full.len(), 2);
+
+        let filter_lim =
+            run(&v2, "MATCH (n:N) WHERE n.v > 1 RETURN n LIMIT 1", &params).unwrap();
+        assert_eq!(filter_lim.len(), 1, "LIMIT 1 on filter query");
+        assert_eq!(rows_of(&filter_lim), rows_of(&filter_full)[..1]);
+
+        // ── relationship-uniqueness rejections do not count toward the bound ──
+        let tri = triangle();
+        let tv = tri.view();
+        // Triangle has 3 two-hop paths; uniqueness rejects 6 (reversed pairs).
+        let tri_full = super::execute_unbounded(
+            &tv,
+            &compile("MATCH (x)-[r1:T]->(y)-[r2:T]->(z) RETURN x, y, z"),
+            &Params(&params),
+        )
+        .unwrap();
+        assert_eq!(tri_full.len(), 3, "triangle has 3 unique two-hop paths");
+        for limit in [1u64, 2, 3, 5] {
+            let q = format!(
+                "MATCH (x)-[r1:T]->(y)-[r2:T]->(z) RETURN x, y, z LIMIT {limit}"
+            );
+            let rs = run(&tv, &q, &params).unwrap();
+            let expected_len = (limit as usize).min(3);
+            assert_eq!(
+                rs.len(),
+                expected_len,
+                "triangle LIMIT {limit}: got {} rows",
+                rs.len()
+            );
+            assert_eq!(
+                rows_of(&rs),
+                rows_of(&tri_full)[..expected_len],
+                "triangle LIMIT {limit}: rows differ"
+            );
+        }
+    }
+
+    /// Early-termination proof: on a star graph (1 hub → 500 leaves), a bounded
+    /// query (LIMIT 5) must cause `exec_expand` to emit ≤ 5 rows, while an
+    /// unbounded run emits all 500 (≥ 100× the bounded count).
+    #[test]
+    fn expand_terminates_early_with_row_bound() {
+        const LEAVES: usize = 500;
+        let mut fx = Fx::new();
+        let hub = fx.add("Hub", "hub", vec![]);
+        for i in 0..LEAVES {
+            let leaf = fx.add("Leaf", &format!("leaf-{i}"), vec![]);
+            fx.edge("T", hub, leaf, vec![]);
+        }
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let full_plan = compile("MATCH (h:Hub)-[:T]->(x:Leaf) RETURN x");
+
+        // Bounded path via the regular execute() entry point (LIMIT 5 → bound 5).
+        let (bounded_result, bounded_produced) = super::with_expand_counter(|| {
+            run(&v, "MATCH (h:Hub)-[:T]->(x:Leaf) RETURN x LIMIT 5", &params)
+        });
+        let bounded_rs = bounded_result.unwrap();
+        assert_eq!(bounded_rs.len(), 5, "LIMIT 5 must return exactly 5 rows");
+        assert!(
+            bounded_produced <= 5,
+            "bounded: exec_expand emitted {bounded_produced} rows, expected ≤ 5"
+        );
+
+        // Unbounded reference path via execute_unbounded (no push-down).
+        let (unbounded_result, unbounded_produced) = super::with_expand_counter(|| {
+            super::execute_unbounded(&v, &full_plan, &Params(&params))
+        });
+        let unbounded_rs = unbounded_result.unwrap();
+        assert_eq!(unbounded_rs.len(), LEAVES, "unbounded must return all {LEAVES} rows");
+        assert_eq!(
+            unbounded_produced, LEAVES,
+            "unbounded: exec_expand must emit all {LEAVES} rows"
+        );
+
+        // Early-termination ratio ≥ 100×.
+        assert!(
+            unbounded_produced >= bounded_produced * 100,
+            "unbounded ({unbounded_produced}) must be ≥ 100× bounded ({bounded_produced})"
+        );
+    }
+
+    /// Budget-survival: a bounded query (LIMIT pushdown active) must complete
+    /// without triggering the intermediate-row cap, even when the same query
+    /// without pushdown (execute_unbounded) would exceed a reduced cap.
+    ///
+    /// This also verifies that the 1 M cap is still live for unbounded queries.
+    #[test]
+    fn bounded_query_survives_low_intermediate_row_cap() {
+        // 20 leaf nodes: unbounded would emit 20 rows, exceeding a cap of 10.
+        let mut fx = Fx::new();
+        let src = fx.add("Src", "s", vec![]);
+        for i in 0..20usize {
+            let dst = fx.add("Dst", &format!("d{i}"), vec![]);
+            fx.edge("T", src, dst, vec![]);
+        }
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let full_plan = compile("MATCH (s:Src)-[:T]->(d:Dst) RETURN d");
+
+        // Unbounded hits the cap — 1 M budget check must remain live.
+        let cap_err = super::with_max_intermediate_rows(10, || {
+            super::execute_unbounded(&v, &full_plan, &Params(&params))
+        });
+        assert!(
+            cap_err.is_err(),
+            "unbounded must hit the intermediate-row cap"
+        );
+        assert!(
+            cap_err.unwrap_err().contains("intermediate result exceeds"),
+            "cap error message must be the budget message"
+        );
+
+        // Bounded (LIMIT 5) stops before the cap — must complete successfully.
+        let ok = super::with_max_intermediate_rows(10, || {
+            run(
+                &v,
+                "MATCH (s:Src)-[:T]->(d:Dst) RETURN d LIMIT 5",
+                &params,
+            )
+        });
+        assert_eq!(
+            ok.unwrap().len(),
+            5,
+            "bounded (LIMIT 5) must complete with 5 rows, not a cap error"
+        );
+
+        // Bounded with LIMIT exactly at cap also survives.
+        let at_cap = super::with_max_intermediate_rows(10, || {
+            run(
+                &v,
+                "MATCH (s:Src)-[:T]->(d:Dst) RETURN d LIMIT 10",
+                &params,
+            )
+        });
+        assert_eq!(
+            at_cap.unwrap().len(),
+            10,
+            "bounded at LIMIT==cap must complete with 10 rows"
+        );
     }
 }

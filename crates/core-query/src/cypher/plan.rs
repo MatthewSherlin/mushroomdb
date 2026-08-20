@@ -61,6 +61,52 @@ pub enum PlanOp {
     Limit(u64),
 }
 
+/// Compute the effective row bound for LIMIT push-down.
+///
+/// Returns `Some(SKIP + LIMIT)` when the plan can terminate producers early —
+/// that is, when the plan contains a `Limit` op **and no `OrderBy`** op.
+/// An `OrderBy` requires full materialisation before slicing, so the bound
+/// cannot be pushed past it.
+///
+/// Returns `None` when:
+/// - No `Limit` op is present, or
+/// - An `OrderBy` op is present (sorting needs every row).
+///
+/// # Decision table
+///
+/// | Plan shape (tail before Project)           | push-down? | note                                    |
+/// |--------------------------------------------|------------|-----------------------------------------|
+/// | Scan / Expand → Project → Limit            | YES        | 1-to-1; bound applied at last Expand    |
+/// | Scan / Expand → Filter → Project → Limit   | PARTIAL    | bound applied at Filter; Expand runs    |
+/// | … → OrderBy → … Limit                      | NO         | sort requires all rows first             |
+///
+/// "PARTIAL" means the row count is still bounded (Filter stops after
+/// `SKIP+LIMIT` post-filter rows) — only the earlier `Expand`/`Scan` stages
+/// run to capacity (capped by `MAX_INTERMEDIATE_ROWS`).
+///
+/// `SKIP + LIMIT` is used instead of plain `LIMIT` so that there are enough
+/// rows to apply the `SKIP` offset and still yield `LIMIT` final rows.
+/// Saturating addition is used to guard against pathological large values.
+pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
+    // ORDER BY requires full materialisation — bound cannot be pushed.
+    if ops.iter().any(|op| matches!(op, PlanOp::OrderBy { .. })) {
+        return None;
+    }
+    let limit_n = ops.iter().rev().find_map(|op| match op {
+        PlanOp::Limit(n) => Some(*n),
+        _ => None,
+    })?;
+    let skip_n = ops
+        .iter()
+        .rev()
+        .find_map(|op| match op {
+            PlanOp::Skip(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(0);
+    Some((skip_n as usize).saturating_add(limit_n as usize))
+}
+
 /// Compile `q` into a logical plan. Errors are contextual `String`s; never panics.
 pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     let mut bound = BTreeSet::new();
