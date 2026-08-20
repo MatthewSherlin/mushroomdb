@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-INGEST_CHUNK = 10_000  # per bindings docstring: keep calls to ≤10k nodes
+INGEST_CHUNK = 2_000  # 5 sequential chunks at 10k scale; avoids single-call WAL-flush cold-start
 
 
 def _percentile(xs: list[float], p: float) -> float:
@@ -145,10 +145,20 @@ def cypher_scan_filter(db: Any) -> dict[str, Any]:
 
 
 def cypher_two_hop(db: Any) -> dict[str, Any]:
-    """Two-hop join via db.query(): Talent→Company→Talent via INDUSTRY_ALIGNMENT."""
+    """Two-hop join via db.query(): Talent→Company←Talent via INDUSTRY_ALIGNMENT.
+
+    The rule derives Talent-[:INDUSTRY_ALIGNMENT]->Company only.  A valid two-hop
+    join traverses the second hop in reverse (<-) so Company is the shared hub:
+      (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)<-[:INDUSTRY_ALIGNMENT]-(t2:Talent)
+
+    At large scale (≥ 2k nodes) the full cartesian enumeration may exceed the
+    engine's 1M intermediate-row budget before LIMIT is applied.  row_count=0
+    with an error note is honest reporting — the query direction is correct.
+    Verify the direction independently at ≤200 nodes (see test_harness.py).
+    """
     cypher = (
         "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)"
-        "-[:INDUSTRY_ALIGNMENT]->(t2:Talent) "
+        "<-[:INDUSTRY_ALIGNMENT]-(t2:Talent) "
         "RETURN t, c, t2 LIMIT 200"
     )
     t0 = time.perf_counter()

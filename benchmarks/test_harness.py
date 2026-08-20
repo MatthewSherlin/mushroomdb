@@ -191,12 +191,28 @@ class TestOursAdapter:
         assert result["per_rule"][0]["name"] == "bench_industry"
         assert result["total_wall_s"] >= 0
 
-    def test_cypher_two_hop_with_rules(self, tmp_path, nodes, talent_keys):
-        """With INDUSTRY_ALIGNMENT rules declared, two-hop join may return rows."""
+    def test_cypher_two_hop_with_rules(self, tmp_path):
+        """Corrected two-hop join direction must return > 0 rows.
+
+        Query: (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)<-[:INDUSTRY_ALIGNMENT]-(t2:Talent)
+        Rule derives Talent->Company only; the second hop REVERSES direction (<-)
+        so Company is the shared hub (find Talent pairs sharing a Company).
+        The original query had the second hop forward (Company->Talent) which
+        does not exist — engine correctly returned 0. This test asserts the
+        corrected direction produces real rows.
+
+        Uses 200 nodes: 140T × 40C × ~60T ≈ 336k intermediate triples, safely
+        under the engine's 1M intermediate-row budget.  Full-scale (2k+) hits
+        the budget before the final LIMIT applies — that is expected engine
+        behavior at cartesian fanout, not a direction bug.
+        """
+        from datasets import iter_nodes
         from adapters.ours import open_db, rule_derive, cypher_two_hop, INGEST_CHUNK
-        db = open_db(tmp_path / "rule_db")
-        for i in range(0, len(nodes), INGEST_CHUNK):
-            db.ingest_batch(nodes[i : i + INGEST_CHUNK])
+        TWO_HOP_SCALE = 200
+        mini_nodes = list(iter_nodes(n=TWO_HOP_SCALE, seed=BENCH_SEED))
+        db = open_db(tmp_path / "twohop_db")
+        for i in range(0, len(mini_nodes), INGEST_CHUNK):
+            db.ingest_batch(mini_nodes[i : i + INGEST_CHUNK])
         rules = [
             {
                 "name": "bench_industry_tc",
@@ -205,13 +221,15 @@ class TestOursAdapter:
                 "predicate": {"FieldEqual": {"field": "industry"}},
                 "edge_type": "INDUSTRY_ALIGNMENT",
                 "weight_prop": "score",
-                "max_edges": 100_000,
+                "max_edges": None,  # no cap: 200-node scale never hits 1M
             }
         ]
         rule_derive(db, rules)
         result = cypher_two_hop(db)
-        # row_count >= 0 (may be 0 if cypher two-hop over derived edges not supported)
-        assert result["row_count"] >= 0
+        assert result["row_count"] > 0, (
+            f"Expected > 0 rows from corrected two-hop join after INDUSTRY_ALIGNMENT; "
+            f"got {result['row_count']}. note={result.get('note')}"
+        )
         db.close()
 
     def test_stats_after_ingest(self, populated_db):

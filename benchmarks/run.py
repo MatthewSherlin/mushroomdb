@@ -340,7 +340,7 @@ def write_markdown(
     a(f"- **Nodes ingested:** {bi.get('node_count', 0):,}")
     a(f"- **Wall time:** {_fmt_s(bi.get('wall_s', float('nan')))}")
     a(f"- **Throughput:** {_fmt_thr(bi.get('throughput_nodes_per_s', 0))}")
-    a(f"- **Chunk size:** 10k nodes / ingest_batch call")
+    a(f"- **Chunk size:** 2k nodes / ingest_batch call (5 sequential chunks at 10k scale)")
     a("")
     a("## mushroomdb — neighbourhood latencies")
     a("")
@@ -358,7 +358,8 @@ def write_markdown(
     cth = ours.get("cypher_two_hop", {})
     a(f"- **scan-filter-project** (`{csf.get('query', '')}`): "
       f"rows={csf.get('row_count', 0)} wall={_fmt_s(csf.get('wall_s', float('nan')))}")
-    a(f"- **two-hop join** (`...INDUSTRY_ALIGNMENT... LIMIT 200`): "
+    a(f"- **two-hop join** "
+      f"(`MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)<-[:INDUSTRY_ALIGNMENT]-(t2:Talent) LIMIT 200`): "
       f"rows={cth.get('row_count', 0)} wall={_fmt_s(cth.get('wall_s', float('nan')))}"
       + (f" — {cth['note']}" if cth.get("note") else ""))
     a("")
