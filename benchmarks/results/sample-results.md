@@ -27,7 +27,7 @@ the cross-engine table.
 | neighborhood_depth1 (p95) | 3.5 µs | not installed — skipped | not installed — skipped | not installed — skipped |
 | neighborhood_depth2 (p50) | 0.8 µs | not installed — skipped | not installed — skipped | not installed — skipped |
 | cypher scan-filter-project | 4.61 ms | not installed — skipped | not installed — skipped | not installed — skipped |
-| cypher two-hop join | 1.278 s | not installed — skipped | not installed — skipped | not installed — skipped |
+| cypher two-hop join | 1.278 s | not installed — skipped | not installed — skipped | not installed — skipped | ¹
 
 ## mushroomdb — bulk ingest throughput
 
@@ -44,7 +44,7 @@ the cross-engine table.
 ## mushroomdb — Cypher workloads
 
 - **scan-filter-project** (`MATCH (n:Talent) WHERE n.size_bucket = 3 RETURN n.key`): rows=1400 wall=4.61 ms
-- **two-hop join** (`MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)<-[:INDUSTRY_ALIGNMENT]-(t2:Talent) LIMIT 200`): rows=0 wall=1.278 s — query error: execute: intermediate result exceeds 1000000 rows; add a LIMIT or constrain patterns with shared variables
+- **two-hop join** (`MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)<-[:INDUSTRY_ALIGNMENT]-(t2:Talent) LIMIT 200`): rows=0 wall=1.278 s — query error: execute: intermediate result exceeds 1000000 rows — the executor has no LIMIT pushdown yet (roadmap item): the join materializes before LIMIT applies; add a LIMIT or constrain patterns with shared variables
 
 ## mushroomdb — rule_derive (ours-only)
 
@@ -58,6 +58,8 @@ the cross-engine table.
 - **Total backfill wall:** 20.518 s
   - `bench_industry_tc` (INDUSTRY_ALIGNMENT): 8.326 s
   - `bench_specialty_tc` (SPECIALTY_MATCH): 12.192 s
+
+¹ 0 rows at 10k: the full join exceeds the 1M intermediate-row budget before LIMIT (see detail below); direction and traversal proven at 200-node scale.
 
 ## Competitors
 
