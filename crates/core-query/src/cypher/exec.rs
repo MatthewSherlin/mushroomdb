@@ -25,6 +25,9 @@ pub struct Params<'a>(pub &'a BTreeMap<String, Value>);
 enum Cell {
     Node(u32),
     Rel(EdgeRef),
+    /// Virtual path cell produced by `VarExpand` / `ShortestPath`.
+    /// The only accessible property is `length` → `Value::Int(hops)`.
+    Path(u8),
 }
 
 /// Binding-table row: one slot per interned variable. Cheaper to clone than
@@ -167,14 +170,25 @@ fn execute_inner(
 ) -> Result<ResultSet, String> {
     check_params(plan, params)?;
 
+    // VarExpand / ShortestPath plans always take the staged path, even when
+    // an Aggregate op is also present.  row_bound() already returns None for
+    // these plans (so the pull path is never chosen), but the aggregate path
+    // check below must also be skipped so that VarExpand+Aggregate falls
+    // through to the staged path where both ops are handled.
+    let has_var_expand = plan
+        .iter()
+        .any(|op| matches!(op, PlanOp::VarExpand { .. } | PlanOp::ShortestPath { .. }));
+
     // Aggregate plans: streaming accumulator path (O(1) memory, no budget).
     // Checked before the bounded path so aggregates are never routed to pull.
-    if plan.iter().any(|op| matches!(op, PlanOp::Aggregate { .. })) {
+    // Skipped for VarExpand plans — they go to the staged path instead.
+    if !has_var_expand && plan.iter().any(|op| matches!(op, PlanOp::Aggregate { .. })) {
         return execute_aggregate(view, plan, params);
     }
 
     // Bounded plans use the pull-based (demand-driven) executor so that ALL
     // producer stages terminate as soon as `bound` final rows are collected.
+    // VarExpand plans have row_bound=None, so this branch never fires for them.
     if let Some(bound) = row_bound {
         return execute_pull(view, plan, params, bound);
     }
@@ -197,6 +211,31 @@ fn execute_inner(
             }
             PlanOp::Expand { .. } => {
                 rows = exec_expand(view, &vars, &rows, op, params)?;
+            }
+            PlanOp::VarExpand {
+                from,
+                rel_var,
+                etype,
+                dir,
+                to,
+                min,
+                max,
+            } => {
+                rows = exec_var_expand(
+                    view, &vars, &rows, from, rel_var, etype, *dir, to, *min, *max,
+                )?;
+            }
+            PlanOp::ShortestPath {
+                from,
+                rel_var,
+                etype,
+                dir,
+                to,
+                max_hops,
+            } => {
+                rows = exec_shortest_path(
+                    view, &vars, &rows, from, rel_var, etype, *dir, to, *max_hops,
+                )?;
             }
             PlanOp::Filter { expr } => {
                 rows = exec_filter(view, &vars, &rows, expr, params)?;
@@ -224,13 +263,27 @@ fn execute_inner(
                     apply_limit(&mut rows, *n);
                 }
             }
-            // Aggregate plans are routed to execute_aggregate() before reaching
-            // the staged path; this arm satisfies the exhaustive match.
-            PlanOp::Aggregate { .. } => {
-                return Err(
-                    "staged executor: Aggregate op reached staged path — plan routing error"
-                        .to_string(),
-                );
+            // Aggregate plans without VarExpand are routed to execute_aggregate()
+            // before reaching the staged path.  Plans that combine VarExpand with
+            // an Aggregate fall through to here; accumulate over the materialised
+            // rows using the same agg_stream terminal logic (empty ops slice).
+            PlanOp::Aggregate { func, arg, column } => {
+                let ctx = AggStreamCtx {
+                    view,
+                    vars: &vars,
+                    params,
+                    func,
+                    arg,
+                };
+                let mut acc = AggAcc::new(func);
+                for row in &rows {
+                    // agg_stream with empty ops hits the terminal branch (accumulate).
+                    agg_stream(&ctx, &[], row, &mut acc)?;
+                }
+                let value = acc.finish();
+                let mut rs = ResultSet::new(vec![column.clone()]);
+                rs.push_row(vec![value]);
+                return Ok(rs);
             }
         }
     }
@@ -335,6 +388,30 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                     intern_operand(&mut vars, operand);
                 }
             }
+            PlanOp::VarExpand {
+                from,
+                rel_var,
+                to,
+                ..
+            } => {
+                vars.intern(from);
+                vars.intern(to);
+                if let Some(r) = rel_var {
+                    vars.intern(r);
+                }
+            }
+            PlanOp::ShortestPath {
+                from,
+                rel_var,
+                to,
+                ..
+            } => {
+                vars.intern(from);
+                vars.intern(to);
+                if let Some(r) = rel_var {
+                    vars.intern(r);
+                }
+            }
             PlanOp::Filter { expr } => intern_expr(&mut vars, expr),
             PlanOp::Project { items } => {
                 for item in items {
@@ -430,6 +507,7 @@ fn require_node(row: &Row, vars: &VarTable, var: &str) -> Result<u32, String> {
     match require_cell(row, vars, var)? {
         Cell::Node(id) => Ok(*id),
         Cell::Rel(_) => Err(format!("variable `{var}` is not a node")),
+        Cell::Path(_) => Err(format!("variable `{var}` is a path, not a node")),
     }
 }
 
@@ -460,6 +538,14 @@ fn resolve_prop(
     match require_cell(row, vars, var)? {
         Cell::Node(id) => Ok(view.prop(*id, field).cloned()),
         Cell::Rel(e) => Ok(view.edge_props.get(e.etype, e.src, e.dst, field).cloned()),
+        // Virtual path cell: only `length` is exposed.
+        Cell::Path(hops) => {
+            if field == "length" {
+                Ok(Some(Value::Int(*hops as i64)))
+            } else {
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -571,7 +657,7 @@ fn exec_expand(
         let from_id = require_node(row, vars, from)?;
         let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
             Some(Cell::Node(id)) => Some(*id),
-            Some(Cell::Rel(_)) => return Err(format!("variable `{to}` is not a node")),
+            Some(Cell::Rel(_) | Cell::Path(_)) => return Err(format!("variable `{to}` is not a node")),
             None => None,
         };
         for e in expand(view, from_id, etypes.as_deref(), exp_dir) {
@@ -600,6 +686,164 @@ fn exec_expand(
             out.push(next);
             #[cfg(test)]
             record_expand_row();
+        }
+    }
+    Ok(out)
+}
+
+/// BFS variable-length expand with per-path edge-uniqueness (Cypher
+/// relationship isomorphism).  A single path never reuses the same `EdgeRef`;
+/// node revisits are allowed.
+///
+/// Emits one row per (start, end, depth) combination where `min ≤ depth ≤ max`.
+/// The 1 M intermediate-row budget applies to `out.len()`.
+#[allow(clippy::too_many_arguments)]
+fn exec_var_expand(
+    view: &GraphView,
+    vars: &VarTable,
+    rows: &[Row],
+    from: &str,
+    rel_var: &Option<String>,
+    etype: &Option<String>,
+    dir: RelDir,
+    to: &str,
+    min: u8,
+    max: u8,
+) -> Result<Vec<Row>, String> {
+    let etypes = resolve_etypes(view, etype.as_deref());
+    let exp_dir = map_dir(dir);
+    let to_slot = vars
+        .slot(to)
+        .ok_or_else(|| format!("unbound variable `{to}`"))?;
+    let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
+    let cap = max_intermediate_rows();
+    let mut out: Vec<Row> = Vec::new();
+
+    for row in rows {
+        let from_id = require_node(row, vars, from)?;
+        let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
+            Some(Cell::Node(id)) => Some(*id),
+            Some(_) => return Err(format!("variable `{to}` is not a node")),
+            None => None,
+        };
+
+        // BFS state: (current_node_id, edges_used_in_this_path).
+        // Vec<EdgeRef> is cheap for paths ≤ 10 edges; contains() is O(max) = O(10).
+        struct PathState {
+            node: u32,
+            edges: Vec<EdgeRef>,
+        }
+
+        let mut frontier: Vec<PathState> = vec![PathState {
+            node: from_id,
+            edges: Vec::new(),
+        }];
+
+        for depth in 1u8..=max {
+            let mut next_frontier: Vec<PathState> = Vec::new();
+            for state in &frontier {
+                for e in expand(view, state.node, etypes.as_deref(), exp_dir) {
+                    // Per-path edge-uniqueness: reject edges already used in this path.
+                    if state.edges.contains(&e) {
+                        continue;
+                    }
+                    let nbr = neighbor(state.node, &e, dir);
+
+                    // Emit a result row if we're within the requested depth range
+                    // and the destination matches any bound constraint.
+                    if depth >= min {
+                        let dest_matches = match bound_to {
+                            Some(want) => nbr == want,
+                            None => true,
+                        };
+                        if dest_matches {
+                            if out.len() >= cap {
+                                return Err(row_cap_err(cap));
+                            }
+                            let mut next = row.clone();
+                            if let Some(slot) = rel_slot {
+                                next[slot] = Some(Cell::Path(depth));
+                            }
+                            next[to_slot] = Some(Cell::Node(nbr));
+                            out.push(next);
+                        }
+                    }
+
+                    // Continue expanding if we haven't hit the max depth yet.
+                    if depth < max {
+                        let mut new_edges = state.edges.clone();
+                        new_edges.push(e);
+                        next_frontier.push(PathState {
+                            node: nbr,
+                            edges: new_edges,
+                        });
+                    }
+                }
+            }
+            frontier = next_frontier;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// BFS shortest-path between two already-bound nodes.
+///
+/// Uses standard BFS with a visited-node set for efficiency.  Since BFS
+/// expands nodes level-by-level, the first time `to` is reached is the
+/// shortest path.  Emits exactly 0 or 1 rows.
+#[allow(clippy::too_many_arguments)]
+fn exec_shortest_path(
+    view: &GraphView,
+    vars: &VarTable,
+    rows: &[Row],
+    from: &str,
+    rel_var: &Option<String>,
+    etype: &Option<String>,
+    dir: RelDir,
+    to: &str,
+    max_hops: u8,
+) -> Result<Vec<Row>, String> {
+    let etypes = resolve_etypes(view, etype.as_deref());
+    let exp_dir = map_dir(dir);
+    let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
+    let mut out: Vec<Row> = Vec::new();
+
+    for row in rows {
+        let from_id = require_node(row, vars, from)?;
+        let to_id = require_node(row, vars, to)?;
+
+        // BFS with visited-node tracking.
+        let mut visited = std::collections::BTreeSet::new();
+        visited.insert(from_id);
+        let mut frontier: Vec<u32> = vec![from_id];
+
+        'bfs: for depth in 1u8..=max_hops {
+            let mut next_frontier: Vec<u32> = Vec::new();
+            for &node in &frontier {
+                for e in expand(view, node, etypes.as_deref(), exp_dir) {
+                    let nbr = neighbor(node, &e, dir);
+                    if nbr == to_id {
+                        // Found the shortest path at this depth — emit one row and stop.
+                        let mut next = row.clone();
+                        if let Some(slot) = rel_slot {
+                            next[slot] = Some(Cell::Path(depth));
+                        }
+                        out.push(next);
+                        break 'bfs;
+                    }
+                    if !visited.contains(&nbr) {
+                        visited.insert(nbr);
+                        next_frontier.push(nbr);
+                    }
+                }
+            }
+            frontier = next_frontier;
+            if frontier.is_empty() {
+                break;
+            }
         }
     }
     Ok(out)
@@ -950,7 +1194,7 @@ fn agg_stream(
             let from_id = require_node(row, ctx.vars, from)?;
             let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Node(id)) => Some(*id),
-                Some(Cell::Rel(_)) => return Err(format!("variable `{to}` is not a node")),
+                Some(Cell::Rel(_) | Cell::Path(_)) => return Err(format!("variable `{to}` is not a node")),
                 None => None,
             };
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
@@ -1007,6 +1251,35 @@ fn agg_stream(
                 ctx.params,
             )? {
                 agg_stream(ctx, rest, row, acc)?;
+            }
+        }
+        PlanOp::VarExpand {
+            from,
+            rel_var,
+            etype,
+            dir,
+            to,
+            min,
+            max,
+        } => {
+            let new_rows =
+                exec_var_expand(ctx.view, ctx.vars, std::slice::from_ref(row), from, rel_var, etype, *dir, to, *min, *max)?;
+            for nr in &new_rows {
+                agg_stream(ctx, rest, nr, acc)?;
+            }
+        }
+        PlanOp::ShortestPath {
+            from,
+            rel_var,
+            etype,
+            dir,
+            to,
+            max_hops,
+        } => {
+            let new_rows =
+                exec_shortest_path(ctx.view, ctx.vars, std::slice::from_ref(row), from, rel_var, etype, *dir, to, *max_hops)?;
+            for nr in &new_rows {
+                agg_stream(ctx, rest, nr, acc)?;
             }
         }
         // These must not appear in the producer slice of an aggregate plan.
@@ -1191,7 +1464,7 @@ fn pull_rows(
             let from_id = require_node(row, ctx.vars, from)?;
             let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Node(id)) => Some(*id),
-                Some(Cell::Rel(_)) => return Err(format!("variable `{to}` is not a node")),
+                Some(Cell::Rel(_) | Cell::Path(_)) => return Err(format!("variable `{to}` is not a node")),
                 None => None,
             };
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
@@ -1286,6 +1559,24 @@ fn pull_rows(
             return Err(
                 "pull executor: Aggregate reached pull_rows — aggregate plans must use \
                  the execute_aggregate path (routed before pull in execute_inner)"
+                    .to_string(),
+            );
+        }
+        // VarExpand and ShortestPath always take the staged path (row_bound()
+        // returns None for plans containing these ops, so pull_rows is never
+        // called with them in the producer slice).  This arm exists so that
+        // adding new variants to PlanOp forces a compile-time decision here.
+        PlanOp::VarExpand { .. } => {
+            return Err(
+                "pull executor: VarExpand reached pull_rows — variable-length path \
+                 plans must use the staged path (row_bound returns None)"
+                    .to_string(),
+            );
+        }
+        PlanOp::ShortestPath { .. } => {
+            return Err(
+                "pull executor: ShortestPath reached pull_rows — shortestPath plans \
+                 must use the staged path (row_bound returns None)"
                     .to_string(),
             );
         }

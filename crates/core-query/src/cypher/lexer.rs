@@ -155,9 +155,17 @@ fn lex_number(
                 .map_err(|_| format!("invalid float at position {start}"))?;
             return Ok(Tok::Float(val));
         }
-        return Err(format!(
-            "invalid number at position {start}: expected digit after decimal point"
-        ));
+        // `..` (two consecutive dots) is the range separator for variable-length
+        // path patterns (`*1..5`).  When after_dot is also '.', stop the number
+        // here without consuming the first dot — the main lex loop will emit two
+        // `Dot` tokens for the `..` separator.
+        if after_dot == Some('.') {
+            // fall through to return the integer below
+        } else {
+            return Err(format!(
+                "invalid number at position {start}: expected digit after decimal point"
+            ));
+        }
     }
     let val: i64 = input[start..end]
         .parse()

@@ -34,10 +34,20 @@ pub enum AggArg {
     Prop { var: String, field: String },
 }
 
+/// Hop-count range for variable-length relationship patterns (`*min..max`).
+/// Both bounds are inclusive.  `min = max` is a fixed-hop pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HopRange {
+    pub min: u8,
+    pub max: u8,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
     pub start: NodePat,
     pub chain: Vec<(RelPat, NodePat)>,
+    /// True when parsed as `MATCH shortestPath(...)`.
+    pub shortest: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +69,9 @@ pub struct RelPat {
     pub var: Option<String>,
     pub etype: Option<String>,
     pub dir: RelDir,
+    /// `None` = single-hop (normal `Expand`).  `Some(r)` = variable-length
+    /// (`VarExpand`) with the given min/max hop bounds.
+    pub hops: Option<HopRange>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

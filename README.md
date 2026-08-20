@@ -245,6 +245,7 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | No node or edge deletes | Not implemented. Nodes can be tombstoned but not removed; derived edges are retracted on property change. |
 | No multi-statement transactions | Single-write commits only. |
 | Cypher aggregations: no grouping | `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` on a single property are supported. Grouped aggregation (`RETURN a, COUNT(*)`) is not — the planner rejects it with a clear error. Multi-aggregate RETURN is also v1-limited. |
+| Variable-length paths: max hops capped at 10 | `-[r:TYPE*min..max]->` and `shortestPath` are supported. Max hops is hard-capped at 10; unbounded forms (`*min..`) are rejected at parse time. Intermediate results are capped at 1,000,000 rows. See [`docs/site/query.md`](docs/site/query.md). |
 
 ---
 
@@ -269,7 +270,7 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 | Medium | Node and edge deletes |
 | Medium | mmap-backed storage (RAM-independent at rest) |
 | Medium | Multi-statement transactions |
-| Medium | Expanded Cypher surface (grouped aggregations `RETURN a, COUNT(*)`, variable-length paths) |
+| Medium | Expanded Cypher surface (grouped aggregations `RETURN a, COUNT(*)`) |
 | Low | TypeScript bindings (napi-rs) |
 | Low | WASM playground |
 | Low | Time-travel queries |

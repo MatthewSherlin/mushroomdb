@@ -1,8 +1,8 @@
 //! Recursive-descent parser for the Cypher subset. Never panics on any token sequence.
 
 use super::ast::{
-    AggArg, AggFunc, Expr, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir,
-    RelPat, RetItem, RetVal,
+    AggArg, AggFunc, Expr, HopRange, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query,
+    RelDir, RelPat, RetItem, RetVal,
 };
 use super::Tok;
 use crate::filter::CmpOp;
@@ -114,7 +114,38 @@ impl<'a> Parser<'a> {
 
     fn match_clause(&mut self) -> Result<Pattern, String> {
         self.expect(&Tok::Match, "expected MATCH")?;
+        // Detect `MATCH shortestPath(...)`.
+        if let Some(Tok::Ident(s)) = self.peek() {
+            if s.eq_ignore_ascii_case("shortestpath") {
+                return self.shortest_path_clause();
+            }
+        }
         self.pattern()
+    }
+
+    fn shortest_path_clause(&mut self) -> Result<Pattern, String> {
+        self.pos += 1; // consume "shortestPath" identifier
+        self.expect(
+            &Tok::LParen,
+            "expected '(' after shortestPath",
+        )?;
+        let start = self.node()?;
+        let rel = self.rel()?;
+        if rel.hops.is_none() {
+            return Err(self.err(
+                "shortestPath requires a variable-length relationship (e.g. [*..5])",
+            ));
+        }
+        let dest = self.node()?;
+        self.expect(
+            &Tok::RParen,
+            "expected ')' to close shortestPath",
+        )?;
+        Ok(Pattern {
+            start,
+            chain: vec![(rel, dest)],
+            shortest: true,
+        })
     }
 
     fn pattern(&mut self) -> Result<Pattern, String> {
@@ -125,7 +156,11 @@ impl<'a> Parser<'a> {
             let dest = self.node()?;
             chain.push((rel, dest));
         }
-        Ok(Pattern { start, chain })
+        Ok(Pattern {
+            start,
+            chain,
+            shortest: false,
+        })
     }
 
     fn node(&mut self) -> Result<NodePat, String> {
@@ -175,7 +210,7 @@ impl<'a> Parser<'a> {
                 &Tok::Dash,
                 "expected '-' after '<' in a left-directed relationship",
             )?;
-            let (var, etype) = self.rel_body()?;
+            let (var, etype, hops) = self.rel_body()?;
             self.expect(
                 &Tok::Dash,
                 "expected '-' to close a left-directed relationship",
@@ -184,20 +219,27 @@ impl<'a> Parser<'a> {
                 var,
                 etype,
                 dir: RelDir::Left,
+                hops,
             });
         }
         self.expect(&Tok::Dash, "expected '-' to start a relationship")?;
-        let (var, etype) = self.rel_body()?;
+        let (var, etype, hops) = self.rel_body()?;
         self.expect(&Tok::Dash, "expected '-' after ']'")?;
         let dir = if self.eat(&Tok::Gt) {
             RelDir::Right
         } else {
             RelDir::Undirected
         };
-        Ok(RelPat { var, etype, dir })
+        Ok(RelPat {
+            var,
+            etype,
+            dir,
+            hops,
+        })
     }
 
-    fn rel_body(&mut self) -> Result<(Option<String>, Option<String>), String> {
+    #[allow(clippy::type_complexity)]
+    fn rel_body(&mut self) -> Result<(Option<String>, Option<String>, Option<HopRange>), String> {
         self.expect(&Tok::LBracket, "expected '[' in a relationship pattern")?;
         let var = match self.peek() {
             Some(Tok::Ident(s)) => {
@@ -212,11 +254,93 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let hops = if self.eat(&Tok::Star) {
+            Some(self.parse_hop_range()?)
+        } else {
+            None
+        };
         self.expect(
             &Tok::RBracket,
             "expected ']' to close a relationship pattern",
         )?;
-        Ok((var, etype))
+        Ok((var, etype, hops))
+    }
+
+    /// Parse the hop-count range that follows `*` inside a relationship bracket.
+    ///
+    /// Recognised forms (after `*` is already consumed):
+    /// - `]`        → bare `*`, treated as `1..10`
+    /// - `n`        → exactly n hops (`n..n`)
+    /// - `n..m`     → n..m hops
+    /// - `..m`      → 1..m hops
+    /// - `n..`      → unbounded → hard-cap error
+    ///
+    /// Hard cap: max > 10 or unbounded → Err("variable-length paths are capped at 10 hops").
+    fn parse_hop_range(&mut self) -> Result<HopRange, String> {
+        const CAP_ERR: &str = "variable-length paths are capped at 10 hops";
+
+        match self.peek() {
+            // bare `*`  →  min=1, max=10
+            Some(Tok::RBracket) => Ok(HopRange { min: 1, max: 10 }),
+
+            // `*n`  or  `*n..`  or  `*n..m`
+            Some(Tok::Int(n)) => {
+                let n = *n;
+                self.pos += 1;
+                if self.eat(&Tok::Dot) {
+                    self.expect(&Tok::Dot, "expected '..' separator in hop range")?;
+                    match self.peek() {
+                        Some(Tok::Int(m)) => {
+                            let m = *m;
+                            self.pos += 1;
+                            // `*n..m`
+                            self.validate_hop_range(n, m, CAP_ERR)
+                        }
+                        _ => {
+                            // `*n..` — unbounded
+                            Err(CAP_ERR.to_string())
+                        }
+                    }
+                } else {
+                    // `*n` — exact hops
+                    self.validate_hop_range(n, n, CAP_ERR)
+                }
+            }
+
+            // `*..m`
+            Some(Tok::Dot) => {
+                self.pos += 1; // consume first '.'
+                self.expect(&Tok::Dot, "expected '..' range separator after '*'")?;
+                match self.peek() {
+                    Some(Tok::Int(m)) => {
+                        let m = *m;
+                        self.pos += 1;
+                        self.validate_hop_range(1, m, CAP_ERR)
+                    }
+                    _ => Err(self.err("expected max-hop integer after '*..'"))
+                }
+            }
+
+            // Anything else after `*` — treat as bare `*`
+            _ => Ok(HopRange { min: 1, max: 10 }),
+        }
+    }
+
+    fn validate_hop_range(&self, min_n: i64, max_n: i64, cap_err: &str) -> Result<HopRange, String> {
+        if min_n < 0 || max_n < 0 {
+            return Err(self.err("hop counts must be non-negative"));
+        }
+        if max_n > 10 {
+            return Err(cap_err.to_string());
+        }
+        let min = min_n as u8;
+        let max = max_n as u8;
+        if min > max {
+            return Err(self.err(&format!(
+                "variable-length path min ({min}) must not exceed max ({max})"
+            )));
+        }
+        Ok(HopRange { min, max })
     }
 
     fn expr(&mut self, paren_depth: usize) -> Result<Expr, String> {
@@ -442,8 +566,8 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::parse;
     use crate::cypher::ast::{
-        Expr, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem,
-        RetVal,
+        Expr, HopRange, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat,
+        RetItem, RetVal,
     };
     use crate::cypher::{lex, Tok};
     use crate::filter::CmpOp;
@@ -497,6 +621,7 @@ SKIP 1 LIMIT 5";
                             var: Some("r".into()),
                             etype: Some("KNOWS".into()),
                             dir: RelDir::Right,
+                            hops: None,
                         },
                         node(Some("b"), None, vec![]),
                     ),
@@ -505,6 +630,7 @@ SKIP 1 LIMIT 5";
                             var: Some("u".into()),
                             etype: Some("TEAM".into()),
                             dir: RelDir::Undirected,
+                            hops: None,
                         },
                         node(Some("c"), None, vec![]),
                     ),
@@ -513,10 +639,12 @@ SKIP 1 LIMIT 5";
                             var: Some("s".into()),
                             etype: Some("LIKES".into()),
                             dir: RelDir::Left,
+                            hops: None,
                         },
                         node(Some("d"), None, vec![]),
                     ),
                 ],
+                shortest: false,
             }],
             where_expr: Some(Expr::Or(
                 Box::new(Expr::And(
@@ -711,6 +839,7 @@ LIMIT 10";
                         vec![("id".into(), Operand::Param("tid".into()))],
                     ),
                     chain: vec![],
+                    shortest: false,
                 },
                 Pattern {
                     start: node(Some("c"), Some("Company"), vec![]),
@@ -719,9 +848,11 @@ LIMIT 10";
                             var: Some("i".into()),
                             etype: Some("INDUSTRY_ALIGNMENT".into()),
                             dir: RelDir::Right,
+                            hops: None,
                         },
                         node(Some("t"), None, vec![]),
                     )],
+                    shortest: false,
                 },
                 Pattern {
                     start: node(Some("c"), None, vec![]),
@@ -730,9 +861,11 @@ LIMIT 10";
                             var: Some("s".into()),
                             etype: Some("SPECIALTY_MATCH".into()),
                             dir: RelDir::Right,
+                            hops: None,
                         },
                         node(Some("t"), None, vec![]),
                     )],
+                    shortest: false,
                 },
             ],
             where_expr: Some(Expr::And(
@@ -982,5 +1115,107 @@ LIMIT 10";
         }
         src.push_str(" RETURN a");
         assert_parse_err(&src);
+    }
+
+    // ── Variable-length path parser tests ─────────────────────────────────────
+
+    fn hop_range_of(src: &str) -> HopRange {
+        let q = parse_src(src).expect(src);
+        let (rel, _) = &q.matches[0].chain[0];
+        rel.hops.expect("expected hop range")
+    }
+
+    fn assert_hop_err(src: &str, needle: &str) {
+        let result = std::panic::catch_unwind(|| parse_src(src));
+        assert!(result.is_ok(), "parse panicked on {src:?}");
+        let err = result
+            .unwrap()
+            .expect_err(&format!("parse({src:?}) must Err"));
+        assert!(
+            err.contains(needle),
+            "error must contain {needle:?}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn var_length_bare_star_is_one_to_ten() {
+        let r = hop_range_of("MATCH (a)-[r:T*]->(b) RETURN a");
+        assert_eq!(r, HopRange { min: 1, max: 10 });
+    }
+
+    #[test]
+    fn var_length_exact_n_hops() {
+        let r = hop_range_of("MATCH (a)-[r:T*3]->(b) RETURN a");
+        assert_eq!(r, HopRange { min: 3, max: 3 });
+    }
+
+    #[test]
+    fn var_length_min_max_range() {
+        let r = hop_range_of("MATCH (a)-[r:T*2..5]->(b) RETURN a");
+        assert_eq!(r, HopRange { min: 2, max: 5 });
+    }
+
+    #[test]
+    fn var_length_dotdot_max() {
+        let r = hop_range_of("MATCH (a)-[r:T*..4]->(b) RETURN a");
+        assert_eq!(r, HopRange { min: 1, max: 4 });
+    }
+
+    #[test]
+    fn var_length_cap_at_ten_is_ok() {
+        let r = hop_range_of("MATCH (a)-[r:T*10]->(b) RETURN a");
+        assert_eq!(r, HopRange { min: 10, max: 10 });
+        let r2 = hop_range_of("MATCH (a)-[r:T*1..10]->(b) RETURN a");
+        assert_eq!(r2, HopRange { min: 1, max: 10 });
+    }
+
+    #[test]
+    fn var_length_cap_exceeded_is_err() {
+        assert_hop_err(
+            "MATCH (a)-[r:T*11]->(b) RETURN a",
+            "variable-length paths are capped at 10 hops",
+        );
+        assert_hop_err(
+            "MATCH (a)-[r:T*1..11]->(b) RETURN a",
+            "variable-length paths are capped at 10 hops",
+        );
+    }
+
+    #[test]
+    fn var_length_unbounded_min_dot_dot_is_err() {
+        assert_hop_err(
+            "MATCH (a)-[r:T*2..]->(b) RETURN a",
+            "variable-length paths are capped at 10 hops",
+        );
+    }
+
+    #[test]
+    fn var_length_shortest_path_parses() {
+        let q = parse_src(
+            "MATCH (a:N) MATCH (b:N) MATCH shortestPath((a)-[r:T*..5]->(b)) RETURN a",
+        )
+        .expect("shortestPath must parse");
+        assert!(q.matches[2].shortest, "third match must be shortest=true");
+        let (rel, _) = &q.matches[2].chain[0];
+        assert_eq!(rel.hops, Some(HopRange { min: 1, max: 5 }));
+        assert_eq!(rel.etype.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn var_length_no_type_is_ok() {
+        // Bare `*` with no type filter
+        let r = hop_range_of("MATCH (a)-[r*1..3]->(b) RETURN a");
+        assert_eq!(r, HopRange { min: 1, max: 3 });
+    }
+
+    #[test]
+    fn var_length_rel_appears_in_chain() {
+        let q = parse_src("MATCH (a)-[r:T*2..4]->(b) RETURN a").unwrap();
+        let (rel, dest) = &q.matches[0].chain[0];
+        assert_eq!(rel.var.as_deref(), Some("r"));
+        assert_eq!(rel.etype.as_deref(), Some("T"));
+        assert_eq!(rel.dir, RelDir::Right);
+        assert_eq!(rel.hops, Some(HopRange { min: 2, max: 4 }));
+        assert_eq!(dest.var.as_deref(), Some("b"));
     }
 }

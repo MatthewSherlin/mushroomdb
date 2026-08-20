@@ -77,6 +77,44 @@ pub enum PlanOp {
         /// function call string (`COUNT(*)`, `SUM(n.age)`, etc.).
         column: String,
     },
+    /// Variable-length path expansion: BFS from `from`, emitting one row per
+    /// (start, end, depth) path found with `min ≤ depth ≤ max`.
+    ///
+    /// Per-path edge-uniqueness (Cypher relationship isomorphism): a single
+    /// path may not reuse the same edge (`EdgeRef`) twice; node revisits ARE
+    /// allowed.  `rel_var`, when present, is bound to a virtual path cell
+    /// whose sole accessible property is `length` (hop count as `Int`).
+    ///
+    /// Always executes via the **staged path** regardless of LIMIT.
+    /// The 1 M intermediate-row budget applies to the output row count.
+    VarExpand {
+        from: String,
+        rel_var: Option<String>,
+        etype: Option<String>,
+        dir: RelDir,
+        to: String,
+        min: u8,
+        max: u8,
+    },
+    /// Shortest path between two already-bound nodes via BFS.
+    ///
+    /// Both `from` and `to` must be bound in the current row before this op
+    /// executes.  BFS terminates at the first depth where `to` is reached.
+    /// If `to` is unreachable within `max_hops`, zero rows are emitted.
+    /// Exactly one row is emitted when a path exists.
+    ///
+    /// `rel_var`, when present, binds to a virtual path cell; `r.length`
+    /// yields the hop count as `Int`.
+    ///
+    /// Always executes via the **staged path** regardless of LIMIT.
+    ShortestPath {
+        from: String,
+        rel_var: Option<String>,
+        etype: Option<String>,
+        dir: RelDir,
+        to: String,
+        max_hops: u8,
+    },
 }
 
 /// Compute the effective row bound for LIMIT push-down.
@@ -115,6 +153,14 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
     if ops.iter().any(|op| matches!(op, PlanOp::Aggregate { .. })) {
         return None;
     }
+    // VarExpand / ShortestPath always use the staged path so that the 1M row
+    // budget applies and BFS state is cleanly managed stage-by-stage.
+    if ops
+        .iter()
+        .any(|op| matches!(op, PlanOp::VarExpand { .. } | PlanOp::ShortestPath { .. }))
+    {
+        return None;
+    }
     let limit_n = ops.iter().rev().find_map(|op| match op {
         PlanOp::Limit(n) => Some(*n),
         _ => None,
@@ -146,7 +192,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
             &mut rel_bound,
             &mut node_anon,
             &mut rel_anon,
-        );
+        )?;
     }
 
     if let Some(expr) = &q.where_expr {
@@ -239,9 +285,22 @@ fn compile_pattern(
     rel_bound: &mut BTreeSet<String>,
     node_anon: &mut u32,
     rel_anon: &mut u32,
-) {
+) -> Result<(), String> {
     let start = name_node(&pat.start, node_anon, bound);
-    if bound.contains(&start) {
+    if pat.shortest {
+        // shortestPath requires both endpoints already bound.
+        if !bound.contains(&start) {
+            return Err(format!(
+                "shortestPath: source node `{start}` is not bound; \
+                 bind both endpoints before shortestPath"
+            ));
+        }
+        ops.push(PlanOp::JoinBound {
+            var: start.clone(),
+            label: pat.start.label.clone(),
+            props: pat.start.props.clone(),
+        });
+    } else if bound.contains(&start) {
         ops.push(PlanOp::JoinBound {
             var: start.clone(),
             label: pat.start.label.clone(),
@@ -267,18 +326,51 @@ fn compile_pattern(
         bound.insert(rel_name.clone());
         rel_bound.insert(rel_name.clone());
         let to = name_node(dest, node_anon, bound);
-        ops.push(PlanOp::Expand {
-            from,
-            rel_var: Some(rel_name),
-            etype: rel.etype.clone(),
-            dir: rel.dir,
-            to: to.clone(),
-            to_label: dest.label.clone(),
-            to_props: dest.props.clone(),
-        });
-        bound.insert(to.clone());
+
+        if let Some(hops) = rel.hops {
+            if pat.shortest {
+                // shortestPath: destination must also already be bound.
+                if !bound.contains(&to) {
+                    return Err(format!(
+                        "shortestPath: destination node `{to}` is not bound; \
+                         bind both endpoints before shortestPath"
+                    ));
+                }
+                ops.push(PlanOp::ShortestPath {
+                    from: from.clone(),
+                    rel_var: Some(rel_name),
+                    etype: rel.etype.clone(),
+                    dir: rel.dir,
+                    to: to.clone(),
+                    max_hops: hops.max,
+                });
+            } else {
+                ops.push(PlanOp::VarExpand {
+                    from: from.clone(),
+                    rel_var: Some(rel_name),
+                    etype: rel.etype.clone(),
+                    dir: rel.dir,
+                    to: to.clone(),
+                    min: hops.min,
+                    max: hops.max,
+                });
+                bound.insert(to.clone());
+            }
+        } else {
+            ops.push(PlanOp::Expand {
+                from: from.clone(),
+                rel_var: Some(rel_name),
+                etype: rel.etype.clone(),
+                dir: rel.dir,
+                to: to.clone(),
+                to_label: dest.label.clone(),
+                to_props: dest.props.clone(),
+            });
+            bound.insert(to.clone());
+        }
         from = to;
     }
+    Ok(())
 }
 
 fn name_node(node: &NodePat, counter: &mut u32, bound: &BTreeSet<String>) -> String {
@@ -942,6 +1034,7 @@ LIMIT 10";
                     props: vec![],
                 },
                 chain: vec![],
+                shortest: false,
             }],
             where_expr: Some(Expr::Not(Box::new(Expr::Cmp {
                 lhs: Operand::Param("p".into()),
@@ -990,5 +1083,72 @@ LIMIT 10";
     fn relationship_prop_in_order_by_is_ok() {
         plan_src("MATCH (a)-[r:T]->(b) RETURN r.w ORDER BY r.w")
             .expect("rel prop ORDER BY must plan");
+    }
+
+    // ── Variable-length path and shortestPath planner tests ───────────────────
+
+    #[test]
+    fn var_expand_op_emitted_for_star_rel() {
+        use super::row_bound;
+        let ops = plan_src("MATCH (a)-[r:T*2..4]->(b) RETURN b").unwrap();
+        let has_var = ops
+            .iter()
+            .any(|op| matches!(op, PlanOp::VarExpand { min: 2, max: 4, .. }));
+        assert!(has_var, "expected VarExpand(2..4) in plan, got: {ops:?}");
+        // row_bound must be None even when no ORDER BY (VarExpand overrides pull routing)
+        assert_eq!(
+            row_bound(&ops),
+            None,
+            "VarExpand plan must not use pull path"
+        );
+    }
+
+    #[test]
+    fn var_expand_with_limit_still_takes_staged_path() {
+        use super::row_bound;
+        let ops = plan_src("MATCH (a)-[r:T*1..3]->(b) RETURN b LIMIT 5").unwrap();
+        // Staged path: row_bound returns None for VarExpand.
+        assert_eq!(
+            row_bound(&ops),
+            None,
+            "VarExpand + LIMIT must still use staged path"
+        );
+        let has_var = ops
+            .iter()
+            .any(|op| matches!(op, PlanOp::VarExpand { .. }));
+        assert!(has_var, "plan must contain VarExpand");
+        let has_limit = ops.iter().any(|op| matches!(op, PlanOp::Limit(5)));
+        assert!(has_limit, "plan must still emit Limit op");
+    }
+
+    #[test]
+    fn shortest_path_op_emitted_for_shortest_path_clause() {
+        let ops =
+            plan_src("MATCH (a:N) MATCH (b:N) MATCH shortestPath((a)-[r:T*..3]->(b)) RETURN a")
+                .unwrap();
+        let has_sp = ops
+            .iter()
+            .any(|op| matches!(op, PlanOp::ShortestPath { max_hops: 3, .. }));
+        assert!(has_sp, "expected ShortestPath op with max_hops=3, got: {ops:?}");
+    }
+
+    #[test]
+    fn shortest_path_unbound_endpoint_is_err() {
+        let err = assert_plan_err(
+            "MATCH shortestPath((a)-[r:T*..3]->(b)) RETURN a",
+            "shortestPath",
+        );
+        assert!(
+            err.contains("not bound") || err.contains("bound"),
+            "error must mention binding, got: {err}"
+        );
+    }
+
+    #[test]
+    fn var_expand_rel_var_is_in_rel_bound() {
+        // r.length should be allowed in RETURN (prop access)
+        plan_src("MATCH (a)-[r:T*1..3]->(b) RETURN r.length").expect("r.length must plan");
+        // bare r must be rejected
+        assert_plan_err("MATCH (a)-[r:T*1..3]->(b) RETURN r", "r");
     }
 }
