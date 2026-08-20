@@ -161,8 +161,9 @@ Predicate::All(vec![
 ```
 
 The edge is written only when every sub-predicate fires. The score is the
-product of the individual scores (or the minimum — the exact aggregation
-is documented in the source).
+**minimum** of the individual sub-predicate scores (`score.min(part_score)`
+per part — verified in `crates/core-rules/src/def.rs`, test
+`all_takes_min_score_and_requires_every_part`).
 
 ---
 

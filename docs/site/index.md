@@ -17,14 +17,14 @@ provenance, produce a score on each derived edge, and are queryable via the
 
 Six predicate kinds ship today:
 
-| Predicate | What it tests |
-|---|---|
-| `key_match` | FK equality — one node's field matches another's key |
-| `field_equal` | Exact string match on a named field |
-| `overlap` | Jaccard coefficient on list-valued fields, min threshold |
-| `numeric_within` | Absolute numeric difference within a tolerance |
-| `geo_radius` | Haversine distance between `[lat, lon]` fields within a radius in km |
-| `vector_similar` | Cosine similarity on fixed-dimension float arrays, min threshold |
+| Display name | Wire shape (JSON `predicate` field) | What it tests |
+|---|---|---|
+| KeyMatch | `{"KeyMatch": {"field": "..."}}` | FK equality — one node's field matches another's key |
+| FieldEqual | `{"FieldEqual": {"field": "..."}}` | Exact string match on a named field |
+| Overlap | `{"Overlap": {"field": "...", "min": 0.5}}` | Jaccard coefficient on list-valued fields, min threshold |
+| NumericWithin | `{"NumericWithin": {"field": "...", "tolerance": 2.0}}` | Absolute numeric difference within a tolerance |
+| GeoRadius | `{"GeoRadius": {"field": "...", "radius_km": 50.0}}` | Haversine distance between `[lat, lon]` fields within a radius in km |
+| VectorSimilar | `{"VectorSimilar": {"field": "...", "min": 0.8, "dims": 8}}` | Cosine similarity on fixed-dimension float arrays, min threshold |
 
 All six compose with `All` to require multiple conditions on the same edge.
 

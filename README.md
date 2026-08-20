@@ -64,7 +64,7 @@ Or run directly from the source tree (no copy needed):
 Open `http://127.0.0.1:8080/`. The demo graph has 10 Orgs, 20 Projects,
 30 People, and 334 edges — 304 of them derived by seven rule sets.
 
-Demo output:
+`mushroomdb demo ./db` output:
 
 ```text
 == demo ==
@@ -95,6 +95,11 @@ columns: p, proj, score
 
 == serve ==
   mushroomdb serve ./db
+```
+
+`mushroomdb serve ./db --addr 127.0.0.1:8080` output:
+
+```text
 listening on http://127.0.0.1:8080
 ```
 
@@ -125,9 +130,10 @@ Auto-FK: fields ending in `_id` whose values match existing node keys get
 
 Approximate mode: `VectorSimilar` accepts `approximate: true`, which
 switches the candidate path to IVF-Flat. Per-query recall ≥ 0.90
-quiesced. Measured at 5k nodes / dim 1536: exact ~12 min backfill,
-approximate ~17 s. Use it when backfill latency matters more than
-completeness; document the recall trade-off for your workload.
+quiesced, ≥ 0.85 immediately post-rebuild. Measured at 5k nodes /
+dim 1536: exact ~12 min backfill, approximate ~17 s. Use it when
+backfill latency matters more than completeness; document the recall
+trade-off for your workload.
 
 Full predicate reference and examples: [`docs/site/rules.md`](docs/site/rules.md).
 
@@ -213,6 +219,7 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
 | No node or edge deletes | Not implemented. Nodes can be tombstoned but not removed; derived edges are retracted on property change. |
 | No multi-statement transactions | Single-write commits only. |
+| Cypher lacks COUNT and aggregations | `COUNT`, `SUM`, `AVG`, and other aggregation functions are not implemented. Use the traversal API or Python bindings for count queries. |
 
 ---
 
