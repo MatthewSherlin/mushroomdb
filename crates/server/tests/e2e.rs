@@ -131,6 +131,7 @@ fn load_demo_equivalent(dir: &Path) -> SharedDb {
             edge_type: "FIT".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         })
         .expect("skill_fit");
     }

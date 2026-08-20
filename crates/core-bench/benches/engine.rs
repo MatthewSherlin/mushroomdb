@@ -192,7 +192,8 @@ fn rule_works_at() -> RuleDef {
         },
         edge_type: "WORKS_AT".into(),
         weight_prop: None,
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     }
 }
 
@@ -206,7 +207,8 @@ fn rule_on_project() -> RuleDef {
         },
         edge_type: "ON_PROJECT".into(),
         weight_prop: None,
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     }
 }
 
@@ -221,7 +223,8 @@ fn rule_skill_fit() -> RuleDef {
         },
         edge_type: "FIT".into(),
         weight_prop: Some("score".into()),
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     }
 }
 
@@ -236,7 +239,8 @@ fn rule_vector_sim() -> RuleDef {
         },
         edge_type: "SIMILAR".into(),
         weight_prop: Some("score".into()),
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     }
 }
 
@@ -469,7 +473,8 @@ fn vector_semantic_backfill(c: &mut Criterion) {
         },
         edge_type: "SEM_SIM".into(),
         weight_prop: None,
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     };
 
     c.bench_function("vector_semantic_backfill_500", |b| {
@@ -482,6 +487,40 @@ fn vector_semantic_backfill(c: &mut Criterion) {
             },
             |mut db| {
                 db.create_rule(rule.clone()).expect("create sem_sim");
+                black_box(db.edge_count());
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    // Approximate variant: same 500-node 1536-D setup with approximate=true
+    // (IVF-Flat candidate path). Target: faster than exact; recall ≥ 0.90.
+    // Binding name: `vector_semantic_backfill_500_approximate` — task-4 report.
+    let approx_rule = RuleDef {
+        name: "sem_sim_approx".into(),
+        src_label: "Doc".into(),
+        dst_label: "Doc".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.85,
+        },
+        edge_type: "SEM_SIM_APPROX".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+    };
+
+    c.bench_function("vector_semantic_backfill_500_approximate", |b| {
+        b.iter_batched(
+            || {
+                let mut db = GraphDb::open(&tmp_dir()).expect("open");
+                db.ingest("Doc", rows.clone(), &ingest_opts())
+                    .expect("ingest docs");
+                db
+            },
+            |mut db| {
+                db.create_rule(approx_rule.clone())
+                    .expect("create sem_sim_approx");
                 black_box(db.edge_count());
             },
             BatchSize::PerIteration,

@@ -22,7 +22,8 @@ fn overlap_rule(name: &str, etype: &str) -> RuleDef {
         },
         edge_type: etype.into(),
         weight_prop: Some("score".into()),
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     }
 }
 
@@ -521,7 +522,8 @@ fn const_eq_rule(max_edges: u64) -> RuleDef {
         predicate: Predicate::FieldEqual { field: "k".into() },
         edge_type: "EQ".into(),
         weight_prop: None,
-        max_edges: Some(max_edges),
+            max_edges: Some(max_edges),
+        approximate: false,
     }
 }
 

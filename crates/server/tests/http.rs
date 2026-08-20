@@ -174,6 +174,7 @@ async fn stats_round_trips_serialize() {
             edges: 4,
             tripped: true,
             fires: 5,
+            approximate: false,
         }],
     };
     let encoded = serde_json::to_value(&live).expect("Stats: Serialize");
@@ -257,6 +258,7 @@ async fn explain_happy_path() {
             edge_type: "WORKS_AT".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         })
         .unwrap();
         w.insert_node(
@@ -320,6 +322,7 @@ async fn explain_predicate_all_json_shape() {
             edge_type: "BOTH".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         })
         .unwrap();
         w.insert_node(
@@ -505,6 +508,7 @@ async fn node_edges_json_shape_user_and_derived() {
             edge_type: "WORKS_AT".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         })
         .unwrap();
         w.insert_node(
@@ -811,6 +815,7 @@ fn wire_types_serialize() {
         edges: 0,
         tripped: false,
         fires: 0,
+        approximate: false,
     })
     .unwrap();
     serde_json::to_value(&IngestReport {

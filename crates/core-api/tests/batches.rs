@@ -29,7 +29,8 @@ fn overlap_rule(name: &str, etype: &str) -> RuleDef {
         },
         edge_type: etype.into(),
         weight_prop: Some("score".into()),
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     }
 }
 

@@ -145,6 +145,8 @@ pub struct RuleStats {
     pub edges: u64,
     pub tripped: bool,
     pub fires: u64,
+    /// Whether this rule uses the approximate IVF-Flat candidate path.
+    pub approximate: bool,
 }
 
 /// Wire summary of a [`Predicate`]. JSON only — `Explanation` is never
@@ -157,6 +159,10 @@ pub struct PredicateSummary {
     pub tolerance: Option<f64>,
     pub km: Option<f64>,
     pub parts: Option<Vec<PredicateSummary>>,
+    /// True when the owning rule has `approximate=true` (IVF-Flat candidate path).
+    /// Always false for predicates reported without rule context (sub-predicates in `parts`).
+    #[serde(default)]
+    pub approximate: bool,
 }
 
 impl From<&Predicate> for PredicateSummary {
@@ -168,7 +174,8 @@ impl From<&Predicate> for PredicateSummary {
                 min: None,
                 tolerance: None,
                 km: None,
-                parts: None,
+parts: None,
+                approximate: false,
             },
             Predicate::FieldEqual { field } => PredicateSummary {
                 kind: "field_equal".into(),
@@ -176,7 +183,8 @@ impl From<&Predicate> for PredicateSummary {
                 min: None,
                 tolerance: None,
                 km: None,
-                parts: None,
+parts: None,
+                approximate: false,
             },
             Predicate::Overlap { field, min } => PredicateSummary {
                 kind: "overlap".into(),
@@ -184,7 +192,8 @@ impl From<&Predicate> for PredicateSummary {
                 min: Some(*min),
                 tolerance: None,
                 km: None,
-                parts: None,
+parts: None,
+                approximate: false,
             },
             Predicate::NumericWithin { field, tolerance } => PredicateSummary {
                 kind: "numeric_within".into(),
@@ -192,7 +201,8 @@ impl From<&Predicate> for PredicateSummary {
                 min: None,
                 tolerance: Some(*tolerance),
                 km: None,
-                parts: None,
+parts: None,
+                approximate: false,
             },
             Predicate::GeoRadius { field, km } => PredicateSummary {
                 kind: "geo_radius".into(),
@@ -200,7 +210,8 @@ impl From<&Predicate> for PredicateSummary {
                 min: None,
                 tolerance: None,
                 km: Some(*km),
-                parts: None,
+parts: None,
+                approximate: false,
             },
             Predicate::VectorSimilar { field, min } => PredicateSummary {
                 kind: "vector_similar".into(),
@@ -208,7 +219,8 @@ impl From<&Predicate> for PredicateSummary {
                 min: Some(*min),
                 tolerance: None,
                 km: None,
-                parts: None,
+parts: None,
+                approximate: false,
             },
             Predicate::All(inner) => {
                 let parts: Vec<PredicateSummary> = inner.iter().map(Self::from).collect();
@@ -226,7 +238,8 @@ impl From<&Predicate> for PredicateSummary {
                     min: None,
                     tolerance: None,
                     km: None,
-                    parts: Some(parts),
+parts: Some(parts),
+                    approximate: false,
                 }
             }
         }
@@ -1151,7 +1164,10 @@ impl<F: Fs> GraphDb<F> {
                 src_key,
                 dst_key,
                 weight,
-                predicate: PredicateSummary::from(&rule_def.predicate),
+                predicate: PredicateSummary {
+                    approximate: rule_def.approximate,
+                    ..PredicateSummary::from(&rule_def.predicate)
+                },
             });
         }
 
@@ -1205,6 +1221,7 @@ impl<F: Fs> GraphDb<F> {
                     .unwrap_or(0),
                 tripped: self.engine.is_tripped(&r.name),
                 fires: self.engine.fire_count(&r.name),
+                approximate: r.approximate,
             })
             .collect();
         Stats {

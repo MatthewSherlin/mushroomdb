@@ -280,6 +280,7 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             edge_type: "FIT".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         })?;
         w.create_rule(RuleDef {
             name: "founded_within".into(),
@@ -292,6 +293,7 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             edge_type: "FOUNDED_WITHIN".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         })?;
         w.create_rule(RuleDef {
             name: "nearby_office".into(),
@@ -304,6 +306,7 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             edge_type: "NEARBY_OFFICE".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         })?;
         w.create_rule(RuleDef {
             name: "similar_interests".into(),
@@ -316,6 +319,7 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             edge_type: "SIMILAR".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         })?;
     }
 

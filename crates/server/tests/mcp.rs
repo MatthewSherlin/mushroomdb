@@ -264,6 +264,7 @@ fn tools_call_happy_path_for_each_tool() {
             edge_type: "WORKS_AT".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         })
         .unwrap();
     }
@@ -344,6 +345,7 @@ fn node_info_and_edges_tool_parity() {
             edge_type: "WORKS_AT".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         })
         .unwrap();
         w.insert_node(

@@ -98,7 +98,8 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         predicate: Predicate::KeyMatch { field: "f".into() },
         edge_type: "KM".into(),
         weight_prop: None,
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     })?;
 
     // --- 6 L1 nodes ---
@@ -136,7 +137,8 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         },
         edge_type: "OV".into(),
         weight_prop: None,
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     })?;
 
     // DUMMY rule created and immediately deleted.
@@ -147,7 +149,8 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         predicate: Predicate::FieldEqual { field: "f".into() },
         edge_type: "DUMMY".into(),
         weight_prop: None,
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     })?;
     db.delete_rule("dummy")?;
 
@@ -169,7 +172,8 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         },
         edge_type: "NW".into(),
         weight_prop: None,
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     })?;
     db.create_rule(RuleDef {
         name: "nz".into(),
@@ -181,7 +185,8 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         },
         edge_type: "NZ".into(),
         weight_prop: None,
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     })?;
 
     // Geo: Paris/London cross-cell; ±180 at lat 70 (antimeridian wrap); NYC far.
@@ -200,7 +205,8 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         },
         edge_type: "GEO".into(),
         weight_prop: None,
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     })?;
 
     // Vector: [1,0] vs near-threshold 0.95; orthogonal [0,1] does not match.
@@ -221,7 +227,8 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         },
         edge_type: "VEC".into(),
         weight_prop: None,
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     })?;
 
     // Snapshot while km, ov, and Plan-7 rules are live (no dummy rule).

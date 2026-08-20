@@ -298,6 +298,7 @@ mod tests {
             edge_type: "FE".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         }
     }
 
@@ -375,6 +376,7 @@ mod tests {
             edge_type: "NW".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         }));
         assert!(o.create_rule(RuleDef {
             name: "nz".into(),
@@ -387,6 +389,7 @@ mod tests {
             edge_type: "NZ".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         }));
         let edges = o.all_edges();
         assert!(edges.contains(&("NW".into(), "a".into(), "b".into())));
@@ -414,6 +417,7 @@ mod tests {
             edge_type: "GEO".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         }));
         let edges = o.all_edges();
         assert!(edges.contains(&("GEO".into(), "paris".into(), "london".into())));
@@ -442,6 +446,7 @@ mod tests {
             edge_type: "VEC".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         }));
         let edges = o.all_edges();
         assert!(edges.contains(&("VEC".into(), "a".into(), "b".into())));

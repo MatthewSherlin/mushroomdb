@@ -65,6 +65,7 @@ fn snapshot_preserves_rules_provenance_and_scores() {
             edge_type: "REL".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         })
         .unwrap();
         db.insert_node(
@@ -145,6 +146,7 @@ fn crash_between_snapshot_and_wal_truncation_recovers() {
             edge_type: "REL".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         })
         .unwrap();
         db.insert_node(
@@ -189,6 +191,7 @@ fn crash_between_snapshot_and_wal_truncation_recovers() {
             edge_type: "GONE".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         })
         .unwrap();
         // first snapshot: rule "gone" in engine

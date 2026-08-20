@@ -18,6 +18,23 @@ pub struct RuleDef {
     /// compat. `#[serde(default)]` cannot help — bincode does not skip
     /// missing positional fields.
     pub max_edges: Option<u64>,
+    /// Opt-in IVF-Flat approximate candidate selection.
+    ///
+    /// `false` (default) → exact `ScanAll` path; semantics and derived edges
+    /// are byte-identical to pre-T4 behaviour for all existing rules.
+    ///
+    /// `true` → `VectorClusters` candidate path: k-means partitions the dst
+    /// (and src) side at backfill/rebuild time; only members of the P nearest
+    /// clusters are evaluated. Recall ≥ 0.90 quiesced, ≥ 0.85 on any
+    /// crash-recovery state — not exact. Only valid when the predicate is
+    /// `VectorSimilar`-rooted (`VectorSimilar` itself, or `All` whose first
+    /// element is `VectorSimilar`); `validate()` rejects other combinations.
+    ///
+    /// APPENDED field — same pre-alpha no-migration ruling as `max_edges`:
+    /// WAL/snapshot records written before this field break positional bincode
+    /// decode. Accepted for pre-1.0 builds; no decoder compat.
+    #[serde(default)]
+    pub approximate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,13 +66,34 @@ impl RuleDef {
                 return Err(format!("{what} must not be empty"));
             }
         }
-        validate_pred(&self.predicate)
+        validate_pred(&self.predicate)?;
+        if self.approximate && !predicate_is_vector_similar_rooted(&self.predicate) {
+            return Err(
+                "approximate=true requires a VectorSimilar-rooted predicate \
+                 (VectorSimilar, or All whose first element is VectorSimilar)"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     pub fn watched_fields(&self) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         collect_fields(&self.predicate, &mut out);
         out
+    }
+}
+
+/// Returns true when the predicate is `VectorSimilar` itself, or an `All`
+/// whose first element is `VectorSimilar` — the only predicates that may use
+/// the IVF-Flat approximate candidate path (`approximate: true`).
+pub fn predicate_is_vector_similar_rooted(p: &Predicate) -> bool {
+    match p {
+        Predicate::VectorSimilar { .. } => true,
+        Predicate::All(parts) => {
+            !parts.is_empty() && matches!(parts[0], Predicate::VectorSimilar { .. })
+        }
+        _ => false,
     }
 }
 
@@ -474,6 +512,7 @@ mod tests {
             edge_type: "E".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         };
         assert!(ok.validate().is_ok());
         assert_eq!(
@@ -681,6 +720,98 @@ mod tests {
     }
 
     #[test]
+    fn approximate_only_valid_with_vector_similar_rooted_predicate() {
+        // approximate=true + VectorSimilar → valid
+        let ok_vec = RuleDef {
+            name: "av".into(),
+            src_label: "V".into(),
+            dst_label: "V".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "VEC".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: true,
+        };
+        assert!(ok_vec.validate().is_ok());
+
+        // approximate=true + All(VectorSimilar, ...) → valid
+        let ok_all = RuleDef {
+            name: "av2".into(),
+            src_label: "V".into(),
+            dst_label: "V".into(),
+            predicate: Predicate::All(vec![
+                Predicate::VectorSimilar {
+                    field: "emb".into(),
+                    min: 0.9,
+                },
+                Predicate::FieldEqual {
+                    field: "kind".into(),
+                },
+            ]),
+            edge_type: "VEC2".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: true,
+        };
+        assert!(ok_all.validate().is_ok());
+
+        // approximate=true + FieldEqual → invalid
+        let bad_fe = RuleDef {
+            name: "bfe".into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate: Predicate::FieldEqual {
+                field: "f".into(),
+            },
+            edge_type: "FE".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: true,
+        };
+        assert!(bad_fe.validate().is_err());
+
+        // approximate=true + Overlap → invalid
+        let bad_ov = RuleDef {
+            name: "bov".into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            },
+            edge_type: "OV".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: true,
+        };
+        assert!(bad_ov.validate().is_err());
+
+        // approximate=true + All(FieldEqual, VectorSimilar) → invalid (first part is not VectorSimilar)
+        let bad_all_order = RuleDef {
+            name: "bao".into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate: Predicate::All(vec![
+                Predicate::FieldEqual {
+                    field: "f".into(),
+                },
+                Predicate::VectorSimilar {
+                    field: "emb".into(),
+                    min: 0.9,
+                },
+            ]),
+            edge_type: "E".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: true,
+        };
+        assert!(bad_all_order.validate().is_err());
+    }
+
+    #[test]
     fn all_composes_field_equal_and_numeric_within() {
         let a: HashMap<_, _> = [
             ("ind".to_string(), Value::Str("arch".into())),
@@ -714,6 +845,7 @@ mod tests {
             edge_type: "E".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         }
     }
 
@@ -790,17 +922,35 @@ mod wire_pins {
             edge_type: "E".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
+        }
+    }
+
+    fn pin_approx(pred: Predicate) -> RuleDef {
+        RuleDef {
+            name: "r".into(),
+            src_label: "A".into(),
+            dst_label: "B".into(),
+            predicate: pred,
+            edge_type: "E".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: true,
         }
     }
 
     #[test]
     fn old_predicate_variants_keep_encoding() {
         // Captured before Plan 7 appends. Discriminants 0..=3 must not move.
+        // Plan 11 T4: `approximate: false` appends one zero byte at the end
+        // of every existing record. Old WAL records written before this field
+        // break positional bincode decode — pre-alpha no-migration ruling.
         assert_eq!(
             bincode::serialize(&pin(Predicate::KeyMatch { field: "fk".into() })).unwrap(),
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
-                66, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 102, 107, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0
+                66, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 102, 107, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0,
+                0
             ]
         );
         assert_eq!(
@@ -811,7 +961,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 105, 110, 100, 1, 0, 0, 0, 0, 0, 0, 0, 69,
-                0, 0
+                0, 0, 0
             ]
         );
         assert_eq!(
@@ -823,7 +973,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 116, 97, 103, 115, 0, 0, 0, 0, 0, 0, 224,
-                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0
+                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -839,7 +989,7 @@ mod wire_pins {
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 102,
                 107, 2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 116, 97, 103, 115, 0, 0, 0, 0, 0, 0, 224,
-                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0
+                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0
             ]
         );
     }
@@ -855,7 +1005,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 4, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 121, 101, 97, 114, 0, 0, 0, 0, 0, 0, 0, 64,
-                1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0
+                1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -867,7 +1017,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 5, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 108, 111, 99, 0, 0, 0, 0, 0, 0, 121, 64, 1,
-                0, 0, 0, 0, 0, 0, 0, 69, 0, 0
+                0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -879,8 +1029,40 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 6, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 101, 109, 98, 205, 204, 204, 204, 204, 204,
-                236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0
+                236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0
             ]
         );
+    }
+
+    #[test]
+    fn approximate_variant_has_pinned_encoding() {
+        // Pin: VectorSimilar with approximate=true. Last byte is 1 (true) vs 0 (false).
+        assert_eq!(
+            bincode::serialize(&pin_approx(Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            }))
+            .unwrap(),
+            vec![
+                1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
+                66, 6, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 101, 109, 98, 205, 204, 204, 204, 204, 204,
+                236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 1
+            ]
+        );
+        // Same predicate with approximate=false (default) differs only in last byte.
+        let exact = bincode::serialize(&pin(Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.9,
+        }))
+        .unwrap();
+        let approx = bincode::serialize(&pin_approx(Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.9,
+        }))
+        .unwrap();
+        assert_eq!(exact.len(), approx.len());
+        assert_eq!(&exact[..exact.len() - 1], &approx[..approx.len() - 1]);
+        assert_eq!(exact.last(), Some(&0u8));
+        assert_eq!(approx.last(), Some(&1u8));
     }
 }

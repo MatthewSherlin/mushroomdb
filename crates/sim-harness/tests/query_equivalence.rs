@@ -65,7 +65,8 @@ fn scored_overlap() -> RuleDef {
         },
         edge_type: RULE_ETYPE.into(),
         weight_prop: Some("score".into()),
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     }
 }
 

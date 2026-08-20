@@ -22,7 +22,8 @@ fn overlap(name: &str, field: &str, edge_type: &str) -> RuleDef {
         },
         edge_type: edge_type.into(),
         weight_prop: Some("score".into()),
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     }
 }
 

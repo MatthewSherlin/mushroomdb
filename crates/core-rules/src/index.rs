@@ -2,6 +2,184 @@ use crate::def::Predicate;
 use core_storage::{list_tokens, Value, ValueKey};
 use std::collections::{BTreeMap, BTreeSet};
 
+// ---------------------------------------------------------------------------
+// IVF-Flat constants (Plan 11 T4)
+// ---------------------------------------------------------------------------
+
+/// Minimum number of k-means clusters. Keeps probing meaningful even for
+/// small sides (< 16 vectors).
+pub const IVF_K_MIN: usize = 4;
+
+/// Maximum number of k-means clusters. Bounds centroid memory and fit time.
+pub const IVF_K_MAX: usize = 1024;
+
+/// Fixed number of k-means iterations per fit (deterministic convergence).
+pub const IVF_ITERATIONS: usize = 12;
+
+/// Probe denominator: P = max(1, ceil(k / IVF_PROBE_DENOM)) centroids queried
+/// per lookup.  k=4 → P=1; k=64 → P=4; k=1024 → P=64.
+pub const IVF_PROBE_DENOM: usize = 16;
+
+/// k = ceil(sqrt(n)) clamped to [IVF_K_MIN, IVF_K_MAX].
+pub fn cluster_k(n: usize) -> usize {
+    if n == 0 {
+        return IVF_K_MIN;
+    }
+    let k = (n as f64).sqrt().ceil() as usize;
+    k.clamp(IVF_K_MIN, IVF_K_MAX)
+}
+
+/// P = max(1, ceil(k / IVF_PROBE_DENOM)).
+pub fn probe_count(k: usize) -> usize {
+    ((k + IVF_PROBE_DENOM - 1) / IVF_PROBE_DENOM).max(1)
+}
+
+/// Squared Euclidean distance between two equal-length slices.
+/// Returns `f64::MAX` on dimension mismatch so callers always have a valid order.
+fn l2_sq(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::MAX;
+    }
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum()
+}
+
+/// Index of the nearest centroid to `xs` by L2 distance (minimum squared).
+/// Returns 0 when `centroids` is empty.
+pub fn nearest_centroid(centroids: &[Vec<f64>], xs: &[f64]) -> usize {
+    centroids
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            l2_sq(xs, a)
+                .partial_cmp(&l2_sq(xs, b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// FNV-1a 64-bit hash — stable, documented, NOT DefaultHasher.
+/// Used to seed k-means so the same rule name always produces the same
+/// clusters on the same data (WAL replay identity).
+pub fn fnv1a_u64(data: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+    const FNV_PRIME: u64 = 1_099_511_628_211;
+    let mut h = FNV_OFFSET;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// Seeded LCG step — Knuth multiplicative; used for centroid init and empty
+/// cluster reseeding.
+#[inline]
+fn lcg_next(state: u64) -> u64 {
+    state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407)
+}
+
+/// Fit k-means over `vecs` (node_id, vector) pairs.
+///
+/// - `k` is clamped to `min(k, vecs.len())` so we never request more centroids
+///   than vectors.
+/// - Centroids are initialised by seeded LCG selection without replacement.
+/// - 12 iterations; empty clusters are deterministically reseeded from the
+///   full dataset.
+/// - Returns a `Vec<Vec<f64>>` of k centroids (same length as `xs` entries).
+pub fn kmeans_fit(vecs: &[(u32, Vec<f64>)], k: usize, seed: u64) -> Vec<Vec<f64>> {
+    if vecs.is_empty() || k == 0 {
+        return vec![];
+    }
+    let n = vecs.len();
+    let k = k.min(n);
+    let dim = vecs[0].1.len();
+    if dim == 0 {
+        return vec![];
+    }
+
+    // --- Centroid initialisation: pick k distinct indices via seeded LCG ---
+    let mut state = seed;
+    let mut used = vec![false; n];
+    let mut init_idxs: Vec<usize> = Vec::with_capacity(k);
+    let mut attempts = 0usize;
+    while init_idxs.len() < k && attempts < n * 4 {
+        state = lcg_next(state);
+        let idx = (state >> 33) as usize % n;
+        if !used[idx] {
+            used[idx] = true;
+            init_idxs.push(idx);
+        }
+        attempts += 1;
+    }
+    // If LCG didn't yield k distinct indices (pathological: n very small or
+    // many collisions), fill sequentially.
+    if init_idxs.len() < k {
+        for i in 0..n {
+            if !used[i] {
+                init_idxs.push(i);
+                if init_idxs.len() == k {
+                    break;
+                }
+            }
+        }
+    }
+    let mut centroids: Vec<Vec<f64>> = init_idxs.iter().map(|&i| vecs[i].1.clone()).collect();
+    let mut assignments = vec![0usize; n];
+
+    // --- k-means iterations ---
+    for iter in 0..IVF_ITERATIONS {
+        // Assignment step
+        for (j, (_, xs)) in vecs.iter().enumerate() {
+            assignments[j] = nearest_centroid(&centroids, xs);
+        }
+
+        // Update step: accumulate sums and counts
+        let mut sums = vec![vec![0.0f64; dim]; k];
+        let mut counts = vec![0usize; k];
+        for (j, (_, xs)) in vecs.iter().enumerate() {
+            let c = assignments[j];
+            counts[c] += 1;
+            for d in 0..dim {
+                sums[c][d] += xs[d];
+            }
+        }
+
+        // Compute new centroids; collect empty ones for reseed
+        let mut new_centroids = vec![vec![0.0f64; dim]; k];
+        let mut empty: Vec<usize> = Vec::new();
+        for c in 0..k {
+            if counts[c] == 0 {
+                empty.push(c);
+            } else {
+                for d in 0..dim {
+                    new_centroids[c][d] = sums[c][d] / counts[c] as f64;
+                }
+            }
+        }
+
+        // Deterministic empty-cluster reseed: pick a vector from the dataset
+        // seeded by (original seed XOR iteration XOR empty-cluster-index).
+        for (ei, ec) in empty.into_iter().enumerate() {
+            let reseed =
+                seed ^ (iter as u64).wrapping_mul(0x9E37) ^ (ei as u64).wrapping_mul(0x1234_5679);
+            let mut rs = lcg_next(reseed);
+            rs = lcg_next(rs);
+            let pick = (rs >> 33) as usize % n;
+            new_centroids[ec] = vecs[pick].1.clone();
+        }
+
+        centroids = new_centroids;
+    }
+
+    centroids
+}
+
 #[cfg(test)]
 thread_local! {
     static VECTOR_DIM_REJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
@@ -80,6 +258,20 @@ pub struct SideIndex {
     /// cheaply.  This is heuristic hardening — not a proof — but eliminates
     /// the energy-distribution construction identified in the Plan 11 T3 review.
     vec_anchor: BTreeMap<u32, f64>,
+
+    // --- IVF-Flat fields (Plan 11 T4; only populated for VectorClusters specs) ---
+
+    /// Raw vectors stored for IVF fitting and assignment-on-insert.
+    /// Populated at insert-time, torn out at remove-time.
+    /// Memory: O(n × dim) per indexed side — present only for approximate rules.
+    ivf_raw: BTreeMap<u32, Vec<f64>>,
+    /// Fitted k-means centroids (empty until after first `fit_ivf_clusters` call).
+    ivf_centroids: Vec<Vec<f64>>,
+    /// Per-node cluster assignment post-fit.  `by_key[Int(cluster)] → {node_ids}`.
+    ivf_clusters: BTreeMap<u32, usize>,
+    /// Count of vector inserts/removes since last fit.  Triggers a full re-fit
+    /// on the next rebuild/backfill when non-zero (recorded; not auto-applied).
+    pub ivf_drift: u64,
 }
 
 #[derive(Debug, Default)]
@@ -95,12 +287,18 @@ pub enum CandidateSpec<'a> {
     NumericBucket { field: &'a str, tolerance: f64 },
     GeoGrid { field: &'a str, km: f64 },
     ScanAll { field: &'a str },
+    /// IVF-Flat approximate candidate selection (opt-in; `approximate: true`).
+    ///
+    /// k-means fitted over the indexed side's vectors; candidates are members
+    /// of the P = `max(1, ceil(k/16))` nearest centroids to the query vector.
+    /// NOT a superset of true positives — recall floor governs correctness.
+    VectorClusters { field: &'a str, min: f64 },
 }
 
-/// Returns the candidate strategy derived from `p`.
+/// Returns the exact candidate strategy derived from `p`.
 ///
 /// `All(parts)` delegates to `parts[0]`: order predicates most-selective-first;
-/// a leading `VectorSimilar` means full-scan candidates.
+/// a leading `VectorSimilar` means full-scan (`ScanAll`) candidates.
 ///
 /// # Panics
 ///
@@ -123,6 +321,32 @@ pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
             );
             candidate_spec(&parts[0])
         }
+    }
+}
+
+/// Approximate candidate strategy: like `candidate_spec` but replaces
+/// `ScanAll` with `VectorClusters` for `VectorSimilar`-rooted predicates.
+///
+/// Used when `RuleDef::approximate == true`.  Falls back to the exact
+/// `candidate_spec` for all other predicate variants so partial-approximate
+/// `All` predicates (first part is not `VectorSimilar`) are handled correctly.
+///
+/// # Panics
+///
+/// Panics on `All([])`. Predicates must pass `RuleDef::validate()` first.
+pub fn candidate_spec_approx(p: &Predicate) -> CandidateSpec<'_> {
+    match p {
+        Predicate::VectorSimilar { field, min } => {
+            CandidateSpec::VectorClusters { field, min: *min }
+        }
+        Predicate::All(parts) => {
+            debug_assert!(
+                !parts.is_empty(),
+                "candidate_spec_approx requires a validated predicate"
+            );
+            candidate_spec_approx(&parts[0])
+        }
+        other => candidate_spec(other),
     }
 }
 
@@ -314,6 +538,11 @@ impl SideIndex {
                 .map(|_| SCAN_ALL_SENTINEL)
                 .into_iter()
                 .collect(),
+            // VectorClusters uses ivf_raw / ivf_clusters, not by_key. The
+            // insert() path returns early before reaching index_keys for this
+            // variant, so this arm is unreachable at runtime; it must be
+            // present to satisfy exhaustiveness.
+            CandidateSpec::VectorClusters { .. } => BTreeSet::new(),
         }
     }
 
@@ -338,10 +567,29 @@ impl SideIndex {
                 .map(|_| SCAN_ALL_SENTINEL)
                 .into_iter()
                 .collect(),
+            // VectorClusters probing is handled by ivf_candidates(), not probe_keys().
+            CandidateSpec::VectorClusters { .. } => BTreeSet::new(),
         }
     }
 
     pub fn insert(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
+        // VectorClusters: IVF path — separate from the by_key / ScanAll path.
+        if let CandidateSpec::VectorClusters { field, .. } = spec {
+            if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
+                self.ivf_raw.insert(node, xs.clone());
+                if !self.ivf_centroids.is_empty() {
+                    let c = nearest_centroid(&self.ivf_centroids, &xs);
+                    self.ivf_clusters.insert(node, c);
+                    self.by_key
+                        .entry(ValueKey::Int(c as i64))
+                        .or_default()
+                        .insert(node);
+                    self.ivf_drift = self.ivf_drift.saturating_add(1);
+                }
+            }
+            return;
+        }
+
         for k in Self::index_keys(spec, get) {
             self.by_key.entry(k).or_default().insert(node);
         }
@@ -361,6 +609,22 @@ impl SideIndex {
     }
 
     pub fn remove(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
+        // VectorClusters: remove from ivf_raw and by_key cluster bucket.
+        if let CandidateSpec::VectorClusters { .. } = spec {
+            if self.ivf_raw.remove(&node).is_some() {
+                if let Some(c) = self.ivf_clusters.remove(&node) {
+                    let key = ValueKey::Int(c as i64);
+                    if let Some(s) = self.by_key.get_mut(&key) {
+                        s.remove(&node);
+                        if s.is_empty() {
+                            self.by_key.remove(&key);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         for k in Self::index_keys(spec, get) {
             if let Some(set) = self.by_key.get_mut(&k) {
                 set.remove(&node);
@@ -457,6 +721,11 @@ impl SideIndex {
         spec: &CandidateSpec,
         get: &dyn Fn(&str) -> Option<Value>,
     ) -> BTreeSet<u32> {
+        // VectorClusters: probe the P nearest centroids.
+        if let CandidateSpec::VectorClusters { field, .. } = spec {
+            return self.ivf_candidates(field, get);
+        }
+
         let mut out = BTreeSet::new();
         for k in Self::probe_keys(spec, get) {
             if let Some(set) = self.by_key.get(&k) {
@@ -472,6 +741,104 @@ impl SideIndex {
             }
         }
         out
+    }
+
+    /// IVF candidate lookup: find the P nearest centroids to the query vector,
+    /// return the union of their cluster members.
+    fn ivf_candidates(
+        &self,
+        field: &str,
+        get: &dyn Fn(&str) -> Option<Value>,
+    ) -> BTreeSet<u32> {
+        let Some(xs) = get(field).as_ref().and_then(as_numeric_list) else {
+            return BTreeSet::new();
+        };
+        if self.ivf_centroids.is_empty() {
+            // Not yet fitted (e.g. empty side at create time, or no data).
+            return BTreeSet::new();
+        }
+        let k = self.ivf_centroids.len();
+        let p = probe_count(k);
+
+        // Rank centroids by L2 distance to query; take top-P.
+        let mut dists: Vec<(usize, f64)> = self
+            .ivf_centroids
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, l2_sq(&xs, c)))
+            .collect();
+        dists.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut out = BTreeSet::new();
+        for (ci, _) in dists.iter().take(p) {
+            let key = ValueKey::Int(*ci as i64);
+            if let Some(nodes) = self.by_key.get(&key) {
+                out.extend(nodes.iter().copied());
+            }
+        }
+        out
+    }
+
+    /// Fit (or re-fit) the IVF k-means index for this side using all currently
+    /// stored raw vectors.  Called by the engine after reindexing all nodes in
+    /// `create_rule` and `rebuild`.
+    ///
+    /// `rule_name` is hashed via FNV-1a to produce a stable seed, ensuring the
+    /// same rule+data always yields the same clusters (WAL replay identity).
+    ///
+    /// Clears all existing cluster assignments and by_key cluster entries, then
+    /// assigns every raw vector to its nearest new centroid.
+    /// Resets `ivf_drift` to zero.
+    pub fn fit_ivf_clusters(&mut self, rule_name: &str) {
+        if self.ivf_raw.is_empty() {
+            self.ivf_centroids.clear();
+            self.ivf_clusters.clear();
+            self.ivf_drift = 0;
+            return;
+        }
+
+        // Clear old cluster → node mappings from by_key (cluster keys are Int).
+        for c in self.ivf_clusters.values() {
+            self.by_key.remove(&ValueKey::Int(*c as i64));
+        }
+        self.ivf_clusters.clear();
+
+        // Gather vectors in deterministic order (BTreeMap → sorted by node id).
+        let vecs: Vec<(u32, Vec<f64>)> = self
+            .ivf_raw
+            .iter()
+            .map(|(&id, xs)| (id, xs.clone()))
+            .collect();
+
+        let n = vecs.len();
+        let k = cluster_k(n);
+        let seed = fnv1a_u64(rule_name.as_bytes());
+
+        self.ivf_centroids = kmeans_fit(&vecs, k, seed);
+
+        // Assign all raw vectors to nearest centroid.
+        for (node, xs) in &vecs {
+            let c = nearest_centroid(&self.ivf_centroids, xs);
+            self.ivf_clusters.insert(*node, c);
+            self.by_key
+                .entry(ValueKey::Int(c as i64))
+                .or_default()
+                .insert(*node);
+        }
+        self.ivf_drift = 0;
+    }
+
+    /// Number of fitted centroids (0 = not yet fitted).
+    pub fn ivf_k(&self) -> usize {
+        self.ivf_centroids.len()
+    }
+
+    /// Cluster assignment for a node (None if not fitted or node not in index).
+    pub fn ivf_cluster_of(&self, node: u32) -> Option<usize> {
+        self.ivf_clusters.get(&node).copied()
     }
 }
 

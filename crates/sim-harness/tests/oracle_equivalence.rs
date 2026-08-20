@@ -30,6 +30,7 @@ fn rule_template(idx: u8) -> RuleDef {
             edge_type: "r_km".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         },
         1 => RuleDef {
             name: "r_fe".into(),
@@ -39,6 +40,7 @@ fn rule_template(idx: u8) -> RuleDef {
             edge_type: "r_fe".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         },
         2 => RuleDef {
             name: "r_ov".into(),
@@ -51,6 +53,7 @@ fn rule_template(idx: u8) -> RuleDef {
             edge_type: "r_ov".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         },
         3 => RuleDef {
             name: "r_all".into(),
@@ -66,6 +69,7 @@ fn rule_template(idx: u8) -> RuleDef {
             edge_type: "r_all".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         },
         // Template 4: shares edge_type "r_fe" with r_fe — exercises C1 (co-owned
         // edge type survival after rule deletion).  Different name and lower min
@@ -81,6 +85,7 @@ fn rule_template(idx: u8) -> RuleDef {
             edge_type: "r_fe".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         },
         5 => RuleDef {
             name: "r_nw".into(),
@@ -93,6 +98,7 @@ fn rule_template(idx: u8) -> RuleDef {
             edge_type: "r_nw".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         },
         6 => RuleDef {
             name: "r_nz".into(),
@@ -105,6 +111,7 @@ fn rule_template(idx: u8) -> RuleDef {
             edge_type: "r_nz".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         },
         7 => RuleDef {
             name: "r_geo".into(),
@@ -117,6 +124,7 @@ fn rule_template(idx: u8) -> RuleDef {
             edge_type: "r_geo".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         },
         _ => RuleDef {
             name: "r_vec".into(),
@@ -129,6 +137,7 @@ fn rule_template(idx: u8) -> RuleDef {
             edge_type: "r_vec".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         },
     }
 }
@@ -877,4 +886,304 @@ fn delete_edge_of_user_first_derived_pair_is_rule_owned() {
     assert_eq!(engine_edges, oracle.all_edges());
     db.rebuild_rule("r_fe").unwrap();
     assert_eq!(sweep_engine_edges(&db), engine_edges);
+}
+
+// ---------------------------------------------------------------------------
+// Approximate-rule tests (IVF-Flat)
+// ---------------------------------------------------------------------------
+
+/// Recall floors for approximate vector rules.
+/// QUIESCED: ≥ 0.90 on a stable graph (all nodes inserted, rule backfilled).
+/// RECOVERY: ≥ 0.85 on crash-recovery states (rebuild path resets clusters).
+/// Do NOT lower these values without controller sign-off.
+const APPROX_RECALL_FLOOR_QUIESCED: f64 = 0.90;
+const APPROX_RECALL_FLOOR_RECOVERY: f64 = 0.85;
+
+fn recall(
+    approx: &BTreeSet<(String, String, String)>,
+    exact: &BTreeSet<(String, String, String)>,
+) -> f64 {
+    if exact.is_empty() {
+        return 1.0;
+    }
+    let hits = exact.iter().filter(|e| approx.contains(e)).count();
+    hits as f64 / exact.len() as f64
+}
+
+/// WAL replay identity: build an approximate rule, replay the WAL, compare
+/// the full derived edge set. Same rule + same data → same clusters → same edges.
+#[test]
+fn approximate_wal_replay_identity() {
+    let dir = {
+        let d = std::env::temp_dir().join(format!(
+            "graphdb-approx-replay-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    };
+
+    // Build initial state: 20 2-D unit vectors in 4 clusters.
+    let vecs: &[[f64; 2]] = &[
+        [1.0, 0.0],
+        [0.98, 0.2],
+        [0.96, 0.28],
+        [0.97, 0.24],
+        [0.0, 1.0],
+        [0.1, 0.995],
+        [0.05, 0.999],
+        [0.08, 0.997],
+        [-1.0, 0.0],
+        [-0.98, 0.2],
+        [-0.96, -0.28],
+        [-0.97, 0.24],
+        [0.0, -1.0],
+        [0.1, -0.995],
+        [-0.05, -0.999],
+        [-0.08, -0.997],
+        [0.7, 0.714],
+        [0.71, 0.704],
+        [-0.7, 0.714],
+        [-0.71, -0.704],
+    ];
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    for (i, v) in vecs.iter().enumerate() {
+        let key = format!("v{i}");
+        let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        let val = Value::List(vec![
+            Value::Float(v[0] / norm),
+            Value::Float(v[1] / norm),
+        ]);
+        db.insert_node("V", &key, vec![("emb".into(), val)]).unwrap();
+    }
+
+    db.create_rule(RuleDef {
+        name: "approx_sim".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.9,
+        },
+        edge_type: "ASIM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+    })
+    .unwrap();
+
+    // Capture edge set.
+    let n = vecs.len();
+    let mut edges_original = BTreeSet::new();
+    for i in 0..n {
+        let src = format!("v{i}");
+        for nb in db.neighbors(&src, "ASIM", Direction::Out).unwrap_or_default() {
+            edges_original.insert(("ASIM".to_string(), src.clone(), nb));
+        }
+    }
+    drop(db);
+
+    // Reopen (WAL replay).
+    let db2 = GraphDb::open(&dir).unwrap();
+    let mut edges_replayed = BTreeSet::new();
+    for i in 0..n {
+        let src = format!("v{i}");
+        for nb in db2.neighbors(&src, "ASIM", Direction::Out).unwrap_or_default() {
+            edges_replayed.insert(("ASIM".to_string(), src.clone(), nb));
+        }
+    }
+
+    assert_eq!(
+        edges_original,
+        edges_replayed,
+        "WAL replay must produce identical derived set for approximate rule"
+    );
+}
+
+/// Recall of approximate rule on a quiesced graph (all nodes present, rebuild done).
+/// Asserts recall ≥ APPROX_RECALL_FLOOR_QUIESCED = 0.90.
+#[test]
+fn approximate_recall_above_floor_quiesced() {
+    // 20 2-D unit vectors matching the WAL replay test setup.
+    let vecs: &[[f64; 2]] = &[
+        [1.0, 0.0], [0.98, 0.2], [0.96, 0.28], [0.97, 0.24],
+        [0.0, 1.0], [0.1, 0.995], [0.05, 0.999], [0.08, 0.997],
+        [-1.0, 0.0], [-0.98, 0.2], [-0.96, -0.28], [-0.97, 0.24],
+        [0.0, -1.0], [0.1, -0.995], [-0.05, -0.999], [-0.08, -0.997],
+        [0.7, 0.714], [0.71, 0.704], [-0.7, 0.714], [-0.71, -0.704],
+    ];
+    let min_sim = 0.9_f64;
+
+    let dir = {
+        let d = std::env::temp_dir().join(format!(
+            "graphdb-approx-recall-q-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    };
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    let mut normalized: Vec<(String, Vec<f64>)> = Vec::new();
+    for (i, v) in vecs.iter().enumerate() {
+        let key = format!("v{i}");
+        let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        let nv = vec![v[0] / norm, v[1] / norm];
+        let val = Value::List(vec![
+            Value::Float(nv[0]),
+            Value::Float(nv[1]),
+        ]);
+        db.insert_node("V", &key, vec![("emb".into(), val)]).unwrap();
+        normalized.push((format!("V{key}"), nv));
+    }
+
+    db.create_rule(RuleDef {
+        name: "approx_sim".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: min_sim,
+        },
+        edge_type: "ASIM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+    })
+    .unwrap();
+
+    // Compute approximate edge set from engine.
+    let approx_edges: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for i in 0..vecs.len() {
+            let src = format!("v{i}");
+            for nb in db.neighbors(&src, "ASIM", Direction::Out).unwrap_or_default() {
+                s.insert(("ASIM".to_string(), src.clone(), nb));
+            }
+        }
+        s
+    };
+
+    // Compute exact ground-truth.
+    let exact_edges: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for (i, vi) in vecs.iter().enumerate() {
+            let norm_i = (vi[0] * vi[0] + vi[1] * vi[1]).sqrt();
+            let ni = [vi[0] / norm_i, vi[1] / norm_i];
+            for (j, vj) in vecs.iter().enumerate() {
+                if i == j { continue; }
+                let norm_j = (vj[0] * vj[0] + vj[1] * vj[1]).sqrt();
+                let nj = [vj[0] / norm_j, vj[1] / norm_j];
+                let dot = ni[0] * nj[0] + ni[1] * nj[1];
+                if dot >= min_sim {
+                    s.insert(("ASIM".to_string(), format!("v{i}"), format!("v{j}")));
+                }
+            }
+        }
+        s
+    };
+
+    let r = recall(&approx_edges, &exact_edges);
+    assert!(
+        r >= APPROX_RECALL_FLOOR_QUIESCED,
+        "quiesced recall {:.3} < floor {:.3} (approx={} exact={})",
+        r,
+        APPROX_RECALL_FLOOR_QUIESCED,
+        approx_edges.len(),
+        exact_edges.len()
+    );
+}
+
+/// Recall after rebuild (simulates crash-recovery re-fit path).
+/// Asserts recall ≥ APPROX_RECALL_FLOOR_RECOVERY = 0.85.
+#[test]
+fn approximate_recall_above_floor_after_rebuild() {
+    let vecs: &[[f64; 2]] = &[
+        [1.0, 0.0], [0.98, 0.2], [0.96, 0.28], [0.97, 0.24],
+        [0.0, 1.0], [0.1, 0.995], [0.05, 0.999], [0.08, 0.997],
+        [-1.0, 0.0], [-0.98, 0.2], [-0.96, -0.28], [-0.97, 0.24],
+        [0.0, -1.0], [0.1, -0.995], [-0.05, -0.999], [-0.08, -0.997],
+        [0.7, 0.714], [0.71, 0.704], [-0.7, 0.714], [-0.71, -0.704],
+    ];
+    let min_sim = 0.9_f64;
+
+    let dir = {
+        let d = std::env::temp_dir().join(format!(
+            "graphdb-approx-recall-r-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    };
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    for (i, v) in vecs.iter().enumerate() {
+        let key = format!("v{i}");
+        let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        let val = Value::List(vec![
+            Value::Float(v[0] / norm),
+            Value::Float(v[1] / norm),
+        ]);
+        db.insert_node("V", &key, vec![("emb".into(), val)]).unwrap();
+    }
+
+    db.create_rule(RuleDef {
+        name: "approx_sim".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: min_sim,
+        },
+        edge_type: "ASIM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+    })
+    .unwrap();
+
+    // Trigger rebuild (simulates crash-recovery re-fit).
+    db.rebuild_rule("approx_sim").unwrap();
+
+    // Compute approximate edge set after rebuild.
+    let approx_edges: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for i in 0..vecs.len() {
+            let src = format!("v{i}");
+            for nb in db.neighbors(&src, "ASIM", Direction::Out).unwrap_or_default() {
+                s.insert(("ASIM".to_string(), src.clone(), nb));
+            }
+        }
+        s
+    };
+
+    // Compute exact ground-truth.
+    let exact_edges: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for (i, vi) in vecs.iter().enumerate() {
+            let norm_i = (vi[0] * vi[0] + vi[1] * vi[1]).sqrt();
+            let ni = [vi[0] / norm_i, vi[1] / norm_i];
+            for (j, vj) in vecs.iter().enumerate() {
+                if i == j { continue; }
+                let norm_j = (vj[0] * vj[0] + vj[1] * vj[1]).sqrt();
+                let nj = [vj[0] / norm_j, vj[1] / norm_j];
+                let dot = ni[0] * nj[0] + ni[1] * nj[1];
+                if dot >= min_sim {
+                    s.insert(("ASIM".to_string(), format!("v{i}"), format!("v{j}")));
+                }
+            }
+        }
+        s
+    };
+
+    let r = recall(&approx_edges, &exact_edges);
+    assert!(
+        r >= APPROX_RECALL_FLOOR_RECOVERY,
+        "rebuild recall {:.3} < floor {:.3} (approx={} exact={})",
+        r,
+        APPROX_RECALL_FLOOR_RECOVERY,
+        approx_edges.len(),
+        exact_edges.len()
+    );
 }

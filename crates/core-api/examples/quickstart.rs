@@ -70,7 +70,8 @@ fn main() {
         },
         edge_type: "FIT".into(),
         weight_prop: Some("score".into()),
-        max_edges: None,
+            max_edges: None,
+        approximate: false,
     })
     .expect("create scored Overlap rule");
 

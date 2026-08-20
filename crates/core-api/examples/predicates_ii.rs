@@ -58,6 +58,7 @@ fn main() {
             edge_type: et.into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         })
         .unwrap();
     }

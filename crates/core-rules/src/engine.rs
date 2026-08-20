@@ -1,5 +1,5 @@
 use crate::def::{evaluate, NodeView, Predicate, RuleDef};
-use crate::index::{candidate_spec, CandidateSpec, RuleIndex};
+use crate::index::{candidate_spec, candidate_spec_approx, CandidateSpec, RuleIndex};
 use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,6 +50,7 @@ pub struct RuleEngine {
 /// For KeyMatch, src side is indexed as Scalar (FK field value → node bucket).
 /// For all other predicates, returns the same as candidate_spec.
 /// Index maintenance uses this for the src side; candidate_spec for the dst side.
+#[allow(dead_code)]
 fn src_lookup_spec(p: &Predicate) -> CandidateSpec<'_> {
     match p {
         Predicate::KeyMatch { field } => CandidateSpec::Scalar { field },
@@ -58,6 +59,52 @@ fn src_lookup_spec(p: &Predicate) -> CandidateSpec<'_> {
             src_lookup_spec(&parts[0])
         }
         other => candidate_spec(other),
+    }
+}
+
+/// Rule-aware candidate spec: exact `ScanAll` for `approximate=false`, IVF
+/// `VectorClusters` for `approximate=true` (VectorSimilar-rooted predicates).
+fn candidate_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
+    if def.approximate {
+        candidate_spec_approx(&def.predicate)
+    } else {
+        candidate_spec(&def.predicate)
+    }
+}
+
+/// Rule-aware src-side lookup spec. KeyMatch is still exact on the src side
+/// regardless of `approximate` (the approximation is on the dst candidate set).
+fn src_lookup_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
+    match &def.predicate {
+        Predicate::KeyMatch { field } => CandidateSpec::Scalar { field },
+        Predicate::All(parts) => {
+            debug_assert!(!parts.is_empty(), "validated predicate required");
+            src_lookup_spec_for_pred(def.approximate, &parts[0])
+        }
+        other => {
+            if def.approximate {
+                candidate_spec_approx(other)
+            } else {
+                candidate_spec(other)
+            }
+        }
+    }
+}
+
+fn src_lookup_spec_for_pred(approximate: bool, p: &Predicate) -> CandidateSpec<'_> {
+    match p {
+        Predicate::KeyMatch { field } => CandidateSpec::Scalar { field },
+        Predicate::All(parts) => {
+            debug_assert!(!parts.is_empty());
+            src_lookup_spec_for_pred(approximate, &parts[0])
+        }
+        other => {
+            if approximate {
+                candidate_spec_approx(other)
+            } else {
+                candidate_spec(other)
+            }
+        }
     }
 }
 
@@ -108,7 +155,7 @@ fn compute_desired(
     };
     let n_get = |f: &str| g.props.get(n, f).cloned();
 
-    let spec = candidate_spec(&def.predicate);
+    let spec = candidate_spec_for(def);
     let candidates: BTreeSet<u32> = if on_src_side {
         match &spec {
             CandidateSpec::ByKey => {
@@ -127,7 +174,7 @@ fn compute_desired(
         }
     } else {
         // n is dst: probe src_side to find src candidates.
-        let src_spec = src_lookup_spec(&def.predicate);
+        let src_spec = src_lookup_spec_for(def);
         if predicate_is_keymatch(&def.predicate) {
             // Synthetic getter: returns n's key for the FK field so we find
             // src nodes whose FK value points to n.
@@ -138,7 +185,11 @@ fn compute_desired(
         }
     };
 
-    // Fast path: Cauchy-Schwarz suffix-norm early exit for VectorSimilar.
+    // Fast path: Cauchy-Schwarz suffix-norm early exit for exact VectorSimilar.
+    //
+    // Skipped for approximate rules (`def.approximate == true`): the IVF
+    // pre-filter already eliminates non-candidate nodes, and ScanAll metadata
+    // (vec_meta / vec_checkpoints) is not maintained for VectorClusters specs.
     //
     // Pre-fetch n's live vector ONCE outside the candidate loop so it is
     // allocated only once per compute_desired call (not per candidate pair).
@@ -149,17 +200,21 @@ fn compute_desired(
     // cached norm differs from the live norm, preventing stale checkpoints from
     // producing a false reject (see doc comment on `fresh_ckpts_for`).
     let n_early_exit_hint: Option<(Vec<f64>, f64, [f64; 8])> =
-        if let Predicate::VectorSimilar { field, .. } = &def.predicate {
-            if crate::index::vector_early_exit_enabled() {
-                let n_side = if on_src_side {
-                    &index.src_side
-                } else {
-                    &index.dst_side
-                };
-                if let Some(vn_v) = n_get(field) {
-                    if let Some(vn) = crate::index::as_numeric_list(&vn_v) {
-                        if let Some((norm_n, ckpts_n)) = n_side.fresh_ckpts_for(n, &vn) {
-                            Some((vn, norm_n, *ckpts_n))
+        if !def.approximate {
+            if let Predicate::VectorSimilar { field, .. } = &def.predicate {
+                if crate::index::vector_early_exit_enabled() {
+                    let n_side = if on_src_side {
+                        &index.src_side
+                    } else {
+                        &index.dst_side
+                    };
+                    if let Some(vn_v) = n_get(field) {
+                        if let Some(vn) = crate::index::as_numeric_list(&vn_v) {
+                            if let Some((norm_n, ckpts_n)) = n_side.fresh_ckpts_for(n, &vn) {
+                                Some((vn, norm_n, *ckpts_n))
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -713,11 +768,11 @@ fn index_node_for_rule(
 ) {
     let get = |f: &str| props.get(id, f).cloned();
     if syms.get(&def.src_label) == Some(label_sym) {
-        let spec = src_lookup_spec(&def.predicate);
+        let spec = src_lookup_spec_for(def);
         index.src_side.insert(&spec, id, &get);
     }
     if syms.get(&def.dst_label) == Some(label_sym) {
-        let spec = candidate_spec(&def.predicate);
+        let spec = candidate_spec_for(def);
         index.dst_side.insert(&spec, id, &get);
     }
 }
@@ -857,6 +912,14 @@ impl RuleEngine {
                 index_node_for_rule(id, label_sym, &def, idx, syms, props);
             }
         }
+        // After all nodes are indexed, fit IVF clusters for approximate rules.
+        for name in &rule_names {
+            if self.rules[name].approximate {
+                let idx = self.indexes.get_mut(name).unwrap();
+                idx.src_side.fit_ivf_clusters(name);
+                idx.dst_side.fit_ivf_clusters(name);
+            }
+        }
     }
 
     /// Register a rule and backfill existing nodes.
@@ -883,6 +946,13 @@ impl RuleEngine {
             };
             let idx = self.indexes.get_mut(&name).unwrap();
             index_node_for_rule(id, label_sym, &def, idx, g.syms, g.props);
+        }
+
+        // Phase 1b: fit IVF clusters for approximate rules (after all nodes indexed).
+        if def.approximate {
+            let idx = self.indexes.get_mut(&name).unwrap();
+            idx.src_side.fit_ivf_clusters(&name);
+            idx.dst_side.fit_ivf_clusters(&name);
         }
 
         // Phase 2: streaming backfill — no global desired map is built.
@@ -997,11 +1067,11 @@ impl RuleEngine {
                 };
                 let idx = self.indexes.get_mut(&rule_name).unwrap();
                 if as_src {
-                    let spec = src_lookup_spec(&def.predicate);
+                    let spec = src_lookup_spec_for(&def);
                     idx.src_side.remove(&spec, n, &old_getter);
                 }
                 if as_dst {
-                    let spec = candidate_spec(&def.predicate);
+                    let spec = candidate_spec_for(&def);
                     idx.dst_side.remove(&spec, n, &old_getter);
                 }
             }
@@ -1011,11 +1081,11 @@ impl RuleEngine {
                 let cur_getter = |f: &str| g.props.get(n, f).cloned();
                 let idx = self.indexes.get_mut(&rule_name).unwrap();
                 if as_src {
-                    let spec = src_lookup_spec(&def.predicate);
+                    let spec = src_lookup_spec_for(&def);
                     idx.src_side.insert(&spec, n, &cur_getter);
                 }
                 if as_dst {
-                    let spec = candidate_spec(&def.predicate);
+                    let spec = candidate_spec_for(&def);
                     idx.dst_side.insert(&spec, n, &cur_getter);
                 }
             }
@@ -1074,11 +1144,11 @@ impl RuleEngine {
                 let cur_getter = |f: &str| g.props.get(n, f).cloned();
                 let idx = self.indexes.get_mut(&rule_name).unwrap();
                 if as_src {
-                    let spec = src_lookup_spec(&def.predicate);
+                    let spec = src_lookup_spec_for(&def);
                     idx.src_side.remove(&spec, n, &cur_getter);
                 }
                 if as_dst {
-                    let spec = candidate_spec(&def.predicate);
+                    let spec = candidate_spec_for(&def);
                     idx.dst_side.remove(&spec, n, &cur_getter);
                 }
             }
@@ -1131,6 +1201,13 @@ impl RuleEngine {
             };
             let idx = self.indexes.get_mut(name).unwrap();
             index_node_for_rule(id, label_sym, &def, idx, g.syms, g.props);
+        }
+
+        // Fit IVF clusters for approximate rules after reindex (drift reset).
+        if def.approximate {
+            let idx = self.indexes.get_mut(name).unwrap();
+            idx.src_side.fit_ivf_clusters(name);
+            idx.dst_side.fit_ivf_clusters(name);
         }
 
         // Streaming rebuild: counts desired pairs up to budget+1 (early exit),
@@ -1231,6 +1308,7 @@ mod tests {
             edge_type: "REL".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         }
     }
 
@@ -1307,7 +1385,8 @@ mod tests {
                     },
                     edge_type: "AT".into(),
                     weight_prop: None,
-                    max_edges: None,
+            max_edges: None,
+                    approximate: false,
                 },
                 &mut g,
             )
@@ -1350,7 +1429,8 @@ mod tests {
                     },
                     edge_type: "SIM".into(),
                     weight_prop: Some("score".into()),
-                    max_edges: None,
+            max_edges: None,
+                    approximate: false,
                 },
                 &mut g,
             )
@@ -1412,7 +1492,8 @@ mod tests {
                     },
                     edge_type: "AT".into(),
                     weight_prop: None,
-                    max_edges: None,
+            max_edges: None,
+                    approximate: false,
                 },
                 &mut g,
             )
@@ -1514,7 +1595,8 @@ mod tests {
                     },
                     edge_type: "REL2".into(),
                     weight_prop: None,
-                    max_edges: None,
+            max_edges: None,
+                    approximate: false,
                 },
                 &mut g,
             )
@@ -1531,7 +1613,8 @@ mod tests {
                     },
                     edge_type: "REL2".into(),
                     weight_prop: None,
-                    max_edges: None,
+            max_edges: None,
+                    approximate: false,
                 },
                 &mut g,
             )
@@ -1590,6 +1673,7 @@ mod tests {
             edge_type: "EQ".into(),
             weight_prop: None,
             max_edges: Some(max_edges),
+            approximate: false,
         }
     }
 
@@ -1835,6 +1919,7 @@ mod tests {
             edge_type: "NEAR".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         }
     }
 
@@ -1850,6 +1935,7 @@ mod tests {
             edge_type: "NEAR_GEO".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         }
     }
 
@@ -1865,6 +1951,7 @@ mod tests {
             edge_type: "SIM".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         }
     }
 
@@ -1898,7 +1985,7 @@ mod tests {
             assert_eq!(g.topo.edge_count(), 0);
         }
         let def = numeric_rule();
-        let spec = candidate_spec(&def.predicate);
+        let spec = candidate_spec_for(&def);
         let old_map: std::collections::HashMap<_, _> =
             [("year".to_string(), Value::Float(12.0))].into();
         let old_get = |f: &str| old_map.get(f).cloned();
@@ -1975,6 +2062,7 @@ mod tests {
             edge_type: "AT".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         }
     }
 
@@ -2300,7 +2388,7 @@ mod tests {
     /// Covers three `CandidateSpec` paths through `compute_desired`:
     /// - `FieldEqual` → `CandidateSpec::Scalar` (bucket-by-value)
     /// - `KeyMatch` → `CandidateSpec::ByKey` (direct FK lookup, src side: `CandidateSpec::Scalar`)
-    /// - `VectorSimilar` → `CandidateSpec::ScanAll` (HNSW / dim-filtered)
+    /// - `VectorSimilar` → `CandidateSpec::ScanAll` (IVF / dim-filtered; exact)
     #[test]
     fn streaming_order_identity_property_test() {
         // Reference: compute_full_desired → take first-budget (src,dst) pairs.
@@ -2351,7 +2439,8 @@ mod tests {
                     predicate: Predicate::FieldEqual { field: "k".into() },
                     edge_type: "EQ".into(),
                     weight_prop: None,
-                    max_edges: Some(budget),
+            max_edges: Some(budget),
+                    approximate: false,
                 };
 
                 let mut fx_ref = {
@@ -2409,7 +2498,8 @@ mod tests {
                     },
                     edge_type: "AT".into(),
                     weight_prop: None,
-                    max_edges: Some(budget),
+            max_edges: Some(budget),
+                    approximate: false,
                 };
 
                 let build = || {
@@ -2435,9 +2525,9 @@ mod tests {
         }
 
         // ----------------------------------------------------------------
-        // Case 3: VectorSimilar (CandidateSpec::ScanAll / HNSW)
+        // Case 3: VectorSimilar (CandidateSpec::ScanAll — exact, dim-filtered)
         // Doc→Doc, all nodes same 2-D embedding → all pairs match (cos=1.0).
-        // Exercises the HNSW candidate path; ordering comes from the
+        // Exercises the ScanAll candidate path; ordering comes from the
         // BTreeMap inside compute_desired, so streaming must agree.
         // ----------------------------------------------------------------
         for budget in [3u64, 6, 10, 20] {
@@ -2451,7 +2541,8 @@ mod tests {
                 },
                 edge_type: "SIM".into(),
                 weight_prop: None,
-                max_edges: Some(budget),
+            max_edges: Some(budget),
+                approximate: false,
             };
 
             // 12 Doc nodes, all same 2-D unit embedding → 12×11 = 132 pairs.
@@ -2562,6 +2653,7 @@ mod tests {
             edge_type: "EQ".into(),
             weight_prop: None,
             max_edges: Some(1_000),
+            approximate: false,
         };
 
         // Baseline: RSS before any create_rule allocation.
@@ -2667,6 +2759,7 @@ mod tests {
             edge_type: "SIM".into(),
             weight_prop: Some("score".into()),
             max_edges: None,
+            approximate: false,
         };
 
         // Build three identical fixtures (independent topo state, same data).
@@ -2763,6 +2856,7 @@ mod tests {
             edge_type: "SIM".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         };
 
         let mut eng = RuleEngine::new();
@@ -2870,6 +2964,7 @@ mod tests {
             edge_type: "SIM".into(),
             weight_prop: None,
             max_edges: None,
+            approximate: false,
         };
 
         // Three independent fixtures with the same razor pair.
