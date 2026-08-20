@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/mark-animated.svg" width="150" alt="mushroomdb" />
+</p>
+
 # mushroomdb
 
 An embedded Rust property-graph database with native incremental linking rules.
