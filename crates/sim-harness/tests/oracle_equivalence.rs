@@ -1,6 +1,6 @@
 use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value};
 use proptest::prelude::*;
-use sim_harness::{Oracle, SimFs};
+use sim_harness::{Oracle, SimFs, APPROX_RECALL_FLOOR_QUIESCED, APPROX_RECALL_FLOOR_RECOVERY};
 use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
@@ -892,12 +892,7 @@ fn delete_edge_of_user_first_derived_pair_is_rule_owned() {
 // Approximate-rule tests (IVF-Flat)
 // ---------------------------------------------------------------------------
 
-/// Recall floors for approximate vector rules.
-/// QUIESCED: ≥ 0.90 on a stable graph (all nodes inserted, rule backfilled).
-/// RECOVERY: ≥ 0.85 on crash-recovery states (rebuild path resets clusters).
-/// Do NOT lower these values without controller sign-off.
-const APPROX_RECALL_FLOOR_QUIESCED: f64 = 0.90;
-const APPROX_RECALL_FLOOR_RECOVERY: f64 = 0.85;
+// Recall floors imported from sim_harness (canonical location: crates/sim-harness/src/lib.rs).
 
 fn recall(
     approx: &BTreeSet<(String, String, String)>,

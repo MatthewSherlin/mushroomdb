@@ -2,7 +2,7 @@ use core_api::{
     AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, RuleStats, Stats, Value,
 };
 use core_storage::fs::Fs;
-use sim_harness::{Oracle, SimFs};
+use sim_harness::{Oracle, SimFs, APPROX_RECALL_FLOOR_RECOVERY};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Original workload: 20 nodes + chain edges + one mid-workload snapshot.
@@ -27,23 +27,32 @@ fn workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
 const WORKLOAD_KEYS: &[&str] = &[
     "n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9", "n10", "n11", "n12", "n13", "x0",
     "y0", "y1", "y2", "y3", "y4", "g0", "g1", "g2", "g3", "g4", "v0", "v1", "v2", "va0", "va1",
-    "va2", "va3",
+    "va2", "va3", "va4", "va5", "va6", "va7",
 ];
 
-/// Recall floors for approximate vector rules (mirrors oracle_equivalence.rs constants).
-const APPROX_RECALL_FLOOR_RECOVERY: f64 = 0.85;
+// APPROX_RECALL_FLOOR_RECOVERY imported from sim_harness (canonical location: src/lib.rs).
 
 /// Approximate cosine-similarity recall over the VA nodes for the vec_approx rule.
+///
+/// 8 VA nodes in 4 pairs spread across quadrants of the 2-D unit circle.
+/// With n=8 and IVF_K_MIN=4, k=4 so n > k: IVF is genuinely active (not scan-all fallback).
+/// k-means converges to one centroid per pair; P=1 probe finds the correct cluster.
+/// Exact pairs (cos ≥ 0.9): va0↔va1, va2↔va3, va4↔va5, va6↔va7 (8 directed edges).
+/// All cross-pair cosines are at most 0.2, ensuring no false positives.
 fn approx_recall(db: &GraphDb<SimFs>) -> f64 {
-    // VA nodes: 4 2-D unit vectors in 2 clusters.
-    // Cluster A: va0=[1,0], va1=[0.98,0.2] — dot ≈ 0.98 ≥ 0.9.
-    // Cluster B: va2=[0,1], va3=[-0.2,0.98] — dot ≈ 0.98 ≥ 0.9; cross-cluster ≤ 0.2.
-    // Exact pairs: va0↔va1, va2↔va3 (4 directed edges).
+    // Pair A (near [1,0]): va0↔va1, cos ≈ 0.98
+    // Pair B (near [0,1]): va2↔va3, cos ≈ 0.98
+    // Pair C (near [-1,0]): va4↔va5, cos ≈ 0.98
+    // Pair D (near [0,-1]): va6↔va7, cos ≈ 0.98
     let va_vecs: &[(&str, [f64; 2])] = &[
         ("va0", [1.0, 0.0]),
         ("va1", [0.98_f64, 0.2_f64]),
         ("va2", [0.0, 1.0]),
         ("va3", [-0.2_f64, (1.0_f64 - 0.04_f64).sqrt()]),
+        ("va4", [-1.0, 0.0]),
+        ("va5", [-0.98_f64, 0.2_f64]),
+        ("va6", [0.0, -1.0]),
+        ("va7", [0.2_f64, -0.98_f64]),
     ];
     let min_sim = 0.9_f64;
 
@@ -80,8 +89,8 @@ fn approx_recall(db: &GraphDb<SimFs>) -> f64 {
 }
 
 /// Slot count after a complete `workload_with_rules` (n0–n11 + batch n12/n13
-/// + ingest x0 + 5Y + 5G + 3V + 4VA; n6 is tombstoned but still a slot).
-const WORKLOAD_MAX_SLOTS: usize = 32;
+/// + ingest x0 + 5Y + 5G + 3V + 8VA; n6 is tombstoned but still a slot).
+const WORKLOAD_MAX_SLOTS: usize = 36;
 
 const WORKLOAD_ETYPES: &[&str] = &[
     "E", "KM", "OV", "DUMMY", "ORG", "NW", "NZ", "GEO", "VEC", "VAPPROX",
@@ -283,9 +292,11 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         approximate: false,
     })?;
 
-    // Approximate vector rule (vec_approx): 4 VA nodes in 2 clusters.
-    // Cluster A: va0≈va1 (cos ≥ 0.9). Cluster B: va2≈va3 (cos ≥ 0.9).
-    // Cross-cluster cos ≤ 0.2 — no edges expected there.
+    // Approximate vector rule (vec_approx): 8 VA nodes in 4 pairs across quadrants.
+    // n=8 > IVF_K_MIN=4, so k=4 and IVF is genuinely active (no scan-all fallback).
+    // Pair A (≈[1,0]): va0↔va1 cos≈0.98. Pair B (≈[0,1]): va2↔va3 cos≈0.98.
+    // Pair C (≈[-1,0]): va4↔va5 cos≈0.98. Pair D (≈[0,-1]): va6↔va7 cos≈0.98.
+    // Cross-pair cosines are ≤0.2 — no cross-pair edges.
     db.insert_node("VA", "va0", vec![("emb".into(), emb(&[1.0, 0.0]))])?;
     db.insert_node("VA", "va1", vec![("emb".into(), emb(&[0.98, 0.2]))])?;
     db.insert_node("VA", "va2", vec![("emb".into(), emb(&[0.0, 1.0]))])?;
@@ -294,6 +305,10 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         "va3",
         vec![("emb".into(), emb(&[-0.2, (1.0_f64 - 0.04_f64).sqrt()]))],
     )?;
+    db.insert_node("VA", "va4", vec![("emb".into(), emb(&[-1.0, 0.0]))])?;
+    db.insert_node("VA", "va5", vec![("emb".into(), emb(&[-0.98, 0.2]))])?;
+    db.insert_node("VA", "va6", vec![("emb".into(), emb(&[0.0, -1.0]))])?;
+    db.insert_node("VA", "va7", vec![("emb".into(), emb(&[0.2, -0.98]))])?;
     db.create_rule(RuleDef {
         name: "vec_approx".into(),
         src_label: "VA".into(),
@@ -538,7 +553,7 @@ fn assert_recovered_invariants(recovered: &mut GraphDb<SimFs>, label: &str) {
     }
     // n6 is the planned delete_node target: if the delete landed, the key is gone.
     // If it has not landed, n6 is still a live L1 with tags (checked above).
-    for key in ["va0", "va1", "va2", "va3"] {
+    for key in ["va0", "va1", "va2", "va3", "va4", "va5", "va6", "va7"] {
         if recovered.has_node(key) {
             assert!(
                 recovered.get_prop(key, "emb").is_some(),
@@ -579,10 +594,9 @@ fn assert_recovered_invariants(recovered: &mut GraphDb<SimFs>, label: &str) {
         .rules()
         .iter()
         .any(|r| r.name == "vec_approx" && r.approximate);
-    let va_nodes_exist = recovered.has_node("va0")
-        || recovered.has_node("va1")
-        || recovered.has_node("va2")
-        || recovered.has_node("va3");
+    let va_nodes_exist = ["va0", "va1", "va2", "va3", "va4", "va5", "va6", "va7"]
+        .iter()
+        .any(|k| recovered.has_node(k));
     if approx_rule_live && va_nodes_exist {
         let r = approx_recall(recovered);
         assert!(
