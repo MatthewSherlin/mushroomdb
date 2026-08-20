@@ -514,7 +514,8 @@ fn cypher_scan_traversal_grouped_explain_ignore_deleted_node() {
     ));
 }
 
-fn const_eq_rule(max_edges: u64) -> RuleDef {
+/// Helper: FieldEqual rule with top-k per-source cap.
+fn topk_eq_rule(k: u64) -> RuleDef {
     RuleDef {
         name: "eq".into(),
         src_label: "N".into(),
@@ -522,9 +523,14 @@ fn const_eq_rule(max_edges: u64) -> RuleDef {
         predicate: Predicate::FieldEqual { field: "k".into() },
         edge_type: "EQ".into(),
         weight_prop: None,
-        max_edges: Some(max_edges),
+        max_edges: Some(k),
         approximate: false,
     }
+}
+
+// Keep const_eq_rule/insert_const_nodes for the delete_rule_drops_rule_stats test.
+fn const_eq_rule(k: u64) -> RuleDef {
+    topk_eq_rule(k)
 }
 
 fn insert_const_nodes(db: &mut GraphDb<core_storage::fs::RealFs>, start: usize, end: usize) {
@@ -538,56 +544,63 @@ fn insert_const_nodes(db: &mut GraphDb<core_storage::fs::RealFs>, start: usize, 
     }
 }
 
-/// Pathological FieldEqual-on-constant: 4 nodes produce 12 directed matches;
-/// budget 10 keeps the first 10 in deterministic order and trips. Later
-/// inserts must still succeed (never Err). WAL replay and snapshot+reopen
-/// reproduce the whole `Stats` value, including fires.
+/// Top-k FieldEqual: 5 nodes all sharing k="const", top-k=2 per source.
+/// Each src gets exactly 2 dsts (the 2 smallest keys that aren't self).
+/// Stats must survive WAL replay and snapshot+reopen; tripped must always
+/// be false for top-k rules.
 #[test]
-fn field_equal_budget_trips_at_10_and_stats_survive_recovery() {
-    let dir = tmp("budget-stats-replay");
+fn topk_field_equal_cap_per_source_and_stats_survive_recovery() {
+    let dir = tmp("topk-stats-replay");
     let live;
     {
         let mut db = GraphDb::open(&dir).unwrap();
-        db.create_rule(const_eq_rule(10)).unwrap();
-        insert_const_nodes(&mut db, 0, 4);
+        db.create_rule(topk_eq_rule(2)).unwrap();
 
-        let keys = ["n0", "n1", "n2", "n3"];
-        let first10 = out_pairs(&db, &keys, "EQ");
-        assert_eq!(
-            first10.len(),
-            10,
-            "must trip at exactly 10 provenance edges"
-        );
+        // Insert 5 nodes with keys n0..n4 (alphabetical order = insertion order).
+        for i in 0..5usize {
+            db.insert_node(
+                "N",
+                &format!("n{i}"),
+                vec![("k".into(), Value::Str("const".into()))],
+            )
+            .unwrap();
+        }
 
         let s = db.stats();
-        assert_eq!(s.nodes_live, 4);
-        assert_eq!(s.nodes_tombstoned, 0);
-        assert_eq!(s.edges, 10);
+        assert_eq!(s.nodes_live, 5);
+        assert_eq!(s.edges, 10, "5 nodes × top-2 each = 10 edges");
         assert_eq!(GraphDb::<core_storage::fs::RealFs>::format_version(), 4);
         assert_eq!(s.rules.len(), 1);
         assert_eq!(s.rules[0].name, "eq");
         assert_eq!(s.rules[0].edges, 10);
-        assert!(s.rules[0].tripped, "budget breach must set tripped");
+        // Top-k rules never set the tripped latch.
+        assert!(
+            !s.rules[0].tripped,
+            "top-k rules must never set tripped"
+        );
         assert!(s.rules[0].fires > 0);
 
-        // Later inserts succeed (writes never Err on budget breach).
-        insert_const_nodes(&mut db, 4, 5);
+        // Additional inserts succeed and update the top-k normally.
+        db.insert_node(
+            "N",
+            "n5",
+            vec![("k".into(), Value::Str("const".into()))],
+        )
+        .unwrap();
         let s = db.stats();
-        assert_eq!(s.rules[0].edges, 10);
-        assert!(s.rules[0].tripped);
-        assert_eq!(s.nodes_live, 5);
-        assert_eq!(s.edges, 10);
+        // 6 nodes × top-2 each = 12 edges.
+        assert_eq!(s.rules[0].edges, 12);
+        assert!(!s.rules[0].tripped);
+        assert_eq!(s.nodes_live, 6);
         live = s;
     }
 
+    // WAL replay must reproduce stats exactly.
     let reopened = GraphDb::open(&dir).unwrap();
     assert_eq!(reopened.stats(), live);
-    assert_eq!(
-        out_pairs(&reopened, &["n0", "n1", "n2", "n3", "n4"], "EQ").len(),
-        10
-    );
     drop(reopened);
 
+    // Snapshot + reopen must also reproduce stats.
     {
         let mut db = GraphDb::open(&dir).unwrap();
         let before = db.stats();
@@ -599,106 +612,116 @@ fn field_equal_budget_trips_at_10_and_stats_survive_recovery() {
     }
 }
 
-/// Rebuild on a still-over-budget rule is a provenance no-op (tripped latch
-/// stays set). Extra post-trip inserts do not change the frozen first-10.
+/// rebuild_rule on a top-k rule re-establishes the correct per-source set
+/// after additional nodes have been inserted.
 #[test]
-fn rebuild_over_budget_is_noop_after_post_trip_inserts() {
-    let dir = tmp("budget-rebuild-set");
+fn topk_rebuild_correct_set_after_inserts() {
+    let dir = tmp("topk-rebuild-set");
     let mut db = GraphDb::open(&dir).unwrap();
-    db.create_rule(const_eq_rule(10)).unwrap();
-    insert_const_nodes(&mut db, 0, 4);
-    let keys4 = ["n0", "n1", "n2", "n3"];
-    let first10 = out_pairs(&db, &keys4, "EQ");
-    assert_eq!(first10.len(), 10);
-    assert!(db.stats().rules[0].tripped);
+    db.create_rule(topk_eq_rule(2)).unwrap();
 
-    insert_const_nodes(&mut db, 4, 5);
-    let keys5 = ["n0", "n1", "n2", "n3", "n4"];
-    let before = out_pairs(&db, &keys5, "EQ");
-    assert_eq!(before, first10);
-    assert!(db.stats().rules[0].tripped);
-
-    db.rebuild_rule("eq").unwrap();
-    assert_eq!(out_pairs(&db, &keys5, "EQ"), before);
-    let s = db.stats();
-    assert!(s.rules[0].tripped);
-    assert_eq!(s.rules[0].edges, 10);
-}
-
-/// Retracts while tripped can drop below budget; new matches stay frozen
-/// until rebuild, which un-trips only when the full desired set fits.
-#[test]
-fn tripped_freeze_then_rebuild_untrips_when_desired_fits() {
-    let dir = tmp("budget-freeze-untrip");
-    let mut db = GraphDb::open(&dir).unwrap();
-    db.create_rule(const_eq_rule(10)).unwrap();
-    insert_const_nodes(&mut db, 0, 4);
-    assert_eq!(db.stats().rules[0].edges, 10);
-    assert!(db.stats().rules[0].tripped);
-
-    db.set_prop("n2", "k", Value::Str("x2".into())).unwrap();
-    db.set_prop("n3", "k", Value::Str("x3".into())).unwrap();
-    let after_retract = db.stats().rules[0].edges;
-    assert!(after_retract < 10);
-    assert!(db.stats().rules[0].tripped);
-
-    insert_const_nodes(&mut db, 4, 5);
-    assert_eq!(db.stats().rules[0].edges, after_retract);
-    assert!(db.stats().rules[0].tripped);
-    assert!(db.neighbors("n4", "EQ", Direction::Out).unwrap().is_empty());
-
-    db.set_prop("n4", "k", Value::Str("x4".into())).unwrap();
-    db.rebuild_rule("eq").unwrap();
-    let s = db.stats();
-    assert!(
-        !s.rules[0].tripped,
-        "rebuild must clear tripped when desired fits"
-    );
-    assert_eq!(s.rules[0].edges, 2);
-    assert_eq!(
-        out_pairs(&db, &["n0", "n1"], "EQ"),
-        BTreeSet::from([("n0".into(), "n1".into()), ("n1".into(), "n0".into())])
-    );
-
-    insert_const_nodes(&mut db, 5, 6);
+    // Insert 5 nodes; top-2 per source = 10 edges total.
+    for i in 0..5usize {
+        db.insert_node(
+            "N",
+            &format!("n{i}"),
+            vec![("k".into(), Value::Str("const".into()))],
+        )
+        .unwrap();
+    }
+    let before = out_pairs(&db, &["n0", "n1", "n2", "n3", "n4"], "EQ");
+    assert_eq!(before.len(), 10);
     assert!(!db.stats().rules[0].tripped);
-    assert_eq!(db.stats().rules[0].edges, 6);
-    assert_eq!(
-        db.neighbors("n5", "EQ", Direction::Out).unwrap(),
-        vec!["n0", "n1"]
-    );
+
+    // rebuild must be a no-op (top-k is already correct).
+    db.rebuild_rule("eq").unwrap();
+    let after = out_pairs(&db, &["n0", "n1", "n2", "n3", "n4"], "EQ");
+    assert_eq!(after, before, "rebuild must not change a correct top-k set");
+    assert!(!db.stats().rules[0].tripped);
+    assert_eq!(db.stats().rules[0].edges, 10);
 }
 
-/// Reviewer divergence: un-trip via rebuild then insert must replay
-/// identically. Without a WAL record, reopen stays frozen and the new
-/// node does not derive.
+/// Property changes trigger top-k eviction and backfill.
+/// Nodes that lose matches are removed from affected srcs' top-k; the
+/// next-best candidate is automatically promoted.
 #[test]
-fn untrip_rebuild_then_insert_survives_wal_replay() {
-    let dir = tmp("budget-untrip-replay");
+fn topk_eviction_on_prop_change_and_backfill() {
+    let dir = tmp("topk-evict-backfill");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // top-k=1: each src gets only its single best (smallest key) dst.
+    db.create_rule(topk_eq_rule(1)).unwrap();
+
+    // Insert 4 nodes all with k="const". Keys: n0 < n1 < n2 < n3.
+    for i in 0..4usize {
+        db.insert_node(
+            "N",
+            &format!("n{i}"),
+            vec![("k".into(), Value::Str("const".into()))],
+        )
+        .unwrap();
+    }
+    // n0→n1, n1→n0, n2→n0, n3→n0 (each points to smallest key ≠ self).
+    assert_eq!(db.stats().rules[0].edges, 4);
+    assert!(!db.stats().rules[0].tripped);
+
+    // Change n0 so it no longer FieldEquals "const" (eviction event).
+    // Nodes that had n0 as their top-1 dst must backfill.
+    db.set_prop("n0", "k", Value::Str("other".into())).unwrap();
+
+    // n1→n0 is retracted; n1 backfills to n2 (next-smallest key that matches).
+    // n2→n0 retracted; n2 backfills to n1.
+    // n3→n0 retracted; n3 backfills to n1.
+    // n0 now has k="other" → no FieldEqual match → 0 dsts.
+    assert_eq!(db.stats().rules[0].edges, 3, "3 edges after n0 eviction: n1→n2, n2→n1, n3→n1");
+    assert!(
+        db.neighbors("n0", "EQ", Direction::Out).unwrap().is_empty(),
+        "n0 no longer matches anyone"
+    );
+    assert_eq!(
+        db.neighbors("n1", "EQ", Direction::Out).unwrap(),
+        vec!["n2"],
+        "n1 backfills to n2"
+    );
+
+    // Rebuild must give the same result (top-k is already correct).
+    db.rebuild_rule("eq").unwrap();
+    assert_eq!(db.stats().rules[0].edges, 3);
+    assert!(!db.stats().rules[0].tripped);
+}
+
+/// Top-k WAL replay: after top-k rule creates edges, close and reopen.
+/// The top-k derived set must be identical to pre-close state.
+#[test]
+fn topk_wal_replay_preserves_top_k() {
+    let dir = tmp("topk-wal-replay");
     let live;
     let live_edges;
     {
         let mut db = GraphDb::open(&dir).unwrap();
-        db.create_rule(const_eq_rule(10)).unwrap();
-        insert_const_nodes(&mut db, 0, 4);
-        assert!(db.stats().rules[0].tripped);
+        db.create_rule(topk_eq_rule(2)).unwrap();
 
+        for i in 0..5usize {
+            db.insert_node(
+                "N",
+                &format!("n{i}"),
+                vec![("k".into(), Value::Str("const".into()))],
+            )
+            .unwrap();
+        }
+
+        // Change some props to trigger eviction + backfill paths through WAL.
         db.set_prop("n2", "k", Value::Str("x2".into())).unwrap();
-        db.set_prop("n3", "k", Value::Str("x3".into())).unwrap();
-        assert!(db.stats().rules[0].tripped);
-        assert!(db.stats().rules[0].edges < 10);
+        db.set_prop("n2", "k", Value::Str("const".into())).unwrap();
 
-        db.rebuild_rule("eq").unwrap();
-        assert!(!db.stats().rules[0].tripped);
-
-        insert_const_nodes(&mut db, 4, 5);
         live = db.stats();
         live_edges = out_pairs(&db, &["n0", "n1", "n2", "n3", "n4"], "EQ");
         assert!(!live.rules[0].tripped);
-        assert_eq!(live.rules[0].edges, 6);
-        assert_eq!(live_edges.len(), 6);
+        assert_eq!(live.rules[0].edges, 10); // 5 nodes × top-2
+        assert_eq!(live_edges.len(), 10);
     }
 
+    // WAL replay must reproduce the exact same edges.
     let reopened = GraphDb::open(&dir).unwrap();
     assert_eq!(reopened.stats(), live);
     assert_eq!(

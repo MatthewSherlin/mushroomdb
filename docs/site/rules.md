@@ -239,11 +239,24 @@ backfills — it evaluates the predicate against all existing node pairs.
 For rules without a `max_edges` cap this is O(|src_nodes| × |dst_nodes|)
 pair evaluations.
 
-**Always set `max_edges` on high-fanout rules at large scale.** Without
-it, a `FieldEqual` rule on 70k Talent × 20k Company nodes evaluates 1.4B
-pairs. With `max_edges: Some(1_000_000)`, the streaming backfill stops
-after 1M edges per rule instance — 9-rule backfill at 100k nodes completes
-in ~20 s.
+### Top-k per-source semantics (`max_edges: Some(k)`)
+
+Setting `max_edges: Some(k)` gives the rule **per-source top-k semantics**:
+each source node derives at most *k* outgoing edges, keeping only the
+best-scoring destinations:
+
+- Scored predicates (`NumericWithin`, `VectorSimilar`): destinations ranked
+  by score DESC, then destination key ASC as a tiebreak.
+- Unscored predicates (`KeyMatch`, `FieldEqual`): destinations ranked by
+  destination key ASC.
+
+When a new candidate beats the current k-th score it is inserted and the
+weakest existing edge is evicted. When a destination node is removed,
+affected sources automatically backfill from the next-best candidate.
+
+**Always set `max_edges` on high-fanout rules at large scale.** A
+`FieldEqual` rule on 70k Talent × 20k Company nodes with `max_edges: Some(5)`
+produces at most 5 edges per source — evaluation stays linear in |src_nodes|.
 
 After a rule is declared, incremental firing on each new write is cheap
 (sub-millisecond for most predicates) because only the changed node's

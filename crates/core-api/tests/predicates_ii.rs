@@ -374,8 +374,8 @@ fn prop_update_retracts_each_new_predicate() {
 }
 
 #[test]
-fn vector_budget_trips_and_stays_frozen() {
-    let dir = tmp("vec-budget");
+fn vector_topk_per_source_caps_and_not_frozen() {
+    let dir = tmp("vec-topk");
     let mut db = GraphDb::open(&dir).unwrap();
     db.create_rule(RuleDef {
         name: "doc_sim".into(),
@@ -387,11 +387,12 @@ fn vector_budget_trips_and_stays_frozen() {
         },
         edge_type: "DOC_SIM".into(),
         weight_prop: Some("score".into()),
-        max_edges: Some(4),
+        max_edges: Some(2),
         approximate: false,
     })
     .unwrap();
-    for i in 0..3 {
+    // 5 nodes all with emb=[1,0] → cosine sim=1.0 ≥ 0.9; top-2 per source.
+    for i in 0..5 {
         db.insert_node(
             "Doc",
             &format!("d{i}"),
@@ -400,20 +401,25 @@ fn vector_budget_trips_and_stays_frozen() {
         .unwrap();
     }
     let s = db.stats();
-    assert_eq!(s.rules[0].edges, 4);
-    assert!(s.rules[0].tripped, "6 desired / budget 4 must trip");
-    assert_eq!(s.edges, 4);
+    // 5 nodes × top-2 each = 10 edges; top-k rules never set tripped.
+    assert_eq!(s.rules[0].edges, 10, "5 nodes × top-2 = 10 edges");
+    assert!(!s.rules[0].tripped, "top-k rules must never set tripped");
+    assert_eq!(s.edges, 10);
 
-    db.insert_node("Doc", "d3", vec![("emb".into(), emb(&[1.0, 0.0]))])
+    // Insert a 6th node → it adds its own top-2 out-edges; not frozen.
+    db.insert_node("Doc", "d5", vec![("emb".into(), emb(&[1.0, 0.0]))])
         .unwrap();
     let s = db.stats();
-    assert_eq!(s.rules[0].edges, 4);
-    assert!(s.rules[0].tripped);
-    assert_eq!(s.edges, 4);
-    assert!(db
-        .neighbors("d3", "DOC_SIM", Direction::Out)
-        .unwrap()
-        .is_empty());
+    // d5's top-2 = d0, d1 (keys sorted ASC, all tied at score=1.0).
+    assert_eq!(s.rules[0].edges, 12, "6 nodes × top-2 = 12 edges");
+    assert!(!s.rules[0].tripped);
+    assert_eq!(s.edges, 12);
+    assert!(
+        !db.neighbors("d5", "DOC_SIM", Direction::Out)
+            .unwrap()
+            .is_empty(),
+        "d5 must have derived out-edges (top-k is not frozen)"
+    );
 }
 
 #[test]

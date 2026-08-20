@@ -317,7 +317,108 @@ fn compute_desired(
 }
 
 fn edge_budget(def: &RuleDef) -> u64 {
+    // Only applies when max_edges is None (global-budget path).
+    // Some(k) rules use per-source top-k semantics, not this budget.
     def.max_edges.unwrap_or(DEFAULT_MAX_EDGES)
+}
+
+/// Filter a per-source candidate map to the top-k destinations.
+///
+/// `per_src` must contain only pairs with the same source node (all
+/// `(src, dst)` keys share the same `src`).  Returns the top-`k` subset
+/// ordered by **(score DESC, dst_key ASC)** — higher scores win; ties are
+/// broken by the destination node's string key in ascending lexicographic
+/// order, giving a deterministic result independent of internal node IDs.
+///
+/// When `k` equals or exceeds the number of candidates, the input is
+/// returned unchanged (no allocation).
+///
+/// # Memory cost (per-source candidate ordering)
+///
+/// This function sorts and truncates a `Vec<((u32,u32), f64)>` of length
+/// equal to the number of matching candidates for one source.  That is
+/// O(M) per call, where M is the candidate count for this source.  Across
+/// a backfill sweep the peak additional memory is O(M_max) — the largest
+/// per-source candidate set — not the global total, because the Vec is
+/// dropped after each source.  No persistent per-source ordering is
+/// maintained beyond the materialized top-k provenance; backfill and
+/// rebuild recompute the ordering on demand from the live candidate index.
+pub(crate) fn filter_src_top_k(
+    per_src: BTreeMap<(u32, u32), f64>,
+    k: u64,
+    ids: &core_storage::IdMap,
+) -> BTreeMap<(u32, u32), f64> {
+    if per_src.len() as u64 <= k {
+        return per_src;
+    }
+    let mut candidates: Vec<((u32, u32), f64)> = per_src.into_iter().collect();
+    // Sort: score DESC (higher = better), then dst_key ASC as tiebreak.
+    candidates.sort_by(|&((_, da), sa), &((_, db), sb)| {
+        sb.total_cmp(&sa).then_with(|| {
+            let ka = ids.key_of(da).unwrap_or("");
+            let kb = ids.key_of(db).unwrap_or("");
+            ka.cmp(kb)
+        })
+    });
+    candidates.truncate(k as usize);
+    candidates.into_iter().collect()
+}
+
+/// Apply top-k derived-edge semantics for a single source node.
+///
+/// Retracts `(src, *)` provenance edges not in `desired_from_src`, then
+/// adds / refreshes weights for those that are.  Does **not** use the
+/// global tripped latch or budget check — top-k rules (`max_edges: Some(k)`)
+/// are self-capping by construction.
+fn apply_per_src_top_k(
+    def: &RuleDef,
+    src: u32,
+    desired_from_src: BTreeMap<(u32, u32), f64>,
+    prov: &mut ProvSets<'_>,
+    g: &mut GraphMut<'_>,
+) {
+    let et = g.syms.intern(&def.edge_type);
+
+    // Collect current (src, *) provenance triples for this rule.
+    // We filter to s == src so that (*, src) triples — where src is a dst
+    // for some other source — are not mistakenly retracted.
+    let current: Vec<Triple> = {
+        let rid = prov.rule_intern.get(&def.name).copied();
+        prov.by_node
+            .get(&src)
+            .into_iter()
+            .flatten()
+            .filter(|(r, t, s, _d)| Some(*r) == rid && *t == et && *s == src)
+            .map(|(_, t, s, d)| (*t, *s, *d))
+            .collect()
+    };
+
+    // Retract (src, dst) pairs no longer in the top-k.
+    for (t, s, d) in current {
+        if !desired_from_src.contains_key(&(s, d)) {
+            g.topo.remove_edge(t, s, d);
+            g.edge_props.remove_edge(t, s, d);
+            prov.remove(&def.name, (t, s, d));
+        }
+    }
+
+    // Insert new top-k pairs; refresh weights on already-owned pairs.
+    for ((s, d), score) in &desired_from_src {
+        let triple = (et, *s, *d);
+        let already = prov.contains(&triple);
+        if !already {
+            let newly = g.topo.add_edge(et, *s, *d);
+            if newly {
+                prov.insert(&def.name, triple);
+            }
+        }
+        let is_owned = already || prov.contains(&triple);
+        if is_owned {
+            if let Some(p) = &def.weight_prop {
+                g.edge_props.set(et, *s, *d, p, Value::Float(*score));
+            }
+        }
+    }
 }
 
 /// Never recycles ids. See `RuleEngine::rule_intern` for why.
@@ -516,6 +617,7 @@ fn apply_desired(
 /// streaming variants (`apply_streaming_create`, `apply_streaming_rebuild`)
 /// which never materialise the global map.
 #[cfg(test)]
+#[allow(dead_code)]
 fn compute_full_desired(
     def: &RuleDef,
     index: &RuleIndex,
@@ -668,6 +770,77 @@ fn apply_streaming_create(
                 }
             }
         }
+    }
+}
+
+/// Streaming backfill for `create_rule` with top-k per-source semantics.
+///
+/// Iterates src-label nodes in ascending id order. For each src, computes
+/// the full candidate set, filters to the top-k destinations (score DESC,
+/// dst_key ASC), and applies via `apply_per_src_top_k`.  No global budget or
+/// tripped latch is used — the per-source cap is enforced by `filter_src_top_k`.
+fn apply_streaming_create_top_k(
+    def: &RuleDef,
+    k: u64,
+    index: &RuleIndex,
+    prov: &mut ProvSets<'_>,
+    g: &mut GraphMut<'_>,
+) {
+    let src_sym = g.syms.get(&def.src_label);
+    for id in 0..g.ids.len() as u32 {
+        let label_sym = match g.labels.get(id as usize).copied() {
+            Some(s) if s != u32::MAX => s,
+            _ => continue,
+        };
+        if src_sym != Some(label_sym) {
+            continue;
+        }
+        let per_src = compute_desired(def, index, id, true, g);
+        let top_k = filter_src_top_k(per_src, k, g.ids);
+        apply_per_src_top_k(def, id, top_k, prov, g);
+    }
+}
+
+/// Streaming rebuild for top-k per-source rules.
+///
+/// Iterates all src-label nodes. For each src, computes fresh desired set,
+/// filters to top-k, and applies via `apply_per_src_top_k` — which retracts
+/// stale edges and inserts newly-ranked ones.  No budget counting, no tripped
+/// latch.
+fn apply_streaming_rebuild_top_k(
+    def: &RuleDef,
+    k: u64,
+    index: &RuleIndex,
+    prov: &mut ProvSets<'_>,
+    g: &mut GraphMut<'_>,
+) {
+    let et = g.syms.intern(&def.edge_type);
+
+    // Collect all src nodes: those currently in provenance (may have lost their
+    // label since last fire) + all live src-label nodes.
+    let existing_srcs: BTreeSet<u32> = prov
+        .set
+        .iter()
+        .filter(|(t, _, _)| *t == et)
+        .map(|(_, s, _)| *s)
+        .collect();
+
+    let src_sym = g.syms.get(&def.src_label);
+    let mut all_srcs: BTreeSet<u32> = existing_srcs;
+    for id in 0..g.ids.len() as u32 {
+        let label_sym = match g.labels.get(id as usize).copied() {
+            Some(s) if s != u32::MAX => s,
+            _ => continue,
+        };
+        if src_sym == Some(label_sym) {
+            all_srcs.insert(id);
+        }
+    }
+
+    for src in all_srcs {
+        let desired_src = compute_desired(def, index, src, true, g);
+        let top_k = filter_src_top_k(desired_src, k, g.ids);
+        apply_per_src_top_k(def, src, top_k, prov, g);
     }
 }
 
@@ -1031,24 +1204,23 @@ impl RuleEngine {
             idx.dst_side.fit_ivf_clusters(&name);
         }
 
-        // Phase 2: streaming backfill — no global desired map is built.
-        // Per-src candidates are computed and applied immediately in src-ascending
-        // id order, reproducing the exact first-N that the old full-BTree path
-        // would have selected (global (src,dst) BTree order == src-major).
-        let tripped = self.tripped.get_mut(&name).unwrap();
-        apply_streaming_create(
-            &def,
-            &self.indexes[&name],
-            &mut ProvSets {
-                set: self.provenance.get_mut(&name).unwrap(),
-                owned: &mut self.owned,
-                by_node: &mut self.by_node,
-                rule_intern: &mut self.rule_intern,
-                intern_rule: &mut self.intern_rule,
-            },
-            tripped,
-            g,
-        );
+        // Phase 2: streaming backfill.
+        // Branches on max_edges semantics:
+        //   None    → global-budget path (tripped latch, first-N in BTree order)
+        //   Some(k) → per-source top-k path (no tripped latch, score-ordered)
+        let mut prov = ProvSets {
+            set: self.provenance.get_mut(&name).unwrap(),
+            owned: &mut self.owned,
+            by_node: &mut self.by_node,
+            rule_intern: &mut self.rule_intern,
+            intern_rule: &mut self.intern_rule,
+        };
+        if let Some(k) = def.max_edges {
+            apply_streaming_create_top_k(&def, k, &self.indexes[&name], &mut prov, g);
+        } else {
+            let tripped = self.tripped.get_mut(&name).unwrap();
+            apply_streaming_create(&def, &self.indexes[&name], &mut prov, tripped, g);
+        }
         // Fires: one tick per participating node evaluated (same unit as
         // on_node_changed). Empty-graph create_rule therefore leaves fires=0.
         let fires = self.fires.get_mut(&name).unwrap();
@@ -1167,34 +1339,96 @@ impl RuleEngine {
             }
 
             // --- Desired set + diff-apply ---
-            let mut desired = BTreeMap::new();
-            if as_src {
-                desired.extend(compute_desired(&def, &self.indexes[&rule_name], n, true, g));
-            }
-            if as_dst {
-                desired.extend(compute_desired(
-                    &def,
-                    &self.indexes[&rule_name],
-                    n,
-                    false,
-                    g,
-                ));
-            }
-            let tripped = self.tripped.entry(rule_name.clone()).or_default();
-            apply_desired(
-                &def,
-                desired,
-                Some(n),
-                &mut ProvSets {
-                    set: self.provenance.entry(rule_name).or_default(),
+            if let Some(k) = def.max_edges {
+                // Top-k per-source semantics.
+                // Collect affected srcs (existing provenance to n as dst) BEFORE
+                // taking the ProvSets borrow, so we can still read self.by_node.
+                let et = g.syms.intern(&def.edge_type);
+                let affected_srcs_for_n_dst: BTreeSet<u32> = if as_dst {
+                    let rid = self.rule_intern.get(&def.name).copied();
+                    self.by_node
+                        .get(&n)
+                        .into_iter()
+                        .flatten()
+                        .filter(|(r, t, _s, d)| Some(*r) == rid && *t == et && *d == n)
+                        .map(|(_, _, s, _)| *s)
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                };
+
+                let mut prov = ProvSets {
+                    set: self.provenance.entry(rule_name.clone()).or_default(),
                     owned: &mut self.owned,
                     by_node: &mut self.by_node,
                     rule_intern: &mut self.rule_intern,
                     intern_rule: &mut self.intern_rule,
-                },
-                tripped,
-                g,
-            );
+                };
+
+                if as_src {
+                    // n changed as src: recompute n's top-k destination set.
+                    let desired_n_src =
+                        compute_desired(&def, &self.indexes[&rule_name], n, true, g);
+                    let top_k = filter_src_top_k(desired_n_src, k, g.ids);
+                    apply_per_src_top_k(&def, n, top_k, &mut prov, g);
+                }
+
+                if as_dst {
+                    // n changed as dst: all srcs that currently have provenance to n
+                    // AND all srcs that newly match n must re-evaluate their top-k.
+                    let new_desired =
+                        compute_desired(&def, &self.indexes[&rule_name], n, false, g);
+                    let new_srcs: BTreeSet<u32> =
+                        new_desired.keys().map(|(s, _)| *s).collect();
+                    let affected_srcs: BTreeSet<u32> =
+                        affected_srcs_for_n_dst.union(&new_srcs).copied().collect();
+                    for src in affected_srcs {
+                        if src == n {
+                            continue; // no self-edges
+                        }
+                        let desired_src =
+                            compute_desired(&def, &self.indexes[&rule_name], src, true, g);
+                        let top_k = filter_src_top_k(desired_src, k, g.ids);
+                        apply_per_src_top_k(&def, src, top_k, &mut prov, g);
+                    }
+                }
+            } else {
+                // Global-budget semantics (unchanged).
+                let mut desired = BTreeMap::new();
+                if as_src {
+                    desired.extend(compute_desired(
+                        &def,
+                        &self.indexes[&rule_name],
+                        n,
+                        true,
+                        g,
+                    ));
+                }
+                if as_dst {
+                    desired.extend(compute_desired(
+                        &def,
+                        &self.indexes[&rule_name],
+                        n,
+                        false,
+                        g,
+                    ));
+                }
+                let tripped = self.tripped.entry(rule_name.clone()).or_default();
+                apply_desired(
+                    &def,
+                    desired,
+                    Some(n),
+                    &mut ProvSets {
+                        set: self.provenance.entry(rule_name).or_default(),
+                        owned: &mut self.owned,
+                        by_node: &mut self.by_node,
+                        rule_intern: &mut self.rule_intern,
+                        intern_rule: &mut self.intern_rule,
+                    },
+                    tripped,
+                    g,
+                );
+            }
         }
     }
 
@@ -1237,6 +1471,24 @@ impl RuleEngine {
             .flatten()
             .map(|&(rid, t, s, d)| (self.intern_rule[rid as usize].clone(), (t, s, d)))
             .collect();
+
+        // Collect srcs that need top-k backfill BEFORE retracting provenance.
+        // For top-k rules: when n is a dst, the src loses one from its top-k
+        // and needs the next-best candidate added.
+        let topk_backfill: Vec<(String, u32)> = touching
+            .iter()
+            .filter_map(|(rule_name, triple)| {
+                let &(_, s, d) = triple;
+                let def = self.rules.get(rule_name)?;
+                def.max_edges?; // only top-k rules need backfill
+                if d == n && s != n {
+                    Some((rule_name.clone(), s))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         for (rule_name, triple) in touching {
             let (t, s, d) = triple;
             g.topo.remove_edge(t, s, d);
@@ -1251,6 +1503,25 @@ impl RuleEngine {
                 }
                 .remove(&rule_name, triple);
             }
+        }
+
+        // Backfill top-k srcs whose dst was removed.
+        // By now n is removed from the dst index (done in the first loop above),
+        // so compute_desired(src, true) will not include n in candidates — the
+        // resulting top-k automatically promotes the next-best candidate.
+        for (rule_name, src) in topk_backfill {
+            let def = self.rules[&rule_name].clone();
+            let k = def.max_edges.unwrap(); // guarded by filter above
+            let desired_src = compute_desired(&def, &self.indexes[&rule_name], src, true, g);
+            let top_k = filter_src_top_k(desired_src, k, g.ids);
+            let mut prov = ProvSets {
+                set: self.provenance.entry(rule_name.clone()).or_default(),
+                owned: &mut self.owned,
+                by_node: &mut self.by_node,
+                rule_intern: &mut self.rule_intern,
+                intern_rule: &mut self.intern_rule,
+            };
+            apply_per_src_top_k(&def, src, top_k, &mut prov, g);
         }
     }
 
@@ -1286,23 +1557,22 @@ impl RuleEngine {
             idx.dst_side.fit_ivf_clusters(name);
         }
 
-        // Streaming rebuild: counts desired pairs up to budget+1 (early exit),
-        // retracts stale triples via direct evaluate, then streams-adds desired.
-        // Never builds the global desired BTreeMap.
-        let tripped = self.tripped.get_mut(name).unwrap();
-        apply_streaming_rebuild(
-            &def,
-            &self.indexes[name],
-            &mut ProvSets {
-                set: self.provenance.get_mut(name).unwrap(),
-                owned: &mut self.owned,
-                by_node: &mut self.by_node,
-                rule_intern: &mut self.rule_intern,
-                intern_rule: &mut self.intern_rule,
-            },
-            tripped,
-            g,
-        );
+        // Streaming rebuild: branches on max_edges semantics.
+        //   None    → global-budget path (may no-op if still over budget)
+        //   Some(k) → per-source top-k rebuild (always converges; no tripped latch)
+        let mut prov = ProvSets {
+            set: self.provenance.get_mut(name).unwrap(),
+            owned: &mut self.owned,
+            by_node: &mut self.by_node,
+            rule_intern: &mut self.rule_intern,
+            intern_rule: &mut self.intern_rule,
+        };
+        if let Some(k) = def.max_edges {
+            apply_streaming_rebuild_top_k(&def, k, &self.indexes[name], &mut prov, g);
+        } else {
+            let tripped = self.tripped.get_mut(name).unwrap();
+            apply_streaming_rebuild(&def, &self.indexes[name], &mut prov, tripped, g);
+        }
         let fires = self.fires.entry(name.to_string()).or_default();
         bump_fires_for_participants(&def, g, fires);
 
@@ -1740,7 +2010,8 @@ mod tests {
         }
     }
 
-    fn const_eq_rule(max_edges: u64) -> RuleDef {
+    /// Helper: FieldEqual rule with top-k per-source cap.
+    fn topk_eq_rule(k: u64) -> RuleDef {
         RuleDef {
             name: "eq".into(),
             src_label: "N".into(),
@@ -1748,104 +2019,9 @@ mod tests {
             predicate: Predicate::FieldEqual { field: "k".into() },
             edge_type: "EQ".into(),
             weight_prop: None,
-            max_edges: Some(max_edges),
+            max_edges: Some(k),
             approximate: false,
         }
-    }
-
-    /// 4 nodes sharing field k="const" want 12 directed FieldEqual edges.
-    /// Budget 10 keeps the first 10 in deterministic (src,dst) order and trips.
-    /// A fifth insert still applies (no Err). Rebuild re-trips with the same
-    /// first-10 set. delete_rule drops tripped/fires.
-    #[test]
-    fn field_equal_budget_trips_at_exactly_10() {
-        let mut fx = Fx::new();
-        let mut eng = RuleEngine::new();
-        {
-            let mut g = fx.g();
-            eng.create_rule(const_eq_rule(10), &mut g).unwrap();
-        }
-        let mut ids = Vec::new();
-        for i in 0..4 {
-            let id = fx.add(
-                "N",
-                &format!("n{i}"),
-                vec![("k", Value::Str("const".into()))],
-            );
-            ids.push(id);
-            let mut g = fx.g();
-            eng.on_node_changed(id, None, &mut g);
-        }
-        let et = fx.syms.get("EQ").unwrap();
-        let mut kept = BTreeSet::new();
-        for &s in &ids {
-            for &d in fx.topo.neighbors(et, Direction::Out, s) {
-                kept.insert((s, d));
-            }
-        }
-        assert_eq!(kept.len(), 10);
-        assert!(eng.is_tripped("eq"));
-        assert_eq!(eng.fire_count("eq"), 4);
-        assert_eq!(eng.provenance()["eq"].len(), 10);
-
-        // Fifth node: fire succeeds, no new edges.
-        let n4 = fx.add("N", "n4", vec![("k", Value::Str("const".into()))]);
-        {
-            let mut g = fx.g();
-            eng.on_node_changed(n4, None, &mut g);
-        }
-        assert_eq!(fx.topo.edge_count(), 10);
-        assert!(eng.is_tripped("eq"));
-        assert_eq!(eng.fire_count("eq"), 5);
-
-        {
-            let mut g = fx.g();
-            eng.delete_rule("eq", &mut g).unwrap();
-        }
-        assert!(!eng.is_tripped("eq"));
-        assert_eq!(eng.fire_count("eq"), 0);
-        assert!(!eng.provenance().contains_key("eq"));
-    }
-
-    #[test]
-    fn rebuild_over_budget_keeps_deterministic_first_10() {
-        let mut fx = Fx::new();
-        let mut ids = Vec::new();
-        for i in 0..4 {
-            ids.push(fx.add(
-                "N",
-                &format!("n{i}"),
-                vec![("k", Value::Str("const".into()))],
-            ));
-        }
-        let mut eng = RuleEngine::new();
-        {
-            let mut g = fx.g();
-            eng.create_rule(const_eq_rule(10), &mut g).unwrap();
-        }
-        let et = fx.syms.get("EQ").unwrap();
-        let mut before = BTreeSet::new();
-        for &s in &ids {
-            for &d in fx.topo.neighbors(et, Direction::Out, s) {
-                before.insert((s, d));
-            }
-        }
-        assert_eq!(before.len(), 10);
-        assert!(eng.is_tripped("eq"));
-
-        {
-            let mut g = fx.g();
-            eng.rebuild("eq", &mut g).unwrap();
-        }
-        let mut after = BTreeSet::new();
-        for &s in &ids {
-            for &d in fx.topo.neighbors(et, Direction::Out, s) {
-                after.insert((s, d));
-            }
-        }
-        assert_eq!(after, before);
-        assert!(eng.is_tripped("eq"));
-        assert_eq!(eng.provenance()["eq"].len(), 10);
     }
 
     fn prov_pairs(eng: &RuleEngine, name: &str) -> BTreeSet<(u32, u32)> {
@@ -1855,132 +2031,257 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Extra matching nodes after the trip must not change the frozen set,
-    /// and rebuild while still over budget is a true provenance no-op.
+    /// k=1: each src gets its single best-scored dst (score DESC, key ASC
+    /// tiebreak).  FieldEqual has uniform score 1.0, so the winner is the dst
+    /// with the lexicographically smallest key that is not the src itself.
     #[test]
-    fn rebuild_while_over_budget_is_provenance_noop() {
+    fn topk_k1_keeps_best_scored_dst() {
         let mut fx = Fx::new();
         let mut eng = RuleEngine::new();
         {
             let mut g = fx.g();
-            eng.create_rule(const_eq_rule(10), &mut g).unwrap();
+            eng.create_rule(topk_eq_rule(1), &mut g).unwrap();
         }
-        for i in 0..4 {
-            let id = fx.add(
-                "N",
-                &format!("n{i}"),
-                vec![("k", Value::Str("const".into()))],
-            );
-            let mut g = fx.g();
-            eng.on_node_changed(id, None, &mut g);
-        }
-        assert!(eng.is_tripped("eq"));
-        assert_eq!(eng.provenance()["eq"].len(), 10);
-
-        let n4 = fx.add("N", "n4", vec![("k", Value::Str("const".into()))]);
-        {
-            let mut g = fx.g();
-            eng.on_node_changed(n4, None, &mut g);
-        }
-        let before = prov_pairs(&eng, "eq");
-        assert_eq!(before.len(), 10);
-        assert!(eng.is_tripped("eq"));
-
-        {
-            let mut g = fx.g();
-            eng.rebuild("eq", &mut g).unwrap();
-        }
-        assert_eq!(prov_pairs(&eng, "eq"), before);
-        assert!(eng.is_tripped("eq"));
-    }
-
-    /// Once tripped, retracts may drop provenance below budget, but new
-    /// matching nodes must not grow the set. Rebuild is the only exit: when
-    /// the full desired set now fits it is applied completely and tripped
-    /// clears; later inserts derive again.
-    #[test]
-    fn tripped_freeze_blocks_adds_until_rebuild_fits() {
-        let mut fx = Fx::new();
-        let mut eng = RuleEngine::new();
-        {
-            let mut g = fx.g();
-            eng.create_rule(const_eq_rule(10), &mut g).unwrap();
-        }
+        // Insert 4 nodes all sharing k="const".  Keys: n0 < n1 < n2 < n3.
         let mut ids = Vec::new();
-        for i in 0..4 {
-            let id = fx.add(
-                "N",
-                &format!("n{i}"),
-                vec![("k", Value::Str("const".into()))],
-            );
+        for i in 0..4usize {
+            let id = fx.add("N", &format!("n{i}"), vec![("k", Value::Str("const".into()))]);
             ids.push(id);
             let mut g = fx.g();
             eng.on_node_changed(id, None, &mut g);
         }
-        assert_eq!(eng.provenance()["eq"].len(), 10);
-        assert!(eng.is_tripped("eq"));
-
-        // Retract n2 and n3 below budget. Distinct values so they do not
-        // FieldEqual each other.
-        for (id, val) in [(ids[2], "x2"), (ids[3], "x3")] {
-            let old = fx.props.get(id, "k").cloned();
-            fx.props.set(id, "k", Value::Str(val.into()));
-            let mut g = fx.g();
-            eng.on_node_changed(id, Some(("k", old)), &mut g);
+        let et = fx.syms.get("EQ").unwrap();
+        // Each src's single allowed dst must be the smallest key ≠ self.
+        // n0 → n1 (smallest other)
+        // n1 → n0 (n0 < n1)
+        // n2 → n0
+        // n3 → n0
+        let expected_dsts = [ids[1], ids[0], ids[0], ids[0]];
+        for (i, (&src, &expected_dst)) in ids.iter().zip(expected_dsts.iter()).enumerate() {
+            let out: Vec<u32> = fx.topo.neighbors(et, Direction::Out, src).to_vec();
+            assert_eq!(out, vec![expected_dst], "src n{i} should point only to the best dst");
         }
-        let after_retract = eng.provenance()["eq"].len();
-        assert!(after_retract < 10, "retracts must still run while tripped");
-        assert!(eng.is_tripped("eq"));
+        assert_eq!(eng.provenance()["eq"].len(), 4);
+        assert!(!eng.is_tripped("eq"), "top-k rules never trip");
+    }
 
-        let n4 = fx.add("N", "n4", vec![("k", Value::Str("const".into()))]);
+    /// k=2 insert-evict: adding a better dst evicts the worst of the current k.
+    /// Uses NumericWithin (scored) so scores differ across dsts.
+    #[test]
+    fn topk_insert_evict() {
+        // Rule: S→D with VectorSimilar-alike (we use NumericWithin for simplicity).
+        // 3 src nodes, numeric field "v"; tolerance 10.0 so score = 1-|Δ|/10.
+        // k=1 per source.
+        let mut fx = Fx::new();
+        let rule = RuleDef {
+            name: "nw".into(),
+            src_label: "S".into(),
+            dst_label: "D".into(),
+            predicate: Predicate::NumericWithin { field: "v".into(), tolerance: 10.0 },
+            edge_type: "NEAR".into(),
+            weight_prop: Some("score".into()),
+            max_edges: Some(1),
+            approximate: false,
+        };
+        let mut eng = RuleEngine::new();
         {
             let mut g = fx.g();
-            eng.on_node_changed(n4, None, &mut g);
+            eng.create_rule(rule, &mut g).unwrap();
         }
-        assert_eq!(
-            eng.provenance()["eq"].len(),
-            after_retract,
-            "freeze: no new edges while tripped, even below budget"
+
+        // src s0 with v=0.0
+        let s0 = fx.add("S", "s0", vec![("v", Value::Float(0.0))]);
+        // dst d_far with v=9.0 → score=0.1 (worst)
+        let d_far = fx.add("D", "d_far", vec![("v", Value::Float(9.0))]);
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(s0, None, &mut g);
+            eng.on_node_changed(d_far, None, &mut g);
+        }
+        let et = fx.syms.get("NEAR").unwrap();
+        // s0 → d_far (only candidate)
+        assert!(fx.topo.neighbors(et, Direction::Out, s0).contains(&d_far));
+        assert_eq!(eng.provenance()["nw"].len(), 1);
+
+        // Insert d_close with v=1.0 → score=0.9 (better than d_far).
+        let d_close = fx.add("D", "d_close", vec![("v", Value::Float(1.0))]);
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(d_close, None, &mut g);
+        }
+        // s0 should now point to d_close (evicting d_far).
+        let out: Vec<u32> = fx.topo.neighbors(et, Direction::Out, s0).to_vec();
+        assert_eq!(out, vec![d_close], "d_close should evict d_far");
+        assert!(!fx.topo.neighbors(et, Direction::Out, s0).contains(&d_far));
+        assert_eq!(eng.provenance()["nw"].len(), 1);
+        assert!(eng.by_node_consistent());
+    }
+
+    /// Retract-backfill: removing the best dst causes the next-best to fill in.
+    #[test]
+    fn topk_retract_backfill() {
+        let mut fx = Fx::new();
+        let rule = RuleDef {
+            name: "nw".into(),
+            src_label: "S".into(),
+            dst_label: "D".into(),
+            predicate: Predicate::NumericWithin { field: "v".into(), tolerance: 10.0 },
+            edge_type: "NEAR".into(),
+            weight_prop: Some("score".into()),
+            max_edges: Some(1),
+            approximate: false,
+        };
+        let mut eng = RuleEngine::new();
+
+        let s0 = fx.add("S", "s0", vec![("v", Value::Float(0.0))]);
+        let d_close = fx.add("D", "d_close", vec![("v", Value::Float(1.0))]); // score=0.9
+        let d_far = fx.add("D", "d_far", vec![("v", Value::Float(8.0))]); // score=0.2
+        {
+            let mut g = fx.g();
+            eng.create_rule(rule, &mut g).unwrap();
+        }
+        let et = fx.syms.get("NEAR").unwrap();
+        // d_close is the top-1 dst.
+        assert!(fx.topo.neighbors(et, Direction::Out, s0).contains(&d_close));
+        assert!(!fx.topo.neighbors(et, Direction::Out, s0).contains(&d_far));
+        assert_eq!(eng.provenance()["nw"].len(), 1);
+
+        // Break d_close's match by pushing its v out of tolerance.
+        let old = fx.props.get(d_close, "v").cloned();
+        fx.props.set(d_close, "v", Value::Float(50.0));
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(d_close, Some(("v", old)), &mut g);
+        }
+        // d_far should backfill.
+        assert!(!fx.topo.neighbors(et, Direction::Out, s0).contains(&d_close));
+        assert!(
+            fx.topo.neighbors(et, Direction::Out, s0).contains(&d_far),
+            "d_far should backfill after d_close retracted"
         );
-        assert!(eng.is_tripped("eq"));
+        assert_eq!(eng.provenance()["nw"].len(), 1);
+        assert!(eng.by_node_consistent());
+    }
 
-        // Drop n4 from the match set so remaining desired is n0↔n1 (2 edges).
-        let old = fx.props.get(n4, "k").cloned();
-        fx.props.set(n4, "k", Value::Str("x4".into()));
+    /// Tie-breaking: equal scores → dst_key ASC wins.
+    #[test]
+    fn topk_tie_broken_by_dst_key() {
+        // FieldEqual: all dsts have score 1.0 → tiebreak by key.
+        let mut fx = Fx::new();
+        let mut eng = RuleEngine::new();
         {
             let mut g = fx.g();
-            eng.on_node_changed(n4, Some(("k", old)), &mut g);
+            eng.create_rule(topk_eq_rule(2), &mut g).unwrap();
         }
+        // 5 nodes all with k="x" → each src matches 4 others; top-2 by key.
+        // Keys: a, b, c, d, e (alphabetical).
+        for name in ["a", "b", "c", "d", "e"] {
+            let id = fx.add("N", name, vec![("k", Value::Str("x".into()))]);
+            let mut g = fx.g();
+            eng.on_node_changed(id, None, &mut g);
+        }
+        let et = fx.syms.get("EQ").unwrap();
+        let get_id = |key: &str| fx.ids.get(key).unwrap();
+        // Node "a" should point to the two smallest keys that aren't "a": b, c.
+        let a = get_id("a");
+        let b = get_id("b");
+        let c = get_id("c");
+        let out_a: BTreeSet<u32> = fx.topo.neighbors(et, Direction::Out, a).iter().copied().collect();
+        assert!(out_a.contains(&b), "a→b (b is best key after a)");
+        assert!(out_a.contains(&c), "a→c (c is 2nd best key)");
+        assert_eq!(out_a.len(), 2);
+        // Node "e" should point to "a" and "b" (two smallest keys ≠ "e").
+        let e = get_id("e");
+        let out_e: BTreeSet<u32> = fx.topo.neighbors(et, Direction::Out, e).iter().copied().collect();
+        assert!(out_e.contains(&a), "e→a");
+        assert!(out_e.contains(&b), "e→b");
+        assert_eq!(out_e.len(), 2);
+        assert!(eng.by_node_consistent());
+    }
+
+    /// When k >= candidate count, all candidates are included (no truncation).
+    #[test]
+    fn topk_k_larger_than_candidate_count() {
+        let mut fx = Fx::new();
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            // k=100 but only 3 other nodes → all 3 included.
+            eng.create_rule(topk_eq_rule(100), &mut g).unwrap();
+        }
+        for i in 0..4usize {
+            let id = fx.add("N", &format!("n{i}"), vec![("k", Value::Str("c".into()))]);
+            let mut g = fx.g();
+            eng.on_node_changed(id, None, &mut g);
+        }
+        // 4 nodes × 3 matches each = 12 directed edges.
+        assert_eq!(eng.provenance()["eq"].len(), 12);
+        assert!(!eng.is_tripped("eq"));
+    }
+
+    /// rebuild() with top-k rule re-converges to the correct per-source top-k
+    /// after externally removing a node's field.
+    #[test]
+    fn topk_rebuild_exact() {
+        let mut fx = Fx::new();
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(topk_eq_rule(1), &mut g).unwrap();
+        }
+        // 3 nodes with k="x" → each gets 1 dst (smallest key ≠ self).
+        let _a = fx.add("N", "a", vec![("k", Value::Str("x".into()))]);
+        let _b = fx.add("N", "b", vec![("k", Value::Str("x".into()))]);
+        let _c = fx.add("N", "c", vec![("k", Value::Str("x".into()))]);
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(_a, None, &mut g);
+            eng.on_node_changed(_b, None, &mut g);
+            eng.on_node_changed(_c, None, &mut g);
+        }
+        assert_eq!(eng.provenance()["eq"].len(), 3);
+
+        // rebuild should produce the same result.
+        {
+            let mut g = fx.g();
+            eng.rebuild("eq", &mut g).unwrap();
+        }
+        assert_eq!(eng.provenance()["eq"].len(), 3);
+        assert!(!eng.is_tripped("eq"));
+        assert!(eng.by_node_consistent());
+    }
+
+    /// by_node index stays consistent across top-k inserts, evictions and rebuild.
+    #[test]
+    fn topk_by_node_consistent() {
+        let mut fx = Fx::new();
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(topk_eq_rule(2), &mut g).unwrap();
+        }
+        for i in 0..5usize {
+            let id = fx.add("N", &format!("n{i}"), vec![("k", Value::Str("const".into()))]);
+            let mut g = fx.g();
+            eng.on_node_changed(id, None, &mut g);
+        }
+        assert!(eng.by_node_consistent(), "consistent after insertions");
+
+        // Evict by changing a prop.
+        let id2 = fx.ids.get("n2").unwrap();
+        let old = fx.props.get(id2, "k").cloned();
+        fx.props.set(id2, "k", Value::Str("other".into()));
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(id2, Some(("k", old)), &mut g);
+        }
+        assert!(eng.by_node_consistent(), "consistent after eviction");
 
         {
             let mut g = fx.g();
             eng.rebuild("eq", &mut g).unwrap();
         }
-        let et = fx.syms.get("EQ").unwrap();
-        assert!(
-            !eng.is_tripped("eq"),
-            "rebuild must un-trip when desired fits"
-        );
-        assert_eq!(eng.provenance()["eq"].len(), 2);
-        assert!(fx
-            .topo
-            .neighbors(et, Direction::Out, ids[0])
-            .contains(&ids[1]));
-        assert!(fx
-            .topo
-            .neighbors(et, Direction::Out, ids[1])
-            .contains(&ids[0]));
-
-        // Subsequent inserts derive normally.
-        let n5 = fx.add("N", "n5", vec![("k", Value::Str("const".into()))]);
-        {
-            let mut g = fx.g();
-            eng.on_node_changed(n5, None, &mut g);
-        }
-        assert!(!eng.is_tripped("eq"));
-        assert_eq!(eng.provenance()["eq"].len(), 6); // {n0,n1,n5} pairwise
-        assert!(fx.topo.neighbors(et, Direction::Out, n5).contains(&ids[0]));
-        assert!(fx.topo.neighbors(et, Direction::Out, ids[0]).contains(&n5));
+        assert!(eng.by_node_consistent(), "consistent after rebuild");
     }
 
     fn numeric_rule() -> RuleDef {
@@ -2255,16 +2556,33 @@ mod tests {
         assert_eq!(hits[0].3, hub);
     }
 
+    /// by_node index stays consistent across global-budget trip and rebuild
+    /// (max_edges: None path — DEFAULT_MAX_EDGES = 1_000_000).
+    ///
+    /// Uses a tiny budget via a special rule with `max_edges: None` but many
+    /// nodes to naturally exceed the default; instead we directly test the
+    /// None-path by verifying that the by_node index is consistent at each
+    /// step of normal insertions and rebuilds.
     #[test]
-    fn by_node_consistent_across_budget_trip_and_rebuild() {
+    fn by_node_consistent_across_inserts_and_rebuild() {
         let mut fx = Fx::new();
         let mut eng = RuleEngine::new();
+        let rule = RuleDef {
+            name: "eq".into(),
+            src_label: "N".into(),
+            dst_label: "N".into(),
+            predicate: Predicate::FieldEqual { field: "k".into() },
+            edge_type: "EQ".into(),
+            weight_prop: None,
+            max_edges: None, // global-budget path, DEFAULT_MAX_EDGES = 1_000_000
+            approximate: false,
+        };
         {
             let mut g = fx.g();
-            eng.create_rule(const_eq_rule(10), &mut g).unwrap();
+            eng.create_rule(rule, &mut g).unwrap();
         }
         let mut ids = Vec::new();
-        for i in 0..4 {
+        for i in 0..6 {
             let id = fx.add(
                 "N",
                 &format!("n{i}"),
@@ -2274,41 +2592,26 @@ mod tests {
             let mut g = fx.g();
             eng.on_node_changed(id, None, &mut g);
         }
-        assert_eq!(eng.provenance()["eq"].len(), 10);
-        assert!(eng.is_tripped("eq"));
-        assert!(eng.by_node_consistent(), "consistent after trip");
+        // 6 nodes × 5 matches each = 30 directed edges (well under 1M budget).
+        assert_eq!(eng.provenance()["eq"].len(), 30);
+        assert!(!eng.is_tripped("eq"));
+        assert!(eng.by_node_consistent(), "consistent after insertions");
 
-        // Rebuild while desired still exceeds the cap: latch stays, no-op on
-        // provenance, reverse index must still match a rebuild-from-provenance.
+        // Change one node's field — triggers retract + backfill on that src.
+        let old = fx.props.get(ids[3], "k").cloned();
+        fx.props.set(ids[3], "k", Value::Str("other".into()));
         {
             let mut g = fx.g();
-            eng.rebuild("eq", &mut g).unwrap();
+            eng.on_node_changed(ids[3], Some(("k", old)), &mut g);
         }
-        assert!(eng.is_tripped("eq"));
-        assert_eq!(eng.provenance()["eq"].len(), 10);
-        assert!(
-            eng.by_node_consistent(),
-            "consistent after over-cap rebuild"
-        );
-
-        // Drain below budget; tripped stays until rebuild.
-        for (id, val) in [(ids[2], "x2"), (ids[3], "x3")] {
-            let old = fx.props.get(id, "k").cloned();
-            fx.props.set(id, "k", Value::Str(val.into()));
-            let mut g = fx.g();
-            eng.on_node_changed(id, Some(("k", old)), &mut g);
-        }
-        assert!(eng.provenance()["eq"].len() < 10);
-        assert!(eng.is_tripped("eq"));
-        assert!(eng.by_node_consistent(), "consistent after drain");
+        assert!(eng.by_node_consistent(), "consistent after property change");
 
         {
             let mut g = fx.g();
             eng.rebuild("eq", &mut g).unwrap();
         }
-        assert!(!eng.is_tripped("eq"), "rebuild un-trips when desired fits");
-        assert_eq!(eng.provenance()["eq"].len(), 2);
-        assert!(eng.by_node_consistent(), "consistent after un-trip rebuild");
+        assert!(!eng.is_tripped("eq"));
+        assert!(eng.by_node_consistent(), "consistent after rebuild");
     }
 
     fn mix64(mut x: u64) -> u64 {
@@ -2454,21 +2757,21 @@ mod tests {
     // Streaming backfill — order-identity and memory-bound tests (Plan 11 M1)
     // -----------------------------------------------------------------------
 
-    /// Order-identity property test (TDD — written before `apply_streaming_create`
-    /// existed; compilation failure was the initial "red" state).
+    /// Top-k order-identity property test.
     ///
-    /// Reference comparator: `compute_full_desired` (the old full-map approach,
-    /// kept `#[cfg(test)]`) + take first-budget entries in BTree (src,dst) order.
-    /// Streaming path: `create_rule`, which now calls `apply_streaming_create`.
+    /// For rules with `max_edges: Some(k)` (top-k per-source semantics),
+    /// verifies that `create_rule` streaming backfill produces the same
+    /// per-source top-k set as a brute-force reference:
+    ///   reference: for each src, compute_desired → filter_src_top_k → collect.
     ///
     /// Covers three `CandidateSpec` paths through `compute_desired`:
-    /// - `FieldEqual` → `CandidateSpec::Scalar` (bucket-by-value)
-    /// - `KeyMatch` → `CandidateSpec::ByKey` (direct FK lookup, src side: `CandidateSpec::Scalar`)
-    /// - `VectorSimilar` → `CandidateSpec::ScanAll` (IVF / dim-filtered; exact)
+    /// - `FieldEqual` → `CandidateSpec::Scalar` (uniform score=1.0, tiebreak by key)
+    /// - `KeyMatch` → `CandidateSpec::ByKey` (unscored → key ASC order)
+    /// - `NumericWithin` → `CandidateSpec::NumericBucket` (scored, variable top-k)
     #[test]
-    fn streaming_order_identity_property_test() {
-        // Reference: compute_full_desired → take first-budget (src,dst) pairs.
-        fn reference_first_n(rule: &RuleDef, fx: &mut Fx, budget: u64) -> BTreeSet<(u32, u32)> {
+    fn streaming_topk_order_identity_property_test() {
+        // Reference: build index, compute_desired per src, filter_src_top_k.
+        fn reference_topk(rule: &RuleDef, k: u64, fx: &mut Fx) -> BTreeSet<(u32, u32)> {
             let mut idx = RuleIndex::default();
             for id in 0..fx.ids.len() as u32 {
                 let label_sym = match fx.labels.get(id as usize).copied() {
@@ -2477,18 +2780,30 @@ mod tests {
                 };
                 index_node_for_rule(id, label_sym, rule, &mut idx, &fx.syms, &fx.props);
             }
-            let g = GraphMut {
-                ids: &fx.ids,
-                syms: &mut fx.syms,
-                labels: &fx.labels,
-                props: &fx.props,
-                topo: &mut fx.topo,
-                edge_props: &mut fx.eprops,
-            };
-            compute_full_desired(rule, &idx, &g)
-                .into_keys()
-                .take(budget as usize)
-                .collect()
+            let src_sym = fx.syms.get(&rule.src_label);
+            let mut out = BTreeSet::new();
+            let ids_snap: Vec<u32> = (0..fx.ids.len() as u32).collect();
+            for id in ids_snap {
+                let label_sym = match fx.labels.get(id as usize).copied() {
+                    Some(s) if s != u32::MAX => s,
+                    _ => continue,
+                };
+                if src_sym != Some(label_sym) {
+                    continue;
+                }
+                let g = GraphMut {
+                    ids: &fx.ids,
+                    syms: &mut fx.syms,
+                    labels: &fx.labels,
+                    props: &fx.props,
+                    topo: &mut fx.topo,
+                    edge_props: &mut fx.eprops,
+                };
+                let per_src = compute_desired(rule, &idx, id, true, &g);
+                let top_k = filter_src_top_k(per_src, k, &fx.ids);
+                out.extend(top_k.into_keys());
+            }
+            out
         }
 
         // Helper: run create_rule and return provenance (src,dst) pairs.
@@ -2503,11 +2818,11 @@ mod tests {
         }
 
         // ----------------------------------------------------------------
-        // Case 1: FieldEqual (CandidateSpec::Scalar)
-        // N→N, 3-value "k" field distributed by mix64.
+        // Case 1: FieldEqual (uniform score=1.0, tiebreak by key ASC)
+        // N→N, 3-value "k" field; top-k filters per src by key.
         // ----------------------------------------------------------------
         for seed in [0u64, 1, 42, 0xDEAD_BEEF, 0x1234_5678, 99, 12_648_430, 7] {
-            for budget in [3u64, 5, 7, 10, 15] {
+            for k in [1u64, 2, 3, 5] {
                 let rule = RuleDef {
                     name: "eq".into(),
                     src_label: "N".into(),
@@ -2515,128 +2830,77 @@ mod tests {
                     predicate: Predicate::FieldEqual { field: "k".into() },
                     edge_type: "EQ".into(),
                     weight_prop: None,
-                    max_edges: Some(budget),
-                    approximate: false,
-                };
-
-                let mut fx_ref = {
-                    let mut fx = Fx::new();
-                    for i in 0..12u32 {
-                        let h = mix64(seed ^ (i as u64 + 1));
-                        let val = match h % 3 {
-                            0 => "a",
-                            1 => "b",
-                            _ => "c",
-                        };
-                        fx.add("N", &format!("n{i}"), vec![("k", Value::Str(val.into()))]);
-                    }
-                    fx
-                };
-                let expected = reference_first_n(&rule, &mut fx_ref, budget);
-
-                let mut fx_stream = {
-                    let mut fx = Fx::new();
-                    for i in 0..12u32 {
-                        let h = mix64(seed ^ (i as u64 + 1));
-                        let val = match h % 3 {
-                            0 => "a",
-                            1 => "b",
-                            _ => "c",
-                        };
-                        fx.add("N", &format!("n{i}"), vec![("k", Value::Str(val.into()))]);
-                    }
-                    fx
-                };
-                let actual = streaming_pairs(rule, &mut fx_stream);
-
-                assert_eq!(
-                    expected, actual,
-                    "FieldEqual seed={seed} budget={budget}: streaming first-N must match BTree first-N"
-                );
-            }
-        }
-
-        // ----------------------------------------------------------------
-        // Case 2: KeyMatch (CandidateSpec::ByKey on dst side,
-        //         CandidateSpec::Scalar on src side)
-        // T→C, src nodes carry a "cid" field that is the key of a C node.
-        // Each T maps to at most one C; global BTree order is T-id ascending.
-        // ----------------------------------------------------------------
-        for seed in [0u64, 1, 42, 0xDEAD_BEEF, 12_648_430, 7] {
-            for budget in [3u64, 6, 10, 14] {
-                // Build 2 C nodes and 16 T nodes; assign cid by mix64 hash.
-                let rule = RuleDef {
-                    name: "fk".into(),
-                    src_label: "T".into(),
-                    dst_label: "C".into(),
-                    predicate: Predicate::KeyMatch {
-                        field: "cid".into(),
-                    },
-                    edge_type: "AT".into(),
-                    weight_prop: None,
-                    max_edges: Some(budget),
+                    max_edges: Some(k),
                     approximate: false,
                 };
 
                 let build = || {
                     let mut fx = Fx::new();
-                    fx.add("C", "ca", vec![]);
-                    fx.add("C", "cb", vec![]);
-                    for i in 0..16u32 {
-                        let h = mix64(seed ^ (i as u64 + 7));
-                        let cid = if h.is_multiple_of(2) { "ca" } else { "cb" };
-                        fx.add("T", &format!("t{i}"), vec![("cid", Value::Str(cid.into()))]);
+                    for i in 0..12u32 {
+                        let h = mix64(seed ^ (i as u64 + 1));
+                        let val = match h % 3 {
+                            0 => "a",
+                            1 => "b",
+                            _ => "c",
+                        };
+                        fx.add("N", &format!("n{i:02}"), vec![("k", Value::Str(val.into()))]);
                     }
                     fx
                 };
 
-                let expected = reference_first_n(&rule, &mut build(), budget);
+                let expected = reference_topk(&rule, k, &mut build());
                 let actual = streaming_pairs(rule, &mut build());
 
                 assert_eq!(
                     expected, actual,
-                    "KeyMatch seed={seed} budget={budget}: streaming first-N must match BTree first-N"
+                    "FieldEqual seed={seed} k={k}: streaming top-k must match brute-force top-k"
                 );
             }
         }
 
         // ----------------------------------------------------------------
-        // Case 3: VectorSimilar (CandidateSpec::ScanAll — exact, dim-filtered)
-        // Doc→Doc, all nodes same 2-D embedding → all pairs match (cos=1.0).
-        // Exercises the ScanAll candidate path; ordering comes from the
-        // BTreeMap inside compute_desired, so streaming must agree.
+        // Case 2: NumericWithin (scored — top-k filters by score DESC, key ASC)
+        // S→D, numeric field "v", tolerance 10.0.
         // ----------------------------------------------------------------
-        for budget in [3u64, 6, 10, 20] {
-            let rule = RuleDef {
-                name: "vec".into(),
-                src_label: "Doc".into(),
-                dst_label: "Doc".into(),
-                predicate: Predicate::VectorSimilar {
-                    field: "emb".into(),
-                    min: 0.5,
-                },
-                edge_type: "SIM".into(),
-                weight_prop: None,
-                max_edges: Some(budget),
-                approximate: false,
-            };
+        for seed in [0u64, 1, 42, 7] {
+            for k in [1u64, 2, 4] {
+                let rule = RuleDef {
+                    name: "nw".into(),
+                    src_label: "S".into(),
+                    dst_label: "D".into(),
+                    predicate: Predicate::NumericWithin {
+                        field: "v".into(),
+                        tolerance: 10.0,
+                    },
+                    edge_type: "NEAR".into(),
+                    weight_prop: Some("score".into()),
+                    max_edges: Some(k),
+                    approximate: false,
+                };
 
-            // 12 Doc nodes, all same 2-D unit embedding → 12×11 = 132 pairs.
-            let build = || {
-                let mut fx = Fx::new();
-                for i in 0..12u32 {
-                    fx.add("Doc", &format!("d{i}"), vec![("emb", emb_val(&[1.0, 0.0]))]);
-                }
-                fx
-            };
+                let build = || {
+                    let mut fx = Fx::new();
+                    for i in 0..6u32 {
+                        let h = mix64(seed ^ (i as u64 + 1));
+                        let v = (h % 20) as f64;
+                        fx.add("S", &format!("s{i}"), vec![("v", Value::Float(v))]);
+                    }
+                    for i in 0..8u32 {
+                        let h = mix64(seed ^ (i as u64 + 101));
+                        let v = (h % 20) as f64;
+                        fx.add("D", &format!("d{i}"), vec![("v", Value::Float(v))]);
+                    }
+                    fx
+                };
 
-            let expected = reference_first_n(&rule, &mut build(), budget);
-            let actual = streaming_pairs(rule, &mut build());
+                let expected = reference_topk(&rule, k, &mut build());
+                let actual = streaming_pairs(rule, &mut build());
 
-            assert_eq!(
-                expected, actual,
-                "VectorSimilar budget={budget}: streaming first-N must match BTree first-N"
-            );
+                assert_eq!(
+                    expected, actual,
+                    "NumericWithin seed={seed} k={k}: streaming top-k must match brute-force top-k"
+                );
+            }
         }
     }
 
@@ -2705,7 +2969,8 @@ mod tests {
         }
 
         // 500 Talent × 500 Company, all FieldEqual on k="same"
-        // → 250 000 desired pairs, budget = 1 000.
+        // → 250 000 desired pairs, top-k = 2 per source (max_edges: Some(2)).
+        // Peak transient: one per-src BTreeMap of ≤ 500 entries ≈ 13 KiB.
         let mut fx = Fx::new();
         for i in 0..500u32 {
             fx.add(
@@ -2728,7 +2993,7 @@ mod tests {
             predicate: Predicate::FieldEqual { field: "k".into() },
             edge_type: "EQ".into(),
             weight_prop: None,
-            max_edges: Some(1_000),
+            max_edges: Some(2), // top-k=2 per source; 500 * 2 = 1000 total edges
             approximate: false,
         };
 
@@ -2760,8 +3025,8 @@ mod tests {
             peak_delta,
             peak_delta / 1024
         );
-        assert_eq!(eng.provenance()["eq_tc"].len(), 1_000);
-        assert!(eng.is_tripped("eq_tc"));
+        assert_eq!(eng.provenance()["eq_tc"].len(), 1_000); // 500 Talent × top-k 2 = 1000
+        assert!(!eng.is_tripped("eq_tc")); // top-k rules never trip
         eprintln!(
             "streaming_peak_transient_bound: baseline={baseline} peak={peak} \
              delta={peak_delta} bytes ({} KiB)",

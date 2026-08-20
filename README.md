@@ -29,7 +29,7 @@ db.create_rule(RuleDef {
     predicate: Predicate::Overlap { field: "skills".into(), min: 0.5 },
     edge_type: "FIT".into(),
     weight_prop: Some("score".into()),
-    max_edges: None,
+    max_edges: Some(5), // keep the 5 best-matching Orgs per Person (top-k per source)
 }).expect("rule");
 ```
 

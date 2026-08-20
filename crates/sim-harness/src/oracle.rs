@@ -118,41 +118,111 @@ impl Oracle {
         }
     }
 
+    /// For a top-k rule (`max_edges: Some(k)`), returns the top-k matching
+    /// dst keys for `src_key`, ordered by (score DESC, key ASC).
+    ///
+    /// This is the oracle invariant for per-source top-k semantics: the derived
+    /// set for a source must equal exactly this set at every quiescent point.
+    pub fn top_k_dsts_for_src(&self, rule: &RuleDef, k: u64, src_key: &str) -> BTreeSet<String> {
+        let src_label = self.labels.get(src_key).map_or("", |l| l.as_str());
+        if src_label != rule.src_label {
+            return BTreeSet::new();
+        }
+        let src_props = match self.nodes.get(src_key) {
+            Some(p) => p,
+            None => return BTreeSet::new(),
+        };
+
+        let mut candidates: Vec<(String, f64)> = Vec::new();
+        for (dst_key, dst_props) in &self.nodes {
+            if dst_key == src_key {
+                continue; // no self-edges
+            }
+            let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
+            if dst_label != rule.dst_label {
+                continue;
+            }
+            let sp = |f: &str| src_props.get(f).cloned();
+            let dp = |f: &str| dst_props.get(f).cloned();
+            let src_view = NodeView {
+                key: src_key,
+                props: &sp,
+            };
+            let dst_view = NodeView {
+                key: dst_key,
+                props: &dp,
+            };
+            if let Some(score) = evaluate(&rule.predicate, &src_view, &dst_view) {
+                candidates.push((dst_key.clone(), score));
+            }
+        }
+
+        // Sort by score DESC, then key ASC for deterministic tiebreak.
+        candidates.sort_by(|(ka, sa), (kb, sb)| sb.total_cmp(sa).then_with(|| ka.cmp(kb)));
+        candidates
+            .into_iter()
+            .take(k as usize)
+            .map(|(k, _)| k)
+            .collect()
+    }
+
     /// Returns user edges ∪ brute-force derived edges as (etype, src_key, dst_key) triples.
     ///
     /// Full O(n²) label-pair scan calling `core_rules::def::evaluate` directly.
     /// Shares nothing with `candidate_spec` / `SideIndex` — incrementality is
-    /// the property under test, not scoring. New Plan-7 predicates
-    /// (`NumericWithin`, `GeoRadius`, `VectorSimilar`) are covered automatically
-    /// because `evaluate` is the sole match authority.
+    /// the property under test, not scoring.
+    ///
+    /// For rules with `max_edges: Some(k)`, applies per-source top-k semantics:
+    /// each source gets only the top-k matching destinations ordered by
+    /// (score DESC, dst_key ASC). For rules with `max_edges: None`, all matching
+    /// pairs are included (global-budget not modelled in oracle — oracle assumes
+    /// budget is never hit for None rules).
     pub fn all_edges(&self) -> BTreeSet<(String, String, String)> {
         let mut out = self.edges.clone();
         for rule in &self.rules {
-            for (src_key, src_props) in &self.nodes {
+            for src_key in &self.node_order {
                 let src_label = self.labels.get(src_key).map_or("", |l| l.as_str());
                 if src_label != rule.src_label {
                     continue;
                 }
-                for (dst_key, dst_props) in &self.nodes {
-                    if src_key == dst_key {
-                        continue; // skip self-pairs
+                let src_props = match self.nodes.get(src_key) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                if let Some(k) = rule.max_edges {
+                    // Top-k per-source: filter to best-k dsts.
+                    let top_k = self.top_k_dsts_for_src(rule, k, src_key);
+                    for dst_key in top_k {
+                        out.insert((rule.edge_type.clone(), src_key.clone(), dst_key));
                     }
-                    let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
-                    if dst_label != rule.dst_label {
-                        continue;
-                    }
-                    let sp = |f: &str| src_props.get(f).cloned();
-                    let dp = |f: &str| dst_props.get(f).cloned();
-                    let src_view = NodeView {
-                        key: src_key,
-                        props: &sp,
-                    };
-                    let dst_view = NodeView {
-                        key: dst_key,
-                        props: &dp,
-                    };
-                    if evaluate(&rule.predicate, &src_view, &dst_view).is_some() {
-                        out.insert((rule.edge_type.clone(), src_key.clone(), dst_key.clone()));
+                } else {
+                    // No cap: include all matching dsts.
+                    for (dst_key, dst_props) in &self.nodes {
+                        if src_key == dst_key {
+                            continue; // skip self-pairs
+                        }
+                        let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
+                        if dst_label != rule.dst_label {
+                            continue;
+                        }
+                        let sp = |f: &str| src_props.get(f).cloned();
+                        let dp = |f: &str| dst_props.get(f).cloned();
+                        let src_view = NodeView {
+                            key: src_key,
+                            props: &sp,
+                        };
+                        let dst_view = NodeView {
+                            key: dst_key,
+                            props: &dp,
+                        };
+                        if evaluate(&rule.predicate, &src_view, &dst_view).is_some() {
+                            out.insert((
+                                rule.edge_type.clone(),
+                                src_key.clone(),
+                                dst_key.clone(),
+                            ));
+                        }
                     }
                 }
             }
@@ -244,6 +314,10 @@ impl Oracle {
 
     /// Returns true if (etype, src_key, dst_key) would be derived by any live rule
     /// given current node props and labels.
+    ///
+    /// For top-k rules (`max_edges: Some(k)`), returns true only if `dst_key` is
+    /// within the top-k for `src_key` (score DESC, key ASC tiebreak). A pair that
+    /// matches the predicate but is outside the top-k is NOT derived.
     pub fn is_derived_edge(&self, etype: &str, src_key: &str, dst_key: &str) -> bool {
         if src_key == dst_key {
             return false;
@@ -276,8 +350,17 @@ impl Oracle {
                 key: dst_key,
                 props: &dp,
             };
-            if evaluate(&rule.predicate, &src_view, &dst_view).is_some() {
-                return true;
+            if evaluate(&rule.predicate, &src_view, &dst_view).is_none() {
+                continue; // predicate doesn't match at all
+            }
+            if let Some(k) = rule.max_edges {
+                // Top-k: check if dst_key is within the top-k for src_key.
+                let top_k = self.top_k_dsts_for_src(rule, k, src_key);
+                if top_k.contains(dst_key) {
+                    return true;
+                }
+            } else {
+                return true; // no cap, any match counts
             }
         }
         false

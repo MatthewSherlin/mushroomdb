@@ -733,3 +733,161 @@ fn v4_weight_prop_round_trip() {
         "expected at least one weighted derived edge between a and b"
     );
 }
+
+// ---------------------------------------------------------------------------
+// V4 round-trip: top-k per-source rule
+// ---------------------------------------------------------------------------
+
+/// V4 round-trip test for top-k rules.
+///
+/// Brief requirement: "snapshot mid-stream with a top-k rule, reopen, more ops,
+/// compare to never-closed reference — eviction state must survive persistence."
+///
+/// Top-k rules do NOT persist candidate ordering — it is recomputed on demand
+/// from the live candidate index (same as the by_node reverse index).  The
+/// materialized top-k provenance IS persisted in the V4 snapshot (it is part
+/// of the normal provenance map), so this test verifies that:
+///   1. The provenance (materialized top-k edges) survives snapshot → reopen.
+///   2. Incremental ops after reopen continue to maintain the correct top-k.
+///   3. The edge set after reopen + more ops equals a never-closed reference db
+///      that received the same complete op sequence.
+///
+/// No VERSION bump is needed: candidate ordering is ephemeral (rebuilt on demand);
+/// only provenance is persisted, which was already handled by the V4 format.
+#[test]
+fn v4_round_trip_topk_rule() {
+    // Phase 1: build db with a top-k rule (k=2), insert some nodes, snapshot.
+    let dir = tmp("snap-v4-topk");
+    let ref_dir = tmp("snap-v4-topk-ref");
+
+    // NumericWithin k=2: each src gets at most the 2 closest dsts by score.
+    let rule = RuleDef {
+        name: "near2".into(),
+        src_label: "N".into(),
+        dst_label: "N".into(),
+        predicate: Predicate::NumericWithin {
+            field: "year".into(),
+            tolerance: 10.0,
+        },
+        edge_type: "NEAR2".into(),
+        weight_prop: Some("score".into()),
+        max_edges: Some(2),
+        approximate: false,
+    };
+
+    // Build the reference db — never snapshot; receives all ops.
+    let mut ref_db = GraphDb::open(&ref_dir).unwrap();
+    ref_db.create_rule(rule.clone()).unwrap();
+
+    // Phase 1 ops: 5 nodes at years 0, 1, 2, 5, 9.
+    let phase1_nodes = [
+        ("n0", 0.0f64),
+        ("n1", 1.0),
+        ("n2", 2.0),
+        ("n5", 5.0),
+        ("n9", 9.0),
+    ];
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.create_rule(rule.clone()).unwrap();
+
+        for (key, year) in phase1_nodes {
+            let props = vec![("year".into(), Value::Float(year))];
+            db.insert_node("N", key, props.clone()).unwrap();
+            ref_db.insert_node("N", key, props).unwrap();
+        }
+
+        // Verify top-k is correct before snapshot.
+        // n0 at year=0: closest are n1 (|Δ|=1, score=0.9) and n2 (|Δ|=2, score=0.8).
+        let n0_out: Vec<String> = db.neighbors("n0", "NEAR2", Direction::Out).unwrap_or_default();
+        assert!(n0_out.contains(&"n1".to_string()), "n0 top-2 should include n1");
+        assert!(n0_out.contains(&"n2".to_string()), "n0 top-2 should include n2");
+        assert_eq!(n0_out.len(), 2, "n0 should have exactly 2 derived edges (k=2)");
+
+        // Snapshot mid-stream.
+        db.snapshot().unwrap();
+
+        // Phase 1b post-snapshot WAL write: year=25.0 is out of tolerance=10
+        // for all phase-1 nodes (max year=9), so this does not evict any
+        // existing top-k edge — tests that provenance survives unchanged.
+        let props = vec![("year".into(), Value::Float(25.0))];
+        db.insert_node("N", "nfar", props.clone()).unwrap();
+        ref_db.insert_node("N", "nfar", props).unwrap();
+    }
+
+    // Reopen from snapshot + WAL.
+    let mut snap_db = GraphDb::open(&dir).unwrap();
+
+    // Top-k edges for n0 must survive the reopen unchanged (nfar is out of
+    // tolerance so it did not evict n1 or n2).
+    let n0_out_after: Vec<String> = snap_db
+        .neighbors("n0", "NEAR2", Direction::Out)
+        .unwrap_or_default();
+    assert_eq!(n0_out_after.len(), 2, "n0 top-2 must survive round-trip");
+    assert!(
+        n0_out_after.contains(&"n1".to_string()),
+        "n0→n1 must survive round-trip"
+    );
+    assert!(
+        n0_out_after.contains(&"n2".to_string()),
+        "n0→n2 must survive round-trip (nfar is out of tolerance)"
+    );
+
+    // Phase 2 ops: add nodes that will trigger evictions to prove incremental
+    // top-k works correctly after reopen.
+    // n05 at year=0.5 (score 0.95 for n0) evicts n2 (score 0.8) from n0's top-2.
+    let phase2_nodes = [("n05", 0.5f64), ("n06", 0.6)];
+    for (key, year) in phase2_nodes {
+        let props = vec![("year".into(), Value::Float(year))];
+        snap_db.insert_node("N", key, props.clone()).unwrap();
+        ref_db.insert_node("N", key, props).unwrap();
+    }
+
+    // Final comparison: snap_db edge set must equal ref_db edge set for NEAR2.
+    let all_keys = [
+        "n0", "n1", "n2", "n5", "n9", "nfar", "n05", "n06",
+    ];
+    for key in all_keys {
+        let snap_out: std::collections::BTreeSet<String> = snap_db
+            .neighbors(key, "NEAR2", Direction::Out)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let ref_out: std::collections::BTreeSet<String> = ref_db
+            .neighbors(key, "NEAR2", Direction::Out)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            snap_out, ref_out,
+            "NEAR2 out-neighbors of {key}: snap={snap_out:?} ref={ref_out:?}"
+        );
+        // Each node should have at most k=2 derived edges.
+        assert!(
+            snap_out.len() <= 2,
+            "top-k=2 violated: {key} has {} out-neighbors",
+            snap_out.len()
+        );
+    }
+
+    // Incremental firing still works: adding a new node triggers correct top-k.
+    snap_db
+        .insert_node("N", "n0b", vec![("year".into(), Value::Float(0.1))])
+        .unwrap();
+    let n0b_out: Vec<String> = snap_db
+        .neighbors("n0b", "NEAR2", Direction::Out)
+        .unwrap_or_default();
+    // n0b at year=0.1 has many close neighbours (n0, n05, n06, n1, n2…).
+    // Exact top-2 depends on score ordering; just verify the cap is enforced.
+    assert_eq!(n0b_out.len(), 2, "n0b top-2 should have exactly 2 out-edges after reopen");
+    // Most important: rule ownership is enforced after round-trip.
+    // n05 (year=0.5) and n06 (year=0.6) are extremely close (score≈0.99) —
+    // n05→n06 is guaranteed to be in n05's top-2 regardless of other candidates.
+    assert!(
+        matches!(
+            snap_db.insert_edge("NEAR2", "n05", "n06"),
+            Err(GraphError::RuleOwned { .. })
+        ),
+        "provenance must be retained after round-trip: insert of derived edge should be RuleOwned"
+    );
+}
