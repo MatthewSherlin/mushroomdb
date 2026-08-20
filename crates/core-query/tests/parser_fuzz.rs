@@ -90,6 +90,10 @@ fn render_tok(t: &Tok) -> String {
         Tok::Ge => ">=".into(),
         Tok::Dash => "-".into(),
         Tok::Star => "*".into(),
+        Tok::Create => "CREATE".into(),
+        Tok::Set => "SET".into(),
+        Tok::Delete => "DELETE".into(),
+        Tok::Merge => "MERGE".into(),
     }
 }
 

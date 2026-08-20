@@ -680,6 +680,71 @@ fn recovery_byte_sweep_rules() {
     }
 }
 
+/// Byte-offset crash sweep for Cypher write statements.
+///
+/// Workload: CREATE two nodes via `query_write`, then SET a property via
+/// `query_write`.  At every crash point we verify the recovered state is
+/// internally consistent: if a node exists its `id` prop must be present and
+/// any SET that landed must be durable.  Confirms that Cypher writes flow
+/// through the WAL with the same durability guarantee as direct API mutations.
+#[test]
+fn cypher_write_dst_byte_sweep() {
+    fn no_params() -> BTreeMap<String, Value> {
+        BTreeMap::new()
+    }
+
+    fn cypher_workload<F: core_storage::fs::Fs>(
+        db: &mut GraphDb<F>,
+    ) -> core_api::Result<()> {
+        db.query_write("CREATE (a:Person {id: 'dst_alice'})", &no_params())?;
+        db.query_write("CREATE (b:Person {id: 'dst_bob'})", &no_params())?;
+        db.query_write(
+            "MATCH (p:Person {id: 'dst_alice'}) SET p.score = 42",
+            &no_params(),
+        )?;
+        Ok(())
+    }
+
+    let total_bytes = {
+        let mut db = GraphDb::open_with(sim_harness::SimFs::new()).unwrap();
+        cypher_workload(&mut db).unwrap();
+        db.into_fs().total_appended()
+    };
+    assert!(total_bytes > 0, "Cypher workload must append bytes");
+
+    for crash_at in 0..=total_bytes {
+        let mut db =
+            GraphDb::open_with(sim_harness::SimFs::with_crash_after(crash_at)).unwrap();
+        let _ = cypher_workload(&mut db);
+        let survivor = db.into_fs().surviving_state();
+
+        let recovered = GraphDb::open_with(survivor).unwrap();
+
+        // If alice exists, her id prop must be present.
+        if recovered.has_node("dst_alice") {
+            assert!(
+                recovered.get_prop("dst_alice", "id").is_some(),
+                "crash_at={crash_at}: dst_alice exists but id prop missing"
+            );
+        }
+        // If bob exists, his id prop must be present.
+        if recovered.has_node("dst_bob") {
+            assert!(
+                recovered.get_prop("dst_bob", "id").is_some(),
+                "crash_at={crash_at}: dst_bob exists but id prop missing"
+            );
+        }
+        // If the SET landed, score must equal 42.
+        if let Some(score) = recovered.get_prop("dst_alice", "score") {
+            assert_eq!(
+                *score,
+                Value::Int(42),
+                "crash_at={crash_at}: dst_alice.score must be 42 when present"
+            );
+        }
+    }
+}
+
 /// Op-count sweep over `workload_with_rules`: injects crashes at every Fs call
 /// boundary (append/sync/read/write_atomic).  This covers crashes *at* the
 /// snapshot `write_atomic` and the WAL-truncation `write_atomic` — closing the

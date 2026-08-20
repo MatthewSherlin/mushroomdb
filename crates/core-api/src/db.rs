@@ -1,5 +1,7 @@
 use crate::ingest::{IngestOptions, IngestReport};
-use core_query::cypher::{execute, lex, parse, plan, Params};
+use core_query::cypher::{
+    execute, lex, parse, parse_write, plan, Params, Query, RetItem, RetVal, WriteStatement,
+};
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{evaluate, GraphMut, NodeView, Predicate, RuleDef, RuleEngine, RuleIvfExport};
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
@@ -302,6 +304,15 @@ pub struct Explanation {
     pub dst_key: String,
     pub weight: Option<f64>,
     pub predicate: PredicateSummary,
+}
+
+/// Construct the standard write-query result set (columns: created, properties_set, deleted).
+fn write_result_set() -> ResultSet {
+    ResultSet::new(vec![
+        "created".into(),
+        "properties_set".into(),
+        "deleted".into(),
+    ])
 }
 
 /// Single construction point for a `GraphMut` view over the split-borrowed graph fields.
@@ -1141,6 +1152,317 @@ impl<F: Fs> GraphDb<F> {
         execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
             detail: format!("execute: {e}"),
         })
+    }
+
+    /// Execute a Cypher write statement (CREATE / MATCH…SET / MATCH…DELETE / MERGE).
+    ///
+    /// All mutations flow through the same `insert_node` / `set_prop` /
+    /// `delete_edge` / `insert_edge` path as the Rust API so the rule engine
+    /// fires and the WAL captures everything with one fsync per statement.
+    ///
+    /// Returns a one-row [`ResultSet`] with columns `created`, `properties_set`,
+    /// and `deleted` matching the write-result contract.
+    ///
+    /// **Mutation routing**: mutations are collected into a single
+    /// [`BatchBuilder`] and committed atomically (one WAL `Batch` frame, one
+    /// fsync). The MATCH phase for SET/DELETE uses a read-only `execute` call
+    /// over `self.view()` — the borrow is dropped before the batch is opened.
+    ///
+    /// **Limitations (v1)**:
+    /// - SET RHS must be a literal; expression RHS → named error.
+    /// - Combined read-write (`MATCH…SET…RETURN`) → named error.
+    /// - Node DELETE / DETACH DELETE → named error (no node deletes via Cypher).
+    /// - MERGE with ON CREATE/ON MATCH → named error.
+    /// - Deleting a derived edge → named error "cannot delete derived edge".
+    pub fn query_write(
+        &mut self,
+        cypher: &str,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
+            detail: format!("lex: {e}"),
+        })?;
+        let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
+            detail: format!("parse: {e}"),
+        })?;
+        self.exec_write_stmt(stmt, params)
+    }
+
+    fn exec_write_stmt(
+        &mut self,
+        stmt: WriteStatement,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        match stmt {
+            WriteStatement::Create(s) => self.exec_create(s),
+            WriteStatement::MatchSet(s) => self.exec_match_set(s, params),
+            WriteStatement::MatchDelete(s) => self.exec_match_delete(s, params),
+            WriteStatement::Merge(s) => self.exec_merge(s),
+        }
+    }
+
+    fn exec_create(
+        &mut self,
+        stmt: core_query::cypher::CreateStmt,
+    ) -> Result<ResultSet> {
+        // Extract the node key from props: require a string-valued `id` field.
+        let mut var_to_key: BTreeMap<String, String> = BTreeMap::new();
+        for node in &stmt.nodes {
+            let var = node.var.as_deref().unwrap_or("_cn0");
+            let key = node
+                .props
+                .iter()
+                .find(|(f, _)| f == "id")
+                .and_then(|(_, v)| {
+                    if let Value::Str(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| GraphError::QueryError {
+                    detail: format!(
+                        "CREATE node ({}:{}) requires a string 'id' property",
+                        var, node.label
+                    ),
+                })?;
+            var_to_key.insert(var.to_string(), key);
+        }
+
+        let mut batch = self.batch();
+        let mut created: usize = 0;
+        for node in &stmt.nodes {
+            let var = node.var.as_deref().unwrap_or("_cn0");
+            let key = &var_to_key[var];
+            batch.insert_node(&node.label, key, node.props.clone());
+            created += 1;
+        }
+        for edge in &stmt.edges {
+            let src_key = var_to_key.get(&edge.src_var).ok_or_else(|| {
+                GraphError::QueryError {
+                    detail: format!(
+                        "CREATE edge src variable '{}' is not bound",
+                        edge.src_var
+                    ),
+                }
+            })?;
+            let dst_key = var_to_key.get(&edge.dst_var).ok_or_else(|| {
+                GraphError::QueryError {
+                    detail: format!(
+                        "CREATE edge dst variable '{}' is not bound",
+                        edge.dst_var
+                    ),
+                }
+            })?;
+            batch.insert_edge(&edge.etype, src_key, dst_key);
+        }
+        batch.commit()?;
+
+        let mut rs = write_result_set();
+        rs.push_row(vec![
+            Some(Value::Int(created as i64)),
+            Some(Value::Int(0)),
+            Some(Value::Int(0)),
+        ]);
+        Ok(rs)
+    }
+
+    fn exec_match_set(
+        &mut self,
+        stmt: core_query::cypher::MatchSetStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        // Collect unique node vars targeted by SET clauses.
+        let mut set_vars: Vec<String> = Vec::new();
+        for s in &stmt.sets {
+            if !set_vars.contains(&s.var) {
+                set_vars.push(s.var.clone());
+            }
+        }
+
+        // Synthesize a read query: MATCH … WHERE … RETURN <set_vars>
+        let returns: Vec<RetItem> = set_vars
+            .iter()
+            .map(|v| RetItem {
+                value: RetVal::Var(v.clone()),
+                alias: None,
+            })
+            .collect();
+        let read_q = Query {
+            matches: stmt.matches,
+            where_expr: stmt.where_expr,
+            returns,
+            order_by: vec![],
+            skip: None,
+            limit: None,
+        };
+        let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        // MATCH phase is read-only; borrow ends before batch opens.
+        let match_rs = execute(&self.view(), &ops, &Params(params))
+            .map_err(|e| GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            })?;
+
+        // Collect (key, field, value) for each matched row × each SET clause.
+        let mut set_ops: Vec<(String, String, Value)> = Vec::new();
+        for row_i in 0..match_rs.len() {
+            for sc in &stmt.sets {
+                let key = match match_rs.get(row_i, &sc.var) {
+                    Some(Value::Str(k)) => k.clone(),
+                    _ => {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "SET variable '{}' did not resolve to a node key",
+                                sc.var
+                            ),
+                        })
+                    }
+                };
+                set_ops.push((key, sc.field.clone(), sc.value.clone()));
+            }
+        }
+
+        // Apply as one atomic batch.
+        let props_set = set_ops.len();
+        let mut batch = self.batch();
+        for (key, field, value) in set_ops {
+            batch.set_prop(&key, &field, value);
+        }
+        batch.commit()?;
+
+        let mut rs = write_result_set();
+        rs.push_row(vec![
+            Some(Value::Int(0)),
+            Some(Value::Int(props_set as i64)),
+            Some(Value::Int(0)),
+        ]);
+        Ok(rs)
+    }
+
+    fn exec_match_delete(
+        &mut self,
+        stmt: core_query::cypher::MatchDeleteStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        // Collect unique node vars needed to identify edge endpoints.
+        let mut node_vars: Vec<String> = Vec::new();
+        for ed in &stmt.deletes {
+            if !node_vars.contains(&ed.src_var) {
+                node_vars.push(ed.src_var.clone());
+            }
+            if !node_vars.contains(&ed.dst_var) {
+                node_vars.push(ed.dst_var.clone());
+            }
+        }
+
+        // Synthesize read query.
+        let returns: Vec<RetItem> = node_vars
+            .iter()
+            .map(|v| RetItem {
+                value: RetVal::Var(v.clone()),
+                alias: None,
+            })
+            .collect();
+        let read_q = Query {
+            matches: stmt.matches,
+            where_expr: stmt.where_expr,
+            returns,
+            order_by: vec![],
+            skip: None,
+            limit: None,
+        };
+        let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        let match_rs = execute(&self.view(), &ops, &Params(params))
+            .map_err(|e| GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            })?;
+
+        // Collect (etype, src_key, dst_key) for each row × each delete target.
+        let mut del_ops: Vec<(String, String, String)> = Vec::new();
+        for row_i in 0..match_rs.len() {
+            for ed in &stmt.deletes {
+                let src_key = match match_rs.get(row_i, &ed.src_var) {
+                    Some(Value::Str(k)) => k.clone(),
+                    _ => {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "DELETE src variable '{}' did not resolve to a node key",
+                                ed.src_var
+                            ),
+                        })
+                    }
+                };
+                let dst_key = match match_rs.get(row_i, &ed.dst_var) {
+                    Some(Value::Str(k)) => k.clone(),
+                    _ => {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "DELETE dst variable '{}' did not resolve to a node key",
+                                ed.dst_var
+                            ),
+                        })
+                    }
+                };
+                del_ops.push((ed.etype.clone(), src_key, dst_key));
+            }
+        }
+
+        // Apply as one atomic batch.
+        let deleted = del_ops.len();
+        let mut batch = self.batch();
+        for (etype, src_key, dst_key) in del_ops {
+            batch.delete_edge(&etype, &src_key, &dst_key);
+        }
+        batch.commit().map_err(|e| match e {
+            GraphError::RuleOwned { .. } => GraphError::QueryError {
+                detail:
+                    "cannot delete derived edge; retract via the rule or change the property"
+                        .to_string(),
+            },
+            other => other,
+        })?;
+
+        let mut rs = write_result_set();
+        rs.push_row(vec![
+            Some(Value::Int(0)),
+            Some(Value::Int(0)),
+            Some(Value::Int(deleted as i64)),
+        ]);
+        Ok(rs)
+    }
+
+    fn exec_merge(&mut self, stmt: core_query::cypher::MergeStmt) -> Result<ResultSet> {
+        // MERGE: check if a node with the given key already exists.
+        let key = match &stmt.key_value {
+            Value::Str(s) => s.clone(),
+            _ => {
+                return Err(GraphError::QueryError {
+                    detail: format!(
+                        "MERGE key value must be a string (got {:?})",
+                        stmt.key_value
+                    ),
+                })
+            }
+        };
+
+        let mut created = 0i64;
+        if !self.has_node(&key) {
+            let props = vec![(stmt.key_field.clone(), stmt.key_value.clone())];
+            self.insert_node(&stmt.label, &key, props)?;
+            created = 1;
+        }
+
+        let mut rs = write_result_set();
+        rs.push_row(vec![
+            Some(Value::Int(created)),
+            Some(Value::Int(0)),
+            Some(Value::Int(0)),
+        ]);
+        Ok(rs)
     }
 
     /// Return all rule-owned edges between `key_a` and `key_b` (either direction),

@@ -242,8 +242,9 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Approximate vector mode is opt-in | `approximate: true` enables IVF-Flat candidate selection. Per-query recall ≥ 0.90 quiesced; ≥ 0.85 post-rebuild. Review the recall trade-off before using it in completeness-critical workloads. |
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is on the roadmap. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
-| No node or edge deletes | Not implemented. Nodes can be tombstoned but not removed; derived edges are retracted on property change. |
-| No multi-statement transactions | Single-write commits only. |
+| No node deletes via Cypher | Node DELETE / DETACH DELETE returns a named error. Nodes can be deleted via the Rust API (`delete_node`). |
+| Cypher write subset v1 | CREATE, MATCH…SET, MATCH…DELETE (manual edges only), and MERGE (single-key match-or-create) are supported. SET RHS must be a literal; combined MATCH…SET…RETURN is rejected; multi-statement transactions are not supported. All writes share one WAL frame (one fsync). |
+| No multi-statement transactions | Single write statement per query in v1. Multi-statement and BEGIN/COMMIT are not supported. |
 | Cypher aggregations | `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` are supported both as single aggregates and as grouped aggregates (`RETURN a, COUNT(*)`). Multiple group keys and multiple aggregates per query are allowed. Group count is capped at 1,000,000 distinct keys. |
 | Variable-length paths: max hops capped at 10 | `-[r:TYPE*min..max]->` and `shortestPath` are supported. Max hops is hard-capped at 10; unbounded forms (`*min..`) are rejected at parse time. Intermediate results are capped at 1,000,000 rows. See [`docs/site/query.md`](docs/site/query.md). |
 

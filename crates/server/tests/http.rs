@@ -886,6 +886,51 @@ fn wire_types_serialize() {
     );
 }
 
+/// Cypher CREATE over HTTP uses the write lock, WAL is fsynced before the
+/// response is sent, and the created node survives a DB re-open.
+#[tokio::test]
+async fn cypher_write_over_http_is_durable() {
+    let dir = tmp("cypher-write-http");
+    let db = SharedDb::open(&dir).unwrap();
+    let app = router(db.clone());
+
+    // CREATE via POST /query?format=json
+    let (status, body, ctype) = send(
+        app.clone(),
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": "CREATE (n:Person {id: 'alice'})"}),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "write must succeed");
+    assert_eq!(ctype.as_deref(), Some("application/json"));
+    let v = parse_json(&body);
+    assert_eq!(v["columns"], json!(["created", "properties_set", "deleted"]));
+    let rows = v["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], json!(1), "created=1");
+    assert_eq!(rows[0][1], json!(0), "properties_set=0");
+    assert_eq!(rows[0][2], json!(0), "deleted=0");
+
+    // Read back via the same SharedDb handle to confirm node is live.
+    assert!(
+        db.read().has_node("alice"),
+        "node must be queryable immediately"
+    );
+
+    // Drop the db + app, re-open from disk: WAL must have been fsynced.
+    drop(app);
+    drop(db);
+    let db2 = SharedDb::open(&dir).unwrap();
+    assert!(
+        db2.read().has_node("alice"),
+        "node must survive DB re-open (WAL fsynced before HTTP response)"
+    );
+}
+
 #[cfg(feature = "embed-ui")]
 #[tokio::test]
 async fn embedded_ui_serves_index_and_stats_wins() {

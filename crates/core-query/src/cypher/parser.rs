@@ -1,8 +1,9 @@
 //! Recursive-descent parser for the Cypher subset. Never panics on any token sequence.
 
 use super::ast::{
-    AggArg, AggFunc, Expr, HopRange, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query,
-    RelDir, RelPat, RetItem, RetVal,
+    AggArg, AggFunc, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
+    MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand, OrderItem, OrderTarget, Pattern,
+    Query, RelDir, RelPat, RetItem, RetVal, SetClause, WriteStatement,
 };
 use super::Tok;
 use crate::filter::CmpOp;
@@ -19,6 +20,29 @@ pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
         pos: 0,
     };
     p.query()
+}
+
+/// Parse a tokenized write statement (CREATE / MATCH…SET / MATCH…DELETE / MERGE).
+/// Returns `Err` for read queries or malformed write statements.
+pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+    };
+    p.write_statement()
+}
+
+/// Return true if the token stream starts with a write keyword, or is a MATCH
+/// statement followed by SET or DELETE.  Used for fast server-side dispatch
+/// without a full parse.
+pub fn is_write_tokens(tokens: &[Tok]) -> bool {
+    match tokens.first() {
+        Some(Tok::Create) | Some(Tok::Merge) => true,
+        Some(Tok::Match) => tokens
+            .iter()
+            .any(|t| matches!(t, Tok::Set | Tok::Delete)),
+        _ => false,
+    }
 }
 
 struct Parser<'a> {
@@ -564,6 +588,367 @@ impl<'a> Parser<'a> {
             Some(Tok::Int(_)) => Err(self.err(&format!("{what} must be a non-negative integer"))),
             _ => Err(self.err(&format!("expected integer after {what}"))),
         }
+    }
+
+    // ── Write statement parsing ───────────────────────────────────────────────
+
+    fn write_statement(&mut self) -> Result<WriteStatement, String> {
+        match self.peek() {
+            Some(Tok::Create) => self.create_stmt(),
+            Some(Tok::Merge) => self.merge_stmt(),
+            Some(Tok::Match) => self.match_write_stmt(),
+            _ => Err(self.err(
+                "expected CREATE, MERGE, or MATCH … SET/DELETE (write statement required)",
+            )),
+        }
+    }
+
+    // ── CREATE ────────────────────────────────────────────────────────────────
+
+    fn create_stmt(&mut self) -> Result<WriteStatement, String> {
+        self.expect(&Tok::Create, "expected CREATE")?;
+        let stmt = self.create_pattern()?;
+        if self.pos < self.toks.len() {
+            return Err(self.err("unexpected tokens after CREATE pattern"));
+        }
+        Ok(WriteStatement::Create(stmt))
+    }
+
+    fn create_pattern(&mut self) -> Result<CreateStmt, String> {
+        // Parse the first (possibly only) node.
+        let first = self.create_node(0)?;
+        let first_var = first
+            .var
+            .clone()
+            .unwrap_or_else(|| format!("_cn{}", 0));
+        let mut nodes: Vec<CreateNode> = vec![first];
+        let mut edges: Vec<CreateEdge> = Vec::new();
+
+        // Chain: (-[:T]-> | <-[:T]-) followed by another node.
+        while matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
+            let (etype, src_is_left) = self.create_rel()?;
+            let idx = nodes.len();
+            let next = self.create_node(idx)?;
+            let next_var = next
+                .var
+                .clone()
+                .unwrap_or_else(|| format!("_cn{idx}"));
+            let prev_var = nodes.last().unwrap().var.clone().unwrap_or_else(|| {
+                if nodes.len() == 1 {
+                    first_var.clone()
+                } else {
+                    format!("_cn{}", nodes.len() - 1)
+                }
+            });
+            let (src_var, dst_var) = if src_is_left {
+                // <-[:T]- means next→prev i.e. next is src
+                (next_var.clone(), prev_var)
+            } else {
+                // -[:T]-> means prev→next
+                (prev_var, next_var.clone())
+            };
+            edges.push(CreateEdge {
+                src_var,
+                etype,
+                dst_var,
+            });
+            nodes.push(next);
+        }
+        Ok(CreateStmt { nodes, edges })
+    }
+
+    fn create_node(&mut self, idx: usize) -> Result<CreateNode, String> {
+        self.expect(&Tok::LParen, "expected '(' in CREATE node pattern")?;
+        let var = match self.peek() {
+            Some(Tok::Ident(s)) => {
+                let s = s.clone();
+                self.pos += 1;
+                Some(s)
+            }
+            _ => None,
+        };
+        if !self.eat(&Tok::Colon) {
+            return Err(self.err("CREATE node requires a label (e.g., (n:Label {…}))"));
+        }
+        let label = self.ident("expected label identifier after ':'")?;
+        let props = if self.peek() == Some(&Tok::LBrace) {
+            self.literal_props()?
+        } else {
+            Vec::new()
+        };
+        self.expect(&Tok::RParen, "expected ')' to close CREATE node pattern")?;
+        let var = Some(var.unwrap_or_else(|| format!("_cn{idx}")));
+        Ok(CreateNode { var, label, props })
+    }
+
+    /// Parse `{key: literal, …}` where all values must be literals (no params, no props).
+    fn literal_props(&mut self) -> Result<Vec<(String, Value)>, String> {
+        self.expect(&Tok::LBrace, "expected '{'")?;
+        let mut out = Vec::new();
+        if self.eat(&Tok::RBrace) {
+            return Ok(out);
+        }
+        loop {
+            let key = self.ident("expected property key")?;
+            self.expect(&Tok::Colon, "expected ':' after property key")?;
+            let val = self.literal_value("property value")?;
+            out.push((key, val));
+            if self.eat(&Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Tok::RBrace, "expected '}' to close property map")?;
+        Ok(out)
+    }
+
+    /// Parse a literal value (int, float, or string). Parameters and property
+    /// references are not accepted in write statements (v1 limitation).
+    fn literal_value(&mut self, what: &str) -> Result<Value, String> {
+        if self.eat(&Tok::Dash) {
+            return match self.peek() {
+                Some(Tok::Int(n)) => {
+                    let n = *n;
+                    self.pos += 1;
+                    Ok(Value::Int(-n))
+                }
+                Some(Tok::Float(x)) => {
+                    let x = *x;
+                    self.pos += 1;
+                    Ok(Value::Float(-x))
+                }
+                _ => Err(self.err("unary minus only applies to numeric literals")),
+            };
+        }
+        match self.peek() {
+            Some(Tok::Int(n)) => {
+                let n = *n;
+                self.pos += 1;
+                Ok(Value::Int(n))
+            }
+            Some(Tok::Float(x)) => {
+                let x = *x;
+                self.pos += 1;
+                Ok(Value::Float(x))
+            }
+            Some(Tok::Str(s)) => {
+                let s = s.clone();
+                self.pos += 1;
+                Ok(Value::Str(s))
+            }
+            Some(Tok::Param(_)) => Err(self.err(&format!(
+                "parameter references are not supported in {what} (v1 limitation: use literals only)"
+            ))),
+            Some(Tok::Ident(_)) => Err(self.err(&format!(
+                "expression RHS not supported in {what} (v1 limitation: use literals only)"
+            ))),
+            _ => Err(self.err(&format!("expected literal value for {what}"))),
+        }
+    }
+
+    /// Parse `-[:TYPE]->` or `<-[:TYPE]-`.  Returns `(etype, src_is_left)` where
+    /// `src_is_left = true` means left node is dst (i.e., next node is src).
+    fn create_rel(&mut self) -> Result<(String, bool), String> {
+        if self.eat(&Tok::Lt) {
+            // <-[:TYPE]-
+            self.expect(&Tok::Dash, "expected '-' after '<' in relationship")?;
+            self.expect(&Tok::LBracket, "expected '[' in relationship pattern")?;
+            self.expect(&Tok::Colon, "expected ':TYPE' in CREATE relationship")?;
+            let etype = self.ident("expected relationship type")?;
+            self.expect(&Tok::RBracket, "expected ']'")?;
+            self.expect(&Tok::Dash, "expected '-'")?;
+            return Ok((etype, true));
+        }
+        // -[:TYPE]->
+        self.expect(&Tok::Dash, "expected '-' to start relationship")?;
+        self.expect(&Tok::LBracket, "expected '[' in relationship pattern")?;
+        self.expect(&Tok::Colon, "expected ':TYPE' in CREATE relationship")?;
+        let etype = self.ident("expected relationship type")?;
+        self.expect(&Tok::RBracket, "expected ']'")?;
+        self.expect(&Tok::Dash, "expected '-'")?;
+        self.expect(&Tok::Gt, "expected '>' — CREATE requires directed relationships")?;
+        Ok((etype, false))
+    }
+
+    // ── MERGE ─────────────────────────────────────────────────────────────────
+
+    fn merge_stmt(&mut self) -> Result<WriteStatement, String> {
+        self.expect(&Tok::Merge, "expected MERGE")?;
+        self.expect(&Tok::LParen, "expected '(' after MERGE")?;
+        // Optional var
+        let _var = match self.peek() {
+            Some(Tok::Ident(_)) => {
+                self.pos += 1; // consume var name (not used)
+                None::<String>
+            }
+            _ => None,
+        };
+        if !self.eat(&Tok::Colon) {
+            return Err(self.err("MERGE requires a label (e.g., MERGE (n:Label {key: 'x'}))"));
+        }
+        let label = self.ident("expected label identifier after ':'")?;
+        if self.peek() != Some(&Tok::LBrace) {
+            return Err(self.err(
+                "MERGE requires a property map with exactly one key (e.g., MERGE (n:Label {id: 'x'}))",
+            ));
+        }
+        let mut props = self.literal_props()?;
+        if props.len() != 1 {
+            return Err(format!(
+                "MERGE supports exactly one key property (got {}); use CREATE for multi-prop nodes",
+                props.len()
+            ));
+        }
+        self.expect(&Tok::RParen, "expected ')' to close MERGE pattern")?;
+        // ON CREATE / ON MATCH: not supported
+        if matches!(self.peek(), Some(Tok::Ident(_))) {
+            let s = match self.peek() {
+                Some(Tok::Ident(s)) => s.to_ascii_lowercase(),
+                _ => String::new(),
+            };
+            if s == "on" {
+                return Err(
+                    "ON CREATE SET / ON MATCH SET are not supported in MERGE (v1 limitation)"
+                        .to_string(),
+                );
+            }
+        }
+        if self.pos < self.toks.len() {
+            return Err(self.err("unexpected tokens after MERGE pattern"));
+        }
+        let (key_field, key_value) = props.remove(0);
+        Ok(WriteStatement::Merge(MergeStmt {
+            label,
+            key_field,
+            key_value,
+        }))
+    }
+
+    // ── MATCH … SET / MATCH … DELETE ─────────────────────────────────────────
+
+    fn match_write_stmt(&mut self) -> Result<WriteStatement, String> {
+        // Parse MATCH clauses (same as read query).
+        let mut matches = Vec::new();
+        while self.peek() == Some(&Tok::Match) {
+            matches.push(self.match_clause()?);
+        }
+        if matches.is_empty() {
+            return Err(self.err("expected MATCH"));
+        }
+        // Optional WHERE.
+        let where_expr = if self.eat(&Tok::Where) {
+            Some(self.expr(0)?)
+        } else {
+            None
+        };
+        // Dispatch on SET or DELETE.
+        match self.peek() {
+            Some(Tok::Set) => {
+                self.pos += 1; // consume SET
+                let sets = self.set_clauses()?;
+                if self.pos < self.toks.len() {
+                    return Err(self.err("unexpected tokens after SET; combined read-write (MATCH…SET…RETURN) is not supported in v1"));
+                }
+                Ok(WriteStatement::MatchSet(MatchSetStmt {
+                    matches,
+                    where_expr,
+                    sets,
+                }))
+            }
+            Some(Tok::Delete) => {
+                self.pos += 1; // consume DELETE
+                let deletes = self.delete_targets(&matches)?;
+                if self.pos < self.toks.len() {
+                    return Err(self.err("unexpected tokens after DELETE"));
+                }
+                Ok(WriteStatement::MatchDelete(MatchDeleteStmt {
+                    matches,
+                    where_expr,
+                    deletes,
+                }))
+            }
+            _ => Err(self.err(
+                "expected SET or DELETE after MATCH [WHERE]; \
+                 combined MATCH…RETURN is a read query, not a write statement",
+            )),
+        }
+    }
+
+    fn set_clauses(&mut self) -> Result<Vec<SetClause>, String> {
+        let mut sets = vec![self.set_clause()?];
+        while self.eat(&Tok::Comma) {
+            sets.push(self.set_clause()?);
+        }
+        Ok(sets)
+    }
+
+    fn set_clause(&mut self) -> Result<SetClause, String> {
+        let var = self.ident("expected variable in SET clause")?;
+        self.expect(&Tok::Dot, "expected '.' after variable in SET")?;
+        let field = self.ident("expected field name after '.'")?;
+        self.expect(&Tok::Eq, "expected '=' in SET clause")?;
+        let value = self.literal_value("SET RHS")?;
+        Ok(SetClause { var, field, value })
+    }
+
+    /// Parse DELETE targets: a comma-separated list of variable names.
+    /// Each variable must be a relationship variable found in the MATCH patterns.
+    fn delete_targets(&mut self, matches: &[Pattern]) -> Result<Vec<EdgeDelete>, String> {
+        let mut targets = Vec::new();
+        loop {
+            let var = self.ident("expected variable to DELETE")?;
+            // Resolve this var in the match patterns.
+            let edge_del = self.resolve_edge_var(&var, matches)?;
+            targets.push(edge_del);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(targets)
+    }
+
+    /// Find the rel-var `var` in `patterns` and return its etype, src node var,
+    /// and dst node var.  Returns Err if the var is not a rel var or has no type.
+    fn resolve_edge_var(&self, var: &str, patterns: &[Pattern]) -> Result<EdgeDelete, String> {
+        for pat in patterns {
+            let start_var = pat.start.var.as_deref().unwrap_or("_unknown");
+            let mut from_var = start_var;
+            for (rel, dest) in &pat.chain {
+                let to_var = dest.var.as_deref().unwrap_or("_unknown");
+                if rel.var.as_deref() == Some(var) {
+                    let etype = match &rel.etype {
+                        Some(t) => t.clone(),
+                        None => {
+                            return Err(format!(
+                                "DELETE `{var}`: relationship has no type; \
+                                 DELETE requires an explicit edge type (e.g., [r:TYPE])"
+                            ))
+                        }
+                    };
+                    let (src_var, dst_var) = match rel.dir {
+                        RelDir::Right => (from_var.to_string(), to_var.to_string()),
+                        RelDir::Left => (to_var.to_string(), from_var.to_string()),
+                        RelDir::Undirected => {
+                            return Err(format!(
+                                "DELETE `{var}`: undirected relationship DELETE is not supported; \
+                                 use a directed pattern (e.g., -[r:TYPE]->)"
+                            ))
+                        }
+                    };
+                    return Ok(EdgeDelete {
+                        rel_var: var.to_string(),
+                        etype,
+                        src_var,
+                        dst_var,
+                    });
+                }
+                from_var = to_var;
+            }
+        }
+        Err(format!(
+            "DELETE `{var}`: variable is not bound as a relationship in any MATCH pattern; \
+             only relationship variables can be deleted (DELETE edge vars, not node vars)"
+        ))
     }
 }
 

@@ -16,6 +16,11 @@ pub enum Tok {
     Not,
     Asc,
     Desc,
+    // write keywords
+    Create,
+    Set,
+    Delete,
+    Merge,
     Ident(String),
     Str(String),
     Int(i64),
@@ -231,6 +236,10 @@ fn keyword(word: &str) -> Option<Tok> {
         "not" => Tok::Not,
         "asc" => Tok::Asc,
         "desc" => Tok::Desc,
+        "create" => Tok::Create,
+        "set" => Tok::Set,
+        "delete" => Tok::Delete,
+        "merge" => Tok::Merge,
         _ => return None,
     })
 }

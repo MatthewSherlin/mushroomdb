@@ -20,7 +20,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use core_api::{json_to_rows, AutoFk, Dir, GraphError, IngestOptions, RuleDef, SharedDb};
+use core_api::{is_write_query, json_to_rows, AutoFk, Dir, GraphError, IngestOptions, RuleDef, SharedDb};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -269,7 +269,19 @@ async fn query(
     };
     let format = qs.get("format").map(String::as_str).unwrap_or("");
 
-    let rs = {
+    // Detect write statements at the token level to dispatch to the correct lock.
+    // Write statements (CREATE / MATCH…SET / MATCH…DELETE / MERGE) need the
+    // write lock so mutations flow through WAL + rule engine with fsync before
+    // the response is sent.  Read queries (MATCH … RETURN …) use the read lock.
+    let is_write = match is_write_query(&cypher) {
+        Ok(b) => b,
+        Err(e) => return err_response(e),
+    };
+
+    let rs = if is_write {
+        let mut g = state.db.write();
+        g.query_write(&cypher, &params)
+    } else {
         let g = state.db.read();
         g.query(&cypher, &params)
     };

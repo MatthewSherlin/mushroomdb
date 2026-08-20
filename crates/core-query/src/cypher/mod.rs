@@ -5,10 +5,11 @@ pub mod parser;
 pub mod plan;
 
 pub use ast::{
-    AggArg, AggFunc, Expr, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir,
-    RelPat, RetItem, RetVal,
+    AggArg, AggFunc, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, MatchDeleteStmt,
+    MatchSetStmt, MergeStmt, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir,
+    RelPat, RetItem, RetVal, SetClause, WriteStatement,
 };
 pub use exec::{execute, Params};
 pub use lexer::{lex, Tok};
-pub use parser::parse;
+pub use parser::{is_write_tokens, parse, parse_write};
 pub use plan::{plan, PlanOp};

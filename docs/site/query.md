@@ -181,12 +181,82 @@ LIMIT 5
 
 ---
 
+## Write statements
+
+mushroomdb supports a Cypher write subset.  Every write statement flows through
+the same mutation path as the Rust API — the rule engine fires incrementally and
+the WAL commits with a single fsync before the response is returned.
+
+Write results are always one row with three columns:
+
+| Column | Meaning |
+|---|---|
+| `created` | nodes inserted |
+| `properties_set` | individual `set_prop` calls applied |
+| `deleted` | edges deleted |
+
+### CREATE
+
+```cypher
+CREATE (n:Person {id: 'alice', score: 1})
+```
+
+- The `id` property is required and becomes the node key.
+- Multiple nodes may appear in one CREATE clause.
+- Edges between CREATE'd nodes are supported:
+  ```cypher
+  CREATE (a:Org {id: 'acme'}), (b:Person {id: 'bob'}), (a)-[:MEMBER]->(b)
+  ```
+
+### MATCH … SET
+
+```cypher
+MATCH (n:Person {id: 'alice'})
+SET n.score = 99
+```
+
+- SET RHS must be a literal (integer, float, string, boolean); expression RHS is
+  rejected with a named error in v1.
+- Multiple SET clauses in one statement are allowed.
+- Combined MATCH … SET … RETURN is not supported; use a separate MATCH … RETURN
+  query after the write.
+- When a SET touches a property that a rule evaluates, the rule engine
+  re-evaluates incrementally: derived edges appear or retract within the same
+  WAL frame.
+
+### MATCH … DELETE
+
+```cypher
+MATCH (a:Org)-[r:MEMBER]->(b:Person)
+DELETE r
+```
+
+- Only manual (user-inserted) edges may be deleted.
+- Attempting to delete a derived (rule-owned) edge returns:
+  `cannot delete derived edge; retract via the rule or change the property`
+- Node DELETE / DETACH DELETE is not supported.
+
+### MERGE
+
+```cypher
+MERGE (n:Person {id: 'alice'})
+```
+
+- Match-or-create by a single key property only.
+- ON CREATE SET / ON MATCH SET clauses are not supported.
+- Multi-property maps are not supported.
+
+---
+
 ## Limitations
 
 | Feature | Status |
 |---|---|
-| Write clauses (CREATE / SET / DELETE) | Not supported |
-| Multi-statement transactions | Not supported |
+| Multi-statement transactions | Not supported (one write statement per query in v1) |
+| Combined MATCH … SET … RETURN | Not supported; use two queries |
+| SET RHS expressions | Literals only in v1 |
+| Node DELETE / DETACH DELETE | Not supported |
+| MERGE ON CREATE / ON MATCH | Not supported |
 | Grouped aggregation | Supported (multiple keys and multiple aggregates allowed; group count capped at 1,000,000) |
 | Variable-length paths: max hops | Capped at 10 |
 | shortestPath with unbound endpoints | Rejected at planning time |
