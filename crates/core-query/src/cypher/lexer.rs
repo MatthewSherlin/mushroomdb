@@ -39,6 +39,8 @@ pub enum Tok {
     Dash, // BINDING: the lexer emits `Dash`, `Lt`, `Gt` as separate tokens and the
           // PARSER assembles rel-arrow shapes (`-[..]->`, `<-[..]-`, `-[..]-`);
           // `<=`, `>=`, `<>` are single tokens (Le, Ge, Ne).
+    /// `*` — used in `COUNT(*)`.
+    Star,
 }
 
 pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
@@ -57,6 +59,7 @@ pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
             ',' => toks.push(Tok::Comma),
             '.' => toks.push(Tok::Dot),
             '=' => toks.push(Tok::Eq),
+            '*' => toks.push(Tok::Star),
             '-' => toks.push(Tok::Dash),
             '<' => match chars.peek() {
                 Some((_, '=')) => {

@@ -163,10 +163,10 @@ and honesty notes: [`benchmarks/results/head-to-head-10k.md`](benchmarks/results
   Bulk ingest skips property serialization. Cypher scan-filter returns 0
   rows (`size_bucket` was not stored) — not semantically equivalent to the
   neo4j/mushroomdb results for those workloads.
-- ‡ mushroomdb returned 0 rows with error: _intermediate result exceeds
-  1,000,000 rows_. The two-hop query pattern triggers a cartesian
-  explosion before `LIMIT` applies. This is a known limitation — LIMIT
-  pushdown is on the roadmap.
+- ‡ Earlier: returned error _intermediate result exceeds 1,000,000 rows_.
+  Fixed by LIMIT pushdown (pull-based executor, no materialization).
+  Re-measured at 3.5k-node scale: 71 µs median. Full 10k re-measurement
+  pending (T5).
 
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
 two-rule backfill on 10k nodes completed in 20.7 s. Competitors have no
@@ -212,14 +212,14 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 
 | Limitation | Detail |
 |---|---|
-| Two-hop Cypher joins at scale | Intermediate results cap at 1,000,000 rows before `LIMIT` applies. Use the `neighborhood` traversal API for multi-hop lookups on dense graphs. LIMIT pushdown is on the roadmap. |
+| Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
 | Cold-start re-fires all rules | Derived edges are not persisted. Re-opening a rich-rule graph re-derives every edge from node data. At 100k nodes with two vector rules, expect ~8 minutes. Derived-edge persistence is roadmap item #1. |
 | Approximate vector mode is opt-in | `approximate: true` enables IVF-Flat candidate selection. Per-query recall ≥ 0.90 quiesced; ≥ 0.85 post-rebuild. Review the recall trade-off before using it in completeness-critical workloads. |
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is on the roadmap. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
 | No node or edge deletes | Not implemented. Nodes can be tombstoned but not removed; derived edges are retracted on property change. |
 | No multi-statement transactions | Single-write commits only. |
-| Cypher lacks COUNT and aggregations | `COUNT`, `SUM`, `AVG`, and other aggregation functions are not implemented. Use the traversal API or Python bindings for count queries. |
+| Cypher aggregations: no grouping | `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` on a single property are supported. Grouped aggregation (`RETURN a, COUNT(*)`) is not — the planner rejects it with a clear error. Multi-aggregate RETURN is also v1-limited. |
 
 ---
 
@@ -241,12 +241,11 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 | Priority | Item |
 |---|---|
 | High | Derived-edge persistence (snapshot includes derived edges; eliminates cold-start re-derivation) |
-| High | LIMIT pushdown in the Cypher join executor |
 | Medium | Lock-free epoch snapshot readers (replacing the `RwLock` facade) |
 | Medium | Node and edge deletes |
 | Medium | mmap-backed storage (RAM-independent at rest) |
 | Medium | Multi-statement transactions |
-| Medium | Expanded Cypher surface (`COUNT`, aggregations, variable-length paths) |
+| Medium | Expanded Cypher surface (grouped aggregations `RETURN a, COUNT(*)`, variable-length paths) |
 | Low | TypeScript bindings (napi-rs) |
 | Low | WASM playground |
 | Low | Time-travel queries |

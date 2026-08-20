@@ -1,7 +1,8 @@
 //! Recursive-descent parser for the Cypher subset. Never panics on any token sequence.
 
 use super::ast::{
-    Expr, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal,
+    AggArg, AggFunc, Expr, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir,
+    RelPat, RetItem, RetVal,
 };
 use super::Tok;
 use crate::filter::CmpOp;
@@ -339,6 +340,50 @@ impl<'a> Parser<'a> {
     }
 
     fn ret_item(&mut self) -> Result<RetItem, String> {
+        // Check for an aggregate function name (COUNT/SUM/AVG/MIN/MAX).
+        // These are ordinary identifiers in the lexer, so we peek and check
+        // the lowercased string before deciding the parse branch.
+        if let Some(Tok::Ident(s)) = self.peek() {
+            let func = match s.to_ascii_lowercase().as_str() {
+                "count" => Some(AggFunc::Count),
+                "sum" => Some(AggFunc::Sum),
+                "avg" => Some(AggFunc::Avg),
+                "min" => Some(AggFunc::Min),
+                "max" => Some(AggFunc::Max),
+                _ => None,
+            };
+            if let Some(func) = func {
+                self.pos += 1; // consume the function name
+                self.expect(
+                    &Tok::LParen,
+                    "expected '(' after aggregate function name",
+                )?;
+                let arg = if self.eat(&Tok::Star) {
+                    AggArg::Star
+                } else {
+                    let var = self.ident("expected variable or '*' in aggregate argument")?;
+                    if self.eat(&Tok::Dot) {
+                        let field =
+                            self.ident("expected field name after '.' in aggregate argument")?;
+                        AggArg::Prop { var, field }
+                    } else {
+                        AggArg::Var(var)
+                    }
+                };
+                self.expect(&Tok::RParen, "expected ')' to close aggregate function")?;
+                let alias = if self.eat(&Tok::As) {
+                    Some(self.ident("expected alias identifier after AS")?)
+                } else {
+                    None
+                };
+                return Ok(RetItem {
+                    value: RetVal::Agg { func, arg },
+                    alias,
+                });
+            }
+        }
+
+        // Normal (non-aggregate) RETURN item.
         let var = self.ident("expected variable in RETURN item")?;
         let value = if self.eat(&Tok::Dot) {
             let field = self.ident("expected field name after '.'")?;
@@ -817,6 +862,35 @@ LIMIT 10";
             vec![Tok::Param("p".into()), Tok::Colon, Tok::Comma],
             vec![Tok::LBracket, Tok::RBracket, Tok::LBrace, Tok::RBrace],
             lex("MATCH (a)-[x:]->(b) RETURN a ORDER BY a LIMIT 1 extra").unwrap(),
+            // Aggregate tokens: COUNT(*), SUM/AVG/MIN/MAX in various positions.
+            vec![Tok::Ident("COUNT".into()), Tok::LParen, Tok::Star, Tok::RParen],
+            vec![
+                Tok::Ident("sum".into()),
+                Tok::LParen,
+                Tok::Ident("n".into()),
+                Tok::Dot,
+                Tok::Ident("x".into()),
+                Tok::RParen,
+            ],
+            vec![Tok::Star],
+            vec![Tok::Star, Tok::LParen, Tok::RParen, Tok::Star],
+            vec![
+                Tok::Ident("avg".into()),
+                Tok::LParen,
+                Tok::Star,
+                Tok::RParen,
+            ],
+            vec![
+                Tok::Ident("min".into()),
+                Tok::LParen,
+                Tok::RParen,
+            ],
+            vec![
+                Tok::Ident("max".into()),
+                Tok::LParen,
+                Tok::Star,
+                Tok::RParen,
+            ],
         ];
         for toks in sequences {
             let result = std::panic::catch_unwind(|| parse(&toks));
@@ -829,6 +903,73 @@ LIMIT 10";
                 );
             }
         }
+    }
+
+    #[test]
+    fn aggregate_functions_parse_to_agg_retval() {
+        use crate::cypher::ast::{AggArg, AggFunc, RetVal};
+
+        // COUNT(*) → AggFunc::Count, AggArg::Star
+        let q = parse_src("MATCH (n) RETURN COUNT(*)").unwrap();
+        assert_eq!(q.returns.len(), 1);
+        assert_eq!(
+            q.returns[0].value,
+            RetVal::Agg {
+                func: AggFunc::Count,
+                arg: AggArg::Star,
+            }
+        );
+        assert_eq!(q.returns[0].alias, None);
+
+        // COUNT(n) → AggFunc::Count, AggArg::Var
+        let q = parse_src("MATCH (n) RETURN COUNT(n)").unwrap();
+        assert_eq!(
+            q.returns[0].value,
+            RetVal::Agg {
+                func: AggFunc::Count,
+                arg: AggArg::Var("n".into()),
+            }
+        );
+
+        // SUM(n.age) → AggFunc::Sum, AggArg::Prop
+        let q = parse_src("MATCH (n) RETURN SUM(n.age) AS total").unwrap();
+        assert_eq!(
+            q.returns[0].value,
+            RetVal::Agg {
+                func: AggFunc::Sum,
+                arg: AggArg::Prop {
+                    var: "n".into(),
+                    field: "age".into()
+                },
+            }
+        );
+        assert_eq!(q.returns[0].alias, Some("total".into()));
+
+        // AVG, MIN, MAX case-insensitive
+        let q = parse_src("MATCH (n) RETURN avg(n.score)").unwrap();
+        assert!(matches!(
+            q.returns[0].value,
+            RetVal::Agg {
+                func: AggFunc::Avg,
+                ..
+            }
+        ));
+        let q = parse_src("MATCH (n) RETURN Min(n.x)").unwrap();
+        assert!(matches!(
+            q.returns[0].value,
+            RetVal::Agg {
+                func: AggFunc::Min,
+                ..
+            }
+        ));
+        let q = parse_src("MATCH (n) RETURN MAX(n.x)").unwrap();
+        assert!(matches!(
+            q.returns[0].value,
+            RetVal::Agg {
+                func: AggFunc::Max,
+                ..
+            }
+        ));
     }
 
     #[test]

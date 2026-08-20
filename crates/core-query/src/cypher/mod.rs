@@ -5,7 +5,8 @@ pub mod parser;
 pub mod plan;
 
 pub use ast::{
-    Expr, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal,
+    AggArg, AggFunc, Expr, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir,
+    RelPat, RetItem, RetVal,
 };
 pub use exec::{execute, Params};
 pub use lexer::{lex, Tok};

@@ -13,6 +13,27 @@ pub struct Query {
     pub limit: Option<u64>,
 }
 
+/// Aggregate function in a RETURN clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// Argument to an aggregate function.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggArg {
+    /// `COUNT(*)` — every matched row counts regardless of binding.
+    Star,
+    /// `COUNT(var)` — counts rows where `var` is bound (non-null).
+    Var(String),
+    /// `SUM(var.field)`, `AVG(var.field)`, etc.
+    Prop { var: String, field: String },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
     pub start: NodePat,
@@ -59,11 +80,15 @@ pub enum Operand {
     Param(String),
 }
 
-/// RETURN item value: bare variable or `var.field`.
+/// RETURN item value: bare variable, `var.field`, or an aggregate call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetVal {
     Var(String),
     Prop { var: String, field: String },
+    /// Single aggregate function call. v1 supports only one aggregate per
+    /// query (no grouping). Grouped aggregation (`RETURN a, COUNT(*)`) is
+    /// rejected at planning time with a clear limitation error.
+    Agg { func: AggFunc, arg: AggArg },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -130,6 +130,31 @@ async fn query_format_json_matches_columns_and_rows() {
     assert_eq!(v["rows"], json!([["p1"]]));
 }
 
+/// Binding: COUNT(*) via ?format=json → {"columns":["COUNT(*)"],"rows":[[n]]}.
+#[tokio::test]
+async fn query_count_star_format_json_wire_shape() {
+    let (app, db) = open("query-count-star");
+    seed_person(&db, "p1");
+    seed_person(&db, "p2");
+    seed_person(&db, "p3");
+
+    let (status, body, ctype) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": "MATCH (p:Person) RETURN COUNT(*)"}),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ctype.as_deref(), Some("application/json"));
+    let v = parse_json(&body);
+    assert_eq!(v["columns"], json!(["COUNT(*)"]), "column name must be COUNT(*)");
+    assert_eq!(v["rows"], json!([[3]]), "three Person nodes must be counted");
+}
+
 /// Binding: bad Cypher is 400 {"error": detail} with a parse:-prefixed detail.
 #[tokio::test]
 async fn query_bad_cypher_is_400_with_parse_prefix() {

@@ -62,9 +62,24 @@ Add `?format=json` for a JSON response:
 operators), `RETURN` with optional `AS`, `ORDER BY`, `SKIP`, `LIMIT`.
 Relationship patterns `->`, `<-`, `-` with optional type and variable.
 
-**Known gap:** multi-hop joins that produce >1,000,000 intermediate rows
-return an error before `LIMIT` is applied. Use the neighborhood endpoint
-for multi-hop traversals on dense graphs.
+**Single aggregate functions** in `RETURN`:
+
+```json
+{"cypher": "MATCH (p:Person) RETURN COUNT(*)"}
+```
+```json
+{"columns": ["COUNT(*)"], "rows": [[42]]}
+```
+
+Supported: `COUNT(*)`, `COUNT(var)` (non-null bindings), `SUM(n.prop)`,
+`AVG(n.prop)`, `MIN(n.prop)`, `MAX(n.prop)`. Null/non-numeric property
+values are silently skipped for SUM/AVG/MIN/MAX. Grouped aggregation
+(`RETURN a, COUNT(*)`) returns a `plan:` error — use the traversal API
+or filter to a single aggregate.
+
+**Multi-hop LIMIT:** `MATCH (a)-[:T]->(b)-[:T]->(c) RETURN a, b, c LIMIT 100`
+runs with O(LIMIT) memory via the pull-based executor. Dense patterns
+without `LIMIT` still error at 1,000,000 intermediate rows.
 
 ---
 

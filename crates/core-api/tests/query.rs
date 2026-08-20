@@ -372,3 +372,65 @@ fn harness_industry_alignment_timing() {
     assert_eq!(times_us.len(), 20);
     assert!(min_us < 500_000, "query should complete in <500 ms");
 }
+
+/// Wire shape pin: aggregate functions produce the expected column name and a
+/// single-row result matching the JSON convention
+/// `{"columns":["COUNT(*)"],"rows":[[n]]}`.
+#[test]
+fn aggregate_wire_shape_and_semantics() {
+    let db = open_fixture("aggregate-wire");
+    let params = BTreeMap::new();
+
+    // COUNT(*) — 7 Org nodes ingested by open_fixture.
+    let rs = db
+        .query("MATCH (o:Org) RETURN COUNT(*)", &params)
+        .expect("COUNT(*) must succeed");
+    assert_eq!(rs.columns(), &["COUNT(*)".to_string()]);
+    assert_eq!(rs.len(), 1, "aggregate always returns exactly one row");
+    assert_eq!(
+        rs.row(0),
+        &[Some(Value::Int(7))],
+        "7 Org nodes must be counted"
+    );
+
+    // COUNT(*) with alias.
+    let rs_alias = db
+        .query("MATCH (o:Org) RETURN COUNT(*) AS n_orgs", &params)
+        .expect("COUNT(*) AS n_orgs");
+    assert_eq!(rs_alias.columns(), &["n_orgs".to_string()]);
+    assert_eq!(rs_alias.row(0), &[Some(Value::Int(7))]);
+
+    // COUNT(*) on edge traversal — each Org-Person overlap rule fires per
+    // matching pair.  We just check it returns Int and is >= 0.
+    let rs_edge = db
+        .query(
+            "MATCH (o:Org)-[:INDUSTRY]->(p:Person) RETURN COUNT(*)",
+            &params,
+        )
+        .expect("COUNT(*) on edge");
+    assert_eq!(rs_edge.columns(), &["COUNT(*)".to_string()]);
+    assert_eq!(rs_edge.len(), 1);
+    match rs_edge.row(0) {
+        [Some(Value::Int(n))] => assert!(*n >= 0, "edge count must be non-negative"),
+        other => panic!("expected [Some(Int)], got {other:?}"),
+    }
+
+    // Grouped aggregation is rejected with a plan-stage error.
+    let err = db
+        .query("MATCH (o:Org) RETURN o, COUNT(*)", &params)
+        .expect_err("grouped aggregation must fail");
+    match &err {
+        GraphError::QueryError { detail } => {
+            assert!(
+                detail.starts_with("plan:"),
+                "grouped aggregation error must be plan-prefixed, got: {detail}"
+            );
+            assert!(
+                detail.to_ascii_lowercase().contains("grouped aggregation")
+                    || detail.to_ascii_lowercase().contains("not supported"),
+                "error must name the limitation, got: {detail}"
+            );
+        }
+        other => panic!("expected QueryError, got {other:?}"),
+    }
+}

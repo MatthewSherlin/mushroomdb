@@ -89,6 +89,7 @@ fn render_tok(t: &Tok) -> String {
         Tok::Gt => ">".into(),
         Tok::Ge => ">=".into(),
         Tok::Dash => "-".into(),
+        Tok::Star => "*".into(),
     }
 }
 

@@ -1,6 +1,6 @@
 //! Cypher executor: `PlanOp` sequence → `ResultSet` over a binding table.
 
-use crate::cypher::ast::{Expr, Operand, OrderItem, OrderTarget, RetItem, RetVal};
+use crate::cypher::ast::{AggArg, AggFunc, Expr, Operand, OrderItem, OrderTarget, RetItem, RetVal};
 use crate::cypher::plan::PlanOp;
 use crate::cypher::RelDir;
 use crate::filter::eval_cmp;
@@ -161,6 +161,12 @@ fn execute_inner(
 ) -> Result<ResultSet, String> {
     check_params(plan, params)?;
 
+    // Aggregate plans: streaming accumulator path (O(1) memory, no budget).
+    // Checked before the bounded path so aggregates are never routed to pull.
+    if plan.iter().any(|op| matches!(op, PlanOp::Aggregate { .. })) {
+        return execute_aggregate(view, plan, params);
+    }
+
     // Bounded plans use the pull-based (demand-driven) executor so that ALL
     // producer stages terminate as soon as `bound` final rows are collected.
     if let Some(bound) = row_bound {
@@ -211,6 +217,14 @@ fn execute_inner(
                 } else {
                     apply_limit(&mut rows, *n);
                 }
+            }
+            // Aggregate plans are routed to execute_aggregate() before reaching
+            // the staged path; this arm satisfies the exhaustive match.
+            PlanOp::Aggregate { .. } => {
+                return Err(
+                    "staged executor: Aggregate op reached staged path — plan routing error"
+                        .to_string(),
+                );
             }
         }
     }
@@ -322,9 +336,19 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                         RetVal::Var(name) | RetVal::Prop { var: name, .. } => {
                             vars.intern(name);
                         }
+                        RetVal::Agg { .. } => {} // handled by Aggregate op
                     }
                 }
             }
+            PlanOp::Aggregate { arg, .. } => match arg {
+                AggArg::Star => {}
+                AggArg::Var(v) => {
+                    vars.intern(v);
+                }
+                AggArg::Prop { var, .. } => {
+                    vars.intern(var);
+                }
+            },
             _ => {}
         }
     }
@@ -660,6 +684,342 @@ fn execute_pull(
     Ok(rs)
 }
 
+// ─── Aggregate execution path ────────────────────────────────────────────────
+//
+// Aggregate plans stream through ALL matching rows one at a time and maintain
+// a single accumulator value.  Memory is O(1) regardless of graph size:
+//
+//   - No binding table is materialised.
+//   - The 1 M intermediate-row budget does **not** apply.  Applying it would
+//     produce wrong counts/sums on large graphs and is unnecessary here because
+//     memory is bounded by the accumulator, not by the number of rows.
+//
+// v1 scope: exactly one aggregate function per query, no grouping keys.
+
+/// Running state for a single aggregate accumulation.
+enum AggAcc {
+    Count(u64),
+    Sum { val: f64, has_value: bool },
+    Avg { sum: f64, n: u64 },
+    Min(Option<Value>),
+    Max(Option<Value>),
+}
+
+impl AggAcc {
+    fn new(func: &AggFunc) -> Self {
+        match func {
+            AggFunc::Count => AggAcc::Count(0),
+            AggFunc::Sum => AggAcc::Sum { val: 0.0, has_value: false },
+            AggFunc::Avg => AggAcc::Avg { sum: 0.0, n: 0 },
+            AggFunc::Min => AggAcc::Min(None),
+            AggFunc::Max => AggAcc::Max(None),
+        }
+    }
+
+    fn finish(self) -> Option<Value> {
+        match self {
+            AggAcc::Count(n) => Some(Value::Int(n as i64)),
+            AggAcc::Sum { val, has_value } => {
+                if has_value { Some(Value::Float(val)) } else { None }
+            }
+            AggAcc::Avg { sum, n } => {
+                if n > 0 { Some(Value::Float(sum / n as f64)) } else { None }
+            }
+            AggAcc::Min(v) => v,
+            AggAcc::Max(v) => v,
+        }
+    }
+}
+
+/// Extract a numeric (f64) value from a `Value`, returning `None` for null /
+/// non-numeric types.  Silently skipped per the aggregate contract.
+fn numeric_val(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
+/// Shared context for `agg_stream`.
+struct AggStreamCtx<'a> {
+    view: &'a GraphView<'a>,
+    vars: &'a VarTable,
+    params: &'a Params<'a>,
+    func: &'a AggFunc,
+    arg: &'a AggArg,
+}
+
+/// Streaming accumulator executor for a single aggregate.
+///
+/// Locates the `Aggregate` op, builds the producer slice (everything before
+/// it), then calls `agg_stream` to walk all matching rows and accumulate.
+fn execute_aggregate(
+    view: &GraphView,
+    plan: &[PlanOp],
+    params: &Params,
+) -> Result<ResultSet, String> {
+    let agg_pos = match plan
+        .iter()
+        .position(|op| matches!(op, PlanOp::Aggregate { .. }))
+    {
+        Some(p) => p,
+        None => return Ok(ResultSet::new(vec![])),
+    };
+    let producers = &plan[..agg_pos];
+    let (func, arg, column) = match &plan[agg_pos] {
+        PlanOp::Aggregate { func, arg, column } => (func, arg, column),
+        _ => unreachable!(),
+    };
+    let vars = collect_vars(plan);
+    let ctx = AggStreamCtx {
+        view,
+        vars: &vars,
+        params,
+        func,
+        arg,
+    };
+    let initial_row: Row = vec![None; vars.names.len()];
+    let mut acc = AggAcc::new(func);
+    agg_stream(&ctx, producers, &initial_row, &mut acc)?;
+
+    let value = acc.finish();
+    let mut rs = ResultSet::new(vec![column.clone()]);
+    rs.push_row(vec![value]);
+    Ok(rs)
+}
+
+/// Recursively walk all matching rows through `ops`, updating `acc` for each
+/// terminal row.  No bound — visits every row the producers can emit.
+fn agg_stream(
+    ctx: &AggStreamCtx<'_>,
+    ops: &[PlanOp],
+    row: &Row,
+    acc: &mut AggAcc,
+) -> Result<(), String> {
+    let (op, rest) = match ops.split_first() {
+        Some(pair) => pair,
+        None => {
+            // Terminal row — update the accumulator.
+            match (ctx.func, ctx.arg) {
+                (AggFunc::Count, AggArg::Star) => {
+                    if let AggAcc::Count(n) = acc {
+                        *n += 1;
+                    }
+                }
+                (AggFunc::Count, AggArg::Var(v)) => {
+                    // Count non-null bindings for `v`.
+                    let slot = ctx.vars.slot(v);
+                    let is_bound = slot
+                        .and_then(|s| row.get(s))
+                        .and_then(|c| c.as_ref())
+                        .is_some();
+                    if is_bound {
+                        if let AggAcc::Count(n) = acc {
+                            *n += 1;
+                        }
+                    }
+                }
+                (AggFunc::Count, AggArg::Prop { var, field }) => {
+                    // Count rows where the property is present.
+                    let val = resolve_prop(ctx.view, ctx.vars, row, var, field)?;
+                    if val.is_some() {
+                        if let AggAcc::Count(n) = acc {
+                            *n += 1;
+                        }
+                    }
+                }
+                (AggFunc::Sum, AggArg::Prop { var, field }) => {
+                    if let Some(v) = resolve_prop(ctx.view, ctx.vars, row, var, field)? {
+                        if let Some(num) = numeric_val(&v) {
+                            if let AggAcc::Sum { val, has_value } = acc {
+                                *val += num;
+                                *has_value = true;
+                            }
+                        }
+                    }
+                }
+                (AggFunc::Avg, AggArg::Prop { var, field }) => {
+                    if let Some(v) = resolve_prop(ctx.view, ctx.vars, row, var, field)? {
+                        if let Some(num) = numeric_val(&v) {
+                            if let AggAcc::Avg { sum, n } = acc {
+                                *sum += num;
+                                *n += 1;
+                            }
+                        }
+                    }
+                }
+                (AggFunc::Min, AggArg::Prop { var, field }) => {
+                    if let Some(v) = resolve_prop(ctx.view, ctx.vars, row, var, field)? {
+                        if numeric_val(&v).is_some() {
+                            if let AggAcc::Min(current) = acc {
+                                *current = Some(match current.take() {
+                                    None => v,
+                                    Some(prev) => {
+                                        if cmp_optional(Some(&prev), Some(&v), false)
+                                            == std::cmp::Ordering::Greater
+                                        {
+                                            v
+                                        } else {
+                                            prev
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                (AggFunc::Max, AggArg::Prop { var, field }) => {
+                    if let Some(v) = resolve_prop(ctx.view, ctx.vars, row, var, field)? {
+                        if numeric_val(&v).is_some() {
+                            if let AggAcc::Max(current) = acc {
+                                *current = Some(match current.take() {
+                                    None => v,
+                                    Some(prev) => {
+                                        if cmp_optional(Some(&prev), Some(&v), true)
+                                            == std::cmp::Ordering::Greater
+                                        {
+                                            v
+                                        } else {
+                                            prev
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                // Remaining combinations are rejected by the planner (e.g., SUM(*))
+                // but handle defensively without panic.
+                _ => {}
+            }
+            return Ok(());
+        }
+    };
+
+    match op {
+        PlanOp::ScanLabel { var, label } => {
+            let ids = scan_ids(ctx.view, label.as_deref());
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for &id in &ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                agg_stream(ctx, rest, &next, acc)?;
+            }
+        }
+        PlanOp::Expand {
+            from,
+            rel_var,
+            etype,
+            dir,
+            to,
+            to_label,
+            to_props,
+        } => {
+            let etypes = resolve_etypes(ctx.view, etype.as_deref());
+            let exp_dir = map_dir(*dir);
+            let to_slot = ctx
+                .vars
+                .slot(to)
+                .ok_or_else(|| format!("unbound variable `{to}`"))?;
+            let rel_slot = rel_var.as_ref().and_then(|rv| ctx.vars.slot(rv));
+            let from_id = require_node(row, ctx.vars, from)?;
+            let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
+                Some(Cell::Node(id)) => Some(*id),
+                Some(Cell::Rel(_)) => return Err(format!("variable `{to}` is not a node")),
+                None => None,
+            };
+            for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
+                if row_has_edge(row, &e) {
+                    continue;
+                }
+                let nbr = neighbor(from_id, &e, *dir);
+                if let Some(want) = bound_to {
+                    if nbr != want {
+                        continue;
+                    }
+                }
+                if !node_matches(
+                    ctx.view,
+                    ctx.vars,
+                    row,
+                    nbr,
+                    to_label.as_deref(),
+                    to_props,
+                    ctx.params,
+                )? {
+                    continue;
+                }
+                let mut next = row.clone();
+                if let Some(slot) = rel_slot {
+                    next[slot] = Some(Cell::Rel(e));
+                }
+                if bound_to.is_none() {
+                    next[to_slot] = Some(Cell::Node(nbr));
+                }
+                agg_stream(ctx, rest, &next, acc)?;
+            }
+        }
+        PlanOp::Filter { expr } => {
+            if eval_expr(ctx.view, ctx.vars, row, expr, ctx.params, 0)? {
+                agg_stream(ctx, rest, row, acc)?;
+            }
+        }
+        PlanOp::LookupProps { var, props } => {
+            let id = require_node(row, ctx.vars, var)?;
+            if node_matches(ctx.view, ctx.vars, row, id, None, props, ctx.params)? {
+                agg_stream(ctx, rest, row, acc)?;
+            }
+        }
+        PlanOp::JoinBound { var, label, props } => {
+            let id = require_node(row, ctx.vars, var)?;
+            if node_matches(
+                ctx.view,
+                ctx.vars,
+                row,
+                id,
+                label.as_deref(),
+                props,
+                ctx.params,
+            )? {
+                agg_stream(ctx, rest, row, acc)?;
+            }
+        }
+        // These must not appear in the producer slice of an aggregate plan.
+        PlanOp::Project { .. } => {
+            return Err(
+                "agg executor: Project in producer slice — plan is structurally malformed"
+                    .to_string(),
+            );
+        }
+        PlanOp::OrderBy { .. } => {
+            return Err(
+                "agg executor: OrderBy in producer slice — structurally malformed".to_string(),
+            );
+        }
+        PlanOp::Skip(n) => {
+            return Err(format!(
+                "agg executor: Skip({n}) in producer slice — structurally malformed"
+            ));
+        }
+        PlanOp::Limit(n) => {
+            return Err(format!(
+                "agg executor: Limit({n}) in producer slice — structurally malformed"
+            ));
+        }
+        PlanOp::Aggregate { .. } => {
+            return Err(
+                "agg executor: nested Aggregate in producer slice — structurally malformed"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Recursively pull rows through `ops`, projecting into `result` until
 /// `result.len() >= ctx.bound`.
 ///
@@ -812,6 +1172,13 @@ fn pull_rows(
                 "pull executor: Limit({n}) reached pull_rows — Limit must appear after Project"
             ));
         }
+        PlanOp::Aggregate { .. } => {
+            return Err(
+                "pull executor: Aggregate reached pull_rows — aggregate plans must use \
+                 the execute_aggregate path (routed before pull in execute_inner)"
+                    .to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -857,6 +1224,24 @@ fn column_name(item: &RetItem) -> String {
     match &item.value {
         RetVal::Var(v) => v.clone(),
         RetVal::Prop { var, field } => format!("{var}.{field}"),
+        // Agg column names are computed by the planner and stored in Aggregate.column;
+        // this branch is unreachable for well-formed plans but needed for exhaustiveness.
+        RetVal::Agg { func, arg } => {
+            use crate::cypher::ast::AggArg;
+            let f = match func {
+                AggFunc::Count => "COUNT",
+                AggFunc::Sum => "SUM",
+                AggFunc::Avg => "AVG",
+                AggFunc::Min => "MIN",
+                AggFunc::Max => "MAX",
+            };
+            let a = match arg {
+                AggArg::Star => "*".to_string(),
+                AggArg::Var(v) => v.clone(),
+                AggArg::Prop { var, field } => format!("{var}.{field}"),
+            };
+            format!("{f}({a})")
+        }
     }
 }
 
@@ -896,6 +1281,12 @@ fn project_item(
             }
         }
         RetVal::Prop { var, field } => resolve_prop(view, vars, row, var, field),
+        // Agg items are never projected by exec_project (aggregate plans have no
+        // Project op). This arm exists solely to satisfy the exhaustive match.
+        RetVal::Agg { .. } => Err(
+            "project_item: Agg variant reached exec_project — aggregate plans must not contain Project"
+                .to_string(),
+        ),
     }
 }
 
@@ -2236,5 +2627,187 @@ LIMIT 10";
             10,
             "bounded at LIMIT==cap must complete with 10 rows"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Aggregate execution tests
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn count_star_returns_total_node_count() {
+        let mut fx = Fx::new();
+        fx.add("Person", "ada", vec![]);
+        fx.add("Person", "bob", vec![]);
+        fx.add("Person", "cam", vec![]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let rs = run(&v, "MATCH (n:Person) RETURN COUNT(*)", &params).expect("COUNT(*)");
+        assert_eq!(rs.columns(), &["COUNT(*)".to_string()]);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.row(0), &[Some(i(3))]);
+
+        // Empty graph: COUNT(*) should return 0.
+        let rs_empty =
+            run(&v, "MATCH (n:Ghost) RETURN COUNT(*)", &params).expect("COUNT(*) empty");
+        assert_eq!(rs_empty.row(0), &[Some(i(0))]);
+    }
+
+    #[test]
+    fn count_star_alias_sets_column_name() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(&v, "MATCH (n:N) RETURN COUNT(*) AS total", &params).expect("COUNT AS");
+        assert_eq!(rs.columns(), &["total".to_string()]);
+        assert_eq!(rs.row(0), &[Some(i(1))]);
+    }
+
+    #[test]
+    fn count_var_skips_null_node_bindings() {
+        // COUNT(n) counts rows where n is bound. Since ScanLabel always binds n,
+        // this matches COUNT(*) for nodes. Primarily documents the semantics.
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![]);
+        fx.add("N", "b", vec![]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(&v, "MATCH (n:N) RETURN COUNT(n)", &params).expect("COUNT(n)");
+        assert_eq!(rs.columns(), &["COUNT(n)".to_string()]);
+        assert_eq!(rs.row(0), &[Some(i(2))]);
+    }
+
+    #[test]
+    fn sum_numeric_prop_ignores_null_and_non_numeric() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("v", i(10))]);
+        fx.add("N", "b", vec![("v", i(20))]);
+        fx.add("N", "c", vec![]); // missing prop — skipped
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(&v, "MATCH (n:N) RETURN SUM(n.v)", &params).expect("SUM");
+        assert_eq!(rs.columns(), &["SUM(n.v)".to_string()]);
+        // 10.0 + 20.0 = 30.0 (null skipped)
+        assert_eq!(rs.row(0), &[Some(f(30.0))]);
+
+        // All props null → result is null.
+        let rs_null = run(&v, "MATCH (n:N) RETURN SUM(n.missing)", &params).expect("SUM null");
+        assert_eq!(rs_null.row(0), &[None]);
+    }
+
+    #[test]
+    fn avg_numeric_prop() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("v", i(10))]);
+        fx.add("N", "b", vec![("v", i(30))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(&v, "MATCH (n:N) RETURN AVG(n.v) AS avg_v", &params).expect("AVG");
+        assert_eq!(rs.columns(), &["avg_v".to_string()]);
+        // (10 + 30) / 2 = 20.0
+        assert_eq!(rs.row(0), &[Some(f(20.0))]);
+
+        // Empty graph: AVG returns null.
+        let rs_empty = run(&v, "MATCH (n:Ghost) RETURN AVG(n.v)", &params).expect("AVG empty");
+        assert_eq!(rs_empty.row(0), &[None]);
+    }
+
+    #[test]
+    fn min_max_numeric_prop() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("v", i(5))]);
+        fx.add("N", "b", vec![("v", i(1))]);
+        fx.add("N", "c", vec![("v", i(9))]);
+        fx.add("N", "d", vec![]); // null skipped
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let min_rs = run(&v, "MATCH (n:N) RETURN MIN(n.v)", &params).expect("MIN");
+        assert_eq!(min_rs.row(0), &[Some(i(1))]);
+
+        let max_rs = run(&v, "MATCH (n:N) RETURN MAX(n.v)", &params).expect("MAX");
+        assert_eq!(max_rs.row(0), &[Some(i(9))]);
+    }
+
+    #[test]
+    fn count_star_no_budget_cap_applies() {
+        // COUNT(*) with a dense graph that would error the staged path.
+        // The aggregate path must complete without hitting the cap.
+        let mut fx = Fx::new();
+        let src = fx.add("Src", "s", vec![]);
+        for i in 0..30usize {
+            let dst = fx.add("Dst", &format!("d{i}"), vec![]);
+            fx.edge("T", src, dst, vec![]);
+        }
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        // Staged path errors on 30 nodes > cap 10.
+        let cap_err = super::with_max_intermediate_rows(10, || {
+            run(&v, "MATCH (n:Dst) RETURN n", &params)
+        });
+        assert!(cap_err.is_err(), "staged path must error on 30 nodes with cap=10");
+
+        // COUNT(*) does not apply the cap — must complete and return 30.
+        let agg_ok = super::with_max_intermediate_rows(10, || {
+            run(&v, "MATCH (n:Dst) RETURN COUNT(*)", &params)
+        })
+        .expect("aggregate must not hit the intermediate-row cap");
+        assert_eq!(
+            agg_ok.row(0),
+            &[Some(i(30))],
+            "COUNT(*) must count all 30 nodes regardless of cap"
+        );
+    }
+
+    fn plan_src(src: &str) -> Result<Vec<crate::cypher::plan::PlanOp>, String> {
+        use crate::cypher::{lex, parse, plan};
+        let toks = lex(src).map_err(|e| format!("lex: {e}"))?;
+        let ast = parse(&toks).map_err(|e| format!("parse: {e}"))?;
+        plan(&ast).map_err(|e| format!("plan: {e}"))
+    }
+
+    #[test]
+    fn grouped_aggregation_is_plan_error() {
+        // RETURN a, COUNT(*) — mixed aggregate + non-aggregate → plan error.
+        let err = plan_src("MATCH (a:N) RETURN a, COUNT(*)")
+            .expect_err("grouped aggregation must be plan error");
+        assert!(
+            err.to_ascii_lowercase().contains("grouped aggregation")
+                || err.to_ascii_lowercase().contains("not supported"),
+            "error must mention grouped aggregation limitation, got: {err}"
+        );
+
+        // Multiple aggregates → plan error.
+        let err2 = plan_src("MATCH (a:N) RETURN COUNT(*), COUNT(a)")
+            .expect_err("multiple aggregates must be plan error");
+        assert!(
+            err2.to_ascii_lowercase().contains("not supported"),
+            "error must mention limitation, got: {err2}"
+        );
+
+        // SUM(*) → plan error (Star is invalid for SUM).
+        let err3 = plan_src("MATCH (a:N) RETURN SUM(*)")
+            .expect_err("SUM(*) must be plan error");
+        assert!(
+            err3.to_ascii_lowercase().contains("sum") || err3.to_ascii_lowercase().contains("*"),
+            "error must mention SUM or *, got: {err3}"
+        );
+    }
+
+    #[test]
+    fn aggregate_over_hop_counts_edges() {
+        let fx = hop_graph();
+        let v = fx.view();
+        let params = BTreeMap::new();
+        // hop_graph has 3 KNOWS edges
+        let rs = run(
+            &v,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN COUNT(*)",
+            &params,
+        )
+        .expect("COUNT(*) on hop graph");
+        assert_eq!(rs.row(0), &[Some(i(3))]);
     }
 }

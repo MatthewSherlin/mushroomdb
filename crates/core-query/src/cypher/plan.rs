@@ -5,7 +5,8 @@
 //! *start* node of a MATCH whose variable is already bound.
 
 use super::ast::{
-    Expr, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal,
+    AggArg, AggFunc, Expr, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir,
+    RelPat, RetItem, RetVal,
 };
 use std::collections::BTreeSet;
 
@@ -59,6 +60,23 @@ pub enum PlanOp {
     },
     Skip(u64),
     Limit(u64),
+    /// Single aggregate over all matched rows (no grouping).
+    ///
+    /// v1 limitation: exactly one aggregate per query.  Grouped aggregation
+    /// (`RETURN a, COUNT(*)`) is rejected with a plan-stage error.
+    ///
+    /// Execution routes to a streaming accumulator path (O(1) memory).
+    /// The 1 M intermediate-row budget does **not** apply: the accumulator
+    /// holds a single running value regardless of how many source rows exist.
+    ///
+    /// Null/non-numeric values in `arg` are silently skipped for SUM/AVG/MIN/MAX.
+    Aggregate {
+        func: AggFunc,
+        arg: AggArg,
+        /// Projected column name — alias if provided, else the canonical
+        /// function call string (`COUNT(*)`, `SUM(n.age)`, etc.).
+        column: String,
+    },
 }
 
 /// Compute the effective row bound for LIMIT push-down.
@@ -91,6 +109,10 @@ pub enum PlanOp {
 pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
     // ORDER BY requires full materialisation — bound cannot be pushed.
     if ops.iter().any(|op| matches!(op, PlanOp::OrderBy { .. })) {
+        return None;
+    }
+    // Aggregate plans use the streaming accumulator path, not the pull path.
+    if ops.iter().any(|op| matches!(op, PlanOp::Aggregate { .. })) {
         return None;
     }
     let limit_n = ops.iter().rev().find_map(|op| match op {
@@ -135,6 +157,55 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     check_return_bound(&q.returns, &bound, &rel_bound)?;
     check_duplicate_aliases(&q.returns)?;
     check_duplicate_columns(&q.returns)?;
+
+    // Detect aggregate vs non-aggregate items in RETURN.
+    let agg_count = q.returns.iter().filter(|r| matches!(&r.value, RetVal::Agg { .. })).count();
+
+    if agg_count > 0 && agg_count < q.returns.len() {
+        // Mixed: some aggregates, some regular items — grouped aggregation.
+        return Err(
+            "grouped aggregation (RETURN with both aggregate functions and plain \
+             variables/properties) is not supported in v1; use a single aggregate \
+             function alone, e.g. `RETURN COUNT(*)`, or remove the aggregate"
+                .to_string(),
+        );
+    }
+
+    if agg_count > 1 {
+        // Multiple aggregates in one RETURN — also out of scope for v1.
+        return Err(
+            "multiple aggregate functions in a single RETURN is not supported in v1; \
+             use exactly one aggregate function per query"
+                .to_string(),
+        );
+    }
+
+    if agg_count == 1 {
+        // Single-aggregate path.
+        let item = &q.returns[0];
+        let (func, arg) = match &item.value {
+            RetVal::Agg { func, arg } => (func.clone(), arg.clone()),
+            _ => unreachable!(),
+        };
+        // Validate: SUM/AVG/MIN/MAX require a Prop arg, not Star.
+        match (&func, &arg) {
+            (AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max, AggArg::Star) => {
+                return Err(format!(
+                    "{name} does not accept '*'; use a property expression like `{name}(n.prop)`",
+                    name = func_name(&func),
+                ));
+            }
+            _ => {}
+        }
+        let column = item
+            .alias
+            .clone()
+            .unwrap_or_else(|| agg_column_name(&func, &arg));
+        ops.push(PlanOp::Aggregate { func, arg, column });
+        // ORDER BY and LIMIT/SKIP are ignored for single-aggregate queries
+        // (always returns exactly one row).
+        return Ok(ops);
+    }
 
     ops.push(PlanOp::Project {
         items: q.returns.clone(),
@@ -291,6 +362,15 @@ fn check_return_bound(
             RetVal::Prop { var, .. } => {
                 require_bound(var, bound, "RETURN")?;
             }
+            RetVal::Agg { arg, .. } => match arg {
+                AggArg::Star => {}
+                AggArg::Var(v) => {
+                    require_bound(v, bound, "RETURN")?;
+                }
+                AggArg::Prop { var, .. } => {
+                    require_bound(var, bound, "RETURN")?;
+                }
+            },
         }
     }
     Ok(())
@@ -319,7 +399,8 @@ fn check_duplicate_columns(items: &[RetItem]) -> Result<(), String> {
     Ok(())
 }
 
-/// Projected column name: alias if given, else the bare var, else `var.field`.
+/// Projected column name: alias if given, else the bare var, else `var.field`,
+/// else the canonical aggregate call string.
 fn column_name(item: &RetItem) -> String {
     if let Some(alias) = &item.alias {
         return alias.clone();
@@ -327,6 +408,29 @@ fn column_name(item: &RetItem) -> String {
     match &item.value {
         RetVal::Var(v) => v.clone(),
         RetVal::Prop { var, field } => format!("{var}.{field}"),
+        RetVal::Agg { func, arg } => agg_column_name(func, arg),
+    }
+}
+
+/// Canonical string for an aggregate without an alias, e.g. `COUNT(*)`,
+/// `SUM(n.age)`.
+fn agg_column_name(func: &AggFunc, arg: &AggArg) -> String {
+    let f = func_name(func);
+    let a = match arg {
+        AggArg::Star => "*".to_string(),
+        AggArg::Var(v) => v.clone(),
+        AggArg::Prop { var, field } => format!("{var}.{field}"),
+    };
+    format!("{f}({a})")
+}
+
+fn func_name(func: &AggFunc) -> &'static str {
+    match func {
+        AggFunc::Count => "COUNT",
+        AggFunc::Sum => "SUM",
+        AggFunc::Avg => "AVG",
+        AggFunc::Min => "MIN",
+        AggFunc::Max => "MAX",
     }
 }
 
