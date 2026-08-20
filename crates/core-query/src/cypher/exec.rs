@@ -11,6 +11,12 @@ use crate::view::GraphView;
 use core_storage::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Test-only counter incremented each time the fused ScanLabel+Filter arm
+/// executes.  Lets property tests assert the fast path actually fires for
+/// matching query shapes (and does NOT fire for fallback shapes).
+#[cfg(test)]
+static FUSED_SCAN_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Query parameters. Missing names anywhere in the plan are an error at
 /// execution start (the plan is walked before any rows are produced).
 pub struct Params<'a>(pub &'a BTreeMap<String, Value>);
@@ -1114,6 +1120,8 @@ fn pull_rows(
             if let Some((field, cmp_op_ref, lit)) = fused_filter {
                 // Fused scan+filter: column resolved once, comparison done
                 // inline — no recursive call into pull_rows for the Filter arm.
+                #[cfg(test)]
+                FUSED_SCAN_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let col = ctx.view.props.column(field);
                 let rest_after_filter = &rest[1..];
                 for (i, &sym) in ctx.view.labels.iter().enumerate() {
@@ -2351,9 +2359,7 @@ LIMIT 10";
             let params = BTreeMap::new();
 
             // ── Fused path ───────────────────────────────────────────────────
-            let full_q = format!(
-                "MATCH (n:N) WHERE n.v {op_str} {threshold} RETURN n"
-            );
+            let full_q = format!("MATCH (n:N) WHERE n.v {op_str} {threshold} RETURN n");
             let bounded_q = format!(
                 "MATCH (n:N) WHERE n.v {op_str} {threshold} RETURN n SKIP {skip} LIMIT {limit}"
             );
@@ -2367,8 +2373,29 @@ LIMIT 10";
             let total = unbounded.len();
             let full_rows = rows_of(&unbounded);
 
-            let bounded = run(&v, &bounded_q, &params)
-                .expect("fused bounded must not error");
+            // Snapshot counter before executing the fused-shape query.
+            let fires_before =
+                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+            let bounded = run(&v, &bounded_q, &params).expect("fused bounded must not error");
+            let fires_after =
+                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+
+            // The planner must have emitted ScanLabel→Filter{Cmp} for this shape;
+            // assert the fused arm actually executed (counter advanced).
+            // Guard: with 0 nodes the label symbol is never interned, so pull_rows
+            // exits before the fused detection — nothing to assert in that case.
+            if n_nodes > 0 {
+                prop_assert!(
+                    fires_after > fires_before,
+                    "fused arm did NOT fire for op={} threshold={} n_nodes={}: \
+                     counter before={} after={}",
+                    op_str,
+                    threshold,
+                    n_nodes,
+                    fires_before,
+                    fires_after
+                );
+            }
 
             let s = (skip as usize).min(total);
             let e = (skip as usize + limit as usize).min(total);
@@ -2384,12 +2411,26 @@ LIMIT 10";
             // `AND n.v >= -999` is always true for our Int/Float range 0..7,
             // so the result set is identical — only the executor path differs.
             let compound_q = format!(
-                "MATCH (n:N) WHERE n.v {} {} AND n.v >= -999 RETURN n \
-                 SKIP {} LIMIT {}",
+                "MATCH (n:N) WHERE n.v {} {} AND n.v >= -999 RETURN n SKIP {} LIMIT {}",
                 op_str, threshold, skip, limit
             );
-            let compound_bounded = run(&v, &compound_q, &params)
-                .expect("compound-AND bounded must not error");
+            let fires_before_compound =
+                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+            let compound_bounded =
+                run(&v, &compound_q, &params).expect("compound-AND bounded must not error");
+            let fires_after_compound =
+                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+
+            // Compound AND must NOT activate the fused arm.
+            prop_assert_eq!(
+                fires_after_compound,
+                fires_before_compound,
+                "fused arm fired for compound-AND shape (should use generic path): \
+                 op={} threshold={} n_nodes={}",
+                op_str,
+                threshold,
+                n_nodes
+            );
             prop_assert_eq!(
                 rows_of(&compound_bounded),
                 full_rows[s..e].to_vec(),
