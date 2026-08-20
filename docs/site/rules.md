@@ -148,7 +148,9 @@ sets.
 
 ---
 
-## Composing predicates — All
+## Composing predicates — All and Any
+
+### All — require every branch
 
 Require multiple conditions on the same edge by wrapping predicates in
 `All`:
@@ -164,6 +166,45 @@ The edge is written only when every sub-predicate fires. The score is the
 **minimum** of the individual sub-predicate scores (`score.min(part_score)`
 per part — verified in `crates/core-rules/src/def.rs`, test
 `all_takes_min_score_and_requires_every_part`).
+
+### Any — require at least one branch
+
+Match when at least one branch fires by wrapping predicates in `Any`:
+
+```rust
+Predicate::Any(vec![
+    Predicate::Overlap { field: "tags".into(), min: 0.3 },
+    Predicate::NumericWithin { field: "founded_year".into(), tolerance: 2.0 },
+])
+```
+
+The edge is written when **any** sub-predicate fires. The score is the
+**maximum** of the satisfied branches' scores (`score.max(branch_score)` —
+verified in `crates/core-rules/src/def.rs`, test
+`any_score_is_max_when_both_branches_match`).
+
+### Nesting
+
+`All` and `Any` nest freely:
+
+```rust
+Predicate::All(vec![
+    Predicate::FieldEqual { field: "region".into() },
+    Predicate::Any(vec![
+        Predicate::Overlap { field: "skills".into(), min: 0.3 },
+        Predicate::NumericWithin { field: "founded_year".into(), tolerance: 2.0 },
+    ]),
+])
+```
+
+The combined score follows the two conventions above: `All` takes the
+**minimum** over its branches' scores; `Any` takes the **maximum**. In the
+example above the combined score is `min(1.0, max(overlap_score,
+numeric_score))`.
+
+**Depth cap:** nesting depth is capped at 4. `validate()` returns a named
+error (`"predicate nesting depth N exceeds cap of 4"`) when the limit is
+exceeded.
 
 ---
 

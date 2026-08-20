@@ -107,6 +107,9 @@ fn predicate_is_keymatch(p: &Predicate) -> bool {
     match p {
         Predicate::KeyMatch { .. } => true,
         Predicate::All(parts) => !parts.is_empty() && predicate_is_keymatch(&parts[0]),
+        // Any predicates use Union candidate specs for OR semantics; the FK
+        // fast-path does not apply even if a branch happens to be KeyMatch.
+        Predicate::Any(_) => false,
         _ => false,
     }
 }
@@ -116,6 +119,7 @@ fn keymatch_field(p: &Predicate) -> Option<&str> {
     match p {
         Predicate::KeyMatch { field } => Some(field),
         Predicate::All(parts) => parts.first().and_then(keymatch_field),
+        Predicate::Any(_) => None,
         _ => None,
     }
 }

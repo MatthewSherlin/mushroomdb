@@ -242,6 +242,26 @@ impl From<&Predicate> for PredicateSummary {
                     approximate: false,
                 }
             }
+            Predicate::Any(inner) => {
+                let parts: Vec<PredicateSummary> = inner.iter().map(Self::from).collect();
+                let mut fields = Vec::new();
+                for part in &parts {
+                    for f in &part.fields {
+                        if !fields.contains(f) {
+                            fields.push(f.clone());
+                        }
+                    }
+                }
+                PredicateSummary {
+                    kind: "any".into(),
+                    fields,
+                    min: None,
+                    tolerance: None,
+                    km: None,
+                    parts: Some(parts),
+                    approximate: false,
+                }
+            }
         }
     }
 }

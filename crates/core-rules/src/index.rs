@@ -304,6 +304,13 @@ pub enum CandidateSpec<'a> {
         field: &'a str,
         min: f64,
     },
+    /// Union of multiple candidate specs, used for `Any` predicates.
+    ///
+    /// Each branch of the `Any` predicate contributes its own candidate set
+    /// (key index, token index, numeric bucket, etc.); the resulting candidate
+    /// set is their union.  Insert and remove recurse into every child spec so
+    /// the index stays coherent for all branches simultaneously.
+    Union(Vec<CandidateSpec<'a>>),
 }
 
 /// Returns the exact candidate strategy derived from `p`.
@@ -311,9 +318,12 @@ pub enum CandidateSpec<'a> {
 /// `All(parts)` delegates to `parts[0]`: order predicates most-selective-first;
 /// a leading `VectorSimilar` means full-scan (`ScanAll`) candidates.
 ///
+/// `Any(parts)` returns `Union` of each branch's candidate spec — the correct
+/// superset for OR semantics.
+///
 /// # Panics
 ///
-/// Panics on `All([])`. Predicates must pass `RuleDef::validate()` first.
+/// Panics on `All([])` or `Any([])`. Predicates must pass `RuleDef::validate()` first.
 pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
     match p {
         Predicate::KeyMatch { .. } => CandidateSpec::ByKey,
@@ -332,6 +342,13 @@ pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
             );
             candidate_spec(&parts[0])
         }
+        Predicate::Any(parts) => {
+            debug_assert!(
+                !parts.is_empty(),
+                "candidate_spec requires a validated predicate"
+            );
+            CandidateSpec::Union(parts.iter().map(candidate_spec).collect())
+        }
     }
 }
 
@@ -342,9 +359,12 @@ pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
 /// `candidate_spec` for all other predicate variants so partial-approximate
 /// `All` predicates (first part is not `VectorSimilar`) are handled correctly.
 ///
+/// `Any` predicates cannot be `approximate=true` (validate() rejects them),
+/// so `Any` falls through to `candidate_spec` (exact Union path).
+///
 /// # Panics
 ///
-/// Panics on `All([])`. Predicates must pass `RuleDef::validate()` first.
+/// Panics on `All([])` or `Any([])`. Predicates must pass `RuleDef::validate()` first.
 pub fn candidate_spec_approx(p: &Predicate) -> CandidateSpec<'_> {
     match p {
         Predicate::VectorSimilar { field, min } => {
@@ -554,6 +574,18 @@ impl SideIndex {
             // variant, so this arm is unreachable at runtime; it must be
             // present to satisfy exhaustiveness.
             CandidateSpec::VectorClusters { .. } => BTreeSet::new(),
+            // Union: each branch contributes its own index keys; the result is
+            // their union.  VectorClusters children are intentionally excluded
+            // here (they are handled by the early-return in insert()/remove()),
+            // but Union-of-VectorClusters is not produced by candidate_spec for
+            // Any (approximate=true is rejected for Any by validate()).
+            CandidateSpec::Union(specs) => {
+                let mut out = BTreeSet::new();
+                for s in specs {
+                    out.extend(Self::index_keys(s, get));
+                }
+                out
+            }
         }
     }
 
@@ -580,10 +612,26 @@ impl SideIndex {
                 .collect(),
             // VectorClusters probing is handled by ivf_candidates(), not probe_keys().
             CandidateSpec::VectorClusters { .. } => BTreeSet::new(),
+            // Union: probe each child spec and take the union.
+            CandidateSpec::Union(specs) => {
+                let mut out = BTreeSet::new();
+                for s in specs {
+                    out.extend(Self::probe_keys(s, get));
+                }
+                out
+            }
         }
     }
 
     pub fn insert(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
+        // Union: recurse into each child spec.  insert() is idempotent for
+        // ScanAll metadata (same-value overwrite), so overlapping children are safe.
+        if let CandidateSpec::Union(specs) = spec {
+            for s in specs {
+                self.insert(s, node, get);
+            }
+            return;
+        }
         // VectorClusters: IVF path — separate from the by_key / ScanAll path.
         if let CandidateSpec::VectorClusters { field, .. } = spec {
             if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
@@ -620,6 +668,13 @@ impl SideIndex {
     }
 
     pub fn remove(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
+        // Union: recurse into each child spec.
+        if let CandidateSpec::Union(specs) = spec {
+            for s in specs {
+                self.remove(s, node, get);
+            }
+            return;
+        }
         // VectorClusters: remove from ivf_raw and by_key cluster bucket.
         // Removal shifts cluster membership (the centroid stays but its member set
         // shrinks), which is a form of drift; increment the counter so callers can
@@ -739,6 +794,10 @@ impl SideIndex {
         // VectorClusters: probe the P nearest centroids.
         if let CandidateSpec::VectorClusters { field, .. } = spec {
             return self.ivf_candidates(field, get);
+        }
+        // Union: take the union of candidates from each child spec.
+        if let CandidateSpec::Union(specs) = spec {
+            return specs.iter().flat_map(|s| self.candidates(s, get)).collect();
         }
 
         let mut out = BTreeSet::new();

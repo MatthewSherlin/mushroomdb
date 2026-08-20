@@ -122,7 +122,7 @@ cargo run -p cli --bin mushroomdb -- serve ./demo-db
 
 ## Rules tour
 
-Six predicate kinds ship today. All compose via `All(...)`.
+Six predicate kinds ship today. Predicates compose via `All(...)` (AND, score = min) and `Any(...)` (OR, score = max). Nesting is allowed up to depth 4.
 
 | Predicate | What it tests |
 |---|---|

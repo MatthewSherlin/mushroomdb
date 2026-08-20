@@ -8,6 +8,10 @@
 /// Operations: random insert-node / set-prop mutations on two top-k rules
 /// (k=1, k=3) spanning FieldEqual (unscored, key-ASC tiebreak) and
 /// NumericWithin (scored, float tiebreak).  Checked after every op.
+///
+/// Plan 13 T2 extension: includes an `Any(FieldEqual, NumericWithin)` rule
+/// (k=2) so that composed-predicate Any semantics are covered by the oracle
+/// sweep alongside the original scalar predicates.
 use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
 use core_rules::index::{cluster_k, probe_count};
 use proptest::prelude::*;
@@ -43,6 +47,28 @@ fn rule_nw_k3() -> RuleDef {
         edge_type: "NW_K3".into(),
         weight_prop: Some("score".into()),
         max_edges: Some(3),
+        approximate: false,
+    }
+}
+
+/// Plan 13 T2: Any(FieldEqual(f), NumericWithin(year, 10)), k=2.
+/// Tests that the oracle's top_k_dsts_for_src agrees with the engine for
+/// composed Any predicates under per-source top-k semantics.
+fn rule_any_k2() -> RuleDef {
+    RuleDef {
+        name: "topk2_any".into(),
+        src_label: "P".into(),
+        dst_label: "P".into(),
+        predicate: Predicate::Any(vec![
+            Predicate::FieldEqual { field: "f".into() },
+            Predicate::NumericWithin {
+                field: "year".into(),
+                tolerance: 10.0,
+            },
+        ]),
+        edge_type: "ANY_K2".into(),
+        weight_prop: Some("score".into()),
+        max_edges: Some(2),
         approximate: false,
     }
 }
@@ -131,17 +157,21 @@ fn assert_dst_invariant(
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// Random-op DST sweep: k ∈ {1, 3}, unscored and scored predicates.
+    /// Random-op DST sweep: k ∈ {1, 2, 3}, scalar and Any composed predicates.
     /// After every op the engine's per-source derived set is compared to
     /// the oracle's scratch recompute at that quiescent point.
+    ///
+    /// Plan 13 T2 extension: `rule_any_k2()` is included so that composed
+    /// `Any(FieldEqual, NumericWithin)` semantics are exercised alongside
+    /// the original scalar predicates in the same random-op sweep.
     #[test]
     fn topk_dst_sweep(ops in proptest::collection::vec(op_strategy(), 1..60)) {
         let mut db = GraphDb::open_with(SimFs::new()).unwrap();
         let mut oracle = Oracle::new();
 
-        // Register both top-k rules upfront (create on empty graph — no backfill
+        // Register all top-k rules upfront (create on empty graph — no backfill
         // needed; incremental fires carry everything).
-        let rules = vec![rule_fe_k1(), rule_nw_k3()];
+        let rules = vec![rule_fe_k1(), rule_nw_k3(), rule_any_k2()];
         for rule in &rules {
             db.create_rule(rule.clone()).unwrap();
             oracle.create_rule(rule.clone());

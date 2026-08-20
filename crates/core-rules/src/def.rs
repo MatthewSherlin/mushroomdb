@@ -37,6 +37,20 @@ pub struct RuleDef {
     pub approximate: bool,
 }
 
+/// Score-combination conventions for composed predicates:
+///
+/// - `All(parts)` — **minimum** of the individual branch scores.  Every
+///   branch must match; the weakest link controls the edge weight.
+///   Verified by test `all_takes_min_score_and_requires_every_part`.
+///
+/// - `Any(parts)` — **maximum** of the satisfied branches' scores.  At
+///   least one branch must match; the strongest match controls the edge
+///   weight.  Verified by test `any_score_is_max_when_both_branches_match`.
+///
+/// These conventions are opposites: `All` is pessimistic (min), `Any` is
+/// optimistic (max).  Nesting is allowed up to depth
+/// `MAX_PREDICATE_NESTING_DEPTH`; `validate()` returns a named error beyond
+/// that.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Predicate {
     KeyMatch { field: String },
@@ -47,6 +61,10 @@ pub enum Predicate {
     NumericWithin { field: String, tolerance: f64 },
     GeoRadius { field: String, km: f64 },
     VectorSimilar { field: String, min: f64 },
+    // APPENDED (Plan 13 T2) — positional bincode: never reorder.
+    /// OR composition: matches when at least one branch matches.
+    /// Score = max over satisfied branches (see doc comment on `Predicate`).
+    Any(Vec<Predicate>),
 }
 
 pub struct NodeView<'a> {
@@ -67,6 +85,13 @@ impl RuleDef {
             }
         }
         validate_pred(&self.predicate)?;
+        let depth = predicate_nesting_depth(&self.predicate);
+        if depth > MAX_PREDICATE_NESTING_DEPTH {
+            return Err(format!(
+                "predicate nesting depth {depth} exceeds cap of \
+                 {MAX_PREDICATE_NESTING_DEPTH}"
+            ));
+        }
         if self.approximate && !predicate_is_vector_similar_rooted(&self.predicate) {
             return Err(
                 "approximate=true requires a VectorSimilar-rooted predicate \
@@ -84,6 +109,14 @@ impl RuleDef {
     }
 }
 
+/// Maximum nesting depth for compound predicates (`All` / `Any`).
+///
+/// Depth is defined as the number of nested compound-predicate layers:
+/// a bare scalar predicate has depth 0; `Any([X, Y])` has depth 1;
+/// `All([Any([X]), Y])` has depth 2; etc.  `validate()` returns a named
+/// error when this cap is exceeded.
+pub const MAX_PREDICATE_NESTING_DEPTH: usize = 4;
+
 /// Returns true when the predicate is `VectorSimilar` itself, or an `All`
 /// whose first element is `VectorSimilar` — the only predicates that may use
 /// the IVF-Flat approximate candidate path (`approximate: true`).
@@ -93,7 +126,22 @@ pub fn predicate_is_vector_similar_rooted(p: &Predicate) -> bool {
         Predicate::All(parts) => {
             !parts.is_empty() && matches!(parts[0], Predicate::VectorSimilar { .. })
         }
+        Predicate::Any(_) => false,
         _ => false,
+    }
+}
+
+/// Returns the nesting depth of a predicate tree.
+///
+/// Scalar predicates return 0.  `All` and `Any` return
+/// `1 + max(depths of children)` (0 when empty, which is guarded by
+/// `validate_pred`).
+fn predicate_nesting_depth(p: &Predicate) -> usize {
+    match p {
+        Predicate::All(parts) | Predicate::Any(parts) => {
+            1 + parts.iter().map(predicate_nesting_depth).max().unwrap_or(0)
+        }
+        _ => 0,
     }
 }
 
@@ -150,6 +198,12 @@ fn validate_pred(p: &Predicate) -> Result<(), String> {
             }
             parts.iter().try_for_each(validate_pred)
         }
+        Predicate::Any(parts) => {
+            if parts.is_empty() {
+                return Err("any() must have at least one predicate".into());
+            }
+            parts.iter().try_for_each(validate_pred)
+        }
     }
 }
 
@@ -163,7 +217,9 @@ fn collect_fields(p: &Predicate, out: &mut BTreeSet<String>) {
         | Predicate::VectorSimilar { field, .. } => {
             out.insert(field.clone());
         }
-        Predicate::All(parts) => parts.iter().for_each(|q| collect_fields(q, out)),
+        Predicate::All(parts) | Predicate::Any(parts) => {
+            parts.iter().for_each(|q| collect_fields(q, out))
+        }
     }
 }
 
@@ -199,6 +255,21 @@ pub fn evaluate(pred: &Predicate, src: &NodeView, dst: &NodeView) -> Option<f64>
                 score = score.min(evaluate(part, src, dst)?);
             }
             Some(score)
+        }
+        Predicate::Any(parts) => {
+            // validate() rejects empty Any; this is defense-in-depth against skipped validation.
+            // Score = max over satisfied branches (see doc comment on Predicate).
+            // Returns None only when no branch matches.
+            let mut best: Option<f64> = None;
+            for part in parts {
+                if let Some(s) = evaluate(part, src, dst) {
+                    best = Some(match best {
+                        None => s,
+                        Some(prev) => prev.max(s),
+                    });
+                }
+            }
+            best
         }
         Predicate::NumericWithin { field, tolerance } => {
             // Score: tolerance == 0.0 → 1.0 (exact match required), else
@@ -845,6 +916,195 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Any predicate tests (TDD — written before implementation)
+    // -----------------------------------------------------------------------
+
+    /// Score = max over satisfied branches; None only when all branches fail.
+    #[test]
+    fn any_takes_max_score_and_requires_at_least_one_branch() {
+        let mk =
+            |items: &[&str]| Value::List(items.iter().map(|s| Value::Str((*s).into())).collect());
+        // src: ind="arch", tags=["x","y"]; dst: ind="law", tags=["y","z"]
+        // Branch A: FieldEqual(ind) → None  (arch ≠ law)
+        // Branch B: Overlap(tags, 0.3) → jaccard = 1/3 ≥ 0.3 → Some(1/3)
+        // Any → Some(max(_, 1/3)) = Some(1/3)
+        let a: HashMap<_, _> = [
+            ("ind".to_string(), Value::Str("arch".into())),
+            ("tags".to_string(), mk(&["x", "y"])),
+        ]
+        .into();
+        let b: HashMap<_, _> = [
+            ("ind".to_string(), Value::Str("law".into())),
+            ("tags".to_string(), mk(&["y", "z"])),
+        ]
+        .into();
+        let p = Predicate::Any(vec![
+            Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+            Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.3,
+            },
+        ]);
+        let s = eval!(&p, ("a", a) => ("b", b)).unwrap();
+        assert!(
+            (s - 1.0 / 3.0).abs() < 1e-9,
+            "score must be max(None, 1/3) = 1/3, got {s}"
+        );
+    }
+
+    /// When both branches match, Any returns the larger score.
+    #[test]
+    fn any_score_is_max_when_both_branches_match() {
+        // src: ind="arch", year=2000; dst: ind="arch", year=2001
+        // Branch A: FieldEqual(ind) → Some(1.0)
+        // Branch B: NumericWithin(year, tol=3) → 1 - 1/3 = 2/3 → Some(2/3)
+        // Any → Some(max(1.0, 2/3)) = Some(1.0)
+        let a: HashMap<_, _> = [
+            ("ind".to_string(), Value::Str("arch".into())),
+            ("year".to_string(), Value::Int(2000)),
+        ]
+        .into();
+        let b: HashMap<_, _> = [
+            ("ind".to_string(), Value::Str("arch".into())),
+            ("year".to_string(), Value::Float(2001.0)),
+        ]
+        .into();
+        let p = Predicate::Any(vec![
+            Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+            Predicate::NumericWithin {
+                field: "year".into(),
+                tolerance: 3.0,
+            },
+        ]);
+        let s = eval!(&p, ("a", a) => ("b", b)).unwrap();
+        assert!(
+            (s - 1.0).abs() < 1e-9,
+            "score must be max(1.0, 2/3) = 1.0, got {s}"
+        );
+    }
+
+    /// None when all branches fail.
+    #[test]
+    fn any_returns_none_when_all_branches_fail() {
+        let a: HashMap<_, _> = [("ind".to_string(), Value::Str("arch".into()))].into();
+        let b: HashMap<_, _> = [("ind".to_string(), Value::Str("law".into()))].into();
+        let p = Predicate::Any(vec![
+            Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+            Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+        ]);
+        assert_eq!(eval!(&p, ("a", a) => ("b", b)), None);
+    }
+
+    /// Nested All(FieldEqual, Any(Overlap, NumericWithin)).
+    /// All uses min; Any uses max.  Combined: min(1.0, max(1/3, 2/3)) = 2/3.
+    #[test]
+    fn nested_all_of_any_uses_min_over_max() {
+        let mk =
+            |items: &[&str]| Value::List(items.iter().map(|s| Value::Str((*s).into())).collect());
+        // src: ind="arch", tags=["x","y"], year=2000
+        // dst: ind="arch", tags=["y","z"], year=2001
+        // FieldEqual(ind)             → Some(1.0)
+        // Overlap(tags, 0.3)          → jaccard=1/3 → Some(1/3)
+        // NumericWithin(year, tol=3)  → 1 - 1/3 = 2/3 → Some(2/3)
+        // Any(Overlap, Numeric)       → max(1/3, 2/3) = 2/3
+        // All(FieldEqual, Any(...))   → min(1.0, 2/3) = 2/3
+        let a: HashMap<_, _> = [
+            ("ind".to_string(), Value::Str("arch".into())),
+            ("tags".to_string(), mk(&["x", "y"])),
+            ("year".to_string(), Value::Int(2000)),
+        ]
+        .into();
+        let b: HashMap<_, _> = [
+            ("ind".to_string(), Value::Str("arch".into())),
+            ("tags".to_string(), mk(&["y", "z"])),
+            ("year".to_string(), Value::Float(2001.0)),
+        ]
+        .into();
+        let p = Predicate::All(vec![
+            Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+            Predicate::Any(vec![
+                Predicate::Overlap {
+                    field: "tags".into(),
+                    min: 0.3,
+                },
+                Predicate::NumericWithin {
+                    field: "year".into(),
+                    tolerance: 3.0,
+                },
+            ]),
+        ]);
+        let s = eval!(&p, ("a", a) => ("b", b)).unwrap();
+        assert!(
+            (s - 2.0 / 3.0).abs() < 1e-9,
+            "expected min(1.0, max(1/3, 2/3)) = 2/3, got {s}"
+        );
+    }
+
+    /// validate() rejects empty Any; depth cap 4 is enforced with a named error.
+    #[test]
+    fn any_validation_errors() {
+        // Empty Any → error
+        let empty = sample_rule(Predicate::Any(vec![]));
+        assert!(empty.validate().is_err());
+
+        // Helper: build a singly-nested Any chain of the given depth.
+        fn any_chain(depth: usize) -> Predicate {
+            if depth == 0 {
+                Predicate::FieldEqual {
+                    field: "f".into(),
+                }
+            } else {
+                Predicate::Any(vec![any_chain(depth - 1)])
+            }
+        }
+
+        // depth 4 = cap → valid
+        assert!(
+            sample_rule(any_chain(4)).validate().is_ok(),
+            "depth 4 must be valid (at cap)"
+        );
+        // depth 5 > cap → named error
+        let too_deep = sample_rule(any_chain(5));
+        let err = too_deep.validate().unwrap_err();
+        assert!(
+            err.contains("nesting depth"),
+            "error must mention 'nesting depth', got: {err}"
+        );
+
+        // Any containing empty All → error propagated from inner validate_pred
+        let bad_inner = sample_rule(Predicate::Any(vec![Predicate::All(vec![])]));
+        assert!(bad_inner.validate().is_err());
+    }
+
+    /// watched_fields collects fields from all branches of Any.
+    #[test]
+    fn any_watched_fields_collected() {
+        let p = Predicate::Any(vec![
+            Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+            Predicate::NumericWithin {
+                field: "year".into(),
+                tolerance: 1.0,
+            },
+        ]);
+        let r = sample_rule(p);
+        assert!(r.validate().is_ok());
+        let fields: Vec<_> = r.watched_fields().into_iter().collect();
+        assert_eq!(fields, vec!["ind".to_string(), "year".to_string()]);
+    }
+
     #[test]
     fn new_predicates_validate_and_watch_fields() {
         let num = sample_rule(Predicate::NumericWithin {
@@ -1027,6 +1287,48 @@ mod wire_pins {
                 66, 6, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 101, 109, 98, 205, 204, 204, 204, 204, 204,
                 236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0
             ]
+        );
+    }
+
+    #[test]
+    fn any_variant_is_appended_at_discriminant_7() {
+        // Any is discriminant 7 (appended after VectorSimilar=6).
+        // Old WAL/snapshot records never contain discriminant 7, so old data
+        // still round-trips via the existing variants 0–6.
+        // Encoding: discriminant(u32 le) + Vec<Predicate> (len u64 le + elements).
+        // This pin guards that Any is never reordered or renumbered.
+        let any_fe = pin(Predicate::Any(vec![Predicate::FieldEqual {
+            field: "f".into(),
+        }]));
+        let bytes = bincode::serialize(&any_fe).unwrap();
+        // Predicate discriminant 7 is at byte 28 (after RuleDef header fields).
+        // Locate the discriminant by checking that bytes[28..32] == [7,0,0,0].
+        // (Exact byte index depends on RuleDef field widths — verified below.)
+        // First, round-trip: Any must decode to itself.
+        let decoded: RuleDef = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, any_fe, "Any must round-trip via bincode");
+        // Discriminant 7 must appear somewhere in the serialised predicate bytes.
+        let contains_discrim_7 = bytes
+            .windows(4)
+            .any(|w| w == [7u8, 0, 0, 0]);
+        assert!(
+            contains_discrim_7,
+            "serialised Any must contain discriminant byte sequence [7,0,0,0]"
+        );
+        // Verify that RuleDefs with the old variants still decode after Any is appended.
+        let old = bincode::serialize(&pin(Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.9,
+        }))
+        .unwrap();
+        let old_decoded: RuleDef = bincode::deserialize(&old).unwrap();
+        assert_eq!(
+            old_decoded.predicate,
+            Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9
+            },
+            "pre-Any VectorSimilar record must still decode"
         );
     }
 
