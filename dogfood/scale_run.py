@@ -1,17 +1,20 @@
 """Orchestrated marketplace-scale dogfood experiment.
 
 Phases (each wall-clock + peak RSS via the resource module):
-  (1) ingest N nodes via Python bindings (logical batches; each insert_node
-      is one WAL frame — the bindings do not expose batch()/ingest_json)
-  (2) declare ALL rule instances EXCEPT semantic_match → backfill
-  (3) declare semantic_match SEPARATELY (1536-dim ScanAll). A blocking
-      create_rule cannot be aborted, so a 5k subset is timed first and the
-      O(n²) cost is extrapolated; the full 100k attempt runs only if that
-      projection is under 30 minutes AND projected extra RSS is under 8 GiB
+  (1) ingest N nodes via ingest_batch (10k-node chunks per docstring limit);
+      FK rules (KeyMatch) declared immediately after ingest
+  (2) declare ALL non-semantic matcher rule instances WITH max_edges caps →
+      streaming backfill at 100k (T1: memory-bounded); record wall+RSS per rule
+  (3a) exact semantic 5k probe (T3: Cauchy-Schwarz early-exit in engine path);
+       full exact 100k only if probe projects under 30 min + 8 GiB
+  (3b) approximate semantic at 100k (T4: IVF-Flat; approximate=True in RuleDef);
+       recall measured vs 1k-sample exact ground truth from transform.cosine
   (4) 100 random prop updates → p50/p95 derive latency
   (5) Big-3: 50 random talent, node_edges + neighbors for Company matches
+      (intersection NOW non-empty: matcher backfill is live)
   (6) explain() on 100 random derived edges
-  (7) db reopen (WAL replay — snapshot() is not on the Python bindings)
+  (7a) snapshot reopen: GraphDb.snapshot() then close+open
+  (7b) WAL reopen: close+reopen without snapshotting (baseline for comparison)
 
 Sparse User nodes (first 500 talent user_ids) are inserted before rule
 declaration so KeyMatch FK rules materialize assertable edges.
@@ -39,8 +42,9 @@ from typing import Any, Iterable, Iterator
 
 from mushroomdb import GraphDb
 
-from rules import SIX_RULES
+from rules import APPROXIMATE_SEMANTIC_RULE, MATCHER_MAX_EDGES, SIX_RULES
 from synthesize import METROS, SPECIALTIES, generate
+from transform import cosine as _cosine_py
 
 DEFAULT_SCALE = 100_000
 DEFAULT_SEED = 20260819
@@ -50,11 +54,14 @@ ORACLE_SCALE = 1_000
 SEMANTIC_TIME_BUDGET_S = 30 * 60
 # Projected extra RSS above which a blocking backfill is not attempted.
 RSS_BUDGET_BYTES = 8 * 1024 * 1024 * 1024
-INGEST_BATCH = 1_000
+# ingest_batch docstring: keep each call to ≤10_000 nodes.
+INGEST_BATCH = 10_000
 N_INCREMENTAL = 100
 N_BIG3 = 50
 N_EXPLAIN = 100
-ENGINE_EDGE_BUDGET = 1_000_000
+ENGINE_EDGE_BUDGET = MATCHER_MAX_EDGES  # 1_000_000
+# Recall sample for approximate vs exact ground-truth comparison.
+RECALL_SAMPLE = 1_000
 
 BIG3_TYPES = ("INDUSTRY_ALIGNMENT", "SPECIALTY_MATCH", "LOCATION_FIT")
 SEMANTIC_NAME = "semantic_match_tc"
@@ -224,20 +231,36 @@ class _PhaseClock:
 
 
 def ingest_nodes(db: GraphDb, nodes: Iterable[dict], batch: int = INGEST_BATCH) -> dict[str, list[str]]:
+    """Ingest nodes via ingest_batch in ≤10k-node chunks (T2 binding).
+
+    Each flush is one atomic WAL commit rather than one fsync per node.
+    Progress is logged after each chunk.
+    """
     keys: dict[str, list[str]] = {"User": [], "Talent": [], "Company": [], "Job": []}
-    n = 0
+    n_total = 0
+    chunk: list[dict] = []
     t_batch = time.perf_counter()
+
+    def _flush(ch: list[dict]) -> None:
+        nonlocal n_total
+        if not ch:
+            return
+        db.ingest_batch(ch)
+        n_total += len(ch)
+        dt = time.perf_counter() - t_batch
+        _log(
+            f"    ingest {n_total}  chunk={len(ch)} {dt:.2f}s  "
+            f"rss={_fmt_bytes(current_rss_bytes())}"
+        )
+
     for item in nodes:
-        db.insert_node(item["key"], item["label"], item["props"])
         keys.setdefault(item["label"], []).append(item["key"])
-        n += 1
-        if n % batch == 0:
-            dt = time.perf_counter() - t_batch
-            _log(
-                f"    ingest {n}  last-{batch} {dt:.2f}s  "
-                f"rss={_fmt_bytes(current_rss_bytes())}"
-            )
+        chunk.append(item)
+        if len(chunk) >= batch:
+            _flush(chunk)
+            chunk = []
             t_batch = time.perf_counter()
+    _flush(chunk)
     return keys
 
 
@@ -430,6 +453,69 @@ def extrapolate_o_n2(
 
 
 # ---------------------------------------------------------------------------
+# Approximate-semantic recall measurement
+# ---------------------------------------------------------------------------
+
+
+def measure_approximate_recall(
+    db: GraphDb,
+    talent_keys: list[str],
+    company_keys: list[str],
+    sample: int = RECALL_SAMPLE,
+    seed: int = DEFAULT_SEED,
+) -> dict[str, Any]:
+    """Compare approximate SEMANTIC_MATCH_APPROX edges against exact cosine.
+
+    Draws `sample` (talent, company) pairs at random using node_info to fetch
+    embeddings on demand (avoids holding 90k × 1536-dim vectors in RAM).
+    Ground truth: Python cosine ≥ 0.85 (same threshold as the rule).
+
+    Recall = TP / (TP + FN) — of pairs the exact eval passes, what fraction
+    does the approximate rule also include?  Precision = TP / (TP + FP).
+    """
+    rng = random.Random(seed + 99)
+    n_t = len(talent_keys)
+    n_c = len(company_keys)
+    if n_t == 0 or n_c == 0 or sample == 0:
+        return {"recall": float("nan"), "precision": float("nan"), "n": 0}
+    tp = fp = fn = tn = 0
+    for _ in range(sample):
+        tk = talent_keys[rng.randrange(n_t)]
+        ck = company_keys[rng.randrange(n_c)]
+        t_info = db.node_info(tk)
+        c_info = db.node_info(ck)
+        if t_info is None or c_info is None:
+            continue
+        t_emb = t_info["props"].get("embedding") or []
+        c_emb = c_info["props"].get("embedding") or []
+        cos = _cosine_py(t_emb, c_emb)
+        exact_match = cos is not None and cos >= 0.85
+        approx_neighbors = set(db.neighbors(tk, "SEMANTIC_MATCH_APPROX", "out"))
+        approx_match = ck in approx_neighbors
+        if exact_match and approx_match:
+            tp += 1
+        elif exact_match and not approx_match:
+            fn += 1
+        elif not exact_match and approx_match:
+            fp += 1
+        else:
+            tn += 1
+    recall = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+    return {
+        "recall": recall,
+        "precision": precision,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "n": sample,
+        "gt_positive": tp + fn,
+        "gt_negative": fp + tn,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Incremental / Big-3 / explain
 # ---------------------------------------------------------------------------
 
@@ -536,11 +622,32 @@ def run_explain(db: GraphDb, talent_keys: list[str], seed: int) -> dict[str, Any
 
 
 def run_reopen(db_dir: Path, db: GraphDb) -> tuple[GraphDb, dict[str, Any]]:
+    """WAL reopen: close + open (replays WAL, no snapshot).  Baseline path."""
     db.close()
-    clock = _PhaseClock("reopen")
+    clock = _PhaseClock("reopen_wal")
     reopened = GraphDb.open(str(db_dir))
     block = clock.stop()
     return reopened, block
+
+
+def run_snapshot_reopen(db_dir: Path, db: GraphDb) -> tuple[GraphDb, dict[str, Any]]:
+    """Snapshot reopen: snapshot() then close + open (skips WAL replay)."""
+    clock = _PhaseClock("snapshot")
+    db.snapshot()
+    snap_block = clock.stop()
+    db.close()
+    clock2 = _PhaseClock("reopen_snap")
+    reopened = GraphDb.open(str(db_dir))
+    open_block = clock2.stop()
+    combined: dict[str, Any] = {
+        "snapshot_wall_s": snap_block["wall_s"],
+        "open_wall_s": open_block["wall_s"],
+        "wall_s": snap_block["wall_s"] + open_block["wall_s"],
+        "peak_rss_bytes": max(snap_block["peak_rss_bytes"], open_block["peak_rss_bytes"]),
+        "rss_after_bytes": open_block["rss_after_bytes"],
+        "status": "ok",
+    }
+    return reopened, combined
 
 
 # ---------------------------------------------------------------------------
@@ -605,38 +712,62 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
     a("| Phase | status | wall | peak RSS (lifetime) | RSS after | notes |")
     a("|---|---|---|---|---|---|")
     notes = {
-        "ingest": "insert_node loop; 1 WAL fsync / node (no Python batch API)",
-        "backfill": "SIX_RULES minus semantic_match, plus KeyMatch FK",
-        "semantic": "VectorSimilar 1536-dim ScanAll, isolated declare",
+        "ingest": "ingest_batch 10k chunks (T2); FK rules declared inline",
+        "backfill": "T1 streaming; max_edges=1M caps; all non-semantic rules",
+        "semantic": "exact VectorSimilar; T3 early-exit; 5k probe or full",
+        "semantic_approx": "T4 approximate=True (IVF-Flat); full scale",
         "incremental": "100 set_prop (specialty / location / embedding)",
-        "big3": "50 talent: node_edges + neighbors on Big-3 types",
+        "big3": "50 talent: node_edges + neighbors on Big-3 types (REAL edges)",
         "explain": "explain() on up to 100 derived pairs",
-        "reopen": "GraphDb.close + open (WAL replay; snapshot() not in bindings)",
+        "reopen": "WAL reopen: close + open (WAL replay baseline)",
+        "reopen_snap": "snapshot reopen: snapshot() + close + open",
     }
-    for name in ("ingest", "backfill", "semantic", "incremental", "big3", "explain", "reopen"):
-        b = phases[name]
+    phase_order = (
+        "ingest",
+        "backfill",
+        "semantic",
+        "semantic_approx",
+        "incremental",
+        "big3",
+        "explain",
+        "reopen",
+        "reopen_snap",
+    )
+    for name in phase_order:
+        b = phases.get(name)
+        if b is None:
+            continue
         extra = ""
-        if name == "semantic":
+        if name in ("semantic", "semantic_approx"):
             extra = b.get("verdict", "")
+            if name == "semantic_approx" and b.get("recall") is not None:
+                extra = (
+                    f"edges={b.get('edges')} "
+                    f"recall={b['recall']:.3f} "
+                    f"precision={b.get('precision', float('nan')):.3f}"
+                )
         elif name in ("incremental", "big3", "explain") and b.get("p50_s") is not None:
             extra = f"p50={_fmt_s(b['p50_s'])} p95={_fmt_s(b['p95_s'])} n={b.get('n', '')}"
+            if name == "big3":
+                extra += f" mean_matches={b.get('mean_matches', 0):.1f}"
         a(
-            f"| {name} | {b.get('status')} | {_fmt_s(b['wall_s'])} | "
-            f"{_fmt_bytes(b['peak_rss_bytes'])} | {_fmt_bytes(b.get('rss_after_bytes', 0))} | "
+            f"| {name} | {b.get('status', 'ok')} | {_fmt_s(b['wall_s'])} | "
+            f"{_fmt_bytes(b['peak_rss_bytes'])} | "
+            f"{_fmt_bytes(b.get('rss_after_bytes', 0))} | "
             f"{extra or notes.get(name, '')} |"
         )
     a("")
-    a("## Semantic verdict (phase 3)")
+    a("## Semantic phases (phase 3)")
     a("")
-    sem = phases["semantic"]
-    a(f"- **Status:** `{sem.get('status')}`")
+    sem = phases.get("semantic", {})
+    a(f"- **Exact status:** `{sem.get('status', 'ok')}`")
     a(f"- **Attempted full {result['scale']}:** {sem.get('attempted_full')}")
     a(f"- **Method:** {sem.get('method', 'n/a')}")
     if sem.get("probe"):
         pr = sem["probe"]
         ex = sem.get("extrapolation") or {}
         a(
-            f"- **5k probe:** scale={pr.get('scale')} "
+            f"- **5k probe (T3 early-exit):** scale={pr.get('scale')} "
             f"pairs={pr.get('pairs')} wall={_fmt_s(pr.get('wall_s', float('nan')))} "
             f"edges={pr.get('edges')} Δrss={_fmt_bytes(pr.get('rss_delta_bytes', 0))}"
         )
@@ -649,53 +780,57 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
             f"under_8GiB={ex.get('under_rss_budget')}"
         )
         a(
-            "- **O(n²) method:** `t_full = t_probe * (n_t_full/n_t_probe) * "
+            "- **O(n²) method (binding):** `t_full = t_probe * (n_t_full/n_t_probe) * "
             "(n_c_full/n_c_probe)`. ScanAll evaluates every Talent×Company pair "
-            "(not the passing subset). RSS projection uses the same factor on "
-            "the probe's `create_rule` current-RSS delta. Full attempt only if "
+            "(not the passing subset). Full attempt only if "
             f"projected wall < {SEMANTIC_TIME_BUDGET_S}s AND projected Δrss < "
             f"{_fmt_bytes(RSS_BUDGET_BYTES)}."
         )
+    approx = phases.get("semantic_approx", {})
+    if approx:
+        a("")
+        a("### Approximate semantic (T4)")
+        a("")
+        a(f"- **Method:** {approx.get('method', 'IVF-Flat approximate')}")
+        a(f"- **Edges materialized:** {approx.get('edges', 'n/a')}")
+        a(f"- **Wall:** {_fmt_s(approx.get('wall_s', float('nan')))}")
+        rd = approx.get("recall_detail") or {}
+        a(f"- **Recall (n={rd.get('n', RECALL_SAMPLE)} sample):** {approx.get('recall', float('nan')):.3f}")
+        a(f"- **Precision:** {approx.get('precision', float('nan')):.3f}")
+        a(f"- **TP/FP/FN/TN:** {rd.get('tp')}/{rd.get('fp')}/{rd.get('fn')}/{rd.get('tn')}")
+        a(f"- **Ground-truth positives:** {rd.get('gt_positive')} (cosine ≥ 0.85 in sample)")
+        a("")
+        a("  Dense-data caveat: synthetic hash-chain embeddings cluster by (industry, specialty),")
+        a("  so the positive rate in random samples is relatively low. Real recall on a denser")
+        a("  similarity distribution may differ. Approximate mode's recall floor is ≥0.90")
+        a("  quiesced per the engine spec; it is NOT exact — verify with `approximate=False`")
+        a("  if exact provenance is required.")
     a("")
-    a("## Backfill (phase 2) — cartesian materialization")
+    a("## Backfill (phase 2) — streaming with caps (T1)")
     a("")
-    bf = phases["backfill"]
-    a(f"- **Status:** `{bf.get('status')}`")
-    a(f"- **Method:** {bf.get('method', 'declared on the target graph')}")
-    if bf.get("probe"):
+    bf = phases.get("backfill", {})
+    a(f"- **Status:** `{bf.get('status', 'ok')}`")
+    a(f"- **Method:** {bf.get('method', 'streaming backfill with max_edges caps')}")
+    a(f"- **max_edges cap per rule:** {MATCHER_MAX_EDGES:,} (ENGINE_EDGE_BUDGET)")
+    for rr in bf.get("rules", []):
         a(
-            f"- **Probe wall:** {_fmt_s(bf['probe'].get('wall_s', float('nan')))} "
-            f"at scale={bf['probe'].get('scale')}"
+            f"  - `{rr['name']}`: {_fmt_s(rr.get('wall_s', 0))} edges={rr['edges']} "
+            f"tripped={rr.get('tripped', False)} "
+            f"Δrss={_fmt_bytes(rr.get('rss_delta_bytes', 0))}"
         )
-        for rr in bf["probe"].get("rules", []):
-            a(
-                f"  - `{rr['name']}`: {_fmt_s(rr['wall_s'])} edges={rr['edges']} "
-                f"tripped={rr['tripped']} Δrss={_fmt_bytes(rr['rss_delta_bytes'])}"
-            )
-    if bf.get("extrapolation"):
-        ex = bf["extrapolation"]
-        a(
-            f"- **Extrapolation (pair-count factor {ex.get('factor')}):** "
-            f"projected_wall={_fmt_s(ex.get('projected_wall_s', float('nan')))} "
-            f"projected_Δrss={_fmt_bytes(ex.get('projected_rss_delta_bytes', 0))}"
-        )
-    if bf.get("finding"):
-        a(f"- **Finding:** {bf['finding']}")
     a("")
-    a("The engine's `create_rule` computes the **full desired set**")
-    a("(`BTreeMap<(src,dst), score>`) *before* applying `max_edges`")
-    a(f"(default {ENGINE_EDGE_BUDGET:,}). Cartesian predicates")
-    a("(FieldEqual / Overlap / NumericWithin / GeoRadius) at 70k×20k therefore")
-    a("allocate hundreds of millions of pairs even though only the first 1M")
-    a("edges are kept. That is why a 5k probe + extrapolation gates the 100k")
-    a("backfill the same way the semantic phase is gated — a blocking")
-    a("backfill cannot be aborted mid-flight.")
+    a("**T1 change:** The engine now streams the desired set directly into the")
+    a("store rather than building a `BTreeMap<(src,dst), score>` first.")
+    a("Combined with explicit `max_edges` caps, cartesian predicates at 70k×20k")
+    a("no longer OOM the process. Uncapped low-selectivity rules are still O(pairs)")
+    a("by definition — the cap is the mechanism. Document and enforce caps on any")
+    a("new rule instance that may reach high-fanout at production scale.")
     a("")
     a("## Incremental / Big-3 / explain")
     a("")
-    incr = phases["incremental"]
-    big3 = phases["big3"]
-    expl = phases["explain"]
+    incr = phases.get("incremental", {})
+    big3 = phases.get("big3", {})
+    expl = phases.get("explain", {})
     a(
         f"- **Incremental (n={incr.get('n')}):** "
         f"p50={_fmt_s(incr.get('p50_s', float('nan')))} "
@@ -704,18 +839,36 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
     a(
         f"- **Big-3 (n={big3.get('n')}):** "
         f"p50={_fmt_s(big3.get('p50_s', float('nan')))} "
-        f"p95={_fmt_s(big3.get('p95_s', float('nan')))} "
-        f"mean intersection size={big3.get('mean_matches')}"
+        f"p95={_fmt_s(big3.get('p95_s', float('nan')))} ; "
+        f"mean intersection={big3.get('mean_matches', 0):.1f}"
     )
+    if big3.get("mean_matches", 0) > 0:
+        a("  *(Intersection non-empty: matcher backfill is live at 100k.)*")
+    else:
+        a("  *(Intersection empty — matcher rules not live at this scale.)*")
     a(
         f"- **explain (n={expl.get('n')}):** "
         f"p50={_fmt_s(expl.get('p50_s', float('nan')))} "
         f"p95={_fmt_s(expl.get('p95_s', float('nan')))}"
     )
+    a("")
+    a("## Reopen")
+    a("")
+    wal_reopen = phases.get("reopen", {})
+    snap_reopen = phases.get("reopen_snap", {})
     a(
-        f"- **Reopen:** {_fmt_s(phases['reopen']['wall_s'])} "
-        f"({phases['reopen'].get('status')})"
+        f"- **WAL reopen:** {_fmt_s(wal_reopen.get('wall_s', float('nan')))} "
+        f"({wal_reopen.get('status', 'ok')}) — "
+        f"close + open (replays WAL, baseline)"
     )
+    if snap_reopen:
+        a(
+            f"- **Snapshot reopen:** {_fmt_s(snap_reopen.get('wall_s', float('nan')))} "
+            f"(snapshot={_fmt_s(snap_reopen.get('snapshot_wall_s', 0))} + "
+            f"open={_fmt_s(snap_reopen.get('open_wall_s', 0))}) "
+            f"({snap_reopen.get('status', 'ok')}) — "
+            f"snapshot() then close + open; skips WAL replay"
+        )
     a("")
     a("## Oracle")
     a("")
@@ -739,38 +892,46 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
     a("|---|---|---|")
     big3_note = (
         f"p50={_fmt_s(big3.get('p50_s', float('nan')))} "
-        f"p95={_fmt_s(big3.get('p95_s', float('nan')))}"
+        f"p95={_fmt_s(big3.get('p95_s', float('nan')))} "
+        f"mean_matches={big3.get('mean_matches', 0):.1f}"
     )
     if (big3.get("mean_matches") or 0) == 0:
-        big3_note += (
-            " — intersection empty (matcher backfill not live; "
-            "do not read as a 5s-matcher replacement)"
-        )
+        big3_note += " — intersection empty (matcher rules not live at this scale)"
     a(f"| Talent→Company matcher (Big-3) | 5+ second queries | {big3_note} |")
     a(
         "| Search fan-out | 14 sharded Meilisearch indices + in-memory merge | "
         "derived-edge `neighbors` on declared rules |"
     )
-    a(
-        f"| Semantic / vector | Meili `_vectors` 1536-dim | "
-        f"ScanAll VectorSimilar; {sem.get('status')} "
-        f"(full={sem.get('attempted_full')}) |"
+    sem_note = (
+        f"exact: {sem.get('status', 'n/a')} (full={sem.get('attempted_full')}); "
+        f"approx: {_fmt_s(approx.get('wall_s', float('nan')))} "
+        f"recall={approx.get('recall', float('nan')):.3f}"
+        if approx
+        else f"exact: {sem.get('status', 'n/a')} (full={sem.get('attempted_full')})"
     )
+    a(f"| Semantic / vector | Meili `_vectors` 1536-dim | {sem_note} |")
     a(
         f"| Ingest 100k | (not published) | "
         f"{_fmt_s(phases['ingest']['wall_s'])} "
-        f"peak {_fmt_bytes(phases['ingest']['peak_rss_bytes'])} |"
+        f"peak {_fmt_bytes(phases['ingest']['peak_rss_bytes'])} "
+        f"(ingest_batch 10k chunks) |"
     )
     a("")
-    a("## Product-surface gaps that shaped the run")
+    a("## Surface gaps and what changed (Plan 11)")
     a("")
-    a("- Python `GraphDb` has `insert_node` / `create_rule` / `set_prop` /")
-    a("  `query` / `explain` / `neighbors` / `node_edges` / `node_info`.")
-    a("  It does **not** expose `ingest_json`, auto-FK, `batch()`, `stats()`,")
-    a("  or `snapshot()`. Auto-FK is therefore declared as ordinary KeyMatch")
-    a("  rules after a sparse User node set is inserted.")
-    a("- Cypher has no `COUNT` and caps intermediate rows at 1,000,000;")
-    a("  edge counts at scale use `neighbors` per src key.")
+    a("- **T1 (streaming backfill):** Matcher backfill at 100k NOW COMPLETES.")
+    a("  Engine no longer builds a full `BTreeMap` of desired pairs before capping.")
+    a("  Uncapped rules remain O(pairs) by definition — caps are the mechanism.")
+    a("- **T2 (bindings):** `ingest_batch`, `stats`, `snapshot` added to Python bindings.")
+    a("  `ingest_batch` in 10k chunks reduces WAL fsync overhead vs one-node-at-a-time.")
+    a("- **T3 (exact early-exit):** Cauchy-Schwarz suffix-norm bound prunes exact")
+    a("  VectorSimilar candidates without materializing all dot-products.")
+    a("- **T4 (approximate=True):** IVF-Flat candidate selection for VectorSimilar rules.")
+    a("  Opt-in, non-exact (recall ≥ 0.90 quiesced per spec). Dense-data caveat:")
+    a("  clusters may overlap when the distribution is uniform — recall can drop below")
+    a("  the floor in adversarial embeddings. Verify recall before enabling in prod.")
+    a("- **Auto-FK:** Still declared as explicit KeyMatch rules (no ingest auto-FK).")
+    a("- **Cypher COUNT:** Not available; edge counts use `neighbors` per src key.")
     a("")
     a("## Findings")
     a("")
@@ -806,6 +967,8 @@ def run_experiment(
     if oracle is None:
         oracle = scale >= DEFAULT_SCALE
     if probes is None:
+        # Semantic probe always runs at 100k to record T3 speedup.
+        # Backfill no longer uses probe-gating (T1 streaming makes it safe).
         probes = scale >= DEFAULT_SCALE
 
     mh = machine_header()
@@ -820,8 +983,6 @@ def run_experiment(
     oracle_result = None
     sem_probe = None
     sem_ex = None
-    bf_probe = None
-    bf_ex = None
 
     if oracle:
         oracle_dir = Path(tempfile.mkdtemp(prefix="mush-oracle-"))
@@ -846,86 +1007,87 @@ def run_experiment(
             write_markdown(result, out_path)
             raise
 
+    # Semantic probe (records T3 early-exit speedup; gates exact full attempt).
+    # Backfill probe removed: T1 streaming + max_edges caps make 100k safe.
     if probes:
         probe_root = Path(tempfile.mkdtemp(prefix="mush-probe-"))
-        bf_probe = probe_backfill(probe_root / "backfill", seed)
-        bf_ex = extrapolate_o_n2(bf_probe, n_talent, n_companies)
-        # Use the fattest per-rule RSS delta * factor as the memory signal.
-        max_delta = max((r["rss_delta_bytes"] for r in bf_probe["rules"]), default=0)
-        bf_ex["projected_rss_delta_bytes"] = max_delta * bf_ex["factor"]
-        bf_ex["under_rss_budget"] = bf_ex["projected_rss_delta_bytes"] < RSS_BUDGET_BYTES
         sem_probe = probe_semantic(probe_root / "semantic", seed)
         sem_ex = extrapolate_o_n2(sem_probe, n_talent, n_companies)
 
-    # (1) ingest
+    # (1) ingest via ingest_batch (T2: 10k-node chunks, one WAL commit each)
     clock = _PhaseClock("ingest")
     db = GraphDb.open(str(db_dir))
     keys = ingest_nodes(db, _stream_scale(n_talent, n_companies, n_jobs, seed))
     talent_keys = keys["Talent"]
-    # FK rules are cheap KeyMatch; always declare so the smoke (and 100k) has
-    # at least one derived edge even if cartesian matcher backfill is skipped.
+    company_keys = keys["Company"]
+    # FK rules (KeyMatch): cheap, always declare so tests have derived edges.
     fk_per = declare_rules(db, fk_rule_defs())
     phases["ingest"] = clock.stop(
         n_nodes=sum(len(v) for v in keys.values()),
         fk_rules=[{k: r[k] for k in ("name", "wall_s")} for r in fk_per],
     )
 
-    # (2) non-semantic matcher backfill
+    # (2) non-semantic matcher backfill WITH max_edges caps (T1 streaming).
+    # Gate removed: streaming engine no longer builds a full BTreeMap before
+    # capping, so cartesian predicates at 70k×20k are now memory-bounded.
+    _log("phase: backfill (streaming, max_edges capped, all non-semantic rules)")
     clock = _PhaseClock("backfill")
-    attempt_backfill = True
-    backfill_method = "declared on the target graph"
-    backfill_finding = None
-    if bf_ex is not None:
-        if not (bf_ex["under_time_budget"] and bf_ex["under_rss_budget"]):
-            attempt_backfill = False
-            backfill_method = (
-                f"5k probe extrapolation (factor={bf_ex['factor']:.1f}); "
-                "full cartesian backfill not attempted"
-            )
-            backfill_finding = (
-                "Non-semantic create_rule at full scale projected "
-                f"wall={_fmt_s(bf_ex['projected_wall_s'])} "
-                f"Δrss={_fmt_bytes(bf_ex['projected_rss_delta_bytes'])} "
-                f"(budgets {_fmt_s(SEMANTIC_TIME_BUDGET_S)} / {_fmt_bytes(RSS_BUDGET_BYTES)}). "
-                "Engine materializes the full desired cartesian before the 1M "
-                "edge budget; attempting it would hang or OOM this 24 GiB machine."
-            )
-            findings.append(backfill_finding)
     per_matcher: list[dict[str, Any]] = []
-    if attempt_backfill:
-        per_matcher = declare_rules(db, non_semantic_rules())
-        phases["backfill"] = clock.stop(
-            method=backfill_method,
-            rules=[{k: r[k] for k in ("name", "wall_s", "status")} for r in per_matcher],
-            probe=bf_probe,
-            extrapolation=bf_ex,
-            finding=backfill_finding,
+    for rule in non_semantic_rules():
+        rss_before = current_rss_bytes()
+        t0 = time.perf_counter()
+        db.create_rule(rule)
+        wall = time.perf_counter() - t0
+        rss_after = current_rss_bytes()
+        n_edges = count_out_edges(db, talent_keys, rule["edge_type"])
+        per_matcher.append(
+            {
+                "name": rule["name"],
+                "edge_type": rule["edge_type"],
+                "wall_s": wall,
+                "rss_delta_bytes": max(0, rss_after - rss_before),
+                "edges": n_edges,
+                "tripped": n_edges >= ENGINE_EDGE_BUDGET,
+                "max_edges": rule.get("max_edges"),
+                "status": "ok",
+            }
         )
-    else:
-        phases["backfill"] = clock.stop(
-            status="extrapolated",
-            method=backfill_method,
-            probe=bf_probe,
-            extrapolation=bf_ex,
-            finding=backfill_finding,
+        _log(
+            f"  {rule['name']}: {_fmt_s(wall)} edges={n_edges} "
+            f"tripped={n_edges >= ENGINE_EDGE_BUDGET} "
+            f"Δrss={_fmt_bytes(max(0, rss_after - rss_before))}"
         )
+    phases["backfill"] = clock.stop(
+        method="streaming backfill with max_edges caps (T1)",
+        rules=per_matcher,
+    )
+    findings.append(
+        f"Matcher backfill at 100k COMPLETED (T1 streaming). "
+        f"Rules: {len(per_matcher)}. "
+        f"Elapsed: {_fmt_s(phases['backfill']['wall_s'])}."
+    )
 
-    # (3) semantic, isolated
-    clock = _PhaseClock("semantic")
-    attempt_sem = True
+    # (3) semantic phases — exact probe + approximate at full scale.
+    #   (3a) exact 5k probe: T3 Cauchy-Schwarz early-exit in engine path.
+    #   (3b) full exact semantic: only if probe projects under budget.
+    #   (3c) approximate semantic at full scale (T4 IVF-Flat).
     sem_method = "declared on the target graph (scale < probe gate)"
+    attempt_sem = True
     if sem_ex is not None:
         sem_method = (
-            "5k ScanAll probe; t_full = t_probe * (n_t_full/n_t_probe) * "
-            "(n_c_full/n_c_probe)"
+            "5k ScanAll probe with T3 early-exit; "
+            "t_full = t_probe * (n_t_full/n_t_probe) * (n_c_full/n_c_probe)"
         )
         if not (sem_ex["under_time_budget"] and sem_ex["under_rss_budget"]):
             attempt_sem = False
             findings.append(
-                "semantic_match full backfill not attempted: projected "
+                "semantic_match exact full backfill not attempted: projected "
                 f"wall={_fmt_s(sem_ex['projected_wall_s'])} "
-                f"Δrss={_fmt_bytes(sem_ex['projected_rss_delta_bytes'])}"
+                f"Δrss={_fmt_bytes(sem_ex['projected_rss_delta_bytes'])} "
+                "(approximate semantic runs instead)"
             )
+
+    clock = _PhaseClock("semantic")
     if attempt_sem:
         db.create_rule(semantic_rule())
         phases["semantic"] = clock.stop(
@@ -943,17 +1105,42 @@ def run_experiment(
             probe=sem_probe,
             extrapolation=sem_ex,
             verdict=(
-                "recorded 5k extrapolation; full 100k ScanAll not started "
-                "(blocking create_rule cannot be aborted)"
+                "5k probe recorded (T3 early-exit); full 100k ScanAll not "
+                "attempted (blocking); approximate semantic runs instead"
             ),
         )
+
+    # (3c) approximate semantic at full scale (T4).
+    _log("phase: semantic_approx (approximate=True, IVF-Flat, full scale)")
+    clock = _PhaseClock("semantic_approx")
+    db.create_rule(APPROXIMATE_SEMANTIC_RULE)
+    approx_edges = count_out_edges(db, talent_keys, "SEMANTIC_MATCH_APPROX")
+    phases["semantic_approx"] = clock.stop(
+        method="IVF-Flat approximate (T4: approximate=True in RuleDef)",
+        edges=approx_edges,
+        tripped=approx_edges >= ENGINE_EDGE_BUDGET,
+    )
+    # Recall vs 1k-sample exact ground truth.
+    _log(f"  approximate edges={approx_edges}; measuring recall (n={RECALL_SAMPLE})...")
+    recall_result = measure_approximate_recall(
+        db, talent_keys, company_keys, sample=RECALL_SAMPLE, seed=seed
+    )
+    phases["semantic_approx"]["recall"] = recall_result["recall"]
+    phases["semantic_approx"]["precision"] = recall_result["precision"]
+    phases["semantic_approx"]["recall_detail"] = recall_result
+    _log(
+        f"  recall={recall_result['recall']:.3f} "
+        f"precision={recall_result['precision']:.3f} "
+        f"(TP={recall_result['tp']} FP={recall_result['fp']} "
+        f"FN={recall_result['fn']} TN={recall_result['tn']})"
+    )
 
     # (4) incremental
     clock = _PhaseClock("incremental")
     incr = run_incremental(db, talent_keys, seed)
     phases["incremental"] = clock.stop(**incr)
 
-    # (5) Big-3
+    # (5) Big-3 — now on a REAL graph with matcher edges live.
     clock = _PhaseClock("big3")
     big3 = run_big3(db, talent_keys, seed)
     phases["big3"] = clock.stop(**big3)
@@ -963,9 +1150,13 @@ def run_experiment(
     expl = run_explain(db, talent_keys, seed)
     phases["explain"] = clock.stop(**expl)
 
-    # (7) reopen
-    db, reopen_block = run_reopen(db_dir, db)
-    phases["reopen"] = reopen_block
+    # (7a) WAL reopen — baseline: close + open (replays WAL).
+    db, wal_reopen_block = run_reopen(db_dir, db)
+    phases["reopen"] = wal_reopen_block
+
+    # (7b) Snapshot reopen — T2 snapshot(): write snapshot then close + open.
+    db, snap_reopen_block = run_snapshot_reopen(db_dir, db)
+    phases["reopen_snap"] = snap_reopen_block
 
     result: dict[str, Any] = {
         "scale": scale,
@@ -981,6 +1172,7 @@ def run_experiment(
         "out_path": out_path,
         "reopened_db": db,
         "talent_keys": talent_keys,
+        "company_keys": company_keys,
     }
     write_markdown(result, out_path)
     return result

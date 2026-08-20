@@ -237,7 +237,12 @@ def test_six_rules_are_per_pair_instances():
         "semantic_match_tc",
         "similar_size_strict_tc",  # negative-case oracle, tolerance=0
     ]
-    assert all(r["weight_prop"] == "score" and r["max_edges"] is None for r in SIX_RULES)
+    # max_edges is now 1_000_000 (Plan 11 T1 streaming cap) — no longer None.
+    from rules import MATCHER_MAX_EDGES
+    assert all(
+        r["weight_prop"] == "score" and r["max_edges"] == MATCHER_MAX_EDGES
+        for r in SIX_RULES
+    )
 
 
 def test_ingest_rules_derived_edges_and_explain(tmp_path):

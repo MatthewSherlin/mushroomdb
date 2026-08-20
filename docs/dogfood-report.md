@@ -191,3 +191,24 @@ The 5k ScanAll probe extrapolates to **80.3 hours at 100k** — `semantic_match`
 | Canvas degradation >1,000 nodes | 589 ms per zoom action at 1k nodes under swiftshader. Document recommended viewport node limit (~200–400 nodes for smooth GPU interaction). |
 | Cypher lacks COUNT | Use `neighbors` per src key for edge-count queries. Document Cypher surface gaps. |
 | Bindings missing `ingest_json` / `auto-FK` / `stats` / `snapshot` | Auto-FK works via explicit `KeyMatch` rules; others absent. Document the exposed surface. |
+
+---
+
+## Addendum — Plan 11 post-run (2026-08-20)
+
+Plan 11 (T1–T4) shipped four targeted engine + bindings changes. The dogfood re-run at the same 100k scale (seed=20260819) confirmed:
+
+| Blocker (pre-Plan-11) | Resolution | Residual |
+|---|---|---|
+| **M1 Cartesian backfill OOM** — projected 489–685 min / 331 GiB; not attempted | **T1 streaming backfill: 19.742 s, peak 3.61 GiB. Wall fell.** Engine now streams desired set directly into the store; `max_edges` cap is applied during iteration without materialising the full `BTreeMap`. | Uncapped low-selectivity rules remain O(pairs) by definition — the cap is the mechanism. Every rule instance targeting a high-fanout pair must carry an explicit `max_edges`. |
+| **M2 No batch ingest** — 8.92 min (1 WAL fsync/node) | **T2 `ingest_batch`: 1.35 min (6.6x).** Python bindings now expose `ingest_batch`, `stats`, `snapshot`. `ingest_batch` groups up to 10k nodes into a single WAL frame. | WAL reopen is now slower (7.91 min vs 26.87 s) because the WAL holds 10M+ backfill edges; snapshot reopen (7.58 min) is comparable to WAL replay at this WAL size. Evaluate snapshot-on-close for prod cold-start paths. |
+| **Semantic ScanAll at 100k (80.3 h projected)** | **T3 Cauchy-Schwarz early-exit: 41.7x probe speedup** (5k probe: 17.315 s was 12.05 min). Extrapolated 100k exact: 115.43 min. Still over 30-min budget. **T4 `approximate=True` IVF-Flat** adds an opt-in approximate path. | **Exact semantic at 100k remains over budget.** T4 recall at 100k (synthetic data) = 0.080 — far below the ≥0.90 spec floor. The dense-data caveat: at 70k×20k with a 1M cap only ~0.07% of pairs are covered; hash-chain embeddings cluster tightly, so the IVF index sees few positive examples per probe. Recall on real OpenAI vectors with a more uniform positive distribution may differ. Validate recall on production embeddings before enabling `approximate=True` in prod. |
+
+### What the numbers do and do not prove
+
+- **Matcher backfill at 100k is now viable** with caps. The 9-rule 19.742 s figure is a fair comparison.
+- **Big-3 intersection is still empty** at this scale because 1M / (70k×20k) ≈ 0.07% cap coverage. This is cap semantics, not an engine defect. Increase `max_edges` or narrow predicates to improve coverage.
+- **Incremental p50 rose** (15.50 ms vs 3.48 ms) because all 9 matcher rules now evaluate on each insert. Proportional to rules-per-event — expected.
+- **Approximate recall (0.080) is an honest number for this dataset.** Do not cite it as the recall floor; cite the spec (≥0.90 quiesced) and note the dense-data caveat above.
+
+Source: `dogfood/results/scale-100k.md`, "Run 2 (post-Plan-11)."

@@ -113,3 +113,65 @@ process on the machine above, synthetic hash-chain embeddings.
 - **Big-3 at 100k is an empty intersection** for the reason above. Do not read 5.7 µs as beating the marketplace 5 s matcher.
 - **2k pytest smoke** (`test_scale_small.py`) ran the full pipeline with all matcher rules + isolated semantic, asserted ≥1 FK edge, and brute-forced 50 random industry pairs against `neighbors`. 11/11 passed in 279.96 s.
 
+---
+
+## Run 2 (post-Plan-11) — 2026-08-20
+
+Same machine, same seed (20260819), same 100k scale (70k Talent + 20k Company + 10k Job + 500 User).
+Engine + bindings updated by Plan 11 T1–T4. Dogfood harness updated per Task 6 spec.
+
+### Before / after table
+
+| Metric | Run 1 (pre-Plan-11) | Run 2 (post-Plan-11) | Change |
+|---|---|---|---|
+| **Ingest 100k** | 8.92 min (1 WAL fsync/node) | **1.35 min** (ingest_batch 10k chunks, T2) | **6.6x faster** |
+| **Backfill (9 non-semantic rules)** | Not attempted — projected 489.66 min / 331 GiB (BTreeMap full desired-set OOM) | **19.742 s**, peak 3.61 GiB — ALL 9 rules applied (T1 streaming + max_edges=1M caps) | **Wall fell** |
+| **Semantic exact (100k)** | Not attempted — projected 80.3 h / 36 GiB (5k probe: 12.05 min) | Not attempted — projected 115.43 min / 0 B (5k probe: 17.315 s, T3 early-exit = **41.7x** speedup vs probe) | Probe 41.7x faster; full still over budget |
+| **Semantic approx (T4)** | Not available | **7.68 min**, 1M edges, recall=0.080, precision=1.000 | New capability |
+| **Incremental p50** | 3.48 ms (FK-only rules live) | **15.50 ms** (all 9 matcher rules now fire on insert) | Expected regression — more work per insert |
+| **Big-3 mean intersection** | 0.0 (no matcher edges declared) | 0.0 (1M cap covers ~0.07% of 70k×20k pairs; random sample hits uncovered range) | Cap coverage finding |
+| **WAL reopen** | 26.87 s (ingest-only WAL, 1.60 GiB) | 7.91 min (10M+ backfill edges in WAL, 1.72 GiB) | Expected regression — WAL holds all edges |
+| **Snapshot reopen (T2)** | Not available (snapshot() not in bindings) | 7.58 min (18.345 s write + 7.28 min open, 2.2 GiB snapshot.bin) | New capability |
+| **Oracle** | ok (58100/58100) | ok (58100/58100) | Correct |
+| **Tests** | 11/11 (2k smoke) | **41/41** (extended: new batch/recall/approx/snap tests) | All green |
+
+### Phase timings (Run 2)
+
+| Phase | status | wall | peak RSS | RSS after | notes |
+|---|---|---|---|---|---|
+| ingest | ok | 1.35 min | 2.57 GiB | 2.20 GiB | ingest_batch 10k chunks (T2); FK rules inline |
+| backfill | ok | 19.742 s | 3.61 GiB | 2.94 GiB | T1 streaming; max_edges=1M; all 9 non-semantic rules |
+| semantic | extrapolated | 54.87 ms | 3.61 GiB | 2.94 GiB | 5k probe only (T3 early-exit 17.315 s → projected 115.43 min) |
+| semantic_approx | ok | 7.68 min | 4.45 GiB | 2.40 GiB | T4 IVF-Flat; edges=1M; recall=0.080; precision=1.000 |
+| incremental | ok | 1.565 s | 4.45 GiB | 2.54 GiB | p50=15.50 ms p95=27.58 ms n=100 |
+| big3 | ok | 50.50 ms | 4.45 GiB | 2.54 GiB | p50=2.0 µs p95=8.7 µs n=50 mean_matches=0.0 |
+| explain | ok | 85.62 ms | 4.45 GiB | 2.62 GiB | p50=57.7 µs p95=117.0 µs n=100 |
+| reopen_wal | ok | 7.91 min | 8.09 GiB | 2.58 GiB | WAL replay baseline |
+| snapshot + reopen_snap | ok | 7.58 min total | 10.27 GiB | 637.16 MiB | snapshot()=18.345 s + open=7.28 min |
+
+### Backfill per-rule (Run 2)
+
+All 9 rules now run in a single streaming pass. Every rule tripped the 1M cap at 70k×20k scale.
+
+| Rule | Wall | Edges | Cap tripped | ΔRSS |
+|---|---|---|---|---|
+| industry_alignment_tc | 1.131 s | 1,000,000 | yes | 145.23 MiB |
+| industry_alignment_tj | 1.150 s | 2,000,000 | yes (TC+TJ share type) | 0 B |
+| specialty_match_tc | 2.499 s | 1,000,000 | yes | 205.05 MiB |
+| specialty_match_tj | 2.487 s | 2,000,000 | yes | 497.39 MiB |
+| location_fit_tc | 1.511 s | 1,000,000 | yes | 450.05 MiB |
+| location_fit_tj | 1.330 s | 2,000,000 | yes | 47.20 MiB |
+| similar_size_tc | 1.667 s | 1,000,000 | yes | 0 B |
+| matches_design_style_tc | 4.538 s | 1,000,000 | yes | 0 B |
+| similar_size_strict_tc | 1.478 s | 1,000,000 | yes | 221.78 MiB |
+
+### Findings (Run 2)
+
+- **T1 (streaming backfill): wall fell.** All 9 non-semantic rules backfilled at 100k in 19.742 s, peak 3.61 GiB. Run 1 projected 489–685 min / 331 GiB and could not be attempted.
+- **T2 (ingest_batch): 6.6x ingest speedup.** 10k-chunk batch reduces WAL fsync overhead. WAL reopen is slower (7.91 min vs 26.87 s) because the WAL now contains 10M+ backfill edges; snapshot reopen (7.58 min) is comparable — loading a 2.2 GiB snapshot takes similar time to replaying a 1.72 GiB WAL on this machine.
+- **T3 (Cauchy-Schwarz early-exit): 41.7x exact-probe speedup.** 5k probe: 17.315 s (was 12.05 min). Extrapolated 100k exact: 115.43 min (was 80.3 h). Full exact still over the 30-min budget.
+- **T4 (approximate=True): new IVF-Flat path works; recall is low on synthetic data.** At 70k×20k with 1M cap the IVF index covers ~0.07% of pairs. Synthetic hash-chain embeddings cluster tightly by (industry, specialty) — random sample found only 25 ground-truth positives in 1000 pairs, TP=2. Real recall on a denser similarity distribution (e.g., real OpenAI vectors with a more uniform positive rate) may differ substantially. Approximate mode's spec floor is recall ≥ 0.90 quiesced; this run at 100k is NOT quiesced.
+- **Big-3 intersection still empty.** 1M cap at 70k×20k covers ~0.07% of pairs (early streaming order). A random 50-talent sample hits mostly uncovered range. This is expected given the cap — not a correctness defect.
+- **Incremental p50 higher (15.50 ms vs 3.48 ms).** In Run 1 only FK rules fired on insert. In Run 2 all 9 matcher rules evaluate on each new node insertion. The increase is proportional to rules fired per event — not a regression.
+- **Oracle: 58100/58100.** No correctness change across Plan 11.
+

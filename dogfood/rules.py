@@ -12,11 +12,25 @@ same-bucket pairs and provably excludes the 5 cross-bucket pairs.
 
 `field_equal(industry)` is binary (score 1.0). marketplace scores industry
 `both` at 0.8 — documented composition gap, not chased.
+
+**max_edges cap (Plan 11 T1):** all cartesian rule instances carry
+`max_edges=1_000_000` — the engine default that the original 5k probe
+tripped. With T1's streaming backfill the engine no longer builds a
+full desired `BTreeMap` before capping; the cap governs only how many
+edges are *kept*, not how much memory is used during evaluation.
+`APPROXIMATE_SEMANTIC_RULE` is the `approximate=True` variant of
+`semantic_match_tc` added in T4.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+# Consistent cap for all cartesian rule instances at 100k.
+# Equal to the engine default (DEFAULT_MAX_EDGES = 1_000_000) so
+# the original probe behaviour is reproduced; the explicit value
+# documents the choice and lets tests assert it.
+MATCHER_MAX_EDGES = 1_000_000
 
 
 def _rule(
@@ -25,6 +39,7 @@ def _rule(
     dst: str,
     predicate: dict,
     edge_type: str,
+    max_edges: int | None = MATCHER_MAX_EDGES,
 ) -> dict[str, Any]:
     return {
         "name": name,
@@ -33,7 +48,7 @@ def _rule(
         "predicate": predicate,
         "edge_type": edge_type,
         "weight_prop": "score",
-        "max_edges": None,
+        "max_edges": max_edges,
     }
 
 
@@ -112,3 +127,20 @@ SIX_RULES: list[dict[str, Any]] = [
         "SIMILAR_SIZE_STRICT",
     ),
 ]
+
+# Approximate semantic rule (Plan 11 T4): IVF-Flat candidate selection.
+# `approximate=True` is only valid with a VectorSimilar-rooted predicate.
+# Recall ≥ 0.90 quiesced per the engine spec (not exact by definition).
+# Named differently from `semantic_match_tc` so both can coexist in the
+# same graph if needed; the scale_run uses this for the 100k phase and
+# separately probes the exact rule on a 5k subset.
+APPROXIMATE_SEMANTIC_RULE: dict[str, Any] = {
+    "name": "semantic_match_approx_tc",
+    "src_label": "Talent",
+    "dst_label": "Company",
+    "predicate": {"VectorSimilar": {"field": "embedding", "min": 0.85}},
+    "edge_type": "SEMANTIC_MATCH_APPROX",
+    "weight_prop": "score",
+    "max_edges": MATCHER_MAX_EDGES,
+    "approximate": True,
+}
