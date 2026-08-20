@@ -146,7 +146,7 @@ Engine + bindings updated by Plan 11 T1–T4. Dogfood harness updated per Task 6
 | semantic_approx | ok | 7.68 min | 4.45 GiB | 2.40 GiB | T4 IVF-Flat; edges=1M; set-cov recall=0.080 (~3% cap ceiling); per-query ANN recall=0.991 (5k probe, uncapped) |
 | incremental | ok | 1.565 s | 4.45 GiB | 2.54 GiB | p50=15.50 ms p95=27.58 ms n=100 |
 | big3 (full-graph) | ok | 50.50 ms | 4.45 GiB | 2.54 GiB | p50=2.0 µs p95=8.7 µs n=50 mean_matches=0.0 (cap coverage 0.07%) |
-| big3_slice (500T×500C) | ok | — | — | — | p50=581 µs p95=604 µs mean_matches=500.0 (all 3 rules fire, no cap) |
+| big3_slice (500T×500C) | ok | — | — | — | p50=581 µs p95=604 µs mean_matches=500.0 (all 3 rules fire, no cap). The slice is fully-connected by construction (every talent matches every company under all three rules), so this measures derived-edge traversal latency, not matcher selectivity. |
 | explain | ok | 85.62 ms | 4.45 GiB | 2.62 GiB | p50=57.7 µs p95=117.0 µs n=100 |
 | reopen_wal | ok | 7.91 min | 8.09 GiB | 2.58 GiB | rules re-fire on open(); IVF-Flat = bottleneck; WAL delta only 120 MiB |
 | snapshot + reopen_snap | ok | 7.58 min total | 10.27 GiB | 637.16 MiB | snapshot()=18.345 s + open=7.28 min; rules ALSO re-fire |
