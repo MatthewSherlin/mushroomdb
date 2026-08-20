@@ -147,7 +147,7 @@ These measurements use swiftshader (software WebGL in headless Chromium). Real-d
 
 ---
 
-## Screenshots (13 total, in `.superpowers/sdd/2026-08-19-plan-10-marketplace-dogfood/`)
+## Screenshots (13 total, captured during the run; not committed)
 
 | File | Description |
 |---|---|
