@@ -67,6 +67,11 @@ const MAX_GROUPS: usize = 1_000_000;
 /// Group-key type: one `Option<ValueKey>` per group-key RETURN item.
 /// `None` represents a null value; null keys group together (openCypher).
 type GroupKey = Vec<Option<ValueKey>>;
+/// Per-group entry: first-seen display values for key columns, plus accumulators.
+/// Display values are the original `Value`s before normalization so that
+/// `Int(42)` groups still display as `Int(42)` even though they are hashed as
+/// `FloatBits`.  For mixed Int/Float groups the first-seen value wins.
+type GroupEntry = (Vec<Option<Value>>, Vec<AggAcc>);
 
 #[cfg(test)]
 thread_local! {
@@ -174,15 +179,6 @@ fn group_cap_err() -> String {
         "group count exceeds {} distinct keys; add a WHERE clause or constrain the grouping key",
         max_groups()
     )
-}
-
-fn value_key_to_value(k: &ValueKey) -> Value {
-    match k {
-        ValueKey::Int(n) => Value::Int(*n),
-        ValueKey::FloatBits(b) => Value::Float(f64::from_bits(*b)),
-        ValueKey::Str(s) => Value::Str(s.clone()),
-        ValueKey::Bool(b) => Value::Bool(*b),
-    }
 }
 
 /// Convert a group-key value to a `ValueKey` with numeric unification.
@@ -345,13 +341,15 @@ fn execute_inner(
             // Plans that combine VarExpand with GroupAggregate fall through
             // to here; group over the already-materialised rows.
             PlanOp::GroupAggregate { keys, aggs } => {
-                let mut grp_groups: HashMap<GroupKey, Vec<AggAcc>> = HashMap::new();
+                let mut grp_groups: HashMap<GroupKey, GroupEntry> = HashMap::new();
                 let mut grp_key_order: Vec<GroupKey> = Vec::new();
                 for row in &rows {
                     let mut gk: GroupKey = Vec::with_capacity(keys.len());
+                    let mut display_vals: Vec<Option<Value>> = Vec::with_capacity(keys.len());
                     for (_, item) in keys {
                         let val = project_item(view, &vars, row, item)?;
                         gk.push(val.as_ref().and_then(group_key_normalize));
+                        display_vals.push(val);
                     }
                     if !grp_groups.contains_key(&gk) {
                         if grp_groups.len() >= max_groups() {
@@ -360,10 +358,10 @@ fn execute_inner(
                         grp_key_order.push(gk.clone());
                         grp_groups.insert(
                             gk.clone(),
-                            aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+                            (display_vals, aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect()),
                         );
                     }
-                    let accs = grp_groups.get_mut(&gk).unwrap();
+                    let (_, accs) = grp_groups.get_mut(&gk).unwrap();
                     for (acc, (func, arg, _)) in accs.iter_mut().zip(aggs.iter()) {
                         update_acc(view, &vars, row, func, arg, acc)?;
                     }
@@ -375,7 +373,7 @@ fn execute_inner(
                     grp_key_order.push(empty_key.clone());
                     grp_groups.insert(
                         empty_key,
-                        aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+                        (vec![], aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect()),
                     );
                 }
                 projected = Some(build_group_projected(keys, aggs, grp_key_order, &mut grp_groups));
@@ -1505,7 +1503,7 @@ fn build_group_projected(
     keys: &[(String, RetItem)],
     aggs: &[(AggFunc, AggArg, String)],
     key_order: Vec<GroupKey>,
-    groups: &mut HashMap<GroupKey, Vec<AggAcc>>,
+    groups: &mut HashMap<GroupKey, GroupEntry>,
 ) -> Projected {
     let columns: Vec<String> = keys
         .iter()
@@ -1514,10 +1512,12 @@ fn build_group_projected(
         .collect();
     let mut rows: Vec<Vec<Option<Value>>> = Vec::with_capacity(key_order.len());
     for gk in key_order {
-        let accs = groups.remove(&gk).unwrap_or_default();
+        let (display_keys, accs) = groups.remove(&gk).unwrap_or_default();
         let mut row: Vec<Option<Value>> = Vec::with_capacity(columns.len());
-        for key_val in &gk {
-            row.push(key_val.as_ref().map(value_key_to_value));
+        // Use the first-seen original values for display; Int(42) stays Int(42)
+        // even though it was normalized to FloatBits for hashing.
+        for display_val in display_keys {
+            row.push(display_val);
         }
         for acc in accs {
             row.push(acc.finish());
@@ -1549,7 +1549,7 @@ fn execute_group_aggregate(
     let tail = &plan[gagg_pos + 1..];
     let vars = collect_vars(plan);
     let initial_row: Row = vec![None; vars.names.len()];
-    let mut groups: HashMap<GroupKey, Vec<AggAcc>> = HashMap::new();
+    let mut groups: HashMap<GroupKey, GroupEntry> = HashMap::new();
     let mut key_order: Vec<GroupKey> = Vec::new();
     let ctx = GroupStreamCtx {
         view,
@@ -1567,7 +1567,7 @@ fn execute_group_aggregate(
         key_order.push(empty_key.clone());
         groups.insert(
             empty_key,
-            aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+            (vec![], aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect()),
         );
     }
     let mut projected = build_group_projected(keys, aggs, key_order, &mut groups);
@@ -1593,17 +1593,20 @@ fn group_stream(
     ctx: &GroupStreamCtx<'_>,
     ops: &[PlanOp],
     row: &Row,
-    groups: &mut HashMap<GroupKey, Vec<AggAcc>>,
+    groups: &mut HashMap<GroupKey, GroupEntry>,
     key_order: &mut Vec<GroupKey>,
 ) -> Result<(), String> {
     let (op, rest) = match ops.split_first() {
         Some(pair) => pair,
         None => {
-            // Terminal row: compute group key and update per-group accumulators.
+            // Terminal row: compute normalized group key for equality/hashing
+            // and capture original values for display (first-seen wins).
             let mut gk: GroupKey = Vec::with_capacity(ctx.keys.len());
+            let mut display_vals: Vec<Option<Value>> = Vec::with_capacity(ctx.keys.len());
             for (_, item) in ctx.keys {
                 let val = project_item(ctx.view, ctx.vars, row, item)?;
                 gk.push(val.as_ref().and_then(group_key_normalize));
+                display_vals.push(val);
             }
             if !groups.contains_key(&gk) {
                 if groups.len() >= max_groups() {
@@ -1612,9 +1615,9 @@ fn group_stream(
                 key_order.push(gk.clone());
                 let init: Vec<AggAcc> =
                     ctx.aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect();
-                groups.insert(gk.clone(), init);
+                groups.insert(gk.clone(), (display_vals, init));
             }
-            let accs = groups.get_mut(&gk).unwrap();
+            let (_, accs) = groups.get_mut(&gk).unwrap();
             for (acc, (func, arg, _)) in accs.iter_mut().zip(ctx.aggs.iter()) {
                 update_acc(ctx.view, ctx.vars, row, func, arg, acc)?;
             }
@@ -4215,8 +4218,11 @@ LIMIT 10";
         // openCypher equality: 1 = 1.0.  Nodes with score=1 (Int) and score=1.0
         // (Float) must land in the same group after group_key_normalize maps
         // both to FloatBits.  Result: one group with count=2.
+        //
+        // Display value: first-seen wins.  Node "a" (Int(1)) is scanned first
+        // (lower id), so the key column must display as Int(1), not Float(1.0).
         let mut fx = Fx::new();
-        fx.add("N", "a", vec![("score", i(1))]);
+        fx.add("N", "a", vec![("score", i(1))]); // scanned first → first-seen
         fx.add("N", "b", vec![("score", f(1.0))]);
         let v = fx.view();
         let params = BTreeMap::new();
@@ -4224,7 +4230,36 @@ LIMIT 10";
         let rs = run(&v, "MATCH (n:N) RETURN n.score, COUNT(*) AS cnt", &params)
             .expect("int/float unification must succeed");
         assert_eq!(rs.len(), 1, "Int(1) and Float(1.0) must group together into 1 group");
+        // Key column must display the first-seen original value (Int), not Float.
+        assert_eq!(rs.row(0)[0], Some(i(1)), "key column must display Int(1) (first-seen)");
         assert_eq!(rs.row(0)[1], Some(i(2)), "unified group must have count=2");
+    }
+
+    #[test]
+    fn pure_int_keys_display_as_int() {
+        // N-1 regression: group keys that are integers must not be upcast to
+        // Float in the output row.  Previously group_key_normalize converted
+        // Int→FloatBits and value_key_to_value reconstructed Float(42.0) from
+        // the key; now the original Value is stored and reused for display.
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("age", i(10))]);
+        fx.add("N", "b", vec![("age", i(20))]);
+        fx.add("N", "c", vec![("age", i(10))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let rs = run(
+            &v,
+            "MATCH (n:N) RETURN n.age, COUNT(*) AS cnt ORDER BY n.age",
+            &params,
+        )
+        .expect("pure-Int group keys must succeed");
+        assert_eq!(rs.len(), 2, "must have 2 groups: age=10 and age=20");
+        // Key column must be Int, not Float.
+        assert_eq!(rs.row(0)[0], Some(i(10)), "age=10 key column must display as Int(10)");
+        assert_eq!(rs.row(0)[1], Some(i(2)), "age=10 group has 2 nodes");
+        assert_eq!(rs.row(1)[0], Some(i(20)), "age=20 key column must display as Int(20)");
+        assert_eq!(rs.row(1)[1], Some(i(1)), "age=20 group has 1 node");
     }
 
     // ──────────────────────────────────────────────────────────────────────────
