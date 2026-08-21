@@ -81,8 +81,8 @@ receipt observes the state that produced the event. Each subscription has a
 marker and continue (no disconnection).
 
 **Measured end-to-end latency** (1 000 events, release build, Apple M4 Pro, 2026-08-21):
-commit-to-event-received p50/p95 — in-process: **0.04 µs / 0.21 µs**; over WS on
-localhost: **61 µs / 88 µs**. Clock: `std::time::Instant` (monotonic).
+commit-to-event-received p50/p95 — in-process: **0.17 µs / 0.42 µs**; over WS on
+localhost: **86 µs / 226 µs**. Clock: `std::time::Instant` (monotonic).
 
 See [docs/site/subscriptions.md](docs/site/subscriptions.md) for the full API reference.
 
@@ -280,10 +280,11 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 | Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
 | Cypher scan-filter-project (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
 | Cypher two-hop join (200 rows) | **261.6 µs** ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
-| Cold-start (snapshot V5) | **see note** ▽ | — | — | — |
+| Cold-start: snapshot V5 open | **8.7 s** ▽ | — | — | — |
+| Cold-start: WAL-only open | 8.25 min ▽ | — | — | — |
 | Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
-*(v2.4 mushroomdb, 2026-08-21, release build; competitor numbers = v2.2 corrected; two-hop row = corrected four-engine benchmark)*
+*(v0.1.0 mushroomdb, 2026-08-21, release build; competitor numbers = v2.2 corrected; two-hop row = corrected four-engine benchmark)*
 
 **Honesty notes:**
 
@@ -307,11 +308,15 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
 two-rule backfill on 10k nodes: 928 ms + 2.221 s = **3.149 s** (+8.8% vs the pre-eventing v2.3 baseline of 2.894 s; cost of live subscriptions and materialized views). A two-stage fix (is\_empty guard + emit\_deltas engine gate, commit d4d312c) recovered the original +44% regression down to +8.8%. Competitors have no auto-derivation equivalent.
 
-▽ 100k cold-start (V5 snapshot): number being updated in v2.4 regression run (100k db
-rebuild required because V4 snapshots are rejected by V5 code). Previous V4 result was
-10.5 s open / 36.1 s write cost at 100k scale. V5 adds view_defs to the snapshot format;
-open time expected similar. WAL-only baseline: 8.86 min (re-fires all 12 rules; IVF dominates).
-See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md) for the updated V5 numbers.
+▽ 100k cold-start (V5 snapshot, measured 2026-08-21, 100k-node marketplace dogfood db, 9 backfill rules,
+~10.5M derived edges in snapshot):
+**WAL-only open:** 8.25 min — WAL CreateRule records trigger full rule re-derivation; IVF-Flat
+re-fitting dominates (~7.68 min). **V5 snapshot open:** 8.71 s — `open_with` deserializes the V5
+snapshot; derived edges and IVF centroids load directly; no rule re-fire.
+**Snapshot write cost:** 25.09 s — `snapshot()` serializes derived edges + IVF centroids (V5 snapshot
+~2.2 GiB). **Backfill (9 rules, max_edges=1M each):** 28.65 s (measured; closes the
+"~21.5s estimate" debt from the two-stage delta fix). Full methodology and numbers:
+[`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
 
 Rule engine vs hand-rolled maintenance (three-way, measured 2026-08-21): on 10k nodes with
 1,000 specialty updates, all three strategies produce identical edge sets (drift = 0).
@@ -366,7 +371,7 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Limitation | Detail |
 |---|---|
 | Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
-| Cold start without a snapshot re-fires all rules | Snapshots (V5) persist derived edges, IVF state, and view definitions — opening from a snapshot skips re-derivation. Previous V4 result: 10.5 s open at 100k nodes vs 8.86 min from WAL alone; V5 numbers update pending 100k rebuild (see `dogfood/results/scale-100k.md`). Call `snapshot()` before close; a WAL-only open still re-derives everything. Snapshot write cost ~36 s at 100k (V4 baseline). |
+| Cold start without a snapshot re-fires all rules | Snapshots (V5) persist derived edges, IVF state, and view definitions — opening from a snapshot skips re-derivation. V5 measured at 100k nodes: 8.71 s open from snapshot vs 8.25 min from WAL alone. Snapshot write cost: 25.09 s. Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
 | Approximate vector mode is opt-in | `approximate: true` enables IVF-Flat candidate selection. Per-query recall ≥ 0.90 quiesced; ≥ 0.85 post-rebuild. Review the recall trade-off before using it in completeness-critical workloads. |
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is on the roadmap. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |

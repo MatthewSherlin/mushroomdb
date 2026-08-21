@@ -335,6 +335,7 @@ per-source cardinality control.
   intermediate-result cap before `LIMIT` is applied. Use the traversal
   API (`node_edges` / `neighborhood`) for multi-hop lookups on large
   graphs. LIMIT pushdown is on the roadmap.
-- Cold-start re-fires all rules from node data (derived edges are not
-  persisted). At 100k nodes with two vector rules, re-open takes ~8
-  minutes. Derived-edge persistence is roadmap item #1.
+- WAL-only cold-start re-fires all rules from node data. At 100k nodes (9 rules), re-open takes
+  8.25 min; IVF-Flat re-derivation dominates. V5 snapshots persist derived edges and IVF centroids —
+  `open_with` from a V5 snapshot takes 8.7 s at 100k (snapshot write cost: 25 s). Call `snapshot()`
+  before close to avoid re-derivation on next open.

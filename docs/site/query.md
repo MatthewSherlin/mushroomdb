@@ -521,6 +521,7 @@ clear, actionable message; **Absent** = not implemented (not tested here).
 | `toLower`, `toUpper`, `size`, `coalesce`, `type`, `abs`, `round` | `RETURN abs(n.score), round(n.weight)` |
 | Binary arithmetic **inside function arguments** only (`-`, `*`) | `RETURN abs(n.age - 27)`, `RETURN round(n.score * 1.5)` — **only valid as function-call arguments**; `-`/`*` outside function calls produce a parse error; `+`/`/` produce a lex error in any position |
 | View-maintained properties queryable like any property | `MATCH (c:City) WHERE c.pop > 1000 RETURN c.name` — `pop` is a degree view maintained incrementally; reads like a stored prop |
+| `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
 
 ### Named-error
 

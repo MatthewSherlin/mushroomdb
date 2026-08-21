@@ -186,6 +186,15 @@ impl FulltextIndex {
         self.enabled.iter().any(|(_, f)| f == field)
     }
 
+    /// Whether `field` is indexed by a label OTHER THAN `label`.
+    /// Used during disable to decide whether to purge individual node postings
+    /// or the whole field column.
+    pub fn field_indexed_by_other(&self, label: &str, field: &str) -> bool {
+        self.enabled
+            .iter()
+            .any(|(l, f)| f == field && l != label)
+    }
+
     /// Iterate all enabled `(label, field)` pairs.
     pub fn enabled_pairs(&self) -> impl Iterator<Item = &(String, String)> {
         self.enabled.iter()

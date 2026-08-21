@@ -1046,6 +1046,19 @@ impl<F: Fs> GraphDb<F> {
                 if !self.fulltext.is_enabled(label, field) {
                     return Ok(());
                 }
+                // If another label still indexes this field, the postings column
+                // is kept — but it must not contain node_ids from the now-disabled
+                // label.  Remove them before calling disable() so the field_indexed
+                // guard inside disable() sees the correct post-removal state.
+                if self.fulltext.field_indexed_by_other(label, field) {
+                    if let Some(label_sym) = self.syms.get(label) {
+                        for (node_id, &lsym) in self.labels.iter().enumerate() {
+                            if lsym == label_sym {
+                                self.fulltext.remove_node_field(node_id as u32, field);
+                            }
+                        }
+                    }
+                }
                 self.fulltext.disable(label, field);
             }
         }

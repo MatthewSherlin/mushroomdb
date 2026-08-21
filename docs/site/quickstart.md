@@ -165,6 +165,6 @@ rules: 7
   counts). Use a fresh path or `rm -rf ./db` first.
 - Port 0 (the default) assigns an ephemeral port. Pass `--addr 127.0.0.1:8080`
   to pin one.
-- Cold-start on a rich-rule graph replays all rule derivations on open. At
-  100k nodes with two vector rules, expect ~8 minutes. This is roadmap item #1
-  (derived-edge persistence).
+- Cold-start on a rich-rule graph: WAL-only open replays all rule derivations (8.25 min at 100k
+  nodes, 9 rules, IVF dominates). Call `snapshot()` before close; opening from a V5 snapshot takes
+  8.7 s at 100k (snapshot write cost: 25 s). See [docs/site/timetravel.md](timetravel.md).
