@@ -38,6 +38,13 @@ impl GraphDb {
         self.with_mut(|db| db.insert_edge(edge_type, src, dst))
     }
 
+    /// Delete a user-owned edge.  Returns `True` if the edge existed and was
+    /// removed, `False` if it was not present.  Raises `RuntimeError` if the
+    /// edge is rule-derived (must retract by changing properties instead).
+    fn delete_edge(&self, edge_type: &str, src: &str, dst: &str) -> PyResult<bool> {
+        self.with_mut(|db| db.delete_edge(edge_type, src, dst))
+    }
+
     fn set_prop(&self, key: &str, field: &str, value: Bound<'_, PyAny>) -> PyResult<()> {
         let v = py_to_value(&value)?;
         self.with_mut(|db| db.set_prop(key, field, v))
@@ -181,6 +188,66 @@ impl GraphDb {
         d.set_item("row_errors", PyList::empty(py))?;
         d.set_item("rules_created", PyList::empty(py))?;
         d.set_item("skipped_fk_fields", PyList::empty(py))?;
+        Ok(d.unbind())
+    }
+
+    /// Atomically apply a set of edge inserts and deletes in a single WAL commit.
+    ///
+    /// `inserts` — each `{edge_type, src, dst}` to insert (user-owned edge).
+    /// `deletes` — each `{edge_type, src, dst}` to delete.
+    ///
+    /// All operations are committed in one fsync.  This is the efficient API
+    /// for the hand-rolled maintenance pattern where a property update triggers
+    /// many retractions and additions — using individual `insert_edge` /
+    /// `delete_edge` calls would serialize one WAL fsync per call.
+    ///
+    /// Returns `{"edges_inserted": N, "edges_deleted": M}`.
+    #[pyo3(signature = (inserts=None, deletes=None))]
+    fn batch_edges(
+        &self,
+        py: Python<'_>,
+        inserts: Option<Bound<'_, PyList>>,
+        deletes: Option<Bound<'_, PyList>>,
+    ) -> PyResult<Py<PyDict>> {
+        fn parse_edges(list: &Bound<'_, PyList>) -> PyResult<Vec<(String, String, String)>> {
+            let mut ops = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                let d = item.downcast::<PyDict>().map_err(|_| {
+                    PyTypeError::new_err("each edge must be a dict {edge_type, src, dst}")
+                })?;
+                let edge_type: String = d
+                    .get_item("edge_type")?
+                    .ok_or_else(|| PyValueError::new_err("edge dict missing 'edge_type'"))?
+                    .extract()?;
+                let src: String = d
+                    .get_item("src")?
+                    .ok_or_else(|| PyValueError::new_err("edge dict missing 'src'"))?
+                    .extract()?;
+                let dst: String = d
+                    .get_item("dst")?
+                    .ok_or_else(|| PyValueError::new_err("edge dict missing 'dst'"))?
+                    .extract()?;
+                ops.push((edge_type, src, dst));
+            }
+            Ok(ops)
+        }
+        let insert_ops = inserts.as_ref().map(parse_edges).transpose()?.unwrap_or_default();
+        let delete_ops = deletes.as_ref().map(parse_edges).transpose()?.unwrap_or_default();
+        let n_insert = insert_ops.len();
+        let n_delete = delete_ops.len();
+        self.with_mut(|db| {
+            let mut batch = db.batch();
+            for (etype, src, dst) in &insert_ops {
+                batch.insert_edge(etype, src, dst);
+            }
+            for (etype, src, dst) in &delete_ops {
+                batch.delete_edge(etype, src, dst);
+            }
+            batch.commit().map(|_| ())
+        })?;
+        let d = PyDict::new(py);
+        d.set_item("edges_inserted", n_insert)?;
+        d.set_item("edges_deleted", n_delete)?;
         Ok(d.unbind())
     }
 

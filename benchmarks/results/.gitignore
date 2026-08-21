@@ -1,7 +1,7 @@
 # Gitignore for benchmark results
-# sample-results.md and the official head-to-head files are committed.
-# All other run outputs (run-NNNN-*.md etc.) are local.
+# Official result files are committed; all per-run outputs are local.
 *.md
 !sample-results.md
 !head-to-head-10k.md
 !head-to-head-10k-v2.md
+!handrolled-vs-rules.md
