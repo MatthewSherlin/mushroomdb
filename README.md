@@ -496,6 +496,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 - Live subscriptions: [`docs/site/subscriptions.md`](docs/site/subscriptions.md)
 - Time travel (as-of queries): [`docs/site/timetravel.md`](docs/site/timetravel.md)
 - Materialized views: [`docs/site/views.md`](docs/site/views.md)
+- Full-text search (inverted index, AND/OR/prefix): [`docs/site/fulltext.md`](docs/site/fulltext.md)
 - Rule suggestions: [`docs/site/suggest.md`](docs/site/suggest.md)
 - Graph algorithms (PageRank, WCC, degree centrality): [`docs/site/algorithms.md`](docs/site/algorithms.md)
 - API reference: [`docs/site/api.md`](docs/site/api.md)

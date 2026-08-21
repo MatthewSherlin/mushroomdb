@@ -20,6 +20,29 @@ const USER_ETYPES: [&str; 3] = ["e0", "e1", "e2"];
 /// 3-token alphabet used by SetTags.
 const TAGS_ALPHA: [&str; 3] = ["a", "b", "c"];
 
+/// Fulltext label pool: match the InsertNode labels.
+const FT_LABELS: [&str; 2] = ["L0", "L1"];
+
+/// Fulltext field pool: use "seed" and "f" which are set on many nodes.
+/// "seed" is an Int so it will be skipped by the string-only tokenizer (no matches).
+/// "f" is a Str so it produces real postings.
+const FT_FIELDS: [&str; 2] = ["f", "p"];
+
+/// Fulltext query pool: short queries likely to hit some nodes.
+const FT_QUERIES: [&str; 4] = ["k0", "k1 OR k2", "k*", "k0 OR k1 OR k2"];
+
+fn ft_label(n: u8) -> &'static str {
+    FT_LABELS[(n as usize) % FT_LABELS.len()]
+}
+
+fn ft_field(n: u8) -> &'static str {
+    FT_FIELDS[(n as usize) % FT_FIELDS.len()]
+}
+
+fn ft_query(n: u8) -> &'static str {
+    FT_QUERIES[(n as usize) % FT_QUERIES.len()]
+}
+
 fn rule_template(idx: u8) -> RuleDef {
     match idx as usize % N_TEMPLATES {
         0 => RuleDef {
@@ -308,6 +331,9 @@ enum Op {
     SetEmb(u8, u8),         // key, emb-selector → near-threshold / orthogonal
     CreateView(u8), // pick from N_VIEW_TEMPLATES templates by index
     DeleteView(u8), // pick from VIEW_NAMES by index
+    EnableFulltext(u8, u8), // label idx (0→"L0", 1→"L1"), field idx into FT_FIELDS
+    DisableFulltext(u8, u8), // label idx, field idx
+    FulltextSearch(u8, u8), // field idx, query idx — asserts db.search == oracle.scratch_search
     /// 2–4 leaf ops committed as one engine `batch()`. Nested Batch is never
     /// generated. CreateRule is omitted from the inner pool so we do not hit
     /// the documented same-batch rule-window (validation cannot see edges a
@@ -351,6 +377,9 @@ fn leaf_op_strategy() -> impl Strategy<Value = Op> {
         (any::<u8>(), any::<u8>()).prop_map(|(k, v)| Op::SetEmb(k, v)),
         any::<u8>().prop_map(Op::CreateView),
         any::<u8>().prop_map(Op::DeleteView),
+        (any::<u8>(), any::<u8>()).prop_map(|(l, f)| Op::EnableFulltext(l, f)),
+        (any::<u8>(), any::<u8>()).prop_map(|(l, f)| Op::DisableFulltext(l, f)),
+        (any::<u8>(), any::<u8>()).prop_map(|(f, q)| Op::FulltextSearch(f, q)),
     ]
 }
 
@@ -529,6 +558,25 @@ fn apply_oracle_leaf(oracle: &mut Oracle, op: &Op) -> Result<(), String> {
                 Err(format!("oracle delete_view({name}) missing"))
             }
         }
+        Op::EnableFulltext(l, f) => {
+            let label = ft_label(*l);
+            let field = ft_field(*f);
+            if oracle.enable_fulltext(label, field) {
+                Ok(())
+            } else {
+                Err(format!("oracle enable_fulltext({label},{field}) already enabled"))
+            }
+        }
+        Op::DisableFulltext(l, f) => {
+            let label = ft_label(*l);
+            let field = ft_field(*f);
+            if oracle.disable_fulltext(label, field) {
+                Ok(())
+            } else {
+                Err(format!("oracle disable_fulltext({label},{field}) not enabled"))
+            }
+        }
+        Op::FulltextSearch(_, _) => Ok(()), // read-only; assertion is in engine loop
         Op::Batch(_) => Err("nested Batch is invalid".into()),
     }
 }
@@ -566,6 +614,10 @@ fn queue_batch_op(b: &mut core_api::BatchBuilder<'_, SimFs>, op: &Op) {
             // batch_inner_strategy never emits CreateView/DeleteView;
             // view mutations are standalone ops applied outside this fn.
             unreachable!("CreateView/DeleteView are not Batch inner ops");
+        }
+        Op::EnableFulltext(..) | Op::DisableFulltext(..) | Op::FulltextSearch(..) => {
+            // batch_inner_strategy never emits fulltext ops — they are standalone.
+            unreachable!("fulltext ops are not Batch inner ops");
         }
         Op::DeleteRule(n) => {
             b.delete_rule(RULE_NAMES[(*n as usize) % N_TEMPLATES]);
@@ -871,6 +923,48 @@ proptest! {
                     );
                 }
 
+                Op::EnableFulltext(l, f) => {
+                    let label = ft_label(*l);
+                    let field = ft_field(*f);
+                    let db_ok = db.enable_fulltext(label, field).is_ok();
+                    let or_ok = oracle.enable_fulltext(label, field);
+                    prop_assert_eq!(
+                        db_ok,
+                        or_ok,
+                        "enable_fulltext({},{}) result mismatch",
+                        label,
+                        field
+                    );
+                }
+
+                Op::DisableFulltext(l, f) => {
+                    let label = ft_label(*l);
+                    let field = ft_field(*f);
+                    let db_ok = db.disable_fulltext(label, field).is_ok();
+                    let or_ok = oracle.disable_fulltext(label, field);
+                    prop_assert_eq!(
+                        db_ok,
+                        or_ok,
+                        "disable_fulltext({},{}) result mismatch",
+                        label,
+                        field
+                    );
+                }
+
+                Op::FulltextSearch(f, q) => {
+                    let field = ft_field(*f);
+                    let query = ft_query(*q);
+                    let engine_results = db.search(field, query);
+                    let oracle_results = oracle.scratch_search(field, query);
+                    prop_assert_eq!(
+                        engine_results,
+                        oracle_results,
+                        "fulltext search mismatch field={} query={:?}",
+                        field,
+                        query
+                    );
+                }
+
                 Op::Batch(sub) => {
                     // Engine: one atomic Batch frame. Oracle has no WAL — apply
                     // sequential user-level ops only when commit succeeds
@@ -991,6 +1085,22 @@ proptest! {
                 "rebuild_rule({}) changed the edge set",
                 rule.name
             );
+        }
+
+        // Req 7: fulltext oracle equivalence — for every field in FT_FIELDS and
+        // every query in FT_QUERIES, db.search == oracle.scratch_search.
+        for field in &FT_FIELDS {
+            for query in &FT_QUERIES {
+                let engine_results = db.search(field, query);
+                let oracle_results = oracle.scratch_search(field, query);
+                prop_assert_eq!(
+                    engine_results,
+                    oracle_results,
+                    "fulltext final-state mismatch field={} query={}",
+                    field,
+                    query
+                );
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 pub mod columns;
 pub mod edge_props;
 pub mod fs;
+pub mod fulltext;
 pub mod idmap;
 pub mod interner;
 pub mod snapshot;

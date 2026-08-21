@@ -799,6 +799,7 @@ fn check_expr_bound(expr: &Expr, bound: &BTreeSet<String>) -> Result<(), String>
             check_operand_bound(lhs, bound, "WHERE")?;
             check_operand_bound(rhs, bound, "WHERE")
         }
+        Expr::Truthy(op) => check_operand_bound(op, bound, "WHERE"),
     }
 }
 

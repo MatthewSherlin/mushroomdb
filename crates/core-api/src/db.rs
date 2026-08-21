@@ -12,6 +12,7 @@ use crate::subscription::{
     event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
 };
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
+use core_storage::fulltext::FulltextIndex;
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{
     ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
@@ -136,7 +137,11 @@ fn event_from_record(rec: &WalRecord) -> Option<MutationEvent> {
         }
         WalRecord::DeleteRule { name } => Some(MutationEvent::RuleDeleted { name: name.clone() }),
         WalRecord::RebuildRule { name } => Some(MutationEvent::RuleRebuilt { name: name.clone() }),
-        WalRecord::Batch(_) | WalRecord::CreateView { .. } | WalRecord::DeleteView { .. } => None,
+        WalRecord::Batch(_)
+        | WalRecord::CreateView { .. }
+        | WalRecord::DeleteView { .. }
+        | WalRecord::EnableFulltext { .. }
+        | WalRecord::DisableFulltext { .. } => None,
     }
 }
 
@@ -369,6 +374,9 @@ pub struct GraphDb<F: Fs> {
     edge_props: EdgeProps,
     engine: RuleEngine,
     view_store: ViewStore,
+    /// Incremental inverted index for full-text-lite search.
+    /// Rebuild-on-open: populated from WAL replay + rebuild_all at open end.
+    fulltext: FulltextIndex,
     event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
     /// Monotonically increasing per-commit counter.  A single `log_then_apply_with`
     /// call increments this once; all events emitted from that call share the same
@@ -432,6 +440,7 @@ impl<F: Fs> GraphDb<F> {
             edge_props: EdgeProps::new(),
             engine: RuleEngine::new(),
             view_store: ViewStore::new(),
+            fulltext: FulltextIndex::new(),
             event_sink: None,
             commit_seq: 0,
             subscriptions: Vec::new(),
@@ -526,6 +535,9 @@ impl<F: Fs> GraphDb<F> {
         // final topo+props state.  This is a full recompute that corrects any
         // incremental drift accumulated during apply() replay.
         db.view_store.rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
+        // Rebuild full-text index after WAL replay.  Corrects drift from
+        // per-record incremental apply during replay.
+        db.fulltext.rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
         Ok(db)
     }
 
@@ -545,6 +557,7 @@ impl<F: Fs> GraphDb<F> {
             edge_props: EdgeProps::new(),
             engine: RuleEngine::new(),
             view_store: ViewStore::new(),
+            fulltext: FulltextIndex::new(),
             event_sink: None,
             commit_seq: 0,
             subscriptions: Vec::new(),
@@ -579,6 +592,8 @@ impl<F: Fs> GraphDb<F> {
         // reflect the as-of state, not just the initial backfill at CreateView.
         // Mirrors the open_with rebuild_all call at db.rs:528.
         db.view_store.rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
+        // Rebuild full-text index for as-of view (mirrors open_with pattern).
+        db.fulltext.rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
         db.read_only = true;
         db.total_wal_commits = total;
         Ok(db)
@@ -640,6 +655,14 @@ impl<F: Fs> GraphDb<F> {
                         );
                     }
                 }
+                // Full-text index maintenance: index enabled fields for this label.
+                if self.fulltext.has_label(label) {
+                    for (field, value) in props {
+                        if self.fulltext.is_enabled(label, field) {
+                            self.fulltext.add_tokens(id, field, value);
+                        }
+                    }
+                }
             }
             WalRecord::InsertEdge {
                 edge_type,
@@ -696,6 +719,18 @@ impl<F: Fs> GraphDb<F> {
                 self.view_store.on_prop_changed(
                     id, field, &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
                 );
+                // Full-text index maintenance: update tokens for this field if indexed.
+                if self.fulltext.field_indexed(field) {
+                    let label_opt = self.labels.get(id as usize).and_then(|&sym| {
+                        if sym == u32::MAX { None } else { self.syms.resolve(sym) }
+                    });
+                    if let Some(label) = label_opt {
+                        if self.fulltext.is_enabled(label, field) {
+                            self.fulltext.remove_node_field(id, field);
+                            self.fulltext.add_tokens(id, field, value);
+                        }
+                    }
+                }
             }
             WalRecord::CreateRule { def_bytes } => {
                 let def: RuleDef =
@@ -810,6 +845,10 @@ impl<F: Fs> GraphDb<F> {
                 self.view_store.on_prop_changed(
                     id, field, &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
                 );
+                // Full-text index maintenance: remove tokens for this field.
+                if self.fulltext.field_indexed(field) {
+                    self.fulltext.remove_node_field(id, field);
+                }
             }
             WalRecord::DeleteEdge {
                 edge_type,
@@ -904,6 +943,8 @@ impl<F: Fs> GraphDb<F> {
 
                 // (3) Drop every remaining prop (`ColumnStore::remove_all`).
                 self.props.remove_all(n);
+                // Full-text index maintenance: remove all tokens for this node.
+                self.fulltext.remove_node(n);
 
                 // (4) Retire the dense id and stamp the label sentinel.
                 self.ids.delete(key);
@@ -972,6 +1013,40 @@ impl<F: Fs> GraphDb<F> {
                 self.view_store
                     .delete_view(name, &mut self.props, &self.ids, &self.labels, &self.syms)
                     .map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
+            }
+            WalRecord::EnableFulltext { label, field } => {
+                // Replay-over-snapshot idempotency: already enabled → skip.
+                if self.fulltext.is_enabled(label, field) {
+                    return Ok(());
+                }
+                self.fulltext.enable(label, field);
+                // Backfill: index all live nodes of this label that have the field.
+                let n = self.ids.len() as u32;
+                for id in 0..n {
+                    let Some(&sym) = self.labels.get(id as usize) else {
+                        continue;
+                    };
+                    if sym == u32::MAX {
+                        continue; // tombstoned
+                    }
+                    let Some(lbl) = self.syms.resolve(sym) else {
+                        continue;
+                    };
+                    if lbl != label {
+                        continue;
+                    }
+                    if let Some(value) = self.props.get(id, field) {
+                        let value = value.clone();
+                        self.fulltext.add_tokens(id, field, &value);
+                    }
+                }
+            }
+            WalRecord::DisableFulltext { label, field } => {
+                // Replay-over-snapshot idempotency: already disabled → skip.
+                if !self.fulltext.is_enabled(label, field) {
+                    return Ok(());
+                }
+                self.fulltext.disable(label, field);
             }
         }
         Ok(())
@@ -1241,7 +1316,9 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::DeleteRule { .. }
             | WalRecord::RebuildRule { .. }
             | WalRecord::CreateView { .. }
-            | WalRecord::DeleteView { .. } => vec![],
+            | WalRecord::DeleteView { .. }
+            | WalRecord::EnableFulltext { .. }
+            | WalRecord::DisableFulltext { .. } => vec![],
         }
     }
 
@@ -1872,6 +1949,144 @@ impl<F: Fs> GraphDb<F> {
     /// Snapshot of all registered view definitions.
     pub fn views(&self) -> Vec<ViewDef> {
         self.view_store.views().cloned().collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-text-lite API
+    // -----------------------------------------------------------------------
+
+    /// Enable full-text indexing for all nodes of `label` on property `field`.
+    ///
+    /// After this call, every subsequent write to `(label, field)` is reflected
+    /// in the index incrementally.  Existing nodes are backfilled immediately.
+    /// The declaration is persisted as a WAL record; the index itself is rebuilt
+    /// from scratch on re-open (no snapshot format changes).
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::RuleInvalid`]: `(label, field)` is already indexed.
+    pub fn enable_fulltext(&mut self, label: &str, field: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if self.fulltext.is_enabled(label, field) {
+            return Err(GraphError::RuleInvalid {
+                detail: format!("full-text index for ({label:?}, {field:?}) already enabled"),
+            });
+        }
+        self.log_then_apply(WalRecord::EnableFulltext {
+            label: label.into(),
+            field: field.into(),
+        })
+    }
+
+    /// Disable full-text indexing for `(label, field)` and drop its postings.
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::RuleNotFound`]: `(label, field)` is not currently indexed.
+    pub fn disable_fulltext(&mut self, label: &str, field: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if !self.fulltext.is_enabled(label, field) {
+            return Err(GraphError::RuleNotFound {
+                name: format!("fulltext({label},{field})"),
+            });
+        }
+        self.log_then_apply(WalRecord::DisableFulltext {
+            label: label.into(),
+            field: field.into(),
+        })
+    }
+
+    /// Whether `(label, field)` is currently indexed for full-text search.
+    pub fn is_fulltext_enabled(&self, label: &str, field: &str) -> bool {
+        self.fulltext.is_enabled(label, field)
+    }
+
+    /// Search a full-text-indexed field.
+    ///
+    /// Returns `(node_key, match_count)` pairs sorted by match_count descending,
+    /// ties broken by key (lexicographic).  Tombstoned nodes are excluded.
+    ///
+    /// **Query syntax:**
+    /// - Space-separated terms are AND'd: `"foo bar"` requires both.
+    /// - `OR` between terms forms disjunction: `"foo OR bar"` matches either.
+    /// - Trailing `*` on a term is a prefix match: `"rust*"` matches `rustlang`, `rusty`.
+    /// - `AND` keyword is accepted explicitly and is the default.
+    /// - Tokenization is unicode-alphanumeric (same as index time); case-insensitive.
+    ///
+    /// **Unindexed field:** returns `Ok(vec![])` if `field` is not indexed.
+    /// Pin: this is the documented, tested, stable behavior for v1.
+    ///
+    /// **Memory / performance:** O(postings) lookup; no scan.  The index is
+    /// in-memory and proportional to total indexed text across all enabled fields.
+    pub fn search(&self, field: &str, query: &str) -> Vec<(String, usize)> {
+        self.fulltext
+            .search(field, query)
+            .into_iter()
+            .filter_map(|(id, count)| {
+                self.ids.key_of(id).map(|key| (key.to_string(), count))
+            })
+            .collect()
+    }
+
+    /// For DST/testing: scratch full-text search over live nodes without using
+    /// the index.  Walks every live node, tokenizes the field value, and returns
+    /// nodes matching the query.  Results are sorted match_count desc, key asc.
+    ///
+    /// The oracle: `search(field, q)` must equal `scratch_search(field, q)`.
+    #[doc(hidden)]
+    pub fn scratch_search(&self, field: &str, query: &str) -> Vec<(String, usize)> {
+        use core_storage::fulltext::{parse_query, tokenize};
+        use std::collections::BTreeSet;
+        let groups = parse_query(query);
+        let mut results: Vec<(String, usize)> = Vec::new();
+        for id in 0..self.ids.len() as u32 {
+            let Some(key) = self.ids.key_of(id) else { continue; };
+            let Some(&sym) = self.labels.get(id as usize) else { continue; };
+            if sym == u32::MAX { continue; }
+            // Only scan nodes whose label has this field indexed.
+            let label = match self.syms.resolve(sym) {
+                Some(l) => l,
+                None => continue,
+            };
+            if !self.fulltext.is_enabled(label, field) { continue; }
+            let Some(value) = self.props.get(id, field) else { continue; };
+            let node_tokens: BTreeSet<String> = match value {
+                Value::Str(s) => tokenize(s).into_iter().collect(),
+                Value::List(items) => items
+                    .iter()
+                    .flat_map(|v| if let Value::Str(s) = v { tokenize(s) } else { vec![] })
+                    .collect(),
+                _ => BTreeSet::new(),
+            };
+            // Count OR-group matches.
+            let mut count = 0usize;
+            for group in &groups {
+                let mut group_match = true;
+                for term in group {
+                    let matched = if term.prefix {
+                        node_tokens.iter().any(|t| t.starts_with(&term.token))
+                    } else {
+                        node_tokens.contains(&term.token)
+                    };
+                    if !matched {
+                        group_match = false;
+                        break;
+                    }
+                }
+                if group_match {
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                results.push((key.to_string(), count));
+            }
+        }
+        results.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        results
     }
 
     /// Return the current view-maintained value of `view_prop` for node `key`.

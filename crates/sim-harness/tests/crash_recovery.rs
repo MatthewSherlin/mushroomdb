@@ -6,6 +6,9 @@ use core_storage::fs::Fs;
 use sim_harness::{Oracle, SimFs, APPROX_RECALL_FLOOR_RECOVERY};
 use std::collections::{BTreeMap, BTreeSet};
 
+// Fulltext crash-recovery workload queries.
+const FT_WORKLOAD_QUERIES: &[&str] = &["rust", "graph OR storage", "embed*", "rust OR graph"];
+
 /// Original workload: 20 nodes + chain edges + one mid-workload snapshot.
 fn workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
     for i in 0..20 {
@@ -1550,6 +1553,90 @@ fn recovery_byte_sweep_views() {
                     ),
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fulltext crash-recovery workload
+// ---------------------------------------------------------------------------
+
+/// Fulltext workload: enable indexing, insert nodes with text fields,
+/// update and delete some, then verify index == scratch scan on recovery.
+fn workload_with_fulltext<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    // Enable index on (Article, bio) before any inserts.
+    db.enable_fulltext("Article", "bio")?;
+
+    // Insert nodes — each has a "bio" text field.
+    db.insert_node(
+        "Article",
+        "fa0",
+        vec![("bio".into(), Value::Str("rust embedded graph storage".into()))],
+    )?;
+    db.insert_node(
+        "Article",
+        "fa1",
+        vec![("bio".into(), Value::Str("graph database embeddings".into()))],
+    )?;
+    db.insert_node(
+        "Article",
+        "fa2",
+        vec![("bio".into(), Value::Str("rust language systems programming".into()))],
+    )?;
+    // Different label — not indexed.
+    db.insert_node(
+        "Blog",
+        "fb0",
+        vec![("bio".into(), Value::Str("rust embedded".into()))],
+    )?;
+    db.insert_node(
+        "Blog",
+        "fb1",
+        vec![("bio".into(), Value::Str("graph storage".into()))],
+    )?;
+
+    // Update fa0's bio (exercises set_prop incremental maintenance).
+    db.set_prop("fa0", "bio", Value::Str("embedded graph rust".into()))?;
+
+    // Delete fa2 (exercises remove_node).
+    db.delete_node("fa2")?;
+
+    Ok(())
+}
+
+/// Crash sweep for fulltext: at every WAL offset, recovered db's index must
+/// equal an independent scratch scan of the same surviving data.
+///
+/// Key invariants:
+/// (a) open_with never panics or errors for any crash point.
+/// (b) db.search(field, query) == db.scratch_search(field, query) for every
+///     query, at every crash point.  This proves rebuild_all() correctly
+///     restores the index from the WAL regardless of where the crash occurred.
+#[test]
+fn recovery_byte_sweep_fulltext() {
+    let total_bytes = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        workload_with_fulltext(&mut db).unwrap();
+        db.into_fs().total_appended()
+    };
+    assert!(total_bytes > 0, "fulltext workload must append bytes");
+
+    for crash_at in 0..=total_bytes {
+        let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();
+        let _ = workload_with_fulltext(&mut db);
+        let survivor = db.into_fs().surviving_state();
+
+        // Invariant (a): open never panics.
+        let recovered = GraphDb::open_with(survivor).unwrap();
+
+        // Invariant (b): index == scratch_search for every query.
+        for query in FT_WORKLOAD_QUERIES {
+            let index_results = recovered.search("bio", query);
+            let scratch_results = recovered.scratch_search("bio", query);
+            assert_eq!(
+                index_results, scratch_results,
+                "crash_at={crash_at}: fulltext index != scratch for query={query:?}"
+            );
         }
     }
 }

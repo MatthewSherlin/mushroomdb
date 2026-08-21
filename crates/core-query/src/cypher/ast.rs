@@ -162,6 +162,12 @@ pub enum Expr {
         op: CmpOp,
         rhs: Operand,
     },
+    /// Standalone operand used as a boolean predicate.
+    ///
+    /// Enables `WHERE textMatches(n.bio, 'query')` without requiring an
+    /// explicit comparison.  Truthiness: `Bool(true)` → true, `Bool(false)`
+    /// → false, null → false, any other non-null non-false value → true.
+    Truthy(Operand),
 }
 
 #[derive(Debug, Clone, PartialEq)]

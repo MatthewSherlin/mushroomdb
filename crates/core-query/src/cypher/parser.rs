@@ -580,9 +580,17 @@ impl<'a> Parser<'a> {
 
     fn cmp(&mut self) -> Result<Expr, String> {
         let lhs = self.operand()?;
-        let op = self.cmp_op()?;
-        let rhs = self.operand()?;
-        Ok(Expr::Cmp { lhs, op, rhs })
+        // If no comparison operator follows, treat the operand as a standalone
+        // boolean predicate (Expr::Truthy).  This enables:
+        //   WHERE textMatches(n.bio, 'query')
+        // without requiring an explicit `= true` or similar.
+        match self.cmp_op() {
+            Ok(op) => {
+                let rhs = self.operand()?;
+                Ok(Expr::Cmp { lhs, op, rhs })
+            }
+            Err(_) => Ok(Expr::Truthy(lhs)),
+        }
     }
 
     fn cmp_op(&mut self) -> Result<CmpOp, String> {

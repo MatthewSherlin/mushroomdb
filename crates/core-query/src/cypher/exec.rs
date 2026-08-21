@@ -804,6 +804,10 @@ fn collect_expr(
             collect_operand(rhs, names, seen);
             Ok(())
         }
+        Expr::Truthy(op) => {
+            collect_operand(op, names, seen);
+            Ok(())
+        }
     }
 }
 
@@ -1037,6 +1041,7 @@ fn intern_expr(vars: &mut VarTable, expr: &Expr) {
             intern_operand(vars, lhs);
             intern_operand(vars, rhs);
         }
+        Expr::Truthy(op) => intern_operand(vars, op),
     }
 }
 
@@ -1096,7 +1101,7 @@ fn require_node(row: &Row, vars: &VarTable, var: &str) -> Result<u32, String> {
 
 /// Supported scalar function names (case-insensitive).
 const SCALAR_FUNCS: &[&str] = &[
-    "toLower", "toUpper", "size", "coalesce", "type", "abs", "round",
+    "toLower", "toUpper", "size", "coalesce", "type", "abs", "round", "textMatches",
 ];
 
 /// Evaluate one of the supported scalar functions.  Unknown function names
@@ -1203,6 +1208,57 @@ fn eval_func(
                 Some(Value::Int(n)) => Ok(Some(Value::Int(n))), // int already rounded
                 Some(Value::Float(f)) => Ok(Some(Value::Float(f.round()))),
                 Some(_) => Ok(None), // non-numeric → null
+            }
+        }
+        "textmatches" => {
+            // Full-text predicate for use in WHERE clauses.
+            // Signature: textMatches(field_value, "query string") → Bool
+            //
+            // Design choice: evaluated per-row via scratch tokenization, not via
+            // the inverted index. The index provides performance for db.search();
+            // this function provides a convenient WHERE-position predicate that
+            // integrates with the planner's existing filter machinery without
+            // requiring the index to be threaded into GraphView.
+            //
+            // Performance characteristic (documented): O(scan) per MATCH row.
+            // For large result sets prefer db.search() + IN or a labeled filter.
+            if args.len() != 2 {
+                return Err(format!(
+                    "textMatches() requires exactly 2 arguments (field_value, query), got {}",
+                    args.len()
+                ));
+            }
+            let field_val = resolve_operand(view, vars, row, &args[0], params)?;
+            let query_val = resolve_operand(view, vars, row, &args[1], params)?;
+            match (field_val, query_val) {
+                (None, _) | (_, None) => Ok(None),
+                (Some(Value::Str(s)), Some(Value::Str(q))) => {
+                    use std::collections::BTreeSet;
+                    let node_tokens: BTreeSet<String> =
+                        core_storage::fulltext::tokenize(&s).into_iter().collect();
+                    Ok(Some(Value::Bool(core_storage::fulltext::eval_query(
+                        &node_tokens,
+                        &q,
+                    ))))
+                }
+                (Some(Value::List(items)), Some(Value::Str(q))) => {
+                    use std::collections::BTreeSet;
+                    let node_tokens: BTreeSet<String> = items
+                        .iter()
+                        .flat_map(|v| {
+                            if let Value::Str(s) = v {
+                                core_storage::fulltext::tokenize(s)
+                            } else {
+                                vec![]
+                            }
+                        })
+                        .collect();
+                    Ok(Some(Value::Bool(core_storage::fulltext::eval_query(
+                        &node_tokens,
+                        &q,
+                    ))))
+                }
+                _ => Ok(Some(Value::Bool(false))), // non-string field → no match
             }
         }
         _ => Err(format!(
@@ -2880,6 +2936,17 @@ fn eval_expr(
                 (Some(a), Some(b)) => Ok(eval_cmp(op, &a, &b)),
                 _ => Ok(false),
             }
+        }
+        Expr::Truthy(op) => {
+            let val = resolve_operand(view, vars, row, op, params)?;
+            Ok(match val {
+                None => false,
+                Some(Value::Bool(b)) => b,
+                Some(Value::Int(n)) => n != 0,
+                Some(Value::Float(f)) => f != 0.0,
+                Some(Value::Str(s)) => !s.is_empty(),
+                Some(Value::List(v)) => !v.is_empty(),
+            })
         }
     }
 }

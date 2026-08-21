@@ -1,6 +1,7 @@
 use core_api::{Direction, Value};
 use core_rules::{evaluate, NodeView, RuleDef, ViewDef};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use core_storage::fulltext::{parse_query, tokenize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Obviously-correct reference. No ids, no interning, no persistence.
 #[derive(Debug, Default, Clone)]
@@ -11,6 +12,7 @@ pub struct Oracle {
     edges: BTreeSet<(String, String, String)>,      // (etype, src, dst) — user-inserted edges
     rules: Vec<RuleDef>,                            // registered rules
     views: Vec<ViewDef>,                            // registered materialized views
+    fulltext_enabled: BTreeSet<(String, String)>,   // (label, field) pairs with full-text enabled
 }
 
 impl Oracle {
@@ -334,6 +336,85 @@ impl Oracle {
     /// absent; `Some(true)` = removed. Retraction falls out of `all_edges`.
     pub fn remove_prop(&mut self, key: &str, field: &str) -> Option<bool> {
         Some(self.nodes.get_mut(key)?.remove(field).is_some())
+    }
+
+    // --- Fulltext support ---
+
+    /// Enable full-text indexing for `(label, field)`.
+    /// Returns `true` if newly added, `false` if already present.
+    pub fn enable_fulltext(&mut self, label: &str, field: &str) -> bool {
+        self.fulltext_enabled
+            .insert((label.into(), field.into()))
+    }
+
+    /// Disable full-text indexing for `(label, field)`.
+    /// Returns `true` if it was present and removed, `false` if absent.
+    pub fn disable_fulltext(&mut self, label: &str, field: &str) -> bool {
+        self.fulltext_enabled
+            .remove(&(label.into(), field.into()))
+    }
+
+    /// Brute-force full-text search equivalent to `GraphDb::search`.
+    ///
+    /// Walks all live nodes whose label has `(label, field)` enabled,
+    /// tokenizes their `field` value, and counts OR-group matches.
+    /// Returns `(key, match_count)` sorted by match_count DESC, key ASC.
+    ///
+    /// This is the DST oracle: its result must match `db.search(field, query)`
+    /// at every quiescent point.
+    pub fn scratch_search(&self, field: &str, query: &str) -> Vec<(String, usize)> {
+        let groups = parse_query(query);
+        if groups.is_empty() {
+            return vec![];
+        }
+
+        // Labels that currently have `field` indexed.
+        let indexed_labels: HashSet<&str> = self
+            .fulltext_enabled
+            .iter()
+            .filter(|(_, f)| f == field)
+            .map(|(l, _)| l.as_str())
+            .collect();
+
+        if indexed_labels.is_empty() {
+            return vec![];
+        }
+
+        let mut results: Vec<(String, usize)> = Vec::new();
+        for (key, props) in &self.nodes {
+            let label = self.labels.get(key).map_or("", |l| l.as_str());
+            if !indexed_labels.contains(label) {
+                continue;
+            }
+            let text = match props.get(field) {
+                Some(Value::Str(s)) => s.clone(),
+                _ => continue, // only Str fields are tokenized in fulltext
+            };
+            let doc_tokens: BTreeSet<String> = tokenize(&text).into_iter().collect();
+
+            // Count how many OR-groups match (mirrors FulltextIndex::search).
+            let mut match_count = 0usize;
+            for group in &groups {
+                let group_matched = group.iter().all(|term| {
+                    if term.prefix {
+                        doc_tokens.iter().any(|t| t.starts_with(term.token.as_str()))
+                    } else {
+                        doc_tokens.contains(&term.token)
+                    }
+                });
+                if group_matched {
+                    match_count += 1;
+                }
+            }
+
+            if match_count > 0 {
+                results.push((key.clone(), match_count));
+            }
+        }
+
+        // Sort by match_count DESC, then key ASC (deterministic tiebreak).
+        results.sort_by(|(ka, ca), (kb, cb)| cb.cmp(ca).then_with(|| ka.cmp(kb)));
+        results
     }
 
     /// Returns true if (etype, src_key, dst_key) would be derived by any live rule

@@ -57,6 +57,20 @@ pub enum WalRecord {
     DeleteView {
         name: String,
     },
+    // ── Full-text-lite variants (appended after views; discriminants 12, 13) ──
+    /// Enable full-text indexing on all nodes of `label` for field `field`.
+    /// The index is rebuilt from live data on open; this record only persists
+    /// the declaration.  Discriminant 12.
+    EnableFulltext {
+        label: String,
+        field: String,
+    },
+    /// Disable full-text indexing for `(label, field)` and drop its postings.
+    /// Discriminant 13.
+    DisableFulltext {
+        label: String,
+        field: String,
+    },
 }
 
 /// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.
@@ -451,6 +465,70 @@ mod tests {
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0], WalRecord::CreateView { def_bytes: vec![0xDE, 0xAD] });
         assert_eq!(recs[1], WalRecord::DeleteView { name: "v".into() });
+    }
+
+    // ── Task full-text-lite: new variant roundtrips + wire pin ────────────────
+
+    #[test]
+    fn roundtrip_enable_fulltext() {
+        let r = WalRecord::EnableFulltext {
+            label: "Person".into(),
+            field: "bio".into(),
+        };
+        let bytes = encode_record(&r);
+        let (recs, _) = decode_all(&bytes);
+        assert_eq!(recs, vec![r]);
+    }
+
+    #[test]
+    fn roundtrip_disable_fulltext() {
+        let r = WalRecord::DisableFulltext {
+            label: "Person".into(),
+            field: "bio".into(),
+        };
+        let bytes = encode_record(&r);
+        let (recs, _) = decode_all(&bytes);
+        assert_eq!(recs, vec![r]);
+    }
+
+    /// Pin discriminants 12 (EnableFulltext) and 13 (DisableFulltext).
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    #[test]
+    fn golden_bytes_pin_fulltext_wire_format() {
+        // ── Variant 12: EnableFulltext { label: "A", field: "b" } ────────────
+        let enable = WalRecord::EnableFulltext {
+            label: "A".into(),
+            field: "b".into(),
+        };
+        let ep = bincode::serialize(&enable).unwrap();
+        assert_eq!(
+            &ep[0..4],
+            &[12, 0, 0, 0],
+            "EnableFulltext discriminant changed — a variant was inserted before position 12"
+        );
+
+        // ── Variant 13: DisableFulltext { label: "A", field: "b" } ───────────
+        let disable = WalRecord::DisableFulltext {
+            label: "A".into(),
+            field: "b".into(),
+        };
+        let dp = bincode::serialize(&disable).unwrap();
+        assert_eq!(
+            &dp[0..4],
+            &[13, 0, 0, 0],
+            "DisableFulltext discriminant changed — a variant was inserted before position 13"
+        );
+
+        // Roundtrip both through encode_record / decode_all.
+        let mut buf = encode_record(&enable);
+        buf.extend(encode_record(&disable));
+        let (recs, consumed) = decode_all(&buf);
+        assert_eq!(consumed, buf.len());
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0], WalRecord::EnableFulltext { label: "A".into(), field: "b".into() });
+        assert_eq!(recs[1], WalRecord::DisableFulltext { label: "A".into(), field: "b".into() });
     }
 
     #[test]
