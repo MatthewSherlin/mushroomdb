@@ -2,7 +2,7 @@
 
 use cli::{
     format_demo, format_stats, format_suggest, maybe_run_demo_if_empty, parse_args, read_stats,
-    run_asof, run_demo, run_suggest, usage, Command, ServeUi,
+    run_algo, run_asof, run_demo, run_suggest, usage, Command, ServeUi,
 };
 use core_api::SharedDb;
 use std::io::{self, Write};
@@ -63,6 +63,15 @@ fn main() -> ExitCode {
         },
         Ok(Command::AsOf { db_dir, commit, query }) => {
             match run_asof(&db_dir, commit, query.as_deref()) {
+                Ok(out) => {
+                    print!("{out}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+        Ok(Command::Algo { db_dir, subcmd, top }) => {
+            match run_algo(&db_dir, &subcmd, top) {
                 Ok(out) => {
                     print!("{out}");
                     ExitCode::SUCCESS

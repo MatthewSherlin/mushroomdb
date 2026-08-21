@@ -1,8 +1,10 @@
+pub mod algo;
 mod db;
 mod ingest;
 mod shared;
 pub mod subscription;
 
+pub use algo::{AlgoDir, DegreeConfig, DegreeReport, PageRankConfig, PageRankReport, WccConfig, WccReport};
 pub use core_query::{CmpOp, Dir, Filter, ResultSet};
 pub use core_rules::{AggFn, Predicate, RuleDef, RuleSuggestion, SuggestConfig, SuggestReport, ViewDef, ViewSource, ViewStore};
 pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;

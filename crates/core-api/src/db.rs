@@ -1895,6 +1895,82 @@ impl<F: Fs> GraphDb<F> {
         )
     }
 
+    // -----------------------------------------------------------------------
+    // Graph algorithm API
+    // -----------------------------------------------------------------------
+
+    /// Run PageRank over the unified topology (manual + derived edges).
+    ///
+    /// Returns a [`PageRankReport`] with scores sorted descending (ties: key
+    /// ascending).  Set `config.edge_type` to restrict to one edge type.
+    /// `config.converged` is `true` only when the power iteration converged
+    /// within `config.max_iters` and within any time budget.
+    pub fn pagerank(&self, config: &crate::algo::PageRankConfig) -> crate::algo::PageRankReport {
+        crate::algo::pagerank(&self.topo, &self.ids, &self.syms, &self.labels, config)
+    }
+
+    /// Weakly-connected components over the unified topology (treated as
+    /// undirected regardless of how edges were inserted).
+    ///
+    /// Component IDs are the key of the smallest member in the component
+    /// (deterministic).  Result sorted by (component_id, key).
+    pub fn connected_components(&self, config: &crate::algo::WccConfig) -> crate::algo::WccReport {
+        crate::algo::wcc(&self.topo, &self.ids, &self.syms, &self.labels, config)
+    }
+
+    /// Degree centrality for every live node.
+    ///
+    /// `direction`: `AlgoDir::Out` = out-degree, `AlgoDir::In` = in-degree,
+    /// `AlgoDir::Both` = out + in (total directed degree).
+    ///
+    /// For one-shot ranking use this; for a live property updated on every
+    /// write, create a Degree materialized view instead (see `docs/site/algorithms.md`).
+    pub fn degree_centrality(
+        &self,
+        config: &crate::algo::DegreeConfig,
+    ) -> crate::algo::DegreeReport {
+        crate::algo::degree_centrality(&self.topo, &self.ids, &self.syms, &self.labels, config)
+    }
+
+    /// Write a vector of `(node_key, score)` pairs as `prop_name` on each node,
+    /// atomically via a single write-batch (one WAL frame, one fsync).
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::RuleInvalid`]: `prop_name` is managed by an existing view
+    ///   (collision check mirrors `create_view`).
+    /// - [`GraphError::KeyNotFound`]: a key in `scores` does not exist as a live node.
+    pub fn write_scores(&mut self, prop_name: &str, scores: &[(String, f64)]) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        // Collision check: refuse if prop_name is view-managed.
+        if let Some(view_name) = self.view_store.view_for_prop(prop_name) {
+            return Err(GraphError::RuleInvalid {
+                detail: format!(
+                    "prop {:?} is managed by view {:?} and cannot be written as scores",
+                    prop_name, view_name
+                ),
+            });
+        }
+        // Refuse if prop_name is a view name itself (confusing namespace collision).
+        if self.view_store.has_view(prop_name) {
+            return Err(GraphError::RuleInvalid {
+                detail: format!(
+                    "prop_name {:?} collides with an existing view name",
+                    prop_name
+                ),
+            });
+        }
+        // Write all scores in a single crash-atomic batch.
+        self.write_batch(|b| {
+            for (key, score) in scores {
+                b.set_prop(key, prop_name, Value::Float(*score));
+            }
+        })?;
+        Ok(())
+    }
+
     pub fn get_prop(&self, key: &str, field: &str) -> Option<&Value> {
         self.props.get(self.ids.get(key)?, field)
     }

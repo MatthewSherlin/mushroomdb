@@ -389,6 +389,9 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | `mushroomdb serve <dir>` | Start the HTTP server + optional UI |
 | `mushroomdb mcp <dir>` | Start a stdio MCP JSON-RPC server for agent tools |
 | `mushroomdb stats <dir>` | Print node/edge/rule counts |
+| `mushroomdb algo pagerank <dir> --top 20` | Run PageRank over the unified topology (manual + derived edges) |
+| `mushroomdb algo wcc <dir> --top 50` | Find weakly-connected components |
+| `mushroomdb algo degree <dir> --top 20` | Degree centrality (out / in / both) |
 
 Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 
@@ -494,6 +497,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 - Time travel (as-of queries): [`docs/site/timetravel.md`](docs/site/timetravel.md)
 - Materialized views: [`docs/site/views.md`](docs/site/views.md)
 - Rule suggestions: [`docs/site/suggest.md`](docs/site/suggest.md)
+- Graph algorithms (PageRank, WCC, degree centrality): [`docs/site/algorithms.md`](docs/site/algorithms.md)
 - API reference: [`docs/site/api.md`](docs/site/api.md)
 - Cypher query reference: [`docs/site/query.md`](docs/site/query.md)
 - Design spec: [`docs/design.md`](docs/design.md)
