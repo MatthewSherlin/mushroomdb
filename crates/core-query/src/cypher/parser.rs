@@ -643,12 +643,14 @@ impl<'a> Parser<'a> {
                 let name = self.ident("expected identifier")?;
                 if self.peek() == Some(&Tok::LParen) {
                     // Scalar function call: name(arg, ...)
+                    // Function arguments may be arbitrary expressions (to support
+                    // forms like abs(n.age - 27) or round(n.score * 1.5)).
                     self.pos += 1; // consume '('
                     let mut args = Vec::new();
                     if self.peek() != Some(&Tok::RParen) {
-                        args.push(self.operand()?);
+                        args.push(self.func_arg_operand()?);
                         while self.eat(&Tok::Comma) {
-                            args.push(self.operand()?);
+                            args.push(self.func_arg_operand()?);
                         }
                     }
                     self.expect(&Tok::RParen, "expected ')' to close function call")?;
@@ -663,6 +665,29 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.err("expected operand (property, literal, or parameter)")),
         }
+    }
+
+    /// Parse a function call argument: a simple operand optionally followed by
+    /// one arithmetic binary operator and another operand.
+    /// Handles `abs(n.age - 27)` and `round(n.score * 1.5)`.
+    ///
+    /// Only `-` (subtraction) and `*` (multiplication) are supported; the
+    /// lexer does not emit `+` or `/` tokens so those forms are a lex error.
+    fn func_arg_operand(&mut self) -> Result<Operand, String> {
+        use super::ast::{ArithOp, Operand as Op};
+        let left = self.operand()?;
+        // Check for an arithmetic operator following the first operand.
+        let op = match self.peek() {
+            Some(Tok::Dash) => { self.pos += 1; ArithOp::Sub }
+            Some(Tok::Star) => { self.pos += 1; ArithOp::Mul }
+            _ => return Ok(left),
+        };
+        let right = self.operand()?;
+        Ok(Op::BinArith {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        })
     }
 
     fn return_clause(&mut self) -> Result<Vec<RetItem>, String> {
@@ -719,12 +744,13 @@ impl<'a> Parser<'a> {
         let name = self.ident("expected variable in RETURN item")?;
         let value = if self.peek() == Some(&Tok::LParen) {
             // Scalar function call in RETURN position: name(args...)
+            // Arguments may be full expressions (e.g. abs(n.age - 27)).
             self.pos += 1; // consume '('
             let mut args = Vec::new();
             if self.peek() != Some(&Tok::RParen) {
-                args.push(self.operand()?);
+                args.push(self.func_arg_operand()?);
                 while self.eat(&Tok::Comma) {
-                    args.push(self.operand()?);
+                    args.push(self.func_arg_operand()?);
                 }
             }
             self.expect(&Tok::RParen, "expected ')' to close function call in RETURN")?;
@@ -1126,7 +1152,10 @@ impl<'a> Parser<'a> {
                 let op = self.operand()?;
                 match &op {
                     Operand::Lit(_) | Operand::Param(_) => op,
-                    Operand::Prop { .. } | Operand::Var(_) | Operand::FuncCall { .. } => {
+                    Operand::Prop { .. }
+                    | Operand::Var(_)
+                    | Operand::FuncCall { .. }
+                    | Operand::BinArith { .. } => {
                         return Err(self.err(
                             "SET RHS must be a literal or $parameter (expressions not supported in v1)",
                         ));

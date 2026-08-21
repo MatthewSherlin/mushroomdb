@@ -55,6 +55,80 @@ impl GraphDb {
         result_set_to_rows(py, &rs)
     }
 
+    /// Execute a read query with named parameters.
+    ///
+    /// ```python
+    /// rows = db.query_with_params(
+    ///     "MATCH (n:Person) WHERE n.age > $min RETURN n.key",
+    ///     [("min", 18)],
+    /// )
+    /// ```
+    ///
+    /// Each element of `params` is a `(name, value)` tuple.  Values must be
+    /// `int`, `float`, `str`, `bool`, or a `list` of those.
+    fn query_with_params(
+        &self,
+        py: Python<'_>,
+        cypher: &str,
+        params: Bound<'_, PyList>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        let mut map = BTreeMap::new();
+        for item in params.iter() {
+            let tuple = item.downcast::<pyo3::types::PyTuple>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "params must be a list of (name, value) tuples",
+                )
+            })?;
+            if tuple.len() != 2 {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "each param must be a (name, value) tuple",
+                ));
+            }
+            let name: String = tuple.get_item(0)?.extract()?;
+            let val = py_to_value(&tuple.get_item(1)?)?;
+            map.insert(name, val);
+        }
+        let rs = self.with_ref(|db| db.query(cypher, &map))?;
+        result_set_to_rows(py, &rs)
+    }
+
+    /// Execute a Cypher write statement (CREATE / MATCH…SET / MATCH…DELETE /
+    /// MATCH…DETACH DELETE / MERGE).
+    ///
+    /// Returns a one-row result dict with keys `created`, `properties_set`,
+    /// and `deleted`.
+    ///
+    /// Params follow the same `[(name, value)]` convention as
+    /// `query_with_params`.
+    #[pyo3(signature = (cypher, params = None))]
+    fn query_write(
+        &self,
+        py: Python<'_>,
+        cypher: &str,
+        params: Option<Bound<'_, PyList>>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        let mut map = BTreeMap::new();
+        if let Some(pl) = params {
+            for item in pl.iter() {
+                let tuple = item.downcast::<pyo3::types::PyTuple>().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "params must be a list of (name, value) tuples",
+                    )
+                })?;
+                if tuple.len() != 2 {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "each param must be a (name, value) tuple",
+                    ));
+                }
+                let name: String = tuple.get_item(0)?.extract()?;
+                let val = py_to_value(&tuple.get_item(1)?)?;
+                map.insert(name, val);
+            }
+        }
+        let rs = self.with_mut(|db| db.query_write(cypher, &map))?;
+        result_set_to_rows(py, &rs)
+    }
+
     fn create_rule(&self, py: Python<'_>, rule: Bound<'_, PyAny>) -> PyResult<()> {
         let def = rule_from_py(py, &rule)?;
         self.with_mut(|db| db.create_rule(def))

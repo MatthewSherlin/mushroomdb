@@ -944,6 +944,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                                     Operand::Lit(_) => "<lit>".to_string(),
                                     Operand::Param(p) => format!("${p}"),
                                     Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
+                                    Operand::BinArith { .. } => "<arith>".to_string(),
                                 }).collect();
                                 let col = format!("{name}({})", arg_strs.join(", "));
                                 vars.intern(&col);
@@ -1009,6 +1010,10 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
             vars.intern(var);
         }
         Operand::Lit(_) | Operand::Param(_) => {}
+        Operand::BinArith { left, right, .. } => {
+            intern_operand(vars, left);
+            intern_operand(vars, right);
+        }
         Operand::FuncCall { args, .. } => {
             for arg in args {
                 intern_operand(vars, arg);
@@ -1231,6 +1236,40 @@ fn resolve_operand(
             }
         }
         Operand::FuncCall { name, args } => eval_func(name, args, view, vars, row, params),
+        Operand::BinArith { op, left, right } => {
+            use super::ast::ArithOp;
+            let lv = resolve_operand(view, vars, row, left, params)?;
+            let rv = resolve_operand(view, vars, row, right, params)?;
+            match (lv, rv) {
+                (None, _) | (_, None) => Ok(None), // null propagation
+                (Some(Value::Int(a)), Some(Value::Int(b))) => {
+                    let result = match op {
+                        ArithOp::Sub => a.saturating_sub(b),
+                        ArithOp::Mul => a.saturating_mul(b),
+                        ArithOp::Add => a.saturating_add(b),
+                        ArithOp::Div => {
+                            if b == 0 { return Err("division by zero".into()); }
+                            a / b
+                        }
+                    };
+                    Ok(Some(Value::Int(result)))
+                }
+                (Some(lv), Some(rv)) => {
+                    let a = match &lv { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err(format!("arithmetic operand must be numeric, got {lv:?}")) };
+                    let b = match &rv { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err(format!("arithmetic operand must be numeric, got {rv:?}")) };
+                    let result = match op {
+                        ArithOp::Sub => a - b,
+                        ArithOp::Mul => a * b,
+                        ArithOp::Add => a + b,
+                        ArithOp::Div => {
+                            if b == 0.0 { return Err("division by zero".into()); }
+                            a / b
+                        }
+                    };
+                    Ok(Some(Value::Float(result)))
+                }
+            }
+        }
     }
 }
 
@@ -1241,7 +1280,17 @@ fn resolve_prop(
     var: &str,
     field: &str,
 ) -> Result<Option<Value>, String> {
-    match require_cell(row, vars, var)? {
+    // Distinguish "variable not in scope" (hard error) from "variable is null
+    // because OPTIONAL MATCH found no match" (returns null, not an error).
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    let cell = match row.get(slot).and_then(|c| c.as_ref()) {
+        Some(c) => c,
+        // Slot exists but is None → OPTIONAL MATCH null binding; propagate null.
+        None => return Ok(None),
+    };
+    match cell {
         Cell::Node(id) => Ok(view.prop(*id, field).cloned()),
         Cell::Rel(e) => Ok(view.edge_props.get(e.etype, e.src, e.dst, field).cloned()),
         // Virtual path cell: only `length` is exposed.
@@ -2863,6 +2912,7 @@ fn column_name(item: &RetItem) -> String {
                 Operand::Lit(_) => "<lit>".to_string(),
                 Operand::Param(p) => format!("${p}"),
                 Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
+                Operand::BinArith { .. } => "<arith>".to_string(),
             }).collect();
             format!("{name}({})", arg_strs.join(", "))
         }

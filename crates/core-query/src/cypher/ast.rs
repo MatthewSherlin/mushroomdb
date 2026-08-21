@@ -180,6 +180,22 @@ pub enum Operand {
         name: String,
         args: Vec<Operand>,
     },
+    /// Arithmetic expression inside a function argument: `abs(n.age - 27)`,
+    /// `round(n.score * 1.5)`.  Supports `+`, `-`, `*`, `/`.
+    BinArith {
+        op: ArithOp,
+        left: Box<Operand>,
+        right: Box<Operand>,
+    },
+}
+
+/// Arithmetic operators for `Operand::BinArith`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 /// RETURN item value: bare variable, `var.field`, an aggregate call, or a

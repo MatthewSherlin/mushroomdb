@@ -811,6 +811,10 @@ fn check_operand_bound(
         Operand::Prop { var, .. } => require_bound(var, bound, clause),
         Operand::Lit(_) | Operand::Param(_) => Ok(()),
         Operand::Var(name) => require_bound(name, bound, clause),
+        Operand::BinArith { left, right, .. } => {
+            check_operand_bound(left, bound, clause)?;
+            check_operand_bound(right, bound, clause)
+        }
         Operand::FuncCall { args, .. } => {
             for arg in args {
                 check_operand_bound(arg, bound, clause)?;
@@ -922,6 +926,7 @@ fn column_name(item: &RetItem) -> String {
                     Operand::Lit(_) => "<lit>".to_string(),
                     Operand::Param(p) => format!("${p}"),
                     Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
+                    Operand::BinArith { .. } => "<arith>".to_string(),
                 })
                 .collect();
             format!("{name}({})", arg_strs.join(", "))
