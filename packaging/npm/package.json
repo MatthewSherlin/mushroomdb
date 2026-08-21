@@ -3,6 +3,13 @@
   "version": "0.1.0",
   "description": "Launcher for the mushroomdb native binary (downloaded from GitHub Releases).",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MatthewSherlin/mushroomdb.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "mushroomdb": "bin/mushroomdb.js"
   },
@@ -13,10 +20,6 @@
     "install.js",
     "bin/mushroomdb.js"
   ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/MatthewSherlin/mushroomdb.git"
-  },
   "engines": {
     "node": ">=18"
   },

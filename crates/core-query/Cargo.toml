@@ -1,11 +1,19 @@
 [package]
-name = "core-query"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+name = "mushroomdb-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Cypher query planner and executor for mushroomdb"
+
+[lib]
+name = "core_query"
 
 [dependencies]
-core-storage = { path = "../core-storage" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.1.0" }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -1,8 +1,16 @@
 [package]
+name = "mushroomdb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "CLI binary for mushroomdb: start, shell, and server commands"
+
+[lib]
 name = "cli"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
 
 [[bin]]
 name = "mushroomdb"
@@ -13,6 +21,6 @@ default = []
 embed-ui = ["server/embed-ui"]
 
 [dependencies]
-core-api = { path = "../core-api" }
-server = { path = "../server" }
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.1.0" }
+server = { package = "mushroomdb-server", path = "../server", version = "0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

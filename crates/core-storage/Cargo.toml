@@ -1,8 +1,16 @@
 [package]
-name = "core-storage"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+name = "mushroomdb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Low-level storage engine for mushroomdb: WAL, column store, topology, and interner"
+
+[lib]
+name = "core_storage"
 
 [dependencies]
 serde = { workspace = true }

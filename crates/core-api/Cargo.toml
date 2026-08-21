@@ -1,13 +1,22 @@
 [package]
-name = "core-api"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+name = "mushroomdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Embedded graph database with Cypher queries, rule triggers, and Arrow export"
+readme = "../../README.md"
+
+[lib]
+name = "core_api"
 
 [dependencies]
-core-storage = { path = "../core-storage" }
-core-rules = { path = "../core-rules" }
-core-query = { path = "../core-query" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.1.0" }
+core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.1.0" }
+core-query = { package = "mushroomdb-query", path = "../core-query", version = "0.1.0" }
 bincode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1,11 +1,19 @@
 [package]
-name = "core-rules"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+name = "mushroomdb-rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Rule evaluation engine for mushroomdb: declarative predicates and trigger logic"
+
+[lib]
+name = "core_rules"
 
 [dependencies]
-core-storage = { path = "../core-storage" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.1.0" }
 serde = { workspace = true }
 
 [dev-dependencies]

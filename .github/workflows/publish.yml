@@ -1,0 +1,276 @@
+# publish.yml — Registry publishing via OIDC Trusted Publishing
+#
+# Triggered on GitHub Release "published" event (or manually).
+# Publishes to crates.io, PyPI, and npm in parallel after building.
+# NO secrets required for crates.io or PyPI — both use OIDC.
+# npm requires a granular token (see bootstrap notes below).
+#
+# ─── HUMAN SETUP REQUIRED BEFORE FIRST RUN ───────────────────────────────────
+#
+# CRATES.IO (Trusted Publishing — no token):
+#   1. Go to https://crates.io and log in.
+#   2. For each crate name below, if it does not yet exist, you MUST publish
+#      it manually the FIRST time (see bootstrap section), OR create the crate
+#      entry by clicking "publish new crate" and registering the name.
+#   3. For each published crate, open its crates.io settings and add a
+#      Trusted Publisher:
+#        - Repository owner: MatthewSherlin
+#        - Repository name: mushroomdb
+#        - Workflow filename: publish.yml
+#      Do this for: mushroomdb-storage, mushroomdb-rules, mushroomdb-query,
+#        mushroomdb, mushroomdb-arrow, mushroomdb-server, mushroomdb-cli
+#   FIRST-PUBLISH BOOTSTRAP: crates.io Trusted Publishing requires the crate
+#   to already exist on the registry before a trusted publisher can be added.
+#   Bootstrap via: cargo login <your-api-token> && cargo publish -p <crate>
+#   (publishing once with a token, then switching to Trusted Publishing for all
+#   subsequent releases). Publish in dependency order:
+#     mushroomdb-storage → mushroomdb-rules → mushroomdb-query → mushroomdb
+#     → mushroomdb-arrow → mushroomdb-server → mushroomdb-cli
+#   Wait ~30 seconds between each publish for the index to update.
+#
+# PYPI (Trusted Publishing — no token):
+#   1. Go to https://pypi.org and log in.
+#   2. Navigate to Publishing > "Add a new pending publisher".
+#   3. Fill in:
+#        PyPI project name: mushroomdb
+#        Owner: MatthewSherlin
+#        Repository name: mushroomdb
+#        Workflow name: publish.yml
+#        Environment name: pypi  (or leave blank — must match the `environment:` below)
+#   FIRST-PUBLISH BOOTSTRAP: PyPI Trusted Publishing supports "pending publishers"
+#   so you can configure it BEFORE the first publish — no prior token publish
+#   needed. Just configure the pending publisher and the first push via this
+#   workflow will create the project automatically.
+#
+# NPM (Granular Token — token required):
+#   npm does not currently support fully-tokenless OIDC publishing in the same
+#   model as PyPI. npm provenance (--provenance flag) attaches a Sigstore
+#   signature but still requires an npm auth token for the publish itself.
+#   1. Go to https://www.npmjs.com → Account → Access Tokens → Generate Token
+#      → Granular Access Token.
+#   2. Select permissions: Read and Write for packages "mushroomdb" and
+#      "mushroomdb-client".
+#   3. Set expiration as appropriate (or "No expiration" for a CI automation token).
+#   4. Add the token as a GitHub Actions secret named NPM_TOKEN in
+#      Settings → Secrets and variables → Actions.
+#   FIRST-PUBLISH BOOTSTRAP for mushroomdb (packaging/npm):
+#     npm does not allow publishing a scoped public package without first
+#     existing. Run once manually: cd packaging/npm && npm publish --access public
+#   FIRST-PUBLISH BOOTSTRAP for mushroomdb-client (clients/typescript):
+#     Build first: npm ci && npm run build
+#     Then: npm publish --access public
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── crates.io ──────────────────────────────────────────────────────────────
+  # Publishes in strict dependency order. Each step waits ~30 s for the index
+  # to propagate before the next crate is submitted.
+  publish-crates:
+    name: crates.io
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC Trusted Publishing
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with:
+          toolchain: "1.92.0"
+
+      # Authenticate to crates.io via OIDC (no CARGO_REGISTRY_TOKEN secret needed).
+      # Setup: crates.io → crate settings → Trusted Publishers → Add publisher
+      #   repo=MatthewSherlin/mushroomdb workflow=publish.yml
+      - uses: rust-lang/crates-io-auth-action@v1
+
+      - name: publish mushroomdb-storage (leaf)
+        run: cargo publish -p mushroomdb-storage
+
+      - name: wait for index propagation
+        run: sleep 30
+
+      - name: publish mushroomdb-rules
+        run: cargo publish -p mushroomdb-rules
+
+      - name: wait for index propagation
+        run: sleep 30
+
+      - name: publish mushroomdb-query
+        run: cargo publish -p mushroomdb-query
+
+      - name: wait for index propagation
+        run: sleep 30
+
+      - name: publish mushroomdb (core-api, user-facing crate)
+        run: cargo publish -p mushroomdb
+
+      - name: wait for index propagation
+        run: sleep 30
+
+      - name: publish mushroomdb-arrow
+        run: cargo publish -p mushroomdb-arrow
+
+      - name: wait for index propagation
+        run: sleep 30
+
+      - name: publish mushroomdb-server
+        run: cargo publish -p mushroomdb-server
+
+      - name: wait for index propagation
+        run: sleep 30
+
+      - name: publish mushroomdb-cli
+        run: cargo publish -p mushroomdb-cli
+
+  # ── PyPI ───────────────────────────────────────────────────────────────────
+  # Builds wheels for four targets, then uploads via OIDC trusted publishing.
+  # No PyPI token secret needed — configure a pending publisher on PyPI first.
+  publish-pypi:
+    name: PyPI
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC Trusted Publishing
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mushroomdb
+
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            maturin-target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            maturin-target: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            maturin-target: aarch64
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with:
+          toolchain: "1.92.0"
+
+      # Build manylinux wheel on Linux, native wheel on macOS.
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: build
+          args: --release --out dist
+          working-directory: bindings/python
+          target: ${{ matrix.maturin-target }}
+          # Use manylinux container on Linux for broad compatibility.
+          manylinux: ${{ startsWith(matrix.os, 'ubuntu') && 'auto' || '' }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: bindings/python/dist/*.whl
+          if-no-files-found: error
+
+  publish-pypi-upload:
+    name: PyPI upload
+    needs: [publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mushroomdb
+
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      # Upload via OIDC — no PyPI token needed.
+      # Setup: pypi.org → Publishing → Add pending publisher
+      #   project=mushroomdb owner=MatthewSherlin repo=mushroomdb
+      #   workflow=publish.yml environment=pypi
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist
+
+  # ── npm ────────────────────────────────────────────────────────────────────
+  # Publishes both npm packages with provenance attestation.
+  # NPM_TOKEN secret is required (see human-setup notes at the top of this file).
+  publish-npm-launcher:
+    name: npm (mushroomdb launcher)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for --provenance
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: set version from tag
+        working-directory: packaging/npm
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          npm version "$VER" --no-git-tag-version --allow-same-version
+
+      # --provenance attaches a Sigstore attestation (requires id-token: write).
+      # NODE_AUTH_TOKEN is the npm granular token from the NPM_TOKEN secret.
+      - name: npm publish mushroomdb
+        working-directory: packaging/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
+
+  publish-npm-client:
+    name: npm (mushroomdb-client)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for --provenance
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+          cache-dependency-path: clients/typescript/package-lock.json
+
+      - name: install + build
+        working-directory: clients/typescript
+        run: |
+          npm ci
+          npm run build
+
+      - name: set version from tag
+        working-directory: clients/typescript
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          npm version "$VER" --no-git-tag-version --allow-same-version
+
+      - name: npm publish mushroomdb-client
+        working-directory: clients/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public

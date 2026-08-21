@@ -1,16 +1,24 @@
 [package]
+name = "mushroomdb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "HTTP/WebSocket server and MCP adapter for mushroomdb"
+
+[lib]
 name = "server"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
 
 [features]
 default = []
 embed-ui = ["dep:include_dir"]
 
 [dependencies]
-core-api = { path = "../core-api" }
-arrow-bridge = { path = "../arrow-bridge" }
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.1.0" }
+arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.1.0" }
 # ws enabled now so Task 5 can add GET /watch without a dep bump.
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }

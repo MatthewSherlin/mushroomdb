@@ -74,16 +74,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrow-bridge"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-ipc",
- "arrow-schema",
- "core-query",
-]
-
-[[package]]
 name = "arrow-buffer"
 version = "59.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -352,15 +342,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "cli"
-version = "0.1.0"
-dependencies = [
- "core-api",
- "server",
- "tokio",
-]
-
-[[package]]
 name = "const-random"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -381,24 +362,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "core-api"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "core-query",
- "core-rules",
- "core-storage",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "core-bench"
 version = "0.1.0"
 dependencies = [
- "core-api",
- "core-storage",
  "criterion",
+ "mushroomdb",
+ "mushroomdb-storage",
 ]
 
 [[package]]
@@ -406,35 +375,6 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
-
-[[package]]
-name = "core-query"
-version = "0.1.0"
-dependencies = [
- "core-storage",
- "proptest",
-]
-
-[[package]]
-name = "core-rules"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "core-storage",
- "proptest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "core-storage"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "crc32fast",
- "proptest",
- "serde",
-]
 
 [[package]]
 name = "cpufeatures"
@@ -920,6 +860,85 @@ dependencies = [
 ]
 
 [[package]]
+name = "mushroomdb"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "mushroomdb-query",
+ "mushroomdb-rules",
+ "mushroomdb-storage",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mushroomdb-arrow"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "mushroomdb-query",
+]
+
+[[package]]
+name = "mushroomdb-cli"
+version = "0.1.0"
+dependencies = [
+ "mushroomdb",
+ "mushroomdb-server",
+ "tokio",
+]
+
+[[package]]
+name = "mushroomdb-query"
+version = "0.1.0"
+dependencies = [
+ "mushroomdb-storage",
+ "proptest",
+]
+
+[[package]]
+name = "mushroomdb-rules"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "mushroomdb-storage",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mushroomdb-server"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "axum",
+ "futures-util",
+ "include_dir",
+ "mushroomdb",
+ "mushroomdb-arrow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tower",
+ "tower-http",
+]
+
+[[package]]
+name = "mushroomdb-storage"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "proptest",
+ "serde",
+]
+
+[[package]]
 name = "num-bigint"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1298,25 +1317,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-bridge",
- "arrow-ipc",
- "axum",
- "core-api",
- "futures-util",
- "include_dir",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tower",
- "tower-http",
-]
-
-[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1337,9 +1337,9 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 name = "sim-harness"
 version = "0.1.0"
 dependencies = [
- "core-api",
- "core-rules",
- "core-storage",
+ "mushroomdb",
+ "mushroomdb-rules",
+ "mushroomdb-storage",
  "proptest",
 ]
 

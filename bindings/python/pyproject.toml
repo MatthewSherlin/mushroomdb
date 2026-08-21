@@ -6,7 +6,22 @@ build-backend = "maturin"
 name = "mushroomdb"
 version = "0.1.0"
 requires-python = ">=3.10"
-description = "Embedded mushroomdb Python bindings"
+description = "Embedded mushroomdb graph database — Python bindings via PyO3"
+license = { text = "Apache-2.0" }
+readme = "../../README.md"
+keywords = ["graph-database", "embedded", "cypher", "rules"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.urls]
+Homepage = "https://github.com/MatthewSherlin/mushroomdb"
+Repository = "https://github.com/MatthewSherlin/mushroomdb"
+"Bug Tracker" = "https://github.com/MatthewSherlin/mushroomdb/issues"
 
 [tool.maturin]
 module-name = "mushroomdb"

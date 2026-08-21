@@ -3,11 +3,12 @@ name = "sim-harness"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+publish = false
 
 [dependencies]
-core-api = { path = "../core-api" }
-core-rules = { path = "../core-rules" }
-core-storage = { path = "../core-storage" }
+core-api = { package = "mushroomdb", path = "../core-api" }
+core-rules = { package = "mushroomdb-rules", path = "../core-rules" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage" }
 
 [dev-dependencies]
 proptest = { workspace = true }
