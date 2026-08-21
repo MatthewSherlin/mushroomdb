@@ -4972,4 +4972,109 @@ LIMIT 10";
             "error must mention the unknown alias: {err}"
         );
     }
+
+    /// Round-2 pin 1: post-UNWIND WHERE referencing a pre-MATCH-bound variable.
+    /// Verifies scope is correctly available across the UNWIND boundary —
+    /// a regression that drops `n` from scope would either error or return all rows.
+    #[test]
+    fn post_unwind_where_references_pre_match_variable() {
+        let mut fx = Fx::new();
+        // n1: threshold=3, list=[1,2,3,4,5] → keep 4,5 (x > threshold)
+        fx.add("N", "n1", vec![
+            ("threshold", Value::Int(3)),
+            ("xs", Value::List(vec![
+                Value::Int(1), Value::Int(2), Value::Int(3),
+                Value::Int(4), Value::Int(5),
+            ])),
+        ]);
+        // n2: threshold=10, list=[1,2] → keep nothing
+        fx.add("N", "n2", vec![
+            ("threshold", Value::Int(10)),
+            ("xs", Value::List(vec![Value::Int(1), Value::Int(2)])),
+        ]);
+        let view = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(
+            &view,
+            "MATCH (n:N) UNWIND n.xs AS x WHERE x > n.threshold RETURN x",
+            &params,
+        )
+        .expect("post-UNWIND WHERE referencing MATCH variable must succeed");
+        // n1 contributes x=4 and x=5; n2 contributes nothing.
+        assert_eq!(rs.len(), 2, "exactly 2 rows: x=4 and x=5 from n1");
+        let v0 = rs.get(0, "x").cloned();
+        let v1 = rs.get(1, "x").cloned();
+        let got = [v0, v1];
+        assert!(got.contains(&Some(Value::Int(4))), "x=4 present");
+        assert!(got.contains(&Some(Value::Int(5))), "x=5 present");
+    }
+
+    /// Round-2 pin 2: ORDER BY on an aggregate alias INSIDE a WITH stage.
+    /// Verifies compile_with_stage emits OrderBy that exec_order_by_rows
+    /// applies to Cell::Scalar group rows — the outer q.order_by path is separate.
+    #[test]
+    fn with_stage_aggregate_order_by_descending() {
+        // Boston: 3 people (alice age=30, bob age=25, eve age=22)
+        // Austin: 2 people (carol age=35, dave age=28)
+        let fx = city_graph();
+        let view = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(
+            &view,
+            "MATCH (p:Person) WITH p.city AS city, COUNT(*) AS cnt ORDER BY cnt DESC RETURN city, cnt",
+            &params,
+        )
+        .expect("aggregate WITH ORDER BY must succeed");
+        assert_eq!(rs.len(), 2, "two city groups");
+        // With ORDER BY cnt DESC: Boston (3) first, Austin (2) second.
+        assert_eq!(
+            rs.get(0, "cnt"),
+            Some(&Value::Int(3)),
+            "first row must be the group with cnt=3 (Boston)"
+        );
+        assert_eq!(
+            rs.get(1, "cnt"),
+            Some(&Value::Int(2)),
+            "second row must be the group with cnt=2 (Austin)"
+        );
+    }
+
+    /// Round-2 pin 3: UNWIND-then-WITH composition.
+    /// Verifies the pipeline correctly threads UNWIND-expanded rows into a
+    /// downstream WITH stage (both simple pass-through and aggregation).
+    #[test]
+    fn unwind_then_with_composition() {
+        let mut fx = Fx::new();
+        fx.add("Doc", "d1", vec![
+            ("scores", Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)])),
+        ]);
+        fx.add("Doc", "d2", vec![
+            ("scores", Value::List(vec![Value::Int(5), Value::Int(15)])),
+        ]);
+        let view = fx.view();
+        let params = BTreeMap::new();
+
+        // Simple pass-through: UNWIND then WITH x (non-aggregate).
+        let rs = run(
+            &view,
+            "MATCH (n:Doc) UNWIND n.scores AS x WITH x RETURN x",
+            &params,
+        )
+        .expect("UNWIND then WITH pass-through must succeed");
+        assert_eq!(rs.len(), 5, "3 + 2 = 5 expanded rows carried through WITH");
+
+        // Aggregation over UNWIND: COUNT all expanded values.
+        let rs2 = run(
+            &view,
+            "MATCH (n:Doc) UNWIND n.scores AS x WITH COUNT(*) AS total RETURN total",
+            &params,
+        )
+        .expect("UNWIND then aggregate WITH must succeed");
+        assert_eq!(rs2.len(), 1, "single aggregate row");
+        assert_eq!(
+            rs2.get(0, "total"),
+            Some(&Value::Int(5)),
+            "total must be 5 (3+2 expanded rows)"
+        );
+    }
 }
