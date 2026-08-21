@@ -28,10 +28,20 @@ Every mutation method on the returned instance returns `GraphError::ReadOnly`.
 If the WAL is empty (i.e., snapshot was just taken and no new writes have
 occurred), `open_at` returns `GraphError::CommitOutOfRange { commit, total: 0 }`.
 
-**To preserve full as-of history:** do not call `snapshot()`, or ensure
-`open_at` calls are bounded to the post-snapshot window. The WAL grows without
-bound until a snapshot is taken. For large databases this may be gigabytes over
-long operational periods.
+**Snapshot tradeoff:** `snapshot()` truncates the WAL — faster cold starts, but
+as-of history restarts from that point. These goals are in direct tension: if
+you take snapshots regularly for fast startup, `open_at` can only reach commits
+after the most recent snapshot. Choose based on operational priorities:
+- **Need as-of history across all time:** never snapshot; accept longer cold-start.
+- **Need fast startup:** snapshot regularly; `open_at` reaches only post-snapshot commits.
+- **Both:** snapshot at a known checkpoint and document that timestamp as the as-of horizon.
+
+The WAL grows without bound until a snapshot is taken. For large databases this
+may be gigabytes over long operational periods.
+
+**Torn WAL tail:** if the WAL has a partial frame at the end (e.g., after a
+crash mid-write), `open_at` silently treats it as fewer commits — only complete,
+valid frames are counted. No error is returned; the valid prefix is replayed.
 
 ## Replay cost
 

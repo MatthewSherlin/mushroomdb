@@ -388,6 +388,10 @@ s = db.stats()
 db.snapshot()  # flush WAL and write a snapshot file
 ```
 
+`snapshot()` truncates the WAL: faster cold starts, but as-of history
+(`open_at`) restarts from that point — commits before the snapshot are no
+longer reachable via time travel.
+
 ### Atomic write batches (Rust API)
 
 `write_batch` is the closure-style entry point for atomic multi-op commits.

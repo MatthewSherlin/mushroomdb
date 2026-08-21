@@ -8,7 +8,7 @@
 //! - pending_delta_count == 0 after open_at (mirror of T1's post-loop assert)
 //! - Commit out of range returns CommitOutOfRange
 
-use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value};
+use core_api::{Direction, GraphDb, GraphError, IngestOptions, Predicate, RuleDef, Value};
 use core_storage::wal::wal_commits;
 use std::path::PathBuf;
 
@@ -171,10 +171,41 @@ fn open_at_commit_4_node_a_deleted() {
 
 // ── open_at(latest) == normal open equivalence ──────────────────────────────
 
+/// Build a db whose FINAL state has live derived edges so equivalence
+/// comparison is non-trivial.
+///
+/// Commit layout:
+///   0: InsertNode "x" tag="hello"
+///   1: CreateRule "eq" (FieldEqual "tag", T→T→SAME)
+///   2: InsertNode "y" tag="hello"   → eq fires: x-[SAME]->y (and y-[SAME]->x)
+///   3: InsertNode "z" tag="hello"   → eq fires: x-[SAME]->z, y-[SAME]->z (+ reverses)
+fn build_equivalence_history(dir: &std::path::Path) {
+    let mut db = GraphDb::open(dir).unwrap();
+    db.insert_node("T", "x", vec![("tag".into(), Value::Str("hello".into()))])
+        .unwrap();
+    db.create_rule(RuleDef {
+        name: "eq".into(),
+        src_label: "T".into(),
+        dst_label: "T".into(),
+        predicate: Predicate::FieldEqual {
+            field: "tag".into(),
+        },
+        edge_type: "SAME".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+    })
+    .unwrap();
+    db.insert_node("T", "y", vec![("tag".into(), Value::Str("hello".into()))])
+        .unwrap();
+    db.insert_node("T", "z", vec![("tag".into(), Value::Str("hello".into()))])
+        .unwrap();
+}
+
 #[test]
 fn open_at_latest_equivalent_to_open() {
     let dir = tmp("at-latest");
-    build_known_history(&dir);
+    build_equivalence_history(&dir);
 
     let total = wal_commits(&std::fs::read(dir.join("wal.bin")).unwrap());
     let latest = total - 1;
@@ -182,16 +213,16 @@ fn open_at_latest_equivalent_to_open() {
     let at = GraphDb::open_at(&dir, latest).unwrap();
     let normal = GraphDb::open(&dir).unwrap();
 
-    assert_eq!(
-        at.has_node("a"),
-        normal.has_node("a"),
-        "open_at(latest) and open must agree on node a"
-    );
-    assert_eq!(
-        at.has_node("b"),
-        normal.has_node("b"),
-        "open_at(latest) and open must agree on node b"
-    );
+    // Node set matches
+    for key in ["x", "y", "z"] {
+        assert_eq!(
+            at.has_node(key),
+            normal.has_node(key),
+            "open_at(latest) and open must agree on node {key}"
+        );
+    }
+
+    // Edge count matches
     assert_eq!(
         at.stats().edges,
         normal.stats().edges,
@@ -202,6 +233,39 @@ fn open_at_latest_equivalent_to_open() {
         normal.stats().nodes_live,
         "open_at(latest) and open must have the same live node count"
     );
+
+    // Per-node derived neighbor sets match for all three nodes
+    for key in ["x", "y", "z"] {
+        let mut at_nbrs = at.neighbors(key, "SAME", Direction::Out).unwrap();
+        let mut norm_nbrs = normal.neighbors(key, "SAME", Direction::Out).unwrap();
+        at_nbrs.sort();
+        norm_nbrs.sort();
+        assert_eq!(
+            at_nbrs, norm_nbrs,
+            "open_at(latest) SAME-Out neighbors of {key} must match open()"
+        );
+    }
+
+    // explain() output matches for 3 known pairs: (x,y), (x,z), (y,z)
+    for (a, b) in [("x", "y"), ("x", "z"), ("y", "z")] {
+        let mut at_exps = at.explain(a, b).unwrap();
+        let mut norm_exps = normal.explain(a, b).unwrap();
+        // Sort by (rule, edge_type) for stable comparison
+        at_exps.sort_by(|l, r| l.rule.cmp(&r.rule).then(l.edge_type.cmp(&r.edge_type)));
+        norm_exps.sort_by(|l, r| l.rule.cmp(&r.rule).then(l.edge_type.cmp(&r.edge_type)));
+        assert_eq!(
+            at_exps.len(),
+            norm_exps.len(),
+            "open_at(latest) explain({a},{b}) count must match open()"
+        );
+        for (ae, ne) in at_exps.iter().zip(norm_exps.iter()) {
+            assert_eq!(ae.rule, ne.rule, "explain rule mismatch for ({a},{b})");
+            assert_eq!(ae.edge_type, ne.edge_type, "explain edge_type mismatch for ({a},{b})");
+            assert_eq!(ae.src_key, ne.src_key, "explain src_key mismatch for ({a},{b})");
+            assert_eq!(ae.dst_key, ne.dst_key, "explain dst_key mismatch for ({a},{b})");
+            assert_eq!(ae.weight, ne.weight, "explain weight mismatch for ({a},{b})");
+        }
+    }
 }
 
 // ── Commit out of range ──────────────────────────────────────────────────────
@@ -225,6 +289,63 @@ fn open_at_out_of_range_returns_error() {
     match err2 {
         GraphError::CommitOutOfRange { commit: 0, total: 0 } => {}
         other => panic!("expected CommitOutOfRange{{0,0}} for empty WAL, got {other:?}"),
+    }
+}
+
+// ── Torn WAL tail ───────────────────────────────────────────────────────────
+
+/// Pin torn-tail behaviour: if the last WAL frame is corrupt/incomplete,
+/// open_at silently counts only the valid prefix.  No error is returned
+/// for the partial write itself; CommitOutOfRange fires if the requested
+/// commit is >= the valid frame count.
+#[test]
+fn torn_tail_open_at_sees_fewer_commits() {
+    let dir = tmp("torn-tail");
+    // Write 3 commits: InsertNode "p", InsertNode "q", InsertNode "r".
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("T", "p", vec![]).unwrap(); // commit 0
+        db.insert_node("T", "q", vec![]).unwrap(); // commit 1
+        db.insert_node("T", "r", vec![]).unwrap(); // commit 2
+    }
+
+    let wal_path = dir.join("wal.bin");
+    let mut bytes = std::fs::read(&wal_path).unwrap();
+    assert_eq!(
+        core_storage::wal::wal_commits(&bytes),
+        3,
+        "must have 3 valid frames before tearing"
+    );
+
+    // Tear the last frame: remove 4 bytes from the end so the last
+    // frame's payload is incomplete (bytes.len() < start + len).
+    let new_len = bytes.len() - 4;
+    bytes.truncate(new_len);
+    std::fs::write(&wal_path, &bytes).unwrap();
+
+    // After tearing: only 2 valid frames remain.
+    assert_eq!(
+        core_storage::wal::wal_commits(&bytes),
+        2,
+        "torn WAL must have 2 valid frames"
+    );
+
+    // open_at(1) succeeds — within the 2 valid frames.
+    let db1 = GraphDb::open_at(&dir, 1).unwrap();
+    assert_eq!(
+        db1.total_wal_commits(),
+        2,
+        "total_wal_commits must reflect the valid (post-tear) count"
+    );
+    assert!(db1.has_node("p"), "commit 1: p inserted at commit 0");
+    assert!(db1.has_node("q"), "commit 1: q inserted at commit 1");
+    assert!(!db1.has_node("r"), "commit 1: r was in the torn frame");
+
+    // open_at(2) is out of range: valid total is 2, so commit 2 >= 2.
+    let err = GraphDb::open_at(&dir, 2).err().expect("should err");
+    match err {
+        GraphError::CommitOutOfRange { commit: 2, total: 2 } => {}
+        other => panic!("expected CommitOutOfRange{{2,2}}, got {other:?}"),
     }
 }
 
@@ -357,6 +478,45 @@ fn mutation_refusal_sweep() {
     assert!(
         matches!(e, GraphError::ReadOnly),
         "snapshot must return ReadOnly, got {e:?}"
+    );
+
+    // ingest — even with zero rows, commit_ingest hits commit_logged_batch
+    let e = db
+        .ingest("T", vec![], &IngestOptions::default())
+        .unwrap_err();
+    assert!(
+        matches!(e, GraphError::ReadOnly),
+        "ingest must return ReadOnly, got {e:?}"
+    );
+
+    // ingest_with_edges — same structural path as ingest
+    let e = db
+        .ingest_with_edges("T", vec![], &IngestOptions::default(), &[])
+        .unwrap_err();
+    assert!(
+        matches!(e, GraphError::ReadOnly),
+        "ingest_with_edges must return ReadOnly, got {e:?}"
+    );
+
+    // ingest_json — empty JSON array still reaches commit_logged_batch
+    let e = db
+        .ingest_json("T", "[]", &IngestOptions::default())
+        .unwrap_err();
+    assert!(
+        matches!(e, GraphError::ReadOnly),
+        "ingest_json must return ReadOnly, got {e:?}"
+    );
+
+    // query_write — MATCH...SET always calls batch.commit() → commit_logged_batch
+    let e = db
+        .query_write(
+            "MATCH (n:T) SET n.qw_marker = 'x'",
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(e, GraphError::ReadOnly),
+        "query_write must return ReadOnly, got {e:?}"
     );
 }
 

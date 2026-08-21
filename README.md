@@ -81,14 +81,14 @@ receipt observes the state that produced the event. Each subscription has a
 marker and continue (no disconnection). See [docs/site/subscriptions.md](docs/site/subscriptions.md)
 for the full API reference.
 
-### Explain any edge as of any past commit
+### Replay to any commit since your last snapshot
 
-mushroomdb's WAL is the complete history of your graph. `open_at` replays it
-to any past commit, giving you a read-only view of the graph — and its derived
-edges — at any point in time:
+mushroomdb's WAL records every write since the last snapshot. `open_at` replays
+that window to any past commit, giving you a read-only view of the graph exactly
+as it existed after that write — including which derived edges existed and why:
 
 ```rust
-// What edges existed at commit 5?
+// Open a read-only view at commit 5 (since last snapshot).
 let db = GraphDb::open_at(&dir, 5)?;
 
 // Why did this edge exist then?
@@ -105,8 +105,11 @@ mushroomdb asof ./db --commit 5 --query "MATCH (n:Person)-[r:FIT]->(p:Project) R
 #   n=alice  p=proj-01  score=0.87
 ```
 
-See [docs/site/timetravel.md](docs/site/timetravel.md) for the full API,
-WAL-retention notes, and replay-cost caveats.
+**Scope:** `open_at` reaches commits recorded in the current WAL — those written
+since the last `snapshot()`. `snapshot()` truncates the WAL: faster cold starts,
+but as-of history restarts from that point. See
+[docs/site/timetravel.md](docs/site/timetravel.md) for the full tradeoff and
+replay-cost caveats.
 
 ---
 
