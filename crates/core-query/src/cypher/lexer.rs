@@ -19,6 +19,8 @@ pub enum Tok {
     // pipeline keywords
     With,
     Unwind,
+    /// `OPTIONAL` — marks the start of an `OPTIONAL MATCH` clause.
+    Optional,
     // write keywords
     Create,
     Set,
@@ -242,6 +244,7 @@ fn keyword(word: &str) -> Option<Tok> {
         "desc" => Tok::Desc,
         "with" => Tok::With,
         "unwind" => Tok::Unwind,
+        "optional" => Tok::Optional,
         "create" => Tok::Create,
         "set" => Tok::Set,
         "delete" => Tok::Delete,

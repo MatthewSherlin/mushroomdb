@@ -2,9 +2,9 @@
 
 use super::ast::{
     AggArg, AggFunc, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
-    MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand, OrderItem,
-    OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, SetClause, UnwindClause,
-    UnwindExpr, WithStage, WriteStatement,
+    MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand, OptionalClause,
+    OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, SetClause,
+    UnwindClause, UnwindExpr, WithStage, WriteStatement,
 };
 use super::Tok;
 use crate::filter::CmpOp;
@@ -102,8 +102,25 @@ impl<'a> Parser<'a> {
         if matches.is_empty() {
             return Err(self.err("expected MATCH"));
         }
-        // Optional WHERE before any UNWIND or WITH.
-        let where_expr = if self.eat(&Tok::Where) {
+        // Optional WHERE clause that follows the required MATCH(es) — may come
+        // before or after OPTIONAL MATCH.  In standard Cypher, WHERE applies to
+        // the preceding MATCH, so `MATCH (a) WHERE … OPTIONAL MATCH … RETURN`
+        // is legal.  Parse it here, then parse OPTIONAL MATCHes, then check
+        // again in case WHERE follows the OPTIONAL MATCHes instead.
+        let where_expr_pre = if self.eat(&Tok::Where) {
+            Some(self.expr(0)?)
+        } else {
+            None
+        };
+        // Optional MATCH clauses (zero or more, after required MATCHes + WHERE).
+        let mut optional_clauses = Vec::new();
+        while self.peek() == Some(&Tok::Optional) {
+            optional_clauses.push(self.optional_match_clause()?);
+        }
+        // WHERE may also appear *after* OPTIONAL MATCHes (if not already seen).
+        let where_expr = if where_expr_pre.is_some() {
+            where_expr_pre
+        } else if self.eat(&Tok::Where) {
             Some(self.expr(0)?)
         } else {
             None
@@ -146,6 +163,7 @@ impl<'a> Parser<'a> {
         }
         Ok(Query {
             matches,
+            optional_clauses,
             where_expr,
             unwinds,
             post_unwind_where,
@@ -155,6 +173,22 @@ impl<'a> Parser<'a> {
             skip,
             limit,
         })
+    }
+
+    /// Parse one `OPTIONAL MATCH pattern [WHERE expr]` clause.
+    ///
+    /// Standard openCypher allows exactly one MATCH per OPTIONAL MATCH.
+    fn optional_match_clause(&mut self) -> Result<OptionalClause, String> {
+        self.expect(&Tok::Optional, "expected OPTIONAL")?;
+        self.expect(&Tok::Match, "expected MATCH after OPTIONAL")?;
+        let patterns = vec![self.pattern()?];
+        // Optional WHERE inside the optional scope.
+        let where_expr = if self.eat(&Tok::Where) {
+            Some(self.expr(0)?)
+        } else {
+            None
+        };
+        Ok(OptionalClause { patterns, where_expr })
     }
 
     /// Parse one `WITH <items> [WHERE] [ORDER BY] [SKIP] [LIMIT] [MATCH]* [UNWIND]* [WHERE]`
@@ -193,6 +227,11 @@ impl<'a> Parser<'a> {
         while self.peek() == Some(&Tok::Match) {
             matches.push(self.match_clause()?);
         }
+        // Optional OPTIONAL MATCH clauses that follow those MATCHes.
+        let mut optional_clauses = Vec::new();
+        while self.peek() == Some(&Tok::Optional) {
+            optional_clauses.push(self.optional_match_clause()?);
+        }
         // Optional UNWIND clauses that follow those MATCHes.
         let mut stage_unwinds = Vec::new();
         while self.peek() == Some(&Tok::Unwind) {
@@ -200,7 +239,7 @@ impl<'a> Parser<'a> {
         }
         // Optional WHERE that follows those MATCHes / UNWINDs.
         let post_where = if self.peek() == Some(&Tok::Where)
-            && (!matches.is_empty() || !stage_unwinds.is_empty())
+            && (!matches.is_empty() || !optional_clauses.is_empty() || !stage_unwinds.is_empty())
         {
             self.pos += 1; // consume WHERE
             Some(self.expr(0)?)
@@ -214,6 +253,7 @@ impl<'a> Parser<'a> {
             skip,
             limit,
             matches,
+            optional_clauses,
             unwinds: stage_unwinds,
             post_where,
         })
@@ -600,13 +640,25 @@ impl<'a> Parser<'a> {
                 Ok(Operand::Param(s))
             }
             Some(Tok::Ident(_)) => {
-                let var = self.ident("expected identifier")?;
-                if self.eat(&Tok::Dot) {
+                let name = self.ident("expected identifier")?;
+                if self.peek() == Some(&Tok::LParen) {
+                    // Scalar function call: name(arg, ...)
+                    self.pos += 1; // consume '('
+                    let mut args = Vec::new();
+                    if self.peek() != Some(&Tok::RParen) {
+                        args.push(self.operand()?);
+                        while self.eat(&Tok::Comma) {
+                            args.push(self.operand()?);
+                        }
+                    }
+                    self.expect(&Tok::RParen, "expected ')' to close function call")?;
+                    Ok(Operand::FuncCall { name, args })
+                } else if self.eat(&Tok::Dot) {
                     let field = self.ident("expected field name after '.'")?;
-                    Ok(Operand::Prop { var, field })
+                    Ok(Operand::Prop { var: name, field })
                 } else {
                     // Bare variable reference (e.g. alias name in WITH … WHERE c > 2).
-                    Ok(Operand::Var(var))
+                    Ok(Operand::Var(name))
                 }
             }
             _ => Err(self.err("expected operand (property, literal, or parameter)")),
@@ -664,12 +716,24 @@ impl<'a> Parser<'a> {
         }
 
         // Normal (non-aggregate) RETURN item.
-        let var = self.ident("expected variable in RETURN item")?;
-        let value = if self.eat(&Tok::Dot) {
+        let name = self.ident("expected variable in RETURN item")?;
+        let value = if self.peek() == Some(&Tok::LParen) {
+            // Scalar function call in RETURN position: name(args...)
+            self.pos += 1; // consume '('
+            let mut args = Vec::new();
+            if self.peek() != Some(&Tok::RParen) {
+                args.push(self.operand()?);
+                while self.eat(&Tok::Comma) {
+                    args.push(self.operand()?);
+                }
+            }
+            self.expect(&Tok::RParen, "expected ')' to close function call in RETURN")?;
+            RetVal::FuncCall { name, args }
+        } else if self.eat(&Tok::Dot) {
             let field = self.ident("expected field name after '.'")?;
-            RetVal::Prop { var, field }
+            RetVal::Prop { var: name, field }
         } else {
-            RetVal::Var(var)
+            RetVal::Var(name)
         };
         let alias = if self.eat(&Tok::As) {
             Some(self.ident("expected alias identifier after AS")?)
@@ -1048,7 +1112,21 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Dot, "expected '.' after variable in SET")?;
         let field = self.ident("expected field name after '.'")?;
         self.expect(&Tok::Eq, "expected '=' in SET clause")?;
-        let value = self.literal_value("SET RHS")?;
+        // Accept Lit or Param on the RHS; other Operand variants → named error.
+        let value = match self.peek() {
+            Some(Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Param(_) | Tok::Dash) => {
+                let op = self.operand()?;
+                match &op {
+                    Operand::Lit(_) | Operand::Param(_) => op,
+                    Operand::Prop { .. } | Operand::Var(_) | Operand::FuncCall { .. } => {
+                        return Err(self.err(
+                            "SET RHS must be a literal or $parameter (expressions not supported in v1)",
+                        ));
+                    }
+                }
+            }
+            _ => return Err(self.err("expected literal or $parameter as SET value")),
+        };
         Ok(SetClause { var, field, value })
     }
 
@@ -1269,6 +1347,7 @@ SKIP 1 LIMIT 5";
                 ],
                 shortest: false,
             }],
+            optional_clauses: vec![],
             unwinds: vec![],
             post_unwind_where: None,
             where_expr: Some(Expr::Or(
@@ -1494,6 +1573,7 @@ LIMIT 10";
                     shortest: false,
                 },
             ],
+            optional_clauses: vec![],
             unwinds: vec![],
             post_unwind_where: None,
             where_expr: Some(Expr::And(

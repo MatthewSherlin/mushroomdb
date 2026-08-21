@@ -290,8 +290,8 @@ MATCH (n:Person {id: 'alice'})
 SET n.score = 99
 ```
 
-- SET RHS must be a literal (integer, float, string, boolean); expression RHS is
-  rejected with a named error in v1.
+- SET RHS must be a literal (integer, float, string, boolean) or a `$param`
+  reference; expression RHS is rejected with a named error.
 - Multiple SET clauses in one statement are allowed.
 - Combined MATCH … SET … RETURN is not supported; use a separate MATCH … RETURN
   query after the write.
@@ -344,13 +344,142 @@ MERGE (n:Person {id: 'alice'})
 
 ---
 
+## OPTIONAL MATCH
+
+`OPTIONAL MATCH` applies left-outer-join semantics.  Rows that satisfy the
+outer `MATCH` always appear in the result; if the optional pattern finds no
+match, its bindings are `null`.
+
+```cypher
+MATCH (a:Person)
+OPTIONAL MATCH (a)-[:KNOWS]->(b)
+RETURN a, COUNT(b)
+```
+
+Edgeless nodes return `COUNT(b) = 0` — the outer row is never dropped.
+
+### WHERE inside OPTIONAL MATCH
+
+A `WHERE` clause inside an `OPTIONAL MATCH` filters the optional candidates,
+not the outer row:
+
+```cypher
+MATCH (a:Person)
+OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.score > 5
+RETURN a, b
+```
+
+If no `b` passes the filter, `b` is `null` for that outer row.
+
+### Chained OPTIONAL MATCHes
+
+Multiple `OPTIONAL MATCH` clauses may follow one `MATCH`:
+
+```cypher
+MATCH (a:Person)
+OPTIONAL MATCH (a)-[:FRIEND]->(b)
+OPTIONAL MATCH (a)-[:COLLEAGUE]->(c)
+RETURN a, b, c
+```
+
+Each clause is independent; a miss in one does not affect the others.
+
+### Composes with aggregation
+
+`OPTIONAL MATCH` composes correctly with grouped aggregation and WITH pipelines.
+
+---
+
+## Query parameters
+
+Parameters substitute `$name` placeholders with values supplied at query time.
+They are safe (the value is never interpreted as Cypher) and avoid string
+interpolation in your application code.
+
+### Rust API
+
+```rust
+// Convenience wrapper — takes a slice of (&str, Value) pairs.
+let rs = db.query_with_params(
+    "MATCH (n:Person) WHERE n.age > $min RETURN n",
+    &[("min", Value::Int(18))],
+)?;
+
+// Low-level form — BTreeMap<String, Value>.
+use std::collections::BTreeMap;
+let mut params = BTreeMap::new();
+params.insert("min".to_string(), Value::Int(18));
+let rs = db.query("MATCH (n:Person) WHERE n.age > $min RETURN n", &params)?;
+```
+
+Parameters also work in `SET` clauses:
+
+```cypher
+MATCH (n:Person) WHERE n.age = 30 SET n.age = $newage
+```
+
+### HTTP API
+
+```json
+POST /query
+{
+  "cypher": "MATCH (n:Person) WHERE n.age > $min RETURN n",
+  "params": { "min": 18 }
+}
+```
+
+### Error: unknown parameter
+
+If `$name` appears in the query but is not supplied, the executor returns:
+
+```
+missing parameter `name`
+```
+
+---
+
+## Scalar functions
+
+Scalar functions are available in `WHERE` expressions and `RETURN` / `WITH`
+projections.  **Null propagation:** if any argument is `null`, the result is
+`null` — except `coalesce`, which skips nulls.
+
+| Function | Input | Output | Notes |
+|---|---|---|---|
+| `toLower(s)` | `String` | `String` | ASCII + Unicode lower-case |
+| `toUpper(s)` | `String` | `String` | ASCII + Unicode upper-case |
+| `size(x)` | `String` or `List` | `Int` | character count or element count |
+| `coalesce(a, b, …)` | any | first non-null | never null unless all args are null |
+| `type(r)` | `Rel` | `String` | relationship type label |
+| `abs(n)` | `Int` or `Float` | same type | absolute value |
+| `round(f)` | `Float` | `Float` | rounds to nearest integer as Float |
+
+Calling an unknown function name returns:
+
+```
+unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round
+```
+
+### Examples
+
+```cypher
+MATCH (n:Person) RETURN toLower(n.name)
+MATCH (n:Person) RETURN size(n.tags)
+MATCH (n:Person) RETURN coalesce(n.nickname, n.name)
+MATCH (a:Person)-[r]->(b:Person) RETURN type(r)
+MATCH (n:Person) RETURN abs(n.score)
+MATCH (n:Measurement) RETURN round(n.value)
+```
+
+---
+
 ## Limitations
 
 | Feature | Status |
 |---|---|
 | Multi-statement transactions | Not supported (one write statement per query in v1) |
 | Combined MATCH … SET … RETURN | Not supported; use two queries |
-| SET RHS expressions | Literals only in v1 |
+| SET RHS expressions | Literals and `$param` references; computed expressions not supported |
 | MATCH … DETACH DELETE (node) | Supported — removes node + all edges |
 | Bare DELETE on node with edges | Error — use DETACH DELETE |
 | MERGE ON CREATE / ON MATCH | Not supported |

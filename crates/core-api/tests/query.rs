@@ -999,3 +999,406 @@ fn aggregate_and_grouped_aggregate_survive_v4_reopen() {
         );
     }
 }
+
+// ── OPTIONAL MATCH tests ──────────────────────────────────────────────────────
+
+/// Helper: assert rs.get returns a cloned value.
+fn get_val(rs: &ResultSet, row: usize, col: &str) -> Option<Value> {
+    rs.get(row, col).cloned()
+}
+
+/// Classic pin: edgeless node returns COUNT(b) = 0 (not 0 rows).
+#[test]
+fn optional_match_count_zero_for_edgeless() {
+    let dir = tmp("optional_count_zero");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Person", "n1", vec![]);
+        batch.insert_node("Person", "n2", vec![]);
+        batch.insert_edge("KNOWS", "n1", "n2");
+        batch.insert_node("Person", "n3", vec![]); // edgeless node
+        batch.commit().unwrap();
+    }
+
+    let rs = db.query(
+        "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a, COUNT(b)",
+        &BTreeMap::new(),
+    ).unwrap();
+
+    // 3 nodes: n1 has 1 edge (b=n2), n2 has no outgoing KNOWS, n3 has no outgoing.
+    assert_eq!(rs.len(), 3, "must have 3 rows, one per node");
+    // At least one row must have COUNT(b) = 0 (edgeless nodes).
+    let counts: Vec<Option<Value>> = (0..rs.len()).map(|i| get_val(&rs, i, "COUNT(b)")).collect();
+    assert!(
+        counts.iter().any(|c| c.as_ref() == Some(&Value::Int(0))),
+        "edgeless node must return COUNT(b) = 0, got: {counts:?}"
+    );
+}
+
+/// Left-outer: optional pattern with WHERE inside the optional scope.
+#[test]
+fn optional_match_with_where_inside_optional() {
+    let dir = tmp("optional_where");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        // Use unique label OW to avoid cross-test label collisions.
+        // Only one "anchor" node: alice.  bob is the optional neighbour.
+        batch.insert_node("OW", "alice", vec![("name".into(), Value::Str("Alice".into()))]);
+        batch.insert_node("OW", "bob", vec![("name".into(), Value::Str("Bob".into()))]);
+        batch.insert_edge("FRIEND", "alice", "bob");
+        batch.commit().unwrap();
+    }
+    // WHERE inside OPTIONAL MATCH: the FRIEND edge from alice reaches bob whose
+    // name='Bob', not 'nonexistent'.  The WHERE blocks the match, so b is null
+    // and the outer alice row still survives (left-outer semantics).
+    // We restrict the MATCH to alice via a.name so we get exactly 1 outer row.
+    let rs = db.query(
+        "MATCH (a:OW) WHERE a.name = 'Alice' \
+         OPTIONAL MATCH (a)-[:FRIEND]->(b) WHERE b.name = 'nonexistent' \
+         RETURN a, b",
+        &BTreeMap::new(),
+    ).unwrap();
+    assert_eq!(rs.len(), 1, "one row expected (left-outer fallback)");
+    assert_eq!(get_val(&rs, 0, "b"), None, "b must be null when WHERE inside optional fails");
+}
+
+/// Multiple chained OPTIONAL MATCHes.
+#[test]
+fn optional_match_chained() {
+    let dir = tmp("optional_chained");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        // Use unique labels NdA/NdB/NdC so only one node per label.
+        // The outer MATCH finds exactly one NdA node ("a").
+        batch.insert_node("NdA", "a", vec![]);
+        batch.insert_node("NdB", "b", vec![]);
+        batch.insert_node("NdC", "c_node", vec![]);
+        batch.insert_edge("X", "a", "b");
+        // no Y edge from a to anything
+        batch.commit().unwrap();
+    }
+    let rs = db.query(
+        "MATCH (a:NdA) \
+         OPTIONAL MATCH (a)-[:X]->(b) \
+         OPTIONAL MATCH (a)-[:Y]->(c) \
+         RETURN a, b, c",
+        &BTreeMap::new(),
+    ).unwrap();
+    assert_eq!(rs.len(), 1);
+    // b = "b" (found via X), c = null (no Y edge)
+    assert_eq!(get_val(&rs, 0, "b"), Some(Value::Str("b".into())));
+    assert_eq!(get_val(&rs, 0, "c"), None);
+}
+
+// ── Parameters tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn query_with_params_basic() {
+    let dir = tmp("params_basic");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Person", "alice", vec![("age".into(), Value::Int(30))]);
+        batch.insert_node("Person", "bob", vec![("age".into(), Value::Int(25))]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query_with_params(
+        "MATCH (n:Person) WHERE n.age = $age RETURN n",
+        &[("age", Value::Int(30))],
+    ).unwrap();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(get_val(&rs, 0, "n"), Some(Value::Str("alice".into())));
+}
+
+#[test]
+fn query_with_params_unknown_param_error() {
+    let dir = tmp("params_unknown");
+    let db = GraphDb::open(&dir).unwrap();
+    let err = db.query_with_params(
+        "MATCH (n:Person) WHERE n.age = $missing RETURN n",
+        &[], // no params provided
+    );
+    assert!(err.is_err(), "unknown param must return Err");
+    let msg = format!("{:?}", err.unwrap_err());
+    assert!(
+        msg.contains("missing") || msg.contains("parameter"),
+        "error must mention the missing param: {msg}"
+    );
+}
+
+#[test]
+fn set_with_param() {
+    let dir = tmp("set_param");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        // Use a unique label so MATCH finds exactly one node.
+        batch.insert_node("SWP", "alice", vec![("age".into(), Value::Int(30))]);
+        batch.commit().unwrap();
+    }
+    let mut params = BTreeMap::new();
+    params.insert("newage".to_string(), Value::Int(99));
+    // Match the sole SWP node and SET age to the $newage param.
+    db.query_write(
+        "MATCH (n:SWP) WHERE n.age = 30 SET n.age = $newage",
+        &params,
+    ).unwrap();
+    let rs = db.query(
+        "MATCH (n:SWP) RETURN n.age",
+        &BTreeMap::new(),
+    ).unwrap();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(get_val(&rs, 0, "n.age"), Some(Value::Int(99)));
+}
+
+/// HTTP injection: a param containing Cypher syntax stays a literal.
+#[test]
+fn params_injection_safe() {
+    let dir = tmp("params_injection");
+    let db = GraphDb::open(&dir).unwrap();
+    // If param value were interpolated as Cypher, this would parse as a statement
+    // and might return rows or error differently. As a literal it's just a string.
+    let rs = db.query_with_params(
+        "MATCH (n:Person {id: $id}) RETURN n",
+        &[("id", Value::Str("' RETURN 1//".into()))],
+    ).unwrap();
+    // No node with that (injected) id exists — should return 0 rows.
+    assert_eq!(rs.len(), 0, "injection payload must be treated as literal string");
+}
+
+// ── Core function tests ───────────────────────────────────────────────────────
+
+#[test]
+fn fn_tolower_happy() {
+    let dir = tmp("fn_tolower");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Tx", "alice", vec![("name".into(), Value::Str("Alice".into()))]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Tx) RETURN toLower(n.name)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "toLower(n.name)"), Some(Value::Str("alice".into())));
+}
+
+#[test]
+fn fn_tolower_null_propagation() {
+    let dir = tmp("fn_tolower_null");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Tx", "n1", vec![]); // no name prop → null
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Tx) RETURN toLower(n.name)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "toLower(n.name)"), None);
+}
+
+#[test]
+fn fn_toupper_happy() {
+    let dir = tmp("fn_toupper");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Ty", "x", vec![("v".into(), Value::Str("hello".into()))]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Ty) RETURN toUpper(n.v)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "toUpper(n.v)"), Some(Value::Str("HELLO".into())));
+}
+
+#[test]
+fn fn_toupper_null_propagation() {
+    let dir = tmp("fn_toupper_null");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Ty", "x", vec![]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Ty) RETURN toUpper(n.v)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "toUpper(n.v)"), None);
+}
+
+#[test]
+fn fn_size_string() {
+    let dir = tmp("fn_size_str");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Ts", "x", vec![("s".into(), Value::Str("hello".into()))]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Ts) RETURN size(n.s)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "size(n.s)"), Some(Value::Int(5)));
+}
+
+#[test]
+fn fn_size_list() {
+    let dir = tmp("fn_size_list");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node(
+            "Tsl",
+            "x",
+            vec![("tags".into(), Value::List(vec![
+                Value::Str("a".into()),
+                Value::Str("b".into()),
+                Value::Str("c".into()),
+            ]))],
+        );
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Tsl) RETURN size(n.tags)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "size(n.tags)"), Some(Value::Int(3)));
+}
+
+#[test]
+fn fn_size_null_propagation() {
+    let dir = tmp("fn_size_null");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Tsnull", "x", vec![]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Tsnull) RETURN size(n.missing)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "size(n.missing)"), None);
+}
+
+#[test]
+fn fn_coalesce_happy() {
+    let dir = tmp("fn_coalesce");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Tc", "x", vec![("b".into(), Value::Int(42))]);
+        batch.commit().unwrap();
+    }
+    // coalesce(n.a, n.b) — n.a is null, n.b = 42
+    let rs = db.query("MATCH (n:Tc) RETURN coalesce(n.a, n.b)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "coalesce(n.a, n.b)"), Some(Value::Int(42)));
+}
+
+#[test]
+fn fn_coalesce_all_null() {
+    let dir = tmp("fn_coalesce_null");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Tc", "x", vec![]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Tc) RETURN coalesce(n.a, n.b)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "coalesce(n.a, n.b)"), None);
+}
+
+#[test]
+fn fn_type_happy() {
+    let dir = tmp("fn_type");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Pt", "ta", vec![]);
+        batch.insert_node("Pt", "tb", vec![]);
+        batch.insert_edge("KNOWS", "ta", "tb");
+        batch.commit().unwrap();
+    }
+    let rs = db.query(
+        "MATCH (a:Pt)-[r]->(b:Pt) RETURN type(r)",
+        &BTreeMap::new(),
+    ).unwrap();
+    assert_eq!(get_val(&rs, 0, "type(r)"), Some(Value::Str("KNOWS".into())));
+}
+
+#[test]
+fn fn_type_null_propagation() {
+    // type() with null binding (OPTIONAL MATCH that misses) → null out.
+    let dir = tmp("fn_type_null");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Ptn", "a", vec![]);
+        batch.commit().unwrap();
+    }
+    // r is null because there are no edges from a.
+    let rs = db.query(
+        "MATCH (a:Ptn) OPTIONAL MATCH (a)-[r]->() RETURN type(r)",
+        &BTreeMap::new(),
+    ).unwrap();
+    assert_eq!(get_val(&rs, 0, "type(r)"), None);
+}
+
+#[test]
+fn fn_abs_happy() {
+    let dir = tmp("fn_abs");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Tab", "x", vec![("v".into(), Value::Int(-7))]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Tab) RETURN abs(n.v)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "abs(n.v)"), Some(Value::Int(7)));
+}
+
+#[test]
+fn fn_abs_null_propagation() {
+    let dir = tmp("fn_abs_null");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Tab", "x", vec![]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Tab) RETURN abs(n.missing)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "abs(n.missing)"), None);
+}
+
+#[test]
+fn fn_round_happy() {
+    let dir = tmp("fn_round");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Tr", "x", vec![("v".into(), Value::Float(2.7))]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Tr) RETURN round(n.v)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "round(n.v)"), Some(Value::Float(3.0)));
+}
+
+#[test]
+fn fn_round_null_propagation() {
+    let dir = tmp("fn_round_null");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Tr", "x", vec![]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Tr) RETURN round(n.missing)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "round(n.missing)"), None);
+}
+
+#[test]
+fn fn_unknown_function_error() {
+    let dir = tmp("fn_unknown");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Tu", "x", vec![("v".into(), Value::Int(1))]);
+        batch.commit().unwrap();
+    }
+    let err = db.query("MATCH (n:Tu) RETURN unknownFn(n.v)", &BTreeMap::new());
+    assert!(err.is_err(), "unknown function must return Err");
+    let msg = format!("{:?}", err.unwrap_err());
+    assert!(
+        msg.contains("unknown function") || msg.contains("unknownFn"),
+        "error must name the unknown function: {msg}"
+    );
+}

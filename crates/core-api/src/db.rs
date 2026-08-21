@@ -1208,6 +1208,21 @@ impl<F: Fs> GraphDb<F> {
         })
     }
 
+    /// Convenience entry-point that accepts a slice of `(name, value)` pairs
+    /// instead of a pre-built `BTreeMap`.  Equivalent to building the map and
+    /// calling [`GraphDb::query`].
+    pub fn query_with_params(
+        &self,
+        cypher: &str,
+        params: &[(&str, Value)],
+    ) -> Result<ResultSet> {
+        let map: BTreeMap<String, Value> = params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        self.query(cypher, &map)
+    }
+
     /// Execute a Cypher write statement (CREATE / MATCH…SET / MATCH…DELETE / MERGE).
     ///
     /// All mutations flow through the same `insert_node` / `set_prop` /
@@ -1346,6 +1361,7 @@ impl<F: Fs> GraphDb<F> {
             .collect();
         let read_q = Query {
             matches: stmt.matches,
+            optional_clauses: vec![],
             where_expr: stmt.where_expr,
             unwinds: vec![],
             post_unwind_where: None,
@@ -1379,7 +1395,24 @@ impl<F: Fs> GraphDb<F> {
                         })
                     }
                 };
-                set_ops.push((key, sc.field.clone(), sc.value.clone()));
+                // Resolve the SET value operand — may be a literal or $param.
+                use core_query::cypher::Operand;
+                let value = match &sc.value {
+                    Operand::Lit(v) => v.clone(),
+                    Operand::Param(name) => {
+                        params.get(name).cloned().ok_or_else(|| GraphError::QueryError {
+                            detail: format!("missing parameter `{name}` in SET clause"),
+                        })?
+                    }
+                    other => {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "SET value must be a literal or $param (got {other:?})"
+                            ),
+                        });
+                    }
+                };
+                set_ops.push((key, sc.field.clone(), value));
             }
         }
 
@@ -1426,6 +1459,7 @@ impl<F: Fs> GraphDb<F> {
             .collect();
         let read_q = Query {
             matches: stmt.matches,
+            optional_clauses: vec![],
             where_expr: stmt.where_expr,
             unwinds: vec![],
             post_unwind_where: None,
@@ -1519,6 +1553,7 @@ impl<F: Fs> GraphDb<F> {
             .collect();
         let read_q = Query {
             matches: stmt.matches,
+            optional_clauses: vec![],
             where_expr: stmt.where_expr,
             unwinds: vec![],
             post_unwind_where: None,

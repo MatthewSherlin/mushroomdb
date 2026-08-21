@@ -97,6 +97,7 @@ fn render_tok(t: &Tok) -> String {
         Tok::Merge => "MERGE".into(),
         Tok::With => "WITH".into(),
         Tok::Unwind => "UNWIND".into(),
+        Tok::Optional => "OPTIONAL".into(),
     }
 }
 

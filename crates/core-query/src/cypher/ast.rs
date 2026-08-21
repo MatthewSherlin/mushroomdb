@@ -3,9 +3,27 @@
 use crate::filter::CmpOp;
 use core_storage::Value;
 
+/// One `OPTIONAL MATCH pattern [WHERE expr]` clause.
+///
+/// If the pattern produces no rows for a given input row, the input row
+/// survives with the optional variables set to `null` (left-outer-join
+/// semantics, openCypher §10.1.3).
+///
+/// `where_expr`, when present, is applied INSIDE the optional scope:
+/// it filters candidate rows before the left-outer fallback fires.  This
+/// differs from a post-filter that would eliminate the null row entirely.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OptionalClause {
+    pub patterns: Vec<Pattern>,
+    /// WHERE clause scoped to this optional match (applied before nullification).
+    pub where_expr: Option<Expr>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub matches: Vec<Pattern>,
+    /// `OPTIONAL MATCH` clauses that follow the required matches.
+    pub optional_clauses: Vec<OptionalClause>,
     /// Top-level WHERE filter, evaluated before UNWIND expansion.
     pub where_expr: Option<Expr>,
     /// Top-level UNWIND clauses (after WHERE, before post_unwind_where/WITH/RETURN).
@@ -42,7 +60,7 @@ pub enum UnwindExpr {
 /// One WITH stage in a pipeline:
 /// ```text
 /// WITH <items> [WHERE <expr>] [ORDER BY …] [SKIP n] [LIMIT n]
-/// [MATCH …]* [UNWIND …]* [WHERE <expr>]
+/// [MATCH …]* [OPTIONAL MATCH …]* [UNWIND …]* [WHERE <expr>]
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct WithStage {
@@ -55,6 +73,8 @@ pub struct WithStage {
     pub limit: Option<u64>,
     /// MATCH clauses that follow this WITH.
     pub matches: Vec<Pattern>,
+    /// OPTIONAL MATCH clauses that follow the required MATCHes in this stage.
+    pub optional_clauses: Vec<OptionalClause>,
     /// UNWIND clauses that follow this WITH.
     pub unwinds: Vec<UnwindClause>,
     /// WHERE clause that follows those MATCHes (pre-next-WITH/RETURN filter).
@@ -141,9 +161,19 @@ pub enum Operand {
     Param(String),
     /// Bare variable reference (used in `WITH … WHERE alias > 2`).
     Var(String),
+    /// Scalar function call: `toLower(n.name)`, `size(n.tags)`, `type(r)`, etc.
+    ///
+    /// Supported functions (case-insensitive): `toLower`, `toUpper`, `size`,
+    /// `coalesce`, `type`, `abs`, `round`.  Unknown names → named error at
+    /// execution time listing the supported set.
+    FuncCall {
+        name: String,
+        args: Vec<Operand>,
+    },
 }
 
-/// RETURN item value: bare variable, `var.field`, or an aggregate call.
+/// RETURN item value: bare variable, `var.field`, an aggregate call, or a
+/// scalar function call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetVal {
     Var(String),
@@ -157,6 +187,12 @@ pub enum RetVal {
     Agg {
         func: AggFunc,
         arg: AggArg,
+    },
+    /// Scalar function call in a RETURN position, e.g. `toLower(n.name)`.
+    /// The same function set as `Operand::FuncCall`.
+    FuncCall {
+        name: String,
+        args: Vec<Operand>,
     },
 }
 
@@ -230,12 +266,17 @@ pub struct MatchSetStmt {
     pub sets: Vec<SetClause>,
 }
 
-/// One `var.field = literal` assignment in a SET clause.
+/// One `var.field = literal_or_param` assignment in a SET clause.
+///
+/// `value` is an `Operand` rather than a bare `Value` so that `$param`
+/// references are legal on the RHS (resolved at execution time from the
+/// query's parameter map).  Only `Operand::Lit` and `Operand::Param` are
+/// accepted by the parser; other variants produce a named parse error.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetClause {
     pub var: String,
     pub field: String,
-    pub value: core_storage::Value,
+    pub value: Operand,
 }
 
 /// `MATCH patterns [WHERE expr] DELETE rel_var [, …]`

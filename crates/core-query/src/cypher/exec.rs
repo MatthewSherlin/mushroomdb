@@ -249,15 +249,14 @@ fn execute_inner(
         .iter()
         .any(|op| matches!(op, PlanOp::VarExpand { .. } | PlanOp::ShortestPath { .. }));
 
-    // Pipeline plans (WITH / UNWIND) always use the staged path so that
-    // intermediate rows produced by GroupAggregate / With / Unwind stages
-    // can feed into later MATCH / RETURN stages.
+    // Pipeline plans (WITH / UNWIND / LeftOuterApply) always use the staged
+    // path so that intermediate rows are correctly sequenced.
     // A GroupAggregate followed by a Filter means aggregate-WITH with a HAVING
     // clause — route through staged path so the Filter evaluates against
     // Cell::Scalar rows produced by group_result_to_rows.
     let is_pipeline = plan
         .iter()
-        .any(|op| matches!(op, PlanOp::With { .. } | PlanOp::Unwind { .. }))
+        .any(|op| matches!(op, PlanOp::With { .. } | PlanOp::Unwind { .. } | PlanOp::LeftOuterApply { .. }))
         || {
             let mut saw_gagg = false;
             plan.iter().any(|op| {
@@ -295,6 +294,9 @@ fn execute_inner(
     let vars = collect_vars(plan);
     let mut rows: Vec<Row> = vec![vec![None; vars.names.len()]];
     let mut projected: Option<Projected> = None;
+    // Tracks column names produced by a pipeline GroupAggregate so the staged
+    // executor can emit the final ResultSet from `rows` when no Project follows.
+    let mut pipeline_group_columns: Option<Vec<String>> = None;
 
     for op in plan {
         match op {
@@ -339,7 +341,7 @@ fn execute_inner(
                 rows = exec_filter(view, &vars, &rows, expr, params)?;
             }
             PlanOp::Project { items } => {
-                projected = Some(exec_project(view, &vars, &rows, items)?);
+                projected = Some(exec_project(view, &vars, &rows, items, params)?);
             }
             PlanOp::OrderBy { items } => {
                 if let Some(table) = projected.as_mut() {
@@ -374,7 +376,7 @@ fn execute_inner(
                     let mut gk: GroupKey = Vec::with_capacity(keys.len());
                     let mut display_vals: Vec<Option<Value>> = Vec::with_capacity(keys.len());
                     for (_, item) in keys {
-                        let val = project_item(view, &vars, row, item)?;
+                        let val = project_item(view, &vars, row, item, params)?;
                         gk.push(val.as_ref().and_then(group_key_normalize));
                         display_vals.push(val);
                     }
@@ -408,8 +410,14 @@ fn execute_inner(
                     // so that subsequent WITH / RETURN stages can consume them.
                     rows = group_result_to_rows(keys, aggs, grp_key_order, &mut grp_groups, &vars);
                     projected = None;
+                    // Record column order so the staged executor can build the final
+                    // ResultSet from `rows` if no Project op follows.
+                    let mut cols: Vec<String> = keys.iter().map(|(c, _)| c.clone()).collect();
+                    cols.extend(aggs.iter().map(|(_, _, c)| c.clone()));
+                    pipeline_group_columns = Some(cols);
                 } else {
                     projected = Some(build_group_projected(keys, aggs, grp_key_order, &mut grp_groups));
+                    pipeline_group_columns = None;
                 }
             }
             // Non-aggregate WITH: apply filter / order / skip / limit, then
@@ -437,6 +445,10 @@ fn execute_inner(
                                 new_row[dst_slot] = val.map(Cell::Scalar);
                             }
                             RetVal::Agg { .. } => {} // aggregate WITH handled via GroupAggregate
+                            RetVal::FuncCall { name, args } => {
+                                let val = eval_func(name, args, view, &vars, row, params)?;
+                                new_row[dst_slot] = val.map(Cell::Scalar);
+                            }
                         }
                     }
                     new_rows.push(new_row);
@@ -536,13 +548,120 @@ fn execute_inner(
                 rs.push_row(vec![value]);
                 return Ok(rs);
             }
+            // OPTIONAL MATCH: left-outer-join apply.
+            //
+            // For each outer row, execute the inner plan in isolation.  If the
+            // inner plan produces ≥1 row, those rows flow out.  If it produces
+            // 0 rows, the outer row flows out with optional_vars nulled.
+            PlanOp::LeftOuterApply { inner, optional_vars } => {
+                let cap = max_intermediate_rows();
+                let mut new_rows: Vec<Row> = Vec::new();
+                for outer_row in &rows {
+                    // Seed the inner executor with just this one outer row.
+                    let inner_seed: Vec<Row> = vec![outer_row.clone()];
+                    // Execute the inner plan in "micro-staged" mode using the
+                    // shared vars table (already contains all variable slots).
+                    let inner_result = exec_left_outer_inner(
+                        view, &vars, inner_seed, inner, params
+                    )?;
+                    if inner_result.is_empty() {
+                        // Left-outer fallback: null out optional vars.
+                        let mut null_row = outer_row.clone();
+                        for v in optional_vars {
+                            if let Some(slot) = vars.slot(v) {
+                                null_row[slot] = None;
+                            }
+                        }
+                        if new_rows.len() >= cap {
+                            return Err(row_cap_err(cap));
+                        }
+                        new_rows.push(null_row);
+                    } else {
+                        for r in inner_result {
+                            if new_rows.len() >= cap {
+                                return Err(row_cap_err(cap));
+                            }
+                            new_rows.push(r);
+                        }
+                    }
+                }
+                rows = new_rows;
+            }
         }
     }
 
     Ok(match projected {
         Some(table) => finish(table),
-        None => ResultSet::new(vec![]),
+        None => {
+            // If a pipeline GroupAggregate ran and no Project followed, build the
+            // final ResultSet from the rows that group_result_to_rows() produced.
+            if let Some(cols) = pipeline_group_columns {
+                let mut rs = ResultSet::new(cols.clone());
+                for row in rows {
+                    let vals: Vec<Option<Value>> = cols
+                        .iter()
+                        .map(|col| {
+                            vars.slot(col)
+                                .and_then(|s| row.get(s))
+                                .and_then(|c| c.as_ref())
+                                .and_then(|c| match c {
+                                    Cell::Scalar(v) => Some(v.clone()),
+                                    Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                                    Cell::Path(h) => Some(Value::Int(*h as i64)),
+                                    Cell::Rel(_) => None,
+                                })
+                        })
+                        .collect();
+                    rs.push_row(vals);
+                }
+                rs
+            } else {
+                ResultSet::new(vec![])
+            }
+        }
     })
+}
+
+/// Execute the inner ops of a `LeftOuterApply` against a set of seed rows
+/// (always a single-element vec in practice).  Returns the resulting rows.
+///
+/// This intentionally runs the same staged-path logic as `execute_inner` but
+/// without the routing checks, aggregate fast-paths, or `check_params` (those
+/// are handled by the outer call).  Only the ops that can appear inside an
+/// OPTIONAL MATCH inner plan are needed: ScanLabel, JoinBound, LookupProps,
+/// Expand, Filter.
+fn exec_left_outer_inner(
+    view: &GraphView,
+    vars: &VarTable,
+    mut rows: Vec<Row>,
+    inner: &[PlanOp],
+    params: &Params,
+) -> Result<Vec<Row>, String> {
+    for op in inner {
+        match op {
+            PlanOp::ScanLabel { var, label } => {
+                rows = scan_label(view, vars, &rows, var, label.as_deref())?;
+            }
+            PlanOp::LookupProps { var, props } => {
+                rows = retain_node(view, vars, &rows, var, None, props, params)?;
+            }
+            PlanOp::JoinBound { var, label, props } => {
+                rows = retain_node(view, vars, &rows, var, label.as_deref(), props, params)?;
+            }
+            PlanOp::Expand { .. } => {
+                rows = exec_expand(view, vars, &rows, op, params)?;
+            }
+            PlanOp::Filter { expr } => {
+                rows = exec_filter(view, vars, &rows, expr, params)?;
+            }
+            other => {
+                return Err(format!(
+                    "unsupported op inside OPTIONAL MATCH inner plan: {other:?}"
+                ));
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn finish(table: Projected) -> ResultSet {
@@ -556,21 +675,7 @@ fn finish(table: Projected) -> ResultSet {
 fn check_params(plan: &[PlanOp], params: &Params) -> Result<(), String> {
     let mut names = Vec::new();
     let mut seen = BTreeSet::new();
-    for op in plan {
-        match op {
-            PlanOp::LookupProps { props, .. }
-            | PlanOp::JoinBound { props, .. }
-            | PlanOp::Expand {
-                to_props: props, ..
-            } => {
-                for (_, operand) in props {
-                    collect_operand(operand, &mut names, &mut seen);
-                }
-            }
-            PlanOp::Filter { expr } => collect_expr(expr, &mut names, &mut seen, 0)?,
-            _ => {}
-        }
-    }
+    collect_params_from_ops(plan, &mut names, &mut seen)?;
     for name in names {
         if !params.0.contains_key(&name) {
             return Err(format!("missing parameter `{name}`"));
@@ -579,11 +684,45 @@ fn check_params(plan: &[PlanOp], params: &Params) -> Result<(), String> {
     Ok(())
 }
 
-fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<String>) {
-    if let Operand::Param(n) = op {
-        if seen.insert(n.clone()) {
-            names.push(n.clone());
+fn collect_params_from_ops(
+    plan: &[PlanOp],
+    names: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    for op in plan {
+        match op {
+            PlanOp::LookupProps { props, .. }
+            | PlanOp::JoinBound { props, .. }
+            | PlanOp::Expand {
+                to_props: props, ..
+            } => {
+                for (_, operand) in props {
+                    collect_operand(operand, names, seen);
+                }
+            }
+            PlanOp::Filter { expr } => collect_expr(expr, names, seen, 0)?,
+            PlanOp::LeftOuterApply { inner, .. } => {
+                collect_params_from_ops(inner, names, seen)?;
+            }
+            _ => {}
         }
+    }
+    Ok(())
+}
+
+fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<String>) {
+    match op {
+        Operand::Param(n) => {
+            if seen.insert(n.clone()) {
+                names.push(n.clone());
+            }
+        }
+        Operand::FuncCall { args, .. } => {
+            for arg in args {
+                collect_operand(arg, names, seen);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -671,6 +810,11 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                             vars.intern(name);
                         }
                         RetVal::Agg { .. } => {} // handled by Aggregate op
+                        RetVal::FuncCall { args, .. } => {
+                            for arg in args {
+                                intern_operand(&mut vars, arg);
+                            }
+                        }
                     }
                 }
             }
@@ -691,6 +835,11 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                             vars.intern(name);
                         }
                         RetVal::Agg { .. } => {}
+                        RetVal::FuncCall { args, .. } => {
+                            for arg in args {
+                                intern_operand(&mut vars, arg);
+                            }
+                        }
                     }
                     // Intern output column name (for subsequent pipeline stages).
                     vars.intern(col);
@@ -716,6 +865,11 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                             vars.intern(name);
                         }
                         RetVal::Agg { .. } => {}
+                        RetVal::FuncCall { args, .. } => {
+                            for arg in args {
+                                intern_operand(&mut vars, arg);
+                            }
+                        }
                     }
                     // Intern output column name (alias or derived).
                     if let Some(alias) = &item.alias {
@@ -728,6 +882,18 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                                 vars.intern(&col);
                             }
                             RetVal::Agg { .. } => {}
+                            RetVal::FuncCall { name, args } => {
+                                // Compute canonical column name inline.
+                                let arg_strs: Vec<String> = args.iter().map(|a| match a {
+                                    Operand::Var(v) => v.clone(),
+                                    Operand::Prop { var, field } => format!("{var}.{field}"),
+                                    Operand::Lit(_) => "<lit>".to_string(),
+                                    Operand::Param(p) => format!("${p}"),
+                                    Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
+                                }).collect();
+                                let col = format!("{name}({})", arg_strs.join(", "));
+                                vars.intern(&col);
+                            }
                         }
                     }
                 }
@@ -753,6 +919,30 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                     UnwindExpr::Lit(_) => {}
                 }
             }
+            PlanOp::LeftOuterApply { inner, optional_vars } => {
+                // Intern all variables introduced by the inner plan.
+                for op in inner {
+                    // Recurse by treating inner ops through the same collect_vars logic.
+                    // We re-use the same VarTable reference here, which is correct:
+                    // inner vars are visible in the outer row after the apply.
+                    match op {
+                        PlanOp::ScanLabel { var, .. } => { vars.intern(var); }
+                        PlanOp::Expand { from, rel_var, to, .. } => {
+                            vars.intern(from);
+                            vars.intern(to);
+                            if let Some(r) = rel_var { vars.intern(r); }
+                        }
+                        PlanOp::JoinBound { var, .. } | PlanOp::LookupProps { var, .. } => {
+                            vars.intern(var);
+                        }
+                        PlanOp::Filter { expr } => intern_expr(&mut vars, expr),
+                        _ => {}
+                    }
+                }
+                for v in optional_vars {
+                    vars.intern(v);
+                }
+            }
             _ => {}
         }
     }
@@ -765,6 +955,11 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
             vars.intern(var);
         }
         Operand::Lit(_) | Operand::Param(_) => {}
+        Operand::FuncCall { args, .. } => {
+            for arg in args {
+                intern_operand(vars, arg);
+            }
+        }
     }
 }
 
@@ -836,6 +1031,124 @@ fn require_node(row: &Row, vars: &VarTable, var: &str) -> Result<u32, String> {
     }
 }
 
+/// Supported scalar function names (case-insensitive).
+const SCALAR_FUNCS: &[&str] = &[
+    "toLower", "toUpper", "size", "coalesce", "type", "abs", "round",
+];
+
+/// Evaluate one of the supported scalar functions.  Unknown function names
+/// produce a named error listing the supported set.  Null propagation:
+/// null in → null out, EXCEPT `coalesce` (which skips nulls).
+fn eval_func(
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    let norm = name.to_ascii_lowercase();
+    match norm.as_str() {
+        "tolower" => {
+            if args.len() != 1 {
+                return Err(format!("toLower() requires exactly 1 argument, got {}", args.len()));
+            }
+            let v = resolve_operand(view, vars, row, &args[0], params)?;
+            Ok(v.map(|val| match val {
+                Value::Str(s) => Value::Str(s.to_ascii_lowercase()),
+                other => other, // non-string: return unchanged (null already handled)
+            }))
+        }
+        "toupper" => {
+            if args.len() != 1 {
+                return Err(format!("toUpper() requires exactly 1 argument, got {}", args.len()));
+            }
+            let v = resolve_operand(view, vars, row, &args[0], params)?;
+            Ok(v.map(|val| match val {
+                Value::Str(s) => Value::Str(s.to_ascii_uppercase()),
+                other => other,
+            }))
+        }
+        "size" => {
+            if args.len() != 1 {
+                return Err(format!("size() requires exactly 1 argument, got {}", args.len()));
+            }
+            let v = resolve_operand(view, vars, row, &args[0], params)?;
+            match v {
+                None => Ok(None), // null in → null out
+                Some(Value::Str(s)) => Ok(Some(Value::Int(s.len() as i64))),
+                Some(Value::List(items)) => Ok(Some(Value::Int(items.len() as i64))),
+                Some(_) => Ok(None), // non-string/non-list → null (openCypher)
+            }
+        }
+        "coalesce" => {
+            // Returns first non-null arg; null if all args are null.
+            for arg in args {
+                if let Some(v) = resolve_operand(view, vars, row, arg, params)? {
+                    return Ok(Some(v));
+                }
+            }
+            Ok(None)
+        }
+        "type" => {
+            if args.len() != 1 {
+                return Err(format!("type() requires exactly 1 argument, got {}", args.len()));
+            }
+            // Argument must be a relationship variable (Cell::Rel).
+            let Operand::Var(var_name) = &args[0] else {
+                return Err(
+                    "type() argument must be a relationship variable (e.g. type(r))".to_string()
+                );
+            };
+            let slot = vars
+                .slot(var_name)
+                .ok_or_else(|| format!("unbound variable `{var_name}` in type()"))?;
+            match row.get(slot).and_then(|c| c.as_ref()) {
+                Some(Cell::Rel(e)) => {
+                    // Look up the etype string from the symbol table.
+                    let etype = view.syms.resolve(e.etype).unwrap_or("").to_owned();
+                    Ok(Some(Value::Str(etype)))
+                }
+                Some(Cell::Node(_)) => Err(format!(
+                    "type() argument `{var_name}` is a node, not a relationship"
+                )),
+                Some(Cell::Scalar(_) | Cell::Path(_)) => Err(format!(
+                    "type() argument `{var_name}` is not a relationship"
+                )),
+                None => Ok(None), // null binding → null (optional match scenario)
+            }
+        }
+        "abs" => {
+            if args.len() != 1 {
+                return Err(format!("abs() requires exactly 1 argument, got {}", args.len()));
+            }
+            let v = resolve_operand(view, vars, row, &args[0], params)?;
+            match v {
+                None => Ok(None),
+                Some(Value::Int(n)) => Ok(Some(Value::Int(n.abs()))),
+                Some(Value::Float(f)) => Ok(Some(Value::Float(f.abs()))),
+                Some(_) => Ok(None), // non-numeric → null
+            }
+        }
+        "round" => {
+            if args.len() != 1 {
+                return Err(format!("round() requires exactly 1 argument, got {}", args.len()));
+            }
+            let v = resolve_operand(view, vars, row, &args[0], params)?;
+            match v {
+                None => Ok(None),
+                Some(Value::Int(n)) => Ok(Some(Value::Int(n))), // int already rounded
+                Some(Value::Float(f)) => Ok(Some(Value::Float(f.round()))),
+                Some(_) => Ok(None), // non-numeric → null
+            }
+        }
+        _ => Err(format!(
+            "unknown function `{name}`; supported: {}",
+            SCALAR_FUNCS.join(", ")
+        )),
+    }
+}
+
 fn resolve_operand(
     view: &GraphView,
     vars: &VarTable,
@@ -863,6 +1176,7 @@ fn resolve_operand(
                 None => Ok(None),
             }
         }
+        Operand::FuncCall { name, args } => eval_func(name, args, view, vars, row, params),
     }
 }
 
@@ -1693,6 +2007,11 @@ fn agg_stream(
                 "agg executor: Unwind in producer slice — structurally malformed".to_string(),
             );
         }
+        PlanOp::LeftOuterApply { .. } => {
+            return Err(
+                "agg executor: LeftOuterApply in producer slice — structurally malformed".to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -1909,7 +2228,7 @@ fn group_stream(
             let mut gk: GroupKey = Vec::with_capacity(ctx.keys.len());
             let mut display_vals: Vec<Option<Value>> = Vec::with_capacity(ctx.keys.len());
             for (_, item) in ctx.keys {
-                let val = project_item(ctx.view, ctx.vars, row, item)?;
+                let val = project_item(ctx.view, ctx.vars, row, item, ctx.params)?;
                 gk.push(val.as_ref().and_then(group_key_normalize));
                 display_vals.push(val);
             }
@@ -2113,6 +2432,12 @@ fn group_stream(
                 "group executor: Unwind in producer slice — structurally malformed".to_string(),
             );
         }
+        PlanOp::LeftOuterApply { .. } => {
+            return Err(
+                "group executor: LeftOuterApply in producer slice — structurally malformed"
+                    .to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -2145,7 +2470,7 @@ fn pull_rows(
             // All producers consumed — project this final row.
             let mut cells = Vec::with_capacity(ctx.project_items.len());
             for item in ctx.project_items {
-                cells.push(project_item(ctx.view, ctx.vars, row, item)?);
+                cells.push(project_item(ctx.view, ctx.vars, row, item, ctx.params)?);
             }
             result.push(cells);
             return Ok(());
@@ -2403,6 +2728,13 @@ fn pull_rows(
                     .to_string(),
             );
         }
+        PlanOp::LeftOuterApply { .. } => {
+            return Err(
+                "pull executor: LeftOuterApply reached pull_rows — OPTIONAL MATCH plans must use \
+                 the staged path (row_bound returns None for plans containing LeftOuterApply)"
+                    .to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -2466,6 +2798,16 @@ fn column_name(item: &RetItem) -> String {
             };
             format!("{f}({a})")
         }
+        RetVal::FuncCall { name, args } => {
+            let arg_strs: Vec<String> = args.iter().map(|a| match a {
+                Operand::Var(v) => v.clone(),
+                Operand::Prop { var, field } => format!("{var}.{field}"),
+                Operand::Lit(_) => "<lit>".to_string(),
+                Operand::Param(p) => format!("${p}"),
+                Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
+            }).collect();
+            format!("{name}({})", arg_strs.join(", "))
+        }
     }
 }
 
@@ -2474,13 +2816,14 @@ fn exec_project(
     vars: &VarTable,
     rows: &[Row],
     items: &[RetItem],
+    params: &Params,
 ) -> Result<Projected, String> {
     let columns: Vec<String> = items.iter().map(column_name).collect();
     let mut out_rows = Vec::with_capacity(rows.len());
     for row in rows {
         let mut cells = Vec::with_capacity(items.len());
         for item in items {
-            cells.push(project_item(view, vars, row, item)?);
+            cells.push(project_item(view, vars, row, item, params)?);
         }
         out_rows.push(cells);
     }
@@ -2495,20 +2838,25 @@ fn project_item(
     vars: &VarTable,
     row: &Row,
     item: &RetItem,
+    params: &Params,
 ) -> Result<Option<Value>, String> {
     match &item.value {
         RetVal::Var(v) => {
-            match require_cell(row, vars, v)? {
-                Cell::Node(id) => match view.ids.key_of(*id) {
+            // Look up the slot; missing from VarTable entirely is a hard error.
+            let slot = vars.slot(v).ok_or_else(|| format!("unbound variable `{v}`"))?;
+            match row.get(slot).and_then(|c| c.as_ref()) {
+                // Cell is None — variable is optionally null (from OPTIONAL MATCH).
+                None => Ok(None),
+                Some(Cell::Node(id)) => match view.ids.key_of(*id) {
                     Some(key) => Ok(Some(Value::Str(key.to_owned()))),
                     None => Err(format!("unknown node id {id}")),
                 },
                 // Scalar alias produced by a prior WITH stage.
-                Cell::Scalar(val) => Ok(Some(val.clone())),
-                Cell::Rel(_) => Err(format!(
+                Some(Cell::Scalar(val)) => Ok(Some(val.clone())),
+                Some(Cell::Rel(_)) => Err(format!(
                     "variable `{v}` is a relationship; return its properties ({v}.field) instead"
                 )),
-                Cell::Path(hops) => Ok(Some(Value::Int(*hops as i64))),
+                Some(Cell::Path(hops)) => Ok(Some(Value::Int(*hops as i64))),
             }
         }
         RetVal::Prop { var, field } => resolve_prop(view, vars, row, var, field),
@@ -2518,6 +2866,7 @@ fn project_item(
             "project_item: Agg variant reached exec_project — aggregate plans must not contain Project"
                 .to_string(),
         ),
+        RetVal::FuncCall { name, args } => eval_func(name, args, view, vars, row, params),
     }
 }
 

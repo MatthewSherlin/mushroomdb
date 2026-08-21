@@ -5,8 +5,8 @@
 //! *start* node of a MATCH whose variable is already bound.
 
 use super::ast::{
-    AggArg, AggFunc, Expr, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir,
-    RelPat, RetItem, RetVal, UnwindExpr, WithStage,
+    AggArg, AggFunc, Expr, NodePat, Operand, OptionalClause, OrderItem, OrderTarget, Pattern,
+    Query, RelDir, RelPat, RetItem, RetVal, UnwindExpr, WithStage,
 };
 use std::collections::BTreeSet;
 
@@ -158,6 +158,25 @@ pub enum PlanOp {
         expr: UnwindExpr,
         alias: String,
     },
+    /// OPTIONAL MATCH: left-outer-join semantics.
+    ///
+    /// For each input row the `inner` plan is executed in isolation.  If the
+    /// inner plan produces at least one output row, those rows replace the
+    /// input row (inner join semantics for the rows that match).  If the inner
+    /// plan produces **zero** rows, the input row survives with every variable
+    /// listed in `optional_vars` set to null (left-outer fallback).
+    ///
+    /// `optional_vars` lists the variables that are introduced inside the
+    /// optional pattern (i.e., the variables that must be nulled when the
+    /// pattern fails).  Variables that were already bound before the optional
+    /// clause are not listed here — they continue to hold their original values
+    /// in the null row.
+    ///
+    /// Always executes via the **staged path** (row_bound returns None).
+    LeftOuterApply {
+        inner: Vec<PlanOp>,
+        optional_vars: Vec<String>,
+    },
 }
 
 /// Compute the effective row bound for LIMIT push-down.
@@ -209,12 +228,14 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
     {
         return None;
     }
-    // Pipeline plans (WITH / UNWIND) always use the staged path so that
-    // intermediate rows are correctly bounded and pipeline stages are sequenced.
-    if ops
-        .iter()
-        .any(|op| matches!(op, PlanOp::With { .. } | PlanOp::Unwind { .. }))
-    {
+    // Pipeline plans (WITH / UNWIND / LeftOuterApply) always use the staged
+    // path so that intermediate rows are correctly bounded and sequenced.
+    if ops.iter().any(|op| {
+        matches!(
+            op,
+            PlanOp::With { .. } | PlanOp::Unwind { .. } | PlanOp::LeftOuterApply { .. }
+        )
+    }) {
         return None;
     }
     let limit_n = ops.iter().rev().find_map(|op| match op {
@@ -243,6 +264,18 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     for pat in &q.matches {
         compile_pattern(
             pat,
+            &mut ops,
+            &mut bound,
+            &mut rel_bound,
+            &mut node_anon,
+            &mut rel_anon,
+        )?;
+    }
+
+    // OPTIONAL MATCH clauses (after required MATCHes).
+    for oc in &q.optional_clauses {
+        compile_optional_clause(
+            oc,
             &mut ops,
             &mut bound,
             &mut rel_bound,
@@ -291,7 +324,10 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     // Detect aggregate vs non-aggregate items in RETURN.
     // For pipeline plans (with stages or top-level UNWIND), single-aggregate
     // path is not used — route to GroupAggregate or Project.
-    let is_pipeline = !q.stages.is_empty() || !q.unwinds.is_empty() || q.post_unwind_where.is_some();
+    let is_pipeline = !q.stages.is_empty()
+        || !q.unwinds.is_empty()
+        || q.post_unwind_where.is_some()
+        || !q.optional_clauses.is_empty();
     let agg_count = q
         .returns
         .iter()
@@ -538,6 +574,10 @@ fn compile_with_stage(
     for pat in &stage.matches {
         compile_pattern(pat, ops, bound, rel_bound, node_anon, rel_anon)?;
     }
+    // OPTIONAL MATCH clauses that follow those MATCHes.
+    for oc in &stage.optional_clauses {
+        compile_optional_clause(oc, ops, bound, rel_bound, node_anon, rel_anon)?;
+    }
     // UNWIND clauses that follow this WITH.
     for uw in &stage.unwinds {
         check_unwind_bound(&uw.list, bound)?;
@@ -662,6 +702,60 @@ fn compile_pattern(
     Ok(())
 }
 
+/// Compile one `OPTIONAL MATCH` clause into a `LeftOuterApply` op.
+///
+/// The inner plan is compiled from the pattern(s) and optional WHERE, starting
+/// from a copy of the outer bound set.  Variables introduced inside the optional
+/// scope are collected as `optional_vars` — they will be nulled in the fallback
+/// row when the inner plan produces no results.
+fn compile_optional_clause(
+    oc: &OptionalClause,
+    ops: &mut Vec<PlanOp>,
+    bound: &mut BTreeSet<String>,
+    rel_bound: &mut BTreeSet<String>,
+    node_anon: &mut u32,
+    rel_anon: &mut u32,
+) -> Result<(), String> {
+    // Clone the outer bound state; the inner plan compiles against it.
+    let mut inner_bound = bound.clone();
+    let mut inner_rel_bound = rel_bound.clone();
+    let mut inner_ops: Vec<PlanOp> = Vec::new();
+
+    for pat in &oc.patterns {
+        compile_pattern(
+            pat,
+            &mut inner_ops,
+            &mut inner_bound,
+            &mut inner_rel_bound,
+            node_anon,
+            rel_anon,
+        )?;
+    }
+    if let Some(expr) = &oc.where_expr {
+        check_expr_bound(expr, &inner_bound)?;
+        inner_ops.push(PlanOp::Filter { expr: expr.clone() });
+    }
+
+    // Variables newly introduced by the optional clause.
+    let optional_vars: Vec<String> = inner_bound
+        .difference(bound)
+        .chain(inner_rel_bound.difference(rel_bound))
+        .cloned()
+        .collect();
+
+    // Merge inner-introduced vars into the outer bound set so subsequent
+    // clauses can reference them (they may be null, but they are "bound").
+    for v in &optional_vars {
+        bound.insert(v.clone());
+    }
+    for v in inner_rel_bound.difference(&*rel_bound).cloned().collect::<Vec<_>>() {
+        rel_bound.insert(v);
+    }
+
+    ops.push(PlanOp::LeftOuterApply { inner: inner_ops, optional_vars });
+    Ok(())
+}
+
 fn name_node(node: &NodePat, counter: &mut u32, bound: &BTreeSet<String>) -> String {
     match &node.var {
         Some(v) => v.clone(),
@@ -712,6 +806,12 @@ fn check_operand_bound(
         Operand::Prop { var, .. } => require_bound(var, bound, clause),
         Operand::Lit(_) | Operand::Param(_) => Ok(()),
         Operand::Var(name) => require_bound(name, bound, clause),
+        Operand::FuncCall { args, .. } => {
+            for arg in args {
+                check_operand_bound(arg, bound, clause)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -765,6 +865,11 @@ fn check_return_bound(
                     require_bound(var, bound, "RETURN")?;
                 }
             },
+            RetVal::FuncCall { args, .. } => {
+                for arg in args {
+                    check_operand_bound(arg, bound, "RETURN")?;
+                }
+            }
         }
     }
     Ok(())
@@ -794,7 +899,7 @@ fn check_duplicate_columns(items: &[RetItem]) -> Result<(), String> {
 }
 
 /// Projected column name: alias if given, else the bare var, else `var.field`,
-/// else the canonical aggregate call string.
+/// else the canonical aggregate call string, else `funcname(...)`.
 fn column_name(item: &RetItem) -> String {
     if let Some(alias) = &item.alias {
         return alias.clone();
@@ -803,6 +908,19 @@ fn column_name(item: &RetItem) -> String {
         RetVal::Var(v) => v.clone(),
         RetVal::Prop { var, field } => format!("{var}.{field}"),
         RetVal::Agg { func, arg } => agg_column_name(func, arg),
+        RetVal::FuncCall { name, args } => {
+            let arg_strs: Vec<String> = args
+                .iter()
+                .map(|a| match a {
+                    Operand::Var(v) => v.clone(),
+                    Operand::Prop { var, field } => format!("{var}.{field}"),
+                    Operand::Lit(_) => "<lit>".to_string(),
+                    Operand::Param(p) => format!("${p}"),
+                    Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
+                })
+                .collect();
+            format!("{name}({})", arg_strs.join(", "))
+        }
     }
 }
 
@@ -1315,6 +1433,7 @@ LIMIT 10";
         use crate::cypher::ast::{NodePat, Pattern, Query};
         let q = Query {
             matches: vec![],
+            optional_clauses: vec![],
             where_expr: None,
             unwinds: vec![],
             post_unwind_where: None,
@@ -1338,6 +1457,7 @@ LIMIT 10";
                 chain: vec![],
                 shortest: false,
             }],
+            optional_clauses: vec![],
             where_expr: Some(Expr::Not(Box::new(Expr::Cmp {
                 lhs: Operand::Param("p".into()),
                 op: CmpOp::Eq,
