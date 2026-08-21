@@ -183,7 +183,7 @@ Build the embedded binary first:
 
 ```text
 cd ui && npm ci && npm run build && cd ..
-cargo build -p cli --bin mushroomdb --features embed-ui --release
+cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
 cp target/release/mushroomdb ~/.local/bin/  # or any directory on PATH
 ```
 
@@ -238,8 +238,8 @@ listening on http://127.0.0.1:8080
 Without the embedded binary (cargo only, debug build):
 
 ```text
-cargo run -p cli --bin mushroomdb -- demo ./demo-db
-cargo run -p cli --bin mushroomdb -- serve ./demo-db
+cargo run -p mushroomdb-cli --bin mushroomdb -- demo ./demo-db
+cargo run -p mushroomdb-cli --bin mushroomdb -- serve ./demo-db
 ```
 
 ---

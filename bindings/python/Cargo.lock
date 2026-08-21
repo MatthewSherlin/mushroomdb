@@ -24,42 +24,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "core-api"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "core-query",
- "core-rules",
- "core-storage",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "core-query"
-version = "0.1.0"
-dependencies = [
- "core-storage",
-]
-
-[[package]]
-name = "core-rules"
-version = "0.1.0"
-dependencies = [
- "core-storage",
- "serde",
-]
-
-[[package]]
-name = "core-storage"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "crc32fast",
- "serde",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -114,10 +78,46 @@ dependencies = [
 name = "mushroomdb"
 version = "0.1.0"
 dependencies = [
- "core-api",
- "core-storage",
+ "bincode",
+ "mushroomdb-query",
+ "mushroomdb-rules",
+ "mushroomdb-storage",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mushroomdb-python"
+version = "0.1.0"
+dependencies = [
+ "mushroomdb",
+ "mushroomdb-storage",
  "pyo3",
  "serde_json",
+]
+
+[[package]]
+name = "mushroomdb-query"
+version = "0.1.0"
+dependencies = [
+ "mushroomdb-storage",
+]
+
+[[package]]
+name = "mushroomdb-rules"
+version = "0.1.0"
+dependencies = [
+ "mushroomdb-storage",
+ "serde",
+]
+
+[[package]]
+name = "mushroomdb-storage"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "serde",
 ]
 
 [[package]]

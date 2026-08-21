@@ -8,7 +8,7 @@ version = "0.1.0"
 requires-python = ">=3.10"
 description = "Embedded mushroomdb graph database — Python bindings via PyO3"
 license = { text = "Apache-2.0" }
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["graph-database", "embedded", "cypher", "rules"]
 classifiers = [
     "License :: OSI Approved :: Apache Software License",

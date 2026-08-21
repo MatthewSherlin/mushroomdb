@@ -1,5 +1,5 @@
 [package]
-name = "mushroomdb"
+name = "mushroomdb-python"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
@@ -15,7 +15,7 @@ name = "mushroomdb"
 crate-type = ["cdylib"]
 
 [dependencies]
-core-api = { path = "../../crates/core-api" }
-core-storage = { path = "../../crates/core-storage" }
+core-api = { package = "mushroomdb", path = "../../crates/core-api", version = "0.1.0" }
+core-storage = { package = "mushroomdb-storage", path = "../../crates/core-storage", version = "0.1.0" }
 pyo3 = { version = "0.26", features = ["extension-module"] }
 serde_json = "1"

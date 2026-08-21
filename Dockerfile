@@ -14,7 +14,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY --from=ui /src/ui/dist ./ui/dist
-RUN cargo build -p cli --bin mushroomdb --features embed-ui --release \
+RUN cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release \
     && mkdir -p /data \
     && chown 65532:65532 /data
 

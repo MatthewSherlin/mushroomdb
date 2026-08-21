@@ -48,8 +48,8 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: ui/package-lock.json
-      - run: cargo build -p cli --bin mushroomdb
-      - run: cargo build -p core-api --example insert_edge
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb
+      - run: cargo build -p mushroomdb --example insert_edge
       - run: npm ci
         working-directory: ui
       - run: npm run build
@@ -113,8 +113,8 @@ jobs:
         working-directory: ui
       - run: npm run build
         working-directory: ui
-      - run: cargo test -p server --features embed-ui
-      - run: cargo build -p cli --bin mushroomdb --features embed-ui --release
+      - run: cargo test -p mushroomdb-server --features embed-ui
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
       - name: demo + serve + curl index, stats, node
         run: |
           set -euo pipefail

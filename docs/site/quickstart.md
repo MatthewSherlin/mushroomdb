@@ -18,7 +18,7 @@ Build the release binary with the UI embedded:
 
 ```text
 cd ui && npm ci && npm run build && cd ..
-cargo build -p cli --bin mushroomdb --features embed-ui --release
+cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
 ```
 
 Run the two-command flow:
@@ -92,14 +92,14 @@ A debug binary (no `--features embed-ui`) is API-only unless you pass
 `--ui ui/dist`:
 
 ```text
-cargo run -p cli --bin mushroomdb -- demo ./demo-db
-cargo run -p cli --bin mushroomdb -- serve ./demo-db --ui ui/dist
+cargo run -p mushroomdb-cli --bin mushroomdb -- demo ./demo-db
+cargo run -p mushroomdb-cli --bin mushroomdb -- serve ./demo-db --ui ui/dist
 ```
 
 Or API-only (no browser):
 
 ```text
-cargo run -p cli --bin mushroomdb -- serve ./demo-db
+cargo run -p mushroomdb-cli --bin mushroomdb -- serve ./demo-db
 ```
 
 ---
@@ -109,7 +109,7 @@ cargo run -p cli --bin mushroomdb -- serve ./demo-db
 For a programmatic walkthrough from Rust:
 
 ```text
-cargo run -p core-api --example quickstart
+cargo run -p mushroomdb --example quickstart
 ```
 
 Source: `crates/core-api/examples/quickstart.rs`.

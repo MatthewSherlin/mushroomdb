@@ -58,8 +58,8 @@ python -m venv .venv
 
 ```text
 cd ui && npm ci && npm run build && cd ..
-cargo test -p server --features embed-ui
-cargo build -p cli --bin mushroomdb --features embed-ui --release
+cargo test -p mushroomdb-server --features embed-ui
+cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
 ```
 
 ---
