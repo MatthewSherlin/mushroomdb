@@ -305,7 +305,7 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
   (current uncapped graph has 5.81M edges; see dataset growth note in methodology).
 
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
-two-rule backfill on 10k nodes: 872 ms + 1.976 s = **2.85 s** (previously 3.08 s). Competitors have no auto-derivation equivalent.
+two-rule backfill on 10k nodes: 928 ms + 2.221 s = **3.149 s** (+8.8% vs the pre-eventing v2.3 baseline of 2.894 s; cost of live subscriptions and materialized views). A two-stage fix (is\_empty guard + emit\_deltas engine gate, commit d4d312c) recovered the original +44% regression down to +8.8%. Competitors have no auto-derivation equivalent.
 
 ▽ 100k cold-start (V5 snapshot): number being updated in v2.4 regression run (100k db
 rebuild required because V4 snapshots are rejected by V5 code). Previous V4 result was

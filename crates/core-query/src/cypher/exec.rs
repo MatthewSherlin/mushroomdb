@@ -5591,4 +5591,28 @@ LIMIT 10";
             "i64::MIN / -1 must saturate to i64::MAX, not panic"
         );
     }
+
+    /// Regression: collect_operand was missing the BinArith arm, so $params inside
+    /// arithmetic expressions were invisible to pre-flight validation.  A query like
+    /// `RETURN abs($missing - 1)` with no $missing supplied must fail at pre-flight
+    /// with a named-param error, not silently return null.
+    #[test]
+    fn binarith_missing_param_caught_at_preflight() {
+        let fx = Fx::new();
+        let view = fx.view();
+        // Parser requires MATCH; bare RETURN is not supported.
+        // The param is inside a BinArith sub-expression wrapped in a scalar
+        // function call (`abs`): collect_operand must recurse into BinArith
+        // left/right to surface $missing at pre-flight time.
+        let err = run(
+            &view,
+            "MATCH (n:X) RETURN abs($missing - 1)",
+            &BTreeMap::new(),
+        )
+        .expect_err("missing param inside BinArith must be caught at preflight");
+        assert!(
+            err.contains("missing"),
+            "error must name the param 'missing', got: {err}"
+        );
+    }
 }

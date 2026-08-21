@@ -518,7 +518,7 @@ Fix: reset `_rule()` default to `max_edges=None` (global budget) in `dogfood/rul
 | similar_size_strict_tc | 1.653 s | 2.628 s | +59.0% | 1M edges, tripped |
 | **backfill total** | **21.228 s** | **28.650 s** | **+35.0% ‡** | same to_vec() root cause as 10k |
 
-‡ 100k backfill numbers measured pre-fix (PID 50395, 2026-08-21T15:42). The `is_empty()` fast-path fix was applied after this run. Based on the 10k re-measurement (−14.9% recovery), estimated post-fix 100k backfill: ~24.4 s (~+15% vs V4). 100k re-run not attempted (20+ min); extrapolation is indicative.
+‡ 100k backfill numbers measured pre-fix (PID 50395, 2026-08-21T15:42). **Both** perf fixes postdate this run: Stage 1 (`is_empty()` guard, commit 2c38199) and Stage 2 (`emit_deltas` engine gate, commit d4d312c). Applying both recovery rates from the 10k re-measurement (Stage 1 −14.9%, Stage 2 −11.8%, combined ~−25%) gives an estimated post-fix 100k backfill of **~21.5 s** (~parity with V4's 21.228 s). **Estimate, not measured** — 100k re-run not attempted (20+ min rebuild).
 
 **Cold-start open times (WAL-only and V5 snapshot):**
 
