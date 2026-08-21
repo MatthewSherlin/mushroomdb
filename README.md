@@ -40,6 +40,11 @@ retracts the edge if the properties later diverge — without any manual work.
 The why panel in the bundled explorer shows exactly which rule fired, the
 field values that matched, and the computed score for every derived edge.
 
+Watch it live — a Cypher `SET` changes one property, the `founded_within`
+rule fires, and new scored edges appear in the explorer:
+
+![A SET statement deriving new scored edges live](docs/assets/demo-set-derives.gif)
+
 ![Why panel showing overlap rule arithmetic](docs/assets/03-why-overlap.png)
 
 ![Neighborhood with derived edges highlighted](docs/assets/02-neighborhood-gold.png)
@@ -308,7 +313,7 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
 two-rule backfill on 10k nodes: v2.4 baseline 928 ms + 2.221 s = 3.149 s (+8.8% vs pre-eventing v2.3 baseline of 2.894 s). **v0.1.0 measured: 3.49–3.51 s** (two runs, 0.6% intrarun variance; +11% from v2.4). A two-stage fix (is\_empty guard + emit\_deltas engine gate, commit d4d312c) recovered the original subscription overhead. Competitors have no auto-derivation equivalent.
 
-▽ 100k cold-start (V5 snapshot, measured 2026-08-21, 100k-node marketplace dogfood db, 9 backfill rules,
+▽ 100k cold-start (V5 snapshot, measured 2026-08-21, 100k-node representative matching workload, 9 backfill rules,
 ~10.5M derived edges in snapshot):
 **WAL-only open:** 8.25 min — WAL CreateRule records trigger full rule re-derivation; IVF-Flat
 re-fitting dominates (~7.68 min). **V5 snapshot open:** 8.71 s — `open_with` deserializes the V5
@@ -536,7 +541,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 - Testing (DST, crash sweeps, oracles): [`docs/site/testing.md`](docs/site/testing.md)
 - Design spec: [`docs/design.md`](docs/design.md)
 - Benchmarks: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md) (v1: [`head-to-head-10k.md`](benchmarks/results/head-to-head-10k.md))
-- Dogfood report: [`docs/dogfood-report.md`](docs/dogfood-report.md)
+- Case study: [`docs/dogfood-report.md`](docs/dogfood-report.md)
 
 ---
 
