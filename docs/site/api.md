@@ -1,8 +1,9 @@
 # API reference
 
-mushroomdb exposes the same graph operations through three surfaces:
+mushroomdb exposes the same graph operations through four surfaces:
 HTTP (served by `mushroomdb serve`), MCP JSON-RPC (served by `mushroomdb mcp`),
-and Python bindings (via PyO3 / maturin).
+Python bindings (via PyO3 / maturin), and the
+**[TypeScript client](../../clients/typescript/README.md)** (`mushroomdb-client` package).
 
 ---
 

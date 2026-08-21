@@ -439,6 +439,27 @@ docker build -t mushroomdb:local .
 docker run --rm -p 8080:8080 mushroomdb:local
 ```
 
+### TypeScript client (install from repo)
+
+The `mushroomdb-client` package wraps the HTTP + WebSocket API with full TypeScript types.
+It is not yet published to npm. Install from the repository:
+
+```sh
+npm install /path/to/graph-db/clients/typescript
+# or in package.json:
+# "mushroomdb-client": "file:../path/to/graph-db/clients/typescript"
+```
+
+```ts
+import { MushroomClient } from 'mushroomdb-client';
+
+const client = new MushroomClient('http://127.0.0.1:8080');
+const result = await client.query('MATCH (p:Person) RETURN p.id LIMIT 5');
+console.log(result.rows);
+```
+
+See [`clients/typescript/README.md`](clients/typescript/README.md) for the full quickstart, API reference, and WebSocket subscription docs.
+
 ### npm (after the first v* tag)
 
 ```text
@@ -480,6 +501,12 @@ Python gate (commits touching `bindings/python/`):
 cd bindings/python
 python -m venv .venv && .venv/bin/pip install -U pip maturin pytest
 .venv/bin/maturin develop && .venv/bin/pytest
+```
+
+TypeScript client gate (commits touching `clients/typescript/`):
+
+```text
+cd clients/typescript && npm ci && npm run typecheck && npm test
 ```
 
 The test suite uses deterministic simulation testing (fault-injecting
