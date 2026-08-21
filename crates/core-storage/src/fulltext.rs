@@ -570,4 +570,34 @@ mod tests {
         let r = idx.search("bio", "rust");
         assert_eq!(r.len(), 1);
     }
+
+    /// Mid-token `*` is NOT a prefix operator — it is stripped by the
+    /// alphanumeric filter and the remaining fragment matches as an exact token.
+    ///
+    /// "ru*st" → strip non-alphanumeric → "rust" (exact match, no prefix flag).
+    /// This pins the documented behavior so any future change is visible.
+    #[test]
+    fn mid_token_star_is_stripped_to_exact() {
+        // Tokenizer: mid-star stripped, result is the exact alphanumeric token.
+        let toks = tokenize("ru*st");
+        assert_eq!(toks, vec!["rust".to_string()]);
+
+        // parse_query: "ru*st" has no trailing `*`, so prefix=false.
+        let groups = parse_query("ru*st");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 1);
+        assert!(!groups[0][0].prefix, "mid-token * must NOT set prefix flag");
+        assert_eq!(groups[0][0].token, "rust");
+
+        // Search: a node with "rust" token matches "ru*st" as an exact query.
+        let mut idx = FulltextIndex::new();
+        idx.enable("T", "f");
+        idx.add_tokens(0, "f", &Value::Str("rust embedded".into()));
+        // Exact match via stripped mid-star → matches.
+        assert_eq!(idx.search("f", "ru*st").len(), 1);
+        // Trailing-star prefix still works separately.
+        assert_eq!(idx.search("f", "ru*").len(), 1);
+        // A literal "rust" exact query also matches.
+        assert_eq!(idx.search("f", "rust").len(), 1);
+    }
 }

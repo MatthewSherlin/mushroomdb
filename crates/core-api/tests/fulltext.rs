@@ -362,6 +362,92 @@ fn oracle_after_update_and_delete() {
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot persistence — declarations must survive snapshot → reopen
+// ---------------------------------------------------------------------------
+
+/// C-1 regression: enable → snapshot → reopen must restore declarations and index.
+#[test]
+fn declarations_survive_snapshot_and_reopen() {
+    let dir = tmp_dir();
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_fulltext("Article", "bio").unwrap();
+        db.insert_node("Article", "a0", vec![("bio".into(), Value::Str("rust embedded graph".into()))]).unwrap();
+        db.insert_node("Article", "a1", vec![("bio".into(), Value::Str("python scripting".into()))]).unwrap();
+        db.snapshot().unwrap();
+        // Confirm search works before close.
+        let r = db.search("bio", "rust");
+        assert_eq!(r.len(), 1, "pre-close search must find a0");
+    }
+    // Reopen from snapshot.
+    {
+        let db2 = GraphDb::open(&dir).unwrap();
+        assert!(db2.is_fulltext_enabled("Article", "bio"), "declaration must survive snapshot");
+        let r = db2.search("bio", "rust");
+        assert_eq!(r.len(), 1, "index must be rebuilt after reopen from snapshot");
+        assert_eq!(r[0].0, "a0");
+    }
+}
+
+/// Snapshot with zero declarations must not write junk to WAL.
+#[test]
+fn snapshot_with_no_declarations_stays_clean() {
+    let dir = tmp_dir();
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("X", "x0", vec![]).unwrap();
+        db.snapshot().unwrap();
+    }
+    // Reopen: no fulltext declarations, no errors.
+    let db2 = GraphDb::open(&dir).unwrap();
+    assert!(!db2.is_fulltext_enabled("X", "bio"));
+    assert!(db2.search("bio", "rust").is_empty());
+}
+
+/// enable → snapshot → more writes → open_at semantics remain correct.
+///
+/// After snapshot(), the WAL is atomically replaced with baseline records:
+/// one EnableFulltext record per enabled pair.  Post-snapshot user writes
+/// follow.  open_at(i) must replay correctly at any position.
+///
+/// WAL structure after the workload below:
+///   pos 0: EnableFulltext("Article","bio")   ← baseline written by snapshot()
+///   pos 1: InsertNode "a1"
+///   pos 2: InsertNode "a2"
+#[test]
+fn open_at_works_after_snapshot_with_declarations() {
+    let dir = tmp_dir();
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_fulltext("Article", "bio").unwrap(); // pre-snapshot WAL commit
+        db.insert_node("Article", "a0", vec![("bio".into(), Value::Str("rust".into()))]).unwrap();
+        db.snapshot().unwrap();
+        // snapshot() replaces WAL with baseline: [EnableFulltext("Article","bio")]
+        db.insert_node("Article", "a1", vec![("bio".into(), Value::Str("python".into()))]).unwrap(); // WAL pos 1
+        db.insert_node("Article", "a2", vec![("bio".into(), Value::Str("rust lang".into()))]).unwrap(); // WAL pos 2
+    }
+    // WAL has exactly 3 records (0..=2).
+    // At every commit, fulltext must be enabled (baseline is always at pos 0).
+    for commit in 0..=2u64 {
+        let snap = GraphDb::open_at(&dir, commit).unwrap();
+        assert!(snap.is_fulltext_enabled("Article", "bio"),
+            "fulltext must be enabled at WAL pos={commit}");
+    }
+    // CommitOutOfRange for pos 3 (only 3 records).
+    assert!(matches!(GraphDb::open_at(&dir, 3), Err(GraphError::CommitOutOfRange { .. })));
+    // At pos 2 (all WAL records), the WAL-replayed state has:
+    //   - fulltext enabled (pos 0 baseline)
+    //   - a1 with "python" (pos 1)
+    //   - a2 with "rust lang" (pos 2)
+    // open_at is WAL-only (no snapshot), so a0 (pre-snapshot) is not visible.
+    let snap = GraphDb::open_at(&dir, 2).unwrap();
+    assert!(snap.is_fulltext_enabled("Article", "bio"), "fulltext must be enabled at pos=2");
+    let r = snap.search("bio", "rust");
+    assert_eq!(r.len(), 1, "only a2 should match 'rust' (a0 is pre-snapshot, not in WAL)");
+    assert_eq!(r[0].0, "a2");
+}
+
+// ---------------------------------------------------------------------------
 // Cypher textMatches function in WHERE position
 // ---------------------------------------------------------------------------
 

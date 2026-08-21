@@ -386,11 +386,23 @@ impl Oracle {
             if !indexed_labels.contains(label) {
                 continue;
             }
-            let text = match props.get(field) {
-                Some(Value::Str(s)) => s.clone(),
-                _ => continue, // only Str fields are tokenized in fulltext
+            // Mirror fulltext.rs value_tokens: tokenize Str, flatten List<Str>,
+            // skip everything else.  Both db.search() and oracle.scratch_search
+            // must agree on which values produce tokens.
+            let doc_tokens: BTreeSet<String> = match props.get(field) {
+                Some(Value::Str(s)) => tokenize(s).into_iter().collect(),
+                Some(Value::List(items)) => items
+                    .iter()
+                    .flat_map(|v| {
+                        if let Value::Str(s) = v {
+                            tokenize(s)
+                        } else {
+                            vec![]
+                        }
+                    })
+                    .collect(),
+                _ => continue,
             };
-            let doc_tokens: BTreeSet<String> = tokenize(&text).into_iter().collect();
 
             // Count how many OR-groups match (mirrors FulltextIndex::search).
             let mut match_count = 0usize;

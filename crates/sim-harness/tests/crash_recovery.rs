@@ -1604,6 +1604,21 @@ fn workload_with_fulltext<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
     Ok(())
 }
 
+/// Fulltext workload that includes a mid-stream snapshot, exercising the
+/// crash window between snapshot write and WAL baseline rewrite.
+fn workload_with_fulltext_and_snapshot<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    db.enable_fulltext("Article", "bio")?;
+    db.insert_node("Article", "fb0", vec![("bio".into(), Value::Str("rust graph database".into()))])?;
+    db.insert_node("Article", "fb1", vec![("bio".into(), Value::Str("graph embeddings".into()))])?;
+    // snapshot() writes snapshot atomically then replaces WAL with EnableFulltext baseline.
+    // Crash between the two atomic writes is the critical window we are testing.
+    db.snapshot()?;
+    // Post-snapshot user writes — go into WAL after the EnableFulltext baseline.
+    db.insert_node("Article", "fb2", vec![("bio".into(), Value::Str("rust embedded systems".into()))])?;
+    db.set_prop("fb0", "bio", Value::Str("embedded graph rust".into()))?;
+    Ok(())
+}
+
 /// Crash sweep for fulltext: at every WAL offset, recovered db's index must
 /// equal an independent scratch scan of the same surviving data.
 ///
@@ -1636,6 +1651,42 @@ fn recovery_byte_sweep_fulltext() {
             assert_eq!(
                 index_results, scratch_results,
                 "crash_at={crash_at}: fulltext index != scratch for query={query:?}"
+            );
+        }
+    }
+}
+
+/// Crash sweep for fulltext with a mid-workload snapshot.
+///
+/// Exercises the crash window between the snapshot write and the WAL baseline
+/// rewrite (EnableFulltext records that survive the WAL truncation).
+/// At every crash point the index must equal scratch_search — proving that
+/// either the old WAL (pre-crash) or the new baseline WAL (post-crash) both
+/// correctly restore declarations on reopen.
+#[test]
+fn recovery_byte_sweep_fulltext_with_snapshot() {
+    let total_bytes = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        workload_with_fulltext_and_snapshot(&mut db).unwrap();
+        db.into_fs().total_appended()
+    };
+    assert!(total_bytes > 0, "fulltext snapshot workload must append bytes");
+
+    for crash_at in 0..=total_bytes {
+        let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();
+        let _ = workload_with_fulltext_and_snapshot(&mut db);
+        let survivor = db.into_fs().surviving_state();
+
+        // Invariant (a): open never panics.
+        let recovered = GraphDb::open_with(survivor).unwrap();
+
+        // Invariant (b): index == scratch_search for every query.
+        for query in FT_WORKLOAD_QUERIES {
+            let index_results = recovered.search("bio", query);
+            let scratch_results = recovered.scratch_search("bio", query);
+            assert_eq!(
+                index_results, scratch_results,
+                "crash_at={crash_at} (snapshot workload): index != scratch for query={query:?}"
             );
         }
     }

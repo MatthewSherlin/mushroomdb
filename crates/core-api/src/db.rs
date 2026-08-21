@@ -2023,13 +2023,20 @@ impl<F: Fs> GraphDb<F> {
     /// **Memory / performance:** O(postings) lookup; no scan.  The index is
     /// in-memory and proportional to total indexed text across all enabled fields.
     pub fn search(&self, field: &str, query: &str) -> Vec<(String, usize)> {
-        self.fulltext
+        // Resolve node_ids to keys (excluding tombstones) then re-sort by
+        // (match_count DESC, key ASC) to give a deterministic, key-lexicographic
+        // tiebreak.  FulltextIndex::search sorts by (count DESC, node_id ASC)
+        // which diverges from key order when nodes were not inserted in key-lex order.
+        let mut results: Vec<(String, usize)> = self
+            .fulltext
             .search(field, query)
             .into_iter()
             .filter_map(|(id, count)| {
                 self.ids.key_of(id).map(|key| (key.to_string(), count))
             })
-            .collect()
+            .collect();
+        results.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        results
     }
 
     /// For DST/testing: scratch full-text search over live nodes without using
@@ -2978,7 +2985,30 @@ impl<F: Fs> GraphDb<F> {
         };
         self.fs
             .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state))?;
-        self.fs.write_atomic(FileId::Wal, b"")?; // wal tail now starts empty
+        // After snapshot, atomically write a baseline WAL containing one
+        // EnableFulltext record per currently-enabled declaration.  On the next
+        // open(), WAL replay re-enables the declarations before rebuild_all()
+        // restores the postings.  This is cheaper than a SnapshotState field
+        // (which would require a VERSION bump) and preserves the no-schema-change
+        // invariant.
+        //
+        // Crash-ordering: write_atomic is atomic.
+        //   • Crash before snapshot write  → WAL unchanged (has old EnableFulltext
+        //     records from the original enable_fulltext calls).  Safe.
+        //   • Crash after snapshot write but before this WAL write → snapshot is
+        //     present; WAL still has the full pre-snapshot history (including the
+        //     original EnableFulltext records).  open_with() applies WAL idempotently
+        //     over the snapshot.  Safe.
+        //   • Crash after both writes → normal post-snapshot state.  Safe.
+        let mut baseline_wal: Vec<u8> = Vec::new();
+        for (label, field) in self.fulltext.enabled_pairs() {
+            let rec = WalRecord::EnableFulltext {
+                label: label.clone(),
+                field: field.clone(),
+            };
+            baseline_wal.extend_from_slice(&encode_record(&rec));
+        }
+        self.fs.write_atomic(FileId::Wal, &baseline_wal)?; // replaces old WAL tail
         Ok(())
     }
 }

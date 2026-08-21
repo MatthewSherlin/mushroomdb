@@ -23,13 +23,14 @@ const TAGS_ALPHA: [&str; 3] = ["a", "b", "c"];
 /// Fulltext label pool: match the InsertNode labels.
 const FT_LABELS: [&str; 2] = ["L0", "L1"];
 
-/// Fulltext field pool: use "seed" and "f" which are set on many nodes.
-/// "seed" is an Int so it will be skipped by the string-only tokenizer (no matches).
-/// "f" is a Str so it produces real postings.
-const FT_FIELDS: [&str; 2] = ["f", "p"];
+/// Fulltext field pool. Both fields produce real postings:
+/// "f" is a Str (SetF writes Value::Str("k{n}")), exercising Str tokenization.
+/// "tags" is a List<Str> drawn from TAGS_ALPHA, exercising List tokenization.
+const FT_FIELDS: [&str; 2] = ["f", "tags"];
 
-/// Fulltext query pool: short queries likely to hit some nodes.
-const FT_QUERIES: [&str; 4] = ["k0", "k1 OR k2", "k*", "k0 OR k1 OR k2"];
+/// Fulltext query pool covering both field types:
+/// "k0" / "k*" match "f" values; "a" / "a OR b" match "tags" values.
+const FT_QUERIES: [&str; 4] = ["k0", "k*", "a", "a OR b"];
 
 fn ft_label(n: u8) -> &'static str {
     FT_LABELS[(n as usize) % FT_LABELS.len()]
