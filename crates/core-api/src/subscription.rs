@@ -147,13 +147,18 @@ impl SubInner {
     }
 
     /// Push an event, dropping it (incrementing `missed`) if the queue is full.
+    ///
+    /// `notify_one` is only called when an item is actually enqueued.  On
+    /// overflow we increment `missed` but skip the notification: no waiter can
+    /// consume a dropped event, and the spurious wakeup just wastes a syscall.
     pub(crate) fn push(&self, event: DbEvent) {
         let mut q = self.mu.lock().unwrap();
         if q.items.len() >= q.capacity {
             q.missed += 1;
-        } else {
-            q.items.push_back(event);
+            // No notify: the dropped event cannot be consumed.
+            return;
         }
+        q.items.push_back(event);
         drop(q);
         self.condvar.notify_one();
     }

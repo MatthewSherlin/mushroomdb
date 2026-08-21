@@ -448,11 +448,14 @@ impl<F: Fs> GraphDb<F> {
         }
         for rec in records {
             db.apply(&rec)?;
+            // Drain per-frame to keep pending_deltas O(1) during replay (I-2).
+            // No subscriber exists yet; discard is correct.
+            let _ = db.engine.drain_deltas();
         }
-        // T2 note: drain_deltas is the suppression seam for replay.  Any future
-        // as-of replay path (Plan-15 T2) must call drain_deltas here to stay
-        // silent; the mechanism is already in place.
-        let _ = db.engine.drain_deltas();
+        // T2 note: the per-frame drain above IS the suppression seam for replay.
+        // Any future as-of replay path (Plan-15 T2) must call drain_deltas here
+        // to feed those events to the replaying subscriber; the mechanism is in place.
+        let _ = db.engine.drain_deltas(); // trailing no-op after loop drain
         Ok(db)
     }
 
@@ -733,6 +736,17 @@ impl<F: Fs> GraphDb<F> {
         rec: WalRecord,
         ingest: Option<(String, usize)>,
     ) -> Result<()> {
+        // Invariant (I-1): no stale deltas may enter from a previous apply.
+        // If any engine method ever accumulates deltas before erroring, they would
+        // contaminate the *next* commit's event stream. This assert fires in debug
+        // builds, making any future regression visible at the earliest point.
+        debug_assert_eq!(
+            self.engine.pending_delta_count(),
+            0,
+            "stale engine deltas at log_then_apply_with entry — \
+             a previous apply arm may have accumulated deltas before erroring; \
+             the caller must drain_deltas() on any error path before returning"
+        );
         self.fs.append(FileId::Wal, &encode_record(&rec))?;
         self.fs.sync(FileId::Wal)?; // strict policy in plan 1
         let apply_result = self.apply(&rec);
@@ -747,7 +761,12 @@ impl<F: Fs> GraphDb<F> {
                  see log_then_apply_with invariant doc"
             );
         }
-        apply_result?;
+        if apply_result.is_err() {
+            // Discard any partial deltas accumulated by the failed apply.
+            // They must not ride the next commit's event stream (I-1).
+            let _ = self.engine.drain_deltas();
+            apply_result?;
+        }
         self.commit_seq += 1;
         let seq = self.commit_seq;
         // Drain engine deltas and distribute to subscribers before the existing
@@ -989,6 +1008,11 @@ impl<F: Fs> GraphDb<F> {
     /// Default is [`DEFAULT_SUB_CAPACITY`] (65,536 events). Use a smaller
     /// value in tests to exercise the [`DbEvent::Lagged`] path without
     /// generating tens of thousands of events.
+    ///
+    /// This is a test-support escape hatch. Calling it in production reduces
+    /// subscriber reliability (more Lagged events). It is hidden from rustdoc
+    /// to discourage accidental production use.
+    #[doc(hidden)]
     pub fn set_sub_capacity(&mut self, capacity: usize) {
         self.sub_capacity = capacity;
     }

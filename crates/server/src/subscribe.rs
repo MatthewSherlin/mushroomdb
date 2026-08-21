@@ -25,6 +25,18 @@
 //! **Lagged**: if a subscriber's internal queue overflows, it receives a
 //! `{"type":"lagged","missed":N}` frame before continuing. The server drops
 //! the connection only on a send error; it does not disconnect slow consumers.
+//!
+//! # Threading model
+//!
+//! Each WS connection spawns **one** persistent blocking thread via
+//! `tokio::task::spawn_blocking`. That thread loops over the `Subscription`
+//! handles, calling `recv_timeout` when idle, and forwards events through a
+//! bounded `tokio::sync::mpsc` channel to the async WS writer task.
+//!
+//! This is O(1) threads per connection — not O(N) blocking tasks per interval
+//! as a poll-based design would be.  When the WS is closed the async task
+//! drops its `Receiver`, causing the next `blocking_send` to fail and the
+//! blocking thread to exit cleanly.
 
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -35,8 +47,8 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::task;
 
-/// How long to block in spawn_blocking before yielding back to the async loop.
-const RECV_TIMEOUT: Duration = Duration::from_millis(50);
+/// How long the bridge thread waits on `recv_timeout` when idle.
+const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Client subscribe message.
 #[derive(Debug, Deserialize, Default)]
@@ -126,44 +138,121 @@ async fn run(mut socket: WebSocket, state: AppState) {
         return;
     }
 
-    // Stream events.
+    // Bridge: one persistent blocking thread forwards events through an mpsc
+    // channel to the async WS writer.  When the WS closes, the Receiver drops,
+    // the next `blocking_send` fails, and the thread exits cleanly.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<DbEvent>(256);
+    let _bridge = task::spawn_blocking(move || bridge_loop(subs, event_tx));
+
+    // Stream events to the WS client.
     loop {
-        // Poll all subscriptions in round-robin with a short blocking timeout.
-        // spawn_blocking bridges the std blocking recv into async.
-        let subs_clone = subs.clone();
-        let events: Vec<DbEvent> = task::spawn_blocking(move || {
-            let mut out = Vec::new();
-            // One pass over all subs, draining non-blocking first.
-            for sub in &subs_clone {
-                while let Some(ev) = sub.try_recv() {
-                    out.push(ev);
+        tokio::select! {
+            ev = event_rx.recv() => {
+                let Some(ev) = ev else { break; }; // bridge thread exited
+                let text = serde_json::to_string(&ev).expect("DbEvent is always serializable");
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
                 }
             }
-            // If nothing arrived, block on the first sub with a timeout.
-            if out.is_empty() && !subs_clone.is_empty() {
-                if let Some(ev) = subs_clone[0].recv_timeout(RECV_TIMEOUT) {
-                    out.push(ev);
-                    // Drain remaining from all subs non-blocking.
-                    for sub in &subs_clone {
-                        while let Some(ev) = sub.try_recv() {
-                            out.push(ev);
+            msg = socket.recv() => {
+                // Break on clean Close, stream end (None), or any socket error
+                // (e.g. TCP reset after the client drops the connection).
+                match msg {
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {} // ping/pong/text from client — ignored
+                }
+            }
+        }
+    }
+    // Dropping event_rx causes blocking_send in bridge_loop to fail → thread exits.
+}
+
+/// Runs in a dedicated blocking thread (one per WS connection).
+/// Loops over subscriptions, draining events into `tx`.  Returns when `tx`
+/// is closed (WS dropped) or when there are no subscriptions.
+fn bridge_loop(subs: Vec<Subscription>, tx: tokio::sync::mpsc::Sender<DbEvent>) {
+    if subs.is_empty() {
+        return;
+    }
+    loop {
+        // Fast exit when the WS task has dropped the receiver.
+        if tx.is_closed() {
+            return;
+        }
+        let mut sent_any = false;
+        // Non-blocking drain of all subscriptions.
+        for sub in &subs {
+            while let Some(ev) = sub.try_recv() {
+                if tx.blocking_send(ev).is_err() {
+                    return; // receiver dropped — WS closed
+                }
+                sent_any = true;
+            }
+        }
+        if !sent_any {
+            // Nothing queued: block on the first subscription with a timeout,
+            // then drain the rest non-blocking before re-looping.
+            if let Some(ev) = subs[0].recv_timeout(BRIDGE_IDLE_TIMEOUT) {
+                if tx.blocking_send(ev).is_err() {
+                    return;
+                }
+                for sub in &subs {
+                    while let Some(ev) = sub.try_recv() {
+                        if tx.blocking_send(ev).is_err() {
+                            return;
                         }
                     }
                 }
             }
-            out
-        })
-        .await
-        .unwrap_or_default();
-
-        for ev in events {
-            let text = serde_json::to_string(&ev).expect("DbEvent is always serializable");
-            if socket.send(Message::Text(text.into())).await.is_err() {
-                return;
-            }
+            // If recv_timeout returned None (timeout): re-check all subs next iteration.
         }
+    }
+}
 
-        // Yield to the async runtime between polls.
-        tokio::task::yield_now().await;
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lagged_event_serializes_to_type_tagged_json() {
+        let ev = DbEvent::Lagged { missed: 5 };
+        let text = serde_json::to_string(&ev).unwrap();
+        assert_eq!(text, r#"{"type":"lagged","missed":5}"#);
+    }
+
+    #[test]
+    fn edge_fired_serializes_correctly() {
+        let ev = DbEvent::EdgeFired {
+            rule: "rel".into(),
+            src_key: "n1".into(),
+            dst_key: "n2".into(),
+            edge_type: "REL".into(),
+            weight: Some(0.9),
+            commit_seq: 7,
+        };
+        let j: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        assert_eq!(j["type"], "edge_fired");
+        assert_eq!(j["rule"], "rel");
+        assert_eq!(j["commit_seq"], 7);
+        assert_eq!(j["weight"], 0.9);
+    }
+
+    #[test]
+    fn subscribe_msg_defaults_to_empty() {
+        let m: SubscribeMsg = serde_json::from_str("{}").unwrap();
+        assert!(m.rules.is_empty());
+        assert!(!m.writes);
+    }
+
+    #[test]
+    fn subscribe_msg_parses_rules_and_writes() {
+        let m: SubscribeMsg =
+            serde_json::from_str(r#"{"rules":["rel"],"writes":true}"#).unwrap();
+        assert_eq!(m.rules, ["rel"]);
+        assert!(m.writes);
     }
 }

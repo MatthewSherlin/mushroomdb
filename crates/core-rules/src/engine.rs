@@ -1105,6 +1105,12 @@ impl RuleEngine {
         std::mem::take(&mut self.pending_deltas)
     }
 
+    /// Number of accumulated deltas not yet drained.  Used by
+    /// `debug_assert` in `log_then_apply_with` to catch stale-delta bugs.
+    pub fn pending_delta_count(&self) -> usize {
+        self.pending_deltas.len()
+    }
+
     /// Snapshot support: definitions + provenance + tripped/fires. Candidate
     /// indexes and the `by_node` reverse index are NOT included (derived:
     /// `reindex_all` / `rebuild_by_node` on open).
