@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 01acab1117a2101a743fa4ad627680772370375ee2c63334e2bb6109c3e73224 # shrinks to ops = [CreateView(41), InsertNode(92)]
+cc 3b60c6812c452ddc1719de2826e5ac6748541473a73643aea58aebd72821c03e # shrinks to ops = [InsertNode(1), CreateView(28)]
+cc 7d32c6eeec183dc253ef1336a1add03c581726c7940b7a26eabd31af62c43cfd # shrinks to ops = [InsertNode(106), EnableFulltext(126, 74), SetF(106, 0), EnableFulltext(109, 92), DisableFulltext(20, 254)]

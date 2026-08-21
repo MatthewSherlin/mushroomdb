@@ -167,4 +167,4 @@ rules: 7
   to pin one.
 - Cold-start on a rich-rule graph: WAL-only open replays all rule derivations (8.25 min at 100k
   nodes, 9 rules, IVF dominates). Call `snapshot()` before close; opening from a V5 snapshot takes
-  8.7 s at 100k (snapshot write cost: 25 s). See [docs/site/timetravel.md](timetravel.md).
+  8.71 s at 100k (snapshot write cost: 25 s). See [docs/site/timetravel.md](timetravel.md).
