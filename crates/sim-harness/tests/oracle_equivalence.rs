@@ -1,4 +1,4 @@
-use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value};
+use core_api::{AggFn, Direction, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource};
 use proptest::prelude::*;
 use sim_harness::{Oracle, SimFs, APPROX_RECALL_FLOOR_QUIESCED, APPROX_RECALL_FLOOR_RECOVERY};
 use std::collections::BTreeSet;
@@ -142,6 +142,49 @@ fn rule_template(idx: u8) -> RuleDef {
     }
 }
 
+// ---------------------------------------------------------------------------
+// View template pool (3 templates; view_prop names distinct from prop_fields)
+// ---------------------------------------------------------------------------
+
+const N_VIEW_TEMPLATES: usize = 3;
+const VIEW_NAMES: [&str; N_VIEW_TEMPLATES] = ["v_deg0", "v_sum1", "v_cnt2"];
+
+fn view_template(idx: u8) -> ViewDef {
+    match (idx as usize) % N_VIEW_TEMPLATES {
+        0 => ViewDef {
+            name: "v_deg0".into(),
+            label: "L0".into(),
+            view_prop: "v_deg0".into(),
+            source: ViewSource::Degree {
+                edge_type: "e0".into(),
+                direction: Direction::Out,
+            },
+        },
+        1 => ViewDef {
+            name: "v_sum1".into(),
+            label: "L1".into(),
+            view_prop: "v_sum1".into(),
+            source: ViewSource::NeighborAgg {
+                edge_type: "e1".into(),
+                direction: Direction::In,
+                agg: AggFn::Sum,
+                prop: "p".into(),
+            },
+        },
+        _ => ViewDef {
+            name: "v_cnt2".into(),
+            label: "L0".into(),
+            view_prop: "v_cnt2".into(),
+            source: ViewSource::NeighborAgg {
+                edge_type: "e2".into(),
+                direction: Direction::Out,
+                agg: AggFn::Count,
+                prop: "seed".into(),
+            },
+        },
+    }
+}
+
 fn loc_list(lat: f64, lon: f64) -> Value {
     Value::List(vec![Value::Float(lat), Value::Float(lon)])
 }
@@ -263,6 +306,8 @@ enum Op {
     SetYear(u8, u8),        // key, year-selector → bucket / signed-zero values
     SetLoc(u8, u8),         // key, loc-selector → Paris/London/±180/NYC
     SetEmb(u8, u8),         // key, emb-selector → near-threshold / orthogonal
+    CreateView(u8), // pick from N_VIEW_TEMPLATES templates by index
+    DeleteView(u8), // pick from VIEW_NAMES by index
     /// 2–4 leaf ops committed as one engine `batch()`. Nested Batch is never
     /// generated. CreateRule is omitted from the inner pool so we do not hit
     /// the documented same-batch rule-window (validation cannot see edges a
@@ -304,6 +349,8 @@ fn leaf_op_strategy() -> impl Strategy<Value = Op> {
         (any::<u8>(), any::<u8>()).prop_map(|(k, v)| Op::SetYear(k, v)),
         (any::<u8>(), any::<u8>()).prop_map(|(k, v)| Op::SetLoc(k, v)),
         (any::<u8>(), any::<u8>()).prop_map(|(k, v)| Op::SetEmb(k, v)),
+        any::<u8>().prop_map(Op::CreateView),
+        any::<u8>().prop_map(Op::DeleteView),
     ]
 }
 
@@ -463,6 +510,25 @@ fn apply_oracle_leaf(oracle: &mut Oracle, op: &Op) -> Result<(), String> {
                 Err(format!("oracle set_emb({key}) KeyNotFound"))
             }
         }
+        Op::CreateView(n) => {
+            let def = view_template(*n);
+            if oracle.create_view(def) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "oracle create_view({}) rejected",
+                    n % N_VIEW_TEMPLATES as u8
+                ))
+            }
+        }
+        Op::DeleteView(n) => {
+            let name = VIEW_NAMES[(*n as usize) % N_VIEW_TEMPLATES];
+            if oracle.delete_view(name) {
+                Ok(())
+            } else {
+                Err(format!("oracle delete_view({name}) missing"))
+            }
+        }
         Op::Batch(_) => Err("nested Batch is invalid".into()),
     }
 }
@@ -495,6 +561,11 @@ fn queue_batch_op(b: &mut core_api::BatchBuilder<'_, SimFs>, op: &Op) {
             // batch_inner_strategy never emits CreateRule (T5 same-batch
             // rule-window); standalone CreateRule is applied outside this fn.
             unreachable!("CreateRule is not a Batch inner op");
+        }
+        Op::CreateView(_) | Op::DeleteView(_) => {
+            // batch_inner_strategy never emits CreateView/DeleteView;
+            // view mutations are standalone ops applied outside this fn.
+            unreachable!("CreateView/DeleteView are not Batch inner ops");
         }
         Op::DeleteRule(n) => {
             b.delete_rule(RULE_NAMES[(*n as usize) % N_TEMPLATES]);
@@ -776,6 +847,30 @@ proptest! {
                     prop_assert_eq!(db_ok, or_ok);
                 }
 
+                Op::CreateView(n) => {
+                    let def = view_template(*n);
+                    let db_ok = db.create_view(def.clone()).is_ok();
+                    let or_ok = oracle.create_view(def);
+                    prop_assert_eq!(
+                        db_ok,
+                        or_ok,
+                        "create_view result mismatch for template {}",
+                        n % N_VIEW_TEMPLATES as u8
+                    );
+                }
+
+                Op::DeleteView(n) => {
+                    let name = VIEW_NAMES[(*n as usize) % N_VIEW_TEMPLATES];
+                    let db_ok = db.delete_view(name).is_ok();
+                    let or_ok = oracle.delete_view(name);
+                    prop_assert_eq!(
+                        db_ok,
+                        or_ok,
+                        "delete_view result mismatch for view {}",
+                        name
+                    );
+                }
+
                 Op::Batch(sub) => {
                     // Engine: one atomic Batch frame. Oracle has no WAL — apply
                     // sequential user-level ops only when commit succeeds
@@ -817,6 +912,53 @@ proptest! {
                     key,
                     field
                 );
+            }
+        }
+
+        // View invariant: for each live view, incremental stored value ==
+        // scratch recompute.  Degree/Count/Min/Max: exact equality.
+        // Sum/Avg: epsilon (1e-6) to tolerate disclosed f64 accumulation drift.
+        for view_def in db.views() {
+            for n in 0..=255u8 {
+                let key = format!("k{n}");
+                if !db.has_node(&key) {
+                    continue;
+                }
+                let stored = db.get_view_prop(&key, &view_def.view_prop).cloned();
+                let scratch = db.scratch_view_value(&key, &view_def.name);
+                let is_float_agg = matches!(
+                    &view_def.source,
+                    ViewSource::NeighborAgg {
+                        agg: AggFn::Sum | AggFn::Avg,
+                        ..
+                    }
+                );
+                if is_float_agg {
+                    match (stored, scratch) {
+                        (None, None) => {}
+                        (Some(Value::Float(s)), Some(Value::Float(sc))) => {
+                            prop_assert!(
+                                (s - sc).abs() < 1e-6,
+                                "view {} key={}: stored {} scratch {} (epsilon exceeded)",
+                                view_def.name, key, s, sc
+                            );
+                        }
+                        (s, sc) => {
+                            prop_assert!(
+                                s == sc,
+                                "view {} key={}: type mismatch stored {:?} scratch {:?}",
+                                view_def.name, key, s, sc
+                            );
+                        }
+                    }
+                } else {
+                    prop_assert_eq!(
+                        stored,
+                        scratch,
+                        "view {} key={}: incremental vs scratch mismatch",
+                        view_def.name, key
+                    );
+                }
             }
         }
 

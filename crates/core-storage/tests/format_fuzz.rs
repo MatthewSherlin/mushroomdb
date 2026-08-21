@@ -81,6 +81,12 @@ fn valid_wal_records() -> Vec<WalRecord> {
             key: "alice".into(),
         },
         WalRecord::DeleteRule { name: "eq".into() },
+        WalRecord::CreateView {
+            def_bytes: b"view-def".to_vec(),
+        },
+        WalRecord::DeleteView {
+            name: "my_view".into(),
+        },
     ]
 }
 

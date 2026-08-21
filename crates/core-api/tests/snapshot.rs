@@ -1,4 +1,4 @@
-use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value};
+use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-{}-{}", name, std::process::id()));
@@ -210,7 +210,7 @@ fn crash_between_snapshot_and_wal_truncation_recovers() {
 }
 
 // ---------------------------------------------------------------------------
-// V4 snapshot tests
+// V5 snapshot tests
 // ---------------------------------------------------------------------------
 
 fn emb(xs: &[f64]) -> Value {
@@ -224,7 +224,7 @@ fn v3_snapshot_is_rejected_with_clear_message() {
     {
         let mut db = GraphDb::open(&dir).unwrap();
         db.insert_node("N", "a", vec![]).unwrap();
-        db.snapshot().unwrap(); // writes V4
+        db.snapshot().unwrap(); // writes V5
     }
     let path = dir.join("snapshot.bin");
     let mut bytes = std::fs::read(&path).unwrap();
@@ -240,6 +240,32 @@ fn v3_snapshot_is_rejected_with_clear_message() {
         }
         Ok(_) => panic!("expected Corrupt for V3 snapshot, got Ok"),
         Err(e) => panic!("expected Corrupt for V3 snapshot, got: {e:?}"),
+    }
+}
+
+/// V4-stamped snapshot must be refused with a clear error naming "version 4".
+#[test]
+fn v4_snapshot_is_rejected_with_clear_message() {
+    let dir = tmp("snap-v4-reject");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap();
+        db.snapshot().unwrap(); // writes V5
+    }
+    let path = dir.join("snapshot.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[4] = 4;
+    bytes[5] = 0; // stamp VERSION=4
+    std::fs::write(&path, bytes).unwrap();
+    match GraphDb::open(&dir) {
+        Err(GraphError::Corrupt { detail }) => {
+            assert!(
+                detail.contains("version 4"),
+                "error should mention version 4; got: {detail}"
+            );
+        }
+        Ok(_) => panic!("expected Corrupt for V4 snapshot, got Ok"),
+        Err(e) => panic!("expected Corrupt for V4 snapshot, got: {e:?}"),
     }
 }
 
@@ -566,14 +592,14 @@ fn v4_crash_between_snapshot_and_wal_truncation_with_approx_rule() {
     );
 }
 
-/// Torn-write safety: truncating a V4 snapshot file to various byte counts must
+/// Torn-write safety: truncating a V5 snapshot file to various byte counts must
 /// always return a Corrupt error, never a silently-wrong database.
 /// Covers both mid-header (bad-magic) and mid-payload (crc-mismatch) truncation.
-/// Exercises a snapshot that includes both an exact rule and an approximate/IVF rule,
-/// ensuring V4's ivf_state section is part of the torn region.
+/// Exercises a snapshot that includes an exact rule, an approximate/IVF rule,
+/// and view_defs — ensuring the V5 view_defs tail region is covered by torn writes.
 #[test]
-fn v4_torn_snapshot_write_is_rejected() {
-    let dir = tmp("snap-v4-torn");
+fn v5_torn_snapshot_write_is_rejected() {
+    let dir = tmp("snap-v5-torn");
     {
         let mut db = GraphDb::open(&dir).unwrap();
         // Exact rule: two nodes with overlapping tags → derived edges.
@@ -627,6 +653,17 @@ fn v4_torn_snapshot_write_is_rejected() {
             approximate: true,
         })
         .unwrap();
+        // V5: create a view so view_defs region is populated in the snapshot.
+        db.create_view(ViewDef {
+            name: "deg_rel".into(),
+            label: "A".into(),
+            view_prop: "deg_rel".into(),
+            source: ViewSource::Degree {
+                edge_type: "REL".into(),
+                direction: Direction::Out,
+            },
+        })
+        .unwrap();
         db.snapshot().unwrap();
     }
 
@@ -636,13 +673,14 @@ fn v4_torn_snapshot_write_is_rejected() {
     assert!(n > 20, "snapshot must be non-trivial; got {n} bytes");
 
     // Truncation points: mid-header (5 B), just-past-header (10 B),
-    // early payload (n/3), mid-payload (n/2), one byte short (n-1).
+    // early payload (n/3), mid-payload (n/2), late payload landing inside the
+    // view_defs tail region (n*2/3, n*3/4, n-5), one byte short (n-1).
     // Any truncation must yield Err — never a silently-wrong open.
-    for &trunc in &[5usize, 10, n / 3, n / 2, n - 1] {
+    for &trunc in &[5usize, 10, n / 3, n / 2, n * 2 / 3, n * 3 / 4, n.saturating_sub(5), n - 1] {
         std::fs::write(&path, &good[..trunc]).unwrap();
         assert!(
             GraphDb::open(&dir).is_err(),
-            "expected Err for {trunc}-byte truncation of {n}-byte V4 snapshot",
+            "expected Err for {trunc}-byte truncation of {n}-byte V5 snapshot",
         );
     }
 }

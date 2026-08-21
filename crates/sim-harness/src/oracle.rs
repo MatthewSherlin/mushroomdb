@@ -1,5 +1,5 @@
 use core_api::{Direction, Value};
-use core_rules::{evaluate, NodeView, RuleDef};
+use core_rules::{evaluate, NodeView, RuleDef, ViewDef};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Obviously-correct reference. No ids, no interning, no persistence.
@@ -10,6 +10,7 @@ pub struct Oracle {
     node_order: Vec<String>,                        // insertion order = dense id order
     edges: BTreeSet<(String, String, String)>,      // (etype, src, dst) — user-inserted edges
     rules: Vec<RuleDef>,                            // registered rules
+    views: Vec<ViewDef>,                            // registered materialized views
 }
 
 impl Oracle {
@@ -112,6 +113,29 @@ impl Oracle {
     pub fn delete_rule(&mut self, name: &str) -> bool {
         if let Some(pos) = self.rules.iter().position(|r| r.name == name) {
             self.rules.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Register a materialized view. Returns false if a view with the same
+    /// name or the same `view_prop` already exists.
+    pub fn create_view(&mut self, def: ViewDef) -> bool {
+        if self.views.iter().any(|v| v.name == def.name) {
+            return false;
+        }
+        if self.views.iter().any(|v| v.view_prop == def.view_prop) {
+            return false;
+        }
+        self.views.push(def);
+        true
+    }
+
+    /// Remove a view by name. Returns false if no view with that name exists.
+    pub fn delete_view(&mut self, name: &str) -> bool {
+        if let Some(pos) = self.views.iter().position(|v| v.name == name) {
+            self.views.remove(pos);
             true
         } else {
             false

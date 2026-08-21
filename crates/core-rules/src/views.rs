@@ -355,32 +355,6 @@ impl ViewStore {
         }
     }
 
-    /// Called in `DeleteNode` just after `engine.on_node_removed` and BEFORE
-    /// user-edge sweep.  For each remaining (user) edge touching `node`,
-    /// removes it from topo and updates the neighbor's view values.
-    ///
-    /// Also removes `node`'s own view values, though `props.remove_all` will
-    /// clean them up regardless.
-    pub fn on_node_pre_remove(
-        &self,
-        node: u32,
-        props: &mut ColumnStore,
-        topo: &Topology,
-        ids: &IdMap,
-        syms: &Interner,
-        labels: &[u32],
-    ) {
-        // Remove node's own view values now (remove_all will also do this, but
-        // doing it here keeps the view invariant consistent during the sweep).
-        for def in self.views.values() {
-            props.remove(node, &def.view_prop);
-        }
-        // Trigger neighbor updates for each view that watches an edge type
-        // incident on node (already handled incrementally via on_edge_changed
-        // calls below in apply — this method is a no-op hook for future use).
-        let _ = (topo, ids, syms, labels); // used by caller via on_edge_changed
-    }
-
     /// Initialize view values for a newly inserted node.
     ///
     /// Sets Degree, Count, and Sum views to their zero values (0 / 0.0).
@@ -406,9 +380,9 @@ impl ViewStore {
                     }
                 }
                 ViewSource::NeighborAgg { agg: AggFn::Sum, .. } => {
-                    if props.get(node, &def.view_prop).is_none() {
-                        props.set(node, &def.view_prop, Value::Float(0.0));
-                    }
+                    // Always set to 0.0 — init is only called for freshly-inserted
+                    // nodes whose view_prop does not yet exist.
+                    props.set(node, &def.view_prop, Value::Float(0.0));
                 }
                 _ => {} // Avg / Min / Max: absent until neighbors exist
             }
@@ -452,8 +426,8 @@ fn backfill_view(
         return;
     };
     let Some(et_sym) = syms.get(def.edge_type()) else {
-        // Edge type not yet interned → all degrees/aggregates are 0/None.
-        // Set 0 for Degree / Count; leave absent for other aggs.
+        // Edge type not yet interned → no such edges exist.
+        // Set zero for Degree / Count / Sum; leave absent for Avg / Min / Max.
         for id in 0..ids.len() as u32 {
             if labels.get(id as usize).copied() == Some(label_sym) {
                 match &def.source {
@@ -464,6 +438,9 @@ fn backfill_view(
                         agg: AggFn::Count, ..
                     } => {
                         props.set(id, &def.view_prop, Value::Int(0));
+                    }
+                    ViewSource::NeighborAgg { agg: AggFn::Sum, .. } => {
+                        props.set(id, &def.view_prop, Value::Float(0.0));
                     }
                     _ => {}
                 }
@@ -507,7 +484,22 @@ pub fn compute_view_value(
         return None;
     }
 
-    let et_sym = syms.get(def.edge_type())?;
+    // If the edge_type has never been used it is not in the symbol table.
+    // There are zero such edges, so Degree/Count return 0, Sum returns 0.0,
+    // and Avg/Min/Max are absent.
+    let et_sym = match syms.get(def.edge_type()) {
+        Some(s) => s,
+        None => {
+            return match &def.source {
+                ViewSource::Degree { .. } => Some(Value::Int(0)),
+                ViewSource::NeighborAgg {
+                    agg: AggFn::Count, ..
+                } => Some(Value::Int(0)),
+                ViewSource::NeighborAgg { agg: AggFn::Sum, .. } => Some(Value::Float(0.0)),
+                ViewSource::NeighborAgg { .. } => None,
+            };
+        }
+    };
     let direction = def.direction();
     let neighbors = topo.neighbors(et_sym, direction, node);
 

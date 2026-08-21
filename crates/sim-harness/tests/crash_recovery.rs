@@ -1,5 +1,6 @@
 use core_api::{
-    AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, RuleStats, Stats, Value,
+    AggFn, AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, RuleStats, Stats,
+    Value, ViewDef, ViewSource,
 };
 use core_storage::fs::Fs;
 use sim_harness::{Oracle, SimFs, APPROX_RECALL_FLOOR_RECOVERY};
@@ -1426,6 +1427,129 @@ fn write_batch_composition_sweep() {
                 None,
                 "crash_at={crash_at}: c2.note must not exist before second write_batch"
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Materialized-view crash sweep (C-2)
+// ---------------------------------------------------------------------------
+
+/// Keys used by `workload_with_views`.
+const VIEW_WORKLOAD_KEYS: &[&str] = &["vn0", "vn1", "vn2", "vn3", "vn4", "vn5"];
+
+/// Simple workload: 5 nodes + chain edges + two views + snapshot + post-snapshot mutations.
+///
+/// Creates a V5 snapshot containing view_defs.  Post-snapshot ops exercise
+/// the incremental-maintenance path after snapshot reload.
+fn workload_with_views<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    // 5 nodes with a "score" prop.
+    let base_keys = &VIEW_WORKLOAD_KEYS[..5];
+    for (i, key) in base_keys.iter().enumerate() {
+        db.insert_node(
+            "VW",
+            key,
+            vec![("score".into(), Value::Int(i as i64 * 10))],
+        )?;
+    }
+    // Chain edges: vn0→vn1, vn1→vn2, vn2→vn3, vn3→vn4.
+    for i in 0..4 {
+        db.insert_edge("VE", base_keys[i], base_keys[i + 1])?;
+    }
+
+    // Degree view (Out): how many VE-out edges does each VW node have?
+    db.create_view(ViewDef {
+        name: "vn_deg".into(),
+        label: "VW".into(),
+        view_prop: "vn_deg".into(),
+        source: ViewSource::Degree {
+            edge_type: "VE".into(),
+            direction: Direction::Out,
+        },
+    })?;
+
+    // NeighborAgg/Count view (In): how many in-neighbors have "score"?
+    db.create_view(ViewDef {
+        name: "vn_cnt".into(),
+        label: "VW".into(),
+        view_prop: "vn_cnt".into(),
+        source: ViewSource::NeighborAgg {
+            edge_type: "VE".into(),
+            direction: Direction::In,
+            agg: AggFn::Count,
+            prop: "score".into(),
+        },
+    })?;
+
+    // Snapshot: V5 snapshot with view_defs populated.
+    db.snapshot()?;
+
+    // Post-snapshot: back-edge to test incremental update after reload.
+    db.insert_edge("VE", VIEW_WORKLOAD_KEYS[4], VIEW_WORKLOAD_KEYS[0])?;
+
+    // Add a sixth node and connect it.
+    db.insert_node("VW", "vn5", vec![("score".into(), Value::Int(50))])?;
+    db.insert_edge("VE", "vn5", VIEW_WORKLOAD_KEYS[0])?;
+
+    Ok(())
+}
+
+/// Byte-offset crash sweep for the view workload.
+///
+/// At every crash point: (a) recovery never panics; (b) for each live view,
+/// every existing node's stored incremental value equals the scratch recompute.
+/// Covers recovery from a V5 snapshot containing view_defs.
+#[test]
+fn recovery_byte_sweep_views() {
+    let total_bytes = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        workload_with_views(&mut db).unwrap();
+        db.into_fs().total_appended()
+    };
+    assert!(total_bytes > 0, "view workload must append bytes");
+
+    for crash_at in 0..=total_bytes {
+        let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();
+        let _ = workload_with_views(&mut db);
+        let survivor = db.into_fs().surviving_state();
+
+        // Invariant (a): open_with never panics or errors.
+        let recovered = GraphDb::open_with(survivor).unwrap();
+
+        // Invariant (b): for each live view, stored == scratch recompute.
+        for view_def in recovered.views() {
+            for key in VIEW_WORKLOAD_KEYS {
+                if !recovered.has_node(key) {
+                    continue;
+                }
+                let stored = recovered.get_view_prop(key, &view_def.view_prop).cloned();
+                let scratch = recovered.scratch_view_value(key, &view_def.name);
+                match &view_def.source {
+                    ViewSource::NeighborAgg {
+                        agg: AggFn::Sum | AggFn::Avg,
+                        ..
+                    } => match (stored, scratch) {
+                        (None, None) => {}
+                        (Some(Value::Float(s)), Some(Value::Float(sc))) => assert!(
+                            (s - sc).abs() < 1e-6,
+                            "crash_at={crash_at}: view {} key={key}: stored {s} scratch {sc}",
+                            view_def.name
+                        ),
+                        (s, sc) => assert_eq!(
+                            s,
+                            sc,
+                            "crash_at={crash_at}: view {} key={key}: type mismatch",
+                            view_def.name
+                        ),
+                    },
+                    _ => assert_eq!(
+                        stored,
+                        scratch,
+                        "crash_at={crash_at}: view {} key={key}: stored {stored:?} scratch {scratch:?}",
+                        view_def.name
+                    ),
+                }
+            }
         }
     }
 }
