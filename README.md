@@ -81,6 +81,33 @@ receipt observes the state that produced the event. Each subscription has a
 marker and continue (no disconnection). See [docs/site/subscriptions.md](docs/site/subscriptions.md)
 for the full API reference.
 
+### Explain any edge as of any past commit
+
+mushroomdb's WAL is the complete history of your graph. `open_at` replays it
+to any past commit, giving you a read-only view of the graph — and its derived
+edges — at any point in time:
+
+```rust
+// What edges existed at commit 5?
+let db = GraphDb::open_at(&dir, 5)?;
+
+// Why did this edge exist then?
+let exps = db.explain("alice", "bob")?;
+// → [{rule: "skill_fit", edge_type: "FIT", weight: 0.87, …}]
+```
+
+From the CLI:
+
+```sh
+mushroomdb asof ./db --commit 5 --query "MATCH (n:Person)-[r:FIT]->(p:Project) RETURN n, p, r.score"
+# as-of commit 5 of 42
+# columns: n, p, score
+#   n=alice  p=proj-01  score=0.87
+```
+
+See [docs/site/timetravel.md](docs/site/timetravel.md) for the full API,
+WAL-retention notes, and replay-cost caveats.
+
 ---
 
 ## Quickstart

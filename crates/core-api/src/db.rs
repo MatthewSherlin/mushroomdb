@@ -371,11 +371,42 @@ pub struct GraphDb<F: Fs> {
     /// [`DEFAULT_SUB_CAPACITY`]; can be overridden via [`set_sub_capacity`]
     /// to test Lagged behaviour with small queues.
     sub_capacity: usize,
+    /// True for as-of instances opened via [`GraphDb::open_at`].
+    /// Every mutation method and `snapshot()` returns [`GraphError::ReadOnly`]
+    /// when this flag is set.
+    read_only: bool,
+    /// Total WAL commit count at the time [`open_at`] was called.
+    /// 0 for normal (non-as-of) instances.
+    total_wal_commits: u64,
 }
 
 impl GraphDb<RealFs> {
     pub fn open(dir: &std::path::Path) -> Result<Self> {
         Self::open_with(RealFs::new(dir)?)
+    }
+
+    /// Open a read-only view of the database as it existed after `commit`.
+    ///
+    /// Commit indices are 0-based over the current WAL: commit 0 is the state
+    /// after the first WAL frame, commit N-1 is the state after the N-th (most
+    /// recent) frame.  Call [`GraphDb::open`] to read the full current state.
+    ///
+    /// **WAL-only replay.** The snapshot file (if any) is ignored.  mushroomdb's
+    /// [`GraphDb::snapshot`] truncates the WAL to empty when it runs, so
+    /// as-of can only reach commits recorded in the current WAL (those written
+    /// after the most recent snapshot, or all commits if no snapshot was ever
+    /// taken).  Commit 0 in `open_at` always refers to the first frame in the
+    /// WAL that exists on disk, not the first ever write to the database.
+    ///
+    /// **Read-only.** Every mutation method and `snapshot()` on the returned
+    /// instance returns [`GraphError::ReadOnly`].  Queries, `explain()`, and
+    /// `stats()` work normally.
+    ///
+    /// # Errors
+    /// - [`GraphError::CommitOutOfRange`] if `commit >= wal_commit_count` (including
+    ///   when the WAL is empty after a snapshot).
+    pub fn open_at(dir: &std::path::Path, commit: u64) -> Result<Self> {
+        Self::open_at_with(RealFs::new(dir)?, commit)
     }
 }
 
@@ -394,6 +425,8 @@ impl<F: Fs> GraphDb<F> {
             commit_seq: 0,
             subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
+            read_only: false,
+            total_wal_commits: 0,
         };
         let snap_bytes = db.fs.read(FileId::Snapshot)?;
         if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
@@ -465,6 +498,67 @@ impl<F: Fs> GraphDb<F> {
         // replaying subscribers; the mechanism is already in place.
         let _ = db.engine.drain_deltas(); // belt-and-braces no-op after loop drain
         Ok(db)
+    }
+
+    /// WAL-only as-of replay for [`GraphDb::open_at`].
+    ///
+    /// Snapshot is deliberately not loaded; see [`GraphDb::open_at`] for the
+    /// design rationale.  The per-frame drain mirrors `open_with` exactly so
+    /// pending_delta_count is 0 on exit.
+    fn open_at_with(fs: F, commit: u64) -> Result<Self> {
+        let mut db = Self {
+            fs,
+            ids: IdMap::new(),
+            syms: Interner::new(),
+            topo: Topology::new(),
+            props: ColumnStore::new(),
+            labels: Vec::new(),
+            edge_props: EdgeProps::new(),
+            engine: RuleEngine::new(),
+            event_sink: None,
+            commit_seq: 0,
+            subscriptions: Vec::new(),
+            sub_capacity: DEFAULT_SUB_CAPACITY,
+            read_only: false, // set to true after replay
+            total_wal_commits: 0,
+        };
+        let bytes = db.fs.read(FileId::Wal)?;
+        let (records, _valid_len) = decode_all(&bytes);
+        let total = records.len() as u64;
+        if commit >= total {
+            return Err(GraphError::CommitOutOfRange { commit, total });
+        }
+        // Replay frames 0..=commit — identical drain pattern to open_with so
+        // the pending_delta_count == 0 invariant holds.
+        for rec in records.into_iter().take((commit + 1) as usize) {
+            db.apply(&rec)?;
+            // Drain per-frame: no subscriber exists; discard is correct.
+            // This keeps memory O(1) and mirrors the open_with seam exactly.
+            let _ = db.engine.drain_deltas();
+        }
+        // Pin: pending_delta_count must be 0 after as-of replay, mirroring T1's
+        // post-loop assert in open_with.
+        debug_assert_eq!(
+            db.engine.pending_delta_count(),
+            0,
+            "pending_deltas non-empty after open_at replay — \
+             per-frame drain must run inside the loop to keep memory O(1)"
+        );
+        let _ = db.engine.drain_deltas(); // belt-and-braces no-op
+        db.read_only = true;
+        db.total_wal_commits = total;
+        Ok(db)
+    }
+
+    /// Whether this instance is a read-only as-of view.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Total number of WAL commits at the time [`open_at`] was called.
+    /// Returns 0 for normal (non-as-of) instances.
+    pub fn total_wal_commits(&self) -> u64 {
+        self.total_wal_commits
     }
 
     /// Apply a record to in-memory state. Used by both live writes and replay,
@@ -744,6 +838,10 @@ impl<F: Fs> GraphDb<F> {
         rec: WalRecord,
         ingest: Option<(String, usize)>,
     ) -> Result<()> {
+        // Read-only guard: as-of instances must never write the WAL.
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         // Invariant (I-1): no stale deltas may enter from a previous apply.
         // If any engine method ever accumulates deltas before erroring, they would
         // contaminate the *next* commit's event stream. This assert fires in debug
@@ -1152,6 +1250,11 @@ impl<F: Fs> GraphDb<F> {
         ops: Vec<BatchOp>,
         ingest: Option<(String, usize)>,
     ) -> Result<(usize, usize)> {
+        // Read-only guard: catches empty-batch calls before the early-return
+        // that skips log_then_apply_with, ensuring all mutation entry points fail.
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         let recs = {
             let mut preview = MutPreview::new(self);
             let mut recs = Vec::with_capacity(ops.len());
@@ -1249,6 +1352,9 @@ impl<F: Fs> GraphDb<F> {
         key: &str,
         props: Vec<(String, Value)>,
     ) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         MutPreview::new(self).check_insert_node(key)?;
         self.log_then_apply(WalRecord::InsertNode {
             label: label.into(),
@@ -1258,6 +1364,9 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn insert_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         if !MutPreview::new(self).prepare_insert_edge(edge_type, src_key, dst_key)? {
             return Ok(false);
         }
@@ -1270,6 +1379,9 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn set_prop(&mut self, key: &str, field: &str, value: Value) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         MutPreview::new(self).check_live_key(key)?;
         self.log_then_apply(WalRecord::SetProp {
             key: key.into(),
@@ -1281,6 +1393,9 @@ impl<F: Fs> GraphDb<F> {
     /// Remove a property. Returns `Ok(false)` (and does not log) if the field
     /// is already absent. Unknown or tombstoned keys are `Err(KeyNotFound)`.
     pub fn remove_prop(&mut self, key: &str, field: &str) -> Result<bool> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         if !MutPreview::new(self).prepare_remove_prop(key, field)? {
             return Ok(false);
         }
@@ -1296,6 +1411,9 @@ impl<F: Fs> GraphDb<F> {
     /// provenance, or a pair a live rule would derive — are `Err(RuleOwned)`
     /// (the rule would just put the edge back; delete or change the rule).
     pub fn delete_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         if !MutPreview::new(self).prepare_delete_edge(edge_type, src_key, dst_key)? {
             return Ok(false);
         }
@@ -1315,6 +1433,9 @@ impl<F: Fs> GraphDb<F> {
     /// Returns a [`DeleteReport`] with counts of manual and derived edges
     /// removed (computed from live state before the deletion is applied).
     pub fn delete_node(&mut self, key: &str) -> Result<DeleteReport> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         let id = self
             .ids
             .get(key)
@@ -1364,6 +1485,9 @@ impl<F: Fs> GraphDb<F> {
     /// Validation and duplicate-name check run before logging so invalid rules
     /// never enter the WAL.
     pub fn create_rule(&mut self, def: RuleDef) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         MutPreview::new(self).check_create_rule(&def)?;
         let def_bytes = bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
             detail: format!("serialize rule: {e}"),
@@ -1373,6 +1497,9 @@ impl<F: Fs> GraphDb<F> {
 
     /// WAL-log rule deletion. Returns RuleNotFound if the rule does not exist.
     pub fn delete_rule(&mut self, name: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         MutPreview::new(self).check_delete_rule(name)?;
         self.log_then_apply(WalRecord::DeleteRule { name: name.into() })
     }
@@ -1392,6 +1519,9 @@ impl<F: Fs> GraphDb<F> {
     /// true. Counts as a fire evaluation (see [`RuleStats::fires`]).
     /// Unknown rule → `RuleNotFound`, nothing logged.
     pub fn rebuild_rule(&mut self, name: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         if !self.engine.rules().any(|r| r.name == name) {
             return Err(GraphError::RuleNotFound { name: name.into() });
         }
@@ -2139,6 +2269,9 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn snapshot(&mut self) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
         let (rule_defs_typed, provenance, rule_tripped, rule_fires) = self.engine.to_persist();
         let rule_defs = rule_defs_typed
             .iter()

@@ -3,7 +3,10 @@
 //! The binary in `main.rs` stays thin — it dispatches on [`parse_args`] and
 //! prints what the lib functions return.
 
-use core_api::{Explanation, IngestOptions, Predicate, ResultSet, RuleDef, SharedDb, Stats, Value};
+use core_api::{
+    wal_commit_count_at, Explanation, GraphDb, IngestOptions, Predicate, ResultSet, RuleDef,
+    SharedDb, Stats, Value,
+};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -54,6 +57,14 @@ pub enum Command {
     Demo {
         db_dir: PathBuf,
     },
+    /// Read-only view of the database at a past commit.
+    AsOf {
+        db_dir: PathBuf,
+        /// 0-based WAL commit index to replay up to (inclusive).
+        commit: u64,
+        /// Optional Cypher read query to execute against the as-of view.
+        query: Option<String>,
+    },
     Help,
 }
 
@@ -101,6 +112,7 @@ Usage:
   mushroomdb mcp <db-dir>
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
+  mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb --help
 "
 }
@@ -117,6 +129,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "mcp" => parse_one_dir("mcp", &args[1..]).map(|db_dir| Command::Mcp { db_dir }),
         "stats" => parse_one_dir("stats", &args[1..]).map(|db_dir| Command::Stats { db_dir }),
         "demo" => parse_one_dir("demo", &args[1..]).map(|db_dir| Command::Demo { db_dir }),
+        "asof" => parse_asof(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -198,6 +211,69 @@ pub fn validate_ui_dir(dir: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(dir.to_path_buf())
+}
+
+fn parse_asof(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir = None;
+    let mut commit: Option<u64> = None;
+    let mut query: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--commit" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --commit".to_string())?;
+            commit = Some(val.parse().map_err(|_| format!("invalid commit index: {val}"))?);
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--commit=") {
+            commit = Some(val.parse().map_err(|_| format!("invalid commit index: {val}"))?);
+            i += 1;
+        } else if a == "--query" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --query".to_string())?;
+            query = Some(val.to_string());
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--query=") {
+            query = Some(val.to_string());
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_none() {
+            db_dir = Some(PathBuf::from(a));
+            i += 1;
+        } else {
+            return Err(format!("unexpected extra argument: {a}"));
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| "asof requires <db-dir>".to_string())?;
+    let commit = commit.ok_or_else(|| "asof requires --commit N".to_string())?;
+    Ok(Command::AsOf { db_dir, commit, query })
+}
+
+/// Execute an as-of query at the given commit and print results.
+pub fn run_asof(db_dir: &Path, commit: u64, query: Option<&str>) -> Result<String, CliError> {
+    let total = wal_commit_count_at(db_dir)?;
+    let db = GraphDb::open_at(db_dir, commit)?;
+    let mut out = String::new();
+    let _ = writeln!(out, "as-of commit {} of {}", commit, total);
+    if let Some(cypher) = query {
+        let params = BTreeMap::new();
+        let rs = db.query(cypher, &params)?;
+        let _ = writeln!(out, "columns: {}", rs.columns().join(", "));
+        for i in 0..rs.len() {
+            let cells: Vec<String> = rs
+                .columns()
+                .iter()
+                .map(|c| format!("{c}={}", fmt_cell(rs.get(i, c))))
+                .collect();
+            let _ = writeln!(out, "  {}", cells.join("  "));
+        }
+    }
+    Ok(out)
 }
 
 fn parse_one_dir(cmd: &str, args: &[&str]) -> Result<PathBuf, String> {

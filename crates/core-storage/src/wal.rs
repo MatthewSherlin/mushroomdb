@@ -70,6 +70,20 @@ pub fn encode_record(rec: &WalRecord) -> Vec<u8> {
     out
 }
 
+/// Count the number of complete, valid WAL frames in `bytes`.
+///
+/// Each frame counts as one commit — both `Batch` frames (which represent an
+/// atomic multi-op commit) and legacy single-op frames (InsertNode, SetProp,
+/// CreateRule, etc.).  The numbering used by `GraphDb::open_at` is 0-based:
+/// commit 0 is the first frame, commit N-1 is the last frame in a WAL with N
+/// total commits.
+///
+/// Equivalent to `decode_all(bytes).0.len() as u64`; exposed as a named
+/// function so commit-count semantics are pinned independently of the decoder.
+pub fn wal_commits(bytes: &[u8]) -> u64 {
+    decode_all(bytes).0.len() as u64
+}
+
 /// Decode as many complete, valid WAL frames as possible from `bytes`.
 ///
 /// Returns `(records, valid_len)` where `valid_len` is the byte offset of the

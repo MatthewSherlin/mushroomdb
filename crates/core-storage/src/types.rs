@@ -47,6 +47,10 @@ pub enum GraphError {
     RuleNotFound { name: String },
     QueryError { detail: String },
     IngestError { detail: String },
+    /// Attempted mutation on a read-only as-of instance.
+    ReadOnly,
+    /// Requested commit index is beyond the valid range.
+    CommitOutOfRange { commit: u64, total: u64 },
 }
 
 impl std::fmt::Display for GraphError {
@@ -61,6 +65,11 @@ impl std::fmt::Display for GraphError {
             GraphError::RuleNotFound { name } => write!(f, "rule not found: {name}"),
             GraphError::QueryError { detail } => write!(f, "query error: {detail}"),
             GraphError::IngestError { detail } => write!(f, "ingest error: {detail}"),
+            GraphError::ReadOnly => write!(f, "as-of instances are read-only"),
+            GraphError::CommitOutOfRange { commit, total } => write!(
+                f,
+                "commit {commit} is out of range; valid range is 0..{total}"
+            ),
         }
     }
 }
