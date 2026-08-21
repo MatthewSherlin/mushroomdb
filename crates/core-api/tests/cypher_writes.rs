@@ -469,15 +469,24 @@ fn detach_delete_node_removes_node_and_edges() {
     assert_eq!(db.edge_count(), 1);
 
     // DETACH DELETE removes alice + all incident edges.
-    db.query_write(
-        "MATCH (n:Person) WHERE n.id = 'alice' DETACH DELETE n",
-        &no_params(),
-    )
-    .unwrap();
+    // Scenario: 1 node + 1 manual edge → deleted column = 1 (node) + 1 (edge) = 2.
+    let rs = db
+        .query_write(
+            "MATCH (n:Person) WHERE n.id = 'alice' DETACH DELETE n",
+            &no_params(),
+        )
+        .unwrap();
 
     assert!(!db.has_node("alice"));
     assert!(db.has_node("bob"));
     assert_eq!(db.edge_count(), 0);
+
+    // Write-result 'deleted' column = nodes_deleted + edges_deleted = 1 + 1 = 2.
+    assert_eq!(
+        rs.get(0, "deleted"),
+        Some(&Value::Int(2)),
+        "DETACH DELETE must report 1 node + 1 manual edge = 2 in 'deleted'"
+    );
 }
 
 #[test]

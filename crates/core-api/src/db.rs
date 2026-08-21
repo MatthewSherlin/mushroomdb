@@ -1005,7 +1005,9 @@ impl<F: Fs> GraphDb<F> {
                 self.topo.neighbors(et, Direction::Out, id).len() as u64
                     + self.topo.neighbors(et, Direction::In, id).len() as u64;
         }
-        // Derived edges each appear exactly once in topo (either Out or In from id).
+        // For symmetric rules (e.g. Overlap), a→b and b→a are two separate directed
+        // triples in both the topo scan (Out and In from id) and in provenance_touching.
+        // The subtraction remains correct because both counts include both directions.
         let manual_edges = total_topo.saturating_sub(derived_edges);
 
         self.log_then_apply(WalRecord::DeleteNode { key: key.into() })?;
@@ -1013,6 +1015,20 @@ impl<F: Fs> GraphDb<F> {
             manual_edges,
             derived_edges,
         })
+    }
+
+    /// Return the IVF drift counter for the dst-side candidate index of `rule`.
+    /// `None` if the rule does not exist or is not approximate.
+    ///
+    /// The drift counter increments whenever a node is removed from the IVF index
+    /// (via `delete_node` or `remove_prop` on the vector field).  When drift exceeds
+    /// a threshold, callers may trigger `rebuild_rule` to re-fit cluster centroids.
+    pub fn ivf_dst_drift(&self, rule: &str) -> Option<u64> {
+        // SideIvfExport = (centroids, node→cluster, drift)
+        self.engine
+            .export_ivf_state()
+            .remove(rule)
+            .map(|(_src, dst)| dst.2)
     }
 
     /// Validate and WAL-log a new rule, then backfill derived edges inside apply.

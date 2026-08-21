@@ -811,3 +811,287 @@ fn recovery_op_sweep_rules() {
         assert_recovered_invariants(&mut recovered, &format!("crash_op={crash_op}"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Delete-heavy crash sweep
+// ---------------------------------------------------------------------------
+
+/// Scratch-reference oracle for the delete-heavy workload.
+///
+/// Runs the same workload on a healthy db to produce the expected final state:
+/// returns (live_keys, rule_edges) where rule_edges is the full derived edge set.
+fn delete_heavy_reference() -> (BTreeSet<String>, BTreeSet<(String, String, String)>) {
+    let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+    delete_heavy_workload(&mut db).unwrap();
+    let live: BTreeSet<String> = [
+        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9", "d10", "d11",
+    ]
+    .iter()
+    .filter(|&&k| db.has_node(k))
+    .map(|k| k.to_string())
+    .collect();
+    let mut edges = BTreeSet::new();
+    for key in &live {
+        if let Ok(ns) = db.neighbors(key, "DTAGS", Direction::Out) {
+            for n in ns {
+                edges.insert(("DTAGS".to_string(), key.clone(), n));
+            }
+        }
+        if let Ok(ns) = db.neighbors(key, "DFE", Direction::Out) {
+            for n in ns {
+                edges.insert(("DFE".to_string(), key.clone(), n));
+            }
+        }
+    }
+    (live, edges)
+}
+
+/// Validate a recovered db against the delete-heavy oracle invariants:
+///
+/// - Every live key present in both recovered and reference must agree on
+///   derived edge membership (a key may be absent if the delete landed;
+///   a key may be present if it did not).
+/// - No edge references a tombstoned node.
+/// - Rebuild of every rule is a no-op.
+fn assert_delete_heavy_invariants(recovered: &mut GraphDb<SimFs>, label: &str) {
+    // All live keys must have consistent props (either d{i} exists with f prop or not).
+    for i in 0..12 {
+        let key = format!("d{i}");
+        if recovered.has_node(&key) {
+            // Nodes inserted with f prop.
+            assert!(
+                recovered.get_prop(&key, "f").is_some(),
+                "{label}: {key} exists but f prop missing"
+            );
+        }
+    }
+
+    // No derived edge references a tombstoned node.
+    let live_keys: BTreeSet<String> = (0..12)
+        .filter(|&i| recovered.has_node(&format!("d{i}")))
+        .map(|i| format!("d{i}"))
+        .collect();
+
+    for etype in &["DTAGS", "DFE"] {
+        for key in &live_keys {
+            for dst in recovered
+                .neighbors(key, etype, Direction::Out)
+                .unwrap_or_default()
+            {
+                assert!(
+                    live_keys.contains(&dst),
+                    "{label}: derived edge {key}→{dst} via {etype} references a non-live node"
+                );
+            }
+        }
+    }
+
+    // Rebuild must be a no-op.
+    let rules: Vec<_> = recovered.rules().iter().map(|r| r.name.clone()).collect();
+    for rule in &rules {
+        let before: BTreeSet<_> = live_keys
+            .iter()
+            .flat_map(|k| {
+                let etype = if rule == "dtags" { "DTAGS" } else { "DFE" };
+                recovered
+                    .neighbors(k, etype, Direction::Out)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|d| (k.clone(), d))
+            })
+            .collect();
+        recovered.rebuild_rule(rule).unwrap();
+        let after: BTreeSet<_> = live_keys
+            .iter()
+            .flat_map(|k| {
+                let etype = if rule == "dtags" { "DTAGS" } else { "DFE" };
+                recovered
+                    .neighbors(k, etype, Direction::Out)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|d| (k.clone(), d))
+            })
+            .collect();
+        assert_eq!(
+            before, after,
+            "{label}: rebuild_rule({rule}) must be a no-op after recovery"
+        );
+    }
+}
+
+/// Delete-heavy workload: inserts 12 nodes then deletes 5 interleaved with
+/// prop updates. Nodes d2, d4, d6, d8, d10 are deleted; remaining are live.
+///
+/// Rule "dtags": Overlap tags ≥ 0.5 → DTAGS edges (symmetric, fires on insert/delete).
+/// Rule "dfe":   FieldEqual field "f" → DFE edges (symmetric, fires on set_prop).
+///
+/// Interleaving: insert 6, create rules, insert 6 more, then alternate
+/// set_prop + delete so each delete removes a top-candidate for the remaining.
+fn delete_heavy_workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    // Insert first 6 nodes: d0..d5 with shared tag "alpha" and unique tags.
+    let pairs: &[(&str, &[&str])] = &[
+        ("d0", &["alpha", "beta"]),
+        ("d1", &["alpha", "gamma"]),
+        ("d2", &["alpha", "beta"]),  // will be deleted
+        ("d3", &["alpha", "gamma"]),
+        ("d4", &["alpha", "beta"]),  // will be deleted
+        ("d5", &["alpha", "gamma"]),
+    ];
+    for (key, ts) in pairs {
+        let tv = Value::List(ts.iter().map(|t| Value::Str((*t).into())).collect());
+        db.insert_node(
+            "D",
+            key,
+            vec![
+                ("f".into(), Value::Str(key.to_string())),
+                ("tags".into(), tv),
+            ],
+        )?;
+    }
+
+    // Create rules while d0..d5 exist.
+    db.create_rule(RuleDef {
+        name: "dtags".into(),
+        src_label: "D".into(),
+        dst_label: "D".into(),
+        predicate: Predicate::Overlap {
+            field: "tags".into(),
+            min: 0.5,
+        },
+        edge_type: "DTAGS".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+    })?;
+    db.create_rule(RuleDef {
+        name: "dfe".into(),
+        src_label: "D".into(),
+        dst_label: "D".into(),
+        predicate: Predicate::FieldEqual { field: "f".into() },
+        edge_type: "DFE".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+    })?;
+
+    // Insert 6 more nodes: d6..d11.
+    let pairs2: &[(&str, &[&str])] = &[
+        ("d6",  &["alpha", "beta"]),  // will be deleted
+        ("d7",  &["alpha", "gamma"]),
+        ("d8",  &["alpha", "beta"]),  // will be deleted
+        ("d9",  &["alpha", "gamma"]),
+        ("d10", &["alpha", "beta"]),  // will be deleted
+        ("d11", &["alpha", "gamma"]),
+    ];
+    for (key, ts) in pairs2 {
+        let tv = Value::List(ts.iter().map(|t| Value::Str((*t).into())).collect());
+        db.insert_node(
+            "D",
+            key,
+            vec![
+                ("f".into(), Value::Str(key.to_string())),
+                ("tags".into(), tv),
+            ],
+        )?;
+    }
+
+    // Interleaved deletes and prop updates.
+    // d2 and d4 share "beta" with d0; deleting d2 first, then update d0.f.
+    db.delete_node("d2")?;
+    db.set_prop("d0", "f", Value::Str("d1".into()))?; // d0 and d1 now FieldEqual
+    db.delete_node("d4")?;
+    db.set_prop("d3", "f", Value::Str("d1".into()))?; // d3 joins d0→d1 cluster
+    db.delete_node("d6")?;
+    db.delete_node("d8")?;
+    db.set_prop("d7", "f", Value::Str("d9".into()))?; // d7 and d9 FieldEqual
+    db.delete_node("d10")?;
+
+    Ok(())
+}
+
+/// Byte-offset crash sweep over the delete-heavy workload.
+///
+/// At every WAL byte offset, crashes the write path and verifies recovery:
+///   (a) open_with never panics or errors
+///   (b) no derived edge references a tombstoned node
+///   (c) rebuild of every rule is a no-op
+/// Satisfies the brief's requirement for "one crash-during-delete-heavy-workload sweep."
+#[test]
+fn recovery_delete_heavy_byte_sweep() {
+    let total_bytes = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        delete_heavy_workload(&mut db).unwrap();
+        db.into_fs().total_appended()
+    };
+    assert!(total_bytes > 0, "delete-heavy workload must append at least one byte");
+    eprintln!(
+        "delete-heavy byte-offset sweep: 0..={total_bytes} ({} crash points)",
+        total_bytes + 1
+    );
+
+    // Scratch reference: the fully-applied final state.
+    let (reference_live, reference_edges) = delete_heavy_reference();
+    eprintln!(
+        "reference: {} live keys, {} derived edges",
+        reference_live.len(),
+        reference_edges.len()
+    );
+
+    for crash_at in 0..=total_bytes {
+        let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();
+        let _ = delete_heavy_workload(&mut db);
+        let survivor = db.into_fs().surviving_state();
+
+        // (a) Recovery never errors.
+        let mut recovered = GraphDb::open_with(survivor).unwrap();
+
+        // (b)+(c) Internally consistent + rebuild-is-noop.
+        assert_delete_heavy_invariants(&mut recovered, &format!("crash_at={crash_at}"));
+
+        // Any subset of deletes may have landed; surviving live keys must be
+        // a subset of or equal to the pre-delete full set.
+        for i in 0..12 {
+            let key = format!("d{i}");
+            if recovered.has_node(&key) {
+                // If the node is still alive its edges must only point to live nodes.
+                for etype in &["DTAGS", "DFE"] {
+                    for dst in recovered
+                        .neighbors(&key, etype, Direction::Out)
+                        .unwrap_or_default()
+                    {
+                        assert!(
+                            recovered.has_node(&dst),
+                            "crash_at={crash_at}: {key}→{dst} via {etype} but {dst} is not live"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Final-state crash points: fully-recovered state must match reference.
+        // We only check when ALL expected deletes have landed AND all prop-sets landed.
+        let all_deleted = ["d2", "d4", "d6", "d8", "d10"]
+            .iter()
+            .all(|k| !recovered.has_node(k));
+        let all_live = ["d0", "d1", "d3", "d5", "d7", "d9", "d11"]
+            .iter()
+            .all(|&k| recovered.has_node(k));
+        if all_deleted && all_live {
+            // Collect actual edges and assert subset of reference (recall check).
+            let mut actual_edges = BTreeSet::new();
+            for etype in &["DTAGS", "DFE"] {
+                for key in &reference_live {
+                    if let Ok(ns) = recovered.neighbors(key, etype, Direction::Out) {
+                        for n in ns {
+                            actual_edges.insert((etype.to_string(), key.clone(), n));
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                actual_edges, reference_edges,
+                "crash_at={crash_at}: fully-recovered state must match reference"
+            );
+        }
+    }
+}

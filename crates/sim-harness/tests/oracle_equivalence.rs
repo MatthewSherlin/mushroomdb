@@ -1456,3 +1456,171 @@ fn approximate_recall_5k_timing() {
         exact_edges.len()
     );
 }
+
+/// IVF cleanup on delete under approximate=true rule.
+///
+/// Setup: 20 2-D unit vectors in 4 clusters; approximate VectorSimilar rule with
+/// IVF genuinely active (n=20 > IVF_K_MIN=4, so scan-all fallback does not fire).
+///
+/// After inserting all nodes and creating the rule (nodes first, rule second so IVF
+/// fits during backfill — same pattern as `approximate_recall_above_floor_quiesced`):
+///   (i)  Delete one node from cluster 0 (v0).
+///   (ii) Assert v0 never appears as a derived-edge dst or src afterward.
+///   (iii) Assert the post-delete derived set matches a reference built without v0.
+///   (iv) Assert the IVF dst-side drift counter > 0 (removal incremented it).
+#[test]
+fn ivf_cleanup_on_delete_under_approximate_rule() {
+    // 20 2-D unit vectors matching the existing approximate-rule tests.
+    // Cluster 0: v0..v3 (near [1,0]), Cluster 1: v4..v7 (near [0,1]),
+    // Cluster 2: v8..v11 (near [-1,0]), Cluster 3: v12..v15 (near [0,-1]),
+    // Extras: v16..v19 (diagonals).
+    let vecs: &[[f64; 2]] = &[
+        [1.0, 0.0],   // v0 — will be deleted
+        [0.98, 0.2],
+        [0.96, 0.28],
+        [0.97, 0.24],
+        [0.0, 1.0],
+        [0.1, 0.995],
+        [0.05, 0.999],
+        [0.08, 0.997],
+        [-1.0, 0.0],
+        [-0.98, 0.2],
+        [-0.96, -0.28],
+        [-0.97, 0.24],
+        [0.0, -1.0],
+        [0.1, -0.995],
+        [-0.05, -0.999],
+        [-0.08, -0.997],
+        [0.7, 0.714],
+        [0.71, 0.704],
+        [-0.7, 0.714],
+        [-0.71, -0.704],
+    ];
+    let min_sim = 0.9_f64;
+    let n = vecs.len();
+    let deleted_key = "v0";
+
+    let dir = {
+        let d =
+            std::env::temp_dir().join(format!("graphdb-ivf-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    };
+
+    // Nodes first, then rule (IVF fits at backfill time with all n nodes).
+    let mut db = GraphDb::open(&dir).unwrap();
+    let mut normalized: Vec<(String, [f64; 2])> = Vec::new();
+    for (i, v) in vecs.iter().enumerate() {
+        let key = format!("v{i}");
+        let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        let nv = [v[0] / norm, v[1] / norm];
+        let val = Value::List(vec![Value::Float(nv[0]), Value::Float(nv[1])]);
+        db.insert_node("V", &key, vec![("emb".into(), val)]).unwrap();
+        normalized.push((key, nv));
+    }
+
+    db.create_rule(RuleDef {
+        name: "ivf_sim".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: min_sim,
+        },
+        edge_type: "IVSIM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+    })
+    .unwrap();
+
+    // Drift should be 0 before any deletion (IVF just fitted).
+    let drift_before = db.ivf_dst_drift("ivf_sim").expect("rule must be approximate");
+    assert_eq!(drift_before, 0, "drift must be 0 immediately after IVF fit");
+
+    // Delete v0.
+    db.delete_node(deleted_key).unwrap();
+
+    // (i) v0 must never appear as a derived-edge source or destination.
+    for i in 0..n {
+        let src = format!("v{i}");
+        if src == deleted_key {
+            continue;
+        }
+        let dsts = db.neighbors(&src, "IVSIM", Direction::Out).unwrap_or_default();
+        assert!(
+            !dsts.contains(&deleted_key.to_string()),
+            "v0 (deleted) must not appear as dst of {src} after deletion; got {dsts:?}"
+        );
+    }
+    let src_edges_of_v0 = db
+        .neighbors(deleted_key, "IVSIM", Direction::Out)
+        .unwrap_or_default();
+    assert!(
+        src_edges_of_v0.is_empty(),
+        "v0 (deleted) must not appear as src; got {src_edges_of_v0:?}"
+    );
+
+    // (ii) Post-delete derived set matches a reference built without v0.
+    // Reference: exact pairs among remaining nodes with cosine ≥ min_sim.
+    let reference_edges: BTreeSet<(String, String)> = {
+        let mut s = BTreeSet::new();
+        for (i, (ki, ni)) in normalized.iter().enumerate() {
+            if ki == deleted_key {
+                continue;
+            }
+            for (j, (kj, nj)) in normalized.iter().enumerate() {
+                if i == j || kj == deleted_key {
+                    continue;
+                }
+                let dot = ni[0] * nj[0] + ni[1] * nj[1];
+                if dot >= min_sim {
+                    s.insert((ki.clone(), kj.clone()));
+                }
+            }
+        }
+        s
+    };
+    let engine_edges: BTreeSet<(String, String)> = {
+        let mut s = BTreeSet::new();
+        for i in 0..n {
+            let src = format!("v{i}");
+            if src == deleted_key || !db.has_node(&src) {
+                continue;
+            }
+            for dst in db.neighbors(&src, "IVSIM", Direction::Out).unwrap_or_default() {
+                s.insert((src.clone(), dst));
+            }
+        }
+        s
+    };
+    // Recall check: engine edges must be a high-recall subset of exact edges.
+    // (Approximate mode: perfect recall not guaranteed, but floor applies.)
+    let exact_count = reference_edges.len();
+    if exact_count > 0 {
+        let hit_count = reference_edges
+            .iter()
+            .filter(|e| engine_edges.contains(*e))
+            .count();
+        let r = hit_count as f64 / exact_count as f64;
+        // After deletion the cluster centroids are not re-fitted (drift > 0 but
+        // no rebuild yet), so recall may fall to the recovery floor.
+        assert!(
+            r >= APPROX_RECALL_FLOOR_RECOVERY,
+            "post-delete recall {r:.3} < floor {:.3} (exact={exact_count} hits={hit_count})",
+            APPROX_RECALL_FLOOR_RECOVERY
+        );
+    }
+    // No false positives from the deleted node.
+    for (src, dst) in &engine_edges {
+        assert_ne!(src, deleted_key, "deleted v0 must not be an edge src");
+        assert_ne!(dst, deleted_key, "deleted v0 must not be an edge dst");
+    }
+
+    // (iii) IVF dst-side drift counter incremented by the deletion.
+    let drift_after = db.ivf_dst_drift("ivf_sim").expect("rule must be approximate");
+    assert!(
+        drift_after > 0,
+        "drift counter must be > 0 after deleting a node from an IVF-indexed rule; got {drift_after}"
+    );
+}
