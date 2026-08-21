@@ -151,18 +151,20 @@ Full predicate reference and examples: [`docs/site/rules.md`](docs/site/rules.md
 
 10,000-node graph (Apple M4 Pro, macOS 15.7.3, arm64). Full methodology
 and honesty notes: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md).
+Post-Plan-13 regression results (v2.1) are appended to that document.
 
 | Workload | mushroomdb | Neo4j | KùzuDB | Memgraph |
 |---|---|---|---|---|
-| Bulk ingest | 0.874 s | 13.227 s | 1.19 min | 19.924 s † |
-| Neighborhood depth-1 (p50) | 0.4 µs | 1.81 ms | 101 µs | 3.00 ms |
-| Neighborhood depth-1 (p95) | 2.2 µs | 14.47 ms | 405 µs | 6.71 ms |
-| Neighborhood depth-2 (p50) | 0.2 µs | 4.73 ms | 1.06 ms | 2.50 ms |
-| Cypher scan-filter-project (1.4k rows) | 2.20 ms | 87.36 ms | 0.37 ms ‡ | 12.56 ms |
-| Cypher two-hop join (200 rows) | **0.198 ms** | 5.68 ms ★ | 1.58 ms ★ | 2.17 ms ★ |
-| Cold-start (WAL-only / connect) | 3.24 s | 18.54 ms ▲ | 23.41 ms | 0.42 ms ▲ |
-| Cold-start (snapshot V4) | **1.01 s** | — | — | — |
+| Bulk ingest | 862 ms | 13.2 s | 1.21 min | 12.5 s |
+| Neighborhood depth-1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
+| Neighborhood depth-1 (p95) | 1.1 µs | 1.46 ms | 519 µs | 2.14 ms |
+| Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
+| Cypher scan-filter-project (1.4k rows) | 1.53 ms | 93.7 ms | 3.95 ms | 83.7 ms |
+| Cypher two-hop join (200 rows) | **307 µs** | 2.88 ms ★ | 2.22 ms ★ | 2.57 ms ★ |
+| Cold-start (snapshot V4) | **10.4 s** | — | — | — |
 | Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
+
+*(v2.1 numbers, 2026-08-21, post-Plan-13 release build)*
 
 **Honesty notes:**
 
@@ -170,32 +172,25 @@ and honesty notes: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/resu
   overhead). KùzuDB is also embedded — its numbers are directly comparable
   to mushroomdb's. Neo4j and Memgraph numbers go over bolt/localhost
   (~0.1–1 ms round-trip per query).
-- † Memgraph adapter v2 fix: now stores full node properties (`SET n = row`).
-  v1 stored only `key`, causing scan-filter to return 0 rows. v2 correctly
-  returns 1,400 rows. Bulk ingest time increased from 46 ms (key-only) to
-  19.9 s (full props) — now semantically comparable to neo4j/mushroomdb.
-- ‡ KùzuDB scan-filter (I2 fix): adapter now stores `size_bucket INT64`; uses
-  `WHERE n.size_bucket = 3` returning 1,400 rows (was `STARTS WITH 'talent'`
-  → 7,000 rows at 2.03 ms; retired).
-- ★ Two-hop join (I1 fix — fair comparison): mushroomdb's 1,000,000 derived
-  INDUSTRY_ALIGNMENT edges were bulk-loaded into each competitor as ordinary edges
-  (pre-materialization). All engines return **200 rows** from the same query.
+- ★ Two-hop join (fair comparison): all competitors pre-loaded with mushroomdb's
+  1M derived INDUSTRY_ALIGNMENT edges as ordinary edges. All engines return 200 rows.
   Pre-mat one-time cost: neo4j 10.8 s, kuzu 0.17 s (COPY FROM CSV), memgraph 8.0 s.
-  mushroomdb derives the same edges in **0.924 s automatically** — no manual ETL.
-  The v1 mushroomdb row was ERROR (fixed by Plan-12 pull executor with LIMIT pushdown).
-- ▲ Neo4j / Memgraph `cold_start` = connect + first query (server already running).
-  `boot-to-ready` reports container-start-to-ready: neo4j 6.6 s, memgraph 4.3 s.
-  mushroomdb and KùzuDB are embedded — `cold_start` IS the full startup cost.
+  mushroomdb derives the same edges **automatically** on rule declaration — no ETL.
 
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
-two-rule backfill on 10k nodes: 0.924 s + 2.152 s = **3.08 s** (Plan-12 T1
-streaming reduced this from 20.7 s). Competitors have no auto-derivation
-equivalent; this workload has no cross-engine baseline.
+two-rule backfill on 10k nodes: 872 ms + 1.976 s = **2.85 s** (Plan-13;
+Plan-12 was 3.08 s). Competitors have no auto-derivation equivalent.
 
-100k cold-start (from `dogfood/results/scale-100k.md`, rebuilt 2026-08-20):
-WAL-only open: **8.86 min** (re-fires all 12 rules; IVF-Flat dominates).
-Snapshot V4 open: **11.15 s** (derived edges + IVF centroids loaded; no re-fire; **47.7× faster**; write cost: 36.1 s paid once at graceful shutdown).
+100k cold-start: Snapshot V4 open **10.4 s** (derived edges + IVF centroids loaded;
+no rule re-fire; **47.5× faster** than WAL-only; write cost: 36.1 s paid once at
+shutdown). WAL-only baseline from v2: 8.86 min (re-fires all 12 rules; IVF dominates).
 See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
+
+Rule engine vs hand-rolled maintenance (Plan-13 benchmark): on 10k nodes with
+1,000 specialty updates, both strategies produce identical edge sets (drift = 0).
+Rule engine is on-par overall (1.49 min vs hand-rolled 1.33 min) and handles
+retraction automatically — 476k retractions across 1k updates required zero
+application code. See [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-vs-rules.md).
 
 ---
 

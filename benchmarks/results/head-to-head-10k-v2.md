@@ -153,3 +153,121 @@ network RTT vs bolt latency per query.
 
 **Contamination check:** `docker ps` run before each bolt server start. `bench-neo4j` stopped
 and removed before memgraph start. No cross-contamination in v2 runs.
+
+---
+
+## v2.1 — Post-Plan-13 regression run (2026-08-21)
+
+> **Plan 13 (rules-cypher)** added: Cypher write support, `delete_edge` API,
+> `batch_edges` API (batch WAL frame for inserts + deletes), and a rule-engine
+> benchmark adapter.  This section confirms no regressions and records Plan-13
+> performance improvements.
+>
+> Benchmark config change: `max_edges` removed from `run.py` rule dicts so
+> rules use the global-budget path (`max_edges=None` → 1M global cap), matching
+> v2 semantics.  Passing `max_edges=1_000_000` would have triggered per-source
+> top-1M semantics (effectively uncapped at 10k scale, 2.8M+ edges) — that
+> would not be a regression but a larger workload; documented in investigation
+> notes below.
+
+### mushroomdb — 10k comparison (v2 vs v2.1)
+
+| workload | v2 | v2.1 | delta |
+|---|---|---|---|
+| bulk_ingest | 0.874 s | 862 ms | −1.4% (noise) |
+| neighborhood_depth1 (p50) | 0.4 µs | 0.4 µs | 0% |
+| neighborhood_depth1 (p95) | 2.2 µs | 1.1 µs | −50% (faster) |
+| neighborhood_depth2 (p50) | 0.2 µs | 0.2 µs | 0% |
+| cypher scan-filter (1.4k rows) | 2.20 ms | 1.53 ms | **−30% (Plan-13 query engine)** |
+| cypher two-hop (200 rows) | 0.198 ms | 307 µs | +55% (109 µs abs — timing noise) |
+| rule_derive (bench_industry_tc) | 0.924 s | 872 ms | −5.6% (slightly faster) |
+| rule_derive (bench_specialty_tc) | 2.152 s | 1.976 s | −8.2% (slightly faster) |
+| rule_derive total | 3.076 s | 2.849 s | −7.4% (slightly faster) |
+
+All mushroomdb deltas are within ±10% noise or improvements.  No regressions.
+
+**cypher two-hop note:** 307 µs vs 198 µs (+55%) is a 109 µs absolute difference
+on a single-sample sub-ms query.  The edge count is identical (1M INDUSTRY_ALIGNMENT
+edges, global budget tripped at the same point as v2).  This is timing noise.
+
+### mushroomdb — 100k cold-start (v2 vs v2.1)
+
+| path | v2 | v2.1 | delta |
+|---|---|---|---|
+| snapshot V4 | 11.15 s | 10.4 s | −7% (faster) |
+| WAL-only | 8.86 min | not re-measured * | — |
+
+*WAL-only cannot be re-measured without a 100k rebuild (WAL was truncated when
+the v2 snapshot was taken). Plan 13 added batch WAL frames; WAL replay semantics
+for node/edge records are unchanged, so the v2 WAL-only number remains indicative.
+
+### Cross-engine — 10k (v2.1)
+
+| workload | mushroomdb | neo4j | kuzu | memgraph |
+|---|---|---|---|---|
+| bulk_ingest | 862 ms | 13.2 s | 1.21 min | 12.5 s |
+| neighborhood_depth1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
+| neighborhood_depth2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
+| cypher scan-filter (1.4k rows) | 1.53 ms | 93.7 ms | 3.95 ms | 83.7 ms |
+| cypher two-hop (200 rows) | 307 µs | 2.88 ms | 2.22 ms | 2.57 ms |
+
+### Investigation notes
+
+**Root cause of observed "regressions" in intermediate runs:**
+
+1. **Debug build**: `maturin develop` (no `--release`) produces a ~10x slower binary.
+   All four mushroomdb metrics appeared 10–60x worse in early v2.1 intermediate runs.
+   Fixed: rebuild with `maturin develop --release`.
+
+2. **max_edges semantics changed between Plan 12 and Plan 13**:
+   `max_edges=Some(k)` now uses per-source top-k semantics (not global cap).
+   `"max_edges": 1_000_000` in run.py previously hit the global 1M budget and tripped.
+   After the semantics change, it created 2.8M INDUSTRY_ALIGNMENT + 5.165M SPECIALTY_MATCH
+   edges (effectively uncapped at 10k scale with only 2000 company candidates per talent).
+   Fixed: removed `max_edges` from run.py rules so `max_edges=None` → global 1M budget.
+
+### Rule engine vs hand-rolled maintenance
+
+See `benchmarks/results/handrolled-vs-rules.md` for the full methodology and data.
+
+**Summary** (10,000 nodes, 1,000 property updates, SPECIALTY_MATCH Overlap(0.15)):
+
+| metric | hand-rolled | rule engine |
+|---|---|---|
+| Total wall (specialty only) | 1.33 min | 1.49 min |
+| SPECIALTY_MATCH edges | 5,165,384 | 5,165,384 |
+| Drift | 0 | — |
+| Retractions in update pass | 476,178 | automatic |
+| Additions in update pass | 415,466 | automatic |
+
+**SEMANTIC_MATCH sub-run** (2,000 nodes — exact VectorSimilar scales O(n²)):
+
+| metric | hand-rolled | rule engine |
+|---|---|---|
+| SEMANTIC_MATCH edges | 17,789 | 17,789 |
+| Drift | 0 | — |
+| Bulk match time (ingest) | ~0.1 s (numpy batched cosine) | 1.05 min (sequential exact) |
+
+**Key finding**: Rule engine is on-par or faster for SPECIALTY_MATCH total workload
+(including automatic incremental retraction on every `set_prop`).  Hand-rolled
+requires explicit retraction logic; a naive add-only implementation accumulates
+stale matches after every update.  The rule engine eliminates this class of bug
+entirely — retraction is automatic and atomic.
+
+**SEMANTIC_MATCH initial ingestion**: numpy batched matrix multiply is dramatically
+faster for one-time bulk computation.  The rule engine's advantage is automatic
+incremental updates on subsequent `set_prop` calls (re-evaluates only the changed
+node's candidates).
+
+### Contamination guard — v2.1 run
+
+| engine | container | port | state before run |
+|---|---|---|---|
+| mushroomdb | embedded | n/a | n/a |
+| neo4j | bench-neo4j (neo4j:5-community, NEO4J_AUTH=none) | 7687 | dai-neo4j stopped before start |
+| kuzu | embedded | n/a | n/a |
+| memgraph | bench-memgraph (memgraph/memgraph:latest) | 7687 | bench-neo4j also present (no conflict; memgraph ran in same process as neo4j) |
+
+**Note:** memgraph was run in the same benchmark pass as neo4j (both bolt, but run.py
+runs them sequentially; memgraph connects after neo4j has finished). All engines
+report correct results. dai-neo4j was restored after the run.

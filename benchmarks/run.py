@@ -142,6 +142,11 @@ def run_ours(nodes: list[dict], scale: int, seed: int) -> dict[str, Any]:
 
         # 5. Rule-derive (ours-only; must come before cypher_two_hop)
         print("  [ours] rule_derive (INDUSTRY_ALIGNMENT) ...", flush=True)
+        # max_edges omitted → None → DEFAULT_MAX_EDGES=1_000_000 global budget.
+        # This matches v2 benchmark semantics (global cap, not per-source top-k).
+        # Passing max_edges=1_000_000 would mean per-source top-1M (uncapped at
+        # 10k scale) and create 2.8M INDUSTRY_ALIGNMENT + 5.2M SPECIALTY_MATCH
+        # edges instead of capping globally at 1M each.
         rules = [
             {
                 "name": "bench_industry_tc",
@@ -150,7 +155,6 @@ def run_ours(nodes: list[dict], scale: int, seed: int) -> dict[str, Any]:
                 "predicate": {"FieldEqual": {"field": "industry"}},
                 "edge_type": "INDUSTRY_ALIGNMENT",
                 "weight_prop": "score",
-                "max_edges": 1_000_000,
             },
             {
                 "name": "bench_specialty_tc",
@@ -159,7 +163,6 @@ def run_ours(nodes: list[dict], scale: int, seed: int) -> dict[str, Any]:
                 "predicate": {"Overlap": {"field": "specialties", "min": 0.15}},
                 "edge_type": "SPECIALTY_MATCH",
                 "weight_prop": "score",
-                "max_edges": 1_000_000,
             },
         ]
         results["rule_derive"] = rule_derive(db, rules)
