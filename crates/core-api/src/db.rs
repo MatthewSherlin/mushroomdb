@@ -452,10 +452,18 @@ impl<F: Fs> GraphDb<F> {
             // No subscriber exists yet; discard is correct.
             let _ = db.engine.drain_deltas();
         }
-        // T2 note: the per-frame drain above IS the suppression seam for replay.
-        // Any future as-of replay path (Plan-15 T2) must call drain_deltas here
-        // to feed those events to the replaying subscriber; the mechanism is in place.
-        let _ = db.engine.drain_deltas(); // trailing no-op after loop drain
+        // Enforce I-2: if the per-frame drain above is ever removed or skipped,
+        // this assert catches the regression in debug builds immediately.
+        debug_assert_eq!(
+            db.engine.pending_delta_count(),
+            0,
+            "pending_deltas non-empty after replay — \
+             per-frame drain must run inside the loop to keep memory O(1)"
+        );
+        // T2 note: the per-frame drain IS the suppression seam for replay.
+        // Any future as-of replay path (Plan-15 T2) must drain here to feed
+        // replaying subscribers; the mechanism is already in place.
+        let _ = db.engine.drain_deltas(); // belt-and-braces no-op after loop drain
         Ok(db)
     }
 

@@ -220,6 +220,67 @@ async fn subscribe_ws_writes_receives_node_events() {
     assert_eq!(ev["key"], "alice");
 }
 
+/// Ordering invariant: on a SINGLE live WS connection, a prop SET that fires
+/// the rule arrives before a subsequent SET that retracts it, and commit_seq
+/// is strictly ascending between the two operations.
+///
+/// Setup: two nodes with non-overlapping tags.  First SET makes tags overlap
+/// (fire).  Second SET breaks the overlap (retract).  All events arrive on one
+/// socket and must be in fire-then-retract order with seq_fire < seq_retract.
+#[tokio::test]
+async fn subscribe_ws_fire_then_retract_ordering_on_single_connection() {
+    let db = SharedDb::open(&tmp("ws-ordering")).unwrap();
+    db.write().create_rule(overlap_rule("rel", "REL")).unwrap();
+    // n1 has tags=["x"], n2 has tags=["y"] — no overlap initially.
+    db.write()
+        .insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    db.write()
+        .insert_node("A", "n2", vec![("tags".into(), tags(&["y"]))])
+        .unwrap();
+    assert_eq!(db.read().edge_count(), 0, "no edges before fire");
+
+    let addr = spawn_server(db.clone()).await;
+    let mut ws = connect_subscribe(addr, r#"{"rules":["rel"]}"#).await;
+
+    // SET that fires: n2.tags = ["x"] → overlap ["x"]∩["x"] = 1.0 ≥ 0.5
+    db.write()
+        .set_prop("n2", "tags", tags(&["x"]))
+        .unwrap();
+    assert!(db.read().edge_count() >= 2, "edges must exist after fire SET");
+
+    // Drain all EdgeFired events (n1→n2 and n2→n1).
+    let ev_fire1 = next_text(&mut ws).await;
+    let ev_fire2 = next_text(&mut ws).await;
+    for ev in [&ev_fire1, &ev_fire2] {
+        assert_eq!(ev["type"], "edge_fired", "expected edge_fired, got {ev}");
+    }
+    let seq_fire = ev_fire1["commit_seq"].as_u64().expect("commit_seq");
+    // Both fire events share the same commit_seq (same commit).
+    assert_eq!(ev_fire2["commit_seq"].as_u64().unwrap(), seq_fire);
+
+    // SET that retracts: n2.tags = ["y"] → overlap ["x"]∩["y"] = 0.0 < 0.5
+    db.write()
+        .set_prop("n2", "tags", tags(&["y"]))
+        .unwrap();
+    assert_eq!(db.read().edge_count(), 0, "edges retracted after second SET");
+
+    // Drain EdgeRetracted events.
+    let ev_ret1 = next_text(&mut ws).await;
+    let ev_ret2 = next_text(&mut ws).await;
+    for ev in [&ev_ret1, &ev_ret2] {
+        assert_eq!(ev["type"], "edge_retracted", "expected edge_retracted, got {ev}");
+    }
+    let seq_retract = ev_ret1["commit_seq"].as_u64().expect("commit_seq");
+    assert_eq!(ev_ret2["commit_seq"].as_u64().unwrap(), seq_retract);
+
+    // Fire events must precede retract events in commit order.
+    assert!(
+        seq_fire < seq_retract,
+        "commit_seq must be strictly ascending: fire={seq_fire} retract={seq_retract}"
+    );
+}
+
 /// Invariant: unknown rule returns an error frame and closes.
 #[tokio::test]
 async fn subscribe_ws_unknown_rule_returns_error() {

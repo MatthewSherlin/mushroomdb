@@ -101,6 +101,8 @@ Events are serialised as internally-tagged JSON:
 
 The server disconnects only on a write error; slow consumers receive `{"type":"lagged","missed":N}` and continue.
 
+**Multi-subscription idle latency:** when a single WS connection subscribes to multiple rules, the server bridge thread blocks on the first subscription when idle. Events arriving on secondary subscriptions while the first is quiet may experience up to ~100 ms of additional latency before being forwarded.
+
 ## Invariants
 
 1. **Post-fsync ordering.** Events are distributed inside `log_then_apply_with` after WAL fsync and in-memory apply both complete. A subscriber querying immediately on receipt sees consistent state.

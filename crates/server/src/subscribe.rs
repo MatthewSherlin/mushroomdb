@@ -35,8 +35,16 @@
 //!
 //! This is O(1) threads per connection — not O(N) blocking tasks per interval
 //! as a poll-based design would be.  When the WS is closed the async task
-//! drops its `Receiver`, causing the next `blocking_send` to fail and the
-//! blocking thread to exit cleanly.
+//! drops its `Receiver`.  The bridge thread notices via `tx.is_closed()` at
+//! the top of its loop (checked after each `recv_timeout` completes, so within
+//! at most one idle timeout — 100 ms), or immediately via `blocking_send` error
+//! if an event was in flight at close time.
+//!
+//! **Multi-subscription idle latency:** when a connection holds subscriptions
+//! to multiple rules, the blocking thread round-robins them but blocks only on
+//! the first subscription during idle.  Events arriving on secondary
+//! subscriptions while the first is quiet may experience up to ~100 ms of
+//! additional latency before the bridge wakes and drains them.
 
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
