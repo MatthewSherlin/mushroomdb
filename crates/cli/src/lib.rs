@@ -5,7 +5,7 @@
 
 use core_api::{
     wal_commit_count_at, Explanation, GraphDb, IngestOptions, Predicate, ResultSet, RuleDef,
-    SharedDb, Stats, Value,
+    RuleSuggestion, SharedDb, Stats, Value,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -65,6 +65,10 @@ pub enum Command {
         /// Optional Cypher read query to execute against the as-of view.
         query: Option<String>,
     },
+    /// Profile the database and suggest linking rules with estimated edge counts.
+    Suggest {
+        db_dir: PathBuf,
+    },
     Help,
 }
 
@@ -76,6 +80,8 @@ pub struct DemoOutcome {
     pub sample_result: ResultSet,
     pub explanations: Vec<Explanation>,
     pub stats: Stats,
+    /// First suggestion from the rule suggester (teaser only — not auto-applied).
+    pub suggestion: Option<RuleSuggestion>,
 }
 
 /// CLI-facing error. [`Display`] is the message printed to stderr.
@@ -112,6 +118,7 @@ Usage:
   mushroomdb mcp <db-dir>
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
+  mushroomdb suggest <db-dir>
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb --help
 "
@@ -129,6 +136,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "mcp" => parse_one_dir("mcp", &args[1..]).map(|db_dir| Command::Mcp { db_dir }),
         "stats" => parse_one_dir("stats", &args[1..]).map(|db_dir| Command::Stats { db_dir }),
         "demo" => parse_one_dir("demo", &args[1..]).map(|db_dir| Command::Demo { db_dir }),
+        "suggest" => parse_one_dir("suggest", &args[1..]).map(|db_dir| Command::Suggest { db_dir }),
         "asof" => parse_asof(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
@@ -403,6 +411,8 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
     let sample_result = r.query(SAMPLE_QUERY, &BTreeMap::new())?;
     let explanations = r.explain(SAMPLE_EXPLAIN_A, SAMPLE_EXPLAIN_B)?;
     let stats = r.stats();
+    // Rule suggestion teaser: first suggestion sorted by est_edges desc.
+    let suggestion = r.suggest_rules().into_iter().next();
 
     Ok(DemoOutcome {
         auto_fk_rules,
@@ -410,6 +420,7 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
         sample_result,
         explanations,
         stats,
+        suggestion,
     })
 }
 
@@ -611,6 +622,61 @@ pub fn format_demo(dir: &Path, out: &DemoOutcome) -> String {
     let _ = writeln!(buf);
     let _ = writeln!(buf, "== serve ==");
     let _ = writeln!(buf, "  mushroomdb serve {}", dir.display());
+
+    // Teaser: one suggestion from the rule suggester (not auto-applied).
+    if let Some(s) = &out.suggestion {
+        let _ = writeln!(buf);
+        let _ = writeln!(buf, "== suggested rule (teaser) ==");
+        let _ = writeln!(buf, "  {}", s.def.name);
+        let _ = writeln!(
+            buf,
+            "  {} → {} via {:?}",
+            s.def.src_label, s.def.dst_label, s.def.predicate
+        );
+        let _ = writeln!(buf, "  est_edges: ~{}", s.est_edges);
+        let _ = writeln!(buf, "  {}", s.rationale);
+        let _ = writeln!(buf, "  (run `mushroomdb suggest {}` for full analysis)", dir.display());
+    }
+
+    buf
+}
+
+/// Profile the database at `dir` and return all rule suggestions.
+pub fn run_suggest(dir: &Path) -> Result<Vec<RuleSuggestion>, CliError> {
+    let db = GraphDb::open(dir)?;
+    Ok(db.suggest_rules())
+}
+
+/// Pretty-print a list of [`RuleSuggestion`]s for `mushroomdb suggest`.
+pub fn format_suggest(suggestions: &[RuleSuggestion]) -> String {
+    let mut buf = String::new();
+    if suggestions.is_empty() {
+        let _ = writeln!(buf, "no rule suggestions (database may be empty or rules already cover all patterns)");
+        return buf;
+    }
+    let _ = writeln!(buf, "== rule suggestions ({}) ==", suggestions.len());
+    for (i, s) in suggestions.iter().enumerate() {
+        let _ = writeln!(buf);
+        let _ = writeln!(buf, "[{}] {}", i + 1, s.def.name);
+        let _ = writeln!(
+            buf,
+            "    {} → {}  via {:?}",
+            s.def.src_label, s.def.dst_label, s.def.predicate
+        );
+        let _ = writeln!(buf, "    est_edges : ~{}", s.est_edges);
+        let _ = writeln!(buf, "    rationale : {}", s.rationale);
+        if !s.examples.is_empty() {
+            let _ = writeln!(buf, "    examples  :");
+            for (src, dst, score) in &s.examples {
+                let _ = writeln!(buf, "      {src} → {dst}  score={score:.4}");
+            }
+        }
+        let _ = writeln!(buf, "    predicate : {:?}", s.def.predicate);
+        let _ = writeln!(
+            buf,
+            "    to apply  : POST /rules  or  db.create_rule(suggestion.def)"
+        );
+    }
     buf
 }
 

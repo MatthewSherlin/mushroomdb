@@ -1,8 +1,8 @@
 //! `mushroomdb` — thin dispatcher over [`cli`] lib functions.
 
 use cli::{
-    format_demo, format_stats, maybe_run_demo_if_empty, parse_args, read_stats, run_asof,
-    run_demo, usage, Command, ServeUi,
+    format_demo, format_stats, format_suggest, maybe_run_demo_if_empty, parse_args, read_stats,
+    run_asof, run_demo, run_suggest, usage, Command, ServeUi,
 };
 use core_api::SharedDb;
 use std::io::{self, Write};
@@ -50,6 +50,13 @@ fn main() -> ExitCode {
         Ok(Command::Demo { db_dir }) => match run_demo(&db_dir) {
             Ok(out) => {
                 print!("{}", format_demo(&db_dir, &out));
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
+        Ok(Command::Suggest { db_dir }) => match run_suggest(&db_dir) {
+            Ok(suggestions) => {
+                print!("{}", format_suggest(&suggestions));
                 ExitCode::SUCCESS
             }
             Err(e) => fail(&e.to_string()),

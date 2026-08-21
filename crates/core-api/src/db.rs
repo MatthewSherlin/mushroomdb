@@ -1657,6 +1657,71 @@ impl<F: Fs> GraphDb<F> {
         self.engine.rules().cloned().collect()
     }
 
+    // -----------------------------------------------------------------------
+    // Rule suggestion API
+    // -----------------------------------------------------------------------
+
+    /// Profile the database and suggest linking rules with previewed edge counts.
+    ///
+    /// Uses the default seed ([`core_rules::SUGGEST_DEFAULT_SEED`]) for deterministic
+    /// sampling. Suggestions are sorted by estimated edge count (descending).
+    /// **NO auto-accept** — call [`GraphDb::create_rule`] explicitly to apply.
+    pub fn suggest_rules(&self) -> Vec<core_rules::RuleSuggestion> {
+        self.suggest_rules_seeded(core_rules::SUGGEST_DEFAULT_SEED)
+    }
+
+    /// Like [`suggest_rules`] but with a caller-supplied RNG seed for
+    /// reproducibility. Same seed + same data = identical output.
+    pub fn suggest_rules_seeded(&self, seed: u64) -> Vec<core_rules::RuleSuggestion> {
+        self.suggest_rules_with_config(&core_rules::suggest::SuggestConfig::default(), seed)
+    }
+
+    /// [`suggest_rules_seeded`] with a fully custom [`SuggestConfig`].
+    ///
+    /// Primary use: tests that need a tiny `budget_ms` to exercise the time-budget
+    /// structural enforcement without running the full 250 ms window.
+    #[doc(hidden)]
+    pub fn suggest_rules_with_config(
+        &self,
+        config: &core_rules::suggest::SuggestConfig,
+        seed: u64,
+    ) -> Vec<core_rules::RuleSuggestion> {
+        use std::collections::BTreeMap;
+
+        // Collect (node_id, key) pairs per label, skipping tombstoned nodes.
+        let mut label_nodes: BTreeMap<String, Vec<(u32, String)>> = BTreeMap::new();
+        for id in 0..self.ids.len() as u32 {
+            let Some(key) = self.ids.key_of(id) else {
+                continue;
+            };
+            let Some(&sym) = self.labels.get(id as usize) else {
+                continue;
+            };
+            if sym == u32::MAX {
+                continue; // tombstoned
+            }
+            let Some(label) = self.syms.resolve(sym) else {
+                continue;
+            };
+            label_nodes
+                .entry(label.to_string())
+                .or_default()
+                .push((id, key.to_string()));
+        }
+
+        let all_fields: Vec<String> = self.props.fields().map(String::from).collect();
+        let existing = self.rules();
+
+        core_rules::suggest::suggest_rules(
+            &label_nodes,
+            &|id, field| self.props.get(id, field).cloned(),
+            &all_fields,
+            &existing,
+            config,
+            seed,
+        )
+    }
+
     /// Recompute a rule's derived edges from scratch. WAL-logged so un-trip
     /// plus later mutations replay identically (rebuild is a pure function
     /// of state).

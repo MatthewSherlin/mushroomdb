@@ -44,6 +44,31 @@ field values that matched, and the computed score for every derived edge.
 
 ![Neighborhood with derived edges highlighted](docs/assets/02-neighborhood-gold.png)
 
+### The database proposes its own rules
+
+Not sure which rules to declare? mushroomdb can profile your data and suggest
+them. Call `db.suggest_rules()` (or `GET /suggest`, or `mushroomdb suggest
+./db`) to receive a ranked list of candidate rules with estimated edge counts,
+example pairs, and rationale:
+
+```rust
+let suggestions = db.suggest_rules();
+for s in &suggestions {
+    println!("{}: ~{} edges — {}", s.def.name, s.est_edges, s.rationale);
+}
+// Accept the top suggestion:
+if let Some(s) = suggestions.into_iter().next() {
+    db.create_rule(s.def)?;
+}
+```
+
+The profiler detects `_id`-suffix foreign keys (KeyMatch), overlapping token
+lists (Overlap), shared low-cardinality strings (FieldEqual), overlapping
+numeric ranges (NumericWithin), and equal-dimension float arrays
+(VectorSimilar). Sampling is seeded so the same database always returns the
+same suggestions. No rule is ever applied automatically. See
+[docs/site/suggest.md](docs/site/suggest.md) for the full reference.
+
 ### Live degree counts and neighbor aggregates, no triggers
 
 mushroomdb maintains per-node derived properties automatically as the graph

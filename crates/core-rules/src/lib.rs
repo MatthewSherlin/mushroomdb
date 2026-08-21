@@ -1,8 +1,10 @@
 pub mod def;
 pub mod engine;
 pub mod index;
+pub mod suggest;
 pub mod views;
 pub use def::{evaluate, NodeView, Predicate, RuleDef};
 pub use engine::{EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport};
 pub use index::{candidate_spec, CandidateSpec, RuleIndex, SideIndex};
+pub use suggest::{RuleSuggestion, SuggestConfig, DEFAULT_SEED as SUGGEST_DEFAULT_SEED};
 pub use views::{AggFn, ViewDef, ViewSource, ViewStore};
