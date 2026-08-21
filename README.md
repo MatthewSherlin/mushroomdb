@@ -151,7 +151,7 @@ Full predicate reference and examples: [`docs/site/rules.md`](docs/site/rules.md
 
 10,000-node graph (Apple M4 Pro, macOS 15.7.3, arm64). Full methodology
 and honesty notes: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md).
-Regression results (v2.1, 2026-08-21) are appended to that document.
+Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 
 | Workload | mushroomdb | Neo4j | KùzuDB | Memgraph |
 |---|---|---|---|---|
@@ -188,8 +188,8 @@ Regression results (v2.1, 2026-08-21) are appended to that document.
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
 two-rule backfill on 10k nodes: 872 ms + 1.976 s = **2.85 s** (previously 3.08 s). Competitors have no auto-derivation equivalent.
 
-100k cold-start: Snapshot V4 open **10.4 s** (derived edges + IVF centroids loaded;
-no rule re-fire; **47.5× faster** than WAL-only; write cost: 36.1 s paid once at
+100k cold-start: Snapshot V4 open **10.5 s** (v2.3; derived edges + IVF centroids loaded;
+no rule re-fire; **~50× faster** than WAL-only; write cost: 36.1 s paid once at
 shutdown). WAL-only baseline from v2: 8.86 min (re-fires all 12 rules; IVF dominates).
 See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
 
@@ -250,14 +250,14 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Approximate vector mode is opt-in | `approximate: true` enables IVF-Flat candidate selection. Per-query recall ≥ 0.90 quiesced; ≥ 0.85 post-rebuild. Review the recall trade-off before using it in completeness-critical workloads. |
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is on the roadmap. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
-| Cypher write subset v1 | CREATE, MATCH…SET, MATCH…DELETE (manual edges only), MATCH…DETACH DELETE (node deletes), MATCH…DELETE (isolated-node or edge deletes), and MERGE (single-key match-or-create) are supported. SET RHS accepts a literal or a `$param` reference; combined MATCH…SET…RETURN is rejected; multi-statement transactions are not supported. CREATE and MATCH…SET/DELETE produce one WAL Batch frame (one fsync); MERGE-create produces one WAL Batch frame (one fsync), same as CREATE; MERGE-match (node exists) produces no frame. |
+| Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE (manual edges only), MATCH…DETACH DELETE (node deletes), MATCH…DELETE (isolated-node or edge deletes), and MERGE (single-key match-or-create) are supported. SET RHS accepts a literal or a `$param` reference; expression RHS (`n.x + 1`) is rejected with a named error. Combined MATCH…SET…RETURN is rejected; multi-statement transactions are not supported. Each write statement produces one WAL Batch frame (one fsync). See [`docs/site/query.md`](docs/site/query.md) coverage table. |
 | Crash-atomic write batches; no interactive transactions or isolation | `db.write_batch(\|b\| { b.insert_node(...); b.set_prop(...); b.delete_node(...); })` commits all ops in one `WalRecord::Batch` frame (one fsync). On crash replay the frame is all-or-nothing: a torn frame replays as none-applied. Rules fire per op in order — semantically identical to sequential singles. Error semantics: validate-then-apply — if op N fails validation (duplicate key, unknown key, rule-owned edge) the entire batch is rejected and nothing is written or applied. **Not isolated:** readers may observe intermediate states while a committed batch is being applied in memory. Per-query Cypher writes (`query_write`) also produce one Batch frame per statement. Multi-statement BEGIN/COMMIT interactive transactions are not supported in v1. |
 | Cypher aggregations | `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` are supported both as single aggregates and as grouped aggregates (`RETURN a, COUNT(*)`). Multiple group keys and multiple aggregates per query are allowed. Group count is capped at 1,000,000 distinct keys. |
 | Variable-length paths: max hops capped at 10 | `-[r:TYPE*min..max]->` and `shortestPath` are supported. Max hops is hard-capped at 10; unbounded forms (`*min..`) are rejected at parse time. Intermediate results are capped at 1,000,000 rows. See [`docs/site/query.md`](docs/site/query.md). |
 | WITH pipeline and UNWIND | `WITH` pipeline stages (projection, aliasing, HAVING-style WHERE, ORDER BY, LIMIT, re-entry MATCH) and `UNWIND` list expansion are fully supported. Intermediate rows count against the 1,000,000-row budget. See [`docs/site/query.md`](docs/site/query.md). |
 | OPTIONAL MATCH | Left-outer-join semantics: rows failing the optional pattern survive with optional bindings null. Composes with WITH, grouped aggregation (`MATCH (a) OPTIONAL MATCH (a)-[:R]->(b) RETURN a, COUNT(b)` → 0 for edgeless nodes), and WHERE inside the optional scope. Multiple chained OPTIONAL MATCHes on the same anchor are supported. |
 | Query parameters | `$name` placeholders are replaced with values supplied at query time. Use `db.query_with_params(cypher, &[("name", value)])` in Rust or `{"params": {...}}` in the HTTP API. Unknown parameters return a named error. Parameters are safe — values are never interpreted as Cypher. |
-| Scalar functions | `toLower`, `toUpper`, `size` (strings + lists), `coalesce`, `type(r)`, `abs`, `round` in WHERE and RETURN/WITH. Null propagates through all functions except `coalesce`. Unknown function names return a named error listing the supported set. |
+| Scalar functions | `toLower`, `toUpper`, `size` (strings + lists), `coalesce`, `type(r)`, `abs`, `round` in WHERE and RETURN/WITH. Binary arithmetic (`-`, `*`) is supported inside function arguments (e.g. `abs(n.age - 27)`). Null propagates through all functions except `coalesce`. Unknown function names return a named error listing the supported set. |
 
 ---
 
@@ -279,10 +279,9 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 | Priority | Item |
 |---|---|
 | Medium | Lock-free epoch snapshot readers (replacing the `RwLock` facade) |
-| Medium | Edge deletes via batch/script API |
 | Medium | mmap-backed storage (RAM-independent at rest) |
-| Medium | Multi-statement transactions |
-| Medium | Expanded Cypher surface (subqueries, `CASE` expressions) |
+| Medium | Multi-statement transactions (BEGIN/COMMIT) |
+| Medium | Expanded Cypher surface (`CASE` expressions, subqueries, `IS NULL/IS NOT NULL`, `+`/`/` arithmetic) |
 | Low | TypeScript bindings (napi-rs) |
 | Low | WASM playground |
 | Low | Time-travel queries |

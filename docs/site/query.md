@@ -473,6 +473,94 @@ MATCH (n:Measurement) RETURN round(n.value)
 
 ---
 
+## Cypher coverage
+
+Tested against the current binary (2026-08-21, release build, maturin develop --release).
+Classification: **Supported** = executes without error; **Named-error** = rejected with a
+clear, actionable message; **Absent** = not implemented (not tested here).
+
+### Supported
+
+| Form | Example |
+|---|---|
+| `MATCH (n:Label)` | `MATCH (n:Person) RETURN n.name` |
+| `MATCH (n {key: val})` inline property filter | `MATCH (n:Person {city: 'Austin'}) RETURN n` |
+| `MATCH (n)-[r:TYPE]->(m)` directed edge | `MATCH (a)-[:KNOWS]->(b) RETURN a` |
+| `MATCH (n)-[r:TYPE]-(m)` undirected edge | `MATCH (a)-[:KNOWS]-(b) RETURN a` |
+| `MATCH (n)-[r]->(m)` any relationship type | `MATCH (n)-[r]->(m) RETURN type(r)` |
+| `WHERE =, <>, <, >, <=, >=` | `WHERE n.age > 18` |
+| `WHERE AND / OR` | `WHERE n.a = 1 AND n.b = 2` |
+| `ORDER BY prop ASC / DESC` | `ORDER BY n.name DESC` |
+| `SKIP n LIMIT n` | `SKIP 10 LIMIT 5` |
+| `$param` in WHERE | `WHERE n.age > $min` |
+| `$param` in SET | `SET n.score = $val` |
+| `COUNT(*)`, `COUNT(var)`, `SUM`, `AVG`, `MIN`, `MAX` (single) | `RETURN COUNT(*), SUM(n.score)` |
+| Grouped aggregation (single or multiple keys, multiple aggs) | `RETURN n.city, COUNT(*) AS c ORDER BY c DESC` |
+| `WITH` projection + aliasing | `WITH n.name AS nm RETURN nm` |
+| `WITH … WHERE` (HAVING) | `WITH city, COUNT(*) AS c WHERE c > 2 RETURN city` |
+| `WITH … ORDER BY … LIMIT` | `WITH n, n.age AS a ORDER BY a DESC LIMIT 5 RETURN n.name` |
+| `WITH … MATCH` re-entry | `WITH city MATCH (p:Person) WHERE p.city = city RETURN p` |
+| `UNWIND list_literal AS x` | `UNWIND [1, 2, 3] AS x RETURN x` |
+| `UNWIND n.prop AS x` (list-valued property) | `UNWIND n.tags AS tag RETURN tag` |
+| `UNWIND alias AS x` (from prior WITH) | `WITH n.tags AS ts UNWIND ts AS t RETURN t` |
+| `UNWIND … WHERE` (filter after UNWIND) | `UNWIND [1,2,3] AS x WHERE x > 1 RETURN x` |
+| `OPTIONAL MATCH` (left-outer-join) | `MATCH (a) OPTIONAL MATCH (a)-[:R]->(b) RETURN a, b` |
+| `OPTIONAL MATCH … WHERE` (filter in optional scope) | `OPTIONAL MATCH (a)-[r]->(b) WHERE b.score > 5` |
+| Multiple chained `OPTIONAL MATCH` | `OPTIONAL MATCH (a)-[:R]->(b) OPTIONAL MATCH (a)-[:S]->(c)` |
+| `OPTIONAL MATCH` + aggregation | `OPTIONAL MATCH (a)-[r]->(b) RETURN a, COUNT(r)` |
+| Variable-length `*1..n`, `*n`, `*..n`, bare `*` | `MATCH (a)-[r:T*1..5]->(b) RETURN r.length` |
+| `shortestPath((a)-[r*..n]->(b))` | `MATCH (a {id: 'x'}), (b {id: 'y'}) MATCH shortestPath((a)-[r*..5]->(b)) RETURN r.length` |
+| `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` |
+| `CREATE (a:L {id: 'x'})-[:T]->(b:L {id: 'y'})` | node-edge chain |
+| `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
+| `MATCH … SET n.prop = $param` | `MATCH (n) WHERE n.id = $id SET n.score = $val` |
+| `MATCH … DELETE r` (manual edge) | `MATCH (a)-[r:KNOWS]->(b) DELETE r` |
+| `MATCH … DETACH DELETE n` | `MATCH (n) WHERE n.id = 'x' DETACH DELETE n` |
+| `MATCH … DELETE n` (isolated node) | `MATCH (n:Tmp) WHERE n.id = 'x' DELETE n` |
+| `MERGE (n:L {id: 'x'})` (single-key upsert) | `MERGE (n:Person {id: 'alice'})` |
+| `toLower`, `toUpper`, `size`, `coalesce`, `type`, `abs`, `round` | `RETURN abs(n.score), round(n.weight)` |
+| Binary arithmetic in function arguments (`-`, `*`) | `RETURN abs(n.age - 27)`, `RETURN round(n.score * 1.5)` |
+
+### Named-error
+
+Forms rejected with a clear, actionable error message (executor returns a typed error; no silent misbehavior).
+
+| Form | Error message (excerpt) |
+|---|---|
+| `MERGE … ON CREATE SET / ON MATCH SET` | `ON CREATE SET / ON MATCH SET are not supported in MERGE (v1 limitation)` |
+| `MERGE (n:L {id: 'x', extra: 2})` (multi-property) | `MERGE supports exactly one key property (got 2)` |
+| `DELETE n` when node has incident edges | `Cannot delete node … because it still has incident edges. Use DETACH DELETE…` |
+| `DELETE r` on derived (rule-owned) edge | `cannot delete derived edge; retract via the rule or change the property` |
+| `SET n.x = n.x + 1` (expression RHS; `+` not lexed) | `lex: illegal character '+' at position …` |
+| `MATCH … SET … RETURN` in one statement | `parse error: expected RETURN (found Set)` |
+| `CREATE (a), (b)` comma-separated form | `parse error: unexpected tokens after CREATE pattern (found Comma)` |
+| Variable-length `*0..n` (zero-length min) | `zero-length variable-length paths are not supported; minimum hop count is 1` |
+| Variable-length `*n..` (unbounded upper) | `variable-length paths are capped at 10 hops` |
+| `UNWIND` without preceding `MATCH` | `parse error: expected MATCH (found Unwind)` |
+| `UNWIND scalar` (non-list value) | `execute: UNWIND requires a list; got … value for …` |
+| Multi-statement / unknown top-level keyword | `parse error: expected MATCH (found …)` |
+| `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
+| `shortestPath` with minimum hop > 1 | `parse error: expected RETURN (found Comma)` (comma-sep MATCH not supported) |
+| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round` |
+| `$param` referenced but not supplied | `execute: missing parameter …` |
+| `WHERE … IS NULL / IS NOT NULL` | `parse error: expected comparison operator (found Ident("IS"))` |
+
+### Absent
+
+Forms not tested (outside scope of v1 implementation). All untested forms are expected to produce parse errors (unexpected token) rather than silently misbehave, but behavior is not guaranteed.
+
+| Form |
+|---|
+| `CASE WHEN … THEN … ELSE … END` expressions |
+| Pattern comprehension `[(n)-[r]->(m) | m.prop]` |
+| List comprehension `[x IN list WHERE …]` |
+| `EXISTS { … }` subquery predicate |
+| `CALL` procedure invocations |
+| Schema operations (`CREATE INDEX`, `CREATE CONSTRAINT`) |
+| `+` and `/` arithmetic (lexer does not emit `+` or `/` tokens) |
+
+---
+
 ## Limitations
 
 | Feature | Status |
