@@ -519,7 +519,7 @@ clear, actionable message; **Absent** = not implemented (not tested here).
 | `MATCH … DELETE n` (isolated node) | `MATCH (n:Tmp) WHERE n.id = 'x' DELETE n` |
 | `MERGE (n:L {id: 'x'})` (single-key upsert) | `MERGE (n:Person {id: 'alice'})` |
 | `toLower`, `toUpper`, `size`, `coalesce`, `type`, `abs`, `round` | `RETURN abs(n.score), round(n.weight)` |
-| Binary arithmetic in function arguments (`-`, `*`) | `RETURN abs(n.age - 27)`, `RETURN round(n.score * 1.5)` |
+| Binary arithmetic **inside function arguments** only (`-`, `*`) | `RETURN abs(n.age - 27)`, `RETURN round(n.score * 1.5)` — **only valid as function-call arguments**; `-`/`*` outside function calls produce a parse error; `+`/`/` produce a lex error in any position |
 
 ### Named-error
 
@@ -544,7 +544,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round` |
 | `$param` referenced but not supplied | `execute: missing parameter …` |
 | `WHERE … IS NULL / IS NOT NULL` | `parse error: expected comparison operator (found Ident("IS"))` |
-| `+` or `/` in any expression position | `lex: illegal character '+' at position …` (or `'/'`); the lexer does not emit these tokens |
+| `+` or `/` in any expression position | `lex: illegal character '+' at position …` (or `'/'`); the lexer does not emit these tokens. `-` and `*` are **not** rejected — they are valid tokens, but produce a parse error when used outside a function-call argument |
 
 ### Absent
 

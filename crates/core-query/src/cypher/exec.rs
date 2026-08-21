@@ -1249,7 +1249,7 @@ fn resolve_operand(
                         ArithOp::Add => a.saturating_add(b),
                         ArithOp::Div => {
                             if b == 0 { return Err("division by zero".into()); }
-                            a / b
+                            a.checked_div(b).unwrap_or(i64::MAX)
                         }
                     };
                     Ok(Some(Value::Int(result)))
@@ -3052,8 +3052,8 @@ fn apply_limit<T>(rows: &mut Vec<T>, n: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute, Params};
-    use crate::cypher::ast::{LimitSkip, Operand, OrderItem, OrderTarget, RetItem, RetVal};
+    use super::{execute, resolve_operand, Params, Row, VarTable};
+    use crate::cypher::ast::{ArithOp, LimitSkip, Operand, OrderItem, OrderTarget, RetItem, RetVal};
     use crate::cypher::plan::{plan, PlanOp};
     use crate::cypher::{lex, parse, RelDir};
     use crate::result::ResultSet;
@@ -5556,6 +5556,35 @@ LIMIT 10";
             rs2.get(0, "total"),
             Some(&Value::Int(5)),
             "total must be 5 (3+2 expanded rows)"
+        );
+    }
+
+    /// Regression: i64::MIN / -1 must not panic (checked_div saturates to i64::MAX).
+    /// Before the fix, the BinArith Div branch used plain `a / b` which panics on overflow
+    /// in both debug and release. ArithOp::Div is not reachable via the current parser
+    /// (the lexer rejects '/' as an illegal character), so this test calls resolve_operand
+    /// directly to pin the exact overflow case.
+    #[test]
+    fn binarith_div_min_over_neg1_does_not_panic() {
+        let fx = Fx::new();
+        let view = fx.view();
+        let vars = VarTable { names: vec![] };
+        let row: Row = vec![];
+        let params = BTreeMap::new();
+
+        // Construct: i64::MIN / -1  (overflows — checked_div returns None → saturates to i64::MAX)
+        let operand = Operand::BinArith {
+            op: ArithOp::Div,
+            left: Box::new(Operand::Lit(Value::Int(i64::MIN))),
+            right: Box::new(Operand::Lit(Value::Int(-1))),
+        };
+
+        let result = resolve_operand(&view, &vars, &row, &operand, &Params(&params));
+        assert!(result.is_ok(), "overflow division must not return Err: {result:?}");
+        assert_eq!(
+            result.unwrap(),
+            Some(Value::Int(i64::MAX)),
+            "i64::MIN / -1 must saturate to i64::MAX, not panic"
         );
     }
 }
