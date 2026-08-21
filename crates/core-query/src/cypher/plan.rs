@@ -243,12 +243,15 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
         PlanOp::Limit(LimitSkip::Param(_)) => None, // param-limit: can't determine bound statically
         _ => None,
     })?;
+    // A param Skip means the skip count is unknown at plan time — force staged.
+    if ops.iter().any(|op| matches!(op, PlanOp::Skip(LimitSkip::Param(_)))) {
+        return None;
+    }
     let skip_n = ops
         .iter()
         .rev()
         .find_map(|op| match op {
             PlanOp::Skip(LimitSkip::Exact(n)) => Some(*n),
-            PlanOp::Skip(LimitSkip::Param(_)) => Some(0), // conservatively treat as 0
             _ => None,
         })
         .unwrap_or(0);

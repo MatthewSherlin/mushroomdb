@@ -737,10 +737,10 @@ fn collect_params_from_ops(
             }
             // SKIP/LIMIT $param: register the name so missing params are
             // caught at pre-flight time rather than execution time.
-            PlanOp::Skip(LimitSkip::Param(n)) | PlanOp::Limit(LimitSkip::Param(n)) => {
-                if seen.insert(n.clone()) {
-                    names.push(n.clone());
-                }
+            PlanOp::Skip(LimitSkip::Param(n)) | PlanOp::Limit(LimitSkip::Param(n))
+                if seen.insert(n.clone()) =>
+            {
+                names.push(n.clone());
             }
             _ => {}
         }

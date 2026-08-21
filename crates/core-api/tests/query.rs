@@ -1605,3 +1605,43 @@ fn fn_type_on_derived_edge() {
         "type(r) must return the rule's edge_type for derived edges"
     );
 }
+
+// ── Round-2 regression tests ──────────────────────────────────────────────────
+
+/// Exposing test: SKIP $n LIMIT 3 over 20 nodes with $n=15 must return 3 rows.
+/// Pre-fix: row_bound returned Some(3) (ignoring param skip), routed to pull
+/// path which fetched only 3 rows then applied SKIP 15 → 0 rows.
+#[test]
+fn skip_param_does_not_route_to_pull_path() {
+    let dir = tmp("skip_param_pull");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        for i in 0..20u32 {
+            batch.insert_node("SPP", &format!("n{i:02}"), vec![]);
+        }
+        batch.commit().unwrap();
+    }
+    let rs = db.query_with_params(
+        "MATCH (n:SPP) RETURN n SKIP $offset LIMIT 3",
+        &[("offset", Value::Int(15))],
+    ).unwrap();
+    assert_eq!(rs.len(), 3, "SKIP 15 LIMIT 3 over 20 nodes must return 3 rows");
+}
+
+/// Non-integer (string) LIMIT param produces a named error.
+#[test]
+fn limit_param_wrong_type_is_named_error() {
+    let dir = tmp("limit_param_type");
+    let db = GraphDb::open(&dir).unwrap();
+    let err = db.query_with_params(
+        "MATCH (n:LPWT) RETURN n LIMIT $cap",
+        &[("cap", Value::Str("five".into()))],
+    );
+    assert!(err.is_err(), "string LIMIT param must return Err");
+    let msg = format!("{:?}", err.unwrap_err());
+    assert!(
+        msg.contains("integer") || msg.contains("cap"),
+        "error must mention integer type or param name: {msg}"
+    );
+}
