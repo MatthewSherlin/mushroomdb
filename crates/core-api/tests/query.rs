@@ -1708,3 +1708,108 @@ fn limit_param_wrong_type_is_named_error() {
         "error must mention integer type or param name: {msg}"
     );
 }
+
+// ── Cross-feature composites (final-review pins) ──────────────────────────────
+
+/// Composite pin: OPTIONAL MATCH + LIMIT $param in one query (Minor-1).
+/// Both shapes force staged routing independently (LeftOuterApply guard +
+/// Param(Limit) guard in `row_bound`); both guards fire for the composite,
+/// meaning the query reaches the staged executor and returns correct rows.
+#[test]
+fn optional_match_with_limit_param() {
+    let dir = tmp("opt_match_limit_param");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        // Four outer nodes; n0 has a KNOWS edge, the rest do not.
+        for i in 0..4u32 {
+            batch.insert_node("OPL", &format!("n{i}"), vec![]);
+        }
+        batch.insert_edge("KNOWS", "n0", "n1");
+        batch.commit().unwrap();
+    }
+    // OPTIONAL MATCH (LeftOuterApply) + LIMIT $cap (Param(Limit)) composite.
+    let rs = db.query_with_params(
+        "MATCH (a:OPL) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a LIMIT $cap",
+        &[("cap", Value::Int(2))],
+    ).unwrap();
+    assert_eq!(rs.len(), 2, "LIMIT $cap=2 must cap result to 2 rows despite OPTIONAL MATCH");
+}
+
+/// Composite pin: $param inside BinArith function argument — happy path (Minor-2).
+/// `resolve_operand` recurses into `BinArith.left` / `.right`, hitting
+/// `Operand::Param` and looking up the params map; same chain as $param in WHERE
+/// but exercised via a different call site (RETURN expression evaluation).
+#[test]
+fn abs_binarith_param_arg_happy() {
+    let dir = tmp("abs_param_arg");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("PB", "x", vec![]);
+        batch.commit().unwrap();
+    }
+    // abs($x - 1) with $x = 5 → abs(4) → 4.
+    let rs = db.query_with_params(
+        "MATCH (n:PB) RETURN abs($x - 1)",
+        &[("x", Value::Int(5))],
+    ).unwrap();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(
+        get_val(&rs, 0, "abs(<arith>)"),
+        Some(Value::Int(4)),
+        "abs($x - 1) with $x=5 must return 4"
+    );
+}
+
+/// Composite pin: $param inside BinArith function arg — missing param is a named
+/// error when the RETURN expression is actually evaluated (Minor-2).
+#[test]
+fn abs_binarith_param_arg_missing_is_error() {
+    let dir = tmp("abs_param_arg_missing");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        // One node so that the RETURN expression is evaluated and the
+        // missing $x param triggers a named error.
+        batch.insert_node("PBM", "x", vec![]);
+        batch.commit().unwrap();
+    }
+    let err = db.query_with_params(
+        "MATCH (n:PBM) RETURN abs($x - 1)",
+        &[], // $x not provided
+    );
+    assert!(err.is_err(), "missing $x must return Err");
+    let msg = format!("{:?}", err.unwrap_err());
+    assert!(
+        msg.contains("x") || msg.contains("parameter"),
+        "error must name the missing parameter: {msg}"
+    );
+}
+
+/// Composite pin: float BinArith null propagation (Minor-3).
+/// `abs(n.missing_float - 1.5)` — left operand is null because the property
+/// is absent → the shared `(None, _) | (_, None) => Ok(None)` guard in
+/// `resolve_operand` fires before float-path dispatch → abs receives None →
+/// null row value, not an error.
+#[test]
+fn abs_float_binarith_null_propagation() {
+    let dir = tmp("abs_float_null");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        // Node has no 'missing_float' property → evaluates to null.
+        batch.insert_node("FBN", "x", vec![]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query(
+        "MATCH (n:FBN) RETURN abs(n.missing_float - 1.5)",
+        &BTreeMap::new(),
+    ).unwrap();
+    assert_eq!(rs.len(), 1, "one row must be produced even when BinArith arg is null");
+    assert_eq!(
+        get_val(&rs, 0, "abs(<arith>)"),
+        None,
+        "abs(null - 1.5) must propagate null, not error"
+    );
+}

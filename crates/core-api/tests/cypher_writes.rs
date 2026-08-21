@@ -747,6 +747,53 @@ fn cypher_write_survives_wal_replay() {
     assert_eq!(db2.get_prop("persist-me", "score"), Some(&Value::Int(42)));
 }
 
+// ─── Cross-feature composites (final-review pins) ────────────────────────────
+
+/// Composite pin: DETACH DELETE + $param in WHERE (Important-1 from final review).
+/// `exec_match_delete_node` → `node_matches` → `eval_filter_expr` →
+/// `resolve_operand` → `Operand::Param` must resolve correctly end-to-end.
+/// Two L-label nodes exist; only the one whose `key` matches $k is removed,
+/// along with its incident manual edge; the bystander survives untouched.
+#[test]
+fn detach_delete_with_param() {
+    let mut db = GraphDb::open(&tmp("detach-delete-param")).unwrap();
+    // Two nodes: "del-target" (has a manual edge) and "keep" (bystander).
+    db.query_write(
+        "CREATE (n:L {id: 'keep', key: 'keep'})",
+        &no_params(),
+    )
+    .unwrap();
+    db.query_write(
+        "CREATE (n:L {id: 'del-target', key: 'del-target'})",
+        &no_params(),
+    )
+    .unwrap();
+    db.insert_edge("LINK", "del-target", "keep").unwrap();
+    assert!(db.has_node("keep"));
+    assert!(db.has_node("del-target"));
+    assert_eq!(db.edge_count(), 1);
+
+    // DETACH DELETE via $k param — must remove del-target and its edge only.
+    let mut params = BTreeMap::new();
+    params.insert("k".to_string(), Value::Str("del-target".into()));
+    let rs = db
+        .query_write(
+            "MATCH (n:L) WHERE n.key = $k DETACH DELETE n",
+            &params,
+        )
+        .unwrap();
+
+    assert!(!db.has_node("del-target"), "targeted node must be deleted");
+    assert!(db.has_node("keep"), "bystander node must survive");
+    assert_eq!(db.edge_count(), 0, "incident edge must be removed by DETACH");
+    // deleted = 1 node + 1 manual edge = 2.
+    assert_eq!(
+        rs.get(0, "deleted"),
+        Some(&Value::Int(2)),
+        "deleted column must be 1 node + 1 manual edge = 2"
+    );
+}
+
 // ─── Error cases for combined read-write ─────────────────────────────────────
 
 #[test]
