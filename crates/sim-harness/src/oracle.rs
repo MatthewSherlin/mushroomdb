@@ -243,11 +243,7 @@ impl Oracle {
                             props: &dp,
                         };
                         if evaluate(&rule.predicate, &src_view, &dst_view).is_some() {
-                            out.insert((
-                                rule.edge_type.clone(),
-                                src_key.clone(),
-                                dst_key.clone(),
-                            ));
+                            out.insert((rule.edge_type.clone(), src_key.clone(), dst_key.clone()));
                         }
                     }
                 }
@@ -343,15 +339,13 @@ impl Oracle {
     /// Enable full-text indexing for `(label, field)`.
     /// Returns `true` if newly added, `false` if already present.
     pub fn enable_fulltext(&mut self, label: &str, field: &str) -> bool {
-        self.fulltext_enabled
-            .insert((label.into(), field.into()))
+        self.fulltext_enabled.insert((label.into(), field.into()))
     }
 
     /// Disable full-text indexing for `(label, field)`.
     /// Returns `true` if it was present and removed, `false` if absent.
     pub fn disable_fulltext(&mut self, label: &str, field: &str) -> bool {
-        self.fulltext_enabled
-            .remove(&(label.into(), field.into()))
+        self.fulltext_enabled.remove(&(label.into(), field.into()))
     }
 
     /// Brute-force full-text search equivalent to `GraphDb::search`.
@@ -409,7 +403,9 @@ impl Oracle {
             for group in &groups {
                 let group_matched = group.iter().all(|term| {
                     if term.prefix {
-                        doc_tokens.iter().any(|t| t.starts_with(term.token.as_str()))
+                        doc_tokens
+                            .iter()
+                            .any(|t| t.starts_with(term.token.as_str()))
                     } else {
                         doc_tokens.contains(&term.token)
                     }

@@ -1,8 +1,8 @@
 //! Recursive-descent parser for the Cypher subset. Never panics on any token sequence.
 
 use super::ast::{
-    AggArg, AggFunc, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
-    LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand,
+    AggArg, AggFunc, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange, LimitSkip,
+    MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand,
     OptionalClause, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal,
     SetClause, UnwindClause, UnwindExpr, WithStage, WriteStatement,
 };
@@ -39,9 +39,7 @@ pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
 pub fn is_write_tokens(tokens: &[Tok]) -> bool {
     match tokens.first() {
         Some(Tok::Create) | Some(Tok::Merge) => true,
-        Some(Tok::Match) => tokens
-            .iter()
-            .any(|t| matches!(t, Tok::Set | Tok::Delete)),
+        Some(Tok::Match) => tokens.iter().any(|t| matches!(t, Tok::Set | Tok::Delete)),
         _ => false,
     }
 }
@@ -188,7 +186,10 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(OptionalClause { patterns, where_expr })
+        Ok(OptionalClause {
+            patterns,
+            where_expr,
+        })
     }
 
     /// Parse one `WITH <items> [WHERE] [ORDER BY] [SKIP] [LIMIT] [MATCH]* [UNWIND]* [WHERE]`
@@ -315,22 +316,16 @@ impl<'a> Parser<'a> {
 
     fn shortest_path_clause(&mut self) -> Result<Pattern, String> {
         self.pos += 1; // consume "shortestPath" identifier
-        self.expect(
-            &Tok::LParen,
-            "expected '(' after shortestPath",
-        )?;
+        self.expect(&Tok::LParen, "expected '(' after shortestPath")?;
         let start = self.node()?;
         let rel = self.rel()?;
         if rel.hops.is_none() {
-            return Err(self.err(
-                "shortestPath requires a variable-length relationship (e.g. [*..5])",
-            ));
+            return Err(
+                self.err("shortestPath requires a variable-length relationship (e.g. [*..5])")
+            );
         }
         let dest = self.node()?;
-        self.expect(
-            &Tok::RParen,
-            "expected ')' to close shortestPath",
-        )?;
+        self.expect(&Tok::RParen, "expected ')' to close shortestPath")?;
         Ok(Pattern {
             start,
             chain: vec![(rel, dest)],
@@ -507,7 +502,7 @@ impl<'a> Parser<'a> {
                         self.pos += 1;
                         self.validate_hop_range(1, m, CAP_ERR)
                     }
-                    _ => Err(self.err("expected max-hop integer after '*..'"))
+                    _ => Err(self.err("expected max-hop integer after '*..'")),
                 }
             }
 
@@ -516,7 +511,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn validate_hop_range(&self, min_n: i64, max_n: i64, cap_err: &str) -> Result<HopRange, String> {
+    fn validate_hop_range(
+        &self,
+        min_n: i64,
+        max_n: i64,
+        cap_err: &str,
+    ) -> Result<HopRange, String> {
         if min_n < 0 || max_n < 0 {
             return Err(self.err("hop counts must be non-negative"));
         }
@@ -686,8 +686,14 @@ impl<'a> Parser<'a> {
         let left = self.operand()?;
         // Check for an arithmetic operator following the first operand.
         let op = match self.peek() {
-            Some(Tok::Dash) => { self.pos += 1; ArithOp::Sub }
-            Some(Tok::Star) => { self.pos += 1; ArithOp::Mul }
+            Some(Tok::Dash) => {
+                self.pos += 1;
+                ArithOp::Sub
+            }
+            Some(Tok::Star) => {
+                self.pos += 1;
+                ArithOp::Mul
+            }
             _ => return Ok(left),
         };
         let right = self.operand()?;
@@ -761,7 +767,10 @@ impl<'a> Parser<'a> {
                     args.push(self.func_arg_operand()?);
                 }
             }
-            self.expect(&Tok::RParen, "expected ')' to close function call in RETURN")?;
+            self.expect(
+                &Tok::RParen,
+                "expected ')' to close function call in RETURN",
+            )?;
             RetVal::FuncCall { name, args }
         } else if self.eat(&Tok::Dot) {
             let field = self.ident("expected field name after '.'")?;
@@ -833,9 +842,8 @@ impl<'a> Parser<'a> {
             Some(Tok::Create) => self.create_stmt(),
             Some(Tok::Merge) => self.merge_stmt(),
             Some(Tok::Match) => self.match_write_stmt(),
-            _ => Err(self.err(
-                "expected CREATE, MERGE, or MATCH … SET/DELETE (write statement required)",
-            )),
+            _ => Err(self
+                .err("expected CREATE, MERGE, or MATCH … SET/DELETE (write statement required)")),
         }
     }
 
@@ -853,10 +861,7 @@ impl<'a> Parser<'a> {
     fn create_pattern(&mut self) -> Result<CreateStmt, String> {
         // Parse the first (possibly only) node.
         let first = self.create_node(0)?;
-        let first_var = first
-            .var
-            .clone()
-            .unwrap_or_else(|| format!("_cn{}", 0));
+        let first_var = first.var.clone().unwrap_or_else(|| format!("_cn{}", 0));
         let mut nodes: Vec<CreateNode> = vec![first];
         let mut edges: Vec<CreateEdge> = Vec::new();
 
@@ -865,10 +870,7 @@ impl<'a> Parser<'a> {
             let (etype, src_is_left) = self.create_rel()?;
             let idx = nodes.len();
             let next = self.create_node(idx)?;
-            let next_var = next
-                .var
-                .clone()
-                .unwrap_or_else(|| format!("_cn{idx}"));
+            let next_var = next.var.clone().unwrap_or_else(|| format!("_cn{idx}"));
             let prev_var = nodes.last().unwrap().var.clone().unwrap_or_else(|| {
                 if nodes.len() == 1 {
                     first_var.clone()
@@ -1002,7 +1004,10 @@ impl<'a> Parser<'a> {
         let etype = self.ident("expected relationship type")?;
         self.expect(&Tok::RBracket, "expected ']'")?;
         self.expect(&Tok::Dash, "expected '-'")?;
-        self.expect(&Tok::Gt, "expected '>' — CREATE requires directed relationships")?;
+        self.expect(
+            &Tok::Gt,
+            "expected '>' — CREATE requires directed relationships",
+        )?;
         Ok((etype, false))
     }
 
@@ -1108,8 +1113,8 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::Delete) => {
                 self.pos += 1; // consume DELETE
-                // Try to resolve all targets as edge vars first. If the first
-                // target is a node var (not an edge var), fall through to node delete.
+                               // Try to resolve all targets as edge vars first. If the first
+                               // target is a node var (not an edge var), fall through to node delete.
                 match self.delete_targets_or_node(&matches)? {
                     DeleteTargetResult::Edges(deletes) => {
                         if self.pos < self.toks.len() {
@@ -1236,10 +1241,7 @@ impl<'a> Parser<'a> {
 
     /// Parse a comma-separated list of node-variable targets for
     /// `[DETACH] DELETE`.  All targets must be node variables bound in `patterns`.
-    fn node_delete_targets(
-        &mut self,
-        patterns: &[Pattern],
-    ) -> Result<Vec<String>, String> {
+    fn node_delete_targets(&mut self, patterns: &[Pattern]) -> Result<Vec<String>, String> {
         let mut vars = Vec::new();
         loop {
             let var = self.ident("expected node variable to DELETE")?;
@@ -1945,10 +1947,9 @@ LIMIT 10";
 
     #[test]
     fn var_length_shortest_path_parses() {
-        let q = parse_src(
-            "MATCH (a:N) MATCH (b:N) MATCH shortestPath((a)-[r:T*..5]->(b)) RETURN a",
-        )
-        .expect("shortestPath must parse");
+        let q =
+            parse_src("MATCH (a:N) MATCH (b:N) MATCH shortestPath((a)-[r:T*..5]->(b)) RETURN a")
+                .expect("shortestPath must parse");
         assert!(q.matches[2].shortest, "third match must be shortest=true");
         let (rel, _) = &q.matches[2].chain[0];
         assert_eq!(rel.hops, Some(HopRange { min: 1, max: 5 }));

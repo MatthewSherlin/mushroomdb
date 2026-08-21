@@ -1,4 +1,6 @@
-use core_api::{AggFn, Direction, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource};
+use core_api::{
+    AggFn, Direction, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource,
+};
 use proptest::prelude::*;
 use sim_harness::{Oracle, SimFs, APPROX_RECALL_FLOOR_QUIESCED, APPROX_RECALL_FLOOR_RECOVERY};
 use std::collections::BTreeSet;
@@ -317,24 +319,24 @@ const PROP_FIELDS: [&str; 7] = ["seed", "p", "f", "tags", "year", "loc", "emb"];
 
 #[derive(Debug, Clone)]
 enum Op {
-    InsertNode(u8),         // key = "k{n}", label = "L{n%2}"
-    InsertEdge(u8, u8, u8), // etype index 0-6 (0-2: user e{i}, 3-6: rule etypes); src k; dst k
-    SetProp(u8, u8),        // key, int value → writes "p"
-    SetF(u8, u8),           // key, target_key_index → writes "f" = "k{m}"
-    SetTags(u8, u8, u8),    // key, tok1, tok2 → writes "tags" as Value::List from 3-token alphabet
-    CreateRule(u8),         // picks from the 5 templates by index
-    DeleteRule(u8),         // picks from the 5 rule names by index
-    DeleteNode(u8),         // key = "k{n}"
-    DeleteEdge(u8, u8, u8), // etype index, src k, dst k
-    RemoveProp(u8, u8),     // key, field-selector → PROP_FIELDS[sel % 7]
-    SetYear(u8, u8),        // key, year-selector → bucket / signed-zero values
-    SetLoc(u8, u8),         // key, loc-selector → Paris/London/±180/NYC
-    SetEmb(u8, u8),         // key, emb-selector → near-threshold / orthogonal
-    CreateView(u8), // pick from N_VIEW_TEMPLATES templates by index
-    DeleteView(u8), // pick from VIEW_NAMES by index
-    EnableFulltext(u8, u8), // label idx (0→"L0", 1→"L1"), field idx into FT_FIELDS
+    InsertNode(u8),          // key = "k{n}", label = "L{n%2}"
+    InsertEdge(u8, u8, u8),  // etype index 0-6 (0-2: user e{i}, 3-6: rule etypes); src k; dst k
+    SetProp(u8, u8),         // key, int value → writes "p"
+    SetF(u8, u8),            // key, target_key_index → writes "f" = "k{m}"
+    SetTags(u8, u8, u8),     // key, tok1, tok2 → writes "tags" as Value::List from 3-token alphabet
+    CreateRule(u8),          // picks from the 5 templates by index
+    DeleteRule(u8),          // picks from the 5 rule names by index
+    DeleteNode(u8),          // key = "k{n}"
+    DeleteEdge(u8, u8, u8),  // etype index, src k, dst k
+    RemoveProp(u8, u8),      // key, field-selector → PROP_FIELDS[sel % 7]
+    SetYear(u8, u8),         // key, year-selector → bucket / signed-zero values
+    SetLoc(u8, u8),          // key, loc-selector → Paris/London/±180/NYC
+    SetEmb(u8, u8),          // key, emb-selector → near-threshold / orthogonal
+    CreateView(u8),          // pick from N_VIEW_TEMPLATES templates by index
+    DeleteView(u8),          // pick from VIEW_NAMES by index
+    EnableFulltext(u8, u8),  // label idx (0→"L0", 1→"L1"), field idx into FT_FIELDS
     DisableFulltext(u8, u8), // label idx, field idx
-    FulltextSearch(u8, u8), // field idx, query idx — asserts db.search == oracle.scratch_search
+    FulltextSearch(u8, u8),  // field idx, query idx — asserts db.search == oracle.scratch_search
     /// 2–4 leaf ops committed as one engine `batch()`. Nested Batch is never
     /// generated. CreateRule is omitted from the inner pool so we do not hit
     /// the documented same-batch rule-window (validation cannot see edges a
@@ -565,7 +567,9 @@ fn apply_oracle_leaf(oracle: &mut Oracle, op: &Op) -> Result<(), String> {
             if oracle.enable_fulltext(label, field) {
                 Ok(())
             } else {
-                Err(format!("oracle enable_fulltext({label},{field}) already enabled"))
+                Err(format!(
+                    "oracle enable_fulltext({label},{field}) already enabled"
+                ))
             }
         }
         Op::DisableFulltext(l, f) => {
@@ -574,7 +578,9 @@ fn apply_oracle_leaf(oracle: &mut Oracle, op: &Op) -> Result<(), String> {
             if oracle.disable_fulltext(label, field) {
                 Ok(())
             } else {
-                Err(format!("oracle disable_fulltext({label},{field}) not enabled"))
+                Err(format!(
+                    "oracle disable_fulltext({label},{field}) not enabled"
+                ))
             }
         }
         Op::FulltextSearch(_, _) => Ok(()), // read-only; assertion is in engine loop
@@ -1728,7 +1734,7 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
     // Cluster 2: v8..v11 (near [-1,0]), Cluster 3: v12..v15 (near [0,-1]),
     // Extras: v16..v19 (diagonals).
     let vecs: &[[f64; 2]] = &[
-        [1.0, 0.0],   // v0 — will be deleted
+        [1.0, 0.0], // v0 — will be deleted
         [0.98, 0.2],
         [0.96, 0.28],
         [0.97, 0.24],
@@ -1754,8 +1760,7 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
     let deleted_key = "v0";
 
     let dir = {
-        let d =
-            std::env::temp_dir().join(format!("graphdb-ivf-delete-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("graphdb-ivf-delete-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     };
@@ -1768,7 +1773,8 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
         let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
         let nv = [v[0] / norm, v[1] / norm];
         let val = Value::List(vec![Value::Float(nv[0]), Value::Float(nv[1])]);
-        db.insert_node("V", &key, vec![("emb".into(), val)]).unwrap();
+        db.insert_node("V", &key, vec![("emb".into(), val)])
+            .unwrap();
         normalized.push((key, nv));
     }
 
@@ -1788,7 +1794,9 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
     .unwrap();
 
     // Drift should be 0 before any deletion (IVF just fitted).
-    let drift_before = db.ivf_dst_drift("ivf_sim").expect("rule must be approximate");
+    let drift_before = db
+        .ivf_dst_drift("ivf_sim")
+        .expect("rule must be approximate");
     assert_eq!(drift_before, 0, "drift must be 0 immediately after IVF fit");
 
     // Delete v0.
@@ -1800,7 +1808,9 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
         if src == deleted_key {
             continue;
         }
-        let dsts = db.neighbors(&src, "IVSIM", Direction::Out).unwrap_or_default();
+        let dsts = db
+            .neighbors(&src, "IVSIM", Direction::Out)
+            .unwrap_or_default();
         assert!(
             !dsts.contains(&deleted_key.to_string()),
             "v0 (deleted) must not appear as dst of {src} after deletion; got {dsts:?}"
@@ -1841,7 +1851,10 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
             if src == deleted_key || !db.has_node(&src) {
                 continue;
             }
-            for dst in db.neighbors(&src, "IVSIM", Direction::Out).unwrap_or_default() {
+            for dst in db
+                .neighbors(&src, "IVSIM", Direction::Out)
+                .unwrap_or_default()
+            {
                 s.insert((src.clone(), dst));
             }
         }
@@ -1871,7 +1884,9 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
     }
 
     // (iii) IVF dst-side drift counter incremented by the deletion.
-    let drift_after = db.ivf_dst_drift("ivf_sim").expect("rule must be approximate");
+    let drift_after = db
+        .ivf_dst_drift("ivf_sim")
+        .expect("rule must be approximate");
     assert!(
         drift_after > 0,
         "drift counter must be > 0 after deleting a node from an IVF-indexed rule; got {drift_after}"

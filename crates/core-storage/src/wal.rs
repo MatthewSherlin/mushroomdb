@@ -448,14 +448,20 @@ mod tests {
         };
         let cv_payload = bincode::serialize(&create_view).unwrap();
         // discriminant must be 10 (0x0a 0x00 0x00 0x00 in LE)
-        assert_eq!(&cv_payload[0..4], &[10, 0, 0, 0],
-            "CreateView discriminant changed — a variant was inserted before position 10");
+        assert_eq!(
+            &cv_payload[0..4],
+            &[10, 0, 0, 0],
+            "CreateView discriminant changed — a variant was inserted before position 10"
+        );
 
         // ── Variant 11: DeleteView { name: "v" } ─────────────────────────────
         let delete_view = WalRecord::DeleteView { name: "v".into() };
         let dv_payload = bincode::serialize(&delete_view).unwrap();
-        assert_eq!(&dv_payload[0..4], &[11, 0, 0, 0],
-            "DeleteView discriminant changed — a variant was inserted before position 11");
+        assert_eq!(
+            &dv_payload[0..4],
+            &[11, 0, 0, 0],
+            "DeleteView discriminant changed — a variant was inserted before position 11"
+        );
 
         // Roundtrip both through encode_record / decode_all.
         let mut buf = encode_record(&create_view);
@@ -463,7 +469,12 @@ mod tests {
         let (recs, consumed) = decode_all(&buf);
         assert_eq!(consumed, buf.len());
         assert_eq!(recs.len(), 2);
-        assert_eq!(recs[0], WalRecord::CreateView { def_bytes: vec![0xDE, 0xAD] });
+        assert_eq!(
+            recs[0],
+            WalRecord::CreateView {
+                def_bytes: vec![0xDE, 0xAD]
+            }
+        );
         assert_eq!(recs[1], WalRecord::DeleteView { name: "v".into() });
     }
 
@@ -527,8 +538,20 @@ mod tests {
         let (recs, consumed) = decode_all(&buf);
         assert_eq!(consumed, buf.len());
         assert_eq!(recs.len(), 2);
-        assert_eq!(recs[0], WalRecord::EnableFulltext { label: "A".into(), field: "b".into() });
-        assert_eq!(recs[1], WalRecord::DisableFulltext { label: "A".into(), field: "b".into() });
+        assert_eq!(
+            recs[0],
+            WalRecord::EnableFulltext {
+                label: "A".into(),
+                field: "b".into()
+            }
+        );
+        assert_eq!(
+            recs[1],
+            WalRecord::DisableFulltext {
+                label: "A".into(),
+                field: "b".into()
+            }
+        );
     }
 
     #[test]

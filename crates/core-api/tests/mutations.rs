@@ -574,19 +574,12 @@ fn topk_field_equal_cap_per_source_and_stats_survive_recovery() {
         assert_eq!(s.rules[0].name, "eq");
         assert_eq!(s.rules[0].edges, 10);
         // Top-k rules never set the tripped latch.
-        assert!(
-            !s.rules[0].tripped,
-            "top-k rules must never set tripped"
-        );
+        assert!(!s.rules[0].tripped, "top-k rules must never set tripped");
         assert!(s.rules[0].fires > 0);
 
         // Additional inserts succeed and update the top-k normally.
-        db.insert_node(
-            "N",
-            "n5",
-            vec![("k".into(), Value::Str("const".into()))],
-        )
-        .unwrap();
+        db.insert_node("N", "n5", vec![("k".into(), Value::Str("const".into()))])
+            .unwrap();
         let s = db.stats();
         // 6 nodes × top-2 each = 12 edges.
         assert_eq!(s.rules[0].edges, 12);
@@ -673,7 +666,11 @@ fn topk_eviction_on_prop_change_and_backfill() {
     // n2→n0 retracted; n2 backfills to n1.
     // n3→n0 retracted; n3 backfills to n1.
     // n0 now has k="other" → no FieldEqual match → 0 dsts.
-    assert_eq!(db.stats().rules[0].edges, 3, "3 edges after n0 eviction: n1→n2, n2→n1, n3→n1");
+    assert_eq!(
+        db.stats().rules[0].edges,
+        3,
+        "3 edges after n0 eviction: n1→n2, n2→n1, n3→n1"
+    );
     assert!(
         db.neighbors("n0", "EQ", Direction::Out).unwrap().is_empty(),
         "n0 no longer matches anyone"
@@ -826,8 +823,10 @@ fn topk_backfill_on_delete_promotes_next_candidate() {
 fn delete_report_counts_are_accurate() {
     let dir = tmp("delete-report-counts");
     let mut db = GraphDb::open(&dir).unwrap();
-    db.insert_node("A", "a", vec![("tags".into(), tags(&["x"]))]).unwrap();
-    db.insert_node("A", "b", vec![("tags".into(), tags(&["x"]))]).unwrap();
+    db.insert_node("A", "a", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    db.insert_node("A", "b", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
     db.insert_node("A", "u", vec![]).unwrap();
     db.insert_node("A", "v", vec![]).unwrap();
 

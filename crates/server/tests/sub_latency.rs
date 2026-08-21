@@ -35,10 +35,7 @@ fn tmp(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "sub-lat-{name}-{}-{nanos}",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("sub-lat-{name}-{}-{nanos}", std::process::id()))
 }
 
 fn percentile(mut v: Vec<f64>, p: f64) -> f64 {
@@ -66,7 +63,8 @@ fn measure_inprocess_subscription_latency() {
     for i in 0..WARMUP {
         let key = format!("w-{i:06}");
         db.write().insert_node("X", &key, vec![]).expect("insert");
-        sub.recv_timeout(Duration::from_secs(1)).expect("warmup event");
+        sub.recv_timeout(Duration::from_secs(1))
+            .expect("warmup event");
     }
 
     // Measured run.
@@ -115,9 +113,8 @@ fn measure_inprocess_subscription_latency() {
 // (b) WS on localhost
 // ---------------------------------------------------------------------------
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn spawn_server(db: SharedDb) -> SocketAddr {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -175,7 +172,10 @@ async fn measure_ws_subscription_latency() {
         // Wait for WS frame.
         let ev = next_text(&mut ws).await;
         let t_recv = Instant::now();
-        assert_eq!(ev["type"], "node_inserted", "expected node_inserted, got {ev}");
+        assert_eq!(
+            ev["type"], "node_inserted",
+            "expected node_inserted, got {ev}"
+        );
         latencies_ns.push((t_recv - t_post).as_nanos() as f64);
     }
 

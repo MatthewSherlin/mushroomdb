@@ -222,12 +222,7 @@ fn dominant_dim(entries: &[(u32, usize)]) -> Option<usize> {
 // Dedup against existing rules
 // ---------------------------------------------------------------------------
 
-fn is_covered(
-    existing: &[RuleDef],
-    src_label: &str,
-    dst_label: &str,
-    pred: &Predicate,
-) -> bool {
+fn is_covered(existing: &[RuleDef], src_label: &str, dst_label: &str, pred: &Predicate) -> bool {
     existing.iter().any(|r| {
         r.src_label == src_label
             && r.dst_label == dst_label
@@ -279,10 +274,9 @@ fn run_preview(
 
     // We do NOT use a seed here — the preview seed was baked into the def index
     // before this call. Use a fixed offset from the def name for reproducibility.
-    let seed = def
-        .name
-        .bytes()
-        .fold(DEFAULT_SEED, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    let seed = def.name.bytes().fold(DEFAULT_SEED, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(b as u64)
+    });
     let src_sample = sample_indices(src_n, config.max_sample_sources, seed);
     let deadline = Instant::now() + Duration::from_millis(config.budget_ms);
 
@@ -333,7 +327,10 @@ fn run_preview(
         (hit_rate * src_n as f64 * dst_n as f64).round() as u64
     };
 
-    Preview { est_edges, examples }
+    Preview {
+        est_edges,
+        examples,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -365,11 +362,13 @@ pub fn suggest_rules(
     seed: u64,
 ) -> SuggestReport {
     if label_nodes.is_empty() || all_fields.is_empty() {
-        return SuggestReport { suggestions: Vec::new(), truncated: false };
+        return SuggestReport {
+            suggestions: Vec::new(),
+            truncated: false,
+        };
     }
 
-    let global_deadline =
-        Instant::now() + Duration::from_millis(config.global_budget_ms);
+    let global_deadline = Instant::now() + Duration::from_millis(config.global_budget_ms);
 
     // Build key sets per label for KeyMatch detection.
     let label_keys: BTreeMap<&str, BTreeSet<&str>> = label_nodes
@@ -393,7 +392,13 @@ pub fn suggest_rules(
                 return None;
             }
             let label_seed = seed.wrapping_add(i as u64 ^ 0x9e37_79b9_7f4a_7c15);
-            let p = profile_label(nodes, get_prop, all_fields, config.max_sample_nodes, label_seed);
+            let p = profile_label(
+                nodes,
+                get_prop,
+                all_fields,
+                config.max_sample_nodes,
+                label_seed,
+            );
             Some((label.clone(), p))
         })
         .collect();
@@ -422,7 +427,11 @@ pub fn suggest_rules(
                     let Some(dst_keys) = label_keys.get(dst_label) else {
                         continue;
                     };
-                    let match_count = fp.str_distinct.iter().filter(|v| dst_keys.contains(v.as_str())).count();
+                    let match_count = fp
+                        .str_distinct
+                        .iter()
+                        .filter(|v| dst_keys.contains(v.as_str()))
+                        .count();
                     if match_count == 0 {
                         continue;
                     }
@@ -453,8 +462,13 @@ pub fn suggest_rules(
                         max_edges: None,
                         approximate: false,
                     };
-                    let examples_preview: Vec<String> =
-                        fp.str_distinct.iter().filter(|v| dst_keys.contains(v.as_str())).take(3).cloned().collect();
+                    let examples_preview: Vec<String> = fp
+                        .str_distinct
+                        .iter()
+                        .filter(|v| dst_keys.contains(v.as_str()))
+                        .take(3)
+                        .cloned()
+                        .collect();
                     let rationale = format!(
                         "Field '{field}' in {src_label} ends with '_id' and {match_count} \
                          sampled value(s) match keys in {dst_label} \
@@ -613,7 +627,10 @@ pub fn suggest_rules(
                     {
                         continue;
                     }
-                    let shared = src_fp.str_distinct.intersection(&dst_fp.str_distinct).count();
+                    let shared = src_fp
+                        .str_distinct
+                        .intersection(&dst_fp.str_distinct)
+                        .count();
                     if shared == 0 {
                         continue;
                     }
@@ -863,6 +880,13 @@ pub fn suggest_rules(
     } // end 'detect block
 
     // Sort by estimated edge count descending so the highest-value suggestions come first.
-    results.sort_by(|a, b| b.est_edges.cmp(&a.est_edges).then(a.def.name.cmp(&b.def.name)));
-    SuggestReport { suggestions: results, truncated: truncated || profiling_truncated }
+    results.sort_by(|a, b| {
+        b.est_edges
+            .cmp(&a.est_edges)
+            .then(a.def.name.cmp(&b.def.name))
+    });
+    SuggestReport {
+        suggestions: results,
+        truncated: truncated || profiling_truncated,
+    }
 }

@@ -44,9 +44,8 @@ async fn spawn_server(db: SharedDb) -> SocketAddr {
     rx.await.expect("ready")
 }
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Connect to /subscribe, send the given subscribe JSON, return the stream
 /// after receiving the `{"subscribed":true}` ack.
@@ -147,7 +146,10 @@ async fn subscribe_ws_receives_edge_fired_with_correct_payload() {
     keys.sort();
     assert_eq!(
         keys,
-        vec![("n1".to_string(), "n2".to_string()), ("n2".to_string(), "n1".to_string())]
+        vec![
+            ("n1".to_string(), "n2".to_string()),
+            ("n2".to_string(), "n1".to_string())
+        ]
     );
 }
 
@@ -171,7 +173,10 @@ async fn subscribe_ws_receives_edge_retracted_on_delete() {
 
     // Expect at least one EdgeRetracted.
     let ev = next_text(&mut ws).await;
-    assert_eq!(ev["type"], "edge_retracted", "expected edge_retracted, got {ev}");
+    assert_eq!(
+        ev["type"], "edge_retracted",
+        "expected edge_retracted, got {ev}"
+    );
     assert_eq!(ev["rule"], "rel");
     assert!(ev["commit_seq"].as_u64().unwrap() > 0);
 }
@@ -210,9 +215,7 @@ async fn subscribe_ws_writes_receives_node_events() {
     let addr = spawn_server(db.clone()).await;
     let mut ws = connect_subscribe(addr, r#"{"writes":true}"#).await;
 
-    db.write()
-        .insert_node("Person", "alice", vec![])
-        .unwrap();
+    db.write().insert_node("Person", "alice", vec![]).unwrap();
 
     let ev = next_text(&mut ws).await;
     assert_eq!(ev["type"], "node_inserted");
@@ -244,10 +247,11 @@ async fn subscribe_ws_fire_then_retract_ordering_on_single_connection() {
     let mut ws = connect_subscribe(addr, r#"{"rules":["rel"]}"#).await;
 
     // SET that fires: n2.tags = ["x"] → overlap ["x"]∩["x"] = 1.0 ≥ 0.5
-    db.write()
-        .set_prop("n2", "tags", tags(&["x"]))
-        .unwrap();
-    assert!(db.read().edge_count() >= 2, "edges must exist after fire SET");
+    db.write().set_prop("n2", "tags", tags(&["x"])).unwrap();
+    assert!(
+        db.read().edge_count() >= 2,
+        "edges must exist after fire SET"
+    );
 
     // Drain all EdgeFired events (n1→n2 and n2→n1).
     let ev_fire1 = next_text(&mut ws).await;
@@ -260,16 +264,21 @@ async fn subscribe_ws_fire_then_retract_ordering_on_single_connection() {
     assert_eq!(ev_fire2["commit_seq"].as_u64().unwrap(), seq_fire);
 
     // SET that retracts: n2.tags = ["y"] → overlap ["x"]∩["y"] = 0.0 < 0.5
-    db.write()
-        .set_prop("n2", "tags", tags(&["y"]))
-        .unwrap();
-    assert_eq!(db.read().edge_count(), 0, "edges retracted after second SET");
+    db.write().set_prop("n2", "tags", tags(&["y"])).unwrap();
+    assert_eq!(
+        db.read().edge_count(),
+        0,
+        "edges retracted after second SET"
+    );
 
     // Drain EdgeRetracted events.
     let ev_ret1 = next_text(&mut ws).await;
     let ev_ret2 = next_text(&mut ws).await;
     for ev in [&ev_ret1, &ev_ret2] {
-        assert_eq!(ev["type"], "edge_retracted", "expected edge_retracted, got {ev}");
+        assert_eq!(
+            ev["type"], "edge_retracted",
+            "expected edge_retracted, got {ev}"
+        );
     }
     let seq_retract = ev_ret1["commit_seq"].as_u64().expect("commit_seq");
     assert_eq!(ev_ret2["commit_seq"].as_u64().unwrap(), seq_retract);

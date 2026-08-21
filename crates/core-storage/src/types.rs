@@ -38,21 +38,42 @@ pub fn list_tokens(v: &Value) -> Option<std::collections::BTreeSet<ValueKey>> {
 
 #[derive(Debug)]
 pub enum GraphError {
-    KeyNotFound { key: String },
-    DuplicateKey { key: String },
+    KeyNotFound {
+        key: String,
+    },
+    DuplicateKey {
+        key: String,
+    },
     Io(std::io::Error),
-    Corrupt { detail: String },
-    RuleInvalid { detail: String },
-    RuleOwned { detail: String },
-    RuleNotFound { name: String },
-    QueryError { detail: String },
-    IngestError { detail: String },
+    Corrupt {
+        detail: String,
+    },
+    RuleInvalid {
+        detail: String,
+    },
+    RuleOwned {
+        detail: String,
+    },
+    RuleNotFound {
+        name: String,
+    },
+    QueryError {
+        detail: String,
+    },
+    IngestError {
+        detail: String,
+    },
     /// Attempted mutation on a read-only as-of instance.
     ReadOnly,
     /// Requested commit index is beyond the valid range.
-    CommitOutOfRange { commit: u64, total: u64 },
+    CommitOutOfRange {
+        commit: u64,
+        total: u64,
+    },
     /// Attempted to write to a view-managed property.
-    ViewPropReadOnly { view_name: String },
+    ViewPropReadOnly {
+        view_name: String,
+    },
 }
 
 impl std::fmt::Display for GraphError {

@@ -91,10 +91,7 @@ fn open_at_commit_0_only_node_a() {
     let db = GraphDb::open_at(&dir, 0).unwrap();
     assert!(db.has_node("a"), "commit 0: node a must exist");
     assert!(!db.has_node("b"), "commit 0: node b not yet inserted");
-    assert!(
-        db.rules().is_empty(),
-        "commit 0: no rules created yet"
-    );
+    assert!(db.rules().is_empty(), "commit 0: no rules created yet");
     let nbrs = db.neighbors("a", "SAME", Direction::Out).unwrap();
     assert!(nbrs.is_empty(), "commit 0: no edges");
     assert!(db.is_read_only(), "open_at result must be read-only");
@@ -162,10 +159,7 @@ fn open_at_commit_4_node_a_deleted() {
     build_known_history(&dir);
 
     let db = GraphDb::open_at(&dir, 4).unwrap();
-    assert!(
-        !db.has_node("a"),
-        "commit 4: node a must be deleted"
-    );
+    assert!(!db.has_node("a"), "commit 4: node a must be deleted");
     assert!(db.has_node("b"), "commit 4: node b still present");
 }
 
@@ -260,10 +254,22 @@ fn open_at_latest_equivalent_to_open() {
         );
         for (ae, ne) in at_exps.iter().zip(norm_exps.iter()) {
             assert_eq!(ae.rule, ne.rule, "explain rule mismatch for ({a},{b})");
-            assert_eq!(ae.edge_type, ne.edge_type, "explain edge_type mismatch for ({a},{b})");
-            assert_eq!(ae.src_key, ne.src_key, "explain src_key mismatch for ({a},{b})");
-            assert_eq!(ae.dst_key, ne.dst_key, "explain dst_key mismatch for ({a},{b})");
-            assert_eq!(ae.weight, ne.weight, "explain weight mismatch for ({a},{b})");
+            assert_eq!(
+                ae.edge_type, ne.edge_type,
+                "explain edge_type mismatch for ({a},{b})"
+            );
+            assert_eq!(
+                ae.src_key, ne.src_key,
+                "explain src_key mismatch for ({a},{b})"
+            );
+            assert_eq!(
+                ae.dst_key, ne.dst_key,
+                "explain dst_key mismatch for ({a},{b})"
+            );
+            assert_eq!(
+                ae.weight, ne.weight,
+                "explain weight mismatch for ({a},{b})"
+            );
         }
     }
 }
@@ -278,7 +284,10 @@ fn open_at_out_of_range_returns_error() {
     // commit 5 is one past the last valid (0..=4)
     let err = GraphDb::open_at(&dir, 5).err().expect("should err");
     match err {
-        GraphError::CommitOutOfRange { commit: 5, total: 5 } => {}
+        GraphError::CommitOutOfRange {
+            commit: 5,
+            total: 5,
+        } => {}
         other => panic!("expected CommitOutOfRange{{5,5}}, got {other:?}"),
     }
 
@@ -287,7 +296,10 @@ fn open_at_out_of_range_returns_error() {
     let _db = GraphDb::open(&dir2).unwrap(); // creates dir, no WAL writes
     let err2 = GraphDb::open_at(&dir2, 0).err().expect("should err");
     match err2 {
-        GraphError::CommitOutOfRange { commit: 0, total: 0 } => {}
+        GraphError::CommitOutOfRange {
+            commit: 0,
+            total: 0,
+        } => {}
         other => panic!("expected CommitOutOfRange{{0,0}} for empty WAL, got {other:?}"),
     }
 }
@@ -344,7 +356,10 @@ fn torn_tail_open_at_sees_fewer_commits() {
     // open_at(2) is out of range: valid total is 2, so commit 2 >= 2.
     let err = GraphDb::open_at(&dir, 2).err().expect("should err");
     match err {
-        GraphError::CommitOutOfRange { commit: 2, total: 2 } => {}
+        GraphError::CommitOutOfRange {
+            commit: 2,
+            total: 2,
+        } => {}
         other => panic!("expected CommitOutOfRange{{2,2}}, got {other:?}"),
     }
 }
@@ -376,9 +391,7 @@ fn mutation_refusal_sweep() {
     let mut db = GraphDb::open_at(&dir, 2).unwrap();
 
     // insert_node
-    let e = db
-        .insert_node("T", "new", vec![])
-        .unwrap_err();
+    let e = db.insert_node("T", "new", vec![]).unwrap_err();
     assert!(
         matches!(e, GraphError::ReadOnly),
         "insert_node must return ReadOnly, got {e:?}"
@@ -406,9 +419,7 @@ fn mutation_refusal_sweep() {
     );
 
     // insert_edge (both nodes exist at commit 2; SAME is rule-owned, use OTHER)
-    let e = db
-        .insert_edge("OTHER", "a", "b")
-        .unwrap_err();
+    let e = db.insert_edge("OTHER", "a", "b").unwrap_err();
     assert!(
         matches!(e, GraphError::ReadOnly),
         "insert_edge must return ReadOnly, got {e:?}"
@@ -531,9 +542,7 @@ fn read_ops_work_on_as_of_instance() {
 
     // query
     let params = std::collections::BTreeMap::new();
-    let rs = db
-        .query("MATCH (n:T) RETURN n", &params)
-        .unwrap();
+    let rs = db.query("MATCH (n:T) RETURN n", &params).unwrap();
     assert_eq!(rs.len(), 2, "commit 2: two T nodes");
 
     // stats

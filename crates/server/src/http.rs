@@ -20,7 +20,10 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use core_api::{is_write_query, json_to_rows, AutoFk, DegreeConfig, Dir, GraphError, IngestOptions, PageRankConfig, RuleDef, SuggestConfig, SharedDb, WccConfig, SUGGEST_DEFAULT_SEED};
+use core_api::{
+    is_write_query, json_to_rows, AutoFk, DegreeConfig, Dir, GraphError, IngestOptions,
+    PageRankConfig, RuleDef, SharedDb, SuggestConfig, WccConfig, SUGGEST_DEFAULT_SEED,
+};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -374,7 +377,8 @@ async fn suggest(State(state): State<AppState>) -> Response {
     let db = state.db.clone();
     match tokio::task::spawn_blocking(move || {
         let config = SuggestConfig::default();
-        db.read().suggest_rules_with_config(&config, SUGGEST_DEFAULT_SEED)
+        db.read()
+            .suggest_rules_with_config(&config, SUGGEST_DEFAULT_SEED)
     })
     .await
     {
@@ -496,17 +500,16 @@ async fn neighborhood(
 /// to `tokio::task::spawn_blocking` (blocking thread-pool). The read guard is
 /// acquired and held inside the blocking task — reads don't block other reads.
 /// The `budget_ms` field in [`PageRankConfig`] caps lock-hold time.
-async fn algo_pagerank(State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Response {
+async fn algo_pagerank(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
     let config: PageRankConfig = match serde_json::from_value(body) {
         Ok(c) => c,
         Err(e) => return err_response(format!("invalid pagerank config: {e}")),
     };
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || {
-        db.read().pagerank(&config)
-    })
-    .await
-    {
+    match tokio::task::spawn_blocking(move || db.read().pagerank(&config)).await {
         Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
         Err(_) => err_response("pagerank task panicked"),
     }
@@ -522,11 +525,7 @@ async fn algo_wcc(State(state): State<AppState>, Json(body): Json<serde_json::Va
         Err(e) => return err_response(format!("invalid wcc config: {e}")),
     };
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || {
-        db.read().connected_components(&config)
-    })
-    .await
-    {
+    match tokio::task::spawn_blocking(move || db.read().connected_components(&config)).await {
         Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
         Err(_) => err_response("wcc task panicked"),
     }
@@ -535,17 +534,16 @@ async fn algo_wcc(State(state): State<AppState>, Json(body): Json<serde_json::Va
 /// `POST /algo/degree` — degree centrality over the unified topology.
 ///
 /// Mirrors the `suggest` locking and blocking pattern exactly.
-async fn algo_degree(State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Response {
+async fn algo_degree(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
     let config: DegreeConfig = match serde_json::from_value(body) {
         Ok(c) => c,
         Err(e) => return err_response(format!("invalid degree config: {e}")),
     };
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || {
-        db.read().degree_centrality(&config)
-    })
-    .await
-    {
+    match tokio::task::spawn_blocking(move || db.read().degree_centrality(&config)).await {
         Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
         Err(_) => err_response("degree task panicked"),
     }

@@ -53,14 +53,30 @@ pub struct RuleDef {
 /// that.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Predicate {
-    KeyMatch { field: String },
-    FieldEqual { field: String },
-    Overlap { field: String, min: f64 },
+    KeyMatch {
+        field: String,
+    },
+    FieldEqual {
+        field: String,
+    },
+    Overlap {
+        field: String,
+        min: f64,
+    },
     All(Vec<Predicate>),
     // APPENDED (Plan 7) — positional bincode: never reorder.
-    NumericWithin { field: String, tolerance: f64 },
-    GeoRadius { field: String, km: f64 },
-    VectorSimilar { field: String, min: f64 },
+    NumericWithin {
+        field: String,
+        tolerance: f64,
+    },
+    GeoRadius {
+        field: String,
+        km: f64,
+    },
+    VectorSimilar {
+        field: String,
+        min: f64,
+    },
     // APPENDED (Plan 13 T2) — positional bincode: never reorder.
     /// OR composition: matches when at least one branch matches.
     /// Score = max over satisfied branches (see doc comment on `Predicate`).
@@ -1058,7 +1074,9 @@ mod tests {
         // Predicate: Any([All([FieldEqual(gen), NumericWithin(yr, 4)]), NumericWithin(yr2, 10)])
         let p = Predicate::Any(vec![
             Predicate::All(vec![
-                Predicate::FieldEqual { field: "gen".into() },
+                Predicate::FieldEqual {
+                    field: "gen".into(),
+                },
                 Predicate::NumericWithin {
                     field: "yr".into(),
                     tolerance: 4.0,
@@ -1128,9 +1146,7 @@ mod tests {
         // Helper: build a singly-nested Any chain of the given depth.
         fn any_chain(depth: usize) -> Predicate {
             if depth == 0 {
-                Predicate::FieldEqual {
-                    field: "f".into(),
-                }
+                Predicate::FieldEqual { field: "f".into() }
             } else {
                 Predicate::Any(vec![any_chain(depth - 1)])
             }
@@ -1379,15 +1395,14 @@ mod wire_pins {
         assert_eq!(
             bincode::serialize(&any_fe).unwrap(),
             vec![
-                1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0,
-                0, 66, 7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                102, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0,
+                1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
+                66, 7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 102, 1,
+                0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0,
             ],
             "Any([FieldEqual{{f}}]) exact-bytes pin failed — discriminant or field layout changed"
         );
         // Also verify round-trip.
-        let decoded: RuleDef =
-            bincode::deserialize(&bincode::serialize(&any_fe).unwrap()).unwrap();
+        let decoded: RuleDef = bincode::deserialize(&bincode::serialize(&any_fe).unwrap()).unwrap();
         assert_eq!(decoded, any_fe, "Any must round-trip via bincode");
         // Verify that RuleDefs with the old variants still decode after Any is appended.
         let old = bincode::serialize(&pin(Predicate::VectorSimilar {
@@ -1438,4 +1453,3 @@ mod wire_pins {
         assert_eq!(approx.last(), Some(&1u8));
     }
 }
-

@@ -575,11 +575,9 @@ impl ProvSets<'_> {
         touch_insert(self.by_node, rid, triple);
         let (etype, src, dst) = triple;
         if self.emit {
-            if let (Some(sk), Some(dk), Some(et)) = (
-                ids.key_of(src),
-                ids.key_of(dst),
-                syms.resolve(etype),
-            ) {
+            if let (Some(sk), Some(dk), Some(et)) =
+                (ids.key_of(src), ids.key_of(dst), syms.resolve(etype))
+            {
                 self.deltas.push(EngineEdgeDelta {
                     rule: rule.to_string(),
                     src_key: sk.to_string(),
@@ -604,11 +602,9 @@ impl ProvSets<'_> {
         touch_remove(self.by_node, rid, triple);
         let (etype, src, dst) = triple;
         if self.emit {
-            if let (Some(sk), Some(dk), Some(et)) = (
-                ids.key_of(src),
-                ids.key_of(dst),
-                syms.resolve(etype),
-            ) {
+            if let (Some(sk), Some(dk), Some(et)) =
+                (ids.key_of(src), ids.key_of(dst), syms.resolve(etype))
+            {
                 self.deltas.push(EngineEdgeDelta {
                     rule: rule.to_string(),
                     src_key: sk.to_string(),
@@ -1227,7 +1223,10 @@ impl RuleEngine {
                 if let Some(idx) = self.indexes.get(name) {
                     out.insert(
                         name.clone(),
-                        (idx.src_side.export_ivf_state(), idx.dst_side.export_ivf_state()),
+                        (
+                            idx.src_side.export_ivf_state(),
+                            idx.dst_side.export_ivf_state(),
+                        ),
                     );
                 }
             }
@@ -1530,10 +1529,8 @@ impl RuleEngine {
                 if as_dst {
                     // n changed as dst: all srcs that currently have provenance to n
                     // AND all srcs that newly match n must re-evaluate their top-k.
-                    let new_desired =
-                        compute_desired(&def, &self.indexes[&rule_name], n, false, g);
-                    let new_srcs: BTreeSet<u32> =
-                        new_desired.keys().map(|(s, _)| *s).collect();
+                    let new_desired = compute_desired(&def, &self.indexes[&rule_name], n, false, g);
+                    let new_srcs: BTreeSet<u32> = new_desired.keys().map(|(s, _)| *s).collect();
                     let affected_srcs: BTreeSet<u32> =
                         affected_srcs_for_n_dst.union(&new_srcs).copied().collect();
                     for src in affected_srcs {
@@ -1550,13 +1547,7 @@ impl RuleEngine {
                 // Global-budget semantics (unchanged).
                 let mut desired = BTreeMap::new();
                 if as_src {
-                    desired.extend(compute_desired(
-                        &def,
-                        &self.indexes[&rule_name],
-                        n,
-                        true,
-                        g,
-                    ));
+                    desired.extend(compute_desired(&def, &self.indexes[&rule_name], n, true, g));
                 }
                 if as_dst {
                     desired.extend(compute_desired(
@@ -2207,7 +2198,11 @@ mod tests {
         // Insert 4 nodes all sharing k="const".  Keys: n0 < n1 < n2 < n3.
         let mut ids = Vec::new();
         for i in 0..4usize {
-            let id = fx.add("N", &format!("n{i}"), vec![("k", Value::Str("const".into()))]);
+            let id = fx.add(
+                "N",
+                &format!("n{i}"),
+                vec![("k", Value::Str("const".into()))],
+            );
             ids.push(id);
             let mut g = fx.g();
             eng.on_node_changed(id, None, &mut g);
@@ -2221,7 +2216,11 @@ mod tests {
         let expected_dsts = [ids[1], ids[0], ids[0], ids[0]];
         for (i, (&src, &expected_dst)) in ids.iter().zip(expected_dsts.iter()).enumerate() {
             let out: Vec<u32> = fx.topo.neighbors(et, Direction::Out, src).to_vec();
-            assert_eq!(out, vec![expected_dst], "src n{i} should point only to the best dst");
+            assert_eq!(
+                out,
+                vec![expected_dst],
+                "src n{i} should point only to the best dst"
+            );
         }
         assert_eq!(eng.provenance()["eq"].len(), 4);
         assert!(!eng.is_tripped("eq"), "top-k rules never trip");
@@ -2239,7 +2238,10 @@ mod tests {
             name: "nw".into(),
             src_label: "S".into(),
             dst_label: "D".into(),
-            predicate: Predicate::NumericWithin { field: "v".into(), tolerance: 10.0 },
+            predicate: Predicate::NumericWithin {
+                field: "v".into(),
+                tolerance: 10.0,
+            },
             edge_type: "NEAR".into(),
             weight_prop: Some("score".into()),
             max_edges: Some(1),
@@ -2287,7 +2289,10 @@ mod tests {
             name: "nw".into(),
             src_label: "S".into(),
             dst_label: "D".into(),
-            predicate: Predicate::NumericWithin { field: "v".into(), tolerance: 10.0 },
+            predicate: Predicate::NumericWithin {
+                field: "v".into(),
+                tolerance: 10.0,
+            },
             edge_type: "NEAR".into(),
             weight_prop: Some("score".into()),
             max_edges: Some(1),
@@ -2348,13 +2353,23 @@ mod tests {
         let a = get_id("a");
         let b = get_id("b");
         let c = get_id("c");
-        let out_a: BTreeSet<u32> = fx.topo.neighbors(et, Direction::Out, a).iter().copied().collect();
+        let out_a: BTreeSet<u32> = fx
+            .topo
+            .neighbors(et, Direction::Out, a)
+            .iter()
+            .copied()
+            .collect();
         assert!(out_a.contains(&b), "a→b (b is best key after a)");
         assert!(out_a.contains(&c), "a→c (c is 2nd best key)");
         assert_eq!(out_a.len(), 2);
         // Node "e" should point to "a" and "b" (two smallest keys ≠ "e").
         let e = get_id("e");
-        let out_e: BTreeSet<u32> = fx.topo.neighbors(et, Direction::Out, e).iter().copied().collect();
+        let out_e: BTreeSet<u32> = fx
+            .topo
+            .neighbors(et, Direction::Out, e)
+            .iter()
+            .copied()
+            .collect();
         assert!(out_e.contains(&a), "e→a");
         assert!(out_e.contains(&b), "e→b");
         assert_eq!(out_e.len(), 2);
@@ -2423,7 +2438,11 @@ mod tests {
             eng.create_rule(topk_eq_rule(2), &mut g).unwrap();
         }
         for i in 0..5usize {
-            let id = fx.add("N", &format!("n{i}"), vec![("k", Value::Str("const".into()))]);
+            let id = fx.add(
+                "N",
+                &format!("n{i}"),
+                vec![("k", Value::Str("const".into()))],
+            );
             let mut g = fx.g();
             eng.on_node_changed(id, None, &mut g);
         }
@@ -3019,7 +3038,11 @@ mod tests {
                             1 => "b",
                             _ => "c",
                         };
-                        fx.add("N", &format!("n{i:02}"), vec![("k", Value::Str(val.into()))]);
+                        fx.add(
+                            "N",
+                            &format!("n{i:02}"),
+                            vec![("k", Value::Str(val.into()))],
+                        );
                     }
                     fx
                 };
@@ -3091,7 +3114,9 @@ mod tests {
                     name: "fk".into(),
                     src_label: "T".into(),
                     dst_label: "C".into(),
-                    predicate: Predicate::KeyMatch { field: "cid".into() },
+                    predicate: Predicate::KeyMatch {
+                        field: "cid".into(),
+                    },
                     edge_type: "AT".into(),
                     weight_prop: None,
                     max_edges: Some(k),
@@ -3159,10 +3184,7 @@ mod tests {
                     let mut fx = Fx::new();
                     let mut add_v = |key: &str, x: f64, y: f64| {
                         let norm = (x * x + y * y).sqrt();
-                        let v = Value::List(vec![
-                            Value::Float(x / norm),
-                            Value::Float(y / norm),
-                        ]);
+                        let v = Value::List(vec![Value::Float(x / norm), Value::Float(y / norm)]);
                         fx.add("V", key, vec![("emb", v)]);
                     };
                     for &(k, x, y) in cluster_a.iter().chain(cluster_b.iter()) {

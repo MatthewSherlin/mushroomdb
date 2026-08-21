@@ -4,20 +4,25 @@ mod ingest;
 mod shared;
 pub mod subscription;
 
-pub use algo::{AlgoDir, DegreeConfig, DegreeReport, PageRankConfig, PageRankReport, WccConfig, WccReport};
+pub use algo::{
+    AlgoDir, DegreeConfig, DegreeReport, PageRankConfig, PageRankReport, WccConfig, WccReport,
+};
 pub use core_query::{CmpOp, Dir, Filter, ResultSet};
-pub use core_rules::{AggFn, Predicate, RuleDef, RuleSuggestion, SuggestConfig, SuggestReport, ViewDef, ViewSource, ViewStore};
 pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;
+pub use core_rules::{
+    AggFn, Predicate, RuleDef, RuleSuggestion, SuggestConfig, SuggestReport, ViewDef, ViewSource,
+    ViewStore,
+};
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{
     BatchBuilder, DeleteReport, EdgeInfo, Explanation, GraphDb, MutationEvent, NodeInfo, NodeRef,
     PredicateSummary, RuleStats, Stats,
 };
-pub use subscription::{DbEvent, Subscription, DEFAULT_SUB_CAPACITY};
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
 pub use shared::SharedDb;
+pub use subscription::{DbEvent, Subscription, DEFAULT_SUB_CAPACITY};
 
 /// Return `true` if `cypher` is a write statement (CREATE / MERGE / MATCH…SET /
 /// MATCH…DELETE).  Returns `Err` only when the string fails to lex.

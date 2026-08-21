@@ -15,8 +15,7 @@ use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
 // ---------------------------------------------------------------------------
 
 fn tmp(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir()
-        .join(format!("graphdb-any-{}-{}", name, std::process::id()));
+    let d = std::env::temp_dir().join(format!("graphdb-any-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
@@ -62,22 +61,42 @@ fn any_two_branch_overlap_or_numeric_derives_edges() {
     // b: tags=["y","z"], year=2010  — shares tag "y" (jaccard 1/3 ≥ 0.3 → Overlap fires)
     // c: tags=["p","q"], year=2003  — no tag overlap; year diff=3 ≤ 5 → NumericWithin fires
     // d: tags=["p","q"], year=2050  — no tag overlap; year diff=50 > 5 → neither fires
-    db.insert_node("N", "a", vec![
-        ("tags".into(), mk_tags(&["x", "y"])),
-        ("year".into(), Value::Int(2000)),
-    ]).unwrap();
-    db.insert_node("N", "b", vec![
-        ("tags".into(), mk_tags(&["y", "z"])),
-        ("year".into(), Value::Int(2010)),
-    ]).unwrap();
-    db.insert_node("N", "c", vec![
-        ("tags".into(), mk_tags(&["p", "q"])),
-        ("year".into(), Value::Int(2003)),
-    ]).unwrap();
-    db.insert_node("N", "d", vec![
-        ("tags".into(), mk_tags(&["p", "q"])),
-        ("year".into(), Value::Int(2050)),
-    ]).unwrap();
+    db.insert_node(
+        "N",
+        "a",
+        vec![
+            ("tags".into(), mk_tags(&["x", "y"])),
+            ("year".into(), Value::Int(2000)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "N",
+        "b",
+        vec![
+            ("tags".into(), mk_tags(&["y", "z"])),
+            ("year".into(), Value::Int(2010)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "N",
+        "c",
+        vec![
+            ("tags".into(), mk_tags(&["p", "q"])),
+            ("year".into(), Value::Int(2003)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "N",
+        "d",
+        vec![
+            ("tags".into(), mk_tags(&["p", "q"])),
+            ("year".into(), Value::Int(2050)),
+        ],
+    )
+    .unwrap();
 
     let a_out: Vec<String> = db.neighbors("a", "ANY", Direction::Out).unwrap_or_default();
 
@@ -139,28 +158,50 @@ fn any_nested_in_all_derives_edges() {
     // a and b: same ind, share tag → FieldEqual fires + Overlap fires.
     // a and c: same ind, year diff=3 ≤ 5 → FieldEqual fires + NumericWithin fires.
     // a and d: different ind → FieldEqual fails → no edge (regardless of Any).
-    db.insert_node("N", "a", vec![
-        ("ind".into(), Value::Str("arch".into())),
-        ("tags".into(), mk_tags(&["x", "y"])),
-        ("year".into(), Value::Int(2000)),
-    ]).unwrap();
-    db.insert_node("N", "b", vec![
-        ("ind".into(), Value::Str("arch".into())),
-        ("tags".into(), mk_tags(&["y", "z"])),
-        ("year".into(), Value::Int(2020)),
-    ]).unwrap();
-    db.insert_node("N", "c", vec![
-        ("ind".into(), Value::Str("arch".into())),
-        ("tags".into(), mk_tags(&["p", "q"])),
-        ("year".into(), Value::Int(2003)),
-    ]).unwrap();
-    db.insert_node("N", "d", vec![
-        ("ind".into(), Value::Str("law".into())),
-        ("tags".into(), mk_tags(&["y", "z"])),
-        ("year".into(), Value::Int(2001)),
-    ]).unwrap();
+    db.insert_node(
+        "N",
+        "a",
+        vec![
+            ("ind".into(), Value::Str("arch".into())),
+            ("tags".into(), mk_tags(&["x", "y"])),
+            ("year".into(), Value::Int(2000)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "N",
+        "b",
+        vec![
+            ("ind".into(), Value::Str("arch".into())),
+            ("tags".into(), mk_tags(&["y", "z"])),
+            ("year".into(), Value::Int(2020)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "N",
+        "c",
+        vec![
+            ("ind".into(), Value::Str("arch".into())),
+            ("tags".into(), mk_tags(&["p", "q"])),
+            ("year".into(), Value::Int(2003)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "N",
+        "d",
+        vec![
+            ("ind".into(), Value::Str("law".into())),
+            ("tags".into(), mk_tags(&["y", "z"])),
+            ("year".into(), Value::Int(2001)),
+        ],
+    )
+    .unwrap();
 
-    let a_out: Vec<String> = db.neighbors("a", "NESTED", Direction::Out).unwrap_or_default();
+    let a_out: Vec<String> = db
+        .neighbors("a", "NESTED", Direction::Out)
+        .unwrap_or_default();
     assert!(
         a_out.contains(&"b".to_string()),
         "a→b: same ind + tag overlap → must exist; got {a_out:?}"
@@ -208,31 +249,48 @@ fn any_score_is_max_over_satisfied_branches() {
 
     // a & b: ind match (score 1.0) AND year diff=1, tol=3 (score 2/3).
     // Any → max(1.0, 2/3) = 1.0.
-    db.insert_node("N", "a", vec![
-        ("ind".into(), Value::Str("arch".into())),
-        ("year".into(), Value::Int(2000)),
-    ]).unwrap();
-    db.insert_node("N", "b", vec![
-        ("ind".into(), Value::Str("arch".into())),
-        ("year".into(), Value::Int(2001)),
-    ]).unwrap();
+    db.insert_node(
+        "N",
+        "a",
+        vec![
+            ("ind".into(), Value::Str("arch".into())),
+            ("year".into(), Value::Int(2000)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "N",
+        "b",
+        vec![
+            ("ind".into(), Value::Str("arch".into())),
+            ("year".into(), Value::Int(2001)),
+        ],
+    )
+    .unwrap();
 
     let explain = db.explain("a", "b").unwrap();
     let entry = explain
         .iter()
         .find(|e| e.rule == "maxscore" && e.src_key == "a" && e.dst_key == "b")
         .expect("a→b must have an explain entry for 'maxscore'");
-    let w = entry.weight.expect("weight must be present (weight_prop set)");
+    let w = entry
+        .weight
+        .expect("weight must be present (weight_prop set)");
     assert!(
         (w - 1.0).abs() < 1e-9,
         "Any score must be max(1.0, 2/3) = 1.0; got {w}"
     );
 
     // a & c: only NumericWithin fires (ind differs), year diff=2 → score 1/3.
-    db.insert_node("N", "c", vec![
-        ("ind".into(), Value::Str("law".into())),
-        ("year".into(), Value::Int(2002)),
-    ]).unwrap();
+    db.insert_node(
+        "N",
+        "c",
+        vec![
+            ("ind".into(), Value::Str("law".into())),
+            ("year".into(), Value::Int(2002)),
+        ],
+    )
+    .unwrap();
     let explain_c = db.explain("a", "c").unwrap();
     let entry_c = explain_c
         .iter()
@@ -277,14 +335,24 @@ fn any_retraction_when_sole_branch_breaks() {
 
     // a: ind="arch", year=2000; b: ind="law", year=2001 (year diff=1 ≤ 2).
     // Only NumericWithin branch fires for a→b initially.
-    db.insert_node("N", "a", vec![
-        ("ind".into(), Value::Str("arch".into())),
-        ("year".into(), Value::Int(2000)),
-    ]).unwrap();
-    db.insert_node("N", "b", vec![
-        ("ind".into(), Value::Str("law".into())),
-        ("year".into(), Value::Int(2001)),
-    ]).unwrap();
+    db.insert_node(
+        "N",
+        "a",
+        vec![
+            ("ind".into(), Value::Str("arch".into())),
+            ("year".into(), Value::Int(2000)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "N",
+        "b",
+        vec![
+            ("ind".into(), Value::Str("law".into())),
+            ("year".into(), Value::Int(2001)),
+        ],
+    )
+    .unwrap();
 
     let a_out = db.neighbors("a", "RET", Direction::Out).unwrap_or_default();
     assert!(
@@ -355,19 +423,29 @@ fn any_edge_retained_when_one_branch_holds() {
     //   → FieldEqual fires (score 1.0)
     //   → NumericWithin: diff=4, tol=10 → score = 1 − 4/10 = 0.6
     //   → initial weight = max(1.0, 0.6) = 1.0
-    db.insert_node("N", "src", vec![
-        ("ind".into(), Value::Str("arch".into())),
-        ("year".into(), Value::Int(2000)),
-    ])
+    db.insert_node(
+        "N",
+        "src",
+        vec![
+            ("ind".into(), Value::Str("arch".into())),
+            ("year".into(), Value::Int(2000)),
+        ],
+    )
     .unwrap();
-    db.insert_node("N", "dst", vec![
-        ("ind".into(), Value::Str("arch".into())),
-        ("year".into(), Value::Int(2004)),
-    ])
+    db.insert_node(
+        "N",
+        "dst",
+        vec![
+            ("ind".into(), Value::Str("arch".into())),
+            ("year".into(), Value::Int(2004)),
+        ],
+    )
     .unwrap();
 
     // Verify initial edge and weight = 1.0
-    let out0 = db.neighbors("src", "R2", Direction::Out).unwrap_or_default();
+    let out0 = db
+        .neighbors("src", "R2", Direction::Out)
+        .unwrap_or_default();
     assert!(
         out0.contains(&"dst".to_string()),
         "src→dst must exist initially; got {out0:?}"
@@ -388,7 +466,9 @@ fn any_edge_retained_when_one_branch_holds() {
     // Edge must be RETAINED with updated weight = 0.6.
     db.set_prop("dst", "ind", Value::Str("law".into())).unwrap();
 
-    let out1 = db.neighbors("src", "R2", Direction::Out).unwrap_or_default();
+    let out1 = db
+        .neighbors("src", "R2", Direction::Out)
+        .unwrap_or_default();
     assert!(
         out1.contains(&"dst".to_string()),
         "src→dst must be RETAINED after FieldEqual branch breaks (NumericWithin still holds); got {out1:?}"
@@ -408,7 +488,9 @@ fn any_edge_retained_when_one_branch_holds() {
     // Neither branch matches → edge must be retracted.
     db.set_prop("dst", "year", Value::Int(2050)).unwrap();
 
-    let out2 = db.neighbors("src", "R2", Direction::Out).unwrap_or_default();
+    let out2 = db
+        .neighbors("src", "R2", Direction::Out)
+        .unwrap_or_default();
     assert!(
         !out2.contains(&"dst".to_string()),
         "src→dst must be retracted after both branches break; got {out2:?}"
@@ -456,18 +538,33 @@ fn any_with_max_edges_score_change_causes_evict_backfill() {
     //
     // Insert d_low first so it claims top-1 provisionally.
     // Insert d_high second → score 1.0 > 0.1 → d_high evicts d_low.
-    db.insert_node("N", "src", vec![
-        ("ind".into(), Value::Str("arch".into())),
-        ("year".into(), Value::Int(2000)),
-    ]).unwrap();
-    db.insert_node("N", "d_low", vec![
-        ("ind".into(), Value::Str("law".into())),
-        ("year".into(), Value::Int(2009)),
-    ]).unwrap();
-    db.insert_node("N", "d_high", vec![
-        ("ind".into(), Value::Str("arch".into())),
-        ("year".into(), Value::Int(2020)),
-    ]).unwrap();
+    db.insert_node(
+        "N",
+        "src",
+        vec![
+            ("ind".into(), Value::Str("arch".into())),
+            ("year".into(), Value::Int(2000)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "N",
+        "d_low",
+        vec![
+            ("ind".into(), Value::Str("law".into())),
+            ("year".into(), Value::Int(2009)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "N",
+        "d_high",
+        vec![
+            ("ind".into(), Value::Str("arch".into())),
+            ("year".into(), Value::Int(2020)),
+        ],
+    )
+    .unwrap();
 
     let top1: Vec<String> = db
         .neighbors("src", "TK", Direction::Out)
@@ -481,7 +578,8 @@ fn any_with_max_edges_score_change_causes_evict_backfill() {
     // Change d_high's ind so FieldEqual no longer fires and year diff=20>10 so
     // NumericWithin also doesn't fire. d_high drops out entirely.
     // d_low (year diff=9 ≤ 10) must backfill as the new top-1.
-    db.set_prop("d_high", "ind", Value::Str("law".into())).unwrap();
+    db.set_prop("d_high", "ind", Value::Str("law".into()))
+        .unwrap();
 
     let top1_after: Vec<String> = db
         .neighbors("src", "TK", Direction::Out)
@@ -493,7 +591,8 @@ fn any_with_max_edges_score_change_causes_evict_backfill() {
     );
 
     // Restore d_high's ind → d_high evicts d_low again.
-    db.set_prop("d_high", "ind", Value::Str("arch".into())).unwrap();
+    db.set_prop("d_high", "ind", Value::Str("arch".into()))
+        .unwrap();
     let top1_restored: Vec<String> = db
         .neighbors("src", "TK", Direction::Out)
         .unwrap_or_default();
@@ -533,23 +632,38 @@ fn any_snapshot_v4_roundtrip() {
         })
         .unwrap();
 
-        db.insert_node("N", "a", vec![
-            ("ind".into(), Value::Str("arch".into())),
-            ("year".into(), Value::Int(2000)),
-        ]).unwrap();
-        db.insert_node("N", "b", vec![
-            ("ind".into(), Value::Str("arch".into())),
-            ("year".into(), Value::Int(2001)),
-        ]).unwrap();
+        db.insert_node(
+            "N",
+            "a",
+            vec![
+                ("ind".into(), Value::Str("arch".into())),
+                ("year".into(), Value::Int(2000)),
+            ],
+        )
+        .unwrap();
+        db.insert_node(
+            "N",
+            "b",
+            vec![
+                ("ind".into(), Value::Str("arch".into())),
+                ("year".into(), Value::Int(2001)),
+            ],
+        )
+        .unwrap();
 
         // Take snapshot while derived edges (a→b, b→a) are live.
         db.snapshot().unwrap();
 
         // WAL-tail write after snapshot.
-        db.insert_node("N", "c", vec![
-            ("ind".into(), Value::Str("law".into())),
-            ("year".into(), Value::Int(2002)),
-        ]).unwrap();
+        db.insert_node(
+            "N",
+            "c",
+            vec![
+                ("ind".into(), Value::Str("law".into())),
+                ("year".into(), Value::Int(2002)),
+            ],
+        )
+        .unwrap();
     }
 
     // Reopen: snapshot + WAL tail must restore the rule and all derived edges.
@@ -559,7 +673,9 @@ fn any_snapshot_v4_roundtrip() {
     assert_eq!(db.rules()[0].name, "any_snap");
 
     // a→b from snapshot (FieldEqual branch fires, both ind="arch").
-    let a_out = db.neighbors("a", "SNAP", Direction::Out).unwrap_or_default();
+    let a_out = db
+        .neighbors("a", "SNAP", Direction::Out)
+        .unwrap_or_default();
     assert!(
         a_out.contains(&"b".to_string()),
         "a→b must survive snapshot round-trip; got {a_out:?}"
@@ -584,9 +700,7 @@ fn any_bincode_roundtrip_and_old_records_still_decode() {
         src_label: "A".into(),
         dst_label: "B".into(),
         predicate: Predicate::Any(vec![
-            Predicate::FieldEqual {
-                field: "f".into(),
-            },
+            Predicate::FieldEqual { field: "f".into() },
             Predicate::Overlap {
                 field: "tags".into(),
                 min: 0.5,
@@ -617,5 +731,8 @@ fn any_bincode_roundtrip_and_old_records_still_decode() {
     };
     let old_bytes = bincode::serialize(&old).unwrap();
     let old_decoded: RuleDef = bincode::deserialize(&old_bytes).unwrap();
-    assert_eq!(old, old_decoded, "pre-Any VectorSimilar record must still decode");
+    assert_eq!(
+        old, old_decoded,
+        "pre-Any VectorSimilar record must still decode"
+    );
 }

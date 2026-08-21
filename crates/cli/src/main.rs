@@ -61,24 +61,28 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
-        Ok(Command::AsOf { db_dir, commit, query }) => {
-            match run_asof(&db_dir, commit, query.as_deref()) {
-                Ok(out) => {
-                    print!("{out}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => fail(&e.to_string()),
+        Ok(Command::AsOf {
+            db_dir,
+            commit,
+            query,
+        }) => match run_asof(&db_dir, commit, query.as_deref()) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
             }
-        }
-        Ok(Command::Algo { db_dir, subcmd, top }) => {
-            match run_algo(&db_dir, &subcmd, top) {
-                Ok(out) => {
-                    print!("{out}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => fail(&e.to_string()),
+            Err(e) => fail(&e.to_string()),
+        },
+        Ok(Command::Algo {
+            db_dir,
+            subcmd,
+            top,
+        }) => match run_algo(&db_dir, &subcmd, top) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
             }
-        }
+            Err(e) => fail(&e.to_string()),
+        },
         Err(e) => {
             let _ = writeln!(io::stderr(), "{e}");
             eprint!("{}", usage());

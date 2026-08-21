@@ -295,15 +295,7 @@ impl ViewStore {
                 Direction::In => src,
             };
             update_node_view(
-                def,
-                subject,
-                neighbor,
-                inserted,
-                props,
-                topo,
-                ids,
-                syms,
-                labels,
+                def, subject, neighbor, inserted, props, topo, ids, syms, labels,
             );
         }
     }
@@ -344,9 +336,7 @@ impl ViewStore {
                 Direction::Out => Direction::In,
                 Direction::In => Direction::Out,
             };
-            let subjects: Vec<u32> = topo
-                .neighbors(et_sym, reverse_dir, changed_node)
-                .to_vec();
+            let subjects: Vec<u32> = topo.neighbors(et_sym, reverse_dir, changed_node).to_vec();
             for subject in subjects {
                 // Full recompute for the subject's view value.
                 if let Some(val) = compute_view_value(def, subject, props, topo, ids, syms, labels)
@@ -368,22 +358,36 @@ impl ViewStore {
     /// Call this BEFORE the rule engine's `on_node_changed` for the new node so
     /// that subsequent `on_edge_changed` calls (from derived-edge deltas) can
     /// increment correctly from a known baseline.
-    pub fn init_node_views(&self, node: u32, props: &mut ColumnStore, syms: &Interner, labels: &[u32]) {
+    pub fn init_node_views(
+        &self,
+        node: u32,
+        props: &mut ColumnStore,
+        syms: &Interner,
+        labels: &[u32],
+    ) {
         for def in self.views.values() {
-            let Some(label_sym) = syms.get(&def.label) else { continue; };
-            if labels.get(node as usize).copied() != Some(label_sym) { continue; }
+            let Some(label_sym) = syms.get(&def.label) else {
+                continue;
+            };
+            if labels.get(node as usize).copied() != Some(label_sym) {
+                continue;
+            }
             match &def.source {
                 ViewSource::Degree { .. } => {
                     if props.get(node, &def.view_prop).is_none() {
                         props.set(node, &def.view_prop, Value::Int(0));
                     }
                 }
-                ViewSource::NeighborAgg { agg: AggFn::Count, .. } => {
+                ViewSource::NeighborAgg {
+                    agg: AggFn::Count, ..
+                } => {
                     if props.get(node, &def.view_prop).is_none() {
                         props.set(node, &def.view_prop, Value::Int(0));
                     }
                 }
-                ViewSource::NeighborAgg { agg: AggFn::Sum, .. } => {
+                ViewSource::NeighborAgg {
+                    agg: AggFn::Sum, ..
+                } => {
                     // Always set to 0.0 — init is only called for freshly-inserted
                     // nodes whose view_prop does not yet exist.
                     props.set(node, &def.view_prop, Value::Float(0.0));
@@ -443,7 +447,9 @@ fn backfill_view(
                     } => {
                         props.set(id, &def.view_prop, Value::Int(0));
                     }
-                    ViewSource::NeighborAgg { agg: AggFn::Sum, .. } => {
+                    ViewSource::NeighborAgg {
+                        agg: AggFn::Sum, ..
+                    } => {
                         props.set(id, &def.view_prop, Value::Float(0.0));
                     }
                     _ => {}
@@ -499,7 +505,9 @@ pub fn compute_view_value(
                 ViewSource::NeighborAgg {
                     agg: AggFn::Count, ..
                 } => Some(Value::Int(0)),
-                ViewSource::NeighborAgg { agg: AggFn::Sum, .. } => Some(Value::Float(0.0)),
+                ViewSource::NeighborAgg {
+                    agg: AggFn::Sum, ..
+                } => Some(Value::Float(0.0)),
                 ViewSource::NeighborAgg { .. } => None,
             };
         }
@@ -509,61 +517,59 @@ pub fn compute_view_value(
 
     match &def.source {
         ViewSource::Degree { .. } => Some(Value::Int(neighbors.len() as i64)),
-        ViewSource::NeighborAgg { agg, prop, .. } => {
-            match agg {
-                AggFn::Count => Some(Value::Int(neighbors.len() as i64)),
-                AggFn::Sum => {
-                    let mut sum = 0.0f64;
-                    for &nbr in neighbors {
-                        if let Some(v) = props.get(nbr, prop) {
-                            if let Some(n) = as_float(v) {
-                                sum += n;
-                            }
+        ViewSource::NeighborAgg { agg, prop, .. } => match agg {
+            AggFn::Count => Some(Value::Int(neighbors.len() as i64)),
+            AggFn::Sum => {
+                let mut sum = 0.0f64;
+                for &nbr in neighbors {
+                    if let Some(v) = props.get(nbr, prop) {
+                        if let Some(n) = as_float(v) {
+                            sum += n;
                         }
-                    }
-                    Some(Value::Float(sum))
-                }
-                AggFn::Avg => {
-                    let mut sum = 0.0f64;
-                    let mut count = 0usize;
-                    for &nbr in neighbors {
-                        if let Some(v) = props.get(nbr, prop) {
-                            if let Some(n) = as_float(v) {
-                                sum += n;
-                                count += 1;
-                            }
-                        }
-                    }
-                    if count == 0 {
-                        None
-                    } else {
-                        Some(Value::Float(sum / count as f64))
                     }
                 }
-                AggFn::Min => {
-                    let mut best: Option<f64> = None;
-                    for &nbr in neighbors {
-                        if let Some(v) = props.get(nbr, prop) {
-                            if let Some(n) = as_float(v) {
-                                best = Some(best.map_or(n, |m: f64| m.min(n)));
-                            }
+                Some(Value::Float(sum))
+            }
+            AggFn::Avg => {
+                let mut sum = 0.0f64;
+                let mut count = 0usize;
+                for &nbr in neighbors {
+                    if let Some(v) = props.get(nbr, prop) {
+                        if let Some(n) = as_float(v) {
+                            sum += n;
+                            count += 1;
                         }
                     }
-                    best.map(Value::Float)
                 }
-                AggFn::Max => {
-                    let mut best: Option<f64> = None;
-                    for &nbr in neighbors {
-                        if let Some(v) = props.get(nbr, prop) {
-                            if let Some(n) = as_float(v) {
-                                best = Some(best.map_or(n, |m: f64| m.max(n)));
-                            }
-                        }
-                    }
-                    best.map(Value::Float)
+                if count == 0 {
+                    None
+                } else {
+                    Some(Value::Float(sum / count as f64))
                 }
             }
-        }
+            AggFn::Min => {
+                let mut best: Option<f64> = None;
+                for &nbr in neighbors {
+                    if let Some(v) = props.get(nbr, prop) {
+                        if let Some(n) = as_float(v) {
+                            best = Some(best.map_or(n, |m: f64| m.min(n)));
+                        }
+                    }
+                }
+                best.map(Value::Float)
+            }
+            AggFn::Max => {
+                let mut best: Option<f64> = None;
+                for &nbr in neighbors {
+                    if let Some(v) = props.get(nbr, prop) {
+                        if let Some(n) = as_float(v) {
+                            best = Some(best.map_or(n, |m: f64| m.max(n)));
+                        }
+                    }
+                }
+                best.map(Value::Float)
+            }
+        },
     }
 }
 
@@ -599,7 +605,11 @@ fn update_node_view(
                 Some(Value::Int(n)) => *n,
                 _ => 0,
             };
-            let new_val = if inserted { current + 1 } else { (current - 1).max(0) };
+            let new_val = if inserted {
+                current + 1
+            } else {
+                (current - 1).max(0)
+            };
             props.set(subject, &def.view_prop, Value::Int(new_val));
         }
         ViewSource::NeighborAgg { agg, prop, .. } => {
@@ -609,7 +619,11 @@ fn update_node_view(
                         Some(Value::Int(n)) => *n,
                         _ => 0,
                     };
-                    let new_val = if inserted { current + 1 } else { (current - 1).max(0) };
+                    let new_val = if inserted {
+                        current + 1
+                    } else {
+                        (current - 1).max(0)
+                    };
                     props.set(subject, &def.view_prop, Value::Int(new_val));
                 }
                 AggFn::Sum => {
@@ -622,7 +636,11 @@ fn update_node_view(
                         Some(Value::Int(n)) => *n as f64,
                         _ => 0.0,
                     };
-                    let new_val = if inserted { current + delta } else { current - delta };
+                    let new_val = if inserted {
+                        current + delta
+                    } else {
+                        current - delta
+                    };
                     props.set(subject, &def.view_prop, Value::Float(new_val));
                 }
                 // Avg, Min, Max: full recompute from topo (O(degree)).
@@ -751,7 +769,10 @@ mod tests {
         let err = vs
             .create_view(def, &mut props, &topo, &ids, &syms, &labels)
             .unwrap_err();
-        assert!(err.contains("conflicts with an existing node property"), "{err}");
+        assert!(
+            err.contains("conflicts with an existing node property"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -217,7 +217,10 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
     }
     // GroupAggregate plans are a sink over the full row stream; ORDER BY and LIMIT
     // apply to the finished group table, never to producers.
-    if ops.iter().any(|op| matches!(op, PlanOp::GroupAggregate { .. })) {
+    if ops
+        .iter()
+        .any(|op| matches!(op, PlanOp::GroupAggregate { .. }))
+    {
         return None;
     }
     // VarExpand / ShortestPath always use the staged path so that the 1M row
@@ -244,7 +247,10 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
         _ => None,
     })?;
     // A param Skip means the skip count is unknown at plan time — force staged.
-    if ops.iter().any(|op| matches!(op, PlanOp::Skip(LimitSkip::Param(_)))) {
+    if ops
+        .iter()
+        .any(|op| matches!(op, PlanOp::Skip(LimitSkip::Param(_))))
+    {
         return None;
     }
     let skip_n = ops
@@ -384,8 +390,10 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
                             name = func_name(func),
                         ));
                     }
-                    let column =
-                        item.alias.clone().unwrap_or_else(|| agg_column_name(func, arg));
+                    let column = item
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| agg_column_name(func, arg));
                     aggs.push((func.clone(), arg.clone(), column));
                 }
                 _ => {
@@ -465,7 +473,10 @@ fn compile_with_stage(
                             name = func_name(func),
                         ));
                     }
-                    let col = item.alias.clone().unwrap_or_else(|| agg_column_name(func, arg));
+                    let col = item
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| agg_column_name(func, arg));
                     aggs.push((func.clone(), arg.clone(), col));
                 }
                 _ => {
@@ -535,16 +546,12 @@ fn compile_with_stage(
             match &item.target {
                 OrderTarget::Prop { var, .. } | OrderTarget::Var(var) => {
                     if !bound.contains(var.as_str()) && !with_col_names.contains(var.as_str()) {
-                        return Err(format!(
-                            "unbound variable `{var}` in ORDER BY in WITH"
-                        ));
+                        return Err(format!("unbound variable `{var}` in ORDER BY in WITH"));
                     }
                 }
                 OrderTarget::Alias(name) => {
                     if !bound.contains(name.as_str()) && !with_col_names.contains(name.as_str()) {
-                        return Err(format!(
-                            "unbound variable `{name}` in ORDER BY in WITH"
-                        ));
+                        return Err(format!("unbound variable `{name}` in ORDER BY in WITH"));
                     }
                 }
             }
@@ -753,11 +760,18 @@ fn compile_optional_clause(
     for v in &optional_vars {
         bound.insert(v.clone());
     }
-    for v in inner_rel_bound.difference(&*rel_bound).cloned().collect::<Vec<_>>() {
+    for v in inner_rel_bound
+        .difference(&*rel_bound)
+        .cloned()
+        .collect::<Vec<_>>()
+    {
         rel_bound.insert(v);
     }
 
-    ops.push(PlanOp::LeftOuterApply { inner: inner_ops, optional_vars });
+    ops.push(PlanOp::LeftOuterApply {
+        inner: inner_ops,
+        optional_vars,
+    });
     Ok(())
 }
 
@@ -1549,11 +1563,11 @@ LIMIT 10";
             None,
             "VarExpand + LIMIT must still use staged path"
         );
-        let has_var = ops
-            .iter()
-            .any(|op| matches!(op, PlanOp::VarExpand { .. }));
+        let has_var = ops.iter().any(|op| matches!(op, PlanOp::VarExpand { .. }));
         assert!(has_var, "plan must contain VarExpand");
-        let has_limit = ops.iter().any(|op| matches!(op, PlanOp::Limit(LimitSkip::Exact(5))));
+        let has_limit = ops
+            .iter()
+            .any(|op| matches!(op, PlanOp::Limit(LimitSkip::Exact(5))));
         assert!(has_limit, "plan must still emit Limit op");
     }
 
@@ -1565,7 +1579,10 @@ LIMIT 10";
         let has_sp = ops
             .iter()
             .any(|op| matches!(op, PlanOp::ShortestPath { max_hops: 3, .. }));
-        assert!(has_sp, "expected ShortestPath op with max_hops=3, got: {ops:?}");
+        assert!(
+            has_sp,
+            "expected ShortestPath op with max_hops=3, got: {ops:?}"
+        );
     }
 
     #[test]

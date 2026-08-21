@@ -46,8 +46,12 @@ fn live_nodes(idmap: &IdMap, labels: &[u32]) -> (Vec<u32>, Vec<String>) {
     let mut ids = Vec::new();
     let mut keys = Vec::new();
     for id in 0..n {
-        let Some(key) = idmap.key_of(id) else { continue };
-        let Some(&sym) = labels.get(id as usize) else { continue };
+        let Some(key) = idmap.key_of(id) else {
+            continue;
+        };
+        let Some(&sym) = labels.get(id as usize) else {
+            continue;
+        };
         if sym == u32::MAX {
             continue; // tombstoned
         }
@@ -62,10 +66,7 @@ fn live_nodes(idmap: &IdMap, labels: &[u32]) -> (Vec<u32>, Vec<String>) {
 /// Returns `None` if `edge_type` is `Some(name)` that is not interned (meaning
 /// no edges of that type exist).  Returns `Some(None)` when `edge_type` is
 /// `None` (all types).
-fn resolve_etype(
-    syms: &Interner,
-    edge_type: Option<&str>,
-) -> Option<Option<u32>> {
+fn resolve_etype(syms: &Interner, edge_type: Option<&str>) -> Option<Option<u32>> {
     match edge_type {
         None => Some(None), // all etypes
         Some(name) => {
@@ -81,7 +82,11 @@ fn etypes_filtered(topo: &Topology, filter: Option<u32>) -> Vec<u32> {
         Some(sym) => {
             // Only include if the etype actually exists.
             let all: Vec<u32> = topo.etypes().collect();
-            if all.contains(&sym) { vec![sym] } else { vec![] }
+            if all.contains(&sym) {
+                vec![sym]
+            } else {
+                vec![]
+            }
         }
         None => topo.etypes().collect(),
     }
@@ -180,7 +185,10 @@ pub(crate) fn pagerank(
     let n = node_ids.len();
 
     if n == 0 {
-        return PageRankReport { scores: Vec::new(), converged: true };
+        return PageRankReport {
+            scores: Vec::new(),
+            converged: true,
+        };
     }
 
     // Map internal id → compact index for fast array access.
@@ -199,9 +207,14 @@ pub(crate) fn pagerank(
             let mut scores: Vec<(String, f64)> =
                 node_keys.iter().map(|k| (k.clone(), score)).collect();
             scores.sort_by(|(ka, sa), (kb, sb)| {
-                sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal).then(ka.cmp(kb))
+                sb.partial_cmp(sa)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(ka.cmp(kb))
             });
-            return PageRankReport { scores, converged: true };
+            return PageRankReport {
+                scores,
+                converged: true,
+            };
         }
         Some(f) => f,
     };
@@ -294,7 +307,11 @@ pub(crate) fn pagerank(
         }
 
         // Check convergence: L1 norm.
-        let delta: f64 = pr.iter().zip(new_pr.iter()).map(|(a, b)| (a - b).abs()).sum();
+        let delta: f64 = pr
+            .iter()
+            .zip(new_pr.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
         pr = new_pr;
 
         if delta < config.tol {
@@ -304,12 +321,11 @@ pub(crate) fn pagerank(
     }
 
     // Sort: score desc, key asc on ties.
-    let mut scores: Vec<(String, f64)> = node_keys
-        .into_iter()
-        .zip(pr)
-        .collect();
+    let mut scores: Vec<(String, f64)> = node_keys.into_iter().zip(pr).collect();
     scores.sort_by(|(ka, sa), (kb, sb)| {
-        sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal).then(ka.cmp(kb))
+        sb.partial_cmp(sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(ka.cmp(kb))
     });
 
     PageRankReport { scores, converged }
@@ -331,7 +347,10 @@ pub struct WccConfig {
 
 impl Default for WccConfig {
     fn default() -> Self {
-        Self { edge_type: None, budget_ms: 5_000 }
+        Self {
+            edge_type: None,
+            budget_ms: 5_000,
+        }
     }
 }
 
@@ -404,7 +423,10 @@ pub(crate) fn wcc(
     let n = node_ids.len();
 
     if n == 0 {
-        return WccReport { components: Vec::new(), truncated: false };
+        return WccReport {
+            components: Vec::new(),
+            truncated: false,
+        };
     }
 
     // Map internal id → compact index.
@@ -420,7 +442,10 @@ pub(crate) fn wcc(
             let mut components: Vec<(String, String)> =
                 node_keys.iter().map(|k| (k.clone(), k.clone())).collect();
             components.sort();
-            return WccReport { components, truncated: false };
+            return WccReport {
+                components,
+                truncated: false,
+            };
         }
         Some(f) => f,
     };
@@ -478,7 +503,10 @@ pub(crate) fn wcc(
         .collect();
     components.sort_by(|(ka, ca), (kb, cb)| ca.cmp(cb).then(ka.cmp(kb)));
 
-    WccReport { components, truncated }
+    WccReport {
+        components,
+        truncated,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -534,7 +562,10 @@ pub(crate) fn degree_centrality(
     let n = node_ids.len();
 
     if n == 0 {
-        return DegreeReport { scores: Vec::new(), truncated: false };
+        return DegreeReport {
+            scores: Vec::new(),
+            truncated: false,
+        };
     }
 
     // Resolve etype filter.
@@ -542,7 +573,10 @@ pub(crate) fn degree_centrality(
         None => {
             // No edges of this type → all degrees are 0.
             let scores = node_keys.iter().map(|k| (k.clone(), 0u64)).collect();
-            return DegreeReport { scores, truncated: false };
+            return DegreeReport {
+                scores,
+                truncated: false,
+            };
         }
         Some(f) => f,
     };
@@ -574,10 +608,7 @@ pub(crate) fn degree_centrality(
         }
     }
 
-    let mut scores: Vec<(String, u64)> = node_keys
-        .into_iter()
-        .zip(degrees)
-        .collect();
+    let mut scores: Vec<(String, u64)> = node_keys.into_iter().zip(degrees).collect();
     scores.sort_by(|(ka, da), (kb, db)| db.cmp(da).then(ka.cmp(kb)));
 
     DegreeReport { scores, truncated }

@@ -1,6 +1,6 @@
 use core_api::{
-    AggFn, AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, RuleStats, Stats,
-    Value, ViewDef, ViewSource,
+    AggFn, AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, RuleStats, Stats, Value,
+    ViewDef, ViewSource,
 };
 use core_storage::fs::Fs;
 use sim_harness::{Oracle, SimFs, APPROX_RECALL_FLOOR_RECOVERY};
@@ -697,9 +697,7 @@ fn cypher_write_dst_byte_sweep() {
         BTreeMap::new()
     }
 
-    fn cypher_workload<F: core_storage::fs::Fs>(
-        db: &mut GraphDb<F>,
-    ) -> core_api::Result<()> {
+    fn cypher_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         // Three single-op Batch frames:
         db.query_write("CREATE (a:Person {id: 'dst_alice'})", &no_params())?;
         db.query_write("CREATE (b:Person {id: 'dst_bob'})", &no_params())?;
@@ -724,8 +722,7 @@ fn cypher_write_dst_byte_sweep() {
     assert!(total_bytes > 0, "Cypher workload must append bytes");
 
     for crash_at in 0..=total_bytes {
-        let mut db =
-            GraphDb::open_with(sim_harness::SimFs::with_crash_after(crash_at)).unwrap();
+        let mut db = GraphDb::open_with(sim_harness::SimFs::with_crash_after(crash_at)).unwrap();
         let _ = cypher_workload(&mut db);
         let survivor = db.into_fs().surviving_state();
 
@@ -936,9 +933,9 @@ fn delete_heavy_workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
     let pairs: &[(&str, &[&str])] = &[
         ("d0", &["alpha", "beta"]),
         ("d1", &["alpha", "gamma"]),
-        ("d2", &["alpha", "beta"]),  // will be deleted
+        ("d2", &["alpha", "beta"]), // will be deleted
         ("d3", &["alpha", "gamma"]),
-        ("d4", &["alpha", "beta"]),  // will be deleted
+        ("d4", &["alpha", "beta"]), // will be deleted
         ("d5", &["alpha", "gamma"]),
     ];
     for (key, ts) in pairs {
@@ -980,11 +977,11 @@ fn delete_heavy_workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
 
     // Insert 6 more nodes: d6..d11.
     let pairs2: &[(&str, &[&str])] = &[
-        ("d6",  &["alpha", "beta"]),  // will be deleted
-        ("d7",  &["alpha", "gamma"]),
-        ("d8",  &["alpha", "beta"]),  // will be deleted
-        ("d9",  &["alpha", "gamma"]),
-        ("d10", &["alpha", "beta"]),  // will be deleted
+        ("d6", &["alpha", "beta"]), // will be deleted
+        ("d7", &["alpha", "gamma"]),
+        ("d8", &["alpha", "beta"]), // will be deleted
+        ("d9", &["alpha", "gamma"]),
+        ("d10", &["alpha", "beta"]), // will be deleted
         ("d11", &["alpha", "gamma"]),
     ];
     for (key, ts) in pairs2 {
@@ -1027,7 +1024,10 @@ fn recovery_delete_heavy_byte_sweep() {
         delete_heavy_workload(&mut db).unwrap();
         db.into_fs().total_appended()
     };
-    assert!(total_bytes > 0, "delete-heavy workload must append at least one byte");
+    assert!(
+        total_bytes > 0,
+        "delete-heavy workload must append at least one byte"
+    );
     eprintln!(
         "delete-heavy byte-offset sweep: 0..={total_bytes} ({} crash points)",
         total_bytes + 1
@@ -1271,7 +1271,16 @@ fn write_batch_large_frame_dst_byte_sweep() {
         }
 
         // Rule consistency: no derived STAG edge may reference a non-live node.
-        let all_keys: &[&str] = &["pre0", "pre1", "del_target", "bn0", "bn1", "bn2", "bn3", "bn4"];
+        let all_keys: &[&str] = &[
+            "pre0",
+            "pre1",
+            "del_target",
+            "bn0",
+            "bn1",
+            "bn2",
+            "bn3",
+            "bn4",
+        ];
         for key in all_keys {
             if !recovered.has_node(key) {
                 continue;
@@ -1304,9 +1313,7 @@ fn write_batch_composition_sweep() {
         Value::List(xs.iter().map(|s| Value::Str((*s).into())).collect())
     }
 
-    fn composition_workload<F: core_storage::fs::Fs>(
-        db: &mut GraphDb<F>,
-    ) -> core_api::Result<()> {
+    fn composition_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         // Phase 1: write_batch — 5 nodes
         db.write_batch(|b| {
             b.insert_node("C", "c0", vec![("tags".into(), tags_v(&["x", "y"]))]);
@@ -1449,11 +1456,7 @@ fn workload_with_views<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api
     // 5 nodes with a "score" prop.
     let base_keys = &VIEW_WORKLOAD_KEYS[..5];
     for (i, key) in base_keys.iter().enumerate() {
-        db.insert_node(
-            "VW",
-            key,
-            vec![("score".into(), Value::Int(i as i64 * 10))],
-        )?;
+        db.insert_node("VW", key, vec![("score".into(), Value::Int(i as i64 * 10))])?;
     }
     // Chain edges: vn0→vn1, vn1→vn2, vn2→vn3, vn3→vn4.
     for i in 0..4 {
@@ -1571,7 +1574,10 @@ fn workload_with_fulltext<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
     db.insert_node(
         "Article",
         "fa0",
-        vec![("bio".into(), Value::Str("rust embedded graph storage".into()))],
+        vec![(
+            "bio".into(),
+            Value::Str("rust embedded graph storage".into()),
+        )],
     )?;
     db.insert_node(
         "Article",
@@ -1581,7 +1587,10 @@ fn workload_with_fulltext<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
     db.insert_node(
         "Article",
         "fa2",
-        vec![("bio".into(), Value::Str("rust language systems programming".into()))],
+        vec![(
+            "bio".into(),
+            Value::Str("rust language systems programming".into()),
+        )],
     )?;
     // Different label — not indexed.
     db.insert_node(
@@ -1608,13 +1617,25 @@ fn workload_with_fulltext<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
 /// crash window between snapshot write and WAL baseline rewrite.
 fn workload_with_fulltext_and_snapshot<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
     db.enable_fulltext("Article", "bio")?;
-    db.insert_node("Article", "fb0", vec![("bio".into(), Value::Str("rust graph database".into()))])?;
-    db.insert_node("Article", "fb1", vec![("bio".into(), Value::Str("graph embeddings".into()))])?;
+    db.insert_node(
+        "Article",
+        "fb0",
+        vec![("bio".into(), Value::Str("rust graph database".into()))],
+    )?;
+    db.insert_node(
+        "Article",
+        "fb1",
+        vec![("bio".into(), Value::Str("graph embeddings".into()))],
+    )?;
     // snapshot() writes snapshot atomically then replaces WAL with EnableFulltext baseline.
     // Crash between the two atomic writes is the critical window we are testing.
     db.snapshot()?;
     // Post-snapshot user writes — go into WAL after the EnableFulltext baseline.
-    db.insert_node("Article", "fb2", vec![("bio".into(), Value::Str("rust embedded systems".into()))])?;
+    db.insert_node(
+        "Article",
+        "fb2",
+        vec![("bio".into(), Value::Str("rust embedded systems".into()))],
+    )?;
     db.set_prop("fb0", "bio", Value::Str("embedded graph rust".into()))?;
     Ok(())
 }
@@ -1670,7 +1691,10 @@ fn recovery_byte_sweep_fulltext_with_snapshot() {
         workload_with_fulltext_and_snapshot(&mut db).unwrap();
         db.into_fs().total_appended()
     };
-    assert!(total_bytes > 0, "fulltext snapshot workload must append bytes");
+    assert!(
+        total_bytes > 0,
+        "fulltext snapshot workload must append bytes"
+    );
 
     for crash_at in 0..=total_bytes {
         let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();

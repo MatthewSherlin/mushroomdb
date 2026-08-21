@@ -445,8 +445,10 @@ fn subscription_drop_unregisters_cleanly() {
     drop(sub); // Unregister before any commit.
 
     // Commits after drop must succeed — no error, no panic.
-    db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))]).unwrap();
-    db.insert_node("A", "n2", vec![("tags".into(), tags(&["x"]))]).unwrap();
+    db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    db.insert_node("A", "n2", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
     assert!(db.edge_count() >= 1);
 }
 
@@ -470,8 +472,10 @@ fn replay_is_silent_for_subscriptions() {
             approximate: false,
         };
         db.create_rule(rule).unwrap();
-        db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))]).unwrap();
-        db.insert_node("A", "n2", vec![("tags".into(), tags(&["x"]))]).unwrap();
+        db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))])
+            .unwrap();
+        db.insert_node("A", "n2", vec![("tags".into(), tags(&["x"]))])
+            .unwrap();
     }
 
     // Reopen — subscriptions registered before open cannot exist, but
@@ -507,8 +511,10 @@ fn subscribe_writes_receives_write_events_only() {
     db.create_rule(rule).unwrap();
     let sub = db.subscribe_writes().unwrap();
 
-    db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))]).unwrap();
-    db.insert_node("A", "n2", vec![("tags".into(), tags(&["x"]))]).unwrap();
+    db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    db.insert_node("A", "n2", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
 
     let events = drain_sub(&sub);
     assert!(!events.is_empty(), "expected write events");
@@ -528,8 +534,13 @@ fn subscribe_writes_receives_write_events_only() {
         );
     }
     // No edge fire events.
-    let has_edge_fired = events.iter().any(|e| matches!(e, DbEvent::EdgeFired { .. }));
-    assert!(!has_edge_fired, "write subscription must not receive EdgeFired");
+    let has_edge_fired = events
+        .iter()
+        .any(|e| matches!(e, DbEvent::EdgeFired { .. }));
+    assert!(
+        !has_edge_fired,
+        "write subscription must not receive EdgeFired"
+    );
 }
 
 /// subscribe_rule returns Err for unknown rule names.
@@ -563,8 +574,10 @@ fn subscribe_rule_receives_retract_on_node_delete() {
         approximate: false,
     };
     db.create_rule(rule).unwrap();
-    db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))]).unwrap();
-    db.insert_node("A", "n2", vec![("tags".into(), tags(&["x"]))]).unwrap();
+    db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    db.insert_node("A", "n2", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
     assert!(db.edge_count() >= 2);
 
     let sub = db.subscribe_rule("rel").unwrap();
@@ -574,5 +587,8 @@ fn subscribe_rule_receives_retract_on_node_delete() {
     let has_retract = events
         .iter()
         .any(|e| matches!(e, DbEvent::EdgeRetracted { .. }));
-    assert!(has_retract, "expected EdgeRetracted after node delete, got {events:?}");
+    assert!(
+        has_retract,
+        "expected EdgeRetracted after node delete, got {events:?}"
+    );
 }

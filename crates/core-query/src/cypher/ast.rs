@@ -172,7 +172,10 @@ pub enum Expr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
-    Prop { var: String, field: String },
+    Prop {
+        var: String,
+        field: String,
+    },
     Lit(Value),
     Param(String),
     /// Bare variable reference (used in `WITH … WHERE alias > 2`).

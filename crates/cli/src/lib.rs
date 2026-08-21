@@ -253,10 +253,16 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
                 .get(i + 1)
                 .copied()
                 .ok_or_else(|| "missing value for --commit".to_string())?;
-            commit = Some(val.parse().map_err(|_| format!("invalid commit index: {val}"))?);
+            commit = Some(
+                val.parse()
+                    .map_err(|_| format!("invalid commit index: {val}"))?,
+            );
             i += 2;
         } else if let Some(val) = a.strip_prefix("--commit=") {
-            commit = Some(val.parse().map_err(|_| format!("invalid commit index: {val}"))?);
+            commit = Some(
+                val.parse()
+                    .map_err(|_| format!("invalid commit index: {val}"))?,
+            );
             i += 1;
         } else if a == "--query" {
             let val = args
@@ -279,7 +285,11 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
     }
     let db_dir = db_dir.ok_or_else(|| "asof requires <db-dir>".to_string())?;
     let commit = commit.ok_or_else(|| "asof requires --commit N".to_string())?;
-    Ok(Command::AsOf { db_dir, commit, query })
+    Ok(Command::AsOf {
+        db_dir,
+        commit,
+        query,
+    })
 }
 
 /// Execute an as-of query at the given commit and print results.
@@ -312,7 +322,11 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
         "pagerank" => AlgoSubcmd::Pagerank,
         "wcc" => AlgoSubcmd::Wcc,
         "degree" => AlgoSubcmd::Degree,
-        other => return Err(format!("unknown algo subcommand: {other}; expected pagerank | wcc | degree")),
+        other => {
+            return Err(format!(
+                "unknown algo subcommand: {other}; expected pagerank | wcc | degree"
+            ))
+        }
     };
     let rest = &args[1..];
     let mut db_dir = None;
@@ -325,10 +339,14 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
                 .get(i + 1)
                 .copied()
                 .ok_or_else(|| "missing value for --top".to_string())?;
-            top = val.parse().map_err(|_| format!("--top must be a non-negative integer, got {val}"))?;
+            top = val
+                .parse()
+                .map_err(|_| format!("--top must be a non-negative integer, got {val}"))?;
             i += 2;
         } else if let Some(val) = a.strip_prefix("--top=") {
-            top = val.parse().map_err(|_| format!("--top must be a non-negative integer, got {val}"))?;
+            top = val
+                .parse()
+                .map_err(|_| format!("--top must be a non-negative integer, got {val}"))?;
             i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
@@ -340,7 +358,11 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
         }
     }
     let db_dir = db_dir.ok_or_else(|| format!("algo {} requires <db-dir>", args[0]))?;
-    Ok(Command::Algo { db_dir, subcmd, top })
+    Ok(Command::Algo {
+        db_dir,
+        subcmd,
+        top,
+    })
 }
 
 /// Run a graph algorithm and return a formatted string.
@@ -358,7 +380,10 @@ pub fn run_algo(db_dir: &Path, subcmd: &AlgoSubcmd, top: usize) -> Result<String
             Ok(format_wcc(&report, top))
         }
         AlgoSubcmd::Degree => {
-            let config = DegreeConfig { direction: AlgoDir::Both, ..DegreeConfig::default() };
+            let config = DegreeConfig {
+                direction: AlgoDir::Both,
+                ..DegreeConfig::default()
+            };
             let report = db.degree_centrality(&config);
             Ok(format_degree(&report, top))
         }
@@ -368,7 +393,11 @@ pub fn run_algo(db_dir: &Path, subcmd: &AlgoSubcmd, top: usize) -> Result<String
 fn format_pagerank(report: &core_api::PageRankReport, top: usize) -> String {
     let mut buf = String::new();
     let _ = writeln!(buf, "== pagerank (converged={}) ==", report.converged);
-    let rows = if top == 0 { report.scores.as_slice() } else { &report.scores[..top.min(report.scores.len())] };
+    let rows = if top == 0 {
+        report.scores.as_slice()
+    } else {
+        &report.scores[..top.min(report.scores.len())]
+    };
     for (i, (key, score)) in rows.iter().enumerate() {
         let _ = writeln!(buf, "  {:>4}  {:<40}  {:.6}", i + 1, key, score);
     }
@@ -378,7 +407,11 @@ fn format_pagerank(report: &core_api::PageRankReport, top: usize) -> String {
 fn format_wcc(report: &core_api::WccReport, top: usize) -> String {
     let mut buf = String::new();
     let _ = writeln!(buf, "== wcc (truncated={}) ==", report.truncated);
-    let rows = if top == 0 { report.components.as_slice() } else { &report.components[..top.min(report.components.len())] };
+    let rows = if top == 0 {
+        report.components.as_slice()
+    } else {
+        &report.components[..top.min(report.components.len())]
+    };
     for (key, comp_id) in rows {
         let _ = writeln!(buf, "  {:<40}  component={}", key, comp_id);
     }
@@ -387,8 +420,16 @@ fn format_wcc(report: &core_api::WccReport, top: usize) -> String {
 
 fn format_degree(report: &core_api::DegreeReport, top: usize) -> String {
     let mut buf = String::new();
-    let _ = writeln!(buf, "== degree centrality (truncated={}) ==", report.truncated);
-    let rows = if top == 0 { report.scores.as_slice() } else { &report.scores[..top.min(report.scores.len())] };
+    let _ = writeln!(
+        buf,
+        "== degree centrality (truncated={}) ==",
+        report.truncated
+    );
+    let rows = if top == 0 {
+        report.scores.as_slice()
+    } else {
+        &report.scores[..top.min(report.scores.len())]
+    };
     for (i, (key, deg)) in rows.iter().enumerate() {
         let _ = writeln!(buf, "  {:>4}  {:<40}  degree={}", i + 1, key, deg);
     }
@@ -746,7 +787,11 @@ pub fn format_demo(dir: &Path, out: &DemoOutcome) -> String {
         );
         let _ = writeln!(buf, "  est_edges: ~{}", s.est_edges);
         let _ = writeln!(buf, "  {}", s.rationale);
-        let _ = writeln!(buf, "  (run `mushroomdb suggest {}` for full analysis)", dir.display());
+        let _ = writeln!(
+            buf,
+            "  (run `mushroomdb suggest {}` for full analysis)",
+            dir.display()
+        );
     }
 
     buf
@@ -762,7 +807,10 @@ pub fn run_suggest(dir: &Path) -> Result<Vec<RuleSuggestion>, CliError> {
 pub fn format_suggest(suggestions: &[RuleSuggestion]) -> String {
     let mut buf = String::new();
     if suggestions.is_empty() {
-        let _ = writeln!(buf, "no rule suggestions (database may be empty or rules already cover all patterns)");
+        let _ = writeln!(
+            buf,
+            "no rule suggestions (database may be empty or rules already cover all patterns)"
+        );
         return buf;
     }
     let _ = writeln!(buf, "== rule suggestions ({}) ==", suggestions.len());

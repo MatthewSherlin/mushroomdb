@@ -68,10 +68,7 @@ struct SubscribeMsg {
 }
 
 /// Upgrade to a WebSocket and stream `DbEvent` frames.
-pub async fn subscribe(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn subscribe(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| run(socket, state))
 }
 
@@ -79,21 +76,19 @@ async fn run(mut socket: WebSocket, state: AppState) {
     // Wait for the client's subscribe message.
     let msg = loop {
         match socket.recv().await {
-            Some(Ok(Message::Text(t))) => {
-                match serde_json::from_str::<SubscribeMsg>(&t) {
-                    Ok(m) => break m,
-                    Err(e) => {
-                        let _ = socket
-                            .send(Message::Text(
-                                serde_json::json!({"error": format!("bad subscribe message: {e}")})
-                                    .to_string()
-                                    .into(),
-                            ))
-                            .await;
-                        return;
-                    }
+            Some(Ok(Message::Text(t))) => match serde_json::from_str::<SubscribeMsg>(&t) {
+                Ok(m) => break m,
+                Err(e) => {
+                    let _ = socket
+                        .send(Message::Text(
+                            serde_json::json!({"error": format!("bad subscribe message: {e}")})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await;
+                    return;
                 }
-            }
+            },
             Some(Ok(Message::Close(_))) | None => return,
             // ignore ping/binary/etc
             Some(Ok(_)) => continue,
@@ -245,7 +240,8 @@ mod tests {
             weight: Some(0.9),
             commit_seq: 7,
         };
-        let j: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        let j: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
         assert_eq!(j["type"], "edge_fired");
         assert_eq!(j["rule"], "rel");
         assert_eq!(j["commit_seq"], 7);
@@ -261,8 +257,7 @@ mod tests {
 
     #[test]
     fn subscribe_msg_parses_rules_and_writes() {
-        let m: SubscribeMsg =
-            serde_json::from_str(r#"{"rules":["rel"],"writes":true}"#).unwrap();
+        let m: SubscribeMsg = serde_json::from_str(r#"{"rules":["rel"],"writes":true}"#).unwrap();
         assert_eq!(m.rules, ["rel"]);
         assert!(m.writes);
     }

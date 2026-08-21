@@ -13,8 +13,7 @@ fn open() -> GraphDb<core_storage::fs::RealFs> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir()
-        .join(format!("graphdb-ft-{}-{}", n, std::process::id()));
+    let d = std::env::temp_dir().join(format!("graphdb-ft-{}-{}", n, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     GraphDb::open(&d).unwrap()
 }
@@ -23,8 +22,7 @@ fn tmp_dir() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(10000);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir()
-        .join(format!("graphdb-ft-dir-{}-{}", n, std::process::id()));
+    let d = std::env::temp_dir().join(format!("graphdb-ft-dir-{}-{}", n, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
@@ -37,8 +35,18 @@ fn tmp_dir() -> std::path::PathBuf {
 fn and_query_requires_all_terms() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap();
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("hello world rust".into()))]).unwrap();
-    db.insert_node("Doc", "d1", vec![("body".into(), Value::Str("hello python".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("hello world rust".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("hello python".into()))],
+    )
+    .unwrap();
 
     // Both must have "hello" AND "rust"
     let r = db.search("body", "hello rust");
@@ -54,9 +62,24 @@ fn and_query_requires_all_terms() {
 fn or_query_matches_either() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap();
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("rust programming".into()))]).unwrap();
-    db.insert_node("Doc", "d1", vec![("body".into(), Value::Str("python scripting".into()))]).unwrap();
-    db.insert_node("Doc", "d2", vec![("body".into(), Value::Str("javascript web".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("rust programming".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("python scripting".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d2",
+        vec![("body".into(), Value::Str("javascript web".into()))],
+    )
+    .unwrap();
 
     let r = db.search("body", "rust OR python");
     let keys: Vec<&str> = r.iter().map(|(k, _)| k.as_str()).collect();
@@ -69,8 +92,18 @@ fn or_query_matches_either() {
 fn explicit_and_keyword() {
     let mut db = open();
     db.enable_fulltext("A", "f").unwrap();
-    db.insert_node("A", "a0", vec![("f".into(), Value::Str("alpha beta gamma".into()))]).unwrap();
-    db.insert_node("A", "a1", vec![("f".into(), Value::Str("alpha only".into()))]).unwrap();
+    db.insert_node(
+        "A",
+        "a0",
+        vec![("f".into(), Value::Str("alpha beta gamma".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "A",
+        "a1",
+        vec![("f".into(), Value::Str("alpha only".into()))],
+    )
+    .unwrap();
 
     // "alpha AND beta" same as "alpha beta"
     let r = db.search("f", "alpha AND beta");
@@ -82,9 +115,24 @@ fn explicit_and_keyword() {
 fn prefix_match() {
     let mut db = open();
     db.enable_fulltext("Doc", "title").unwrap();
-    db.insert_node("Doc", "d0", vec![("title".into(), Value::Str("rustlang".into()))]).unwrap();
-    db.insert_node("Doc", "d1", vec![("title".into(), Value::Str("rusty nails".into()))]).unwrap();
-    db.insert_node("Doc", "d2", vec![("title".into(), Value::Str("python".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("title".into(), Value::Str("rustlang".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("title".into(), Value::Str("rusty nails".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d2",
+        vec![("title".into(), Value::Str("python".into()))],
+    )
+    .unwrap();
 
     let r = db.search("title", "rust*");
     let keys: Vec<&str> = r.iter().map(|(k, _)| k.as_str()).collect();
@@ -97,9 +145,24 @@ fn prefix_match() {
 fn prefix_and_literal_combined() {
     let mut db = open();
     db.enable_fulltext("X", "f").unwrap();
-    db.insert_node("X", "n0", vec![("f".into(), Value::Str("rustlang awesome".into()))]).unwrap();
-    db.insert_node("X", "n1", vec![("f".into(), Value::Str("rustlang boring".into()))]).unwrap();
-    db.insert_node("X", "n2", vec![("f".into(), Value::Str("python awesome".into()))]).unwrap();
+    db.insert_node(
+        "X",
+        "n0",
+        vec![("f".into(), Value::Str("rustlang awesome".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "X",
+        "n1",
+        vec![("f".into(), Value::Str("rustlang boring".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "X",
+        "n2",
+        vec![("f".into(), Value::Str("python awesome".into()))],
+    )
+    .unwrap();
 
     // rust* AND awesome — only n0 has both
     let r = db.search("f", "rust* awesome");
@@ -115,7 +178,12 @@ fn prefix_and_literal_combined() {
 fn case_insensitive_indexing_and_query() {
     let mut db = open();
     db.enable_fulltext("Msg", "text").unwrap();
-    db.insert_node("Msg", "m0", vec![("text".into(), Value::Str("Hello World RUST".into()))]).unwrap();
+    db.insert_node(
+        "Msg",
+        "m0",
+        vec![("text".into(), Value::Str("Hello World RUST".into()))],
+    )
+    .unwrap();
 
     // All case variants of the query should match
     for q in &["hello", "HELLO", "Hello", "rust", "RUST", "World"] {
@@ -132,17 +200,27 @@ fn case_insensitive_indexing_and_query() {
 fn set_prop_reindexes_old_tokens_removed_new_found() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap();
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("rust rocks".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("rust rocks".into()))],
+    )
+    .unwrap();
 
     // Initially finds "rust"
     assert_eq!(db.search("body", "rust").len(), 1);
     assert_eq!(db.search("body", "python").len(), 0);
 
     // Update to python — old tokens gone, new present
-    db.set_prop("d0", "body", Value::Str("python rules".into())).unwrap();
+    db.set_prop("d0", "body", Value::Str("python rules".into()))
+        .unwrap();
 
     assert_eq!(db.search("body", "rust").len(), 0, "old token must be gone");
-    assert_eq!(db.search("body", "python").len(), 1, "new token must be found");
+    assert_eq!(
+        db.search("body", "python").len(),
+        1,
+        "new token must be found"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -153,8 +231,18 @@ fn set_prop_reindexes_old_tokens_removed_new_found() {
 fn delete_node_removes_from_index() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap();
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("rust programming".into()))]).unwrap();
-    db.insert_node("Doc", "d1", vec![("body".into(), Value::Str("rust databases".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("rust programming".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("rust databases".into()))],
+    )
+    .unwrap();
 
     assert_eq!(db.search("body", "rust").len(), 2);
 
@@ -173,7 +261,12 @@ fn delete_node_removes_from_index() {
 fn remove_prop_clears_tokens() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap();
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("hello rust".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("hello rust".into()))],
+    )
+    .unwrap();
 
     assert_eq!(db.search("body", "hello").len(), 1);
 
@@ -191,18 +284,31 @@ fn remove_prop_clears_tokens() {
 fn unindexed_field_returns_empty() {
     let mut db = open();
     // No enable_fulltext call
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("hello rust".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("hello rust".into()))],
+    )
+    .unwrap();
 
     // Stable pinned behavior: empty result, no error
     let r = db.search("body", "hello");
-    assert!(r.is_empty(), "unindexed field must return empty, got: {r:?}");
+    assert!(
+        r.is_empty(),
+        "unindexed field must return empty, got: {r:?}"
+    );
 }
 
 #[test]
 fn search_wrong_field_returns_empty() {
     let mut db = open();
     db.enable_fulltext("Doc", "bio").unwrap();
-    db.insert_node("Doc", "d0", vec![("bio".into(), Value::Str("hello".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("bio".into(), Value::Str("hello".into()))],
+    )
+    .unwrap();
 
     // Searching a different (non-indexed) field returns empty
     let r = db.search("title", "hello");
@@ -220,9 +326,20 @@ fn reopen_rebuild_identical_to_never_closed() {
     {
         let mut db = GraphDb::open(&dir).unwrap();
         db.enable_fulltext("Doc", "body").unwrap();
-        db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("rust is great".into()))]).unwrap();
-        db.insert_node("Doc", "d1", vec![("body".into(), Value::Str("python django".into()))]).unwrap();
-        db.set_prop("d0", "body", Value::Str("rust and databases".into())).unwrap();
+        db.insert_node(
+            "Doc",
+            "d0",
+            vec![("body".into(), Value::Str("rust is great".into()))],
+        )
+        .unwrap();
+        db.insert_node(
+            "Doc",
+            "d1",
+            vec![("body".into(), Value::Str("python django".into()))],
+        )
+        .unwrap();
+        db.set_prop("d0", "body", Value::Str("rust and databases".into()))
+            .unwrap();
     }
     // Reopen
     let db2 = GraphDb::open(&dir).unwrap();
@@ -263,7 +380,12 @@ fn disable_fulltext_not_enabled_is_error() {
 fn disable_fulltext_drops_postings() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap();
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("hello rust".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("hello rust".into()))],
+    )
+    .unwrap();
 
     assert_eq!(db.search("body", "hello").len(), 1);
 
@@ -278,7 +400,12 @@ fn disable_fulltext_drops_postings() {
 fn re_enable_after_disable_backfills() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap();
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("rust rocks".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("rust rocks".into()))],
+    )
+    .unwrap();
     db.disable_fulltext("Doc", "body").unwrap();
 
     // Re-enable: existing nodes must be backfilled
@@ -295,8 +422,18 @@ fn re_enable_after_disable_backfills() {
 fn only_enabled_label_indexed() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap(); // only Doc, not Article
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("hello rust".into()))]).unwrap();
-    db.insert_node("Article", "a0", vec![("body".into(), Value::Str("hello rust".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("hello rust".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Article",
+        "a0",
+        vec![("body".into(), Value::Str("hello rust".into()))],
+    )
+    .unwrap();
 
     let r = db.search("body", "hello");
     assert_eq!(r.len(), 1);
@@ -312,8 +449,18 @@ fn ranking_match_count_desc() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap();
     // d0 matches both OR-groups (alpha + beta); d1 matches only one (beta)
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("alpha beta".into()))]).unwrap();
-    db.insert_node("Doc", "d1", vec![("body".into(), Value::Str("beta gamma".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("alpha beta".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("beta gamma".into()))],
+    )
+    .unwrap();
 
     let r = db.search("body", "alpha OR beta");
     assert_eq!(r.len(), 2);
@@ -332,11 +479,39 @@ fn ranking_match_count_desc() {
 fn oracle_equivalence_basic() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap();
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("I love Rust and databases".into()))]).unwrap();
-    db.insert_node("Doc", "d1", vec![("body".into(), Value::Str("Python is also great".into()))]).unwrap();
-    db.insert_node("Doc", "d2", vec![("body".into(), Value::Str("rust AND python both useful".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![(
+            "body".into(),
+            Value::Str("I love Rust and databases".into()),
+        )],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("Python is also great".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d2",
+        vec![(
+            "body".into(),
+            Value::Str("rust AND python both useful".into()),
+        )],
+    )
+    .unwrap();
 
-    for q in &["rust", "python", "rust OR python", "rust*", "databases", "nope"] {
+    for q in &[
+        "rust",
+        "python",
+        "rust OR python",
+        "rust*",
+        "databases",
+        "nope",
+    ] {
         let idx = db.search("body", q);
         let scratch = db.scratch_search("body", q);
         assert_eq!(idx, scratch, "oracle mismatch for query {q:?}");
@@ -347,11 +522,27 @@ fn oracle_equivalence_basic() {
 fn oracle_after_update_and_delete() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap();
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("rust rocks".into()))]).unwrap();
-    db.insert_node("Doc", "d1", vec![("body".into(), Value::Str("python cool".into()))]).unwrap();
-    db.insert_node("Doc", "d2", vec![("body".into(), Value::Str("java enterprise".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("rust rocks".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("python cool".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d2",
+        vec![("body".into(), Value::Str("java enterprise".into()))],
+    )
+    .unwrap();
 
-    db.set_prop("d0", "body", Value::Str("python now".into())).unwrap();
+    db.set_prop("d0", "body", Value::Str("python now".into()))
+        .unwrap();
     db.delete_node("d2").unwrap();
 
     for q in &["rust", "python", "java", "rust OR python", "now", "py*"] {
@@ -372,8 +563,18 @@ fn declarations_survive_snapshot_and_reopen() {
     {
         let mut db = GraphDb::open(&dir).unwrap();
         db.enable_fulltext("Article", "bio").unwrap();
-        db.insert_node("Article", "a0", vec![("bio".into(), Value::Str("rust embedded graph".into()))]).unwrap();
-        db.insert_node("Article", "a1", vec![("bio".into(), Value::Str("python scripting".into()))]).unwrap();
+        db.insert_node(
+            "Article",
+            "a0",
+            vec![("bio".into(), Value::Str("rust embedded graph".into()))],
+        )
+        .unwrap();
+        db.insert_node(
+            "Article",
+            "a1",
+            vec![("bio".into(), Value::Str("python scripting".into()))],
+        )
+        .unwrap();
         db.snapshot().unwrap();
         // Confirm search works before close.
         let r = db.search("bio", "rust");
@@ -382,9 +583,16 @@ fn declarations_survive_snapshot_and_reopen() {
     // Reopen from snapshot.
     {
         let db2 = GraphDb::open(&dir).unwrap();
-        assert!(db2.is_fulltext_enabled("Article", "bio"), "declaration must survive snapshot");
+        assert!(
+            db2.is_fulltext_enabled("Article", "bio"),
+            "declaration must survive snapshot"
+        );
         let r = db2.search("bio", "rust");
-        assert_eq!(r.len(), 1, "index must be rebuilt after reopen from snapshot");
+        assert_eq!(
+            r.len(),
+            1,
+            "index must be rebuilt after reopen from snapshot"
+        );
         assert_eq!(r[0].0, "a0");
     }
 }
@@ -420,30 +628,57 @@ fn open_at_works_after_snapshot_with_declarations() {
     {
         let mut db = GraphDb::open(&dir).unwrap();
         db.enable_fulltext("Article", "bio").unwrap(); // pre-snapshot WAL commit
-        db.insert_node("Article", "a0", vec![("bio".into(), Value::Str("rust".into()))]).unwrap();
+        db.insert_node(
+            "Article",
+            "a0",
+            vec![("bio".into(), Value::Str("rust".into()))],
+        )
+        .unwrap();
         db.snapshot().unwrap();
         // snapshot() replaces WAL with baseline: [EnableFulltext("Article","bio")]
-        db.insert_node("Article", "a1", vec![("bio".into(), Value::Str("python".into()))]).unwrap(); // WAL pos 1
-        db.insert_node("Article", "a2", vec![("bio".into(), Value::Str("rust lang".into()))]).unwrap(); // WAL pos 2
+        db.insert_node(
+            "Article",
+            "a1",
+            vec![("bio".into(), Value::Str("python".into()))],
+        )
+        .unwrap(); // WAL pos 1
+        db.insert_node(
+            "Article",
+            "a2",
+            vec![("bio".into(), Value::Str("rust lang".into()))],
+        )
+        .unwrap(); // WAL pos 2
     }
     // WAL has exactly 3 records (0..=2).
     // At every commit, fulltext must be enabled (baseline is always at pos 0).
     for commit in 0..=2u64 {
         let snap = GraphDb::open_at(&dir, commit).unwrap();
-        assert!(snap.is_fulltext_enabled("Article", "bio"),
-            "fulltext must be enabled at WAL pos={commit}");
+        assert!(
+            snap.is_fulltext_enabled("Article", "bio"),
+            "fulltext must be enabled at WAL pos={commit}"
+        );
     }
     // CommitOutOfRange for pos 3 (only 3 records).
-    assert!(matches!(GraphDb::open_at(&dir, 3), Err(GraphError::CommitOutOfRange { .. })));
+    assert!(matches!(
+        GraphDb::open_at(&dir, 3),
+        Err(GraphError::CommitOutOfRange { .. })
+    ));
     // At pos 2 (all WAL records), the WAL-replayed state has:
     //   - fulltext enabled (pos 0 baseline)
     //   - a1 with "python" (pos 1)
     //   - a2 with "rust lang" (pos 2)
     // open_at is WAL-only (no snapshot), so a0 (pre-snapshot) is not visible.
     let snap = GraphDb::open_at(&dir, 2).unwrap();
-    assert!(snap.is_fulltext_enabled("Article", "bio"), "fulltext must be enabled at pos=2");
+    assert!(
+        snap.is_fulltext_enabled("Article", "bio"),
+        "fulltext must be enabled at pos=2"
+    );
     let r = snap.search("bio", "rust");
-    assert_eq!(r.len(), 1, "only a2 should match 'rust' (a0 is pre-snapshot, not in WAL)");
+    assert_eq!(
+        r.len(),
+        1,
+        "only a2 should match 'rust' (a0 is pre-snapshot, not in WAL)"
+    );
     assert_eq!(r[0].0, "a2");
 }
 
@@ -454,24 +689,43 @@ fn open_at_works_after_snapshot_with_declarations() {
 #[test]
 fn cypher_text_matches_where() {
     let mut db = open();
-    db.insert_node("Doc", "d0", vec![("body".into(), Value::Str("rust is great".into()))]).unwrap();
-    db.insert_node("Doc", "d1", vec![("body".into(), Value::Str("python scripting".into()))]).unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("rust is great".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("python scripting".into()))],
+    )
+    .unwrap();
 
     let no_params: BTreeMap<String, Value> = BTreeMap::new();
 
     // textMatches does per-row scratch matching — no index needed
     let rs = db
-        .query("MATCH (d:Doc) WHERE textMatches(d.body, 'rust') RETURN d", &no_params)
+        .query(
+            "MATCH (d:Doc) WHERE textMatches(d.body, 'rust') RETURN d",
+            &no_params,
+        )
         .unwrap();
     assert_eq!(rs.len(), 1);
 
     let rs2 = db
-        .query("MATCH (d:Doc) WHERE textMatches(d.body, 'python OR rust') RETURN d", &no_params)
+        .query(
+            "MATCH (d:Doc) WHERE textMatches(d.body, 'python OR rust') RETURN d",
+            &no_params,
+        )
         .unwrap();
     assert_eq!(rs2.len(), 2);
 
     let rs3 = db
-        .query("MATCH (d:Doc) WHERE textMatches(d.body, 'rust*') RETURN d", &no_params)
+        .query(
+            "MATCH (d:Doc) WHERE textMatches(d.body, 'rust*') RETURN d",
+            &no_params,
+        )
         .unwrap();
     assert_eq!(rs3.len(), 1);
 }
@@ -493,9 +747,12 @@ fn disable_shared_field_removes_only_disabled_label_postings() {
     let mut db = open();
 
     // Three nodes across three labels, all with field "f".
-    db.insert_node("A", "a1", vec![("f".into(), Value::Str("alpha".into()))]).unwrap();
-    db.insert_node("B", "b1", vec![("f".into(), Value::Str("beta".into()))]).unwrap();
-    db.insert_node("C", "c1", vec![("f".into(), Value::Str("gamma".into()))]).unwrap();
+    db.insert_node("A", "a1", vec![("f".into(), Value::Str("alpha".into()))])
+        .unwrap();
+    db.insert_node("B", "b1", vec![("f".into(), Value::Str("beta".into()))])
+        .unwrap();
+    db.insert_node("C", "c1", vec![("f".into(), Value::Str("gamma".into()))])
+        .unwrap();
 
     // Enable fulltext on field "f" for all three labels.
     db.enable_fulltext("A", "f").unwrap();
@@ -503,23 +760,59 @@ fn disable_shared_field_removes_only_disabled_label_postings() {
     db.enable_fulltext("C", "f").unwrap();
 
     // All three nodes searchable before any disable.
-    assert_eq!(db.search("f", "alpha").len(), 1, "a1 present before disable");
-    assert_eq!(db.search("f", "beta").len(),  1, "b1 present before disable");
-    assert_eq!(db.search("f", "gamma").len(), 1, "c1 present before disable");
+    assert_eq!(
+        db.search("f", "alpha").len(),
+        1,
+        "a1 present before disable"
+    );
+    assert_eq!(db.search("f", "beta").len(), 1, "b1 present before disable");
+    assert_eq!(
+        db.search("f", "gamma").len(),
+        1,
+        "c1 present before disable"
+    );
 
     // Disable label A — B and C must remain.
     db.disable_fulltext("A", "f").unwrap();
-    assert_eq!(db.search("f", "alpha").len(), 0, "a1 absent after A disabled");
-    assert_eq!(db.search("f", "beta").len(),  1, "b1 still present after A disabled");
-    assert_eq!(db.search("f", "gamma").len(), 1, "c1 still present after A disabled");
+    assert_eq!(
+        db.search("f", "alpha").len(),
+        0,
+        "a1 absent after A disabled"
+    );
+    assert_eq!(
+        db.search("f", "beta").len(),
+        1,
+        "b1 still present after A disabled"
+    );
+    assert_eq!(
+        db.search("f", "gamma").len(),
+        1,
+        "c1 still present after A disabled"
+    );
 
     // Disable label B — C must remain.
     db.disable_fulltext("B", "f").unwrap();
-    assert_eq!(db.search("f", "beta").len(),  0, "b1 absent after B disabled");
-    assert_eq!(db.search("f", "gamma").len(), 1, "c1 still present after B disabled");
+    assert_eq!(
+        db.search("f", "beta").len(),
+        0,
+        "b1 absent after B disabled"
+    );
+    assert_eq!(
+        db.search("f", "gamma").len(),
+        1,
+        "c1 still present after B disabled"
+    );
 
     // Disable label C — column now fully dropped; all searches empty.
     db.disable_fulltext("C", "f").unwrap();
-    assert_eq!(db.search("f", "gamma").len(), 0, "c1 absent after C disabled");
-    assert_eq!(db.search("f", "alpha").len(), 0, "column dropped; no results");
+    assert_eq!(
+        db.search("f", "gamma").len(),
+        0,
+        "c1 absent after C disabled"
+    );
+    assert_eq!(
+        db.search("f", "alpha").len(),
+        0,
+        "column dropped; no results"
+    );
 }

@@ -74,10 +74,7 @@ pub enum DbEvent {
         commit_seq: u64,
     },
     /// A node was deleted.
-    NodeDeleted {
-        key: String,
-        commit_seq: u64,
-    },
+    NodeDeleted { key: String, commit_seq: u64 },
     /// A user-inserted edge was added.
     EdgeInserted {
         edge_type: String,
@@ -108,9 +105,7 @@ pub enum DbEvent {
     ///
     /// The subscriber must re-read graph state to recover consistency for
     /// lossless consumers.  `missed` is the count of dropped events.
-    Lagged {
-        missed: u64,
-    },
+    Lagged { missed: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +219,10 @@ pub(crate) fn event_matches(event: &DbEvent, filter: &SubFilter) -> bool {
             _ => false,
         },
         SubFilter::AllRules => {
-            matches!(event, DbEvent::EdgeFired { .. } | DbEvent::EdgeRetracted { .. })
+            matches!(
+                event,
+                DbEvent::EdgeFired { .. } | DbEvent::EdgeRetracted { .. }
+            )
         }
         SubFilter::Writes => matches!(
             event,

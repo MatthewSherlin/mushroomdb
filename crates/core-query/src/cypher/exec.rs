@@ -254,32 +254,42 @@ fn execute_inner(
     // A GroupAggregate followed by a Filter means aggregate-WITH with a HAVING
     // clause — route through staged path so the Filter evaluates against
     // Cell::Scalar rows produced by group_result_to_rows.
-    let is_pipeline = plan
-        .iter()
-        .any(|op| matches!(op, PlanOp::With { .. } | PlanOp::Unwind { .. } | PlanOp::LeftOuterApply { .. }))
-        || {
-            let mut saw_gagg = false;
-            plan.iter().any(|op| {
-                if matches!(op, PlanOp::GroupAggregate { .. }) {
-                    saw_gagg = true;
-                    false
-                } else {
-                    saw_gagg && matches!(op, PlanOp::Filter { .. })
-                }
-            })
-        };
+    let is_pipeline = plan.iter().any(|op| {
+        matches!(
+            op,
+            PlanOp::With { .. } | PlanOp::Unwind { .. } | PlanOp::LeftOuterApply { .. }
+        )
+    }) || {
+        let mut saw_gagg = false;
+        plan.iter().any(|op| {
+            if matches!(op, PlanOp::GroupAggregate { .. }) {
+                saw_gagg = true;
+                false
+            } else {
+                saw_gagg && matches!(op, PlanOp::Filter { .. })
+            }
+        })
+    };
 
     // GroupAggregate plans: streaming HashMap accumulator (O(groups) memory).
     // Checked before the bounded path and before single-aggregate so they are
     // never routed to pull.  Skipped for VarExpand and pipeline plans.
-    if !has_var_expand && !is_pipeline && plan.iter().any(|op| matches!(op, PlanOp::GroupAggregate { .. })) {
+    if !has_var_expand
+        && !is_pipeline
+        && plan
+            .iter()
+            .any(|op| matches!(op, PlanOp::GroupAggregate { .. }))
+    {
         return execute_group_aggregate(view, plan, params);
     }
 
     // Aggregate plans: streaming accumulator path (O(1) memory, no budget).
     // Checked before the bounded path so aggregates are never routed to pull.
     // Skipped for VarExpand and pipeline plans — they go to the staged path.
-    if !has_var_expand && !is_pipeline && plan.iter().any(|op| matches!(op, PlanOp::Aggregate { .. })) {
+    if !has_var_expand
+        && !is_pipeline
+        && plan.iter().any(|op| matches!(op, PlanOp::Aggregate { .. }))
+    {
         return execute_aggregate(view, plan, params);
     }
 
@@ -389,7 +399,10 @@ fn execute_inner(
                         grp_key_order.push(gk.clone());
                         grp_groups.insert(
                             gk.clone(),
-                            (display_vals, aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect()),
+                            (
+                                display_vals,
+                                aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+                            ),
                         );
                     }
                     let (_, accs) = grp_groups.get_mut(&gk).unwrap();
@@ -404,7 +417,10 @@ fn execute_inner(
                     grp_key_order.push(empty_key.clone());
                     grp_groups.insert(
                         empty_key,
-                        (vec![], aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect()),
+                        (
+                            vec![],
+                            aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+                        ),
                     );
                 }
                 if is_pipeline {
@@ -418,13 +434,24 @@ fn execute_inner(
                     cols.extend(aggs.iter().map(|(_, _, c)| c.clone()));
                     pipeline_group_columns = Some(cols);
                 } else {
-                    projected = Some(build_group_projected(keys, aggs, grp_key_order, &mut grp_groups));
+                    projected = Some(build_group_projected(
+                        keys,
+                        aggs,
+                        grp_key_order,
+                        &mut grp_groups,
+                    ));
                     pipeline_group_columns = None;
                 }
             }
             // Non-aggregate WITH: apply filter / order / skip / limit, then
             // project scalar aliases as Cell::Scalar while keeping node bindings.
-            PlanOp::With { items, where_expr, order_by, skip, limit } => {
+            PlanOp::With {
+                items,
+                where_expr,
+                order_by,
+                skip,
+                limit,
+            } => {
                 // Project each input row through the WITH items first so that
                 // output aliases (e.g. `p.age AS age`) are available for the
                 // subsequent WHERE filter, ORDER BY, SKIP, and LIMIT.
@@ -434,7 +461,9 @@ fn execute_inner(
                     let mut new_row: Row = vec![None; row_len];
                     for item in items {
                         let col = column_name(item);
-                        let Some(dst_slot) = vars.slot(&col) else { continue };
+                        let Some(dst_slot) = vars.slot(&col) else {
+                            continue;
+                        };
                         match &item.value {
                             RetVal::Var(v) => {
                                 // Carry the existing cell (node binding or scalar alias).
@@ -475,20 +504,20 @@ fn execute_inner(
             }
             // UNWIND: expand each input row into N rows by iterating a list value.
             PlanOp::Unwind { expr, alias } => {
-                let alias_slot = vars.slot(alias)
+                let alias_slot = vars
+                    .slot(alias)
                     .ok_or_else(|| format!("UNWIND alias `{alias}` not in VarTable"))?;
                 let cap = max_intermediate_rows();
                 let mut new_rows: Vec<Row> = Vec::new();
                 for row in &rows {
                     let list_val: Option<Value> = match expr {
-                        UnwindExpr::Lit(vals) => {
-                            Some(Value::List(vals.clone()))
-                        }
+                        UnwindExpr::Lit(vals) => Some(Value::List(vals.clone())),
                         UnwindExpr::Prop { var, field } => {
                             resolve_prop(view, &vars, row, var, field)?
                         }
                         UnwindExpr::Var(name) => {
-                            let slot = vars.slot(name)
+                            let slot = vars
+                                .slot(name)
                                 .ok_or_else(|| format!("UNWIND variable `{name}` is not bound"))?;
                             match row.get(slot).and_then(|c| c.as_ref()) {
                                 Some(Cell::Scalar(v)) => Some(v.clone()),
@@ -557,7 +586,10 @@ fn execute_inner(
             // For each outer row, execute the inner plan in isolation.  If the
             // inner plan produces ≥1 row, those rows flow out.  If it produces
             // 0 rows, the outer row flows out with optional_vars nulled.
-            PlanOp::LeftOuterApply { inner, optional_vars } => {
+            PlanOp::LeftOuterApply {
+                inner,
+                optional_vars,
+            } => {
                 let cap = max_intermediate_rows();
                 let mut new_rows: Vec<Row> = Vec::new();
                 for outer_row in &rows {
@@ -565,9 +597,8 @@ fn execute_inner(
                     let inner_seed: Vec<Row> = vec![outer_row.clone()];
                     // Execute the inner plan in "micro-staged" mode using the
                     // shared vars table (already contains all variable slots).
-                    let inner_result = exec_left_outer_inner(
-                        view, &vars, inner_seed, inner, params
-                    )?;
+                    let inner_result =
+                        exec_left_outer_inner(view, &vars, inner_seed, inner, params)?;
                     if inner_result.is_empty() {
                         // Left-outer fallback: null out optional vars.
                         let mut null_row = outer_row.clone();
@@ -610,7 +641,9 @@ fn execute_inner(
                                 .and_then(|c| c.as_ref())
                                 .and_then(|c| match c {
                                     Cell::Scalar(v) => Some(v.clone()),
-                                    Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                                    Cell::Node(id) => {
+                                        view.ids.key_of(*id).map(|k| Value::Str(k.to_owned()))
+                                    }
                                     Cell::Path(h) => Some(Value::Int(*h as i64)),
                                     Cell::Rel(_) => None,
                                 })
@@ -715,7 +748,9 @@ fn collect_params_from_ops(
                     collect_ret_item_params(item, names, seen);
                 }
             }
-            PlanOp::With { items, where_expr, .. } => {
+            PlanOp::With {
+                items, where_expr, ..
+            } => {
                 for item in items {
                     collect_ret_item_params(item, names, seen);
                 }
@@ -749,11 +784,7 @@ fn collect_params_from_ops(
 }
 
 /// Collect `$param` names referenced inside a single RETURN/WITH item.
-fn collect_ret_item_params(
-    item: &RetItem,
-    names: &mut Vec<String>,
-    seen: &mut BTreeSet<String>,
-) {
+fn collect_ret_item_params(item: &RetItem, names: &mut Vec<String>, seen: &mut BTreeSet<String>) {
     match &item.value {
         RetVal::FuncCall { args, .. } => {
             for arg in args {
@@ -841,10 +872,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                 }
             }
             PlanOp::VarExpand {
-                from,
-                rel_var,
-                to,
-                ..
+                from, rel_var, to, ..
             } => {
                 vars.intern(from);
                 vars.intern(to);
@@ -853,10 +881,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                 }
             }
             PlanOp::ShortestPath {
-                from,
-                rel_var,
-                to,
-                ..
+                from, rel_var, to, ..
             } => {
                 vars.intern(from);
                 vars.intern(to);
@@ -920,7 +945,12 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                     vars.intern(col);
                 }
             }
-            PlanOp::With { items, where_expr, order_by, .. } => {
+            PlanOp::With {
+                items,
+                where_expr,
+                order_by,
+                ..
+            } => {
                 for item in items {
                     match &item.value {
                         RetVal::Var(name) | RetVal::Prop { var: name, .. } => {
@@ -938,7 +968,9 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                         vars.intern(alias);
                     } else {
                         match &item.value {
-                            RetVal::Var(name) => { vars.intern(name); }
+                            RetVal::Var(name) => {
+                                vars.intern(name);
+                            }
                             RetVal::Prop { var, field } => {
                                 let col = format!("{var}.{field}");
                                 vars.intern(&col);
@@ -946,14 +978,17 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                             RetVal::Agg { .. } => {}
                             RetVal::FuncCall { name, args } => {
                                 // Compute canonical column name inline.
-                                let arg_strs: Vec<String> = args.iter().map(|a| match a {
-                                    Operand::Var(v) => v.clone(),
-                                    Operand::Prop { var, field } => format!("{var}.{field}"),
-                                    Operand::Lit(_) => "<lit>".to_string(),
-                                    Operand::Param(p) => format!("${p}"),
-                                    Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
-                                    Operand::BinArith { .. } => "<arith>".to_string(),
-                                }).collect();
+                                let arg_strs: Vec<String> = args
+                                    .iter()
+                                    .map(|a| match a {
+                                        Operand::Var(v) => v.clone(),
+                                        Operand::Prop { var, field } => format!("{var}.{field}"),
+                                        Operand::Lit(_) => "<lit>".to_string(),
+                                        Operand::Param(p) => format!("${p}"),
+                                        Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
+                                        Operand::BinArith { .. } => "<arith>".to_string(),
+                                    })
+                                    .collect();
                                 let col = format!("{name}({})", arg_strs.join(", "));
                                 vars.intern(&col);
                             }
@@ -977,23 +1012,36 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
             PlanOp::Unwind { expr, alias } => {
                 vars.intern(alias);
                 match expr {
-                    UnwindExpr::Prop { var, .. } => { vars.intern(var); }
-                    UnwindExpr::Var(name) => { vars.intern(name); }
+                    UnwindExpr::Prop { var, .. } => {
+                        vars.intern(var);
+                    }
+                    UnwindExpr::Var(name) => {
+                        vars.intern(name);
+                    }
                     UnwindExpr::Lit(_) => {}
                 }
             }
-            PlanOp::LeftOuterApply { inner, optional_vars } => {
+            PlanOp::LeftOuterApply {
+                inner,
+                optional_vars,
+            } => {
                 // Intern all variables introduced by the inner plan.
                 for op in inner {
                     // Recurse by treating inner ops through the same collect_vars logic.
                     // We re-use the same VarTable reference here, which is correct:
                     // inner vars are visible in the outer row after the apply.
                     match op {
-                        PlanOp::ScanLabel { var, .. } => { vars.intern(var); }
-                        PlanOp::Expand { from, rel_var, to, .. } => {
+                        PlanOp::ScanLabel { var, .. } => {
+                            vars.intern(var);
+                        }
+                        PlanOp::Expand {
+                            from, rel_var, to, ..
+                        } => {
                             vars.intern(from);
                             vars.intern(to);
-                            if let Some(r) = rel_var { vars.intern(r); }
+                            if let Some(r) = rel_var {
+                                vars.intern(r);
+                            }
                         }
                         PlanOp::JoinBound { var, .. } | PlanOp::LookupProps { var, .. } => {
                             vars.intern(var);
@@ -1101,7 +1149,14 @@ fn require_node(row: &Row, vars: &VarTable, var: &str) -> Result<u32, String> {
 
 /// Supported scalar function names (case-insensitive).
 const SCALAR_FUNCS: &[&str] = &[
-    "toLower", "toUpper", "size", "coalesce", "type", "abs", "round", "textMatches",
+    "toLower",
+    "toUpper",
+    "size",
+    "coalesce",
+    "type",
+    "abs",
+    "round",
+    "textMatches",
 ];
 
 /// Evaluate one of the supported scalar functions.  Unknown function names
@@ -1119,7 +1174,10 @@ fn eval_func(
     match norm.as_str() {
         "tolower" => {
             if args.len() != 1 {
-                return Err(format!("toLower() requires exactly 1 argument, got {}", args.len()));
+                return Err(format!(
+                    "toLower() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
             }
             let v = resolve_operand(view, vars, row, &args[0], params)?;
             Ok(v.map(|val| match val {
@@ -1129,7 +1187,10 @@ fn eval_func(
         }
         "toupper" => {
             if args.len() != 1 {
-                return Err(format!("toUpper() requires exactly 1 argument, got {}", args.len()));
+                return Err(format!(
+                    "toUpper() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
             }
             let v = resolve_operand(view, vars, row, &args[0], params)?;
             Ok(v.map(|val| match val {
@@ -1139,7 +1200,10 @@ fn eval_func(
         }
         "size" => {
             if args.len() != 1 {
-                return Err(format!("size() requires exactly 1 argument, got {}", args.len()));
+                return Err(format!(
+                    "size() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
             }
             let v = resolve_operand(view, vars, row, &args[0], params)?;
             match v {
@@ -1160,12 +1224,15 @@ fn eval_func(
         }
         "type" => {
             if args.len() != 1 {
-                return Err(format!("type() requires exactly 1 argument, got {}", args.len()));
+                return Err(format!(
+                    "type() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
             }
             // Argument must be a relationship variable (Cell::Rel).
             let Operand::Var(var_name) = &args[0] else {
                 return Err(
-                    "type() argument must be a relationship variable (e.g. type(r))".to_string()
+                    "type() argument must be a relationship variable (e.g. type(r))".to_string(),
                 );
             };
             let slot = vars
@@ -1188,7 +1255,10 @@ fn eval_func(
         }
         "abs" => {
             if args.len() != 1 {
-                return Err(format!("abs() requires exactly 1 argument, got {}", args.len()));
+                return Err(format!(
+                    "abs() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
             }
             let v = resolve_operand(view, vars, row, &args[0], params)?;
             match v {
@@ -1200,7 +1270,10 @@ fn eval_func(
         }
         "round" => {
             if args.len() != 1 {
-                return Err(format!("round() requires exactly 1 argument, got {}", args.len()));
+                return Err(format!(
+                    "round() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
             }
             let v = resolve_operand(view, vars, row, &args[0], params)?;
             match v {
@@ -1284,7 +1357,11 @@ fn resolve_operand(
         Operand::Prop { var, field } => resolve_prop(view, vars, row, var, field),
         Operand::Var(name) => {
             // Bare variable reference: resolve from Cell (scalar alias or node key).
-            match vars.slot(name).and_then(|s| row.get(s)).and_then(|c| c.as_ref()) {
+            match vars
+                .slot(name)
+                .and_then(|s| row.get(s))
+                .and_then(|c| c.as_ref())
+            {
                 Some(Cell::Scalar(v)) => Ok(Some(v.clone())),
                 Some(Cell::Node(id)) => match view.ids.key_of(*id) {
                     Some(key) => Ok(Some(Value::Str(key.to_owned()))),
@@ -1308,21 +1385,33 @@ fn resolve_operand(
                         ArithOp::Mul => a.saturating_mul(b),
                         ArithOp::Add => a.saturating_add(b),
                         ArithOp::Div => {
-                            if b == 0 { return Err("division by zero".into()); }
+                            if b == 0 {
+                                return Err("division by zero".into());
+                            }
                             a.checked_div(b).unwrap_or(i64::MAX)
                         }
                     };
                     Ok(Some(Value::Int(result)))
                 }
                 (Some(lv), Some(rv)) => {
-                    let a = match &lv { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err(format!("arithmetic operand must be numeric, got {lv:?}")) };
-                    let b = match &rv { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err(format!("arithmetic operand must be numeric, got {rv:?}")) };
+                    let a = match &lv {
+                        Value::Float(f) => *f,
+                        Value::Int(i) => *i as f64,
+                        _ => return Err(format!("arithmetic operand must be numeric, got {lv:?}")),
+                    };
+                    let b = match &rv {
+                        Value::Float(f) => *f,
+                        Value::Int(i) => *i as f64,
+                        _ => return Err(format!("arithmetic operand must be numeric, got {rv:?}")),
+                    };
                     let result = match op {
                         ArithOp::Sub => a - b,
                         ArithOp::Mul => a * b,
                         ArithOp::Add => a + b,
                         ArithOp::Div => {
-                            if b == 0.0 { return Err("division by zero".into()); }
+                            if b == 0.0 {
+                                return Err("division by zero".into());
+                            }
                             a / b
                         }
                     };
@@ -1474,7 +1563,9 @@ fn exec_expand(
         let from_id = require_node(row, vars, from)?;
         let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
             Some(Cell::Node(id)) => Some(*id),
-            Some(Cell::Rel(_) | Cell::Path(_) | Cell::Scalar(_)) => return Err(format!("variable `{to}` is not a node")),
+            Some(Cell::Rel(_) | Cell::Path(_) | Cell::Scalar(_)) => {
+                return Err(format!("variable `{to}` is not a node"))
+            }
             None => None,
         };
         for e in expand(view, from_id, etypes.as_deref(), exp_dir) {
@@ -2040,7 +2131,9 @@ fn agg_stream(
             let from_id = require_node(row, ctx.vars, from)?;
             let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Node(id)) => Some(*id),
-                Some(Cell::Rel(_) | Cell::Path(_) | Cell::Scalar(_)) => return Err(format!("variable `{to}` is not a node")),
+                Some(Cell::Rel(_) | Cell::Path(_) | Cell::Scalar(_)) => {
+                    return Err(format!("variable `{to}` is not a node"))
+                }
                 None => None,
             };
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
@@ -2108,8 +2201,18 @@ fn agg_stream(
             min,
             max,
         } => {
-            let new_rows =
-                exec_var_expand(ctx.view, ctx.vars, std::slice::from_ref(row), from, rel_var, etype, *dir, to, *min, *max)?;
+            let new_rows = exec_var_expand(
+                ctx.view,
+                ctx.vars,
+                std::slice::from_ref(row),
+                from,
+                rel_var,
+                etype,
+                *dir,
+                to,
+                *min,
+                *max,
+            )?;
             for nr in &new_rows {
                 agg_stream(ctx, rest, nr, acc)?;
             }
@@ -2122,8 +2225,17 @@ fn agg_stream(
             to,
             max_hops,
         } => {
-            let new_rows =
-                exec_shortest_path(ctx.view, ctx.vars, std::slice::from_ref(row), from, rel_var, etype, *dir, to, *max_hops)?;
+            let new_rows = exec_shortest_path(
+                ctx.view,
+                ctx.vars,
+                std::slice::from_ref(row),
+                from,
+                rel_var,
+                etype,
+                *dir,
+                to,
+                *max_hops,
+            )?;
             for nr in &new_rows {
                 agg_stream(ctx, rest, nr, acc)?;
             }
@@ -2142,12 +2254,12 @@ fn agg_stream(
         }
         PlanOp::Skip(_) => {
             return Err(
-                "agg executor: Skip in producer slice — structurally malformed".to_string()
+                "agg executor: Skip in producer slice — structurally malformed".to_string(),
             );
         }
         PlanOp::Limit(_) => {
             return Err(
-                "agg executor: Limit in producer slice — structurally malformed".to_string()
+                "agg executor: Limit in producer slice — structurally malformed".to_string(),
             );
         }
         PlanOp::Aggregate { .. } => {
@@ -2174,7 +2286,8 @@ fn agg_stream(
         }
         PlanOp::LeftOuterApply { .. } => {
             return Err(
-                "agg executor: LeftOuterApply in producer slice — structurally malformed".to_string(),
+                "agg executor: LeftOuterApply in producer slice — structurally malformed"
+                    .to_string(),
             );
         }
     }
@@ -2264,12 +2377,7 @@ fn group_result_to_rows(
 /// for example, inside a non-aggregate WITH stage or after a pipeline
 /// GroupAggregate.  `OrderTarget::Prop` is resolved by looking up the node
 /// property; `Alias` / `Var` are resolved from `Cell::Scalar` in the row.
-fn exec_order_by_rows(
-    vars: &VarTable,
-    rows: &mut Vec<Row>,
-    items: &[OrderItem],
-    view: &GraphView,
-) {
+fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem], view: &GraphView) {
     // Pre-compute sort-key values for all rows.  This avoids re-resolving
     // inside the comparator (the closure cannot return Err, so we pre-compute).
     let mut key_table: Vec<Vec<Option<Value>>> = Vec::with_capacity(rows.len());
@@ -2277,21 +2385,25 @@ fn exec_order_by_rows(
         let mut row_key: Vec<Option<Value>> = Vec::with_capacity(items.len());
         for item in items {
             let val = match &item.target {
-                OrderTarget::Alias(name) | OrderTarget::Var(name) => {
-                    vars.slot(name).and_then(|s| row.get(s)).and_then(|c| c.as_ref()).and_then(|c| match c {
+                OrderTarget::Alias(name) | OrderTarget::Var(name) => vars
+                    .slot(name)
+                    .and_then(|s| row.get(s))
+                    .and_then(|c| c.as_ref())
+                    .and_then(|c| match c {
                         Cell::Scalar(v) => Some(v.clone()),
                         Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
                         Cell::Path(hops) => Some(Value::Int(*hops as i64)),
                         Cell::Rel(_) => None,
-                    })
-                }
-                OrderTarget::Prop { var, field } => {
-                    vars.slot(var).and_then(|s| row.get(s)).and_then(|c| c.as_ref()).and_then(|c| match c {
+                    }),
+                OrderTarget::Prop { var, field } => vars
+                    .slot(var)
+                    .and_then(|s| row.get(s))
+                    .and_then(|c| c.as_ref())
+                    .and_then(|c| match c {
                         Cell::Node(id) => view.prop(*id, field).cloned(),
                         Cell::Rel(e) => view.edge_props.get(e.etype, e.src, e.dst, field).cloned(),
                         _ => None,
-                    })
-                }
+                    }),
             };
             row_key.push(val);
         }
@@ -2356,7 +2468,10 @@ fn execute_group_aggregate(
         key_order.push(empty_key.clone());
         groups.insert(
             empty_key,
-            (vec![], aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect()),
+            (
+                vec![],
+                aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+            ),
         );
     }
     let mut projected = build_group_projected(keys, aggs, key_order, &mut groups);
@@ -2364,8 +2479,14 @@ fn execute_group_aggregate(
     for op in tail {
         match op {
             PlanOp::OrderBy { items } => exec_order_by(&mut projected, items)?,
-            PlanOp::Skip(ls) => { let n = resolve_ls(ls, params)?; apply_skip(&mut projected.rows, n); }
-            PlanOp::Limit(ls) => { let n = resolve_ls(ls, params)?; apply_limit(&mut projected.rows, n); }
+            PlanOp::Skip(ls) => {
+                let n = resolve_ls(ls, params)?;
+                apply_skip(&mut projected.rows, n);
+            }
+            PlanOp::Limit(ls) => {
+                let n = resolve_ls(ls, params)?;
+                apply_limit(&mut projected.rows, n);
+            }
             _ => {} // Ignore unexpected ops defensively.
         }
     }
@@ -2402,8 +2523,7 @@ fn group_stream(
                     return Err(group_cap_err());
                 }
                 key_order.push(gk.clone());
-                let init: Vec<AggAcc> =
-                    ctx.aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect();
+                let init: Vec<AggAcc> = ctx.aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect();
                 groups.insert(gk.clone(), (display_vals, init));
             }
             let (_, accs) = groups.get_mut(&gk).unwrap();
@@ -2568,12 +2688,12 @@ fn group_stream(
         }
         PlanOp::Skip(_) => {
             return Err(
-                "group executor: Skip in producer slice — structurally malformed".to_string()
+                "group executor: Skip in producer slice — structurally malformed".to_string(),
             );
         }
         PlanOp::Limit(_) => {
             return Err(
-                "group executor: Limit in producer slice — structurally malformed".to_string()
+                "group executor: Limit in producer slice — structurally malformed".to_string(),
             );
         }
         PlanOp::Aggregate { .. } => {
@@ -2756,7 +2876,9 @@ fn pull_rows(
             let from_id = require_node(row, ctx.vars, from)?;
             let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Node(id)) => Some(*id),
-                Some(Cell::Rel(_) | Cell::Path(_) | Cell::Scalar(_)) => return Err(format!("variable `{to}` is not a node")),
+                Some(Cell::Rel(_) | Cell::Path(_) | Cell::Scalar(_)) => {
+                    return Err(format!("variable `{to}` is not a node"))
+                }
                 None => None,
             };
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
@@ -2840,13 +2962,13 @@ fn pull_rows(
         PlanOp::Skip(_) => {
             return Err(
                 "pull executor: Skip reached pull_rows — Skip must appear after Project"
-                    .to_string()
+                    .to_string(),
             );
         }
         PlanOp::Limit(_) => {
             return Err(
                 "pull executor: Limit reached pull_rows — Limit must appear after Project"
-                    .to_string()
+                    .to_string(),
             );
         }
         PlanOp::Aggregate { .. } => {
@@ -2977,14 +3099,17 @@ fn column_name(item: &RetItem) -> String {
             format!("{f}({a})")
         }
         RetVal::FuncCall { name, args } => {
-            let arg_strs: Vec<String> = args.iter().map(|a| match a {
-                Operand::Var(v) => v.clone(),
-                Operand::Prop { var, field } => format!("{var}.{field}"),
-                Operand::Lit(_) => "<lit>".to_string(),
-                Operand::Param(p) => format!("${p}"),
-                Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
-                Operand::BinArith { .. } => "<arith>".to_string(),
-            }).collect();
+            let arg_strs: Vec<String> = args
+                .iter()
+                .map(|a| match a {
+                    Operand::Var(v) => v.clone(),
+                    Operand::Prop { var, field } => format!("{var}.{field}"),
+                    Operand::Lit(_) => "<lit>".to_string(),
+                    Operand::Param(p) => format!("${p}"),
+                    Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
+                    Operand::BinArith { .. } => "<arith>".to_string(),
+                })
+                .collect();
             format!("{name}({})", arg_strs.join(", "))
         }
     }
@@ -3091,9 +3216,10 @@ fn resolve_ls(ls: &LimitSkip, params: &Params) -> Result<u64, String> {
     match ls {
         LimitSkip::Exact(n) => Ok(*n),
         LimitSkip::Param(name) => {
-            let val = params.0.get(name).ok_or_else(|| {
-                format!("missing parameter `{name}` (used in LIMIT/SKIP)")
-            })?;
+            let val = params
+                .0
+                .get(name)
+                .ok_or_else(|| format!("missing parameter `{name}` (used in LIMIT/SKIP)"))?;
             match val {
                 Value::Int(i) if *i >= 0 => Ok(*i as u64),
                 Value::Int(i) => Err(format!(
@@ -3124,7 +3250,9 @@ fn apply_limit<T>(rows: &mut Vec<T>, n: u64) {
 #[cfg(test)]
 mod tests {
     use super::{execute, resolve_operand, Params, Row, VarTable};
-    use crate::cypher::ast::{ArithOp, LimitSkip, Operand, OrderItem, OrderTarget, RetItem, RetVal};
+    use crate::cypher::ast::{
+        ArithOp, LimitSkip, Operand, OrderItem, OrderTarget, RetItem, RetVal,
+    };
     use crate::cypher::plan::{plan, PlanOp};
     use crate::cypher::{lex, parse, RelDir};
     use crate::result::ResultSet;
@@ -3812,7 +3940,10 @@ LIMIT 10";
                     props: vec![("k".into(), Operand::Lit(i(1)))],
                 },
             ],
-            vec![PlanOp::Skip(LimitSkip::Exact(99)), PlanOp::Limit(LimitSkip::Exact(0))],
+            vec![
+                PlanOp::Skip(LimitSkip::Exact(99)),
+                PlanOp::Limit(LimitSkip::Exact(0)),
+            ],
         ];
         for plan in hostile {
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4789,7 +4920,8 @@ LIMIT 10";
         let ops = plan_src("MATCH (a:N) RETURN a, COUNT(*)")
             .expect("grouped aggregation must now succeed");
         assert!(
-            ops.iter().any(|op| matches!(op, PlanOp::GroupAggregate { .. })),
+            ops.iter()
+                .any(|op| matches!(op, PlanOp::GroupAggregate { .. })),
             "grouped aggregation plan must contain GroupAggregate op, got: {ops:?}"
         );
 
@@ -4797,7 +4929,8 @@ LIMIT 10";
         let ops2 = plan_src("MATCH (a:N) RETURN COUNT(*), COUNT(a)")
             .expect("multi-aggregate must now succeed");
         assert!(
-            ops2.iter().any(|op| matches!(op, PlanOp::GroupAggregate { .. })),
+            ops2.iter()
+                .any(|op| matches!(op, PlanOp::GroupAggregate { .. })),
             "multi-aggregate plan must contain GroupAggregate op, got: {ops2:?}"
         );
 
@@ -4831,9 +4964,7 @@ LIMIT 10";
         assert_eq!(rs.len(), 2, "must produce exactly 2 groups (X and Y)");
 
         // Find each group regardless of row order.
-        let find = |label: &Value| {
-            (0..rs.len()).find(|&i| rs.row(i)[0].as_ref() == Some(label))
-        };
+        let find = |label: &Value| (0..rs.len()).find(|&i| rs.row(i)[0].as_ref() == Some(label));
         let xi = find(&s("X")).expect("group X must exist");
         let yi = find(&s("Y")).expect("group Y must exist");
         assert_eq!(rs.row(xi)[1], Some(i(2)), "X group count must be 2");
@@ -4844,10 +4975,26 @@ LIMIT 10";
     fn grouped_two_keys_sum_avg() {
         // Four nodes with two categorical props and a numeric value.
         let mut fx = Fx::new();
-        fx.add("N", "a", vec![("cat", s("A")), ("sub", s("1")), ("v", i(10))]);
-        fx.add("N", "b", vec![("cat", s("A")), ("sub", s("1")), ("v", i(20))]);
-        fx.add("N", "c", vec![("cat", s("A")), ("sub", s("2")), ("v", i(5))]);
-        fx.add("N", "d", vec![("cat", s("B")), ("sub", s("1")), ("v", i(100))]);
+        fx.add(
+            "N",
+            "a",
+            vec![("cat", s("A")), ("sub", s("1")), ("v", i(10))],
+        );
+        fx.add(
+            "N",
+            "b",
+            vec![("cat", s("A")), ("sub", s("1")), ("v", i(20))],
+        );
+        fx.add(
+            "N",
+            "c",
+            vec![("cat", s("A")), ("sub", s("2")), ("v", i(5))],
+        );
+        fx.add(
+            "N",
+            "d",
+            vec![("cat", s("B")), ("sub", s("1")), ("v", i(100))],
+        );
         let v = fx.view();
         let params = BTreeMap::new();
 
@@ -4869,9 +5016,8 @@ LIMIT 10";
         assert_eq!(rs.len(), 3, "must produce 3 groups: (A,1), (A,2), (B,1)");
 
         let find = |cat: &Value, sub: &Value| {
-            (0..rs.len()).find(|&i| {
-                rs.row(i)[0].as_ref() == Some(cat) && rs.row(i)[1].as_ref() == Some(sub)
-            })
+            (0..rs.len())
+                .find(|&i| rs.row(i)[0].as_ref() == Some(cat) && rs.row(i)[1].as_ref() == Some(sub))
         };
         let a1 = find(&s("A"), &s("1")).expect("group (A,1) must exist");
         assert_eq!(rs.row(a1)[2], Some(f(30.0)), "(A,1) SUM must be 30.0");
@@ -4919,8 +5065,9 @@ LIMIT 10";
         assert_eq!(rs.row(2)[0], Some(s("B")), "row 2 must be category B");
 
         // Also verify row_bound is None for this plan (LIMIT must not be pushed).
-        let plan_ops = plan_src("MATCH (n:N) RETURN n.cat, COUNT(*) AS cnt ORDER BY cnt DESC LIMIT 3")
-            .expect("plan must succeed");
+        let plan_ops =
+            plan_src("MATCH (n:N) RETURN n.cat, COUNT(*) AS cnt ORDER BY cnt DESC LIMIT 3")
+                .expect("plan must succeed");
         assert_eq!(
             crate::cypher::plan::row_bound(&plan_ops),
             None,
@@ -5050,8 +5197,16 @@ LIMIT 10";
         let rs = run(&v, "MATCH (n:N) RETURN COUNT(*), COUNT(n)", &params)
             .expect("empty-graph multi-agg must succeed");
         assert_eq!(rs.len(), 1, "must produce exactly 1 row on empty input");
-        assert_eq!(rs.row(0)[0], Some(i(0)), "COUNT(*) on empty graph must be 0");
-        assert_eq!(rs.row(0)[1], Some(i(0)), "COUNT(n) on empty graph must be 0");
+        assert_eq!(
+            rs.row(0)[0],
+            Some(i(0)),
+            "COUNT(*) on empty graph must be 0"
+        );
+        assert_eq!(
+            rs.row(0)[1],
+            Some(i(0)),
+            "COUNT(n) on empty graph must be 0"
+        );
     }
 
     #[test]
@@ -5116,9 +5271,17 @@ LIMIT 10";
 
         let rs = run(&v, "MATCH (n:N) RETURN n.score, COUNT(*) AS cnt", &params)
             .expect("int/float unification must succeed");
-        assert_eq!(rs.len(), 1, "Int(1) and Float(1.0) must group together into 1 group");
+        assert_eq!(
+            rs.len(),
+            1,
+            "Int(1) and Float(1.0) must group together into 1 group"
+        );
         // Key column must display the first-seen original value (Int), not Float.
-        assert_eq!(rs.row(0)[0], Some(i(1)), "key column must display Int(1) (first-seen)");
+        assert_eq!(
+            rs.row(0)[0],
+            Some(i(1)),
+            "key column must display Int(1) (first-seen)"
+        );
         assert_eq!(rs.row(0)[1], Some(i(2)), "unified group must have count=2");
     }
 
@@ -5143,9 +5306,17 @@ LIMIT 10";
         .expect("pure-Int group keys must succeed");
         assert_eq!(rs.len(), 2, "must have 2 groups: age=10 and age=20");
         // Key column must be Int, not Float.
-        assert_eq!(rs.row(0)[0], Some(i(10)), "age=10 key column must display as Int(10)");
+        assert_eq!(
+            rs.row(0)[0],
+            Some(i(10)),
+            "age=10 key column must display as Int(10)"
+        );
         assert_eq!(rs.row(0)[1], Some(i(2)), "age=10 group has 2 nodes");
-        assert_eq!(rs.row(1)[0], Some(i(20)), "age=20 key column must display as Int(20)");
+        assert_eq!(
+            rs.row(1)[0],
+            Some(i(20)),
+            "age=20 key column must display as Int(20)"
+        );
         assert_eq!(rs.row(1)[1], Some(i(1)), "age=20 group has 1 node");
     }
 
@@ -5184,7 +5355,11 @@ LIMIT 10";
         assert_eq!(rs.row(0)[0], Some(s("b")), "first group key must be 'b'");
         assert_eq!(rs.row(0)[1], Some(i(1)), "b is reached via 1 path");
         assert_eq!(rs.row(1)[0], Some(s("c")), "second group key must be 'c'");
-        assert_eq!(rs.row(1)[1], Some(i(2)), "c is reached via 2 paths (1-hop and 2-hop)");
+        assert_eq!(
+            rs.row(1)[1],
+            Some(i(2)),
+            "c is reached via 2 paths (1-hop and 2-hop)"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -5198,7 +5373,9 @@ LIMIT 10";
     fn pull_rows_var_expand_arm_returns_named_err() {
         let fx = Fx::new();
         let view = fx.view();
-        let vars = super::VarTable { names: vec!["a".into(), "b".into()] };
+        let vars = super::VarTable {
+            names: vec!["a".into(), "b".into()],
+        };
         let project_items: Vec<crate::cypher::ast::RetItem> = vec![];
         let empty_params = BTreeMap::new();
         let params = super::Params(&empty_params);
@@ -5232,7 +5409,9 @@ LIMIT 10";
     fn pull_rows_shortest_path_arm_returns_named_err() {
         let fx = Fx::new();
         let view = fx.view();
-        let vars = super::VarTable { names: vec!["a".into(), "b".into()] };
+        let vars = super::VarTable {
+            names: vec!["a".into(), "b".into()],
+        };
         let project_items: Vec<crate::cypher::ast::RetItem> = vec![];
         let empty_params = BTreeMap::new();
         let params = super::Params(&empty_params);
@@ -5266,10 +5445,22 @@ LIMIT 10";
     /// Helper: build a graph with cities for pipeline tests.
     fn city_graph() -> Fx {
         let mut fx = Fx::new();
-        fx.add("Person", "alice", vec![("city", s("Boston")), ("age", i(30))]);
+        fx.add(
+            "Person",
+            "alice",
+            vec![("city", s("Boston")), ("age", i(30))],
+        );
         fx.add("Person", "bob", vec![("city", s("Boston")), ("age", i(25))]);
-        fx.add("Person", "carol", vec![("city", s("Austin")), ("age", i(35))]);
-        fx.add("Person", "dave", vec![("city", s("Austin")), ("age", i(28))]);
+        fx.add(
+            "Person",
+            "carol",
+            vec![("city", s("Austin")), ("age", i(35))],
+        );
+        fx.add(
+            "Person",
+            "dave",
+            vec![("city", s("Austin")), ("age", i(28))],
+        );
         fx.add("Person", "eve", vec![("city", s("Boston")), ("age", i(22))]);
         fx
     }
@@ -5281,8 +5472,12 @@ LIMIT 10";
         let fx = city_graph();
         let view = fx.view();
         let params = BTreeMap::new();
-        let rs = run(&view, "MATCH (p:Person) WITH p.city AS city, COUNT(*) AS cnt WHERE cnt > 2 RETURN city, cnt", &params)
-            .expect("WITH HAVING query must succeed");
+        let rs = run(
+            &view,
+            "MATCH (p:Person) WITH p.city AS city, COUNT(*) AS cnt WHERE cnt > 2 RETURN city, cnt",
+            &params,
+        )
+        .expect("WITH HAVING query must succeed");
         assert_eq!(rs.len(), 1, "only Boston group has cnt > 2");
         assert_eq!(rs.get(0, "city"), Some(&s("Boston")));
         assert_eq!(rs.get(0, "cnt"), Some(&i(3)));
@@ -5343,13 +5538,18 @@ LIMIT 10";
         let fx = city_graph();
         let view = fx.view();
         let params = BTreeMap::new();
-        let rs = run(&view, "MATCH (p:Person) WHERE p.city = 'Boston' UNWIND [1, 2, 3] AS x RETURN p, x", &params)
-            .expect("UNWIND literal must succeed");
+        let rs = run(
+            &view,
+            "MATCH (p:Person) WHERE p.city = 'Boston' UNWIND [1, 2, 3] AS x RETURN p, x",
+            &params,
+        )
+        .expect("UNWIND literal must succeed");
         // 3 Boston people × 3 elements = 9 rows
         assert_eq!(rs.len(), 9, "UNWIND [1,2,3] × 3 Boston people = 9 rows");
         // All x values should include 1, 2, and 3.
-        let xs: Vec<Option<Value>> =
-            (0..rs.len()).map(|row_i| rs.get(row_i, "x").cloned()).collect();
+        let xs: Vec<Option<Value>> = (0..rs.len())
+            .map(|row_i| rs.get(row_i, "x").cloned())
+            .collect();
         assert!(xs.contains(&Some(i(1))));
         assert!(xs.contains(&Some(i(2))));
         assert!(xs.contains(&Some(i(3))));
@@ -5359,16 +5559,20 @@ LIMIT 10";
     #[test]
     fn unwind_list_property() {
         let mut fx = Fx::new();
-        fx.add("Tag", "post1", vec![
-            ("tags", Value::List(vec![s("rust"), s("graph")])),
-        ]);
-        fx.add("Tag", "post2", vec![
-            ("tags", Value::List(vec![s("db")])),
-        ]);
+        fx.add(
+            "Tag",
+            "post1",
+            vec![("tags", Value::List(vec![s("rust"), s("graph")]))],
+        );
+        fx.add("Tag", "post2", vec![("tags", Value::List(vec![s("db")]))]);
         let view = fx.view();
         let params = BTreeMap::new();
-        let rs = run(&view, "MATCH (p:Tag) UNWIND p.tags AS tag RETURN p, tag", &params)
-            .expect("UNWIND property must succeed");
+        let rs = run(
+            &view,
+            "MATCH (p:Tag) UNWIND p.tags AS tag RETURN p, tag",
+            &params,
+        )
+        .expect("UNWIND property must succeed");
         assert_eq!(rs.len(), 3, "2+1 tag elements");
     }
 
@@ -5378,8 +5582,12 @@ LIMIT 10";
         let fx = city_graph();
         let view = fx.view();
         let params = BTreeMap::new();
-        let rs = run(&view, "MATCH (p:Person) WHERE p.city = 'Boston' UNWIND [] AS x RETURN x", &params)
-            .expect("UNWIND [] must succeed with 0 rows");
+        let rs = run(
+            &view,
+            "MATCH (p:Person) WHERE p.city = 'Boston' UNWIND [] AS x RETURN x",
+            &params,
+        )
+        .expect("UNWIND [] must succeed with 0 rows");
         assert_eq!(rs.len(), 0, "UNWIND [] should produce 0 rows");
     }
 
@@ -5390,8 +5598,12 @@ LIMIT 10";
         let view = fx.view();
         let params = BTreeMap::new();
         // p.city is a Str, not a List.
-        let err = run(&view, "MATCH (p:Person) WHERE p.city = 'Boston' UNWIND p.city AS x RETURN x", &params)
-            .expect_err("UNWIND non-list must error");
+        let err = run(
+            &view,
+            "MATCH (p:Person) WHERE p.city = 'Boston' UNWIND p.city AS x RETURN x",
+            &params,
+        )
+        .expect_err("UNWIND non-list must error");
         assert!(
             err.contains("UNWIND") && err.contains("list"),
             "error must mention UNWIND and list: {err}"
@@ -5409,8 +5621,13 @@ LIMIT 10";
         let view = fx.view();
         let params = BTreeMap::new();
         let err = super::with_max_intermediate_rows(5, || {
-            run(&view, "MATCH (n:N) UNWIND [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] AS x RETURN n, x", &params)
-        }).expect_err("must hit budget");
+            run(
+                &view,
+                "MATCH (n:N) UNWIND [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] AS x RETURN n, x",
+                &params,
+            )
+        })
+        .expect_err("must hit budget");
         assert!(
             err.contains("intermediate result exceeds"),
             "error must mention intermediate result limit: {err}"
@@ -5423,14 +5640,25 @@ LIMIT 10";
     fn routing_with_plan_uses_staged_path() {
         use crate::cypher::plan::row_bound;
         let ops_with = compile("MATCH (a) WITH a RETURN a");
-        assert_eq!(row_bound(&ops_with), None, "WITH plan must have row_bound=None");
+        assert_eq!(
+            row_bound(&ops_with),
+            None,
+            "WITH plan must have row_bound=None"
+        );
 
         let ops_unwind = compile("MATCH (a) UNWIND [1, 2] AS x RETURN a");
-        assert_eq!(row_bound(&ops_unwind), None, "UNWIND plan must have row_bound=None");
+        assert_eq!(
+            row_bound(&ops_unwind),
+            None,
+            "UNWIND plan must have row_bound=None"
+        );
 
         // Non-WITH plan with LIMIT still uses pull path.
         let ops_plain = compile("MATCH (a) RETURN a LIMIT 5");
-        assert!(row_bound(&ops_plain).is_some(), "plain LIMIT plan must have a row bound");
+        assert!(
+            row_bound(&ops_plain).is_some(),
+            "plain LIMIT plan must have a row bound"
+        );
     }
 
     /// I-1: UNWIND of a null/absent property → 0 rows for that node; other nodes
@@ -5439,18 +5667,26 @@ LIMIT 10";
     fn unwind_null_property_yields_zero_rows_for_that_node() {
         let mut fx = Fx::new();
         // post1 has a list property; post2 has no `tags` property at all (null).
-        fx.add("Post", "post1", vec![
-            ("tags", Value::List(vec![s("rust"), s("graph")])),
-        ]);
-        fx.add("Post", "post2", vec![
-            ("other", Value::Str("hello".into())),
-        ]);
+        fx.add(
+            "Post",
+            "post1",
+            vec![("tags", Value::List(vec![s("rust"), s("graph")]))],
+        );
+        fx.add("Post", "post2", vec![("other", Value::Str("hello".into()))]);
         let view = fx.view();
         let params = BTreeMap::new();
-        let rs = run(&view, "MATCH (p:Post) UNWIND p.tags AS tag RETURN tag", &params)
-            .expect("UNWIND null property must succeed (not error)");
+        let rs = run(
+            &view,
+            "MATCH (p:Post) UNWIND p.tags AS tag RETURN tag",
+            &params,
+        )
+        .expect("UNWIND null property must succeed (not error)");
         // post1 contributes 2 rows; post2 contributes 0 rows (null → skip).
-        assert_eq!(rs.len(), 2, "null property must yield 0 rows; list property yields N rows");
+        assert_eq!(
+            rs.len(),
+            2,
+            "null property must yield 0 rows; list property yields N rows"
+        );
         let tag0 = rs.get(0, "tag");
         let tag1 = rs.get(1, "tag");
         let tags = [tag0, tag1];
@@ -5462,19 +5698,31 @@ LIMIT 10";
     #[test]
     fn where_before_unwind_filters_nodes() {
         let mut fx = Fx::new();
-        fx.add("P", "a", vec![
-            ("group", Value::Str("keep".into())),
-            ("items", Value::List(vec![Value::Int(1), Value::Int(2)])),
-        ]);
-        fx.add("P", "b", vec![
-            ("group", Value::Str("drop".into())),
-            ("items", Value::List(vec![Value::Int(3), Value::Int(4)])),
-        ]);
+        fx.add(
+            "P",
+            "a",
+            vec![
+                ("group", Value::Str("keep".into())),
+                ("items", Value::List(vec![Value::Int(1), Value::Int(2)])),
+            ],
+        );
+        fx.add(
+            "P",
+            "b",
+            vec![
+                ("group", Value::Str("drop".into())),
+                ("items", Value::List(vec![Value::Int(3), Value::Int(4)])),
+            ],
+        );
         let view = fx.view();
         let params = BTreeMap::new();
         // WHERE filters before UNWIND: only node `a` (group=keep) expands.
-        let rs = run(&view, "MATCH (n:P) WHERE n.group = 'keep' UNWIND n.items AS x RETURN x", &params)
-            .expect("WHERE before UNWIND must succeed");
+        let rs = run(
+            &view,
+            "MATCH (n:P) WHERE n.group = 'keep' UNWIND n.items AS x RETURN x",
+            &params,
+        )
+        .expect("WHERE before UNWIND must succeed");
         assert_eq!(rs.len(), 2, "only matching node expands; 2 items");
     }
 
@@ -5482,14 +5730,23 @@ LIMIT 10";
     #[test]
     fn where_after_unwind_filters_expanded_rows() {
         let mut fx = Fx::new();
-        fx.add("N", "n1", vec![
-            ("vals", Value::List(vec![Value::Int(1), Value::Int(3), Value::Int(5)])),
-        ]);
+        fx.add(
+            "N",
+            "n1",
+            vec![(
+                "vals",
+                Value::List(vec![Value::Int(1), Value::Int(3), Value::Int(5)]),
+            )],
+        );
         let view = fx.view();
         let params = BTreeMap::new();
         // WHERE after UNWIND: filters by the alias `x`; keeps only x > 2.
-        let rs = run(&view, "MATCH (n:N) UNWIND n.vals AS x WHERE x > 2 RETURN x", &params)
-            .expect("WHERE after UNWIND must succeed");
+        let rs = run(
+            &view,
+            "MATCH (n:N) UNWIND n.vals AS x WHERE x > 2 RETURN x",
+            &params,
+        )
+        .expect("WHERE after UNWIND must succeed");
         assert_eq!(rs.len(), 2, "x=3 and x=5 pass; x=1 filtered out");
         let v0 = rs.get(0, "x").cloned();
         let v1 = rs.get(1, "x").cloned();
@@ -5505,7 +5762,8 @@ LIMIT 10";
         // `cntt` is a typo; the real column is `cnt` — must fail at planning.
         let src = "MATCH (p:Person) WITH p.city AS city, COUNT(*) AS cnt ORDER BY cntt DESC RETURN city, cnt";
         let plan_result = plan(&parse(&lex(src).expect("lex")).expect("parse"));
-        let err = plan_result.expect_err("typo'd ORDER BY alias in aggregate WITH must be a named plan error");
+        let err = plan_result
+            .expect_err("typo'd ORDER BY alias in aggregate WITH must be a named plan error");
         assert!(
             err.contains("cntt") || err.contains("unbound"),
             "error must mention the unknown alias: {err}"
@@ -5518,7 +5776,8 @@ LIMIT 10";
         use crate::cypher::{lex, parser::parse, plan::plan};
         let src = "MATCH (p:Person) WITH p, p.age AS age ORDER BY nope DESC RETURN p.city AS city";
         let plan_result = plan(&parse(&lex(src).expect("lex")).expect("parse"));
-        let err = plan_result.expect_err("typo'd ORDER BY alias in non-aggregate WITH must be a named plan error");
+        let err = plan_result
+            .expect_err("typo'd ORDER BY alias in non-aggregate WITH must be a named plan error");
         assert!(
             err.contains("nope") || err.contains("unbound"),
             "error must mention the unknown alias: {err}"
@@ -5532,18 +5791,32 @@ LIMIT 10";
     fn post_unwind_where_references_pre_match_variable() {
         let mut fx = Fx::new();
         // n1: threshold=3, list=[1,2,3,4,5] → keep 4,5 (x > threshold)
-        fx.add("N", "n1", vec![
-            ("threshold", Value::Int(3)),
-            ("xs", Value::List(vec![
-                Value::Int(1), Value::Int(2), Value::Int(3),
-                Value::Int(4), Value::Int(5),
-            ])),
-        ]);
+        fx.add(
+            "N",
+            "n1",
+            vec![
+                ("threshold", Value::Int(3)),
+                (
+                    "xs",
+                    Value::List(vec![
+                        Value::Int(1),
+                        Value::Int(2),
+                        Value::Int(3),
+                        Value::Int(4),
+                        Value::Int(5),
+                    ]),
+                ),
+            ],
+        );
         // n2: threshold=10, list=[1,2] → keep nothing
-        fx.add("N", "n2", vec![
-            ("threshold", Value::Int(10)),
-            ("xs", Value::List(vec![Value::Int(1), Value::Int(2)])),
-        ]);
+        fx.add(
+            "N",
+            "n2",
+            vec![
+                ("threshold", Value::Int(10)),
+                ("xs", Value::List(vec![Value::Int(1), Value::Int(2)])),
+            ],
+        );
         let view = fx.view();
         let params = BTreeMap::new();
         let rs = run(
@@ -5597,12 +5870,19 @@ LIMIT 10";
     #[test]
     fn unwind_then_with_composition() {
         let mut fx = Fx::new();
-        fx.add("Doc", "d1", vec![
-            ("scores", Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)])),
-        ]);
-        fx.add("Doc", "d2", vec![
-            ("scores", Value::List(vec![Value::Int(5), Value::Int(15)])),
-        ]);
+        fx.add(
+            "Doc",
+            "d1",
+            vec![(
+                "scores",
+                Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+            )],
+        );
+        fx.add(
+            "Doc",
+            "d2",
+            vec![("scores", Value::List(vec![Value::Int(5), Value::Int(15)]))],
+        );
         let view = fx.view();
         let params = BTreeMap::new();
 
@@ -5651,7 +5931,10 @@ LIMIT 10";
         };
 
         let result = resolve_operand(&view, &vars, &row, &operand, &Params(&params));
-        assert!(result.is_ok(), "overflow division must not return Err: {result:?}");
+        assert!(
+            result.is_ok(),
+            "overflow division must not return Err: {result:?}"
+        );
         assert_eq!(
             result.unwrap(),
             Some(Value::Int(i64::MAX)),

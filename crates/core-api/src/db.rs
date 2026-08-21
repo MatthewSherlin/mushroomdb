@@ -1,15 +1,15 @@
 use crate::ingest::{IngestOptions, IngestReport};
+use crate::subscription::{
+    event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
+};
 use core_query::cypher::{
     execute, lex, parse, parse_write, plan, MatchDeleteNodeStmt, Params, Query, RetItem, RetVal,
     WriteStatement,
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
-    evaluate, EngineEdgeDelta, GraphMut, NodeView, Predicate, RuleDef, RuleEngine,
-    RuleIvfExport, ViewDef, ViewStore,
-};
-use crate::subscription::{
-    event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
+    evaluate, EngineEdgeDelta, GraphMut, NodeView, Predicate, RuleDef, RuleEngine, RuleIvfExport,
+    ViewDef, ViewStore,
 };
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
@@ -486,21 +486,17 @@ impl<F: Fs> GraphDb<F> {
                     )
                 })
                 .collect();
-            db.engine.reindex_all_load_ivf(
-                &db.ids,
-                &db.syms,
-                &db.labels,
-                &db.props,
-                ivf_state,
-            );
+            db.engine
+                .reindex_all_load_ivf(&db.ids, &db.syms, &db.labels, &db.props, ivf_state);
             // Restore view defs from snapshot (V5).
             // The ColumnStore already contains view values from the snapshot;
             // use restore_view (no collision check, no backfill) so the store
             // is aware of the definitions.  rebuild_all runs after WAL replay.
             for def_bytes in &state.view_defs {
-                let def: ViewDef = bincode::deserialize(def_bytes).map_err(|e| GraphError::Corrupt {
-                    detail: format!("snapshot view_def deserialize: {e}"),
-                })?;
+                let def: ViewDef =
+                    bincode::deserialize(def_bytes).map_err(|e| GraphError::Corrupt {
+                        detail: format!("snapshot view_def deserialize: {e}"),
+                    })?;
                 db.view_store
                     .restore_view(def)
                     .map_err(|e| GraphError::Corrupt {
@@ -531,13 +527,15 @@ impl<F: Fs> GraphDb<F> {
         // Any future as-of replay path (Plan-15 T2) must drain here to feed
         // replaying subscribers; the mechanism is already in place.
         let _ = db.engine.drain_deltas(); // belt-and-braces no-op after loop drain
-        // Rebuild view values after WAL replay so values are consistent with
-        // final topo+props state.  This is a full recompute that corrects any
-        // incremental drift accumulated during apply() replay.
-        db.view_store.rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
+                                          // Rebuild view values after WAL replay so values are consistent with
+                                          // final topo+props state.  This is a full recompute that corrects any
+                                          // incremental drift accumulated during apply() replay.
+        db.view_store
+            .rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
         // Rebuild full-text index after WAL replay.  Corrects drift from
         // per-record incremental apply during replay.
-        db.fulltext.rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
+        db.fulltext
+            .rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
         Ok(db)
     }
 
@@ -588,12 +586,14 @@ impl<F: Fs> GraphDb<F> {
              per-frame drain must run inside the loop to keep memory O(1)"
         );
         let _ = db.engine.drain_deltas(); // belt-and-braces no-op
-        // Rebuild view values after WAL replay so derived-edge-driven views
-        // reflect the as-of state, not just the initial backfill at CreateView.
-        // Mirrors the open_with rebuild_all call at db.rs:528.
-        db.view_store.rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
+                                          // Rebuild view values after WAL replay so derived-edge-driven views
+                                          // reflect the as-of state, not just the initial backfill at CreateView.
+                                          // Mirrors the open_with rebuild_all call at db.rs:528.
+        db.view_store
+            .rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
         // Rebuild full-text index for as-of view (mirrors open_with pattern).
-        db.fulltext.rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
+        db.fulltext
+            .rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
         db.read_only = true;
         db.total_wal_commits = total;
         Ok(db)
@@ -627,7 +627,8 @@ impl<F: Fs> GraphDb<F> {
                 }
                 // Initialize view values for the new node before the engine runs so
                 // delta-based increments start from a known zero baseline.
-                self.view_store.init_node_views(id, &mut self.props, &self.syms, &self.labels);
+                self.view_store
+                    .init_node_views(id, &mut self.props, &self.syms, &self.labels);
                 // Fire rules for the newly inserted node.
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
@@ -646,12 +647,20 @@ impl<F: Fs> GraphDb<F> {
                 // Process derived-edge deltas for view maintenance.
                 // Fast path: skip the O(delta_count) allocation when no views exist.
                 if !self.view_store.is_empty() {
-                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    #[cfg(test)]
+                    DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
                     let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
                     for d in &new_deltas {
                         self.view_store.on_edge_changed(
-                            d.etype_sym, d.src_id, d.dst_id, d.fired,
-                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
                         );
                     }
                 }
@@ -679,8 +688,15 @@ impl<F: Fs> GraphDb<F> {
                 self.topo.add_edge(etype, src, dst);
                 // View maintenance for manual edge insert.
                 self.view_store.on_edge_changed(
-                    etype, src, dst, true,
-                    &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    etype,
+                    src,
+                    dst,
+                    true,
+                    &mut self.props,
+                    &self.topo,
+                    &self.ids,
+                    &self.syms,
+                    &self.labels,
                 );
             }
             WalRecord::SetProp { key, field, value } => {
@@ -706,23 +722,41 @@ impl<F: Fs> GraphDb<F> {
                 self.engine = eng;
                 // Derived-edge deltas → view updates.
                 if !self.view_store.is_empty() {
-                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    #[cfg(test)]
+                    DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
                     let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
                     for d in &new_deltas {
                         self.view_store.on_edge_changed(
-                            d.etype_sym, d.src_id, d.dst_id, d.fired,
-                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
                         );
                     }
                 }
                 // Neighbor-aggregate views that read `field` must also update.
                 self.view_store.on_prop_changed(
-                    id, field, &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    id,
+                    field,
+                    &mut self.props,
+                    &self.topo,
+                    &self.ids,
+                    &self.syms,
+                    &self.labels,
                 );
                 // Full-text index maintenance: update tokens for this field if indexed.
                 if self.fulltext.field_indexed(field) {
                     let label_opt = self.labels.get(id as usize).and_then(|&sym| {
-                        if sym == u32::MAX { None } else { self.syms.resolve(sym) }
+                        if sym == u32::MAX {
+                            None
+                        } else {
+                            self.syms.resolve(sym)
+                        }
                     });
                     if let Some(label) = label_opt {
                         if self.fulltext.is_enabled(label, field) {
@@ -762,12 +796,20 @@ impl<F: Fs> GraphDb<F> {
                 // Derived-edge fires from backfill → view updates.
                 // Fast path: skip O(edge_count) allocation when no views exist.
                 if !self.view_store.is_empty() {
-                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    #[cfg(test)]
+                    DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
                     let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
                     for d in &new_deltas {
                         self.view_store.on_edge_changed(
-                            d.etype_sym, d.src_id, d.dst_id, d.fired,
-                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
                         );
                     }
                 }
@@ -797,12 +839,20 @@ impl<F: Fs> GraphDb<F> {
                 result.map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
                 // Derived-edge retractions → view updates.
                 if !self.view_store.is_empty() {
-                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    #[cfg(test)]
+                    DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
                     let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
                     for d in &new_deltas {
                         self.view_store.on_edge_changed(
-                            d.etype_sym, d.src_id, d.dst_id, d.fired,
-                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
                         );
                     }
                 }
@@ -832,18 +882,32 @@ impl<F: Fs> GraphDb<F> {
                 self.engine = eng;
                 // Derived-edge deltas → view updates.
                 if !self.view_store.is_empty() {
-                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    #[cfg(test)]
+                    DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
                     let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
                     for d in &new_deltas {
                         self.view_store.on_edge_changed(
-                            d.etype_sym, d.src_id, d.dst_id, d.fired,
-                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
                         );
                     }
                 }
                 // Neighbor-aggregate views that read `field` must also update.
                 self.view_store.on_prop_changed(
-                    id, field, &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    id,
+                    field,
+                    &mut self.props,
+                    &self.topo,
+                    &self.ids,
+                    &self.syms,
+                    &self.labels,
                 );
                 // Full-text index maintenance: remove tokens for this field.
                 if self.fulltext.field_indexed(field) {
@@ -870,8 +934,15 @@ impl<F: Fs> GraphDb<F> {
                 self.edge_props.remove_edge(etype, src, dst);
                 // View maintenance for manual edge delete (topo already updated above).
                 self.view_store.on_edge_changed(
-                    etype, src, dst, false,
-                    &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    etype,
+                    src,
+                    dst,
+                    false,
+                    &mut self.props,
+                    &self.topo,
+                    &self.ids,
+                    &self.syms,
+                    &self.labels,
                 );
                 // No rule callback: validated as not provenance-owned and not
                 // would_derive, so no rule needs to update its desired set.
@@ -906,12 +977,20 @@ impl<F: Fs> GraphDb<F> {
                 self.engine = eng;
                 // Derived-edge retractions → view updates for neighbors.
                 if !self.view_store.is_empty() {
-                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    #[cfg(test)]
+                    DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
                     let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
                     for d in &new_deltas {
                         self.view_store.on_edge_changed(
-                            d.etype_sym, d.src_id, d.dst_id, d.fired,
-                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
                         );
                     }
                 }
@@ -936,8 +1015,15 @@ impl<F: Fs> GraphDb<F> {
                     // View maintenance: n's own view values will be cleared by
                     // remove_all below; only update surviving neighbors.
                     self.view_store.on_edge_changed(
-                        et, s, d, false,
-                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                        et,
+                        s,
+                        d,
+                        false,
+                        &mut self.props,
+                        &self.topo,
+                        &self.ids,
+                        &self.syms,
+                        &self.labels,
                     );
                 }
 
@@ -982,12 +1068,20 @@ impl<F: Fs> GraphDb<F> {
                 result.map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
                 // Derived-edge delta changes → view updates.
                 if !self.view_store.is_empty() {
-                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    #[cfg(test)]
+                    DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
                     let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
                     for d in &new_deltas {
                         self.view_store.on_edge_changed(
-                            d.etype_sym, d.src_id, d.dst_id, d.fired,
-                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
                         );
                     }
                 }
@@ -1002,7 +1096,14 @@ impl<F: Fs> GraphDb<F> {
                     return Ok(());
                 }
                 self.view_store
-                    .create_view(def, &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels)
+                    .create_view(
+                        def,
+                        &mut self.props,
+                        &self.topo,
+                        &self.ids,
+                        &self.syms,
+                        &self.labels,
+                    )
                     .map_err(|e| GraphError::RuleInvalid { detail: e })?;
             }
             WalRecord::DeleteView { name } => {
@@ -1200,12 +1301,7 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Called from `log_then_apply_with` after apply + fsync, before the
     /// legacy MutationEvent sink. Prunes dead `Weak` entries in-place.
-    fn distribute_events(
-        &mut self,
-        rec: &WalRecord,
-        engine_deltas: &[EngineEdgeDelta],
-        seq: u64,
-    ) {
+    fn distribute_events(&mut self, rec: &WalRecord, engine_deltas: &[EngineEdgeDelta], seq: u64) {
         if self.subscriptions.is_empty() {
             return;
         }
@@ -1276,7 +1372,10 @@ impl<F: Fs> GraphDb<F> {
     /// accumulation. Used to set `engine.emit_deltas` on subscribe/view DDL.
     fn needs_emit_deltas(&self) -> bool {
         !self.view_store.is_empty()
-            || self.subscriptions.iter().any(|e| e.inner.upgrade().is_some())
+            || self
+                .subscriptions
+                .iter()
+                .any(|e| e.inner.upgrade().is_some())
     }
 
     /// Convert a WAL record into `DbEvent` write events with the given seq.
@@ -1755,9 +1854,8 @@ impl<F: Fs> GraphDb<F> {
 
         let mut total_topo = 0u64;
         for et in self.topo.etypes() {
-            total_topo +=
-                self.topo.neighbors(et, Direction::Out, id).len() as u64
-                    + self.topo.neighbors(et, Direction::In, id).len() as u64;
+            total_topo += self.topo.neighbors(et, Direction::Out, id).len() as u64
+                + self.topo.neighbors(et, Direction::In, id).len() as u64;
         }
         // For symmetric rules (e.g. Overlap), a→b and b→a are two separate directed
         // triples in both the topo scan (Out and In from id) and in provenance_touching.
@@ -2044,9 +2142,7 @@ impl<F: Fs> GraphDb<F> {
             .fulltext
             .search(field, query)
             .into_iter()
-            .filter_map(|(id, count)| {
-                self.ids.key_of(id).map(|key| (key.to_string(), count))
-            })
+            .filter_map(|(id, count)| self.ids.key_of(id).map(|key| (key.to_string(), count)))
             .collect();
         results.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         results
@@ -2064,21 +2160,37 @@ impl<F: Fs> GraphDb<F> {
         let groups = parse_query(query);
         let mut results: Vec<(String, usize)> = Vec::new();
         for id in 0..self.ids.len() as u32 {
-            let Some(key) = self.ids.key_of(id) else { continue; };
-            let Some(&sym) = self.labels.get(id as usize) else { continue; };
-            if sym == u32::MAX { continue; }
+            let Some(key) = self.ids.key_of(id) else {
+                continue;
+            };
+            let Some(&sym) = self.labels.get(id as usize) else {
+                continue;
+            };
+            if sym == u32::MAX {
+                continue;
+            }
             // Only scan nodes whose label has this field indexed.
             let label = match self.syms.resolve(sym) {
                 Some(l) => l,
                 None => continue,
             };
-            if !self.fulltext.is_enabled(label, field) { continue; }
-            let Some(value) = self.props.get(id, field) else { continue; };
+            if !self.fulltext.is_enabled(label, field) {
+                continue;
+            }
+            let Some(value) = self.props.get(id, field) else {
+                continue;
+            };
             let node_tokens: BTreeSet<String> = match value {
                 Value::Str(s) => tokenize(s).into_iter().collect(),
                 Value::List(items) => items
                     .iter()
-                    .flat_map(|v| if let Value::Str(s) = v { tokenize(s) } else { vec![] })
+                    .flat_map(|v| {
+                        if let Value::Str(s) = v {
+                            tokenize(s)
+                        } else {
+                            vec![]
+                        }
+                    })
                     .collect(),
                 _ => BTreeSet::new(),
             };
@@ -2126,7 +2238,13 @@ impl<F: Fs> GraphDb<F> {
         // Direct scratch computation using the same internal function,
         // reading from live props so NeighborAgg sees real neighbor values.
         core_rules::views::compute_view_value(
-            def, node, &self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+            def,
+            node,
+            &self.props,
+            &self.topo,
+            &self.ids,
+            &self.syms,
+            &self.labels,
         )
     }
 
@@ -2348,11 +2466,7 @@ impl<F: Fs> GraphDb<F> {
     /// Convenience entry-point that accepts a slice of `(name, value)` pairs
     /// instead of a pre-built `BTreeMap`.  Equivalent to building the map and
     /// calling [`GraphDb::query`].
-    pub fn query_with_params(
-        &self,
-        cypher: &str,
-        params: &[(&str, Value)],
-    ) -> Result<ResultSet> {
+    pub fn query_with_params(&self, cypher: &str, params: &[(&str, Value)]) -> Result<ResultSet> {
         let map: BTreeMap<String, Value> = params
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
@@ -2409,10 +2523,7 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
-    fn exec_create(
-        &mut self,
-        stmt: core_query::cypher::CreateStmt,
-    ) -> Result<ResultSet> {
+    fn exec_create(&mut self, stmt: core_query::cypher::CreateStmt) -> Result<ResultSet> {
         // Extract the node key from props: require a string-valued `id` field.
         let mut var_to_key: BTreeMap<String, String> = BTreeMap::new();
         for node in &stmt.nodes {
@@ -2446,22 +2557,16 @@ impl<F: Fs> GraphDb<F> {
             created += 1;
         }
         for edge in &stmt.edges {
-            let src_key = var_to_key.get(&edge.src_var).ok_or_else(|| {
-                GraphError::QueryError {
-                    detail: format!(
-                        "CREATE edge src variable '{}' is not bound",
-                        edge.src_var
-                    ),
-                }
-            })?;
-            let dst_key = var_to_key.get(&edge.dst_var).ok_or_else(|| {
-                GraphError::QueryError {
-                    detail: format!(
-                        "CREATE edge dst variable '{}' is not bound",
-                        edge.dst_var
-                    ),
-                }
-            })?;
+            let src_key = var_to_key
+                .get(&edge.src_var)
+                .ok_or_else(|| GraphError::QueryError {
+                    detail: format!("CREATE edge src variable '{}' is not bound", edge.src_var),
+                })?;
+            let dst_key = var_to_key
+                .get(&edge.dst_var)
+                .ok_or_else(|| GraphError::QueryError {
+                    detail: format!("CREATE edge dst variable '{}' is not bound", edge.dst_var),
+                })?;
             batch.insert_edge(&edge.etype, src_key, dst_key);
         }
         batch.commit()?;
@@ -2512,8 +2617,8 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("plan: {e}"),
         })?;
         // MATCH phase is read-only; borrow ends before batch opens.
-        let match_rs = execute(&self.view(), &ops, &Params(params))
-            .map_err(|e| GraphError::QueryError {
+        let match_rs =
+            execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),
             })?;
 
@@ -2537,9 +2642,12 @@ impl<F: Fs> GraphDb<F> {
                 let value = match &sc.value {
                     Operand::Lit(v) => v.clone(),
                     Operand::Param(name) => {
-                        params.get(name).cloned().ok_or_else(|| GraphError::QueryError {
-                            detail: format!("missing parameter `{name}` in SET clause"),
-                        })?
+                        params
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| GraphError::QueryError {
+                                detail: format!("missing parameter `{name}` in SET clause"),
+                            })?
                     }
                     other => {
                         return Err(GraphError::QueryError {
@@ -2609,8 +2717,8 @@ impl<F: Fs> GraphDb<F> {
         let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
             detail: format!("plan: {e}"),
         })?;
-        let match_rs = execute(&self.view(), &ops, &Params(params))
-            .map_err(|e| GraphError::QueryError {
+        let match_rs =
+            execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),
             })?;
 
@@ -2652,9 +2760,8 @@ impl<F: Fs> GraphDb<F> {
         }
         batch.commit().map_err(|e| match e {
             GraphError::RuleOwned { .. } => GraphError::QueryError {
-                detail:
-                    "cannot delete derived edge; retract via the rule or change the property"
-                        .to_string(),
+                detail: "cannot delete derived edge; retract via the rule or change the property"
+                    .to_string(),
             },
             other => other,
         })?;
@@ -2703,11 +2810,10 @@ impl<F: Fs> GraphDb<F> {
         let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
             detail: format!("plan: {e}"),
         })?;
-        let match_rs = execute(&self.view(), &ops, &Params(params)).map_err(|e| {
-            GraphError::QueryError {
+        let match_rs =
+            execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
                 detail: format!("execute: {e}"),
-            }
-        })?;
+            })?;
 
         // Collect unique node keys to delete (deduplicate across rows × vars).
         let mut keys: Vec<String> = Vec::new();
@@ -2747,8 +2853,7 @@ impl<F: Fs> GraphDb<F> {
             match self.delete_node(&key) {
                 Ok(report) => {
                     nodes_deleted += 1;
-                    edges_deleted +=
-                        (report.manual_edges + report.derived_edges) as i64;
+                    edges_deleted += (report.manual_edges + report.derived_edges) as i64;
                 }
                 Err(GraphError::KeyNotFound { .. }) => {
                     // Node may have been deleted by an earlier iteration (e.g., via
@@ -3639,8 +3744,8 @@ mod tests {
     use core_rules::Predicate;
 
     fn tmp_dir(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("graphdb-db-unit-{}-{}", name, std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("graphdb-db-unit-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -3650,7 +3755,9 @@ mod tests {
             name: "works_at".into(),
             src_label: "Person".into(),
             dst_label: "Org".into(),
-            predicate: Predicate::KeyMatch { field: "org_id".into() },
+            predicate: Predicate::KeyMatch {
+                field: "org_id".into(),
+            },
             edge_type: "WORKS_AT".into(),
             weight_prop: None,
             max_edges: None,
@@ -3687,14 +3794,19 @@ mod tests {
 
             // Counter must stay 0 — no views, no copies.
             let copies = DELTA_COPY_COUNT.with(|c| c.get());
-            assert_eq!(copies, 0, "pending_deltas_since().to_vec() called despite no views");
+            assert_eq!(
+                copies, 0,
+                "pending_deltas_since().to_vec() called despite no views"
+            );
 
             // Derived edges must still be correct (the guard skips only the
             // empty delta propagation loop, not the rule application itself).
-            let nbrs = db
-                .neighbors("p0", "WORKS_AT", Direction::Out)
-                .unwrap();
-            assert_eq!(nbrs, vec!["o0"], "rule must derive edges even with no views");
+            let nbrs = db.neighbors("p0", "WORKS_AT", Direction::Out).unwrap();
+            assert_eq!(
+                nbrs,
+                vec!["o0"],
+                "rule must derive edges even with no views"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3807,12 +3919,18 @@ mod tests {
 
             // At least one delta copy should have happened (CreateRule backfill).
             let copies = DELTA_COPY_COUNT.with(|c| c.get());
-            assert!(copies > 0, "expected delta copy to fire when a view is defined");
+            assert!(
+                copies > 0,
+                "expected delta copy to fire when a view is defined"
+            );
 
             // View value should be computed: p1 has one WORKS_AT out-edge.
             let info = db.node_info("p1").unwrap();
             let degree = info.props.get("degree_out");
-            assert!(degree.is_some(), "view prop should be written to node props");
+            assert!(
+                degree.is_some(),
+                "view prop should be written to node props"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3923,11 +4041,17 @@ mod tests {
         let mut aof = GraphDb::open_at(&dir, 0).unwrap();
 
         assert!(
-            matches!(aof.subscribe_all_rules(), Err(core_storage::GraphError::ReadOnly)),
+            matches!(
+                aof.subscribe_all_rules(),
+                Err(core_storage::GraphError::ReadOnly)
+            ),
             "subscribe_all_rules on as-of must return ReadOnly"
         );
         assert!(
-            matches!(aof.subscribe_writes(), Err(core_storage::GraphError::ReadOnly)),
+            matches!(
+                aof.subscribe_writes(),
+                Err(core_storage::GraphError::ReadOnly)
+            ),
             "subscribe_writes on as-of must return ReadOnly"
         );
         assert!(

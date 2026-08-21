@@ -79,10 +79,10 @@ fn rule_any_k2() -> RuleDef {
 
 #[derive(Debug, Clone)]
 enum Op {
-    InsertNode(u8),   // key = "k{n}", label always "P"
-    SetF(u8, u8),     // key k{n}, write f = "k{m}" (FE tiebreak material)
-    SetYear(u8, u8),  // key k{n}, write year = (m % 20) as f64
-    DeleteNode(u8),   // key = "k{n}"
+    InsertNode(u8),  // key = "k{n}", label always "P"
+    SetF(u8, u8),    // key k{n}, write f = "k{m}" (FE tiebreak material)
+    SetYear(u8, u8), // key k{n}, write year = (m % 20) as f64
+    DeleteNode(u8),  // key = "k{n}"
 }
 
 fn year_of(m: u8) -> Value {
@@ -310,7 +310,10 @@ fn topk_dst_numeric_k3_score_order() {
     assert!(engine_top.contains("d1"), "d1 should be in top-3");
     assert!(engine_top.contains("d2"), "d2 should be in top-3");
     assert!(engine_top.contains("d3"), "d3 should be in top-3");
-    assert!(!engine_top.contains("d9"), "d9 should be evicted (4th best)");
+    assert!(
+        !engine_top.contains("d9"),
+        "d9 should be evicted (4th best)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -356,17 +359,27 @@ fn topk_evicted_pair_has_no_explain_entry() {
     db.create_rule(rule).unwrap();
 
     // Insert src first.
-    db.insert_node("P", "s0", vec![("year".into(), Value::Float(0.0))]).unwrap();
+    db.insert_node("P", "s0", vec![("year".into(), Value::Float(0.0))])
+        .unwrap();
     // Insert WORST candidate first (score = 1 - 9/10 = 0.1).
-    db.insert_node("P", "d9", vec![("year".into(), Value::Float(9.0))]).unwrap();
+    db.insert_node("P", "d9", vec![("year".into(), Value::Float(9.0))])
+        .unwrap();
     // Insert BEST candidate second (score = 1 - 1/10 = 0.9); must evict d9.
-    db.insert_node("P", "d1", vec![("year".into(), Value::Float(1.0))]).unwrap();
+    db.insert_node("P", "d1", vec![("year".into(), Value::Float(1.0))])
+        .unwrap();
     // Insert another candidate (score = 0.8); also below d1, so evicted.
-    db.insert_node("P", "d2", vec![("year".into(), Value::Float(2.0))]).unwrap();
+    db.insert_node("P", "d2", vec![("year".into(), Value::Float(2.0))])
+        .unwrap();
 
     // Top-1 must be d1 (highest score, evicted d9 on insert).
-    let top1: Vec<String> = db.neighbors("s0", "NW1", Direction::Out).unwrap_or_default();
-    assert_eq!(top1, vec!["d1"], "s0's top-1 must be d1 (score=0.9 beat d9's 0.1)");
+    let top1: Vec<String> = db
+        .neighbors("s0", "NW1", Direction::Out)
+        .unwrap_or_default();
+    assert_eq!(
+        top1,
+        vec!["d1"],
+        "s0's top-1 must be d1 (score=0.9 beat d9's 0.1)"
+    );
 
     // d1 (best, in top-k) must have a derived edge explanation.
     let s0_d1_edges = db.explain("s0", "d1").expect("explain must not error");
@@ -505,7 +518,11 @@ fn topk_approx_recall_floor() {
             .filter(|&&(dkey, _, _)| dkey != src_key)
             .filter_map(|&(dkey, dx, dy)| {
                 let sim = sx * dx + sy * dy; // already normalized
-                if sim >= min_sim { Some((dkey.to_string(), sim)) } else { None }
+                if sim >= min_sim {
+                    Some((dkey.to_string(), sim))
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -514,12 +531,9 @@ fn topk_approx_recall_floor() {
         }
 
         // Sort by sim DESC, key ASC, take top-k.
-        exact_candidates.sort_by(|(ka, sa), (kb, sb)| {
-            sb.total_cmp(sa).then_with(|| ka.cmp(kb))
-        });
+        exact_candidates.sort_by(|(ka, sa), (kb, sb)| sb.total_cmp(sa).then_with(|| ka.cmp(kb)));
         exact_candidates.truncate(topk as usize);
-        let exact_topk: BTreeSet<String> =
-            exact_candidates.into_iter().map(|(ek, _)| ek).collect();
+        let exact_topk: BTreeSet<String> = exact_candidates.into_iter().map(|(ek, _)| ek).collect();
 
         let engine_topk: BTreeSet<String> = db
             .neighbors(src_key, "ATOPK", Direction::Out)
@@ -531,7 +545,10 @@ fn topk_approx_recall_floor() {
         total_exact += exact_topk.len();
     }
 
-    assert!(total_exact > 0, "test setup error: no source had exact candidates");
+    assert!(
+        total_exact > 0,
+        "test setup error: no source had exact candidates"
+    );
     let global_recall = total_hits as f64 / total_exact as f64;
     assert!(
         global_recall >= APPROX_RECALL_FLOOR_QUIESCED,

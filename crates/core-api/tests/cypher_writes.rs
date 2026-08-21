@@ -8,8 +8,11 @@ use core_api::{GraphDb, GraphError, Predicate, RuleDef, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir()
-        .join(format!("graphdb-cypher-writes-{}-{}", name, std::process::id()));
+    let d = std::env::temp_dir().join(format!(
+        "graphdb-cypher-writes-{}-{}",
+        name,
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
@@ -76,7 +79,8 @@ fn create_node_fires_rules_on_insert() {
     .unwrap();
     // Install an overlap rule.  After CREATE inserts a matching Person,
     // the rule engine fires and must derive the TAGGED edge.
-    db.create_rule(overlap_rule("ov", "tags", "TAGGED")).unwrap();
+    db.create_rule(overlap_rule("ov", "tags", "TAGGED"))
+        .unwrap();
     // Now CREATE the person via Cypher.  The id is used as the key;
     // the tags field is set via the Rust API after creation.
     db.query_write("CREATE (p:Person {id: 'bob'})", &no_params())
@@ -85,14 +89,13 @@ fn create_node_fires_rules_on_insert() {
     assert!(db.has_node("bob"));
     assert!(db.explain("org1", "bob").unwrap().is_empty());
     // Now set bob's tags via the Rust API to trigger overlap.
-    db.set_prop(
-        "bob",
-        "tags",
-        Value::List(vec![Value::Str("rust".into())]),
-    )
-    .unwrap();
+    db.set_prop("bob", "tags", Value::List(vec![Value::Str("rust".into())]))
+        .unwrap();
     let expl = db.explain("org1", "bob").unwrap();
-    assert!(!expl.is_empty(), "TAGGED edge must be derived after tags overlap");
+    assert!(
+        !expl.is_empty(),
+        "TAGGED edge must be derived after tags overlap"
+    );
 }
 
 #[test]
@@ -117,10 +120,7 @@ fn create_node_and_edge() {
 fn create_node_missing_id_is_error() {
     let mut db = GraphDb::open(&tmp("create-no-id")).unwrap();
     let err = db
-        .query_write(
-            "CREATE (n:Person {name: 'No ID'})",
-            &no_params(),
-        )
+        .query_write("CREATE (n:Person {name: 'No ID'})", &no_params())
         .unwrap_err();
     let detail = match err {
         GraphError::QueryError { detail } => detail,
@@ -182,10 +182,7 @@ fn set_flips_overlap_derived_edge() {
             ("id".into(), Value::Str("org1".into())),
             (
                 "tags".into(),
-                Value::List(vec![
-                    Value::Str("rust".into()),
-                    Value::Str("db".into()),
-                ]),
+                Value::List(vec![Value::Str("rust".into()), Value::Str("db".into())]),
             ),
         ],
     )
@@ -273,12 +270,8 @@ fn set_overlap_on_off_via_cypher() {
     let mut db = GraphDb::open(&tmp("set-overlap-cypher")).unwrap();
 
     // Org node (key "o1").
-    db.insert_node(
-        "Org",
-        "o1",
-        vec![("id".into(), Value::Str("o1".into()))],
-    )
-    .unwrap();
+    db.insert_node("Org", "o1", vec![("id".into(), Value::Str("o1".into()))])
+        .unwrap();
     // Person node with org_ref initially pointing at nobody.
     db.insert_node(
         "Person",
@@ -296,7 +289,9 @@ fn set_overlap_on_off_via_cypher() {
         name: "linked".into(),
         src_label: "Person".into(),
         dst_label: "Org".into(),
-        predicate: Predicate::KeyMatch { field: "org_ref".into() },
+        predicate: Predicate::KeyMatch {
+            field: "org_ref".into(),
+        },
         edge_type: "LINKED".into(),
         weight_prop: None,
         max_edges: None,
@@ -318,7 +313,11 @@ fn set_overlap_on_off_via_cypher() {
     .unwrap();
 
     let expl = db.explain("o1", "p1").unwrap();
-    assert_eq!(expl.len(), 1, "LINKED edge must be derived after SET org_ref = 'o1'");
+    assert_eq!(
+        expl.len(),
+        1,
+        "LINKED edge must be derived after SET org_ref = 'o1'"
+    );
     assert_eq!(expl[0].rule, "linked", "rule name must be 'linked'");
 
     // ── Cypher SET flips derivation OFF ─────────────────────────────────────
@@ -358,10 +357,7 @@ fn set_multiple_props_one_statement() {
 fn set_expression_rhs_is_error() {
     let mut db = GraphDb::open(&tmp("set-expr-err")).unwrap();
     let err = db
-        .query_write(
-            "MATCH (n:Person) SET n.x = n.y",
-            &no_params(),
-        )
+        .query_write("MATCH (n:Person) SET n.x = n.y", &no_params())
         .unwrap_err();
     let detail = match err {
         GraphError::QueryError { detail } => detail,
@@ -409,10 +405,7 @@ fn delete_derived_edge_is_error() {
         "org1",
         vec![
             ("id".into(), Value::Str("org1".into())),
-            (
-                "tags".into(),
-                Value::List(vec![Value::Str("rust".into())]),
-            ),
+            ("tags".into(), Value::List(vec![Value::Str("rust".into())])),
         ],
     )
     .unwrap();
@@ -421,16 +414,14 @@ fn delete_derived_edge_is_error() {
         "bob",
         vec![
             ("id".into(), Value::Str("bob".into())),
-            (
-                "tags".into(),
-                Value::List(vec![Value::Str("rust".into())]),
-            ),
+            ("tags".into(), Value::List(vec![Value::Str("rust".into())])),
         ],
     )
     .unwrap();
     // Use "TAGGED" not "MATCH" — "MATCH" is a Cypher keyword and cannot be
     // used as an edge type identifier in query strings.
-    db.create_rule(overlap_rule("ov", "tags", "TAGGED")).unwrap();
+    db.create_rule(overlap_rule("ov", "tags", "TAGGED"))
+        .unwrap();
     assert!(!db.explain("org1", "bob").unwrap().is_empty());
 
     let err = db
@@ -454,16 +445,10 @@ fn delete_derived_edge_is_error() {
 #[test]
 fn detach_delete_node_removes_node_and_edges() {
     let mut db = GraphDb::open(&tmp("detach-delete-node")).unwrap();
-    db.query_write(
-        "CREATE (n:Person {id: 'alice'})",
-        &no_params(),
-    )
-    .unwrap();
-    db.query_write(
-        "CREATE (n:Person {id: 'bob'})",
-        &no_params(),
-    )
-    .unwrap();
+    db.query_write("CREATE (n:Person {id: 'alice'})", &no_params())
+        .unwrap();
+    db.query_write("CREATE (n:Person {id: 'bob'})", &no_params())
+        .unwrap();
     db.insert_edge("KNOWS", "alice", "bob").unwrap();
     assert!(db.has_node("alice"));
     assert_eq!(db.edge_count(), 1);
@@ -503,33 +488,21 @@ fn detach_delete_node_via_cypher_fires_rules_on_reinsert() {
         approximate: false,
     })
     .unwrap();
-    db.query_write(
-        "CREATE (n:N {id: 'a', k: 'x'})",
-        &no_params(),
-    )
-    .unwrap();
-    db.query_write(
-        "CREATE (n:N {id: 'b', k: 'x'})",
-        &no_params(),
-    )
-    .unwrap();
+    db.query_write("CREATE (n:N {id: 'a', k: 'x'})", &no_params())
+        .unwrap();
+    db.query_write("CREATE (n:N {id: 'b', k: 'x'})", &no_params())
+        .unwrap();
     assert_eq!(db.edge_count(), 2); // a↔b derived
 
     // Detach-delete 'a' via Cypher.
-    db.query_write(
-        "MATCH (n:N) WHERE n.id = 'a' DETACH DELETE n",
-        &no_params(),
-    )
-    .unwrap();
+    db.query_write("MATCH (n:N) WHERE n.id = 'a' DETACH DELETE n", &no_params())
+        .unwrap();
     assert!(!db.has_node("a"));
     assert_eq!(db.edge_count(), 0);
 
     // Reinsert 'a' with same key and same field — rules must fire fresh.
-    db.query_write(
-        "CREATE (n:N {id: 'a', k: 'x'})",
-        &no_params(),
-    )
-    .unwrap();
+    db.query_write("CREATE (n:N {id: 'a', k: 'x'})", &no_params())
+        .unwrap();
     assert!(db.has_node("a"));
     assert_eq!(db.edge_count(), 2, "rule must fire fresh on reinserted 'a'");
 }
@@ -561,10 +534,7 @@ fn bare_delete_node_with_edges_errors() {
 
     // Bare DELETE on a node that has edges → named error mentioning DETACH DELETE.
     let err = db
-        .query_write(
-            "MATCH (n:Person) WHERE n.id = 'a' DELETE n",
-            &no_params(),
-        )
+        .query_write("MATCH (n:Person) WHERE n.id = 'a' DELETE n", &no_params())
         .unwrap_err();
     let detail = match err {
         GraphError::QueryError { detail } => detail,
@@ -629,10 +599,7 @@ fn merge_on_create_set_is_error() {
 fn merge_multi_prop_is_error() {
     let mut db = GraphDb::open(&tmp("merge-multi-prop")).unwrap();
     let err = db
-        .query_write(
-            "MERGE (n:Person {id: 'x', name: 'Alice'})",
-            &no_params(),
-        )
+        .query_write("MERGE (n:Person {id: 'x', name: 'Alice'})", &no_params())
         .unwrap_err();
     let detail = match err {
         GraphError::QueryError { detail } => detail,
@@ -716,9 +683,7 @@ fn create_comma_separated_form_is_named_error() {
                 "error detail must not be empty for comma-separated CREATE"
             );
         }
-        other => panic!(
-            "comma-separated CREATE must fail as QueryError, got {other:?}"
-        ),
+        other => panic!("comma-separated CREATE must fail as QueryError, got {other:?}"),
     }
 }
 
@@ -758,11 +723,8 @@ fn cypher_write_survives_wal_replay() {
 fn detach_delete_with_param() {
     let mut db = GraphDb::open(&tmp("detach-delete-param")).unwrap();
     // Two nodes: "del-target" (has a manual edge) and "keep" (bystander).
-    db.query_write(
-        "CREATE (n:L {id: 'keep', key: 'keep'})",
-        &no_params(),
-    )
-    .unwrap();
+    db.query_write("CREATE (n:L {id: 'keep', key: 'keep'})", &no_params())
+        .unwrap();
     db.query_write(
         "CREATE (n:L {id: 'del-target', key: 'del-target'})",
         &no_params(),
@@ -777,15 +739,16 @@ fn detach_delete_with_param() {
     let mut params = BTreeMap::new();
     params.insert("k".to_string(), Value::Str("del-target".into()));
     let rs = db
-        .query_write(
-            "MATCH (n:L) WHERE n.key = $k DETACH DELETE n",
-            &params,
-        )
+        .query_write("MATCH (n:L) WHERE n.key = $k DETACH DELETE n", &params)
         .unwrap();
 
     assert!(!db.has_node("del-target"), "targeted node must be deleted");
     assert!(db.has_node("keep"), "bystander node must survive");
-    assert_eq!(db.edge_count(), 0, "incident edge must be removed by DETACH");
+    assert_eq!(
+        db.edge_count(),
+        0,
+        "incident edge must be removed by DETACH"
+    );
     // deleted = 1 node + 1 manual edge = 2.
     assert_eq!(
         rs.get(0, "deleted"),
@@ -800,10 +763,7 @@ fn detach_delete_with_param() {
 fn combined_match_set_return_is_error() {
     let mut db = GraphDb::open(&tmp("combined-rw")).unwrap();
     let err = db
-        .query_write(
-            "MATCH (n:Person) SET n.x = 1 RETURN n",
-            &no_params(),
-        )
+        .query_write("MATCH (n:Person) SET n.x = 1 RETURN n", &no_params())
         .unwrap_err();
     let detail = match err {
         GraphError::QueryError { detail } => detail,

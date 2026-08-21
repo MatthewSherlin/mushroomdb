@@ -477,10 +477,7 @@ fn var_expand_diamond_path_counts() {
     // We query from "a" specifically using props.
     // *1..1 from a: a→b, a→c → 2 rows
     let rs = db
-        .query(
-            "MATCH (a:N {id: 'a'})-[r:T*1..1]->(b) RETURN b",
-            &empty,
-        )
+        .query("MATCH (a:N {id: 'a'})-[r:T*1..1]->(b) RETURN b", &empty)
         .unwrap_or_else(|e| panic!("var expand *1..1 failed: {e}"));
     // a→b and a→c = 2 destinations
     assert_eq!(rs.len(), 2, "*1..1 from a must yield 2 rows (b and c)");
@@ -502,10 +499,7 @@ fn var_expand_diamond_path_counts() {
     // *2..3 from a: only depth-2 reachable in diamond is d (via b or c) → 2 rows
     // depth-3 from a: would need T-T-T which doesn't exist → 0 additional
     let rs3 = db
-        .query(
-            "MATCH (a:N {id: 'a'})-[r:T*2..3]->(b) RETURN b",
-            &empty,
-        )
+        .query("MATCH (a:N {id: 'a'})-[r:T*2..3]->(b) RETURN b", &empty)
         .unwrap_or_else(|e| panic!("var expand *2..3 failed: {e}"));
     assert_eq!(
         rs3.len(),
@@ -588,7 +582,11 @@ fn shortest_path_reachable_at_depth_3() {
             &p,
         )
         .unwrap_or_else(|e| panic!("shortestPath must succeed: {e}"));
-    assert_eq!(rs.len(), 1, "shortestPath must return exactly 1 row when reachable");
+    assert_eq!(
+        rs.len(),
+        1,
+        "shortestPath must return exactly 1 row when reachable"
+    );
     assert_eq!(
         rs.row(0)[0],
         Some(Value::Int(3)),
@@ -648,10 +646,7 @@ fn var_expand_with_limit_takes_staged_path_and_returns_correct_rows() {
     // *1..2 from all nodes without a filter yields 6 total rows in diamond.
     // LIMIT 3 must return exactly 3.
     let rs = db
-        .query(
-            "MATCH (a:N)-[r:T*1..2]->(b) RETURN b LIMIT 3",
-            &p,
-        )
+        .query("MATCH (a:N)-[r:T*1..2]->(b) RETURN b LIMIT 3", &p)
         .unwrap_or_else(|e| panic!("var expand with LIMIT: {e}"));
     assert_eq!(rs.len(), 3, "LIMIT 3 must return exactly 3 rows");
 }
@@ -806,7 +801,12 @@ fn var_expand_left_directed() {
             &BTreeMap::new(),
         )
         .expect("left-directed *1..2 must succeed");
-    assert_eq!(rs.len(), 4, "left-directed from d: expected 4 rows, got {}", rs.len());
+    assert_eq!(
+        rs.len(),
+        4,
+        "left-directed from d: expected 4 rows, got {}",
+        rs.len()
+    );
 }
 
 /// Undirected `-[:T*1..2]-` var-expand: traverses both orientations.
@@ -826,7 +826,12 @@ fn var_expand_undirected() {
         .expect("undirected *1..2 must succeed");
     // Undirected from a: right-direction gives 4 rows (b, c at depth 1; d, d at depth 2).
     // Left-direction from a: no incoming T edges to a, so 0 additional rows.
-    assert_eq!(rs.len(), 4, "undirected from a: expected 4 rows, got {}", rs.len());
+    assert_eq!(
+        rs.len(),
+        4,
+        "undirected from a: expected 4 rows, got {}",
+        rs.len()
+    );
 }
 
 /// shortestPath with min>1 must be rejected at planning time with a named error.
@@ -1021,10 +1026,12 @@ fn optional_match_count_zero_for_edgeless() {
         batch.commit().unwrap();
     }
 
-    let rs = db.query(
-        "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a, COUNT(b)",
-        &BTreeMap::new(),
-    ).unwrap();
+    let rs = db
+        .query(
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a, COUNT(b)",
+            &BTreeMap::new(),
+        )
+        .unwrap();
 
     // 3 nodes: n1 has 1 edge (b=n2), n2 has no outgoing KNOWS, n3 has no outgoing.
     assert_eq!(rs.len(), 3, "must have 3 rows, one per node");
@@ -1045,7 +1052,11 @@ fn optional_match_with_where_inside_optional() {
         let mut batch = db.batch();
         // Use unique label OW to avoid cross-test label collisions.
         // Only one "anchor" node: alice.  bob is the optional neighbour.
-        batch.insert_node("OW", "alice", vec![("name".into(), Value::Str("Alice".into()))]);
+        batch.insert_node(
+            "OW",
+            "alice",
+            vec![("name".into(), Value::Str("Alice".into()))],
+        );
         batch.insert_node("OW", "bob", vec![("name".into(), Value::Str("Bob".into()))]);
         batch.insert_edge("FRIEND", "alice", "bob");
         batch.commit().unwrap();
@@ -1054,14 +1065,20 @@ fn optional_match_with_where_inside_optional() {
     // name='Bob', not 'nonexistent'.  The WHERE blocks the match, so b is null
     // and the outer alice row still survives (left-outer semantics).
     // We restrict the MATCH to alice via a.name so we get exactly 1 outer row.
-    let rs = db.query(
-        "MATCH (a:OW) WHERE a.name = 'Alice' \
+    let rs = db
+        .query(
+            "MATCH (a:OW) WHERE a.name = 'Alice' \
          OPTIONAL MATCH (a)-[:FRIEND]->(b) WHERE b.name = 'nonexistent' \
          RETURN a, b",
-        &BTreeMap::new(),
-    ).unwrap();
+            &BTreeMap::new(),
+        )
+        .unwrap();
     assert_eq!(rs.len(), 1, "one row expected (left-outer fallback)");
-    assert_eq!(get_val(&rs, 0, "b"), None, "b must be null when WHERE inside optional fails");
+    assert_eq!(
+        get_val(&rs, 0, "b"),
+        None,
+        "b must be null when WHERE inside optional fails"
+    );
 }
 
 /// Multiple chained OPTIONAL MATCHes.
@@ -1080,13 +1097,15 @@ fn optional_match_chained() {
         // no Y edge from a to anything
         batch.commit().unwrap();
     }
-    let rs = db.query(
-        "MATCH (a:NdA) \
+    let rs = db
+        .query(
+            "MATCH (a:NdA) \
          OPTIONAL MATCH (a)-[:X]->(b) \
          OPTIONAL MATCH (a)-[:Y]->(c) \
          RETURN a, b, c",
-        &BTreeMap::new(),
-    ).unwrap();
+            &BTreeMap::new(),
+        )
+        .unwrap();
     assert_eq!(rs.len(), 1);
     // b = "b" (found via X), c = null (no Y edge)
     assert_eq!(get_val(&rs, 0, "b"), Some(Value::Str("b".into())));
@@ -1105,10 +1124,12 @@ fn query_with_params_basic() {
         batch.insert_node("Person", "bob", vec![("age".into(), Value::Int(25))]);
         batch.commit().unwrap();
     }
-    let rs = db.query_with_params(
-        "MATCH (n:Person) WHERE n.age = $age RETURN n",
-        &[("age", Value::Int(30))],
-    ).unwrap();
+    let rs = db
+        .query_with_params(
+            "MATCH (n:Person) WHERE n.age = $age RETURN n",
+            &[("age", Value::Int(30))],
+        )
+        .unwrap();
     assert_eq!(rs.len(), 1);
     assert_eq!(get_val(&rs, 0, "n"), Some(Value::Str("alice".into())));
 }
@@ -1145,11 +1166,11 @@ fn set_with_param() {
     db.query_write(
         "MATCH (n:SWP) WHERE n.age = 30 SET n.age = $newage",
         &params,
-    ).unwrap();
-    let rs = db.query(
-        "MATCH (n:SWP) RETURN n.age",
-        &BTreeMap::new(),
-    ).unwrap();
+    )
+    .unwrap();
+    let rs = db
+        .query("MATCH (n:SWP) RETURN n.age", &BTreeMap::new())
+        .unwrap();
     assert_eq!(rs.len(), 1);
     assert_eq!(get_val(&rs, 0, "n.age"), Some(Value::Int(99)));
 }
@@ -1161,12 +1182,18 @@ fn params_injection_safe() {
     let db = GraphDb::open(&dir).unwrap();
     // If param value were interpolated as Cypher, this would parse as a statement
     // and might return rows or error differently. As a literal it's just a string.
-    let rs = db.query_with_params(
-        "MATCH (n:Person {id: $id}) RETURN n",
-        &[("id", Value::Str("' RETURN 1//".into()))],
-    ).unwrap();
+    let rs = db
+        .query_with_params(
+            "MATCH (n:Person {id: $id}) RETURN n",
+            &[("id", Value::Str("' RETURN 1//".into()))],
+        )
+        .unwrap();
     // No node with that (injected) id exists — should return 0 rows.
-    assert_eq!(rs.len(), 0, "injection payload must be treated as literal string");
+    assert_eq!(
+        rs.len(),
+        0,
+        "injection payload must be treated as literal string"
+    );
 }
 
 // ── Core function tests ───────────────────────────────────────────────────────
@@ -1177,11 +1204,20 @@ fn fn_tolower_happy() {
     let mut db = GraphDb::open(&dir).unwrap();
     {
         let mut batch = db.batch();
-        batch.insert_node("Tx", "alice", vec![("name".into(), Value::Str("Alice".into()))]);
+        batch.insert_node(
+            "Tx",
+            "alice",
+            vec![("name".into(), Value::Str("Alice".into()))],
+        );
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Tx) RETURN toLower(n.name)", &BTreeMap::new()).unwrap();
-    assert_eq!(get_val(&rs, 0, "toLower(n.name)"), Some(Value::Str("alice".into())));
+    let rs = db
+        .query("MATCH (n:Tx) RETURN toLower(n.name)", &BTreeMap::new())
+        .unwrap();
+    assert_eq!(
+        get_val(&rs, 0, "toLower(n.name)"),
+        Some(Value::Str("alice".into()))
+    );
 }
 
 #[test]
@@ -1193,7 +1229,9 @@ fn fn_tolower_null_propagation() {
         batch.insert_node("Tx", "n1", vec![]); // no name prop → null
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Tx) RETURN toLower(n.name)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Tx) RETURN toLower(n.name)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "toLower(n.name)"), None);
 }
 
@@ -1206,8 +1244,13 @@ fn fn_toupper_happy() {
         batch.insert_node("Ty", "x", vec![("v".into(), Value::Str("hello".into()))]);
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Ty) RETURN toUpper(n.v)", &BTreeMap::new()).unwrap();
-    assert_eq!(get_val(&rs, 0, "toUpper(n.v)"), Some(Value::Str("HELLO".into())));
+    let rs = db
+        .query("MATCH (n:Ty) RETURN toUpper(n.v)", &BTreeMap::new())
+        .unwrap();
+    assert_eq!(
+        get_val(&rs, 0, "toUpper(n.v)"),
+        Some(Value::Str("HELLO".into()))
+    );
 }
 
 #[test]
@@ -1219,7 +1262,9 @@ fn fn_toupper_null_propagation() {
         batch.insert_node("Ty", "x", vec![]);
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Ty) RETURN toUpper(n.v)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Ty) RETURN toUpper(n.v)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "toUpper(n.v)"), None);
 }
 
@@ -1232,7 +1277,9 @@ fn fn_size_string() {
         batch.insert_node("Ts", "x", vec![("s".into(), Value::Str("hello".into()))]);
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Ts) RETURN size(n.s)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Ts) RETURN size(n.s)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "size(n.s)"), Some(Value::Int(5)));
 }
 
@@ -1245,15 +1292,20 @@ fn fn_size_list() {
         batch.insert_node(
             "Tsl",
             "x",
-            vec![("tags".into(), Value::List(vec![
-                Value::Str("a".into()),
-                Value::Str("b".into()),
-                Value::Str("c".into()),
-            ]))],
+            vec![(
+                "tags".into(),
+                Value::List(vec![
+                    Value::Str("a".into()),
+                    Value::Str("b".into()),
+                    Value::Str("c".into()),
+                ]),
+            )],
         );
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Tsl) RETURN size(n.tags)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Tsl) RETURN size(n.tags)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "size(n.tags)"), Some(Value::Int(3)));
 }
 
@@ -1266,7 +1318,9 @@ fn fn_size_null_propagation() {
         batch.insert_node("Tsnull", "x", vec![]);
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Tsnull) RETURN size(n.missing)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Tsnull) RETURN size(n.missing)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "size(n.missing)"), None);
 }
 
@@ -1280,7 +1334,9 @@ fn fn_coalesce_happy() {
         batch.commit().unwrap();
     }
     // coalesce(n.a, n.b) — n.a is null, n.b = 42
-    let rs = db.query("MATCH (n:Tc) RETURN coalesce(n.a, n.b)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Tc) RETURN coalesce(n.a, n.b)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "coalesce(n.a, n.b)"), Some(Value::Int(42)));
 }
 
@@ -1293,7 +1349,9 @@ fn fn_coalesce_all_null() {
         batch.insert_node("Tc", "x", vec![]);
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Tc) RETURN coalesce(n.a, n.b)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Tc) RETURN coalesce(n.a, n.b)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "coalesce(n.a, n.b)"), None);
 }
 
@@ -1308,10 +1366,9 @@ fn fn_type_happy() {
         batch.insert_edge("KNOWS", "ta", "tb");
         batch.commit().unwrap();
     }
-    let rs = db.query(
-        "MATCH (a:Pt)-[r]->(b:Pt) RETURN type(r)",
-        &BTreeMap::new(),
-    ).unwrap();
+    let rs = db
+        .query("MATCH (a:Pt)-[r]->(b:Pt) RETURN type(r)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "type(r)"), Some(Value::Str("KNOWS".into())));
 }
 
@@ -1326,10 +1383,12 @@ fn fn_type_null_propagation() {
         batch.commit().unwrap();
     }
     // r is null because there are no edges from a.
-    let rs = db.query(
-        "MATCH (a:Ptn) OPTIONAL MATCH (a)-[r]->() RETURN type(r)",
-        &BTreeMap::new(),
-    ).unwrap();
+    let rs = db
+        .query(
+            "MATCH (a:Ptn) OPTIONAL MATCH (a)-[r]->() RETURN type(r)",
+            &BTreeMap::new(),
+        )
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "type(r)"), None);
 }
 
@@ -1342,7 +1401,9 @@ fn fn_abs_happy() {
         batch.insert_node("Tab", "x", vec![("v".into(), Value::Int(-7))]);
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Tab) RETURN abs(n.v)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Tab) RETURN abs(n.v)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "abs(n.v)"), Some(Value::Int(7)));
 }
 
@@ -1355,7 +1416,9 @@ fn fn_abs_null_propagation() {
         batch.insert_node("Tab", "x", vec![]);
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Tab) RETURN abs(n.missing)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Tab) RETURN abs(n.missing)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "abs(n.missing)"), None);
 }
 
@@ -1368,7 +1431,9 @@ fn fn_round_happy() {
         batch.insert_node("Tr", "x", vec![("v".into(), Value::Float(2.7))]);
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Tr) RETURN round(n.v)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Tr) RETURN round(n.v)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "round(n.v)"), Some(Value::Float(3.0)));
 }
 
@@ -1381,7 +1446,9 @@ fn fn_round_null_propagation() {
         batch.insert_node("Tr", "x", vec![]);
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Tr) RETURN round(n.missing)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Tr) RETURN round(n.missing)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "round(n.missing)"), None);
 }
 
@@ -1397,7 +1464,9 @@ fn fn_abs_binarith_sub_arg() {
         batch.commit().unwrap();
     }
     // abs(n.age - 27) => abs(30 - 27) => abs(3) => 3
-    let rs = db.query("MATCH (n:Ba) RETURN abs(n.age - 27)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Ba) RETURN abs(n.age - 27)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "abs(<arith>)"), Some(Value::Int(3)));
 }
 
@@ -1413,7 +1482,9 @@ fn fn_round_binarith_mul_arg() {
         batch.commit().unwrap();
     }
     // round(n.score * 1.5) => round(2.0 * 1.5) => round(3.0) => 3.0
-    let rs = db.query("MATCH (n:Br) RETURN round(n.score * 1.5)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Br) RETURN round(n.score * 1.5)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(get_val(&rs, 0, "round(<arith>)"), Some(Value::Float(3.0)));
 }
 
@@ -1427,15 +1498,25 @@ fn optional_match_null_property_access() {
     {
         let mut batch = db.batch();
         // Anchor node with no outgoing KNOWS edges — OPTIONAL MATCH will find nothing.
-        batch.insert_node("ONP", "solo", vec![("name".into(), Value::Str("Solo".into()))]);
+        batch.insert_node(
+            "ONP",
+            "solo",
+            vec![("name".into(), Value::Str("Solo".into()))],
+        );
         batch.commit().unwrap();
     }
     // b is null (no KNOWS edge), so b.name must be null (not an error).
-    let rs = db.query(
-        "MATCH (a:ONP) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a.name, b.name",
-        &BTreeMap::new(),
-    ).unwrap();
-    assert_eq!(rs.len(), 1, "one outer row must survive OPTIONAL MATCH miss");
+    let rs = db
+        .query(
+            "MATCH (a:ONP) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a.name, b.name",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "one outer row must survive OPTIONAL MATCH miss"
+    );
     assert_eq!(
         get_val(&rs, 0, "a.name"),
         Some(Value::Str("Solo".into())),
@@ -1480,10 +1561,12 @@ fn limit_param_basic() {
         }
         batch.commit().unwrap();
     }
-    let rs = db.query_with_params(
-        "MATCH (n:LP) RETURN n LIMIT $cap",
-        &[("cap", Value::Int(2))],
-    ).unwrap();
+    let rs = db
+        .query_with_params(
+            "MATCH (n:LP) RETURN n LIMIT $cap",
+            &[("cap", Value::Int(2))],
+        )
+        .unwrap();
     assert_eq!(rs.len(), 2, "LIMIT $cap=2 must return exactly 2 rows");
 }
 
@@ -1499,11 +1582,17 @@ fn skip_param_basic() {
         }
         batch.commit().unwrap();
     }
-    let rs = db.query_with_params(
-        "MATCH (n:SP) RETURN n SKIP $offset LIMIT 10",
-        &[("offset", Value::Int(3))],
-    ).unwrap();
-    assert_eq!(rs.len(), 2, "SKIP $offset=3 with 5 nodes must return 2 rows");
+    let rs = db
+        .query_with_params(
+            "MATCH (n:SP) RETURN n SKIP $offset LIMIT 10",
+            &[("offset", Value::Int(3))],
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        2,
+        "SKIP $offset=3 with 5 nodes must return 2 rows"
+    );
 }
 
 /// Negative integer for LIMIT $param is a named error.
@@ -1560,11 +1649,14 @@ fn pipeline_group_aggregate_without_optional_match() {
     }
     // This query forces the pipeline path via GroupAggregate in staged executor.
     // Without the fix, it would return 0 rows.
-    let rs = db.query(
-        "MATCH (a:PGA) WITH a RETURN COUNT(a)",
-        &BTreeMap::new(),
-    ).unwrap();
-    assert_eq!(rs.len(), 1, "grouped aggregate with no keys must return exactly 1 row");
+    let rs = db
+        .query("MATCH (a:PGA) WITH a RETURN COUNT(a)", &BTreeMap::new())
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "grouped aggregate with no keys must return exactly 1 row"
+    );
     assert_eq!(
         get_val(&rs, 0, "COUNT(a)"),
         Some(Value::Int(3)),
@@ -1584,7 +1676,10 @@ fn params_preflight_catches_missing_param_in_return_funccall() {
         "MATCH (n:PF) RETURN toLower($val)",
         &BTreeMap::new(), // $val not provided
     );
-    assert!(err.is_err(), "missing $val in RETURN FuncCall must return Err");
+    assert!(
+        err.is_err(),
+        "missing $val in RETURN FuncCall must return Err"
+    );
     let msg = format!("{:?}", err.unwrap_err());
     assert!(
         msg.contains("missing") || msg.contains("val"),
@@ -1600,11 +1695,11 @@ fn params_preflight_catches_missing_param_in_return_funccall() {
 fn optional_match_as_first_clause_is_parse_error() {
     let dir = tmp("optional_first");
     let db = GraphDb::open(&dir).unwrap();
-    let err = db.query(
-        "OPTIONAL MATCH (a:Person) RETURN a",
-        &BTreeMap::new(),
+    let err = db.query("OPTIONAL MATCH (a:Person) RETURN a", &BTreeMap::new());
+    assert!(
+        err.is_err(),
+        "OPTIONAL MATCH without preceding MATCH must fail"
     );
-    assert!(err.is_err(), "OPTIONAL MATCH without preceding MATCH must fail");
     let msg = format!("{:?}", err.unwrap_err());
     assert!(
         msg.contains("MATCH") || msg.contains("parse") || msg.contains("expected"),
@@ -1622,10 +1717,16 @@ fn fn_size_non_string_non_list_is_null() {
         batch.insert_node("Si", "x", vec![("v".into(), Value::Int(42))]);
         batch.commit().unwrap();
     }
-    let rs = db.query("MATCH (n:Si) RETURN size(n.v)", &BTreeMap::new()).unwrap();
+    let rs = db
+        .query("MATCH (n:Si) RETURN size(n.v)", &BTreeMap::new())
+        .unwrap();
     assert_eq!(rs.len(), 1);
     // size(<Int>) → null (not an error; openCypher null propagation)
-    assert_eq!(get_val(&rs, 0, "size(n.v)"), None, "size on Int must return null");
+    assert_eq!(
+        get_val(&rs, 0, "size(n.v)"),
+        None,
+        "size on Int must return null"
+    );
 }
 
 /// type(r) on a rule-derived edge returns the rule's edge_type string.
@@ -1646,21 +1747,28 @@ fn fn_type_on_derived_edge() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
-    }).unwrap();
+    })
+    .unwrap();
     {
         let mut batch = db.batch();
-        batch.insert_node("TypeOrg", "org1", vec![
-            ("tags".into(), Value::List(vec![Value::Str("rust".into())])),
-        ]);
-        batch.insert_node("TypePerson", "person1", vec![
-            ("tags".into(), Value::List(vec![Value::Str("rust".into())])),
-        ]);
+        batch.insert_node(
+            "TypeOrg",
+            "org1",
+            vec![("tags".into(), Value::List(vec![Value::Str("rust".into())]))],
+        );
+        batch.insert_node(
+            "TypePerson",
+            "person1",
+            vec![("tags".into(), Value::List(vec![Value::Str("rust".into())]))],
+        );
         batch.commit().unwrap();
     }
-    let rs = db.query(
-        "MATCH (a:TypeOrg)-[r]->(b:TypePerson) RETURN type(r)",
-        &BTreeMap::new(),
-    ).unwrap();
+    let rs = db
+        .query(
+            "MATCH (a:TypeOrg)-[r]->(b:TypePerson) RETURN type(r)",
+            &BTreeMap::new(),
+        )
+        .unwrap();
     assert_eq!(rs.len(), 1, "derived edge must appear in MATCH");
     assert_eq!(
         get_val(&rs, 0, "type(r)"),
@@ -1685,11 +1793,17 @@ fn skip_param_does_not_route_to_pull_path() {
         }
         batch.commit().unwrap();
     }
-    let rs = db.query_with_params(
-        "MATCH (n:SPP) RETURN n SKIP $offset LIMIT 3",
-        &[("offset", Value::Int(15))],
-    ).unwrap();
-    assert_eq!(rs.len(), 3, "SKIP 15 LIMIT 3 over 20 nodes must return 3 rows");
+    let rs = db
+        .query_with_params(
+            "MATCH (n:SPP) RETURN n SKIP $offset LIMIT 3",
+            &[("offset", Value::Int(15))],
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        3,
+        "SKIP 15 LIMIT 3 over 20 nodes must return 3 rows"
+    );
 }
 
 /// Non-integer (string) LIMIT param produces a named error.
@@ -1729,11 +1843,17 @@ fn optional_match_with_limit_param() {
         batch.commit().unwrap();
     }
     // OPTIONAL MATCH (LeftOuterApply) + LIMIT $cap (Param(Limit)) composite.
-    let rs = db.query_with_params(
-        "MATCH (a:OPL) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a LIMIT $cap",
-        &[("cap", Value::Int(2))],
-    ).unwrap();
-    assert_eq!(rs.len(), 2, "LIMIT $cap=2 must cap result to 2 rows despite OPTIONAL MATCH");
+    let rs = db
+        .query_with_params(
+            "MATCH (a:OPL) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a LIMIT $cap",
+            &[("cap", Value::Int(2))],
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        2,
+        "LIMIT $cap=2 must cap result to 2 rows despite OPTIONAL MATCH"
+    );
 }
 
 /// Composite pin: $param inside BinArith function argument — happy path (Minor-2).
@@ -1750,10 +1870,9 @@ fn abs_binarith_param_arg_happy() {
         batch.commit().unwrap();
     }
     // abs($x - 1) with $x = 5 → abs(4) → 4.
-    let rs = db.query_with_params(
-        "MATCH (n:PB) RETURN abs($x - 1)",
-        &[("x", Value::Int(5))],
-    ).unwrap();
+    let rs = db
+        .query_with_params("MATCH (n:PB) RETURN abs($x - 1)", &[("x", Value::Int(5))])
+        .unwrap();
     assert_eq!(rs.len(), 1);
     assert_eq!(
         get_val(&rs, 0, "abs(<arith>)"),
@@ -1802,11 +1921,17 @@ fn abs_float_binarith_null_propagation() {
         batch.insert_node("FBN", "x", vec![]);
         batch.commit().unwrap();
     }
-    let rs = db.query(
-        "MATCH (n:FBN) RETURN abs(n.missing_float - 1.5)",
-        &BTreeMap::new(),
-    ).unwrap();
-    assert_eq!(rs.len(), 1, "one row must be produced even when BinArith arg is null");
+    let rs = db
+        .query(
+            "MATCH (n:FBN) RETURN abs(n.missing_float - 1.5)",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "one row must be produced even when BinArith arg is null"
+    );
     assert_eq!(
         get_val(&rs, 0, "abs(<arith>)"),
         None,

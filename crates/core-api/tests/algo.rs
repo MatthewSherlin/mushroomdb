@@ -5,8 +5,8 @@
 //! test with an independent BFS reference.
 
 use core_api::{
-    AlgoDir, DegreeConfig, GraphDb, GraphError, PageRankConfig, Predicate,
-    RuleDef, Value, WccConfig,
+    AlgoDir, DegreeConfig, GraphDb, GraphError, PageRankConfig, Predicate, RuleDef, Value,
+    WccConfig,
 };
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -63,12 +63,19 @@ fn pagerank_star_hub_ranks_top() {
     for i in 1..=4 {
         insert_edge(&mut db, "POINTS", &format!("spoke{i}"), "hub");
     }
-    let config = PageRankConfig { max_iters: 100, ..PageRankConfig::default() };
+    let config = PageRankConfig {
+        max_iters: 100,
+        ..PageRankConfig::default()
+    };
     let report = db.pagerank(&config);
     assert!(report.converged, "star should converge");
     assert_eq!(report.scores.len(), 5);
     let (top_key, top_score) = &report.scores[0];
-    assert_eq!(top_key, "hub", "hub must rank first, got {:?}", report.scores);
+    assert_eq!(
+        top_key, "hub",
+        "hub must rank first, got {:?}",
+        report.scores
+    );
     // All spokes should have same score (symmetry) and be less than hub.
     for (key, score) in &report.scores[1..] {
         assert!(
@@ -148,20 +155,28 @@ fn pagerank_over_derived_edges() {
     let dir = tmp("pr-derived");
     let mut db = open(&dir);
     // Create two nodes with same tag → rule creates an edge between them.
-    db.insert_node("T", "x", vec![("tag".into(), Value::Str("same".into()))]).unwrap();
-    db.insert_node("T", "y", vec![("tag".into(), Value::Str("same".into()))]).unwrap();
+    db.insert_node("T", "x", vec![("tag".into(), Value::Str("same".into()))])
+        .unwrap();
+    db.insert_node("T", "y", vec![("tag".into(), Value::Str("same".into()))])
+        .unwrap();
     db.create_rule(RuleDef {
         name: "link".into(),
         src_label: "T".into(),
         dst_label: "T".into(),
-        predicate: Predicate::FieldEqual { field: "tag".into() },
+        predicate: Predicate::FieldEqual {
+            field: "tag".into(),
+        },
         edge_type: "LINKED".into(),
         weight_prop: None,
         max_edges: None,
         approximate: false,
-    }).unwrap();
+    })
+    .unwrap();
     // After rule fires: x→y and y→x exist as derived edges.
-    let config = PageRankConfig { max_iters: 100, ..PageRankConfig::default() };
+    let config = PageRankConfig {
+        max_iters: 100,
+        ..PageRankConfig::default()
+    };
     let report = db.pagerank(&config);
     // Both nodes have same in-degree so scores should be equal.
     assert_eq!(report.scores.len(), 2);
@@ -182,7 +197,10 @@ fn pagerank_reports_not_converged_when_zero_iters() {
     insert_node(&mut db, "N", "a");
     insert_node(&mut db, "N", "b");
     insert_edge(&mut db, "E", "a", "b");
-    let config = PageRankConfig { max_iters: 0, ..PageRankConfig::default() };
+    let config = PageRankConfig {
+        max_iters: 0,
+        ..PageRankConfig::default()
+    };
     let report = db.pagerank(&config);
     assert!(!report.converged, "0 iterations must report not converged");
     let _ = std::fs::remove_dir_all(&dir);
@@ -199,7 +217,10 @@ fn pagerank_sort_order() {
     }
     insert_edge(&mut db, "E", "a", "b");
     insert_edge(&mut db, "E", "b", "c");
-    let report = db.pagerank(&PageRankConfig { max_iters: 100, ..PageRankConfig::default() });
+    let report = db.pagerank(&PageRankConfig {
+        max_iters: 100,
+        ..PageRankConfig::default()
+    });
     let scores: Vec<f64> = report.scores.iter().map(|(_, s)| *s).collect();
     for w in scores.windows(2) {
         assert!(
@@ -223,7 +244,10 @@ fn pagerank_dangling_node_mass_conservation() {
     }
     insert_edge(&mut db, "E", "a", "b");
     insert_edge(&mut db, "E", "a", "c");
-    let config = PageRankConfig { max_iters: 100, ..PageRankConfig::default() };
+    let config = PageRankConfig {
+        max_iters: 100,
+        ..PageRankConfig::default()
+    };
     let report = db.pagerank(&config);
     assert!(report.converged, "simple dangling graph should converge");
     let mass: f64 = report.scores.iter().map(|(_, s)| s).sum();
@@ -241,21 +265,27 @@ fn pagerank_derived_edge_type_filter() {
     let dir = tmp("pr-derived-filter");
     let mut db = open(&dir);
     // Two nodes sharing the same tag: rule fires a LINKED edge between them.
-    db.insert_node("T", "x", vec![("tag".into(), Value::Str("same".into()))]).unwrap();
-    db.insert_node("T", "y", vec![("tag".into(), Value::Str("same".into()))]).unwrap();
+    db.insert_node("T", "x", vec![("tag".into(), Value::Str("same".into()))])
+        .unwrap();
+    db.insert_node("T", "y", vec![("tag".into(), Value::Str("same".into()))])
+        .unwrap();
     // Third node connected to x via a manual MANUAL edge only.
-    db.insert_node("T", "z", vec![("tag".into(), Value::Str("other".into()))]).unwrap();
+    db.insert_node("T", "z", vec![("tag".into(), Value::Str("other".into()))])
+        .unwrap();
     insert_edge(&mut db, "MANUAL", "z", "x");
     db.create_rule(RuleDef {
         name: "link-same".into(),
         src_label: "T".into(),
         dst_label: "T".into(),
-        predicate: Predicate::FieldEqual { field: "tag".into() },
+        predicate: Predicate::FieldEqual {
+            field: "tag".into(),
+        },
         edge_type: "LINKED".into(),
         weight_prop: None,
         max_edges: None,
         approximate: false,
-    }).unwrap();
+    })
+    .unwrap();
     // Filter to only LINKED (derived) edges: z has no LINKED edge, so z should score lower.
     let config = PageRankConfig {
         edge_type: Some("LINKED".into()),
@@ -298,15 +328,23 @@ fn wcc_two_clusters() {
     insert_edge(&mut db, "E", "b", "c");
     insert_edge(&mut db, "E", "x", "y");
     let report = db.connected_components(&WccConfig::default());
-    let comp_ids: BTreeSet<&str> =
-        report.components.iter().map(|(_, c)| c.as_str()).collect();
-    assert_eq!(comp_ids.len(), 2, "expected 2 components, got {:?}", report.components);
+    let comp_ids: BTreeSet<&str> = report.components.iter().map(|(_, c)| c.as_str()).collect();
+    assert_eq!(
+        comp_ids.len(),
+        2,
+        "expected 2 components, got {:?}",
+        report.components
+    );
     // Component ID is the smallest key: "a" for {a,b,c} and "x" for {x,y}.
     assert!(comp_ids.contains("a"), "component a-b-c should have id 'a'");
     assert!(comp_ids.contains("x"), "component x-y should have id 'x'");
     // Every node in {a,b,c} should be in comp "a".
     for k in ["a", "b", "c"] {
-        let comp = report.components.iter().find(|(key, _)| key == k).map(|(_, c)| c.as_str());
+        let comp = report
+            .components
+            .iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, c)| c.as_str());
         assert_eq!(comp, Some("a"), "node {k} should be in component 'a'");
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -331,7 +369,10 @@ fn wcc_single_node() {
     insert_node(&mut db, "N", "solo");
     let report = db.connected_components(&WccConfig::default());
     assert_eq!(report.components.len(), 1);
-    assert_eq!(report.components[0], ("solo".to_string(), "solo".to_string()));
+    assert_eq!(
+        report.components[0],
+        ("solo".to_string(), "solo".to_string())
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -345,12 +386,30 @@ fn wcc_directed_treated_as_undirected() {
     }
     // Only directed edges, no back-edges.
     insert_edge(&mut db, "E", "c", "a"); // c→a: they should be connected
-    // b is isolated.
+                                         // b is isolated.
     let report = db.connected_components(&WccConfig::default());
-    let a_comp = report.components.iter().find(|(k, _)| k == "a").unwrap().1.clone();
-    let c_comp = report.components.iter().find(|(k, _)| k == "c").unwrap().1.clone();
+    let a_comp = report
+        .components
+        .iter()
+        .find(|(k, _)| k == "a")
+        .unwrap()
+        .1
+        .clone();
+    let c_comp = report
+        .components
+        .iter()
+        .find(|(k, _)| k == "c")
+        .unwrap()
+        .1
+        .clone();
     assert_eq!(a_comp, c_comp, "a and c must be in same component");
-    let b_comp = report.components.iter().find(|(k, _)| k == "b").unwrap().1.clone();
+    let b_comp = report
+        .components
+        .iter()
+        .find(|(k, _)| k == "b")
+        .unwrap()
+        .1
+        .clone();
     assert_ne!(a_comp, b_comp, "b must be isolated");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -424,7 +483,9 @@ fn bfs_wcc_reference(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
 fn wcc_matches_bfs_reference_on_random_graphs() {
     let mut rng: u64 = 0x4d75_7368_726f_6f6d;
     let lcg = |s: &mut u64| -> u64 {
-        *s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        *s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         *s
     };
 
@@ -473,8 +534,20 @@ fn wcc_matches_bfs_reference_on_random_graphs() {
         for i in 0..n {
             for j in (i + 1)..n {
                 let same_ref = ref_comp[i] == ref_comp[j];
-                let prod_i = report.components.iter().find(|(k, _)| k == &keys[i]).unwrap().1.as_str();
-                let prod_j = report.components.iter().find(|(k, _)| k == &keys[j]).unwrap().1.as_str();
+                let prod_i = report
+                    .components
+                    .iter()
+                    .find(|(k, _)| k == &keys[i])
+                    .unwrap()
+                    .1
+                    .as_str();
+                let prod_j = report
+                    .components
+                    .iter()
+                    .find(|(k, _)| k == &keys[j])
+                    .unwrap()
+                    .1
+                    .as_str();
                 let same_prod = prod_i == prod_j;
                 assert_eq!(
                     same_ref, same_prod,
@@ -504,7 +577,10 @@ fn degree_directed_vs_undirected() {
     insert_edge(&mut db, "E", "a", "c");
 
     // Out-degree: a=2, b=0, c=0.
-    let out_cfg = DegreeConfig { direction: AlgoDir::Out, ..DegreeConfig::default() };
+    let out_cfg = DegreeConfig {
+        direction: AlgoDir::Out,
+        ..DegreeConfig::default()
+    };
     let out_rep = db.degree_centrality(&out_cfg);
     let a_out = out_rep.scores.iter().find(|(k, _)| k == "a").unwrap().1;
     let b_out = out_rep.scores.iter().find(|(k, _)| k == "b").unwrap().1;
@@ -512,7 +588,10 @@ fn degree_directed_vs_undirected() {
     assert_eq!(b_out, 0, "b out-degree should be 0");
 
     // In-degree: a=0, b=1, c=1.
-    let in_cfg = DegreeConfig { direction: AlgoDir::In, ..DegreeConfig::default() };
+    let in_cfg = DegreeConfig {
+        direction: AlgoDir::In,
+        ..DegreeConfig::default()
+    };
     let in_rep = db.degree_centrality(&in_cfg);
     let a_in = in_rep.scores.iter().find(|(k, _)| k == "a").unwrap().1;
     let b_in = in_rep.scores.iter().find(|(k, _)| k == "b").unwrap().1;
@@ -522,7 +601,10 @@ fn degree_directed_vs_undirected() {
     assert_eq!(c_in, 1, "c in-degree should be 1");
 
     // Both: a=2, b=1, c=1.
-    let both_cfg = DegreeConfig { direction: AlgoDir::Both, ..DegreeConfig::default() };
+    let both_cfg = DegreeConfig {
+        direction: AlgoDir::Both,
+        ..DegreeConfig::default()
+    };
     let both_rep = db.degree_centrality(&both_cfg);
     let a_both = both_rep.scores.iter().find(|(k, _)| k == "a").unwrap().1;
     assert_eq!(a_both, 2, "a both-degree should be 2 (out=2, in=0)");
@@ -567,8 +649,14 @@ fn degree_sort_order() {
     insert_edge(&mut db, "E", "hub", "s1");
     insert_edge(&mut db, "E", "hub", "s2");
     insert_edge(&mut db, "E", "hub", "s3");
-    let report = db.degree_centrality(&DegreeConfig { direction: AlgoDir::Out, ..DegreeConfig::default() });
-    assert_eq!(report.scores[0].0, "hub", "hub should rank first by out-degree");
+    let report = db.degree_centrality(&DegreeConfig {
+        direction: AlgoDir::Out,
+        ..DegreeConfig::default()
+    });
+    assert_eq!(
+        report.scores[0].0, "hub",
+        "hub should rank first by out-degree"
+    );
     // Remaining nodes tied at 0; sorted by key asc.
     let tails: Vec<&str> = report.scores[1..].iter().map(|(k, _)| k.as_str()).collect();
     let mut sorted = tails.clone();
@@ -641,7 +729,8 @@ fn write_scores_refuses_view_managed_prop() {
             edge_type: "E".into(),
             direction: core_api::Direction::Out,
         },
-    }).expect("create_view");
+    })
+    .expect("create_view");
     // write_scores on the view-managed prop must be refused.
     let result = db.write_scores("my_degree", &[("x".to_string(), 1.0)]);
     match result {
@@ -671,7 +760,8 @@ fn write_scores_refuses_view_name_collision() {
             edge_type: "E".into(),
             direction: core_api::Direction::Out,
         },
-    }).expect("create_view");
+    })
+    .expect("create_view");
     // Using the view name as prop_name for write_scores must be refused.
     let result = db.write_scores("my_view", &[("x".to_string(), 1.0)]);
     match result {
@@ -741,9 +831,15 @@ fn pagerank_edge_type_filter() {
     let hub_score = report.scores.iter().find(|(k, _)| k == "hub").unwrap().1;
     let a_score = report.scores.iter().find(|(k, _)| k == "a").unwrap().1;
     let b_score = report.scores.iter().find(|(k, _)| k == "b").unwrap().1;
-    assert!(hub_score > a_score, "hub must rank above a with LIKE filter");
+    assert!(
+        hub_score > a_score,
+        "hub must rank above a with LIKE filter"
+    );
     // b has no LIKE edges: b is dangling, all scores equal when only 1 edge.
-    assert!(hub_score > b_score, "hub must rank above b with LIKE filter");
+    assert!(
+        hub_score > b_score,
+        "hub must rank above b with LIKE filter"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -761,7 +857,11 @@ fn wcc_edge_type_filter_nonexistent() {
         budget_ms: 5000,
     });
     let comp_ids: BTreeSet<&str> = report.components.iter().map(|(_, c)| c.as_str()).collect();
-    assert_eq!(comp_ids.len(), 2, "nonexistent etype → 2 isolated components");
+    assert_eq!(
+        comp_ids.len(),
+        2,
+        "nonexistent etype → 2 isolated components"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -795,14 +895,21 @@ fn pagerank_on_demo_graph() {
         name: "overlap".into(),
         src_label: "Person".into(),
         dst_label: "Org".into(),
-        predicate: Predicate::Overlap { field: "skills".into(), min: 0.5 },
+        predicate: Predicate::Overlap {
+            field: "skills".into(),
+            min: 0.5,
+        },
         edge_type: "FIT".into(),
         weight_prop: None,
         max_edges: None,
         approximate: false,
-    }).unwrap();
+    })
+    .unwrap();
 
-    let report = db.pagerank(&PageRankConfig { max_iters: 100, ..PageRankConfig::default() });
+    let report = db.pagerank(&PageRankConfig {
+        max_iters: 100,
+        ..PageRankConfig::default()
+    });
     // Some nodes must have positive PR (non-trivial graph).
     assert!(!report.scores.is_empty());
     let max_score = report.scores[0].1;

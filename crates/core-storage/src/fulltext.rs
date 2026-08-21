@@ -125,7 +125,9 @@ pub fn eval_query_terms(node_tokens: &BTreeSet<String>, groups: &[Vec<Term>]) ->
     'outer: for group in groups {
         for term in group {
             let matched = if term.prefix {
-                node_tokens.iter().any(|t| t.starts_with(term.token.as_str()))
+                node_tokens
+                    .iter()
+                    .any(|t| t.starts_with(term.token.as_str()))
             } else {
                 node_tokens.contains(&term.token)
             };
@@ -173,7 +175,8 @@ impl FulltextIndex {
 
     /// Whether `(label, field)` is currently indexed.
     pub fn is_enabled(&self, label: &str, field: &str) -> bool {
-        self.enabled.contains(&(label.to_string(), field.to_string()))
+        self.enabled
+            .contains(&(label.to_string(), field.to_string()))
     }
 
     /// Whether any field is enabled for this label.
@@ -190,9 +193,7 @@ impl FulltextIndex {
     /// Used during disable to decide whether to purge individual node postings
     /// or the whole field column.
     pub fn field_indexed_by_other(&self, label: &str, field: &str) -> bool {
-        self.enabled
-            .iter()
-            .any(|(l, f)| f == field && l != label)
+        self.enabled.iter().any(|(l, f)| f == field && l != label)
     }
 
     /// Iterate all enabled `(label, field)` pairs.
@@ -203,8 +204,7 @@ impl FulltextIndex {
     /// Enable full-text indexing for `(label, field)`.  Returns `true` if newly
     /// added, `false` if already present (idempotent for replay safety).
     pub fn enable(&mut self, label: &str, field: &str) -> bool {
-        self.enabled
-            .insert((label.to_string(), field.to_string()))
+        self.enabled.insert((label.to_string(), field.to_string()))
     }
 
     /// Disable full-text indexing for `(label, field)`.
@@ -219,9 +219,7 @@ impl FulltextIndex {
     /// For v1, we clear the whole field's postings on disable and rely
     /// on rebuild_all (called on open) to restore surviving-label entries.
     pub fn disable(&mut self, label: &str, field: &str) -> bool {
-        let removed = self
-            .enabled
-            .remove(&(label.to_string(), field.to_string()));
+        let removed = self.enabled.remove(&(label.to_string(), field.to_string()));
         if removed && !self.field_indexed(field) {
             // No other label indexes this field — drop the whole column.
             self.postings.remove(field);
@@ -462,7 +460,10 @@ mod tests {
 
     #[test]
     fn eval_query_prefix() {
-        let toks: BTreeSet<_> = ["rustlang", "python"].iter().map(|s| s.to_string()).collect();
+        let toks: BTreeSet<_> = ["rustlang", "python"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert!(eval_query(&toks, "rust*"));
         assert!(!eval_query(&toks, "java*"));
     }

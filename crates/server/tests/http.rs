@@ -908,7 +908,10 @@ async fn cypher_write_over_http_is_durable() {
     assert_eq!(status, StatusCode::OK, "write must succeed");
     assert_eq!(ctype.as_deref(), Some("application/json"));
     let v = parse_json(&body);
-    assert_eq!(v["columns"], json!(["created", "properties_set", "deleted"]));
+    assert_eq!(
+        v["columns"],
+        json!(["created", "properties_set", "deleted"])
+    );
     let rows = v["rows"].as_array().expect("rows array");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], json!(1), "created=1");
@@ -965,8 +968,10 @@ async fn http_params_read_round_trip() {
     let (app, db) = open("http-params-read");
     {
         let mut w = db.write();
-        w.insert_node("HP", "alice", vec![("age".into(), Value::Int(30))]).unwrap();
-        w.insert_node("HP", "bob", vec![("age".into(), Value::Int(25))]).unwrap();
+        w.insert_node("HP", "alice", vec![("age".into(), Value::Int(30))])
+            .unwrap();
+        w.insert_node("HP", "bob", vec![("age".into(), Value::Int(25))])
+            .unwrap();
     }
 
     let (status, body, _) = send(
@@ -979,7 +984,8 @@ async fn http_params_read_round_trip() {
                 "params": {"age": 30}
             }),
         ),
-    ).await;
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK);
     let v = parse_json(&body);
@@ -987,7 +993,10 @@ async fn http_params_read_round_trip() {
     assert_eq!(rows.len(), 1, "must match exactly the node with age=30");
     // The node key "alice" should appear in the result row.
     let row_str = rows[0].to_string();
-    assert!(row_str.contains("alice"), "returned node must be alice: {row_str}");
+    assert!(
+        row_str.contains("alice"),
+        "returned node must be alice: {row_str}"
+    );
 }
 
 /// Injection safety at the HTTP layer: a param value containing Cypher syntax
@@ -1014,12 +1023,17 @@ async fn http_params_injection_safe() {
                 "params": {"id": "' RETURN 1//"}
             }),
         ),
-    ).await;
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK);
     let v = parse_json(&body);
     let rows = v["rows"].as_array().expect("rows array");
-    assert_eq!(rows.len(), 0, "injection payload must not return rows: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        0,
+        "injection payload must not return rows: {rows:?}"
+    );
 }
 
 /// Write with SET n.p = $newval over HTTP is durable across DB re-open.
@@ -1032,7 +1046,8 @@ async fn http_params_write_set_is_durable() {
     // Insert the node to update.
     {
         let mut w = db.write();
-        w.insert_node("HPW", "target", vec![("score".into(), Value::Int(0))]).unwrap();
+        w.insert_node("HPW", "target", vec![("score".into(), Value::Int(0))])
+            .unwrap();
     }
 
     // MATCH…SET with $newval over HTTP.
@@ -1046,8 +1061,14 @@ async fn http_params_write_set_is_durable() {
                 "params": {"newval": 99}
             }),
         ),
-    ).await;
-    assert_eq!(status, StatusCode::OK, "write must succeed: {}", String::from_utf8_lossy(&body));
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "write must succeed: {}",
+        String::from_utf8_lossy(&body)
+    );
     let v = parse_json(&body);
     assert_eq!(v["rows"][0][1], json!(1), "properties_set must be 1");
 
@@ -1056,10 +1077,17 @@ async fn http_params_write_set_is_durable() {
     drop(db);
     let db2 = SharedDb::open(&dir).unwrap();
     // Read back the updated score via a direct query.
-    let rs = db2.read().query(
-        "MATCH (n:HPW) RETURN n.score",
-        &std::collections::BTreeMap::new(),
-    ).unwrap();
+    let rs = db2
+        .read()
+        .query(
+            "MATCH (n:HPW) RETURN n.score",
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
     assert_eq!(rs.len(), 1);
-    assert_eq!(rs.get(0, "n.score"), Some(&Value::Int(99)), "score must be 99 after re-open");
+    assert_eq!(
+        rs.get(0, "n.score"),
+        Some(&Value::Int(99)),
+        "score must be 99 after re-open"
+    );
 }

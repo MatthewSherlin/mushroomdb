@@ -353,7 +353,8 @@ fn v4_round_trip_approx_rule_edge_set_identical() {
     {
         let mut db = GraphDb::open(&dir).unwrap();
         for (k, v) in va_data {
-            db.insert_node("VA", k, vec![("emb".into(), emb(v))]).unwrap();
+            db.insert_node("VA", k, vec![("emb".into(), emb(v))])
+                .unwrap();
         }
         db.create_rule(RuleDef {
             name: "vapprox".into(),
@@ -462,7 +463,8 @@ fn v4_replay_identity_with_approx_rule() {
     {
         let mut db = GraphDb::open(&dir).unwrap();
         for (k, v) in va_data {
-            db.insert_node("VA", k, vec![("emb".into(), emb(v))]).unwrap();
+            db.insert_node("VA", k, vec![("emb".into(), emb(v))])
+                .unwrap();
         }
         db.create_rule(RuleDef {
             name: "vapprox".into(),
@@ -554,7 +556,8 @@ fn v4_crash_between_snapshot_and_wal_truncation_with_approx_rule() {
     {
         let mut db = GraphDb::open(&dir).unwrap();
         for (k, v) in va_data {
-            db.insert_node("VA", k, vec![("emb".into(), emb(v))]).unwrap();
+            db.insert_node("VA", k, vec![("emb".into(), emb(v))])
+                .unwrap();
         }
         db.create_rule(RuleDef {
             name: "vapprox".into(),
@@ -574,7 +577,7 @@ fn v4_crash_between_snapshot_and_wal_truncation_with_approx_rule() {
         // Save the pre-snapshot WAL (has InsertNode * 8 + CreateRule).
         let pre_snap_wal = std::fs::read(dir.join("wal.bin")).unwrap();
         db.snapshot().unwrap(); // V4 snapshot written; WAL truncated
-        // Simulate crash: restore pre-snapshot WAL (CreateRule + inserts still there).
+                                // Simulate crash: restore pre-snapshot WAL (CreateRule + inserts still there).
         std::fs::write(dir.join("wal.bin"), &pre_snap_wal).unwrap();
     }
     // Reopen: V4 snapshot loaded (with IVF state), WAL replays CreateRule idempotently.
@@ -584,7 +587,11 @@ fn v4_crash_between_snapshot_and_wal_truncation_with_approx_rule() {
     // At least some edges should be present (recovery didn't drop the rule state).
     let total_approx: usize = va_data
         .iter()
-        .map(|(k, _)| db.neighbors(k, "VAPPROX", Direction::Out).unwrap_or_default().len())
+        .map(|(k, _)| {
+            db.neighbors(k, "VAPPROX", Direction::Out)
+                .unwrap_or_default()
+                .len()
+        })
         .sum();
     assert!(
         total_approx >= 4,
@@ -637,7 +644,8 @@ fn v5_torn_snapshot_write_is_rejected() {
             ("va3", [-0.2, (1.0_f64 - 0.04_f64).sqrt()]),
         ];
         for (k, v) in va_pts {
-            db.insert_node("VA", k, vec![("emb".into(), emb(v))]).unwrap();
+            db.insert_node("VA", k, vec![("emb".into(), emb(v))])
+                .unwrap();
         }
         db.create_rule(RuleDef {
             name: "approx".into(),
@@ -676,7 +684,16 @@ fn v5_torn_snapshot_write_is_rejected() {
     // early payload (n/3), mid-payload (n/2), late payload landing inside the
     // view_defs tail region (n*2/3, n*3/4, n-5), one byte short (n-1).
     // Any truncation must yield Err — never a silently-wrong open.
-    for &trunc in &[5usize, 10, n / 3, n / 2, n * 2 / 3, n * 3 / 4, n.saturating_sub(5), n - 1] {
+    for &trunc in &[
+        5usize,
+        10,
+        n / 3,
+        n / 2,
+        n * 2 / 3,
+        n * 3 / 4,
+        n.saturating_sub(5),
+        n - 1,
+    ] {
         std::fs::write(&path, &good[..trunc]).unwrap();
         assert!(
             GraphDb::open(&dir).is_err(),
@@ -693,15 +710,11 @@ fn v4_weight_prop_round_trip() {
     let dir = tmp("snap-v4-weight");
     let ref_dir = tmp("snap-v4-weight-ref");
 
-    let node_data: &[(&str, &[&str])] = &[
-        ("a", &["x", "y"]),
-        ("b", &["x", "y", "z"]),
-        ("c", &["x"]),
-    ];
+    let node_data: &[(&str, &[&str])] =
+        &[("a", &["x", "y"]), ("b", &["x", "y", "z"]), ("c", &["x"])];
 
-    let make_tags = |tags: &[&str]| {
-        Value::List(tags.iter().map(|t| Value::Str(t.to_string())).collect())
-    };
+    let make_tags =
+        |tags: &[&str]| Value::List(tags.iter().map(|t| Value::Str(t.to_string())).collect());
 
     let rule = || RuleDef {
         name: "overlap_weighted".into(),
@@ -837,10 +850,22 @@ fn v4_round_trip_topk_rule() {
 
         // Verify top-k is correct before snapshot.
         // n0 at year=0: closest are n1 (|Δ|=1, score=0.9) and n2 (|Δ|=2, score=0.8).
-        let n0_out: Vec<String> = db.neighbors("n0", "NEAR2", Direction::Out).unwrap_or_default();
-        assert!(n0_out.contains(&"n1".to_string()), "n0 top-2 should include n1");
-        assert!(n0_out.contains(&"n2".to_string()), "n0 top-2 should include n2");
-        assert_eq!(n0_out.len(), 2, "n0 should have exactly 2 derived edges (k=2)");
+        let n0_out: Vec<String> = db
+            .neighbors("n0", "NEAR2", Direction::Out)
+            .unwrap_or_default();
+        assert!(
+            n0_out.contains(&"n1".to_string()),
+            "n0 top-2 should include n1"
+        );
+        assert!(
+            n0_out.contains(&"n2".to_string()),
+            "n0 top-2 should include n2"
+        );
+        assert_eq!(
+            n0_out.len(),
+            2,
+            "n0 should have exactly 2 derived edges (k=2)"
+        );
 
         // Snapshot mid-stream.
         db.snapshot().unwrap();
@@ -882,9 +907,7 @@ fn v4_round_trip_topk_rule() {
     }
 
     // Final comparison: snap_db edge set must equal ref_db edge set for NEAR2.
-    let all_keys = [
-        "n0", "n1", "n2", "n5", "n9", "nfar", "n05", "n06",
-    ];
+    let all_keys = ["n0", "n1", "n2", "n5", "n9", "nfar", "n05", "n06"];
     for key in all_keys {
         let snap_out: std::collections::BTreeSet<String> = snap_db
             .neighbors(key, "NEAR2", Direction::Out)
@@ -917,7 +940,11 @@ fn v4_round_trip_topk_rule() {
         .unwrap_or_default();
     // n0b at year=0.1 has many close neighbours (n0, n05, n06, n1, n2…).
     // Exact top-2 depends on score ordering; just verify the cap is enforced.
-    assert_eq!(n0b_out.len(), 2, "n0b top-2 should have exactly 2 out-edges after reopen");
+    assert_eq!(
+        n0b_out.len(),
+        2,
+        "n0b top-2 should have exactly 2 out-edges after reopen"
+    );
     // Most important: rule ownership is enforced after round-trip.
     // n05 (year=0.5) and n06 (year=0.6) are extremely close (score≈0.99) —
     // n05→n06 is guaranteed to be in n05's top-2 regardless of other candidates.
