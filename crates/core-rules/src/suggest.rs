@@ -380,14 +380,21 @@ pub fn suggest_rules(
         })
         .collect();
 
-    // Profile each label.
+    // Profile each label. The global deadline is checked between labels so the
+    // budget bounds the whole run, not only the candidate-preview phase; labels
+    // profiled after the deadline are skipped and the report is marked truncated.
+    let mut profiling_truncated = false;
     let profiles: BTreeMap<String, BTreeMap<String, FieldProfile>> = label_nodes
         .iter()
         .enumerate()
-        .map(|(i, (label, nodes))| {
+        .filter_map(|(i, (label, nodes))| {
+            if Instant::now() >= global_deadline {
+                profiling_truncated = true;
+                return None;
+            }
             let label_seed = seed.wrapping_add(i as u64 ^ 0x9e37_79b9_7f4a_7c15);
             let p = profile_label(nodes, get_prop, all_fields, config.max_sample_nodes, label_seed);
-            (label.clone(), p)
+            Some((label.clone(), p))
         })
         .collect();
 
@@ -857,5 +864,5 @@ pub fn suggest_rules(
 
     // Sort by estimated edge count descending so the highest-value suggestions come first.
     results.sort_by(|a, b| b.est_edges.cmp(&a.est_edges).then(a.def.name.cmp(&b.def.name)));
-    SuggestReport { suggestions: results, truncated }
+    SuggestReport { suggestions: results, truncated: truncated || profiling_truncated }
 }
