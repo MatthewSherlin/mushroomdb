@@ -1247,6 +1247,23 @@ fn write_batch_large_frame_dst_byte_sweep() {
                     "crash_at={crash_at}: del_target.v must be 7 before batch"
                 );
             }
+            // LNK edges must be absent when the batch hasn't landed.
+            // bn0 and bn2 don't exist yet, so neighbors returns Err → empty.
+            // This assertion is symmetric with the landed-batch edge check above.
+            assert!(
+                recovered
+                    .neighbors("bn0", "LNK", Direction::Out)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "crash_at={crash_at}: LNK edges from bn0 must be absent before batch"
+            );
+            assert!(
+                recovered
+                    .neighbors("bn2", "LNK", Direction::Out)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "crash_at={crash_at}: LNK edges from bn2 must be absent before batch"
+            );
         }
 
         // Rule consistency: no derived STAG edge may reference a non-live node.

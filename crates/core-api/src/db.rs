@@ -684,6 +684,27 @@ impl<F: Fs> GraphDb<F> {
         self.log_then_apply_with(rec, None)
     }
 
+    /// # Apply-infallibility invariant (load-bearing)
+    ///
+    /// The ordering is: WAL append → fsync → apply. If `apply` returned `Err`
+    /// for a `Batch` frame after a successful WAL write, the WAL would contain
+    /// the full frame while in-memory state would reflect only the ops before
+    /// the failure. On reopen, WAL replay would then apply the entire batch —
+    /// diverging permanently from what the pre-crash process had in memory.
+    ///
+    /// For `Batch` frames this situation cannot arise because:
+    /// - All validation runs via `commit_logged_batch`/`MutPreview` **before**
+    ///   the WAL write. `MutPreview` uses the same `&mut self` that apply will
+    ///   use, with no concurrent mutation between validation exit and apply entry.
+    /// - Every `apply` arm for a validated op is either infallible by construction
+    ///   (`InsertNode`, `RemoveProp`, `DeleteEdge`, `DeleteNode`), has idempotency
+    ///   guards that return `Ok(())` (`CreateRule`, `DeleteRule`), or is
+    ///   guaranteed-present by validation (`InsertEdge`/`SetProp` key lookups).
+    /// - `on_node_changed` and `on_node_removed` return `()` — never `Err`.
+    ///
+    /// A `debug_assert!` below fires in debug builds if `apply` ever returns
+    /// `Err` for a `Batch` frame, making any future regression immediately visible
+    /// in tests rather than silently diverging crash-recovery behaviour.
     fn log_then_apply_with(
         &mut self,
         rec: WalRecord,
@@ -691,7 +712,19 @@ impl<F: Fs> GraphDb<F> {
     ) -> Result<()> {
         self.fs.append(FileId::Wal, &encode_record(&rec))?;
         self.fs.sync(FileId::Wal)?; // strict policy in plan 1
-        self.apply(&rec)?;
+        let apply_result = self.apply(&rec);
+        // For Batch frames, post-validation apply must be infallible (see above).
+        // A debug_assert here catches any future change that makes apply fallible
+        // before the caller notices via silent WAL/memory divergence.
+        if matches!(&rec, WalRecord::Batch(_)) {
+            debug_assert!(
+                apply_result.is_ok(),
+                "Batch apply returned Err after successful WAL write — \
+                 the validate-then-apply invariant has been violated; \
+                 see log_then_apply_with invariant doc"
+            );
+        }
+        apply_result?;
         self.emit_committed(&rec, ingest);
         Ok(())
     }

@@ -324,6 +324,39 @@ mod tests {
             "RemoveProp wire format changed — this breaks all existing WAL files"
         );
 
+        // ── Variant 8: Batch([DeleteNode { key: "z" }]) ──────────────────────
+        // Pins discriminant 8 with an exact-bytes golden (payload hardcoded;
+        // CRC derived from that payload so the frame is self-consistent).
+        // An accidental insertion of any variant before `Batch` in the enum
+        // changes the discriminant bytes, which breaks this assertion
+        // immediately — preventing silent corruption of every existing WAL file
+        // that contains Batch frames.
+        let batch_single = WalRecord::Batch(vec![WalRecord::DeleteNode { key: "z".into() }]);
+        // Payload: discriminant 8, vec len 1, DeleteNode discriminant 7, key "z".
+        // 4 + 8 + 4 + 8 + 1 = 25 bytes.
+        #[rustfmt::skip]
+        let batch_payload: &[u8] = &[
+            // discriminant=8 (Batch)
+            8, 0, 0, 0,
+            // inner vec len=1 (bincode u64 LE)
+            1, 0, 0, 0, 0, 0, 0, 0,
+            // DeleteNode discriminant=7
+            7, 0, 0, 0,
+            // key "z": len=1 (u64 LE), b'z'=122
+            1, 0, 0, 0, 0, 0, 0, 0, 122,
+        ];
+        let batch_crc = crc32fast::hash(batch_payload);
+        let mut expected_batch_frame: Vec<u8> = Vec::with_capacity(8 + batch_payload.len());
+        expected_batch_frame.extend((batch_payload.len() as u32).to_le_bytes());
+        expected_batch_frame.extend(batch_crc.to_le_bytes());
+        expected_batch_frame.extend_from_slice(batch_payload);
+        assert_eq!(
+            encode_record(&batch_single),
+            expected_batch_frame,
+            "Batch (discriminant 8) wire format changed — a variant may have \
+             been inserted before position 8, breaking all existing WAL Batch frames"
+        );
+
         // ── Variant 9: RebuildRule { name: "eq" } ─────────────────────────────
         // Batch remains discriminant 8; this variant is appended after it.
         let rebuild = WalRecord::RebuildRule { name: "eq".into() };
