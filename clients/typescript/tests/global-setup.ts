@@ -107,7 +107,7 @@ function tryBuild(cargo: string): { ok: true } | { ok: false; reason: string } {
   try {
     execFileSync(
       cargo,
-      ["build", "-p", "cli", "--bin", "mushroomdb"],
+      ["build", "-p", "mushroomdb-cli", "--bin", "mushroomdb"],
       {
         cwd: REPO_ROOT,
         stdio: "inherit",
