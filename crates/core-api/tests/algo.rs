@@ -80,6 +80,18 @@ fn pagerank_star_hub_ranks_top() {
             "hub score {top_score} must exceed spoke score {score}"
         );
     }
+    // Mass conservation: scores must sum to 1.0 (±1e-6).
+    let mass: f64 = report.scores.iter().map(|(_, s)| s).sum();
+    assert!(
+        (mass - 1.0).abs() < 1e-6,
+        "PageRank mass must be conserved (sum ≈ 1.0), got {mass}"
+    );
+    // Hand-computed hub score for this star topology with d=0.85, N=5:
+    //   PR(hub) = 0.132 / 0.252 ≈ 0.5238
+    assert!(
+        (*top_score - 0.524).abs() < 0.01,
+        "hub score should be ≈0.524 (±0.01), got {top_score}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -196,6 +208,76 @@ fn pagerank_sort_order() {
             report.scores
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dangling-node mass conservation: a graph where some nodes have no out-edges.
+/// The sum of all PageRank scores must stay ≈ 1.0 despite dangling mass redistribution.
+#[test]
+fn pagerank_dangling_node_mass_conservation() {
+    let dir = tmp("pr-dangle-mass");
+    let mut db = open(&dir);
+    // a→b, a→c; b and c are dangling (no out-edges).
+    for k in ["a", "b", "c"] {
+        insert_node(&mut db, "N", k);
+    }
+    insert_edge(&mut db, "E", "a", "b");
+    insert_edge(&mut db, "E", "a", "c");
+    let config = PageRankConfig { max_iters: 100, ..PageRankConfig::default() };
+    let report = db.pagerank(&config);
+    assert!(report.converged, "simple dangling graph should converge");
+    let mass: f64 = report.scores.iter().map(|(_, s)| s).sum();
+    assert!(
+        (mass - 1.0).abs() < 1e-6,
+        "dangling-node PR mass must be conserved (sum ≈ 1.0), got {mass}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Edge-type filter using a DERIVED edge type: rule fires LINKED edges,
+/// filter to LINKED, results reflect only the derived topology.
+#[test]
+fn pagerank_derived_edge_type_filter() {
+    let dir = tmp("pr-derived-filter");
+    let mut db = open(&dir);
+    // Two nodes sharing the same tag: rule fires a LINKED edge between them.
+    db.insert_node("T", "x", vec![("tag".into(), Value::Str("same".into()))]).unwrap();
+    db.insert_node("T", "y", vec![("tag".into(), Value::Str("same".into()))]).unwrap();
+    // Third node connected to x via a manual MANUAL edge only.
+    db.insert_node("T", "z", vec![("tag".into(), Value::Str("other".into()))]).unwrap();
+    insert_edge(&mut db, "MANUAL", "z", "x");
+    db.create_rule(RuleDef {
+        name: "link-same".into(),
+        src_label: "T".into(),
+        dst_label: "T".into(),
+        predicate: Predicate::FieldEqual { field: "tag".into() },
+        edge_type: "LINKED".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+    }).unwrap();
+    // Filter to only LINKED (derived) edges: z has no LINKED edge, so z should score lower.
+    let config = PageRankConfig {
+        edge_type: Some("LINKED".into()),
+        max_iters: 100,
+        ..PageRankConfig::default()
+    };
+    let report = db.pagerank(&config);
+    assert_eq!(report.scores.len(), 3, "all 3 nodes must appear");
+    // x and y are mutually linked via LINKED; z has no LINKED edges → dangling.
+    // x and y must have equal scores (symmetric LINKED graph).
+    let x_score = report.scores.iter().find(|(k, _)| k == "x").unwrap().1;
+    let y_score = report.scores.iter().find(|(k, _)| k == "y").unwrap().1;
+    assert!(
+        (x_score - y_score).abs() < 1e-9,
+        "x and y should have equal PR under LINKED filter, got x={x_score} y={y_score}"
+    );
+    // Mass conservation still holds.
+    let mass: f64 = report.scores.iter().map(|(_, s)| s).sum();
+    assert!(
+        (mass - 1.0).abs() < 1e-6,
+        "derived-filter PR mass must be conserved, got {mass}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

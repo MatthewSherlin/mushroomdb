@@ -84,6 +84,8 @@ db.write_scores("pagerank", &report.scores)?;
 - Any call on a read-only as-of instance (`ReadOnly`).
 - Unknown node keys in the scores list (`KeyNotFound`).
 
+Any rules or materialized views that watch the written property will fire immediately after the batch commits — this is a feature, not a side effect. For example, writing a `pagerank` score property and having a rule that links high-PR nodes will produce derived edges on the next access.
+
 ## HTTP API
 
 All three algorithms are accessible via `POST /algo/{pagerank|wcc|degree}`:
