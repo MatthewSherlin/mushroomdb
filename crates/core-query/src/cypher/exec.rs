@@ -1,7 +1,7 @@
 //! Cypher executor: `PlanOp` sequence → `ResultSet` over a binding table.
 
 use crate::cypher::ast::{
-    AggArg, AggFunc, Expr, Operand, OrderItem, OrderTarget, RetItem, RetVal, UnwindExpr,
+    AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem, OrderTarget, RetItem, RetVal, UnwindExpr,
 };
 use crate::cypher::plan::PlanOp;
 use crate::cypher::RelDir;
@@ -351,18 +351,20 @@ fn execute_inner(
                     exec_order_by_rows(&vars, &mut rows, items, view);
                 }
             }
-            PlanOp::Skip(n) => {
+            PlanOp::Skip(ls) => {
+                let n = resolve_ls(ls, params)?;
                 if let Some(table) = projected.as_mut() {
-                    apply_skip(&mut table.rows, *n);
+                    apply_skip(&mut table.rows, n);
                 } else {
-                    apply_skip(&mut rows, *n);
+                    apply_skip(&mut rows, n);
                 }
             }
-            PlanOp::Limit(n) => {
+            PlanOp::Limit(ls) => {
+                let n = resolve_ls(ls, params)?;
                 if let Some(table) = projected.as_mut() {
-                    apply_limit(&mut table.rows, *n);
+                    apply_limit(&mut table.rows, n);
                 } else {
-                    apply_limit(&mut rows, *n);
+                    apply_limit(&mut rows, n);
                 }
             }
             // GroupAggregate plans without VarExpand or pipeline are routed to
@@ -462,11 +464,13 @@ fn execute_inner(
                 if !order_by.is_empty() {
                     exec_order_by_rows(&vars, &mut rows, order_by, view);
                 }
-                if let Some(n) = skip {
-                    apply_skip(&mut rows, *n);
+                if let Some(ls) = skip {
+                    let n = resolve_ls(ls, params)?;
+                    apply_skip(&mut rows, n);
                 }
-                if let Some(n) = limit {
-                    apply_limit(&mut rows, *n);
+                if let Some(ls) = limit {
+                    let n = resolve_ls(ls, params)?;
+                    apply_limit(&mut rows, n);
                 }
             }
             // UNWIND: expand each input row into N rows by iterating a list value.
@@ -704,10 +708,60 @@ fn collect_params_from_ops(
             PlanOp::LeftOuterApply { inner, .. } => {
                 collect_params_from_ops(inner, names, seen)?;
             }
+            // Recurse into Project, With, and GroupAggregate to catch $param
+            // references inside RETURN/WITH FuncCall args and group-key items.
+            PlanOp::Project { items } => {
+                for item in items {
+                    collect_ret_item_params(item, names, seen);
+                }
+            }
+            PlanOp::With { items, where_expr, .. } => {
+                for item in items {
+                    collect_ret_item_params(item, names, seen);
+                }
+                if let Some(expr) = where_expr {
+                    let _ = collect_expr(expr, names, seen, 0);
+                }
+            }
+            PlanOp::GroupAggregate { keys, aggs } => {
+                for (_, item) in keys {
+                    collect_ret_item_params(item, names, seen);
+                }
+                for (_, arg, _) in aggs {
+                    match arg {
+                        AggArg::Star => {}
+                        AggArg::Var(_) => {}
+                        AggArg::Prop { .. } => {}
+                    }
+                }
+            }
+            // SKIP/LIMIT $param: register the name so missing params are
+            // caught at pre-flight time rather than execution time.
+            PlanOp::Skip(LimitSkip::Param(n)) | PlanOp::Limit(LimitSkip::Param(n)) => {
+                if seen.insert(n.clone()) {
+                    names.push(n.clone());
+                }
+            }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Collect `$param` names referenced inside a single RETURN/WITH item.
+fn collect_ret_item_params(
+    item: &RetItem,
+    names: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+) {
+    match &item.value {
+        RetVal::FuncCall { args, .. } => {
+            for arg in args {
+                collect_operand(arg, names, seen);
+            }
+        }
+        RetVal::Prop { .. } | RetVal::Var(_) | RetVal::Agg { .. } => {}
+    }
 }
 
 fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<String>) {
@@ -1585,12 +1639,14 @@ fn execute_pull(
     let mut result_rows: Vec<Vec<Option<Value>>> = Vec::with_capacity(bound);
     pull_rows(&ctx, producers, &mut initial_row, &mut result_rows)?;
     // SKIP: discard the leading rows (bound = SKIP+LIMIT ensures there are enough).
+    // Resolve SKIP — params must have been validated by check_params already.
     let skip_n = plan[proj_pos + 1..]
         .iter()
         .find_map(|op| match op {
-            PlanOp::Skip(n) => Some(*n),
+            PlanOp::Skip(ls) => Some(resolve_ls(ls, params)),
             _ => None,
         })
+        .transpose()?
         .unwrap_or(0);
     let skip_n = usize::try_from(skip_n).unwrap_or(usize::MAX);
     let mut rs = ResultSet::new(columns);
@@ -1975,15 +2031,15 @@ fn agg_stream(
                 "agg executor: OrderBy in producer slice — structurally malformed".to_string(),
             );
         }
-        PlanOp::Skip(n) => {
-            return Err(format!(
-                "agg executor: Skip({n}) in producer slice — structurally malformed"
-            ));
+        PlanOp::Skip(_) => {
+            return Err(
+                "agg executor: Skip in producer slice — structurally malformed".to_string()
+            );
         }
-        PlanOp::Limit(n) => {
-            return Err(format!(
-                "agg executor: Limit({n}) in producer slice — structurally malformed"
-            ));
+        PlanOp::Limit(_) => {
+            return Err(
+                "agg executor: Limit in producer slice — structurally malformed".to_string()
+            );
         }
         PlanOp::Aggregate { .. } => {
             return Err(
@@ -2199,8 +2255,8 @@ fn execute_group_aggregate(
     for op in tail {
         match op {
             PlanOp::OrderBy { items } => exec_order_by(&mut projected, items)?,
-            PlanOp::Skip(n) => apply_skip(&mut projected.rows, *n),
-            PlanOp::Limit(n) => apply_limit(&mut projected.rows, *n),
+            PlanOp::Skip(ls) => { let n = resolve_ls(ls, params)?; apply_skip(&mut projected.rows, n); }
+            PlanOp::Limit(ls) => { let n = resolve_ls(ls, params)?; apply_limit(&mut projected.rows, n); }
             _ => {} // Ignore unexpected ops defensively.
         }
     }
@@ -2401,15 +2457,15 @@ fn group_stream(
                 "group executor: OrderBy in producer slice — structurally malformed".to_string(),
             );
         }
-        PlanOp::Skip(n) => {
-            return Err(format!(
-                "group executor: Skip({n}) in producer slice — structurally malformed"
-            ));
+        PlanOp::Skip(_) => {
+            return Err(
+                "group executor: Skip in producer slice — structurally malformed".to_string()
+            );
         }
-        PlanOp::Limit(n) => {
-            return Err(format!(
-                "group executor: Limit({n}) in producer slice — structurally malformed"
-            ));
+        PlanOp::Limit(_) => {
+            return Err(
+                "group executor: Limit in producer slice — structurally malformed".to_string()
+            );
         }
         PlanOp::Aggregate { .. } => {
             return Err(
@@ -2672,15 +2728,17 @@ fn pull_rows(
                     .to_string(),
             );
         }
-        PlanOp::Skip(n) => {
-            return Err(format!(
-                "pull executor: Skip({n}) reached pull_rows — Skip must appear after Project"
-            ));
+        PlanOp::Skip(_) => {
+            return Err(
+                "pull executor: Skip reached pull_rows — Skip must appear after Project"
+                    .to_string()
+            );
         }
-        PlanOp::Limit(n) => {
-            return Err(format!(
-                "pull executor: Limit({n}) reached pull_rows — Limit must appear after Project"
-            ));
+        PlanOp::Limit(_) => {
+            return Err(
+                "pull executor: Limit reached pull_rows — Limit must appear after Project"
+                    .to_string()
+            );
         }
         PlanOp::Aggregate { .. } => {
             return Err(
@@ -2904,6 +2962,30 @@ fn exec_order_by(table: &mut Projected, items: &[OrderItem]) -> Result<(), Strin
     Ok(())
 }
 
+/// Resolve a `LimitSkip` value to a concrete `u64` using the query params map.
+///
+/// `LimitSkip::Exact(n)` resolves immediately.  `LimitSkip::Param(name)` looks
+/// up the named parameter and validates it is a non-negative integer.
+fn resolve_ls(ls: &LimitSkip, params: &Params) -> Result<u64, String> {
+    match ls {
+        LimitSkip::Exact(n) => Ok(*n),
+        LimitSkip::Param(name) => {
+            let val = params.0.get(name).ok_or_else(|| {
+                format!("missing parameter `{name}` (used in LIMIT/SKIP)")
+            })?;
+            match val {
+                Value::Int(i) if *i >= 0 => Ok(*i as u64),
+                Value::Int(i) => Err(format!(
+                    "LIMIT/SKIP parameter `{name}` must be a non-negative integer, got {i}"
+                )),
+                other => Err(format!(
+                    "LIMIT/SKIP parameter `{name}` must be an integer, got {other:?}"
+                )),
+            }
+        }
+    }
+}
+
 fn apply_skip<T>(rows: &mut Vec<T>, n: u64) {
     let n = usize::try_from(n).unwrap_or(usize::MAX);
     if n >= rows.len() {
@@ -2921,7 +3003,7 @@ fn apply_limit<T>(rows: &mut Vec<T>, n: u64) {
 #[cfg(test)]
 mod tests {
     use super::{execute, Params};
-    use crate::cypher::ast::{Operand, OrderItem, OrderTarget, RetItem, RetVal};
+    use crate::cypher::ast::{LimitSkip, Operand, OrderItem, OrderTarget, RetItem, RetVal};
     use crate::cypher::plan::{plan, PlanOp};
     use crate::cypher::{lex, parse, RelDir};
     use crate::result::ResultSet;
@@ -3609,7 +3691,7 @@ LIMIT 10";
                     props: vec![("k".into(), Operand::Lit(i(1)))],
                 },
             ],
-            vec![PlanOp::Skip(99), PlanOp::Limit(0)],
+            vec![PlanOp::Skip(LimitSkip::Exact(99)), PlanOp::Limit(LimitSkip::Exact(0))],
         ];
         for plan in hostile {
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

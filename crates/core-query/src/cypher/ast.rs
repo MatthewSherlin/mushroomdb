@@ -3,6 +3,16 @@
 use crate::filter::CmpOp;
 use core_storage::Value;
 
+/// A LIMIT or SKIP value: either an exact count or a named query parameter.
+///
+/// `$name` parameters are resolved at execution time from the params map and
+/// validated to be a non-negative integer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LimitSkip {
+    Exact(u64),
+    Param(String),
+}
+
 /// One `OPTIONAL MATCH pattern [WHERE expr]` clause.
 ///
 /// If the pattern produces no rows for a given input row, the input row
@@ -35,8 +45,8 @@ pub struct Query {
     pub stages: Vec<WithStage>,
     pub returns: Vec<RetItem>,
     pub order_by: Vec<OrderItem>,
-    pub skip: Option<u64>,
-    pub limit: Option<u64>,
+    pub skip: Option<LimitSkip>,
+    pub limit: Option<LimitSkip>,
 }
 
 /// One `UNWIND <expr> AS <alias>` clause.
@@ -69,8 +79,8 @@ pub struct WithStage {
     /// Optional WHERE / HAVING filter immediately after the WITH keyword.
     pub where_expr: Option<Expr>,
     pub order_by: Vec<OrderItem>,
-    pub skip: Option<u64>,
-    pub limit: Option<u64>,
+    pub skip: Option<LimitSkip>,
+    pub limit: Option<LimitSkip>,
     /// MATCH clauses that follow this WITH.
     pub matches: Vec<Pattern>,
     /// OPTIONAL MATCH clauses that follow the required MATCHes in this stage.

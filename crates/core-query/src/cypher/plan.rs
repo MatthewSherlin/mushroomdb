@@ -5,8 +5,8 @@
 //! *start* node of a MATCH whose variable is already bound.
 
 use super::ast::{
-    AggArg, AggFunc, Expr, NodePat, Operand, OptionalClause, OrderItem, OrderTarget, Pattern,
-    Query, RelDir, RelPat, RetItem, RetVal, UnwindExpr, WithStage,
+    AggArg, AggFunc, Expr, LimitSkip, NodePat, Operand, OptionalClause, OrderItem, OrderTarget,
+    Pattern, Query, RelDir, RelPat, RetItem, RetVal, UnwindExpr, WithStage,
 };
 use std::collections::BTreeSet;
 
@@ -58,8 +58,8 @@ pub enum PlanOp {
     OrderBy {
         items: Vec<OrderItem>,
     },
-    Skip(u64),
-    Limit(u64),
+    Skip(LimitSkip),
+    Limit(LimitSkip),
     /// Single aggregate over all matched rows (no grouping).
     ///
     /// Execution routes to a streaming accumulator path (O(1) memory).
@@ -141,8 +141,8 @@ pub enum PlanOp {
         items: Vec<RetItem>,
         where_expr: Option<Expr>,
         order_by: Vec<OrderItem>,
-        skip: Option<u64>,
-        limit: Option<u64>,
+        skip: Option<LimitSkip>,
+        limit: Option<LimitSkip>,
     },
     /// UNWIND: expand each input row into N rows by iterating a list value.
     ///
@@ -239,14 +239,16 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
         return None;
     }
     let limit_n = ops.iter().rev().find_map(|op| match op {
-        PlanOp::Limit(n) => Some(*n),
+        PlanOp::Limit(LimitSkip::Exact(n)) => Some(*n),
+        PlanOp::Limit(LimitSkip::Param(_)) => None, // param-limit: can't determine bound statically
         _ => None,
     })?;
     let skip_n = ops
         .iter()
         .rev()
         .find_map(|op| match op {
-            PlanOp::Skip(n) => Some(*n),
+            PlanOp::Skip(LimitSkip::Exact(n)) => Some(*n),
+            PlanOp::Skip(LimitSkip::Param(_)) => Some(0), // conservatively treat as 0
             _ => None,
         })
         .unwrap_or(0);
@@ -397,11 +399,11 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
             }
             ops.push(PlanOp::OrderBy { items });
         }
-        if let Some(n) = q.skip {
-            ops.push(PlanOp::Skip(n));
+        if let Some(ls) = &q.skip {
+            ops.push(PlanOp::Skip(ls.clone()));
         }
-        if let Some(n) = q.limit {
-            ops.push(PlanOp::Limit(n));
+        if let Some(ls) = &q.limit {
+            ops.push(PlanOp::Limit(ls.clone()));
         }
         return Ok(ops);
     }
@@ -418,11 +420,11 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         ops.push(PlanOp::OrderBy { items });
     }
 
-    if let Some(n) = q.skip {
-        ops.push(PlanOp::Skip(n));
+    if let Some(ls) = &q.skip {
+        ops.push(PlanOp::Skip(ls.clone()));
     }
-    if let Some(n) = q.limit {
-        ops.push(PlanOp::Limit(n));
+    if let Some(ls) = &q.limit {
+        ops.push(PlanOp::Limit(ls.clone()));
     }
 
     Ok(ops)
@@ -505,11 +507,11 @@ fn compile_with_stage(
                 items: stage.order_by.clone(),
             });
         }
-        if let Some(n) = stage.skip {
-            ops.push(PlanOp::Skip(n));
+        if let Some(ls) = &stage.skip {
+            ops.push(PlanOp::Skip(ls.clone()));
         }
-        if let Some(n) = stage.limit {
-            ops.push(PlanOp::Limit(n));
+        if let Some(ls) = &stage.limit {
+            ops.push(PlanOp::Limit(ls.clone()));
         }
     } else {
         // Non-aggregate WITH → validate items and emit PlanOp::With.
@@ -548,8 +550,8 @@ fn compile_with_stage(
             items: stage.items.clone(),
             where_expr: stage.where_expr.clone(),
             order_by: stage.order_by.clone(),
-            skip: stage.skip,
-            limit: stage.limit,
+            skip: stage.skip.clone(),
+            limit: stage.limit.clone(),
         });
 
         // Update bound: after non-aggregate WITH, only the WITH items survive.
@@ -999,7 +1001,7 @@ fn rewrite_order_item(
 #[cfg(test)]
 mod tests {
     use super::{plan, PlanOp};
-    use crate::cypher::ast::{Expr, Operand, OrderItem, OrderTarget, RetItem, RetVal};
+    use crate::cypher::ast::{Expr, LimitSkip, Operand, OrderItem, OrderTarget, RetItem, RetVal};
     use crate::cypher::{lex, parse, RelDir};
     use crate::filter::CmpOp;
     use core_storage::Value;
@@ -1128,7 +1130,7 @@ LIMIT 10";
                     },
                 ],
             },
-            PlanOp::Limit(10),
+            PlanOp::Limit(LimitSkip::Exact(10)),
         ];
         assert_eq!(got, expected);
     }
@@ -1403,8 +1405,8 @@ LIMIT 10";
                         alias: None,
                     }],
                 },
-                PlanOp::Skip(2),
-                PlanOp::Limit(3),
+                PlanOp::Skip(LimitSkip::Exact(2)),
+                PlanOp::Limit(LimitSkip::Exact(3)),
             ]
         );
     }
@@ -1471,8 +1473,8 @@ LIMIT 10";
                 target: OrderTarget::Alias("missing".into()),
                 descending: true,
             }],
-            skip: Some(0),
-            limit: Some(0),
+            skip: Some(LimitSkip::Exact(0)),
+            limit: Some(LimitSkip::Exact(0)),
         };
         let result = std::panic::catch_unwind(|| plan(&q));
         assert!(result.is_ok(), "plan panicked on hand-built Query");
@@ -1542,7 +1544,7 @@ LIMIT 10";
             .iter()
             .any(|op| matches!(op, PlanOp::VarExpand { .. }));
         assert!(has_var, "plan must contain VarExpand");
-        let has_limit = ops.iter().any(|op| matches!(op, PlanOp::Limit(5)));
+        let has_limit = ops.iter().any(|op| matches!(op, PlanOp::Limit(LimitSkip::Exact(5))));
         assert!(has_limit, "plan must still emit Limit op");
     }
 

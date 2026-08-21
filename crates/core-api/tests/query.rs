@@ -1402,3 +1402,206 @@ fn fn_unknown_function_error() {
         "error must name the unknown function: {msg}"
     );
 }
+
+// ── LIMIT/SKIP $param tests ───────────────────────────────────────────────────
+
+/// LIMIT $n resolves the named parameter at runtime.
+#[test]
+fn limit_param_basic() {
+    let dir = tmp("limit_param");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        for i in 0..5u32 {
+            batch.insert_node("LP", &format!("n{i}"), vec![]);
+        }
+        batch.commit().unwrap();
+    }
+    let rs = db.query_with_params(
+        "MATCH (n:LP) RETURN n LIMIT $cap",
+        &[("cap", Value::Int(2))],
+    ).unwrap();
+    assert_eq!(rs.len(), 2, "LIMIT $cap=2 must return exactly 2 rows");
+}
+
+/// SKIP $n resolves the named parameter at runtime.
+#[test]
+fn skip_param_basic() {
+    let dir = tmp("skip_param");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        for i in 0..5u32 {
+            batch.insert_node("SP", &format!("n{i}"), vec![]);
+        }
+        batch.commit().unwrap();
+    }
+    let rs = db.query_with_params(
+        "MATCH (n:SP) RETURN n SKIP $offset LIMIT 10",
+        &[("offset", Value::Int(3))],
+    ).unwrap();
+    assert_eq!(rs.len(), 2, "SKIP $offset=3 with 5 nodes must return 2 rows");
+}
+
+/// Negative integer for LIMIT $param is a named error.
+#[test]
+fn limit_param_negative_is_error() {
+    let dir = tmp("limit_param_neg");
+    let db = GraphDb::open(&dir).unwrap();
+    let err = db.query_with_params(
+        "MATCH (n:LPN) RETURN n LIMIT $cap",
+        &[("cap", Value::Int(-1))],
+    );
+    assert!(err.is_err(), "negative LIMIT param must return Err");
+    let msg = format!("{:?}", err.unwrap_err());
+    assert!(
+        msg.contains("non-negative") || msg.contains("cap"),
+        "error must mention the param or non-negative: {msg}"
+    );
+}
+
+/// Unknown $param in LIMIT is caught upfront.
+#[test]
+fn limit_param_unknown_is_error() {
+    let dir = tmp("limit_param_unknown");
+    let db = GraphDb::open(&dir).unwrap();
+    let err = db.query_with_params(
+        "MATCH (n:LPUK) RETURN n LIMIT $missing",
+        &[], // no params provided
+    );
+    assert!(err.is_err(), "missing LIMIT param must return Err");
+    let msg = format!("{:?}", err.unwrap_err());
+    assert!(
+        msg.contains("missing") || msg.contains("missing_param") || msg.contains("missing"),
+        "error must mention missing parameter: {msg}"
+    );
+}
+
+// ── Regression: pipeline GroupAggregate without OPTIONAL MATCH ────────────────
+
+/// Regression pin for the pre-existing pipeline GroupAggregate bug fixed in T3.
+/// `MATCH (a) WITH a RETURN COUNT(a)` went through the pipeline path even without
+/// OPTIONAL MATCH (because GroupAggregate-then-Filter counts as pipeline).  The
+/// executor returned an empty ResultSet instead of one row with the aggregate.
+/// This test uses a concrete query shape that exercises the same code path.
+#[test]
+fn pipeline_group_aggregate_without_optional_match() {
+    let dir = tmp("pipeline_gagg");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("PGA", "a", vec![]);
+        batch.insert_node("PGA", "b", vec![]);
+        batch.insert_node("PGA", "c", vec![]);
+        batch.commit().unwrap();
+    }
+    // This query forces the pipeline path via GroupAggregate in staged executor.
+    // Without the fix, it would return 0 rows.
+    let rs = db.query(
+        "MATCH (a:PGA) WITH a RETURN COUNT(a)",
+        &BTreeMap::new(),
+    ).unwrap();
+    assert_eq!(rs.len(), 1, "grouped aggregate with no keys must return exactly 1 row");
+    assert_eq!(
+        get_val(&rs, 0, "COUNT(a)"),
+        Some(Value::Int(3)),
+        "COUNT(a) over 3 nodes must be 3"
+    );
+}
+
+// ── collect_params pre-flight for RETURN FuncCall ─────────────────────────────
+
+/// A missing $param referenced inside a RETURN FuncCall must be caught by the
+/// pre-flight param check, not per-row inside eval_func.
+#[test]
+fn params_preflight_catches_missing_param_in_return_funccall() {
+    let dir = tmp("params_preflight");
+    let db = GraphDb::open(&dir).unwrap();
+    let err = db.query(
+        "MATCH (n:PF) RETURN toLower($val)",
+        &BTreeMap::new(), // $val not provided
+    );
+    assert!(err.is_err(), "missing $val in RETURN FuncCall must return Err");
+    let msg = format!("{:?}", err.unwrap_err());
+    assert!(
+        msg.contains("missing") || msg.contains("val"),
+        "error must mention the missing parameter: {msg}"
+    );
+}
+
+// ── Minor gap tests ───────────────────────────────────────────────────────────
+
+/// OPTIONAL MATCH as the first clause (no preceding MATCH) must be rejected
+/// with a named parse error, not a panic.
+#[test]
+fn optional_match_as_first_clause_is_parse_error() {
+    let dir = tmp("optional_first");
+    let db = GraphDb::open(&dir).unwrap();
+    let err = db.query(
+        "OPTIONAL MATCH (a:Person) RETURN a",
+        &BTreeMap::new(),
+    );
+    assert!(err.is_err(), "OPTIONAL MATCH without preceding MATCH must fail");
+    let msg = format!("{:?}", err.unwrap_err());
+    assert!(
+        msg.contains("MATCH") || msg.contains("parse") || msg.contains("expected"),
+        "error must indicate a parse issue: {msg}"
+    );
+}
+
+/// size() on a non-string non-list value (Int) propagates null, not an error.
+#[test]
+fn fn_size_non_string_non_list_is_null() {
+    let dir = tmp("fn_size_int");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Si", "x", vec![("v".into(), Value::Int(42))]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query("MATCH (n:Si) RETURN size(n.v)", &BTreeMap::new()).unwrap();
+    assert_eq!(rs.len(), 1);
+    // size(<Int>) → null (not an error; openCypher null propagation)
+    assert_eq!(get_val(&rs, 0, "size(n.v)"), None, "size on Int must return null");
+}
+
+/// type(r) on a rule-derived edge returns the rule's edge_type string.
+#[test]
+fn fn_type_on_derived_edge() {
+    let dir = tmp("fn_type_derived");
+    let mut db = GraphDb::open(&dir).unwrap();
+    // Create a rule that produces a LINKED_TO edge.
+    db.create_rule(RuleDef {
+        name: "link_rule".into(),
+        src_label: "TypeOrg".into(),
+        dst_label: "TypePerson".into(),
+        predicate: Predicate::Overlap {
+            field: "tags".into(),
+            min: 0.1,
+        },
+        edge_type: "LINKED_TO".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+    }).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("TypeOrg", "org1", vec![
+            ("tags".into(), Value::List(vec![Value::Str("rust".into())])),
+        ]);
+        batch.insert_node("TypePerson", "person1", vec![
+            ("tags".into(), Value::List(vec![Value::Str("rust".into())])),
+        ]);
+        batch.commit().unwrap();
+    }
+    let rs = db.query(
+        "MATCH (a:TypeOrg)-[r]->(b:TypePerson) RETURN type(r)",
+        &BTreeMap::new(),
+    ).unwrap();
+    assert_eq!(rs.len(), 1, "derived edge must appear in MATCH");
+    assert_eq!(
+        get_val(&rs, 0, "type(r)"),
+        Some(Value::Str("LINKED_TO".into())),
+        "type(r) must return the rule's edge_type for derived edges"
+    );
+}

@@ -2,9 +2,9 @@
 
 use super::ast::{
     AggArg, AggFunc, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
-    MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand, OptionalClause,
-    OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, SetClause,
-    UnwindClause, UnwindExpr, WithStage, WriteStatement,
+    LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand,
+    OptionalClause, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal,
+    SetClause, UnwindClause, UnwindExpr, WithStage, WriteStatement,
 };
 use super::Tok;
 use crate::filter::CmpOp;
@@ -772,15 +772,23 @@ impl<'a> Parser<'a> {
         Ok(OrderItem { target, descending })
     }
 
-    fn uint(&mut self, what: &str) -> Result<u64, String> {
+    fn uint(&mut self, what: &str) -> Result<LimitSkip, String> {
         match self.peek() {
             Some(Tok::Int(n)) if *n >= 0 => {
                 let n = *n as u64;
                 self.pos += 1;
-                Ok(n)
+                Ok(LimitSkip::Exact(n))
             }
             Some(Tok::Int(_)) => Err(self.err(&format!("{what} must be a non-negative integer"))),
-            _ => Err(self.err(&format!("expected integer after {what}"))),
+            Some(Tok::Param(_)) => {
+                let name = match self.toks.get(self.pos) {
+                    Some(Tok::Param(s)) => s.clone(),
+                    _ => unreachable!(),
+                };
+                self.pos += 1;
+                Ok(LimitSkip::Param(name))
+            }
+            _ => Err(self.err(&format!("expected integer or $parameter after {what}"))),
         }
     }
 
@@ -1267,8 +1275,8 @@ enum DeleteTargetResult {
 mod tests {
     use super::parse;
     use crate::cypher::ast::{
-        Expr, HopRange, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat,
-        RetItem, RetVal,
+        Expr, HopRange, LimitSkip, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query,
+        RelDir, RelPat, RetItem, RetVal,
     };
     use crate::cypher::{lex, Tok};
     use crate::filter::CmpOp;
@@ -1403,8 +1411,8 @@ SKIP 1 LIMIT 5";
                     descending: false,
                 },
             ],
-            skip: Some(1),
-            limit: Some(5),
+            skip: Some(LimitSkip::Exact(1)),
+            limit: Some(LimitSkip::Exact(5)),
         };
         assert_eq!(got, expected);
     }
@@ -1620,7 +1628,7 @@ LIMIT 10";
                 },
             ],
             skip: None,
-            limit: Some(10),
+            limit: Some(LimitSkip::Exact(10)),
         };
         assert_eq!(got, expected);
     }

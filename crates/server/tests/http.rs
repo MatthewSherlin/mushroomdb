@@ -956,3 +956,110 @@ async fn embedded_ui_serves_index_and_stats_wins() {
     let j = parse_json(&body);
     assert!(j.get("nodes_live").is_some(), "/stats JSON, got {j}");
 }
+
+// ── HTTP params tests ─────────────────────────────────────────────────────────
+
+/// Params round-trip over HTTP: $age filters nodes, returns correct rows.
+#[tokio::test]
+async fn http_params_read_round_trip() {
+    let (app, db) = open("http-params-read");
+    {
+        let mut w = db.write();
+        w.insert_node("HP", "alice", vec![("age".into(), Value::Int(30))]).unwrap();
+        w.insert_node("HP", "bob", vec![("age".into(), Value::Int(25))]).unwrap();
+    }
+
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({
+                "cypher": "MATCH (n:HP) WHERE n.age = $age RETURN n",
+                "params": {"age": 30}
+            }),
+        ),
+    ).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    let rows = v["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "must match exactly the node with age=30");
+    // The node key "alice" should appear in the result row.
+    let row_str = rows[0].to_string();
+    assert!(row_str.contains("alice"), "returned node must be alice: {row_str}");
+}
+
+/// Injection safety at the HTTP layer: a param value containing Cypher syntax
+/// must be treated as a literal string, not executed.
+#[tokio::test]
+async fn http_params_injection_safe() {
+    let (app, db) = open("http-params-injection");
+    {
+        let mut w = db.write();
+        w.insert_node("HPI", "real_node", vec![]).unwrap();
+    }
+
+    // The param value contains Cypher meta-characters.  If the value were
+    // interpolated into the query string, the query would parse differently
+    // and could return unexpected rows.  As a literal, no node has id equal
+    // to the injection payload, so 0 rows are returned.
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({
+                "cypher": "MATCH (n:HPI {id: $id}) RETURN n",
+                "params": {"id": "' RETURN 1//"}
+            }),
+        ),
+    ).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    let rows = v["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 0, "injection payload must not return rows: {rows:?}");
+}
+
+/// Write with SET n.p = $newval over HTTP is durable across DB re-open.
+#[tokio::test]
+async fn http_params_write_set_is_durable() {
+    let dir = tmp("http-params-write");
+    let db = SharedDb::open(&dir).unwrap();
+    let app = router(db.clone());
+
+    // Insert the node to update.
+    {
+        let mut w = db.write();
+        w.insert_node("HPW", "target", vec![("score".into(), Value::Int(0))]).unwrap();
+    }
+
+    // MATCH…SET with $newval over HTTP.
+    let (status, body, _) = send(
+        app.clone(),
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({
+                "cypher": "MATCH (n:HPW) WHERE n.score = 0 SET n.score = $newval",
+                "params": {"newval": 99}
+            }),
+        ),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "write must succeed: {}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(v["rows"][0][1], json!(1), "properties_set must be 1");
+
+    // Verify durability: drop handles and re-open.
+    drop(app);
+    drop(db);
+    let db2 = SharedDb::open(&dir).unwrap();
+    // Read back the updated score via a direct query.
+    let rs = db2.read().query(
+        "MATCH (n:HPW) RETURN n.score",
+        &std::collections::BTreeMap::new(),
+    ).unwrap();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "n.score"), Some(&Value::Int(99)), "score must be 99 after re-open");
+}
