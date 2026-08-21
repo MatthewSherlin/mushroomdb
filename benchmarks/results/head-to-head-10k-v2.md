@@ -209,14 +209,16 @@ for node/edge records are unchanged, so the v2 WAL-only number remains indicativ
 | neighborhood_depth1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
 | neighborhood_depth2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
 | cypher scan-filter (1.4k rows) | 1.53 ms | 93.7 ms | 3.95 ms | 83.7 ms |
-| cypher two-hop (200 rows) | 307 µs | 2.88 ms ‡ | 2.22 ms ‡ | 2.57 ms ‡⚠ |
+| cypher two-hop (200 rows) | **261.6 µs** ★ | **3.99 ms** ★ | **1.59 ms** ★ | **1.96 ms** ★ |
 | cold_start (WAL-only / connect) | 3.24 s ⊕ | 18.54 ms ⊕ | 23.41 ms ⊕ | 0.42 ms ⊕ |
 | cold_start (snapshot V4) | 1.01 s ⊕ | — | — | — |
 
-‡ competitor two-hop values from v2.1 single-pass run; neo4j −49% and kuzu +40% vs v2 are unexplained
-  (possible warmup/ordering effects). ⚠ v2.1 "memgraph" two-hop (2.57 ms) is contaminated: bench-memgraph
-  was never started; adapter fell back to neo4j driver on bench-neo4j. See contamination finding below.
-  Isolated rerun in progress (Fix round 1); results to replace these values.
+★ **v2.1 consolidated-pass values retracted**: cross-engine contamination confirmed — memgraph cell was
+  neo4j on a warm container; neo4j and kuzu v2.1 values also unreliable (warmup/ordering artifacts from
+  single-pass run). **Current row = Fix round 2 four-engine benchmark** (same dataset, same warmup policy):
+  5,810,000 INDUSTRY_ALIGNMENT edges, fresh process/container, 3 warmup + median of 10 measured runs.
+  v2 mushroomdb 307 µs retired (was on old 1M-edge global-budget graph).
+  Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`. See contamination finding below.
 
 ⊕ cold_start rows not re-measured in v2.1 regression run; Plan-13 changes (WAL batch frames,
   Cypher writes, rule semantics) do not affect cold-start replay or snapshot load paths.
@@ -244,15 +246,19 @@ See `benchmarks/results/handrolled-vs-rules.md` for full methodology and data.
 
 **Three strategies measured** (10,000 nodes, 1,000 property updates, SPECIALTY_MATCH Overlap(0.15)):
 
-> **(a) Naive** — individual `delete_edge`/`insert_edge` per op, one WAL fsync each.
-> This is the natural first implementation. `batch_edges` did not exist before Plan-13.
+> **(a) per-op (expert-written)** — individual `delete_edge`/`insert_edge` per op, one WAL fsync each.
+> Correctly retracts stale edges; retraction logic written with expert API knowledge.
+> `batch_edges` did not exist before Plan-13.
 >
-> **(b) Optimized** — uses `batch_edges` (Plan-13 new API), one WAL frame per update.
-> Expert-tier code requiring knowledge of the batching contract; not available on competitor engines.
+> **(b) batched (expert-written)** — uses `batch_edges` (Plan-13 new API), one WAL frame per update.
+> Expert knowledge of batching contract required; not available on competitor engines.
 >
 > **(c) Rule engine** — `create_rule` + `set_prop`. Derivation and retraction are automatic and atomic in Rust.
+>
+> **Add-only pattern (NOT benchmarked):** omits `delete_edge`; stale edges accumulate on every update.
+> Not a correct implementation — described in correctness section, not measured as a variant.
 
-| Phase | (a) naive | (b) optimized | (c) rule engine |
+| Phase | (a) per-op | (b) batched | (c) rule engine |
 |---|---|---|---|
 | Ingest (10k nodes) | 17.5 s | 20.0 s | 0.82 s |
 | Rule backfill / match computation | (included in ingest) | (included in ingest) | 11.7 s |
@@ -261,7 +267,7 @@ See `benchmarks/results/handrolled-vs-rules.md` for full methodology and data.
 | SPECIALTY_MATCH edges | 5,165,384 | 5,165,384 | 5,165,384 |
 | Drift (vs rule engine) | **0** | **0** | — |
 
-Rule engine is **1.42× faster** than optimized hand-rolled; **221.6× faster** than naive.
+Rule engine is **1.42× faster** than batched hand-rolled; **221.6× faster** than per-op.
 
 **Authorship disclosure (C-2):** Both hand-rolled variants were written by the mushroomdb engine team
 with full knowledge of retraction semantics. Drift=0 is a property of expert implementation,
@@ -314,8 +320,40 @@ See `benchmarks/results/isolated-twohop-*.md` for the full isolation log.
 | memgraph | 2.17 ms | 2.57 ms ⚠ (was neo4j) | **5.46 ms** | +152% |
 
 ⚠ v2.1 neo4j = warm second measurement; v2.1 "memgraph" = neo4j under different label.
-**Methodology note:** isolated rerun uses fresh docker containers with no prior query-cache warmup,
-and all 5,810,000 INDUSTRY_ALIGNMENT edges pre-loaded before the two-hop query is issued.
-v2 measurements used single-pass containers that were already warm from ingestion.
-The absolute deltas reflect container cold-start penalty, not a regression in the engines.
-Full isolation log: `benchmarks/results/isolated-twohop-20260821-041719.md`.
+
+**Why the Fix round 1 isolated numbers differ from v2 baseline — two confounds:**
+
+1. **Dataset growth (1M → 5.81M edges):** v2 used `max_edges=None` → global budget
+   capped INDUSTRY_ALIGNMENT at 1,000,000. Post-Plan-13, `max_edges=Some(k)` switches to
+   per-source top-k semantics; with 2,000 company candidates per talent the FieldEqual rule
+   produces **5,810,000 edges** (all matching pairs, effectively uncapped). Comparing the
+   two-hop on 1M-edge v2 data vs 5.81M-edge current data is apples-to-oranges — denser
+   graphs take longer to traverse.
+
+2. **Cold-start vs warm container:** v2 two-hop queries ran on a container that had
+   already completed the full ingestion pass (warm buffer pool). Fix round 1 isolated
+   reruns used fresh containers with no prior warmup queries.
+
+**Fix round 2** eliminates both confounds: all four engines use the same 5,810,000-edge
+dataset with a uniform warmup policy (3 warmup + median of 10 measured runs).
+See the four-engine table below.
+
+Full isolation log (Fix round 1 cold runs): `benchmarks/results/isolated-twohop-20260821-041719.md`.
+
+### Four-engine two-hop — Fix round 2 (same dataset, warmup policy)
+
+**Date:** 2026-08-21T04:41:00  
+**Dataset:** 5,810,000 INDUSTRY_ALIGNMENT edges (FieldEqual on `industry`, uncapped per-source)  
+**Policy:** fresh process/container → ingest + preload → 3 warmup → median of 10 measured runs  
+**Contamination:** Run A (bench-neo4j only) then Run B (bench-memgraph only); port :7687 exclusively held.
+
+| engine | rows | median | embed? |
+|---|---|---|---|
+| mushroomdb | 200 | **261.6 µs** | yes (embedded, no bolt RTT) |
+| neo4j | 200 | **3.99 ms** | no (bolt/localhost) |
+| kuzu | 200 | **1.59 ms** | yes (embedded, no bolt RTT) |
+| memgraph | 200 | **1.96 ms** | no (bolt/localhost) |
+
+mushroomdb derives INDUSTRY_ALIGNMENT automatically via `create_rule` (no ETL).
+Competitors pre-loaded via UNWIND MERGE (neo4j, memgraph) or COPY FROM CSV (kuzu).
+Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`.

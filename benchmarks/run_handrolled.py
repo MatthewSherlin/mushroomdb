@@ -114,16 +114,21 @@ def write_markdown(
     a("")
     a("> **Three strategies measured on the same mushroomdb engine:**")
     a(">")
-    a("> **(a) hand-rolled NAIVE** — individual `delete_edge` / `insert_edge` calls,")
-    a(">     one WAL fsync per retraction and one per addition.  This is the natural")
-    a(">     first implementation a developer writes.  `batch_edges` did not exist before")
-    a(">     Plan-13 and is not available on any competitor engine.")
+    a("> **(a) per-op (expert-written)** — individual `delete_edge` / `insert_edge` calls,")
+    a(">     one WAL fsync per retraction and one per addition.  Correctly retracts stale")
+    a(">     edges on every update; retraction logic written with expert API knowledge.")
+    a(">     `batch_edges` did not exist before Plan-13 and is not available on any")
+    a(">     competitor engine.")
     a(">")
-    a("> **(b) hand-rolled OPTIMIZED** — uses `batch_edges` (Plan-13, new API) to commit")
+    a("> **(b) batched (expert-written)** — uses `batch_edges` (Plan-13, new API) to commit")
     a(">     all retractions + additions for each talent update in a single WAL frame.")
-    a(">     This represents expert-tier application code written with full knowledge of")
-    a(">     the API's batching semantics.  `batch_edges` was introduced specifically to")
-    a(">     make this benchmark fairer; it is not available on competitor engines.")
+    a(">     Expert knowledge of the batching contract required.  `batch_edges` is a")
+    a(">     mushroomdb-only API; no equivalent exists on competitor engines.")
+    a(">")
+    a("> **Note — add-only (NOT benchmarked):** the most common real-app first attempt omits")
+    a(">     `delete_edge` entirely. Stale edges accumulate on every update; drift grows")
+    a(">     monotonically. This pattern is described in the correctness section below but")
+    a(">     was NOT measured as a separate variant — it is not a correct implementation.")
     a(">")
     a("> **(c) rule engine** — `create_rule` + `set_prop`.  All derivation and retraction")
     a(">     is automatic, atomic, and happens inside Rust with no application code.")
@@ -141,7 +146,7 @@ def write_markdown(
     naive_update_cell = _fmt_s(hr_naive['update_wall_s']) if hr_naive else "n/a"
     naive_ingest_cell = _fmt_s(hr_naive['ingest_wall_s']) if hr_naive else "n/a"
 
-    a(f"| Phase | (a) naive | (b) optimized | (c) rule engine |")
+    a(f"| Phase | (a) per-op | (b) batched | (c) rule engine |")
     a("|---|---|---|---|")
     a(f"| Ingest ({scale:,} nodes) | "
       f"{naive_ingest_cell} | "
@@ -165,20 +170,20 @@ def write_markdown(
     if hr_naive and math.isfinite(hr_naive_total) and hr_naive_total > 0 and re_spec_total > 0:
         naive_vs_re = hr_naive_total / re_spec_total
         opt_vs_re = hr_spec_total / re_spec_total
-        a(f"> Rule engine vs naive: rule engine is **{naive_vs_re:.1f}× faster** than naive hand-rolled.")
+        a(f"> Rule engine vs per-op: rule engine is **{naive_vs_re:.1f}× faster** than per-op hand-rolled.")
         if opt_vs_re > 1.0:
-            a(f"> Rule engine vs optimized: rule engine is **{opt_vs_re:.2f}× faster** than optimized "
+            a(f"> Rule engine vs batched: rule engine is **{opt_vs_re:.2f}× faster** than batched "
               f"({_fmt_s(re_spec_total)} vs {_fmt_s(hr_spec_total)}).")
         else:
-            a(f"> Rule engine vs optimized: optimized is **{1/opt_vs_re:.2f}× faster** than rule engine "
+            a(f"> Rule engine vs batched: batched is **{1/opt_vs_re:.2f}× faster** than rule engine "
               f"({_fmt_s(hr_spec_total)} vs {_fmt_s(re_spec_total)}).")
     elif re_spec_total > 0:
         opt_vs_re = hr_spec_total / re_spec_total
         if opt_vs_re > 1.0:
-            a(f"> Rule engine is {opt_vs_re:.2f}× faster than optimized hand-rolled "
+            a(f"> Rule engine is {opt_vs_re:.2f}× faster than batched hand-rolled "
               f"({_fmt_s(hr_spec_total)} vs {_fmt_s(re_spec_total)}).")
         else:
-            a(f"> Optimized hand-rolled is {1/opt_vs_re:.2f}× faster than rule engine "
+            a(f"> Batched hand-rolled is {1/opt_vs_re:.2f}× faster than rule engine "
               f"({_fmt_s(hr_spec_total)} vs {_fmt_s(re_spec_total)}).")
     a("")
 
@@ -186,7 +191,7 @@ def write_markdown(
     a("")
     naive_spec_cell = f"{hr_naive['specialty_edge_count']:,}" if hr_naive else "n/a"
     naive_drift_cell = f"{hr_naive.get('drift_count', 0):,}" if hr_naive else "n/a"
-    a(f"| Metric | (a) naive | (b) optimized | (c) rule engine |")
+    a(f"| Metric | (a) per-op | (b) batched | (c) rule engine |")
     a("|---|---|---|---|")
     a(f"| SPECIALTY_MATCH edges | {naive_spec_cell} | {hr['specialty_edge_count']:,} | {re['specialty_edge_count']:,} |")
     a(f"| Spurious (vs rule engine) | {naive_drift_cell} | {drift['specialty_hr_only']:,} | — |")
@@ -258,11 +263,11 @@ def write_markdown(
     a("")
     a("The rule engine handles all of these automatically and atomically on every `set_prop`.")
     a("")
-    a(f"- **Retraction count (optimized):** {hr.get('retraction_count', 'n/a'):,} retractions across {n_updates} updates")
-    a(f"- **Addition count (optimized):**   {hr.get('addition_count', 'n/a'):,} additions across {n_updates} updates")
+    a(f"- **Retraction count (batched):** {hr.get('retraction_count', 'n/a'):,} retractions across {n_updates} updates")
+    a(f"- **Addition count (batched):**   {hr.get('addition_count', 'n/a'):,} additions across {n_updates} updates")
     if hr_naive:
         naive_spec_drift = hr_naive.get('drift_count', 0)
-        a(f"- **Naive variant drift (failed retractions):** {naive_spec_drift:,}")
+        a(f"- **Per-op variant drift (failed retractions):** {naive_spec_drift:,}")
     a("")
     a("The hand-rolled SPECIALTY_MATCH maintainer requires explicit retraction logic:")
     a("")
@@ -280,26 +285,28 @@ def write_markdown(
     a("        db.insert_edge('SPECIALTY_MATCH', tkey, ckey)  # addition")
     a("```")
     a("")
-    a("**A naive add-only implementation** (the most common first attempt) never calls")
-    a("`delete_edge`, so stale edges accumulate.  After 1000 property updates:")
+    a("**Add-only pattern (NOT benchmarked — incorrect implementation):** the most common")
+    a("real-app first attempt omits `delete_edge`, so stale edges accumulate on every update.")
     re_edge_count = re.get('specialty_edge_count', 0)
     hr_edge_count = hr.get('specialty_edge_count', 0)
-    a(f"  expected edge count = {hr_edge_count:,} (ground truth from rule engine);")
-    a(f"  naive add-only would retain ALL {hr_edge_count:,} edges even for talents whose")
-    a("  specialties changed to the rare set — leading to tens of thousands of spurious")
-    a("  matches (precise count depends on update targets; rule engine drift = 0 always).")
+    a(f"After 1000 property updates: expected edge count = {hr_edge_count:,} (ground truth from rule engine);")
+    a(f"an add-only implementation would retain ALL {hr_edge_count:,} edges even for talents whose")
+    a("specialties changed to the rare set — leading to tens of thousands of spurious")
+    a("matches (precise count depends on update targets; rule engine drift = 0 always).")
+    a("This pattern was described for context only — it was NOT measured as variant (a);")
+    a("variant (a) 'per-op (expert-written)' correctly retracts stale edges.")
     a("")
     a("## Methodology notes")
     a("")
     a("- All three strategies use the **same mushroomdb engine** and same Python API.")
     a("  The comparison isolates *maintenance strategy*, not the store.")
-    a("- **(a) Naive**: `insert_edge` / `delete_edge` / `ingest_batch` called individually.")
-    a("  One WAL fsync per retraction, one per addition.  No `batch_edges` API.")
-    a("  This was the only option before Plan-13.")
-    a("- **(b) Optimized**: uses `batch_edges` (Plan-13, added Task-6) to commit all")
+    a("- **(a) per-op (expert-written)**: `insert_edge` / `delete_edge` called individually.")
+    a("  One WAL fsync per retraction, one per addition.  Correctly implements retraction.")
+    a("  No `batch_edges` API — this was the only option before Plan-13.")
+    a("- **(b) batched (expert-written)**: uses `batch_edges` (Plan-13, added Task-6) to commit all")
     a("  retractions + additions for each update in one WAL frame (one fsync).")
     a("  `batch_edges` is a mushroomdb-specific API; no equivalent exists on competitor")
-    a("  engines.  This variant requires expert knowledge of the batching contract.")
+    a("  engines.  Requires expert knowledge of the batching contract.")
     a("- **(c) Rule engine**: `db.create_rule()` + `db.set_prop()` — derivation and")
     a("  retraction happen in Rust, atomically, with no application maintenance code.")
     a("  numpy used for batched cosine in the hand-rolled SEMANTIC path (not applicable")

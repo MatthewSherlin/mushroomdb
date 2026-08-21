@@ -21,16 +21,21 @@
 
 > **Three strategies measured on the same mushroomdb engine:**
 >
-> **(a) hand-rolled NAIVE** — individual `delete_edge` / `insert_edge` calls,
->     one WAL fsync per retraction and one per addition.  This is the natural
->     first implementation a developer writes.  `batch_edges` did not exist before
->     Plan-13 and is not available on any competitor engine.
+> **(a) per-op (expert-written)** — individual `delete_edge` / `insert_edge` calls,
+>     one WAL fsync per retraction and one per addition.  Correctly retracts stale
+>     edges on every update; retraction logic written with full knowledge of the API.
+>     `batch_edges` did not exist before Plan-13 and is not available on any
+>     competitor engine.
 >
-> **(b) hand-rolled OPTIMIZED** — uses `batch_edges` (Plan-13, new API) to commit
+> **(b) batched (expert-written)** — uses `batch_edges` (Plan-13, new API) to commit
 >     all retractions + additions for each talent update in a single WAL frame.
->     This represents expert-tier application code written with full knowledge of
->     the API's batching semantics.  `batch_edges` was introduced specifically to
->     make this benchmark fairer; it is not available on competitor engines.
+>     Expert knowledge of the batching contract required.  `batch_edges` is a
+>     mushroomdb-only API; no equivalent exists on competitor engines.
+>
+> **Note — add-only (NOT benchmarked):** the most common real-app first attempt omits
+>     `delete_edge` entirely. Stale edges accumulate on every update; drift grows
+>     monotonically. This pattern is described in the correctness section below but
+>     was NOT measured as a separate variant — it is not a correct implementation.
 >
 > **(c) rule engine** — `create_rule` + `set_prop`.  All derivation and retraction
 >     is automatic, atomic, and happens inside Rust with no application code.
@@ -39,19 +44,19 @@
 > Hand-rolled: Python Jaccard on all talent-company pairs.
 > Rule engine: token inverted-index (shared-specialty candidates only).
 
-| Phase | (a) naive | (b) optimized | (c) rule engine |
+| Phase | (a) per-op | (b) batched | (c) rule engine |
 |---|---|---|---|
 | Ingest (10,000 nodes) | 17.525 s | 19.965 s | 817.84 ms |
 | Rule backfill / match computation | (included in ingest) | (included in ingest) | 11.700 s |
 | Property updates (1000 × set_prop + retract/add) | 64.63 min | 5.015 s | 5.064 s |
 | **Total wall (spec only)** | **64.93 min** | **24.979 s** | **17.582 s** |
 
-> Rule engine vs naive: rule engine is **221.6× faster** than naive hand-rolled.
-> Rule engine vs optimized: rule engine is **1.42× faster** than optimized (17.582 s vs 24.979 s).
+> Rule engine vs per-op: rule engine is **221.6× faster** than per-op hand-rolled.
+> Rule engine vs batched: rule engine is **1.42× faster** than batched (17.582 s vs 24.979 s).
 
 ### SPECIALTY_MATCH edge counts and drift
 
-| Metric | (a) naive | (b) optimized | (c) rule engine |
+| Metric | (a) per-op | (b) batched | (c) rule engine |
 |---|---|---|---|
 | SPECIALTY_MATCH edges | 5,165,384 | 5,165,384 | 5,165,384 |
 | Spurious (vs rule engine) | 0 | 0 | — |
@@ -98,7 +103,7 @@ The rule engine handles all of these automatically and atomically on every `set_
 - **Retraction count (optimized):** not separately tracked in this run; batch_edges commits
   retractions + additions atomically. Reference from v2: ~476k retractions across 1000 updates.
 - **Addition count (optimized):** not separately tracked; reference from v2: ~415k additions.
-- **Naive variant drift (failed retractions):** 0
+- **Per-op variant drift (failed retractions):** 0
 
 The hand-rolled SPECIALTY_MATCH maintainer requires explicit retraction logic:
 
@@ -116,24 +121,26 @@ for ckey, cprops in all_companies.items():
         db.insert_edge('SPECIALTY_MATCH', tkey, ckey)  # addition
 ```
 
-**A naive add-only implementation** (the most common first attempt) never calls
-`delete_edge`, so stale edges accumulate.  After 1000 property updates:
-  expected edge count = 5,165,384 (ground truth from rule engine);
-  naive add-only would retain ALL 5,165,384 edges even for talents whose
-  specialties changed to the rare set — leading to tens of thousands of spurious
-  matches (precise count depends on update targets; rule engine drift = 0 always).
+**Add-only pattern (NOT benchmarked — incorrect implementation):** the most common
+real-app first attempt omits `delete_edge`, so stale edges accumulate on every update.
+After 1000 property updates: expected edge count = 5,165,384 (ground truth from rule engine);
+an add-only implementation would retain ALL 5,165,384 edges even for talents whose
+specialties changed to the rare set — leading to tens of thousands of spurious
+matches (precise count depends on update targets; rule engine drift = 0 always).
+This pattern was described for context only — it was NOT measured as variant (a);
+variant (a) "per-op (expert-written)" correctly retracts stale edges.
 
 ## Methodology notes
 
 - All three strategies use the **same mushroomdb engine** and same Python API.
   The comparison isolates *maintenance strategy*, not the store.
-- **(a) Naive**: `insert_edge` / `delete_edge` / `ingest_batch` called individually.
-  One WAL fsync per retraction, one per addition.  No `batch_edges` API.
-  This was the only option before Plan-13.
-- **(b) Optimized**: uses `batch_edges` (Plan-13, added Task-6) to commit all
+- **(a) per-op (expert-written)**: `insert_edge` / `delete_edge` called individually.
+  One WAL fsync per retraction, one per addition.  Correctly implements retraction.
+  No `batch_edges` API — this was the only option before Plan-13.
+- **(b) batched (expert-written)**: uses `batch_edges` (Plan-13, added Task-6) to commit all
   retractions + additions for each update in one WAL frame (one fsync).
   `batch_edges` is a mushroomdb-specific API; no equivalent exists on competitor
-  engines.  This variant requires expert knowledge of the batching contract.
+  engines.  Requires expert knowledge of the batching contract.
 - **(c) Rule engine**: `db.create_rule()` + `db.set_prop()` — derivation and
   retraction happen in Rust, atomically, with no application maintenance code.
   numpy used for batched cosine in the hand-rolled SEMANTIC path (not applicable

@@ -160,11 +160,11 @@ Post-Plan-13 regression results (v2.1) are appended to that document.
 | Neighborhood depth-1 (p95) | 1.1 µs | 1.46 ms | 519 µs | 2.14 ms |
 | Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
 | Cypher scan-filter-project (1.4k rows) | 1.53 ms | 93.7 ms | 3.95 ms | 83.7 ms |
-| Cypher two-hop join (200 rows) | **307 µs** | 2.88 ms ★ | 2.22 ms ★ | 2.57 ms ★ |
+| Cypher two-hop join (200 rows) | **261.6 µs** ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
 | Cold-start (snapshot V4) | **10.4 s** | — | — | — |
 | Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
-*(v2.1 numbers, 2026-08-21, post-Plan-13 release build)*
+*(v2.1 numbers, 2026-08-21, post-Plan-13 release build; two-hop row = Fix round 2 four-engine benchmark)*
 
 **Honesty notes:**
 
@@ -172,10 +172,18 @@ Post-Plan-13 regression results (v2.1) are appended to that document.
   overhead). KùzuDB is also embedded — its numbers are directly comparable
   to mushroomdb's. Neo4j and Memgraph numbers go over bolt/localhost
   (~0.1–1 ms round-trip per query).
-- ★ Two-hop join (fair comparison): all competitors pre-loaded with mushroomdb's
-  1M derived INDUSTRY_ALIGNMENT edges as ordinary edges. All engines return 200 rows.
-  Pre-mat one-time cost: neo4j 10.8 s, kuzu 0.17 s (COPY FROM CSV), memgraph 8.0 s.
-  mushroomdb derives the same edges **automatically** on rule declaration — no ETL.
+- ★ Two-hop join — same dataset, same warmup policy (Fix round 2): all four engines use
+  **5,810,000 INDUSTRY_ALIGNMENT edges** (FieldEqual on `industry`; per-source top-k,
+  effectively uncapped at 10k scale). Policy: fresh process/container → ingest + preload
+  → 3 warmup executions (discarded) → **median of 10 measured runs**. mushroomdb derives
+  edges automatically via `create_rule`; competitors pre-loaded via UNWIND MERGE (neo4j,
+  memgraph) or COPY FROM CSV (kuzu). All engines return 200 rows.
+  Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`.
+- v2.1 consolidated-pass two-hop values (2.88 ms neo4j / 2.22 ms kuzu / 2.57 ms memgraph)
+  **retracted**: cross-engine contamination confirmed — memgraph cell was neo4j on a warm
+  container; see `benchmarks/results/head-to-head-10k-v2.md` contamination section.
+  v2 mushroomdb 307 µs **retired**: measured on the old 1M-edge global-budget graph
+  (current uncapped graph has 5.81M edges; see dataset growth note in methodology).
 
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
 two-rule backfill on 10k nodes: 872 ms + 1.976 s = **2.85 s** (Plan-13;
@@ -188,9 +196,10 @@ See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
 
 Rule engine vs hand-rolled maintenance (Plan-13 benchmark, three-way measured): on 10k nodes with
 1,000 specialty updates, all three strategies produce identical edge sets (drift = 0).
-**(a) Naive** (per-op `delete_edge`/`insert_edge`, one WAL fsync each): **64.93 min**.
-**(b) Optimized** (uses `batch_edges` — a Plan-13 mushroomdb-only API, one WAL frame per update): **24.98 s**.
-**(c) Rule engine** (`create_rule` + `set_prop`, fully automatic): **17.58 s** (1.42× faster than optimized).
+**(a) per-op (expert-written)** (individual `delete_edge`/`insert_edge`, one WAL fsync each): **64.93 min**.
+**(b) batched (expert-written)** (uses `batch_edges` — Plan-13 mushroomdb-only API, one WAL frame per update): **24.98 s**.
+**(c) Rule engine** (`create_rule` + `set_prop`, fully automatic): **17.58 s** (1.42× faster than batched).
+Add-only pattern (NOT benchmarked — omits retraction; stale edges accumulate on every update).
 Disclosures: (1) `batch_edges` was introduced in this same Plan-13 task to make the benchmark fair; it
 is not available on any competitor engine. (2) Both hand-rolled variants were written by the engine team
 with full knowledge of retraction semantics; drift=0 is a property of expert implementation, not of the
