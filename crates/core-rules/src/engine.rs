@@ -3,6 +3,31 @@ use crate::index::{candidate_spec, candidate_spec_approx, CandidateSpec, RuleInd
 use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// A single derived-edge fire or retract captured during a commit.
+///
+/// Populated inside [`ProvSets::insert`] / [`ProvSets::remove`] while graph
+/// state is fully intact (before any tombstone step in `DeleteNode`).
+/// String keys are resolved at capture time so they remain valid even after
+/// node deletion.
+#[derive(Debug, Clone)]
+pub struct EngineEdgeDelta {
+    pub rule: String,
+    /// User-facing source node key.
+    pub src_key: String,
+    /// User-facing destination node key.
+    pub dst_key: String,
+    /// Edge-type string.
+    pub edge_type: String,
+    /// Internal edge-type symbol (for edge_props weight lookup in db.rs).
+    pub etype_sym: u32,
+    /// Internal source node id (for edge_props weight lookup in db.rs).
+    pub src_id: u32,
+    /// Internal destination node id (for edge_props weight lookup in db.rs).
+    pub dst_id: u32,
+    /// `true` = edge was fired (added to provenance); `false` = retracted.
+    pub fired: bool,
+}
+
 #[cfg(test)]
 pub use crate::index::{with_vector_dim_reject, with_vector_early_exit};
 
@@ -47,6 +72,13 @@ pub struct RuleEngine {
     intern_rule: Vec<String>,
     tripped: BTreeMap<String, bool>,
     fires: BTreeMap<String, u64>,
+    /// Staging buffer for post-commit [`EngineEdgeDelta`] events.
+    ///
+    /// Populated by [`ProvSets::insert`] / [`ProvSets::remove`] during
+    /// `apply` (live writes AND WAL replay). Callers must drain via
+    /// [`RuleEngine::drain_deltas`] immediately after apply to consume live
+    /// events or discard replay noise.
+    pending_deltas: Vec<EngineEdgeDelta>,
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +434,7 @@ fn apply_per_src_top_k(
         if !desired_from_src.contains_key(&(s, d)) {
             g.topo.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
-            prov.remove(&def.name, (t, s, d));
+            prov.remove(&def.name, (t, s, d), g.ids, g.syms);
         }
     }
 
@@ -413,7 +445,7 @@ fn apply_per_src_top_k(
         if !already {
             let newly = g.topo.add_edge(et, *s, *d);
             if newly {
-                prov.insert(&def.name, triple);
+                prov.insert(&def.name, triple, g.ids, g.syms);
             }
         }
         let is_owned = already || prov.contains(&triple);
@@ -508,26 +540,67 @@ struct ProvSets<'a> {
     by_node: &'a mut BTreeMap<u32, BTreeSet<Touch>>,
     rule_intern: &'a mut BTreeMap<String, u32>,
     intern_rule: &'a mut Vec<String>,
+    /// Staging buffer for post-commit events. Keys are resolved at capture
+    /// time (before any tombstone step) so the strings remain valid after
+    /// node deletion.
+    deltas: &'a mut Vec<EngineEdgeDelta>,
 }
 
 impl ProvSets<'_> {
-    fn insert(&mut self, rule: &str, triple: Triple) -> bool {
+    /// `ids` and `syms` are passed by the caller (not stored in ProvSets) to
+    /// avoid a conflicting borrow when callers also need `&mut g.syms` for
+    /// `intern` calls in the same function body.
+    fn insert(&mut self, rule: &str, triple: Triple, ids: &IdMap, syms: &Interner) -> bool {
         if !self.set.insert(triple) {
             return false;
         }
         self.owned.insert(triple);
         let rid = intern_rule(self.rule_intern, self.intern_rule, rule);
         touch_insert(self.by_node, rid, triple);
+        let (etype, src, dst) = triple;
+        if let (Some(sk), Some(dk), Some(et)) = (
+            ids.key_of(src),
+            ids.key_of(dst),
+            syms.resolve(etype),
+        ) {
+            self.deltas.push(EngineEdgeDelta {
+                rule: rule.to_string(),
+                src_key: sk.to_string(),
+                dst_key: dk.to_string(),
+                edge_type: et.to_string(),
+                etype_sym: etype,
+                src_id: src,
+                dst_id: dst,
+                fired: true,
+            });
+        }
         true
     }
 
-    fn remove(&mut self, rule: &str, triple: Triple) -> bool {
+    fn remove(&mut self, rule: &str, triple: Triple, ids: &IdMap, syms: &Interner) -> bool {
         if !self.set.remove(&triple) {
             return false;
         }
         self.owned.remove(&triple);
         let rid = intern_rule(self.rule_intern, self.intern_rule, rule);
         touch_remove(self.by_node, rid, triple);
+        let (etype, src, dst) = triple;
+        if let (Some(sk), Some(dk), Some(et)) = (
+            ids.key_of(src),
+            ids.key_of(dst),
+            syms.resolve(etype),
+        ) {
+            self.deltas.push(EngineEdgeDelta {
+                rule: rule.to_string(),
+                src_key: sk.to_string(),
+                dst_key: dk.to_string(),
+                edge_type: et.to_string(),
+                etype_sym: etype,
+                src_id: src,
+                dst_id: dst,
+                fired: false,
+            });
+        }
         true
     }
 
@@ -584,7 +657,7 @@ fn apply_desired(
         if !desired.contains_key(&(s, d)) {
             g.topo.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
-            prov.remove(&def.name, (t, s, d));
+            prov.remove(&def.name, (t, s, d), g.ids, g.syms);
         }
     }
 
@@ -598,7 +671,7 @@ fn apply_desired(
             }
             let newly = g.topo.add_edge(et, s, d);
             if newly {
-                prov.insert(&def.name, triple);
+                prov.insert(&def.name, triple, g.ids, g.syms);
             }
         }
         // Only set weight_prop on edges this rule owns (newly added now, or
@@ -764,7 +837,7 @@ fn apply_streaming_create(
                 }
                 let newly = g.topo.add_edge(et, s, d);
                 if newly {
-                    prov.insert(&def.name, triple);
+                    prov.insert(&def.name, triple, g.ids, g.syms);
                 }
             }
             let is_owned_here = already || prov.contains(&triple);
@@ -892,7 +965,7 @@ fn apply_streaming_rebuild(
         if !pair_still_desired(def, s, d, g) {
             g.topo.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
-            prov.remove(&def.name, (t, s, d));
+            prov.remove(&def.name, (t, s, d), g.ids, g.syms);
         }
     }
 
@@ -914,7 +987,7 @@ fn apply_streaming_rebuild(
             if !already {
                 let newly = g.topo.add_edge(et, s, d);
                 if newly {
-                    prov.insert(&def.name, triple);
+                    prov.insert(&def.name, triple, g.ids, g.syms);
                 }
             }
             let is_owned_here = already || prov.contains(&triple);
@@ -1015,6 +1088,23 @@ impl RuleEngine {
         self.fires.get(name).copied().unwrap_or(0)
     }
 
+    /// Drain and return all pending edge-fire / retract deltas since the last
+    /// call.  Callers (`db.rs` `log_then_apply_with`) invoke this after a
+    /// successful WAL commit + apply to build [`DbEvent`]s for live
+    /// subscriptions.  [`GraphDb::open_with`] drains and discards after WAL
+    /// replay so replay noise never leaks to subscribers.
+    ///
+    /// # T2 note (as-of replay)
+    ///
+    /// When Plan-15 T2 adds as-of replay for subscribers, that path should
+    /// call apply-only (no `log_then_apply_with`) and then call
+    /// `drain_deltas()` to feed those events to the replaying subscriber.
+    /// The suppression is already in place: `apply` accumulates but never
+    /// emits; `drain_deltas` is the only emission gate.
+    pub fn drain_deltas(&mut self) -> Vec<EngineEdgeDelta> {
+        std::mem::take(&mut self.pending_deltas)
+    }
+
     /// Snapshot support: definitions + provenance + tripped/fires. Candidate
     /// indexes and the `by_node` reverse index are NOT included (derived:
     /// `reindex_all` / `rebuild_by_node` on open).
@@ -1070,6 +1160,7 @@ impl RuleEngine {
             intern_rule,
             tripped,
             fires,
+            pending_deltas: Vec::new(),
         }
     }
 
@@ -1218,6 +1309,7 @@ impl RuleEngine {
             by_node: &mut self.by_node,
             rule_intern: &mut self.rule_intern,
             intern_rule: &mut self.intern_rule,
+            deltas: &mut self.pending_deltas,
         };
         if let Some(k) = def.max_edges {
             apply_streaming_create_top_k(&def, k, &self.indexes[&name], &mut prov, g);
@@ -1252,12 +1344,13 @@ impl RuleEngine {
             by_node: &mut self.by_node,
             rule_intern: &mut self.rule_intern,
             intern_rule: &mut self.intern_rule,
+            deltas: &mut self.pending_deltas,
         };
         for triple in triples {
             let (t, s, d) = triple;
             g.topo.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
-            sets.remove(name, triple);
+            sets.remove(name, triple, g.ids, g.syms);
         }
         // Surviving rules that share the same edge_type may derive edges that
         // were previously blocked (add_edge returned false because the deleted
@@ -1367,6 +1460,7 @@ impl RuleEngine {
                     by_node: &mut self.by_node,
                     rule_intern: &mut self.rule_intern,
                     intern_rule: &mut self.intern_rule,
+                    deltas: &mut self.pending_deltas,
                 };
 
                 if as_src {
@@ -1428,6 +1522,7 @@ impl RuleEngine {
                         by_node: &mut self.by_node,
                         rule_intern: &mut self.rule_intern,
                         intern_rule: &mut self.intern_rule,
+                        deltas: &mut self.pending_deltas,
                     },
                     tripped,
                     g,
@@ -1504,8 +1599,9 @@ impl RuleEngine {
                     by_node: &mut self.by_node,
                     rule_intern: &mut self.rule_intern,
                     intern_rule: &mut self.intern_rule,
+                    deltas: &mut self.pending_deltas,
                 }
-                .remove(&rule_name, triple);
+                .remove(&rule_name, triple, g.ids, g.syms);
             }
         }
 
@@ -1524,6 +1620,7 @@ impl RuleEngine {
                 by_node: &mut self.by_node,
                 rule_intern: &mut self.rule_intern,
                 intern_rule: &mut self.intern_rule,
+                deltas: &mut self.pending_deltas,
             };
             apply_per_src_top_k(&def, src, top_k, &mut prov, g);
         }
@@ -1570,6 +1667,7 @@ impl RuleEngine {
             by_node: &mut self.by_node,
             rule_intern: &mut self.rule_intern,
             intern_rule: &mut self.intern_rule,
+            deltas: &mut self.pending_deltas,
         };
         if let Some(k) = def.max_edges {
             apply_streaming_rebuild_top_k(&def, k, &self.indexes[name], &mut prov, g);

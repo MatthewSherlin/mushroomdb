@@ -44,6 +44,43 @@ field values that matched, and the computed score for every derived edge.
 
 ![Neighborhood with derived edges highlighted](docs/assets/02-neighborhood-gold.png)
 
+### Live rule and write subscriptions
+
+mushroomdb streams derived-edge events in real time. Subscribe to any rule and
+receive `EdgeFired` / `EdgeRetracted` events the moment they are committed to
+the WAL — not polled, not batched, not delayed by a background job:
+
+```rust
+let sub = db.subscribe_rule("skill_fit")?;
+
+// In another thread:
+while let Some(ev) = sub.recv_timeout(Duration::from_millis(100)) {
+    match ev {
+        DbEvent::EdgeFired { src_key, dst_key, weight, commit_seq, .. } => { /* … */ }
+        DbEvent::EdgeRetracted { src_key, dst_key, .. } => { /* … */ }
+        DbEvent::Lagged { missed } => { /* re-read state if lossless */ }
+        _ => {}
+    }
+}
+```
+
+The same stream is available over WebSocket at `GET /subscribe`:
+
+```json
+// Client sends:
+{"rules": ["skill_fit"], "writes": true}
+
+// Server streams:
+{"type":"edge_fired","rule":"skill_fit","src_key":"p1","dst_key":"org-1","edge_type":"FIT","weight":0.87,"commit_seq":42}
+{"type":"node_inserted","label":"Person","key":"p2","commit_seq":43}
+```
+
+Events arrive after the WAL fsync — a subscriber that queries immediately on
+receipt observes the state that produced the event. Each subscription has a
+65,536-event bounded queue; slow consumers receive a `Lagged { missed: N }`
+marker and continue (no disconnection). See [docs/site/subscriptions.md](docs/site/subscriptions.md)
+for the full API reference.
+
 ---
 
 ## Quickstart

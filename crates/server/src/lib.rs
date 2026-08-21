@@ -3,6 +3,7 @@
 mod http;
 mod json;
 mod mcp;
+mod subscribe;
 mod ws;
 
 use core_api::{MutationEvent, SharedDb};

@@ -14,6 +14,7 @@ arrow-bridge = { path = "../arrow-bridge" }
 # ws enabled now so Task 5 can add GET /watch without a dep bump.
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tower-http = { version = "0.6", default-features = false, features = ["fs"] }
 include_dir = { version = "0.7", optional = true }

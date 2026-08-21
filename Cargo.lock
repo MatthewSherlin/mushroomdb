@@ -1308,6 +1308,7 @@ dependencies = [
  "core-api",
  "futures-util",
  "include_dir",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",

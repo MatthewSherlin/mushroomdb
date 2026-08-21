@@ -4,7 +4,12 @@ use core_query::cypher::{
     WriteStatement,
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
-use core_rules::{evaluate, GraphMut, NodeView, Predicate, RuleDef, RuleEngine, RuleIvfExport};
+use core_rules::{
+    evaluate, EngineEdgeDelta, GraphMut, NodeView, Predicate, RuleDef, RuleEngine, RuleIvfExport,
+};
+use crate::subscription::{
+    event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
+};
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{
@@ -355,6 +360,17 @@ pub struct GraphDb<F: Fs> {
     edge_props: EdgeProps,
     engine: RuleEngine,
     event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
+    /// Monotonically increasing per-commit counter.  A single `log_then_apply_with`
+    /// call increments this once; all events emitted from that call share the same
+    /// `commit_seq` value.
+    commit_seq: u64,
+    /// Live subscriptions.  Entries with a dead `Weak` are pruned on the next
+    /// distribute_events call.
+    subscriptions: Vec<SubEntry>,
+    /// Queue capacity for new subscriptions created by this db.  Default is
+    /// [`DEFAULT_SUB_CAPACITY`]; can be overridden via [`set_sub_capacity`]
+    /// to test Lagged behaviour with small queues.
+    sub_capacity: usize,
 }
 
 impl GraphDb<RealFs> {
@@ -375,6 +391,9 @@ impl<F: Fs> GraphDb<F> {
             edge_props: EdgeProps::new(),
             engine: RuleEngine::new(),
             event_sink: None,
+            commit_seq: 0,
+            subscriptions: Vec::new(),
+            sub_capacity: DEFAULT_SUB_CAPACITY,
         };
         let snap_bytes = db.fs.read(FileId::Snapshot)?;
         if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
@@ -430,6 +449,10 @@ impl<F: Fs> GraphDb<F> {
         for rec in records {
             db.apply(&rec)?;
         }
+        // T2 note: drain_deltas is the suppression seam for replay.  Any future
+        // as-of replay path (Plan-15 T2) must call drain_deltas here to stay
+        // silent; the mechanism is already in place.
+        let _ = db.engine.drain_deltas();
         Ok(db)
     }
 
@@ -725,6 +748,12 @@ impl<F: Fs> GraphDb<F> {
             );
         }
         apply_result?;
+        self.commit_seq += 1;
+        let seq = self.commit_seq;
+        // Drain engine deltas and distribute to subscribers before the existing
+        // MutationEvent sink fires — both happen post-fsync, post-apply.
+        let engine_deltas = self.engine.drain_deltas();
+        self.distribute_events(&rec, &engine_deltas, seq);
         self.emit_committed(&rec, ingest);
         Ok(())
     }
@@ -778,6 +807,193 @@ impl<F: Fs> GraphDb<F> {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Subscription API
+    // -----------------------------------------------------------------------
+
+    /// Distribute post-commit events to all live subscribers.
+    ///
+    /// Called from `log_then_apply_with` after apply + fsync, before the
+    /// legacy MutationEvent sink. Prunes dead `Weak` entries in-place.
+    fn distribute_events(
+        &mut self,
+        rec: &WalRecord,
+        engine_deltas: &[EngineEdgeDelta],
+        seq: u64,
+    ) {
+        if self.subscriptions.is_empty() {
+            return;
+        }
+
+        // Build write events from the WAL record.
+        let write_events: Vec<DbEvent> = Self::write_events_from_record(rec, seq);
+
+        // Build edge events from engine deltas.  Weight is looked up from
+        // edge_props at distribution time (after apply), so it's always fresh.
+        let edge_events: Vec<DbEvent> = engine_deltas
+            .iter()
+            .map(|d| {
+                if d.fired {
+                    let weight = self
+                        .edge_props
+                        .get(d.etype_sym, d.src_id, d.dst_id, "weight")
+                        .and_then(|v| {
+                            if let core_storage::Value::Float(f) = v {
+                                Some(*f)
+                            } else {
+                                None
+                            }
+                        });
+                    DbEvent::EdgeFired {
+                        rule: d.rule.clone(),
+                        src_key: d.src_key.clone(),
+                        dst_key: d.dst_key.clone(),
+                        edge_type: d.edge_type.clone(),
+                        weight,
+                        commit_seq: seq,
+                    }
+                } else {
+                    DbEvent::EdgeRetracted {
+                        rule: d.rule.clone(),
+                        src_key: d.src_key.clone(),
+                        dst_key: d.dst_key.clone(),
+                        edge_type: d.edge_type.clone(),
+                        commit_seq: seq,
+                    }
+                }
+            })
+            .collect();
+
+        // Prune dead entries; push matching events to live ones.
+        self.subscriptions.retain(|entry| {
+            let Some(inner) = entry.inner.upgrade() else {
+                return false;
+            };
+            for ev in &write_events {
+                if event_matches(ev, &entry.filter) {
+                    inner.push(ev.clone());
+                }
+            }
+            for ev in &edge_events {
+                if event_matches(ev, &entry.filter) {
+                    inner.push(ev.clone());
+                }
+            }
+            true
+        });
+    }
+
+    /// Convert a WAL record into `DbEvent` write events with the given seq.
+    fn write_events_from_record(rec: &WalRecord, seq: u64) -> Vec<DbEvent> {
+        match rec {
+            WalRecord::InsertNode { label, key, .. } => vec![DbEvent::NodeInserted {
+                label: label.clone(),
+                key: key.clone(),
+                commit_seq: seq,
+            }],
+            WalRecord::SetProp { key, field, .. } => vec![DbEvent::PropSet {
+                key: key.clone(),
+                field: field.clone(),
+                commit_seq: seq,
+            }],
+            WalRecord::RemoveProp { key, field } => vec![DbEvent::PropRemoved {
+                key: key.clone(),
+                field: field.clone(),
+                commit_seq: seq,
+            }],
+            WalRecord::InsertEdge {
+                edge_type,
+                src_key,
+                dst_key,
+            } => vec![DbEvent::EdgeInserted {
+                edge_type: edge_type.clone(),
+                src: src_key.clone(),
+                dst: dst_key.clone(),
+                commit_seq: seq,
+            }],
+            WalRecord::DeleteEdge {
+                edge_type,
+                src_key,
+                dst_key,
+            } => vec![DbEvent::EdgeDeleted {
+                edge_type: edge_type.clone(),
+                src: src_key.clone(),
+                dst: dst_key.clone(),
+                commit_seq: seq,
+            }],
+            WalRecord::DeleteNode { key } => vec![DbEvent::NodeDeleted {
+                key: key.clone(),
+                commit_seq: seq,
+            }],
+            WalRecord::Batch(inner) => inner
+                .iter()
+                .flat_map(|r| Self::write_events_from_record(r, seq))
+                .collect(),
+            WalRecord::CreateRule { .. }
+            | WalRecord::DeleteRule { .. }
+            | WalRecord::RebuildRule { .. } => vec![],
+        }
+    }
+
+    /// Subscribe to edge-fire and edge-retract events for one named rule.
+    ///
+    /// Returns `Err(GraphError::RuleNotFound)` if `rule_name` is not
+    /// currently registered. Dropping the returned [`Subscription`] handle
+    /// unregisters the subscriber — no further events are queued, no
+    /// resources leak.
+    pub fn subscribe_rule(&mut self, rule_name: &str) -> core_storage::Result<Subscription> {
+        if !self.engine.rules().any(|r| r.name == rule_name) {
+            return Err(core_storage::GraphError::RuleNotFound {
+                name: rule_name.to_string(),
+            });
+        }
+        let inner = SubInner::new(self.sub_capacity());
+        self.subscriptions.push(SubEntry {
+            filter: SubFilter::Rule(rule_name.to_string()),
+            inner: std::sync::Arc::downgrade(&inner),
+        });
+        Ok(Subscription(inner))
+    }
+
+    /// Subscribe to edge-fire and edge-retract events for **all** rules.
+    pub fn subscribe_all_rules(&mut self) -> Subscription {
+        let inner = SubInner::new(self.sub_capacity());
+        self.subscriptions.push(SubEntry {
+            filter: SubFilter::AllRules,
+            inner: std::sync::Arc::downgrade(&inner),
+        });
+        Subscription(inner)
+    }
+
+    /// Subscribe to write events: node insert/delete, prop set/remove.
+    ///
+    /// Does not include edge-fire / edge-retract (rule-derived edge events).
+    pub fn subscribe_writes(&mut self) -> Subscription {
+        let inner = SubInner::new(self.sub_capacity());
+        self.subscriptions.push(SubEntry {
+            filter: SubFilter::Writes,
+            inner: std::sync::Arc::downgrade(&inner),
+        });
+        Subscription(inner)
+    }
+
+    /// Queue capacity used for new subscriptions.
+    fn sub_capacity(&self) -> usize {
+        self.sub_capacity
+    }
+
+    /// Override per-subscriber queue capacity for subsequently created
+    /// subscriptions on this db instance.
+    ///
+    /// Default is [`DEFAULT_SUB_CAPACITY`] (65,536 events). Use a smaller
+    /// value in tests to exercise the [`DbEvent::Lagged`] path without
+    /// generating tens of thousands of events.
+    pub fn set_sub_capacity(&mut self, capacity: usize) {
+        self.sub_capacity = capacity;
+    }
+
+    // -----------------------------------------------------------------------
 
     /// Start an atomic batch.
     ///

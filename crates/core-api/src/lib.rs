@@ -1,6 +1,7 @@
 mod db;
 mod ingest;
 mod shared;
+pub mod subscription;
 
 pub use core_query::{CmpOp, Dir, Filter, ResultSet};
 pub use core_rules::{Predicate, RuleDef};
@@ -9,6 +10,7 @@ pub use db::{
     BatchBuilder, DeleteReport, EdgeInfo, Explanation, GraphDb, MutationEvent, NodeInfo, NodeRef,
     PredicateSummary, RuleStats, Stats,
 };
+pub use subscription::{DbEvent, Subscription, DEFAULT_SUB_CAPACITY};
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };

@@ -71,6 +71,7 @@ pub fn router(db: SharedDb) -> Router {
         .route("/node/{key}/edges", get(node_edges))
         .route("/node/{key}/neighborhood", get(neighborhood))
         .route("/watch", get(crate::ws::watch))
+        .route("/subscribe", get(crate::subscribe::subscribe))
         .with_state(state)
 }
 
