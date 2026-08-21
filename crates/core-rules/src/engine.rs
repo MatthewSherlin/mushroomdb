@@ -1111,6 +1111,18 @@ impl RuleEngine {
         self.pending_deltas.len()
     }
 
+    /// Borrow the slice of deltas accumulated since `cursor` without
+    /// consuming them.  `cursor` should be the value returned by
+    /// `pending_delta_count()` before an engine call.
+    ///
+    /// The returned slice is valid until the next call to `drain_deltas()`.
+    /// T1's drain discipline is preserved: these deltas are still in the
+    /// buffer and will be drained by `log_then_apply_with` after `apply`
+    /// returns.
+    pub fn pending_deltas_since(&self, cursor: usize) -> &[EngineEdgeDelta] {
+        &self.pending_deltas[cursor..]
+    }
+
     /// Snapshot support: definitions + provenance + tripped/fires. Candidate
     /// indexes and the `by_node` reverse index are NOT included (derived:
     /// `reindex_all` / `rebuild_by_node` on open).

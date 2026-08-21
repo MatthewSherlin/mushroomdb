@@ -47,6 +47,16 @@ pub enum WalRecord {
     RebuildRule {
         name: String,
     },
+    // ── View variants (appended LAST; bincode discriminant is positional) ─────
+    /// Create (or restore) a materialized property view.  Bincoded `ViewDef`
+    /// bytes keep core-storage free of core-rules types.  Discriminant 10.
+    CreateView {
+        def_bytes: Vec<u8>,
+    },
+    /// Delete a named view and remove its values from all nodes.  Discriminant 11.
+    DeleteView {
+        name: String,
+    },
 }
 
 /// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.
@@ -388,6 +398,59 @@ mod tests {
             expected_rebuild,
             "RebuildRule wire format changed — append-only WAL variants"
         );
+    }
+
+    // ── Task 3: view variant roundtrips + wire pins ───────────────────────────
+
+    #[test]
+    fn roundtrip_create_view() {
+        let r = WalRecord::CreateView {
+            def_bytes: vec![1, 2, 3],
+        };
+        let bytes = encode_record(&r);
+        let (recs, _) = decode_all(&bytes);
+        assert_eq!(recs, vec![r]);
+    }
+
+    #[test]
+    fn roundtrip_delete_view() {
+        let r = WalRecord::DeleteView {
+            name: "my_view".into(),
+        };
+        let bytes = encode_record(&r);
+        let (recs, _) = decode_all(&bytes);
+        assert_eq!(recs, vec![r]);
+    }
+
+    /// Pin discriminants 10 (CreateView) and 11 (DeleteView).
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    #[test]
+    fn golden_bytes_pin_view_wire_format() {
+        // ── Variant 10: CreateView { def_bytes: [0xDE, 0xAD] } ───────────────
+        let create_view = WalRecord::CreateView {
+            def_bytes: vec![0xDE, 0xAD],
+        };
+        let cv_payload = bincode::serialize(&create_view).unwrap();
+        // discriminant must be 10 (0x0a 0x00 0x00 0x00 in LE)
+        assert_eq!(&cv_payload[0..4], &[10, 0, 0, 0],
+            "CreateView discriminant changed — a variant was inserted before position 10");
+
+        // ── Variant 11: DeleteView { name: "v" } ─────────────────────────────
+        let delete_view = WalRecord::DeleteView { name: "v".into() };
+        let dv_payload = bincode::serialize(&delete_view).unwrap();
+        assert_eq!(&dv_payload[0..4], &[11, 0, 0, 0],
+            "DeleteView discriminant changed — a variant was inserted before position 11");
+
+        // Roundtrip both through encode_record / decode_all.
+        let mut buf = encode_record(&create_view);
+        buf.extend(encode_record(&delete_view));
+        let (recs, consumed) = decode_all(&buf);
+        assert_eq!(consumed, buf.len());
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0], WalRecord::CreateView { def_bytes: vec![0xDE, 0xAD] });
+        assert_eq!(recs[1], WalRecord::DeleteView { name: "v".into() });
     }
 
     #[test]

@@ -44,6 +44,28 @@ field values that matched, and the computed score for every derived edge.
 
 ![Neighborhood with derived edges highlighted](docs/assets/02-neighborhood-gold.png)
 
+### Live degree counts and neighbor aggregates, no triggers
+
+mushroomdb maintains per-node derived properties automatically as the graph
+changes.  A degree view counts incident edges; a neighbor-aggregate view sums,
+averages, or takes the min/max of a neighbor property — all updated
+incrementally on every edge insert, delete, rule fire, or retract.  No cron
+jobs, no triggers, no stale caches:
+
+```rust
+db.create_view(ViewDef {
+    name: "city_population".into(), label: "City".into(),
+    view_prop: "pop".into(),
+    source: ViewSource::Degree { edge_type: "LIVES_IN".into(), direction: Direction::In },
+})?;
+// After any edge change, c.pop is instantly correct in every query.
+db.query("MATCH (c:City) WHERE c.pop > 1000 RETURN c.name", &Default::default())?;
+```
+
+View definitions persist through WAL and snapshots; values rebuild on open in
+O(nodes × degree).  Writing to a view prop returns a named error so the guard
+is explicit.  See [`docs/site/views.md`](docs/site/views.md).
+
 ### Live rule and write subscriptions
 
 mushroomdb streams derived-edge events in real time. Subscribe to any rule and

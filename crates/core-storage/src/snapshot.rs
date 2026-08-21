@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAGIC: [u8; 4] = *b"GDB1";
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 
 /// IVF state for one side (src or dst) of a single approximate rule.
 /// Persisted in V4 snapshots so `open()` can restore cluster assignments
@@ -50,6 +50,11 @@ pub struct SnapshotState {
     /// Empty for exact rules and rules with no fitted clusters.
     /// Added in VERSION 4.
     pub ivf_state: BTreeMap<String, PerRuleIvfState>,
+    /// Bincoded `ViewDef` bytes — one entry per materialized view.  Raw bytes
+    /// keep core-storage independent of core-rules.  Values are NOT stored
+    /// here; they are recomputed after open from the persisted topo + props.
+    /// Added in VERSION 5.
+    pub view_defs: Vec<Vec<u8>>,
 }
 
 pub fn encode(state: &SnapshotState) -> Vec<u8> {
@@ -74,7 +79,9 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
     let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
     if version != VERSION {
         let hint = if version == 3 {
-            " — V3 snapshot is no longer supported; re-snapshot with a V4 binary"
+            " — V3 snapshot is no longer supported; re-snapshot with a V5 binary"
+        } else if version == 4 {
+            " — V4 snapshot is no longer supported; re-snapshot with a V5 binary"
         } else {
             ""
         };

@@ -51,6 +51,8 @@ pub enum GraphError {
     ReadOnly,
     /// Requested commit index is beyond the valid range.
     CommitOutOfRange { commit: u64, total: u64 },
+    /// Attempted to write to a view-managed property.
+    ViewPropReadOnly { view_name: String },
 }
 
 impl std::fmt::Display for GraphError {
@@ -69,6 +71,11 @@ impl std::fmt::Display for GraphError {
             GraphError::CommitOutOfRange { commit, total } => write!(
                 f,
                 "commit {commit} is out of range; valid range is 0..{total}"
+            ),
+            GraphError::ViewPropReadOnly { view_name } => write!(
+                f,
+                "property is managed by view {:?} and cannot be written directly",
+                view_name
             ),
         }
     }

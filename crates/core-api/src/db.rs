@@ -5,7 +5,8 @@ use core_query::cypher::{
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
-    evaluate, EngineEdgeDelta, GraphMut, NodeView, Predicate, RuleDef, RuleEngine, RuleIvfExport,
+    evaluate, EngineEdgeDelta, GraphMut, NodeView, Predicate, RuleDef, RuleEngine,
+    RuleIvfExport, ViewDef, ViewStore,
 };
 use crate::subscription::{
     event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
@@ -127,7 +128,7 @@ fn event_from_record(rec: &WalRecord) -> Option<MutationEvent> {
         }
         WalRecord::DeleteRule { name } => Some(MutationEvent::RuleDeleted { name: name.clone() }),
         WalRecord::RebuildRule { name } => Some(MutationEvent::RuleRebuilt { name: name.clone() }),
-        WalRecord::Batch(_) => None,
+        WalRecord::Batch(_) | WalRecord::CreateView { .. } | WalRecord::DeleteView { .. } => None,
     }
 }
 
@@ -359,6 +360,7 @@ pub struct GraphDb<F: Fs> {
     labels: Vec<u32>, // node id -> label symbol
     edge_props: EdgeProps,
     engine: RuleEngine,
+    view_store: ViewStore,
     event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
     /// Monotonically increasing per-commit counter.  A single `log_then_apply_with`
     /// call increments this once; all events emitted from that call share the same
@@ -421,6 +423,7 @@ impl<F: Fs> GraphDb<F> {
             labels: Vec::new(),
             edge_props: EdgeProps::new(),
             engine: RuleEngine::new(),
+            view_store: ViewStore::new(),
             event_sink: None,
             commit_seq: 0,
             subscriptions: Vec::new(),
@@ -451,7 +454,7 @@ impl<F: Fs> GraphDb<F> {
                 state.rule_tripped,
                 state.rule_fires,
             );
-            // V4 snapshot carries IVF state: restore it instead of re-fitting.
+            // V5 snapshot carries IVF state: restore it instead of re-fitting.
             // This turns the cold-start multi-minute re-fit into microseconds.
             let ivf_state: BTreeMap<String, RuleIvfExport> = state
                 .ivf_state
@@ -473,6 +476,20 @@ impl<F: Fs> GraphDb<F> {
                 &db.props,
                 ivf_state,
             );
+            // Restore view defs from snapshot (V5).
+            // The ColumnStore already contains view values from the snapshot;
+            // use restore_view (no collision check, no backfill) so the store
+            // is aware of the definitions.  rebuild_all runs after WAL replay.
+            for def_bytes in &state.view_defs {
+                let def: ViewDef = bincode::deserialize(def_bytes).map_err(|e| GraphError::Corrupt {
+                    detail: format!("snapshot view_def deserialize: {e}"),
+                })?;
+                db.view_store
+                    .restore_view(def)
+                    .map_err(|e| GraphError::Corrupt {
+                        detail: format!("snapshot view restore: {e}"),
+                    })?;
+            }
         }
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
@@ -497,6 +514,10 @@ impl<F: Fs> GraphDb<F> {
         // Any future as-of replay path (Plan-15 T2) must drain here to feed
         // replaying subscribers; the mechanism is already in place.
         let _ = db.engine.drain_deltas(); // belt-and-braces no-op after loop drain
+        // Rebuild view values after WAL replay so values are consistent with
+        // final topo+props state.  This is a full recompute that corrects any
+        // incremental drift accumulated during apply() replay.
+        db.view_store.rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
         Ok(db)
     }
 
@@ -515,6 +536,7 @@ impl<F: Fs> GraphDb<F> {
             labels: Vec::new(),
             edge_props: EdgeProps::new(),
             engine: RuleEngine::new(),
+            view_store: ViewStore::new(),
             event_sink: None,
             commit_seq: 0,
             subscriptions: Vec::new(),
@@ -576,7 +598,11 @@ impl<F: Fs> GraphDb<F> {
                 for (field, value) in props {
                     self.props.set(id, field, value.clone());
                 }
+                // Initialize view values for the new node before the engine runs so
+                // delta-based increments start from a known zero baseline.
+                self.view_store.init_node_views(id, &mut self.props, &self.syms, &self.labels);
                 // Fire rules for the newly inserted node.
+                let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
                     let mut gm = make_graph_mut(
@@ -590,6 +616,14 @@ impl<F: Fs> GraphDb<F> {
                     eng.on_node_changed(id, None, &mut gm);
                 }
                 self.engine = eng;
+                // Process derived-edge deltas for view maintenance.
+                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                for d in &new_deltas {
+                    self.view_store.on_edge_changed(
+                        d.etype_sym, d.src_id, d.dst_id, d.fired,
+                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    );
+                }
             }
             WalRecord::InsertEdge {
                 edge_type,
@@ -604,6 +638,11 @@ impl<F: Fs> GraphDb<F> {
                 })?;
                 let etype = self.syms.intern(edge_type);
                 self.topo.add_edge(etype, src, dst);
+                // View maintenance for manual edge insert.
+                self.view_store.on_edge_changed(
+                    etype, src, dst, true,
+                    &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                );
             }
             WalRecord::SetProp { key, field, value } => {
                 let id = self.ids.get(key).ok_or_else(|| GraphError::Corrupt {
@@ -612,6 +651,7 @@ impl<F: Fs> GraphDb<F> {
                 let old_value = self.props.get(id, field).cloned();
                 self.props.set(id, field, value.clone());
                 // Fire rules for the changed field.
+                let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
                     let mut gm = make_graph_mut(
@@ -625,6 +665,18 @@ impl<F: Fs> GraphDb<F> {
                     eng.on_node_changed(id, Some((field, old_value)), &mut gm);
                 }
                 self.engine = eng;
+                // Derived-edge deltas → view updates.
+                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                for d in &new_deltas {
+                    self.view_store.on_edge_changed(
+                        d.etype_sym, d.src_id, d.dst_id, d.fired,
+                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    );
+                }
+                // Neighbor-aggregate views that read `field` must also update.
+                self.view_store.on_prop_changed(
+                    id, field, &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                );
             }
             WalRecord::CreateRule { def_bytes } => {
                 let def: RuleDef =
@@ -638,6 +690,7 @@ impl<F: Fs> GraphDb<F> {
                 if self.engine.rules().any(|r| r.name == def.name) {
                     return Ok(());
                 }
+                let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 let result = {
                     let mut gm = make_graph_mut(
@@ -652,6 +705,14 @@ impl<F: Fs> GraphDb<F> {
                 };
                 self.engine = eng;
                 result.map_err(|e| GraphError::RuleInvalid { detail: e })?;
+                // Derived-edge fires from backfill → view updates.
+                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                for d in &new_deltas {
+                    self.view_store.on_edge_changed(
+                        d.etype_sym, d.src_id, d.dst_id, d.fired,
+                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    );
+                }
             }
             WalRecord::DeleteRule { name } => {
                 // Replay-over-snapshot idempotency: the snapshot already captured the
@@ -661,6 +722,7 @@ impl<F: Fs> GraphDb<F> {
                 if !self.engine.rules().any(|r| r.name == *name) {
                     return Ok(());
                 }
+                let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 let result = {
                     let mut gm = make_graph_mut(
@@ -675,6 +737,14 @@ impl<F: Fs> GraphDb<F> {
                 };
                 self.engine = eng;
                 result.map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
+                // Derived-edge retractions → view updates.
+                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                for d in &new_deltas {
+                    self.view_store.on_edge_changed(
+                        d.etype_sym, d.src_id, d.dst_id, d.fired,
+                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    );
+                }
             }
             WalRecord::RemoveProp { key, field } => {
                 // Recovery-safe: unknown key or already-absent field is a
@@ -685,6 +755,7 @@ impl<F: Fs> GraphDb<F> {
                 };
                 let old = self.props.get(id, field).cloned();
                 self.props.remove(id, field);
+                let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
                     let mut gm = make_graph_mut(
@@ -698,6 +769,18 @@ impl<F: Fs> GraphDb<F> {
                     eng.on_node_changed(id, Some((field, old)), &mut gm);
                 }
                 self.engine = eng;
+                // Derived-edge deltas → view updates.
+                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                for d in &new_deltas {
+                    self.view_store.on_edge_changed(
+                        d.etype_sym, d.src_id, d.dst_id, d.fired,
+                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    );
+                }
+                // Neighbor-aggregate views that read `field` must also update.
+                self.view_store.on_prop_changed(
+                    id, field, &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                );
             }
             WalRecord::DeleteEdge {
                 edge_type,
@@ -717,6 +800,11 @@ impl<F: Fs> GraphDb<F> {
                 };
                 self.topo.remove_edge(etype, src, dst);
                 self.edge_props.remove_edge(etype, src, dst);
+                // View maintenance for manual edge delete (topo already updated above).
+                self.view_store.on_edge_changed(
+                    etype, src, dst, false,
+                    &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                );
                 // No rule callback: validated as not provenance-owned and not
                 // would_derive, so no rule needs to update its desired set.
             }
@@ -734,6 +822,7 @@ impl<F: Fs> GraphDb<F> {
                 };
 
                 // (1) Retract derived edges + de-index while props/labels live.
+                let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
                     let mut gm = make_graph_mut(
@@ -747,22 +836,38 @@ impl<F: Fs> GraphDb<F> {
                     eng.on_node_removed(n, &mut gm);
                 }
                 self.engine = eng;
+                // Derived-edge retractions → view updates for neighbors.
+                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                for d in &new_deltas {
+                    self.view_store.on_edge_changed(
+                        d.etype_sym, d.src_id, d.dst_id, d.fired,
+                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    );
+                }
 
                 // (2) Sweep remaining user edges touching n, both directions,
                 // every etype. Collect then remove so neighbor slices stay valid.
+                // Remove from topo first, then call view maintenance so Avg/Min/Max
+                // recompute sees the correct (reduced) neighbor set.
                 let etypes: Vec<u32> = self.topo.etypes().collect();
                 let mut doomed = Vec::new();
-                for et in etypes {
-                    for &dst in self.topo.neighbors(et, Direction::Out, n) {
-                        doomed.push((et, n, dst));
+                for et in &etypes {
+                    for &dst in self.topo.neighbors(*et, Direction::Out, n) {
+                        doomed.push((*et, n, dst));
                     }
-                    for &src in self.topo.neighbors(et, Direction::In, n) {
-                        doomed.push((et, src, n));
+                    for &src in self.topo.neighbors(*et, Direction::In, n) {
+                        doomed.push((*et, src, n));
                     }
                 }
                 for (et, s, d) in doomed {
                     self.topo.remove_edge(et, s, d);
                     self.edge_props.remove_edge(et, s, d);
+                    // View maintenance: n's own view values will be cleared by
+                    // remove_all below; only update surviving neighbors.
+                    self.view_store.on_edge_changed(
+                        et, s, d, false,
+                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    );
                 }
 
                 // (3) Drop every remaining prop (`ColumnStore::remove_all`).
@@ -787,6 +892,7 @@ impl<F: Fs> GraphDb<F> {
                 if !self.engine.rules().any(|r| r.name == *name) {
                     return Ok(());
                 }
+                let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 let result = {
                     let mut gm = make_graph_mut(
@@ -801,6 +907,36 @@ impl<F: Fs> GraphDb<F> {
                 };
                 self.engine = eng;
                 result.map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
+                // Derived-edge delta changes → view updates.
+                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                for d in &new_deltas {
+                    self.view_store.on_edge_changed(
+                        d.etype_sym, d.src_id, d.dst_id, d.fired,
+                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                    );
+                }
+            }
+            WalRecord::CreateView { def_bytes } => {
+                let def: ViewDef =
+                    bincode::deserialize(def_bytes).map_err(|e| GraphError::Corrupt {
+                        detail: format!("CreateView def_bytes deserialize failed: {e}"),
+                    })?;
+                // Replay-over-snapshot idempotency: view already present → skip.
+                if self.view_store.has_view(&def.name) {
+                    return Ok(());
+                }
+                self.view_store
+                    .create_view(def, &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels)
+                    .map_err(|e| GraphError::RuleInvalid { detail: e })?;
+            }
+            WalRecord::DeleteView { name } => {
+                // Replay-over-snapshot idempotency: view already absent → skip.
+                if !self.view_store.has_view(name) {
+                    return Ok(());
+                }
+                self.view_store
+                    .delete_view(name, &mut self.props, &self.ids, &self.labels, &self.syms)
+                    .map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
             }
         }
         Ok(())
@@ -1057,7 +1193,9 @@ impl<F: Fs> GraphDb<F> {
                 .collect(),
             WalRecord::CreateRule { .. }
             | WalRecord::DeleteRule { .. }
-            | WalRecord::RebuildRule { .. } => vec![],
+            | WalRecord::RebuildRule { .. }
+            | WalRecord::CreateView { .. }
+            | WalRecord::DeleteView { .. } => vec![],
         }
     }
 
@@ -1382,6 +1520,11 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        if let Some(view_name) = self.view_store.view_for_prop(field) {
+            return Err(GraphError::ViewPropReadOnly {
+                view_name: view_name.to_string(),
+            });
+        }
         MutPreview::new(self).check_live_key(key)?;
         self.log_then_apply(WalRecord::SetProp {
             key: key.into(),
@@ -1395,6 +1538,11 @@ impl<F: Fs> GraphDb<F> {
     pub fn remove_prop(&mut self, key: &str, field: &str) -> Result<bool> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
+        }
+        if let Some(view_name) = self.view_store.view_for_prop(field) {
+            return Err(GraphError::ViewPropReadOnly {
+                view_name: view_name.to_string(),
+            });
         }
         if !MutPreview::new(self).prepare_remove_prop(key, field)? {
             return Ok(false);
@@ -1526,6 +1674,83 @@ impl<F: Fs> GraphDb<F> {
             return Err(GraphError::RuleNotFound { name: name.into() });
         }
         self.log_then_apply(WalRecord::RebuildRule { name: name.into() })
+    }
+
+    // -----------------------------------------------------------------------
+    // Materialized view API
+    // -----------------------------------------------------------------------
+
+    /// Register a new materialized property view, backfill its values for all
+    /// existing nodes, and WAL-log the definition.
+    ///
+    /// # Errors
+    /// - `ReadOnly`: called on an as-of instance.
+    /// - `RuleInvalid`: name collision, view_prop collision, or invalid def.
+    pub fn create_view(&mut self, def: ViewDef) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        // Pre-validate before WAL write.
+        def.validate()
+            .map_err(|e| GraphError::RuleInvalid { detail: e })?;
+        if self.view_store.has_view(&def.name) {
+            return Err(GraphError::RuleInvalid {
+                detail: format!("view {:?} already exists", def.name),
+            });
+        }
+        if let Some(existing) = self.view_store.view_for_prop(&def.view_prop) {
+            return Err(GraphError::RuleInvalid {
+                detail: format!(
+                    "view_prop {:?} is already used by view {:?}",
+                    def.view_prop, existing
+                ),
+            });
+        }
+        let def_bytes = bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
+            detail: format!("serialize view: {e}"),
+        })?;
+        self.log_then_apply(WalRecord::CreateView { def_bytes })
+    }
+
+    /// Remove a named view and delete its values from every node.
+    ///
+    /// # Errors
+    /// - `ReadOnly`: called on an as-of instance.
+    /// - `RuleNotFound`: view does not exist.
+    pub fn delete_view(&mut self, name: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if !self.view_store.has_view(name) {
+            return Err(GraphError::RuleNotFound { name: name.into() });
+        }
+        self.log_then_apply(WalRecord::DeleteView { name: name.into() })
+    }
+
+    /// Snapshot of all registered view definitions.
+    pub fn views(&self) -> Vec<ViewDef> {
+        self.view_store.views().cloned().collect()
+    }
+
+    /// Return the current view-maintained value of `view_prop` for node `key`.
+    /// Equivalent to `get_prop` but documents that it reads a view-managed column.
+    pub fn get_view_prop(&self, key: &str, view_prop: &str) -> Option<&Value> {
+        self.props.get(self.ids.get(key)?, view_prop)
+    }
+
+    /// For testing / DST oracle: scratch recompute of a view value for one node.
+    ///
+    /// Returns `None` if the node does not exist, the view does not exist, or
+    /// the view has no result for the node (e.g. Avg with no qualifying neighbors).
+    #[doc(hidden)]
+    pub fn scratch_view_value(&self, key: &str, view_name: &str) -> Option<Value> {
+        let node = self.ids.get(key)?;
+        let def = self.view_store.views().find(|v| v.name == view_name)?;
+        // Direct scratch computation using the same internal function,
+        // reading from live props so NeighborAgg sees real neighbor values.
+        core_rules::views::compute_view_value(
+            def, node, &self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+        )
     }
 
     pub fn get_prop(&self, key: &str, field: &str) -> Option<&Value> {
@@ -2299,6 +2524,11 @@ impl<F: Fs> GraphDb<F> {
                 )
             })
             .collect();
+        let view_defs: Vec<Vec<u8>> = self
+            .view_store
+            .views()
+            .map(|v| bincode::serialize(v).expect("ViewDef serialize cannot fail"))
+            .collect();
         let state = core_storage::snapshot::SnapshotState {
             ids: self.ids.clone(),
             syms: self.syms.clone(),
@@ -2311,6 +2541,7 @@ impl<F: Fs> GraphDb<F> {
             rule_tripped,
             rule_fires,
             ivf_state,
+            view_defs,
         };
         self.fs
             .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state))?;
