@@ -78,10 +78,7 @@ pub fn json_to_value(v: serde_json::Value) -> Option<Value> {
         serde_json::Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                match json_to_value(item) {
-                    Some(val) => out.push(val),
-                    None => return None,
-                }
+                out.push(json_to_value(item)?);
             }
             Some(Value::List(out))
         }

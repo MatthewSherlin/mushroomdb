@@ -7,7 +7,8 @@ pub mod plan;
 pub use ast::{
     AggArg, AggFunc, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, MatchDeleteNodeStmt,
     MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand, OrderItem, OrderTarget, Pattern,
-    Query, RelDir, RelPat, RetItem, RetVal, SetClause, WriteStatement,
+    Query, RelDir, RelPat, RetItem, RetVal, SetClause, UnwindClause, UnwindExpr, WithStage,
+    WriteStatement,
 };
 pub use exec::{execute, Params};
 pub use lexer::{lex, Tok};

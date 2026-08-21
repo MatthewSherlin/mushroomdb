@@ -6,7 +6,7 @@
 
 use super::ast::{
     AggArg, AggFunc, Expr, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query, RelDir,
-    RelPat, RetItem, RetVal,
+    RelPat, RetItem, RetVal, UnwindExpr, WithStage,
 };
 use std::collections::BTreeSet;
 
@@ -131,6 +131,33 @@ pub enum PlanOp {
         to: String,
         max_hops: u8,
     },
+    /// Non-aggregate WITH: apply filter / order / skip / limit to the current
+    /// row set without projecting. Node bindings in the row survive as-is so
+    /// that subsequent MATCH clauses can join against them.
+    ///
+    /// Always executes via the **staged path** (row_bound returns None for any
+    /// plan containing this op).
+    With {
+        items: Vec<RetItem>,
+        where_expr: Option<Expr>,
+        order_by: Vec<OrderItem>,
+        skip: Option<u64>,
+        limit: Option<u64>,
+    },
+    /// UNWIND: expand each input row into N rows by iterating a list value.
+    ///
+    /// - `list: UnwindExpr::Lit(v)` → use a literal list.
+    /// - `list: UnwindExpr::Prop { var, field }` → resolve the list from a node property.
+    /// - `list: UnwindExpr::Var(name)` → look up a scalar binding from a prior WITH.
+    ///
+    /// null / empty list → 0 output rows (openCypher).
+    /// Non-list → named error at execution time.
+    ///
+    /// Always executes via the **staged path** (row_bound returns None).
+    Unwind {
+        expr: UnwindExpr,
+        alias: String,
+    },
 }
 
 /// Compute the effective row bound for LIMIT push-down.
@@ -182,6 +209,14 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
     {
         return None;
     }
+    // Pipeline plans (WITH / UNWIND) always use the staged path so that
+    // intermediate rows are correctly bounded and pipeline stages are sequenced.
+    if ops
+        .iter()
+        .any(|op| matches!(op, PlanOp::With { .. } | PlanOp::Unwind { .. }))
+    {
+        return None;
+    }
     let limit_n = ops.iter().rev().find_map(|op| match op {
         PlanOp::Limit(n) => Some(*n),
         _ => None,
@@ -216,9 +251,31 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         )?;
     }
 
+    // Top-level UNWIND clauses.
+    for uw in &q.unwinds {
+        check_unwind_bound(&uw.list, &bound)?;
+        bound.insert(uw.alias.clone());
+        ops.push(PlanOp::Unwind {
+            expr: uw.list.clone(),
+            alias: uw.alias.clone(),
+        });
+    }
+
     if let Some(expr) = &q.where_expr {
         check_expr_bound(expr, &bound)?;
         ops.push(PlanOp::Filter { expr: expr.clone() });
+    }
+
+    // WITH pipeline stages.
+    for stage in &q.stages {
+        compile_with_stage(
+            stage,
+            &mut ops,
+            &mut bound,
+            &mut rel_bound,
+            &mut node_anon,
+            &mut rel_anon,
+        )?;
     }
 
     check_return_bound(&q.returns, &bound, &rel_bound)?;
@@ -226,13 +283,16 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     check_duplicate_columns(&q.returns)?;
 
     // Detect aggregate vs non-aggregate items in RETURN.
+    // For pipeline plans (with stages or top-level UNWIND), single-aggregate
+    // path is not used — route to GroupAggregate or Project.
+    let is_pipeline = !q.stages.is_empty() || !q.unwinds.is_empty();
     let agg_count = q
         .returns
         .iter()
         .filter(|r| matches!(&r.value, RetVal::Agg { .. }))
         .count();
 
-    if agg_count == 1 && q.returns.len() == 1 {
+    if agg_count == 1 && q.returns.len() == 1 && !is_pipeline {
         // Single-aggregate fast path: streaming O(1) accumulator, no grouping.
         let item = &q.returns[0];
         let (func, arg) = match &item.value {
@@ -324,6 +384,159 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     }
 
     Ok(ops)
+}
+
+/// Compile one WITH pipeline stage.
+fn compile_with_stage(
+    stage: &WithStage,
+    ops: &mut Vec<PlanOp>,
+    bound: &mut BTreeSet<String>,
+    rel_bound: &mut BTreeSet<String>,
+    node_anon: &mut u32,
+    rel_anon: &mut u32,
+) -> Result<(), String> {
+    let agg_count = stage
+        .items
+        .iter()
+        .filter(|r| matches!(&r.value, RetVal::Agg { .. }))
+        .count();
+
+    if agg_count > 0 {
+        // Aggregate WITH → compile GroupAggregate + optional Filter/OrderBy/Skip/Limit.
+        let mut keys: Vec<(String, RetItem)> = Vec::new();
+        let mut aggs: Vec<(AggFunc, AggArg, String)> = Vec::new();
+        for item in &stage.items {
+            match &item.value {
+                RetVal::Agg { func, arg } => {
+                    if let (
+                        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
+                        AggArg::Star,
+                    ) = (func, arg)
+                    {
+                        return Err(format!(
+                            "{name} does not accept '*'; use a property expression like `{name}(n.prop)`",
+                            name = func_name(func),
+                        ));
+                    }
+                    let col = item.alias.clone().unwrap_or_else(|| agg_column_name(func, arg));
+                    aggs.push((func.clone(), arg.clone(), col));
+                }
+                _ => {
+                    keys.push((column_name(item), item.clone()));
+                }
+            }
+        }
+        ops.push(PlanOp::GroupAggregate {
+            keys: keys.clone(),
+            aggs: aggs.clone(),
+        });
+
+        // Update bound to reflect only what GroupAggregate outputs.
+        bound.clear();
+        rel_bound.clear();
+        for (col, _) in &keys {
+            bound.insert(col.clone());
+        }
+        for (_, _, col) in &aggs {
+            bound.insert(col.clone());
+        }
+
+        // Optional HAVING filter (WHERE after WITH with aggregates).
+        if let Some(expr) = &stage.where_expr {
+            check_expr_bound(expr, bound)?;
+            ops.push(PlanOp::Filter { expr: expr.clone() });
+        }
+        // ORDER BY on the group result rows (not yet projected).
+        if !stage.order_by.is_empty() {
+            ops.push(PlanOp::OrderBy {
+                items: stage.order_by.clone(),
+            });
+        }
+        if let Some(n) = stage.skip {
+            ops.push(PlanOp::Skip(n));
+        }
+        if let Some(n) = stage.limit {
+            ops.push(PlanOp::Limit(n));
+        }
+    } else {
+        // Non-aggregate WITH → validate items and emit PlanOp::With.
+        check_return_bound(&stage.items, bound, rel_bound)?;
+
+        // Optional WHERE filter on the current (pre-WITH) rows.
+        // This also handles bare-variable operands (Operand::Var) referencing
+        // scalar aliases produced by earlier stages.
+        if let Some(expr) = &stage.where_expr {
+            check_expr_bound(expr, bound)?;
+        }
+        // ORDER BY items reference either var names or prop paths — no rewrite needed
+        // here; exec_order_by_rows handles raw row ordering.
+        // ORDER BY may reference the WITH output columns (aliases) in addition to
+        // variables already in scope before the WITH.
+        let with_col_names: BTreeSet<String> = stage.items.iter().map(column_name).collect();
+        for item in &stage.order_by {
+            match &item.target {
+                OrderTarget::Prop { var, .. } | OrderTarget::Var(var) => {
+                    if !bound.contains(var.as_str()) && !with_col_names.contains(var.as_str()) {
+                        return Err(format!(
+                            "unbound variable `{var}` in ORDER BY in WITH"
+                        ));
+                    }
+                }
+                OrderTarget::Alias(name) => {
+                    if !bound.contains(name.as_str()) && !with_col_names.contains(name.as_str()) {
+                        return Err(format!(
+                            "unbound variable `{name}` in ORDER BY in WITH"
+                        ));
+                    }
+                }
+            }
+        }
+        ops.push(PlanOp::With {
+            items: stage.items.clone(),
+            where_expr: stage.where_expr.clone(),
+            order_by: stage.order_by.clone(),
+            skip: stage.skip,
+            limit: stage.limit,
+        });
+
+        // Update bound: after non-aggregate WITH, only the WITH items survive.
+        let mut new_bound: BTreeSet<String> = BTreeSet::new();
+        let mut new_rel_bound: BTreeSet<String> = BTreeSet::new();
+        for item in &stage.items {
+            let col = column_name(item);
+            new_bound.insert(col.clone());
+            // Preserve rel-bound status for relationship variables carried through.
+            match &item.value {
+                RetVal::Var(v) if rel_bound.contains(v.as_str()) => {
+                    new_rel_bound.insert(col);
+                }
+                _ => {}
+            }
+        }
+        *bound = new_bound;
+        *rel_bound = new_rel_bound;
+    }
+
+    // MATCH clauses that follow this WITH.
+    for pat in &stage.matches {
+        compile_pattern(pat, ops, bound, rel_bound, node_anon, rel_anon)?;
+    }
+    // UNWIND clauses that follow this WITH.
+    for uw in &stage.unwinds {
+        check_unwind_bound(&uw.list, bound)?;
+        bound.insert(uw.alias.clone());
+        ops.push(PlanOp::Unwind {
+            expr: uw.list.clone(),
+            alias: uw.alias.clone(),
+        });
+    }
+    // WHERE that follows those MATCHes.
+    if let Some(expr) = &stage.post_where {
+        check_expr_bound(expr, bound)?;
+        ops.push(PlanOp::Filter { expr: expr.clone() });
+    }
+
+    Ok(())
 }
 
 fn compile_pattern(
@@ -481,6 +694,16 @@ fn check_operand_bound(
     match operand {
         Operand::Prop { var, .. } => require_bound(var, bound, clause),
         Operand::Lit(_) | Operand::Param(_) => Ok(()),
+        Operand::Var(name) => require_bound(name, bound, clause),
+    }
+}
+
+/// Validate that any variable referenced in an UNWIND expression is already bound.
+fn check_unwind_bound(expr: &UnwindExpr, bound: &BTreeSet<String>) -> Result<(), String> {
+    match expr {
+        UnwindExpr::Lit(_) => Ok(()),
+        UnwindExpr::Prop { var, .. } => require_bound(var, bound, "UNWIND"),
+        UnwindExpr::Var(name) => require_bound(name, bound, "UNWIND"),
     }
 }
 
@@ -1075,7 +1298,9 @@ LIMIT 10";
         use crate::cypher::ast::{NodePat, Pattern, Query};
         let q = Query {
             matches: vec![],
+            unwinds: vec![],
             where_expr: None,
+            stages: vec![],
             returns: vec![],
             order_by: vec![],
             skip: None,
@@ -1095,11 +1320,13 @@ LIMIT 10";
                 chain: vec![],
                 shortest: false,
             }],
+            unwinds: vec![],
             where_expr: Some(Expr::Not(Box::new(Expr::Cmp {
                 lhs: Operand::Param("p".into()),
                 op: CmpOp::Eq,
                 rhs: Operand::Lit(Value::Int(1)),
             }))),
+            stages: vec![],
             returns: vec![],
             order_by: vec![OrderItem {
                 target: OrderTarget::Alias("missing".into()),

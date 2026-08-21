@@ -1346,7 +1346,9 @@ impl<F: Fs> GraphDb<F> {
             .collect();
         let read_q = Query {
             matches: stmt.matches,
+            unwinds: vec![],
             where_expr: stmt.where_expr,
+            stages: vec![],
             returns,
             order_by: vec![],
             skip: None,
@@ -1423,7 +1425,9 @@ impl<F: Fs> GraphDb<F> {
             .collect();
         let read_q = Query {
             matches: stmt.matches,
+            unwinds: vec![],
             where_expr: stmt.where_expr,
+            stages: vec![],
             returns,
             order_by: vec![],
             skip: None,
@@ -1513,7 +1517,9 @@ impl<F: Fs> GraphDb<F> {
             .collect();
         let read_q = Query {
             matches: stmt.matches,
+            unwinds: vec![],
             where_expr: stmt.where_expr,
+            stages: vec![],
             returns,
             order_by: vec![],
             skip: None,

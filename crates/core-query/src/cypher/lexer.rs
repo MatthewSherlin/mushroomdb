@@ -16,6 +16,9 @@ pub enum Tok {
     Not,
     Asc,
     Desc,
+    // pipeline keywords
+    With,
+    Unwind,
     // write keywords
     Create,
     Set,
@@ -237,6 +240,8 @@ fn keyword(word: &str) -> Option<Tok> {
         "not" => Tok::Not,
         "asc" => Tok::Asc,
         "desc" => Tok::Desc,
+        "with" => Tok::With,
+        "unwind" => Tok::Unwind,
         "create" => Tok::Create,
         "set" => Tok::Set,
         "delete" => Tok::Delete,

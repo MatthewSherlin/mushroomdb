@@ -126,6 +126,81 @@ RETURN r.length
 
 ---
 
+## WITH pipelines
+
+`WITH` turns the executor into a multi-stage pipeline: each clause projects,
+filters, sorts, and/or limits the working set before passing rows into the
+next stage.
+
+### Basic projection and aliasing
+
+```cypher
+MATCH (p:Person)
+WITH p, p.city AS city
+RETURN city
+ORDER BY city
+```
+
+### Aggregation with HAVING (WHERE after WITH)
+
+```cypher
+MATCH (p:Person)
+WITH p.city AS city, COUNT(*) AS cnt
+WHERE cnt > 2
+RETURN city, cnt
+ORDER BY cnt DESC
+```
+
+The `WHERE` clause after an aggregating `WITH` acts as a HAVING filter —
+evaluated against the group result, not the raw matched rows.
+
+### ORDER BY and LIMIT inside WITH
+
+```cypher
+MATCH (p:Person)
+WITH p, p.age AS age
+ORDER BY age DESC
+LIMIT 5
+RETURN p.name AS name, age
+```
+
+### Chained stages with re-entry MATCH
+
+```cypher
+MATCH (p:Person)
+WITH p.city AS city, COUNT(*) AS cnt
+WHERE cnt > 1
+MATCH (p2:Person)
+WHERE p2.city = city
+RETURN p2.name AS name, city
+```
+
+Each `WITH` stage produces a new working set.  A subsequent `MATCH` clause
+joins against that set — use `WHERE` to correlate.
+
+---
+
+## UNWIND
+
+`UNWIND` expands a list into one row per element.  Null or empty lists produce
+zero rows.
+
+```cypher
+MATCH (p:Person)
+UNWIND [1, 2, 3] AS x
+RETURN p.name AS name, x
+```
+
+List source forms:
+- Literal list: `UNWIND [1, 2, 'a'] AS x`
+- Property containing a list value: `UNWIND p.tags AS tag`
+- A named alias from a prior `WITH`: `UNWIND items AS item`
+
+Passing a non-list value (e.g., a plain integer property) is a named error.
+Intermediate rows produced by `UNWIND` count against the 1,000,000-row budget.
+
+---
+
 ## Aggregation
 
 ```cypher
@@ -280,6 +355,8 @@ MERGE (n:Person {id: 'alice'})
 | Bare DELETE on node with edges | Error — use DETACH DELETE |
 | MERGE ON CREATE / ON MATCH | Not supported |
 | Grouped aggregation | Supported (multiple keys and multiple aggregates allowed; group count capped at 1,000,000) |
+| WITH pipeline stages | Supported — projection, aliasing, WHERE (HAVING), ORDER BY, LIMIT, and re-entry MATCH |
+| UNWIND | Supported — list literals, list-valued properties, and scalar aliases from prior WITH; non-list → named error |
 | Variable-length paths: max hops | Capped at 10 |
 | shortestPath with unbound endpoints | Rejected at planning time |
-| Intermediate result budget | 1,000,000 rows |
+| Intermediate result budget | 1,000,000 rows (WITH/UNWIND intermediate rows count against this cap) |

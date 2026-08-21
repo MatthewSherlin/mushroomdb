@@ -3,7 +3,8 @@
 use super::ast::{
     AggArg, AggFunc, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
     MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand, OrderItem,
-    OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, SetClause, WriteStatement,
+    OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, SetClause, UnwindClause,
+    UnwindExpr, WithStage, WriteStatement,
 };
 use super::Tok;
 use crate::filter::CmpOp;
@@ -101,11 +102,22 @@ impl<'a> Parser<'a> {
         if matches.is_empty() {
             return Err(self.err("expected MATCH"));
         }
+        // Optional WHERE before any UNWIND or WITH.
         let where_expr = if self.eat(&Tok::Where) {
             Some(self.expr(0)?)
         } else {
             None
         };
+        // Optional top-level UNWIND clauses (after WHERE, before WITH).
+        let mut unwinds = Vec::new();
+        while self.peek() == Some(&Tok::Unwind) {
+            unwinds.push(self.unwind_clause()?);
+        }
+        // WITH pipeline stages (zero or more).
+        let mut stages = Vec::new();
+        while self.peek() == Some(&Tok::With) {
+            stages.push(self.with_stage()?);
+        }
         let returns = self.return_clause()?;
         let aliases: Vec<&str> = returns.iter().filter_map(|r| r.alias.as_deref()).collect();
         let order_by = if self.peek() == Some(&Tok::Order) {
@@ -128,12 +140,119 @@ impl<'a> Parser<'a> {
         }
         Ok(Query {
             matches,
+            unwinds,
             where_expr,
+            stages,
             returns,
             order_by,
             skip,
             limit,
         })
+    }
+
+    /// Parse one `WITH <items> [WHERE] [ORDER BY] [SKIP] [LIMIT] [MATCH]* [UNWIND]* [WHERE]`
+    /// stage and return a `WithStage`.
+    fn with_stage(&mut self) -> Result<WithStage, String> {
+        self.expect(&Tok::With, "expected WITH")?;
+        let mut items = vec![self.ret_item()?];
+        while self.eat(&Tok::Comma) {
+            items.push(self.ret_item()?);
+        }
+        // Optional WHERE / HAVING immediately after WITH items.
+        let where_expr = if self.eat(&Tok::Where) {
+            Some(self.expr(0)?)
+        } else {
+            None
+        };
+        // Optional ORDER BY inside WITH.
+        let aliases: Vec<&str> = items.iter().filter_map(|r| r.alias.as_deref()).collect();
+        let order_by = if self.peek() == Some(&Tok::Order) {
+            self.order_clause(&aliases)?
+        } else {
+            Vec::new()
+        };
+        let skip = if self.eat(&Tok::Skip) {
+            Some(self.uint("SKIP")?)
+        } else {
+            None
+        };
+        let limit = if self.eat(&Tok::Limit) {
+            Some(self.uint("LIMIT")?)
+        } else {
+            None
+        };
+        // Optional MATCH clauses that follow this WITH.
+        let mut matches = Vec::new();
+        while self.peek() == Some(&Tok::Match) {
+            matches.push(self.match_clause()?);
+        }
+        // Optional UNWIND clauses that follow those MATCHes.
+        let mut stage_unwinds = Vec::new();
+        while self.peek() == Some(&Tok::Unwind) {
+            stage_unwinds.push(self.unwind_clause()?);
+        }
+        // Optional WHERE that follows those MATCHes / UNWINDs.
+        let post_where = if self.peek() == Some(&Tok::Where)
+            && (!matches.is_empty() || !stage_unwinds.is_empty())
+        {
+            self.pos += 1; // consume WHERE
+            Some(self.expr(0)?)
+        } else {
+            None
+        };
+        Ok(WithStage {
+            items,
+            where_expr,
+            order_by,
+            skip,
+            limit,
+            matches,
+            unwinds: stage_unwinds,
+            post_where,
+        })
+    }
+
+    /// Parse `UNWIND <expr> AS <alias>`.
+    fn unwind_clause(&mut self) -> Result<UnwindClause, String> {
+        self.expect(&Tok::Unwind, "expected UNWIND")?;
+        let list = self.unwind_expr()?;
+        self.expect(&Tok::As, "expected AS after UNWIND expression")?;
+        let alias = self.ident("expected alias identifier after AS")?;
+        Ok(UnwindClause { list, alias })
+    }
+
+    /// Parse the list expression in an UNWIND clause:
+    /// - `[v1, v2, …]` — literal list.
+    /// - `var.field`   — property reference.
+    /// - `var`         — bare variable (alias from a prior WITH).
+    fn unwind_expr(&mut self) -> Result<UnwindExpr, String> {
+        match self.peek() {
+            Some(Tok::LBracket) => {
+                self.pos += 1; // consume '['
+                let mut vals = Vec::new();
+                if !self.eat(&Tok::RBracket) {
+                    loop {
+                        vals.push(self.literal_value("UNWIND list element")?);
+                        if self.eat(&Tok::Comma) {
+                            continue;
+                        }
+                        self.expect(&Tok::RBracket, "expected ']' to close UNWIND list")?;
+                        break;
+                    }
+                }
+                Ok(UnwindExpr::Lit(vals))
+            }
+            Some(Tok::Ident(_)) => {
+                let name = self.ident("expected variable or property in UNWIND")?;
+                if self.eat(&Tok::Dot) {
+                    let field = self.ident("expected field name after '.' in UNWIND")?;
+                    Ok(UnwindExpr::Prop { var: name, field })
+                } else {
+                    Ok(UnwindExpr::Var(name))
+                }
+            }
+            _ => Err(self.err("expected list literal, property, or variable in UNWIND")),
+        }
     }
 
     fn match_clause(&mut self) -> Result<Pattern, String> {
@@ -475,9 +594,13 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::Ident(_)) => {
                 let var = self.ident("expected identifier")?;
-                self.expect(&Tok::Dot, "expected '.' after variable in operand")?;
-                let field = self.ident("expected field name after '.'")?;
-                Ok(Operand::Prop { var, field })
+                if self.eat(&Tok::Dot) {
+                    let field = self.ident("expected field name after '.'")?;
+                    Ok(Operand::Prop { var, field })
+                } else {
+                    // Bare variable reference (e.g. alias name in WITH … WHERE c > 2).
+                    Ok(Operand::Var(var))
+                }
             }
             _ => Err(self.err("expected operand (property, literal, or parameter)")),
         }
@@ -1139,6 +1262,7 @@ SKIP 1 LIMIT 5";
                 ],
                 shortest: false,
             }],
+            unwinds: vec![],
             where_expr: Some(Expr::Or(
                 Box::new(Expr::And(
                     Box::new(Expr::Not(Box::new(cmp(
@@ -1158,6 +1282,7 @@ SKIP 1 LIMIT 5";
                     Operand::Lit(Value::Float(2.5)),
                 )),
             )),
+            stages: vec![],
             returns: vec![
                 RetItem {
                     value: RetVal::Var("a".into()),
@@ -1361,6 +1486,7 @@ LIMIT 10";
                     shortest: false,
                 },
             ],
+            unwinds: vec![],
             where_expr: Some(Expr::And(
                 Box::new(cmp(
                     prop("i", "score"),
@@ -1373,6 +1499,7 @@ LIMIT 10";
                     Operand::Lit(Value::Float(0.5)),
                 )),
             )),
+            stages: vec![],
             returns: vec![
                 RetItem {
                     value: RetVal::Var("c".into()),

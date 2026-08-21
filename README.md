@@ -254,6 +254,7 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | No multi-statement transactions | Single write statement per query in v1. Multi-statement and BEGIN/COMMIT are not supported. |
 | Cypher aggregations | `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` are supported both as single aggregates and as grouped aggregates (`RETURN a, COUNT(*)`). Multiple group keys and multiple aggregates per query are allowed. Group count is capped at 1,000,000 distinct keys. |
 | Variable-length paths: max hops capped at 10 | `-[r:TYPE*min..max]->` and `shortestPath` are supported. Max hops is hard-capped at 10; unbounded forms (`*min..`) are rejected at parse time. Intermediate results are capped at 1,000,000 rows. See [`docs/site/query.md`](docs/site/query.md). |
+| WITH pipeline and UNWIND | `WITH` pipeline stages (projection, aliasing, HAVING-style WHERE, ORDER BY, LIMIT, re-entry MATCH) and `UNWIND` list expansion are fully supported. Intermediate rows count against the 1,000,000-row budget. See [`docs/site/query.md`](docs/site/query.md). |
 
 ---
 
@@ -278,7 +279,7 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 | Medium | Edge deletes via batch/script API |
 | Medium | mmap-backed storage (RAM-independent at rest) |
 | Medium | Multi-statement transactions |
-| Medium | Expanded Cypher surface (subqueries, `WITH` clause, `CASE` expressions) |
+| Medium | Expanded Cypher surface (subqueries, `CASE` expressions) |
 | Low | TypeScript bindings (napi-rs) |
 | Low | WASM playground |
 | Low | Time-travel queries |

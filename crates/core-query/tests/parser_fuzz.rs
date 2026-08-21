@@ -95,6 +95,8 @@ fn render_tok(t: &Tok) -> String {
         Tok::Delete => "DELETE".into(),
         Tok::Detach => "DETACH".into(),
         Tok::Merge => "MERGE".into(),
+        Tok::With => "WITH".into(),
+        Tok::Unwind => "UNWIND".into(),
     }
 }
 

@@ -6,11 +6,56 @@ use core_storage::Value;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub matches: Vec<Pattern>,
+    /// Top-level UNWIND clauses (after initial MATCH, before WHERE/WITH/RETURN).
+    pub unwinds: Vec<UnwindClause>,
     pub where_expr: Option<Expr>,
+    /// WITH pipeline stages. Each stage carries a WITH clause and optional
+    /// MATCH / UNWIND / WHERE that follow it.
+    pub stages: Vec<WithStage>,
     pub returns: Vec<RetItem>,
     pub order_by: Vec<OrderItem>,
     pub skip: Option<u64>,
     pub limit: Option<u64>,
+}
+
+/// One `UNWIND <expr> AS <alias>` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnwindClause {
+    pub list: UnwindExpr,
+    pub alias: String,
+}
+
+/// The expression whose value is iterated in UNWIND.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnwindExpr {
+    /// Inline list literal: `[1, 2, 3]`.
+    Lit(Vec<Value>),
+    /// Property on a bound node: `n.tags`.
+    Prop { var: String, field: String },
+    /// A previously bound alias (from a prior WITH): `alias`.
+    Var(String),
+}
+
+/// One WITH stage in a pipeline:
+/// ```text
+/// WITH <items> [WHERE <expr>] [ORDER BY …] [SKIP n] [LIMIT n]
+/// [MATCH …]* [UNWIND …]* [WHERE <expr>]
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithStage {
+    /// The projected items in the WITH clause.
+    pub items: Vec<RetItem>,
+    /// Optional WHERE / HAVING filter immediately after the WITH keyword.
+    pub where_expr: Option<Expr>,
+    pub order_by: Vec<OrderItem>,
+    pub skip: Option<u64>,
+    pub limit: Option<u64>,
+    /// MATCH clauses that follow this WITH.
+    pub matches: Vec<Pattern>,
+    /// UNWIND clauses that follow this WITH.
+    pub unwinds: Vec<UnwindClause>,
+    /// WHERE clause that follows those MATCHes (pre-next-WITH/RETURN filter).
+    pub post_where: Option<Expr>,
 }
 
 /// Aggregate function in a RETURN clause.
@@ -91,6 +136,8 @@ pub enum Operand {
     Prop { var: String, field: String },
     Lit(Value),
     Param(String),
+    /// Bare variable reference (used in `WITH … WHERE alias > 2`).
+    Var(String),
 }
 
 /// RETURN item value: bare variable, `var.field`, or an aggregate call.

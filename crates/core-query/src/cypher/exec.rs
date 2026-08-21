@@ -1,6 +1,8 @@
 //! Cypher executor: `PlanOp` sequence → `ResultSet` over a binding table.
 
-use crate::cypher::ast::{AggArg, AggFunc, Expr, Operand, OrderItem, OrderTarget, RetItem, RetVal};
+use crate::cypher::ast::{
+    AggArg, AggFunc, Expr, Operand, OrderItem, OrderTarget, RetItem, RetVal, UnwindExpr,
+};
 use crate::cypher::plan::PlanOp;
 use crate::cypher::RelDir;
 use crate::filter::eval_cmp;
@@ -21,13 +23,15 @@ static FUSED_SCAN_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// execution start (the plan is walked before any rows are produced).
 pub struct Params<'a>(pub &'a BTreeMap<String, Value>);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Cell {
     Node(u32),
     Rel(EdgeRef),
     /// Virtual path cell produced by `VarExpand` / `ShortestPath`.
     /// The only accessible property is `length` → `Value::Int(hops)`.
     Path(u8),
+    /// Scalar value produced by a WITH projection (property alias, aggregate result, etc.).
+    Scalar(Value),
 }
 
 /// Binding-table row: one slot per interned variable. Cheaper to clone than
@@ -245,17 +249,38 @@ fn execute_inner(
         .iter()
         .any(|op| matches!(op, PlanOp::VarExpand { .. } | PlanOp::ShortestPath { .. }));
 
+    // Pipeline plans (WITH / UNWIND) always use the staged path so that
+    // intermediate rows produced by GroupAggregate / With / Unwind stages
+    // can feed into later MATCH / RETURN stages.
+    // A GroupAggregate followed by a Filter means aggregate-WITH with a HAVING
+    // clause — route through staged path so the Filter evaluates against
+    // Cell::Scalar rows produced by group_result_to_rows.
+    let is_pipeline = plan
+        .iter()
+        .any(|op| matches!(op, PlanOp::With { .. } | PlanOp::Unwind { .. }))
+        || {
+            let mut saw_gagg = false;
+            plan.iter().any(|op| {
+                if matches!(op, PlanOp::GroupAggregate { .. }) {
+                    saw_gagg = true;
+                    false
+                } else {
+                    saw_gagg && matches!(op, PlanOp::Filter { .. })
+                }
+            })
+        };
+
     // GroupAggregate plans: streaming HashMap accumulator (O(groups) memory).
     // Checked before the bounded path and before single-aggregate so they are
-    // never routed to pull.  Skipped for VarExpand plans (go to staged path).
-    if !has_var_expand && plan.iter().any(|op| matches!(op, PlanOp::GroupAggregate { .. })) {
+    // never routed to pull.  Skipped for VarExpand and pipeline plans.
+    if !has_var_expand && !is_pipeline && plan.iter().any(|op| matches!(op, PlanOp::GroupAggregate { .. })) {
         return execute_group_aggregate(view, plan, params);
     }
 
     // Aggregate plans: streaming accumulator path (O(1) memory, no budget).
     // Checked before the bounded path so aggregates are never routed to pull.
-    // Skipped for VarExpand plans — they go to the staged path instead.
-    if !has_var_expand && plan.iter().any(|op| matches!(op, PlanOp::Aggregate { .. })) {
+    // Skipped for VarExpand and pipeline plans — they go to the staged path.
+    if !has_var_expand && !is_pipeline && plan.iter().any(|op| matches!(op, PlanOp::Aggregate { .. })) {
         return execute_aggregate(view, plan, params);
     }
 
@@ -317,10 +342,12 @@ fn execute_inner(
                 projected = Some(exec_project(view, &vars, &rows, items)?);
             }
             PlanOp::OrderBy { items } => {
-                let table = projected
-                    .as_mut()
-                    .ok_or_else(|| "ORDER BY before PROJECT".to_string())?;
-                exec_order_by(table, items)?;
+                if let Some(table) = projected.as_mut() {
+                    exec_order_by(table, items)?;
+                } else {
+                    // Pipeline mode: ORDER BY on raw rows (before any Project).
+                    exec_order_by_rows(&vars, &mut rows, items, view);
+                }
             }
             PlanOp::Skip(n) => {
                 if let Some(table) = projected.as_mut() {
@@ -336,10 +363,10 @@ fn execute_inner(
                     apply_limit(&mut rows, *n);
                 }
             }
-            // GroupAggregate plans without VarExpand are routed to
+            // GroupAggregate plans without VarExpand or pipeline are routed to
             // execute_group_aggregate() before reaching the staged path.
-            // Plans that combine VarExpand with GroupAggregate fall through
-            // to here; group over the already-materialised rows.
+            // Plans that combine VarExpand with GroupAggregate, or pipeline plans
+            // with an intermediate GroupAggregate, fall through to here.
             PlanOp::GroupAggregate { keys, aggs } => {
                 let mut grp_groups: HashMap<GroupKey, GroupEntry> = HashMap::new();
                 let mut grp_key_order: Vec<GroupKey> = Vec::new();
@@ -376,7 +403,116 @@ fn execute_inner(
                         (vec![], aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect()),
                     );
                 }
-                projected = Some(build_group_projected(keys, aggs, grp_key_order, &mut grp_groups));
+                if is_pipeline {
+                    // Pipeline mode: convert group results to raw rows with Cell::Scalar
+                    // so that subsequent WITH / RETURN stages can consume them.
+                    rows = group_result_to_rows(keys, aggs, grp_key_order, &mut grp_groups, &vars);
+                    projected = None;
+                } else {
+                    projected = Some(build_group_projected(keys, aggs, grp_key_order, &mut grp_groups));
+                }
+            }
+            // Non-aggregate WITH: apply filter / order / skip / limit, then
+            // project scalar aliases as Cell::Scalar while keeping node bindings.
+            PlanOp::With { items, where_expr, order_by, skip, limit } => {
+                // Project each input row through the WITH items first so that
+                // output aliases (e.g. `p.age AS age`) are available for the
+                // subsequent WHERE filter, ORDER BY, SKIP, and LIMIT.
+                let row_len = vars.names.len();
+                let mut new_rows: Vec<Row> = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let mut new_row: Row = vec![None; row_len];
+                    for item in items {
+                        let col = column_name(item);
+                        let Some(dst_slot) = vars.slot(&col) else { continue };
+                        match &item.value {
+                            RetVal::Var(v) => {
+                                // Carry the existing cell (node binding or scalar alias).
+                                if let Some(src_slot) = vars.slot(v) {
+                                    new_row[dst_slot] = row.get(src_slot).cloned().flatten();
+                                }
+                            }
+                            RetVal::Prop { var, field } => {
+                                let val = resolve_prop(view, &vars, row, var, field)?;
+                                new_row[dst_slot] = val.map(Cell::Scalar);
+                            }
+                            RetVal::Agg { .. } => {} // aggregate WITH handled via GroupAggregate
+                        }
+                    }
+                    new_rows.push(new_row);
+                }
+                rows = new_rows;
+                // Apply WHERE (HAVING-like) filter on projected rows.
+                if let Some(expr) = where_expr {
+                    rows = exec_filter(view, &vars, &rows, expr, params)?;
+                }
+                // ORDER BY / SKIP / LIMIT on projected rows.
+                if !order_by.is_empty() {
+                    exec_order_by_rows(&vars, &mut rows, order_by, view);
+                }
+                if let Some(n) = skip {
+                    apply_skip(&mut rows, *n);
+                }
+                if let Some(n) = limit {
+                    apply_limit(&mut rows, *n);
+                }
+            }
+            // UNWIND: expand each input row into N rows by iterating a list value.
+            PlanOp::Unwind { expr, alias } => {
+                let alias_slot = vars.slot(alias)
+                    .ok_or_else(|| format!("UNWIND alias `{alias}` not in VarTable"))?;
+                let cap = max_intermediate_rows();
+                let mut new_rows: Vec<Row> = Vec::new();
+                for row in &rows {
+                    let list_val: Option<Value> = match expr {
+                        UnwindExpr::Lit(vals) => {
+                            Some(Value::List(vals.clone()))
+                        }
+                        UnwindExpr::Prop { var, field } => {
+                            resolve_prop(view, &vars, row, var, field)?
+                        }
+                        UnwindExpr::Var(name) => {
+                            let slot = vars.slot(name)
+                                .ok_or_else(|| format!("UNWIND variable `{name}` is not bound"))?;
+                            match row.get(slot).and_then(|c| c.as_ref()) {
+                                Some(Cell::Scalar(v)) => Some(v.clone()),
+                                Some(Cell::Node(_) | Cell::Rel(_) | Cell::Path(_)) => {
+                                    return Err(format!(
+                                        "UNWIND requires a list; `{name}` is bound to a graph element"
+                                    ));
+                                }
+                                None => None,
+                            }
+                        }
+                    };
+                    match list_val {
+                        None => {} // null → 0 rows (openCypher)
+                        Some(Value::List(items_list)) => {
+                            // Empty list → 0 rows (openCypher)
+                            for item_val in items_list {
+                                if new_rows.len() >= cap {
+                                    return Err(row_cap_err(cap));
+                                }
+                                let mut new_row = row.clone();
+                                new_row[alias_slot] = Some(Cell::Scalar(item_val));
+                                new_rows.push(new_row);
+                            }
+                        }
+                        Some(other) => {
+                            let type_name = match &other {
+                                Value::Int(_) => "Int",
+                                Value::Float(_) => "Float",
+                                Value::Str(_) => "Str",
+                                Value::Bool(_) => "Bool",
+                                Value::List(_) => unreachable!(),
+                            };
+                            return Err(format!(
+                                "UNWIND requires a list; got {type_name} value for `{alias}`"
+                            ));
+                        }
+                    }
+                }
+                rows = new_rows;
             }
             // Aggregate plans without VarExpand are routed to execute_aggregate()
             // before reaching the staged path.  Plans that combine VarExpand with
@@ -548,15 +684,18 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                 }
             },
             PlanOp::GroupAggregate { keys, aggs } => {
-                for (_, item) in keys {
+                // Intern input variable names (for the producer pass).
+                for (col, item) in keys {
                     match &item.value {
                         RetVal::Var(name) | RetVal::Prop { var: name, .. } => {
                             vars.intern(name);
                         }
                         RetVal::Agg { .. } => {}
                     }
+                    // Intern output column name (for subsequent pipeline stages).
+                    vars.intern(col);
                 }
-                for (_, arg, _) in aggs {
+                for (_, arg, col) in aggs {
                     match arg {
                         AggArg::Star => {}
                         AggArg::Var(v) => {
@@ -566,6 +705,52 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                             vars.intern(var);
                         }
                     }
+                    // Intern output column name.
+                    vars.intern(col);
+                }
+            }
+            PlanOp::With { items, where_expr, order_by, .. } => {
+                for item in items {
+                    match &item.value {
+                        RetVal::Var(name) | RetVal::Prop { var: name, .. } => {
+                            vars.intern(name);
+                        }
+                        RetVal::Agg { .. } => {}
+                    }
+                    // Intern output column name (alias or derived).
+                    if let Some(alias) = &item.alias {
+                        vars.intern(alias);
+                    } else {
+                        match &item.value {
+                            RetVal::Var(name) => { vars.intern(name); }
+                            RetVal::Prop { var, field } => {
+                                let col = format!("{var}.{field}");
+                                vars.intern(&col);
+                            }
+                            RetVal::Agg { .. } => {}
+                        }
+                    }
+                }
+                if let Some(expr) = where_expr {
+                    intern_expr(&mut vars, expr);
+                }
+                for oi in order_by {
+                    match &oi.target {
+                        OrderTarget::Alias(name) | OrderTarget::Var(name) => {
+                            vars.intern(name);
+                        }
+                        OrderTarget::Prop { var, .. } => {
+                            vars.intern(var);
+                        }
+                    }
+                }
+            }
+            PlanOp::Unwind { expr, alias } => {
+                vars.intern(alias);
+                match expr {
+                    UnwindExpr::Prop { var, .. } => { vars.intern(var); }
+                    UnwindExpr::Var(name) => { vars.intern(name); }
+                    UnwindExpr::Lit(_) => {}
                 }
             }
             _ => {}
@@ -575,8 +760,11 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
 }
 
 fn intern_operand(vars: &mut VarTable, operand: &Operand) {
-    if let Operand::Prop { var, .. } = operand {
-        vars.intern(var);
+    match operand {
+        Operand::Prop { var, .. } | Operand::Var(var) => {
+            vars.intern(var);
+        }
+        Operand::Lit(_) | Operand::Param(_) => {}
     }
 }
 
@@ -644,6 +832,7 @@ fn require_node(row: &Row, vars: &VarTable, var: &str) -> Result<u32, String> {
         Cell::Node(id) => Ok(*id),
         Cell::Rel(_) => Err(format!("variable `{var}` is not a node")),
         Cell::Path(_) => Err(format!("variable `{var}` is a path, not a node")),
+        Cell::Scalar(_) => Err(format!("variable `{var}` is a scalar value, not a node")),
     }
 }
 
@@ -661,6 +850,19 @@ fn resolve_operand(
             None => Err(format!("missing parameter `{name}`")),
         },
         Operand::Prop { var, field } => resolve_prop(view, vars, row, var, field),
+        Operand::Var(name) => {
+            // Bare variable reference: resolve from Cell (scalar alias or node key).
+            match vars.slot(name).and_then(|s| row.get(s)).and_then(|c| c.as_ref()) {
+                Some(Cell::Scalar(v)) => Ok(Some(v.clone())),
+                Some(Cell::Node(id)) => match view.ids.key_of(*id) {
+                    Some(key) => Ok(Some(Value::Str(key.to_owned()))),
+                    None => Ok(None),
+                },
+                Some(Cell::Path(hops)) => Ok(Some(Value::Int(*hops as i64))),
+                Some(Cell::Rel(_)) => Err(format!("variable `{name}` is a relationship")),
+                None => Ok(None),
+            }
+        }
     }
 }
 
@@ -682,6 +884,8 @@ fn resolve_prop(
                 Ok(None)
             }
         }
+        // Scalar alias: has no properties.
+        Cell::Scalar(_) => Ok(None),
     }
 }
 
@@ -793,7 +997,7 @@ fn exec_expand(
         let from_id = require_node(row, vars, from)?;
         let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
             Some(Cell::Node(id)) => Some(*id),
-            Some(Cell::Rel(_) | Cell::Path(_)) => return Err(format!("variable `{to}` is not a node")),
+            Some(Cell::Rel(_) | Cell::Path(_) | Cell::Scalar(_)) => return Err(format!("variable `{to}` is not a node")),
             None => None,
         };
         for e in expand(view, from_id, etypes.as_deref(), exp_dir) {
@@ -1357,7 +1561,7 @@ fn agg_stream(
             let from_id = require_node(row, ctx.vars, from)?;
             let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Node(id)) => Some(*id),
-                Some(Cell::Rel(_) | Cell::Path(_)) => return Err(format!("variable `{to}` is not a node")),
+                Some(Cell::Rel(_) | Cell::Path(_) | Cell::Scalar(_)) => return Err(format!("variable `{to}` is not a node")),
                 None => None,
             };
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
@@ -1479,6 +1683,16 @@ fn agg_stream(
                     .to_string(),
             );
         }
+        PlanOp::With { .. } => {
+            return Err(
+                "agg executor: With in producer slice — structurally malformed".to_string(),
+            );
+        }
+        PlanOp::Unwind { .. } => {
+            return Err(
+                "agg executor: Unwind in producer slice — structurally malformed".to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -1525,6 +1739,97 @@ fn build_group_projected(
         rows.push(row);
     }
     Projected { columns, rows }
+}
+
+/// Convert a finished group map into raw `Row` vectors for pipeline consumption.
+///
+/// Used by the staged executor when a `GroupAggregate` appears in a WITH pipeline
+/// (i.e., `is_pipeline = true`).  Each group becomes one `Row` with `Cell::Scalar`
+/// values for key and aggregate columns.  Column names are interned in `vars` so
+/// that subsequent pipeline stages can look them up by slot.
+fn group_result_to_rows(
+    keys: &[(String, RetItem)],
+    aggs: &[(AggFunc, AggArg, String)],
+    key_order: Vec<GroupKey>,
+    groups: &mut HashMap<GroupKey, GroupEntry>,
+    vars: &VarTable,
+) -> Vec<Row> {
+    let row_len = vars.names.len();
+    let mut out: Vec<Row> = Vec::with_capacity(key_order.len());
+    for gk in key_order {
+        let (display_keys, accs) = groups.remove(&gk).unwrap_or_default();
+        let mut row: Row = vec![None; row_len];
+        for ((col, _), val) in keys.iter().zip(display_keys) {
+            if let Some(slot) = vars.slot(col) {
+                row[slot] = val.map(Cell::Scalar);
+            }
+        }
+        for ((_, _, col), acc) in aggs.iter().zip(accs) {
+            if let Some(slot) = vars.slot(col) {
+                row[slot] = acc.finish().map(Cell::Scalar);
+            }
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// Sort raw rows by a list of `OrderItem`s (before projection).
+///
+/// Used by the staged path when an `OrderBy` op appears before `Project` —
+/// for example, inside a non-aggregate WITH stage or after a pipeline
+/// GroupAggregate.  `OrderTarget::Prop` is resolved by looking up the node
+/// property; `Alias` / `Var` are resolved from `Cell::Scalar` in the row.
+fn exec_order_by_rows(
+    vars: &VarTable,
+    rows: &mut Vec<Row>,
+    items: &[OrderItem],
+    view: &GraphView,
+) {
+    // Pre-compute sort-key values for all rows.  This avoids re-resolving
+    // inside the comparator (the closure cannot return Err, so we pre-compute).
+    let mut key_table: Vec<Vec<Option<Value>>> = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        let mut row_key: Vec<Option<Value>> = Vec::with_capacity(items.len());
+        for item in items {
+            let val = match &item.target {
+                OrderTarget::Alias(name) | OrderTarget::Var(name) => {
+                    vars.slot(name).and_then(|s| row.get(s)).and_then(|c| c.as_ref()).and_then(|c| match c {
+                        Cell::Scalar(v) => Some(v.clone()),
+                        Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                        Cell::Path(hops) => Some(Value::Int(*hops as i64)),
+                        Cell::Rel(_) => None,
+                    })
+                }
+                OrderTarget::Prop { var, field } => {
+                    vars.slot(var).and_then(|s| row.get(s)).and_then(|c| c.as_ref()).and_then(|c| match c {
+                        Cell::Node(id) => view.prop(*id, field).cloned(),
+                        Cell::Rel(e) => view.edge_props.get(e.etype, e.src, e.dst, field).cloned(),
+                        _ => None,
+                    })
+                }
+            };
+            row_key.push(val);
+        }
+        key_table.push(row_key);
+    }
+    // Sort using a stable, index-based sort to keep equal rows in encounter order.
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+    indices.sort_by(|&a, &b| {
+        for (ki, item) in items.iter().enumerate() {
+            let c = cmp_optional(
+                key_table[a].get(ki).and_then(|x| x.as_ref()),
+                key_table[b].get(ki).and_then(|x| x.as_ref()),
+                item.descending,
+            );
+            if c != std::cmp::Ordering::Equal {
+                return c;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    let sorted: Vec<Row> = indices.into_iter().map(|i| rows[i].clone()).collect();
+    *rows = sorted;
 }
 
 /// Streaming grouped-aggregate executor.
@@ -1657,7 +1962,7 @@ fn group_stream(
             let from_id = require_node(row, ctx.vars, from)?;
             let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Node(id)) => Some(*id),
-                Some(Cell::Rel(_) | Cell::Path(_)) => {
+                Some(Cell::Rel(_) | Cell::Path(_) | Cell::Scalar(_)) => {
                     return Err(format!("variable `{to}` is not a node"))
                 }
                 None => None,
@@ -1798,6 +2103,16 @@ fn group_stream(
                     .to_string(),
             );
         }
+        PlanOp::With { .. } => {
+            return Err(
+                "group executor: With in producer slice — structurally malformed".to_string(),
+            );
+        }
+        PlanOp::Unwind { .. } => {
+            return Err(
+                "group executor: Unwind in producer slice — structurally malformed".to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -1849,8 +2164,7 @@ fn pull_rows(
                 return Ok(());
             }
             // Save the slot value so we can restore it after the loop.
-            // Cell is Copy so this is a cheap register-level operation.
-            let prev = row[slot];
+            let prev = row[slot].clone();
 
             // Fast path: if the immediately following op is a simple
             // `Prop op Lit` comparison on this scan variable, fuse the filter
@@ -1952,7 +2266,7 @@ fn pull_rows(
             let from_id = require_node(row, ctx.vars, from)?;
             let bound_to = match row.get(to_slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Node(id)) => Some(*id),
-                Some(Cell::Rel(_) | Cell::Path(_)) => return Err(format!("variable `{to}` is not a node")),
+                Some(Cell::Rel(_) | Cell::Path(_) | Cell::Scalar(_)) => return Err(format!("variable `{to}` is not a node")),
                 None => None,
             };
             for e in expand(ctx.view, from_id, etypes.as_deref(), exp_dir) {
@@ -2075,6 +2389,20 @@ fn pull_rows(
                     .to_string(),
             );
         }
+        PlanOp::With { .. } => {
+            return Err(
+                "pull executor: With reached pull_rows — pipeline plans must use the staged path \
+                 (row_bound returns None for plans containing With)"
+                    .to_string(),
+            );
+        }
+        PlanOp::Unwind { .. } => {
+            return Err(
+                "pull executor: Unwind reached pull_rows — pipeline plans must use the staged path \
+                 (row_bound returns None for plans containing Unwind)"
+                    .to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -2170,10 +2498,17 @@ fn project_item(
 ) -> Result<Option<Value>, String> {
     match &item.value {
         RetVal::Var(v) => {
-            let id = require_node(row, vars, v)?;
-            match view.ids.key_of(id) {
-                Some(key) => Ok(Some(Value::Str(key.to_owned()))),
-                None => Err(format!("unknown node id {id}")),
+            match require_cell(row, vars, v)? {
+                Cell::Node(id) => match view.ids.key_of(*id) {
+                    Some(key) => Ok(Some(Value::Str(key.to_owned()))),
+                    None => Err(format!("unknown node id {id}")),
+                },
+                // Scalar alias produced by a prior WITH stage.
+                Cell::Scalar(val) => Ok(Some(val.clone())),
+                Cell::Rel(_) => Err(format!(
+                    "variable `{v}` is a relationship; return its properties ({v}.field) instead"
+                )),
+                Cell::Path(hops) => Ok(Some(Value::Int(*hops as i64))),
             }
         }
         RetVal::Prop { var, field } => resolve_prop(view, vars, row, var, field),
@@ -4372,5 +4707,177 @@ LIMIT 10";
             err.contains("ShortestPath") && err.contains("pull executor"),
             "error must name ShortestPath and pull executor, got: {err}"
         );
+    }
+
+    // ── WITH / UNWIND pipeline tests ─────────────────────────────────────────
+
+    /// Helper: build a graph with cities for pipeline tests.
+    fn city_graph() -> Fx {
+        let mut fx = Fx::new();
+        fx.add("Person", "alice", vec![("city", s("Boston")), ("age", i(30))]);
+        fx.add("Person", "bob", vec![("city", s("Boston")), ("age", i(25))]);
+        fx.add("Person", "carol", vec![("city", s("Austin")), ("age", i(35))]);
+        fx.add("Person", "dave", vec![("city", s("Austin")), ("age", i(28))]);
+        fx.add("Person", "eve", vec![("city", s("Boston")), ("age", i(22))]);
+        fx
+    }
+
+    /// HAVING idiom: WITH a, COUNT(*) AS c WHERE c > 2.
+    /// Boston has 3 people, Austin has 2. WHERE c > 2 keeps only Boston.
+    #[test]
+    fn with_aggregate_having_filters_groups() {
+        let fx = city_graph();
+        let view = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(&view, "MATCH (p:Person) WITH p.city AS city, COUNT(*) AS cnt WHERE cnt > 2 RETURN city, cnt", &params)
+            .expect("WITH HAVING query must succeed");
+        assert_eq!(rs.len(), 1, "only Boston group has cnt > 2");
+        assert_eq!(rs.get(0, "city"), Some(&s("Boston")));
+        assert_eq!(rs.get(0, "cnt"), Some(&i(3)));
+    }
+
+    /// WITH ORDER BY / LIMIT then RETURN.
+    #[test]
+    fn with_order_limit_then_return() {
+        let fx = city_graph();
+        let view = fx.view();
+        let params = BTreeMap::new();
+        // Get top 2 oldest people via WITH … ORDER BY age DESC LIMIT 2 RETURN name.
+        let rs = run(&view, "MATCH (p:Person) WITH p, p.age AS age ORDER BY age DESC LIMIT 2 RETURN p.city AS city, age", &params)
+            .expect("WITH ORDER LIMIT must succeed");
+        assert_eq!(rs.len(), 2, "LIMIT 2");
+        // carol=35 is first, alice=30 is second (or bob=25, dave=28 depending on tie)
+        let ages: Vec<Option<Value>> = (0..rs.len()).map(|i| rs.get(i, "age").cloned()).collect();
+        assert_eq!(ages[0], Some(i(35)), "oldest person first");
+        assert_eq!(ages[1], Some(i(30)), "second oldest");
+    }
+
+    /// Chained WITH stages.
+    #[test]
+    fn chained_with_stages() {
+        let fx = city_graph();
+        let view = fx.view();
+        let params = BTreeMap::new();
+        // First WITH: project city alias. Second WITH: filter by city.
+        let rs = run(&view,
+            "MATCH (p:Person) WITH p.city AS city, p.age AS age WITH city, age WHERE age > 25 RETURN city, age",
+            &params).expect("chained WITH must succeed");
+        // alice=30, carol=35, dave=28 have age > 25; bob=25, eve=22 excluded
+        assert_eq!(rs.len(), 3, "3 people with age > 25");
+    }
+
+    /// MATCH re-entry after WITH using a bound variable.
+    #[test]
+    fn with_then_match_reentry() {
+        let mut fx = Fx::new();
+        let alice = fx.add("Person", "alice", vec![]);
+        let bob = fx.add("Person", "bob", vec![]);
+        let corp = fx.add("Company", "acme", vec![]);
+        fx.edge("WORKS_AT", alice, corp, vec![("years", i(5))]);
+        fx.edge("WORKS_AT", bob, corp, vec![("years", i(3))]);
+        let view = fx.view();
+        let params = BTreeMap::new();
+        // Find person, re-enter MATCH via their company.
+        let rs = run(&view,
+            "MATCH (p:Person)-[r:WORKS_AT]->(c:Company) WITH p, c MATCH (c)-[r2:WORKS_AT]-(colleague:Person) RETURN p, colleague",
+            &params).expect("WITH MATCH re-entry must succeed");
+        // alice→acme→bob, bob→acme→alice each appear (2 people × 2 colleagues)
+        assert!(rs.len() >= 2, "cross join via company: got {}", rs.len());
+    }
+
+    /// UNWIND literal list produces one row per element.
+    #[test]
+    fn unwind_literal_list_produces_rows() {
+        let fx = city_graph();
+        let view = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(&view, "MATCH (p:Person) WHERE p.city = 'Boston' UNWIND [1, 2, 3] AS x RETURN p, x", &params)
+            .expect("UNWIND literal must succeed");
+        // 3 Boston people × 3 elements = 9 rows
+        assert_eq!(rs.len(), 9, "UNWIND [1,2,3] × 3 Boston people = 9 rows");
+        // All x values should include 1, 2, and 3.
+        let xs: Vec<Option<Value>> =
+            (0..rs.len()).map(|row_i| rs.get(row_i, "x").cloned()).collect();
+        assert!(xs.contains(&Some(i(1))));
+        assert!(xs.contains(&Some(i(2))));
+        assert!(xs.contains(&Some(i(3))));
+    }
+
+    /// UNWIND of a list-valued property.
+    #[test]
+    fn unwind_list_property() {
+        let mut fx = Fx::new();
+        fx.add("Tag", "post1", vec![
+            ("tags", Value::List(vec![s("rust"), s("graph")])),
+        ]);
+        fx.add("Tag", "post2", vec![
+            ("tags", Value::List(vec![s("db")])),
+        ]);
+        let view = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(&view, "MATCH (p:Tag) UNWIND p.tags AS tag RETURN p, tag", &params)
+            .expect("UNWIND property must succeed");
+        assert_eq!(rs.len(), 3, "2+1 tag elements");
+    }
+
+    /// UNWIND null / empty list → 0 rows (openCypher).
+    #[test]
+    fn unwind_empty_list_yields_zero_rows() {
+        let fx = city_graph();
+        let view = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(&view, "MATCH (p:Person) WHERE p.city = 'Boston' UNWIND [] AS x RETURN x", &params)
+            .expect("UNWIND [] must succeed with 0 rows");
+        assert_eq!(rs.len(), 0, "UNWIND [] should produce 0 rows");
+    }
+
+    /// UNWIND of a non-list → named error.
+    #[test]
+    fn unwind_non_list_is_named_error() {
+        let fx = city_graph();
+        let view = fx.view();
+        let params = BTreeMap::new();
+        // p.city is a Str, not a List.
+        let err = run(&view, "MATCH (p:Person) WHERE p.city = 'Boston' UNWIND p.city AS x RETURN x", &params)
+            .expect_err("UNWIND non-list must error");
+        assert!(
+            err.contains("UNWIND") && err.contains("list"),
+            "error must mention UNWIND and list: {err}"
+        );
+    }
+
+    /// UNWIND cross-product that trips the intermediate-row budget.
+    #[test]
+    fn unwind_cross_product_trips_budget() {
+        let mut fx = Fx::new();
+        // 10 nodes, each UNWIND 10 elements → 100 rows; set cap to 5.
+        for i in 0..10 {
+            fx.add("N", &format!("n{i}"), vec![]);
+        }
+        let view = fx.view();
+        let params = BTreeMap::new();
+        let err = super::with_max_intermediate_rows(5, || {
+            run(&view, "MATCH (n:N) UNWIND [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] AS x RETURN n, x", &params)
+        }).expect_err("must hit budget");
+        assert!(
+            err.contains("intermediate result exceeds"),
+            "error must mention intermediate result limit: {err}"
+        );
+    }
+
+    /// Routing pins: plans with WITH take staged path (row_bound returns None);
+    /// non-WITH plans are unchanged.
+    #[test]
+    fn routing_with_plan_uses_staged_path() {
+        use crate::cypher::plan::row_bound;
+        let ops_with = compile("MATCH (a) WITH a RETURN a");
+        assert_eq!(row_bound(&ops_with), None, "WITH plan must have row_bound=None");
+
+        let ops_unwind = compile("MATCH (a) UNWIND [1, 2] AS x RETURN a");
+        assert_eq!(row_bound(&ops_unwind), None, "UNWIND plan must have row_bound=None");
+
+        // Non-WITH plan with LIMIT still uses pull path.
+        let ops_plain = compile("MATCH (a) RETURN a LIMIT 5");
+        assert!(row_bound(&ops_plain).is_some(), "plain LIMIT plan must have a row bound");
     }
 }
