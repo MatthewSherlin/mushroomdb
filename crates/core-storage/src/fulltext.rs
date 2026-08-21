@@ -571,18 +571,23 @@ mod tests {
         assert_eq!(r.len(), 1);
     }
 
-    /// Mid-token `*` is NOT a prefix operator — it is stripped by the
-    /// alphanumeric filter and the remaining fragment matches as an exact token.
+    /// Mid-token `*` is NOT a prefix operator, and the two sides treat it
+    /// differently by design:
     ///
-    /// "ru*st" → strip non-alphanumeric → "rust" (exact match, no prefix flag).
-    /// This pins the documented behavior so any future change is visible.
+    /// - INDEX side (`tokenize`): any non-alphanumeric splits, so document
+    ///   text "ru*st" indexes as two tokens ["ru", "st"].
+    /// - QUERY side (`parse_query`): non-alphanumerics inside a word are
+    ///   stripped, so the query "ru*st" is the exact term "rust" (no prefix).
+    ///
+    /// This pins both behaviors so any future change is visible.
     #[test]
     fn mid_token_star_is_stripped_to_exact() {
-        // Tokenizer: mid-star stripped, result is the exact alphanumeric token.
+        // Index-side tokenizer: mid-star SPLITS document text.
         let toks = tokenize("ru*st");
-        assert_eq!(toks, vec!["rust".to_string()]);
+        assert_eq!(toks, vec!["ru".to_string(), "st".to_string()]);
 
-        // parse_query: "ru*st" has no trailing `*`, so prefix=false.
+        // Query-side parse_query: "ru*st" has no trailing `*`, so prefix=false
+        // and the mid-star is stripped to the exact term "rust".
         let groups = parse_query("ru*st");
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 1);

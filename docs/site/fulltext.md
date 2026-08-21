@@ -41,7 +41,7 @@ Match count is the number of OR-groups satisfied by the node (see query syntax b
 `AND` is the default; the keyword `AND` may be written explicitly or omitted.
 `OR` is case-insensitive. Empty or whitespace-only queries return no results.
 
-**Mid-token `*`:** A `*` that is not at the trailing position of a word (e.g., `"ru*st"`) is NOT a prefix operator. The non-alphanumeric `*` is stripped by the tokenizer, and the remaining fragment is treated as an exact token (`"rust"`). This is the defined behavior; use a trailing `*` (`"ru*"`) for prefix matching.
+**Mid-token `*`:** A `*` that is not at the trailing position of a word (e.g., `"ru*st"`) is NOT a prefix operator, and the two sides treat it differently: in **queries**, non-alphanumeric characters inside a word are stripped, so `"ru*st"` searches for the exact term `rust`; in **indexed document text**, any non-alphanumeric character splits tokens, so a stored value `"ru*st"` indexes as the two tokens `ru` and `st`. Use a trailing `*` (`"ru*"`) for prefix matching.
 
 ## Tokenization
 
