@@ -528,6 +528,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 - Graph algorithms (PageRank, WCC, degree centrality): [`docs/site/algorithms.md`](docs/site/algorithms.md)
 - API reference: [`docs/site/api.md`](docs/site/api.md)
 - Cypher query reference: [`docs/site/query.md`](docs/site/query.md)
+- Testing (DST, crash sweeps, oracles): [`docs/site/testing.md`](docs/site/testing.md)
 - Design spec: [`docs/design.md`](docs/design.md)
 - Benchmarks: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md) (v1: [`head-to-head-10k.md`](benchmarks/results/head-to-head-10k.md))
 - Dogfood report: [`docs/dogfood-report.md`](docs/dogfood-report.md)

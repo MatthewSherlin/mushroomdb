@@ -13,7 +13,6 @@
 /// - delete_view removes values cleanly
 /// - Snapshot+WAL round-trip preserves views
 /// - DST oracle: quiescent value == scratch recompute
-
 use core_api::{AggFn, Direction, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource};
 
 fn tmp(name: &str) -> std::path::PathBuf {

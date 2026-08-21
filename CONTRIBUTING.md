@@ -2,9 +2,20 @@
 
 ## Before you start
 
-Read `README.md` and the design spec at
-`docs/design.md` so you understand the
+Read `README.md` and the design spec at `docs/design.md` so you understand the
 architecture, the generality guarantee, and the wire discipline.
+
+---
+
+## Toolchain
+
+The Rust toolchain is pinned in `rust-toolchain.toml` (currently 1.92.0). `rustup` picks
+it up automatically when you run `cargo` from the repository root. Install rustup from
+<https://rustup.rs/> if you do not already have it; the correct toolchain version is
+downloaded on first use.
+
+Node (18+) is required for the UI gate. Python 3.9+ and `maturin` are required for the
+Python bindings gate.
 
 ---
 
@@ -69,8 +80,8 @@ After any sequence of `insert_node` / `set_prop` / `create_rule` calls,
 the set of derived edges produced by the incremental rule engine must
 equal the set produced by a from-scratch `rebuild`. This invariant is
 checked continuously in the property-test suite
-(`crates/core-rules/tests/oracle.rs`). Any rule predicate addition must
-extend the oracle path first.
+(`crates/sim-harness/tests/oracle_equivalence.rs`). Any rule predicate
+addition must extend the oracle path first.
 
 ### Differential Cypher testing
 

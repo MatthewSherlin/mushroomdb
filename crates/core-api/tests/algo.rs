@@ -404,16 +404,15 @@ fn bfs_wcc_reference(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
     }
     // Normalise: component ID = smallest node in the component.
     let mut min_in_comp: Vec<usize> = (0..n).collect();
-    for i in 0..n {
-        let root = comp[i];
+    for (i, &root) in comp.iter().enumerate().take(n) {
         if i < min_in_comp[root] {
             min_in_comp[root] = i;
         }
     }
     // Map each node to the true min of its component.
     let mut result = vec![0usize; n];
-    for i in 0..n {
-        result[i] = min_in_comp[comp[i]];
+    for (i, r) in result.iter_mut().enumerate().take(n) {
+        *r = min_in_comp[comp[i]];
     }
     result
 }
