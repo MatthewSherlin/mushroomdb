@@ -33,10 +33,31 @@ regressions). Baselines from `regression-post-plan13-final-20260821-021956.md`.
 | neighborhood_depth2 (p50) | 0.2 µs | 0.2 µs | 0.2 µs | 0% | No change. |
 | cypher scan-filter-project | 1.53 ms | 2.04 ms | 2.12 ms | +33% | Cold first-call (single-pass). Warmup-median from 20-run direct measurement: **0.9 ms** (faster than baseline). Criterion bench on same code path shows +7.2% (within threshold). T15-16 did not change the Cypher scan executor. Single-pass cold measurement artifact. |
 | cypher two-hop join | 307.0 µs† | 206.7 µs | 325.6 µs | −33% / +6% | High variance (57% run-to-run). The canonical four-engine number (261.6 µs) is from a warmup-median methodology (3+10 runs). Single-pass measurement unreliable for this workload. Canonical 261.6 µs stands. |
-| rule_derive (total) | 3.149 s‡ | 3.493 s | 3.514 s | +11% | At the 10% threshold. Natural workload variance established at ≥10% (v2.4 showed 2.849–3.149 s across runs). T15-16 did not change the rule engine backfill path. Within noise. |
+| rule_derive (total) | 3.149 s‡ | 3.493 s | 3.514 s | +11% | **Real and stable** (0.6% intrarun variance). Cause not isolated — see rule_derive note below. |
 
 † v2.4 307 µs was on a pre-rule-derive in-process run (warmup state variable); canonical is the four-engine benchmark.  
-‡ v2.4 3.149 s was one measurement; the same binary measured 2.849 s in another run.
+‡ v2.4 3.149 s: one measurement; the v2.4 binary also measured 2.849 s in a separate run. These are different code versions, not intrarun variance — the 2.849–3.149 s spread is cross-version drift, not a noise floor.
+
+### rule_derive — +11% investigation
+
+v0.1.0 runs A (3.493 s) and B (3.514 s) are 0.6% apart — the workload is stable within this binary.
+The +11% cross-version jump from v2.4 (3.149 s) is real.
+
+Plans 15-16 changes analyzed for per-backfill overhead:
+
+- **T1 (algorithms):** adds `algo.rs` in core-api; no changes to rule engine or apply() paths.
+- **T2 (fulltext):** adds `FulltextIndex` field to `GraphDb`; `has_label(label)` is called per InsertNode
+  apply (O(1) on empty BTreeSet), and `field_indexed(field)` per SetProp apply. However, `create_rule`
+  timing in the benchmark starts AFTER `ingest_batch` completes, so per-node fulltext checks during
+  ingest do not add to the rule_derive measurement. The rule engine's streaming backfill bypasses the
+  WAL apply path for individual edges — no fulltext check fires per derived edge.
+- **view_store fast path (pre-v0.1, d4d312c):** The `if !self.view_store.is_empty()` guard skips
+  O(edge_count) delta accumulation when no views are declared. Benchmark declares no views — this path
+  is O(1). No overhead here.
+
+**Cause not isolated.** The most plausible explanation is memory layout / cache behavior differences
+from the larger `GraphDb` struct (added `FulltextIndex`), or CPU frequency/thermal variation between
+the 02:19 AM v2.4 run and 20:09 v0.1 runs. Tracked.
 
 ## Four-engine two-hop (canonical)
 

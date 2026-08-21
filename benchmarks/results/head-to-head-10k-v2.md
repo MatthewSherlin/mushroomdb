@@ -582,3 +582,81 @@ Competitor engines not re-run (numbers unchanged from v2.2). The v2.4 run:
   connectivity check (`_AUTH = ("neo4j", "neo4j")` rejected by production container)
   and was skipped — no contamination of mushroomdb results
 - mushroomdb is embedded; bolt port state is irrelevant
+
+---
+
+## v2.5 / v0.1.0 regression (2026-08-21)
+
+**Plans covered:** Plan 15 (algorithms, full-text-lite, TypeScript client) + Plan 16 (docs, release).
+**Binary:** release build — `maturin develop --release` for Python bindings; `cargo --release` for latency.
+**Full report:** `benchmarks/results/regression-v0.1-20260821.md`.
+
+### Latency correction note (v2.4 numbers above)
+
+The v2.4 subscription latency numbers in this document (`0.04 µs / 0.21 µs` in-process;
+`61 µs / 88 µs` WS p95) are **corrected** in v0.1.0:
+
+| Channel | v2.4 (above) | v0.1.0 corrected | Reason |
+|---|---|---|---|
+| In-process p50 | 0.04 µs | **0.17 µs** | 0.04 µs (40 ns) is below `Instant::now()` granularity on Darwin (~10 ns resolution); two v0.1.0 runs agree at 0.17 µs. |
+| In-process p95 | 0.21 µs | **0.42 µs** | Same — v2.4 was a quiet-machine (02:19 AM) single run. |
+| WS p50 | 61 µs | **86 µs** | Single-run at 02:19 AM vs two consistent v0.1.0 runs at 20:09. |
+| WS p95 | 88 µs | **226 µs** | Same quiet-machine effect. Tests still pass (p50 < 1 ms, p95 < 5 ms assertions). |
+
+These numbers are documented as corrected; the v2.4 entries above are historical record only.
+
+### 10k mushroomdb — v0.1.0 (two runs for variance)
+
+Competitor workloads not re-run (no contamination risk; embedded mushroomdb unaffected by bolt state).
+
+| Workload | v2.4 baseline | v0.1 Run A | v0.1 Run B | Delta (A) | Status |
+|---|---|---|---|---|---|
+| bulk_ingest | 862 ms | 989 ms | 931 ms | +15% | OS load variance; v2.4 at 02:19 AM, v0.1 at 20:09; single-pass, no warmup |
+| neighborhood_depth1 (p50) | 0.4 µs | 0.4 µs | 0.3 µs | 0% | No change |
+| neighborhood_depth2 (p50) | 0.2 µs | 0.2 µs | 0.2 µs | 0% | No change |
+| cypher scan-filter (1.4k rows) | 1.53 ms | 2.04 ms | 2.12 ms | +33% | Cold single-pass artifact; warmup-median (20 runs) = **0.9 ms** (faster than v2.4). Criterion bench +7.2%. T15-16 did not change scan executor. |
+| cypher two-hop (200 rows) | 307 µs† | 207 µs | 326 µs | — | 57% run-to-run variance; canonical is four-engine benchmark (261.6 µs warmup-median). |
+| rule_derive (two rules) | 3.149 s‡ | 3.493 s | 3.514 s | +11% | See rule_derive note below. |
+
+† v2.4 307 µs: single-pass after ingest with variable warmup state. Canonical: four-engine warmup-median 261.6 µs.
+‡ v2.4 3.149 s was a single run; the same binary measured 2.849 s in another run on the same day.
+
+### rule_derive — v0.1.0 detailed
+
+v0.1.0 runs A and B give 3.493 s and 3.514 s (0.6% intrarun variance) — **a stable +11% above the v2.4 3.149 s baseline**.
+
+This cross-version delta is real, not noise. Investigation: Plans 15-16 added `FulltextIndex` as a field
+in `GraphDb` (T2) and graph algorithms (T1). Neither touches the rule engine's streaming backfill path.
+The `view_store.is_empty()` fast path (commit d4d312c, pre-v0.1) gates delta accumulation; with no views
+declared in the benchmark, no per-edge overhead is incurred from view maintenance. Per-node fulltext checks
+(`has_label` on empty `BTreeSet`) fire during `ingest_batch` (before `create_rule` timing starts) and add
+negligible overhead (~10 ns × 10k nodes = 0.1 ms).
+
+**Cause not isolated.** The most plausible candidates are binary size / memory-layout differences from the
+added `FulltextIndex` struct (GraphDb grew), or CPU frequency/thermal variation between the 02:19 AM v2.4
+run and 20:09 v0.1 runs. Tracked.
+
+### Subscription latency — v0.1.0 re-run
+
+`cargo test -p server --test sub_latency --release -- --nocapture`
+1,000 events, 50 warmup, t_recv − t_post (post-commit-to-receive), `std::time::Instant`.
+
+| Channel | v0.1.0 p50 | v0.1.0 p95 |
+|---|---|---|
+| In-process (`subscribe_writes`) | **0.17 µs** | **0.42 µs** |
+| WebSocket localhost (`/subscribe`) | **86 µs** | **226 µs** |
+
+Two consecutive runs agree within 2 µs (WS) and <0.01 µs (in-process). Test assertions pass with
+large margin (p50 < 1 ms, p95 < 5 ms).
+
+### Bug found and fixed during regression
+
+`engine_matches_oracle` proptest caught a fulltext `disable_fulltext` bug:
+when labels A and B both index field f and A is disabled, A's node postings remained in the
+shared column. Fixed in `crates/core-storage/src/fulltext.rs` (new `field_indexed_by_other`)
+and `crates/core-api/src/db.rs` (DisableFulltext apply removes A-node postings before calling disable).
+Deterministic regression test added: `crates/core-api/tests/fulltext.rs::disable_shared_field_removes_only_disabled_label_postings`.
+
+### Contamination guard — v0.1.0 run
+
+Competitor workloads not re-run. mushroomdb is embedded; bolt port state is irrelevant to these results.

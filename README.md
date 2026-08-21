@@ -280,7 +280,7 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 | Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
 | Cypher scan-filter-project (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
 | Cypher two-hop join (200 rows) | **261.6 µs** ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
-| Cold-start: snapshot V5 open | **8.7 s** ▽ | — | — | — |
+| Cold-start: snapshot V5 open | **8.71 s** ▽ | — | — | — |
 | Cold-start: WAL-only open | 8.25 min ▽ | — | — | — |
 | Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
@@ -306,7 +306,7 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
   (current uncapped graph has 5.81M edges; see dataset growth note in methodology).
 
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
-two-rule backfill on 10k nodes: 928 ms + 2.221 s = **3.149 s** (+8.8% vs the pre-eventing v2.3 baseline of 2.894 s; cost of live subscriptions and materialized views). A two-stage fix (is\_empty guard + emit\_deltas engine gate, commit d4d312c) recovered the original +44% regression down to +8.8%. Competitors have no auto-derivation equivalent.
+two-rule backfill on 10k nodes: v2.4 baseline 928 ms + 2.221 s = 3.149 s (+8.8% vs pre-eventing v2.3 baseline of 2.894 s). **v0.1.0 measured: 3.49–3.51 s** (two runs, 0.6% intrarun variance; +11% from v2.4). A two-stage fix (is\_empty guard + emit\_deltas engine gate, commit d4d312c) recovered the original subscription overhead. Competitors have no auto-derivation equivalent.
 
 ▽ 100k cold-start (V5 snapshot, measured 2026-08-21, 100k-node marketplace dogfood db, 9 backfill rules,
 ~10.5M derived edges in snapshot):

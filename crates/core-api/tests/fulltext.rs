@@ -475,3 +475,51 @@ fn cypher_text_matches_where() {
         .unwrap();
     assert_eq!(rs3.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Regression: disable_fulltext with shared field (multi-label index)
+// ---------------------------------------------------------------------------
+
+/// When labels A, B, C all index field f and label A is disabled:
+/// - A's nodes must vanish from search results
+/// - B's and C's nodes must remain searchable (postings column kept)
+/// - Disabling B and C then drops the column entirely
+///
+/// Pins the fix for the proptest-discovered bug: `disable_fulltext(A, f)` was
+/// leaving A-node postings in the shared field column when another label still
+/// indexed the same field.
+#[test]
+fn disable_shared_field_removes_only_disabled_label_postings() {
+    let mut db = open();
+
+    // Three nodes across three labels, all with field "f".
+    db.insert_node("A", "a1", vec![("f".into(), Value::Str("alpha".into()))]).unwrap();
+    db.insert_node("B", "b1", vec![("f".into(), Value::Str("beta".into()))]).unwrap();
+    db.insert_node("C", "c1", vec![("f".into(), Value::Str("gamma".into()))]).unwrap();
+
+    // Enable fulltext on field "f" for all three labels.
+    db.enable_fulltext("A", "f").unwrap();
+    db.enable_fulltext("B", "f").unwrap();
+    db.enable_fulltext("C", "f").unwrap();
+
+    // All three nodes searchable before any disable.
+    assert_eq!(db.search("f", "alpha").len(), 1, "a1 present before disable");
+    assert_eq!(db.search("f", "beta").len(),  1, "b1 present before disable");
+    assert_eq!(db.search("f", "gamma").len(), 1, "c1 present before disable");
+
+    // Disable label A — B and C must remain.
+    db.disable_fulltext("A", "f").unwrap();
+    assert_eq!(db.search("f", "alpha").len(), 0, "a1 absent after A disabled");
+    assert_eq!(db.search("f", "beta").len(),  1, "b1 still present after A disabled");
+    assert_eq!(db.search("f", "gamma").len(), 1, "c1 still present after A disabled");
+
+    // Disable label B — C must remain.
+    db.disable_fulltext("B", "f").unwrap();
+    assert_eq!(db.search("f", "beta").len(),  0, "b1 absent after B disabled");
+    assert_eq!(db.search("f", "gamma").len(), 1, "c1 still present after B disabled");
+
+    // Disable label C — column now fully dropped; all searches empty.
+    db.disable_fulltext("C", "f").unwrap();
+    assert_eq!(db.search("f", "gamma").len(), 0, "c1 absent after C disabled");
+    assert_eq!(db.search("f", "alpha").len(), 0, "column dropped; no results");
+}
