@@ -2,8 +2,8 @@
 
 use super::ast::{
     AggArg, AggFunc, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
-    MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand, OrderItem, OrderTarget, Pattern,
-    Query, RelDir, RelPat, RetItem, RetVal, SetClause, WriteStatement,
+    MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand, OrderItem,
+    OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, SetClause, WriteStatement,
 };
 use super::Tok;
 use crate::filter::CmpOp;
@@ -841,7 +841,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // Dispatch on SET or DELETE.
+        // Dispatch on SET, DETACH DELETE, or DELETE.
         match self.peek() {
             Some(Tok::Set) => {
                 self.pos += 1; // consume SET
@@ -855,17 +855,48 @@ impl<'a> Parser<'a> {
                     sets,
                 }))
             }
-            Some(Tok::Delete) => {
-                self.pos += 1; // consume DELETE
-                let deletes = self.delete_targets(&matches)?;
+            Some(Tok::Detach) => {
+                // DETACH DELETE <node_var> [, …]
+                self.pos += 1; // consume DETACH
+                self.expect(&Tok::Delete, "expected DELETE after DETACH")?;
+                let node_vars = self.node_delete_targets(&matches)?;
                 if self.pos < self.toks.len() {
-                    return Err(self.err("unexpected tokens after DELETE"));
+                    return Err(self.err("unexpected tokens after DETACH DELETE"));
                 }
-                Ok(WriteStatement::MatchDelete(MatchDeleteStmt {
+                Ok(WriteStatement::MatchDeleteNode(MatchDeleteNodeStmt {
                     matches,
                     where_expr,
-                    deletes,
+                    node_vars,
+                    detach: true,
                 }))
+            }
+            Some(Tok::Delete) => {
+                self.pos += 1; // consume DELETE
+                // Try to resolve all targets as edge vars first. If the first
+                // target is a node var (not an edge var), fall through to node delete.
+                match self.delete_targets_or_node(&matches)? {
+                    DeleteTargetResult::Edges(deletes) => {
+                        if self.pos < self.toks.len() {
+                            return Err(self.err("unexpected tokens after DELETE"));
+                        }
+                        Ok(WriteStatement::MatchDelete(MatchDeleteStmt {
+                            matches,
+                            where_expr,
+                            deletes,
+                        }))
+                    }
+                    DeleteTargetResult::Nodes(node_vars) => {
+                        if self.pos < self.toks.len() {
+                            return Err(self.err("unexpected tokens after DELETE"));
+                        }
+                        Ok(WriteStatement::MatchDeleteNode(MatchDeleteNodeStmt {
+                            matches,
+                            where_expr,
+                            node_vars,
+                            detach: false,
+                        }))
+                    }
+                }
             }
             _ => Err(self.err(
                 "expected SET or DELETE after MATCH [WHERE]; \
@@ -889,22 +920,6 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Eq, "expected '=' in SET clause")?;
         let value = self.literal_value("SET RHS")?;
         Ok(SetClause { var, field, value })
-    }
-
-    /// Parse DELETE targets: a comma-separated list of variable names.
-    /// Each variable must be a relationship variable found in the MATCH patterns.
-    fn delete_targets(&mut self, matches: &[Pattern]) -> Result<Vec<EdgeDelete>, String> {
-        let mut targets = Vec::new();
-        loop {
-            let var = self.ident("expected variable to DELETE")?;
-            // Resolve this var in the match patterns.
-            let edge_del = self.resolve_edge_var(&var, matches)?;
-            targets.push(edge_del);
-            if !self.eat(&Tok::Comma) {
-                break;
-            }
-        }
-        Ok(targets)
     }
 
     /// Find the rel-var `var` in `patterns` and return its etype, src node var,
@@ -950,6 +965,94 @@ impl<'a> Parser<'a> {
              only relationship variables can be deleted (DELETE edge vars, not node vars)"
         ))
     }
+
+    /// Return `true` if `var` is bound as a node variable in `patterns`.
+    fn is_node_var(&self, var: &str, patterns: &[Pattern]) -> bool {
+        for pat in patterns {
+            if pat.start.var.as_deref() == Some(var) {
+                return true;
+            }
+            for (_, dest) in &pat.chain {
+                if dest.var.as_deref() == Some(var) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Parse a comma-separated list of node-variable targets for
+    /// `[DETACH] DELETE`.  All targets must be node variables bound in `patterns`.
+    fn node_delete_targets(
+        &mut self,
+        patterns: &[Pattern],
+    ) -> Result<Vec<String>, String> {
+        let mut vars = Vec::new();
+        loop {
+            let var = self.ident("expected node variable to DELETE")?;
+            if !self.is_node_var(&var, patterns) {
+                return Err(format!(
+                    "DELETE `{var}`: variable is not bound as a node in any MATCH pattern"
+                ));
+            }
+            vars.push(var);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(vars)
+    }
+
+    /// Try to parse DELETE targets as edge vars; if the first target is a node
+    /// var, fall back to parsing all targets as node vars.
+    fn delete_targets_or_node(
+        &mut self,
+        patterns: &[Pattern],
+    ) -> Result<DeleteTargetResult, String> {
+        // Peek at the identifier to decide which path to take.
+        let var = self.ident("expected variable to DELETE")?;
+        // Try edge var first.
+        match self.resolve_edge_var(&var, patterns) {
+            Ok(edge_del) => {
+                // At least the first target is an edge var; parse the rest as
+                // edge vars too.
+                let mut targets = vec![edge_del];
+                while self.eat(&Tok::Comma) {
+                    let v = self.ident("expected variable to DELETE")?;
+                    targets.push(self.resolve_edge_var(&v, patterns)?);
+                }
+                Ok(DeleteTargetResult::Edges(targets))
+            }
+            Err(_) => {
+                // Not an edge var; try as node var.
+                if self.is_node_var(&var, patterns) {
+                    let mut node_vars = vec![var];
+                    while self.eat(&Tok::Comma) {
+                        let v = self.ident("expected variable to DELETE")?;
+                        if !self.is_node_var(&v, patterns) {
+                            return Err(format!(
+                                "DELETE `{v}`: variable is not bound as a node in any MATCH pattern"
+                            ));
+                        }
+                        node_vars.push(v);
+                    }
+                    Ok(DeleteTargetResult::Nodes(node_vars))
+                } else {
+                    Err(format!(
+                        "DELETE `{var}`: variable is not bound as a relationship or node \
+                         in any MATCH pattern"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Used internally by `delete_targets_or_node` to signal whether the targets
+/// resolved to edge variables or node variables.
+enum DeleteTargetResult {
+    Edges(Vec<EdgeDelete>),
+    Nodes(Vec<String>),
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ pub enum Tok {
     Create,
     Set,
     Delete,
+    Detach,
     Merge,
     Ident(String),
     Str(String),
@@ -239,6 +240,7 @@ fn keyword(word: &str) -> Option<Tok> {
         "create" => Tok::Create,
         "set" => Tok::Set,
         "delete" => Tok::Delete,
+        "detach" => Tok::Detach,
         "merge" => Tok::Merge,
         _ => return None,
     })

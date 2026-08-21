@@ -1,6 +1,7 @@
 use crate::ingest::{IngestOptions, IngestReport};
 use core_query::cypher::{
-    execute, lex, parse, parse_write, plan, Params, Query, RetItem, RetVal, WriteStatement,
+    execute, lex, parse, parse_write, plan, MatchDeleteNodeStmt, Params, Query, RetItem, RetVal,
+    WriteStatement,
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{evaluate, GraphMut, NodeView, Predicate, RuleDef, RuleEngine, RuleIvfExport};
@@ -280,6 +281,15 @@ pub struct NodeInfo {
     pub key: String,
     pub label: String,
     pub props: BTreeMap<String, Value>,
+}
+
+/// Counts returned by [`GraphDb::delete_node`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeleteReport {
+    /// Number of manual (user-inserted) edges removed.
+    pub manual_edges: u64,
+    /// Number of derived (rule-owned) edges retracted.
+    pub derived_edges: u64,
 }
 
 /// One directed edge incident on a node, with provenance membership.
@@ -972,9 +982,37 @@ impl<F: Fs> GraphDb<F> {
     /// `Err(KeyNotFound)` and are not logged. Validation runs before the WAL
     /// write; `apply` of a logged `DeleteNode` for an already-tombstoned key
     /// (crash window) is a clean no-op.
-    pub fn delete_node(&mut self, key: &str) -> Result<()> {
-        MutPreview::new(self).check_live_key(key)?;
-        self.log_then_apply(WalRecord::DeleteNode { key: key.into() })
+    ///
+    /// Returns a [`DeleteReport`] with counts of manual and derived edges
+    /// removed (computed from live state before the deletion is applied).
+    pub fn delete_node(&mut self, key: &str) -> Result<DeleteReport> {
+        let id = self
+            .ids
+            .get(key)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+
+        // Count edges before the delete is applied so we can report counts.
+        let derived_set: BTreeSet<(u32, u32, u32)> = self
+            .engine
+            .provenance_touching(id)
+            .map(|(_, etype, src, dst)| (etype, src, dst))
+            .collect();
+        let derived_edges = derived_set.len() as u64;
+
+        let mut total_topo = 0u64;
+        for et in self.topo.etypes() {
+            total_topo +=
+                self.topo.neighbors(et, Direction::Out, id).len() as u64
+                    + self.topo.neighbors(et, Direction::In, id).len() as u64;
+        }
+        // Derived edges each appear exactly once in topo (either Out or In from id).
+        let manual_edges = total_topo.saturating_sub(derived_edges);
+
+        self.log_then_apply(WalRecord::DeleteNode { key: key.into() })?;
+        Ok(DeleteReport {
+            manual_edges,
+            derived_edges,
+        })
     }
 
     /// Validate and WAL-log a new rule, then backfill derived edges inside apply.
@@ -1171,7 +1209,8 @@ impl<F: Fs> GraphDb<F> {
     /// **Limitations (v1)**:
     /// - SET RHS must be a literal; expression RHS → named error.
     /// - Combined read-write (`MATCH…SET…RETURN`) → named error.
-    /// - Node DELETE / DETACH DELETE → named error (no node deletes via Cypher).
+    /// - `DETACH DELETE n` → calls `delete_node` for each matched node (removes all edges).
+    /// - Bare `DELETE n` → error if n has any incident edges; succeeds for isolated nodes.
     /// - MERGE with ON CREATE/ON MATCH → named error.
     /// - Deleting a derived edge → named error "cannot delete derived edge".
     pub fn query_write(
@@ -1197,6 +1236,7 @@ impl<F: Fs> GraphDb<F> {
             WriteStatement::Create(s) => self.exec_create(s),
             WriteStatement::MatchSet(s) => self.exec_match_set(s, params),
             WriteStatement::MatchDelete(s) => self.exec_match_delete(s, params),
+            WriteStatement::MatchDeleteNode(s) => self.exec_match_delete_node(s, params),
             WriteStatement::Merge(s) => self.exec_merge(s),
         }
     }
@@ -1431,6 +1471,101 @@ impl<F: Fs> GraphDb<F> {
             Some(Value::Int(0)),
             Some(Value::Int(0)),
             Some(Value::Int(deleted as i64)),
+        ]);
+        Ok(rs)
+    }
+
+    /// Execute `MATCH … [DETACH] DELETE <node_var> [, …]`.
+    ///
+    /// Collects the matching node keys via an ephemeral read query, then calls
+    /// `delete_node` on each one.  When `stmt.detach` is `false` (bare DELETE)
+    /// the executor first checks that the node has no incident edges; if any
+    /// remain it returns a named error matching openCypher semantics.
+    fn exec_match_delete_node(
+        &mut self,
+        stmt: MatchDeleteNodeStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        // Build a read query returning only the node keys we need.
+        let returns: Vec<RetItem> = stmt
+            .node_vars
+            .iter()
+            .map(|v| RetItem {
+                value: RetVal::Var(v.clone()),
+                alias: None,
+            })
+            .collect();
+        let read_q = Query {
+            matches: stmt.matches,
+            where_expr: stmt.where_expr,
+            returns,
+            order_by: vec![],
+            skip: None,
+            limit: None,
+        };
+        let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        let match_rs = execute(&self.view(), &ops, &Params(params)).map_err(|e| {
+            GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            }
+        })?;
+
+        // Collect unique node keys to delete (deduplicate across rows × vars).
+        let mut keys: Vec<String> = Vec::new();
+        for row_i in 0..match_rs.len() {
+            for var in &stmt.node_vars {
+                if let Some(Value::Str(k)) = match_rs.get(row_i, var) {
+                    if !keys.contains(k) {
+                        keys.push(k.clone());
+                    }
+                }
+            }
+        }
+
+        if !stmt.detach {
+            // openCypher bare DELETE: error if any matched node has incident edges.
+            for key in &keys {
+                if let Some(id) = self.ids.get(key) {
+                    let has_edges = self.topo.etypes().any(|et| {
+                        !self.topo.neighbors(et, Direction::Out, id).is_empty()
+                            || !self.topo.neighbors(et, Direction::In, id).is_empty()
+                    });
+                    if has_edges {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "Cannot delete node `{key}` because it still has incident edges. \
+                                 Use DETACH DELETE to remove the node and all its edges."
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut nodes_deleted = 0i64;
+        let mut edges_deleted = 0i64;
+        for key in keys {
+            match self.delete_node(&key) {
+                Ok(report) => {
+                    nodes_deleted += 1;
+                    edges_deleted +=
+                        (report.manual_edges + report.derived_edges) as i64;
+                }
+                Err(GraphError::KeyNotFound { .. }) => {
+                    // Node may have been deleted by an earlier iteration (e.g., via
+                    // multiple MATCH rows for the same node).  Safe to skip.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut rs = write_result_set();
+        rs.push_row(vec![
+            Some(Value::Int(0)),
+            Some(Value::Int(0)),
+            Some(Value::Int(nodes_deleted + edges_deleted)),
         ]);
         Ok(rs)
     }

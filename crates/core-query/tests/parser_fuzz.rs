@@ -93,6 +93,7 @@ fn render_tok(t: &Tok) -> String {
         Tok::Create => "CREATE".into(),
         Tok::Set => "SET".into(),
         Tok::Delete => "DELETE".into(),
+        Tok::Detach => "DETACH".into(),
         Tok::Merge => "MERGE".into(),
     }
 }

@@ -133,13 +133,14 @@ pub struct OrderItem {
 
 // ─── Write statement AST ──────────────────────────────────────────────────────
 
-/// Top-level write statement (CREATE / MATCH…SET / MATCH…DELETE / MERGE).
+/// Top-level write statement (CREATE / MATCH…SET / MATCH…DELETE / MATCH…DETACH DELETE / MERGE).
 /// Produced by `parse_write`; executed by `GraphDb::query_write`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteStatement {
     Create(CreateStmt),
     MatchSet(MatchSetStmt),
     MatchDelete(MatchDeleteStmt),
+    MatchDeleteNode(MatchDeleteNodeStmt),
     Merge(MergeStmt),
 }
 
@@ -206,6 +207,23 @@ pub struct EdgeDelete {
     pub etype: String,
     pub src_var: String,
     pub dst_var: String,
+}
+
+/// `MATCH patterns [WHERE expr] [DETACH] DELETE node_var [, …]`
+///
+/// When `detach` is `true` (DETACH DELETE), all incident edges are removed
+/// before the node is tombstoned (openCypher semantics).  When `false`
+/// (bare DELETE), the node must have no incident edges; the executor returns
+/// an error if any remain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchDeleteNodeStmt {
+    pub matches: Vec<Pattern>,
+    pub where_expr: Option<Expr>,
+    /// Node variable names whose nodes are to be deleted (resolved from MATCH patterns).
+    pub node_vars: Vec<String>,
+    /// `true` → DETACH DELETE (allowed regardless of edges).
+    /// `false` → bare DELETE (error if any edges touch the node).
+    pub detach: bool,
 }
 
 /// `MERGE (n:Label {id: 'x'})` — match-or-create by a single key property.

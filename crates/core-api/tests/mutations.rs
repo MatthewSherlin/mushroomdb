@@ -766,3 +766,137 @@ fn stats_live_and_tombstoned_after_delete_node() {
     assert!(db.has_node("b"));
     assert!(!db.has_node("a"));
 }
+
+/// Top-k k=1: deleting the current top-1 dst promotes the next-best candidate.
+///
+/// Setup: 3 nodes (n0, n1, n2) all with k="x". Rule: FieldEqual top-k=1.
+/// Each src gets its single-best (smallest key ≠ self) dst:
+///   n0→n1, n1→n0, n2→n0.
+/// Deleting n0 must retract n1→n0 and n2→n0, then backfill both to n2 and n1
+/// respectively (the next eligible dst for each src).
+///   After delete: n1→n2, n2→n1.
+#[test]
+fn topk_backfill_on_delete_promotes_next_candidate() {
+    let dir = tmp("topk-delete-backfill");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_rule(topk_eq_rule(1)).unwrap();
+
+    for i in 0..3usize {
+        db.insert_node(
+            "N",
+            &format!("n{i}"),
+            vec![("k".into(), Value::Str("x".into()))],
+        )
+        .unwrap();
+    }
+    // n0→n1, n1→n0, n2→n0  (each points to smallest-key ≠ self)
+    assert_eq!(db.stats().rules[0].edges, 3);
+    assert_eq!(
+        db.neighbors("n1", "EQ", Direction::Out).unwrap(),
+        vec!["n0"]
+    );
+    assert_eq!(
+        db.neighbors("n2", "EQ", Direction::Out).unwrap(),
+        vec!["n0"]
+    );
+
+    let report = db.delete_node("n0").unwrap();
+    // n0 was the dst of n1→n0 and n2→n0 (2 derived edges where n0 is dst),
+    // and the src of n0→n1 (1 derived edge where n0 is src). Total derived = 3.
+    assert_eq!(report.derived_edges, 3, "all 3 edges were derived");
+    assert_eq!(report.manual_edges, 0);
+
+    assert!(!db.has_node("n0"));
+    // n1 and n2 must have backfilled: each now points to the other.
+    assert_eq!(
+        db.neighbors("n1", "EQ", Direction::Out).unwrap(),
+        vec!["n2"],
+        "n1 backfills to n2 after n0 deleted"
+    );
+    assert_eq!(
+        db.neighbors("n2", "EQ", Direction::Out).unwrap(),
+        vec!["n1"],
+        "n2 backfills to n1 after n0 deleted"
+    );
+    assert_eq!(db.stats().rules[0].edges, 2);
+}
+
+/// DeleteReport counts: manual and derived edge counts are accurate.
+#[test]
+fn delete_report_counts_are_accurate() {
+    let dir = tmp("delete-report-counts");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("A", "a", vec![("tags".into(), tags(&["x"]))]).unwrap();
+    db.insert_node("A", "b", vec![("tags".into(), tags(&["x"]))]).unwrap();
+    db.insert_node("A", "u", vec![]).unwrap();
+    db.insert_node("A", "v", vec![]).unwrap();
+
+    // 2 manual edges touching "a"
+    db.insert_edge("KNOWS", "a", "u").unwrap();
+    db.insert_edge("LIKES", "v", "a").unwrap();
+    // 2 derived edges via overlap rule (a↔b)
+    db.create_rule(overlap_rule("rel", "REL")).unwrap();
+    assert_eq!(db.edge_count(), 4);
+
+    let report = db.delete_node("a").unwrap();
+    assert_eq!(report.manual_edges, 2, "2 manual edges (a→u and v→a)");
+    assert_eq!(report.derived_edges, 2, "2 derived edges (a↔b)");
+    assert_eq!(db.edge_count(), 0);
+}
+
+/// Cypher-SET-driven top-k evict/backfill integration test (Plan-13 carryover).
+///
+/// Uses `query_write` (MATCH…SET) to change the score-driving field; asserts
+/// eviction and backfill happen through the full Cypher write entry.
+#[test]
+fn cypher_set_topk_evict_and_backfill() {
+    let dir = tmp("cypher-set-topk");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_rule(topk_eq_rule(1)).unwrap();
+    let no_params = BTreeMap::new();
+
+    // 3 nodes, all k="x". top-1 per-src: n0→n1, n1→n0, n2→n0.
+    // Include "id" as a prop so Cypher WHERE can target individual nodes.
+    for i in 0..3usize {
+        db.insert_node(
+            "N",
+            &format!("n{i}"),
+            vec![
+                ("id".into(), Value::Str(format!("n{i}"))),
+                ("k".into(), Value::Str("x".into())),
+            ],
+        )
+        .unwrap();
+    }
+    assert_eq!(db.stats().rules[0].edges, 3);
+    assert_eq!(
+        db.neighbors("n1", "EQ", Direction::Out).unwrap(),
+        vec!["n0"]
+    );
+
+    // Change n0's field via Cypher SET so it no longer matches "x".
+    // This must trigger eviction of n1→n0 and n2→n0 and backfill.
+    db.query_write(
+        "MATCH (n:N) WHERE n.id = 'n0' SET n.k = 'other'",
+        &no_params,
+    )
+    .unwrap();
+
+    // n0 no longer matches — its out-edges are retracted.
+    assert!(
+        db.neighbors("n0", "EQ", Direction::Out).unwrap().is_empty(),
+        "n0 has no EQ edges after SET"
+    );
+    // n1 and n2 backfill to each other.
+    assert_eq!(
+        db.neighbors("n1", "EQ", Direction::Out).unwrap(),
+        vec!["n2"],
+        "n1 backfills to n2 after n0 evicted via Cypher SET"
+    );
+    assert_eq!(
+        db.neighbors("n2", "EQ", Direction::Out).unwrap(),
+        vec!["n1"],
+        "n2 backfills to n1 after n0 evicted via Cypher SET"
+    );
+    assert_eq!(db.stats().rules[0].edges, 2);
+}

@@ -449,13 +449,111 @@ fn delete_derived_edge_is_error() {
     );
 }
 
+// ─── Node DELETE / DETACH DELETE ─────────────────────────────────────────────
+
 #[test]
-fn delete_node_detach_is_error() {
-    let mut db = GraphDb::open(&tmp("delete-node-err")).unwrap();
-    // DETACH DELETE / node DELETE is not supported — named error at parse time.
+fn detach_delete_node_removes_node_and_edges() {
+    let mut db = GraphDb::open(&tmp("detach-delete-node")).unwrap();
+    db.query_write(
+        "CREATE (n:Person {id: 'alice'})",
+        &no_params(),
+    )
+    .unwrap();
+    db.query_write(
+        "CREATE (n:Person {id: 'bob'})",
+        &no_params(),
+    )
+    .unwrap();
+    db.insert_edge("KNOWS", "alice", "bob").unwrap();
+    assert!(db.has_node("alice"));
+    assert_eq!(db.edge_count(), 1);
+
+    // DETACH DELETE removes alice + all incident edges.
+    db.query_write(
+        "MATCH (n:Person) WHERE n.id = 'alice' DETACH DELETE n",
+        &no_params(),
+    )
+    .unwrap();
+
+    assert!(!db.has_node("alice"));
+    assert!(db.has_node("bob"));
+    assert_eq!(db.edge_count(), 0);
+}
+
+#[test]
+fn detach_delete_node_via_cypher_fires_rules_on_reinsert() {
+    let mut db = GraphDb::open(&tmp("detach-delete-rules")).unwrap();
+    db.create_rule(RuleDef {
+        name: "eq".into(),
+        src_label: "N".into(),
+        dst_label: "N".into(),
+        predicate: Predicate::FieldEqual { field: "k".into() },
+        edge_type: "EQ".into(),
+        max_edges: None,
+        weight_prop: None,
+        approximate: false,
+    })
+    .unwrap();
+    db.query_write(
+        "CREATE (n:N {id: 'a', k: 'x'})",
+        &no_params(),
+    )
+    .unwrap();
+    db.query_write(
+        "CREATE (n:N {id: 'b', k: 'x'})",
+        &no_params(),
+    )
+    .unwrap();
+    assert_eq!(db.edge_count(), 2); // a↔b derived
+
+    // Detach-delete 'a' via Cypher.
+    db.query_write(
+        "MATCH (n:N) WHERE n.id = 'a' DETACH DELETE n",
+        &no_params(),
+    )
+    .unwrap();
+    assert!(!db.has_node("a"));
+    assert_eq!(db.edge_count(), 0);
+
+    // Reinsert 'a' with same key and same field — rules must fire fresh.
+    db.query_write(
+        "CREATE (n:N {id: 'a', k: 'x'})",
+        &no_params(),
+    )
+    .unwrap();
+    assert!(db.has_node("a"));
+    assert_eq!(db.edge_count(), 2, "rule must fire fresh on reinserted 'a'");
+}
+
+#[test]
+fn bare_delete_isolated_node_succeeds() {
+    let mut db = GraphDb::open(&tmp("bare-delete-isolated")).unwrap();
+    db.query_write("CREATE (n:Person {id: 'solo'})", &no_params())
+        .unwrap();
+    assert!(db.has_node("solo"));
+
+    // Bare DELETE on an isolated node (no edges) → succeeds.
+    db.query_write(
+        "MATCH (n:Person) WHERE n.id = 'solo' DELETE n",
+        &no_params(),
+    )
+    .unwrap();
+    assert!(!db.has_node("solo"));
+}
+
+#[test]
+fn bare_delete_node_with_edges_errors() {
+    let mut db = GraphDb::open(&tmp("bare-delete-with-edges")).unwrap();
+    db.query_write("CREATE (n:Person {id: 'a'})", &no_params())
+        .unwrap();
+    db.query_write("CREATE (n:Person {id: 'b'})", &no_params())
+        .unwrap();
+    db.insert_edge("KNOWS", "a", "b").unwrap();
+
+    // Bare DELETE on a node that has edges → named error mentioning DETACH DELETE.
     let err = db
         .query_write(
-            "MATCH (n:Person) WHERE n.id = 'x' DELETE n",
+            "MATCH (n:Person) WHERE n.id = 'a' DELETE n",
             &no_params(),
         )
         .unwrap_err();
@@ -463,11 +561,13 @@ fn delete_node_detach_is_error() {
         GraphError::QueryError { detail } => detail,
         other => panic!("expected QueryError, got {other:?}"),
     };
-    // n is not a relationship variable → parse error mentioning "relationship"
     assert!(
-        detail.contains("relationship") || detail.contains("not bound as a relationship"),
-        "error must mention relationship variable, got: {detail}"
+        detail.contains("DETACH DELETE"),
+        "error must mention DETACH DELETE, got: {detail}"
     );
+    // Node must still be live.
+    assert!(db.has_node("a"));
+    assert_eq!(db.edge_count(), 1);
 }
 
 // ─── MERGE ───────────────────────────────────────────────────────────────────

@@ -224,7 +224,7 @@ SET n.score = 99
   re-evaluates incrementally: derived edges appear or retract within the same
   WAL frame.
 
-### MATCH … DELETE
+### MATCH … DELETE (edge)
 
 ```cypher
 MATCH (a:Org)-[r:MEMBER]->(b:Person)
@@ -234,7 +234,28 @@ DELETE r
 - Only manual (user-inserted) edges may be deleted.
 - Attempting to delete a derived (rule-owned) edge returns:
   `cannot delete derived edge; retract via the rule or change the property`
-- Node DELETE / DETACH DELETE is not supported.
+
+### MATCH … DETACH DELETE (node)
+
+```cypher
+MATCH (n:Person) WHERE n.id = 'alice'
+DETACH DELETE n
+```
+
+Deletes the node and all incident edges (manual and derived). Derived edges
+are retracted via the rule engine; top-k backfill fires automatically for any
+source whose top-k slot was occupied by the removed node.
+
+### MATCH … DELETE (isolated node)
+
+```cypher
+MATCH (n:Person) WHERE n.id = 'solo'
+DELETE n
+```
+
+Bare `DELETE n` on a node variable succeeds when the node has no incident
+edges (openCypher semantics).  If any edges remain the executor returns:
+`Cannot delete node … because it still has incident edges. Use DETACH DELETE…`
 
 ### MERGE
 
@@ -255,7 +276,8 @@ MERGE (n:Person {id: 'alice'})
 | Multi-statement transactions | Not supported (one write statement per query in v1) |
 | Combined MATCH … SET … RETURN | Not supported; use two queries |
 | SET RHS expressions | Literals only in v1 |
-| Node DELETE / DETACH DELETE | Not supported |
+| MATCH … DETACH DELETE (node) | Supported — removes node + all edges |
+| Bare DELETE on node with edges | Error — use DETACH DELETE |
 | MERGE ON CREATE / ON MATCH | Not supported |
 | Grouped aggregation | Supported (multiple keys and multiple aggregates allowed; group count capped at 1,000,000) |
 | Variable-length paths: max hops | Capped at 10 |

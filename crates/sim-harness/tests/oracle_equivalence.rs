@@ -661,7 +661,7 @@ proptest! {
                     let db_res = db.delete_node(&key);
                     let or_ok = oracle.delete_node(&key);
                     match db_res {
-                        Ok(()) => prop_assert!(or_ok, "engine Ok delete_node({key}) but oracle KeyNotFound"),
+                        Ok(_report) => prop_assert!(or_ok, "engine Ok delete_node({key}) but oracle KeyNotFound"),
                         Err(GraphError::KeyNotFound { .. }) => {
                             prop_assert!(!or_ok, "engine KeyNotFound delete_node({key}) but oracle deleted")
                         }
