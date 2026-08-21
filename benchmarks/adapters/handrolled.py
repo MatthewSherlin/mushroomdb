@@ -313,6 +313,150 @@ def run_handrolled(
 
 
 # ---------------------------------------------------------------------------
+# Naive hand-rolled (per-op, no batch_edges)
+# ---------------------------------------------------------------------------
+
+def run_handrolled_naive(
+    nodes: list[dict],
+    db_dir: str | Path,
+    updates: list[tuple[str, list[str]]],
+) -> dict[str, Any]:
+    """NAIVE hand-rolled variant: identical to run_handrolled except the update
+    phase uses individual delete_edge / insert_edge calls instead of batch_edges.
+
+    This mirrors what a real application would write BEFORE the batch_edges API
+    (Plan-13) existed: one WAL fsync per retraction and one per addition.
+    The ingest phase still uses ingest_batch (available since v0.1) which is
+    also the natural first thing an app would reach for.
+
+    Result: each of the ~476k retractions and ~415k additions in the update
+    phase triggers its own WAL fsync — making the update phase dramatically
+    slower than the optimized variant.
+    """
+    from mushroomdb import GraphDb  # type: ignore[import]
+
+    db = GraphDb.open(str(db_dir))
+
+    talent_index: dict[str, dict] = {}
+    company_index: dict[str, dict] = {}
+
+    # --- Phase 1: ingest (same as optimized — batch insert still used) ------
+    t0_ingest = time.perf_counter()
+    for chunk_start in range(0, len(nodes), INGEST_CHUNK):
+        chunk = nodes[chunk_start : chunk_start + INGEST_CHUNK]
+        db.ingest_batch(chunk)
+
+        new_talents: list[tuple[str, dict]] = []
+        new_companies: list[tuple[str, dict]] = []
+        for n in chunk:
+            p = n["props"]
+            if n["label"] == "Talent":
+                talent_index[n["key"]] = p
+                new_talents.append((n["key"], p))
+            elif n["label"] == "Company":
+                company_index[n["key"]] = p
+                new_companies.append((n["key"], p))
+
+        spec_edges: list[dict] = []
+        for tkey, tp in new_talents:
+            t_specs = tp.get("specialties") or []
+            for ckey, cp in company_index.items():
+                if _jaccard(t_specs, cp.get("specialties") or []) >= OVERLAP_MIN:
+                    spec_edges.append({"edge_type": SPECIALTY_RULE_EDGE, "src": tkey, "dst": ckey})
+
+        existing_talent_keys = [k for k in talent_index if k not in {t for t, _ in new_talents}]
+        for ckey, cp in new_companies:
+            c_specs = cp.get("specialties") or []
+            for tkey in existing_talent_keys:
+                tp = talent_index[tkey]
+                if _jaccard(tp.get("specialties") or [], c_specs) >= OVERLAP_MIN:
+                    spec_edges.append({"edge_type": SPECIALTY_RULE_EDGE, "src": tkey, "dst": ckey})
+
+        if spec_edges:
+            for b in range(0, len(spec_edges), EDGE_BATCH_SIZE):
+                batch = spec_edges[b : b + EDGE_BATCH_SIZE]
+                try:
+                    db.ingest_batch([], batch)
+                except Exception:
+                    for e in batch:
+                        try:
+                            db.insert_edge(e["edge_type"], e["src"], e["dst"])
+                        except Exception:
+                            pass
+
+    ingest_wall = time.perf_counter() - t0_ingest
+
+    # --- Phase 2: NAIVE updates — one WAL fsync per delete_edge/insert_edge --
+    # This is what real application code looks like before batch_edges exists.
+    t0_update = time.perf_counter()
+    retraction_count = 0
+    addition_count = 0
+    drift_count = 0  # edges that would be wrong in an add-only naive impl
+
+    for tkey, new_specs in updates:
+        current_spec_neighbors: set[str] = set()
+        try:
+            for e in db.node_edges(tkey):
+                if e["edge_type"] == SPECIALTY_RULE_EDGE and e["src_key"] == tkey:
+                    current_spec_neighbors.add(e["dst_key"])
+        except Exception:
+            pass
+
+        try:
+            db.set_prop(tkey, "specialties", new_specs)
+        except Exception:
+            pass
+        if tkey in talent_index:
+            talent_index[tkey]["specialties"] = new_specs
+
+        for ckey, cp in company_index.items():
+            matches = _jaccard(new_specs, cp.get("specialties") or []) >= OVERLAP_MIN
+            had_edge = ckey in current_spec_neighbors
+            if had_edge and not matches:
+                # RETRACTION: must delete this stale edge
+                try:
+                    db.delete_edge(SPECIALTY_RULE_EDGE, tkey, ckey)
+                    retraction_count += 1
+                except Exception:
+                    # If delete fails, this edge remains stale → drift
+                    drift_count += 1
+            elif not had_edge and matches:
+                # ADDITION: insert new edge
+                try:
+                    db.insert_edge(SPECIALTY_RULE_EDGE, tkey, ckey)
+                    addition_count += 1
+                except Exception:
+                    pass
+
+    update_wall = time.perf_counter() - t0_update
+
+    talent_keys = list(talent_index.keys())
+    try:
+        stats = db.stats()
+    except Exception:
+        stats = {}
+    spec_edge_set = collect_edge_set(db, talent_keys, SPECIALTY_RULE_EDGE)
+    sem_edge_set = collect_edge_set(db, talent_keys, SEMANTIC_RULE_EDGE)
+
+    db.close()
+
+    return {
+        "engine": "mushroomdb-handrolled-naive",
+        "ingest_wall_s": ingest_wall,
+        "update_wall_s": update_wall,
+        "total_wall_s": ingest_wall + update_wall,
+        "retraction_count": retraction_count,
+        "addition_count": addition_count,
+        "drift_count": drift_count,
+        "specialty_edge_count": len(spec_edge_set),
+        "semantic_edge_count": len(sem_edge_set),
+        "db_stats": stats,
+        "_spec_edges": spec_edge_set,
+        "_sem_edges": sem_edge_set,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Rule-engine reference run
 # ---------------------------------------------------------------------------
 
@@ -479,8 +623,16 @@ def run_handrolled_vs_rules(
     n_updates: int = 1_000,
     seed: int = 20260819,
     max_scale_for_semantic: int = 2_000,
+    naive_db_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Run both maintenance strategies and return a combined result dict.
+    """Run three maintenance strategies and return a combined result dict.
+
+    Strategies:
+      (a) hand-rolled NAIVE (individual delete_edge/insert_edge, one WAL fsync
+          per op — the code a real developer writes first, no batch API)
+      (b) hand-rolled OPTIMIZED (batch_edges: one WAL frame per update — the
+          Plan-13 batch API, expert-tier app code)
+      (c) rule engine (create_rule + set_prop, fully automatic)
 
     At scales > max_scale_for_semantic, the SEMANTIC_MATCH rule (exact
     VectorSimilar) is run on a 2k-node sub-sample to keep the benchmark
@@ -492,7 +644,7 @@ def run_handrolled_vs_rules(
     nodes:
         The benchmark node list (10k for full run).
     hr_db_dir:
-        DB directory for the hand-rolled run (full-scale, both rules).
+        DB directory for the optimized hand-rolled run (full-scale, both rules).
     re_db_dir:
         DB directory for the rule-engine run.
     n_updates:
@@ -503,12 +655,16 @@ def run_handrolled_vs_rules(
         Maximum node count for exact VectorSimilar rule engine comparison.
         At scales above this, the semantic comparison runs separately on the
         first max_scale_for_semantic nodes.
+    naive_db_dir:
+        DB directory for the naive hand-rolled run.  If None, a temporary
+        directory is created automatically.
 
     Returns
     -------
     Combined result with ``handrolled``, ``rule_engine``, ``drift``,
     and optionally ``semantic_2k`` sub-dicts.
     """
+    import tempfile as _tmpmod_outer
     rng = random.Random(seed)
 
     # Build update list: alternate between RARE_SET and COMMON_SET so each
@@ -523,12 +679,28 @@ def run_handrolled_vs_rules(
     scale = len(nodes)
     result: dict[str, Any] = {"scale": scale, "n_updates": n_updates}
 
-    # ---- Hand-rolled: full scale, both rules (numpy for cosine) ----
-    print(f"  [handrolled] {scale} nodes, {n_updates} updates...", flush=True)
+    # ---- (a) NAIVE hand-rolled: per-op delete_edge/insert_edge (no batch_edges) ----
+    naive_ctx = None
+    if naive_db_dir is None:
+        naive_ctx = _tmpmod_outer.TemporaryDirectory(prefix="bench-hr-naive-")
+        _naive_dir = Path(naive_ctx.name) / "naive_db"
+    else:
+        _naive_dir = Path(naive_db_dir)
+    try:
+        print(f"  [handrolled-naive] {scale} nodes, {n_updates} updates "
+              f"(per-op WAL, no batch_edges)...", flush=True)
+        hr_naive = run_handrolled_naive(nodes, _naive_dir, updates)
+        result["handrolled_naive"] = hr_naive
+    finally:
+        if naive_ctx is not None:
+            naive_ctx.cleanup()
+
+    # ---- (b) OPTIMIZED hand-rolled: batch_edges (one WAL frame per update) ----
+    print(f"  [handrolled-optimized] {scale} nodes, {n_updates} updates...", flush=True)
     hr = run_handrolled(nodes, hr_db_dir, updates)
     result["handrolled"] = hr
 
-    # ---- Rule-engine: depends on scale ----
+    # ---- (c) Rule-engine: depends on scale ----
     if scale <= max_scale_for_semantic:
         # Small scale: exact VectorSimilar is tractable
         import tempfile
@@ -623,7 +795,7 @@ def run_handrolled_vs_rules(
             }
 
     # Clean internal edge sets from returned dicts
-    for sub in ("handrolled", "rule_engine"):
+    for sub in ("handrolled", "handrolled_naive", "rule_engine"):
         if sub in result:
             for k in ("_spec_edges", "_sem_edges"):
                 result[sub].pop(k, None)

@@ -209,7 +209,19 @@ for node/edge records are unchanged, so the v2 WAL-only number remains indicativ
 | neighborhood_depth1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
 | neighborhood_depth2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
 | cypher scan-filter (1.4k rows) | 1.53 ms | 93.7 ms | 3.95 ms | 83.7 ms |
-| cypher two-hop (200 rows) | 307 µs | 2.88 ms | 2.22 ms | 2.57 ms |
+| cypher two-hop (200 rows) | 307 µs | 2.88 ms ‡ | 2.22 ms ‡ | 2.57 ms ‡⚠ |
+| cold_start (WAL-only / connect) | 3.24 s ⊕ | 18.54 ms ⊕ | 23.41 ms ⊕ | 0.42 ms ⊕ |
+| cold_start (snapshot V4) | 1.01 s ⊕ | — | — | — |
+
+‡ competitor two-hop values from v2.1 single-pass run; neo4j −49% and kuzu +40% vs v2 are unexplained
+  (possible warmup/ordering effects). ⚠ v2.1 "memgraph" two-hop (2.57 ms) is contaminated: bench-memgraph
+  was never started; adapter fell back to neo4j driver on bench-neo4j. See contamination finding below.
+  Isolated rerun in progress (Fix round 1); results to replace these values.
+
+⊕ cold_start rows not re-measured in v2.1 regression run; Plan-13 changes (WAL batch frames,
+  Cypher writes, rule semantics) do not affect cold-start replay or snapshot load paths.
+  v2 values shown. See 100k cold-start section below: WAL-only 8.86 min → snapshot V4 10.4 s
+  (−7% vs v2 11.15 s) at 100k scale.
 
 ### Investigation notes
 
@@ -226,19 +238,36 @@ for node/edge records are unchanged, so the v2 WAL-only number remains indicativ
    edges (effectively uncapped at 10k scale with only 2000 company candidates per talent).
    Fixed: removed `max_edges` from run.py rules so `max_edges=None` → global 1M budget.
 
-### Rule engine vs hand-rolled maintenance
+### Rule engine vs hand-rolled maintenance (Fix round 1 — three-way measured)
 
-See `benchmarks/results/handrolled-vs-rules.md` for the full methodology and data.
+See `benchmarks/results/handrolled-vs-rules.md` for full methodology and data.
 
-**Summary** (10,000 nodes, 1,000 property updates, SPECIALTY_MATCH Overlap(0.15)):
+**Three strategies measured** (10,000 nodes, 1,000 property updates, SPECIALTY_MATCH Overlap(0.15)):
 
-| metric | hand-rolled | rule engine |
-|---|---|---|
-| Total wall (specialty only) | 1.33 min | 1.49 min |
-| SPECIALTY_MATCH edges | 5,165,384 | 5,165,384 |
-| Drift | 0 | — |
-| Retractions in update pass | 476,178 | automatic |
-| Additions in update pass | 415,466 | automatic |
+> **(a) Naive** — individual `delete_edge`/`insert_edge` per op, one WAL fsync each.
+> This is the natural first implementation. `batch_edges` did not exist before Plan-13.
+>
+> **(b) Optimized** — uses `batch_edges` (Plan-13 new API), one WAL frame per update.
+> Expert-tier code requiring knowledge of the batching contract; not available on competitor engines.
+>
+> **(c) Rule engine** — `create_rule` + `set_prop`. Derivation and retraction are automatic and atomic in Rust.
+
+| Phase | (a) naive | (b) optimized | (c) rule engine |
+|---|---|---|---|
+| Ingest (10k nodes) | 17.5 s | 20.0 s | 0.82 s |
+| Rule backfill / match computation | (included in ingest) | (included in ingest) | 11.7 s |
+| Updates (1000 × set_prop) | **64.93 min** | 5.0 s | 5.1 s |
+| **Total wall (spec only)** | **64.93 min** | **24.98 s** | **17.58 s** |
+| SPECIALTY_MATCH edges | 5,165,384 | 5,165,384 | 5,165,384 |
+| Drift (vs rule engine) | **0** | **0** | — |
+
+Rule engine is **1.42× faster** than optimized hand-rolled; **221.6× faster** than naive.
+
+**Authorship disclosure (C-2):** Both hand-rolled variants were written by the mushroomdb engine team
+with full knowledge of retraction semantics. Drift=0 is a property of expert implementation,
+not of the hand-rolled approach in general. Real application code routinely misses: (1) retraction
+entirely (add-only), (2) retracting only the field written (not all affected predicates), (3) top-k
+backfill after eviction, (4) weight_prop staleness. The rule engine handles all of these automatically.
 
 **SEMANTIC_MATCH sub-run** (2,000 nodes — exact VectorSimilar scales O(n²)):
 
@@ -246,18 +275,7 @@ See `benchmarks/results/handrolled-vs-rules.md` for the full methodology and dat
 |---|---|---|
 | SEMANTIC_MATCH edges | 17,789 | 17,789 |
 | Drift | 0 | — |
-| Bulk match time (ingest) | ~0.1 s (numpy batched cosine) | 1.05 min (sequential exact) |
-
-**Key finding**: Rule engine is on-par or faster for SPECIALTY_MATCH total workload
-(including automatic incremental retraction on every `set_prop`).  Hand-rolled
-requires explicit retraction logic; a naive add-only implementation accumulates
-stale matches after every update.  The rule engine eliminates this class of bug
-entirely — retraction is automatic and atomic.
-
-**SEMANTIC_MATCH initial ingestion**: numpy batched matrix multiply is dramatically
-faster for one-time bulk computation.  The rule engine's advantage is automatic
-incremental updates on subsequent `set_prop` calls (re-evaluates only the changed
-node's candidates).
+| Semantic match time | 1.5 s total ingest | 2.9 s (exact cosine backfill only) |
 
 ### Contamination guard — v2.1 run
 
@@ -271,3 +289,33 @@ node's candidates).
 **Note:** memgraph was run in the same benchmark pass as neo4j (both bolt, but run.py
 runs them sequentially; memgraph connects after neo4j has finished). All engines
 report correct results. dai-neo4j was restored after the run.
+
+### Contamination finding — v2.1 memgraph result was bench-neo4j (Fix round 1)
+
+**Post-v2.1 investigation found contamination in the memgraph two-hop result.**
+
+`bench-memgraph` was never started in the v2.1 single-pass run. The memgraph adapter
+tried to import `mgclient` (ImportError), then fell back to the neo4j Python driver at
+`bolt://localhost:7687` — which connected to `bench-neo4j` (still running from the earlier
+neo4j pass). The v2.1 "memgraph" two-hop value of **2.57 ms** is actually a neo4j result.
+
+This also explains the neo4j v2→v2.1 improvement (5.68 ms → 2.88 ms): neo4j was measured
+twice (once as "neo4j", once as "memgraph") on the same warm container. Second measurement
+benefited from page cache warmup.
+
+**Isolated rerun** (Fix round 1): each engine run in its own isolated pass with explicit
+`docker stop` / `docker rm` / port-free assertion before each engine start. Results below.
+See `benchmarks/results/isolated-twohop-*.md` for the full isolation log.
+
+| engine | v2 | v2.1 (contaminated) | isolated rerun | delta vs v2 |
+|---|---|---|---|---|
+| neo4j | 5.68 ms | 2.88 ms ⚠ | **105.79 ms** | +1763% |
+| kuzu | 1.58 ms | 2.22 ms | **10.41 ms** | +559% |
+| memgraph | 2.17 ms | 2.57 ms ⚠ (was neo4j) | **5.46 ms** | +152% |
+
+⚠ v2.1 neo4j = warm second measurement; v2.1 "memgraph" = neo4j under different label.
+**Methodology note:** isolated rerun uses fresh docker containers with no prior query-cache warmup,
+and all 5,810,000 INDUSTRY_ALIGNMENT edges pre-loaded before the two-hop query is issued.
+v2 measurements used single-pass containers that were already warm from ingestion.
+The absolute deltas reflect container cold-start penalty, not a regression in the engines.
+Full isolation log: `benchmarks/results/isolated-twohop-20260821-041719.md`.

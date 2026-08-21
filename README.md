@@ -186,11 +186,16 @@ no rule re-fire; **47.5× faster** than WAL-only; write cost: 36.1 s paid once a
 shutdown). WAL-only baseline from v2: 8.86 min (re-fires all 12 rules; IVF dominates).
 See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
 
-Rule engine vs hand-rolled maintenance (Plan-13 benchmark): on 10k nodes with
-1,000 specialty updates, both strategies produce identical edge sets (drift = 0).
-Rule engine is on-par overall (1.49 min vs hand-rolled 1.33 min) and handles
-retraction automatically — 476k retractions across 1k updates required zero
-application code. See [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-vs-rules.md).
+Rule engine vs hand-rolled maintenance (Plan-13 benchmark, three-way measured): on 10k nodes with
+1,000 specialty updates, all three strategies produce identical edge sets (drift = 0).
+**(a) Naive** (per-op `delete_edge`/`insert_edge`, one WAL fsync each): **64.93 min**.
+**(b) Optimized** (uses `batch_edges` — a Plan-13 mushroomdb-only API, one WAL frame per update): **24.98 s**.
+**(c) Rule engine** (`create_rule` + `set_prop`, fully automatic): **17.58 s** (1.42× faster than optimized).
+Disclosures: (1) `batch_edges` was introduced in this same Plan-13 task to make the benchmark fair; it
+is not available on any competitor engine. (2) Both hand-rolled variants were written by the engine team
+with full knowledge of retraction semantics; drift=0 is a property of expert implementation, not of the
+hand-rolled approach in general — real application code typically misses at least one retraction path.
+See [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-vs-rules.md).
 
 ---
 

@@ -265,6 +265,89 @@ def test_stats_rule_approximate_true(tmp_path):
 # snapshot
 # ---------------------------------------------------------------------------
 
+def test_delete_edge_happy_path(tmp_path):
+    """delete_edge removes a user-inserted edge and returns True; second call returns False."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("a", "Thing", {})
+    db.insert_node("b", "Thing", {})
+    db.insert_edge("KNOWS", "a", "b")
+
+    assert "b" in db.neighbors("a", "KNOWS", "out")
+    removed = db.delete_edge("KNOWS", "a", "b")
+    assert removed is True
+    assert "b" not in db.neighbors("a", "KNOWS", "out")
+
+    # Second delete on an absent edge returns False (idempotent).
+    removed2 = db.delete_edge("KNOWS", "a", "b")
+    assert removed2 is False
+    db.close()
+
+
+def test_delete_edge_derived_raises(tmp_path):
+    """delete_edge on a rule-derived edge should raise (derived edges are rule-owned)."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("x", "Org", {"year": 2010})
+    db.insert_node("y", "Org", {"year": 2011})
+    db.create_rule({
+        "name": "r",
+        "src_label": "Org",
+        "dst_label": "Org",
+        "predicate": {"NumericWithin": {"field": "year", "tolerance": 2.0}},
+        "edge_type": "SIMILAR_YEAR",
+        "weight_prop": "score",
+        "max_edges": None,
+    })
+    # Derived edge exists
+    assert "y" in db.neighbors("x", "SIMILAR_YEAR", "out")
+    # Deleting it must raise (not silently succeed)
+    with pytest.raises(Exception):
+        db.delete_edge("SIMILAR_YEAR", "x", "y")
+    db.close()
+
+
+def test_batch_edges_happy_path(tmp_path):
+    """batch_edges inserts and deletes edges in one atomic WAL frame."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    for k in ("a", "b", "c", "d"):
+        db.insert_node(k, "N", {})
+    db.insert_edge("KNOWS", "a", "b")  # will be deleted
+
+    result = db.batch_edges(
+        inserts=[
+            {"edge_type": "KNOWS", "src": "a", "dst": "c"},
+            {"edge_type": "KNOWS", "src": "a", "dst": "d"},
+        ],
+        deletes=[{"edge_type": "KNOWS", "src": "a", "dst": "b"}],
+    )
+    assert result["edges_inserted"] == 2
+    assert result["edges_deleted"] == 1
+
+    out = db.neighbors("a", "KNOWS", "out")
+    assert "c" in out
+    assert "d" in out
+    assert "b" not in out
+    db.close()
+
+
+def test_batch_edges_bad_edge_is_atomic(tmp_path):
+    """batch_edges with a nonexistent-node edge should error; inserts before it roll back."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("a", "N", {})
+    db.insert_node("b", "N", {})
+
+    # Insert a valid edge first to confirm it's absent after rollback
+    with pytest.raises(Exception):
+        db.batch_edges(
+            inserts=[
+                {"edge_type": "KNOWS", "src": "a", "dst": "b"},
+                {"edge_type": "KNOWS", "src": "a", "dst": "ghost"},  # ghost does not exist
+            ],
+        )
+    # On error the whole batch must have been rolled back — a→b must not exist
+    assert "b" not in db.neighbors("a", "KNOWS", "out")
+    db.close()
+
+
 def test_snapshot_and_reopen(tmp_path):
     """snapshot() writes a durable checkpoint; reopening after snapshot yields
     the same data without full WAL replay."""
