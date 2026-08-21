@@ -17,7 +17,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/MatthewSherlin/mushroomdb"
-rust-version = "1.85.0"
+rust-version = "1.92.0"
 keywords = ["graph-database", "embedded", "cypher", "rules"]
 categories = ["database-implementations", "data-structures"]
 
