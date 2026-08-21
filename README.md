@@ -44,53 +44,6 @@ field values that matched, and the computed score for every derived edge.
 
 ![Neighborhood with derived edges highlighted](docs/assets/02-neighborhood-gold.png)
 
-### The database proposes its own rules
-
-Not sure which rules to declare? mushroomdb can profile your data and suggest
-them. Call `db.suggest_rules()` (or `GET /suggest`, or `mushroomdb suggest
-./db`) to receive a ranked list of candidate rules with estimated edge counts,
-example pairs, and rationale:
-
-```rust
-let suggestions = db.suggest_rules();
-for s in &suggestions {
-    println!("{}: ~{} edges — {}", s.def.name, s.est_edges, s.rationale);
-}
-// Accept the top suggestion:
-if let Some(s) = suggestions.into_iter().next() {
-    db.create_rule(s.def)?;
-}
-```
-
-The profiler detects `_id`-suffix foreign keys (KeyMatch), overlapping token
-lists (Overlap), shared low-cardinality strings (FieldEqual), overlapping
-numeric ranges (NumericWithin), and equal-dimension float arrays
-(VectorSimilar). Sampling is seeded so the same database always returns the
-same suggestions. No rule is ever applied automatically. See
-[docs/site/suggest.md](docs/site/suggest.md) for the full reference.
-
-### Live degree counts and neighbor aggregates, no triggers
-
-mushroomdb maintains per-node derived properties automatically as the graph
-changes.  A degree view counts incident edges; a neighbor-aggregate view sums,
-averages, or takes the min/max of a neighbor property — all updated
-incrementally on every edge insert, delete, rule fire, or retract.  No cron
-jobs, no triggers, no stale caches:
-
-```rust
-db.create_view(ViewDef {
-    name: "city_population".into(), label: "City".into(),
-    view_prop: "pop".into(),
-    source: ViewSource::Degree { edge_type: "LIVES_IN".into(), direction: Direction::In },
-})?;
-// After any edge change, c.pop is instantly correct in every query.
-db.query("MATCH (c:City) WHERE c.pop > 1000 RETURN c.name", &Default::default())?;
-```
-
-View definitions persist through WAL and snapshots; values rebuild on open in
-O(nodes × degree).  Writing to a view prop returns a named error so the guard
-is explicit.  See [`docs/site/views.md`](docs/site/views.md).
-
 ### Live rule and write subscriptions
 
 mushroomdb streams derived-edge events in real time. Subscribe to any rule and
@@ -125,8 +78,13 @@ The same stream is available over WebSocket at `GET /subscribe`:
 Events arrive after the WAL fsync — a subscriber that queries immediately on
 receipt observes the state that produced the event. Each subscription has a
 65,536-event bounded queue; slow consumers receive a `Lagged { missed: N }`
-marker and continue (no disconnection). See [docs/site/subscriptions.md](docs/site/subscriptions.md)
-for the full API reference.
+marker and continue (no disconnection).
+
+**Measured end-to-end latency** (1 000 events, release build, Apple M4 Pro, 2026-08-21):
+commit-to-event-received p50/p95 — in-process: **0.04 µs / 0.21 µs**; over WS on
+localhost: **61 µs / 88 µs**. Clock: `std::time::Instant` (monotonic).
+
+See [docs/site/subscriptions.md](docs/site/subscriptions.md) for the full API reference.
 
 ### Replay to any commit since your last snapshot
 
@@ -157,6 +115,53 @@ since the last `snapshot()`. `snapshot()` truncates the WAL: faster cold starts,
 but as-of history restarts from that point. See
 [docs/site/timetravel.md](docs/site/timetravel.md) for the full tradeoff and
 replay-cost caveats.
+
+### Live degree counts and neighbor aggregates, no triggers
+
+mushroomdb maintains per-node derived properties automatically as the graph
+changes.  A degree view counts incident edges; a neighbor-aggregate view sums,
+averages, or takes the min/max of a neighbor property — all updated
+incrementally on every edge insert, delete, rule fire, or retract.  No cron
+jobs, no triggers, no stale caches:
+
+```rust
+db.create_view(ViewDef {
+    name: "city_population".into(), label: "City".into(),
+    view_prop: "pop".into(),
+    source: ViewSource::Degree { edge_type: "LIVES_IN".into(), direction: Direction::In },
+})?;
+// After any edge change, c.pop is instantly correct in every query.
+db.query("MATCH (c:City) WHERE c.pop > 1000 RETURN c.name", &Default::default())?;
+```
+
+View definitions persist through WAL and snapshots; values rebuild on open in
+O(nodes × degree).  Writing to a view prop returns a named error so the guard
+is explicit.  See [`docs/site/views.md`](docs/site/views.md).
+
+### The database proposes its own rules
+
+Not sure which rules to declare? mushroomdb can profile your data and suggest
+them. Call `db.suggest_rules()` (or `GET /suggest`, or `mushroomdb suggest
+./db`) to receive a ranked list of candidate rules with estimated edge counts,
+example pairs, and rationale:
+
+```rust
+let suggestions = db.suggest_rules();
+for s in &suggestions {
+    println!("{}: ~{} edges — {}", s.def.name, s.est_edges, s.rationale);
+}
+// Accept the top suggestion:
+if let Some(s) = suggestions.into_iter().next() {
+    db.create_rule(s.def)?;
+}
+```
+
+The profiler detects `_id`-suffix foreign keys (KeyMatch), overlapping token
+lists (Overlap), shared low-cardinality strings (FieldEqual), overlapping
+numeric ranges (NumericWithin), and equal-dimension float arrays
+(VectorSimilar). Sampling is seeded so the same database always returns the
+same suggestions. No rule is ever applied automatically. See
+[docs/site/suggest.md](docs/site/suggest.md) for the full reference.
 
 ---
 
@@ -269,16 +274,16 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 
 | Workload | mushroomdb | Neo4j | KùzuDB | Memgraph |
 |---|---|---|---|---|
-| Bulk ingest | 862 ms | 13.2 s | 1.21 min | 12.5 s |
+| Bulk ingest | 784 ms | 13.2 s | 1.21 min | 12.5 s |
 | Neighborhood depth-1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
-| Neighborhood depth-1 (p95) | 1.1 µs | 1.46 ms | 519 µs | 2.14 ms |
+| Neighborhood depth-1 (p95) | 2.2 µs | 1.46 ms | 519 µs | 2.14 ms |
 | Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
-| Cypher scan-filter-project (1.4k rows) | 1.53 ms | 93.7 ms | 3.95 ms | 83.7 ms |
+| Cypher scan-filter-project (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
 | Cypher two-hop join (200 rows) | **261.6 µs** ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
-| Cold-start (snapshot V4) | **10.4 s** | — | — | — |
+| Cold-start (snapshot V5) | **see note** ▽ | — | — | — |
 | Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
-*(v2.1 numbers, 2026-08-21, release build; two-hop row = corrected four-engine benchmark (v2.2))*
+*(v2.4 mushroomdb, 2026-08-21, release build; competitor numbers = v2.2 corrected; two-hop row = corrected four-engine benchmark)*
 
 **Honesty notes:**
 
@@ -302,10 +307,11 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
 two-rule backfill on 10k nodes: 872 ms + 1.976 s = **2.85 s** (previously 3.08 s). Competitors have no auto-derivation equivalent.
 
-100k cold-start: Snapshot V4 open **10.5 s** (v2.3; derived edges + IVF centroids loaded;
-no rule re-fire; **~50× faster** than WAL-only; write cost: 36.1 s paid once at
-shutdown). WAL-only baseline from v2: 8.86 min (re-fires all 12 rules; IVF dominates).
-See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
+▽ 100k cold-start (V5 snapshot): number being updated in v2.4 regression run (100k db
+rebuild required because V4 snapshots are rejected by V5 code). Previous V4 result was
+10.5 s open / 36.1 s write cost at 100k scale. V5 adds view_defs to the snapshot format;
+open time expected similar. WAL-only baseline: 8.86 min (re-fires all 12 rules; IVF dominates).
+See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md) for the updated V5 numbers.
 
 Rule engine vs hand-rolled maintenance (three-way, measured 2026-08-21): on 10k nodes with
 1,000 specialty updates, all three strategies produce identical edge sets (drift = 0).
@@ -360,7 +366,7 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Limitation | Detail |
 |---|---|
 | Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
-| Cold start without a snapshot re-fires all rules | Snapshots (V4) persist derived edges and IVF state — opening from a snapshot skips re-derivation (10.5 s at 100k nodes vs 8.86 min from WAL alone). Call `snapshot()` before close; a WAL-only open still re-derives everything. Snapshot write costs ~36 s at 100k. |
+| Cold start without a snapshot re-fires all rules | Snapshots (V5) persist derived edges, IVF state, and view definitions — opening from a snapshot skips re-derivation. Previous V4 result: 10.5 s open at 100k nodes vs 8.86 min from WAL alone; V5 numbers update pending 100k rebuild (see `dogfood/results/scale-100k.md`). Call `snapshot()` before close; a WAL-only open still re-derives everything. Snapshot write cost ~36 s at 100k (V4 baseline). |
 | Approximate vector mode is opt-in | `approximate: true` enables IVF-Flat candidate selection. Per-query recall ≥ 0.90 quiesced; ≥ 0.85 post-rebuild. Review the recall trade-off before using it in completeness-critical workloads. |
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is on the roadmap. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
@@ -392,13 +398,14 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 
 | Priority | Item |
 |---|---|
-| Medium | Lock-free epoch snapshot readers (replacing the `RwLock` facade) |
+| Medium | Differential-dataflow query subscriptions (incremental result-set updates, not just edge events) |
+| Medium | General view expressions (computed transforms and cross-label aggregates) |
 | Medium | mmap-backed storage (RAM-independent at rest) |
+| Medium | Lock-free epoch snapshot readers (replacing the `RwLock` facade) |
 | Medium | Multi-statement transactions (BEGIN/COMMIT) |
 | Medium | Expanded Cypher surface (`CASE` expressions, subqueries, `IS NULL/IS NOT NULL`, `+`/`/` arithmetic) |
 | Low | TypeScript bindings (napi-rs) |
 | Low | WASM playground |
-| Low | Time-travel queries |
 
 ---
 
@@ -483,7 +490,12 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 
 - Quickstart: [`docs/site/quickstart.md`](docs/site/quickstart.md)
 - Rules reference: [`docs/site/rules.md`](docs/site/rules.md)
+- Live subscriptions: [`docs/site/subscriptions.md`](docs/site/subscriptions.md)
+- Time travel (as-of queries): [`docs/site/timetravel.md`](docs/site/timetravel.md)
+- Materialized views: [`docs/site/views.md`](docs/site/views.md)
+- Rule suggestions: [`docs/site/suggest.md`](docs/site/suggest.md)
 - API reference: [`docs/site/api.md`](docs/site/api.md)
+- Cypher query reference: [`docs/site/query.md`](docs/site/query.md)
 - Design spec: [`docs/design.md`](docs/design.md)
 - Benchmarks: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md) (v1: [`head-to-head-10k.md`](benchmarks/results/head-to-head-10k.md))
 - Dogfood report: [`docs/dogfood-report.md`](docs/dogfood-report.md)

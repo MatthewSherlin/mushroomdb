@@ -8,7 +8,7 @@ mushroomdb exposes a post-commit event stream for both rule-derived edge events 
 |---|---|
 | Rule edge events (`EdgeFired`, `EdgeRetracted`) | yes |
 | Write events (`NodeInserted`, `NodeDeleted`, `PropSet`, `PropRemoved`, `EdgeInserted`, `EdgeDeleted`) | yes |
-| Incremental query subscriptions (differential dataflow) | roadmap (Plan-15 T3+) |
+| Incremental query subscriptions (differential dataflow) | roadmap |
 
 ## Rust API
 
