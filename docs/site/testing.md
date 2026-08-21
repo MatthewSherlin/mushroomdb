@@ -93,7 +93,7 @@ crashes at every Fs-call boundary, covering snapshot `write_atomic` and WAL-trun
 **Run the byte and op sweep tests:**
 
 ```text
-CARGO_ENV=1 cargo test -p sim-harness --test crash_recovery -- --nocapture 2>&1 | grep -E "crash points|test result"
+cargo test -p sim-harness --test crash_recovery -- --nocapture 2>&1 | grep -E "crash points|test result"
 ```
 
 Or to run just one sweep with full output:
