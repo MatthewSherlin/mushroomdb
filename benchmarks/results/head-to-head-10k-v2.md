@@ -16,7 +16,7 @@
 
 | Engine | Version |
 |---|---|
-| mushroomdb | 0.1.0 (embedded Rust, Python bindings; Plan-12 pull executor + V4 snapshot) |
+| mushroomdb | 0.1.0 (embedded Rust, Python bindings; pull executor + V4 snapshot) |
 | neo4j | 5-community (image: `neo4j:5-community`; driver: `neo4j` 6.2.0) |
 | kuzu | 0.11.3 (pip, embedded) |
 | memgraph | latest (image: `memgraph/memgraph:latest`; driver: `neo4j` 6.2.0 via bolt) |
@@ -89,7 +89,7 @@
   One-time pre-mat cost: neo4j 10.8 s, kuzu 0.17 s (COPY FROM CSV), memgraph 8.0 s.
   mushroomdb derives the same edges automatically in 0.924 s on rule declaration — no manual
   ETL required. v1 entries showed 0 rows (empty scan); those have been superseded by this run.
-  mushroomdb v1 row was ERROR; fixed (Plan-12 pull executor with LIMIT pushdown).
+  mushroomdb v1 row was ERROR; fixed by the pull executor with LIMIT pushdown.
 
 ▲ neo4j / memgraph `cold_start`: server already running; measures connect + first query
   only. `boot-to-ready` row reports the actual container-start-to-first-query-answered time
@@ -110,7 +110,7 @@
   - `bench_industry_tc` (INDUSTRY_ALIGNMENT): 0.924 s
   - `bench_specialty_tc` (SPECIALTY_MATCH): 2.152 s
 
-(v1: 20.728 s total — Plan-12 T1 streaming backfill reduced this ~7×)
+(v1: 20.728 s total — earlier streaming backfill reduced this ~7×)
 
 ---
 
@@ -118,18 +118,18 @@
 
 > Measured from a freshly rebuilt 100k-node dogfood database
 > (`dogfood/results/scale-100000-db`, rebuilt 2026-08-20 via `dogfood/scale_run.py`).
-> The old `scale-100000-db` was pre-Plan-11 bincode and unreadable; it was deleted
+> The old `scale-100000-db` was an incompatible pre-release binary format and unreadable; it was deleted
 > and rebuilt from scratch.
 
 | Path | Cold-start wall | Notes |
 |---|---|---|
-| mushroomdb WAL-only (100k) | **8.86 min** | WAL replay re-fires all 12 rules; IVF-Flat dominates (~8.37 min). Same bottleneck as Plan-11 7.91 min (non-semantic rules faster now via T1). |
+| mushroomdb WAL-only (100k) | **8.86 min** | WAL replay re-fires all 12 rules; IVF-Flat dominates (~8.37 min). Same bottleneck as the earlier 7.91 min measurement (non-semantic rules faster now via T1). |
 | mushroomdb snapshot V4 (100k) | **11.15 s** | V4 snapshot loads derived edges + IVF centroids; no rule re-fire. **47.7× faster** than WAL-only. snapshot() write cost was 36.1 s (one-time, paid at graceful shutdown). |
 | neo4j connect-only (10k scale) | 18.54 ms | Server already running; boot-to-ready = 6.6 s |
 | kuzu open+query (10k) | 23.41 ms | Embedded; no rules to replay |
 | memgraph connect-only (10k scale) | 0.42 ms | Server already running; boot-to-ready = 4.3 s |
 
-**Key finding:** V4 snapshot (T4 Plan-12) reduces 100k cold-start from 8.86 min to 11 s —
+**Key finding:** V4 snapshot  reduces 100k cold-start from 8.86 min to 11 s —
 a 47.7× improvement. The honest embedded-vs-server comparison:
 - mushroomdb (embedded): 11 s from V4 snapshot, or 8.86 min from WAL-only
 - neo4j (server): 6.6 s to boot the process; connect+query adds 18.5 ms after boot
@@ -156,11 +156,11 @@ and removed before memgraph start. No cross-contamination in v2 runs.
 
 ---
 
-## v2.1 — Post-Plan-13 regression run (2026-08-21)
+## v2.1 — Regression run (2026-08-21)
 
-> **Plan 13 (rules-cypher)** added: Cypher write support, `delete_edge` API,
+> **The 2026-08-21 release cycle** added: Cypher write support, `delete_edge` API,
 > `batch_edges` API (batch WAL frame for inserts + deletes), and a rule-engine
-> benchmark adapter.  This section confirms no regressions and records Plan-13
+> benchmark adapter.  This section confirms no regressions and records the 2026-08-21 release cycle
 > performance improvements.
 >
 > Benchmark config change: `max_edges` removed from `run.py` rule dicts so
@@ -178,7 +178,7 @@ and removed before memgraph start. No cross-contamination in v2 runs.
 | neighborhood_depth1 (p50) | 0.4 µs | 0.4 µs | 0% |
 | neighborhood_depth1 (p95) | 2.2 µs | 1.1 µs | −50% (faster) |
 | neighborhood_depth2 (p50) | 0.2 µs | 0.2 µs | 0% |
-| cypher scan-filter (1.4k rows) | 2.20 ms | 1.53 ms | **−30% (Plan-13 query engine)** |
+| cypher scan-filter (1.4k rows) | 2.20 ms | 1.53 ms | **−30% (query engine improvements)** |
 | cypher two-hop (200 rows) | 0.198 ms | 307 µs | +55% (109 µs abs — timing noise) |
 | rule_derive (bench_industry_tc) | 0.924 s | 872 ms | −5.6% (slightly faster) |
 | rule_derive (bench_specialty_tc) | 2.152 s | 1.976 s | −8.2% (slightly faster) |
@@ -198,7 +198,7 @@ edges, global budget tripped at the same point as v2).  This is timing noise.
 | WAL-only | 8.86 min | not re-measured * | — |
 
 *WAL-only cannot be re-measured without a 100k rebuild (WAL was truncated when
-the v2 snapshot was taken). Plan 13 added batch WAL frames; WAL replay semantics
+the v2 snapshot was taken). The 2026-08-21 release cycle added batch WAL frames; WAL replay semantics
 for node/edge records are unchanged, so the v2 WAL-only number remains indicative.
 
 ### Cross-engine — 10k (v2.1)
@@ -215,12 +215,12 @@ for node/edge records are unchanged, so the v2 WAL-only number remains indicativ
 
 ★ **v2.1 consolidated-pass values retracted**: cross-engine contamination confirmed — memgraph cell was
   neo4j on a warm container; neo4j and kuzu v2.1 values also unreliable (warmup/ordering artifacts from
-  single-pass run). **Current row = Fix round 2 four-engine benchmark** (same dataset, same warmup policy):
+  single-pass run). **Current row = v2.2 corrected four-engine benchmark** (same dataset, same warmup policy):
   5,810,000 INDUSTRY_ALIGNMENT edges, fresh process/container, 3 warmup + median of 10 measured runs.
   v2 mushroomdb 307 µs retired (was on old 1M-edge global-budget graph).
   Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`. See contamination finding below.
 
-⊕ cold_start rows not re-measured in v2.1 regression run; Plan-13 changes (WAL batch frames,
+⊕ cold_start rows not re-measured in v2.1 regression run; 2026-08-21 changes (WAL batch frames,
   Cypher writes, rule semantics) do not affect cold-start replay or snapshot load paths.
   v2 values shown. See 100k cold-start section below: WAL-only 8.86 min → snapshot V4 10.4 s
   (−7% vs v2 11.15 s) at 100k scale.
@@ -233,14 +233,14 @@ for node/edge records are unchanged, so the v2 WAL-only number remains indicativ
    All four mushroomdb metrics appeared 10–60x worse in early v2.1 intermediate runs.
    Fixed: rebuild with `maturin develop --release`.
 
-2. **max_edges semantics changed between Plan 12 and Plan 13**:
+2. **max_edges semantics changed in the 2026-08-21 release cycle**:
    `max_edges=Some(k)` now uses per-source top-k semantics (not global cap).
    `"max_edges": 1_000_000` in run.py previously hit the global 1M budget and tripped.
    After the semantics change, it created 2.8M INDUSTRY_ALIGNMENT + 5.165M SPECIALTY_MATCH
    edges (effectively uncapped at 10k scale with only 2000 company candidates per talent).
    Fixed: removed `max_edges` from run.py rules so `max_edges=None` → global 1M budget.
 
-### Rule engine vs hand-rolled maintenance (Fix round 1 — three-way measured)
+### Rule engine vs hand-rolled maintenance (three-way, release build)
 
 See `benchmarks/results/handrolled-vs-rules.md` for full methodology and data.
 
@@ -248,9 +248,9 @@ See `benchmarks/results/handrolled-vs-rules.md` for full methodology and data.
 
 > **(a) per-op (expert-written)** — individual `delete_edge`/`insert_edge` per op, one WAL fsync each.
 > Correctly retracts stale edges; retraction logic written with expert API knowledge.
-> `batch_edges` did not exist before Plan-13.
+> `batch_edges` is new in this release.
 >
-> **(b) batched (expert-written)** — uses `batch_edges` (Plan-13 new API), one WAL frame per update.
+> **(b) batched (expert-written)** — uses `batch_edges` (new API in this release), one WAL frame per update.
 > Expert knowledge of batching contract required; not available on competitor engines.
 >
 > **(c) Rule engine** — `create_rule` + `set_prop`. Derivation and retraction are automatic and atomic in Rust.
@@ -296,7 +296,7 @@ backfill after eviction, (4) weight_prop staleness. The rule engine handles all 
 runs them sequentially; memgraph connects after neo4j has finished). All engines
 report correct results. dai-neo4j was restored after the run.
 
-### Contamination finding — v2.1 memgraph result was bench-neo4j (Fix round 1)
+### Contamination finding — v2.1 memgraph result was bench-neo4j (found during the v2.2 correction pass)
 
 **Post-v2.1 investigation found contamination in the memgraph two-hop result.**
 
@@ -309,7 +309,7 @@ This also explains the neo4j v2→v2.1 improvement (5.68 ms → 2.88 ms): neo4j 
 twice (once as "neo4j", once as "memgraph") on the same warm container. Second measurement
 benefited from page cache warmup.
 
-**Isolated rerun** (Fix round 1): each engine run in its own isolated pass with explicit
+**Isolated rerun** (v2.2 correction pass): each engine run in its own isolated pass with explicit
 `docker stop` / `docker rm` / port-free assertion before each engine start. Results below.
 See `benchmarks/results/isolated-twohop-*.md` for the full isolation log.
 
@@ -321,26 +321,26 @@ See `benchmarks/results/isolated-twohop-*.md` for the full isolation log.
 
 ⚠ v2.1 neo4j = warm second measurement; v2.1 "memgraph" = neo4j under different label.
 
-**Why the Fix round 1 isolated numbers differ from v2 baseline — two confounds:**
+**Why the isolated rerun numbers differ from v2 baseline — two confounds:**
 
 1. **Dataset growth (1M → 5.81M edges):** v2 used `max_edges=None` → global budget
-   capped INDUSTRY_ALIGNMENT at 1,000,000. Post-Plan-13, `max_edges=Some(k)` switches to
+   capped INDUSTRY_ALIGNMENT at 1,000,000. Since the 2026-08-21 semantics change, `max_edges=Some(k)` switches to
    per-source top-k semantics; with 2,000 company candidates per talent the FieldEqual rule
    produces **5,810,000 edges** (all matching pairs, effectively uncapped). Comparing the
    two-hop on 1M-edge v2 data vs 5.81M-edge current data is apples-to-oranges — denser
    graphs take longer to traverse.
 
 2. **Cold-start vs warm container:** v2 two-hop queries ran on a container that had
-   already completed the full ingestion pass (warm buffer pool). Fix round 1 isolated
+   already completed the full ingestion pass (warm buffer pool). the isolated rerun
    reruns used fresh containers with no prior warmup queries.
 
-**Fix round 2** eliminates both confounds: all four engines use the same 5,810,000-edge
+**The v2.2 corrected benchmark** eliminates both confounds: all four engines use the same 5,810,000-edge
 dataset with a uniform warmup policy (3 warmup + median of 10 measured runs).
 See the four-engine table below.
 
-Full isolation log (Fix round 1 cold runs): `benchmarks/results/isolated-twohop-20260821-041719.md`.
+Full isolation log (single-shot cold runs, superseded by v2.2): `benchmarks/results/isolated-twohop-20260821-041719.md`.
 
-### Four-engine two-hop — Fix round 2 (same dataset, warmup policy)
+### Four-engine two-hop — v2.2 corrected (same dataset, warmup policy)
 
 **Date:** 2026-08-21T04:41:00  
 **Dataset:** 5,810,000 INDUSTRY_ALIGNMENT edges (FieldEqual on `industry`, uncapped per-source)  

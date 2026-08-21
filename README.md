@@ -151,7 +151,7 @@ Full predicate reference and examples: [`docs/site/rules.md`](docs/site/rules.md
 
 10,000-node graph (Apple M4 Pro, macOS 15.7.3, arm64). Full methodology
 and honesty notes: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md).
-Post-Plan-13 regression results (v2.1) are appended to that document.
+Regression results (v2.1, 2026-08-21) are appended to that document.
 
 | Workload | mushroomdb | Neo4j | KùzuDB | Memgraph |
 |---|---|---|---|---|
@@ -164,7 +164,7 @@ Post-Plan-13 regression results (v2.1) are appended to that document.
 | Cold-start (snapshot V4) | **10.4 s** | — | — | — |
 | Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
-*(v2.1 numbers, 2026-08-21, post-Plan-13 release build; two-hop row = Fix round 2 four-engine benchmark)*
+*(v2.1 numbers, 2026-08-21, release build; two-hop row = corrected four-engine benchmark (v2.2))*
 
 **Honesty notes:**
 
@@ -172,7 +172,7 @@ Post-Plan-13 regression results (v2.1) are appended to that document.
   overhead). KùzuDB is also embedded — its numbers are directly comparable
   to mushroomdb's. Neo4j and Memgraph numbers go over bolt/localhost
   (~0.1–1 ms round-trip per query).
-- ★ Two-hop join — same dataset, same warmup policy (Fix round 2): all four engines use
+- ★ Two-hop join — same dataset, same warmup policy (v2.2 corrected benchmark): all four engines use
   **5,810,000 INDUSTRY_ALIGNMENT edges** (FieldEqual on `industry`; per-source top-k,
   effectively uncapped at 10k scale). Policy: fresh process/container → ingest + preload
   → 3 warmup executions (discarded) → **median of 10 measured runs**. mushroomdb derives
@@ -186,21 +186,20 @@ Post-Plan-13 regression results (v2.1) are appended to that document.
   (current uncapped graph has 5.81M edges; see dataset growth note in methodology).
 
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
-two-rule backfill on 10k nodes: 872 ms + 1.976 s = **2.85 s** (Plan-13;
-Plan-12 was 3.08 s). Competitors have no auto-derivation equivalent.
+two-rule backfill on 10k nodes: 872 ms + 1.976 s = **2.85 s** (previously 3.08 s). Competitors have no auto-derivation equivalent.
 
 100k cold-start: Snapshot V4 open **10.4 s** (derived edges + IVF centroids loaded;
 no rule re-fire; **47.5× faster** than WAL-only; write cost: 36.1 s paid once at
 shutdown). WAL-only baseline from v2: 8.86 min (re-fires all 12 rules; IVF dominates).
 See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
 
-Rule engine vs hand-rolled maintenance (Plan-13 benchmark, three-way measured): on 10k nodes with
+Rule engine vs hand-rolled maintenance (three-way, measured 2026-08-21): on 10k nodes with
 1,000 specialty updates, all three strategies produce identical edge sets (drift = 0).
 **(a) per-op (expert-written)** (individual `delete_edge`/`insert_edge`, one WAL fsync each): **64.93 min**.
-**(b) batched (expert-written)** (uses `batch_edges` — Plan-13 mushroomdb-only API, one WAL frame per update): **24.98 s**.
+**(b) batched (expert-written)** (uses `batch_edges` — a mushroomdb-only API, one WAL frame per update): **24.98 s**.
 **(c) Rule engine** (`create_rule` + `set_prop`, fully automatic): **17.58 s** (1.42× faster than batched).
 Add-only pattern (NOT benchmarked — omits retraction; stale edges accumulate on every update).
-Disclosures: (1) `batch_edges` was introduced in this same Plan-13 task to make the benchmark fair; it
+Disclosures: (1) `batch_edges` was introduced alongside this benchmark to make the comparison fair; it
 is not available on any competitor engine. (2) Both hand-rolled variants were written by the engine team
 with full knowledge of retraction semantics; drift=0 is a property of expert implementation, not of the
 hand-rolled approach in general — real application code typically misses at least one retraction path.

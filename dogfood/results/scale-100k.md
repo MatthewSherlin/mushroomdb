@@ -101,7 +101,7 @@ new rule instance that may reach high-fanout at production scale.
 Cold-start time scales with rule count × rule computation complexity.
 The dominant cost is IVF-Flat re-derivation (~8.37 min at this rule set).
 
-**Snapshot V4 path (Plan-12 T4):** `snapshot()` writes derived edges + IVF centroids
+**Snapshot V4 path (the V4 snapshot release):** `snapshot()` writes derived edges + IVF centroids
 to the snapshot file (V4 format). On subsequent `open()`, these are loaded directly —
 no rule re-fire. The 11.148 s open time (vs 8.86 min WAL-only) reflects loading
 pre-materialized edges from disk, not rule recomputation.
@@ -127,7 +127,7 @@ process on the machine above, synthetic hash-chain embeddings.
 | Semantic / vector | Meili `_vectors` 1536-dim | exact: extrapolated (full=False); approx: 8.37 min recall=0.080 |
 | Ingest 100k | (not published) | 1.46 min peak 2.09 GiB (ingest_batch 10k chunks) |
 
-## Surface gaps and what changed (Plan 11)
+## Surface gaps and what changed
 
 - **T1 (streaming backfill):** Matcher backfill at 100k NOW COMPLETES.
   Engine no longer builds a full `BTreeMap` of desired pairs before capping.

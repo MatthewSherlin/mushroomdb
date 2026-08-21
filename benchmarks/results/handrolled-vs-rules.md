@@ -24,10 +24,10 @@
 > **(a) per-op (expert-written)** — individual `delete_edge` / `insert_edge` calls,
 >     one WAL fsync per retraction and one per addition.  Correctly retracts stale
 >     edges on every update; retraction logic written with full knowledge of the API.
->     `batch_edges` did not exist before Plan-13 and is not available on any
+>     `batch_edges` is new in this release and is not available on any
 >     competitor engine.
 >
-> **(b) batched (expert-written)** — uses `batch_edges` (Plan-13, new API) to commit
+> **(b) batched (expert-written)** — uses `batch_edges` (new API in this release) to commit
 >     all retractions + additions for each talent update in a single WAL frame.
 >     Expert knowledge of the batching contract required.  `batch_edges` is a
 >     mushroomdb-only API; no equivalent exists on competitor engines.
@@ -136,8 +136,8 @@ variant (a) "per-op (expert-written)" correctly retracts stale edges.
   The comparison isolates *maintenance strategy*, not the store.
 - **(a) per-op (expert-written)**: `insert_edge` / `delete_edge` called individually.
   One WAL fsync per retraction, one per addition.  Correctly implements retraction.
-  No `batch_edges` API — this was the only option before Plan-13.
-- **(b) batched (expert-written)**: uses `batch_edges` (Plan-13, added Task-6) to commit all
+  No `batch_edges` API — this was the only option before `batch_edges` landed.
+- **(b) batched (expert-written)**: uses `batch_edges` (new in this release) to commit all
   retractions + additions for each update in one WAL frame (one fsync).
   `batch_edges` is a mushroomdb-specific API; no equivalent exists on competitor
   engines.  Requires expert knowledge of the batching contract.
