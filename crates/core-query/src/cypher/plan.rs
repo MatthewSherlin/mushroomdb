@@ -266,6 +266,12 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         ops.push(PlanOp::Filter { expr: expr.clone() });
     }
 
+    // Post-UNWIND WHERE: filter expanded rows using UNWIND alias bindings.
+    if let Some(expr) = &q.post_unwind_where {
+        check_expr_bound(expr, &bound)?;
+        ops.push(PlanOp::Filter { expr: expr.clone() });
+    }
+
     // WITH pipeline stages.
     for stage in &q.stages {
         compile_with_stage(
@@ -285,7 +291,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     // Detect aggregate vs non-aggregate items in RETURN.
     // For pipeline plans (with stages or top-level UNWIND), single-aggregate
     // path is not used — route to GroupAggregate or Project.
-    let is_pipeline = !q.stages.is_empty() || !q.unwinds.is_empty();
+    let is_pipeline = !q.stages.is_empty() || !q.unwinds.is_empty() || q.post_unwind_where.is_some();
     let agg_count = q
         .returns
         .iter()
@@ -446,8 +452,19 @@ fn compile_with_stage(
             check_expr_bound(expr, bound)?;
             ops.push(PlanOp::Filter { expr: expr.clone() });
         }
-        // ORDER BY on the group result rows (not yet projected).
+        // ORDER BY on the group result rows — validate targets against GroupAggregate output.
+        // `bound` was updated above (lines 435–442) to hold only group output columns.
         if !stage.order_by.is_empty() {
+            for item in &stage.order_by {
+                match &item.target {
+                    OrderTarget::Prop { var, .. } | OrderTarget::Var(var) => {
+                        require_bound(var, bound, "ORDER BY in aggregate WITH")?;
+                    }
+                    OrderTarget::Alias(name) => {
+                        require_bound(name, bound, "ORDER BY in aggregate WITH")?;
+                    }
+                }
+            }
             ops.push(PlanOp::OrderBy {
                 items: stage.order_by.clone(),
             });
@@ -1298,8 +1315,9 @@ LIMIT 10";
         use crate::cypher::ast::{NodePat, Pattern, Query};
         let q = Query {
             matches: vec![],
-            unwinds: vec![],
             where_expr: None,
+            unwinds: vec![],
+            post_unwind_where: None,
             stages: vec![],
             returns: vec![],
             order_by: vec![],
@@ -1320,12 +1338,13 @@ LIMIT 10";
                 chain: vec![],
                 shortest: false,
             }],
-            unwinds: vec![],
             where_expr: Some(Expr::Not(Box::new(Expr::Cmp {
                 lhs: Operand::Param("p".into()),
                 op: CmpOp::Eq,
                 rhs: Operand::Lit(Value::Int(1)),
             }))),
+            unwinds: vec![],
+            post_unwind_where: None,
             stages: vec![],
             returns: vec![],
             order_by: vec![OrderItem {

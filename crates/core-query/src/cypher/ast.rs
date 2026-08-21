@@ -6,9 +6,12 @@ use core_storage::Value;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub matches: Vec<Pattern>,
-    /// Top-level UNWIND clauses (after initial MATCH, before WHERE/WITH/RETURN).
-    pub unwinds: Vec<UnwindClause>,
+    /// Top-level WHERE filter, evaluated before UNWIND expansion.
     pub where_expr: Option<Expr>,
+    /// Top-level UNWIND clauses (after WHERE, before post_unwind_where/WITH/RETURN).
+    pub unwinds: Vec<UnwindClause>,
+    /// Optional WHERE evaluated after UNWIND expansion (references UNWIND aliases).
+    pub post_unwind_where: Option<Expr>,
     /// WITH pipeline stages. Each stage carries a WITH clause and optional
     /// MATCH / UNWIND / WHERE that follow it.
     pub stages: Vec<WithStage>,

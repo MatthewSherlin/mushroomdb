@@ -4880,4 +4880,96 @@ LIMIT 10";
         let ops_plain = compile("MATCH (a) RETURN a LIMIT 5");
         assert!(row_bound(&ops_plain).is_some(), "plain LIMIT plan must have a row bound");
     }
+
+    /// I-1: UNWIND of a null/absent property → 0 rows for that node; other nodes
+    /// with valid lists still expand normally.
+    #[test]
+    fn unwind_null_property_yields_zero_rows_for_that_node() {
+        let mut fx = Fx::new();
+        // post1 has a list property; post2 has no `tags` property at all (null).
+        fx.add("Post", "post1", vec![
+            ("tags", Value::List(vec![s("rust"), s("graph")])),
+        ]);
+        fx.add("Post", "post2", vec![
+            ("other", Value::Str("hello".into())),
+        ]);
+        let view = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(&view, "MATCH (p:Post) UNWIND p.tags AS tag RETURN tag", &params)
+            .expect("UNWIND null property must succeed (not error)");
+        // post1 contributes 2 rows; post2 contributes 0 rows (null → skip).
+        assert_eq!(rs.len(), 2, "null property must yield 0 rows; list property yields N rows");
+        let tag0 = rs.get(0, "tag");
+        let tag1 = rs.get(1, "tag");
+        let tags = [tag0, tag1];
+        assert!(tags.contains(&Some(&s("rust"))), "rust tag present");
+        assert!(tags.contains(&Some(&s("graph"))), "graph tag present");
+    }
+
+    /// I-2a: WHERE before UNWIND (pre-expansion filter — existing grammar).
+    #[test]
+    fn where_before_unwind_filters_nodes() {
+        let mut fx = Fx::new();
+        fx.add("P", "a", vec![
+            ("group", Value::Str("keep".into())),
+            ("items", Value::List(vec![Value::Int(1), Value::Int(2)])),
+        ]);
+        fx.add("P", "b", vec![
+            ("group", Value::Str("drop".into())),
+            ("items", Value::List(vec![Value::Int(3), Value::Int(4)])),
+        ]);
+        let view = fx.view();
+        let params = BTreeMap::new();
+        // WHERE filters before UNWIND: only node `a` (group=keep) expands.
+        let rs = run(&view, "MATCH (n:P) WHERE n.group = 'keep' UNWIND n.items AS x RETURN x", &params)
+            .expect("WHERE before UNWIND must succeed");
+        assert_eq!(rs.len(), 2, "only matching node expands; 2 items");
+    }
+
+    /// I-2b: UNWIND then WHERE (post-expansion filter — new grammar support).
+    #[test]
+    fn where_after_unwind_filters_expanded_rows() {
+        let mut fx = Fx::new();
+        fx.add("N", "n1", vec![
+            ("vals", Value::List(vec![Value::Int(1), Value::Int(3), Value::Int(5)])),
+        ]);
+        let view = fx.view();
+        let params = BTreeMap::new();
+        // WHERE after UNWIND: filters by the alias `x`; keeps only x > 2.
+        let rs = run(&view, "MATCH (n:N) UNWIND n.vals AS x WHERE x > 2 RETURN x", &params)
+            .expect("WHERE after UNWIND must succeed");
+        assert_eq!(rs.len(), 2, "x=3 and x=5 pass; x=1 filtered out");
+        let v0 = rs.get(0, "x").cloned();
+        let v1 = rs.get(1, "x").cloned();
+        let vals = [v0, v1];
+        assert!(vals.contains(&Some(Value::Int(3))), "x=3 present");
+        assert!(vals.contains(&Some(Value::Int(5))), "x=5 present");
+    }
+
+    /// I-3: ORDER BY with a typo'd alias in aggregate WITH → named error at plan time.
+    #[test]
+    fn aggregate_with_order_by_unknown_alias_is_named_error() {
+        use crate::cypher::{lex, parser::parse, plan::plan};
+        // `cntt` is a typo; the real column is `cnt` — must fail at planning.
+        let src = "MATCH (p:Person) WITH p.city AS city, COUNT(*) AS cnt ORDER BY cntt DESC RETURN city, cnt";
+        let plan_result = plan(&parse(&lex(src).expect("lex")).expect("parse"));
+        let err = plan_result.expect_err("typo'd ORDER BY alias in aggregate WITH must be a named plan error");
+        assert!(
+            err.contains("cntt") || err.contains("unbound"),
+            "error must mention the unknown alias: {err}"
+        );
+    }
+
+    /// I-3 non-aggregate path: ORDER BY with unknown alias → named error at plan time.
+    #[test]
+    fn non_aggregate_with_order_by_unknown_alias_is_named_error() {
+        use crate::cypher::{lex, parser::parse, plan::plan};
+        let src = "MATCH (p:Person) WITH p, p.age AS age ORDER BY nope DESC RETURN p.city AS city";
+        let plan_result = plan(&parse(&lex(src).expect("lex")).expect("parse"));
+        let err = plan_result.expect_err("typo'd ORDER BY alias in non-aggregate WITH must be a named plan error");
+        assert!(
+            err.contains("nope") || err.contains("unbound"),
+            "error must mention the unknown alias: {err}"
+        );
+    }
 }

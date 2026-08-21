@@ -113,6 +113,12 @@ impl<'a> Parser<'a> {
         while self.peek() == Some(&Tok::Unwind) {
             unwinds.push(self.unwind_clause()?);
         }
+        // Optional WHERE that follows UNWIND (references UNWIND aliases).
+        let post_unwind_where = if !unwinds.is_empty() && self.eat(&Tok::Where) {
+            Some(self.expr(0)?)
+        } else {
+            None
+        };
         // WITH pipeline stages (zero or more).
         let mut stages = Vec::new();
         while self.peek() == Some(&Tok::With) {
@@ -140,8 +146,9 @@ impl<'a> Parser<'a> {
         }
         Ok(Query {
             matches,
-            unwinds,
             where_expr,
+            unwinds,
+            post_unwind_where,
             stages,
             returns,
             order_by,
@@ -1263,6 +1270,7 @@ SKIP 1 LIMIT 5";
                 shortest: false,
             }],
             unwinds: vec![],
+            post_unwind_where: None,
             where_expr: Some(Expr::Or(
                 Box::new(Expr::And(
                     Box::new(Expr::Not(Box::new(cmp(
@@ -1487,6 +1495,7 @@ LIMIT 10";
                 },
             ],
             unwinds: vec![],
+            post_unwind_where: None,
             where_expr: Some(Expr::And(
                 Box::new(cmp(
                     prop("i", "score"),
