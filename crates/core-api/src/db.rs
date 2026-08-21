@@ -19,6 +19,14 @@ use core_storage::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+// Test-only: counts how many times `pending_deltas_since().to_vec()` actually
+// executes (i.e., at least one view is defined). Used to verify the fast-path
+// guard skips the allocation when `view_store.is_empty()`.
+#[cfg(test)]
+thread_local! {
+    static DELTA_COPY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A post-commit mutation notification.
 ///
 /// Emitted from `log_then_apply` after the WAL append, fsync, and
@@ -617,12 +625,16 @@ impl<F: Fs> GraphDb<F> {
                 }
                 self.engine = eng;
                 // Process derived-edge deltas for view maintenance.
-                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
-                for d in &new_deltas {
-                    self.view_store.on_edge_changed(
-                        d.etype_sym, d.src_id, d.dst_id, d.fired,
-                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
-                    );
+                // Fast path: skip the O(delta_count) allocation when no views exist.
+                if !self.view_store.is_empty() {
+                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym, d.src_id, d.dst_id, d.fired,
+                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                        );
+                    }
                 }
             }
             WalRecord::InsertEdge {
@@ -666,12 +678,15 @@ impl<F: Fs> GraphDb<F> {
                 }
                 self.engine = eng;
                 // Derived-edge deltas → view updates.
-                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
-                for d in &new_deltas {
-                    self.view_store.on_edge_changed(
-                        d.etype_sym, d.src_id, d.dst_id, d.fired,
-                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
-                    );
+                if !self.view_store.is_empty() {
+                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym, d.src_id, d.dst_id, d.fired,
+                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                        );
+                    }
                 }
                 // Neighbor-aggregate views that read `field` must also update.
                 self.view_store.on_prop_changed(
@@ -706,12 +721,16 @@ impl<F: Fs> GraphDb<F> {
                 self.engine = eng;
                 result.map_err(|e| GraphError::RuleInvalid { detail: e })?;
                 // Derived-edge fires from backfill → view updates.
-                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
-                for d in &new_deltas {
-                    self.view_store.on_edge_changed(
-                        d.etype_sym, d.src_id, d.dst_id, d.fired,
-                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
-                    );
+                // Fast path: skip O(edge_count) allocation when no views exist.
+                if !self.view_store.is_empty() {
+                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym, d.src_id, d.dst_id, d.fired,
+                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                        );
+                    }
                 }
             }
             WalRecord::DeleteRule { name } => {
@@ -738,12 +757,15 @@ impl<F: Fs> GraphDb<F> {
                 self.engine = eng;
                 result.map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
                 // Derived-edge retractions → view updates.
-                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
-                for d in &new_deltas {
-                    self.view_store.on_edge_changed(
-                        d.etype_sym, d.src_id, d.dst_id, d.fired,
-                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
-                    );
+                if !self.view_store.is_empty() {
+                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym, d.src_id, d.dst_id, d.fired,
+                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                        );
+                    }
                 }
             }
             WalRecord::RemoveProp { key, field } => {
@@ -770,12 +792,15 @@ impl<F: Fs> GraphDb<F> {
                 }
                 self.engine = eng;
                 // Derived-edge deltas → view updates.
-                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
-                for d in &new_deltas {
-                    self.view_store.on_edge_changed(
-                        d.etype_sym, d.src_id, d.dst_id, d.fired,
-                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
-                    );
+                if !self.view_store.is_empty() {
+                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym, d.src_id, d.dst_id, d.fired,
+                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                        );
+                    }
                 }
                 // Neighbor-aggregate views that read `field` must also update.
                 self.view_store.on_prop_changed(
@@ -837,12 +862,15 @@ impl<F: Fs> GraphDb<F> {
                 }
                 self.engine = eng;
                 // Derived-edge retractions → view updates for neighbors.
-                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
-                for d in &new_deltas {
-                    self.view_store.on_edge_changed(
-                        d.etype_sym, d.src_id, d.dst_id, d.fired,
-                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
-                    );
+                if !self.view_store.is_empty() {
+                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym, d.src_id, d.dst_id, d.fired,
+                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                        );
+                    }
                 }
 
                 // (2) Sweep remaining user edges touching n, both directions,
@@ -908,12 +936,15 @@ impl<F: Fs> GraphDb<F> {
                 self.engine = eng;
                 result.map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
                 // Derived-edge delta changes → view updates.
-                let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
-                for d in &new_deltas {
-                    self.view_store.on_edge_changed(
-                        d.etype_sym, d.src_id, d.dst_id, d.fired,
-                        &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
-                    );
+                if !self.view_store.is_empty() {
+                    #[cfg(test)] DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym, d.src_id, d.dst_id, d.fired,
+                            &mut self.props, &self.topo, &self.ids, &self.syms, &self.labels,
+                        );
+                    }
                 }
             }
             WalRecord::CreateView { def_bytes } => {
@@ -3220,5 +3251,112 @@ impl<'a, F: Fs> NodeRef<'a, F> {
             .into_iter()
             .map(|(k, v)| (k, v.into_iter().collect()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_rules::Predicate;
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("graphdb-db-unit-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn fk_rule() -> RuleDef {
+        RuleDef {
+            name: "works_at".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: Predicate::KeyMatch { field: "org_id".into() },
+            edge_type: "WORKS_AT".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+        }
+    }
+
+    /// Regression guard for the no-views delta-copy fast path.
+    ///
+    /// When no views are defined, `pending_deltas_since().to_vec()` must never
+    /// be called — even during a large CreateRule backfill. The DELTA_COPY_COUNT
+    /// thread-local is incremented inside every `if !view_store.is_empty()` block;
+    /// a count of 0 after the entire sequence proves the guard fires correctly.
+    #[test]
+    fn no_delta_copy_when_no_views() {
+        DELTA_COPY_COUNT.with(|c| c.set(0));
+        let dir = tmp_dir("no-delta-copy");
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            // Insert 50 Org + 50 Person nodes with FK links.
+            for i in 0..50u32 {
+                db.insert_node("Org", &format!("o{i}"), vec![]).unwrap();
+            }
+            for i in 0..50u32 {
+                db.insert_node(
+                    "Person",
+                    &format!("p{i}"),
+                    vec![("org_id".into(), Value::Str(format!("o{i}")))],
+                )
+                .unwrap();
+            }
+            // CreateRule backfill should NOT invoke to_vec() when no views are defined.
+            db.create_rule(fk_rule()).unwrap();
+
+            // Counter must stay 0 — no views, no copies.
+            let copies = DELTA_COPY_COUNT.with(|c| c.get());
+            assert_eq!(copies, 0, "pending_deltas_since().to_vec() called despite no views");
+
+            // Derived edges must still be correct (the guard skips only the
+            // empty delta propagation loop, not the rule application itself).
+            let nbrs = db
+                .neighbors("p0", "WORKS_AT", Direction::Out)
+                .unwrap();
+            assert_eq!(nbrs, vec!["o0"], "rule must derive edges even with no views");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Companion: when a view IS defined, the delta path fires and view values update.
+    #[test]
+    fn delta_copy_fires_when_view_exists() {
+        use core_rules::ViewSource;
+        DELTA_COPY_COUNT.with(|c| c.set(0));
+        let dir = tmp_dir("delta-copy-with-view");
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            db.insert_node("Org", "o1", vec![]).unwrap();
+            db.insert_node(
+                "Person",
+                "p1",
+                vec![("org_id".into(), Value::Str("o1".into()))],
+            )
+            .unwrap();
+            // Declare a Degree view so is_empty() returns false.
+            db.create_view(ViewDef {
+                name: "degree_out".into(),
+                label: "Person".into(),
+                view_prop: "degree_out".into(),
+                source: ViewSource::Degree {
+                    edge_type: "WORKS_AT".into(),
+                    direction: Direction::Out,
+                },
+            })
+            .unwrap();
+            db.create_rule(fk_rule()).unwrap();
+
+            // At least one delta copy should have happened (CreateRule backfill).
+            let copies = DELTA_COPY_COUNT.with(|c| c.get());
+            assert!(copies > 0, "expected delta copy to fire when a view is defined");
+
+            // View value should be computed: p1 has one WORKS_AT out-edge.
+            let info = db.node_info("p1").unwrap();
+            let degree = info.props.get("degree_out");
+            assert!(degree.is_some(), "view prop should be written to node props");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

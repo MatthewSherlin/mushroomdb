@@ -964,8 +964,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         "big3": "50 talent: node_edges + neighbors on Big-3 types (full-graph, capped)",
         "big3_slice": f"{BIG3_SLICE_SIZE}T×{BIG3_SLICE_SIZE}C metro/industry slice (all 3 rules fire uncapped)",
         "explain": "explain() on up to 100 derived pairs",
-        "reopen": "WAL reopen: rules re-fire on open() (derived edges not persisted)",
-        "reopen_snap": "snapshot reopen: snapshot() + close + open; rules still re-fire",
+        "reopen": "WAL reopen: WAL CreateRule records trigger rule re-application on full node set (derived edges not in WAL)",
+        "reopen_snap": "snapshot reopen: snapshot() + close + open_with; V5 snapshot includes derived edges + IVF centroids; no rule re-fire",
     }
     phase_order = (
         "ingest",
@@ -1128,20 +1128,22 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
     a("")
     a("## Reopen (cold-start)")
     a("")
-    a("**Mechanism:** Derived edges are NOT persisted in the WAL or snapshot.")
-    a("On every `open()` the engine re-fires all declared rules from node data.")
-    a("The WAL stores only node inserts + rule declarations (~120 MiB delta).")
-    a("the snapshot stores only node data. Cold-start time therefore scales with")
-    a("rule count × rule computation complexity, independent of edge count.")
-    a("The dominant cost at this rule set is IVF-Flat re-derivation (~7.68 min).")
-    a("**Roadmap #1:** Derived-edge persistence / snapshot-including-derived.")
+    a("**WAL reopen:** WAL replay applies each `CreateRule` record, which triggers rule")
+    a("re-application on the full node set (same as initial backfill). Derived edges are")
+    a("not stored in the WAL — only rule declarations + node inserts. The dominant cost")
+    a("at this rule set is IVF-Flat re-derivation (~7.68 min).")
+    a("")
+    a("**Snapshot reopen (V5):** V5 `SnapshotState` includes `topo` (all edges, including")
+    a("derived) and `provenance` (rule engine state). `open_with` restores from snapshot")
+    a("without re-firing rules — derived edges + IVF centroids loaded from snapshot payload.")
     a("")
     wal_reopen = phases.get("reopen", {})
     snap_reopen = phases.get("reopen_snap", {})
     a(
         f"- **WAL reopen:** {_fmt_s(wal_reopen.get('wall_s', float('nan')))} "
         f"({wal_reopen.get('status', 'ok')}) — "
-        f"close + open; rules re-fire (9 streaming ~20s + IVF-Flat ~7.68 min = bottleneck)"
+        f"close + open; CreateRule WAL records trigger rule re-application on full node set; "
+        f"IVF-Flat re-derivation is bottleneck"
     )
     if snap_reopen:
         a(
@@ -1149,7 +1151,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
             f"(snapshot={_fmt_s(snap_reopen.get('snapshot_wall_s', 0))} + "
             f"open={_fmt_s(snap_reopen.get('open_wall_s', 0))}) "
             f"({snap_reopen.get('status', 'ok')}) — "
-            f"snapshot() + close + open; rules ALSO re-fire (derived edges not in snapshot)"
+            f"snapshot() + close + open_with; V5 snapshot includes derived edges + IVF centroids; no rule re-fire"
         )
     a("")
     a("## Oracle")

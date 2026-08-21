@@ -776,6 +776,10 @@ fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<St
                 collect_operand(arg, names, seen);
             }
         }
+        Operand::BinArith { left, right, .. } => {
+            collect_operand(left, names, seen);
+            collect_operand(right, names, seen);
+        }
         _ => {}
     }
 }

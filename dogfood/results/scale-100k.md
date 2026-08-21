@@ -2,7 +2,7 @@
 
 ## Machine / date
 
-- **Date:** 2026-08-20T19:46:29
+- **Date:** 2026-08-21T15:42:11
 - **Host:** mac.lan
 - **OS:** macOS-15.7.3-arm64-arm-64bit
 - **CPU:** Apple M4 Pro (12 cores, arm64)
@@ -21,31 +21,31 @@ hardware, no network, synthetic embeddings).
 
 | Phase | status | wall | peak RSS (lifetime) | RSS after | notes |
 |---|---|---|---|---|---|
-| ingest | ok | 1.46 min | 2.09 GiB | 1.38 GiB | ingest_batch 10k chunks (T2); FK rules declared inline |
-| backfill | ok | 21.228 s | 2.58 GiB | 2.04 GiB | T1 streaming; max_edges=1M caps; all non-semantic rules |
-| semantic | extrapolated | 46.17 ms | 2.58 GiB | 2.04 GiB | 5k probe recorded (T3 early-exit); full 100k ScanAll not attempted (blocking); approximate semantic runs instead |
-| semantic_approx | ok | 8.37 min | 7.04 GiB | 2.34 GiB | edges=1000000 recall=0.080 precision=1.000 |
-| incremental | ok | 1.779 s | 7.04 GiB | 1.32 GiB | p50=17.26 ms p95=32.23 ms n=100 |
-| big3 | ok | 32.11 ms | 7.04 GiB | 1.32 GiB | p50=7.8 µs p95=18.0 µs n=50 mean_matches=0.0 |
-| big3_slice | ok | 34.03 ms | 7.04 GiB | 1.68 GiB | 500T×500C metro/industry slice (all 3 rules fire uncapped) |
-| explain | ok | 90.33 ms | 7.04 GiB | 1.37 GiB | p50=112.1 µs p95=570.7 µs n=100 |
-| reopen | ok | 8.86 min | 8.48 GiB | 1.45 GiB | WAL reopen: rules re-fire on open() (derived edges not persisted) |
-| reopen_snap | ok | 47.252 s | 8.48 GiB | 3.68 GiB | snapshot V4: snapshot() + close + open; derived edges + IVF centroids loaded from snapshot; no rule re-fire. write=36.105 s + open=11.148 s |
+| ingest | ok | 1.33 min | 6.38 GiB | 6.18 GiB | ingest_batch 10k chunks (T2); FK rules declared inline |
+| backfill | ok | 28.650 s | 7.50 GiB | 6.29 GiB | T1 streaming; max_edges=1M caps; all non-semantic rules |
+| semantic | extrapolated | 92.83 ms | 7.50 GiB | 6.29 GiB | 5k probe recorded (T3 early-exit); full 100k ScanAll not attempted (blocking); approximate semantic runs instead |
+| semantic_approx | ok | 7.70 min | 8.18 GiB | 5.06 GiB | edges=1000000 recall=0.080 precision=1.000 |
+| incremental | ok | 1.819 s | 8.18 GiB | 4.29 GiB | p50=17.19 ms p95=31.70 ms n=100 |
+| big3 | ok | 76.09 ms | 8.18 GiB | 4.29 GiB | p50=3.3 µs p95=9.9 µs n=50 mean_matches=0.0 |
+| big3_slice | ok | 40.48 ms | 8.18 GiB | 4.55 GiB | 500T×500C metro/industry slice (all 3 rules fire uncapped) |
+| explain | ok | 157.59 ms | 8.18 GiB | 4.34 GiB | p50=59.9 µs p95=222.1 µs n=100 |
+| reopen | ok | 8.25 min | 8.23 GiB | 3.04 GiB | WAL reopen: CreateRule WAL records trigger rule re-application on full node set; bottleneck is IVF-Flat re-derivation (~7.68 min) |
+| reopen_snap | ok | 33.804 s | 9.48 GiB | 5.31 GiB | snapshot reopen: snapshot() 25.094 s + open_with 8.710 s; V5 snapshot includes derived edges + IVF centroids; no rule re-fire |
 
 ## Semantic phases (phase 3)
 
 - **Exact status:** `extrapolated`
 - **Attempted full 100000:** False
 - **Method:** 5k ScanAll probe with T3 early-exit; t_full = t_probe * (n_t_full/n_t_probe) * (n_c_full/n_c_probe)
-- **5k probe (T3 early-exit):** scale=5000 pairs=3500000 wall=18.690 s edges=111696 Δrss=0 B
-- **Extrapolation:** factor=400.0 pairs_full=1400000000 projected_wall=124.60 min projected_Δrss=0 B under_30min=False under_8GiB=True
+- **5k probe (T3 early-exit):** scale=5000 pairs=3500000 wall=17.419 s edges=111696 Δrss=125.06 MiB
+- **Extrapolation:** factor=400.0 pairs_full=1400000000 projected_wall=116.12 min projected_Δrss=48.85 GiB under_30min=False under_8GiB=False
 - **O(n²) method (binding):** `t_full = t_probe * (n_t_full/n_t_probe) * (n_c_full/n_c_probe)`. ScanAll evaluates every Talent×Company pair (not the passing subset). Full attempt only if projected wall < 1800s AND projected Δrss < 8.00 GiB.
 
 ### Approximate semantic (T4)
 
 - **Method:** IVF-Flat approximate (T4: approximate=True in RuleDef)
 - **Edges materialized:** 1000000
-- **Wall:** 8.37 min
+- **Wall:** 7.70 min
 
   **Set-coverage recall** (measured): fraction of ALL threshold-passing global pairs
   stored in the 1M-edge materialized set.  NOT the per-query IVF recall the
@@ -68,15 +68,15 @@ hardware, no network, synthetic embeddings).
 - **Status:** `ok`
 - **Method:** streaming backfill with max_edges caps (T1)
 - **max_edges cap per rule:** 1,000,000 (ENGINE_EDGE_BUDGET)
-  - `industry_alignment_tc`: 1.216 s edges=1000000 tripped=True Δrss=101.58 MiB
-  - `industry_alignment_tj`: 1.202 s edges=2000000 tripped=True Δrss=166.11 MiB
-  - `specialty_match_tc`: 2.573 s edges=1000000 tripped=True Δrss=0 B
-  - `specialty_match_tj`: 2.658 s edges=2000000 tripped=True Δrss=637.67 MiB
-  - `location_fit_tc`: 1.757 s edges=1000000 tripped=True Δrss=242.70 MiB
-  - `location_fit_tj`: 1.667 s edges=2000000 tripped=True Δrss=89.14 MiB
-  - `similar_size_tc`: 1.706 s edges=1000000 tripped=True Δrss=0 B
-  - `matches_design_style_tc`: 4.843 s edges=1000000 tripped=True Δrss=0 B
-  - `similar_size_strict_tc`: 1.653 s edges=1000000 tripped=True Δrss=159.14 MiB
+  - `industry_alignment_tc`: 1.910 s edges=1000000 tripped=True Δrss=0 B
+  - `industry_alignment_tj`: 1.942 s edges=2000000 tripped=True Δrss=0 B
+  - `specialty_match_tc`: 3.150 s edges=1000000 tripped=True Δrss=0 B
+  - `specialty_match_tj`: 3.370 s edges=2000000 tripped=True Δrss=248.69 MiB
+  - `location_fit_tc`: 2.432 s edges=1000000 tripped=True Δrss=690.45 MiB
+  - `location_fit_tj`: 2.630 s edges=2000000 tripped=True Δrss=739.06 MiB
+  - `similar_size_tc`: 2.406 s edges=1000000 tripped=True Δrss=819.06 MiB
+  - `matches_design_style_tc`: 5.587 s edges=1000000 tripped=True Δrss=0 B
+  - `similar_size_strict_tc`: 2.628 s edges=1000000 tripped=True Δrss=161.83 MiB
 
 **T1 change:** The engine now streams the desired set directly into the
 store rather than building a `BTreeMap<(src,dst), score>` first.
@@ -87,27 +87,36 @@ new rule instance that may reach high-fanout at production scale.
 
 ## Incremental / Big-3 / explain
 
-- **Incremental (n=100):** p50=17.26 ms p95=32.23 ms
-- **Big-3 full-graph (n=50):** p50=7.8 µs p95=18.0 µs ; mean intersection=0.0
+- **Incremental (n=100):** p50=17.19 ms p95=31.70 ms
+- **Big-3 full-graph (n=50):** p50=3.3 µs p95=9.9 µs ; mean intersection=0.0
   *(Full-graph Big-3 intersection empty: 1M cap at 70k×20k = 0.07% pair coverage; random talent sample misses the covered slice. This is cap-coverage semantics, not an engine defect. See Big-3 slice below.)*
-- **Big-3 slice (500T×500C metro/industry, n=50):** p50=633.2 µs p95=848.9 µs ; mean intersection=500.0
+- **Big-3 slice (500T×500C metro/industry, n=50):** p50=772.5 µs p95=1.19 ms ; mean intersection=500.0
   *(Answers marketplace 5-second question in a focused bucket. first_ia=500 first_sm=500 first_lf=500 first_intersection=500. Full-graph coverage awaits derived-edge persistence — see Roadmap.)*
-- **explain (n=100):** p50=112.1 µs p95=570.7 µs
+- **explain (n=100):** p50=59.9 µs p95=222.1 µs
 
 ## Reopen (cold-start)
 
-**WAL-only path:** On `open()` without a snapshot, the engine replays the WAL
-(node inserts + rule declarations) and re-fires all declared rules from node data.
-Cold-start time scales with rule count × rule computation complexity.
-The dominant cost is IVF-Flat re-derivation (~8.37 min at this rule set).
+**V5 snapshot behavior (corrected):** V5 `SnapshotState` includes `topo` (all edges, including
+derived) and `provenance` (rule engine state). `open_with` restores from snapshot without
+re-firing rules — derived edges are loaded directly from the snapshot payload. WAL replay
+(`open`) does re-fire rules because it applies each WAL record in order, including `CreateRule`
+records, which trigger `apply_streaming_create` / `apply_streaming_create_top_k` on the
+current node set.
 
-**Snapshot V4 path (the V4 snapshot release):** `snapshot()` writes derived edges + IVF centroids
-to the snapshot file (V4 format). On subsequent `open()`, these are loaded directly —
-no rule re-fire. The 11.148 s open time (vs 8.86 min WAL-only) reflects loading
-pre-materialized edges from disk, not rule recomputation.
+- **WAL reopen:** 8.25 min (ok) — close + open; WAL CreateRule records trigger rule re-application on full node set (9 streaming backfill ~28 s + IVF-Flat fit + apply ~7.68 min = bottleneck)
+- **Snapshot reopen:** 33.804 s (snapshot=25.094 s + open=8.710 s) (ok) — snapshot() + close + open_with; derived edges + IVF centroids loaded from V5 snapshot; no rule re-fire; 8.710 s is pure deserialization
 
-- **WAL reopen:** 8.86 min (ok) — close + open, no snapshot; re-fires all rules (non-semantic ~21 s + IVF-Flat ~8.37 min = bottleneck)
-- **Snapshot reopen:** 47.252 s total (snapshot write=36.105 s + open=11.148 s) (ok) — V4 snapshot: derived edges + IVF centroids loaded; no rule re-fire; **47.7× faster than WAL-only on the open() step**
+**V5 snapshot size (2.2 GiB vs V4's ~283 MB):** V5 `SnapshotState` serializes the full
+derived edge set that V4 did not persist. With 9 backfill rules × ~1M edges each plus 1M
+semantic_approx edges = ~10.5M derived edges, each edge is stored in three payload sections:
+`topo` (src+dst+etype per edge), `edge_props` (per-edge weight scalar), and `provenance`
+(rule-name → BTreeSet of (src,dst,etype) triples for each rule-owned edge). Together these
+dominate the snapshot size. Node embeddings (90k × 384 f32 = ~138 MB) and rule definitions
+are negligible by comparison.
+
+**Note:** This file was generated by the V5 rebuild run (PID 50395, 2026-08-21T15:42:11). The
+previous V4 snapshot was unreadable by V5 binary (`view_defs` field added to `SnapshotState`
+in V5). The text above supersedes any prior description of snapshot behavior in this document.
 
 ## Oracle
 
@@ -122,12 +131,12 @@ process on the machine above, synthetic hash-chain embeddings.
 
 | Path | Marketplace (reported) | mushroomdb this run |
 |---|---|---|
-| Talent→Company matcher (Big-3) | 5+ second queries | p50=7.8 µs p95=18.0 µs mean_matches=0.0 — intersection empty (matcher rules not live at this scale) |
+| Talent→Company matcher (Big-3) | 5+ second queries | p50=3.3 µs p95=9.9 µs mean_matches=0.0 — intersection empty (matcher rules not live at this scale) |
 | Search fan-out | 14 sharded Meilisearch indices + in-memory merge | derived-edge `neighbors` on declared rules |
-| Semantic / vector | Meili `_vectors` 1536-dim | exact: extrapolated (full=False); approx: 8.37 min recall=0.080 |
-| Ingest 100k | (not published) | 1.46 min peak 2.09 GiB (ingest_batch 10k chunks) |
+| Semantic / vector | Meili `_vectors` 1536-dim | exact: extrapolated (full=False); approx: 7.70 min recall=0.080 |
+| Ingest 100k | (not published) | 1.33 min peak 6.38 GiB (ingest_batch 10k chunks) |
 
-## Surface gaps and what changed
+## Surface gaps and what changed (Plan 11)
 
 - **T1 (streaming backfill):** Matcher backfill at 100k NOW COMPLETES.
   Engine no longer builds a full `BTreeMap` of desired pairs before capping.
@@ -145,6 +154,6 @@ process on the machine above, synthetic hash-chain embeddings.
 
 ## Findings
 
-- Matcher backfill at 100k COMPLETED (T1 streaming). Rules: 9. Elapsed: 21.228 s.
-- semantic_match exact full backfill not attempted: projected wall=124.60 min Δrss=0 B (approximate semantic runs instead)
+- Matcher backfill at 100k COMPLETED (T1 streaming). Rules: 9. Elapsed: 28.650 s.
+- semantic_match exact full backfill not attempted: projected wall=116.12 min Δrss=48.85 GiB (approximate semantic runs instead)
 

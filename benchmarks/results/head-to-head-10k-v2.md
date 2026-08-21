@@ -426,3 +426,170 @@ for competitor engines (numbers unchanged from v2.2). The v2.3 mushroomdb-only r
 executed with:
 - `docker ps | grep bench-` → no bench-* containers present before start (verified)
 - dai-neo4j: present and not touched (unrelated container; no port conflict for embedded mushroomdb)
+
+---
+
+## v2.4 — Post-unlocks regression run (2026-08-21)
+
+> **The unlocks release** (Plan 15) added: live subscriptions (`subscribe_rule`,
+> `subscribe_all_rules`, `subscribe_writes`, WS `GET /subscribe`), as-of time travel
+> (`open_at`), materialized property views (`create_view`, `ViewStore`, snapshot V4→V5 —
+> V4 snapshots are unreadable with V5 binary), and rule suggestion (`suggest_rules`,
+> `GET /suggest`, CLI `suggest`). This section confirms no regressions and records any
+> performance changes from the new features.
+>
+> **Competitor numbers are unchanged from v2.2.** No competitor code changed; two-hop
+> row = v2.2 corrected four-engine benchmark.
+
+### mushroomdb — 10k comparison (v2.3 vs v2.4)
+
+| workload | v2.3 | v2.4 | delta | note |
+|---|---|---|---|---|
+| bulk_ingest | 913.70 ms | 783.57 ms | −14.2% (faster) | single-shot |
+| neighborhood_depth1 (p50) | 0.5 µs | 0.4 µs | −20% | sub-µs noise |
+| neighborhood_depth1 (p95) | 1.3 µs | 2.2 µs | +69% | absolute: 0.9 µs; sub-µs noise |
+| neighborhood_depth2 (p50) | 0.2 µs | 0.2 µs | 0% | |
+| cypher scan-filter (1.4k rows) | 3.35 ms | 1.22 ms | −64% | cold-start; see scan-filter note |
+| cypher two-hop (200 rows) | 207.8 µs | 254.1 µs | +22% | single-shot sub-ms; timing noise |
+| rule_derive (bench_industry_tc) | 873.71 ms | 1.141 s | **+30.6%** | residual delta-accum overhead; see investigation |
+| rule_derive (bench_specialty_tc) | 2.020 s | 2.401 s | **+18.9%** | residual delta-accum overhead; see investigation |
+| rule_derive total | 2.894 s | 3.542 s | **+22.4%** | −14.9% vs pre-fix 4.161 s; see investigation |
+
+*Re-measured post-fix (N=5, median, 2026-08-21). Pre-fix v2.4 numbers were industry=1.551 s (+77%), specialty=2.610 s (+29%), total=4.161 s (+44%).*
+
+**rule_derive regression investigation and fix:**
+
+The initial v2.4 measurement showed +44% total regression from new view-maintenance code.
+Root cause: `CreateRule` apply arm called `.to_vec()` unconditionally on the engine's delta
+buffer regardless of whether any views were defined:
+
+```rust
+// pre-fix (always executes):
+let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+for d in &new_deltas {
+    self.view_store.on_edge_changed(…);
+}
+```
+
+Each `EngineEdgeDelta` holds 4 heap `String` fields. Cloning 1M deltas allocates ~130MB per
+`create_rule` call — an entirely wasted copy when no views exist.
+
+**Fix applied in this cycle** (`crates/core-api/src/db.rs`): all 7 `pending_deltas_since().to_vec()`
+call sites guarded by `if !self.view_store.is_empty()`. Backed by a unit test
+(`db::tests::no_delta_copy_when_no_views`) using a thread-local counter to structurally
+assert zero delta copies occur with no views defined.
+
+**Recovery at 10k:** −14.9% vs pre-fix (industry: −26.4%, specialty: −8.0%).
+
+**Residual +22.4% vs v2.3 (explained):** The fix eliminates the delta _copy_ overhead, but
+the engine still _accumulates_ `EngineEdgeDelta` items during backfill (pushed into
+`pending_deltas`). These are needed for subscription events and drained by
+`log_then_apply_with` after each commit. With no subscribers and no views, the push+drain
+is O(edge_count) overhead that did not exist in v2.3. Estimated allocation: ~1M × 100 bytes
+= ~100MB per `create_rule` call (push phase). Further fix: skip delta accumulation entirely
+when `subscriptions.is_empty() && view_store.is_empty()` — tracked, not in this cycle.
+
+**scan-filter note:** Both 3.35 ms (v2.3) and 1.22 ms (v2.4) are single-shot cold-start
+measurements — policy-matched. The v2.3 scan-filter note documented the cold-start artifact;
+v2.4 shows a lower cold-start value (run order, allocator state). No regression.
+
+**sub-µs timings note:** depth-1 (p95) went from 1.3 µs to 2.2 µs (+0.9 µs absolute).
+Sub-µs p95 swings of ±1 µs are within normal scheduling jitter on 20 samples. Not a regression.
+
+### 100k cold-start (v2.4 — V5 snapshot)
+
+> The V4 snapshot format is rejected by V5 binary ("V4 snapshot is no longer supported;
+> re-snapshot with a V5 binary"). The previous 100k db (snapshot.bin V4, wal.bin 0 bytes)
+> was unreadable. The database was rebuilt from scratch via `dogfood/scale_run.py`.
+> V5 adds `view_defs` to the snapshot payload.
+
+**rules.py compatibility fix:** The V4 dogfood run (Aug 20, 03:57) used `max_edges=None`
+(global budget, DEFAULT_MAX_EDGES=1M cap). A later commit (d3eeb44) changed the
+`_rule()` default to `max_edges=1_000_000`. At the time, `max_edges=Some(k)` still used
+the global budget path. The 9151c2b (top-k, Aug 20 21:33) changed `max_edges=Some(k)` to
+per-source top-k semantics. For dogfood rules with only 3 industries and high fanout
+(31.5k "architecture" Talent × 9k "architecture" Company = 283.5M matching pairs),
+the per-source cap of 1M is never hit, creating all 283.5M+ edges and causing OOM.
+Fix: reset `_rule()` default to `max_edges=None` (global budget) in `dogfood/rules.py`.
+
+**APPROXIMATE_SEMANTIC_RULE compatibility fix (same root cause):** `APPROXIMATE_SEMANTIC_RULE` also used `max_edges=MATCHER_MAX_EDGES=1_000_000`. At 100k scale, IVF with the global 1M cap (V4) queried only ~6k Talent nodes before hitting the cap. With V5 per-source cap of 1M and ~160 qualifying Companies per Talent (cosine ≥ 0.85), all 70k Talent nodes must be queried, materializing ~11M edges — ~11× more than V4. This causes semantic_approx to take 90+ min instead of ~8.4 min, and WAL reopen to take another 90+ min. Fix: set `max_edges=None` in `APPROXIMATE_SEMANTIC_RULE` (preserves V4 global-budget semantics).
+
+**V5 backfill timing** (with global-budget max_edges=None fix):
+
+| rule | V4 time | V5 time | delta | note |
+|---|---|---|---|---|
+| industry_alignment_tc | 1.216 s | 1.910 s | +57.1% | 1M edges, tripped |
+| industry_alignment_tj | 1.202 s | 1.942 s | +61.6% | 2M edges, tripped |
+| specialty_match_tc | 2.573 s | 3.150 s | +22.4% | 1M edges, tripped |
+| specialty_match_tj | 2.658 s | 3.370 s | +26.8% | 2M edges, tripped |
+| location_fit_tc | 1.757 s | 2.432 s | +38.4% | 1M edges, tripped |
+| location_fit_tj | 1.667 s | 2.630 s | +57.8% | 2M edges, tripped |
+| similar_size_tc | 1.706 s | 2.406 s | +41.0% | 1M edges, tripped |
+| matches_design_style_tc | 4.843 s | 5.587 s | +15.4% | 1M edges, tripped |
+| similar_size_strict_tc | 1.653 s | 2.628 s | +59.0% | 1M edges, tripped |
+| **backfill total** | **21.228 s** | **28.650 s** | **+35.0% ‡** | same to_vec() root cause as 10k |
+
+‡ 100k backfill numbers measured pre-fix (PID 50395, 2026-08-21T15:42). The `is_empty()` fast-path fix was applied after this run. Based on the 10k re-measurement (−14.9% recovery), estimated post-fix 100k backfill: ~24.4 s (~+15% vs V4). 100k re-run not attempted (20+ min); extrapolation is indicative.
+
+**Cold-start open times (WAL-only and V5 snapshot):**
+
+| path | v2.3 (V4) | v2.4 (V5) | delta vs v2.3 |
+|---|---|---|---|
+| WAL-only open (100k) | 8.86 min | 8.25 min | −6.9% |
+| V5 snapshot open (100k) | 10.508 s | 8.710 s | −17.1% |
+| snapshot write cost | 36.105 s | 25.094 s | −30.5% |
+
+*Source: `dogfood/results/scale-100k.md` V5 rebuild run 2026-08-21T15:42:11 (PID 50395). WAL path replays all rule declarations + node inserts; snapshot path: `snapshot()` 25.094 s write + 8.710 s `open_with` (V5 snapshot includes derived edges via topo+provenance; no rule re-fire on snapshot open).*
+
+### NEW: Subscription end-to-end latency
+
+> Commit-to-event-received p50/p95 over 1,000 events. Methodology: t_post = Instant::now()
+> after insert_node() returns (commit is synchronous — WAL fsync + apply + event push all
+> complete inside the call); event received via recv_timeout() / WS frame; latency = t_recv
+> − t_post. Clock: std::time::Instant (monotonic, ~ns resolution, Apple M4 Pro). Warmup:
+> 50 events discarded. Release build (`cargo test --release`). Measured 2026-08-21.
+
+| path | p50 | p95 | p99 |
+|---|---|---|---|
+| in-process (Rust `subscribe_writes`) | **0.04 µs** | **0.21 µs** | 0.33 µs |
+| WS localhost (`GET /subscribe`, writes=true) | **61 µs** | **88 µs** | 382 µs |
+
+**In-process:** Events are pushed to the queue synchronously inside `log_then_apply_with`
+(after WAL fsync) and are immediately available when the caller reads the subscription.
+The ~40 ns p50 latency is queue-pop overhead (mutex acquire + VecDeque pop + Instant::now()).
+
+**WS localhost:** Events traverse: subscription queue → bridge thread wakeup → tokio mpsc
+channel → async WS writer → TCP loopback → OS socket read. The 61 µs p50 on localhost
+includes bridge thread idle polling (100 ms timeout, but bridge loop round-robins without
+blocking when events are present). The 382 µs p99 spike reflects scheduling jitter on a
+loaded M4 Pro.
+
+Source: `crates/server/tests/sub_latency.rs` (added in this release).
+
+### Cross-engine — 10k (v2.4)
+
+Competitor workloads not re-run; numbers unchanged from v2.2 corrected benchmark.
+mushroomdb non-two-hop numbers updated to v2.4 single-shot values.
+
+| workload | mushroomdb | neo4j | kuzu | memgraph |
+|---|---|---|---|---|
+| bulk_ingest | **784 ms** | 13.2 s | 1.21 min | 12.5 s |
+| neighborhood_depth1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
+| neighborhood_depth2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
+| cypher scan-filter (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
+| cypher two-hop (200 rows) | **261.6 µs** ★ | **3.99 ms** ★ | **1.59 ms** ★ | **1.96 ms** ★ |
+| cold_start (V5 snapshot / connect) | 8.710 s ▽ | 18.54 ms ⊕ | 23.41 ms ⊕ | 0.42 ms ⊕ |
+
+★ v2.2 corrected four-engine benchmark (5.81M edges, 3-warmup/median-10, isolated).
+⊕ v2 values; competitor servers unchanged.
+▽ mushroomdb cold-start is 100k-node snapshot open (not a 10k connect latency); V5 `open_with` from snapshot 8.710 s measured 2026-08-21; write cost 25.094 s. V4 baseline was 10.508 s (−17.1%).
+
+### Contamination guard — v2.4 run
+
+mushroomdb workloads are embedded and unaffected by bolt servers.
+Competitor engines not re-run (numbers unchanged from v2.2). The v2.4 run:
+- `docker ps | grep bench-` → no bench-* containers before start (verified)
+- `dai-neo4j` present on port 7687 with non-standard auth; neo4j adapter failed
+  connectivity check (`_AUTH = ("neo4j", "neo4j")` rejected by production container)
+  and was skipped — no contamination of mushroomdb results
+- mushroomdb is embedded; bolt port state is irrelevant

@@ -13,11 +13,15 @@ same-bucket pairs and provably excludes the 5 cross-bucket pairs.
 `field_equal(industry)` is binary (score 1.0). marketplace scores industry
 `both` at 0.8 — documented composition gap, not chased.
 
-**max_edges cap (Plan 11 T1):** all cartesian rule instances carry
-`max_edges=1_000_000` — the engine default that the original 5k probe
-tripped. With T1's streaming backfill the engine no longer builds a
-full desired `BTreeMap` before capping; the cap governs only how many
-edges are *kept*, not how much memory is used during evaluation.
+**max_edges semantics (V5 note):** cartesian rule instances use
+`max_edges=None` to engage the global-budget path (DEFAULT_MAX_EDGES=1M
+global cap, tripped latch). In V5 the engine added per-source top-k
+semantics: `max_edges=Some(k)` now means each source gets up to k
+destination edges. For dogfood rules where a single industry can span
+9k companies at 100k scale, a per-source cap of 1M would materialize
+all 9k edges per talent (283M+ total for FieldEqual), causing OOM.
+The global-budget path (max_edges=None) preserves the V4 behavior:
+a global 1M cap is applied in BTree order across all source nodes.
 `APPROXIMATE_SEMANTIC_RULE` is the `approximate=True` variant of
 `semantic_match_tc` added in T4.
 """
@@ -26,10 +30,8 @@ from __future__ import annotations
 
 from typing import Any
 
-# Consistent cap for all cartesian rule instances at 100k.
-# Equal to the engine default (DEFAULT_MAX_EDGES = 1_000_000) so
-# the original probe behaviour is reproduced; the explicit value
-# documents the choice and lets tests assert it.
+# Global 1M cap for approximate-recall reporting in the backfill summary.
+# This is the count the global-budget path will produce (it hits the cap).
 MATCHER_MAX_EDGES = 1_000_000
 
 
@@ -39,7 +41,7 @@ def _rule(
     dst: str,
     predicate: dict,
     edge_type: str,
-    max_edges: int | None = MATCHER_MAX_EDGES,
+    max_edges: int | None = None,  # None = global-budget path (DEFAULT_MAX_EDGES=1M cap)
 ) -> dict[str, Any]:
     return {
         "name": name,
@@ -141,6 +143,10 @@ APPROXIMATE_SEMANTIC_RULE: dict[str, Any] = {
     "predicate": {"VectorSimilar": {"field": "embedding", "min": 0.85}},
     "edge_type": "SEMANTIC_MATCH_APPROX",
     "weight_prop": "score",
-    "max_edges": MATCHER_MAX_EDGES,
+    "max_edges": None,  # None = global-budget path (DEFAULT_MAX_EDGES=1M cap)
+    # V5 note: max_edges=Some(k) is now per-source top-k. For VectorSimilar at
+    # 100k scale, IVF returns ~160 qualifying Companies per Talent (above 0.85
+    # threshold). Per-source cap of 1M is never hit, materializing 11M+ edges
+    # and taking 90+ min. Use None to keep the global 1M cap (same as V4).
     "approximate": True,
 }
