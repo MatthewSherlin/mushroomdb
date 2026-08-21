@@ -575,6 +575,10 @@ impl<F: Fs> GraphDb<F> {
              per-frame drain must run inside the loop to keep memory O(1)"
         );
         let _ = db.engine.drain_deltas(); // belt-and-braces no-op
+        // Rebuild view values after WAL replay so derived-edge-driven views
+        // reflect the as-of state, not just the initial backfill at CreateView.
+        // Mirrors the open_with rebuild_all call at db.rs:528.
+        db.view_store.rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
         db.read_only = true;
         db.total_wal_commits = total;
         Ok(db)
@@ -1248,6 +1252,9 @@ impl<F: Fs> GraphDb<F> {
     /// unregisters the subscriber — no further events are queued, no
     /// resources leak.
     pub fn subscribe_rule(&mut self, rule_name: &str) -> core_storage::Result<Subscription> {
+        if self.read_only {
+            return Err(core_storage::GraphError::ReadOnly);
+        }
         if !self.engine.rules().any(|r| r.name == rule_name) {
             return Err(core_storage::GraphError::RuleNotFound {
                 name: rule_name.to_string(),
@@ -1263,27 +1270,41 @@ impl<F: Fs> GraphDb<F> {
     }
 
     /// Subscribe to edge-fire and edge-retract events for **all** rules.
-    pub fn subscribe_all_rules(&mut self) -> Subscription {
+    ///
+    /// Returns `Err(GraphError::ReadOnly)` if called on an as-of instance —
+    /// as-of instances never commit, so `distribute_events` never runs and the
+    /// subscription would never deliver events.
+    pub fn subscribe_all_rules(&mut self) -> core_storage::Result<Subscription> {
+        if self.read_only {
+            return Err(core_storage::GraphError::ReadOnly);
+        }
         let inner = SubInner::new(self.sub_capacity());
         self.subscriptions.push(SubEntry {
             filter: SubFilter::AllRules,
             inner: std::sync::Arc::downgrade(&inner),
         });
         self.engine.set_emit_deltas(true);
-        Subscription(inner)
+        Ok(Subscription(inner))
     }
 
     /// Subscribe to write events: node insert/delete, prop set/remove.
     ///
     /// Does not include edge-fire / edge-retract (rule-derived edge events).
-    pub fn subscribe_writes(&mut self) -> Subscription {
+    ///
+    /// Returns `Err(GraphError::ReadOnly)` if called on an as-of instance —
+    /// as-of instances never commit, so `distribute_events` never runs and the
+    /// subscription would never deliver events.
+    pub fn subscribe_writes(&mut self) -> core_storage::Result<Subscription> {
+        if self.read_only {
+            return Err(core_storage::GraphError::ReadOnly);
+        }
         let inner = SubInner::new(self.sub_capacity());
         self.subscriptions.push(SubEntry {
             filter: SubFilter::Writes,
             inner: std::sync::Arc::downgrade(&inner),
         });
         self.engine.set_emit_deltas(true);
-        Subscription(inner)
+        Ok(Subscription(inner))
     }
 
     /// Queue capacity used for new subscriptions.
@@ -3364,7 +3385,7 @@ mod tests {
             db.create_rule(fk_rule()).unwrap();
 
             // Subscribe AFTER the backfill — queue must be empty (no stale events).
-            let sub = db.subscribe_all_rules();
+            let sub = db.subscribe_all_rules().unwrap();
             // No events should have queued for the prior backfill.
             assert!(
                 sub.try_recv().is_none(),
@@ -3395,7 +3416,7 @@ mod tests {
         {
             let mut db = GraphDb::open(&dir).unwrap();
             // Subscribe FIRST — emit_deltas becomes true.
-            let sub = db.subscribe_all_rules();
+            let sub = db.subscribe_all_rules().unwrap();
 
             for i in 0..5u32 {
                 db.insert_node("Org", &format!("o{i}"), vec![]).unwrap();
@@ -3459,6 +3480,129 @@ mod tests {
             let degree = info.props.get("degree_out");
             assert!(degree.is_some(), "view prop should be written to node props");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: `open_at_with` must call `rebuild_all` after WAL replay so
+    /// derived-edge-driven view values reflect the as-of state rather than just
+    /// the initial backfill written at `CreateView` time.
+    ///
+    /// History (6 WAL frames, indices 0..=5):
+    ///   0: insert Org "o1"
+    ///   1: create_view "employee_count" (Degree / WORKS_AT / In) on Org
+    ///   2: create_rule fk_rule (WORKS_AT, Person→Org via org_id)
+    ///   3: insert Person "p1" → rule fires WORKS_AT p1→o1 (degree = 1)  ← mid
+    ///   4: insert Person "p2" → rule fires WORKS_AT p2→o1 (degree = 2)
+    ///   5: insert Person "p3" → rule fires WORKS_AT p3→o1 (degree = 3)  ← latest
+    ///
+    /// Without `rebuild_all`, the as-of instance's "emp" view stays at the
+    /// initial backfill value (0) instead of reflecting the replayed derived edges.
+    #[test]
+    fn open_at_derived_edge_view_values_correct() {
+        use core_rules::ViewSource;
+        let dir = tmp_dir("open-at-view-rebuild");
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            // frame 0
+            db.insert_node("Org", "o1", vec![]).unwrap();
+            // frame 1: create view — initial backfill sees 0 derived edges (none fired yet)
+            db.create_view(ViewDef {
+                name: "employee_count".into(),
+                label: "Org".into(),
+                view_prop: "emp".into(),
+                source: ViewSource::Degree {
+                    edge_type: "WORKS_AT".into(),
+                    direction: Direction::In,
+                },
+            })
+            .unwrap();
+            // frame 2: create rule — no Persons yet; backfill is a no-op
+            db.create_rule(fk_rule()).unwrap();
+            // frame 3: p1 — rule fires WORKS_AT p1→o1; degree = 1
+            db.insert_node(
+                "Person",
+                "p1",
+                vec![("org_id".into(), Value::Str("o1".into()))],
+            )
+            .unwrap();
+            // frame 4: p2 — degree = 2
+            db.insert_node(
+                "Person",
+                "p2",
+                vec![("org_id".into(), Value::Str("o1".into()))],
+            )
+            .unwrap();
+            // frame 5: p3 — degree = 3
+            db.insert_node(
+                "Person",
+                "p3",
+                vec![("org_id".into(), Value::Str("o1".into()))],
+            )
+            .unwrap();
+            // Sanity: normal open sees degree = 3.
+            assert_eq!(
+                db.get_view_prop("o1", "emp").cloned(),
+                Some(Value::Int(3)),
+                "normal db must show degree 3 after 3 derived edges"
+            );
+        } // WAL flushed
+
+        // Re-open normally to get the authoritative reference value.
+        let normal_db = GraphDb::open(&dir).unwrap();
+        let normal_emp = normal_db.get_view_prop("o1", "emp").cloned();
+        assert_eq!(
+            normal_emp,
+            Some(Value::Int(3)),
+            "re-opened normal db must show degree 3"
+        );
+
+        // Latest as-of (commit 5 = frames 0..=5): must match the normal open.
+        let aof_latest = GraphDb::open_at(&dir, 5).unwrap();
+        assert_eq!(
+            aof_latest.get_view_prop("o1", "emp").cloned(),
+            normal_emp,
+            "open_at latest: derived-edge view must equal normal open (rebuild_all required)"
+        );
+
+        // Mid-history as-of (commit 3 = frames 0..=3): only p1; degree = 1.
+        let aof_mid = GraphDb::open_at(&dir, 3).unwrap();
+        assert_eq!(
+            aof_mid.get_view_prop("o1", "emp").cloned(),
+            Some(Value::Int(1)),
+            "open_at mid-history: only p1 exists at frame 3, degree must be 1"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pin: subscribe_* on an as-of instance must return Err(ReadOnly) —
+    /// as-of instances never commit, so distribute_events never runs and any
+    /// subscription would wait forever.
+    #[test]
+    fn subscribe_on_as_of_returns_read_only_error() {
+        let dir = tmp_dir("sub-as-of-read-only");
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            db.insert_node("Org", "o1", vec![]).unwrap();
+            db.create_rule(fk_rule()).unwrap();
+        }
+        let mut aof = GraphDb::open_at(&dir, 0).unwrap();
+
+        assert!(
+            matches!(aof.subscribe_all_rules(), Err(core_storage::GraphError::ReadOnly)),
+            "subscribe_all_rules on as-of must return ReadOnly"
+        );
+        assert!(
+            matches!(aof.subscribe_writes(), Err(core_storage::GraphError::ReadOnly)),
+            "subscribe_writes on as-of must return ReadOnly"
+        );
+        assert!(
+            matches!(
+                aof.subscribe_rule("works_at"),
+                Err(core_storage::GraphError::ReadOnly)
+            ),
+            "subscribe_rule on as-of must return ReadOnly"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

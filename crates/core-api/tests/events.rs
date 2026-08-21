@@ -478,7 +478,7 @@ fn replay_is_silent_for_subscriptions() {
     // pending_deltas must be drained (invariant 4). Install sub AFTER open.
     let mut db = GraphDb::open(&dir).unwrap();
     // subscribe_all_rules is available immediately; no events from replay.
-    let sub = db.subscribe_all_rules();
+    let sub = db.subscribe_all_rules().unwrap();
     assert!(
         sub.try_recv().is_none(),
         "replay must not emit subscription events"
@@ -505,7 +505,7 @@ fn subscribe_writes_receives_write_events_only() {
         approximate: false,
     };
     db.create_rule(rule).unwrap();
-    let sub = db.subscribe_writes();
+    let sub = db.subscribe_writes().unwrap();
 
     db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))]).unwrap();
     db.insert_node("A", "n2", vec![("tags".into(), tags(&["x"]))]).unwrap();

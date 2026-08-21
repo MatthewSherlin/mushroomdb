@@ -117,7 +117,10 @@ async fn run(mut socket: WebSocket, state: AppState) {
             }
         }
         if err.is_none() && msg.writes {
-            subs.push(db.subscribe_writes());
+            match db.subscribe_writes() {
+                Ok(sub) => subs.push(sub),
+                Err(e) => err = Some(e.to_string()),
+            }
         }
         drop(db);
         match err {

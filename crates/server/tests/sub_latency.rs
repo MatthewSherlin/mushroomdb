@@ -58,7 +58,7 @@ fn fmt_us(ns: f64) -> String {
 #[test]
 fn measure_inprocess_subscription_latency() {
     let db = SharedDb::open(&tmp("inproc")).expect("open db");
-    let sub = db.write().subscribe_writes();
+    let sub = db.write().subscribe_writes().unwrap();
 
     let mut latencies_ns: Vec<f64> = Vec::with_capacity(N_EVENTS);
 

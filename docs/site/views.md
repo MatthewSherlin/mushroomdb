@@ -124,7 +124,7 @@ let err = db.set_prop("london", "pop", Value::Int(999));
 >
 > **Rebuild procedure:** delete `snapshot.bin` and re-open the database; the
 > WAL is replayed from scratch and a fresh V5 snapshot is written on the next
-> `snapshot()` call.  The 100k fixture rebuild is deferred to Task 5.
+> `snapshot()` call.
 
 ## Persistence
 
@@ -135,6 +135,11 @@ records (discriminants 10 / 11).  They also survive snapshots via a
 View **values** are NOT stored in snapshots — they are recomputed from
 topo + props on every open.  This matches the rebuild-on-open pattern
 used by candidate indexes and keeps snapshot writes simple.
+
+> **Disk-space note.** Snapshots store the raw edge list including all derived
+> edges.  At 100k nodes with a dense rule (10.5M derived edges) a V5 snapshot
+> is approximately 2.2 GiB on disk.  Plan accordingly if you call `snapshot()`
+> on large graphs with high-fanout rules.
 
 ## Subscriptions
 
