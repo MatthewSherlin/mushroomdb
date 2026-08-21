@@ -79,6 +79,19 @@ pub struct RuleEngine {
     /// [`RuleEngine::drain_deltas`] immediately after apply to consume live
     /// events or discard replay noise.
     pending_deltas: Vec<EngineEdgeDelta>,
+    /// Gate: whether to accumulate [`EngineEdgeDelta`] items during rule
+    /// application.
+    ///
+    /// **Safety invariant:** events are fire-and-forget live streams — a
+    /// subscriber that attaches *later* never receives past events by design.
+    /// Similarly, views call `backfill_view` at creation time (reading directly
+    /// from `topo`, not from pending deltas), so deltas accumulated before a
+    /// view is defined are not needed. Accumulation can therefore be skipped
+    /// whenever no subscriber and no view exists; the observable behaviour is
+    /// identical. Set to `true` by `set_emit_deltas` before the first
+    /// subscribe, create_view, or any operation that needs events; cleared when
+    /// the last listener is removed.
+    emit_deltas: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +557,9 @@ struct ProvSets<'a> {
     /// time (before any tombstone step) so the strings remain valid after
     /// node deletion.
     deltas: &'a mut Vec<EngineEdgeDelta>,
+    /// Mirror of [`RuleEngine::emit_deltas`]: when `false`, pushes to
+    /// `deltas` are skipped entirely (no heap allocation, no String clone).
+    emit: bool,
 }
 
 impl ProvSets<'_> {
@@ -558,21 +574,23 @@ impl ProvSets<'_> {
         let rid = intern_rule(self.rule_intern, self.intern_rule, rule);
         touch_insert(self.by_node, rid, triple);
         let (etype, src, dst) = triple;
-        if let (Some(sk), Some(dk), Some(et)) = (
-            ids.key_of(src),
-            ids.key_of(dst),
-            syms.resolve(etype),
-        ) {
-            self.deltas.push(EngineEdgeDelta {
-                rule: rule.to_string(),
-                src_key: sk.to_string(),
-                dst_key: dk.to_string(),
-                edge_type: et.to_string(),
-                etype_sym: etype,
-                src_id: src,
-                dst_id: dst,
-                fired: true,
-            });
+        if self.emit {
+            if let (Some(sk), Some(dk), Some(et)) = (
+                ids.key_of(src),
+                ids.key_of(dst),
+                syms.resolve(etype),
+            ) {
+                self.deltas.push(EngineEdgeDelta {
+                    rule: rule.to_string(),
+                    src_key: sk.to_string(),
+                    dst_key: dk.to_string(),
+                    edge_type: et.to_string(),
+                    etype_sym: etype,
+                    src_id: src,
+                    dst_id: dst,
+                    fired: true,
+                });
+            }
         }
         true
     }
@@ -585,21 +603,23 @@ impl ProvSets<'_> {
         let rid = intern_rule(self.rule_intern, self.intern_rule, rule);
         touch_remove(self.by_node, rid, triple);
         let (etype, src, dst) = triple;
-        if let (Some(sk), Some(dk), Some(et)) = (
-            ids.key_of(src),
-            ids.key_of(dst),
-            syms.resolve(etype),
-        ) {
-            self.deltas.push(EngineEdgeDelta {
-                rule: rule.to_string(),
-                src_key: sk.to_string(),
-                dst_key: dk.to_string(),
-                edge_type: et.to_string(),
-                etype_sym: etype,
-                src_id: src,
-                dst_id: dst,
-                fired: false,
-            });
+        if self.emit {
+            if let (Some(sk), Some(dk), Some(et)) = (
+                ids.key_of(src),
+                ids.key_of(dst),
+                syms.resolve(etype),
+            ) {
+                self.deltas.push(EngineEdgeDelta {
+                    rule: rule.to_string(),
+                    src_key: sk.to_string(),
+                    dst_key: dk.to_string(),
+                    edge_type: et.to_string(),
+                    etype_sym: etype,
+                    src_id: src,
+                    dst_id: dst,
+                    fired: false,
+                });
+            }
         }
         true
     }
@@ -1179,7 +1199,22 @@ impl RuleEngine {
             tripped,
             fires,
             pending_deltas: Vec::new(),
+            emit_deltas: false,
         }
+    }
+
+    /// Enable or disable delta accumulation.
+    ///
+    /// Set to `true` before the first subscriber or view is added.
+    /// Set to `false` when the last subscriber and last view are removed.
+    /// See the `emit_deltas` field doc for the safety invariant.
+    pub fn set_emit_deltas(&mut self, emit: bool) {
+        self.emit_deltas = emit;
+    }
+
+    /// Whether delta accumulation is currently enabled.
+    pub fn emit_deltas(&self) -> bool {
+        self.emit_deltas
     }
 
     /// Export IVF state for all approximate rules.  Passed to `snapshot()` in
@@ -1328,6 +1363,7 @@ impl RuleEngine {
             rule_intern: &mut self.rule_intern,
             intern_rule: &mut self.intern_rule,
             deltas: &mut self.pending_deltas,
+            emit: self.emit_deltas,
         };
         if let Some(k) = def.max_edges {
             apply_streaming_create_top_k(&def, k, &self.indexes[&name], &mut prov, g);
@@ -1363,6 +1399,7 @@ impl RuleEngine {
             rule_intern: &mut self.rule_intern,
             intern_rule: &mut self.intern_rule,
             deltas: &mut self.pending_deltas,
+            emit: self.emit_deltas,
         };
         for triple in triples {
             let (t, s, d) = triple;
@@ -1479,6 +1516,7 @@ impl RuleEngine {
                     rule_intern: &mut self.rule_intern,
                     intern_rule: &mut self.intern_rule,
                     deltas: &mut self.pending_deltas,
+                    emit: self.emit_deltas,
                 };
 
                 if as_src {
@@ -1541,6 +1579,7 @@ impl RuleEngine {
                         rule_intern: &mut self.rule_intern,
                         intern_rule: &mut self.intern_rule,
                         deltas: &mut self.pending_deltas,
+                        emit: self.emit_deltas,
                     },
                     tripped,
                     g,
@@ -1618,6 +1657,7 @@ impl RuleEngine {
                     rule_intern: &mut self.rule_intern,
                     intern_rule: &mut self.intern_rule,
                     deltas: &mut self.pending_deltas,
+                    emit: self.emit_deltas,
                 }
                 .remove(&rule_name, triple, g.ids, g.syms);
             }
@@ -1639,6 +1679,7 @@ impl RuleEngine {
                 rule_intern: &mut self.rule_intern,
                 intern_rule: &mut self.intern_rule,
                 deltas: &mut self.pending_deltas,
+                emit: self.emit_deltas,
             };
             apply_per_src_top_k(&def, src, top_k, &mut prov, g);
         }
@@ -1686,6 +1727,7 @@ impl RuleEngine {
             rule_intern: &mut self.rule_intern,
             intern_rule: &mut self.intern_rule,
             deltas: &mut self.pending_deltas,
+            emit: self.emit_deltas,
         };
         if let Some(k) = def.max_edges {
             apply_streaming_rebuild_top_k(&def, k, &self.indexes[name], &mut prov, g);

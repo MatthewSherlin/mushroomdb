@@ -451,43 +451,32 @@ executed with:
 | neighborhood_depth2 (p50) | 0.2 µs | 0.2 µs | 0% | |
 | cypher scan-filter (1.4k rows) | 3.35 ms | 1.22 ms | −64% | cold-start; see scan-filter note |
 | cypher two-hop (200 rows) | 207.8 µs | 254.1 µs | +22% | single-shot sub-ms; timing noise |
-| rule_derive (bench_industry_tc) | 873.71 ms | 1.141 s | **+30.6%** | residual delta-accum overhead; see investigation |
-| rule_derive (bench_specialty_tc) | 2.020 s | 2.401 s | **+18.9%** | residual delta-accum overhead; see investigation |
-| rule_derive total | 2.894 s | 3.542 s | **+22.4%** | −14.9% vs pre-fix 4.161 s; see investigation |
+| rule_derive (bench_industry_tc) | 873.71 ms | 928 ms | +6.2% |
+| rule_derive (bench_specialty_tc) | 2.020 s | 2.221 s | +10.0% |
+| rule_derive total | 2.894 s | 3.149 s | **+8.8%** |
 
-*Re-measured post-fix (N=5, median, 2026-08-21). Pre-fix v2.4 numbers were industry=1.551 s (+77%), specialty=2.610 s (+29%), total=4.161 s (+44%).*
+*Final numbers: N=5 median, release build, 2026-08-21. Two-stage fix applied (see below). Pre-fix v2.4: industry=1.551 s (+77%), specialty=2.610 s (+29%), total=4.161 s (+44%).*
 
-**rule_derive regression investigation and fix:**
+**rule_derive regression — root cause and two-stage fix:**
 
-The initial v2.4 measurement showed +44% total regression from new view-maintenance code.
-Root cause: `CreateRule` apply arm called `.to_vec()` unconditionally on the engine's delta
-buffer regardless of whether any views were defined:
+Initial v2.4 measurement showed +44% regression from Plan-15 view-maintenance infrastructure.
+Two separate overhead sources identified and fixed in this session:
 
-```rust
-// pre-fix (always executes):
-let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
-for d in &new_deltas {
-    self.view_store.on_edge_changed(…);
-}
-```
+**Stage 1** (`crates/core-api/src/db.rs`): `pending_deltas_since().to_vec()` was called
+unconditionally in all 7 WAL apply arms even with zero views defined. Each `EngineEdgeDelta`
+holds 4 heap `String` fields; copying 1M deltas per backfill allocated ~130MB. Fix: all 7
+sites guarded by `if !self.view_store.is_empty()`. Recovery: −14.9% (4.161 s → 3.542 s).
 
-Each `EngineEdgeDelta` holds 4 heap `String` fields. Cloning 1M deltas allocates ~130MB per
-`create_rule` call — an entirely wasted copy when no views exist.
+**Stage 2** (`crates/core-rules/src/engine.rs`): the engine still _accumulated_ 1M deltas
+during backfill even with no subscribers and no views. Fix: `emit_deltas: bool` added to
+`RuleEngine`; `ProvSets::insert/remove` skip the push when `emit: false`. Flag set `true` by
+`subscribe_*` / `create_view`, cleared when last subscriber drops and no views remain.
+Safety: events are fire-and-forget live streams — late subscribers never receive past events
+by design; views call `backfill_view` from `topo` directly at creation (confirmed at
+`views.rs::create_view`), not from pending deltas. Recovery: further −11.8% (3.542 s → 3.149 s).
 
-**Fix applied in this cycle** (`crates/core-api/src/db.rs`): all 7 `pending_deltas_since().to_vec()`
-call sites guarded by `if !self.view_store.is_empty()`. Backed by a unit test
-(`db::tests::no_delta_copy_when_no_views`) using a thread-local counter to structurally
-assert zero delta copies occur with no views defined.
-
-**Recovery at 10k:** −14.9% vs pre-fix (industry: −26.4%, specialty: −8.0%).
-
-**Residual +22.4% vs v2.3 (explained):** The fix eliminates the delta _copy_ overhead, but
-the engine still _accumulates_ `EngineEdgeDelta` items during backfill (pushed into
-`pending_deltas`). These are needed for subscription events and drained by
-`log_then_apply_with` after each commit. With no subscribers and no views, the push+drain
-is O(edge_count) overhead that did not exist in v2.3. Estimated allocation: ~1M × 100 bytes
-= ~100MB per `create_rule` call (push phase). Further fix: skip delta accumulation entirely
-when `subscriptions.is_empty() && view_store.is_empty()` — tracked, not in this cycle.
+**Residual +8.8% vs v2.3:** minor per-commit overhead from Plan-15 bookkeeping
+(`init_node_views` per InsertNode, engine index updates). All individual regressions are <11%.
 
 **scan-filter note:** Both 3.35 ms (v2.3) and 1.22 ms (v2.4) are single-shot cold-start
 measurements — policy-matched. The v2.3 scan-filter note documented the cold-start artifact;

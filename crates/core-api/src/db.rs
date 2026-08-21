@@ -1174,6 +1174,17 @@ impl<F: Fs> GraphDb<F> {
             }
             true
         });
+        // Turn off delta accumulation if all subscribers dropped and no views remain.
+        if self.subscriptions.is_empty() && self.view_store.is_empty() {
+            self.engine.set_emit_deltas(false);
+        }
+    }
+
+    /// Returns `true` if any live subscriber or view definition requires delta
+    /// accumulation. Used to set `engine.emit_deltas` on subscribe/view DDL.
+    fn needs_emit_deltas(&self) -> bool {
+        !self.view_store.is_empty()
+            || self.subscriptions.iter().any(|e| e.inner.upgrade().is_some())
     }
 
     /// Convert a WAL record into `DbEvent` write events with the given seq.
@@ -1247,6 +1258,7 @@ impl<F: Fs> GraphDb<F> {
             filter: SubFilter::Rule(rule_name.to_string()),
             inner: std::sync::Arc::downgrade(&inner),
         });
+        self.engine.set_emit_deltas(true);
         Ok(Subscription(inner))
     }
 
@@ -1257,6 +1269,7 @@ impl<F: Fs> GraphDb<F> {
             filter: SubFilter::AllRules,
             inner: std::sync::Arc::downgrade(&inner),
         });
+        self.engine.set_emit_deltas(true);
         Subscription(inner)
     }
 
@@ -1269,6 +1282,7 @@ impl<F: Fs> GraphDb<F> {
             filter: SubFilter::Writes,
             inner: std::sync::Arc::downgrade(&inner),
         });
+        self.engine.set_emit_deltas(true);
         Subscription(inner)
     }
 
@@ -1806,6 +1820,11 @@ impl<F: Fs> GraphDb<F> {
         let def_bytes = bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
             detail: format!("serialize view: {e}"),
         })?;
+        // Enable delta accumulation before the view is registered so subsequent
+        // incremental edge events reach view maintenance from this point onward.
+        // (The backfill inside create_view reads topo directly; it does not rely
+        // on pending deltas.)
+        self.engine.set_emit_deltas(true);
         self.log_then_apply(WalRecord::CreateView { def_bytes })
     }
 
@@ -1821,7 +1840,12 @@ impl<F: Fs> GraphDb<F> {
         if !self.view_store.has_view(name) {
             return Err(GraphError::RuleNotFound { name: name.into() });
         }
-        self.log_then_apply(WalRecord::DeleteView { name: name.into() })
+        let result = self.log_then_apply(WalRecord::DeleteView { name: name.into() });
+        // After deletion, disable accumulation if no listeners remain.
+        if !self.needs_emit_deltas() {
+            self.engine.set_emit_deltas(false);
+        }
+        result
     }
 
     /// Snapshot of all registered view definitions.
@@ -3316,6 +3340,84 @@ mod tests {
                 .neighbors("p0", "WORKS_AT", Direction::Out)
                 .unwrap();
             assert_eq!(nbrs, vec!["o0"], "rule must derive edges even with no views");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gating regression: subscribe AFTER a backfill must see no stale events.
+    /// subscribe BEFORE a backfill must see every edge-fire event.
+    #[test]
+    fn subscribe_after_backfill_no_stale_events() {
+        let dir = tmp_dir("sub-after-backfill");
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            for i in 0..10u32 {
+                db.insert_node("Org", &format!("o{i}"), vec![]).unwrap();
+                db.insert_node(
+                    "Person",
+                    &format!("p{i}"),
+                    vec![("org_id".into(), Value::Str(format!("o{i}")))],
+                )
+                .unwrap();
+            }
+            // Create rule BEFORE subscribing — emit_deltas is false during backfill.
+            db.create_rule(fk_rule()).unwrap();
+
+            // Subscribe AFTER the backfill — queue must be empty (no stale events).
+            let sub = db.subscribe_all_rules();
+            // No events should have queued for the prior backfill.
+            assert!(
+                sub.try_recv().is_none(),
+                "subscribe after backfill must see no stale events"
+            );
+
+            // Inserting a new node now should fire an event (emit_deltas is now true).
+            db.insert_node("Org", "o_new", vec![]).unwrap();
+            db.insert_node(
+                "Person",
+                "p_new",
+                vec![("org_id".into(), Value::Str("o_new".into()))],
+            )
+            .unwrap();
+            let ev = sub.recv_timeout(std::time::Duration::from_millis(200));
+            assert!(
+                ev.is_some(),
+                "edge-fire event must arrive after subscribe (emit_deltas=true)"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gating regression: subscribe BEFORE a backfill → events flow.
+    #[test]
+    fn subscribe_before_backfill_events_flow() {
+        let dir = tmp_dir("sub-before-backfill");
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            // Subscribe FIRST — emit_deltas becomes true.
+            let sub = db.subscribe_all_rules();
+
+            for i in 0..5u32 {
+                db.insert_node("Org", &format!("o{i}"), vec![]).unwrap();
+                db.insert_node(
+                    "Person",
+                    &format!("p{i}"),
+                    vec![("org_id".into(), Value::Str(format!("o{i}")))],
+                )
+                .unwrap();
+            }
+            // Backfill fires with emit_deltas=true → events queued.
+            db.create_rule(fk_rule()).unwrap();
+
+            // Should receive at least one edge-fired event from the backfill.
+            let mut received = 0usize;
+            while sub.try_recv().is_some() {
+                received += 1;
+            }
+            assert!(
+                received > 0,
+                "subscribe before backfill must receive edge-fire events (got 0)"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
