@@ -213,18 +213,12 @@ export class MushroomClient {
     algo: "pagerank" | "wcc" | "degree",
     config?: PageRankConfig | WccConfig | DegreeConfig,
   ): Promise<AlgoReport> {
-    // Server structs use #[derive(Deserialize)] without #[serde(default)], so
-    // every field is required in the JSON body. Merge caller config over the
-    // server's own defaults so an empty call works out of the box.
-    const defaults: Record<string, Record<string, unknown>> = {
-      pagerank: { damping: 0.85, max_iters: 50, tol: 1e-6, edge_type: null, direction: "out", budget_ms: 5000 },
-      wcc:      { edge_type: null, budget_ms: 5000 },
-      degree:   { edge_type: null, direction: "both", budget_ms: 5000 },
-    };
-    const body = { ...defaults[algo]!, ...(config ?? {}) };
+    // The server structs carry #[serde(default)], so sending only the fields
+    // the caller explicitly set (or an empty body {}) is valid — the server
+    // fills in its own defaults for any missing fields.
     return this.fetchJson<AlgoReport>(`/algo/${algo}`, {
       method: "POST",
-      body: JSON.stringify(body),
+      body: JSON.stringify(config ?? {}),
     });
   }
 

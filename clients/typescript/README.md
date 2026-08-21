@@ -194,6 +194,40 @@ try {
 
 ---
 
+## Known server-side limitations
+
+These are limitations of the mushroomdb server's Cypher implementation that
+affect how you write queries through this client.
+
+### 1. `CREATE ... RETURN` is not supported
+
+The server's Cypher parser does not allow a `RETURN` clause after a `CREATE`
+pattern. Use two separate statements instead:
+
+```ts
+// WRONG — will throw MushroomError
+await client.query("CREATE (n:Widget {id: 'w1'}) RETURN n.id");
+
+// CORRECT — create, then read back
+await client.query("CREATE (n:Widget {id: 'w1', name: 'Sprocket'})");
+const result = await client.query("MATCH (n:Widget {id: 'w1'}) RETURN n.name");
+```
+
+### 2. Every node requires a string `id` property
+
+When using `CREATE`, nodes must include an `id` field with a string value.
+This is the key the server uses to identify the node:
+
+```ts
+// WRONG — missing 'id'
+await client.query("CREATE (n:Widget {name: 'Sprocket'})");
+
+// CORRECT
+await client.query("CREATE (n:Widget {id: 'w1', name: 'Sprocket'})");
+```
+
+---
+
 ## Node-only vs browser-compatible
 
 | Feature | Browser | Node 18+ |
@@ -212,8 +246,11 @@ npm test
 ```
 
 Tests spawn a real `mushroomdb` binary. The first run builds it with `cargo`
-(takes ~30 s on a cold cache). If the build fails, all tests are skipped with
-a clear message.
+(takes ~30 s on a cold cache). If the build fails, all tests are **skipped**
+with a clear message (not marked as failed).
+
+Set `CARGO=/path/to/cargo` to use a specific cargo binary (required in CI or
+on machines where cargo is not on `PATH`).
 
 ---
 

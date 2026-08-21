@@ -12,12 +12,19 @@
  * A single cell value in a query result row.
  *
  * Mirrors `core_storage::types::Value`:
- *   Int(i64)   → number
- *   Float(f64) → number (NaN serializes as null per server behaviour)
- *   Str(String) → string
- *   Bool(bool) → boolean
+ *   Int(i64)        → number
+ *   Float(f64)      → number (NaN serializes as null per server behaviour)
+ *   Str(String)     → string
+ *   Bool(bool)      → boolean
  *   List(Vec<Value>) → CellValue[]
- *   null cell → null
+ *   null cell       → null
+ *
+ * **Precision warning (Int / i64):** JavaScript `number` (IEEE 754 double)
+ * safely represents integers only up to ±2^53 − 1 (~9×10^15). Rust `i64`
+ * reaches ±9.2×10^18. Integer node properties whose absolute value exceeds
+ * 2^53 will be silently corrupted when parsed as JS numbers. For such values
+ * use a string representation in the graph instead. A future release will
+ * offer a BigInt-aware parsing mode.
  */
 export type CellValue = number | string | boolean | null | CellValue[];
 
@@ -214,7 +221,14 @@ export interface DegreeConfig {
  * Mirrors `core_api::algo::DegreeReport`.
  */
 export interface DegreeReport {
-  /** [node_key, degree] pairs, sorted by degree descending (ties: key asc). */
+  /**
+   * [node_key, degree] pairs, sorted by degree descending (ties: key asc).
+   *
+   * **Precision warning:** Rust returns `u64` degrees. JS `number` (IEEE 754)
+   * safely represents values up to 2^53 − 1. Nodes with degree above ~9×10^15
+   * will silently lose precision. In practice graphs with that many edges per
+   * node do not exist, but be aware of the type constraint.
+   */
   scores: [string, number][];
   truncated: boolean;
 }
@@ -238,9 +252,16 @@ export type AlgoReport = PageRankReport | WccReport | DegreeReport;
  * Mirrors `core_api::subscription::DbEvent` — serialised as internally-tagged
  * JSON with `"type"` as the discriminant.
  *
- * All variants except `lagged` carry `commit_seq: number` (u64 in Rust).
+ * All variants except `lagged` carry `commit_seq: number` (Rust: `u64`).
  * `lagged` means the subscriber's internal queue overflowed; the caller should
  * re-read graph state to recover consistency for lossless consumers.
+ *
+ * **Precision warning (`commit_seq` / `missed`):** Both are Rust `u64` and map
+ * to JS `number` (IEEE 754 double, safe up to 2^53 − 1 ≈ 9×10^15). A
+ * long-lived server generating more than ~9×10^15 commits will silently
+ * corrupt these values. A future release will represent u64 fields as
+ * `string` or `bigint`. For now treat `commit_seq` as an opaque ordering key,
+ * not an exact integer.
  */
 export type DbEvent =
   | {

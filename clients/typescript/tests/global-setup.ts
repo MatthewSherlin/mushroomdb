@@ -2,17 +2,24 @@
  * Vitest global setup: build the mushroomdb binary (once), populate a demo
  * database, and start the HTTP server on an ephemeral port.
  *
- * Provides two values to tests via vitest's inject() API:
- *   - `baseUrl`  — HTTP base URL, e.g. "http://127.0.0.1:54321"
- *   - `wsUrl`    — WebSocket base URL, e.g. "ws://127.0.0.1:54321"
- *   - `skipReason` — non-null string when tests should be skipped
+ * Provides values to tests via vitest's inject() API:
+ *   - `baseUrl`    — HTTP base URL, e.g. "http://127.0.0.1:54321"
+ *   - `wsUrl`      — WebSocket base URL, e.g. "ws://127.0.0.1:54321"
+ *   - `skipReason` — non-empty string when tests should be skipped; empty string = run
  *
  * If the binary cannot be built, all tests are skipped with a clear message
  * rather than failing.
+ *
+ * # Cargo binary resolution
+ *
+ * Set `CARGO=/path/to/cargo` in the environment to override the binary used.
+ * Without the env var, `cargo` is looked up on PATH first, then a dev-machine
+ * fallback path is tried. If none are found, tests skip with a clear message
+ * naming the env var.
  */
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { GlobalSetupContext } from "vitest/node";
@@ -27,11 +34,52 @@ const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 /** Where cargo should deposit the binary. */
 const CARGO_BIN = join(REPO_ROOT, "target", "debug", "mushroomdb");
 
-/** Cargo binary (from the specified toolchain path). */
-const CARGO = join(
-  "/Users/nilrehsttam/.rustup/toolchains/stable-aarch64-apple-darwin/bin",
-  "cargo",
-);
+/**
+ * Resolve the cargo executable.
+ *
+ * Priority:
+ *   1. `CARGO` environment variable (CI / alternate machines).
+ *   2. `cargo` on PATH.
+ *   3. Dev-machine fallback: rustup toolchain paths tried in order.
+ *
+ * Returns null if none of the candidates can be executed.
+ */
+function resolveCargo(): string | null {
+  // 1. Explicit env override.
+  if (process.env["CARGO"]) return process.env["CARGO"];
+
+  // 2. PATH.
+  try {
+    execFileSync("cargo", ["--version"], { stdio: "ignore" });
+    return "cargo";
+  } catch {
+    // not on PATH
+  }
+
+  // 3. Dev-machine rustup toolchain fallbacks.
+  const fallbacks = [
+    join(
+      process.env["HOME"] ?? "",
+      ".rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+    ),
+    join(
+      process.env["HOME"] ?? "",
+      ".rustup/toolchains/1.92.0-aarch64-apple-darwin/bin/cargo",
+    ),
+  ];
+  for (const p of fallbacks) {
+    if (existsSync(p)) {
+      try {
+        execFileSync(p, ["--version"], { stdio: "ignore" });
+        return p;
+      } catch {
+        // not executable
+      }
+    }
+  }
+
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // State shared between setup and teardown
@@ -44,18 +92,21 @@ let tmpDbDir: string | null = null;
 // Helpers
 // ---------------------------------------------------------------------------
 
-function tryBuild(): { ok: true } | { ok: false; reason: string } {
-  // If the binary already exists, skip build to keep test startup fast.
-  try {
-    execFileSync(CARGO_BIN, ["--help"], { stdio: "ignore" });
-    return { ok: true };
-  } catch {
-    // Binary missing or not executable — try to build.
+function tryBuild(cargo: string): { ok: true } | { ok: false; reason: string } {
+  // If the binary already exists, probe it with --version (more reliable than
+  // --help for detecting a corrupt or mismatched binary).
+  if (existsSync(CARGO_BIN)) {
+    try {
+      execFileSync(CARGO_BIN, ["--version"], { stdio: "ignore" });
+      return { ok: true };
+    } catch {
+      // Binary exists but can't run — fall through and rebuild.
+    }
   }
 
   try {
     execFileSync(
-      CARGO,
+      cargo,
       ["build", "-p", "cli", "--bin", "mushroomdb"],
       {
         cwd: REPO_ROOT,
@@ -141,8 +192,20 @@ function startServer(dbDir: string): Promise<{ port: number; proc: ChildProcess 
 // ---------------------------------------------------------------------------
 
 export default async function setup({ provide }: GlobalSetupContext) {
-  // 1. Build (or verify existing) binary.
-  const buildResult = tryBuild();
+  // 1. Resolve cargo.
+  const cargo = resolveCargo();
+  if (!cargo) {
+    provide(
+      "skipReason",
+      "cargo not found. Set CARGO=/path/to/cargo or ensure cargo is on PATH.",
+    );
+    provide("baseUrl", "");
+    provide("wsUrl", "");
+    return;
+  }
+
+  // 2. Build (or verify existing) binary.
+  const buildResult = tryBuild(cargo);
   if (!buildResult.ok) {
     provide("skipReason", buildResult.reason);
     provide("baseUrl", "");
@@ -150,7 +213,7 @@ export default async function setup({ provide }: GlobalSetupContext) {
     return;
   }
 
-  // 2. Populate demo database.
+  // 3. Populate demo database.
   tmpDbDir = mkdtempSync(join(tmpdir(), "mushroomdb-ts-test-"));
   const demoResult = runDemo(tmpDbDir);
   if (!demoResult.ok) {
@@ -160,17 +223,18 @@ export default async function setup({ provide }: GlobalSetupContext) {
     return;
   }
 
-  // 3. Start server.
+  // 4. Start server.
   const { port, proc } = await startServer(tmpDbDir);
   serverProcess = proc;
 
   const base = `http://127.0.0.1:${port}`;
   const ws = `ws://127.0.0.1:${port}`;
   provide("skipReason", "");
+  provide("serverReady", true);
   provide("baseUrl", base);
   provide("wsUrl", ws);
 
-  // 4. Return teardown.
+  // 5. Return teardown.
   return async () => {
     if (serverProcess) {
       // Try graceful SIGTERM first, then SIGKILL after 3 s.

@@ -555,7 +555,7 @@ async fn algo_degree(State(state): State<AppState>, Json(body): Json<serde_json:
 mod tests {
     use super::*;
     use crate::json::result_set_json;
-    use core_api::{ResultSet, Value};
+    use core_api::{DegreeConfig, PageRankConfig, ResultSet, Value, WccConfig};
 
     #[test]
     fn nan_float_cell_serializes_as_null() {
@@ -563,5 +563,36 @@ mod tests {
         rs.push_row(vec![Some(Value::Float(f64::NAN))]);
         let j = result_set_json(&rs);
         assert_eq!(j["rows"][0][0], Js::Null);
+    }
+
+    /// Verify that `POST /algo/pagerank` accepts an empty JSON body `{}` and
+    /// applies server defaults (regression guard for `#[serde(default)]`).
+    #[test]
+    fn pagerank_config_empty_body_uses_defaults() {
+        let config: PageRankConfig = serde_json::from_str("{}").unwrap();
+        let default = PageRankConfig::default();
+        assert_eq!(config.damping, default.damping);
+        assert_eq!(config.max_iters, default.max_iters);
+        assert_eq!(config.tol, default.tol);
+        assert_eq!(config.budget_ms, default.budget_ms);
+        assert_eq!(config.edge_type, default.edge_type);
+    }
+
+    /// Same guard for `POST /algo/wcc`.
+    #[test]
+    fn wcc_config_empty_body_uses_defaults() {
+        let config: WccConfig = serde_json::from_str("{}").unwrap();
+        let default = WccConfig::default();
+        assert_eq!(config.budget_ms, default.budget_ms);
+        assert_eq!(config.edge_type, default.edge_type);
+    }
+
+    /// Same guard for `POST /algo/degree`.
+    #[test]
+    fn degree_config_empty_body_uses_defaults() {
+        let config: DegreeConfig = serde_json::from_str("{}").unwrap();
+        let default = DegreeConfig::default();
+        assert_eq!(config.budget_ms, default.budget_ms);
+        assert_eq!(config.edge_type, default.edge_type);
     }
 }
