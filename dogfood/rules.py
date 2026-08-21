@@ -1,4 +1,4 @@
-"""The six marketplace matcher rules as mushroomdb RuleDef dicts.
+"""Six matching rules for the representative workload, as mushroomdb RuleDef dicts.
 
 Cross-label: a rule binds one (src_label, dst_label) pair. Industry and
 specialty (and location, because jobs carry geo) are declared twice —
@@ -10,8 +10,8 @@ negative-case oracle: the verbatim fixture bucket space {2, 3} means
 tolerance=1 is vacuously all-match; tolerance=0 produces exactly the 5
 same-bucket pairs and provably excludes the 5 cross-bucket pairs.
 
-`field_equal(industry)` is binary (score 1.0). marketplace scores industry
-`both` at 0.8 — documented composition gap, not chased.
+`field_equal(industry)` is binary (score 1.0). An alternate scoring convention
+weights industry `both` at 0.8 — documented composition gap, not chased.
 
 **max_edges semantics (V5 note):** cartesian rule instances use
 `max_edges=None` to engage the global-budget path (DEFAULT_MAX_EDGES=1M

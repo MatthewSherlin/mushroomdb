@@ -53,13 +53,13 @@
 
 The depth-1 expand protocol (2 parallel neighborhood calls + /edges + neighbor node-info fetch) completes in **2.1 ms** in-browser. Depth-2 expand (single neighborhood?depth=2 + hop-1 sub-expansions) completes in **1.6 ms** — the sparse FK graph means depth-2 yields the same single hop-1 node as depth-1 with no further expansion.
 
-**Finding:** API latency at 100k for FK-only neighborhood traversal is excellent (sub-3 ms). These numbers do not represent matcher/semantic hub density — a marketplace hub with hundreds of INDUSTRY_ALIGNMENT edges would have significantly more I/O. The 2k db expansion is covered under Leg 2 indirectly (company nodes with 400+ incoming edges caused the "Add to canvas" button to be busy for > 5 seconds — see UI concern below).
+**Finding:** API latency at 100k for FK-only neighborhood traversal is excellent (sub-3 ms). These numbers do not represent matcher/semantic hub density — a high-fanout hub with hundreds of INDUSTRY_ALIGNMENT edges would have significantly more I/O. The 2k db expansion is covered under Leg 2 indirectly (company nodes with 400+ incoming edges caused the "Add to canvas" button to be busy for > 5 seconds — see UI concern below).
 
 ---
 
 ## Leg 2 — Why Panels (2k DB, all rules live)
 
-All four why-panel types rendered correctly with real marketplace-shaped arithmetic:
+All four why-panel types rendered correctly with representative matching arithmetic:
 
 | Rule | Edge Type | Weight | Why Line |
 |---|---|---|---|
@@ -85,7 +85,7 @@ The semantic why panel (`t4-why-semantic.png`) shows a Talent→Company pairing 
 | Add 100 query results to canvas | 1,138 ms | Actual 200 nodes rendered: `addHarvestedToCanvas` calls `expandNode(depth=1)` per result key, adding user-neighbor nodes |
 | Add 500 query results to canvas | 1,965 ms | Actual 1,000 nodes rendered (same expansion behavior) |
 
-**Design note:** `addHarvestedToCanvas` in `query-result.ts` always expands each returned node at depth 1 (fetching its neighborhood and edges). For the 100k FK-only graph, this doubles node count on canvas (100 Talent + 100 User). This is by design but creates a non-obvious UX where "add 100 nodes" results in 200 visible. At marketplace scale with dense matcher edges, this could add O(N × degree) nodes.
+**Design note:** `addHarvestedToCanvas` in `query-result.ts` always expands each returned node at depth 1 (fetching its neighborhood and edges). For the 100k FK-only graph, this doubles node count on canvas (100 Talent + 100 User). This is by design but creates a non-obvious UX where "add 100 nodes" results in 200 visible. At high-fanout scale with dense matcher edges, this could add O(N × degree) nodes.
 
 ---
 
@@ -126,7 +126,7 @@ These measurements use swiftshader (software WebGL in headless Chromium). Real-d
 | F1 | Rules panel overlaps console: clicking "Run" in console fails if Rules panel is open | Medium | The `.rules` aside panel uses `pointer-events` intercepting `.console-btn[Run]`. UI layout bug — both panels stack in the same z-layer. Confirmed in playwright driver (30 s timeout before workaround). Repro: open both Console and Rules simultaneously. **Visual evidence:** `t4-2k-error.png` captures this state — the Rules panel is open on the left (all 12 rules visible), the console is visible at the bottom with a partial query (`...90002'}) RETURN c`), and the Run button is inaccessible because the rules panel's pointer-event region covers it. |
 | F2 | Add-to-canvas for dense company nodes blocks UI for > 5 s | Medium | `addHarvestedToCanvas` calls `expandNode(depth=1)` for each added node. A company node with 400+ incoming INDUSTRY_ALIGNMENT edges triggers 400+ parallel neighborhood fetches. In the 2k db, adding company-000000 (400+ talent neighbors) left the "Add to canvas" button disabled for > 5 s. Not tested at 100k density. |
 | F3 | Ticker shows "no events" until first WS event after page load | Low | Expected behavior but visible gap between page-load "connected" state and first ticker line. |
-| F4 | label-chip count is 2× query LIMIT at 100k (FK-only graph) | Low / Informational | `addHarvestedToCanvas` depth-1 expansion doubles visible nodes. Expected by design; potentially surprising in marketplace context where each talent-→company expansion could add hundreds of nodes. |
+| F4 | label-chip count is 2× query LIMIT at 100k (FK-only graph) | Low / Informational | `addHarvestedToCanvas` depth-1 expansion doubles visible nodes. Expected by design; potentially surprising with dense matcher nodes where each talent-→company expansion could add hundreds of nodes. |
 | F5 | Zoom interaction degrades ~2× from 200→1000 rendered nodes (swiftshader) | Medium | 308 ms at 200 nodes, 589 ms at 1,000. Interaction remains functional but noticeable under software renderer. GPU performance expected to be significantly better. |
 
 ---

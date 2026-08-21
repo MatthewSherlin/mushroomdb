@@ -1,4 +1,4 @@
-"""Seeded marketplace-faithful node synthesizer (stdlib only).
+"""Seeded deterministic node synthesizer for a matching workload (stdlib only).
 
 `generate(n_talent, n_companies, n_jobs, seed)` yields node_dicts of shape
 `{key, label, props}` — the same shape as `transform.load_fixtures`.
@@ -29,7 +29,7 @@ DEFAULT_N_JOBS = 10_000
 INDUSTRIES: tuple[str, ...] = ("architecture", "interior-design", "both")
 INDUSTRY_WEIGHTS: tuple[float, ...] = (0.45, 0.45, 0.10)
 
-# marketplace ProjectSpecialty (13).
+# Matching workload specialties (13 values).
 SPECIALTIES: tuple[str, ...] = (
     "single-family",
     "multi-family",
@@ -46,7 +46,7 @@ SPECIALTIES: tuple[str, ...] = (
     "institutional",
 )
 
-# marketplace DesignStyle (23).
+# Matching workload design styles (23 values).
 DESIGN_STYLES: tuple[str, ...] = (
     "bohemian",
     "bright",

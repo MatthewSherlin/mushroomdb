@@ -1,13 +1,12 @@
-# mushroomdb dogfood — marketplace fixtures
+# mushroomdb dogfood — matching workload fixtures
 
-Real-workload validation of the shipped product (Python bindings). Zero
-engine / UI / bindings source changes.
+Validation of the shipped product (Python bindings) against a representative
+matching domain. Zero engine / UI / bindings source changes.
 
 ## Fixtures
 
-Copied verbatim from Matthew's marketplace-app test fixtures
-(`talentco/talentcoai-backend/tests/migration/fixtures/`). Test data, no
-production PII.
+Representative fixture set for a Talent / Company / Job matching workload.
+Test data; all data is synthetic or anonymized.
 
 | file | nodes |
 |---|---|
@@ -26,9 +25,9 @@ and `MATCHES_DESIGN_STYLE` produce empty edge sets (honest).
 
 ## Flattening
 
-`transform.py` extracts the same fields as marketplace
-`listingshub_transformers.py` (`transform_talent_listing` /
-`transform_company_listing` / `transform_opportunity_listing`):
+`transform.py` extracts the same fields as the representative workload schema
+(`transform_talent_listing` / `transform_company_listing` /
+`transform_opportunity_listing`):
 
 - `specialties` = primarySpecialty + secondarySpecialty (one list)
 - `location` = `[lat, lon]` from latitude/longitude, location JSON, or geolocation
@@ -52,8 +51,8 @@ mushroomdb binds `(src_label, dst_label)`. The six kinds become:
 | `matches_design_style_tc` | `Overlap(design_styles, 0.2)` | Talent→Company |
 | `semantic_match_tc` | `VectorSimilar(embedding, 0.85)` | Talent→Company |
 
-Composition gap (accepted): marketplace scores industry `both` at 0.8; our
-`field_equal` is binary.
+Composition gap (accepted): an alternate scoring convention weights industry
+`both` at 0.8; our `field_equal` is binary.
 
 ## Run
 

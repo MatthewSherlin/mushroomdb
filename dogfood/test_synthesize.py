@@ -1,7 +1,7 @@
 """Seeded synthesizer: determinism, distributions, geo/style negatives.
 
-Industry / specialty / style enums are copied from marketplace's
-`core.models.enum` (ProjectSpecialty=13, DesignStyle=23) — not imported
+Industry / specialty / style enums mirror the matching workload schema
+(13 specialty values, 23 design-style values) — not imported
 from synthesize.py, so a typo in the generator cannot echo-pass.
 
 Cosine and haversine oracles below are independent reimplementations
@@ -29,7 +29,7 @@ from synthesize import (
     generate,
 )
 
-# marketplace ProjectSpecialty values (enum.py) — independent of synthesize.py.
+# Matching workload specialty values — independent of synthesize.py.
 SPECIALTIES = {
     "single-family",
     "multi-family",
@@ -46,7 +46,7 @@ SPECIALTIES = {
     "institutional",
 }
 
-# marketplace DesignStyle values (enum.py) — independent of synthesize.py.
+# Matching workload design-style values — independent of synthesize.py.
 DESIGN_STYLES = {
     "bohemian",
     "bright",

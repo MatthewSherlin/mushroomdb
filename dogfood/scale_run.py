@@ -1,4 +1,4 @@
-"""Orchestrated marketplace-scale dogfood experiment.
+"""Orchestrated scale experiment for a representative matching workload.
 
 Phases (each wall-clock + peak RSS via the resource module):
   (1) ingest N nodes via ingest_batch (10k-node chunks per docstring limit);
@@ -136,7 +136,7 @@ def semantic_rule() -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="mushroomdb marketplace scale run")
+    p = argparse.ArgumentParser(description="mushroomdb matching workload scale run")
     p.add_argument("--scale", type=int, default=DEFAULT_SCALE)
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--out", default=str(_RESULTS_DIR / "scale-100k.md"))
@@ -635,7 +635,7 @@ def run_big3_slice(seed: int, n_slice: int = BIG3_SLICE_SIZE) -> dict[str, Any]:
     - Same metro within <1 km jitter (GeoRadius 160.9 km fires for all pairs)
 
     500×500 = 250k pairs << 1M cap so no max_edges cap is needed.
-    Answers the marketplace 5-second question (scoped: metro/industry slice;
+    Answers the 5-second latency question (scoped: metro/industry slice;
     full-graph Big-3 coverage awaits derived-edge persistence, the new #1
     roadmap item).
     """
@@ -928,7 +928,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
     phases = result["phases"]
     lines: list[str] = []
     a = lines.append
-    a("# Scale run — marketplace dogfood (100k protocol)")
+    a("# Scale run — representative matching workload (100k protocol)")
     a("")
     a("## Machine / date")
     a("")
@@ -947,9 +947,10 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
     a("")
     a("Peak RSS is `resource.ru_maxrss` (process-lifetime, Darwin bytes).")
     a("Current RSS is `ps -o rss=` after the phase. Bindings are embedded Rust")
-    a("via `mushroomdb.GraphDb` — not HTTP. Numbers are labeled **not")
-    a("apples-to-apples** vs the marketplace production stack (different")
-    a("hardware, no network, synthetic embeddings).")
+    a("via `mushroomdb.GraphDb` — not HTTP. This is a representative matching")
+    a("workload (Talent / Company / Job nodes) with **synthetic hash-chain")
+    a("embeddings**; numbers are not apples-to-apples with any specific")
+    a("production deployment (different hardware, no network, real embeddings).")
     a("")
     a("## Phase timings")
     a("")
@@ -1115,7 +1116,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
             f"mean intersection={b3s.get('mean_matches', 0):.1f}"
         )
         a(
-            f"  *(Answers marketplace 5-second question in a focused bucket. "
+            f"  *(Answers the 5-second latency question in a focused bucket. "
             f"first_ia={b3s.get('first_ia')} first_sm={b3s.get('first_sm')} "
             f"first_lf={b3s.get('first_lf')} first_intersection={b3s.get('first_intersection')}. "
             "Full-graph coverage awaits derived-edge persistence — see Roadmap.)*"
@@ -1165,14 +1166,14 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
     else:
         a("- Skipped (scale < 100k smoke). 2k pytest covers 50-pair brute-force.")
     a("")
-    a("## Comparison vs marketplace pain points")
+    a("## Comparison vs reported pain points")
     a("")
-    a("**CONTEXT — not apples-to-apples.** Marketplace numbers are their")
-    a("reported production pain (different hardware, networked 14-shard")
-    a("search, real OpenAI 1536-dim vectors). Ours are a local embedded")
+    a("**CONTEXT — not apples-to-apples.** Reference numbers come from a")
+    a("reported production workload (different hardware, networked multi-shard")
+    a("search, real high-dim vectors). Ours are a local embedded")
     a("process on the machine above, synthetic hash-chain embeddings.")
     a("")
-    a("| Path | Marketplace (reported) | mushroomdb this run |")
+    a("| Path | Reported (production) | mushroomdb this run |")
     a("|---|---|---|")
     big3_note = (
         f"p50={_fmt_s(big3.get('p50_s', float('nan')))} "

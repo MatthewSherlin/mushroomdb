@@ -132,7 +132,7 @@ rules are not included in the benchmark workloads for this reason.
 
 #### Scale vs. production
 
-The default benchmark scale is 10k nodes.  The marketplace production dataset
+The default benchmark scale is 10k nodes.  The representative matching dataset
 is 70k+ Talent, 20k+ Company.  Numbers do not extrapolate linearly for
 O(n²) workloads (rule backfill, certain Cypher patterns).  Always re-run at
 production scale before drawing conclusions.

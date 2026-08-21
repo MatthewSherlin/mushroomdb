@@ -32,10 +32,9 @@ One-line positioning: *"The embedded graph database that builds itself."*
 
 ### Primary user / dogfood target
 
-Matthew's existing graph workloads (talent-backend Neo4j pipeline; marketplace-app
-association graph). Current pain: 5+ second neighborhood queries, hand-built batch
-edge-scoring scripts, UI unusable beyond ~40 nodes. These workloads are worked
-examples only — see the Generality Guarantee.
+A people-organization-posting matching workload. Current pain: 5+ second neighborhood
+queries, hand-built batch edge-scoring scripts, UI unusable beyond ~40 nodes. This
+workload is a worked example only — see the Generality Guarantee.
 
 ## 2. Generality Guarantee
 

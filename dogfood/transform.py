@@ -1,9 +1,8 @@
 """ListingsHub listing JSON → flat mushroomdb node dicts.
 
-Field semantics mirror marketplace `listingshub_transformers.py` (talent / company /
-opportunity flattening) without porting that module. Specialty merge, geo
-`[lat, lon]`, and size-bucketization are the dogfood adaptations called out
-in Plan 10 Task 1.
+Field semantics follow the representative workload schema (talent / company /
+opportunity flattening). Specialty merge, geo `[lat, lon]`, and
+size-bucketization are the fixture adaptations for the matching workload.
 
 Embeddings are synthetic (fixtures carry none): a deterministic 1536-dim
 unit vector per Talent/Company, hashed from a fixed seed + industry with

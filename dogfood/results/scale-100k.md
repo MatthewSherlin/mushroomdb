@@ -1,4 +1,4 @@
-# Scale run — marketplace dogfood (100k protocol)
+# Scale run — representative matching workload (100k protocol)
 
 ## Machine / date
 
@@ -13,9 +13,10 @@
 
 Peak RSS is `resource.ru_maxrss` (process-lifetime, Darwin bytes).
 Current RSS is `ps -o rss=` after the phase. Bindings are embedded Rust
-via `mushroomdb.GraphDb` — not HTTP. Numbers are labeled **not
-apples-to-apples** vs the marketplace production stack (different
-hardware, no network, synthetic embeddings).
+via `mushroomdb.GraphDb` — not HTTP. This is a representative matching
+workload (Talent / Company / Job nodes) with **synthetic hash-chain
+embeddings**; numbers are not apples-to-apples with any specific
+production deployment (different hardware, no network, real embeddings).
 
 ## Phase timings
 
@@ -91,7 +92,7 @@ new rule instance that may reach high-fanout at production scale.
 - **Big-3 full-graph (n=50):** p50=3.3 µs p95=9.9 µs ; mean intersection=0.0
   *(Full-graph Big-3 intersection empty: 1M cap at 70k×20k = 0.07% pair coverage; random talent sample misses the covered slice. This is cap-coverage semantics, not an engine defect. See Big-3 slice below.)*
 - **Big-3 slice (500T×500C metro/industry, n=50):** p50=772.5 µs p95=1.19 ms ; mean intersection=500.0
-  *(Answers marketplace 5-second question in a focused bucket. first_ia=500 first_sm=500 first_lf=500 first_intersection=500. Full-graph coverage awaits derived-edge persistence — see Roadmap.)*
+  *(Answers the 5-second latency question in a focused bucket. first_ia=500 first_sm=500 first_lf=500 first_intersection=500. Full-graph coverage awaits derived-edge persistence — see Roadmap.)*
 - **explain (n=100):** p50=59.9 µs p95=222.1 µs
 
 ## Reopen (cold-start)
@@ -122,14 +123,14 @@ in V5). The text above supersedes any prior description of snapshot behavior in 
 
 - 1k-node industry_alignment exact-set compare: **ok** (expected=58100 got=58100)
 
-## Comparison vs marketplace pain points
+## Comparison vs reported pain points
 
-**CONTEXT — not apples-to-apples.** Marketplace numbers are their
-reported production pain (different hardware, networked 14-shard
-search, real OpenAI 1536-dim vectors). Ours are a local embedded
-process on the machine above, synthetic hash-chain embeddings.
+**CONTEXT — not apples-to-apples.** Reference numbers come from a
+reported production workload (different hardware, networked multi-shard
+search, real high-dim vectors). Ours are a local embedded process on
+the machine above, synthetic hash-chain embeddings.
 
-| Path | Marketplace (reported) | mushroomdb this run |
+| Path | Reported (production) | mushroomdb this run |
 |---|---|---|
 | Talent→Company matcher (Big-3) | 5+ second queries | p50=3.3 µs p95=9.9 µs mean_matches=0.0 — intersection empty (matcher rules not live at this scale) |
 | Search fan-out | 14 sharded Meilisearch indices + in-memory merge | derived-edge `neighbors` on declared rules |
