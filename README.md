@@ -246,7 +246,7 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Limitation | Detail |
 |---|---|
 | Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
-| Cold start without a snapshot re-fires all rules | Snapshots (V4) persist derived edges and IVF state — opening from a snapshot skips re-derivation (11.15 s at 100k nodes vs 8.86 min from WAL alone). Call `snapshot()` before close; a WAL-only open still re-derives everything. Snapshot write costs ~36 s at 100k. |
+| Cold start without a snapshot re-fires all rules | Snapshots (V4) persist derived edges and IVF state — opening from a snapshot skips re-derivation (10.5 s at 100k nodes vs 8.86 min from WAL alone). Call `snapshot()` before close; a WAL-only open still re-derives everything. Snapshot write costs ~36 s at 100k. |
 | Approximate vector mode is opt-in | `approximate: true` enables IVF-Flat candidate selection. Per-query recall ≥ 0.90 quiesced; ≥ 0.85 post-rebuild. Review the recall trade-off before using it in completeness-critical workloads. |
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is on the roadmap. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |

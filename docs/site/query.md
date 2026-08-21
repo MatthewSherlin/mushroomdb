@@ -540,14 +540,18 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | `UNWIND scalar` (non-list value) | `execute: UNWIND requires a list; got … value for …` |
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH (found …)` |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
-| `shortestPath` with minimum hop > 1 | `parse error: expected RETURN (found Comma)` (comma-sep MATCH not supported) |
+| `shortestPath` with endpoints bound via comma-sep `MATCH (a), (b)` | `parse error: unexpected tokens after CREATE pattern (found Comma)` — comma-separated MATCH is not supported; use sequential `MATCH (a) MATCH (b)` forms |
 | Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round` |
 | `$param` referenced but not supplied | `execute: missing parameter …` |
 | `WHERE … IS NULL / IS NOT NULL` | `parse error: expected comparison operator (found Ident("IS"))` |
+| `+` or `/` in any expression position | `lex: illegal character '+' at position …` (or `'/'`); the lexer does not emit these tokens |
 
 ### Absent
 
-Forms not tested (outside scope of v1 implementation). All untested forms are expected to produce parse errors (unexpected token) rather than silently misbehave, but behavior is not guaranteed.
+Forms not implemented and not tested. Behavior is not guaranteed — these may produce an
+unexpected-token parse error or other unspecified result. `-` and `*` arithmetic are **not**
+absent: they are supported inside function arguments (see Supported table). `+` and `/` are
+**not** absent: they produce a confirmed named lex error (see Named-error table).
 
 | Form |
 |---|
@@ -557,7 +561,6 @@ Forms not tested (outside scope of v1 implementation). All untested forms are ex
 | `EXISTS { … }` subquery predicate |
 | `CALL` procedure invocations |
 | Schema operations (`CREATE INDEX`, `CREATE CONSTRAINT`) |
-| `+` and `/` arithmetic (lexer does not emit `+` or `/` tokens) |
 
 ---
 

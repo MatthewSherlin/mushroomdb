@@ -1385,6 +1385,69 @@ fn fn_round_null_propagation() {
     assert_eq!(get_val(&rs, 0, "round(n.missing)"), None);
 }
 
+/// Regression: abs(n.age - 27) — BinArith in function argument (Dash token inside func call).
+/// Before the fix, the parser rejected this with "expected ')' to close function call (found Dash)".
+#[test]
+fn fn_abs_binarith_sub_arg() {
+    let dir = tmp("fn_abs_binarith");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Ba", "x", vec![("age".into(), Value::Int(30))]);
+        batch.commit().unwrap();
+    }
+    // abs(n.age - 27) => abs(30 - 27) => abs(3) => 3
+    let rs = db.query("MATCH (n:Ba) RETURN abs(n.age - 27)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "abs(<arith>)"), Some(Value::Int(3)));
+}
+
+/// Regression: round(n.score * 1.5) — BinArith with Star token inside function argument.
+/// Before the fix, the parser rejected this with "expected ')' to close function call (found Star)".
+#[test]
+fn fn_round_binarith_mul_arg() {
+    let dir = tmp("fn_round_binarith");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("Br", "x", vec![("score".into(), Value::Float(2.0))]);
+        batch.commit().unwrap();
+    }
+    // round(n.score * 1.5) => round(2.0 * 1.5) => round(3.0) => 3.0
+    let rs = db.query("MATCH (n:Br) RETURN round(n.score * 1.5)", &BTreeMap::new()).unwrap();
+    assert_eq!(get_val(&rs, 0, "round(<arith>)"), Some(Value::Float(3.0)));
+}
+
+/// Regression: OPTIONAL MATCH null-binding property access.
+/// Before the fix, accessing b.name when b is null from OPTIONAL MATCH returned
+/// "execute: unbound variable `b`" instead of propagating null.
+#[test]
+fn optional_match_null_property_access() {
+    let dir = tmp("optional_null_prop");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        // Anchor node with no outgoing KNOWS edges — OPTIONAL MATCH will find nothing.
+        batch.insert_node("ONP", "solo", vec![("name".into(), Value::Str("Solo".into()))]);
+        batch.commit().unwrap();
+    }
+    // b is null (no KNOWS edge), so b.name must be null (not an error).
+    let rs = db.query(
+        "MATCH (a:ONP) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a.name, b.name",
+        &BTreeMap::new(),
+    ).unwrap();
+    assert_eq!(rs.len(), 1, "one outer row must survive OPTIONAL MATCH miss");
+    assert_eq!(
+        get_val(&rs, 0, "a.name"),
+        Some(Value::Str("Solo".into())),
+        "outer node property must be accessible"
+    );
+    assert_eq!(
+        get_val(&rs, 0, "b.name"),
+        None,
+        "null-binding property access must propagate null, not error"
+    );
+}
+
 #[test]
 fn fn_unknown_function_error() {
     let dir = tmp("fn_unknown");
