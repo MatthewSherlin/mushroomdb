@@ -20,7 +20,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use core_api::{is_write_query, json_to_rows, AutoFk, Dir, GraphError, IngestOptions, RuleDef, RuleSuggestion, SharedDb};
+use core_api::{is_write_query, json_to_rows, AutoFk, Dir, GraphError, IngestOptions, RuleDef, SuggestConfig, SharedDb, SUGGEST_DEFAULT_SEED};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -357,9 +357,27 @@ async fn ingest(State(state): State<AppState>, Json(body): Json<Js>) -> Response
     }
 }
 
+/// `GET /suggest` — profile the database and return rule suggestions.
+///
+/// # Locking and blocking strategy
+///
+/// `suggest_rules_with_config` is CPU-intensive and synchronous. Running it on a
+/// Tokio worker thread would starve the executor. This handler offloads the work to
+/// `tokio::task::spawn_blocking`, which uses the blocking thread-pool. The
+/// `std::sync::RwLock` read guard is acquired and held inside the blocking task —
+/// reads don't block other reads; writes wait for the guard to drop. The global
+/// budget (`SuggestConfig::global_budget_ms`, default 5 s) caps lock-hold time.
 async fn suggest(State(state): State<AppState>) -> Response {
-    let suggestions: Vec<RuleSuggestion> = state.db.read().suggest_rules();
-    json_ok(serde_json::to_value(&suggestions).unwrap_or(Js::Array(vec![])))
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || {
+        let config = SuggestConfig::default();
+        db.read().suggest_rules_with_config(&config, SUGGEST_DEFAULT_SEED)
+    })
+    .await
+    {
+        Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+        Err(_) => err_response("suggest task panicked"),
+    }
 }
 
 async fn create_rule(State(state): State<AppState>, Json(body): Json<Js>) -> Response {

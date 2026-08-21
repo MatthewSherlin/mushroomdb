@@ -8,7 +8,7 @@
 ///   (c) FieldEqual:    category (low card, shared values) |  model (only in Product)
 ///   (d) NumericWithin: score ranges overlap               |  weight ranges don't overlap
 ///   (e) VectorSimilar: embedding dim-4 matches            |  emb_short dim mismatch (2 vs 3)
-use core_api::{GraphDb, Predicate, RuleDef, RuleSuggestion, SuggestConfig, Value, SUGGEST_DEFAULT_SEED};
+use core_api::{GraphDb, Predicate, RuleDef, RuleSuggestion, SuggestConfig, SuggestReport, Value, SUGGEST_DEFAULT_SEED};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -197,20 +197,18 @@ fn keymatches_true_positive_and_near_miss() {
 }
 
 #[test]
-fn keymatch_est_edges_within_tolerance() {
+fn keymatch_est_edges_exact_when_fully_sampled() {
+    // With 3 Product nodes and max_sample_sources=200, all 3 are sampled.
+    // True count: p1→s1, p2→s2, p3→s1 = 3 edges.
+    // Formula: hit_rate = 3/(3×2) = 0.5; est = 0.5×3×2 = 3.0 → exact.
     let dir = build_fixture("km-est");
     let db = GraphDb::open(&dir).unwrap();
     let suggestions = db.suggest_rules_seeded(SUGGEST_DEFAULT_SEED);
     let s = find_km(&suggestions, "Product", "Supplier", "supplier_id");
-    // True count: p1→s1, p2→s2, p3→s1 = 3 edges.
-    let true_count = 3u64;
-    let tolerance = true_count; // 100 % of true count is generous but stable
-    assert!(
-        s.est_edges > 0 && s.est_edges <= true_count + tolerance,
-        "est_edges={} should be within [{}, {}]",
-        s.est_edges,
-        1,
-        true_count + tolerance,
+    assert_eq!(
+        s.est_edges, 3,
+        "all 3 sources sampled → est_edges must exactly equal true count 3, got {}",
+        s.est_edges
     );
 }
 
@@ -348,8 +346,24 @@ fn determinism_same_seed_identical_output() {
         "same seed should return same number of suggestions"
     );
     for (a, b) in r1.iter().zip(r2.iter()) {
-        assert_eq!(a.def.name, b.def.name, "suggestion order/name must match");
-        assert_eq!(a.est_edges, b.est_edges, "est_edges must match for same seed");
+        assert_eq!(a.def.name, b.def.name, "def.name must be identical");
+        assert_eq!(a.est_edges, b.est_edges, "est_edges must be identical");
+        assert_eq!(a.rationale, b.rationale, "rationale must be identical (same seed)");
+        assert_eq!(
+            a.examples.len(),
+            b.examples.len(),
+            "example count must be identical"
+        );
+        for ((src1, dst1, score1), (src2, dst2, score2)) in
+            a.examples.iter().zip(b.examples.iter())
+        {
+            assert_eq!(src1, src2, "example src must be identical");
+            assert_eq!(dst1, dst2, "example dst must be identical");
+            assert!(
+                (score1 - score2).abs() < 1e-12,
+                "example score must be identical: {score1} vs {score2}"
+            );
+        }
     }
 }
 
@@ -368,21 +382,57 @@ fn different_seeds_may_differ() {
 }
 
 #[test]
-fn time_budget_structural_does_not_hang() {
-    // Use a 1 ms budget — the function must return quickly and not panic.
-    let dir = build_fixture("budget");
+fn time_budget_per_candidate_does_not_hang() {
+    // per-candidate budget=1 ms — must return quickly, not panic.
+    let dir = build_fixture("budget-pc");
     let db = GraphDb::open(&dir).unwrap();
-
     let config = SuggestConfig {
         budget_ms: 1,
         ..SuggestConfig::default()
     };
     let start = Instant::now();
     let _ = db.suggest_rules_with_config(&config, SUGGEST_DEFAULT_SEED);
-    let elapsed = start.elapsed();
+    assert!(start.elapsed().as_secs() < 30, "suggest hung");
+}
+
+#[test]
+fn global_budget_fires_and_sets_truncated() {
+    // Non-vacuous: the fixture produces multiple suggestions with the full budget.
+    // With global_budget_ms=0 the deadline fires before the first preview, so we get
+    // truncated=true and fewer suggestions than the full run.
+    //
+    // Removing the `if Instant::now() >= global_deadline { truncated = true; break 'detect; }`
+    // lines from suggest.rs would leave truncated=false and suggestions.len() equal to the full
+    // run's count — both assertions below would then fail.
+    let dir = build_fixture("budget-global");
+    let db = GraphDb::open(&dir).unwrap();
+
+    // Full run must produce at least one suggestion from this fixture.
+    let full: SuggestReport =
+        db.suggest_rules_with_config(&SuggestConfig::default(), SUGGEST_DEFAULT_SEED);
     assert!(
-        elapsed.as_secs() < 30,
-        "suggest_rules_with_config hung for {elapsed:?}"
+        !full.suggestions.is_empty(),
+        "fixture must produce suggestions with full budget"
+    );
+    assert!(!full.truncated, "full budget must not set truncated");
+
+    // Zero global budget must truncate immediately.
+    let config_zero = SuggestConfig {
+        global_budget_ms: 0,
+        ..SuggestConfig::default()
+    };
+    let partial: SuggestReport =
+        db.suggest_rules_with_config(&config_zero, SUGGEST_DEFAULT_SEED);
+    assert!(
+        partial.truncated,
+        "global_budget_ms=0 must set truncated=true; got truncated={}",
+        partial.truncated
+    );
+    assert!(
+        partial.suggestions.len() < full.suggestions.len(),
+        "partial run must have fewer suggestions than full run: {} vs {}",
+        partial.suggestions.len(),
+        full.suggestions.len()
     );
 }
 
@@ -392,6 +442,7 @@ fn time_budget_zero_no_panic() {
     let db = GraphDb::open(&dir).unwrap();
     let config = SuggestConfig {
         budget_ms: 0,
+        global_budget_ms: 0,
         ..SuggestConfig::default()
     };
     // Must not panic; results may be empty.

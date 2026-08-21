@@ -36,6 +36,14 @@ pub struct SuggestConfig {
     pub max_examples: usize,
     /// Per-candidate preview time budget in milliseconds.
     pub budget_ms: u64,
+    /// Global time budget across all candidates in milliseconds.
+    ///
+    /// When elapsed time exceeds this value before a candidate's preview begins,
+    /// generation stops and [`SuggestReport::truncated`] is set to `true`.
+    /// Partial results are returned. The lock is held for at most this long
+    /// (plus profiling time, which is fast). Set to `0` to truncate immediately
+    /// after profiling (useful for tests).
+    pub global_budget_ms: u64,
 }
 
 impl Default for SuggestConfig {
@@ -45,8 +53,20 @@ impl Default for SuggestConfig {
             max_sample_sources: 200,
             max_examples: 3,
             budget_ms: 250,
+            global_budget_ms: 5_000,
         }
     }
+}
+
+/// Result of [`suggest_rules`]. Carries the candidate list and a flag indicating
+/// whether the global budget fired before all candidates were evaluated.
+#[derive(Debug, Clone, Serialize)]
+pub struct SuggestReport {
+    /// Proposed rules, sorted by `est_edges` descending.
+    pub suggestions: Vec<RuleSuggestion>,
+    /// `true` if the global time budget (`SuggestConfig::global_budget_ms`) caused
+    /// early termination. Partial results are still returned.
+    pub truncated: bool,
 }
 
 /// One suggested rule with estimated edge count, example pairs, and rationale.
@@ -331,8 +351,11 @@ fn run_preview(
 /// - `config` — tuning parameters. Use [`SuggestConfig::default()`] for the standard settings.
 /// - `seed` — seed for deterministic sampling. Use [`DEFAULT_SEED`] for the stable default.
 ///
-/// Returns a `Vec` sorted by `est_edges` descending. Never panics on an empty or
-/// degenerate database — returns an empty `Vec` instead.
+/// Returns a [`SuggestReport`] sorted by `est_edges` descending. Never panics on an empty or
+/// degenerate database — returns an empty report instead.
+///
+/// The global budget (`config.global_budget_ms`) caps total wall time. When it fires,
+/// `report.truncated` is `true` and partial results are returned.
 pub fn suggest_rules(
     label_nodes: &BTreeMap<String, Vec<(u32, String)>>,
     get_prop: &dyn Fn(u32, &str) -> Option<Value>,
@@ -340,10 +363,13 @@ pub fn suggest_rules(
     existing: &[RuleDef],
     config: &SuggestConfig,
     seed: u64,
-) -> Vec<RuleSuggestion> {
+) -> SuggestReport {
     if label_nodes.is_empty() || all_fields.is_empty() {
-        return Vec::new();
+        return SuggestReport { suggestions: Vec::new(), truncated: false };
     }
+
+    let global_deadline =
+        Instant::now() + Duration::from_millis(config.global_budget_ms);
 
     // Build key sets per label for KeyMatch detection.
     let label_keys: BTreeMap<&str, BTreeSet<&str>> = label_nodes
@@ -367,435 +393,469 @@ pub fn suggest_rules(
 
     let labels: Vec<&str> = label_nodes.keys().map(String::as_str).collect();
     let mut results: Vec<RuleSuggestion> = Vec::new();
+    let mut truncated = false;
 
-    // -----------------------------------------------------------------------
-    // (a) KeyMatch: _id-suffix fields matching another label's keys
-    // -----------------------------------------------------------------------
-    for src_label in &labels {
-        let Some(src_profile) = profiles.get(*src_label) else {
-            continue;
-        };
-        let src_nodes = &label_nodes[*src_label];
-
-        for (field, fp) in src_profile {
-            if !field.ends_with("_id") || fp.str_distinct.is_empty() {
-                continue;
-            }
-            for dst_label in &labels {
-                let Some(dst_keys) = label_keys.get(dst_label) else {
-                    continue;
-                };
-                let match_count = fp.str_distinct.iter().filter(|v| dst_keys.contains(v.as_str())).count();
-                if match_count == 0 {
-                    continue;
-                }
-                let pred = Predicate::KeyMatch {
-                    field: field.clone(),
-                };
-                if is_covered(existing, src_label, dst_label, &pred) {
-                    continue;
-                }
-                let base = field.trim_end_matches("_id").to_uppercase();
-                let name = format!(
-                    "suggest_km_{}_{}_{field}",
-                    src_label.to_lowercase(),
-                    dst_label.to_lowercase(),
-                );
-                let def = RuleDef {
-                    name,
-                    src_label: src_label.to_string(),
-                    dst_label: dst_label.to_string(),
-                    predicate: pred,
-                    edge_type: format!("{base}_OF"),
-                    weight_prop: None,
-                    max_edges: None,
-                    approximate: false,
-                };
-                let examples_preview: Vec<String> =
-                    fp.str_distinct.iter().filter(|v| dst_keys.contains(v.as_str())).take(3).cloned().collect();
-                let rationale = format!(
-                    "Field '{field}' in {src_label} ends with '_id' and {match_count} \
-                     sampled value(s) match keys in {dst_label} \
-                     (e.g. {}). Suggests a foreign-key relationship.",
-                    examples_preview.join(", ")
-                );
-                let preview =
-                    run_preview(&def, src_nodes, &label_nodes[*dst_label], get_prop, config);
-                results.push(RuleSuggestion {
-                    def,
-                    est_edges: preview.est_edges,
-                    examples: preview.examples,
-                    rationale,
-                });
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // (b) Overlap: list-field cross-label Jaccard ≥ p50
-    // -----------------------------------------------------------------------
-    for (si, src_label) in labels.iter().enumerate() {
-        let Some(src_profile) = profiles.get(*src_label) else {
-            continue;
-        };
-        let src_nodes = &label_nodes[*src_label];
-
-        for (di, dst_label) in labels.iter().enumerate() {
-            if di < si {
-                continue; // process each (unordered) pair once
-            }
-            let Some(dst_profile) = profiles.get(*dst_label) else {
+    // All candidate-generation is wrapped in a labeled block so any detector
+    // can break out early when the global deadline fires.
+    'detect: {
+        // -----------------------------------------------------------------------
+        // (a) KeyMatch: _id-suffix fields matching another label's keys
+        // -----------------------------------------------------------------------
+        for src_label in &labels {
+            let Some(src_profile) = profiles.get(*src_label) else {
                 continue;
             };
-            let dst_nodes = &label_nodes[*dst_label];
+            let src_nodes = &label_nodes[*src_label];
 
-            for field in all_fields {
-                let Some(src_fp) = src_profile.get(field) else {
-                    continue;
-                };
-                let Some(dst_fp) = dst_profile.get(field) else {
-                    continue;
-                };
-                if src_fp.list_tokens.is_empty() || dst_fp.list_tokens.is_empty() {
+            for (field, fp) in src_profile {
+                if !field.ends_with("_id") || fp.str_distinct.is_empty() {
                     continue;
                 }
-
-                // Sample Jaccard values from the profiled token sets.
-                let n_src_toks = src_fp.list_tokens.len();
-                let n_dst_toks = dst_fp.list_tokens.len();
-                let n_pairs = 200.min(n_src_toks * n_dst_toks);
-                let mut rng = seed
-                    .wrapping_add(0xAB_CD_EF_01u64)
-                    .wrapping_add(si as u64 * 0x1111)
-                    .wrapping_add(di as u64 * 0x2222)
-                    .wrapping_add(field.len() as u64 * 0x3333);
-
-                let mut jaccards: Vec<f64> = Vec::with_capacity(n_pairs);
-                for _ in 0..n_pairs {
-                    let si2 = lcg_step(&mut rng) as usize % n_src_toks;
-                    let di2 = lcg_step(&mut rng) as usize % n_dst_toks;
-                    let (_, src_toks) = &src_fp.list_tokens[si2];
-                    let (_, dst_toks) = &dst_fp.list_tokens[di2];
-                    let inter = src_toks.intersection(dst_toks).count();
-                    let union = src_toks.union(dst_toks).count();
-                    if union > 0 {
-                        jaccards.push(inter as f64 / union as f64);
+                for dst_label in &labels {
+                    let Some(dst_keys) = label_keys.get(dst_label) else {
+                        continue;
+                    };
+                    let match_count = fp.str_distinct.iter().filter(|v| dst_keys.contains(v.as_str())).count();
+                    if match_count == 0 {
+                        continue;
                     }
-                }
-
-                if jaccards.is_empty() {
-                    continue;
-                }
-                jaccards.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let p50 = jaccards[jaccards.len() / 2];
-                if p50 <= 0.0 {
-                    continue;
-                }
-
-                let min_val = ((p50 * 100.0).round() / 100.0).clamp(0.01, 1.0);
-                let pred = Predicate::Overlap {
-                    field: field.clone(),
-                    min: min_val,
-                };
-                if is_covered(existing, src_label, dst_label, &pred) {
-                    continue;
-                }
-
-                let name = format!(
-                    "suggest_ov_{}_{}_{field}",
-                    src_label.to_lowercase(),
-                    dst_label.to_lowercase(),
-                );
-                let def = RuleDef {
-                    name,
-                    src_label: src_label.to_string(),
-                    dst_label: dst_label.to_string(),
-                    predicate: pred,
-                    edge_type: format!("OVERLAPS_{}", field.to_uppercase()),
-                    weight_prop: Some("score".into()),
-                    max_edges: None,
-                    approximate: false,
-                };
-                let rationale = format!(
-                    "Field '{field}' is a token list in both {src_label} and {dst_label}. \
-                     Sampled Jaccard p50={p50:.2}; using that as the minimum threshold \
-                     (min={min_val:.2}). Lists share common tokens suggesting semantic affinity."
-                );
-                let preview = run_preview(&def, src_nodes, dst_nodes, get_prop, config);
-                results.push(RuleSuggestion {
-                    def,
-                    est_edges: preview.est_edges,
-                    examples: preview.examples,
-                    rationale,
-                });
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // (c) FieldEqual: low-cardinality string fields with shared values
-    // -----------------------------------------------------------------------
-    for (si, src_label) in labels.iter().enumerate() {
-        let Some(src_profile) = profiles.get(*src_label) else {
-            continue;
-        };
-        let src_nodes = &label_nodes[*src_label];
-
-        for (di, dst_label) in labels.iter().enumerate() {
-            if di < si {
-                continue;
-            }
-            let Some(dst_profile) = profiles.get(*dst_label) else {
-                continue;
-            };
-            let dst_nodes = &label_nodes[*dst_label];
-
-            for field in all_fields {
-                let Some(src_fp) = src_profile.get(field) else {
-                    continue;
-                };
-                let Some(dst_fp) = dst_profile.get(field) else {
-                    continue;
-                };
-                if src_fp.str_distinct.is_empty() || dst_fp.str_distinct.is_empty() {
-                    continue;
-                }
-                if src_fp.str_distinct.len() > LOW_CARDINALITY_MAX
-                    || dst_fp.str_distinct.len() > LOW_CARDINALITY_MAX
-                {
-                    continue;
-                }
-                let shared = src_fp.str_distinct.intersection(&dst_fp.str_distinct).count();
-                if shared == 0 {
-                    continue;
-                }
-
-                let pred = Predicate::FieldEqual {
-                    field: field.clone(),
-                };
-                if is_covered(existing, src_label, dst_label, &pred) {
-                    continue;
-                }
-
-                let name = format!(
-                    "suggest_fe_{}_{}_{field}",
-                    src_label.to_lowercase(),
-                    dst_label.to_lowercase(),
-                );
-                let def = RuleDef {
-                    name,
-                    src_label: src_label.to_string(),
-                    dst_label: dst_label.to_string(),
-                    predicate: pred,
-                    edge_type: format!("SAME_{}", field.to_uppercase()),
-                    weight_prop: None,
-                    max_edges: None,
-                    approximate: false,
-                };
-                let rationale = format!(
-                    "Field '{field}' has low cardinality in {src_label} \
-                     ({} distinct value(s)) and {dst_label} ({} distinct value(s)), \
-                     with {shared} shared value(s). Suggests a categorical grouping predicate.",
-                    src_fp.str_distinct.len(),
-                    dst_fp.str_distinct.len(),
-                );
-                let preview = run_preview(&def, src_nodes, dst_nodes, get_prop, config);
-                results.push(RuleSuggestion {
-                    def,
-                    est_edges: preview.est_edges,
-                    examples: preview.examples,
-                    rationale,
-                });
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // (d) NumericWithin: overlapping numeric ranges → tolerance from spread
-    // -----------------------------------------------------------------------
-    for (si, src_label) in labels.iter().enumerate() {
-        let Some(src_profile) = profiles.get(*src_label) else {
-            continue;
-        };
-        let src_nodes = &label_nodes[*src_label];
-
-        for (di, dst_label) in labels.iter().enumerate() {
-            if di < si {
-                continue;
-            }
-            let Some(dst_profile) = profiles.get(*dst_label) else {
-                continue;
-            };
-            let dst_nodes = &label_nodes[*dst_label];
-
-            for field in all_fields {
-                let Some(src_fp) = src_profile.get(field) else {
-                    continue;
-                };
-                let Some(dst_fp) = dst_profile.get(field) else {
-                    continue;
-                };
-                if src_fp.numeric_vals.is_empty() || dst_fp.numeric_vals.is_empty() {
-                    continue;
-                }
-
-                let src_min = src_fp
-                    .numeric_vals
-                    .iter()
-                    .cloned()
-                    .fold(f64::INFINITY, f64::min);
-                let src_max = src_fp
-                    .numeric_vals
-                    .iter()
-                    .cloned()
-                    .fold(f64::NEG_INFINITY, f64::max);
-                let dst_min = dst_fp
-                    .numeric_vals
-                    .iter()
-                    .cloned()
-                    .fold(f64::INFINITY, f64::min);
-                let dst_max = dst_fp
-                    .numeric_vals
-                    .iter()
-                    .cloned()
-                    .fold(f64::NEG_INFINITY, f64::max);
-
-                // Check range overlap.
-                if src_max < dst_min || dst_max < src_min {
-                    continue;
-                }
-
-                let combined_min = src_min.min(dst_min);
-                let combined_max = src_max.max(dst_max);
-                let spread = combined_max - combined_min;
-                if !spread.is_finite() || spread <= 0.0 {
-                    continue;
-                }
-                // Tolerance = spread / 4, minimum 1.0 so exact-match rules are avoided.
-                let tolerance = (spread / 4.0).max(1.0);
-
-                let pred = Predicate::NumericWithin {
-                    field: field.clone(),
-                    tolerance,
-                };
-                if is_covered(existing, src_label, dst_label, &pred) {
-                    continue;
-                }
-
-                let name = format!(
-                    "suggest_nw_{}_{}_{field}",
-                    src_label.to_lowercase(),
-                    dst_label.to_lowercase(),
-                );
-                let def = RuleDef {
-                    name,
-                    src_label: src_label.to_string(),
-                    dst_label: dst_label.to_string(),
-                    predicate: pred,
-                    edge_type: format!("NEAR_{}", field.to_uppercase()),
-                    weight_prop: Some("score".into()),
-                    max_edges: None,
-                    approximate: false,
-                };
-                let rationale = format!(
-                    "Field '{field}' is numeric in {src_label} (range [{src_min:.2}, {src_max:.2}]) \
-                     and {dst_label} (range [{dst_min:.2}, {dst_max:.2}]); ranges overlap. \
-                     Tolerance {tolerance:.2} derived from combined spread {spread:.2}."
-                );
-                let preview = run_preview(&def, src_nodes, dst_nodes, get_prop, config);
-                results.push(RuleSuggestion {
-                    def,
-                    est_edges: preview.est_edges,
-                    examples: preview.examples,
-                    rationale,
-                });
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // (e) VectorSimilar: equal-dim float arrays → cosine similarity
-    // -----------------------------------------------------------------------
-    for (si, src_label) in labels.iter().enumerate() {
-        let Some(src_profile) = profiles.get(*src_label) else {
-            continue;
-        };
-        let src_nodes = &label_nodes[*src_label];
-
-        for (di, dst_label) in labels.iter().enumerate() {
-            if di < si {
-                continue;
-            }
-            let Some(dst_profile) = profiles.get(*dst_label) else {
-                continue;
-            };
-            let dst_nodes = &label_nodes[*dst_label];
-
-            for field in all_fields {
-                let Some(src_fp) = src_profile.get(field) else {
-                    continue;
-                };
-                let Some(dst_fp) = dst_profile.get(field) else {
-                    continue;
-                };
-                if src_fp.vec_entries.is_empty() || dst_fp.vec_entries.is_empty() {
-                    continue;
-                }
-
-                let src_dim = dominant_dim(&src_fp.vec_entries);
-                let dst_dim = dominant_dim(&dst_fp.vec_entries);
-                let (Some(sdim), Some(ddim)) = (src_dim, dst_dim) else {
-                    continue;
-                };
-                if sdim != ddim || sdim == 0 {
-                    continue;
-                }
-
-                let approximate = dst_nodes.len() > VECTOR_APPROX_THRESHOLD;
-                let pred = Predicate::VectorSimilar {
-                    field: field.clone(),
-                    min: VECTOR_SIMILAR_MIN,
-                };
-                if is_covered(existing, src_label, dst_label, &pred) {
-                    continue;
-                }
-
-                let name = format!(
-                    "suggest_vs_{}_{}_{field}",
-                    src_label.to_lowercase(),
-                    dst_label.to_lowercase(),
-                );
-                let def = RuleDef {
-                    name,
-                    src_label: src_label.to_string(),
-                    dst_label: dst_label.to_string(),
-                    predicate: pred,
-                    edge_type: format!("SIMILAR_{}", field.to_uppercase()),
-                    weight_prop: Some("score".into()),
-                    max_edges: None,
-                    approximate,
-                };
-                let rationale = format!(
-                    "Field '{field}' is a float-array of dim {sdim} in both {src_label} \
-                     and {dst_label}. Suggests embedding-based similarity (min={VECTOR_SIMILAR_MIN}){}.",
-                    if approximate {
-                        ", approximate=true suggested (n>2000)"
-                    } else {
-                        ""
+                    let pred = Predicate::KeyMatch {
+                        field: field.clone(),
+                    };
+                    if is_covered(existing, src_label, dst_label, &pred) {
+                        continue;
                     }
-                );
-                let preview = run_preview(&def, src_nodes, dst_nodes, get_prop, config);
-                results.push(RuleSuggestion {
-                    def,
-                    est_edges: preview.est_edges,
-                    examples: preview.examples,
-                    rationale,
-                });
+                    // Global budget check before each preview.
+                    if Instant::now() >= global_deadline {
+                        truncated = true;
+                        break 'detect;
+                    }
+                    let base = field.trim_end_matches("_id").to_uppercase();
+                    let name = format!(
+                        "suggest_km_{}_{}_{field}",
+                        src_label.to_lowercase(),
+                        dst_label.to_lowercase(),
+                    );
+                    let def = RuleDef {
+                        name,
+                        src_label: src_label.to_string(),
+                        dst_label: dst_label.to_string(),
+                        predicate: pred,
+                        edge_type: format!("{base}_OF"),
+                        weight_prop: None,
+                        max_edges: None,
+                        approximate: false,
+                    };
+                    let examples_preview: Vec<String> =
+                        fp.str_distinct.iter().filter(|v| dst_keys.contains(v.as_str())).take(3).cloned().collect();
+                    let rationale = format!(
+                        "Field '{field}' in {src_label} ends with '_id' and {match_count} \
+                         sampled value(s) match keys in {dst_label} \
+                         (e.g. {}). Suggests a foreign-key relationship.",
+                        examples_preview.join(", ")
+                    );
+                    let preview =
+                        run_preview(&def, src_nodes, &label_nodes[*dst_label], get_prop, config);
+                    results.push(RuleSuggestion {
+                        def,
+                        est_edges: preview.est_edges,
+                        examples: preview.examples,
+                        rationale,
+                    });
+                }
             }
         }
-    }
+
+        // -----------------------------------------------------------------------
+        // (b) Overlap: list-field cross-label Jaccard ≥ p50
+        // -----------------------------------------------------------------------
+        for (si, src_label) in labels.iter().enumerate() {
+            let Some(src_profile) = profiles.get(*src_label) else {
+                continue;
+            };
+            let src_nodes = &label_nodes[*src_label];
+
+            for (di, dst_label) in labels.iter().enumerate() {
+                if di < si {
+                    continue; // process each (unordered) pair once
+                }
+                let Some(dst_profile) = profiles.get(*dst_label) else {
+                    continue;
+                };
+                let dst_nodes = &label_nodes[*dst_label];
+
+                for field in all_fields {
+                    let Some(src_fp) = src_profile.get(field) else {
+                        continue;
+                    };
+                    let Some(dst_fp) = dst_profile.get(field) else {
+                        continue;
+                    };
+                    if src_fp.list_tokens.is_empty() || dst_fp.list_tokens.is_empty() {
+                        continue;
+                    }
+
+                    // Sample Jaccard values from the profiled token sets.
+                    let n_src_toks = src_fp.list_tokens.len();
+                    let n_dst_toks = dst_fp.list_tokens.len();
+                    let n_pairs = 200.min(n_src_toks * n_dst_toks);
+                    let mut rng = seed
+                        .wrapping_add(0xAB_CD_EF_01u64)
+                        .wrapping_add(si as u64 * 0x1111)
+                        .wrapping_add(di as u64 * 0x2222)
+                        .wrapping_add(field.len() as u64 * 0x3333);
+
+                    let mut jaccards: Vec<f64> = Vec::with_capacity(n_pairs);
+                    for _ in 0..n_pairs {
+                        let si2 = lcg_step(&mut rng) as usize % n_src_toks;
+                        let di2 = lcg_step(&mut rng) as usize % n_dst_toks;
+                        let (_, src_toks) = &src_fp.list_tokens[si2];
+                        let (_, dst_toks) = &dst_fp.list_tokens[di2];
+                        let inter = src_toks.intersection(dst_toks).count();
+                        let union = src_toks.union(dst_toks).count();
+                        if union > 0 {
+                            jaccards.push(inter as f64 / union as f64);
+                        }
+                    }
+
+                    if jaccards.is_empty() {
+                        continue;
+                    }
+                    jaccards.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let p50 = jaccards[jaccards.len() / 2];
+                    if p50 <= 0.0 {
+                        continue;
+                    }
+
+                    let min_val = ((p50 * 100.0).round() / 100.0).clamp(0.01, 1.0);
+                    let pred = Predicate::Overlap {
+                        field: field.clone(),
+                        min: min_val,
+                    };
+                    if is_covered(existing, src_label, dst_label, &pred) {
+                        continue;
+                    }
+
+                    // Global budget check before each preview.
+                    if Instant::now() >= global_deadline {
+                        truncated = true;
+                        break 'detect;
+                    }
+
+                    let name = format!(
+                        "suggest_ov_{}_{}_{field}",
+                        src_label.to_lowercase(),
+                        dst_label.to_lowercase(),
+                    );
+                    let def = RuleDef {
+                        name,
+                        src_label: src_label.to_string(),
+                        dst_label: dst_label.to_string(),
+                        predicate: pred,
+                        edge_type: format!("OVERLAPS_{}", field.to_uppercase()),
+                        weight_prop: Some("score".into()),
+                        max_edges: None,
+                        approximate: false,
+                    };
+                    let rationale = format!(
+                        "Field '{field}' is a token list in both {src_label} and {dst_label}. \
+                         Sampled Jaccard p50={p50:.2}; using that as the minimum threshold \
+                         (min={min_val:.2}). Lists share common tokens suggesting semantic affinity."
+                    );
+                    let preview = run_preview(&def, src_nodes, dst_nodes, get_prop, config);
+                    results.push(RuleSuggestion {
+                        def,
+                        est_edges: preview.est_edges,
+                        examples: preview.examples,
+                        rationale,
+                    });
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // (c) FieldEqual: low-cardinality string fields with shared values
+        // -----------------------------------------------------------------------
+        for (si, src_label) in labels.iter().enumerate() {
+            let Some(src_profile) = profiles.get(*src_label) else {
+                continue;
+            };
+            let src_nodes = &label_nodes[*src_label];
+
+            for (di, dst_label) in labels.iter().enumerate() {
+                if di < si {
+                    continue;
+                }
+                let Some(dst_profile) = profiles.get(*dst_label) else {
+                    continue;
+                };
+                let dst_nodes = &label_nodes[*dst_label];
+
+                for field in all_fields {
+                    let Some(src_fp) = src_profile.get(field) else {
+                        continue;
+                    };
+                    let Some(dst_fp) = dst_profile.get(field) else {
+                        continue;
+                    };
+                    if src_fp.str_distinct.is_empty() || dst_fp.str_distinct.is_empty() {
+                        continue;
+                    }
+                    if src_fp.str_distinct.len() > LOW_CARDINALITY_MAX
+                        || dst_fp.str_distinct.len() > LOW_CARDINALITY_MAX
+                    {
+                        continue;
+                    }
+                    let shared = src_fp.str_distinct.intersection(&dst_fp.str_distinct).count();
+                    if shared == 0 {
+                        continue;
+                    }
+
+                    let pred = Predicate::FieldEqual {
+                        field: field.clone(),
+                    };
+                    if is_covered(existing, src_label, dst_label, &pred) {
+                        continue;
+                    }
+
+                    // Global budget check before each preview.
+                    if Instant::now() >= global_deadline {
+                        truncated = true;
+                        break 'detect;
+                    }
+
+                    let name = format!(
+                        "suggest_fe_{}_{}_{field}",
+                        src_label.to_lowercase(),
+                        dst_label.to_lowercase(),
+                    );
+                    let def = RuleDef {
+                        name,
+                        src_label: src_label.to_string(),
+                        dst_label: dst_label.to_string(),
+                        predicate: pred,
+                        edge_type: format!("SAME_{}", field.to_uppercase()),
+                        weight_prop: None,
+                        max_edges: None,
+                        approximate: false,
+                    };
+                    let rationale = format!(
+                        "Field '{field}' has low cardinality in {src_label} \
+                         ({} distinct value(s)) and {dst_label} ({} distinct value(s)), \
+                         with {shared} shared value(s). Suggests a categorical grouping predicate.",
+                        src_fp.str_distinct.len(),
+                        dst_fp.str_distinct.len(),
+                    );
+                    let preview = run_preview(&def, src_nodes, dst_nodes, get_prop, config);
+                    results.push(RuleSuggestion {
+                        def,
+                        est_edges: preview.est_edges,
+                        examples: preview.examples,
+                        rationale,
+                    });
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // (d) NumericWithin: overlapping numeric ranges → tolerance from spread
+        // -----------------------------------------------------------------------
+        for (si, src_label) in labels.iter().enumerate() {
+            let Some(src_profile) = profiles.get(*src_label) else {
+                continue;
+            };
+            let src_nodes = &label_nodes[*src_label];
+
+            for (di, dst_label) in labels.iter().enumerate() {
+                if di < si {
+                    continue;
+                }
+                let Some(dst_profile) = profiles.get(*dst_label) else {
+                    continue;
+                };
+                let dst_nodes = &label_nodes[*dst_label];
+
+                for field in all_fields {
+                    let Some(src_fp) = src_profile.get(field) else {
+                        continue;
+                    };
+                    let Some(dst_fp) = dst_profile.get(field) else {
+                        continue;
+                    };
+                    if src_fp.numeric_vals.is_empty() || dst_fp.numeric_vals.is_empty() {
+                        continue;
+                    }
+
+                    let src_min = src_fp
+                        .numeric_vals
+                        .iter()
+                        .cloned()
+                        .fold(f64::INFINITY, f64::min);
+                    let src_max = src_fp
+                        .numeric_vals
+                        .iter()
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let dst_min = dst_fp
+                        .numeric_vals
+                        .iter()
+                        .cloned()
+                        .fold(f64::INFINITY, f64::min);
+                    let dst_max = dst_fp
+                        .numeric_vals
+                        .iter()
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max);
+
+                    // Check range overlap.
+                    if src_max < dst_min || dst_max < src_min {
+                        continue;
+                    }
+
+                    let combined_min = src_min.min(dst_min);
+                    let combined_max = src_max.max(dst_max);
+                    let spread = combined_max - combined_min;
+                    if !spread.is_finite() || spread <= 0.0 {
+                        continue;
+                    }
+                    // Tolerance = spread / 4, minimum 1.0 so exact-match rules are avoided.
+                    let tolerance = (spread / 4.0).max(1.0);
+
+                    let pred = Predicate::NumericWithin {
+                        field: field.clone(),
+                        tolerance,
+                    };
+                    if is_covered(existing, src_label, dst_label, &pred) {
+                        continue;
+                    }
+
+                    // Global budget check before each preview.
+                    if Instant::now() >= global_deadline {
+                        truncated = true;
+                        break 'detect;
+                    }
+
+                    let name = format!(
+                        "suggest_nw_{}_{}_{field}",
+                        src_label.to_lowercase(),
+                        dst_label.to_lowercase(),
+                    );
+                    let def = RuleDef {
+                        name,
+                        src_label: src_label.to_string(),
+                        dst_label: dst_label.to_string(),
+                        predicate: pred,
+                        edge_type: format!("NEAR_{}", field.to_uppercase()),
+                        weight_prop: Some("score".into()),
+                        max_edges: None,
+                        approximate: false,
+                    };
+                    let rationale = format!(
+                        "Field '{field}' is numeric in {src_label} (range [{src_min:.2}, {src_max:.2}]) \
+                         and {dst_label} (range [{dst_min:.2}, {dst_max:.2}]); ranges overlap. \
+                         Tolerance {tolerance:.2} derived from combined spread {spread:.2}."
+                    );
+                    let preview = run_preview(&def, src_nodes, dst_nodes, get_prop, config);
+                    results.push(RuleSuggestion {
+                        def,
+                        est_edges: preview.est_edges,
+                        examples: preview.examples,
+                        rationale,
+                    });
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // (e) VectorSimilar: equal-dim float arrays → cosine similarity
+        // -----------------------------------------------------------------------
+        for (si, src_label) in labels.iter().enumerate() {
+            let Some(src_profile) = profiles.get(*src_label) else {
+                continue;
+            };
+            let src_nodes = &label_nodes[*src_label];
+
+            for (di, dst_label) in labels.iter().enumerate() {
+                if di < si {
+                    continue;
+                }
+                let Some(dst_profile) = profiles.get(*dst_label) else {
+                    continue;
+                };
+                let dst_nodes = &label_nodes[*dst_label];
+
+                for field in all_fields {
+                    let Some(src_fp) = src_profile.get(field) else {
+                        continue;
+                    };
+                    let Some(dst_fp) = dst_profile.get(field) else {
+                        continue;
+                    };
+                    if src_fp.vec_entries.is_empty() || dst_fp.vec_entries.is_empty() {
+                        continue;
+                    }
+
+                    let src_dim = dominant_dim(&src_fp.vec_entries);
+                    let dst_dim = dominant_dim(&dst_fp.vec_entries);
+                    let (Some(sdim), Some(ddim)) = (src_dim, dst_dim) else {
+                        continue;
+                    };
+                    if sdim != ddim || sdim == 0 {
+                        continue;
+                    }
+
+                    let approximate = dst_nodes.len() > VECTOR_APPROX_THRESHOLD;
+                    let pred = Predicate::VectorSimilar {
+                        field: field.clone(),
+                        min: VECTOR_SIMILAR_MIN,
+                    };
+                    if is_covered(existing, src_label, dst_label, &pred) {
+                        continue;
+                    }
+
+                    // Global budget check before each preview.
+                    if Instant::now() >= global_deadline {
+                        truncated = true;
+                        break 'detect;
+                    }
+
+                    let name = format!(
+                        "suggest_vs_{}_{}_{field}",
+                        src_label.to_lowercase(),
+                        dst_label.to_lowercase(),
+                    );
+                    let def = RuleDef {
+                        name,
+                        src_label: src_label.to_string(),
+                        dst_label: dst_label.to_string(),
+                        predicate: pred,
+                        edge_type: format!("SIMILAR_{}", field.to_uppercase()),
+                        weight_prop: Some("score".into()),
+                        max_edges: None,
+                        approximate,
+                    };
+                    let rationale = format!(
+                        "Field '{field}' is a float-array of dim {sdim} in both {src_label} \
+                         and {dst_label}. Suggests embedding-based similarity (min={VECTOR_SIMILAR_MIN}){}.",
+                        if approximate {
+                            ", approximate=true suggested (n>2000)"
+                        } else {
+                            ""
+                        }
+                    );
+                    let preview = run_preview(&def, src_nodes, dst_nodes, get_prop, config);
+                    results.push(RuleSuggestion {
+                        def,
+                        est_edges: preview.est_edges,
+                        examples: preview.examples,
+                        rationale,
+                    });
+                }
+            }
+        }
+    } // end 'detect block
 
     // Sort by estimated edge count descending so the highest-value suggestions come first.
     results.sort_by(|a, b| b.est_edges.cmp(&a.est_edges).then(a.def.name.cmp(&b.def.name)));
-    results
+    SuggestReport { suggestions: results, truncated }
 }

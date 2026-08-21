@@ -1674,18 +1674,19 @@ impl<F: Fs> GraphDb<F> {
     /// reproducibility. Same seed + same data = identical output.
     pub fn suggest_rules_seeded(&self, seed: u64) -> Vec<core_rules::RuleSuggestion> {
         self.suggest_rules_with_config(&core_rules::suggest::SuggestConfig::default(), seed)
+            .suggestions
     }
 
     /// [`suggest_rules_seeded`] with a fully custom [`SuggestConfig`].
     ///
-    /// Primary use: tests that need a tiny `budget_ms` to exercise the time-budget
-    /// structural enforcement without running the full 250 ms window.
-    #[doc(hidden)]
+    /// Returns a [`core_rules::SuggestReport`] that includes both the candidate list
+    /// and a `truncated` flag indicating whether the global budget fired before all
+    /// candidates were evaluated.
     pub fn suggest_rules_with_config(
         &self,
         config: &core_rules::suggest::SuggestConfig,
         seed: u64,
-    ) -> Vec<core_rules::RuleSuggestion> {
+    ) -> core_rules::SuggestReport {
         use std::collections::BTreeMap;
 
         // Collect (node_id, key) pairs per label, skipping tombstoned nodes.
