@@ -388,11 +388,60 @@ s = db.stats()
 db.snapshot()  # flush WAL and write a snapshot file
 ```
 
+### Atomic write batches (Rust API)
+
+`write_batch` is the closure-style entry point for atomic multi-op commits.
+All ops queued inside the closure are validated in order and committed as a
+single `WalRecord::Batch` frame (one fsync). Rules fire per op, in order.
+
+```rust
+let (nodes, edges) = db.write_batch(|b| {
+    b.insert_node("Person", "alice", vec![("age".into(), Value::Int(30))]);
+    b.insert_node("Person", "bob", vec![]);
+    b.insert_edge("KNOWS", "alice", "bob");
+    b.set_prop("alice", "role", Value::Str("admin".into()));
+    b.delete_node("old_key");
+})?;
+// nodes == 2, edges == 1; one fsync, crash-atomic
+```
+
+**Error semantics — validate-then-apply:** the closure queues ops without
+touching the database. `commit` validates every op before writing anything.
+If op N fails validation (duplicate key, unknown key, rule-owned edge) the
+entire batch is rejected: no WAL bytes written, no in-memory state changes.
+
+**Crash atomicity, not isolation:** on WAL replay after a crash, a torn
+`Batch` frame applies none of its ops. However, while applying a committed
+batch in memory, concurrent readers may observe intermediate states. There is
+no interactive transaction isolation in v1.
+
+The following ops are supported inside `write_batch`:
+
+| Method | Description |
+|---|---|
+| `b.insert_node(label, key, props)` | Insert a new node |
+| `b.insert_edge(edge_type, src, dst)` | Insert a user-owned edge |
+| `b.set_prop(key, field, value)` | Set or overwrite a property |
+| `b.remove_prop(key, field)` | Remove a property (no-op if absent) |
+| `b.delete_edge(edge_type, src, dst)` | Delete a user-owned edge |
+| `b.delete_node(key)` | Delete a node and all its incident edges |
+| `b.create_rule(def)` | Register a linking rule |
+| `b.delete_rule(name)` | Remove a linking rule |
+
+The method-chaining `db.batch()` builder is equivalent; `write_batch` is a
+convenience wrapper that auto-commits.
+
 ### Exposed surface
 
-The bindings expose: `insert_node`, `ingest_batch`, `create_rule`,
-`set_prop`, `query`, `explain`, `neighbors`, `node_edges`, `node_info`,
-`stats`, `snapshot`.
+The bindings expose: `insert_node`, `ingest_batch`, `batch_edges`,
+`create_rule`, `set_prop`, `query`, `explain`, `neighbors`, `node_edges`,
+`node_info`, `stats`, `snapshot`.
+
+`write_batch` is not directly exposed in the Python bindings because Rust
+closures capturing `&mut BatchBuilder` do not map naturally to the Python
+object model. Use `ingest_batch` (node + edge inserts in one frame) or
+`batch_edges` (mixed insert/delete edges in one frame) for atomic Python
+writes. Both use the same `WalRecord::Batch` frame and one-fsync guarantee.
 
 Not yet exposed: `ingest_json` (use `ingest_batch`), auto-FK inference
 (declare `KeyMatch` rules explicitly), `rebuild`.

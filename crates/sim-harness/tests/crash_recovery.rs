@@ -1095,3 +1095,320 @@ fn recovery_delete_heavy_byte_sweep() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Task 4: write_batch DST — large frame crash sweep + composition sweep
+// ---------------------------------------------------------------------------
+
+/// Crash sweep at every WAL byte offset inside a large `write_batch` frame.
+///
+/// The batch contains 12 ops: insert_node ×5, insert_edge ×2,
+/// set_prop ×3 (two of which are rule-triggering), remove_prop ×1,
+/// delete_node ×1.  At every crash point the recovered state must satisfy
+/// the none-or-all invariant: either ALL batch effects landed or NONE did.
+///
+/// This is the DST gate specified in the task-4 brief ("crash sweep at byte
+/// offsets inside a LARGE batch frame, 10+ mixed ops incl. delete_node and
+/// rule-triggering set_props → none-applied at every point").
+#[test]
+fn write_batch_large_frame_dst_byte_sweep() {
+    fn tags_v(xs: &[&str]) -> Value {
+        Value::List(xs.iter().map(|s| Value::Str((*s).into())).collect())
+    }
+
+    fn workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+        // Pre-state: 3 nodes + 1 rule
+        db.insert_node(
+            "S",
+            "pre0",
+            vec![
+                ("tags".into(), tags_v(&["alpha", "beta"])),
+                ("v".into(), Value::Int(1)),
+            ],
+        )?;
+        db.insert_node(
+            "S",
+            "pre1",
+            vec![("tags".into(), tags_v(&["alpha", "beta"]))],
+        )?;
+        db.insert_node(
+            "S",
+            "del_target",
+            vec![
+                ("v".into(), Value::Int(7)),
+                ("flag".into(), Value::Bool(true)),
+            ],
+        )?;
+        db.create_rule(RuleDef {
+            name: "ov_s".into(),
+            src_label: "S".into(),
+            dst_label: "S".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            },
+            edge_type: "STAG".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+        })?;
+        // 12-op write_batch: all-or-none atomicity gate
+        db.write_batch(|b| {
+            b.insert_node("S", "bn0", vec![("n".into(), Value::Str("n0".into()))]);
+            b.insert_node(
+                "S",
+                "bn1",
+                vec![("tags".into(), tags_v(&["alpha", "beta"]))],
+            );
+            b.insert_node("S", "bn2", vec![("v".into(), Value::Int(42))]);
+            b.insert_node("S", "bn3", vec![]);
+            b.insert_node(
+                "S",
+                "bn4",
+                vec![("tags".into(), tags_v(&["alpha", "beta"]))],
+            );
+            b.insert_edge("LNK", "bn0", "bn1");
+            b.insert_edge("LNK", "bn2", "bn3");
+            b.set_prop("pre0", "name", Value::Str("upd".into())); // non-rule prop
+            b.set_prop("pre0", "tags", tags_v(&["alpha", "beta", "gamma"])); // rule-triggering
+            b.set_prop("pre1", "status", Value::Bool(true)); // non-rule prop
+            b.remove_prop("del_target", "flag");
+            b.delete_node("del_target");
+        })?;
+        Ok(())
+    }
+
+    let total_bytes = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        workload(&mut db).unwrap();
+        db.into_fs().total_appended()
+    };
+    assert!(total_bytes > 0, "workload must append bytes");
+
+    for crash_at in 0..=total_bytes {
+        let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();
+        let _ = workload(&mut db);
+        let survivor = db.into_fs().surviving_state();
+        let recovered = GraphDb::open_with(survivor).unwrap();
+
+        // Core none-or-all invariant: batch nodes are all present or all absent.
+        let batch_keys = ["bn0", "bn1", "bn2", "bn3", "bn4"];
+        let any_batch = batch_keys.iter().any(|k| recovered.has_node(k));
+        let all_batch = batch_keys.iter().all(|k| recovered.has_node(k));
+        assert_eq!(
+            any_batch, all_batch,
+            "crash_at={crash_at}: batch nodes must be all-or-none (any={any_batch} all={all_batch})"
+        );
+
+        if any_batch {
+            // Batch landed: batch props and delete must be visible.
+            assert_eq!(
+                recovered.get_prop("pre0", "name"),
+                Some(&Value::Str("upd".into())),
+                "crash_at={crash_at}: pre0.name must be 'upd' after batch"
+            );
+            assert!(
+                !recovered.has_node("del_target"),
+                "crash_at={crash_at}: del_target must be deleted after batch"
+            );
+            // LNK edges: bn0→bn1 and bn2→bn3.
+            assert!(
+                recovered
+                    .neighbors("bn0", "LNK", Direction::Out)
+                    .unwrap_or_default()
+                    .contains(&"bn1".to_string()),
+                "crash_at={crash_at}: LNK bn0→bn1 must exist after batch"
+            );
+            assert!(
+                recovered
+                    .neighbors("bn2", "LNK", Direction::Out)
+                    .unwrap_or_default()
+                    .contains(&"bn3".to_string()),
+                "crash_at={crash_at}: LNK bn2→bn3 must exist after batch"
+            );
+        } else {
+            // Batch not landed: pre-state must be unchanged where nodes exist.
+            if recovered.has_node("pre0") {
+                assert_eq!(
+                    recovered.get_prop("pre0", "name"),
+                    None,
+                    "crash_at={crash_at}: pre0.name must not exist before batch"
+                );
+            }
+            if recovered.has_node("del_target") {
+                assert_eq!(
+                    recovered.get_prop("del_target", "flag"),
+                    Some(&Value::Bool(true)),
+                    "crash_at={crash_at}: del_target.flag must be true before batch"
+                );
+                assert_eq!(
+                    recovered.get_prop("del_target", "v"),
+                    Some(&Value::Int(7)),
+                    "crash_at={crash_at}: del_target.v must be 7 before batch"
+                );
+            }
+        }
+
+        // Rule consistency: no derived STAG edge may reference a non-live node.
+        let all_keys: &[&str] = &["pre0", "pre1", "del_target", "bn0", "bn1", "bn2", "bn3", "bn4"];
+        for key in all_keys {
+            if !recovered.has_node(key) {
+                continue;
+            }
+            for dst in recovered
+                .neighbors(key, "STAG", Direction::Out)
+                .unwrap_or_default()
+            {
+                assert!(
+                    recovered.has_node(&dst),
+                    "crash_at={crash_at}: derived STAG edge {key}→{dst} but {dst} is not live"
+                );
+            }
+        }
+    }
+}
+
+/// Composition crash sweep: `write_batch` → `snapshot` → `delete_node`
+/// (triggers top-k backfill) → `write_batch`.
+///
+/// Verifies that at every WAL byte offset the recovered state is consistent:
+///   (a) no derived edge references a non-live node
+///   (b) rebuild_rule is a no-op (engine state == brute-force desired state)
+///   (c) second write_batch is atomic (c5 and c6 are none-or-all)
+///
+/// Uses `max_edges: Some(2)` to force top-k backfill after delete_node.
+#[test]
+fn write_batch_composition_sweep() {
+    fn tags_v(xs: &[&str]) -> Value {
+        Value::List(xs.iter().map(|s| Value::Str((*s).into())).collect())
+    }
+
+    fn composition_workload<F: core_storage::fs::Fs>(
+        db: &mut GraphDb<F>,
+    ) -> core_api::Result<()> {
+        // Phase 1: write_batch — 5 nodes
+        db.write_batch(|b| {
+            b.insert_node("C", "c0", vec![("tags".into(), tags_v(&["x", "y"]))]);
+            b.insert_node("C", "c1", vec![("tags".into(), tags_v(&["x", "y"]))]);
+            b.insert_node("C", "c2", vec![("tags".into(), tags_v(&["x", "y"]))]);
+            b.insert_node("C", "c3", vec![("tags".into(), tags_v(&["x", "y"]))]);
+            b.insert_node("C", "c4", vec![("tags".into(), tags_v(&["x", "y"]))]);
+        })?;
+
+        // Create rule with max_edges=2 (top-2 per node).
+        db.create_rule(RuleDef {
+            name: "ctag".into(),
+            src_label: "C".into(),
+            dst_label: "C".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            },
+            edge_type: "CTAG".into(),
+            weight_prop: None,
+            max_edges: Some(2),
+            approximate: false,
+        })?;
+
+        // Phase 2: snapshot — captures nodes + rule + derived edges.
+        db.snapshot()?;
+
+        // Phase 3: delete_node — triggers top-k backfill in rule engine.
+        db.delete_node("c0")?;
+
+        // Phase 4: second write_batch — 2 new nodes + 1 set_prop.
+        db.write_batch(|b| {
+            b.insert_node("C", "c5", vec![("tags".into(), tags_v(&["x", "y"]))]);
+            b.insert_node("C", "c6", vec![("tags".into(), tags_v(&["x", "y"]))]);
+            b.set_prop("c2", "note", Value::Str("updated".into()));
+        })?;
+
+        Ok(())
+    }
+
+    let total_bytes = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        composition_workload(&mut db).unwrap();
+        db.into_fs().total_appended()
+    };
+    assert!(total_bytes > 0, "composition workload must append bytes");
+
+    let c_keys: &[&str] = &["c0", "c1", "c2", "c3", "c4", "c5", "c6"];
+
+    for crash_at in 0..=total_bytes {
+        let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();
+        let _ = composition_workload(&mut db);
+        let survivor = db.into_fs().surviving_state();
+        let mut recovered = GraphDb::open_with(survivor).unwrap();
+
+        // (a) No derived CTAG edge references a non-live node.
+        for key in c_keys {
+            if !recovered.has_node(key) {
+                continue;
+            }
+            for dst in recovered
+                .neighbors(key, "CTAG", Direction::Out)
+                .unwrap_or_default()
+            {
+                assert!(
+                    recovered.has_node(&dst),
+                    "crash_at={crash_at}: derived CTAG {key}→{dst} but {dst} is not live"
+                );
+            }
+        }
+
+        // (b) rebuild_rule is a no-op (rule engine == desired state).
+        if recovered.rules().iter().any(|r| r.name == "ctag") {
+            let before: BTreeSet<(String, String)> = c_keys
+                .iter()
+                .filter(|k| recovered.has_node(k))
+                .flat_map(|k| {
+                    recovered
+                        .neighbors(k, "CTAG", Direction::Out)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|d| (k.to_string(), d))
+                })
+                .collect();
+            recovered.rebuild_rule("ctag").unwrap();
+            let after: BTreeSet<(String, String)> = c_keys
+                .iter()
+                .filter(|k| recovered.has_node(k))
+                .flat_map(|k| {
+                    recovered
+                        .neighbors(k, "CTAG", Direction::Out)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|d| (k.to_string(), d))
+                })
+                .collect();
+            assert_eq!(
+                before, after,
+                "crash_at={crash_at}: rebuild_rule(ctag) must be a no-op"
+            );
+        }
+
+        // (c) Second write_batch is atomic: c5 and c6 are none-or-all,
+        //     and c2.note is set iff the second batch landed.
+        let c5 = recovered.has_node("c5");
+        let c6 = recovered.has_node("c6");
+        if c5 || c6 {
+            assert!(
+                c5 && c6,
+                "crash_at={crash_at}: c5={c5} c6={c6} must be both-or-neither (same write_batch)"
+            );
+            assert_eq!(
+                recovered.get_prop("c2", "note"),
+                Some(&Value::Str("updated".into())),
+                "crash_at={crash_at}: c2.note must be set when second write_batch landed"
+            );
+        }
+        if !c5 && !c6 && recovered.has_node("c2") {
+            assert_eq!(
+                recovered.get_prop("c2", "note"),
+                None,
+                "crash_at={crash_at}: c2.note must not exist before second write_batch"
+            );
+        }
+    }
+}

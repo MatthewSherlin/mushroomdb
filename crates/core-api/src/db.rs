@@ -774,6 +774,54 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
+    /// Closure-style atomic write batch.
+    ///
+    /// Equivalent to calling [`GraphDb::batch`], invoking `build` to queue ops,
+    /// then committing. All ops queued inside `build` are validated in order and
+    /// committed as a single `WalRecord::Batch` frame (one fsync). Rules fire
+    /// once per inner record, in order, after commit — semantically identical to
+    /// sequential single-op writes.
+    ///
+    /// **Error semantics — validate-then-apply.** `build` queues ops without
+    /// touching the database. [`BatchBuilder::commit`] validates every op against
+    /// live state plus earlier ops in this batch before writing anything. If op N
+    /// fails validation (duplicate key, unknown key, rule-owned edge, …) the
+    /// entire batch is rejected: no WAL bytes are written and no in-memory state
+    /// changes. The database is identical to its state before `write_batch` was
+    /// called.
+    ///
+    /// **Atomicity is crash-level, NOT isolation-level.** On replay after a crash,
+    /// a partial (torn) `Batch` frame applies NONE of its ops — the frame is
+    /// either fully applied or not at all. However, while applying a committed
+    /// batch, concurrent readers may observe intermediate states as ops are applied
+    /// sequentially in memory. There is no interactive transaction isolation in v1.
+    /// This is documented as "crash-atomic write batches; no interactive
+    /// transactions or read isolation."
+    ///
+    /// **Returns** `(nodes_inserted, edges_inserted)`. An empty or all-noop batch
+    /// writes zero WAL bytes and returns `(0, 0)`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let (nodes, edges) = db.write_batch(|b| {
+    ///     b.insert_node("Person", "alice", vec![("age".into(), Value::Int(30))]);
+    ///     b.insert_node("Person", "bob", vec![]);
+    ///     b.insert_edge("KNOWS", "alice", "bob");
+    ///     b.set_prop("alice", "role", Value::Str("admin".into()));
+    ///     b.delete_node("old_key");
+    /// })?;
+    /// // One fsync; on crash replay: all five ops land or none do.
+    /// ```
+    pub fn write_batch<C>(&mut self, build: C) -> Result<(usize, usize)>
+    where
+        C: FnOnce(&mut BatchBuilder<'_, F>),
+    {
+        let mut b = self.batch();
+        build(&mut b);
+        b.commit()
+    }
+
     /// Insert `rows` as nodes of `label`. One call is one atomic batch:
     /// auto-declared KeyMatch rules (if any) first, then the accepted node
     /// inserts, so incremental fire sees the new rules. Per-row key problems
