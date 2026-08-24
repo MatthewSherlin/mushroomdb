@@ -1,8 +1,8 @@
 //! Recursive-descent parser for the Cypher subset. Never panics on any token sequence.
 
 use super::ast::{
-    AggArg, AggFunc, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange, LimitSkip,
-    MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand,
+    AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
+    LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand,
     OptionalClause, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal,
     SetClause, UnwindClause, UnwindExpr, WithStage, WriteStatement,
 };
@@ -579,36 +579,105 @@ impl<'a> Parser<'a> {
     }
 
     fn cmp(&mut self) -> Result<Expr, String> {
-        let lhs = self.operand()?;
+        let lhs = self.arith_expr()?;
+        // Check for IS NULL / IS NOT NULL postfix.
+        if let Some(Tok::Ident(s)) = self.peek() {
+            if s.eq_ignore_ascii_case("is") {
+                self.pos += 1; // consume "IS"
+                               // Optional NOT.
+                let negated = self.eat(&Tok::Not);
+                // Expect NULL identifier.
+                match self.peek() {
+                    Some(Tok::Ident(n)) if n.eq_ignore_ascii_case("null") => {
+                        self.pos += 1; // consume "NULL"
+                        return Ok(if negated {
+                            Expr::IsNotNull(lhs)
+                        } else {
+                            Expr::IsNull(lhs)
+                        });
+                    }
+                    _ => {
+                        return Err(self.err(if negated {
+                            "expected NULL after IS NOT"
+                        } else {
+                            "expected NULL after IS"
+                        }));
+                    }
+                }
+            }
+        }
         // If no comparison operator follows, treat the operand as a standalone
         // boolean predicate (Expr::Truthy).  This enables:
         //   WHERE textMatches(n.bio, 'query')
         // without requiring an explicit `= true` or similar.
         match self.cmp_op() {
             Ok(op) => {
-                let rhs = self.operand()?;
+                let rhs = self.arith_expr()?;
                 Ok(Expr::Cmp { lhs, op, rhs })
             }
             Err(_) => Ok(Expr::Truthy(lhs)),
         }
     }
 
-    fn cmp_op(&mut self) -> Result<CmpOp, String> {
-        let op = match self.peek() {
-            Some(Tok::Eq) => CmpOp::Eq,
-            Some(Tok::Ne) => CmpOp::Ne,
-            Some(Tok::Lt) => CmpOp::Lt,
-            Some(Tok::Le) => CmpOp::Le,
-            Some(Tok::Gt) => CmpOp::Gt,
-            Some(Tok::Ge) => CmpOp::Ge,
-            _ => return Err(self.err("expected comparison operator")),
-        };
-        self.pos += 1;
-        Ok(op)
+    // ── Arithmetic expression parsing (precedence: * / > + -) ──────────────
+    //
+    // Grammar:
+    //   arith_expr  = arith_add
+    //   arith_add   = arith_mul ((+ | -) arith_mul)*
+    //   arith_mul   = arith_unary ((* | /) arith_unary)*
+    //   arith_unary = - arith_atom | arith_atom
+    //   arith_atom  = literal | param | ident | ident.field | ident(args…) | (arith_add)
+
+    /// Parse a full arithmetic expression (additive level).
+    fn arith_expr(&mut self) -> Result<Operand, String> {
+        let mut left = self.arith_mul()?;
+        loop {
+            let op = if self.eat(&Tok::Plus) {
+                ArithOp::Add
+            } else if self.eat(&Tok::Dash) {
+                // Dash is `-`; but we must not consume a Dash that starts a
+                // relationship pattern (those appear at the top-level pattern
+                // parser, not inside an expression). Inside expressions `-`
+                // is always subtraction.
+                ArithOp::Sub
+            } else {
+                break;
+            };
+            let right = self.arith_mul()?;
+            left = Operand::BinArith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
     }
 
-    fn operand(&mut self) -> Result<Operand, String> {
+    /// Parse a multiplicative-level arithmetic expression.
+    fn arith_mul(&mut self) -> Result<Operand, String> {
+        let mut left = self.arith_unary()?;
+        loop {
+            let op = if self.eat(&Tok::Star) {
+                ArithOp::Mul
+            } else if self.eat(&Tok::Slash) {
+                ArithOp::Div
+            } else {
+                break;
+            };
+            let right = self.arith_unary()?;
+            left = Operand::BinArith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// Parse a unary-level arithmetic expression (handles unary `-`).
+    fn arith_unary(&mut self) -> Result<Operand, String> {
         if self.eat(&Tok::Dash) {
+            // Unary minus: fold into the next atom.
             return match self.peek() {
                 Some(Tok::Int(n)) => {
                     let n = *n;
@@ -626,6 +695,39 @@ impl<'a> Parser<'a> {
                 _ => Err(self.err("unary minus only applies to numeric literals")),
             };
         }
+        self.arith_atom()
+    }
+
+    /// Parse an atomic operand (leaf of the arithmetic expression tree).
+    fn arith_atom(&mut self) -> Result<Operand, String> {
+        // Parenthesized arithmetic expression.
+        if self.eat(&Tok::LParen) {
+            let inner = self.arith_expr()?;
+            self.expect(&Tok::RParen, "expected ')' to close arithmetic expression")?;
+            return Ok(inner);
+        }
+        // Delegate to the existing atom parser (no unary minus here — handled above).
+        self.operand_atom()
+    }
+
+    fn cmp_op(&mut self) -> Result<CmpOp, String> {
+        let op = match self.peek() {
+            Some(Tok::Eq) => CmpOp::Eq,
+            Some(Tok::Ne) => CmpOp::Ne,
+            Some(Tok::Lt) => CmpOp::Lt,
+            Some(Tok::Le) => CmpOp::Le,
+            Some(Tok::Gt) => CmpOp::Gt,
+            Some(Tok::Ge) => CmpOp::Ge,
+            _ => return Err(self.err("expected comparison operator")),
+        };
+        self.pos += 1;
+        Ok(op)
+    }
+
+    /// Parse a single atomic operand (no arithmetic wrapping — use `arith_expr`
+    /// for full expression support).  This is the leaf parser for literals,
+    /// parameters, property references, variable references, and function calls.
+    fn operand_atom(&mut self) -> Result<Operand, String> {
         match self.peek() {
             Some(Tok::Int(n)) => {
                 let n = *n;
@@ -651,14 +753,13 @@ impl<'a> Parser<'a> {
                 let name = self.ident("expected identifier")?;
                 if self.peek() == Some(&Tok::LParen) {
                     // Scalar function call: name(arg, ...)
-                    // Function arguments may be arbitrary expressions (to support
-                    // forms like abs(n.age - 27) or round(n.score * 1.5)).
+                    // Function arguments may be arbitrary arithmetic expressions.
                     self.pos += 1; // consume '('
                     let mut args = Vec::new();
                     if self.peek() != Some(&Tok::RParen) {
-                        args.push(self.func_arg_operand()?);
+                        args.push(self.arith_expr()?);
                         while self.eat(&Tok::Comma) {
-                            args.push(self.func_arg_operand()?);
+                            args.push(self.arith_expr()?);
                         }
                     }
                     self.expect(&Tok::RParen, "expected ')' to close function call")?;
@@ -675,33 +776,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a function call argument: a simple operand optionally followed by
-    /// one arithmetic binary operator and another operand.
-    /// Handles `abs(n.age - 27)` and `round(n.score * 1.5)`.
-    ///
-    /// Only `-` (subtraction) and `*` (multiplication) are supported; the
-    /// lexer does not emit `+` or `/` tokens so those forms are a lex error.
-    fn func_arg_operand(&mut self) -> Result<Operand, String> {
-        use super::ast::{ArithOp, Operand as Op};
-        let left = self.operand()?;
-        // Check for an arithmetic operator following the first operand.
-        let op = match self.peek() {
-            Some(Tok::Dash) => {
-                self.pos += 1;
-                ArithOp::Sub
-            }
-            Some(Tok::Star) => {
-                self.pos += 1;
-                ArithOp::Mul
-            }
-            _ => return Ok(left),
-        };
-        let right = self.operand()?;
-        Ok(Op::BinArith {
-            op,
-            left: Box::new(left),
-            right: Box::new(right),
-        })
+    /// Parse a full arithmetic expression (additive + multiplicative + unary +
+    /// atom).  This is the primary operand entry point for WHERE, RETURN, SET,
+    /// and function arguments.  Use `operand_atom` for contexts that truly
+    /// require a single atom (e.g., MATCH property map values where arithmetic
+    /// would be syntactically ambiguous with the `}` delimiter).
+    fn operand(&mut self) -> Result<Operand, String> {
+        // In contexts where `operand` is called for MATCH props, the parser
+        // never sees arithmetic operators (`+`/`/`) because they can't appear
+        // inside `{key: val}` maps.  Delegating to `arith_expr` is safe here.
+        self.arith_expr()
     }
 
     fn return_clause(&mut self) -> Result<Vec<RetItem>, String> {
@@ -754,29 +838,20 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Normal (non-aggregate) RETURN item.
-        let name = self.ident("expected variable in RETURN item")?;
-        let value = if self.peek() == Some(&Tok::LParen) {
-            // Scalar function call in RETURN position: name(args...)
-            // Arguments may be full expressions (e.g. abs(n.age - 27)).
-            self.pos += 1; // consume '('
-            let mut args = Vec::new();
-            if self.peek() != Some(&Tok::RParen) {
-                args.push(self.func_arg_operand()?);
-                while self.eat(&Tok::Comma) {
-                    args.push(self.func_arg_operand()?);
-                }
-            }
-            self.expect(
-                &Tok::RParen,
-                "expected ')' to close function call in RETURN",
-            )?;
-            RetVal::FuncCall { name, args }
-        } else if self.eat(&Tok::Dot) {
-            let field = self.ident("expected field name after '.'")?;
-            RetVal::Prop { var: name, field }
-        } else {
-            RetVal::Var(name)
+        // Non-aggregate RETURN item: parse as a full arithmetic expression,
+        // then convert the resulting Operand to the appropriate RetVal variant.
+        // This unified path handles:
+        //   n          → RetVal::Var
+        //   n.prop     → RetVal::Prop
+        //   f(...)     → RetVal::FuncCall
+        //   n.age + 1  → RetVal::ScalarExpr(BinArith)
+        //   42         → RetVal::ScalarExpr(Lit)
+        let op = self.arith_expr()?;
+        let value = match op {
+            Operand::Var(name) => RetVal::Var(name),
+            Operand::Prop { var, field } => RetVal::Prop { var, field },
+            Operand::FuncCall { name, args } => RetVal::FuncCall { name, args },
+            other => RetVal::ScalarExpr(other),
         };
         let alias = if self.eat(&Tok::As) {
             Some(self.ident("expected alias identifier after AS")?)
@@ -851,9 +926,17 @@ impl<'a> Parser<'a> {
 
     fn create_stmt(&mut self) -> Result<WriteStatement, String> {
         self.expect(&Tok::Create, "expected CREATE")?;
-        let stmt = self.create_pattern()?;
+        let mut stmt = self.create_pattern()?;
+        // Optional RETURN clause: `CREATE (n:L {…}) RETURN n` or `RETURN n.id AS id`.
+        if self.eat(&Tok::Return) {
+            let mut items = vec![self.ret_item()?];
+            while self.eat(&Tok::Comma) {
+                items.push(self.ret_item()?);
+            }
+            stmt.returns = Some(items);
+        }
         if self.pos < self.toks.len() {
-            return Err(self.err("unexpected tokens after CREATE pattern"));
+            return Err(self.err("unexpected tokens after CREATE"));
         }
         Ok(WriteStatement::Create(stmt))
     }
@@ -892,7 +975,11 @@ impl<'a> Parser<'a> {
             });
             nodes.push(next);
         }
-        Ok(CreateStmt { nodes, edges })
+        Ok(CreateStmt {
+            nodes,
+            edges,
+            returns: None,
+        })
     }
 
     fn create_node(&mut self, idx: usize) -> Result<CreateNode, String> {
@@ -1016,11 +1103,15 @@ impl<'a> Parser<'a> {
     fn merge_stmt(&mut self) -> Result<WriteStatement, String> {
         self.expect(&Tok::Merge, "expected MERGE")?;
         self.expect(&Tok::LParen, "expected '(' after MERGE")?;
-        // Optional var
-        let _var = match self.peek() {
+        // Optional var: `MERGE (n:Label {…})` — capture n for RETURN projection.
+        let var = match self.peek() {
             Some(Tok::Ident(_)) => {
-                self.pos += 1; // consume var name (not used)
-                None::<String>
+                let s = match self.toks.get(self.pos) {
+                    Some(Tok::Ident(s)) => s.clone(),
+                    _ => unreachable!(),
+                };
+                self.pos += 1; // consume var name
+                Some(s)
             }
             _ => None,
         };
@@ -1042,26 +1133,34 @@ impl<'a> Parser<'a> {
         }
         self.expect(&Tok::RParen, "expected ')' to close MERGE pattern")?;
         // ON CREATE / ON MATCH: not supported
-        if matches!(self.peek(), Some(Tok::Ident(_))) {
-            let s = match self.peek() {
-                Some(Tok::Ident(s)) => s.to_ascii_lowercase(),
-                _ => String::new(),
-            };
-            if s == "on" {
+        if let Some(Tok::Ident(s)) = self.peek() {
+            if s.eq_ignore_ascii_case("on") {
                 return Err(
                     "ON CREATE SET / ON MATCH SET are not supported in MERGE (v1 limitation)"
                         .to_string(),
                 );
             }
         }
+        // Optional RETURN clause.
+        let returns = if self.eat(&Tok::Return) {
+            let mut items = vec![self.ret_item()?];
+            while self.eat(&Tok::Comma) {
+                items.push(self.ret_item()?);
+            }
+            Some(items)
+        } else {
+            None
+        };
         if self.pos < self.toks.len() {
-            return Err(self.err("unexpected tokens after MERGE pattern"));
+            return Err(self.err("unexpected tokens after MERGE"));
         }
         let (key_field, key_value) = props.remove(0);
         Ok(WriteStatement::Merge(MergeStmt {
             label,
             key_field,
             key_value,
+            var,
+            returns,
         }))
     }
 
@@ -1159,23 +1258,38 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Dot, "expected '.' after variable in SET")?;
         let field = self.ident("expected field name after '.'")?;
         self.expect(&Tok::Eq, "expected '=' in SET clause")?;
-        // Accept Lit or Param on the RHS; other Operand variants → named error.
+        // Accept Lit, Param, BinArith (arithmetic expression), and FuncCall on
+        // the RHS. Bare Prop/Var (e.g. `SET n.x = m.y`) remain a named error
+        // because that form requires join semantics not supported in v1; use
+        // an arithmetic expression like `m.y + 0` if needed.
         let value = match self.peek() {
-            Some(Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Param(_) | Tok::Dash) => {
-                let op = self.operand()?;
+            Some(
+                Tok::Int(_)
+                | Tok::Float(_)
+                | Tok::Str(_)
+                | Tok::Param(_)
+                | Tok::Dash
+                | Tok::Ident(_),
+            ) => {
+                let op = self.arith_expr()?;
                 match &op {
-                    Operand::Lit(_) | Operand::Param(_) => op,
-                    Operand::Prop { .. }
-                    | Operand::Var(_)
-                    | Operand::FuncCall { .. }
-                    | Operand::BinArith { .. } => {
+                    Operand::Lit(_)
+                    | Operand::Param(_)
+                    | Operand::BinArith { .. }
+                    | Operand::FuncCall { .. } => op,
+                    Operand::Prop { .. } | Operand::Var(_) => {
                         return Err(self.err(
-                            "SET RHS must be a literal or $parameter (expressions not supported in v1)",
+                            "SET RHS: bare property/variable reference is not supported; \
+                             use a literal, $parameter, or arithmetic expression (e.g. n.x + 1)",
                         ));
                     }
                 }
             }
-            _ => return Err(self.err("expected literal or $parameter as SET value")),
+            _ => {
+                return Err(
+                    self.err("expected literal, $parameter, or arithmetic expression as SET value")
+                )
+            }
         };
         Ok(SetClause { var, field, value })
     }
@@ -1682,9 +1796,217 @@ LIMIT 10";
                 ("y".into(), Operand::Lit(Value::Float(-1.5))),
             ]
         );
-        assert_parse_err("MATCH (a) WHERE a.x = 1 - 2 RETURN a");
+        // `1 - 2` is now valid arithmetic — no longer a parse error.
+        let q2 = parse_src("MATCH (a) WHERE a.x = 1 - 2 RETURN a").unwrap();
+        assert!(q2.where_expr.is_some());
+        // Unary minus on non-literal remains an error.
         assert_parse_err("MATCH (a) WHERE a.x > -b.y RETURN a");
         assert_parse_err("MATCH (a) RETURN a SKIP -1");
+    }
+
+    // ── IS NULL / IS NOT NULL ──────────────────────────────────────────────────
+
+    #[test]
+    fn is_null_parses_on_prop() {
+        let q = parse_src("MATCH (a) WHERE a.x IS NULL RETURN a").unwrap();
+        assert_eq!(q.where_expr, Some(Expr::IsNull(prop("a", "x"))),);
+    }
+
+    #[test]
+    fn is_not_null_parses_on_prop() {
+        let q = parse_src("MATCH (a) WHERE a.x IS NOT NULL RETURN a").unwrap();
+        assert_eq!(q.where_expr, Some(Expr::IsNotNull(prop("a", "x"))),);
+    }
+
+    #[test]
+    fn is_null_on_var() {
+        let q =
+            parse_src("MATCH (a) OPTIONAL MATCH (a)-[:T]->(b) WITH a, b WHERE b IS NULL RETURN a")
+                .unwrap();
+        // The IS NULL filter lives on the first WITH stage's where_expr.
+        let stage = &q.stages[0];
+        assert_eq!(
+            stage.where_expr,
+            Some(Expr::IsNull(Operand::Var("b".into()))),
+        );
+    }
+
+    #[test]
+    fn is_null_case_insensitive() {
+        let q = parse_src("MATCH (a) WHERE a.x is null RETURN a").unwrap();
+        assert_eq!(q.where_expr, Some(Expr::IsNull(prop("a", "x"))));
+        let q2 = parse_src("MATCH (a) WHERE a.x IS NOT NULL RETURN a").unwrap();
+        assert_eq!(q2.where_expr, Some(Expr::IsNotNull(prop("a", "x"))));
+    }
+
+    #[test]
+    fn is_null_combined_with_and() {
+        let q = parse_src("MATCH (a) WHERE a.x IS NULL AND a.y > 5 RETURN a").unwrap();
+        assert!(matches!(q.where_expr, Some(Expr::And(_, _))));
+    }
+
+    // ── Arithmetic expression parsing ──────────────────────────────────────────
+
+    #[test]
+    fn arith_add_in_where() {
+        use crate::cypher::ast::ArithOp;
+        let q = parse_src("MATCH (n) WHERE n.age + 1 > 5 RETURN n").unwrap();
+        let expected_lhs = Operand::BinArith {
+            op: ArithOp::Add,
+            left: Box::new(prop("n", "age")),
+            right: Box::new(Operand::Lit(Value::Int(1))),
+        };
+        assert_eq!(
+            q.where_expr,
+            Some(Expr::Cmp {
+                lhs: expected_lhs,
+                op: CmpOp::Gt,
+                rhs: Operand::Lit(Value::Int(5)),
+            })
+        );
+    }
+
+    #[test]
+    fn arith_precedence_mul_over_add() {
+        use crate::cypher::ast::ArithOp;
+        // 1 + 2 * 3  should parse as  1 + (2 * 3)
+        let q = parse_src("MATCH (n) WHERE n.x = 1 + 2 * 3 RETURN n").unwrap();
+        let expected_rhs = Operand::BinArith {
+            op: ArithOp::Add,
+            left: Box::new(Operand::Lit(Value::Int(1))),
+            right: Box::new(Operand::BinArith {
+                op: ArithOp::Mul,
+                left: Box::new(Operand::Lit(Value::Int(2))),
+                right: Box::new(Operand::Lit(Value::Int(3))),
+            }),
+        };
+        assert_eq!(
+            q.where_expr,
+            Some(Expr::Cmp {
+                lhs: prop("n", "x"),
+                op: CmpOp::Eq,
+                rhs: expected_rhs,
+            })
+        );
+    }
+
+    #[test]
+    fn arith_parens_override_precedence() {
+        use crate::cypher::ast::ArithOp;
+        // In RETURN position: (1+2)*3 should parse as (1+2)*3
+        let q = parse_src("MATCH (n) RETURN (1 + 2) * 3 AS r").unwrap();
+        let expected = RetVal::ScalarExpr(Operand::BinArith {
+            op: ArithOp::Mul,
+            left: Box::new(Operand::BinArith {
+                op: ArithOp::Add,
+                left: Box::new(Operand::Lit(Value::Int(1))),
+                right: Box::new(Operand::Lit(Value::Int(2))),
+            }),
+            right: Box::new(Operand::Lit(Value::Int(3))),
+        });
+        assert_eq!(q.returns[0].value, expected);
+        assert_eq!(q.returns[0].alias, Some("r".into()));
+    }
+
+    #[test]
+    fn arith_scalar_expr_in_return() {
+        use crate::cypher::ast::ArithOp;
+        let q = parse_src("MATCH (n) RETURN n.age + 1 AS adjusted").unwrap();
+        let expected = RetVal::ScalarExpr(Operand::BinArith {
+            op: ArithOp::Add,
+            left: Box::new(prop("n", "age")),
+            right: Box::new(Operand::Lit(Value::Int(1))),
+        });
+        assert_eq!(q.returns[0].value, expected);
+        assert_eq!(q.returns[0].alias, Some("adjusted".into()));
+    }
+
+    #[test]
+    fn arith_div_in_where() {
+        use crate::cypher::ast::ArithOp;
+        let q = parse_src("MATCH (n) WHERE n.x / 2 > 3 RETURN n").unwrap();
+        assert!(matches!(
+            q.where_expr,
+            Some(Expr::Cmp {
+                lhs: Operand::BinArith {
+                    op: ArithOp::Div,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    // ── CREATE...RETURN and MERGE...RETURN parser tests ────────────────────────
+
+    #[test]
+    fn create_return_parses_node_var() {
+        use super::parse_write;
+        use crate::cypher::ast::{RetVal, WriteStatement};
+
+        let toks = crate::cypher::lex("CREATE (n:Thing {id: 'x'}) RETURN n").unwrap();
+        let stmt = parse_write(&toks).unwrap();
+        match stmt {
+            WriteStatement::Create(s) => {
+                assert_eq!(s.nodes.len(), 1);
+                let returns = s.returns.expect("expected RETURN clause");
+                assert_eq!(returns.len(), 1);
+                assert_eq!(returns[0].value, RetVal::Var("n".into()));
+            }
+            _ => panic!("expected Create"),
+        }
+    }
+
+    #[test]
+    fn create_return_prop_with_alias() {
+        use super::parse_write;
+        use crate::cypher::ast::{RetVal, WriteStatement};
+
+        let toks = crate::cypher::lex("CREATE (n:Thing {id: 'x'}) RETURN n.id AS node_id").unwrap();
+        let stmt = parse_write(&toks).unwrap();
+        match stmt {
+            WriteStatement::Create(s) => {
+                let returns = s.returns.expect("RETURN required");
+                assert_eq!(
+                    returns[0].value,
+                    RetVal::Prop {
+                        var: "n".into(),
+                        field: "id".into()
+                    }
+                );
+                assert_eq!(returns[0].alias, Some("node_id".into()));
+            }
+            _ => panic!("expected Create"),
+        }
+    }
+
+    #[test]
+    fn merge_return_parses_node_var() {
+        use super::parse_write;
+        use crate::cypher::ast::{RetVal, WriteStatement};
+
+        let toks = crate::cypher::lex("MERGE (n:Thing {id: 'x'}) RETURN n").unwrap();
+        let stmt = parse_write(&toks).unwrap();
+        match stmt {
+            WriteStatement::Merge(s) => {
+                assert_eq!(s.var, Some("n".into()));
+                let returns = s.returns.expect("RETURN required");
+                assert_eq!(returns[0].value, RetVal::Var("n".into()));
+            }
+            _ => panic!("expected Merge"),
+        }
+    }
+
+    #[test]
+    fn is_write_tokens_still_true_for_create_return() {
+        use super::is_write_tokens;
+        use crate::cypher::lex;
+
+        let toks = lex("CREATE (n:T {id: 'x'}) RETURN n").unwrap();
+        assert!(
+            is_write_tokens(&toks),
+            "CREATE...RETURN must still be classified as write"
+        );
     }
 
     #[test]

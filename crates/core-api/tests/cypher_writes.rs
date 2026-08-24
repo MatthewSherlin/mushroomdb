@@ -757,6 +757,132 @@ fn detach_delete_with_param() {
     );
 }
 
+// ─── CREATE ... RETURN ────────────────────────────────────────────────────────
+
+#[test]
+fn create_return_node_binding() {
+    let mut db = GraphDb::open(&tmp("cr-node")).unwrap();
+    let rs = db
+        .query_write("CREATE (n:Person {id: 'eva'}) RETURN n", &no_params())
+        .unwrap();
+    // RETURN n produces the node key.
+    assert_eq!(rs.columns(), &["n"]);
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "n"), Some(&Value::Str("eva".into())));
+    // Node must persist.
+    assert!(db.has_node("eva"));
+}
+
+#[test]
+fn create_return_prop_alias() {
+    let mut db = GraphDb::open(&tmp("cr-prop")).unwrap();
+    let rs = db
+        .query_write(
+            "CREATE (n:Person {id: 'eva', name: 'Eva'}) RETURN n.name AS nm",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(rs.columns(), &["nm"]);
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "nm"), Some(&Value::Str("Eva".into())));
+}
+
+#[test]
+fn create_return_multi_prop() {
+    let mut db = GraphDb::open(&tmp("cr-multi")).unwrap();
+    let rs = db
+        .query_write(
+            "CREATE (n:Item {id: 'itm', score: 42}) RETURN n, n.score AS sc",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "n"), Some(&Value::Str("itm".into())));
+    assert_eq!(rs.get(0, "sc"), Some(&Value::Int(42)));
+}
+
+/// CREATE...RETURN durability: after WAL commit the node exists even if
+/// the projection call were to be interrupted (WAL write precedes projection).
+/// We simulate this by verifying that the node is durably stored after a
+/// successful query_write call and survives a fresh open.
+#[test]
+fn create_return_node_durable_after_commit() {
+    let dir = tmp("cr-durable");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.query_write("CREATE (n:Widget {id: 'w1'}) RETURN n", &no_params())
+            .unwrap();
+    }
+    // Re-open from WAL — node must survive.
+    let db2 = GraphDb::open(&dir).unwrap();
+    assert!(db2.has_node("w1"), "node must survive WAL replay");
+}
+
+// ─── MERGE ... RETURN ─────────────────────────────────────────────────────────
+
+#[test]
+fn merge_return_created_node() {
+    let mut db = GraphDb::open(&tmp("mr-create")).unwrap();
+    let rs = db
+        .query_write("MERGE (n:Tag {id: 'rust'}) RETURN n", &no_params())
+        .unwrap();
+    assert_eq!(rs.columns(), &["n"]);
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "n"), Some(&Value::Str("rust".into())));
+    assert!(db.has_node("rust"));
+}
+
+#[test]
+fn merge_return_existing_node() {
+    let mut db = GraphDb::open(&tmp("mr-existing")).unwrap();
+    db.query_write("CREATE (n:Tag {id: 'rust'})", &no_params())
+        .unwrap();
+    // MERGE on an existing node — RETURN must still project it.
+    let rs = db
+        .query_write("MERGE (n:Tag {id: 'rust'}) RETURN n", &no_params())
+        .unwrap();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "n"), Some(&Value::Str("rust".into())));
+}
+
+// ─── SET with arithmetic RHS ──────────────────────────────────────────────────
+
+#[test]
+fn set_arithmetic_rhs_literal_expr() {
+    let mut db = GraphDb::open(&tmp("set-arith")).unwrap();
+    db.query_write("CREATE (n:Counter {id: 'c1', count: 10})", &no_params())
+        .unwrap();
+    // SET value is an arithmetic expression: 10 + 5 = 15.
+    db.query_write(
+        "MATCH (n:Counter {id: 'c1'}) SET n.count = 10 + 5",
+        &no_params(),
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_prop("c1", "count"),
+        Some(&Value::Int(15)),
+        "SET with arithmetic literal must write the computed value"
+    );
+}
+
+#[test]
+fn set_arithmetic_prop_increment() {
+    let mut db = GraphDb::open(&tmp("set-incr")).unwrap();
+    db.query_write("CREATE (n:Counter {id: 'c2', count: 7})", &no_params())
+        .unwrap();
+    // Increment using the node's own property.
+    db.query_write(
+        "MATCH (n:Counter {id: 'c2'}) SET n.count = n.count + 1",
+        &no_params(),
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_prop("c2", "count"),
+        Some(&Value::Int(8)),
+        "n.count + 1 must increment from 7 to 8"
+    );
+}
+
 // ─── Error cases for combined read-write ─────────────────────────────────────
 
 #[test]

@@ -199,18 +199,22 @@ try {
 These are limitations of the mushroomdb server's Cypher implementation that
 affect how you write queries through this client.
 
-### 1. `CREATE ... RETURN` is not supported
+### 1. `CREATE ... RETURN` is supported
 
-The server's Cypher parser does not allow a `RETURN` clause after a `CREATE`
-pattern. Use two separate statements instead:
+You can include a `RETURN` clause directly after `CREATE` or `MERGE` to get
+back the created or matched bindings in a single statement:
 
 ```ts
-// WRONG — will throw MushroomError
-await client.query("CREATE (n:Widget {id: 'w1'}) RETURN n.id");
+// Single-statement create + return:
+const result = await client.query(
+  "CREATE (n:Widget {id: 'w1', name: 'Sprocket'}) RETURN n.name AS nm"
+);
+// result.rows[0][0] === 'Sprocket'
 
-// CORRECT — create, then read back
-await client.query("CREATE (n:Widget {id: 'w1', name: 'Sprocket'})");
-const result = await client.query("MATCH (n:Widget {id: 'w1'}) RETURN n.name");
+// MERGE + RETURN (returns the node whether created or matched):
+const r2 = await client.query(
+  "MERGE (n:Tag {id: 'rust'}) RETURN n"
+);
 ```
 
 ### 2. Every node requires a string `id` property

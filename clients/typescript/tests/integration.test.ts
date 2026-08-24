@@ -97,7 +97,6 @@ describe.skipIf(NO_SERVER)("write via query", () => {
   const testKey = `ts-client-test-${Date.now()}`;
 
   it("creates a node and reads it back", async () => {
-    // Server constraint: CREATE does not support RETURN in this Cypher impl.
     // Nodes require a string `id` property as the node key.
     await client.query(
       `CREATE (n:TsTest {id: '${testKey}', label: 'hello'})`,
@@ -109,6 +108,18 @@ describe.skipIf(NO_SERVER)("write via query", () => {
     );
     expect(readResult.rows.length).toBe(1);
     expect(readResult.rows[0]![0]).toBe("hello");
+  });
+
+  it("CREATE ... RETURN returns the created node binding in one statement", async () => {
+    const crKey = `ts-cr-test-${Date.now()}`;
+    const result = await client.query(
+      `CREATE (n:TsTest {id: '${crKey}', score: 42}) RETURN n, n.score AS sc`,
+    );
+    // Should return 1 row with n=key and sc=42.
+    expect(result.columns).toEqual(["n", "sc"]);
+    expect(result.rows.length).toBe(1);
+    expect(result.rows[0]![0]).toBe(crKey);
+    expect(result.rows[0]![1]).toBe(42);
   });
 });
 
@@ -219,7 +230,7 @@ describe.skipIf(NO_SERVER)("subscribe", () => {
     );
 
     try {
-      // Server constraint: CREATE does not support RETURN; nodes keyed by `id`.
+      // Nodes are keyed by `id`; CREATE...RETURN is also supported but not needed here.
       await client.query(
         `CREATE (n:SubTestNode {id: '${nodeKey}'})`,
       );

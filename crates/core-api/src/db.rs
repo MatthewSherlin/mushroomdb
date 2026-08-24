@@ -3,8 +3,8 @@ use crate::subscription::{
     event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
 };
 use core_query::cypher::{
-    execute, lex, parse, parse_write, plan, MatchDeleteNodeStmt, Params, Query, RetItem, RetVal,
-    WriteStatement,
+    execute, lex, parse, parse_write, plan, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern,
+    Query, RetItem, RetVal, WriteStatement,
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
@@ -2571,6 +2571,50 @@ impl<F: Fs> GraphDb<F> {
         }
         batch.commit()?;
 
+        // Optional RETURN clause: project created bindings as a read result.
+        if let Some(returns) = stmt.returns {
+            // Each created node is looked up by its key via a separate MATCH pattern.
+            // Multiple single-node patterns cross-join to produce 1 output row with
+            // all variables bound (each pattern returns exactly 1 row).
+            let patterns: Vec<Pattern> = stmt
+                .nodes
+                .iter()
+                .map(|node| {
+                    let var = node.var.as_deref().unwrap_or("_cn0");
+                    let key = var_to_key[var].clone();
+                    Pattern {
+                        start: NodePat {
+                            var: Some(var.to_string()),
+                            label: Some(node.label.clone()),
+                            props: vec![("id".to_string(), Operand::Lit(Value::Str(key)))],
+                        },
+                        chain: vec![],
+                        shortest: false,
+                    }
+                })
+                .collect();
+            let q = Query {
+                matches: patterns,
+                optional_clauses: vec![],
+                where_expr: None,
+                unwinds: vec![],
+                post_unwind_where: None,
+                stages: vec![],
+                returns,
+                order_by: vec![],
+                skip: None,
+                limit: None,
+            };
+            let ops = plan(&q).map_err(|e| GraphError::QueryError {
+                detail: format!("plan: {e}"),
+            })?;
+            return execute(&self.view(), &ops, &Params(&BTreeMap::new())).map_err(|e| {
+                GraphError::QueryError {
+                    detail: format!("execute: {e}"),
+                }
+            });
+        }
+
         let mut rs = write_result_set();
         rs.push_row(vec![
             Some(Value::Int(created as i64)),
@@ -2593,14 +2637,30 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        // Synthesize a read query: MATCH … WHERE … RETURN <set_vars>
-        let returns: Vec<RetItem> = set_vars
+        // Synthesize a read query: MATCH … WHERE … RETURN <set_vars>, <set_values…>
+        // SET values are projected as ScalarExpr items so that arithmetic expressions
+        // (e.g. `SET n.score = n.score * 1.5`) are evaluated in the matched-row context.
+        let mut returns: Vec<RetItem> = set_vars
             .iter()
             .map(|v| RetItem {
                 value: RetVal::Var(v.clone()),
                 alias: None,
             })
             .collect();
+        // One computed column per SET clause; alias is `__sv_<i>`.
+        let set_val_cols: Vec<String> = stmt
+            .sets
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("__sv_{i}"))
+            .collect();
+        for (sc, col) in stmt.sets.iter().zip(&set_val_cols) {
+            returns.push(RetItem {
+                value: RetVal::ScalarExpr(sc.value.clone()),
+                alias: Some(col.clone()),
+            });
+        }
+
         let read_q = Query {
             matches: stmt.matches,
             optional_clauses: vec![],
@@ -2625,7 +2685,7 @@ impl<F: Fs> GraphDb<F> {
         // Collect (key, field, value) for each matched row × each SET clause.
         let mut set_ops: Vec<(String, String, Value)> = Vec::new();
         for row_i in 0..match_rs.len() {
-            for sc in &stmt.sets {
+            for (sc, col) in stmt.sets.iter().zip(&set_val_cols) {
                 let key = match match_rs.get(row_i, &sc.var) {
                     Some(Value::Str(k)) => k.clone(),
                     _ => {
@@ -2637,24 +2697,16 @@ impl<F: Fs> GraphDb<F> {
                         })
                     }
                 };
-                // Resolve the SET value operand — may be a literal or $param.
-                use core_query::cypher::Operand;
-                let value = match &sc.value {
-                    Operand::Lit(v) => v.clone(),
-                    Operand::Param(name) => {
-                        params
-                            .get(name)
-                            .cloned()
-                            .ok_or_else(|| GraphError::QueryError {
-                                detail: format!("missing parameter `{name}` in SET clause"),
-                            })?
-                    }
-                    other => {
+                // The SET value was already evaluated by the executor.
+                let value = match match_rs.get(row_i, col) {
+                    Some(v) => v.clone(),
+                    None => {
                         return Err(GraphError::QueryError {
                             detail: format!(
-                                "SET value must be a literal or $param (got {other:?})"
+                                "SET value for {}.{} evaluated to null",
+                                sc.var, sc.field
                             ),
-                        });
+                        })
                     }
                 };
                 set_ops.push((key, sc.field.clone(), value));
@@ -2893,6 +2945,39 @@ impl<F: Fs> GraphDb<F> {
                 .insert_node(&stmt.label, &key, props)
                 .commit()?;
             created = 1;
+        }
+
+        // Optional RETURN clause: project the node (created or matched) as a read result.
+        if let Some(returns) = stmt.returns {
+            let var = stmt.var.as_deref().unwrap_or("_mn0");
+            let q = Query {
+                matches: vec![Pattern {
+                    start: NodePat {
+                        var: Some(var.to_string()),
+                        label: Some(stmt.label.clone()),
+                        props: vec![("id".to_string(), Operand::Lit(stmt.key_value.clone()))],
+                    },
+                    chain: vec![],
+                    shortest: false,
+                }],
+                optional_clauses: vec![],
+                where_expr: None,
+                unwinds: vec![],
+                post_unwind_where: None,
+                stages: vec![],
+                returns,
+                order_by: vec![],
+                skip: None,
+                limit: None,
+            };
+            let ops = plan(&q).map_err(|e| GraphError::QueryError {
+                detail: format!("plan: {e}"),
+            })?;
+            return execute(&self.view(), &ops, &Params(&BTreeMap::new())).map_err(|e| {
+                GraphError::QueryError {
+                    detail: format!("execute: {e}"),
+                }
+            });
         }
 
         let mut rs = write_result_set();

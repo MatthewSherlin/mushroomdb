@@ -518,8 +518,11 @@ clear, actionable message; **Absent** = not implemented (not tested here).
 | `MATCH … DETACH DELETE n` | `MATCH (n) WHERE n.id = 'x' DETACH DELETE n` |
 | `MATCH … DELETE n` (isolated node) | `MATCH (n:Tmp) WHERE n.id = 'x' DELETE n` |
 | `MERGE (n:L {id: 'x'})` (single-key upsert) | `MERGE (n:Person {id: 'alice'})` |
+| `MERGE (n:L {id: 'x'}) RETURN …` | `MERGE (n:Person {id: 'alice'}) RETURN n` — returns node whether created or matched |
+| `CREATE … RETURN …` | `CREATE (n:Person {id: 'alice'}) RETURN n.id AS id` — single-statement create + projection |
+| `WHERE … IS NULL / IS NOT NULL` | `WHERE n.score IS NULL`, `WHERE b IS NOT NULL` — null-check predicate; composes with AND/OR |
+| Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error |
 | `toLower`, `toUpper`, `size`, `coalesce`, `type`, `abs`, `round` | `RETURN abs(n.score), round(n.weight)` |
-| Binary arithmetic **inside function arguments** only (`-`, `*`) | `RETURN abs(n.age - 27)`, `RETURN round(n.score * 1.5)` — **only valid as function-call arguments**; `-`/`*` outside function calls produce a parse error; `+`/`/` produce a lex error in any position |
 | View-maintained properties queryable like any property | `MATCH (c:City) WHERE c.pop > 1000 RETURN c.name` — `pop` is a degree view maintained incrementally; reads like a stored prop |
 | `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
 
@@ -533,7 +536,6 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | `MERGE (n:L {id: 'x', extra: 2})` (multi-property) | `MERGE supports exactly one key property (got 2)` |
 | `DELETE n` when node has incident edges | `Cannot delete node … because it still has incident edges. Use DETACH DELETE…` |
 | `DELETE r` on derived (rule-owned) edge | `cannot delete derived edge; retract via the rule or change the property` |
-| `SET n.x = n.x + 1` (expression RHS; `+` not lexed) | `lex: illegal character '+' at position …` |
 | `MATCH … SET … RETURN` in one statement | `parse error: expected RETURN (found Set)` |
 | `CREATE (a), (b)` comma-separated form | `parse error: unexpected tokens after CREATE pattern (found Comma)` |
 | Variable-length `*0..n` (zero-length min) | `zero-length variable-length paths are not supported; minimum hop count is 1` |
@@ -545,17 +547,15 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | `shortestPath` with endpoints bound via comma-sep `MATCH (a), (b)` | `parse error: unexpected tokens after CREATE pattern (found Comma)` — comma-separated MATCH is not supported; use sequential `MATCH (a) MATCH (b)` forms |
 | Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round` |
 | `$param` referenced but not supplied | `execute: missing parameter …` |
-| `WHERE … IS NULL / IS NOT NULL` | `parse error: expected comparison operator (found Ident("IS"))` |
+| `SET n.prop = n.other` (bare property-to-property copy) | `SET RHS: bare property/variable reference is not supported; use a literal, $parameter, or arithmetic expression` |
+| Integer division by zero | `execute: division by zero` |
 | Writing to a view-maintained property | `property is managed by view "…" and cannot be written directly` |
 | Any write on an `open_at` (as-of) instance | `as-of instances are read-only` |
-| `+` or `/` in any expression position | `lex: illegal character '+' at position …` (or `'/'`); the lexer does not emit these tokens. `-` and `*` are **not** rejected — they are valid tokens, but produce a parse error when used outside a function-call argument |
 
 ### Absent
 
 Forms not implemented and not tested. Behavior is not guaranteed — these may produce an
-unexpected-token parse error or other unspecified result. `-` and `*` arithmetic are **not**
-absent: they are supported inside function arguments (see Supported table). `+` and `/` are
-**not** absent: they produce a confirmed named lex error (see Named-error table).
+unexpected-token parse error or other unspecified result.
 
 | Form |
 |---|
@@ -574,7 +574,7 @@ absent: they are supported inside function arguments (see Supported table). `+` 
 |---|---|
 | Multi-statement transactions | Not supported (one write statement per query in v1) |
 | Combined MATCH … SET … RETURN | Not supported; use two queries |
-| SET RHS expressions | Literals and `$param` references; computed expressions not supported |
+| SET RHS expressions | Literals, `$param` references, and arithmetic expressions (`n.x + 1`, `n.score * 1.5`); bare property-to-property copy (`SET n.x = m.y`) is a named error |
 | MATCH … DETACH DELETE (node) | Supported — removes node + all edges |
 | Bare DELETE on node with edges | Error — use DETACH DELETE |
 | MERGE ON CREATE / ON MATCH | Not supported |

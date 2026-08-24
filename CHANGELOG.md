@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.1 — unreleased
+
+### Cypher
+
+- **`IS NULL` / `IS NOT NULL`** — postfix null-check predicate in `WHERE` and `WITH … WHERE`; composes with `AND`/`OR`/`NOT`; enables the anti-join idiom (`OPTIONAL MATCH … WHERE b IS NULL`).
+- **General arithmetic (`+`, `-`, `*`, `/`)** — arithmetic expressions in `RETURN`, `WHERE` comparisons, `SET` RHS, and function arguments; operator precedence (`*`/`/` over `+`/`-`); parentheses; null propagation; saturating integer arithmetic; named error on division by zero.
+- **`CREATE … RETURN`** and **`MERGE … RETURN`** — single-statement write-then-project; write commits to WAL before projection; returns created/matched node bindings and computed columns.
+
+---
+
 ## v0.1.0 — 2026-08-21
 
 First tagged release.

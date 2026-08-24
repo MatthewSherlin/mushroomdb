@@ -6,6 +6,10 @@ use core_storage::fs::Fs;
 use sim_harness::{Oracle, SimFs, APPROX_RECALL_FLOOR_RECOVERY};
 use std::collections::{BTreeMap, BTreeSet};
 
+fn no_params_map() -> BTreeMap<String, Value> {
+    BTreeMap::new()
+}
+
 // Fulltext crash-recovery workload queries.
 const FT_WORKLOAD_QUERIES: &[&str] = &["rust", "graph OR storage", "embed*", "rust OR graph"];
 
@@ -1711,6 +1715,60 @@ fn recovery_byte_sweep_fulltext_with_snapshot() {
             assert_eq!(
                 index_results, scratch_results,
                 "crash_at={crash_at} (snapshot workload): index != scratch for query={query:?}"
+            );
+        }
+    }
+}
+
+/// Durability of `CREATE ... RETURN`:
+///
+/// The WAL commit happens *before* the RETURN projection, so a crash anywhere
+/// between the WAL write and the projection's completion must still leave the
+/// node in the recovered state.  We verify the invariant across all byte-offset
+/// crash points in the CREATE...RETURN workload.
+#[test]
+fn create_return_wal_durability_byte_sweep() {
+    fn create_return_workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+        // Single Batch frame: InsertNode only (no edges).
+        // The RETURN projection is a read-only operation after WAL commit.
+        db.query_write("CREATE (n:Widget {id: 'cr_w1'}) RETURN n", &no_params_map())?;
+        db.query_write(
+            "CREATE (n:Widget {id: 'cr_w2', score: 99}) RETURN n.score AS sc",
+            &no_params_map(),
+        )?;
+        Ok(())
+    }
+
+    let total_bytes = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        create_return_workload(&mut db).unwrap();
+        db.into_fs().total_appended()
+    };
+    assert!(
+        total_bytes > 0,
+        "CREATE...RETURN workload must append bytes"
+    );
+
+    for crash_at in 0..=total_bytes {
+        let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();
+        let _ = create_return_workload(&mut db);
+        let survivor = db.into_fs().surviving_state();
+        let recovered = GraphDb::open_with(survivor).unwrap();
+
+        // Invariant: if cr_w2 exists, cr_w1 must also exist (WAL ordering).
+        let w2 = recovered.has_node("cr_w2");
+        let w1 = recovered.has_node("cr_w1");
+        if w2 {
+            assert!(
+                w1,
+                "crash_at={crash_at}: cr_w2 present but cr_w1 absent — WAL ordering violated"
+            );
+        }
+        // Invariant: if cr_w1 exists its id property must be present.
+        if w1 {
+            assert!(
+                recovered.get_prop("cr_w1", "id").is_some(),
+                "crash_at={crash_at}: cr_w1 node missing its id property"
             );
         }
     }

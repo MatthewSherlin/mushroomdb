@@ -480,6 +480,10 @@ fn execute_inner(
                                 let val = eval_func(name, args, view, &vars, row, params)?;
                                 new_row[dst_slot] = val.map(Cell::Scalar);
                             }
+                            RetVal::ScalarExpr(op) => {
+                                let val = resolve_operand(view, &vars, row, op, params)?;
+                                new_row[dst_slot] = val.map(Cell::Scalar);
+                            }
                         }
                     }
                     new_rows.push(new_row);
@@ -791,6 +795,9 @@ fn collect_ret_item_params(item: &RetItem, names: &mut Vec<String>, seen: &mut B
                 collect_operand(arg, names, seen);
             }
         }
+        RetVal::ScalarExpr(op) => {
+            collect_operand(op, names, seen);
+        }
         RetVal::Prop { .. } | RetVal::Var(_) | RetVal::Agg { .. } => {}
     }
 }
@@ -836,6 +843,10 @@ fn collect_expr(
             Ok(())
         }
         Expr::Truthy(op) => {
+            collect_operand(op, names, seen);
+            Ok(())
+        }
+        Expr::IsNull(op) | Expr::IsNotNull(op) => {
             collect_operand(op, names, seen);
             Ok(())
         }
@@ -902,6 +913,9 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                                 intern_operand(&mut vars, arg);
                             }
                         }
+                        RetVal::ScalarExpr(op) => {
+                            intern_operand(&mut vars, op);
+                        }
                     }
                 }
             }
@@ -926,6 +940,9 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                             for arg in args {
                                 intern_operand(&mut vars, arg);
                             }
+                        }
+                        RetVal::ScalarExpr(op) => {
+                            intern_operand(&mut vars, op);
                         }
                     }
                     // Intern output column name (for subsequent pipeline stages).
@@ -962,6 +979,9 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                                 intern_operand(&mut vars, arg);
                             }
                         }
+                        RetVal::ScalarExpr(op) => {
+                            intern_operand(&mut vars, op);
+                        }
                     }
                     // Intern output column name (alias or derived).
                     if let Some(alias) = &item.alias {
@@ -976,6 +996,9 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                                 vars.intern(&col);
                             }
                             RetVal::Agg { .. } => {}
+                            RetVal::ScalarExpr(_) => {
+                                vars.intern("<expr>");
+                            }
                             RetVal::FuncCall { name, args } => {
                                 // Compute canonical column name inline.
                                 let arg_strs: Vec<String> = args
@@ -1090,6 +1113,7 @@ fn intern_expr(vars: &mut VarTable, expr: &Expr) {
             intern_operand(vars, rhs);
         }
         Expr::Truthy(op) => intern_operand(vars, op),
+        Expr::IsNull(op) | Expr::IsNotNull(op) => intern_operand(vars, op),
     }
 }
 
@@ -3070,6 +3094,14 @@ fn eval_expr(
                 Some(Value::List(v)) => !v.is_empty(),
             })
         }
+        Expr::IsNull(op) => {
+            let val = resolve_operand(view, vars, row, op, params)?;
+            Ok(val.is_none())
+        }
+        Expr::IsNotNull(op) => {
+            let val = resolve_operand(view, vars, row, op, params)?;
+            Ok(val.is_some())
+        }
     }
 }
 
@@ -3112,6 +3144,7 @@ fn column_name(item: &RetItem) -> String {
                 .collect();
             format!("{name}({})", arg_strs.join(", "))
         }
+        RetVal::ScalarExpr(_) => "<expr>".to_string(),
     }
 }
 
@@ -3171,6 +3204,7 @@ fn project_item(
                 .to_string(),
         ),
         RetVal::FuncCall { name, args } => eval_func(name, args, view, vars, row, params),
+        RetVal::ScalarExpr(op) => resolve_operand(view, vars, row, op, params),
     }
 }
 
@@ -5964,5 +5998,178 @@ LIMIT 10";
             err.contains("missing"),
             "error must name the param 'missing', got: {err}"
         );
+    }
+
+    // ── IS NULL / IS NOT NULL evaluation ─────────────────────────────────────
+
+    /// `WHERE n.missing IS NULL` must return nodes that lack the property.
+    #[test]
+    fn is_null_filters_absent_prop() {
+        let mut fx = Fx::new();
+        fx.add("Person", "alice", vec![("age", Value::Int(30))]);
+        fx.add("Person", "bob", vec![]); // no `age` prop
+        let view = fx.view();
+        let rs = run(
+            &view,
+            "MATCH (n:Person) WHERE n.age IS NULL RETURN n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 1, "only bob lacks age");
+        assert_eq!(rs.get(0, "n"), Some(&s("bob")));
+    }
+
+    /// `WHERE n.prop IS NOT NULL` must return nodes that have the property.
+    #[test]
+    fn is_not_null_filters_present_prop() {
+        let mut fx = Fx::new();
+        fx.add("Person", "alice", vec![("age", Value::Int(30))]);
+        fx.add("Person", "bob", vec![]); // no `age` prop
+        let view = fx.view();
+        let rs = run(
+            &view,
+            "MATCH (n:Person) WHERE n.age IS NOT NULL RETURN n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 1, "only alice has age");
+        assert_eq!(rs.get(0, "n"), Some(&s("alice")));
+    }
+
+    /// Anti-join idiom: OPTIONAL MATCH (a)-[:T]->(b) WHERE b IS NULL
+    /// returns nodes that have no outgoing T edge.
+    #[test]
+    fn optional_match_is_null_anti_join() {
+        let mut fx = Fx::new();
+        let alice = fx.add("Person", "alice", vec![]);
+        let bob = fx.add("Person", "bob", vec![]);
+        let carol = fx.add("Person", "carol", vec![]);
+        fx.edge("KNOWS", alice, carol, vec![]); // alice → carol
+        fx.edge("KNOWS", carol, bob, vec![]); // carol → bob
+                                              // bob has no outgoing KNOWS edge; alice and carol both do.
+        let view = fx.view();
+        let rs = run(
+            &view,
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) WITH a, b WHERE b IS NULL RETURN a",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 1, "only bob has no outgoing KNOWS edge");
+        assert_eq!(rs.get(0, "a"), Some(&s("bob")));
+    }
+
+    /// IS NULL composes with AND correctly.
+    #[test]
+    fn is_null_combined_with_and_exec() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("x", Value::Int(1))]);
+        fx.add("N", "b", vec![("x", Value::Int(2)), ("y", Value::Int(9))]);
+        fx.add("N", "c", vec![]); // no x, no y
+        let view = fx.view();
+        // WHERE n.y IS NULL AND n.x IS NOT NULL → only a (x=1, no y)
+        let rs = run(
+            &view,
+            "MATCH (n:N) WHERE n.y IS NULL AND n.x IS NOT NULL RETURN n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.get(0, "n"), Some(&s("a")));
+    }
+
+    // ── Arithmetic evaluation ─────────────────────────────────────────────────
+
+    /// `n.age + 1` in RETURN produces ScalarExpr result per row.
+    #[test]
+    fn arithmetic_add_in_return() {
+        let mut fx = Fx::new();
+        fx.add("Person", "alice", vec![("age", Value::Int(29))]);
+        let view = fx.view();
+        let rs = run(
+            &view,
+            "MATCH (n:Person) RETURN n.age + 1 AS adjusted",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.get(0, "adjusted"), Some(&Value::Int(30)));
+    }
+
+    /// Parentheses override default precedence: (1+2)*3 = 9, not 1+(2*3)=7.
+    #[test]
+    fn arithmetic_precedence_parens_pin() {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]);
+        let view = fx.view();
+        let rs = run(
+            &view,
+            "MATCH (n:N) RETURN (1 + 2) * 3 AS r",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.get(0, "r"), Some(&Value::Int(9)));
+    }
+
+    /// Without parens, 1+2*3 = 7 (multiplication over addition).
+    #[test]
+    fn arithmetic_precedence_mul_over_add_pin() {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]);
+        let view = fx.view();
+        let rs = run(&view, "MATCH (n:N) RETURN 1 + 2 * 3 AS r", &BTreeMap::new()).unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.get(0, "r"), Some(&Value::Int(7)));
+    }
+
+    /// Division by zero in an arithmetic expression returns an error (not panic).
+    #[test]
+    fn arithmetic_div_by_zero_returns_error() {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]);
+        let view = fx.view();
+        let err = run(
+            &view,
+            "MATCH (n:N) WHERE 1 / 0 > 0 RETURN n",
+            &BTreeMap::new(),
+        )
+        .expect_err("division by zero must error");
+        assert!(
+            err.contains("division by zero"),
+            "error must mention division by zero, got: {err}"
+        );
+    }
+
+    /// Null propagation: arithmetic on a null operand yields null (filter excludes row).
+    #[test]
+    fn arithmetic_null_propagates() {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]); // no `val` prop → null
+        let view = fx.view();
+        // WHERE n.val + 1 > 0 — null propagates → false → no rows
+        let rs = run(
+            &view,
+            "MATCH (n:N) WHERE n.val + 1 > 0 RETURN n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 0, "null arithmetic must not match");
+    }
+
+    /// Arithmetic in a WHERE comparison: `n.age + 1 > 5` filters correctly.
+    #[test]
+    fn arithmetic_in_where_comparison() {
+        let mut fx = Fx::new();
+        fx.add("Person", "alice", vec![("age", Value::Int(5))]); // 5+1=6 > 5 → match
+        fx.add("Person", "bob", vec![("age", Value::Int(4))]); // 4+1=5 not > 5 → skip
+        let view = fx.view();
+        let rs = run(
+            &view,
+            "MATCH (n:Person) WHERE n.age + 1 > 5 RETURN n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.get(0, "n"), Some(&s("alice")));
     }
 }
