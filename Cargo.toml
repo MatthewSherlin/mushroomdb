@@ -27,6 +27,7 @@ serde_json = "1"
 bincode = "1"
 crc32fast = "1"
 proptest = "1"
+zstd = "0.13"
 # Bench-only. Consumed as a dev-dep by core-bench; do not take it as a
 # runtime dependency.
 criterion = "0.8"

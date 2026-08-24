@@ -1,6 +1,6 @@
 use core_api::{
-    AggFn, AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, RuleStats, Stats, Value,
-    ViewDef, ViewSource,
+    AggFn, AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, RuleStats,
+    SnapshotOptions, Stats, Value, ViewDef, ViewSource,
 };
 use core_storage::fs::Fs;
 use sim_harness::{Oracle, SimFs, APPROX_RECALL_FLOOR_RECOVERY};
@@ -1771,5 +1771,195 @@ fn create_return_wal_durability_byte_sweep() {
                 "crash_at={crash_at}: cr_w1 node missing its id property"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DST: V6 snapshot write path crash sweep
+// ---------------------------------------------------------------------------
+
+/// Workload that writes V6 snapshots mid-stream (used by DST sweeps).
+fn v6_snapshot_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    for i in 0..10u32 {
+        db.insert_node(
+            "S",
+            &format!("s{i}"),
+            vec![("i".into(), Value::Int(i as i64))],
+        )?;
+        if i > 0 {
+            db.insert_edge("SE", &format!("s{}", i - 1), &format!("s{i}"))?;
+        }
+        if i == 5 {
+            // Mid-workload V6 snapshot.
+            db.snapshot()?;
+        }
+    }
+    Ok(())
+}
+
+/// DST byte-level crash sweep over the V6 snapshot write path.
+///
+/// Crashes are injected at every byte offset in the WAL append stream.
+/// The V6 snapshot write_atomic is covered by the op-mode sweep below.
+/// Recovery invariant: every crash point opens cleanly; at most 5 nodes
+/// exist (pre-snapshot) and incremental nodes (post-snapshot WAL tail)
+/// may be absent — both are valid states.
+#[test]
+fn v6_snapshot_dst_byte_sweep() {
+    let total_bytes = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        v6_snapshot_workload(&mut db).unwrap();
+        db.into_fs().total_appended()
+    };
+
+    for crash_at in 0..=total_bytes {
+        let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();
+        let _ = v6_snapshot_workload(&mut db);
+        let survivor = db.into_fs().surviving_state();
+
+        let recovered = GraphDb::open_with(survivor)
+            .unwrap_or_else(|_| panic!("v6 crash_at={crash_at}: recovery must not error"));
+        // Invariant: node count is between 0 and 10.
+        let nc = recovered.node_count();
+        assert!(
+            nc <= 10,
+            "v6 crash_at={crash_at}: node_count={nc} exceeds maximum"
+        );
+        // Invariant: edge count is consistent (at most nc-1 chain edges).
+        let ec = recovered.edge_count();
+        assert!(
+            ec <= nc.saturating_sub(1) as u64,
+            "v6 crash_at={crash_at}: edge_count={ec} > node_count-1={nc}"
+        );
+    }
+}
+
+/// DST op-level crash sweep over the V6 snapshot write path.
+/// Covers crashes at the `write_atomic(Snapshot)` and the WAL-truncation
+/// `write_atomic` that follows.
+#[test]
+fn v6_snapshot_dst_op_sweep() {
+    let total_ops = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        v6_snapshot_workload(&mut db).unwrap();
+        db.into_fs().total_ops()
+    };
+    assert!(total_ops > 0, "v6 workload must make at least one Fs call");
+
+    for crash_op in 0..=total_ops {
+        let survivor = match GraphDb::open_with(SimFs::with_crash_after_ops(crash_op)) {
+            Ok(mut db) => {
+                let _ = v6_snapshot_workload(&mut db);
+                db.into_fs().surviving_state()
+            }
+            Err(_) => SimFs::new(),
+        };
+
+        let recovered = GraphDb::open_with(survivor)
+            .unwrap_or_else(|_| panic!("v6 op crash_op={crash_op}: recovery must not error"));
+        let nc = recovered.node_count();
+        assert!(
+            nc <= 10,
+            "v6 op crash_op={crash_op}: node_count={nc} exceeds maximum"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DST: keep_wal path crash sweep
+// ---------------------------------------------------------------------------
+
+/// Workload that exercises the keep_wal=true snapshot path.
+fn keep_wal_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    db.insert_node("KW", "kw0", vec![("v".into(), Value::Int(0))])?;
+    db.insert_node("KW", "kw1", vec![("v".into(), Value::Int(1))])?;
+    db.insert_edge("KWE", "kw0", "kw1")?;
+    // keep_wal snapshot: WAL is preserved after snapshot write.
+    db.snapshot_with(SnapshotOptions { keep_wal: true })?;
+    // Post-snapshot writes.
+    db.insert_node("KW", "kw2", vec![("v".into(), Value::Int(2))])?;
+    db.insert_edge("KWE", "kw1", "kw2")?;
+    Ok(())
+}
+
+/// DST byte-level crash sweep over the keep_wal snapshot path.
+///
+/// With keep_wal=true, only the snapshot write_atomic can crash (no WAL
+/// truncation write_atomic follows).  Recovery must produce a consistent
+/// state in all cases:
+///   - Crash before snapshot write: WAL-only recovery, 0..=3 nodes.
+///   - Crash after snapshot write: snapshot+WAL recovery, 0..=3 nodes.
+///
+/// The WAL is never truncated so all pre-snapshot WAL frames remain; replay
+/// over the snapshot is idempotent (guards in apply() skip already-current ops).
+#[test]
+fn keep_wal_dst_byte_sweep() {
+    let total_bytes = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        keep_wal_workload(&mut db).unwrap();
+        db.into_fs().total_appended()
+    };
+
+    for crash_at in 0..=total_bytes {
+        let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();
+        let _ = keep_wal_workload(&mut db);
+        let survivor = db.into_fs().surviving_state();
+
+        let recovered = GraphDb::open_with(survivor)
+            .unwrap_or_else(|_| panic!("keep_wal crash_at={crash_at}: recovery must not error"));
+        let nc = recovered.node_count();
+        assert!(
+            nc <= 3,
+            "keep_wal crash_at={crash_at}: node_count={nc} exceeds maximum (3)"
+        );
+        let ec = recovered.edge_count();
+        assert!(
+            ec <= 2,
+            "keep_wal crash_at={crash_at}: edge_count={ec} exceeds maximum (2)"
+        );
+        // kw0→kw1 edge can only exist if both nodes exist.
+        let has_kw0 = recovered.has_node("kw0");
+        let has_kw1 = recovered.has_node("kw1");
+        if !has_kw0 || !has_kw1 {
+            assert_eq!(
+                recovered.edge_count(),
+                0,
+                "keep_wal crash_at={crash_at}: edge present but endpoint missing"
+            );
+        }
+    }
+}
+
+/// DST op-level crash sweep over the keep_wal path.
+/// Covers the snapshot write_atomic op; the WAL write_atomic is absent
+/// (keep_wal=true skips it).
+#[test]
+fn keep_wal_dst_op_sweep() {
+    let total_ops = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        keep_wal_workload(&mut db).unwrap();
+        db.into_fs().total_ops()
+    };
+    assert!(
+        total_ops > 0,
+        "keep_wal workload must make at least one Fs call"
+    );
+
+    for crash_op in 0..=total_ops {
+        let survivor = match GraphDb::open_with(SimFs::with_crash_after_ops(crash_op)) {
+            Ok(mut db) => {
+                let _ = keep_wal_workload(&mut db);
+                db.into_fs().surviving_state()
+            }
+            Err(_) => SimFs::new(),
+        };
+
+        let recovered = GraphDb::open_with(survivor)
+            .unwrap_or_else(|_| panic!("keep_wal op crash_op={crash_op}: recovery must not error"));
+        let nc = recovered.node_count();
+        assert!(
+            nc <= 3,
+            "keep_wal op crash_op={crash_op}: node_count={nc} exceeds maximum (3)"
+        );
     }
 }

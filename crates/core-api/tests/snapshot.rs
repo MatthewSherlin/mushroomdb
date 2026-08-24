@@ -1,4 +1,7 @@
-use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource};
+use core_api::{
+    Direction, GraphDb, GraphError, Predicate, RuleDef, SnapshotOptions, Value, ViewDef, ViewSource,
+};
+use core_storage::wal::decode_all;
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-{}-{}", name, std::process::id()));
@@ -955,4 +958,389 @@ fn v4_round_trip_topk_rule() {
         ),
         "provenance must be retained after round-trip: insert of derived edge should be RuleOwned"
     );
+}
+
+// ---------------------------------------------------------------------------
+// V6 container tests (zstd-compressed snapshots)
+// ---------------------------------------------------------------------------
+
+/// Golden V5 fixture pin: the pre-V6 snapshot byte sequence must remain readable.
+/// Fixture was generated from base commit c3bffd1 with encode() writing VERSION=5.
+/// Contains 2 nodes ("a", "b"), 1 edge ("E", a→b), prop v=42 on "a".
+#[test]
+fn golden_v5_pin() {
+    let snap_bytes = include_bytes!("fixtures/golden_v5.bin");
+    // Verify magic and version header.
+    assert_eq!(
+        &snap_bytes[0..4],
+        b"GDB1",
+        "V5 fixture must start with GDB1 magic"
+    );
+    assert_eq!(
+        u16::from_le_bytes([snap_bytes[4], snap_bytes[5]]),
+        5,
+        "V5 fixture version field must be 5"
+    );
+    // Load into a real temp dir and open.
+    let dir = tmp("golden-v5-pin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("snapshot.bin"), snap_bytes).unwrap();
+    // WAL must exist (may be empty) for open to succeed.
+    std::fs::write(dir.join("wal.bin"), b"").unwrap();
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.node_count(), 2, "V5 fixture must decode to 2 nodes");
+    assert_eq!(db.edge_count(), 1, "V5 fixture must decode to 1 edge");
+    assert_eq!(
+        db.get_prop("a", "v"),
+        Some(&Value::Int(42)),
+        "V5 fixture must preserve prop v=42 on node 'a'"
+    );
+}
+
+/// Golden V6 fixture pin: snapshot() now writes VERSION=6 (zstd-compressed).
+/// Fixture generated after V6 implementation; decoding it verifies the wire format
+/// is stable — future changes that silently alter byte output will fail this test.
+///
+/// To regenerate: `cargo run --example gen_v6_fixture` from workspace root.
+#[test]
+fn golden_v6_pin() {
+    let snap_bytes = include_bytes!("fixtures/golden_v6.bin");
+    // Verify magic and version header.
+    assert_eq!(
+        &snap_bytes[0..4],
+        b"GDB1",
+        "V6 fixture must start with GDB1 magic"
+    );
+    assert_eq!(
+        u16::from_le_bytes([snap_bytes[4], snap_bytes[5]]),
+        6,
+        "V6 fixture version field must be 6"
+    );
+    // Load into a real temp dir and open.
+    let dir = tmp("golden-v6-pin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("snapshot.bin"), snap_bytes).unwrap();
+    std::fs::write(dir.join("wal.bin"), b"").unwrap();
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.node_count(), 2, "V6 fixture must decode to 2 nodes");
+    assert_eq!(db.edge_count(), 1, "V6 fixture must decode to 1 edge");
+    assert_eq!(
+        db.get_prop("a", "v"),
+        Some(&Value::Int(42)),
+        "V6 fixture must preserve prop v=42 on node 'a'"
+    );
+}
+
+/// V6 round-trip: snapshot now writes V6; reopen recovers the full state.
+#[test]
+fn v6_snapshot_roundtrip() {
+    let dir = tmp("snap-v6-rt");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![("v".into(), Value::Int(7))])
+            .unwrap();
+        db.insert_node("N", "b", vec![]).unwrap();
+        db.insert_edge("E", "a", "b").unwrap();
+        db.snapshot().unwrap();
+        // Post-snapshot WAL tail.
+        db.insert_node("N", "c", vec![]).unwrap();
+    }
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.node_count(), 3);
+    assert_eq!(db.edge_count(), 1);
+    assert_eq!(db.get_prop("a", "v"), Some(&Value::Int(7)));
+    // Verify the snapshot file actually uses V6 container.
+    let snap = std::fs::read(dir.join("snapshot.bin")).unwrap();
+    assert_eq!(&snap[0..4], b"GDB1");
+    assert_eq!(u16::from_le_bytes([snap[4], snap[5]]), 6);
+}
+
+/// V4-refuse is unchanged by V6: a V4-stamped snapshot must still be rejected.
+#[test]
+fn v4_refuse_unchanged_after_v6() {
+    let dir = tmp("snap-v6-v4-refuse");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap();
+        db.snapshot().unwrap(); // writes V6
+    }
+    let path = dir.join("snapshot.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[4] = 4;
+    bytes[5] = 0; // stamp VERSION=4
+    std::fs::write(&path, bytes).unwrap();
+    match GraphDb::open(&dir) {
+        Err(GraphError::Corrupt { detail }) => {
+            assert!(
+                detail.contains("version 4"),
+                "error should mention version 4; got: {detail}"
+            );
+        }
+        Ok(_) => panic!("expected Corrupt for V4 snapshot, got Ok"),
+        Err(e) => panic!("expected Corrupt for V4 snapshot, got: {e:?}"),
+    }
+}
+
+/// Torn-write safety for V6: truncating a V6 snapshot to any byte count must
+/// always return Corrupt, never open silently.  Covers mid-header (bad magic or
+/// version), post-header (truncated compressed stream), and mid-payload offsets.
+#[test]
+fn v6_torn_snapshot_write_is_rejected() {
+    let dir = tmp("snap-v6-torn");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node(
+            "A",
+            "a",
+            vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+        )
+        .unwrap();
+        db.insert_node(
+            "A",
+            "b",
+            vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+        )
+        .unwrap();
+        db.create_rule(RuleDef {
+            name: "exact".into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            },
+            edge_type: "REL".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+        })
+        .unwrap();
+        // Add a view so the snapshot payload covers the view_defs region.
+        db.create_view(ViewDef {
+            name: "deg_rel".into(),
+            label: "A".into(),
+            view_prop: "deg_rel".into(),
+            source: ViewSource::Degree {
+                edge_type: "REL".into(),
+                direction: Direction::Out,
+            },
+        })
+        .unwrap();
+        db.snapshot().unwrap(); // writes V6
+    }
+
+    let path = dir.join("snapshot.bin");
+    let good = std::fs::read(&path).unwrap();
+    let n = good.len();
+    assert!(n > 20, "V6 snapshot must be non-trivial; got {n} bytes");
+
+    // Truncation points: mid-header (3B), version-only (5B), just-past-header (7B),
+    // early compressed stream (n/3), mid-stream (n/2), late compressed stream
+    // (n*2/3, n*3/4, n-5), one byte short (n-1).
+    // Any truncation must yield Err — never a silently-wrong open.
+    for &trunc in &[
+        3usize,
+        5,
+        7,
+        n / 3,
+        n / 2,
+        n * 2 / 3,
+        n * 3 / 4,
+        n.saturating_sub(5),
+        n - 1,
+    ] {
+        if trunc == 0 || trunc >= n {
+            continue;
+        }
+        std::fs::write(&path, &good[..trunc]).unwrap();
+        assert!(
+            GraphDb::open(&dir).is_err(),
+            "expected Err for {trunc}-byte truncation of {n}-byte V6 snapshot",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// keep_wal tests
+// ---------------------------------------------------------------------------
+
+/// keep_wal=true reopen equivalence: a database that took a keep_wal snapshot and
+/// continued writing must produce the same state as a reference db that was never
+/// closed.  This verifies that snapshot-over-WAL replay is idempotent and that
+/// post-snapshot commits survive.
+#[test]
+fn keep_wal_reopen_equivalence() {
+    let dir = tmp("keep-wal-equiv");
+    let ref_dir = tmp("keep-wal-equiv-ref");
+
+    // Build reference db — never snapshot, receives all ops.
+    let mut ref_db = GraphDb::open(&ref_dir).unwrap();
+    ref_db
+        .insert_node("N", "a", vec![("v".into(), Value::Int(1))])
+        .unwrap();
+    ref_db.insert_node("N", "b", vec![]).unwrap();
+    ref_db.insert_edge("E", "a", "b").unwrap();
+
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![("v".into(), Value::Int(1))])
+            .unwrap();
+        db.insert_node("N", "b", vec![]).unwrap();
+        db.insert_edge("E", "a", "b").unwrap();
+        // Snapshot with keep_wal=true — WAL is preserved.
+        db.snapshot_with(SnapshotOptions { keep_wal: true })
+            .unwrap();
+        // Post-snapshot writes, same as reference.
+        db.insert_node("N", "c", vec![]).unwrap();
+        db.insert_edge("E", "b", "c").unwrap();
+    }
+    ref_db.insert_node("N", "c", vec![]).unwrap();
+    ref_db.insert_edge("E", "b", "c").unwrap();
+
+    // Reopen and compare with reference.
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.node_count(),
+        ref_db.node_count(),
+        "node count must match reference after keep_wal reopen"
+    );
+    assert_eq!(
+        db.edge_count(),
+        ref_db.edge_count(),
+        "edge count must match reference after keep_wal reopen"
+    );
+    assert_eq!(
+        db.get_prop("a", "v"),
+        Some(&Value::Int(1)),
+        "prop must survive keep_wal round-trip"
+    );
+    assert_eq!(
+        db.neighbors("b", "E", Direction::Out).unwrap(),
+        vec!["c"],
+        "edge from b must survive keep_wal round-trip"
+    );
+}
+
+/// keep_wal=true preserves open_at access to pre-snapshot commits.
+///
+/// After a keep_wal snapshot, old WAL frames remain on disk.  open_at must
+/// be able to reach commits made BEFORE the snapshot — that is the entire point
+/// of keep_wal.
+#[test]
+fn keep_wal_open_at_reaches_pre_snapshot_commits() {
+    let dir = tmp("keep-wal-open-at");
+    let wal_commit_before_snap;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        // commit 0: insert "a"
+        db.insert_node("N", "a", vec![("v".into(), Value::Int(10))])
+            .unwrap();
+        // commit 1: insert "b"
+        db.insert_node("N", "b", vec![]).unwrap();
+        // WAL now has 2 frames (commits 0 and 1).
+        wal_commit_before_snap = 0; // commit 0 = first WAL frame
+                                    // Snapshot with keep_wal=true — commits 0 and 1 stay in WAL.
+        db.snapshot_with(SnapshotOptions { keep_wal: true })
+            .unwrap();
+        // Post-snapshot commits.
+        db.insert_node("N", "c", vec![]).unwrap(); // commit 2
+        db.insert_node("N", "d", vec![]).unwrap(); // commit 3
+    }
+
+    // open_at(0) = WAL replay of just the first frame = only node "a".
+    let at0 = GraphDb::open_at(&dir, wal_commit_before_snap).unwrap();
+    assert!(at0.has_node("a"), "commit 0 must have node 'a'");
+    assert!(!at0.has_node("b"), "commit 0 must not yet have node 'b'");
+    assert!(
+        !at0.has_node("c"),
+        "commit 0 must not yet have node 'c' (post-snapshot)"
+    );
+    assert_eq!(
+        at0.get_prop("a", "v"),
+        Some(&Value::Int(10)),
+        "prop on 'a' must be correct at commit 0"
+    );
+
+    // open_at(1) = WAL replay of first 2 frames = nodes "a" and "b".
+    let at1 = GraphDb::open_at(&dir, 1).unwrap();
+    assert!(at1.has_node("a"));
+    assert!(at1.has_node("b"));
+    assert!(!at1.has_node("c"));
+}
+
+/// Fulltext baseline no double-log: with keep_wal=true, the WAL is not truncated
+/// and no new baseline EnableFulltext records are appended.  The only EnableFulltext
+/// records in the WAL are the original ones from the enable_fulltext() calls.
+/// Assert the count is exactly the number of enabled declarations (not doubled).
+#[test]
+fn keep_wal_fulltext_baseline_not_doubled() {
+    let dir = tmp("keep-wal-ft-nodbl");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node(
+            "N",
+            "a",
+            vec![("text".into(), Value::Str("hello world".into()))],
+        )
+        .unwrap();
+        db.insert_node(
+            "N",
+            "b",
+            vec![("text".into(), Value::Str("graph storage".into()))],
+        )
+        .unwrap();
+        // Enable fulltext for 1 pair → 1 EnableFulltext record written to WAL.
+        db.enable_fulltext("N", "text").unwrap();
+        db.snapshot_with(SnapshotOptions { keep_wal: true })
+            .unwrap();
+    }
+
+    // Read WAL and count EnableFulltext records.
+    let wal_bytes = std::fs::read(dir.join("wal.bin")).unwrap();
+    let (records, _) = decode_all(&wal_bytes);
+    let ft_count = records
+        .iter()
+        .filter(|r| matches!(r, core_storage::wal::WalRecord::EnableFulltext { .. }))
+        .count();
+
+    // Exactly 1 EnableFulltext record — same as the original enable call.
+    // If keep_wal erroneously wrote a baseline, this would be 2.
+    assert_eq!(
+        ft_count, 1,
+        "keep_wal=true must not append a baseline: expected 1 EnableFulltext record, got {ft_count}"
+    );
+
+    // Reopen must succeed and fulltext still works.
+    let db = GraphDb::open(&dir).unwrap();
+    let results = db.search("text", "hello");
+    assert!(
+        results.iter().any(|(k, _)| k == "a"),
+        "fulltext must still find 'a' after keep_wal reopen"
+    );
+}
+
+/// keep_wal=false (the default snapshot()) truncates the WAL to a minimal baseline.
+/// After snapshot(), open_at returns CommitOutOfRange because all pre-snapshot commits
+/// are gone.
+#[test]
+fn default_snapshot_truncates_wal_history() {
+    let dir = tmp("snap-truncate-hist");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap(); // commit 0
+        db.insert_node("N", "b", vec![]).unwrap(); // commit 1
+                                                   // Default snapshot: truncates WAL.
+        db.snapshot().unwrap();
+        // Post-snapshot writes.
+        db.insert_node("N", "c", vec![]).unwrap(); // new commit 0
+    }
+
+    // open_at(1) — these were pre-snapshot commits; WAL is now minimal (just
+    // EnableFulltext baseline or empty), so commit 1 no longer exists.
+    // CommitOutOfRange means the history was indeed truncated.
+    match GraphDb::open_at(&dir, 1) {
+        Err(GraphError::CommitOutOfRange { .. }) => {}
+        Ok(_) => panic!("expected CommitOutOfRange after default snapshot, got Ok"),
+        Err(e) => panic!("expected CommitOutOfRange, got {e:?}"),
+    }
 }

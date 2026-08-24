@@ -29,15 +29,18 @@ If the WAL is empty (i.e., snapshot was just taken and no new writes have
 occurred), `open_at` returns `GraphError::CommitOutOfRange { commit, total: 0 }`.
 
 **Snapshot tradeoff:** `snapshot()` truncates the WAL — faster cold starts, but
-as-of history restarts from that point. These goals are in direct tension: if
-you take snapshots regularly for fast startup, `open_at` can only reach commits
-after the most recent snapshot. Choose based on operational priorities:
-- **Need as-of history across all time:** never snapshot; accept longer cold-start.
-- **Need fast startup:** snapshot regularly; `open_at` reaches only post-snapshot commits.
-- **Both:** snapshot at a known checkpoint and document that timestamp as the as-of horizon.
+as-of history restarts from that point. These goals are in direct tension.
+`snapshot_with(SnapshotOptions { keep_wal: true })` is now the answer: the V6
+snapshot is written, but the WAL is left intact. `open_at` can reach commits
+from before the snapshot; cold-start loads the snapshot and then replays the
+full WAL idempotently (recovery guards in `apply()` skip already-reflected ops).
+Choose based on operational priorities:
+- **Need as-of history across all time:** use `snapshot_with(SnapshotOptions { keep_wal: true })` regularly; `open_at` can reach all WAL commits.
+- **Need fast startup with a short WAL:** use `snapshot()` (default); WAL is truncated; `open_at` can only reach post-snapshot commits.
+- **Both:** use `keep_wal=true` for checkpoints; WAL grows until you explicitly truncate it with a standard `snapshot()`.
 
-The WAL grows without bound until a snapshot is taken. For large databases this
-may be gigabytes over long operational periods.
+The WAL grows without bound until a standard `snapshot()` truncates it. For
+large databases this may be gigabytes over long operational periods.
 
 **Torn WAL tail:** if the WAL has a partial frame at the end (e.g., after a
 crash mid-write), `open_at` silently treats it as fewer commits — only complete,

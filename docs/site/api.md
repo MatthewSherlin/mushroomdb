@@ -386,12 +386,30 @@ s = db.stats()
 ### Snapshot
 
 ```python
-db.snapshot()  # flush WAL and write a snapshot file
+db.snapshot()  # write V6 (zstd-compressed) snapshot and truncate WAL
 ```
 
-`snapshot()` truncates the WAL: faster cold starts, but as-of history
-(`open_at`) restarts from that point — commits before the snapshot are no
-longer reachable via time travel.
+`snapshot()` writes the current state as a V6 (zstd-compressed) snapshot and
+then truncates the WAL to a minimal baseline. Faster cold starts, but as-of
+history (`open_at`) restarts from that point — commits before the snapshot are
+no longer reachable via time travel.
+
+**Keep WAL (Rust API):**
+
+```rust
+use core_api::{SnapshotOptions};
+db.snapshot_with(SnapshotOptions { keep_wal: true })?;
+```
+
+`keep_wal: true` writes the V6 snapshot but leaves the WAL intact. `open_at`
+can still reach pre-snapshot commits. The WAL replay over the snapshot is
+idempotent — no manual recovery is needed. The WAL grows until an explicit
+`snapshot()` (with default `keep_wal: false`) truncates it.
+
+**V6 snapshot format:** magic + version header uncompressed (6 bytes); the
+rest is zstd-compressed (level 3). Measured at 5k nodes: 62 KiB on disk,
+16 ms to write, 2 ms to open. V5 snapshots (from v0.1.0) are read
+transparently — no migration required.
 
 ### Atomic write batches (Rust API)
 

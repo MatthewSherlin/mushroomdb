@@ -398,6 +398,16 @@ pub struct GraphDb<F: Fs> {
     total_wal_commits: u64,
 }
 
+/// Options for [`GraphDb::snapshot_with`].
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotOptions {
+    /// When `true`, the WAL is preserved after the snapshot write.
+    /// Pre-snapshot commits remain reachable via [`GraphDb::open_at`].
+    /// When `false` (the default), the WAL is truncated to a minimal
+    /// baseline so cold-start replay stays fast.
+    pub keep_wal: bool,
+}
+
 impl GraphDb<RealFs> {
     pub fn open(dir: &std::path::Path) -> Result<Self> {
         Self::open_with(RealFs::new(dir)?)
@@ -3145,6 +3155,30 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn snapshot(&mut self) -> Result<()> {
+        self.snapshot_with(SnapshotOptions::default())
+    }
+
+    /// Snapshot with explicit options.
+    ///
+    /// # `keep_wal`
+    ///
+    /// When `keep_wal` is `false` (the default, same as [`snapshot`]):
+    ///   - The WAL is replaced with a minimal baseline containing one
+    ///     `EnableFulltext` record per active declaration.  All pre-snapshot
+    ///     history is discarded; `open_at` can only reach post-snapshot commits.
+    ///
+    /// When `keep_wal` is `true`:
+    ///   - The WAL is left intact.  All pre-snapshot commits remain reachable
+    ///     via `open_at`.  The existing WAL already contains the original
+    ///     `EnableFulltext` records, so no baseline re-write is needed; the
+    ///     recovery guards in `apply()` silently skip any duplicate records on
+    ///     replay.
+    ///   - Crash window: a crash after the snapshot write but before the next
+    ///     WAL write leaves the full pre-snapshot WAL intact.  On reopen the
+    ///     snapshot is loaded and the WAL replayed idempotently over it — safe
+    ///     because every `apply()` arm is idempotent when replayed over an
+    ///     already-current snapshot.
+    pub fn snapshot_with(&mut self, opts: SnapshotOptions) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
@@ -3196,30 +3230,32 @@ impl<F: Fs> GraphDb<F> {
         };
         self.fs
             .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state))?;
-        // After snapshot, atomically write a baseline WAL containing one
-        // EnableFulltext record per currently-enabled declaration.  On the next
-        // open(), WAL replay re-enables the declarations before rebuild_all()
-        // restores the postings.  This is cheaper than a SnapshotState field
-        // (which would require a VERSION bump) and preserves the no-schema-change
-        // invariant.
-        //
-        // Crash-ordering: write_atomic is atomic.
-        //   • Crash before snapshot write  → WAL unchanged (has old EnableFulltext
-        //     records from the original enable_fulltext calls).  Safe.
-        //   • Crash after snapshot write but before this WAL write → snapshot is
-        //     present; WAL still has the full pre-snapshot history (including the
-        //     original EnableFulltext records).  open_with() applies WAL idempotently
-        //     over the snapshot.  Safe.
-        //   • Crash after both writes → normal post-snapshot state.  Safe.
-        let mut baseline_wal: Vec<u8> = Vec::new();
-        for (label, field) in self.fulltext.enabled_pairs() {
-            let rec = WalRecord::EnableFulltext {
-                label: label.clone(),
-                field: field.clone(),
-            };
-            baseline_wal.extend_from_slice(&encode_record(&rec));
+
+        if opts.keep_wal {
+            // keep_wal=true: WAL is left untouched.  The existing WAL already
+            // contains the EnableFulltext records from the original enable calls;
+            // replay is idempotent (guards in apply() skip already-live entries).
+            // No baseline re-write is needed or safe here — the full WAL history
+            // must remain intact for open_at to reach pre-snapshot commits.
+        } else {
+            // keep_wal=false (default): truncate by replacing the WAL with a
+            // minimal baseline of one EnableFulltext record per active pair.
+            //
+            // Crash-ordering: write_atomic is atomic.
+            //   • Crash before snapshot write  → WAL unchanged.  Safe.
+            //   • Crash after snapshot write but before this WAL write → full
+            //     pre-snapshot WAL still present; open_with replays idempotently.
+            //   • Crash after both writes → normal post-snapshot state.
+            let mut baseline_wal: Vec<u8> = Vec::new();
+            for (label, field) in self.fulltext.enabled_pairs() {
+                let rec = WalRecord::EnableFulltext {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
         }
-        self.fs.write_atomic(FileId::Wal, &baseline_wal)?; // replaces old WAL tail
         Ok(())
     }
 }

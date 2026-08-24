@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAGIC: [u8; 4] = *b"GDB1";
-pub const VERSION: u16 = 5;
+/// V5: uncompressed bincode payload with CRC32 header.
+pub const VERSION_5: u16 = 5;
+/// V6: zstd-compressed V5 payload in a container.
+/// Header (magic + version) is uncompressed; the rest is zstd.
+pub const VERSION: u16 = 6;
 
 /// IVF state for one side (src or dst) of a single approximate rule.
 /// Persisted in V4 snapshots so `open()` can restore cluster assignments
@@ -57,13 +61,26 @@ pub struct SnapshotState {
     pub view_defs: Vec<Vec<u8>>,
 }
 
+/// Encode a snapshot as a V6 container (zstd-compressed).
+///
+/// Wire format:
+///   [4B magic][2B version=6][zstd-compressed([4B crc32][bincode payload])]
+///
+/// The header (magic + version) is deliberately left uncompressed so
+/// `decode()` can identify the container type before decompressing.
 pub fn encode(state: &SnapshotState) -> Vec<u8> {
     let payload = bincode::serialize(state).expect("snapshot serialize cannot fail");
-    let mut out = Vec::with_capacity(10 + payload.len());
+    let crc = crc32fast::hash(&payload);
+    // Build the inner bytes: CRC32 + payload (mirrors V5 layout pre-compression).
+    let mut inner = Vec::with_capacity(4 + payload.len());
+    inner.extend(crc.to_le_bytes());
+    inner.extend(payload);
+    let compressed =
+        zstd::encode_all(inner.as_slice(), 3).expect("zstd compress cannot fail on in-memory buf");
+    let mut out = Vec::with_capacity(6 + compressed.len());
     out.extend(MAGIC);
     out.extend(VERSION.to_le_bytes());
-    out.extend(crc32fast::hash(&payload).to_le_bytes());
-    out.extend(payload);
+    out.extend(compressed);
     out
 }
 
@@ -71,26 +88,40 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    if bytes.len() < 10 || bytes[0..4] != MAGIC {
+    if bytes.len() < 6 || bytes[0..4] != MAGIC {
         return Err(GraphError::Corrupt {
             detail: "snapshot: bad magic".into(),
         });
     }
     let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-    if version != VERSION {
-        let hint = if version == 3 {
-            " — V3 snapshot is no longer supported; re-snapshot with a V5 binary"
-        } else if version == 4 {
-            " — V4 snapshot is no longer supported; re-snapshot with a V5 binary"
-        } else {
-            ""
-        };
+    match version {
+        VERSION_5 => decode_v5(&bytes[6..]),
+        VERSION => decode_v6(&bytes[6..]),
+        other => {
+            let hint = if other == 3 {
+                " — V3 snapshot is no longer supported; re-snapshot with a V6 binary"
+            } else if other == 4 {
+                " — V4 snapshot is no longer supported; re-snapshot with a V6 binary"
+            } else {
+                ""
+            };
+            Err(GraphError::Corrupt {
+                detail: format!("snapshot: unsupported version {other}{hint}"),
+            })
+        }
+    }
+}
+
+/// Decode a V5 (uncompressed) payload.  The 4-byte header has already been
+/// stripped; `body` starts at the CRC32 field.
+fn decode_v5(body: &[u8]) -> Result<Option<SnapshotState>> {
+    if body.len() < 4 {
         return Err(GraphError::Corrupt {
-            detail: format!("snapshot: unsupported version {version}{hint}"),
+            detail: "snapshot: truncated V5 header".into(),
         });
     }
-    let crc = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
-    let payload = &bytes[10..];
+    let crc = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    let payload = &body[4..];
     if crc32fast::hash(payload) != crc {
         return Err(GraphError::Corrupt {
             detail: "snapshot: crc mismatch".into(),
@@ -101,4 +132,14 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
         .map_err(|e| GraphError::Corrupt {
             detail: format!("snapshot: {e}"),
         })
+}
+
+/// Decode a V6 (zstd-compressed) payload.  The 4-byte header has already been
+/// stripped; `body` starts at the compressed bytes.
+fn decode_v6(body: &[u8]) -> Result<Option<SnapshotState>> {
+    let inner = zstd::decode_all(body).map_err(|e| GraphError::Corrupt {
+        detail: format!("snapshot: zstd decompress failed: {e}"),
+    })?;
+    // After decompression the inner layout is identical to V5: [4B crc32][payload].
+    decode_v5(&inner)
 }
