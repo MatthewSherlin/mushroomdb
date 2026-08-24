@@ -839,10 +839,6 @@ fn collect_expr(
             collect_operand(op, names, seen);
             Ok(())
         }
-        Expr::IsNull(op) | Expr::IsNotNull(op) => {
-            collect_operand(op, names, seen);
-            Ok(())
-        }
     }
 }
 
@@ -906,9 +902,6 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                                 intern_operand(&mut vars, arg);
                             }
                         }
-                        RetVal::ScalarExpr(op) => {
-                            intern_operand(&mut vars, op);
-                        }
                     }
                 }
             }
@@ -933,9 +926,6 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                             for arg in args {
                                 intern_operand(&mut vars, arg);
                             }
-                        }
-                        RetVal::ScalarExpr(op) => {
-                            intern_operand(&mut vars, op);
                         }
                     }
                     // Intern output column name (for subsequent pipeline stages).

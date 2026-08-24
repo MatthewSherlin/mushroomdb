@@ -50,12 +50,8 @@ pub enum Tok {
     Dash, // BINDING: the lexer emits `Dash`, `Lt`, `Gt` as separate tokens and the
     // PARSER assembles rel-arrow shapes (`-[..]->`, `<-[..]-`, `-[..]-`);
     // `<=`, `>=`, `<>` are single tokens (Le, Ge, Ne).
-    /// `*` — used in `COUNT(*)` and multiplication.
+    /// `*` — used in `COUNT(*)`.
     Star,
-    /// `+` — addition operator.
-    Plus,
-    /// `/` — division operator.
-    Slash,
 }
 
 pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
@@ -76,8 +72,6 @@ pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
             '=' => toks.push(Tok::Eq),
             '*' => toks.push(Tok::Star),
             '-' => toks.push(Tok::Dash),
-            '+' => toks.push(Tok::Plus),
-            '/' => toks.push(Tok::Slash),
             '<' => match chars.peek() {
                 Some((_, '=')) => {
                     chars.next();
@@ -450,16 +444,6 @@ mod tests {
                 Tok::Limit,
                 Tok::Int(10),
             ]
-        );
-    }
-
-    #[test]
-    fn plus_and_slash_lex_as_tokens() {
-        assert_eq!(lex("+").unwrap(), vec![Tok::Plus]);
-        assert_eq!(lex("/").unwrap(), vec![Tok::Slash]);
-        assert_eq!(
-            lex("1 + 2 / 3").unwrap(),
-            vec![Tok::Int(1), Tok::Plus, Tok::Int(2), Tok::Slash, Tok::Int(3)]
         );
     }
 
