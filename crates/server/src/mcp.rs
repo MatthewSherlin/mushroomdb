@@ -462,8 +462,10 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
 
 /// Return neighbors connected by a given edge type (default `"SIMILAR"`).
 ///
-/// Useful for agent-memory recall: "what entities are similar to X via the
-/// vector rule?" Returns up to `limit` (default 10) neighbor entries.
+/// Results are read from edges already materialized by a derivation rule
+/// (e.g. a `VectorSimilar` rule). Without a matching rule the returned list
+/// is empty — no live cosine computation is performed here.
+/// Returns up to `limit` (default 10) neighbor entries.
 fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
     let Some(key) = args.get("key").and_then(Js::as_str) else {
         return CallOutcome::ToolErr("missing key".into());
@@ -664,7 +666,7 @@ fn tools_list() -> Js {
             },
             {
                 "name": "find_similar",
-                "description": "Return neighbors connected to a node by a given edge type. Useful for agent-memory recall: find entities similar to a given key via a vector rule edge (e.g. SIMILAR, SEM_SIM).",
+                "description": "Return neighbors connected to a node by a given edge type. Results come from edges that were previously derived by a rule (e.g. a VectorSimilar rule); without a matching rule the result set is empty. Useful for agent-memory recall: find entities similar to a given key via a vector rule edge (e.g. SIMILAR, SEM_SIM).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

@@ -33,11 +33,8 @@ release build:
 | `bench_specialty_tc` (Overlap → SPECIALTY_MATCH) | ~2.041 s |
 | **Total** | **2.878 s** |
 
-Result: **within target** (2.878 s is −0.6% from the 2.894 s pre-eventing
-baseline). No code change was required. The +11% regression reported against
-v2.3/v2.4 was recovered by the `emit_deltas` engine gate introduced in an
-earlier fix (commit d4d312c); Plans 13–16 changes carried no additional
-overhead measurable at this scale.
+Result: **within target**. Re-measured on v0.1.1: N=5 median 2.878 s vs 2.894 s
+baseline — no residual regression at this scale. No code change was required.
 
 ### Snapshots
 

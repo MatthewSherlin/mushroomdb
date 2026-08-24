@@ -115,6 +115,12 @@ pairs in the graph. New entities added later are matched automatically.
 { "key": "alice", "edge_type": "SIMILAR", "limit": 5 }
 ```
 
+**Precondition:** `find_similar` reads edges that were previously derived by a
+rule. Without a matching rule (e.g. a `VectorSimilar` rule with
+`edge_type: "SIMILAR"`), the result is empty — no live cosine computation is
+performed. The `create_rule` call in step 2 must come before any `find_similar`
+call on the same edge type.
+
 Returns up to 5 neighbors connected to `alice` via `SIMILAR` edges, with
 direction and whether the edge is rule-derived.
 
