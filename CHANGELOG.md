@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.1.1 — unreleased
+## v0.1.1 — 2026-08-24
 
 ### MCP agent-memory tools
 
@@ -58,6 +58,10 @@ baseline — no residual regression at this scale. No code change was required.
 - **`IS NULL` / `IS NOT NULL`** — postfix null-check predicate in `WHERE` and `WITH … WHERE`; composes with `AND`/`OR`/`NOT`; enables the anti-join idiom (`OPTIONAL MATCH … WHERE b IS NULL`).
 - **General arithmetic (`+`, `-`, `*`, `/`)** — arithmetic expressions in `RETURN`, `WHERE` comparisons, `SET` RHS, and function arguments; operator precedence (`*`/`/` over `+`/`-`); parentheses; null propagation; saturating integer arithmetic; named error on division by zero.
 - **`CREATE … RETURN`** and **`MERGE … RETURN`** — single-statement write-then-project; write commits to WAL before projection; returns created/matched node bindings and computed columns.
+
+### Packaging
+
+- **Prebuilt Intel macOS (`x86_64-apple-darwin`) binaries dropped** — GitHub's hosted `macos-13` runners are chronically starved (the v0.1.0 build sat queued past the 24-hour cap). Releases now ship `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`; Intel macOS users build from source (`cargo build -p mushroomdb-cli --release`). The Homebrew formula is arm64-only on macOS.
 
 ---
 
