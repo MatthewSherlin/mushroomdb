@@ -21,7 +21,6 @@ target_for() {
   arch=$2
   case "${os}-${arch}" in
     darwin-arm64|darwin-aarch64) echo aarch64-apple-darwin ;;
-    darwin-x64|darwin-x86_64) echo x86_64-apple-darwin ;;
     linux-x64|linux-x86_64) echo x86_64-unknown-linux-gnu ;;
     linux-arm64|linux-aarch64) echo aarch64-unknown-linux-gnu ;;
     *) echo "" ;;
@@ -31,7 +30,8 @@ target_for() {
 TARGET=$(target_for "$OS" "$ARCH")
 if [ -z "$TARGET" ]; then
   echo "unsupported platform: ${OS}-${ARCH}" >&2
-  echo "supported: darwin-arm64, darwin-x64, linux-x64, linux-arm64" >&2
+  echo "supported: darwin-arm64, linux-x64, linux-arm64" >&2
+  echo "no prebuilt binary for this platform (Intel macOS dropped in v0.1.1) — build from source: cargo build -p mushroomdb-cli --release" >&2
   exit 1
 fi
 

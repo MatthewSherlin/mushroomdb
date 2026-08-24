@@ -1,4 +1,4 @@
-# Tag-gated. Pushing a v* tag builds four-platform binaries, a GitHub Release,
+# Tag-gated. Pushing a v* tag builds three-platform binaries, a GitHub Release,
 # GHCR images, and (when tokens/OIDC exist) npm / PyPI. crates.io is referenced
 # but not published until workspace path deps gain version= keys.
 #
@@ -21,10 +21,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # x86_64-apple-darwin dropped in v0.1.1: hosted macos-13 runners are
+          # chronically starved (v0.1.0 job sat queued past the 24h cap twice).
+          # Intel macOS users build from source; the formula is arm64-only on macOS.
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm

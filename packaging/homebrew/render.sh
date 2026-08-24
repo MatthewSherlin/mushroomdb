@@ -31,12 +31,10 @@ need() {
 }
 
 SHA_AARCH64_APPLE_DARWIN=$(sha_for aarch64-apple-darwin)
-SHA_X86_64_APPLE_DARWIN=$(sha_for x86_64-apple-darwin)
 SHA_AARCH64_UNKNOWN_LINUX_GNU=$(sha_for aarch64-unknown-linux-gnu)
 SHA_X86_64_UNKNOWN_LINUX_GNU=$(sha_for x86_64-unknown-linux-gnu)
 
 need aarch64-apple-darwin "$SHA_AARCH64_APPLE_DARWIN"
-need x86_64-apple-darwin "$SHA_X86_64_APPLE_DARWIN"
 need aarch64-unknown-linux-gnu "$SHA_AARCH64_UNKNOWN_LINUX_GNU"
 need x86_64-unknown-linux-gnu "$SHA_X86_64_UNKNOWN_LINUX_GNU"
 
@@ -48,7 +46,6 @@ escaped() {
 sed \
   -e "s/__VERSION__/$(escaped "$VERSION")/g" \
   -e "s/__SHA_AARCH64_APPLE_DARWIN__/$(escaped "$SHA_AARCH64_APPLE_DARWIN")/g" \
-  -e "s/__SHA_X86_64_APPLE_DARWIN__/$(escaped "$SHA_X86_64_APPLE_DARWIN")/g" \
   -e "s/__SHA_AARCH64_UNKNOWN_LINUX_GNU__/$(escaped "$SHA_AARCH64_UNKNOWN_LINUX_GNU")/g" \
   -e "s/__SHA_X86_64_UNKNOWN_LINUX_GNU__/$(escaped "$SHA_X86_64_UNKNOWN_LINUX_GNU")/g" \
   "$IN" > "$OUT"

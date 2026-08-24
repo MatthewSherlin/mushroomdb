@@ -12,14 +12,12 @@ const { spawnSync } = require("child_process");
 const pkg = require("./package.json");
 const SUPPORTED = [
   "darwin-arm64 → aarch64-apple-darwin",
-  "darwin-x64 → x86_64-apple-darwin",
   "linux-x64 → x86_64-unknown-linux-gnu",
   "linux-arm64 → aarch64-unknown-linux-gnu",
 ];
 
 function rustTarget(platform, arch) {
   if (platform === "darwin" && arch === "arm64") return "aarch64-apple-darwin";
-  if (platform === "darwin" && arch === "x64") return "x86_64-apple-darwin";
   if (platform === "linux" && arch === "x64") return "x86_64-unknown-linux-gnu";
   if (platform === "linux" && (arch === "arm64" || arch === "aarch64")) {
     return "aarch64-unknown-linux-gnu";

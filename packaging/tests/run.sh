@@ -10,11 +10,10 @@ os=$(uname -s | tr '[:upper:]' '[:lower:]')
 arch=$(uname -m)
 case "${os}-${arch}" in
   darwin-arm64|darwin-aarch64) TARGET=aarch64-apple-darwin ;;
-  darwin-x64|darwin-x86_64) TARGET=x86_64-apple-darwin ;;
   linux-x64|linux-x86_64) TARGET=x86_64-unknown-linux-gnu ;;
   linux-arm64|linux-aarch64) TARGET=aarch64-unknown-linux-gnu ;;
   *)
-    echo "host platform ${os}-${arch} is not one of the four release targets" >&2
+    echo "host platform ${os}-${arch} is not one of the three release targets" >&2
     exit 1
     ;;
 esac
@@ -132,10 +131,9 @@ grep -qi checksum "$WORKDIR/tamper-npm.err"
 test ! -e "$NPM/vendor/mushroomdb"
 
 echo "== homebrew render.sh fills real sha256s"
-FAKE_SUMS="$WORKDIR/SHA256SUMS-four"
+FAKE_SUMS="$WORKDIR/SHA256SUMS-three"
 {
   echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mushroomdb-${TAG}-aarch64-apple-darwin.tar.gz"
-  echo "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  mushroomdb-${TAG}-x86_64-apple-darwin.tar.gz"
   echo "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  mushroomdb-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
   echo "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  mushroomdb-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
 } > "$FAKE_SUMS"
