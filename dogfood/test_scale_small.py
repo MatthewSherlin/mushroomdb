@@ -70,12 +70,12 @@ def test_rule_partition_excludes_semantic_from_backfill_set():
     assert sem["predicate"] == {"VectorSimilar": {"field": "embedding", "min": 0.85}}
 
 
-def test_matcher_rules_carry_max_edges_cap():
-    """All SIX_RULES carry MATCHER_MAX_EDGES (Plan 11 T1 requirement)."""
+def test_matcher_rules_use_global_budget_path():
+    """SIX_RULES use max_edges=None: the V5 global-budget path (cap = 1M)."""
     assert MATCHER_MAX_EDGES == 1_000_000
     for r in SIX_RULES:
-        assert r["max_edges"] == MATCHER_MAX_EDGES, (
-            f"{r['name']}: expected max_edges={MATCHER_MAX_EDGES}, got {r['max_edges']}"
+        assert r["max_edges"] is None, (
+            f"{r['name']}: expected max_edges=None (global-budget path), got {r['max_edges']}"
         )
 
 
