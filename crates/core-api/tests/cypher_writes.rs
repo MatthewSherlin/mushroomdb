@@ -900,3 +900,83 @@ fn combined_match_set_return_is_error() {
         "combined read-write must be a named error, got: {detail}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CREATE...RETURN with $param in RETURN expression
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_return_param_in_return_expr() {
+    // $factor is supplied by the caller; the RETURN projection must forward it.
+    let mut db = GraphDb::open(&tmp("cr-param-return")).unwrap();
+    let mut params = BTreeMap::new();
+    params.insert("factor".to_string(), Value::Int(3));
+    let rs = db
+        .query_write(
+            "CREATE (n:Widget {id: 'crp1', score: 10}) RETURN n.score * $factor AS scaled",
+            &params,
+        )
+        .unwrap();
+    assert_eq!(rs.columns(), &["scaled"]);
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "scaled"), Some(&Value::Int(30)));
+}
+
+#[test]
+fn create_return_param_node_binding_with_param() {
+    // Param used in WHERE-style position via the RETURN clause (node var + prop).
+    let mut db = GraphDb::open(&tmp("cr-param-node")).unwrap();
+    let mut params = BTreeMap::new();
+    params.insert("nid".to_string(), Value::Str("crp2".to_string()));
+    // $nid isn't used in the RETURN directly but this verifies params are forwarded
+    // without crashing; test also checks the node binding is returned.
+    let rs = db
+        .query_write("CREATE (n:Widget {id: 'crp2', score: 7}) RETURN n", &params)
+        .unwrap();
+    assert_eq!(rs.columns(), &["n"]);
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "n"), Some(&Value::Str("crp2".to_string())));
+}
+
+// ---------------------------------------------------------------------------
+// MERGE...RETURN with $param in RETURN expression — created and existing paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn merge_return_param_in_return_created() {
+    // Node does not exist yet → MERGE creates it; $multiplier forwarded to RETURN.
+    let mut db = GraphDb::open(&tmp("mr-param-created")).unwrap();
+    let mut params = BTreeMap::new();
+    params.insert("multiplier".to_string(), Value::Int(2));
+    let rs = db
+        .query_write(
+            "MERGE (n:Tag {id: 'rust'}) RETURN n.id AS tag, 10 * $multiplier AS score",
+            &params,
+        )
+        .unwrap();
+    assert_eq!(rs.columns(), &["tag", "score"]);
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "tag"), Some(&Value::Str("rust".to_string())));
+    assert_eq!(rs.get(0, "score"), Some(&Value::Int(20)));
+}
+
+#[test]
+fn merge_return_param_in_return_existing() {
+    // Node already exists → MERGE matches it; $multiplier forwarded to RETURN.
+    let mut db = GraphDb::open(&tmp("mr-param-existing")).unwrap();
+    // Pre-create the node.
+    db.query_write("CREATE (n:Tag {id: 'rust'})", &no_params())
+        .unwrap();
+    let mut params = BTreeMap::new();
+    params.insert("multiplier".to_string(), Value::Int(5));
+    let rs = db
+        .query_write(
+            "MERGE (n:Tag {id: 'rust'}) RETURN n.id AS tag, 4 * $multiplier AS score",
+            &params,
+        )
+        .unwrap();
+    assert_eq!(rs.columns(), &["tag", "score"]);
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "tag"), Some(&Value::Str("rust".to_string())));
+    assert_eq!(rs.get(0, "score"), Some(&Value::Int(20)));
+}

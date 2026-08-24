@@ -2515,15 +2515,19 @@ impl<F: Fs> GraphDb<F> {
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
         match stmt {
-            WriteStatement::Create(s) => self.exec_create(s),
+            WriteStatement::Create(s) => self.exec_create(s, params),
             WriteStatement::MatchSet(s) => self.exec_match_set(s, params),
             WriteStatement::MatchDelete(s) => self.exec_match_delete(s, params),
             WriteStatement::MatchDeleteNode(s) => self.exec_match_delete_node(s, params),
-            WriteStatement::Merge(s) => self.exec_merge(s),
+            WriteStatement::Merge(s) => self.exec_merge(s, params),
         }
     }
 
-    fn exec_create(&mut self, stmt: core_query::cypher::CreateStmt) -> Result<ResultSet> {
+    fn exec_create(
+        &mut self,
+        stmt: core_query::cypher::CreateStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
         // Extract the node key from props: require a string-valued `id` field.
         let mut var_to_key: BTreeMap<String, String> = BTreeMap::new();
         for node in &stmt.nodes {
@@ -2608,7 +2612,7 @@ impl<F: Fs> GraphDb<F> {
             let ops = plan(&q).map_err(|e| GraphError::QueryError {
                 detail: format!("plan: {e}"),
             })?;
-            return execute(&self.view(), &ops, &Params(&BTreeMap::new())).map_err(|e| {
+            return execute(&self.view(), &ops, &Params(params)).map_err(|e| {
                 GraphError::QueryError {
                     detail: format!("execute: {e}"),
                 }
@@ -2924,7 +2928,11 @@ impl<F: Fs> GraphDb<F> {
         Ok(rs)
     }
 
-    fn exec_merge(&mut self, stmt: core_query::cypher::MergeStmt) -> Result<ResultSet> {
+    fn exec_merge(
+        &mut self,
+        stmt: core_query::cypher::MergeStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
         // MERGE: check if a node with the given key already exists.
         let key = match &stmt.key_value {
             Value::Str(s) => s.clone(),
@@ -2973,7 +2981,7 @@ impl<F: Fs> GraphDb<F> {
             let ops = plan(&q).map_err(|e| GraphError::QueryError {
                 detail: format!("plan: {e}"),
             })?;
-            return execute(&self.view(), &ops, &Params(&BTreeMap::new())).map_err(|e| {
+            return execute(&self.view(), &ops, &Params(params)).map_err(|e| {
                 GraphError::QueryError {
                     detail: format!("execute: {e}"),
                 }
