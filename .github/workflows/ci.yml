@@ -82,10 +82,15 @@ jobs:
         working-directory: bindings/python
     steps:
       - uses: actions/checkout@v4
-      # Plain rustup install (--force resolves component conflicts with the
-      # runner's preinstalled toolchain); the repo's rust-toolchain.toml would
-      # otherwise trigger a conflicting auto-install when maturin invokes rustc.
-      - run: rustup toolchain install 1.92.0 --profile minimal --force && rustup default 1.92.0
+      # Uninstall the runner's preinstalled 1.92.0 first: a --force minimal
+      # reinstall over it leaves untracked binaries (bin/cargo-fmt) that later
+      # conflict when rust-toolchain.toml's component auto-sync fires on the
+      # first rustc invocation from maturin. A clean install with the exact
+      # components the toolchain file pins means no sync, no conflict.
+      - run: |
+          rustup toolchain uninstall 1.92.0 || true
+          rustup toolchain install 1.92.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.92.0
         working-directory: .
       - uses: actions/setup-python@v5
         with:
