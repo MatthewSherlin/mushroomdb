@@ -29,13 +29,13 @@ Command: `bindings/python/.venv/bin/python benchmarks/run.py --scale 10000 --out
 
 | Workload | v0.1.0 baseline | v0.1.1 | Delta | Investigation |
 |---|---|---|---|---|
-| bulk_ingest | 989.73 ms | 797.75 ms | −19% | Single-pass cold; v0.1.0 was also single-pass. No code changes in ingest path for v0.1.1. Improvement attributed to machine state variance (v0.1.0 at 20:09 2026-08-21; v0.1.1 at 18:21 2026-08-24). Magnitude within observed cross-run variance for this workload. |
+| bulk_ingest | 989.73 ms | 797.75 ms | −19% | Single-pass cold; v0.1.0 was also single-pass. No code changes in ingest path for v0.1.1. Environmental factors (machine state) suspected; magnitude unconfirmed without additional runs. |
 | neighborhood_depth1 (p50) | 0.4 µs | 0.5 µs | +25% | n=20 samples; below Instant clock resolution (~10 ns). Noise. |
 | neighborhood_depth1 (p95) | 2.0 µs | 3.6 µs | +80% | p95 on n=20 = 1 outlier out of 20. p50 stable. Not a regression. |
 | neighborhood_depth2 (p50) | 0.2 µs | 0.2 µs | 0% | No change. |
-| cypher scan-filter-project | 2.04 ms | 1.45 ms | −29% | Single-pass cold; improvement consistent with v0.1.0 baseline variance. No Cypher scan changes in v0.1.1 (IS NULL/arithmetic/CREATE-RETURN are new paths; scan-filter path unchanged). Attributed to machine state. |
+| cypher scan-filter-project | 2.04 ms | 1.45 ms | −29% | Single-pass cold. No Cypher scan changes in v0.1.1 (IS NULL/arithmetic/CREATE-RETURN are new paths; scan-filter path unchanged). Environmental factors (machine state) suspected; magnitude unconfirmed without additional runs. |
 | cypher two-hop join | 206.7 µs | 185.8 µs | −10% | Single-pass; canonical number remains the warmup-median 261.6 µs from the four-engine benchmark. This single-pass number has high variance. |
-| rule_derive (total) | 3.493 s | 2.929 s | −16% | Real improvement direction; no code changes to rule engine in v0.1.1. Attributed to measurement-day machine state (quieter than the 20:09 v0.1.0 run). Consistent with known cross-run variance for this workload. |
+| rule_derive (total) | 3.493 s | 2.929 s | −16% | Single-pass measurement. No code changes to rule engine in v0.1.1. Environmental factors (machine state) suspected; magnitude unconfirmed without additional runs. |
 
 ## Subscription latency (v0.1.1 re-run)
 
@@ -57,7 +57,7 @@ Full results: `dogfood/results/scale-100k.md`.
 
 | Phase | v0.1.0 (V5) | v0.1.1 (V6) | Delta | Investigation |
 |---|---|---|---|---|
-| Backfill (9 rules, max_edges=1M each) | 28.65 s | **20.343 s** | −29% | No rule engine code changes in v0.1.1 (only rustfmt touches in engine.rs). Consistent improvement across all 9 rules (no outlier). Attributed to machine state on measurement day (afternoon run vs prior). |
+| Backfill (9 rules, max_edges=1M each) | 28.65 s | **20.343 s** | −29% | Single-pass measurement; no rule engine code changes in v0.1.1 (only rustfmt touches in engine.rs, confirmed via git diff). No corresponding code change; environmental factors (machine state) suspected but magnitude unconfirmed without additional runs. |
 | WAL-only open | 8.25 min | **8.16 min** | −1% | Within noise. No WAL replay changes in v0.1.1. |
 | V6 snapshot write (`snapshot()`) | 25.09 s (V5) | **22.563 s** | −10% | V6 adds zstd level-3 compression. File smaller (1.1 GiB vs ~2.2 GiB, −50%). I/O savings partly offset by compression CPU; net −10% wall time. |
 | V6 snapshot open (`open_with`) | 8.71 s (V5) | **8.880 s** | +2% | V6 requires decompression on load. Smaller file reads faster; decompression adds CPU overhead. Net effect neutral (+2%, within noise). |
@@ -77,7 +77,7 @@ Full results: `dogfood/results/scale-100k.md`.
 | matches_design_style_tc | 5.587 s | 4.444 s | −20% |
 | similar_size_strict_tc | 2.628 s | 1.550 s | −41% |
 
-All rules improve by 20–46%. No rule engine code changed (confirmed via `git diff v0.1.0..HEAD -- crates/core-rules/src/engine.rs`; only whitespace/rustfmt changes). Improvement is attributed to machine state variance between measurement days.
+All rules improve by 20–46%. No rule engine code changed (confirmed via `git diff v0.1.0..HEAD -- crates/core-rules/src/engine.rs`; only whitespace/rustfmt changes). Single-pass measurement; no corresponding code change; environmental factors suspected but magnitude unconfirmed without additional runs.
 
 ### Other 100k phases (v0.1.1 measured)
 
@@ -136,8 +136,8 @@ Table date updated from 2026-08-21 to 2026-08-24. Supported row count: 42. Named
 ## Self-review
 
 - All benchmark cells are from executed runs on the machine described. No estimates.
-- Delta investigations are complete for all cells showing >10%: backfill −29% (no code change, machine state), subscription latencies (noise floor), scan-filter −29% (single-pass variance).
-- The backfill delta is the largest unexplained improvement. Investigation conclusion: no code changes to rule engine; consistent improvement across all rules; attributed to machine state. This is documented honestly.
+- Delta investigations are complete for all cells showing >10%: backfill −29% (single-pass; no code change; environmental factors suspected, magnitude unconfirmed), subscription latencies (noise floor), scan-filter −29% (single-pass; no code change; environmental factors suspected, magnitude unconfirmed).
+- The backfill delta is the largest unexplained improvement. No rule engine code changed. Cause not confirmed — additional runs needed to establish spread.
 - Snapshot V6 numbers are correctly attributed to the V6 format change in T2.
 - Publish dry-run: only the root leaf passes. This is correct and expected behavior — documented honestly.
 - 100k WAL reopen −1% and snapshot open +2%: both within noise; no investigation required (< 10% threshold).
