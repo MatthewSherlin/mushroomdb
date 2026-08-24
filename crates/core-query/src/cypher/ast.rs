@@ -168,6 +168,10 @@ pub enum Expr {
     /// explicit comparison.  Truthiness: `Bool(true)` → true, `Bool(false)`
     /// → false, null → false, any other non-null non-false value → true.
     Truthy(Operand),
+    /// `operand IS NULL` — true iff the operand evaluates to null.
+    IsNull(Operand),
+    /// `operand IS NOT NULL` — true iff the operand is non-null.
+    IsNotNull(Operand),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -207,8 +211,8 @@ pub enum ArithOp {
     Div,
 }
 
-/// RETURN item value: bare variable, `var.field`, an aggregate call, or a
-/// scalar function call.
+/// RETURN item value: bare variable, `var.field`, an aggregate call, a
+/// scalar function call, or an arbitrary scalar expression (arithmetic etc.).
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetVal {
     Var(String),
@@ -229,6 +233,9 @@ pub enum RetVal {
         name: String,
         args: Vec<Operand>,
     },
+    /// Arbitrary scalar expression in a RETURN/WITH position, e.g. `n.age + 1`.
+    /// Evaluated via `resolve_operand` at execution time; null propagates.
+    ScalarExpr(Operand),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -265,14 +272,19 @@ pub enum WriteStatement {
     Merge(MergeStmt),
 }
 
-/// `CREATE (a:L {id: 'x', ...})[-[:T]->(b:L2 {id: 'y', ...})]`
+/// `CREATE (a:L {id: 'x', ...})[-[:T]->(b:L2 {id: 'y', ...})] [RETURN …]`
 ///
 /// `nodes` is in encounter order. `edges` reference node vars that appear in
 /// `nodes`. Each node must have a string-valued `id` property (used as key).
+///
+/// `returns`, when `Some`, projects the created bindings as a read result.
+/// The write and the projection are committed as a single WAL batch frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateStmt {
     pub nodes: Vec<CreateNode>,
     pub edges: Vec<CreateEdge>,
+    /// Optional RETURN clause: project created bindings after commit.
+    pub returns: Option<Vec<RetItem>>,
 }
 
 /// One node in a CREATE pattern.
@@ -352,14 +364,20 @@ pub struct MatchDeleteNodeStmt {
     pub detach: bool,
 }
 
-/// `MERGE (n:Label {id: 'x'})` — match-or-create by a single key property.
+/// `MERGE (n:Label {id: 'x'}) [RETURN …]` — match-or-create by a single key property.
 ///
 /// Exactly one property is allowed (the key).  More properties, or `ON CREATE
 /// SET` / `ON MATCH SET` → named error at parse time.
+///
+/// `returns`, when `Some`, projects the merged/created node as a read result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeStmt {
     pub label: String,
     /// The single property that identifies the node. Value must be a string.
     pub key_field: String,
     pub key_value: core_storage::Value,
+    /// Optional bound variable for the MERGE node (for RETURN projection).
+    pub var: Option<String>,
+    /// Optional RETURN clause: project the node after commit.
+    pub returns: Option<Vec<RetItem>>,
 }

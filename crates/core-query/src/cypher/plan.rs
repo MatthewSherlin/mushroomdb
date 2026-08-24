@@ -814,6 +814,7 @@ fn check_expr_bound(expr: &Expr, bound: &BTreeSet<String>) -> Result<(), String>
             check_operand_bound(rhs, bound, "WHERE")
         }
         Expr::Truthy(op) => check_operand_bound(op, bound, "WHERE"),
+        Expr::IsNull(op) | Expr::IsNotNull(op) => check_operand_bound(op, bound, "WHERE"),
     }
 }
 
@@ -894,6 +895,9 @@ fn check_return_bound(
                     check_operand_bound(arg, bound, "RETURN")?;
                 }
             }
+            RetVal::ScalarExpr(op) => {
+                check_operand_bound(op, bound, "RETURN")?;
+            }
         }
     }
     Ok(())
@@ -923,7 +927,7 @@ fn check_duplicate_columns(items: &[RetItem]) -> Result<(), String> {
 }
 
 /// Projected column name: alias if given, else the bare var, else `var.field`,
-/// else the canonical aggregate call string, else `funcname(...)`.
+/// else the canonical aggregate call string, else `funcname(...)`, else `<expr>`.
 fn column_name(item: &RetItem) -> String {
     if let Some(alias) = &item.alias {
         return alias.clone();
@@ -946,6 +950,7 @@ fn column_name(item: &RetItem) -> String {
                 .collect();
             format!("{name}({})", arg_strs.join(", "))
         }
+        RetVal::ScalarExpr(_) => "<expr>".to_string(),
     }
 }
 
