@@ -475,7 +475,7 @@ MATCH (n:Measurement) RETURN round(n.value)
 
 ## Cypher coverage
 
-Tested against the current binary (2026-08-21, release build, maturin develop --release).
+Tested against the current binary (2026-08-24, release build, maturin develop --release).
 Classification: **Supported** = executes without error; **Named-error** = rejected with a
 clear, actionable message; **Absent** = not implemented (not tested here).
 

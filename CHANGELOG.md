@@ -41,11 +41,12 @@ baseline — no residual regression at this scale. No code change was required.
 - **V6 snapshot format (compressed)** — `snapshot()` now writes a zstd-compressed
   (level 3) V6 container. Wire format: `GDB1` magic + 2-byte version header
   (uncompressed); body is a zstd stream of the existing V5 payload (CRC32 + bincode).
-  Measured at 5k nodes: 62 KiB on disk, 16 ms write, 2 ms open. v0.1.0 V5 snapshots
-  are read transparently — no migration required. Old binaries cannot read V6 files
-  (forward-breaking for the snapshot file only; WAL format and Python/HTTP API are
-  unchanged). 100k-node numbers will be re-published with the v0.1.1 benchmark
-  regression pass.
+  Measured at 5k nodes: 62 KiB on disk, 16 ms write, 2 ms open. At 100k nodes
+  (9 rules, ~10.5M derived edges): **1.1 GiB on disk** (−50% vs V5 ~2.2 GiB),
+  **22.563 s write**, **8.880 s open** (V5 baseline: 25.09 s write, 8.71 s open).
+  v0.1.0 V5 snapshots are read transparently — no migration required. Old binaries
+  cannot read V6 files (forward-breaking for the snapshot file only; WAL format and
+  Python/HTTP API are unchanged).
 - **`snapshot_with(SnapshotOptions { keep_wal: bool })`** — new API that exposes
   snapshot options. `keep_wal: true` writes the V6 snapshot but preserves the WAL,
   keeping pre-snapshot commits reachable via `open_at`. Crash-safe: snapshot write
