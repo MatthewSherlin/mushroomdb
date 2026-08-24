@@ -602,13 +602,18 @@ fn v4_crash_between_snapshot_and_wal_truncation_with_approx_rule() {
     );
 }
 
-/// Torn-write safety: truncating a V5 snapshot file to various byte counts must
-/// always return a Corrupt error, never a silently-wrong database.
-/// Covers both mid-header (bad-magic) and mid-payload (crc-mismatch) truncation.
+/// Torn-write safety: truncating a V6 snapshot file (with IVF state) to various
+/// byte counts must always return a Corrupt error, never a silently-wrong database.
+/// Covers mid-header (bad magic), mid-compressed-stream, and late-payload truncation.
 /// Exercises a snapshot that includes an exact rule, an approximate/IVF rule,
-/// and view_defs — ensuring the V5 view_defs tail region is covered by torn writes.
+/// and view_defs — ensuring the IVF + view_defs payload region is covered.
+///
+/// NOTE: this test was originally named `v5_torn_snapshot_write_is_rejected` and
+/// exercised the V5 uncompressed format. Since `snapshot()` now writes V6, this
+/// test covers V6 torn-write detection. V5 torn-write detection is covered by
+/// `v5_torn_file_is_rejected` which uses the committed golden_v5.bin fixture.
 #[test]
-fn v5_torn_snapshot_write_is_rejected() {
+fn v6_torn_written_snapshot_with_ivf_state_is_rejected() {
     let dir = tmp("snap-v5-torn");
     {
         let mut db = GraphDb::open(&dir).unwrap();
@@ -683,9 +688,9 @@ fn v5_torn_snapshot_write_is_rejected() {
     let n = good.len();
     assert!(n > 20, "snapshot must be non-trivial; got {n} bytes");
 
-    // Truncation points: mid-header (5 B), just-past-header (10 B),
-    // early payload (n/3), mid-payload (n/2), late payload landing inside the
-    // view_defs tail region (n*2/3, n*3/4, n-5), one byte short (n-1).
+    // Truncation points: mid-header (5 B), just-past-compressed-header (10 B),
+    // early stream (n/3), mid-stream (n/2), late stream covering IVF+view_defs
+    // region (n*2/3, n*3/4, n-5), one byte short (n-1).
     // Any truncation must yield Err — never a silently-wrong open.
     for &trunc in &[
         5usize,
@@ -700,7 +705,7 @@ fn v5_torn_snapshot_write_is_rejected() {
         std::fs::write(&path, &good[..trunc]).unwrap();
         assert!(
             GraphDb::open(&dir).is_err(),
-            "expected Err for {trunc}-byte truncation of {n}-byte V5 snapshot",
+            "expected Err for {trunc}-byte truncation of {n}-byte V6 snapshot",
         );
     }
 }
@@ -1029,6 +1034,51 @@ fn golden_v6_pin() {
         Some(&Value::Int(42)),
         "V6 fixture must preserve prop v=42 on node 'a'"
     );
+}
+
+/// V5 torn-file rejection: every truncation of the committed golden_v5.bin fixture
+/// must return a Corrupt error.  This pins the V5 backward-compat decode path
+/// (`decode_v5`) independently of the current encoder (which writes V6).  The
+/// untruncated fixture must still open successfully.
+#[test]
+fn v5_torn_file_is_rejected() {
+    let good = include_bytes!("fixtures/golden_v5.bin");
+    let n = good.len();
+    assert!(n > 10, "golden_v5.bin must be non-trivial; got {n} bytes");
+
+    // Untruncated fixture must open cleanly (backward-compat is intact).
+    let dir = tmp("v5-torn-good");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("snapshot.bin"), good).unwrap();
+    std::fs::write(dir.join("wal.bin"), b"").unwrap();
+    assert!(
+        GraphDb::open(&dir).is_ok(),
+        "untruncated golden_v5.bin must open without error"
+    );
+
+    // Truncation sweep: mid-header (3B), version-only (5B), crc-partial (8B),
+    // just-past-header (9B), early payload (n/3), mid-payload (n/2),
+    // late payload (n*3/4, n-3), one byte short (n-1).
+    for &trunc in &[
+        3usize,
+        5,
+        8,
+        9,
+        n / 3,
+        n / 2,
+        n * 3 / 4,
+        n.saturating_sub(3),
+        n - 1,
+    ] {
+        if trunc == 0 || trunc >= n {
+            continue;
+        }
+        std::fs::write(dir.join("snapshot.bin"), &good[..trunc]).unwrap();
+        assert!(
+            GraphDb::open(&dir).is_err(),
+            "expected Err for {trunc}-byte truncation of {n}-byte golden V5 fixture"
+        );
+    }
 }
 
 /// V6 round-trip: snapshot now writes V6; reopen recovers the full state.

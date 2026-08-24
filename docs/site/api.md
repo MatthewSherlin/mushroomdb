@@ -409,7 +409,8 @@ idempotent — no manual recovery is needed. The WAL grows until an explicit
 **V6 snapshot format:** magic + version header uncompressed (6 bytes); the
 rest is zstd-compressed (level 3). Measured at 5k nodes: 62 KiB on disk,
 16 ms to write, 2 ms to open. V5 snapshots (from v0.1.0) are read
-transparently — no migration required.
+transparently — no migration required. 100k-node numbers will be published
+with the v0.1.1 benchmark regression pass.
 
 ### Atomic write batches (Rust API)
 

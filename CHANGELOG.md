@@ -7,10 +7,11 @@
 - **V6 snapshot format (compressed)** — `snapshot()` now writes a zstd-compressed
   (level 3) V6 container. Wire format: `GDB1` magic + 2-byte version header
   (uncompressed); body is a zstd stream of the existing V5 payload (CRC32 + bincode).
-  At 5k nodes: 62 KiB on disk, 16 ms write, 2 ms open. v0.1.0 V5 snapshots are
-  read transparently — no migration required. Old binaries cannot read V6 files
+  Measured at 5k nodes: 62 KiB on disk, 16 ms write, 2 ms open. v0.1.0 V5 snapshots
+  are read transparently — no migration required. Old binaries cannot read V6 files
   (forward-breaking for the snapshot file only; WAL format and Python/HTTP API are
-  unchanged).
+  unchanged). 100k-node numbers will be re-published with the v0.1.1 benchmark
+  regression pass.
 - **`snapshot_with(SnapshotOptions { keep_wal: bool })`** — new API that exposes
   snapshot options. `keep_wal: true` writes the V6 snapshot but preserves the WAL,
   keeping pre-snapshot commits reachable via `open_at`. Crash-safe: snapshot write
