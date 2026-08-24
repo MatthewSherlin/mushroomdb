@@ -2,6 +2,43 @@
 
 ## v0.1.1 — unreleased
 
+### MCP agent-memory tools
+
+Three new MCP tools for agent workflows — available via `mushroomdb mcp <dir>`:
+
+- **`upsert_entity`** — insert or update a node by key with no existence
+  check required; creates the node if absent, updates properties if present.
+- **`find_similar`** — return neighbors connected by a given edge type
+  (default `SIMILAR`); designed for vector-rule recall in agent-memory
+  workflows.
+- **`explain_association`** — explain rule-derived associations between two
+  node keys; returns rule name, edge type, and match score per link. Alias
+  of `explain` with a semantically clearer name.
+
+The MCP server now exposes eleven tools total. Tests: 15 stdio round-trip
+unit tests in `crates/server/src/mcp.rs` covering all eleven tools.
+
+See [`docs/site/mcp.md`](docs/site/mcp.md) for the Claude Desktop
+configuration and the full agent-memory quickstart (store → link → recall →
+explain).
+
+### Performance (rule_derive backfill)
+
+N=5 median measured 2026-08-24 on Apple M4 Pro, macOS 15.7.3, arm64,
+release build:
+
+| Rule | Time |
+|---|---|
+| `bench_industry_tc` (FieldEqual → INDUSTRY_ALIGNMENT) | ~856 ms |
+| `bench_specialty_tc` (Overlap → SPECIALTY_MATCH) | ~2.041 s |
+| **Total** | **2.878 s** |
+
+Result: **within target** (2.878 s is −0.6% from the 2.894 s pre-eventing
+baseline). No code change was required. The +11% regression reported against
+v2.3/v2.4 was recovered by the `emit_deltas` engine gate introduced in an
+earlier fix (commit d4d312c); Plans 13–16 changes carried no additional
+overhead measurable at this scale.
+
 ### Snapshots
 
 - **V6 snapshot format (compressed)** — `snapshot()` now writes a zstd-compressed

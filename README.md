@@ -407,6 +407,51 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 
 ---
 
+## Agent Memory
+
+mushroomdb is a natural fit for AI agent memory. Graph structure captures the
+semantic shape of real knowledge — entities, associations, similarity, and
+lineage — and rule-derived edges keep those associations fresh automatically as
+new facts arrive.
+
+**How it works:**
+
+- Entities map to nodes (`Person`, `Document`, `Project`, `Concept`, …).
+- Associations are edges derived from data: cosine similarity on embeddings,
+  shared field values, FK relationships, geographic proximity, and more.
+  Declare a rule once; every write maintains the matching edges without any
+  agent-side bookkeeping.
+- Recall is graph traversal: `find_similar` returns neighbors via rule-derived
+  edges; `query` runs Cypher for structured recall; `neighborhood` does
+  multi-hop exploration.
+- Explanations are built in: `explain_association` shows which rules and scores
+  produced each link — an agent can cite evidence, not just conclusions.
+
+**Claude Desktop config** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "mushroomdb": {
+      "command": "mushroomdb",
+      "args": ["mcp", "/path/to/your/db"]
+    }
+  }
+}
+```
+
+**Minimal workflow** (four tool calls):
+
+```
+upsert_entity  →  create_rule  →  find_similar  →  explain_association
+  (store)           (link)           (recall)          (explain)
+```
+
+Full walkthrough, tool reference, and Claude Desktop setup:
+[`docs/site/mcp.md`](docs/site/mcp.md).
+
+---
+
 ## Roadmap
 
 | Priority | Item |

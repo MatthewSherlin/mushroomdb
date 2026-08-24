@@ -9,7 +9,7 @@
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
 //!   `serverInfo.name` `"mushroomdb"`
 //! - `notifications/initialized` — ignored
-//! - `tools/list` — the eight tools below, each with a JSON Schema
+//! - `tools/list` — the eleven tools below, each with a JSON Schema
 //! - `tools/call` — dispatch; success is
 //!   `{content:[{type:"text", text:<json string>}]}`
 //!
@@ -42,8 +42,11 @@
 use crate::json::{
     node_edges_json, node_info_json, params_from_json, parse_ingest_edges, result_set_json,
 };
-use core_api::{json_to_rows, AutoFk, Dir, GraphError, IngestOptions, RuleDef, SharedDb};
+use core_api::{
+    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, RuleDef, SharedDb, Value,
+};
 use serde_json::{json, Value as Js};
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
 /// Run the MCP loop until `reader` hits EOF.
@@ -154,6 +157,9 @@ fn dispatch_call(db: &SharedDb, params: Option<&Js>) -> CallOutcome {
         "neighborhood" => tool_neighborhood(db, args),
         "node_info" => tool_node_info(db, args),
         "node_edges" => tool_node_edges(db, args),
+        "upsert_entity" => tool_upsert_entity(db, args),
+        "find_similar" => tool_find_similar(db, args),
+        "explain_association" => tool_explain(db, args),
         _ => protocol_invalid(),
     }
 }
@@ -376,6 +382,137 @@ fn tool_node_edges(db: &SharedDb, args: &Js) -> CallOutcome {
     }
 }
 
+/// Insert a new node or update an existing node's properties, keyed by `key`.
+///
+/// If the node exists: each prop in `props` is written via `set_prop`.
+/// If the node does not exist: `label` is required; the node is ingested with
+/// `key_field = "id"` and the supplied props.
+///
+/// Returns `{ok, key, created, updated_fields?}`.
+fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
+    let Some(key) = args.get("key").and_then(Js::as_str) else {
+        return CallOutcome::ToolErr("missing key".into());
+    };
+    let label_opt = args.get("label").and_then(Js::as_str);
+    let Some(props_obj) = args.get("props").and_then(Js::as_object) else {
+        return CallOutcome::ToolErr("missing props".into());
+    };
+
+    let exists = {
+        let g = db.read();
+        g.has_node(key)
+    };
+
+    if exists {
+        let mut g = db.write();
+        let mut count = 0usize;
+        for (field, json_val) in props_obj {
+            match json_to_value(json_val.clone()) {
+                Some(v) => {
+                    if let Err(e) = g.set_prop(key, field, v) {
+                        return CallOutcome::ToolErr(graph_err_msg(e));
+                    }
+                    count += 1;
+                }
+                None => {
+                    return CallOutcome::ToolErr(format!(
+                        "prop {field} is not a supported value type"
+                    ))
+                }
+            }
+        }
+        CallOutcome::ToolOk(json!({
+            "ok": true,
+            "key": key,
+            "created": false,
+            "updated_fields": count
+        }))
+    } else {
+        let Some(label) = label_opt else {
+            return CallOutcome::ToolErr("label required when creating a new entity".into());
+        };
+        let mut row: BTreeMap<String, Value> = BTreeMap::new();
+        row.insert("id".to_string(), Value::Str(key.to_string()));
+        for (field, json_val) in props_obj {
+            if field == "id" {
+                continue;
+            }
+            match json_to_value(json_val.clone()) {
+                Some(v) => {
+                    row.insert(field.clone(), v);
+                }
+                None => {
+                    return CallOutcome::ToolErr(format!(
+                        "prop {field} is not a supported value type"
+                    ))
+                }
+            }
+        }
+        let opts = IngestOptions {
+            key_field: "id".to_string(),
+            auto_fk: AutoFk::Off,
+        };
+        let mut g = db.write();
+        match g.ingest(label, vec![row], &opts) {
+            Ok(_) => CallOutcome::ToolOk(json!({ "ok": true, "key": key, "created": true })),
+            Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+        }
+    }
+}
+
+/// Return neighbors connected by a given edge type (default `"SIMILAR"`).
+///
+/// Useful for agent-memory recall: "what entities are similar to X via the
+/// vector rule?" Returns up to `limit` (default 10) neighbor entries.
+fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
+    let Some(key) = args.get("key").and_then(Js::as_str) else {
+        return CallOutcome::ToolErr("missing key".into());
+    };
+    let edge_type = args
+        .get("edge_type")
+        .and_then(Js::as_str)
+        .unwrap_or("SIMILAR");
+    let limit = args
+        .get("limit")
+        .and_then(Js::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(10);
+
+    let out = {
+        let g = db.read();
+        g.node_edges(key)
+    };
+    match out {
+        Ok(edges) => {
+            let similar: Vec<Js> = edges
+                .iter()
+                .filter(|e| e.edge_type == edge_type)
+                .take(limit)
+                .map(|e| {
+                    let neighbor_key = if e.src_key == key {
+                        &e.dst_key
+                    } else {
+                        &e.src_key
+                    };
+                    let direction = if e.src_key == key { "out" } else { "in" };
+                    json!({
+                        "neighbor_key": neighbor_key,
+                        "direction": direction,
+                        "edge_type": e.edge_type,
+                        "derived": e.derived,
+                    })
+                })
+                .collect();
+            CallOutcome::ToolOk(json!({
+                "key": key,
+                "edge_type": edge_type,
+                "similar": similar
+            }))
+        }
+        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+    }
+}
+
 fn graph_err_msg(e: GraphError) -> String {
     match e {
         GraphError::QueryError { detail } | GraphError::IngestError { detail } => detail,
@@ -508,6 +645,47 @@ fn tools_list() -> Js {
                     },
                     "required": ["key"]
                 }
+            },
+            {
+                "name": "upsert_entity",
+                "description": "Insert or update a node by key. If the key exists, updates the supplied properties. If not, creates a new node with the given label and properties. Useful for agent memory: store or refresh an entity without checking existence first.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string", "description": "Unique node key." },
+                        "label": { "type": "string", "description": "Node label (required when creating a new entity)." },
+                        "props": {
+                            "type": "object",
+                            "description": "Properties to set. Values must be scalars (string, number, bool) or arrays of scalars."
+                        }
+                    },
+                    "required": ["key", "props"]
+                }
+            },
+            {
+                "name": "find_similar",
+                "description": "Return neighbors connected to a node by a given edge type. Useful for agent-memory recall: find entities similar to a given key via a vector rule edge (e.g. SIMILAR, SEM_SIM).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string", "description": "Source node key." },
+                        "edge_type": { "type": "string", "description": "Edge type to filter by (default: SIMILAR)." },
+                        "limit": { "type": "integer", "description": "Maximum neighbors to return (default: 10)." }
+                    },
+                    "required": ["key"]
+                }
+            },
+            {
+                "name": "explain_association",
+                "description": "Explain rule-derived associations between two node keys. Returns the rules, edge types, and match scores that connect them. Useful for agent memory: understand why two entities are associated.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "a": { "type": "string", "minLength": 1 },
+                        "b": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["a", "b"]
+                }
             }
         ]
     })
@@ -557,4 +735,402 @@ fn write_json(writer: &mut impl Write, value: &Js) -> io::Result<()> {
     let s = serde_json::to_string(value).map_err(io::Error::other)?;
     writeln!(writer, "{s}")?;
     writer.flush()
+}
+
+// ---------------------------------------------------------------------------
+// Tests: MCP tool round-trips via stdio
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_api::{AutoFk, IngestOptions, Predicate, RuleDef, Value};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp_dir() -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("mcp-test-{}-{}", std::process::id(), n))
+    }
+
+    /// Open a SharedDb with two Person nodes and one derived SIMILAR edge.
+    fn demo_db() -> SharedDb {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            let opts = IngestOptions {
+                key_field: "id".into(),
+                auto_fk: AutoFk::Off,
+            };
+            // Two people with identical embeddings → will fire SIMILAR rule.
+            let people: Vec<BTreeMap<String, Value>> = vec![
+                [
+                    ("id", Value::Str("alice".into())),
+                    ("name", Value::Str("Alice".into())),
+                    (
+                        "emb",
+                        Value::List(vec![Value::Float(1.0), Value::Float(0.0)]),
+                    ),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+                [
+                    ("id", Value::Str("bob".into())),
+                    ("name", Value::Str("Bob".into())),
+                    (
+                        "emb",
+                        Value::List(vec![Value::Float(1.0), Value::Float(0.0)]),
+                    ),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            ];
+            g.ingest("Person", people, &opts).expect("ingest");
+
+            // Rule: VectorSimilar on emb → SIMILAR edge (cosine(ident,ident)=1.0 ≥ 0.9).
+            g.create_rule(RuleDef {
+                name: "sim_emb".into(),
+                src_label: "Person".into(),
+                dst_label: "Person".into(),
+                predicate: Predicate::VectorSimilar {
+                    field: "emb".into(),
+                    min: 0.9,
+                },
+                edge_type: "SIMILAR".into(),
+                weight_prop: Some("score".into()),
+                max_edges: None,
+                approximate: false,
+            })
+            .expect("rule");
+        }
+        db
+    }
+
+    fn roundtrip(db: &SharedDb, request: &str) -> Js {
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        run_mcp_stdio(db.clone(), input.as_bytes(), &mut output).expect("mcp");
+        let s = std::str::from_utf8(&output).expect("utf8");
+        serde_json::from_str(s.trim()).expect("json response")
+    }
+
+    fn tool_call(db: &SharedDb, id: u64, tool: &str, args: Js) -> Js {
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": args }
+        });
+        roundtrip(db, &req.to_string())
+    }
+
+    /// Unwrap the `text` field from a successful tool response.
+    fn tool_text(resp: &Js) -> Js {
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text");
+        serde_json::from_str(text).expect("tool text is json")
+    }
+
+    fn is_error(resp: &Js) -> bool {
+        resp["result"]["isError"].as_bool().unwrap_or(false)
+    }
+
+    // --- existing tools ---
+
+    #[test]
+    fn test_tools_list_includes_all_eleven() {
+        let db = demo_db();
+        let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        let tools = resp["result"]["tools"].as_array().expect("tools array");
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().expect("name"))
+            .collect();
+        for expected in &[
+            "query",
+            "ingest_json",
+            "create_rule",
+            "explain",
+            "stats",
+            "neighborhood",
+            "node_info",
+            "node_edges",
+            "upsert_entity",
+            "find_similar",
+            "explain_association",
+        ] {
+            assert!(names.contains(expected), "missing tool: {expected}");
+        }
+        assert_eq!(
+            names.len(),
+            11,
+            "expected exactly 11 tools, got {}",
+            names.len()
+        );
+    }
+
+    #[test]
+    fn test_stats_returns_node_count() {
+        let db = demo_db();
+        let resp = tool_call(&db, 1, "stats", json!({}));
+        assert!(!is_error(&resp));
+        let result = tool_text(&resp);
+        assert_eq!(result["nodes_live"], 2);
+    }
+
+    #[test]
+    fn test_query_runs_cypher() {
+        let db = demo_db();
+        let resp = tool_call(
+            &db,
+            1,
+            "query",
+            json!({ "cypher": "MATCH (n:Person) RETURN n.name ORDER BY n.name" }),
+        );
+        assert!(!is_error(&resp));
+        let result = tool_text(&resp);
+        // columns + 2 rows
+        assert_eq!(result["columns"], json!(["n.name"]));
+        assert_eq!(result["rows"].as_array().map(|r| r.len()), Some(2));
+    }
+
+    #[test]
+    fn test_ingest_json_inserts_nodes() {
+        let db = demo_db();
+        let resp = tool_call(
+            &db,
+            1,
+            "ingest_json",
+            json!({
+                "label": "Person",
+                "rows_json": r#"[{"id":"carol","name":"Carol"}]"#,
+                "key_field": "id"
+            }),
+        );
+        assert!(!is_error(&resp));
+        // Verify node visible via stats
+        let stats = tool_text(&tool_call(&db, 2, "stats", json!({})));
+        assert_eq!(stats["nodes_live"], 3);
+    }
+
+    #[test]
+    fn test_node_info_returns_props() {
+        let db = demo_db();
+        let resp = tool_call(&db, 1, "node_info", json!({ "key": "alice" }));
+        assert!(!is_error(&resp));
+        let result = tool_text(&resp);
+        assert_eq!(result["key"], "alice");
+        assert_eq!(result["label"], "Person");
+        assert_eq!(result["props"]["name"], "Alice");
+    }
+
+    #[test]
+    fn test_node_edges_returns_edges() {
+        let db = demo_db();
+        let resp = tool_call(&db, 1, "node_edges", json!({ "key": "alice" }));
+        assert!(!is_error(&resp));
+        let result = tool_text(&resp);
+        let edges = result["edges"].as_array().expect("edges");
+        assert!(
+            !edges.is_empty(),
+            "alice should have at least one derived edge"
+        );
+        // All edges touch alice.
+        for e in edges {
+            let touches = e["src_key"] == "alice" || e["dst_key"] == "alice";
+            assert!(touches, "edge does not touch alice: {e}");
+        }
+    }
+
+    #[test]
+    fn test_neighborhood_traverses_one_hop() {
+        let db = demo_db();
+        let resp = tool_call(
+            &db,
+            1,
+            "neighborhood",
+            json!({ "key": "alice", "depth": 1 }),
+        );
+        assert!(!is_error(&resp));
+        let result = tool_text(&resp);
+        assert!(result["rows"].as_array().is_some());
+    }
+
+    #[test]
+    fn test_explain_returns_rule_info() {
+        let db = demo_db();
+        let resp = tool_call(&db, 1, "explain", json!({ "a": "alice", "b": "bob" }));
+        assert!(!is_error(&resp));
+        let result = tool_text(&resp);
+        let arr = result.as_array().expect("explain returns array");
+        assert!(!arr.is_empty(), "expected at least one explanation");
+        assert_eq!(arr[0]["rule"], "sim_emb");
+    }
+
+    #[test]
+    fn test_create_rule_backfills() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            let opts = IngestOptions {
+                key_field: "id".into(),
+                auto_fk: AutoFk::Off,
+            };
+            let rows: Vec<BTreeMap<String, Value>> = vec![
+                [
+                    ("id", Value::Str("x".into())),
+                    ("tag", Value::Str("a".into())),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+                [
+                    ("id", Value::Str("y".into())),
+                    ("tag", Value::Str("a".into())),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            ];
+            g.ingest("Item", rows, &opts).expect("ingest");
+        }
+        let resp = tool_call(
+            &db,
+            1,
+            "create_rule",
+            json!({
+                "name": "same_tag",
+                "src_label": "Item",
+                "dst_label": "Item",
+                "predicate": { "FieldEqual": { "field": "tag" } },
+                "edge_type": "SAME_TAG"
+            }),
+        );
+        assert!(!is_error(&resp));
+        let result = tool_text(&resp);
+        assert_eq!(result["ok"], true);
+        // Derived edges should now exist.
+        let edges_resp = tool_call(&db, 2, "node_edges", json!({ "key": "x" }));
+        let edges_result = tool_text(&edges_resp);
+        let edges = edges_result["edges"].as_array().expect("edges");
+        assert!(
+            edges.iter().any(|e| e["edge_type"] == "SAME_TAG"),
+            "SAME_TAG edge not found after create_rule"
+        );
+    }
+
+    // --- new tools ---
+
+    #[test]
+    fn test_upsert_entity_creates_new_node() {
+        let db = demo_db();
+        let resp = tool_call(
+            &db,
+            1,
+            "upsert_entity",
+            json!({
+                "key": "carol",
+                "label": "Person",
+                "props": { "name": "Carol", "age": 30 }
+            }),
+        );
+        assert!(!is_error(&resp));
+        let result = tool_text(&resp);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["created"], true);
+        assert_eq!(result["key"], "carol");
+        // Verify node exists
+        let info = tool_text(&tool_call(&db, 2, "node_info", json!({ "key": "carol" })));
+        assert_eq!(info["props"]["name"], "Carol");
+    }
+
+    #[test]
+    fn test_upsert_entity_updates_existing_node() {
+        let db = demo_db();
+        let resp = tool_call(
+            &db,
+            1,
+            "upsert_entity",
+            json!({
+                "key": "alice",
+                "props": { "name": "Alice Updated" }
+            }),
+        );
+        assert!(!is_error(&resp));
+        let result = tool_text(&resp);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["created"], false);
+        assert_eq!(result["updated_fields"], 1);
+        // Verify prop changed
+        let info = tool_text(&tool_call(&db, 2, "node_info", json!({ "key": "alice" })));
+        assert_eq!(info["props"]["name"], "Alice Updated");
+    }
+
+    #[test]
+    fn test_upsert_entity_missing_label_on_create_is_error() {
+        let db = demo_db();
+        let resp = tool_call(
+            &db,
+            1,
+            "upsert_entity",
+            json!({ "key": "new-node", "props": { "x": 1 } }),
+        );
+        assert!(is_error(&resp), "should error without label for new node");
+    }
+
+    #[test]
+    fn test_find_similar_returns_similar_edges() {
+        let db = demo_db();
+        let resp = tool_call(
+            &db,
+            1,
+            "find_similar",
+            json!({ "key": "alice", "edge_type": "SIMILAR" }),
+        );
+        assert!(!is_error(&resp));
+        let result = tool_text(&resp);
+        assert_eq!(result["key"], "alice");
+        assert_eq!(result["edge_type"], "SIMILAR");
+        let similar = result["similar"].as_array().expect("similar array");
+        assert!(!similar.is_empty(), "expected SIMILAR neighbors for alice");
+        assert_eq!(similar[0]["neighbor_key"], "bob");
+    }
+
+    #[test]
+    fn test_find_similar_limit_respected() {
+        let db = demo_db();
+        let resp = tool_call(
+            &db,
+            1,
+            "find_similar",
+            json!({ "key": "alice", "edge_type": "SIMILAR", "limit": 0 }),
+        );
+        assert!(!is_error(&resp));
+        let result = tool_text(&resp);
+        let similar = result["similar"].as_array().expect("similar array");
+        assert_eq!(similar.len(), 0);
+    }
+
+    #[test]
+    fn test_explain_association_same_as_explain() {
+        let db = demo_db();
+        let explain = tool_text(&tool_call(
+            &db,
+            1,
+            "explain",
+            json!({ "a": "alice", "b": "bob" }),
+        ));
+        let assoc = tool_text(&tool_call(
+            &db,
+            2,
+            "explain_association",
+            json!({ "a": "alice", "b": "bob" }),
+        ));
+        // Both tools return identical results.
+        assert_eq!(explain, assoc);
+    }
 }

@@ -135,7 +135,7 @@ fn handshake_initialize_then_initialized_is_silent() {
     );
 }
 
-/// Binding: tools/list returns exactly the eight tools with the specified schemas.
+/// Binding: tools/list returns exactly the eleven tools with the specified schemas.
 #[test]
 fn tools_list_returns_eight_tools_with_schemas() {
     let stdin = req(json!(1), "tools/list", None);
@@ -150,20 +150,23 @@ fn tools_list_returns_eight_tools_with_schemas() {
         .iter()
         .map(|t| t["name"].as_str().expect("tool name"))
         .collect();
-    assert_eq!(
-        names,
-        BTreeSet::from([
-            "query",
-            "ingest_json",
-            "explain",
-            "stats",
-            "neighborhood",
-            "node_info",
-            "node_edges",
-            "create_rule",
-        ])
-    );
-    assert_eq!(tools.len(), 8);
+    // Original eight tools plus three agent-memory tools.
+    for expected in &[
+        "query",
+        "ingest_json",
+        "explain",
+        "stats",
+        "neighborhood",
+        "node_info",
+        "node_edges",
+        "create_rule",
+        "upsert_entity",
+        "find_similar",
+        "explain_association",
+    ] {
+        assert!(names.contains(*expected), "missing tool: {expected}");
+    }
+    assert_eq!(tools.len(), 11);
 
     let by_name = |n: &str| {
         tools
