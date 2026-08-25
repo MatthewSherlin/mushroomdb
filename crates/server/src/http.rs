@@ -254,7 +254,7 @@ fn request_token(req: &Request) -> Option<String> {
 fn bearer_token(header: &str) -> Option<&str> {
     let (scheme, value) = header.split_once(' ')?;
     if scheme.eq_ignore_ascii_case("Bearer") {
-        Some(value)
+        Some(value.trim())
     } else {
         None
     }

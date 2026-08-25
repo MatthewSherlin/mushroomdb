@@ -112,9 +112,18 @@ export function nextDot(
   return reducedMotion ? "connected" : "flash";
 }
 
-export function watchUrl(location: { protocol: string; host: string }): string {
+export function watchUrl(location: {
+  protocol: string;
+  host: string;
+  search?: string;
+}): string {
   const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${location.host}/watch`;
+  const token = new URLSearchParams(location.search ?? "").get("token");
+  const qs =
+    token !== null && token !== ""
+      ? `?token=${encodeURIComponent(token)}`
+      : "";
+  return `${scheme}//${location.host}/watch${qs}`;
 }
 
 export function applyLiveEvent(store: GraphStore, event: MutationEvent): void {

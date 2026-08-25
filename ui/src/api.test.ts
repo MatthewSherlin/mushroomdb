@@ -7,6 +7,7 @@ import {
   ApiError,
   isAbsentEndpoint,
   isKeyNotFound,
+  pageToken,
 } from "./api";
 
 const tokens = readFileSync(
@@ -54,6 +55,42 @@ describe("ApiClient", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("pageToken reads a non-empty ?token= from the page search", () => {
+    expect(pageToken("?token=s3cret")).toBe("s3cret");
+    expect(pageToken("?format=json&token=s3cret")).toBe("s3cret");
+    expect(pageToken("?token=")).toBeUndefined();
+    expect(pageToken("")).toBeUndefined();
+  });
+
+  it("sends Authorization Bearer when constructed with a token", async () => {
+    const authed = new ApiClient("http://127.0.0.1:8080", "s3cret");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, { columns: ["n"], rows: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse(200, {
+          nodes_live: 0,
+          nodes_tombstoned: 0,
+          edges: 0,
+          rules: [],
+        }),
+      );
+
+    await authed.query("MATCH (n) RETURN n");
+    await authed.stats();
+
+    const [, queryInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(queryInit.headers).toEqual({
+      "Content-Type": "application/json",
+      Authorization: "Bearer s3cret",
+    });
+    const [statsUrl, statsInit] = fetchMock.mock.calls[1] as [
+      string,
+      RequestInit,
+    ];
+    expect(statsUrl).toBe("http://127.0.0.1:8080/stats");
+    expect(statsInit.headers).toEqual({ Authorization: "Bearer s3cret" });
   });
 
   it("query POSTs /query?format=json and returns columns/rows", async () => {

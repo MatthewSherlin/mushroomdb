@@ -116,6 +116,55 @@ async fn query_with_bearer_succeeds_when_token_configured() {
     assert_eq!(status, StatusCode::OK);
 }
 
+#[tokio::test]
+async fn query_with_query_token_succeeds_when_token_configured() {
+    let db = SharedDb::open(&tmp("query-qs-token")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, _, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?token=t&format=json",
+            json!({"cypher": "MATCH (n) RETURN n"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn query_with_wrong_query_token_is_401() {
+    let db = SharedDb::open(&tmp("query-qs-wrong")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?token=wrong",
+            json!({"cypher": "MATCH (n) RETURN n"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let v = parse_json(&body);
+    assert!(
+        v["error"].as_str().is_some_and(|s| !s.is_empty()),
+        "401 body must be {{\"error\":\"...\"}}, got {v}"
+    );
+}
+
+#[tokio::test]
+async fn watch_with_query_token_is_not_401_when_token_configured() {
+    let db = SharedDb::open(&tmp("watch-qs-token")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, _, _) = send(app, get("/watch?token=t")).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "GET /watch?token=t must pass auth (upgrade may still fail without WS headers)"
+    );
+}
+
 /// Binding: POST /query default is Arrow IPC stream; StreamReader reads the batch.
 #[tokio::test]
 async fn query_default_returns_arrow_ipc() {

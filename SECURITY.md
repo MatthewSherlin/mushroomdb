@@ -9,8 +9,9 @@ stack; it reads and writes a local directory only. When you run
 `MUSHROOMDB_TOKEN`. Loopback binds may omit a token. When a token is
 configured, every HTTP request except `GET /health` must present
 `Authorization: Bearer <token>` or `?token=` (WebSocket `/watch` and
-`/subscribe` take `?token=`). The process refuses to start if `--addr` is
-not loopback and no token is set.
+`/subscribe` take `?token=`). Open the explorer at `http://host:8080/?token=…`
+so the UI can attach that token to API fetches and WebSockets. The process
+refuses to start if `--addr` is not loopback and no token is set.
 
 The `mushroomdb mcp` mode reads and writes to a local database via stdio
 only. It opens no sockets.

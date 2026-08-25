@@ -193,7 +193,8 @@ Or run directly from the source tree (no copy needed):
 ./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db --addr 127.0.0.1:8080
 ```
 
-Open `http://127.0.0.1:8080/`. The demo graph has 10 Orgs, 20 Projects,
+Open `http://127.0.0.1:8080/`. When a token is configured, open
+`http://host:8080/?token=…`. The demo graph has 10 Orgs, 20 Projects,
 30 People, and 334 edges — 304 of them derived by seven rule sets.
 
 `mushroomdb demo ./db` output:
@@ -479,7 +480,9 @@ docker run --rm -p 8080:8080 ghcr.io/matthewsherlin/mushroomdb
 ```
 
 The image CMD runs `mushroomdb serve /data --addr 0.0.0.0:8080 --demo-if-empty`
-(writes the demo graph into the volume when empty, then serves).
+(writes the demo graph into the volume when empty, then serves). Non-loopback
+bind requires a token; pass `-e MUSHROOMDB_TOKEN=…` and open
+`http://localhost:8080/?token=…`.
 Explicit two-step:
 
 ```text
