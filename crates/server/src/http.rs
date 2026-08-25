@@ -264,7 +264,7 @@ fn presented_bearer_or_query(req: &Request) -> Option<String> {
             return Some(value.to_string());
         }
     }
-    query_param(req.uri().query().unwrap_or(""), "token").map(str::to_string)
+    query_param(req.uri().query().unwrap_or(""), "token")
 }
 
 fn presented_cookie(req: &Request) -> Option<String> {
@@ -314,18 +314,56 @@ fn bearer_token(header: &str) -> Option<&str> {
     }
 }
 
-fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+fn query_param(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
         if pair.is_empty() {
             continue;
         }
         match pair.split_once('=') {
-            Some((k, v)) if k == key => return Some(v),
-            None if pair == key => return Some(""),
+            Some((k, v)) if k == key => return percent_decode_plus(v),
+            None if pair == key => return Some(String::new()),
             _ => {}
         }
     }
     None
+}
+
+/// `application/x-www-form-urlencoded`: `+` is space, `%HH` is a byte.
+fn percent_decode_plus(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return None;
+                }
+                let hi = from_hex(bytes[i + 1])?;
+                let lo = from_hex(bytes[i + 2])?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn unauthorized() -> Response {

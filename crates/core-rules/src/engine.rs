@@ -1216,6 +1216,13 @@ impl RuleEngine {
             .collect()
     }
 
+    /// Re-queue `name` so a later write can issue `RebuildRule`.
+    ///
+    /// Used when auto-rebuild WAL IO fails after a durable user op.
+    pub fn queue_rebuild_needed(&mut self, name: String) {
+        self.rebuild_needed.insert(name);
+    }
+
     fn maybe_queue_ivf_rebuild(&mut self, rule_name: &str, def: &RuleDef) {
         if !def.approximate {
             return;

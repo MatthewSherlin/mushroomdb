@@ -186,7 +186,11 @@ fn run_serve(
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            // Install failure is not SIGINT; park like SIGTERM handler Err.
+            Err(_) => std::future::pending::<()>().await,
+        }
     };
     #[cfg(unix)]
     let terminate = async {

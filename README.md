@@ -480,7 +480,7 @@ front door **after the first `v*` tag**; they are not available until then.
 ### Docker (after the first v* tag)
 
 ```text
-docker run --rm -p 8080:8080 ghcr.io/matthewsherlin/mushroomdb
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=… ghcr.io/matthewsherlin/mushroomdb
 ```
 
 The image CMD runs `mushroomdb serve /data --addr 0.0.0.0:8080 --demo-if-empty`
@@ -491,14 +491,14 @@ Explicit two-step:
 
 ```text
 docker run --rm -v mushroomdb-data:/data ghcr.io/matthewsherlin/mushroomdb demo /data
-docker run --rm -p 8080:8080 -v mushroomdb-data:/data ghcr.io/matthewsherlin/mushroomdb serve /data --addr 0.0.0.0:8080
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=… -v mushroomdb-data:/data ghcr.io/matthewsherlin/mushroomdb serve /data --addr 0.0.0.0:8080
 ```
 
 Local image build (available now):
 
 ```text
 docker build -t mushroomdb:local .
-docker run --rm -p 8080:8080 mushroomdb:local
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=… mushroomdb:local
 ```
 
 ### TypeScript client (install from repo)

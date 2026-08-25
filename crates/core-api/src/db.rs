@@ -1258,10 +1258,23 @@ impl<F: Fs> GraphDb<F> {
         // drain the flag so a leftover cannot re-enter.
         let rebuilds = self.engine.take_rebuild_needed();
         if !matches!(&rec, WalRecord::RebuildRule { .. }) {
+            let mut failed = Vec::new();
             for name in rebuilds {
                 if self.engine.rules().any(|r| r.name == name) {
-                    self.log_then_apply(WalRecord::RebuildRule { name })?;
+                    // User op is already durable. A failed second commit must
+                    // not surface as the caller's error.
+                    if let Err(e) =
+                        self.log_then_apply(WalRecord::RebuildRule { name: name.clone() })
+                    {
+                        eprintln!(
+                            "auto-rebuild of rule {name:?} failed after durable user commit: {e}"
+                        );
+                        failed.push(name);
+                    }
                 }
+            }
+            for name in failed {
+                self.engine.queue_rebuild_needed(name);
             }
         }
         Ok(())

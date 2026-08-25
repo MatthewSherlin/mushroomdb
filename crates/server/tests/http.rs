@@ -165,6 +165,55 @@ async fn watch_with_query_token_is_not_401_when_token_configured() {
     );
 }
 
+#[tokio::test]
+async fn query_token_percent_decoded_matches_configured_token() {
+    let db = SharedDb::open(&tmp("query-qs-encoded-slash")).unwrap();
+    let app = router_with_auth(db, Some("a/b".into()));
+    let (status, _, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?token=a%2Fb&format=json",
+            json!({"cypher": "MATCH (n) RETURN n"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "configured token \"a/b\" must match URL-encoded ?token=a%2Fb"
+    );
+
+    let db = SharedDb::open(&tmp("query-qs-encoded-plus")).unwrap();
+    let app = router_with_auth(db, Some("a+b".into()));
+    let (status, _, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?token=a%2Bb&format=json",
+            json!({"cypher": "MATCH (n) RETURN n"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "configured token \"a+b\" must match URL-encoded ?token=a%2Bb"
+    );
+}
+
+#[tokio::test]
+async fn watch_with_url_encoded_query_token_is_not_401() {
+    let db = SharedDb::open(&tmp("watch-qs-encoded")).unwrap();
+    let app = router_with_auth(db, Some("a/b".into()));
+    let (status, _, _) = send(app, get("/watch?token=a%2Fb")).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "GET /watch?token=a%2Fb must pass auth for configured token \"a/b\""
+    );
+}
+
 async fn send_headers(
     app: Router,
     req: Request<Body>,

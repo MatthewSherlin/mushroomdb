@@ -137,6 +137,52 @@ describe("MushroomError shape", () => {
   });
 });
 
+describe("subscribe constructor token", () => {
+  function fakeWs(seen: string[]) {
+    class FakeWs {
+      onopen: ((ev: unknown) => void) | null = null;
+      onmessage: ((ev: { data: unknown }) => void) | null = null;
+      onclose: ((ev: unknown) => void) | null = null;
+      onerror: ((ev: unknown) => void) | null = null;
+      constructor(url: string) {
+        seen.push(url);
+        queueMicrotask(() => this.onopen?.(null));
+      }
+      send(_data: string): void {
+        queueMicrotask(() => {
+          this.onmessage?.({ data: JSON.stringify({ subscribed: true }) });
+        });
+      }
+      close(): void {
+        queueMicrotask(() => this.onclose?.(null));
+      }
+    }
+    return FakeWs as unknown as WsConstructor;
+  }
+
+  it("appends ?token= from constructor token, URL-encoded", async () => {
+    const seen: string[] = [];
+    const authed = new MushroomClient("http://example.test", { token: "a/b" });
+    const handle = await authed.subscribe(
+      { writes: true, wsConstructor: fakeWs(seen) },
+      () => {},
+    );
+    await handle.close();
+    expect(seen).toEqual(["ws://example.test/subscribe?token=a%2Fb"]);
+  });
+
+  it("omits ?token= when constructor has no token", async () => {
+    const seen: string[] = [];
+    const plain = new MushroomClient("http://example.test");
+    const handle = await plain.subscribe(
+      { writes: true, wsConstructor: fakeWs(seen) },
+      () => {},
+    );
+    await handle.close();
+    expect(seen).toEqual(["ws://example.test/subscribe"]);
+  });
+});
+
 describe.skipIf(NO_SERVER)("error handling", () => {
   it("surfaces server error message intact on bad Cypher", async () => {
     let caught: MushroomError | null = null;

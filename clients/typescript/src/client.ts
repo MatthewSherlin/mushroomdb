@@ -353,7 +353,11 @@ export class MushroomClient {
     opts: SubscribeOptions,
     onEvent: (event: import("./types.js").DbEvent) => void,
   ): Promise<SubscribeHandle> {
-    return wsSubscribe(this.wsUrl("/subscribe"), opts, onEvent);
+    let url = this.wsUrl("/subscribe");
+    if (this.token) {
+      url += `?token=${encodeURIComponent(this.token)}`;
+    }
+    return wsSubscribe(url, opts, onEvent);
   }
 }
 

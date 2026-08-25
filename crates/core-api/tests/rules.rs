@@ -3,6 +3,9 @@ use core_api::{
     PredicateSummary, RuleDef, Value,
 };
 use core_rules::with_ivf_drift_rebuild;
+use core_storage::fs::{FileId, Fs, RealFs};
+use core_storage::wal::{decode_all, WalRecord};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -488,4 +491,89 @@ fn approximate_rule_rebuilds_after_drift_threshold() {
         "RebuildRule must not retrigger another RebuildRule"
     );
     assert_eq!(db.ivf_dst_drift("sim"), Some(0));
+}
+
+/// WAL append that fails only `RebuildRule` frames when `fail_rebuild` is set.
+struct FailRebuildWal {
+    inner: RealFs,
+    fail_rebuild: Arc<AtomicBool>,
+}
+
+impl Fs for FailRebuildWal {
+    fn append(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
+        if file == FileId::Wal
+            && self.fail_rebuild.load(Ordering::SeqCst)
+            && decode_all(data)
+                .0
+                .iter()
+                .any(|r| matches!(r, WalRecord::RebuildRule { .. }))
+        {
+            return Err(std::io::Error::other("forced RebuildRule wal failure"));
+        }
+        self.inner.append(file, data)
+    }
+
+    fn sync(&mut self, file: FileId) -> std::io::Result<()> {
+        self.inner.sync(file)
+    }
+
+    fn read(&self, file: FileId) -> std::io::Result<Vec<u8>> {
+        self.inner.read(file)
+    }
+
+    fn write_atomic(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_atomic(file, data)
+    }
+}
+
+#[test]
+fn auto_rebuild_wal_failure_does_not_fail_user_write() {
+    let dir = tmp("approx-rebuild-wal-fail");
+    let fail_rebuild = Arc::new(AtomicBool::new(false));
+    let fs = FailRebuildWal {
+        inner: RealFs::new(&dir).unwrap(),
+        fail_rebuild: fail_rebuild.clone(),
+    };
+    let mut db = GraphDb::open_with(fs).unwrap();
+    for i in 0..6 {
+        let x = i as f64 * 0.2;
+        db.insert_node(
+            "V",
+            &format!("v{i}"),
+            vec![("emb".into(), emb(&[x, 1.0 - x]))],
+        )
+        .unwrap();
+    }
+    db.create_rule(approx_vec_rule()).unwrap();
+
+    fail_rebuild.store(true, Ordering::SeqCst);
+    with_ivf_drift_rebuild(1, || {
+        db.delete_node("v0").unwrap();
+        let before = wal_commit_count_at(&dir).unwrap();
+        db.delete_node("v1")
+            .expect("user delete must succeed even if auto-rebuild WAL fails");
+        assert!(
+            !db.has_node("v1"),
+            "user delete is durable when rebuild WAL fails"
+        );
+        assert_eq!(
+            wal_commit_count_at(&dir).unwrap(),
+            before + 1,
+            "RebuildRule must not be committed when its WAL append fails"
+        );
+        assert_eq!(
+            db.ivf_dst_drift("sim"),
+            Some(2),
+            "failed auto-rebuild must leave dst drift in place"
+        );
+    });
+
+    fail_rebuild.store(false, Ordering::SeqCst);
+    db.insert_node("V", "v9", vec![("emb".into(), emb(&[0.1, 0.9]))])
+        .unwrap();
+    assert_eq!(
+        db.ivf_dst_drift("sim"),
+        Some(0),
+        "re-queued rebuild must run on a later write"
+    );
 }
