@@ -24,5 +24,8 @@ COPY --from=build /src/target/release/mushroomdb /usr/local/bin/mushroomdb
 COPY --from=build --chown=65532:65532 /data /data
 USER nonroot
 EXPOSE 8080
+# Non-loopback bind requires a token. Set at run:
+#   docker run -e MUSHROOMDB_TOKEN=… -p 8080:8080 …
+ENV MUSHROOMDB_TOKEN=""
 ENTRYPOINT ["/usr/local/bin/mushroomdb"]
 CMD ["serve", "/data", "--addr", "0.0.0.0:8080", "--demo-if-empty"]

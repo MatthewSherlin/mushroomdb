@@ -56,8 +56,9 @@ field matches an Org's key gets a `ORG` edge to that Org. After the demo,
 
 ### 2. FieldEqual
 
-Matches when a named string field on the source node exactly equals the
-same field on the destination node.
+Matches when a named field on the source node exactly equals the same
+field on the destination node. Comparison is on any scalar `ValueKey`
+(string, int, float, bool), not strings only.
 
 ```rust
 Predicate::FieldEqual { field: "industry".into() }
@@ -116,7 +117,7 @@ Matches when the Haversine distance between two `[lat, lon]` fields is
 within a radius (in km). Score is `1 - distance / radius`.
 
 ```rust
-Predicate::GeoRadius { field: "office".into(), radius_km: 50.0 }
+Predicate::GeoRadius { field: "office".into(), km: 50.0 }
 ```
 
 **Demo example:** `nearby_office` — Org.office, 50 km. Uses real city
@@ -133,7 +134,7 @@ Computes cosine similarity between two fixed-dimension float array fields
 and writes an edge when similarity meets a minimum threshold.
 
 ```rust
-Predicate::VectorSimilar { field: "embedding".into(), min: 0.8, dims: 8 }
+Predicate::VectorSimilar { field: "embedding".into(), min: 0.8 }
 ```
 
 **Score:** cosine similarity, stored on the edge via `weight_prop`.

@@ -946,6 +946,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "crc32fast",
+ "libc",
  "proptest",
  "serde",
  "zstd",

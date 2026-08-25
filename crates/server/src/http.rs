@@ -15,8 +15,9 @@ use crate::json::{
 };
 use crate::AppState;
 use arrow_bridge::to_ipc_bytes;
-use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -50,41 +51,18 @@ use tower_http::services::ServeDir;
 /// Wrap these calls in `tokio::task::spawn_blocking` before exposing the
 /// server to concurrent multi-client load.
 pub fn router(db: SharedDb) -> Router {
-    debug_assert!(
-        !db.read().has_event_sink(),
-        "router() must be called at most once per SharedDb; a second call \
-         replaces the sink and terminates all existing /watch subscribers \
-         with RecvError::Closed"
-    );
-    let (tx, _) = tokio::sync::broadcast::channel(1024);
-    {
-        let tx = tx.clone();
-        db.write().set_event_sink(Box::new(move |ev| {
-            let _ = tx.send(ev);
-        }));
-    }
-    let state = AppState { db, watch: tx };
-    Router::new()
-        .route("/query", post(query))
-        .route("/stats", get(stats))
-        .route("/ingest", post(ingest))
-        .route("/rules", post(create_rule))
-        .route("/suggest", get(suggest))
-        .route("/explain", get(explain))
-        .route("/node/{key}", get(node_info))
-        .route("/node/{key}/edges", get(node_edges))
-        .route("/node/{key}/neighborhood", get(neighborhood))
-        .route("/algo/pagerank", post(algo_pagerank))
-        .route("/algo/wcc", post(algo_wcc))
-        .route("/algo/degree", post(algo_degree))
-        .route("/watch", get(crate::ws::watch))
-        .route("/subscribe", get(crate::subscribe::subscribe))
-        .with_state(state)
+    router_with_auth(db, None)
+}
+
+/// [`router`] with an optional bearer/`?token=` requirement on every route
+/// except unauthenticated `GET /health`.
+pub fn router_with_auth(db: SharedDb, token: Option<String>) -> Router {
+    build_app(db, token, UiFallback::None)
 }
 
 /// Same as [`router`], then `ServeDir` as the fallback so API routes win.
 pub fn router_with_ui(db: SharedDb, ui_dir: impl AsRef<std::path::Path>) -> Router {
-    router(db).fallback_service(ServeDir::new(ui_dir))
+    build_app(db, None, UiFallback::Dir(ui_dir.as_ref().to_path_buf()))
 }
 
 #[cfg(feature = "embed-ui")]
@@ -94,7 +72,7 @@ static EMBEDDED_UI: include_dir::Dir<'_> =
 /// [`router`] plus the `embed-ui` static tree as fallback.
 #[cfg(feature = "embed-ui")]
 pub fn router_with_embedded_ui(db: SharedDb) -> Router {
-    router(db).fallback(embedded_fallback)
+    build_app(db, None, UiFallback::Embedded)
 }
 
 #[cfg(feature = "embed-ui")]
@@ -147,8 +125,9 @@ pub async fn serve(
     db: SharedDb,
     addr: SocketAddr,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::None).await
+    serve_inner(db, addr, ready, UiFallback::None, token).await
 }
 
 /// [`serve`] plus a UI dist directory mounted behind the API routes.
@@ -157,8 +136,9 @@ pub async fn serve_with_ui(
     addr: SocketAddr,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
     ui_dir: PathBuf,
+    token: Option<String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::Dir(ui_dir)).await
+    serve_inner(db, addr, ready, UiFallback::Dir(ui_dir), token).await
 }
 
 /// [`serve`] plus the compiled-in UI (no-op fallback if `embed-ui` is off).
@@ -167,8 +147,9 @@ pub async fn serve_with_embedded_ui(
     db: SharedDb,
     addr: SocketAddr,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::Embedded).await
+    serve_inner(db, addr, ready, UiFallback::Embedded, token).await
 }
 
 enum UiFallback {
@@ -183,6 +164,7 @@ async fn serve_inner(
     addr: SocketAddr,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
     ui: UiFallback,
+    token: Option<String>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -190,13 +172,114 @@ async fn serve_inner(
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    let app = match ui {
-        UiFallback::None => router(db),
-        UiFallback::Dir(dir) => router_with_ui(db, dir),
-        #[cfg(feature = "embed-ui")]
-        UiFallback::Embedded => router_with_embedded_ui(db),
-    };
+    let app = build_app(db, token, ui);
     axum::serve(listener, app).await
+}
+
+fn build_app(db: SharedDb, token: Option<String>, ui: UiFallback) -> Router {
+    debug_assert!(
+        !db.read().has_event_sink(),
+        "router() must be called at most once per SharedDb; a second call \
+         replaces the sink and terminates all existing /watch subscribers \
+         with RecvError::Closed"
+    );
+    let (tx, _) = tokio::sync::broadcast::channel(1024);
+    {
+        let tx = tx.clone();
+        db.write().set_event_sink(Box::new(move |ev| {
+            let _ = tx.send(ev);
+        }));
+    }
+    let state = AppState {
+        db,
+        watch: tx,
+        token,
+    };
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/query", post(query))
+        .route("/stats", get(stats))
+        .route("/ingest", post(ingest))
+        .route("/rules", post(create_rule))
+        .route("/suggest", get(suggest))
+        .route("/explain", get(explain))
+        .route("/node/{key}", get(node_info))
+        .route("/node/{key}/edges", get(node_edges))
+        .route("/node/{key}/neighborhood", get(neighborhood))
+        .route("/algo/pagerank", post(algo_pagerank))
+        .route("/algo/wcc", post(algo_wcc))
+        .route("/algo/degree", post(algo_degree))
+        .route("/watch", get(crate::ws::watch))
+        .route("/subscribe", get(crate::subscribe::subscribe))
+        .with_state(state.clone());
+    let app = match ui {
+        UiFallback::None => app,
+        UiFallback::Dir(dir) => app.fallback_service(ServeDir::new(dir)),
+        #[cfg(feature = "embed-ui")]
+        UiFallback::Embedded => app.fallback(embedded_fallback),
+    };
+    app.layer(middleware::from_fn_with_state(state, auth_middleware))
+}
+
+async fn health() -> Response {
+    json_ok(json!({"ok": true}))
+}
+
+async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(expected) = state.token.as_deref().filter(|s| !s.is_empty()) else {
+        return next.run(req).await;
+    };
+    if req.method() == Method::GET && req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    if request_token(&req).as_deref() == Some(expected) {
+        return next.run(req).await;
+    }
+    unauthorized()
+}
+
+fn request_token(req: &Request) -> Option<String> {
+    if let Some(header) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(value) = bearer_token(header) {
+            return Some(value.to_string());
+        }
+    }
+    query_param(req.uri().query().unwrap_or(""), "token").map(str::to_string)
+}
+
+fn bearer_token(header: &str) -> Option<&str> {
+    let (scheme, value) = header.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("Bearer") {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        match pair.split_once('=') {
+            Some((k, v)) if k == key => return Some(v),
+            None if pair == key => return Some(""),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "unauthorized"})),
+    )
+        .into_response()
 }
 
 fn err_response(detail: impl Into<String>) -> Response {

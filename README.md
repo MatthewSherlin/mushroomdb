@@ -359,7 +359,7 @@ Dependency rule (inward only):
 `bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
 
 Storage uses a CRC-checksummed WAL with per-commit fsync, plus versioned
-snapshots in a zero-copy archived format. Open = snapshot + WAL replay.
+zstd-compressed bincode snapshots (V6); not mmap. Open = snapshot + WAL replay.
 Derived edges are not WAL-logged; they are re-materialized from node data
 on open by replaying rule application.
 
@@ -378,7 +378,7 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
 | Cold start without a snapshot re-fires all rules | Snapshots (V6, zstd-compressed) persist derived edges, IVF state, and view definitions — opening from a snapshot skips re-derivation. V6 measured at 100k nodes: 8.88 s open from snapshot vs 8.16 min from WAL alone. Snapshot write cost: 22.563 s (1.1 GiB). Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
 | Approximate vector mode is opt-in | `approximate: true` enables IVF-Flat candidate selection. Per-query recall ≥ 0.90 quiesced; ≥ 0.85 post-rebuild. Review the recall trade-off before using it in completeness-critical workloads. |
-| Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is on the roadmap. |
+| Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
 | Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE (manual edges only), MATCH…DETACH DELETE (node deletes), MATCH…DELETE (isolated-node or edge deletes), and MERGE (single-key match-or-create) are supported. SET RHS accepts a literal or a `$param` reference; expression RHS (`n.x + 1`) is rejected with a named error. Combined MATCH…SET…RETURN is rejected; multi-statement transactions are not supported. Each write statement produces one WAL Batch frame (one fsync). See [`docs/site/query.md`](docs/site/query.md) coverage table. |
 | Crash-atomic write batches; no interactive transactions or isolation | `db.write_batch(\|b\| { b.insert_node(...); b.set_prop(...); b.delete_node(...); })` commits all ops in one `WalRecord::Batch` frame (one fsync). On crash replay the frame is all-or-nothing: a torn frame replays as none-applied. Rules fire per op in order — semantically identical to sequential singles. Error semantics: validate-then-apply — if op N fails validation (duplicate key, unknown key, rule-owned edge) the entire batch is rejected and nothing is written or applied. **Not isolated:** readers may observe intermediate states while a committed batch is being applied in memory. Per-query Cypher writes (`query_write`) also produce one Batch frame per statement. Multi-statement BEGIN/COMMIT interactive transactions are not supported in v1. |
@@ -458,11 +458,11 @@ Full walkthrough, tool reference, and Claude Desktop setup:
 |---|---|
 | Medium | Differential-dataflow query subscriptions (incremental result-set updates, not just edge events) |
 | Medium | General view expressions (computed transforms and cross-label aggregates) |
-| Medium | mmap-backed storage (RAM-independent at rest) |
-| Medium | Lock-free epoch snapshot readers (replacing the `RwLock` facade) |
+| Medium | mmap-backed storage (deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`) |
+| Medium | Lock-free epoch snapshot readers (deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`) |
 | Medium | Multi-statement transactions (BEGIN/COMMIT) |
 | Medium | Expanded Cypher surface (`CASE` expressions, subqueries, `IS NULL/IS NOT NULL`, `+`/`/` arithmetic) |
-| Low | TypeScript bindings (napi-rs) |
+| Low | Native TypeScript bindings (napi-rs; wait-list — HTTP `mushroomdb-client` is the TS surface) |
 | Low | WASM playground |
 
 ---

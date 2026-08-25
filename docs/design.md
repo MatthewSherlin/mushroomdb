@@ -53,13 +53,13 @@ ingestion posture.
 | Deployment shape | Embedded Rust core + optional thin server + bundled UI (DuckDB playbook); `graphdb ui mydb.graph` serves the UI locally |
 | Query surface | Programmatic traversal API (primary) + openCypher subset (compat). No custom language, ever |
 | Auto-linking | Layered: zero-config key/FK inference by default + declared incremental rules. LLM extraction is a possible later optional plugin, never core |
-| Storage model | Memory-first: Sortledton-style dynamic adjacency + columnar properties; WAL + mmap'd zero-copy snapshots. Storage behind a Rust trait (future disk-native backend possible without touching query/rule layers) |
-| Execution | Vectorized batches (~1–2k IDs per operator step), rayon-parallel traversals. Factorized processing / WCOJ deferred to v2 |
-| Concurrency | Single writer + epoch-based snapshot reads (lock-free readers). No general MVCC |
-| Results format | Apache Arrow everywhere: zero-copy to pandas/polars/JS; Arrow IPC over WebSocket to UI. JSON exists nowhere in the data path |
+| Storage model | Memory-first HashMap topology + columnar properties; CRC WAL + zstd-compressed bincode snapshots (V6). Sortledton adjacency and mmap'd snapshots deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
+| Execution | Pull-based interpreter over the Cypher subset. Vectorized batches deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
+| Concurrency | Single writer + many readers via `RwLock` (`SharedDb`). Epoch-based lock-free snapshot reads deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
+| Results format | Apache Arrow for query results (IPC over HTTP; pandas/polars in Python). JSON is used for `?format=json`, `/watch`, `/subscribe`, and MCP |
 | UI rendering | cosmos.gl (GPU force layout + rendering; OpenJS Foundation) |
-| Bindings | Python (PyO3), TypeScript (napi-rs), Rust — all at launch, generated/derived from one core-api source of truth, shared conformance suite |
-| Testing | Deterministic simulation testing (FoundationDB-style) from day one + model-based oracle testing + rule-equivalence invariant + differential Cypher testing vs Neo4j |
+| Bindings | Python (PyO3) and Rust at launch; TypeScript via HTTP `mushroomdb-client`. napi-rs deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
+| Testing | Deterministic simulation testing (FoundationDB-style) from day one + model-based oracle testing + rule-equivalence invariant. Differential Cypher testing vs Neo4j deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
 | Scale target | Design for 10M nodes in RAM (~5–15 GB with properties); document the RAM ceiling honestly. Real initial workloads are ~10k nodes |
 
 ### Explicit non-goals (v1)
@@ -235,7 +235,7 @@ Not v1: general editing/admin UI, dashboards, saved queries.
 | Point lookup + depth-2 typed neighborhood, 10k-node graph | < 100 µs engine-side |
 | Same, 10M-node graph | < 10 ms |
 | Insert with 5 active rules, 100k-node graph | < 1 ms |
-| DB open (5 GB snapshot) | < 100 ms |
+| DB open (5 GB snapshot) | Target < 100 ms (mmap/rkyv; deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md`). Current V6 zstd-bincode open is ~8.88 s at 100k nodes |
 | UI: click-to-rendered neighborhood (500 nodes, end-to-end) | < 100 ms |
 | UI: smooth interaction | 50k+ nodes without frame collapse |
 | Replaces talent-backend Neo4j usage | current 5+ s queries < 50 ms end-to-end |

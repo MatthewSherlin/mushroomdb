@@ -56,6 +56,8 @@ pub enum Command {
         /// If the db dir is missing or empty, run [`run_demo`] before serving.
         /// Docker's default CMD uses this so a fresh volume is ready on first boot.
         demo_if_empty: bool,
+        /// Bearer token for non-loopback binds. Loopback may omit it.
+        token: Option<String>,
     },
     Mcp {
         db_dir: PathBuf,
@@ -130,7 +132,7 @@ pub fn usage() -> &'static str {
 mushroomdb — embedded graph database
 
 Usage:
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:0] [--ui <dist-dir>] [--no-ui] [--demo-if-empty]
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty]
   mushroomdb mcp <db-dir>
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
@@ -163,7 +165,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
 }
 
 fn default_addr() -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 0))
+    SocketAddr::from(([127, 0, 0, 1], 8080))
 }
 
 fn parse_serve(args: &[&str]) -> Result<Command, String> {
@@ -173,6 +175,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut saw_ui = false;
     let mut saw_no_ui = false;
     let mut demo_if_empty = false;
+    let mut token = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -205,6 +208,16 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if a == "--demo-if-empty" {
             demo_if_empty = true;
             i += 1;
+        } else if a == "--token" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --token".to_string())?;
+            token = Some(val.to_string());
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--token=") {
+            token = Some(val.to_string());
+            i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -223,6 +236,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         addr,
         ui,
         demo_if_empty,
+        token,
     })
 }
 
@@ -939,7 +953,7 @@ mod tests {
     }
 
     fn default_bind() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 0))
+        SocketAddr::from(([127, 0, 0, 1], 8080))
     }
 
     #[test]
@@ -979,11 +993,13 @@ mod tests {
                         addr,
                         ui,
                         demo_if_empty,
+                        token,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, default_bind());
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
+                        assert_eq!(token, None);
                     }
                     other => panic!("serve <dir> → Serve default addr, got {other:?}"),
                 },
@@ -996,11 +1012,13 @@ mod tests {
                         addr,
                         ui,
                         demo_if_empty,
+                        token,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
+                        assert_eq!(token, None);
                     }
                     other => panic!("serve --addr after dir, got {other:?}"),
                 },
@@ -1013,11 +1031,13 @@ mod tests {
                         addr,
                         ui,
                         demo_if_empty,
+                        token,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, "127.0.0.1:9090".parse().unwrap());
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
+                        assert_eq!(token, None);
                     }
                     other => panic!("serve --addr=VALUE, got {other:?}"),
                 },
@@ -1195,11 +1215,13 @@ mod tests {
                         addr,
                         demo_if_empty,
                         ui,
+                        token,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/data"));
                         assert_eq!(addr, "0.0.0.0:8080".parse().unwrap());
                         assert!(demo_if_empty);
                         assert_eq!(ui, super::ServeUi::Embedded);
+                        assert_eq!(token, None);
                     }
                     other => panic!("serve --demo-if-empty docker default, got {other:?}"),
                 },
@@ -1208,6 +1230,37 @@ mod tests {
 
         for case in &cases {
             (case.check)(parse_args(case.args));
+        }
+    }
+
+    #[test]
+    fn serve_default_addr_is_loopback_8080() {
+        match parse_args(&["serve", "/tmp/db"]).unwrap() {
+            Command::Serve { addr, .. } => {
+                assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_token_flag_and_non_loopback_without_token_is_parsed() {
+        // parse succeeds; main() enforces the bind rule. Token is stored.
+        match parse_args(&[
+            "serve",
+            "/tmp/db",
+            "--addr",
+            "0.0.0.0:8080",
+            "--token",
+            "s3cret",
+        ])
+        .unwrap()
+        {
+            Command::Serve { token, addr, .. } => {
+                assert_eq!(token.as_deref(), Some("s3cret"));
+                assert_eq!(addr.ip().to_string(), "0.0.0.0");
+            }
+            other => panic!("{other:?}"),
         }
     }
 
@@ -1223,6 +1276,7 @@ mod tests {
             "--ui",
             "--no-ui",
             "--demo-if-empty",
+            "--token",
         ] {
             assert!(
                 text.contains(word),

@@ -1,8 +1,9 @@
 # Cypher Query Reference
 
-mushroomdb supports a read-only Cypher subset for pattern matching, filtering,
-aggregation, and ordering.  This page documents the full grammar, with a
-dedicated section on variable-length paths and `shortestPath`.
+mushroomdb supports a Cypher subset for pattern matching, filtering,
+aggregation, ordering, and writes (`CREATE`, `SET`, `DELETE`, `DETACH DELETE`,
+`MERGE`). This page documents the full grammar, with a dedicated section on
+variable-length paths and `shortestPath`.
 
 ---
 

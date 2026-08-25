@@ -20,11 +20,11 @@ Six predicate kinds ship today:
 | Display name | Wire shape (JSON `predicate` field) | What it tests |
 |---|---|---|
 | KeyMatch | `{"KeyMatch": {"field": "..."}}` | FK equality — one node's field matches another's key |
-| FieldEqual | `{"FieldEqual": {"field": "..."}}` | Exact string match on a named field |
+| FieldEqual | `{"FieldEqual": {"field": "..."}}` | Exact match on a named field (any `ValueKey`: string, int, float, bool) |
 | Overlap | `{"Overlap": {"field": "...", "min": 0.5}}` | Jaccard coefficient on list-valued fields, min threshold |
 | NumericWithin | `{"NumericWithin": {"field": "...", "tolerance": 2.0}}` | Absolute numeric difference within a tolerance |
-| GeoRadius | `{"GeoRadius": {"field": "...", "radius_km": 50.0}}` | Haversine distance between `[lat, lon]` fields within a radius in km |
-| VectorSimilar | `{"VectorSimilar": {"field": "...", "min": 0.8, "dims": 8}}` | Cosine similarity on fixed-dimension float arrays, min threshold |
+| GeoRadius | `{"GeoRadius": {"field": "...", "km": 50.0}}` | Haversine distance between `[lat, lon]` fields within a radius in km |
+| VectorSimilar | `{"VectorSimilar": {"field": "...", "min": 0.8}}` | Cosine similarity on float arrays, min threshold |
 
 All six compose with `All` to require multiple conditions on the same edge.
 
@@ -43,7 +43,7 @@ The design spec and roadmap are in `README.md`. The full spec is at
 
 ## Status
 
-Pre-alpha. Single-writer, no node/edge deletes, no multi-statement
+Pre-alpha. Single-writer, no multi-statement
 transactions. Toolchain pinned to Rust 1.92.0.
 
 The distribution commands below (Docker, npm, install.sh) are available

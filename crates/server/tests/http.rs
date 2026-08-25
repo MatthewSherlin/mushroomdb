@@ -10,7 +10,7 @@ use core_api::{
 use serde_json::{json, Value as Json};
 #[cfg(feature = "embed-ui")]
 use server::router_with_embedded_ui;
-use server::{router, router_with_ui, serve};
+use server::{router, router_with_auth, router_with_ui, serve};
 use std::io::Cursor;
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -67,6 +67,53 @@ fn seed_person(db: &SharedDb, key: &str) {
 fn parse_json(bytes: &[u8]) -> Json {
     serde_json::from_slice(bytes)
         .unwrap_or_else(|e| panic!("json: {e}: {}", String::from_utf8_lossy(bytes)))
+}
+
+#[tokio::test]
+async fn health_is_unauthenticated() {
+    // boot with token Some("t"); GET /health must 200 without Authorization
+    let db = SharedDb::open(&tmp("health-unauth")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, body, _) = send(app, get("/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(v, json!({"ok": true}));
+}
+
+#[tokio::test]
+async fn query_without_bearer_is_401_when_token_configured() {
+    // POST /query with no header → 401 {"error":"..."}
+    let db = SharedDb::open(&tmp("query-no-bearer")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, body, _) = send(
+        app,
+        json_req("POST", "/query", json!({"cypher": "MATCH (n) RETURN n"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let v = parse_json(&body);
+    assert!(
+        v["error"].as_str().is_some_and(|s| !s.is_empty()),
+        "401 body must be {{\"error\":\"...\"}}, got {v}"
+    );
+}
+
+#[tokio::test]
+async fn query_with_bearer_succeeds_when_token_configured() {
+    // Authorization: Bearer t → 200
+    let db = SharedDb::open(&tmp("query-bearer")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/query?format=json")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::AUTHORIZATION, "Bearer t")
+        .body(Body::from(
+            json!({"cypher": "MATCH (n) RETURN n"}).to_string(),
+        ))
+        .unwrap();
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 /// Binding: POST /query default is Arrow IPC stream; StreamReader reads the batch.
@@ -648,7 +695,9 @@ async fn serve_readiness_returns_local_addr() {
     let db = SharedDb::open(&tmp("serve")).unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
-        serve(db, "127.0.0.1:0".parse().unwrap(), tx).await.unwrap();
+        serve(db, "127.0.0.1:0".parse().unwrap(), tx, None)
+            .await
+            .unwrap();
     });
     let addr = rx.await.expect("readiness");
     assert_ne!(addr.port(), 0, "ephemeral port must be resolved");

@@ -30,7 +30,7 @@ fn tmp(name: &str) -> PathBuf {
 async fn spawn_server(db: SharedDb) -> SocketAddr {
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        serve(db, "127.0.0.1:0".parse().unwrap(), tx)
+        serve(db, "127.0.0.1:0".parse().unwrap(), tx, None)
             .await
             .expect("serve");
     });

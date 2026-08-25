@@ -22,7 +22,19 @@ fn main() -> ExitCode {
             addr,
             ui,
             demo_if_empty,
+            token,
         }) => {
+            let token = token.filter(|s| !s.is_empty()).or_else(|| {
+                std::env::var("MUSHROOMDB_TOKEN")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            });
+            if !addr.ip().is_loopback() && token.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                return fail(
+                    "non-loopback --addr requires --token or MUSHROOMDB_TOKEN \
+                     (see SECURITY.md)",
+                );
+            }
             if demo_if_empty {
                 match maybe_run_demo_if_empty(&db_dir) {
                     Ok(Some(out)) => print!("{}", format_demo(&db_dir, &out)),
@@ -37,7 +49,7 @@ fn main() -> ExitCode {
                 },
                 other => other,
             };
-            exit(run_serve(db_dir, addr, ui))
+            exit(run_serve(db_dir, addr, ui, token))
         }
         Ok(Command::Mcp { db_dir }) => exit(run_mcp(db_dir)),
         Ok(Command::Stats { db_dir }) => match read_stats(&db_dir) {
@@ -103,23 +115,28 @@ fn fail(msg: &str) -> ExitCode {
     ExitCode::from(1)
 }
 
-fn run_serve(db_dir: PathBuf, addr: SocketAddr, ui: ServeUi) -> Result<(), String> {
+fn run_serve(
+    db_dir: PathBuf,
+    addr: SocketAddr,
+    ui: ServeUi,
+    token: Option<String>,
+) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async {
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let serve = tokio::spawn(async move {
             match ui {
-                ServeUi::Filesystem(dir) => server::serve_with_ui(db, addr, tx, dir).await,
-                ServeUi::None => server::serve(db, addr, tx).await,
+                ServeUi::Filesystem(dir) => server::serve_with_ui(db, addr, tx, dir, token).await,
+                ServeUi::None => server::serve(db, addr, tx, token).await,
                 ServeUi::Embedded => {
                     #[cfg(feature = "embed-ui")]
                     {
-                        server::serve_with_embedded_ui(db, addr, tx).await
+                        server::serve_with_embedded_ui(db, addr, tx, token).await
                     }
                     #[cfg(not(feature = "embed-ui"))]
                     {
-                        server::serve(db, addr, tx).await
+                        server::serve(db, addr, tx, token).await
                     }
                 }
             }
