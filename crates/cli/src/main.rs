@@ -2,7 +2,7 @@
 
 use cli::{
     format_demo, format_stats, format_suggest, maybe_run_demo_if_empty, parse_args, read_stats,
-    run_algo, run_asof, run_demo, run_suggest, usage, Command, ServeUi,
+    run_algo, run_asof, run_demo, run_query, run_snapshot, run_suggest, usage, Command, ServeUi,
 };
 use core_api::SharedDb;
 use std::io::{self, Write};
@@ -95,6 +95,20 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
+        Ok(Command::Query { db_dir, cypher }) => match run_query(&db_dir, &cypher) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
+        Ok(Command::Snapshot { db_dir, keep_wal }) => match run_snapshot(&db_dir, keep_wal) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
         Err(e) => {
             let _ = writeln!(io::stderr(), "{e}");
             eprint!("{}", usage());
@@ -125,18 +139,21 @@ fn run_serve(
     rt.block_on(async {
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let serve = tokio::spawn(async move {
+        let db_serve = db.clone();
+        let mut serve = tokio::spawn(async move {
             match ui {
-                ServeUi::Filesystem(dir) => server::serve_with_ui(db, addr, tx, dir, token).await,
-                ServeUi::None => server::serve(db, addr, tx, token).await,
+                ServeUi::Filesystem(dir) => {
+                    server::serve_with_ui(db_serve, addr, tx, dir, token).await
+                }
+                ServeUi::None => server::serve(db_serve, addr, tx, token).await,
                 ServeUi::Embedded => {
                     #[cfg(feature = "embed-ui")]
                     {
-                        server::serve_with_embedded_ui(db, addr, tx, token).await
+                        server::serve_with_embedded_ui(db_serve, addr, tx, token).await
                     }
                     #[cfg(not(feature = "embed-ui"))]
                     {
-                        server::serve(db, addr, tx, token).await
+                        server::serve(db_serve, addr, tx, token).await
                     }
                 }
             }
@@ -151,12 +168,41 @@ fn run_serve(
                 };
             }
         }
-        match serve.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e.to_string()),
-            Err(e) => Err(e.to_string()),
+        tokio::select! {
+            result = &mut serve => match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            _ = shutdown_signal() => {
+                serve.abort();
+                let _ = serve.await;
+                db.write().snapshot().map_err(|e| e.to_string())?;
+                Ok(())
+            }
         }
     })
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                let _ = sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 fn run_mcp(db_dir: PathBuf) -> Result<(), String> {

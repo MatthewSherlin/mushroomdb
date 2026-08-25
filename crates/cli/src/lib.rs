@@ -4,9 +4,9 @@
 //! prints what the lib functions return.
 
 use core_api::{
-    default_max_edges, wal_commit_count_at, AlgoDir, DegreeConfig, Explanation, GraphDb,
-    IngestOptions, PageRankConfig, Predicate, ResultSet, RuleDef, RuleSuggestion, SharedDb, Stats,
-    Value, WccConfig,
+    default_max_edges, is_write_query, wal_commit_count_at, AlgoDir, DegreeConfig, Explanation,
+    GraphDb, IngestOptions, PageRankConfig, Predicate, ResultSet, RuleDef, RuleSuggestion,
+    SharedDb, SnapshotOptions, Stats, Value, WccConfig,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -87,6 +87,17 @@ pub enum Command {
         /// Print only the top N results (0 = all).
         top: usize,
     },
+    /// Run a Cypher query (read or write).
+    Query {
+        db_dir: PathBuf,
+        /// Positional after dir (remaining args joined), or `--query`.
+        cypher: String,
+    },
+    /// Write `snapshot.bin` (default truncates WAL unless `--keep-wal`).
+    Snapshot {
+        db_dir: PathBuf,
+        keep_wal: bool,
+    },
     Help,
 }
 
@@ -138,6 +149,8 @@ Usage:
   mushroomdb demo <db-dir>
   mushroomdb suggest <db-dir>
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
+  mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
+  mushroomdb snapshot <db-dir> [--keep-wal]
   mushroomdb algo pagerank <db-dir> [--top N]
   mushroomdb algo wcc <db-dir> [--top N]
   mushroomdb algo degree <db-dir> [--top N]
@@ -160,6 +173,8 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "suggest" => parse_one_dir("suggest", &args[1..]).map(|db_dir| Command::Suggest { db_dir }),
         "asof" => parse_asof(&args[1..]),
         "algo" => parse_algo(&args[1..]),
+        "query" => parse_query(&args[1..]),
+        "snapshot" => parse_snapshot(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -315,17 +330,117 @@ pub fn run_asof(db_dir: &Path, commit: u64, query: Option<&str>) -> Result<Strin
     if let Some(cypher) = query {
         let params = BTreeMap::new();
         let rs = db.query(cypher, &params)?;
-        let _ = writeln!(out, "columns: {}", rs.columns().join(", "));
-        for i in 0..rs.len() {
-            let cells: Vec<String> = rs
-                .columns()
-                .iter()
-                .map(|c| format!("{c}={}", fmt_cell(rs.get(i, c))))
-                .collect();
-            let _ = writeln!(out, "  {}", cells.join("  "));
-        }
+        out.push_str(&format_result_set(&rs));
     }
     Ok(out)
+}
+
+fn parse_query(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir = None;
+    let mut query_flag: Option<String> = None;
+    let mut cypher_parts: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--query" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --query".to_string())?;
+            query_flag = Some(val.to_string());
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--query=") {
+            query_flag = Some(val.to_string());
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_none() {
+            db_dir = Some(PathBuf::from(a));
+            i += 1;
+        } else {
+            cypher_parts.push(a);
+            i += 1;
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| "query requires <db-dir>".to_string())?;
+    let cypher = if let Some(q) = query_flag {
+        if !cypher_parts.is_empty() {
+            return Err(
+                "query: pass Cypher as remaining arguments or --query, not both".to_string(),
+            );
+        }
+        q
+    } else {
+        if cypher_parts.is_empty() {
+            return Err("query requires a Cypher string".to_string());
+        }
+        cypher_parts.join(" ")
+    };
+    Ok(Command::Query { db_dir, cypher })
+}
+
+/// Run a Cypher read or write and print columns/rows like [`run_asof`].
+pub fn run_query(db_dir: &Path, cypher: &str) -> Result<String, CliError> {
+    let params = BTreeMap::new();
+    let is_write = is_write_query(cypher).map_err(CliError)?;
+    let rs = if is_write {
+        let mut db = GraphDb::open(db_dir)?;
+        db.query_write(cypher, &params)?
+    } else {
+        let db = GraphDb::open(db_dir)?;
+        db.query(cypher, &params)?
+    };
+    Ok(format_result_set(&rs))
+}
+
+fn parse_snapshot(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir = None;
+    let mut keep_wal = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--keep-wal" {
+            keep_wal = true;
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_none() {
+            db_dir = Some(PathBuf::from(a));
+            i += 1;
+        } else {
+            return Err(format!("unexpected extra argument: {a}"));
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| "snapshot requires <db-dir>".to_string())?;
+    Ok(Command::Snapshot { db_dir, keep_wal })
+}
+
+/// Open `dir` and write `snapshot.bin`. Default truncates the WAL.
+pub fn run_snapshot(db_dir: &Path, keep_wal: bool) -> Result<String, CliError> {
+    let mut db = GraphDb::open(db_dir)?;
+    if keep_wal {
+        db.snapshot_with(SnapshotOptions { keep_wal: true })?;
+    } else {
+        db.snapshot()?;
+    }
+    Ok(format!(
+        "snapshot written: {}\n",
+        db_dir.join("snapshot.bin").display()
+    ))
+}
+
+fn format_result_set(rs: &ResultSet) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "columns: {}", rs.columns().join(", "));
+    for i in 0..rs.len() {
+        let cells: Vec<String> = rs
+            .columns()
+            .iter()
+            .map(|c| format!("{c}={}", fmt_cell(rs.get(i, c))))
+            .collect();
+        let _ = writeln!(out, "  {}", cells.join("  "));
+    }
+    out
 }
 
 fn parse_algo(args: &[&str]) -> Result<Command, String> {
@@ -1273,6 +1388,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_snapshot_and_query() {
+        match parse_args(&["snapshot", "/tmp/db"]).unwrap() {
+            Command::Snapshot { keep_wal, .. } => assert!(!keep_wal),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["snapshot", "/tmp/db", "--keep-wal"]).unwrap() {
+            Command::Snapshot { keep_wal, .. } => assert!(keep_wal),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["query", "/tmp/db", "MATCH (n) RETURN n LIMIT 1"]).unwrap() {
+            Command::Query { cypher, .. } => assert!(cypher.contains("MATCH")),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["query", "/tmp/db", "MATCH", "(n)", "RETURN", "n"]).unwrap() {
+            Command::Query { cypher, .. } => assert_eq!(cypher, "MATCH (n) RETURN n"),
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["query", "/tmp/db", "--query", "MATCH (n) RETURN n"]).unwrap() {
+            Command::Query { cypher, .. } => assert_eq!(cypher, "MATCH (n) RETURN n"),
+            other => panic!("{other:?}"),
+        }
+        let text = usage();
+        assert!(
+            text.contains("query"),
+            "usage should mention query, got:\n{text}"
+        );
+        assert!(
+            text.contains("snapshot"),
+            "usage should mention snapshot, got:\n{text}"
+        );
+    }
+
+    #[test]
     fn usage_lists_every_subcommand() {
         let text = usage();
         for word in [
@@ -1280,6 +1428,9 @@ mod tests {
             "mcp",
             "stats",
             "demo",
+            "query",
+            "snapshot",
+            "--keep-wal",
             "mushroomdb",
             "--ui",
             "--no-ui",
@@ -1538,6 +1689,52 @@ mod tests {
             "refuse message must mention hidden files, got {err}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_snapshot_writes_snapshot_bin() {
+        let dir = tmp("snapshot-cli");
+        {
+            let mut db = GraphDb::open(&dir).expect("open");
+            db.insert_node("Person", "alice", vec![]).expect("insert");
+        }
+        assert!(
+            !dir.join("snapshot.bin").exists(),
+            "GraphDb Drop must not snapshot"
+        );
+        let out = run_snapshot(&dir, false).expect("snapshot");
+        assert!(
+            dir.join("snapshot.bin").is_file(),
+            "run_snapshot must write snapshot.bin"
+        );
+        assert!(
+            out.contains("snapshot.bin"),
+            "snapshot output should mention snapshot.bin, got {out}"
+        );
+        let db = GraphDb::open(&dir).expect("reopen");
+        assert!(db.has_node("alice"), "reopen after snapshot must recover");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_query_formats_like_asof() {
+        let dir = tmp("query-cli");
+        {
+            let mut db = GraphDb::open(&dir).expect("open");
+            db.insert_node(
+                "Person",
+                "alice",
+                vec![("id".into(), Value::Str("alice".into()))],
+            )
+            .expect("insert");
+        }
+        let out = run_query(&dir, "MATCH (n:Person) RETURN n.id AS id").expect("query");
+        assert!(out.contains("columns:"), "got {out}");
+        assert!(out.contains("id=alice"), "got {out}");
+        let _ = run_query(&dir, "CREATE (n:Person {id: 'bob'})").expect("write");
+        let db = GraphDb::open(&dir).expect("reopen");
+        assert!(db.has_node("bob"), "query_write must persist CREATE");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
