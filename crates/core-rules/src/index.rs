@@ -680,12 +680,15 @@ impl SideIndex {
             if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
                 self.ivf_raw.insert(node, xs.clone());
                 if !self.ivf_centroids.is_empty() {
-                    let c = nearest_centroid(&self.ivf_centroids, &xs);
-                    self.ivf_clusters.insert(node, c);
-                    self.by_key
-                        .entry(ValueKey::Int(c as i64))
-                        .or_default()
-                        .insert(node);
+                    // Assign in cosine space (centroids are unit-norm). Skip zeros.
+                    if let Some(unit) = l2_normalize(&xs) {
+                        let c = nearest_centroid(&self.ivf_centroids, &unit);
+                        self.ivf_clusters.insert(node, c);
+                        self.by_key
+                            .entry(ValueKey::Int(c as i64))
+                            .or_default()
+                            .insert(node);
+                    }
                     self.ivf_drift = self.ivf_drift.saturating_add(1);
                 }
             }
@@ -882,7 +885,13 @@ impl SideIndex {
         let k = self.ivf_centroids.len();
         let p = probe_count(k);
 
-        // Rank centroids by L2 distance to query; take top-P.
+        // Probe in cosine space (same as centroid fit). Zero query → no candidates
+        // (cosine with a zero vector is undefined; exact evaluate also returns None).
+        let Some(xs) = l2_normalize(&xs) else {
+            return BTreeSet::new();
+        };
+
+        // Rank centroids by L2 distance to the unit query; take top-P.
         let mut dists: Vec<(usize, f64)> = self
             .ivf_centroids
             .iter()
@@ -909,7 +918,7 @@ impl SideIndex {
     /// same rule+data always yields the same clusters (WAL replay identity).
     ///
     /// Clears all existing cluster assignments and by_key cluster entries, then
-    /// assigns every raw vector to its nearest new centroid.
+    /// assigns every non-zero vector (L2-normalized) to its nearest new centroid.
     /// Resets `ivf_drift` to zero.
     pub fn fit_ivf_clusters(&mut self, rule_name: &str) {
         if self.ivf_raw.is_empty() {
@@ -938,9 +947,12 @@ impl SideIndex {
 
         self.ivf_centroids = kmeans_fit(&vecs, k, seed);
 
-        // Assign all raw vectors to nearest centroid.
+        // Assign in cosine space (skip zeros; they stay in ivf_raw but unclustered).
         for (node, xs) in &vecs {
-            let c = nearest_centroid(&self.ivf_centroids, xs);
+            let Some(unit) = l2_normalize(xs) else {
+                continue;
+            };
+            let c = nearest_centroid(&self.ivf_centroids, &unit);
             self.ivf_clusters.insert(*node, c);
             self.by_key
                 .entry(ValueKey::Int(c as i64))
@@ -1019,7 +1031,7 @@ mod tests {
     use super::*;
     use crate::def::Predicate;
     use core_storage::Value;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn getter(map: &HashMap<String, Value>) -> impl Fn(&str) -> Option<Value> + '_ {
         move |f: &str| map.get(f).cloned()
@@ -1033,6 +1045,34 @@ mod tests {
             let n = c.iter().map(|x| x * x).sum::<f64>().sqrt();
             assert!((n - 1.0).abs() < 1e-9, "{n}");
         }
+    }
+
+    /// Raw L2 would put `[3,0,0]` on a nearby large centroid while cosine (and
+    /// the unit vector `[1,0,0]`) prefer the x-axis centroid. Assignment must
+    /// L2-normalize first so scale-equivalent vectors share a cluster.
+    #[test]
+    fn scaled_vector_joins_same_ivf_cluster_as_unit() {
+        let pred = Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.5,
+        };
+        let spec = candidate_spec_approx(&pred);
+        let mut idx = SideIndex::default();
+        idx.load_ivf_state(
+            vec![vec![1.0, 0.0, 0.0], vec![2.5, 0.1, 0.0]],
+            BTreeMap::new(),
+            0,
+        );
+        idx.insert(&spec, 1, &getter(&emb(&[1.0, 0.0, 0.0])));
+        idx.insert(&spec, 2, &getter(&emb(&[3.0, 0.0, 0.0])));
+        assert_eq!(
+            idx.ivf_cluster_of(1),
+            idx.ivf_cluster_of(2),
+            "scale-equivalent vectors must share an IVF cluster; got {:?} vs {:?}",
+            idx.ivf_cluster_of(1),
+            idx.ivf_cluster_of(2)
+        );
+        assert_eq!(idx.ivf_cluster_of(1), Some(0));
     }
 
     #[test]
