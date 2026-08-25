@@ -343,7 +343,7 @@ See [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-
 ```
 graph-db/
 ├── crates/
-│   ├── core-storage      # topology + columnar properties + WAL + snapshots
+│   ├── core-storage      # HashMap topology + HashMap columns + WAL + snapshots
 │   ├── core-rules        # linking rules, per-rule indexes, incremental maintenance
 │   ├── core-query        # pull-based interpreter; traversal ops + Cypher subset
 │   ├── core-api          # the one public Rust interface; typed error enums

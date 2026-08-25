@@ -50,7 +50,7 @@ ingestion posture.
 
 | Decision | Choice |
 |---|---|
-| Deployment shape | Embedded Rust core + optional thin server + bundled UI (DuckDB playbook); `graphdb ui mydb.graph` serves the UI locally |
+| Deployment shape | Embedded Rust core + optional thin server + bundled UI (DuckDB playbook); `mushroomdb serve <db-dir>` serves the UI locally |
 | Query surface | Programmatic traversal API (primary) + openCypher subset (compat). No custom language, ever |
 | Auto-linking | Layered: zero-config key/FK inference by default + declared incremental rules. LLM extraction is a possible later optional plugin, never core |
 | Storage model | Memory-first HashMap topology + HashMap columns; CRC WAL + zstd-compressed bincode snapshots (V6). Sortledton adjacency and mmap'd snapshots deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
@@ -131,20 +131,27 @@ db.rules.create(
 v1 rule predicate library: `key_match` (FK-style; also runs zero-config by default),
 `field_equal`, `overlap`, `numeric_within`, `geo_radius`, composable via `all(...)`.
 Fast-follow: user-defined scoring functions (UDF escape hatch). Each rule declares
-watched fields and maintains its own index (hash / token / R-tree / sorted).
+watched fields and maintains its own candidate index: hash (`KeyMatch` /
+`FieldEqual`), token (`Overlap`), numeric bucket (`NumericWithin`), geo grid
+(`GeoRadius`), IVF-Flat clusters (`VectorSimilar` when `approximate: true`).
+Exact `VectorSimilar` is a scan. R-tree indexes are deferred; see
+`docs/superpowers/specs/2026-08-25-best-graph-db.md`.
 
 **Write path (one insert/update):**
 
-1. WAL append (only mandatory disk touch; fsync per policy).
-2. ID map + topology + columns updated in memory.
+1. WAL append + per-commit fsync (the only mandatory disk touch).
+2. ID map + topology + columns mutated in place under the `RwLock` write guard.
 3. **Incremental rule firing:** changed fields wake only watching rules; each probes
-   its own index for candidate partners (never a scan), computes scores,
+   its own index for candidate partners, computes scores,
    writes/updates/deletes its derived edges. Derived edges carry rule provenance;
    they are not hand-editable and are removed cleanly on `rule delete`. Updates diff
    old vs new field values and touch only affected partner edges.
-4. **Epoch publish:** atomic pointer flip makes node + derived edges visible
-   together. Auto-linking is synchronous and transactional — never an
-   eventually-consistent background job.
+4. **Publish:** the write guard is released; concurrent `SharedDb` readers then
+   observe node + derived edges together. Auto-linking is synchronous and
+   transactional — never an eventually-consistent background job. Epoch / ArcSwap
+   snapshot publish is deferred; see
+   `docs/superpowers/specs/2026-08-25-best-graph-db.md` and
+   `docs/concurrency-decision.md`.
 
 Budget: sub-millisecond per insert at 10k–100k-node scale; bulk loads amortize rule
 firing per batch. Rule create/delete on a live graph = online backfill/removal job
@@ -190,10 +197,13 @@ Not v1: general editing/admin UI, dashboards, saved queries.
 ## 8. Error Handling & Durability Contract
 
 - **Contract:** a committed write survives crash, power loss, kill -9. Torn WAL
-  tails detected via CRC and dropped whole — never half-applied. Recovery target
-  < 1 s (bounded by snapshot cadence).
-- **Fsync policy:** `strict` (per commit) / `batched` (default, per N ms) /
-  `relaxed` (bulk loads).
+  tails detected via CRC and dropped whole — never half-applied. Recovery is
+  snapshot decompress + WAL replay. Current V6 zstd-bincode open is ~8.88 s at
+  100k nodes. Sub-second (mmap) open is deferred; see
+  `docs/superpowers/specs/2026-08-25-best-graph-db.md`.
+- **Fsync:** every WAL commit fsyncs (Darwin `F_FULLFSYNC` on the file).
+  `FsyncPolicy` `batched` / `relaxed` is deferred (Phase 2); there is no default
+  batched window. Do not treat `strict`/`batched`/`relaxed` as a live API.
 - **Ingest:** lenient by default (unknown fields → new columns; type conflicts →
   tagged mixed representation + counted warning). Declared schemas = hard errors
   with row detail. No silent drops; all coercions/skips queryable via
