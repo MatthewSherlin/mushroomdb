@@ -660,6 +660,7 @@ fn compile_pattern(
             props: pat.start.props.clone(),
         });
     } else if pat.chain.len() == 1
+        && pat.chain[0].0.hops.is_none()
         && pat.chain[0]
             .1
             .var
@@ -667,7 +668,9 @@ fn compile_pattern(
             .is_some_and(|v| bound.contains(v))
     {
         // Expand-from-bound: leftmost unbound, rightmost dest already bound,
-        // single-rel pattern. Start from dest, invert dir, expand toward start.
+        // single-rel *fixed-hop* pattern. Start from dest, invert dir, expand
+        // toward start. Variable-length (`*min..max`) is not reversed: VarExpand
+        // has no dest label/prop filter, so reversing would drop start checks.
         let (rel, dest) = &pat.chain[0];
         let dest_name = name_node(dest, node_anon, bound);
         let rel_name = name_rel(rel, rel_anon, bound);
@@ -680,27 +683,15 @@ fn compile_pattern(
                 props: dest.props.clone(),
             });
         }
-        if let Some(hops) = rel.hops {
-            ops.push(PlanOp::VarExpand {
-                from: dest_name,
-                rel_var: Some(rel_name),
-                etype: rel.etype.clone(),
-                dir: invert_dir(rel.dir),
-                to: start.clone(),
-                min: hops.min,
-                max: hops.max,
-            });
-        } else {
-            ops.push(PlanOp::Expand {
-                from: dest_name,
-                rel_var: Some(rel_name),
-                etype: rel.etype.clone(),
-                dir: invert_dir(rel.dir),
-                to: start.clone(),
-                to_label: pat.start.label.clone(),
-                to_props: pat.start.props.clone(),
-            });
-        }
+        ops.push(PlanOp::Expand {
+            from: dest_name,
+            rel_var: Some(rel_name),
+            etype: rel.etype.clone(),
+            dir: invert_dir(rel.dir),
+            to: start.clone(),
+            to_label: pat.start.label.clone(),
+            to_props: pat.start.props.clone(),
+        });
         bound.insert(start);
         return Ok(());
     } else if let Some(key) = id_lookup(&pat.start.props) {
@@ -1339,6 +1330,40 @@ LIMIT 10";
                 assert_eq!(from, "t");
                 assert_eq!(to, "c");
                 assert_eq!(*dir, RelDir::Left);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// VarExpand has no dest label/prop filter. Reversing
+    /// `MATCH (c:Company)-[*1..2]->(t)` would drop `:Company` and bind
+    /// non-Company `c`. Keep LTR: ScanLabel Company then VarExpand.
+    #[test]
+    fn plan_does_not_reverse_variable_length_from_bound() {
+        let cy = "MATCH (t {id: $tid}) MATCH (c:Company)-[*1..2]->(t) RETURN c";
+        let ops = plan_src(cy).unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::ScanKey { var, .. } if var == "t"),
+            "{ops:?}"
+        );
+        assert!(
+            matches!(&ops[1], PlanOp::ScanLabel { var, label } if var == "c" && label.as_deref() == Some("Company")),
+            "{ops:?}"
+        );
+        match &ops[2] {
+            PlanOp::VarExpand {
+                from,
+                dir,
+                to,
+                min,
+                max,
+                ..
+            } => {
+                assert_eq!(from, "c");
+                assert_eq!(to, "t");
+                assert_eq!(*dir, RelDir::Right);
+                assert_eq!(*min, 1);
+                assert_eq!(*max, 2);
             }
             other => panic!("{other:?}"),
         }
