@@ -1,4 +1,9 @@
-use core_api::{Direction, GraphDb, GraphError, Predicate, PredicateSummary, RuleDef, Value};
+use core_api::{
+    wal_commit_count_at, Direction, GraphDb, GraphError, MutationEvent, Predicate,
+    PredicateSummary, RuleDef, Value,
+};
+use core_rules::with_ivf_drift_rebuild;
+use std::sync::{Arc, Mutex};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-{}-{}", name, std::process::id()));
@@ -399,4 +404,88 @@ fn predicate_summary_kind_table() {
             }
         }
     }
+}
+
+fn emb(xs: &[f64]) -> Value {
+    Value::List(xs.iter().copied().map(Value::Float).collect())
+}
+
+fn approx_vec_rule() -> RuleDef {
+    RuleDef {
+        name: "sim".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.5,
+        },
+        edge_type: "SIM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+    }
+}
+
+#[test]
+fn approximate_rule_rebuilds_after_drift_threshold() {
+    let dir = tmp("approx-drift-rebuild");
+    let mut db = GraphDb::open(&dir).unwrap();
+    for i in 0..6 {
+        let x = i as f64 * 0.2;
+        db.insert_node(
+            "V",
+            &format!("v{i}"),
+            vec![("emb".into(), emb(&[x, 1.0 - x]))],
+        )
+        .unwrap();
+    }
+    db.create_rule(approx_vec_rule()).unwrap();
+    assert_eq!(db.ivf_dst_drift("sim"), Some(0));
+
+    let evs = Arc::new(Mutex::new(Vec::new()));
+    let sink = evs.clone();
+    db.set_event_sink(Box::new(move |e| sink.lock().unwrap().push(e)));
+
+    with_ivf_drift_rebuild(1, || {
+        let before = wal_commit_count_at(&dir).unwrap();
+        db.delete_node("v0").unwrap();
+        assert_eq!(
+            wal_commit_count_at(&dir).unwrap(),
+            before + 1,
+            "first delete is under threshold; single commit"
+        );
+        assert_eq!(db.ivf_dst_drift("sim"), Some(1));
+
+        db.delete_node("v1").unwrap();
+        assert_eq!(
+            wal_commit_count_at(&dir).unwrap(),
+            before + 3,
+            "second delete trips drift > 1; user op + RebuildRule as two commits"
+        );
+        assert_eq!(
+            db.ivf_dst_drift("sim"),
+            Some(0),
+            "rebuild_rule resets dst drift"
+        );
+    });
+
+    let got = evs.lock().unwrap().clone();
+    let rebuilt = got
+        .iter()
+        .filter(|e| matches!(e, MutationEvent::RuleRebuilt { name } if name == "sim"))
+        .count();
+    assert_eq!(
+        rebuilt, 1,
+        "exactly one auto RebuildRule, not a retrigger loop; got {got:?}"
+    );
+
+    // Explicit RebuildRule must not enqueue another rebuild (rebuild resets drift).
+    let before = wal_commit_count_at(&dir).unwrap();
+    db.rebuild_rule("sim").unwrap();
+    assert_eq!(
+        wal_commit_count_at(&dir).unwrap(),
+        before + 1,
+        "RebuildRule must not retrigger another RebuildRule"
+    );
+    assert_eq!(db.ivf_dst_drift("sim"), Some(0));
 }

@@ -1,5 +1,7 @@
 use crate::def::{evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef};
-use crate::index::{candidate_spec, candidate_spec_approx, CandidateSpec, RuleIndex};
+use crate::index::{
+    candidate_spec, candidate_spec_approx, ivf_drift_rebuild_threshold, CandidateSpec, RuleIndex,
+};
 use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,7 +31,7 @@ pub struct EngineEdgeDelta {
 }
 
 #[cfg(test)]
-pub use crate::index::{with_vector_dim_reject, with_vector_early_exit};
+pub use crate::index::{with_ivf_drift_rebuild, with_vector_dim_reject, with_vector_early_exit};
 
 /// Borrowed mutable view of graph state the engine writes derived edges into.
 pub struct GraphMut<'a> {
@@ -92,6 +94,10 @@ pub struct RuleEngine {
     /// subscribe, create_view, or any operation that needs events; cleared when
     /// the last listener is removed.
     emit_deltas: bool,
+    /// Approximate rule names whose dst-side IVF drift exceeded
+    /// [`crate::IVF_DRIFT_REBUILD`] during the last index maintenance.
+    /// Drained by [`RuleEngine::take_rebuild_needed`] after apply.
+    rebuild_needed: BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,6 +1190,7 @@ impl RuleEngine {
             fires,
             pending_deltas: Vec::new(),
             emit_deltas: false,
+            rebuild_needed: BTreeSet::new(),
         }
     }
 
@@ -1199,6 +1206,26 @@ impl RuleEngine {
     /// Whether delta accumulation is currently enabled.
     pub fn emit_deltas(&self) -> bool {
         self.emit_deltas
+    }
+
+    /// Drain rule names that exceeded the IVF dst-drift rebuild threshold
+    /// during the most recent `on_node_changed` / `on_node_removed`.
+    pub fn take_rebuild_needed(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.rebuild_needed)
+            .into_iter()
+            .collect()
+    }
+
+    fn maybe_queue_ivf_rebuild(&mut self, rule_name: &str, def: &RuleDef) {
+        if !def.approximate {
+            return;
+        }
+        let Some(idx) = self.indexes.get(rule_name) else {
+            return;
+        };
+        if idx.dst_side.ivf_drift > ivf_drift_rebuild_threshold() {
+            self.rebuild_needed.insert(rule_name.to_string());
+        }
     }
 
     /// Export IVF state for all approximate rules.  Passed to `snapshot()` in
@@ -1477,6 +1504,8 @@ impl RuleEngine {
                 }
             }
 
+            self.maybe_queue_ivf_rebuild(&rule_name, &def);
+
             // --- Desired set + diff-apply ---
             if let Some(k) = def.max_edges {
                 // Top-k per-source semantics.
@@ -1597,6 +1626,8 @@ impl RuleEngine {
                     idx.dst_side.remove(&spec, n, &cur_getter);
                 }
             }
+
+            self.maybe_queue_ivf_rebuild(&rule_name, &def);
         }
 
         let touching: Vec<(String, Triple)> = self
@@ -1675,6 +1706,7 @@ impl RuleEngine {
         if !self.rules.contains_key(name) {
             return Err(format!("rule {:?} not found", name));
         }
+        self.rebuild_needed.remove(name);
         let def = self.rules[name].clone();
 
         // Reindex this rule from scratch (indexes only).
@@ -1797,6 +1829,71 @@ mod tests {
             max_edges: None,
             approximate: false,
         }
+    }
+
+    fn emb(xs: &[f64]) -> Value {
+        Value::List(xs.iter().copied().map(Value::Float).collect())
+    }
+
+    fn approx_vec_rule() -> RuleDef {
+        RuleDef {
+            name: "sim".into(),
+            src_label: "V".into(),
+            dst_label: "V".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.5,
+            },
+            edge_type: "SIM".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: true,
+        }
+    }
+
+    #[test]
+    fn approximate_rule_rebuilds_after_drift_threshold() {
+        with_ivf_drift_rebuild(1, || {
+            let mut fx = Fx::new();
+            let mut ids = Vec::new();
+            for i in 0..6 {
+                let x = i as f64 * 0.2;
+                ids.push(fx.add("V", &format!("v{i}"), vec![("emb", emb(&[x, 1.0 - x]))]));
+            }
+            let mut eng = RuleEngine::new();
+            {
+                let mut g = fx.g();
+                eng.create_rule(approx_vec_rule(), &mut g).unwrap();
+            }
+            assert!(eng.take_rebuild_needed().is_empty());
+            {
+                let mut g = fx.g();
+                eng.on_node_removed(ids[0], &mut g);
+            }
+            assert!(
+                eng.take_rebuild_needed().is_empty(),
+                "drift=1 is not > threshold 1"
+            );
+            {
+                let mut g = fx.g();
+                eng.on_node_removed(ids[1], &mut g);
+            }
+            assert_eq!(eng.take_rebuild_needed(), vec!["sim".to_string()]);
+            {
+                let mut g = fx.g();
+                eng.rebuild("sim", &mut g).unwrap();
+            }
+            assert!(
+                eng.take_rebuild_needed().is_empty(),
+                "rebuild must reset drift and not re-queue itself"
+            );
+            let drift = eng
+                .export_ivf_state()
+                .get("sim")
+                .map(|(_, dst)| dst.2)
+                .unwrap();
+            assert_eq!(drift, 0, "rebuild resets dst-side IVF drift");
+        });
     }
 
     #[test]

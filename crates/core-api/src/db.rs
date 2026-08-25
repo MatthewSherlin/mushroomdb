@@ -1241,6 +1241,7 @@ impl<F: Fs> GraphDb<F> {
             // Discard any partial deltas accumulated by the failed apply.
             // They must not ride the next commit's event stream (I-1).
             let _ = self.engine.drain_deltas();
+            let _ = self.engine.take_rebuild_needed();
             apply_result?;
         }
         self.commit_seq += 1;
@@ -1250,6 +1251,19 @@ impl<F: Fs> GraphDb<F> {
         let engine_deltas = self.engine.drain_deltas();
         self.distribute_events(&rec, &engine_deltas, seq);
         self.emit_committed(&rec, ingest);
+        // Drift is only known after apply, so auto-rebuild cannot join the
+        // triggering op's WAL frame. Issue RebuildRule as a second commit.
+        // Skip when `rec` is itself RebuildRule: rebuild resets drift, so a
+        // retrigger loop is impossible if the fit succeeded, but we still
+        // drain the flag so a leftover cannot re-enter.
+        let rebuilds = self.engine.take_rebuild_needed();
+        if !matches!(&rec, WalRecord::RebuildRule { .. }) {
+            for name in rebuilds {
+                if self.engine.rules().any(|r| r.name == name) {
+                    self.log_then_apply(WalRecord::RebuildRule { name })?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1882,9 +1896,9 @@ impl<F: Fs> GraphDb<F> {
     /// Return the IVF drift counter for the dst-side candidate index of `rule`.
     /// `None` if the rule does not exist or is not approximate.
     ///
-    /// The drift counter increments whenever a node is removed from the IVF index
-    /// (via `delete_node` or `remove_prop` on the vector field).  When drift exceeds
-    /// a threshold, callers may trigger `rebuild_rule` to re-fit cluster centroids.
+    /// The drift counter increments on IVF insert/remove after the last fit.
+    /// When dst-side drift exceeds [`core_rules::IVF_DRIFT_REBUILD`], apply
+    /// WAL-logs `RebuildRule` as a second commit (rebuild resets the counter).
     pub fn ivf_dst_drift(&self, rule: &str) -> Option<u64> {
         // SideIvfExport = (centroids, node→cluster, drift)
         self.engine

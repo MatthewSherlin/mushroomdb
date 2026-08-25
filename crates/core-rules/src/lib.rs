@@ -8,7 +8,9 @@ pub use def::{
     DEFAULT_KEYMATCH_TOP_K, DEFAULT_SCORED_TOP_K,
 };
 pub use engine::{EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport};
-pub use index::{candidate_spec, CandidateSpec, RuleIndex, SideIndex};
+pub use index::{
+    candidate_spec, with_ivf_drift_rebuild, CandidateSpec, RuleIndex, SideIndex, IVF_DRIFT_REBUILD,
+};
 pub use suggest::{
     RuleSuggestion, SuggestConfig, SuggestReport, DEFAULT_SEED as SUGGEST_DEFAULT_SEED,
 };
