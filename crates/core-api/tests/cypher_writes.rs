@@ -918,6 +918,55 @@ fn match_set_return_same_statement() {
     assert_eq!(rs.row(0)[0], Some(Value::Int(2)));
 }
 
+#[test]
+fn match_set_return_projects_after_where_property_changes() {
+    let mut db = GraphDb::open(&tmp("set-ret-where")).unwrap();
+    db.insert_node(
+        "Person",
+        "a",
+        vec![
+            ("id".into(), Value::Str("a".into())),
+            ("x".into(), Value::Int(1)),
+        ],
+    )
+    .unwrap();
+    let rs = db
+        .query_write(
+            "MATCH (n) WHERE n.x = 1 SET n.x = 2 RETURN n.x",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "SET of a WHERE'd property must still RETURN the matched row"
+    );
+    assert_eq!(rs.row(0)[0], Some(Value::Int(2)));
+}
+
+#[test]
+fn match_set_return_projects_after_inline_prop_changes() {
+    let mut db = GraphDb::open(&tmp("set-ret-inline")).unwrap();
+    db.insert_node(
+        "Person",
+        "a",
+        vec![
+            ("id".into(), Value::Str("a".into())),
+            ("x".into(), Value::Int(1)),
+        ],
+    )
+    .unwrap();
+    let rs = db
+        .query_write("MATCH (n {x:1}) SET n.x = 2 RETURN n.x", &no_params())
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "SET of an inline pattern prop must still RETURN the matched row"
+    );
+    assert_eq!(rs.row(0)[0], Some(Value::Int(2)));
+}
+
 // ---------------------------------------------------------------------------
 // CREATE...RETURN with $param in RETURN expression
 // ---------------------------------------------------------------------------

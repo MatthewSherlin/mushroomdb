@@ -3,8 +3,8 @@ use crate::subscription::{
     event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
 };
 use core_query::cypher::{
-    execute, lex, parse, parse_write, plan, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern,
-    Query, RetItem, RetVal, WriteStatement,
+    execute, lex, parse, parse_write, plan, Expr, MatchDeleteNodeStmt, NodePat, Operand, Params,
+    Pattern, Query, RetItem, RetVal, WriteStatement,
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
@@ -356,6 +356,220 @@ fn resolve_merge_set_value(op: &Operand, params: &BTreeMap<String, Value>) -> Re
         _ => Err(GraphError::QueryError {
             detail: "ON CREATE/ON MATCH SET value must be a literal or $parameter".into(),
         }),
+    }
+}
+
+fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
+    match op {
+        Operand::Prop { var, .. } | Operand::Var(var) => {
+            if !out.contains(var) {
+                out.push(var.clone());
+            }
+        }
+        Operand::FuncCall { args, .. } => {
+            for arg in args {
+                operand_node_vars(arg, out);
+            }
+        }
+        Operand::BinArith { left, right, .. } => {
+            operand_node_vars(left, out);
+            operand_node_vars(right, out);
+        }
+        Operand::Lit(_) | Operand::Param(_) => {}
+    }
+}
+
+fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in items {
+        match &item.value {
+            RetVal::Var(v) | RetVal::Prop { var: v, .. } => {
+                if !out.contains(v) {
+                    out.push(v.clone());
+                }
+            }
+            RetVal::FuncCall { args, .. } => {
+                for arg in args {
+                    operand_node_vars(arg, &mut out);
+                }
+            }
+            RetVal::ScalarExpr(op) => operand_node_vars(op, &mut out),
+            RetVal::Agg { .. } => {}
+        }
+    }
+    out
+}
+
+fn collect_unique_keys(rs: &ResultSet, var: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for i in 0..rs.len() {
+        if let Some(Value::Str(k)) = rs.get(i, var) {
+            if !keys.contains(k) {
+                keys.push(k.clone());
+            }
+        }
+    }
+    keys
+}
+
+fn id_lookup_pattern(var: &str, key: &str) -> Pattern {
+    Pattern {
+        start: NodePat {
+            var: Some(var.to_string()),
+            label: None,
+            props: vec![("id".to_string(), Operand::Lit(Value::Str(key.to_string())))],
+        },
+        chain: vec![],
+        shortest: false,
+    }
+}
+
+fn project_query(matches: Vec<Pattern>, where_expr: Option<Expr>, returns: Vec<RetItem>) -> Query {
+    Query {
+        matches,
+        optional_clauses: vec![],
+        where_expr,
+        unwinds: vec![],
+        post_unwind_where: None,
+        stages: vec![],
+        returns,
+        distinct: false,
+        order_by: vec![],
+        skip: None,
+        limit: None,
+    }
+}
+
+fn run_project_query<F: Fs>(
+    db: &GraphDb<F>,
+    q: Query,
+    params: &BTreeMap<String, Value>,
+) -> Result<ResultSet> {
+    let ops = plan(&q).map_err(|e| GraphError::QueryError {
+        detail: format!("plan: {e}"),
+    })?;
+    execute(&db.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
+        detail: format!("execute: {e}"),
+    })
+}
+
+/// Project RETURN items by IdMap key lookup. Omits the original WHERE and
+/// non-id pattern props so SET of a filtered property still returns the row.
+fn project_from_matched_keys<F: Fs>(
+    db: &GraphDb<F>,
+    vars: &[String],
+    match_rs: &ResultSet,
+    returns: Vec<RetItem>,
+    params: &BTreeMap<String, Value>,
+) -> Result<ResultSet> {
+    let var = match vars.first() {
+        Some(v) => v,
+        None => {
+            return Err(GraphError::QueryError {
+                detail: "SET … RETURN has no node variable to project".into(),
+            })
+        }
+    };
+    if vars.len() == 1 {
+        let keys = collect_unique_keys(match_rs, var);
+        let q = match keys.as_slice() {
+            [] => project_query(
+                vec![Pattern {
+                    start: NodePat {
+                        var: Some(var.clone()),
+                        label: None,
+                        props: vec![],
+                    },
+                    chain: vec![],
+                    shortest: false,
+                }],
+                Some(Expr::In {
+                    expr: Operand::Prop {
+                        var: var.clone(),
+                        field: "id".into(),
+                    },
+                    list: vec![],
+                }),
+                returns,
+            ),
+            [one] => project_query(vec![id_lookup_pattern(var, one)], None, returns),
+            many => project_query(
+                vec![Pattern {
+                    start: NodePat {
+                        var: Some(var.clone()),
+                        label: None,
+                        props: vec![],
+                    },
+                    chain: vec![],
+                    shortest: false,
+                }],
+                Some(Expr::In {
+                    expr: Operand::Prop {
+                        var: var.clone(),
+                        field: "id".into(),
+                    },
+                    list: many
+                        .iter()
+                        .map(|k| Operand::Lit(Value::Str(k.clone())))
+                        .collect(),
+                }),
+                returns,
+            ),
+        };
+        return run_project_query(db, q, params);
+    }
+
+    let mut out: Option<ResultSet> = None;
+    for row_i in 0..match_rs.len() {
+        let mut patterns = Vec::with_capacity(vars.len());
+        let mut complete = true;
+        for v in vars {
+            match match_rs.get(row_i, v) {
+                Some(Value::Str(k)) => patterns.push(id_lookup_pattern(v, k)),
+                _ => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            continue;
+        }
+        let rs = run_project_query(db, project_query(patterns, None, returns.clone()), params)?;
+        match out.as_mut() {
+            None => out = Some(rs),
+            Some(acc) => {
+                for i in 0..rs.len() {
+                    acc.push_row(rs.row(i).to_vec());
+                }
+            }
+        }
+    }
+    match out {
+        Some(rs) => Ok(rs),
+        None => run_project_query(
+            db,
+            project_query(
+                vec![Pattern {
+                    start: NodePat {
+                        var: Some(var.clone()),
+                        label: None,
+                        props: vec![],
+                    },
+                    chain: vec![],
+                    shortest: false,
+                }],
+                Some(Expr::In {
+                    expr: Operand::Prop {
+                        var: var.clone(),
+                        field: "id".into(),
+                    },
+                    list: vec![],
+                }),
+                returns,
+            ),
+            params,
+        ),
     }
 }
 
@@ -2686,18 +2900,27 @@ impl<F: Fs> GraphDb<F> {
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
         let project_returns = stmt.returns.clone();
-        // Collect unique node vars targeted by SET clauses.
+        // Collect unique node vars targeted by SET clauses, plus RETURN bindings
+        // so the post-write projection can look them up by key.
         let mut set_vars: Vec<String> = Vec::new();
         for s in &stmt.sets {
             if !set_vars.contains(&s.var) {
                 set_vars.push(s.var.clone());
             }
         }
+        let mut lookup_vars = set_vars.clone();
+        if let Some(ref returns) = project_returns {
+            for v in ret_node_vars(returns) {
+                if !lookup_vars.contains(&v) {
+                    lookup_vars.push(v);
+                }
+            }
+        }
 
-        // Synthesize a read query: MATCH … WHERE … RETURN <set_vars>, <set_values…>
+        // Synthesize a read query: MATCH … WHERE … RETURN <lookup_vars>, <set_values…>
         // SET values are projected as ScalarExpr items so that arithmetic expressions
         // (e.g. `SET n.score = n.score * 1.5`) are evaluated in the matched-row context.
-        let mut set_returns: Vec<RetItem> = set_vars
+        let mut set_returns: Vec<RetItem> = lookup_vars
             .iter()
             .map(|v| RetItem {
                 value: RetVal::Var(v.clone()),
@@ -2780,27 +3003,7 @@ impl<F: Fs> GraphDb<F> {
         batch.commit()?;
 
         if let Some(returns) = project_returns {
-            let q = Query {
-                matches: stmt.matches,
-                optional_clauses: vec![],
-                where_expr: stmt.where_expr,
-                unwinds: vec![],
-                post_unwind_where: None,
-                stages: vec![],
-                returns,
-                distinct: false,
-                order_by: vec![],
-                skip: None,
-                limit: None,
-            };
-            let ops = plan(&q).map_err(|e| GraphError::QueryError {
-                detail: format!("plan: {e}"),
-            })?;
-            return execute(&self.view(), &ops, &Params(params)).map_err(|e| {
-                GraphError::QueryError {
-                    detail: format!("execute: {e}"),
-                }
-            });
+            return project_from_matched_keys(self, &lookup_vars, &match_rs, returns, params);
         }
 
         let mut rs = write_result_set();
