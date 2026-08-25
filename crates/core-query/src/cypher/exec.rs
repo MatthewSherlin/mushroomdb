@@ -19,6 +19,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(test)]
 static FUSED_SCAN_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only counter incremented each time a `ScanKey` arm executes.
+/// Lets tests assert the point-lookup path actually fires (and does not
+/// walk `view.labels`).
+#[cfg(test)]
+static SCAN_KEY_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Query parameters. Missing names anywhere in the plan are an error at
 /// execution start (the plan is walked before any rows are produced).
 pub struct Params<'a>(pub &'a BTreeMap<String, Value>);
@@ -312,6 +318,9 @@ fn execute_inner(
         match op {
             PlanOp::ScanLabel { var, label } => {
                 rows = scan_label(view, &vars, &rows, var, label.as_deref())?;
+            }
+            PlanOp::ScanKey { var, key, label } => {
+                rows = scan_key(view, &vars, &rows, var, key, label.as_deref(), params)?;
             }
             PlanOp::LookupProps { var, props } => {
                 rows = retain_node(view, &vars, &rows, var, None, props, params)?;
@@ -683,6 +692,9 @@ fn exec_left_outer_inner(
             PlanOp::ScanLabel { var, label } => {
                 rows = scan_label(view, vars, &rows, var, label.as_deref())?;
             }
+            PlanOp::ScanKey { var, key, label } => {
+                rows = scan_key(view, vars, &rows, var, key, label.as_deref(), params)?;
+            }
             PlanOp::LookupProps { var, props } => {
                 rows = retain_node(view, vars, &rows, var, None, props, params)?;
             }
@@ -732,6 +744,7 @@ fn collect_params_from_ops(
 ) -> Result<(), String> {
     for op in plan {
         match op {
+            PlanOp::ScanKey { key, .. } => collect_operand(key, names, seen),
             PlanOp::LookupProps { props, .. }
             | PlanOp::JoinBound { props, .. }
             | PlanOp::Expand {
@@ -859,6 +872,10 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
         match op {
             PlanOp::ScanLabel { var, .. } => {
                 vars.intern(var);
+            }
+            PlanOp::ScanKey { var, key, .. } => {
+                vars.intern(var);
+                intern_operand(&mut vars, key);
             }
             PlanOp::LookupProps { var, props } | PlanOp::JoinBound { var, props, .. } => {
                 vars.intern(var);
@@ -1057,6 +1074,10 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                         PlanOp::ScanLabel { var, .. } => {
                             vars.intern(var);
                         }
+                        PlanOp::ScanKey { var, key, .. } => {
+                            vars.intern(var);
+                            intern_operand(&mut vars, key);
+                        }
                         PlanOp::Expand {
                             from, rel_var, to, ..
                         } => {
@@ -1125,6 +1146,65 @@ fn scan_ids(view: &GraphView, label: Option<&str>) -> Vec<u32> {
             .filter(|&id| view.label_of(id).is_some())
             .collect(),
     }
+}
+
+/// Resolve a `ScanKey` operand to at most one dense id.
+/// Missing key, non-string value, or label mismatch → `Ok(None)` (zero rows).
+fn resolve_scan_key_id(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    key: &Operand,
+    label: Option<&str>,
+    params: &Params,
+) -> Result<Option<u32>, String> {
+    #[cfg(test)]
+    SCAN_KEY_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let Some(val) = resolve_operand(view, vars, row, key, params)? else {
+        return Ok(None);
+    };
+    let Value::Str(s) = val else {
+        return Ok(None);
+    };
+    let Some(id) = view.node_id(&s) else {
+        return Ok(None);
+    };
+    if let Some(want) = label {
+        match view.label_of(id) {
+            Some(got) if got == want => {}
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(id))
+}
+
+fn scan_key(
+    view: &GraphView,
+    vars: &VarTable,
+    rows: &[Row],
+    var: &str,
+    key: &Operand,
+    label: Option<&str>,
+    params: &Params,
+) -> Result<Vec<Row>, String> {
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    let cap = max_intermediate_rows();
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(id) = resolve_scan_key_id(view, vars, row, key, label, params)? else {
+            continue;
+        };
+        if out.len() >= cap {
+            return Err(row_cap_err(cap));
+        }
+        let mut next = row.clone();
+        next[slot] = Some(Cell::Node(id));
+        out.push(next);
+    }
+    Ok(out)
 }
 
 fn scan_label(
@@ -2136,6 +2216,19 @@ fn agg_stream(
                 agg_stream(ctx, rest, &next, acc)?;
             }
         }
+        PlanOp::ScanKey { var, key, label } => {
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            if let Some(id) =
+                resolve_scan_key_id(ctx.view, ctx.vars, row, key, label.as_deref(), ctx.params)?
+            {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                agg_stream(ctx, rest, &next, acc)?;
+            }
+        }
         PlanOp::Expand {
             from,
             rel_var,
@@ -2571,6 +2664,19 @@ fn group_stream(
                 group_stream(ctx, rest, &next, groups, key_order)?;
             }
         }
+        PlanOp::ScanKey { var, key, label } => {
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            if let Some(id) =
+                resolve_scan_key_id(ctx.view, ctx.vars, row, key, label.as_deref(), ctx.params)?
+            {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                group_stream(ctx, rest, &next, groups, key_order)?;
+            }
+        }
         PlanOp::Expand {
             from,
             rel_var,
@@ -2880,6 +2986,20 @@ fn pull_rows(
             // here and `execute_pull` may catch an Err and re-use the row.
             // Future refactors adding mid-stream error recovery must audit this site.
             row[slot] = prev;
+        }
+        PlanOp::ScanKey { var, key, label } => {
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            if let Some(id) =
+                resolve_scan_key_id(ctx.view, ctx.vars, row, key, label.as_deref(), ctx.params)?
+            {
+                let prev = row[slot].clone();
+                row[slot] = Some(Cell::Node(id));
+                pull_rows(ctx, rest, row, result)?;
+                row[slot] = prev;
+            }
         }
         PlanOp::Expand {
             from,
@@ -3635,6 +3755,38 @@ LIMIT 10";
         )
         .unwrap();
         assert!(drop.is_empty());
+    }
+
+    #[test]
+    fn scan_key_exec_does_not_use_label_scan() {
+        let mut fx = Fx::new();
+        fx.add("Person", "p1", vec![]);
+        fx.add("Person", "p2", vec![]);
+        fx.add("Person", "p3", vec![]);
+        fx.add("Company", "c1", vec![]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+
+        let fires_before = super::SCAN_KEY_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+        let rs = run(&v, "MATCH (n:Person {id: 'p2'}) RETURN n", &params).expect("scan key");
+        let fires_after = super::SCAN_KEY_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fires_after > fires_before,
+            "SCAN_KEY_FIRES must increment; before={fires_before} after={fires_after}"
+        );
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("p2"))]]);
+
+        let miss = run(&v, "MATCH (n:Person {id: 'nope'}) RETURN n", &params).unwrap();
+        assert!(
+            miss.is_empty(),
+            "missing key must be zero rows, not an error"
+        );
+
+        let wrong = run(&v, "MATCH (n:Person {id: 'c1'}) RETURN n", &params).unwrap();
+        assert!(
+            wrong.is_empty(),
+            "wrong label must be zero rows, not an error"
+        );
     }
 
     #[test]
