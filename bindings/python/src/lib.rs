@@ -29,7 +29,7 @@ impl GraphDb {
         })
     }
 
-    fn insert_node(&self, key: &str, label: &str, props: Bound<'_, PyDict>) -> PyResult<()> {
+    fn insert_node(&self, label: &str, key: &str, props: Bound<'_, PyDict>) -> PyResult<()> {
         let mapped = dict_to_props(&props)?;
         self.with_mut(|db| db.insert_node(label, key, mapped))
     }

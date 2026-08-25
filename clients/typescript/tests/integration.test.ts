@@ -274,5 +274,88 @@ describe.skipIf(NO_SERVER)("subscribe", () => {
   }, 10_000);
 });
 
+// ---------------------------------------------------------------------------
+// Explain / node / neighborhood / createRule
+// ---------------------------------------------------------------------------
+
+describe("createRule request", () => {
+  it("POSTs /rules with RuleDef JSON and optional Bearer token", async () => {
+    const orig = globalThis.fetch;
+    const seen: { url: string; init?: RequestInit }[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push({ url: String(input), init });
+      return new Response(JSON.stringify({ ok: true, name: "r" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      const authed = new MushroomClient("http://example.test", {
+        token: "s3cret",
+      });
+      const def = {
+        name: "r",
+        src_label: "Org",
+        dst_label: "Org",
+        predicate: { NumericWithin: { field: "founded_year", tolerance: 2.0 } },
+        edge_type: "FOUNDED_WITHIN",
+      };
+      await authed.createRule(def);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.url).toBe("http://example.test/rules");
+      expect(seen[0]!.init?.method).toBe("POST");
+      expect(seen[0]!.init?.body).toBe(JSON.stringify(def));
+      const headers = new Headers(seen[0]!.init?.headers);
+      expect(headers.get("Authorization")).toBe("Bearer s3cret");
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+});
+
+describe.skipIf(NO_SERVER)("explain / node / neighborhood / createRule", () => {
+  it("explain returns Explanation[] for a demo pair", async () => {
+    const why = await client.explain("person-01", "proj-01");
+    expect(Array.isArray(why)).toBe(true);
+    expect(why.length).toBeGreaterThan(0);
+    expect(typeof why[0]!.rule).toBe("string");
+    expect(typeof why[0]!.edge_type).toBe("string");
+    expect(why[0]!.src_key).toBe("person-01");
+    expect(why[0]!.dst_key).toBe("proj-01");
+  });
+
+  it("node returns NodeInfo or null", async () => {
+    const info = await client.node("person-01");
+    expect(info).not.toBeNull();
+    expect(info!.key).toBe("person-01");
+    expect(info!.label).toBe("Person");
+    expect(info!.props).toBeDefined();
+
+    const missing = await client.node("no-such-node-ts-client");
+    expect(missing).toBeNull();
+  });
+
+  it("neighborhood returns key/label/depth rows", async () => {
+    const nb = await client.neighborhood("person-01", { depth: 1 });
+    expect(nb.columns).toEqual(["key", "label", "depth"]);
+    expect(Array.isArray(nb.rows)).toBe(true);
+    expect(nb.rows.length).toBeGreaterThan(0);
+  });
+
+  it("createRule POSTs a RuleDef and the rule appears in stats", async () => {
+    const name = `ts-client-rule-${Date.now()}`;
+    await client.createRule({
+      name,
+      src_label: "Person",
+      dst_label: "Person",
+      predicate: { FieldEqual: { field: "id" } },
+      edge_type: "TS_SAME_ID",
+      max_edges: null,
+    });
+    const s = await client.stats();
+    expect(s.rules.some((r) => r.name === name)).toBe(true);
+  });
+});
+
 // Prevent unused variable warning for wsBase — used via inject() in beforeAll.
 void (wsBase!);

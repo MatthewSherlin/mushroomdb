@@ -179,7 +179,14 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
         Ok(p) => p,
         Err(e) => return CallOutcome::ToolErr(e),
     };
-    let rs = {
+    let is_write = match core_api::is_write_query(cypher) {
+        Ok(b) => b,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let rs = if is_write {
+        let mut g = db.write();
+        g.query_write(cypher, &params)
+    } else {
         let g = db.read();
         g.query(cypher, &params)
     };
@@ -535,7 +542,7 @@ fn tools_list() -> Js {
         "tools": [
             {
                 "name": "query",
-                "description": "Run a Cypher query against the graph.",
+                "description": "Run a Cypher query (read or write) against the graph.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -898,6 +905,23 @@ mod tests {
         // columns + 2 rows
         assert_eq!(result["columns"], json!(["n.name"]));
         assert_eq!(result["rows"].as_array().map(|r| r.len()), Some(2));
+    }
+
+    #[test]
+    fn test_query_create_is_a_write() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let resp = tool_call(
+            &db,
+            1,
+            "query",
+            json!({ "cypher": "CREATE (n:L {id: 'k'}) RETURN n" }),
+        );
+        assert!(
+            !is_error(&resp),
+            "CREATE via MCP query must succeed: {resp}"
+        );
+        let stats = tool_text(&tool_call(&db, 2, "stats", json!({})));
+        assert_eq!(stats["nodes_live"], 1);
     }
 
     #[test]

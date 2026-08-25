@@ -329,9 +329,9 @@ def run_industry_oracle(db_dir: Path, seed: int, scale: int = ORACLE_SCALE) -> d
     db_dir.mkdir(parents=True, exist_ok=True)
     db = GraphDb.open(str(db_dir))
     for u in sparse_user_nodes(nt):
-        db.insert_node(u["key"], u["label"], u["props"])
+        db.insert_node(u["label"], u["key"], u["props"])
     for item in nodes:
-        db.insert_node(item["key"], item["label"], item["props"])
+        db.insert_node(item["label"], item["key"], item["props"])
     industry_tc = next(r for r in SIX_RULES if r["name"] == "industry_alignment_tc")
     db.create_rule(industry_tc)
     got = engine_industry_pairs(db, [t["key"] for t in talent])

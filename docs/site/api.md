@@ -296,7 +296,7 @@ Eleven tools:
 
 | Tool | Description |
 |---|---|
-| `query` | Run a Cypher query; params: `cypher`, `params?` |
+| `query` | Run a Cypher query (read or write); params: `cypher`, `params?` |
 | `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?` |
 | `create_rule` | Declare a linking rule; params: `RuleDef` fields |
 | `explain` | Explain edges; params: `a`, `b` |
@@ -327,14 +327,16 @@ python -m venv .venv
 ```python
 import mushroomdb
 
-db = mushroomdb.GraphDb("/path/to/db")
+db = mushroomdb.GraphDb.open("/path/to/db")
 ```
 
 ### Insert nodes
 
+`insert_node(label, key, props)` — same argument order as Rust.
+
 ```python
-db.insert_node("Person", {"id": "alice", "skills": ["graph", "rust"]})
-db.insert_node("Org", {"id": "acme", "skills": ["graph", "rust", "search"]})
+db.insert_node("Person", "alice", {"skills": ["graph", "rust"]})
+db.insert_node("Org", "acme", {"skills": ["graph", "rust", "search"]})
 ```
 
 ### Batch ingest

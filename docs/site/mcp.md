@@ -186,7 +186,7 @@ are 96% similar and they share the role `"engineer"`.
 | `find_similar` | Return neighbors connected by a given edge type (default: `SIMILAR`). |
 | `explain_association` | Show which rules and scores produced edges between two nodes. |
 | `explain` | Alias for `explain_association`. |
-| `query` | Run a Cypher read query. |
+| `query` | Run a Cypher query (read or write). Writes (`CREATE`, `MERGE`, `SET`, `DELETE`) use the write lock and `query_write`. |
 | `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter. |
 | `node_info` | Return a node's key, label, and all properties. |
 | `node_edges` | Return all edges incident on a node. |

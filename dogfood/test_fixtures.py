@@ -250,7 +250,7 @@ def test_ingest_rules_derived_edges_and_explain(tmp_path):
     db = GraphDb.open(str(tmp_path / "db"))
     for label in ("User", "Talent", "Company", "Job"):
         for item in nodes[label]:
-            db.insert_node(item["key"], item["label"], item["props"])
+            db.insert_node(item["label"], item["key"], item["props"])
     for etype, src, dst in load_user_edges(FIXTURES):
         db.insert_edge(etype, src, dst)
     for rule in SIX_RULES:

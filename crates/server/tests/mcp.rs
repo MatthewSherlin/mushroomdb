@@ -331,6 +331,36 @@ fn tools_call_happy_path_for_each_tool() {
     assert_eq!(nb["rows"], json!([["p2", "Person", 1]]));
 }
 
+/// Binding: MCP `query` dispatches CREATE through the write lock.
+#[test]
+fn query_create_is_a_write() {
+    let db = open("mcp-create");
+    let stdin = call(
+        1,
+        "query",
+        json!({"cypher": "CREATE (n:L {id: 'k'}) RETURN n"}),
+    );
+    let (res, out) = exchange(db.clone(), &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    assert_eq!(replies.len(), 1);
+    assert!(
+        replies[0].get("error").is_none() || replies[0]["error"].is_null(),
+        "CREATE via query must not be a protocol error: {}",
+        replies[0]
+    );
+    assert_ne!(
+        replies[0]["result"]["isError"],
+        json!(true),
+        "CREATE via query must succeed: {}",
+        replies[0]
+    );
+    let q = content_json(&replies[0]);
+    assert_eq!(q["columns"], json!(["n"]));
+    assert_eq!(q["rows"], json!([["k"]]));
+    assert_eq!(db.read().stats().nodes_live, 1);
+}
+
 /// Binding: node_info / node_edges MCP payloads match the HTTP wire shapes.
 #[test]
 fn node_info_and_edges_tool_parity() {
