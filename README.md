@@ -345,7 +345,7 @@ graph-db/
 ├── crates/
 │   ├── core-storage      # topology + columnar properties + WAL + snapshots
 │   ├── core-rules        # linking rules, per-rule indexes, incremental maintenance
-│   ├── core-query        # vectorized executor; traversal ops + Cypher subset
+│   ├── core-query        # pull-based interpreter; traversal ops + Cypher subset
 │   ├── core-api          # the one public Rust interface; typed error enums
 │   ├── arrow-bridge      # results ↔ Arrow buffers
 │   ├── bindings-python   # PyO3 thin wrapper over core-api
@@ -397,9 +397,13 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Command | What it does |
 |---|---|
 | `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
-| `mushroomdb serve <dir>` | Start the HTTP server + optional UI |
+| `mushroomdb serve <dir>` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback) |
+| `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted) |
+| `mushroomdb snapshot <dir> [--keep-wal]` | Write `snapshot.bin` (truncates WAL unless `--keep-wal`) |
 | `mushroomdb mcp <dir>` | Start a stdio MCP JSON-RPC server for agent tools |
 | `mushroomdb stats <dir>` | Print node/edge/rule counts |
+| `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 1) |
+| `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit |
 | `mushroomdb algo pagerank <dir> --top 20` | Run PageRank over the unified topology (manual + derived edges) |
 | `mushroomdb algo wcc <dir> --top 50` | Find weakly-connected components |
 | `mushroomdb algo degree <dir> --top 20` | Degree centrality (out / in / both) |

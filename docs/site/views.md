@@ -19,6 +19,11 @@ over a node's neighbors:
 | `NeighborAgg` / Max | Maximum of a neighbor property |
 | `NeighborAgg` / Count | Count of neighbors that have the property |
 
+`NeighborAgg` Count skips neighbors missing the named property (`props.get`
+is `None`). It is not Degree: an incident edge whose endpoint has no value
+for `prop` does not increment Count. Degree still counts every incident
+edge of that type and direction.
+
 Views are label-scoped: only nodes with the declared `label` carry the
 synthetic property.  Views cover both user-inserted edges and rule-derived
 edges.

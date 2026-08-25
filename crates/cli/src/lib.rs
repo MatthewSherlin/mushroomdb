@@ -155,6 +155,8 @@ Usage:
   mushroomdb algo wcc <db-dir> [--top N]
   mushroomdb algo degree <db-dir> [--top N]
   mushroomdb --help
+
+Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
 "
 }
 

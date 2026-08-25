@@ -12,7 +12,7 @@
 An open-source, embedded-first property graph database whose defining feature is
 **native automatic connection creation**: users declare general linking rules once,
 and the engine maintains those edges incrementally, transactionally, on every write.
-Secondary pillars: extreme read speed (in-memory engine, zero-copy everywhere) and a
+Secondary pillars: extreme read speed (in-memory engine) and a
 first-class bundled UI that stays smooth at hundreds of thousands of nodes.
 
 One-line positioning: *"The embedded graph database that builds itself."*
@@ -53,7 +53,7 @@ ingestion posture.
 | Deployment shape | Embedded Rust core + optional thin server + bundled UI (DuckDB playbook); `graphdb ui mydb.graph` serves the UI locally |
 | Query surface | Programmatic traversal API (primary) + openCypher subset (compat). No custom language, ever |
 | Auto-linking | Layered: zero-config key/FK inference by default + declared incremental rules. LLM extraction is a possible later optional plugin, never core |
-| Storage model | Memory-first HashMap topology + columnar properties; CRC WAL + zstd-compressed bincode snapshots (V6). Sortledton adjacency and mmap'd snapshots deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
+| Storage model | Memory-first HashMap topology + HashMap columns; CRC WAL + zstd-compressed bincode snapshots (V6). Sortledton adjacency and mmap'd snapshots deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
 | Execution | Pull-based interpreter over the Cypher subset. Vectorized batches deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
 | Concurrency | Single writer + many readers via `RwLock` (`SharedDb`). Epoch-based lock-free snapshot reads deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
 | Results format | Apache Arrow for query results (IPC over HTTP; pandas/polars in Python). JSON is used for `?format=json`, `/watch`, `/subscribe`, and MCP |
@@ -74,17 +74,17 @@ full openCypher coverage; LLM-based extraction; io_uring; multi-writer.
 ```
 graph-db/
 ├── crates/
-│   ├── core-storage      # topology + columnar properties + WAL + snapshots
+│   ├── core-storage      # HashMap topology + HashMap columns + WAL + snapshots
 │   ├── core-rules        # linking rules, per-rule indexes, incremental maintenance
-│   ├── core-query        # vectorized executor; traversal ops + openCypher subset
+│   ├── core-query        # pull-based interpreter; traversal ops + openCypher subset
 │   ├── core-api          # the ONE public Rust interface; typed error enums
-│   ├── arrow-bridge      # results ↔ Arrow buffers (zero-copy)
-│   ├── bindings-python   # PyO3 thin wrapper over core-api
-│   ├── bindings-node     # napi-rs thin wrapper over core-api
+│   ├── arrow-bridge      # results ↔ Arrow buffers
 │   ├── server            # axum HTTP + WebSocket (Arrow IPC); serves UI
+│   ├── cli               # `mushroomdb` binary: demo, serve, query, snapshot, stats
 │   └── sim-harness       # DST: virtual clock, fault-injecting IO, seeded runner
-├── ui/                   # TypeScript + cosmos.gl explorer/console/rule-inspector
-└── cli/                  # `graphdb` binary: open, serve UI, rebuild, stats
+├── bindings/python/      # PyO3 thin wrapper over core-api
+├── clients/typescript/   # HTTP `mushroomdb-client` (napi-rs deferred)
+└── ui/                   # TypeScript + cosmos.gl explorer/console/rule-inspector
 ```
 
 Dependency rule (inward only):
@@ -96,19 +96,19 @@ multi-agent build boundaries.
 
 ### 4.2 Storage internals
 
+Shipped pre-1.0. Spec end-state (Sortledton adjacency, packed columns, mmap/rkyv
+open) is deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`.
+
 - **IDs:** user keys (default field `id`) hash-mapped once to dense internal `u32`.
-  All internal structures use dense IDs — integer-array adjacency, no pointer chasing.
-- **Topology:** per-vertex sorted neighbor blocks per (edge-type, direction), per
-  Sortledton (VLDB 2022): near-CSR scan speed, cheap inserts, ~2.1× CSR memory,
-  simple design. Edges partitioned by type so typed expansion touches only relevant
-  blocks.
-- **Properties:** columnar, stored away from topology; lazily loaded per column.
-  Strings dictionary-encoded/interned. Set-valued fields → roaring bitmaps over an
-  interned dictionary (overlap scoring = SIMD bitmap AND). Recognized geo pairs →
-  R-tree-indexable points. Null bitmaps per column.
-- **Durability:** WAL (CRC-checksummed records) + background snapshots in an
-  rkyv-style zero-copy archived format. Open = mmap snapshot (milliseconds) + replay
-  WAL tail. Snapshot files versioned + checksummed; ambiguous/corrupt files rejected
+  All internal structures use dense IDs.
+- **Topology:** `HashMap` of edge-type → `{out, inn}` maps of `u32 → sorted Vec<u32>`.
+  Typed expansion touches only the relevant type map. Not CSR, not Sortledton
+  blocked adjacency.
+- **Properties:** per-field `HashMap<u32, Value>` behind a `ColumnStore` interface,
+  stored away from topology. Not packed columns, roaring bitmaps, or R-trees.
+- **Durability:** CRC-checksummed WAL + versioned zstd-compressed bincode snapshots
+  (V6). Open = decompress snapshot into the heap + replay WAL tail. Not mmap, not
+  rkyv. Snapshot files versioned + checksummed; ambiguous/corrupt files rejected
   loudly.
 
 ## 5. Data Model & Write Path
@@ -217,8 +217,9 @@ Not v1: general editing/admin UI, dashboards, saved queries.
    a deliberately naive in-memory oracle; exact-match required.
 3. **Rule-equivalence invariant:** after any op sequence, incremental edges ==
    from-scratch `rebuild`. Shrunken repro on failure.
-4. **Differential Cypher testing** vs Neo4j on the supported subset; cargo-fuzz on
-   parser and WAL/snapshot readers.
+4. **Differential Cypher testing vs Neo4j** is deferred; see
+   `docs/superpowers/specs/2026-08-25-best-graph-db.md`. cargo-fuzz on parser and
+   WAL/snapshot readers ships.
 5. **Cross-binding conformance:** one shared corpus (queries + expected Arrow
    results) through Rust/Python/TS in the CI matrix.
 6. **Performance:** criterion microbenchmarks with CI regression gates; public

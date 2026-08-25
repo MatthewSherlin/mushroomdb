@@ -151,10 +151,14 @@ Body is a `RuleDef` object:
   "predicate": {"Overlap": {"field": "skills", "min": 0.5}},
   "edge_type": "FIT",
   "weight_prop": "score",
-  "max_edges": null,
   "approximate": false
 }
 ```
+
+Omitted or JSON-null `max_edges` fills the default after deserialize: **32**
+for scored predicates, **1** for KeyMatch (and KeyMatch-rooted `All`). Rust
+`max_edges: None` remains the 1,000,000 global-budget hatch; HTTP cannot
+express that hatch (null fills the default).
 
 Returns 400 with `{"error": "..."}` on validation failure (unknown field
 type, missing required field, duplicate rule name).
