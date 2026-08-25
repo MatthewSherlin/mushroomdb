@@ -230,7 +230,7 @@ columns: p, proj, score
   mushroomdb serve ./db
 ```
 
-`mushroomdb serve ./db --addr 127.0.0.1:8080` output:
+`mushroomdb serve ./db` output:
 
 ```text
 listening on http://127.0.0.1:8080
