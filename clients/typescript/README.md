@@ -130,10 +130,11 @@ await handle.close();
 
 ## API reference
 
-### `new MushroomClient(baseUrl: string)`
+### `new MushroomClient(baseUrl: string, opts?: { token?: string })`
 
 Create a client. `baseUrl` is the HTTP base URL printed by `mushroomdb serve`,
-e.g. `"http://127.0.0.1:8080"`.
+e.g. `"http://127.0.0.1:8080"`. When `opts.token` is set, every HTTP fetch
+sends `Authorization: Bearer <token>`.
 
 ### `client.query(cypher, opts?) → Promise<QueryResult>`
 
@@ -157,6 +158,23 @@ Returns live node/edge counts and per-rule statistics.
 Profile the database and return candidate linking rules. CPU-intensive;
 capped at 5 s server-side. The `truncated` flag is `true` when the budget
 fires early.
+
+### `client.explain(a, b) → Promise<Explanation[]>`
+
+Wires `GET /explain?a=&b=`. Returns rule-derived edges between two node keys.
+
+### `client.createRule(def) → Promise<void>`
+
+Wires `POST /rules` with a `RuleDef` JSON body.
+
+### `client.node(key) → Promise<NodeInfo | null>`
+
+Wires `GET /node/{key}`. Returns `null` for an unknown key (HTTP 404).
+
+### `client.neighborhood(key, opts?) → Promise<Neighborhood>`
+
+Wires `GET /node/{key}/neighborhood`. `opts.depth` defaults to the server's
+(1). Result columns are `key`, `label`, `depth`.
 
 ### `client.algo(name, config?) → Promise<AlgoReport>`
 
@@ -236,7 +254,7 @@ await client.query("CREATE (n:Widget {id: 'w1', name: 'Sprocket'})");
 
 | Feature | Browser | Node 18+ |
 |---------|---------|----------|
-| `query`, `ingest`, `stats`, `suggest`, `algo` | Yes (uses `fetch`) | Yes |
+| `query`, `ingest`, `stats`, `suggest`, `algo`, `explain`, `createRule`, `node`, `neighborhood` | Yes (uses `fetch`) | Yes |
 | `subscribe` | Yes (uses global `WebSocket`) | Requires `wsConstructor` option + `ws` package |
 
 ---

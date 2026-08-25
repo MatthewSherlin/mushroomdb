@@ -20,6 +20,13 @@ pub enum PlanOp {
         var: String,
         label: Option<String>,
     },
+    /// Point lookup by IdMap key. Emitted when a MATCH node property map is
+    /// exactly one equality on field `id` (mixed maps stay ScanLabel+LookupProps).
+    ScanKey {
+        var: String,
+        key: Operand,
+        label: Option<String>,
+    },
     /// Retain rows whose `var` node matches the pattern-map props.
     LookupProps {
         var: String,
@@ -608,6 +615,22 @@ fn compile_with_stage(
     Ok(())
 }
 
+fn id_lookup(props: &[(String, Operand)]) -> Option<&Operand> {
+    if props.len() == 1 && props[0].0 == "id" {
+        Some(&props[0].1)
+    } else {
+        None
+    }
+}
+
+fn invert_dir(d: RelDir) -> RelDir {
+    match d {
+        RelDir::Right => RelDir::Left,
+        RelDir::Left => RelDir::Right,
+        RelDir::Undirected => RelDir::Undirected,
+    }
+}
+
 fn compile_pattern(
     pat: &Pattern,
     ops: &mut Vec<PlanOp>,
@@ -636,6 +659,48 @@ fn compile_pattern(
             label: pat.start.label.clone(),
             props: pat.start.props.clone(),
         });
+    } else if pat.chain.len() == 1
+        && pat.chain[0].0.hops.is_none()
+        && pat.chain[0]
+            .1
+            .var
+            .as_ref()
+            .is_some_and(|v| bound.contains(v))
+    {
+        // Expand-from-bound: leftmost unbound, rightmost dest already bound,
+        // single-rel *fixed-hop* pattern. Start from dest, invert dir, expand
+        // toward start. Variable-length (`*min..max`) is not reversed: VarExpand
+        // has no dest label/prop filter, so reversing would drop start checks.
+        let (rel, dest) = &pat.chain[0];
+        let dest_name = name_node(dest, node_anon, bound);
+        let rel_name = name_rel(rel, rel_anon, bound);
+        bound.insert(rel_name.clone());
+        rel_bound.insert(rel_name.clone());
+        if dest.label.is_some() || !dest.props.is_empty() {
+            ops.push(PlanOp::JoinBound {
+                var: dest_name.clone(),
+                label: dest.label.clone(),
+                props: dest.props.clone(),
+            });
+        }
+        ops.push(PlanOp::Expand {
+            from: dest_name,
+            rel_var: Some(rel_name),
+            etype: rel.etype.clone(),
+            dir: invert_dir(rel.dir),
+            to: start.clone(),
+            to_label: pat.start.label.clone(),
+            to_props: pat.start.props.clone(),
+        });
+        bound.insert(start);
+        return Ok(());
+    } else if let Some(key) = id_lookup(&pat.start.props) {
+        ops.push(PlanOp::ScanKey {
+            var: start.clone(),
+            key: key.clone(),
+            label: pat.start.label.clone(),
+        });
+        bound.insert(start.clone());
     } else {
         ops.push(PlanOp::ScanLabel {
             var: start.clone(),
@@ -1052,10 +1117,9 @@ mod tests {
     }
 
     /// Dogfood query from T6. Shape:
-    /// - MATCH 1: `t` unbound → `ScanLabel` + `LookupProps`.
-    /// - MATCH 2: `c` unbound → `ScanLabel`; expand to already-bound `t`.
-    ///   Bound dest is *not* a trailing `JoinBound` — Expand carries dest
-    ///   checks and the executor filters edges to the bound `to` id.
+    /// - MATCH 1: `t` unbound with `{id: $tid}` → `ScanKey`.
+    /// - MATCH 2: `c` unbound, dest `t` already bound, single-rel → reverse:
+    ///   Expand from `t` dir Left (inbound) to `c` (Company label on `to`).
     /// - MATCH 3: start `c` already bound → `JoinBound`; expand to bound `t`.
     #[test]
     fn dogfood_query_exact_plan() {
@@ -1069,25 +1133,18 @@ ORDER BY industry DESC, specialty DESC \
 LIMIT 10";
         let got = plan_src(src).expect("dogfood query must plan");
         let expected = vec![
-            PlanOp::ScanLabel {
+            PlanOp::ScanKey {
                 var: "t".into(),
+                key: Operand::Param("tid".into()),
                 label: Some("Talent".into()),
             },
-            PlanOp::LookupProps {
-                var: "t".into(),
-                props: vec![("id".into(), Operand::Param("tid".into()))],
-            },
-            PlanOp::ScanLabel {
-                var: "c".into(),
-                label: Some("Company".into()),
-            },
             PlanOp::Expand {
-                from: "c".into(),
+                from: "t".into(),
                 rel_var: Some("i".into()),
                 etype: Some("INDUSTRY_ALIGNMENT".into()),
-                dir: RelDir::Right,
-                to: "t".into(),
-                to_label: None,
+                dir: RelDir::Left,
+                to: "c".into(),
+                to_label: Some("Company".into()),
                 to_props: vec![],
             },
             PlanOp::JoinBound {
@@ -1165,7 +1222,8 @@ LIMIT 10";
 
     /// Anonymous names increment in encounter order across the whole query.
     /// MATCH 1: start `_n0`, rel `_r0`, dest `a`.
-    /// MATCH 2: start `_n1`, rel `_r1`, dest already-bound `a` (Expand only).
+    /// MATCH 2: start `_n1` unbound, dest already-bound `a` → reverse Expand
+    /// from `a` dir Left to `_n1`.
     #[test]
     fn anonymous_node_and_rel_names_are_stable() {
         let got = plan_src("MATCH ()-[]->(a) MATCH ()-[]->(a) RETURN a").unwrap();
@@ -1185,16 +1243,12 @@ LIMIT 10";
                     to_label: None,
                     to_props: vec![],
                 },
-                PlanOp::ScanLabel {
-                    var: "_n1".into(),
-                    label: None,
-                },
                 PlanOp::Expand {
-                    from: "_n1".into(),
+                    from: "a".into(),
                     rel_var: Some("_r1".into()),
                     etype: None,
-                    dir: RelDir::Right,
-                    to: "a".into(),
+                    dir: RelDir::Left,
+                    to: "_n1".into(),
                     to_label: None,
                     to_props: vec![],
                 },
@@ -1214,13 +1268,10 @@ LIMIT 10";
         assert_eq!(
             got,
             vec![
-                PlanOp::ScanLabel {
+                PlanOp::ScanKey {
                     var: "t".into(),
+                    key: Operand::Param("tid".into()),
                     label: Some("Talent".into()),
-                },
-                PlanOp::LookupProps {
-                    var: "t".into(),
-                    props: vec![("id".into(), Operand::Param("tid".into()))],
                 },
                 PlanOp::Project {
                     items: vec![RetItem {
@@ -1230,6 +1281,92 @@ LIMIT 10";
                 },
             ]
         );
+    }
+
+    #[test]
+    fn mixed_id_map_stays_scan_label_then_lookup() {
+        let got = plan_src("MATCH (t:Talent {id: $k, name: 'x'}) RETURN t").unwrap();
+        assert_eq!(
+            got,
+            vec![
+                PlanOp::ScanLabel {
+                    var: "t".into(),
+                    label: Some("Talent".into()),
+                },
+                PlanOp::LookupProps {
+                    var: "t".into(),
+                    props: vec![
+                        ("id".into(), Operand::Param("k".into())),
+                        ("name".into(), Operand::Lit(Value::Str("x".into()))),
+                    ],
+                },
+                PlanOp::Project {
+                    items: vec![RetItem {
+                        value: RetVal::Var("t".into()),
+                        alias: None,
+                    }],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_id_map_is_scan_key() {
+        let toks = crate::cypher::lex("MATCH (n:Person {id: $k}) RETURN n").unwrap();
+        let q = crate::cypher::parse(&toks).unwrap();
+        let ops = plan(&q).unwrap();
+        assert!(matches!(ops[0], PlanOp::ScanKey { .. }), "{ops:?}");
+    }
+
+    #[test]
+    fn plan_expands_from_bound_key() {
+        let cy =
+            "MATCH (t:Talent {id: $tid}) MATCH (c:Company)-[i:INDUSTRY_ALIGNMENT]->(t) RETURN c";
+        let ops = plan(&crate::cypher::parse(&crate::cypher::lex(cy).unwrap()).unwrap()).unwrap();
+        // first: ScanKey t; then Expand from t, dir Left (inbound)
+        assert!(matches!(&ops[0], PlanOp::ScanKey { var, .. } if var == "t"));
+        match &ops[1] {
+            PlanOp::Expand { from, dir, to, .. } => {
+                assert_eq!(from, "t");
+                assert_eq!(to, "c");
+                assert_eq!(*dir, RelDir::Left);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// VarExpand has no dest label/prop filter. Reversing
+    /// `MATCH (c:Company)-[*1..2]->(t)` would drop `:Company` and bind
+    /// non-Company `c`. Keep LTR: ScanLabel Company then VarExpand.
+    #[test]
+    fn plan_does_not_reverse_variable_length_from_bound() {
+        let cy = "MATCH (t {id: $tid}) MATCH (c:Company)-[*1..2]->(t) RETURN c";
+        let ops = plan_src(cy).unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::ScanKey { var, .. } if var == "t"),
+            "{ops:?}"
+        );
+        assert!(
+            matches!(&ops[1], PlanOp::ScanLabel { var, label } if var == "c" && label.as_deref() == Some("Company")),
+            "{ops:?}"
+        );
+        match &ops[2] {
+            PlanOp::VarExpand {
+                from,
+                dir,
+                to,
+                min,
+                max,
+                ..
+            } => {
+                assert_eq!(from, "c");
+                assert_eq!(to, "t");
+                assert_eq!(*dir, RelDir::Right);
+                assert_eq!(*min, 1);
+                assert_eq!(*max, 2);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1394,18 +1531,19 @@ LIMIT 10";
                     var: "t".into(),
                     label: Some("Talent".into()),
                 },
-                PlanOp::ScanLabel {
-                    var: "c".into(),
-                    label: None,
+                PlanOp::JoinBound {
+                    var: "t".into(),
+                    label: Some("Talent".into()),
+                    props: vec![("id".into(), Operand::Lit(Value::Int(1)))],
                 },
                 PlanOp::Expand {
-                    from: "c".into(),
+                    from: "t".into(),
                     rel_var: Some("r".into()),
                     etype: None,
-                    dir: RelDir::Right,
-                    to: "t".into(),
-                    to_label: Some("Talent".into()),
-                    to_props: vec![("id".into(), Operand::Lit(Value::Int(1)))],
+                    dir: RelDir::Left,
+                    to: "c".into(),
+                    to_label: None,
+                    to_props: vec![],
                 },
                 PlanOp::Project {
                     items: vec![RetItem {

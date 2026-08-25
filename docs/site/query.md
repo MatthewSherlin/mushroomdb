@@ -1,8 +1,9 @@
 # Cypher Query Reference
 
-mushroomdb supports a read-only Cypher subset for pattern matching, filtering,
-aggregation, and ordering.  This page documents the full grammar, with a
-dedicated section on variable-length paths and `shortestPath`.
+mushroomdb supports a Cypher subset for pattern matching, filtering,
+aggregation, ordering, and writes (`CREATE`, `SET`, `DELETE`, `DETACH DELETE`,
+`MERGE`). This page documents the full grammar, with a dedicated section on
+variable-length paths and `shortestPath`.
 
 ---
 
@@ -446,18 +447,19 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 
 | Function | Input | Output | Notes |
 |---|---|---|---|
-| `toLower(s)` | `String` | `String` | ASCII + Unicode lower-case |
-| `toUpper(s)` | `String` | `String` | ASCII + Unicode upper-case |
-| `size(x)` | `String` or `List` | `Int` | character count or element count |
+| `toLower(s)` | `String` | `String` | ASCII casefold |
+| `toUpper(s)` | `String` | `String` | ASCII casefold |
+| `size(x)` | `String` or `List` | `Int` | `size(str)` is bytes; lists are element count |
 | `coalesce(a, b, …)` | any | first non-null | never null unless all args are null |
 | `type(r)` | `Rel` | `String` | relationship type label |
 | `abs(n)` | `Int` or `Float` | same type | absolute value |
 | `round(f)` | `Float` | `Float` | rounds to nearest integer as Float |
+| `textMatches(s, q)` | `String`/`List`, `String` | `Bool` | per-row scratch full-text; see [`fulltext.md`](fulltext.md) |
 
 Calling an unknown function name returns:
 
 ```
-unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round
+unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches
 ```
 
 ### Examples
@@ -545,7 +547,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH (found …)` |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
 | `shortestPath` with endpoints bound via comma-sep `MATCH (a), (b)` | `parse error: unexpected tokens after CREATE pattern (found Comma)` — comma-separated MATCH is not supported; use sequential `MATCH (a) MATCH (b)` forms |
-| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round` |
+| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches` |
 | `$param` referenced but not supplied | `execute: missing parameter …` |
 | `SET n.prop = n.other` (bare property-to-property copy) | `SET RHS: bare property/variable reference is not supported; use a literal, $parameter, or arithmetic expression` |
 | Integer division by zero | `execute: division by zero` |

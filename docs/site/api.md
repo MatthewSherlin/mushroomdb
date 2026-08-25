@@ -12,16 +12,18 @@ Python bindings (via PyO3 / maturin), and the
 Start the server:
 
 ```text
-mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--ui <dist-dir>] [--no-ui] [--demo-if-empty]
+mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty]
 ```
 
-Default bind is `127.0.0.1:0` (ephemeral port). The bound address is printed
-after the listener is accepting. Pass `--addr 127.0.0.1:8080` to pin a port.
+Default bind is `127.0.0.1:8080`. The bound address is printed after the
+listener is accepting. Non-loopback `--addr` requires `--token` or
+`MUSHROOMDB_TOKEN` (see `SECURITY.md`).
 
 ### Endpoints
 
 | Method | Path | Description |
 |---|---|---|
+| `GET` | `/health` | Liveness stub `{"ok": true}` (no auth) |
 | `POST` | `/query` | Run a Cypher query |
 | `GET` | `/stats` | Database statistics |
 | `POST` | `/ingest` | Ingest nodes and/or edges |
@@ -31,6 +33,7 @@ after the listener is accepting. Pass `--addr 127.0.0.1:8080` to pin a port.
 | `GET` | `/node/{key}/edges` | Incident edges (typed, with derived flag) |
 | `GET` | `/node/{key}/neighborhood` | Typed neighborhood expansion |
 | `GET` | `/watch` | WebSocket — live mutation events |
+| `GET` | `/subscribe` | WebSocket — rule and write events |
 
 ---
 
@@ -148,10 +151,14 @@ Body is a `RuleDef` object:
   "predicate": {"Overlap": {"field": "skills", "min": 0.5}},
   "edge_type": "FIT",
   "weight_prop": "score",
-  "max_edges": null,
   "approximate": false
 }
 ```
+
+Omitted or JSON-null `max_edges` fills the default after deserialize: **32**
+for scored predicates, **1** for KeyMatch (and KeyMatch-rooted `All`). Rust
+`max_edges: None` remains the 1,000,000 global-budget hatch; HTTP cannot
+express that hatch (null fills the default).
 
 Returns 400 with `{"error": "..."}` on validation failure (unknown field
 type, missing required field, duplicate rule name).
@@ -163,8 +170,8 @@ Predicate JSON shapes:
 {"FieldEqual": {"field": "industry"}}
 {"Overlap": {"field": "skills", "min": 0.5}}
 {"NumericWithin": {"field": "founded_year", "tolerance": 2.0}}
-{"GeoRadius": {"field": "office", "radius_km": 50.0}}
-{"VectorSimilar": {"field": "embedding", "min": 0.8, "dims": 8}}
+{"GeoRadius": {"field": "office", "km": 50.0}}
+{"VectorSimilar": {"field": "embedding", "min": 0.8}}
 {"All": [{"FieldEqual": {"field": "region"}}, {"Overlap": {"field": "tags", "min": 0.3}}]}
 ```
 
@@ -243,16 +250,18 @@ ingest or the edges field of `/ingest`.
 
 ### GET /watch (WebSocket)
 
-Connect with any WebSocket client. After each committed write, the server
-sends one JSON text frame per `MutationEvent`:
+Connect with any WebSocket client. After upgrade the first text frame is
+`{"subscribed":true}`. Subsequent frames are `MutationEvent` JSON,
+externally tagged snake_case — one frame per committed mutation (or a
+lag notice):
 
 ```json
-{
-  "type": "NodeInserted",
-  "key": "alice",
-  "label": "Person"
-}
+{"node_inserted":{"label":"Person","key":"alice"}}
+{"prop_set":{"key":"alice","field":"age"}}
+{"lagged":3}
 ```
+
+When the server is started with a token, pass `?token=` on the WebSocket URL.
 
 ---
 
@@ -287,16 +296,21 @@ Response:
 
 ### Tools
 
+Eleven tools:
+
 | Tool | Description |
 |---|---|
-| `query` | Run a Cypher query; params: `cypher`, `params?` |
-| `ingest_json` | Ingest nodes; params: `label`, `rows`, `edges?` |
+| `query` | Run a Cypher query (read or write); params: `cypher`, `params?` |
+| `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?` |
 | `create_rule` | Declare a linking rule; params: `RuleDef` fields |
 | `explain` | Explain edges; params: `a`, `b` |
 | `stats` | Database statistics (no params) |
 | `neighborhood` | Typed neighborhood; params: `key`, `depth?`, `dir?` |
 | `node_info` | Node info and props; params: `key` |
 | `node_edges` | Incident edges; params: `key` |
+| `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?` |
+| `find_similar` | Neighbors via a given edge type; params: `key`, `edge_type?`, `limit?` |
+| `explain_association` | Alias of `explain`; params: `a`, `b` |
 
 ---
 
@@ -317,14 +331,16 @@ python -m venv .venv
 ```python
 import mushroomdb
 
-db = mushroomdb.GraphDb("/path/to/db")
+db = mushroomdb.GraphDb.open("/path/to/db")
 ```
 
 ### Insert nodes
 
+`insert_node(label, key, props)` — same argument order as Rust.
+
 ```python
-db.insert_node("Person", {"id": "alice", "skills": ["graph", "rust"]})
-db.insert_node("Org", {"id": "acme", "skills": ["graph", "rust", "search"]})
+db.insert_node("Person", "alice", {"skills": ["graph", "rust"]})
+db.insert_node("Org", "acme", {"skills": ["graph", "rust", "search"]})
 ```
 
 ### Batch ingest

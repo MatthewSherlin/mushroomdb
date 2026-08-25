@@ -3,7 +3,7 @@
 /// The database proposes its own schema: call [`suggest_rules`] to get a ranked list of
 /// candidate [`RuleDef`]s with estimated edge counts and example pairs. No rule is
 /// created automatically — the caller must call `db.create_rule(suggestion.def)` explicitly.
-use crate::def::{evaluate, NodeView, Predicate, RuleDef};
+use crate::def::{default_max_edges, evaluate, NodeView, Predicate, RuleDef};
 use core_storage::{list_tokens, Value, ValueKey};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,7 +77,9 @@ pub struct RuleSuggestion {
     /// The proposed rule definition (not yet created in the database).
     pub def: RuleDef,
     /// Estimated edge count if the rule were applied. Labeled as an estimate —
-    /// derived by extrapolating from a sample of source nodes.
+    /// derived by extrapolating from a sample of source nodes. When
+    /// `def.max_edges` is `Some(k)`, the estimate is per-source top-k
+    /// (never more than `k × |src|`).
     pub est_edges: u64,
     /// Up to [`SuggestConfig::max_examples`] example `(src_key, dst_key, score)` pairs
     /// drawn from the sample evaluation.
@@ -296,6 +298,7 @@ fn run_preview(
             props: &sp,
         };
 
+        let mut src_hits = 0u64;
         for (dst_id, dst_key) in dst_nodes {
             if src_key == dst_key {
                 continue; // skip self-loops
@@ -306,12 +309,18 @@ fn run_preview(
                 props: &dp,
             };
             if let Some(score) = evaluate(&def.predicate, &src_view, &dst_view) {
-                hit_edges += 1;
+                src_hits += 1;
                 if examples.len() < config.max_examples {
                     examples.push((src_key.clone(), dst_key.clone(), score));
                 }
             }
         }
+        // Per-source top-k (engine `max_edges: Some(k)`), not global first-N.
+        let kept = match def.max_edges {
+            Some(k) => src_hits.min(k),
+            None => src_hits,
+        };
+        hit_edges += kept;
         processed += 1;
 
         // Second time-budget check: bail after each source completes.
@@ -323,8 +332,13 @@ fn run_preview(
     let est_edges = if processed == 0 {
         0
     } else {
-        let hit_rate = hit_edges as f64 / (processed as f64 * dst_n as f64);
-        (hit_rate * src_n as f64 * dst_n as f64).round() as u64
+        // `hit_edges` is already per-source-capped; extrapolate mean kept × |src|.
+        let avg_kept = hit_edges as f64 / processed as f64;
+        let raw = (avg_kept * src_n as f64).round() as u64;
+        match def.max_edges {
+            Some(k) => raw.min(k.saturating_mul(src_n as u64)),
+            None => raw,
+        }
     };
 
     Preview {
@@ -452,6 +466,7 @@ pub fn suggest_rules(
                         src_label.to_lowercase(),
                         dst_label.to_lowercase(),
                     );
+                    let max_edges = Some(default_max_edges(&pred));
                     let def = RuleDef {
                         name,
                         src_label: src_label.to_string(),
@@ -459,7 +474,7 @@ pub fn suggest_rules(
                         predicate: pred,
                         edge_type: format!("{base}_OF"),
                         weight_prop: None,
-                        max_edges: None,
+                        max_edges,
                         approximate: false,
                     };
                     let examples_preview: Vec<String> = fp
@@ -568,6 +583,7 @@ pub fn suggest_rules(
                         src_label.to_lowercase(),
                         dst_label.to_lowercase(),
                     );
+                    let max_edges = Some(default_max_edges(&pred));
                     let def = RuleDef {
                         name,
                         src_label: src_label.to_string(),
@@ -575,7 +591,7 @@ pub fn suggest_rules(
                         predicate: pred,
                         edge_type: format!("OVERLAPS_{}", field.to_uppercase()),
                         weight_prop: Some("score".into()),
-                        max_edges: None,
+                        max_edges,
                         approximate: false,
                     };
                     let rationale = format!(
@@ -653,6 +669,7 @@ pub fn suggest_rules(
                         src_label.to_lowercase(),
                         dst_label.to_lowercase(),
                     );
+                    let max_edges = Some(default_max_edges(&pred));
                     let def = RuleDef {
                         name,
                         src_label: src_label.to_string(),
@@ -660,7 +677,7 @@ pub fn suggest_rules(
                         predicate: pred,
                         edge_type: format!("SAME_{}", field.to_uppercase()),
                         weight_prop: None,
-                        max_edges: None,
+                        max_edges,
                         approximate: false,
                     };
                     let rationale = format!(
@@ -764,6 +781,7 @@ pub fn suggest_rules(
                         src_label.to_lowercase(),
                         dst_label.to_lowercase(),
                     );
+                    let max_edges = Some(default_max_edges(&pred));
                     let def = RuleDef {
                         name,
                         src_label: src_label.to_string(),
@@ -771,7 +789,7 @@ pub fn suggest_rules(
                         predicate: pred,
                         edge_type: format!("NEAR_{}", field.to_uppercase()),
                         weight_prop: Some("score".into()),
-                        max_edges: None,
+                        max_edges,
                         approximate: false,
                     };
                     let rationale = format!(
@@ -848,6 +866,7 @@ pub fn suggest_rules(
                         src_label.to_lowercase(),
                         dst_label.to_lowercase(),
                     );
+                    let max_edges = Some(default_max_edges(&pred));
                     let def = RuleDef {
                         name,
                         src_label: src_label.to_string(),
@@ -855,7 +874,7 @@ pub fn suggest_rules(
                         predicate: pred,
                         edge_type: format!("SIMILAR_{}", field.to_uppercase()),
                         weight_prop: Some("score".into()),
-                        max_edges: None,
+                        max_edges,
                         approximate,
                     };
                     let rationale = format!(

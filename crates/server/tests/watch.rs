@@ -28,9 +28,13 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 async fn spawn_server(db: SharedDb) -> SocketAddr {
+    spawn_server_with_token(db, None).await
+}
+
+async fn spawn_server_with_token(db: SharedDb, token: Option<String>) -> SocketAddr {
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        serve(db, "127.0.0.1:0".parse().unwrap(), tx)
+        serve(db, "127.0.0.1:0".parse().unwrap(), tx, token)
             .await
             .expect("serve");
     });
@@ -90,6 +94,23 @@ async fn watch_receives_insert_from_shared_db_clone() {
     })
     .unwrap();
     assert_eq!(frame, expected);
+}
+
+/// Binding: `/watch?token=` upgrades when the server is started with that token.
+#[tokio::test]
+async fn watch_query_token_upgrades_when_token_configured() {
+    let db = SharedDb::open(&tmp("watch-token")).unwrap();
+    let addr = spawn_server_with_token(db, Some("t".into())).await;
+    let url = format!("ws://{addr}/watch?token=t");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect with ?token=");
+    let ack = next_text(&mut ws).await;
+    assert_eq!(
+        ack,
+        serde_json::json!({"subscribed": true}),
+        "first frame must be the subscribe ack"
+    );
 }
 
 /// Binding: batch inner events then BatchApplied, in order, one frame each.

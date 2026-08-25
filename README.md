@@ -176,7 +176,7 @@ The two-command flow uses the release binary with the UI embedded:
 
 ```text
 mushroomdb demo ./db
-mushroomdb serve ./db --addr 127.0.0.1:8080
+mushroomdb serve ./db
 ```
 
 Build the embedded binary first:
@@ -190,10 +190,11 @@ cp target/release/mushroomdb ~/.local/bin/  # or any directory on PATH
 Or run directly from the source tree (no copy needed):
 
 ```text
-./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db --addr 127.0.0.1:8080
+./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db
 ```
 
-Open `http://127.0.0.1:8080/`. The demo graph has 10 Orgs, 20 Projects,
+Open `http://127.0.0.1:8080/`. When a token is configured, open
+`http://host:8080/?token=…`. The demo graph has 10 Orgs, 20 Projects,
 30 People, and 334 edges — 304 of them derived by seven rule sets.
 
 `mushroomdb demo ./db` output:
@@ -229,7 +230,7 @@ columns: p, proj, score
   mushroomdb serve ./db
 ```
 
-`mushroomdb serve ./db --addr 127.0.0.1:8080` output:
+`mushroomdb serve ./db` output:
 
 ```text
 listening on http://127.0.0.1:8080
@@ -251,7 +252,7 @@ Six predicate kinds ship today. Predicates compose via `All(...)` (AND, score = 
 | Predicate | What it tests |
 |---|---|
 | `KeyMatch` | FK equality — source field matches destination key |
-| `FieldEqual` | Exact string match on a named field |
+| `FieldEqual` | Exact match on a named scalar field (string, int, float, bool) |
 | `Overlap` | Jaccard on list-valued fields, min threshold |
 | `NumericWithin` | Absolute numeric difference within a tolerance; score = `1 - |Δ|/tolerance` |
 | `GeoRadius` | Haversine distance on `[lat, lon]` fields within km; score = `1 - dist/radius` |
@@ -342,32 +343,33 @@ See [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-
 ```
 graph-db/
 ├── crates/
-│   ├── core-storage      # topology + columnar properties + WAL + snapshots
+│   ├── core-storage      # HashMap topology + HashMap columns + WAL + snapshots
 │   ├── core-rules        # linking rules, per-rule indexes, incremental maintenance
-│   ├── core-query        # vectorized executor; traversal ops + Cypher subset
+│   ├── core-query        # pull-based interpreter; traversal ops + Cypher subset
 │   ├── core-api          # the one public Rust interface; typed error enums
 │   ├── arrow-bridge      # results ↔ Arrow buffers
-│   ├── bindings-python   # PyO3 thin wrapper over core-api
 │   ├── server            # axum HTTP + WebSocket; serves UI
+│   ├── cli               # mushroomdb binary
 │   └── sim-harness       # DST: virtual clock, fault-injecting IO, seeded runner
 ├── ui/                   # TypeScript + Vite graph explorer
-├── bindings/python/      # maturin package
-└── cli/                  # mushroomdb binary
+├── bindings/python/      # PyO3 / maturin
+└── clients/typescript/   # HTTP + WebSocket client
 ```
 
 Dependency rule (inward only):
 `bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
 
 Storage uses a CRC-checksummed WAL with per-commit fsync, plus versioned
-snapshots in a zero-copy archived format. Open = snapshot + WAL replay.
+zstd-compressed bincode snapshots (V6); not mmap. Open = snapshot + WAL replay.
 Derived edges are not WAL-logged; they are re-materialized from node data
 on open by replaying rule application.
 
 Concurrency: single writer, many readers via `RwLock`-backed `SharedDb`.
 Lock-free epoch snapshot readers are on the roadmap.
 
-Results surface as Apache Arrow everywhere: zero-copy to pandas/polars in
-Python bindings, Arrow IPC over WebSocket to the UI.
+HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
+(pandas/polars zero-copy is not wired yet). JSON is available via
+`?format=json`.
 
 ---
 
@@ -378,9 +380,9 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
 | Cold start without a snapshot re-fires all rules | Snapshots (V6, zstd-compressed) persist derived edges, IVF state, and view definitions — opening from a snapshot skips re-derivation. V6 measured at 100k nodes: 8.88 s open from snapshot vs 8.16 min from WAL alone. Snapshot write cost: 22.563 s (1.1 GiB). Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
 | Approximate vector mode is opt-in | `approximate: true` enables IVF-Flat candidate selection. Per-query recall ≥ 0.90 quiesced; ≥ 0.85 post-rebuild. Review the recall trade-off before using it in completeness-critical workloads. |
-| Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is on the roadmap. |
+| Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
-| Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE (manual edges only), MATCH…DETACH DELETE (node deletes), MATCH…DELETE (isolated-node or edge deletes), and MERGE (single-key match-or-create) are supported. SET RHS accepts a literal or a `$param` reference; expression RHS (`n.x + 1`) is rejected with a named error. Combined MATCH…SET…RETURN is rejected; multi-statement transactions are not supported. Each write statement produces one WAL Batch frame (one fsync). See [`docs/site/query.md`](docs/site/query.md) coverage table. |
+| Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE (manual edges only), MATCH…DETACH DELETE (node deletes), MATCH…DELETE (isolated-node or edge deletes), and MERGE (single-key match-or-create) are supported. SET RHS accepts a literal, `$param`, or arithmetic (`n.x + 1`). Combined MATCH…SET…RETURN is rejected (Phase 2). Multi-statement transactions are not supported. Each write statement produces one WAL Batch frame (one fsync). See [`docs/site/query.md`](docs/site/query.md) coverage table. |
 | Crash-atomic write batches; no interactive transactions or isolation | `db.write_batch(\|b\| { b.insert_node(...); b.set_prop(...); b.delete_node(...); })` commits all ops in one `WalRecord::Batch` frame (one fsync). On crash replay the frame is all-or-nothing: a torn frame replays as none-applied. Rules fire per op in order — semantically identical to sequential singles. Error semantics: validate-then-apply — if op N fails validation (duplicate key, unknown key, rule-owned edge) the entire batch is rejected and nothing is written or applied. **Not isolated:** readers may observe intermediate states while a committed batch is being applied in memory. Per-query Cypher writes (`query_write`) also produce one Batch frame per statement. Multi-statement BEGIN/COMMIT interactive transactions are not supported in v1. |
 | Cypher aggregations | `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` are supported both as single aggregates and as grouped aggregates (`RETURN a, COUNT(*)`). Multiple group keys and multiple aggregates per query are allowed. Group count is capped at 1,000,000 distinct keys. |
 | Variable-length paths: max hops capped at 10 | `-[r:TYPE*min..max]->` and `shortestPath` are supported. Max hops is hard-capped at 10; unbounded forms (`*min..`) are rejected at parse time. Intermediate results are capped at 1,000,000 rows. See [`docs/site/query.md`](docs/site/query.md). |
@@ -396,9 +398,13 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Command | What it does |
 |---|---|
 | `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
-| `mushroomdb serve <dir>` | Start the HTTP server + optional UI |
+| `mushroomdb serve <dir>` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback) |
+| `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted) |
+| `mushroomdb snapshot <dir> [--keep-wal]` | Write `snapshot.bin` (truncates WAL unless `--keep-wal`) |
 | `mushroomdb mcp <dir>` | Start a stdio MCP JSON-RPC server for agent tools |
 | `mushroomdb stats <dir>` | Print node/edge/rule counts |
+| `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 1) |
+| `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit |
 | `mushroomdb algo pagerank <dir> --top 20` | Run PageRank over the unified topology (manual + derived edges) |
 | `mushroomdb algo wcc <dir> --top 50` | Find weakly-connected components |
 | `mushroomdb algo degree <dir> --top 20` | Degree centrality (out / in / both) |
@@ -456,14 +462,14 @@ Full walkthrough, tool reference, and Claude Desktop setup:
 
 | Priority | Item |
 |---|---|
-| Medium | Differential-dataflow query subscriptions (incremental result-set updates, not just edge events) |
-| Medium | General view expressions (computed transforms and cross-label aggregates) |
-| Medium | mmap-backed storage (RAM-independent at rest) |
-| Medium | Lock-free epoch snapshot readers (replacing the `RwLock` facade) |
-| Medium | Multi-statement transactions (BEGIN/COMMIT) |
-| Medium | Expanded Cypher surface (`CASE` expressions, subqueries, `IS NULL/IS NOT NULL`, `+`/`/` arithmetic) |
-| Low | TypeScript bindings (napi-rs) |
-| Low | WASM playground |
+| Next | Cypher paste-subset: `IN`, `DISTINCT`, `MATCH … SET … RETURN`, `MERGE ON CREATE` (`docs/superpowers/plans/2026-08-25-phase-2-app-query.md`) |
+| Next | `All` predicates intersect indexes (not `parts[0]` only) |
+| Medium | Packed CSR + real columns + fast snapshot open (storage physics) |
+| Medium | In-tree HNSW + `find_similar` from a raw vector |
+| Medium | 3-node / via-hop linking rules |
+| Medium | mmap snapshots; lock-free epoch readers |
+| Medium | Query result subscriptions; multi-statement `BEGIN/COMMIT` |
+| Low | `CASE` / subqueries / `UNION`; napi-rs; WASM |
 
 ---
 
@@ -475,23 +481,25 @@ front door **after the first `v*` tag**; they are not available until then.
 ### Docker (after the first v* tag)
 
 ```text
-docker run --rm -p 8080:8080 ghcr.io/matthewsherlin/mushroomdb
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=… ghcr.io/matthewsherlin/mushroomdb
 ```
 
 The image CMD runs `mushroomdb serve /data --addr 0.0.0.0:8080 --demo-if-empty`
-(writes the demo graph into the volume when empty, then serves).
+(writes the demo graph into the volume when empty, then serves). Non-loopback
+bind requires a token; pass `-e MUSHROOMDB_TOKEN=…` and open
+`http://localhost:8080/?token=…`.
 Explicit two-step:
 
 ```text
 docker run --rm -v mushroomdb-data:/data ghcr.io/matthewsherlin/mushroomdb demo /data
-docker run --rm -p 8080:8080 -v mushroomdb-data:/data ghcr.io/matthewsherlin/mushroomdb serve /data --addr 0.0.0.0:8080
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=… -v mushroomdb-data:/data ghcr.io/matthewsherlin/mushroomdb serve /data --addr 0.0.0.0:8080
 ```
 
 Local image build (available now):
 
 ```text
 docker build -t mushroomdb:local .
-docker run --rm -p 8080:8080 mushroomdb:local
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=… mushroomdb:local
 ```
 
 ### TypeScript client (install from repo)

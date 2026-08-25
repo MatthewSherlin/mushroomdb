@@ -115,6 +115,23 @@ describe("watchUrl", () => {
       "wss://example.test/watch",
     );
   });
+
+  it("forwards page ?token= onto /watch", () => {
+    expect(
+      watchUrl({
+        protocol: "http:",
+        host: "127.0.0.1:8080",
+        search: "?token=s3cret",
+      }),
+    ).toBe("ws://127.0.0.1:8080/watch?token=s3cret");
+    expect(
+      watchUrl({
+        protocol: "https:",
+        host: "example.test",
+        search: "?other=1",
+      }),
+    ).toBe("wss://example.test/watch");
+  });
 });
 
 describe("applyLiveEvent", () => {

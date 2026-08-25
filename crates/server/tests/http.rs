@@ -10,7 +10,7 @@ use core_api::{
 use serde_json::{json, Value as Json};
 #[cfg(feature = "embed-ui")]
 use server::router_with_embedded_ui;
-use server::{router, router_with_ui, serve};
+use server::{router, router_with_auth, router_with_ui, serve};
 use std::io::Cursor;
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -67,6 +67,238 @@ fn seed_person(db: &SharedDb, key: &str) {
 fn parse_json(bytes: &[u8]) -> Json {
     serde_json::from_slice(bytes)
         .unwrap_or_else(|e| panic!("json: {e}: {}", String::from_utf8_lossy(bytes)))
+}
+
+#[tokio::test]
+async fn health_is_unauthenticated() {
+    // boot with token Some("t"); GET /health must 200 without Authorization
+    let db = SharedDb::open(&tmp("health-unauth")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, body, _) = send(app, get("/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(v, json!({"ok": true}));
+}
+
+#[tokio::test]
+async fn query_without_bearer_is_401_when_token_configured() {
+    // POST /query with no header → 401 {"error":"..."}
+    let db = SharedDb::open(&tmp("query-no-bearer")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, body, _) = send(
+        app,
+        json_req("POST", "/query", json!({"cypher": "MATCH (n) RETURN n"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let v = parse_json(&body);
+    assert!(
+        v["error"].as_str().is_some_and(|s| !s.is_empty()),
+        "401 body must be {{\"error\":\"...\"}}, got {v}"
+    );
+}
+
+#[tokio::test]
+async fn query_with_bearer_succeeds_when_token_configured() {
+    // Authorization: Bearer t → 200
+    let db = SharedDb::open(&tmp("query-bearer")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/query?format=json")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::AUTHORIZATION, "Bearer t")
+        .body(Body::from(
+            json!({"cypher": "MATCH (n) RETURN n"}).to_string(),
+        ))
+        .unwrap();
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn query_with_query_token_succeeds_when_token_configured() {
+    let db = SharedDb::open(&tmp("query-qs-token")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, _, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?token=t&format=json",
+            json!({"cypher": "MATCH (n) RETURN n"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn query_with_wrong_query_token_is_401() {
+    let db = SharedDb::open(&tmp("query-qs-wrong")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?token=wrong",
+            json!({"cypher": "MATCH (n) RETURN n"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let v = parse_json(&body);
+    assert!(
+        v["error"].as_str().is_some_and(|s| !s.is_empty()),
+        "401 body must be {{\"error\":\"...\"}}, got {v}"
+    );
+}
+
+#[tokio::test]
+async fn watch_with_query_token_is_not_401_when_token_configured() {
+    let db = SharedDb::open(&tmp("watch-qs-token")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, _, _) = send(app, get("/watch?token=t")).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "GET /watch?token=t must pass auth (upgrade may still fail without WS headers)"
+    );
+}
+
+#[tokio::test]
+async fn query_token_percent_decoded_matches_configured_token() {
+    let db = SharedDb::open(&tmp("query-qs-encoded-slash")).unwrap();
+    let app = router_with_auth(db, Some("a/b".into()));
+    let (status, _, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?token=a%2Fb&format=json",
+            json!({"cypher": "MATCH (n) RETURN n"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "configured token \"a/b\" must match URL-encoded ?token=a%2Fb"
+    );
+
+    let db = SharedDb::open(&tmp("query-qs-encoded-plus")).unwrap();
+    let app = router_with_auth(db, Some("a+b".into()));
+    let (status, _, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?token=a%2Bb&format=json",
+            json!({"cypher": "MATCH (n) RETURN n"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "configured token \"a+b\" must match URL-encoded ?token=a%2Bb"
+    );
+}
+
+#[tokio::test]
+async fn watch_with_url_encoded_query_token_is_not_401() {
+    let db = SharedDb::open(&tmp("watch-qs-encoded")).unwrap();
+    let app = router_with_auth(db, Some("a/b".into()));
+    let (status, _, _) = send(app, get("/watch?token=a%2Fb")).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "GET /watch?token=a%2Fb must pass auth for configured token \"a/b\""
+    );
+}
+
+async fn send_headers(
+    app: Router,
+    req: Request<Body>,
+) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
+    let res = app.oneshot(req).await.unwrap();
+    let status = res.status();
+    let headers = res.headers().clone();
+    let body = to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, body, headers)
+}
+
+#[tokio::test]
+async fn html_query_token_sets_auth_cookie() {
+    let ui = tmp("ui-cookie");
+    std::fs::create_dir_all(&ui).unwrap();
+    std::fs::write(
+        ui.join("index.html"),
+        "<!doctype html><title>graph-db</title>",
+    )
+    .unwrap();
+    let db = SharedDb::open(&tmp("ui-cookie-db")).unwrap();
+    let app = router_with_ui(db, &ui, Some("t".into()));
+    let (status, _, headers) = send_headers(app, get("/?token=t")).await;
+    assert_eq!(status, StatusCode::OK);
+    let cookie = headers
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        cookie.contains("mushroomdb_token=t"),
+        "Set-Cookie must include mushroomdb_token=, got {cookie:?}"
+    );
+    assert!(
+        cookie.contains("Path=/"),
+        "Set-Cookie Path=/, got {cookie:?}"
+    );
+    assert!(
+        cookie.contains("SameSite=Lax"),
+        "Set-Cookie SameSite=Lax, got {cookie:?}"
+    );
+    assert!(
+        cookie.contains("HttpOnly"),
+        "Set-Cookie HttpOnly, got {cookie:?}"
+    );
+}
+
+#[tokio::test]
+async fn missing_asset_with_cookie_is_404_not_401() {
+    let db = SharedDb::open(&tmp("asset-cookie")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let req = Request::builder()
+        .method("GET")
+        .uri("/no-such.js")
+        .header(axum::http::header::COOKIE, "mushroomdb_token=t")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn missing_asset_without_auth_is_401() {
+    let db = SharedDb::open(&tmp("asset-noauth")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, _, _) = send(app, get("/no-such.js")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn stats_with_cookie_succeeds_when_token_configured() {
+    let db = SharedDb::open(&tmp("stats-cookie")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let req = Request::builder()
+        .method("GET")
+        .uri("/stats")
+        .header(axum::http::header::COOKIE, "mushroomdb_token=t")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert!(v.get("nodes_live").is_some(), "/stats JSON, got {v}");
 }
 
 /// Binding: POST /query default is Arrow IPC stream; StreamReader reads the batch.
@@ -617,7 +849,7 @@ async fn ui_fallback_serves_static_and_stats_stays_json() {
     std::fs::write(ui.join("hello.txt"), "hello-static").unwrap();
 
     let db = SharedDb::open(&tmp("ui-api")).unwrap();
-    let app = router_with_ui(db, &ui);
+    let app = router_with_ui(db, &ui, None);
 
     let (st, body, _) = send(app.clone(), get("/hello.txt")).await;
     assert_eq!(st, StatusCode::OK);
@@ -648,7 +880,9 @@ async fn serve_readiness_returns_local_addr() {
     let db = SharedDb::open(&tmp("serve")).unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
-        serve(db, "127.0.0.1:0".parse().unwrap(), tx).await.unwrap();
+        serve(db, "127.0.0.1:0".parse().unwrap(), tx, None)
+            .await
+            .unwrap();
     });
     let addr = rx.await.expect("readiness");
     assert_ne!(addr.port(), 0, "ephemeral port must be resolved");
@@ -807,6 +1041,16 @@ async fn create_rule_http_and_validation() {
         json!({"ok": true, "name": "founded_within"})
     );
     assert!(db.read().rules().iter().any(|r| r.name == "founded_within"));
+    assert_eq!(
+        db.read()
+            .rules()
+            .iter()
+            .find(|r| r.name == "founded_within")
+            .unwrap()
+            .max_edges,
+        Some(32),
+        "JSON null max_edges fills default scored top-k"
+    );
 
     let (status, body, _) = send(
         app,
@@ -831,6 +1075,47 @@ async fn create_rule_http_and_validation() {
     assert!(
         err.contains("invalid rule:"),
         "engine message verbatim, got {err}"
+    );
+}
+
+/// Binding: omitted JSON `max_edges` fills `default_max_edges` (scored=32, KeyMatch=1).
+#[tokio::test]
+async fn create_rule_http_omitted_max_edges_fills_default() {
+    let (app, db) = open("rules-omit-max");
+    db.write().insert_node("Org", "o1", vec![]).unwrap();
+    db.write()
+        .insert_node(
+            "Person",
+            "p1",
+            vec![("org_id".into(), Value::Str("o1".into()))],
+        )
+        .unwrap();
+
+    let (status, _, _) = send(
+        app.clone(),
+        json_req(
+            "POST",
+            "/rules",
+            json!({
+                "name": "works_at",
+                "src_label": "Person",
+                "dst_label": "Org",
+                "predicate": {"KeyMatch": {"field": "org_id"}},
+                "edge_type": "WORKS_AT",
+                "weight_prop": null
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        db.read()
+            .rules()
+            .iter()
+            .find(|r| r.name == "works_at")
+            .unwrap()
+            .max_edges,
+        Some(1)
     );
 }
 

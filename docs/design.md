@@ -12,7 +12,7 @@
 An open-source, embedded-first property graph database whose defining feature is
 **native automatic connection creation**: users declare general linking rules once,
 and the engine maintains those edges incrementally, transactionally, on every write.
-Secondary pillars: extreme read speed (in-memory engine, zero-copy everywhere) and a
+Secondary pillars: extreme read speed (in-memory engine) and a
 first-class bundled UI that stays smooth at hundreds of thousands of nodes.
 
 One-line positioning: *"The embedded graph database that builds itself."*
@@ -50,16 +50,16 @@ ingestion posture.
 
 | Decision | Choice |
 |---|---|
-| Deployment shape | Embedded Rust core + optional thin server + bundled UI (DuckDB playbook); `graphdb ui mydb.graph` serves the UI locally |
+| Deployment shape | Embedded Rust core + optional thin server + bundled UI (DuckDB playbook); `mushroomdb serve <db-dir>` serves the UI locally |
 | Query surface | Programmatic traversal API (primary) + openCypher subset (compat). No custom language, ever |
 | Auto-linking | Layered: zero-config key/FK inference by default + declared incremental rules. LLM extraction is a possible later optional plugin, never core |
-| Storage model | Memory-first: Sortledton-style dynamic adjacency + columnar properties; WAL + mmap'd zero-copy snapshots. Storage behind a Rust trait (future disk-native backend possible without touching query/rule layers) |
-| Execution | Vectorized batches (~1–2k IDs per operator step), rayon-parallel traversals. Factorized processing / WCOJ deferred to v2 |
-| Concurrency | Single writer + epoch-based snapshot reads (lock-free readers). No general MVCC |
-| Results format | Apache Arrow everywhere: zero-copy to pandas/polars/JS; Arrow IPC over WebSocket to UI. JSON exists nowhere in the data path |
+| Storage model | Memory-first HashMap topology + HashMap columns; CRC WAL + zstd-compressed bincode snapshots (V6). Sortledton adjacency and mmap'd snapshots deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
+| Execution | Pull-based interpreter over the Cypher subset. Vectorized batches deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
+| Concurrency | Single writer + many readers via `RwLock` (`SharedDb`). Epoch-based lock-free snapshot reads deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
+| Results format | Apache Arrow for query results (IPC over HTTP; pandas/polars in Python). JSON is used for `?format=json`, `/watch`, `/subscribe`, and MCP |
 | UI rendering | cosmos.gl (GPU force layout + rendering; OpenJS Foundation) |
-| Bindings | Python (PyO3), TypeScript (napi-rs), Rust — all at launch, generated/derived from one core-api source of truth, shared conformance suite |
-| Testing | Deterministic simulation testing (FoundationDB-style) from day one + model-based oracle testing + rule-equivalence invariant + differential Cypher testing vs Neo4j |
+| Bindings | Python (PyO3) and Rust at launch; TypeScript via HTTP `mushroomdb-client`. napi-rs deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
+| Testing | Deterministic simulation testing (FoundationDB-style) from day one + model-based oracle testing + rule-equivalence invariant. Differential Cypher testing vs Neo4j deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
 | Scale target | Design for 10M nodes in RAM (~5–15 GB with properties); document the RAM ceiling honestly. Real initial workloads are ~10k nodes |
 
 ### Explicit non-goals (v1)
@@ -74,17 +74,17 @@ full openCypher coverage; LLM-based extraction; io_uring; multi-writer.
 ```
 graph-db/
 ├── crates/
-│   ├── core-storage      # topology + columnar properties + WAL + snapshots
+│   ├── core-storage      # HashMap topology + HashMap columns + WAL + snapshots
 │   ├── core-rules        # linking rules, per-rule indexes, incremental maintenance
-│   ├── core-query        # vectorized executor; traversal ops + openCypher subset
+│   ├── core-query        # pull-based interpreter; traversal ops + openCypher subset
 │   ├── core-api          # the ONE public Rust interface; typed error enums
-│   ├── arrow-bridge      # results ↔ Arrow buffers (zero-copy)
-│   ├── bindings-python   # PyO3 thin wrapper over core-api
-│   ├── bindings-node     # napi-rs thin wrapper over core-api
+│   ├── arrow-bridge      # results ↔ Arrow buffers
 │   ├── server            # axum HTTP + WebSocket (Arrow IPC); serves UI
+│   ├── cli               # `mushroomdb` binary: demo, serve, query, snapshot, stats
 │   └── sim-harness       # DST: virtual clock, fault-injecting IO, seeded runner
-├── ui/                   # TypeScript + cosmos.gl explorer/console/rule-inspector
-└── cli/                  # `graphdb` binary: open, serve UI, rebuild, stats
+├── bindings/python/      # PyO3 thin wrapper over core-api
+├── clients/typescript/   # HTTP `mushroomdb-client` (napi-rs deferred)
+└── ui/                   # TypeScript + cosmos.gl explorer/console/rule-inspector
 ```
 
 Dependency rule (inward only):
@@ -96,19 +96,19 @@ multi-agent build boundaries.
 
 ### 4.2 Storage internals
 
+Shipped pre-1.0. Spec end-state (Sortledton adjacency, packed columns, mmap/rkyv
+open) is deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`.
+
 - **IDs:** user keys (default field `id`) hash-mapped once to dense internal `u32`.
-  All internal structures use dense IDs — integer-array adjacency, no pointer chasing.
-- **Topology:** per-vertex sorted neighbor blocks per (edge-type, direction), per
-  Sortledton (VLDB 2022): near-CSR scan speed, cheap inserts, ~2.1× CSR memory,
-  simple design. Edges partitioned by type so typed expansion touches only relevant
-  blocks.
-- **Properties:** columnar, stored away from topology; lazily loaded per column.
-  Strings dictionary-encoded/interned. Set-valued fields → roaring bitmaps over an
-  interned dictionary (overlap scoring = SIMD bitmap AND). Recognized geo pairs →
-  R-tree-indexable points. Null bitmaps per column.
-- **Durability:** WAL (CRC-checksummed records) + background snapshots in an
-  rkyv-style zero-copy archived format. Open = mmap snapshot (milliseconds) + replay
-  WAL tail. Snapshot files versioned + checksummed; ambiguous/corrupt files rejected
+  All internal structures use dense IDs.
+- **Topology:** `HashMap` of edge-type → `{out, inn}` maps of `u32 → sorted Vec<u32>`.
+  Typed expansion touches only the relevant type map. Not CSR, not Sortledton
+  blocked adjacency.
+- **Properties:** per-field `HashMap<u32, Value>` behind a `ColumnStore` interface,
+  stored away from topology. Not packed columns, roaring bitmaps, or R-trees.
+- **Durability:** CRC-checksummed WAL + versioned zstd-compressed bincode snapshots
+  (V6). Open = decompress snapshot into the heap + replay WAL tail. Not mmap, not
+  rkyv. Snapshot files versioned + checksummed; ambiguous/corrupt files rejected
   loudly.
 
 ## 5. Data Model & Write Path
@@ -131,20 +131,27 @@ db.rules.create(
 v1 rule predicate library: `key_match` (FK-style; also runs zero-config by default),
 `field_equal`, `overlap`, `numeric_within`, `geo_radius`, composable via `all(...)`.
 Fast-follow: user-defined scoring functions (UDF escape hatch). Each rule declares
-watched fields and maintains its own index (hash / token / R-tree / sorted).
+watched fields and maintains its own candidate index: hash (`KeyMatch` /
+`FieldEqual`), token (`Overlap`), numeric bucket (`NumericWithin`), geo grid
+(`GeoRadius`), IVF-Flat clusters (`VectorSimilar` when `approximate: true`).
+Exact `VectorSimilar` is a scan. R-tree indexes are deferred; see
+`docs/superpowers/specs/2026-08-25-best-graph-db.md`.
 
 **Write path (one insert/update):**
 
-1. WAL append (only mandatory disk touch; fsync per policy).
-2. ID map + topology + columns updated in memory.
+1. WAL append + per-commit fsync (the only mandatory disk touch).
+2. ID map + topology + columns mutated in place under the `RwLock` write guard.
 3. **Incremental rule firing:** changed fields wake only watching rules; each probes
-   its own index for candidate partners (never a scan), computes scores,
+   its own index for candidate partners, computes scores,
    writes/updates/deletes its derived edges. Derived edges carry rule provenance;
    they are not hand-editable and are removed cleanly on `rule delete`. Updates diff
    old vs new field values and touch only affected partner edges.
-4. **Epoch publish:** atomic pointer flip makes node + derived edges visible
-   together. Auto-linking is synchronous and transactional — never an
-   eventually-consistent background job.
+4. **Publish:** the write guard is released; concurrent `SharedDb` readers then
+   observe node + derived edges together. Auto-linking is synchronous and
+   transactional — never an eventually-consistent background job. Epoch / ArcSwap
+   snapshot publish is deferred; see
+   `docs/superpowers/specs/2026-08-25-best-graph-db.md` and
+   `docs/concurrency-decision.md`.
 
 Budget: sub-millisecond per insert at 10k–100k-node scale; bulk loads amortize rule
 firing per batch. Rule create/delete on a live graph = online backfill/removal job
@@ -190,10 +197,13 @@ Not v1: general editing/admin UI, dashboards, saved queries.
 ## 8. Error Handling & Durability Contract
 
 - **Contract:** a committed write survives crash, power loss, kill -9. Torn WAL
-  tails detected via CRC and dropped whole — never half-applied. Recovery target
-  < 1 s (bounded by snapshot cadence).
-- **Fsync policy:** `strict` (per commit) / `batched` (default, per N ms) /
-  `relaxed` (bulk loads).
+  tails detected via CRC and dropped whole — never half-applied. Recovery is
+  snapshot decompress + WAL replay. Current V6 zstd-bincode open is ~8.88 s at
+  100k nodes. Sub-second (mmap) open is deferred; see
+  `docs/superpowers/specs/2026-08-25-best-graph-db.md`.
+- **Fsync:** every WAL commit fsyncs (Darwin `F_FULLFSYNC` on the file).
+  `FsyncPolicy` `batched` / `relaxed` is deferred (Phase 2); there is no default
+  batched window. Do not treat `strict`/`batched`/`relaxed` as a live API.
 - **Ingest:** lenient by default (unknown fields → new columns; type conflicts →
   tagged mixed representation + counted warning). Declared schemas = hard errors
   with row detail. No silent drops; all coercions/skips queryable via
@@ -217,8 +227,9 @@ Not v1: general editing/admin UI, dashboards, saved queries.
    a deliberately naive in-memory oracle; exact-match required.
 3. **Rule-equivalence invariant:** after any op sequence, incremental edges ==
    from-scratch `rebuild`. Shrunken repro on failure.
-4. **Differential Cypher testing** vs Neo4j on the supported subset; cargo-fuzz on
-   parser and WAL/snapshot readers.
+4. **Differential Cypher testing vs Neo4j** is deferred; see
+   `docs/superpowers/specs/2026-08-25-best-graph-db.md`. cargo-fuzz on parser and
+   WAL/snapshot readers ships.
 5. **Cross-binding conformance:** one shared corpus (queries + expected Arrow
    results) through Rust/Python/TS in the CI matrix.
 6. **Performance:** criterion microbenchmarks with CI regression gates; public
@@ -235,7 +246,7 @@ Not v1: general editing/admin UI, dashboards, saved queries.
 | Point lookup + depth-2 typed neighborhood, 10k-node graph | < 100 µs engine-side |
 | Same, 10M-node graph | < 10 ms |
 | Insert with 5 active rules, 100k-node graph | < 1 ms |
-| DB open (5 GB snapshot) | < 100 ms |
+| DB open (5 GB snapshot) | Target < 100 ms (mmap/rkyv; deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md`). Current V6 zstd-bincode open is ~8.88 s at 100k nodes |
 | UI: click-to-rendered neighborhood (500 nodes, end-to-end) | < 100 ms |
 | UI: smooth interaction | 50k+ nodes without frame collapse |
 | Replaces talent-backend Neo4j usage | current 5+ s queries < 50 ms end-to-end |

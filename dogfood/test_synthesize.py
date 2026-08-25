@@ -469,7 +469,7 @@ def test_geo_and_style_predicates_fire_and_reject(tmp_path, labeled):
 
     db = GraphDb.open(str(tmp_path / "db"))
     for item in uniq:
-        db.insert_node(item["key"], item["label"], item["props"])
+        db.insert_node(item["label"], item["key"], item["props"])
     for rule in SIX_RULES:
         if rule["name"] in {
             "location_fit_tc",

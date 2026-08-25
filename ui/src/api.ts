@@ -129,11 +129,25 @@ export function isAbsentEndpoint(err: unknown): boolean {
   return err instanceof ApiError && err.status === 404 && !isKeyNotFound(err);
 }
 
+/** Page `?token=` value, if present and non-empty. */
+export function pageToken(search?: string): string | undefined {
+  const raw =
+    search ??
+    (typeof window !== "undefined" ? window.location.search : "");
+  const value = new URLSearchParams(raw).get("token");
+  if (value === null || value === "") {
+    return undefined;
+  }
+  return value;
+}
+
 export class ApiClient {
   private readonly baseUrl: string;
+  private readonly token: string | undefined;
 
-  constructor(baseUrl = "") {
+  constructor(baseUrl = "", token?: string) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
+    this.token = token;
   }
 
   query(
@@ -215,9 +229,16 @@ export class ApiClient {
     body?: unknown,
   ): Promise<T> {
     const init: RequestInit = { method };
+    const headers: Record<string, string> = {};
     if (body !== undefined) {
-      init.headers = { "Content-Type": "application/json" };
+      headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(body);
+    }
+    if (this.token !== undefined) {
+      headers.Authorization = `Bearer ${this.token}`;
+    }
+    if (Object.keys(headers).length > 0) {
+      init.headers = headers;
     }
     const res = await fetch(`${this.baseUrl}${path}`, init);
     const parsed = await readBody(res);

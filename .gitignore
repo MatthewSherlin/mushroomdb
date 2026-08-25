@@ -16,3 +16,5 @@ ui/blob-report/
 ui/playwright/.cache/
 /db/
 .DS_Store
+
+.worktrees/

@@ -1547,6 +1547,22 @@ fn fn_unknown_function_error() {
     );
 }
 
+#[test]
+fn unknown_function_lists_text_matches() {
+    let dir = tmp("fn_unknown_text_matches");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node("N", "k", vec![]);
+        batch.commit().unwrap();
+    }
+    let err = db
+        .query("MATCH (n) RETURN nosuch(n)", &BTreeMap::new())
+        .unwrap_err();
+    let s = err.to_string();
+    assert!(s.contains("textMatches"), "{s}");
+}
+
 // ── LIMIT/SKIP $param tests ───────────────────────────────────────────────────
 
 /// LIMIT $n resolves the named parameter at runtime.

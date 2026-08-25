@@ -1,5 +1,5 @@
 use crate::db::GraphDb;
-use core_rules::{Predicate, RuleDef};
+use core_rules::{default_max_edges, Predicate, RuleDef};
 use core_storage::fs::Fs;
 use core_storage::{GraphError, Result, Value};
 use serde::Serialize;
@@ -342,16 +342,18 @@ fn infer_auto_fk<F: Fs>(
                     continue;
                 }
                 let remainder = &field[..field.len() - suffix.len()];
+                let predicate = Predicate::KeyMatch {
+                    field: field.clone(),
+                };
+                let max_edges = Some(default_max_edges(&predicate));
                 new_rules.push(RuleDef {
                     name,
                     src_label: src_label.to_string(),
                     dst_label,
-                    predicate: Predicate::KeyMatch {
-                        field: field.clone(),
-                    },
+                    predicate,
                     edge_type: remainder.to_uppercase(),
                     weight_prop: None,
-                    max_edges: None,
+                    max_edges,
                     approximate: false,
                 });
             }

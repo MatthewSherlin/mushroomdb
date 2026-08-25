@@ -25,7 +25,7 @@ Run the two-command flow:
 
 ```text
 ./target/release/mushroomdb demo ./db
-./target/release/mushroomdb serve ./db --addr 127.0.0.1:8080
+./target/release/mushroomdb serve ./db
 ```
 
 Open `http://127.0.0.1:8080/` in a browser. The explorer loads the demo
@@ -35,7 +35,7 @@ rule sets).
 You can combine both commands on one line:
 
 ```text
-./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db --addr 127.0.0.1:8080
+./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db
 ```
 
 Expected output:
@@ -121,8 +121,9 @@ Source: `crates/core-api/examples/quickstart.rs`.
 After the first tagged release, these one-liners will be available:
 
 ```text
-# Docker
-docker run --rm -p 8080:8080 ghcr.io/matthewsherlin/mushroomdb
+# Docker (non-loopback requires a token)
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=changeme ghcr.io/matthewsherlin/mushroomdb
+# then open http://localhost:8080/?token=changeme
 
 # npm
 npx mushroomdb --help
@@ -163,8 +164,8 @@ rules: 7
 
 - `demo` refuses a non-empty directory, including hidden files (`.DS_Store`
   counts). Use a fresh path or `rm -rf ./db` first.
-- Port 0 (the default) assigns an ephemeral port. Pass `--addr 127.0.0.1:8080`
-  to pin one.
-- Cold-start on a rich-rule graph: WAL-only open replays all rule derivations (8.25 min at 100k
-  nodes, 9 rules, IVF dominates). Call `snapshot()` before close; opening from a V5 snapshot takes
-  8.71 s at 100k (snapshot write cost: 25 s). See [docs/site/timetravel.md](timetravel.md).
+- Default bind is `127.0.0.1:8080`. Pass `--addr host:port` to change it.
+  Non-loopback binds require `--token` or `MUSHROOMDB_TOKEN`.
+- Cold-start on a rich-rule graph: WAL-only open replays all rule derivations (8.16 min at 100k
+  nodes, 9 rules, IVF dominates). Call `snapshot()` before close; opening from a V6 snapshot takes
+  8.88 s at 100k (snapshot write cost: 22.563 s). See [docs/site/timetravel.md](timetravel.md).

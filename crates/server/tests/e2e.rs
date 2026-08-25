@@ -146,7 +146,7 @@ fn load_demo_equivalent(dir: &Path) -> SharedDb {
 async fn spawn_server(db: SharedDb) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
-        serve(db, "127.0.0.1:0".parse().unwrap(), tx)
+        serve(db, "127.0.0.1:0".parse().unwrap(), tx, None)
             .await
             .expect("serve");
     });

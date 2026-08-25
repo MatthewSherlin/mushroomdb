@@ -41,9 +41,10 @@
 
 use crate::json::{
     node_edges_json, node_info_json, params_from_json, parse_ingest_edges, result_set_json,
+    rule_def_from_json,
 };
 use core_api::{
-    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, RuleDef, SharedDb, Value,
+    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, SharedDb, Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -179,7 +180,14 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
         Ok(p) => p,
         Err(e) => return CallOutcome::ToolErr(e),
     };
-    let rs = {
+    let is_write = match core_api::is_write_query(cypher) {
+        Ok(b) => b,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let rs = if is_write {
+        let mut g = db.write();
+        g.query_write(cypher, &params)
+    } else {
         let g = db.read();
         g.query(cypher, &params)
     };
@@ -247,9 +255,9 @@ fn tool_ingest(db: &SharedDb, args: &Js) -> CallOutcome {
 }
 
 fn tool_create_rule(db: &SharedDb, args: &Js) -> CallOutcome {
-    let def: RuleDef = match serde_json::from_value(args.clone()) {
+    let def = match rule_def_from_json(args.clone()) {
         Ok(d) => d,
-        Err(e) => return CallOutcome::ToolErr(e.to_string()),
+        Err(e) => return CallOutcome::ToolErr(e),
     };
     let name = def.name.clone();
     let res = {
@@ -535,7 +543,7 @@ fn tools_list() -> Js {
         "tools": [
             {
                 "name": "query",
-                "description": "Run a Cypher query against the graph.",
+                "description": "Run a Cypher query (read or write) against the graph.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -898,6 +906,23 @@ mod tests {
         // columns + 2 rows
         assert_eq!(result["columns"], json!(["n.name"]));
         assert_eq!(result["rows"].as_array().map(|r| r.len()), Some(2));
+    }
+
+    #[test]
+    fn test_query_create_is_a_write() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let resp = tool_call(
+            &db,
+            1,
+            "query",
+            json!({ "cypher": "CREATE (n:L {id: 'k'}) RETURN n" }),
+        );
+        assert!(
+            !is_error(&resp),
+            "CREATE via MCP query must succeed: {resp}"
+        );
+        let stats = tool_text(&tool_call(&db, 2, "stats", json!({})));
+        assert_eq!(stats["nodes_live"], 1);
     }
 
     #[test]

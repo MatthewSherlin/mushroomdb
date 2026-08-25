@@ -161,6 +161,69 @@ fn neighbor_sum_backfill_and_incremental() {
 }
 
 #[test]
+fn neighbor_count_skips_missing_prop() {
+    // City c1 with two LIVES_IN people: one has `weight`, one does not
+    // View NeighborAgg Count on `weight` → 1, not 2
+    // Degree view on same etype → 2
+    let dir = tmp("count_missing");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node("City", "c1", vec![]).unwrap();
+    db.insert_node("Person", "p1", vec![("weight".into(), Value::Float(1.5))])
+        .unwrap();
+    db.insert_node("Person", "p2", vec![]).unwrap();
+    db.insert_edge("LIVES_IN", "p1", "c1").unwrap();
+    db.insert_edge("LIVES_IN", "p2", "c1").unwrap();
+
+    db.create_view(neighbor_agg_view(
+        "city_weight_count",
+        "City",
+        "weight_n",
+        "LIVES_IN",
+        Direction::In,
+        AggFn::Count,
+        "weight",
+    ))
+    .unwrap();
+    db.create_view(degree_view(
+        "city_in_deg",
+        "City",
+        "pop",
+        "LIVES_IN",
+        Direction::In,
+    ))
+    .unwrap();
+
+    assert_eq!(db.get_prop("c1", "weight_n"), Some(&Value::Int(1)));
+    assert_eq!(db.get_prop("c1", "pop"), Some(&Value::Int(2)));
+    assert_eq!(
+        db.get_prop("c1", "weight_n").cloned(),
+        db.scratch_view_value("c1", "city_weight_count"),
+        "incremental Count must match scratch recompute"
+    );
+
+    db.set_prop("p2", "weight", Value::Float(2.0)).unwrap();
+    assert_eq!(db.get_prop("c1", "weight_n"), Some(&Value::Int(2)));
+    db.remove_prop("p1", "weight").unwrap();
+    assert_eq!(db.get_prop("c1", "weight_n"), Some(&Value::Int(1)));
+    assert_eq!(db.get_prop("c1", "pop"), Some(&Value::Int(2)));
+
+    db.insert_node("Person", "p3", vec![("weight".into(), Value::Float(3.0))])
+        .unwrap();
+    db.insert_edge("LIVES_IN", "p3", "c1").unwrap();
+    db.insert_node("Person", "p4", vec![]).unwrap();
+    db.insert_edge("LIVES_IN", "p4", "c1").unwrap();
+    assert_eq!(db.get_prop("c1", "weight_n"), Some(&Value::Int(2)));
+    assert_eq!(db.get_prop("c1", "pop"), Some(&Value::Int(4)));
+    db.delete_edge("LIVES_IN", "p3", "c1").unwrap();
+    assert_eq!(db.get_prop("c1", "weight_n"), Some(&Value::Int(1)));
+    assert_eq!(
+        db.get_prop("c1", "weight_n").cloned(),
+        db.scratch_view_value("c1", "city_weight_count")
+    );
+}
+
+#[test]
 fn neighbor_avg_updates_on_prop_change() {
     let dir = tmp("avg");
     let mut db = GraphDb::open(&dir).unwrap();

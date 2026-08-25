@@ -15,8 +15,9 @@ pub use mcp::run_mcp_stdio;
 struct AppState {
     db: SharedDb,
     watch: tokio::sync::broadcast::Sender<MutationEvent>,
+    token: Option<String>,
 }
 
-pub use http::{router, router_with_ui, serve, serve_with_ui};
+pub use http::{router, router_with_auth, router_with_ui, serve, serve_with_ui};
 #[cfg(feature = "embed-ui")]
 pub use http::{router_with_embedded_ui, serve_with_embedded_ui};

@@ -10,7 +10,7 @@
 ///   (e) VectorSimilar: embedding dim-4 matches            |  emb_short dim mismatch (2 vs 3)
 use core_api::{
     GraphDb, Predicate, RuleDef, RuleSuggestion, SuggestConfig, SuggestReport, Value,
-    SUGGEST_DEFAULT_SEED,
+    DEFAULT_SCORED_TOP_K, SUGGEST_DEFAULT_SEED,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -506,4 +506,70 @@ fn suggestions_sorted_by_est_edges_desc() {
             w[1].def.name
         );
     }
+}
+
+#[test]
+fn suggest_never_emits_uncapped_max_edges() {
+    // ingest a small two-label graph with overlapping tags
+    let dir = build_fixture("suggest-topk");
+    let db = GraphDb::open(&dir).unwrap();
+    let s = db.suggest_rules();
+    assert!(!s.is_empty());
+    for row in s {
+        assert!(row.def.max_edges.is_some(), "{}", row.def.name);
+    }
+}
+
+#[test]
+fn suggest_preview_est_edges_respects_per_source_topk() {
+    // Dense FieldEqual: every A matches every B. Cartesian = 40×50 = 2000.
+    // Preview sample is pinned to full src count (max_sample_sources ≥ 40).
+    const N_A: u64 = 40;
+    const N_B: u64 = 50;
+    let dir = tmp("preview-fe-topk");
+    let mut db = GraphDb::open(&dir).unwrap();
+    for i in 0..N_A {
+        db.insert_node("A", &format!("a{i:02}"), vec![("cat".into(), str("x"))])
+            .unwrap();
+    }
+    for i in 0..N_B {
+        db.insert_node("B", &format!("b{i:02}"), vec![("cat".into(), str("x"))])
+            .unwrap();
+    }
+    let sampled_src = N_A as usize;
+    let config = SuggestConfig {
+        max_sample_sources: sampled_src,
+        ..SuggestConfig::default()
+    };
+    let report: SuggestReport = db.suggest_rules_with_config(&config, SUGGEST_DEFAULT_SEED);
+    let s = report
+        .suggestions
+        .iter()
+        .find(|s| {
+            s.def.src_label == "A"
+                && s.def.dst_label == "B"
+                && matches!(&s.def.predicate, Predicate::FieldEqual { field } if field == "cat")
+        })
+        .expect("FieldEqual(cat) A→B suggestion");
+    assert_eq!(s.def.max_edges, Some(DEFAULT_SCORED_TOP_K));
+    let cap = DEFAULT_SCORED_TOP_K * sampled_src as u64;
+    assert!(
+        s.est_edges <= cap,
+        "est_edges {} exceeds per-source top-k cap {} (k={} × sampled_src={})",
+        s.est_edges,
+        cap,
+        DEFAULT_SCORED_TOP_K,
+        sampled_src
+    );
+    assert_eq!(
+        s.est_edges, cap,
+        "fully sampled dense FieldEqual must estimate exactly k per source"
+    );
+    assert!(
+        s.est_edges < N_A * N_B,
+        "cap must be tighter than cartesian {}×{} — got {}",
+        N_A,
+        N_B,
+        s.est_edges
+    );
 }

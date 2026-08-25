@@ -56,7 +56,8 @@ impl Fs for RealFs {
     }
 
     fn sync(&mut self, file: FileId) -> std::io::Result<()> {
-        File::open(self.path(file))?.sync_all()
+        let f = File::open(self.path(file))?;
+        full_sync(&f)
     }
 
     fn read(&self, file: FileId) -> std::io::Result<Vec<u8>> {
@@ -76,10 +77,33 @@ impl Fs for RealFs {
         {
             let mut f = File::create(&tmp)?;
             f.write_all(data)?;
-            f.sync_all()?;
+            full_sync(&f)?;
         }
-        std::fs::rename(&tmp, self.path(file))
+        std::fs::rename(&tmp, self.path(file))?;
+        sync_dir(&self.dir)
     }
+}
+
+fn full_sync(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        let rc = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
+        if rc == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_all()
+    }
+}
+
+fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    let d = File::open(dir)?;
+    d.sync_all()
 }
 
 #[cfg(test)]
@@ -105,5 +129,18 @@ mod tests {
         assert_eq!(fs.read(FileId::Snapshot).unwrap(), b"snap2");
         fs.write_atomic(FileId::Wal, b"").unwrap(); // truncation path
         assert_eq!(fs.read(FileId::Wal).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_still_readable() {
+        // existing append_read_and_atomic_write already covers replace;
+        // keep it; dir-sync is best-effort observable only via crash tests.
+        // Do not fake F_FULLFSYNC in SimFs.
+        let d = std::env::temp_dir().join(format!("graphdb-fs-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let mut fs = RealFs::new(&d).unwrap();
+        fs.write_atomic(FileId::Snapshot, b"snap1").unwrap();
+        fs.write_atomic(FileId::Snapshot, b"snap2").unwrap();
+        assert_eq!(fs.read(FileId::Snapshot).unwrap(), b"snap2");
     }
 }

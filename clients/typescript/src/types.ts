@@ -111,6 +111,105 @@ export interface IngestRequest {
 export type IngestReport = Record<string, unknown>;
 
 // ---------------------------------------------------------------------------
+// Node / explain / neighborhood / rules
+// ---------------------------------------------------------------------------
+
+/**
+ * Wire `NodeInfo` from `GET /node/{key}`.
+ *
+ * `props` uses the same untagged Value JSON as `/query`. Unknown keys are
+ * HTTP 404; the client `node()` method maps that to `null`.
+ */
+export interface NodeInfo {
+  key: string;
+  label: string;
+  props: Record<string, CellValue>;
+}
+
+/**
+ * Predicate kind on an {@link Explanation}, matching HTTP snake_case JSON.
+ */
+export type PredicateKind =
+  | "key_match"
+  | "field_equal"
+  | "overlap"
+  | "all"
+  | "numeric_within"
+  | "geo_radius"
+  | "vector_similar";
+
+/**
+ * Wire `PredicateSummary`. Option fields are present-null, never omitted.
+ */
+export interface PredicateSummary {
+  kind: PredicateKind;
+  fields: string[];
+  min: number | null;
+  tolerance: number | null;
+  km: number | null;
+  parts: PredicateSummary[] | null;
+}
+
+/**
+ * One rule-derived edge between two nodes from `GET /explain?a=&b=`.
+ *
+ * Mirrors `core_api::db::Explanation`.
+ */
+export interface Explanation {
+  rule: string;
+  edge_type: string;
+  src_key: string;
+  dst_key: string;
+  weight: number | null;
+  predicate: PredicateSummary;
+}
+
+/**
+ * Wire neighborhood expansion from `GET /node/{key}/neighborhood`.
+ *
+ * Columns are `key`, `label`, `depth`.
+ */
+export interface Neighborhood {
+  columns: string[];
+  rows: CellValue[][];
+}
+
+/**
+ * Internally-tagged `Predicate` JSON accepted by `POST /rules`.
+ *
+ * Mirrors `core_rules::Predicate`.
+ */
+export type RulePredicate =
+  | { KeyMatch: { field: string } }
+  | { FieldEqual: { field: string } }
+  | { Overlap: { field: string; min: number } }
+  | { NumericWithin: { field: string; tolerance: number } }
+  | { GeoRadius: { field: string; km: number } }
+  | { VectorSimilar: { field: string; min: number } }
+  | { All: RulePredicate[] }
+  | { Any: RulePredicate[] };
+
+/**
+ * Rule definition posted to `POST /rules`.
+ *
+ * Mirrors `core_rules::RuleDef`. Omit or `max_edges: null` → server fills
+ * scored top-k 32, or 1 if the predicate is KeyMatch-rooted. HTTP has no
+ * uncapped hatch (Rust/Python explicit `None` still uses the 1_000_000
+ * global first-N-by-id budget).
+ */
+export interface RuleDef {
+  name: string;
+  src_label: string;
+  dst_label: string;
+  predicate: RulePredicate;
+  edge_type: string;
+  weight_prop?: string | null;
+  /** Per-source top-k. Omit/`null` fills 32 (scored) or 1 (KeyMatch-rooted). */
+  max_edges?: number | null;
+  approximate?: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Suggest
 // ---------------------------------------------------------------------------
 

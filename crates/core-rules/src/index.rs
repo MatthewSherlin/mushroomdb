@@ -20,6 +20,34 @@ pub const IVF_ITERATIONS: usize = 12;
 /// per lookup.  k=4 → P=1; k=64 → P=4; k=1024 → P=64.
 pub const IVF_PROBE_DENOM: usize = 16;
 
+/// Rebuild an approximate rule when dst-side IVF drift exceeds this count.
+/// Drift is only known after apply, so the WAL path issues `RebuildRule` as a
+/// second commit (not a pre-WAL Batch).
+pub const IVF_DRIFT_REBUILD: u64 = 256;
+
+thread_local! {
+    static IVF_DRIFT_REBUILD_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn ivf_drift_rebuild_threshold() -> u64 {
+    IVF_DRIFT_REBUILD_OVERRIDE.with(|c| c.get().unwrap_or(IVF_DRIFT_REBUILD))
+}
+
+/// Run `f` with a temporary IVF dst-drift rebuild threshold.
+/// Restores the previous override (including across panics).
+pub fn with_ivf_drift_rebuild<R>(threshold: u64, f: impl FnOnce() -> R) -> R {
+    IVF_DRIFT_REBUILD_OVERRIDE.with(|c| {
+        let prev = c.replace(Some(threshold));
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
+}
+
 /// k = ceil(sqrt(n)) clamped to [IVF_K_MIN, IVF_K_MAX].
 pub fn cluster_k(n: usize) -> usize {
     if n == 0 {
@@ -32,6 +60,15 @@ pub fn cluster_k(n: usize) -> usize {
 /// P = max(1, ceil(k / IVF_PROBE_DENOM)).
 pub fn probe_count(k: usize) -> usize {
     k.div_ceil(IVF_PROBE_DENOM).max(1)
+}
+
+/// L2-normalize `xs`. Returns `None` for the zero vector (skipped, not clustered).
+fn l2_normalize(xs: &[f64]) -> Option<Vec<f64>> {
+    let n = xs.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if n == 0.0 {
+        return None;
+    }
+    Some(xs.iter().map(|x| x / n).collect())
 }
 
 /// Squared Euclidean distance between two equal-length slices.
@@ -83,6 +120,7 @@ fn lcg_next(state: u64) -> u64 {
 
 /// Fit k-means over `vecs` (node_id, vector) pairs.
 ///
+/// - Each vector is L2-normalized before clustering (zero vectors skipped).
 /// - `k` is clamped to `min(k, vecs.len())` so we never request more centroids
 ///   than vectors.
 /// - Centroids are initialised by seeded LCG selection without replacement.
@@ -90,6 +128,10 @@ fn lcg_next(state: u64) -> u64 {
 ///   full dataset.
 /// - Returns a `Vec<Vec<f64>>` of k centroids (same length as `xs` entries).
 pub fn kmeans_fit(vecs: &[(u32, Vec<f64>)], k: usize, seed: u64) -> Vec<Vec<f64>> {
+    let vecs: Vec<(u32, Vec<f64>)> = vecs
+        .iter()
+        .filter_map(|(id, xs)| l2_normalize(xs).map(|n| (*id, n)))
+        .collect();
     if vecs.is_empty() || k == 0 {
         return vec![];
     }
@@ -265,8 +307,9 @@ pub struct SideIndex {
     ivf_centroids: Vec<Vec<f64>>,
     /// Per-node cluster assignment post-fit.  `by_key[Int(cluster)] → {node_ids}`.
     ivf_clusters: BTreeMap<u32, usize>,
-    /// Count of vector inserts/removes since last fit.  Triggers a full re-fit
-    /// on the next rebuild/backfill when non-zero (recorded; not auto-applied).
+    /// Count of vector inserts/removes since last fit.  When dst-side drift
+    /// exceeds [`IVF_DRIFT_REBUILD`] on an approximate rule, apply queues a
+    /// `RebuildRule` second commit (fit resets this to zero).
     pub ivf_drift: u64,
 }
 
@@ -637,12 +680,15 @@ impl SideIndex {
             if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
                 self.ivf_raw.insert(node, xs.clone());
                 if !self.ivf_centroids.is_empty() {
-                    let c = nearest_centroid(&self.ivf_centroids, &xs);
-                    self.ivf_clusters.insert(node, c);
-                    self.by_key
-                        .entry(ValueKey::Int(c as i64))
-                        .or_default()
-                        .insert(node);
+                    // Assign in cosine space (centroids are unit-norm). Skip zeros.
+                    if let Some(unit) = l2_normalize(&xs) {
+                        let c = nearest_centroid(&self.ivf_centroids, &unit);
+                        self.ivf_clusters.insert(node, c);
+                        self.by_key
+                            .entry(ValueKey::Int(c as i64))
+                            .or_default()
+                            .insert(node);
+                    }
                     self.ivf_drift = self.ivf_drift.saturating_add(1);
                 }
             }
@@ -839,7 +885,13 @@ impl SideIndex {
         let k = self.ivf_centroids.len();
         let p = probe_count(k);
 
-        // Rank centroids by L2 distance to query; take top-P.
+        // Probe in cosine space (same as centroid fit). Zero query → no candidates
+        // (cosine with a zero vector is undefined; exact evaluate also returns None).
+        let Some(xs) = l2_normalize(&xs) else {
+            return BTreeSet::new();
+        };
+
+        // Rank centroids by L2 distance to the unit query; take top-P.
         let mut dists: Vec<(usize, f64)> = self
             .ivf_centroids
             .iter()
@@ -866,7 +918,7 @@ impl SideIndex {
     /// same rule+data always yields the same clusters (WAL replay identity).
     ///
     /// Clears all existing cluster assignments and by_key cluster entries, then
-    /// assigns every raw vector to its nearest new centroid.
+    /// assigns every non-zero vector (L2-normalized) to its nearest new centroid.
     /// Resets `ivf_drift` to zero.
     pub fn fit_ivf_clusters(&mut self, rule_name: &str) {
         if self.ivf_raw.is_empty() {
@@ -895,9 +947,12 @@ impl SideIndex {
 
         self.ivf_centroids = kmeans_fit(&vecs, k, seed);
 
-        // Assign all raw vectors to nearest centroid.
+        // Assign in cosine space (skip zeros; they stay in ivf_raw but unclustered).
         for (node, xs) in &vecs {
-            let c = nearest_centroid(&self.ivf_centroids, xs);
+            let Some(unit) = l2_normalize(xs) else {
+                continue;
+            };
+            let c = nearest_centroid(&self.ivf_centroids, &unit);
             self.ivf_clusters.insert(*node, c);
             self.by_key
                 .entry(ValueKey::Int(c as i64))
@@ -976,10 +1031,48 @@ mod tests {
     use super::*;
     use crate::def::Predicate;
     use core_storage::Value;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn getter(map: &HashMap<String, Value>) -> impl Fn(&str) -> Option<Value> + '_ {
         move |f: &str| map.get(f).cloned()
+    }
+
+    #[test]
+    fn kmeans_centroids_are_unit_norm() {
+        let vecs = vec![(0, vec![3.0, 0.0, 0.0]), (1, vec![0.0, 4.0, 0.0])];
+        let cents = kmeans_fit(&vecs, 2, 1);
+        for c in cents {
+            let n = c.iter().map(|x| x * x).sum::<f64>().sqrt();
+            assert!((n - 1.0).abs() < 1e-9, "{n}");
+        }
+    }
+
+    /// Raw L2 would put `[3,0,0]` on a nearby large centroid while cosine (and
+    /// the unit vector `[1,0,0]`) prefer the x-axis centroid. Assignment must
+    /// L2-normalize first so scale-equivalent vectors share a cluster.
+    #[test]
+    fn scaled_vector_joins_same_ivf_cluster_as_unit() {
+        let pred = Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.5,
+        };
+        let spec = candidate_spec_approx(&pred);
+        let mut idx = SideIndex::default();
+        idx.load_ivf_state(
+            vec![vec![1.0, 0.0, 0.0], vec![2.5, 0.1, 0.0]],
+            BTreeMap::new(),
+            0,
+        );
+        idx.insert(&spec, 1, &getter(&emb(&[1.0, 0.0, 0.0])));
+        idx.insert(&spec, 2, &getter(&emb(&[3.0, 0.0, 0.0])));
+        assert_eq!(
+            idx.ivf_cluster_of(1),
+            idx.ivf_cluster_of(2),
+            "scale-equivalent vectors must share an IVF cluster; got {:?} vs {:?}",
+            idx.ivf_cluster_of(1),
+            idx.ivf_cluster_of(2)
+        );
+        assert_eq!(idx.ivf_cluster_of(1), Some(0));
     }
 
     #[test]

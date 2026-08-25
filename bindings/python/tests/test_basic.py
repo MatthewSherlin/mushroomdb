@@ -8,11 +8,19 @@ import time
 from mushroomdb import GraphDb
 
 
+def test_insert_node_label_then_key(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Org", "org-01", {"founded_year": 2010})
+    info = db.node_info("org-01")
+    assert info["label"] == "Org"
+    db.close()
+
+
 def test_round_trip_numeric_within(tmp_path):
     db = GraphDb.open(str(tmp_path / "db"))
-    db.insert_node("org-01", "Org", {"founded_year": 2010, "name": "Acme"})
-    db.insert_node("org-02", "Org", {"founded_year": 2011, "ok": True})
-    db.insert_node("org-03", "Org", {"founded_year": 2020, "rating": 0.5})
+    db.insert_node("Org", "org-01", {"founded_year": 2010, "name": "Acme"})
+    db.insert_node("Org", "org-02", {"founded_year": 2011, "ok": True})
+    db.insert_node("Org", "org-03", {"founded_year": 2020, "rating": 0.5})
     db.create_rule(
         {
             "name": "founded_within",
@@ -23,7 +31,6 @@ def test_round_trip_numeric_within(tmp_path):
             },
             "edge_type": "FOUNDED_WITHIN",
             "weight_prop": "score",
-            "max_edges": None,
         }
     )
 
@@ -64,9 +71,9 @@ def test_round_trip_numeric_within(tmp_path):
 
 def test_value_mapping_rejects_dict(tmp_path):
     db = GraphDb.open(str(tmp_path / "db"))
-    db.insert_node("p1", "Person", {"skills": ["rust", "graph"], "n": 1})
+    db.insert_node("Person", "p1", {"skills": ["rust", "graph"], "n": 1})
     with pytest.raises(TypeError, match="dict"):
-        db.insert_node("p2", "Person", {"nested": {"a": 1}})
+        db.insert_node("Person", "p2", {"nested": {"a": 1}})
     with pytest.raises(TypeError, match="dict"):
         db.set_prop("p1", "meta", {"a": 1})
     info = db.node_info("p1")
@@ -77,7 +84,7 @@ def test_value_mapping_rejects_dict(tmp_path):
 
 def test_set_prop_and_scalar_list_round_trip(tmp_path):
     db = GraphDb.open(str(tmp_path / "db"))
-    db.insert_node("n", "L", {"ok": True, "rating": 0.5})
+    db.insert_node("L", "n", {"ok": True, "rating": 0.5})
     db.set_prop("n", "ok", False)
     db.set_prop("n", "rating", 1.25)
     db.set_prop("n", "tags", ["a", ["b", "c"]])
@@ -121,7 +128,7 @@ def test_query_error_is_runtime_error_with_stage_prefix(tmp_path):
 def test_context_manager_closes(tmp_path):
     path = str(tmp_path / "db")
     with GraphDb.open(path) as db:
-        db.insert_node("k", "L", {})
+        db.insert_node("L", "k", {})
         assert db.node_info("k")["label"] == "L"
     with pytest.raises(RuntimeError, match="closed"):
         db.node_info("k")
@@ -184,8 +191,8 @@ def test_ingest_batch_duplicate_edge_not_counted(tmp_path):
     Mirrors HTTP /ingest duplicate-edge semantics from P9 T7."""
     db = GraphDb.open(str(tmp_path / "db"))
     # Create two nodes first via single inserts, then test edge-only batches.
-    db.insert_node("m", "N", {})
-    db.insert_node("n", "N", {})
+    db.insert_node("N", "m", {})
+    db.insert_node("N", "n", {})
     r1 = db.ingest_batch([], [{"edge_type": "REL", "src": "m", "dst": "n"}])
     assert r1["edges_inserted"] == 1  # new edge — counted
     r2 = db.ingest_batch([], [{"edge_type": "REL", "src": "m", "dst": "n"}])
@@ -200,7 +207,7 @@ def test_ingest_batch_duplicate_edge_not_counted(tmp_path):
 def test_stats_shape(tmp_path):
     """stats() returns a dict with the expected top-level keys."""
     db = GraphDb.open(str(tmp_path / "db"))
-    db.insert_node("x", "L", {"v": 1})
+    db.insert_node("L", "x", {"v": 1})
     s = db.stats()
     assert isinstance(s, dict)
     for key in ("nodes_live", "nodes_tombstoned", "edges", "rules"):
@@ -214,7 +221,7 @@ def test_stats_shape(tmp_path):
 def test_stats_rule_shape(tmp_path):
     """Each entry in stats()['rules'] has name/edges/tripped/fires/approximate."""
     db = GraphDb.open(str(tmp_path / "db"))
-    db.insert_node("p", "P", {"score": 10})
+    db.insert_node("P", "p", {"score": 10})
     db.create_rule({
         "name": "match_score",
         "src_label": "P",
@@ -241,8 +248,8 @@ def test_stats_rule_approximate_true(tmp_path):
     """stats()['rules'] exposes approximate=True for IVF-Flat rules."""
     db = GraphDb.open(str(tmp_path / "db"))
     # Two nodes with vectors so the rule can index them.
-    db.insert_node("a", "Item", {"vec": [1.0, 0.0]})
-    db.insert_node("b", "Item", {"vec": [0.9, 0.1]})
+    db.insert_node("Item", "a", {"vec": [1.0, 0.0]})
+    db.insert_node("Item", "b", {"vec": [0.9, 0.1]})
     db.create_rule({
         "name": "approx_sim",
         "src_label": "Item",
@@ -268,8 +275,8 @@ def test_stats_rule_approximate_true(tmp_path):
 def test_delete_edge_happy_path(tmp_path):
     """delete_edge removes a user-inserted edge and returns True; second call returns False."""
     db = GraphDb.open(str(tmp_path / "db"))
-    db.insert_node("a", "Thing", {})
-    db.insert_node("b", "Thing", {})
+    db.insert_node("Thing", "a", {})
+    db.insert_node("Thing", "b", {})
     db.insert_edge("KNOWS", "a", "b")
 
     assert "b" in db.neighbors("a", "KNOWS", "out")
@@ -286,8 +293,8 @@ def test_delete_edge_happy_path(tmp_path):
 def test_delete_edge_derived_raises(tmp_path):
     """delete_edge on a rule-derived edge should raise (derived edges are rule-owned)."""
     db = GraphDb.open(str(tmp_path / "db"))
-    db.insert_node("x", "Org", {"year": 2010})
-    db.insert_node("y", "Org", {"year": 2011})
+    db.insert_node("Org", "x", {"year": 2010})
+    db.insert_node("Org", "y", {"year": 2011})
     db.create_rule({
         "name": "r",
         "src_label": "Org",
@@ -309,7 +316,7 @@ def test_batch_edges_happy_path(tmp_path):
     """batch_edges inserts and deletes edges in one atomic WAL frame."""
     db = GraphDb.open(str(tmp_path / "db"))
     for k in ("a", "b", "c", "d"):
-        db.insert_node(k, "N", {})
+        db.insert_node("N", k, {})
     db.insert_edge("KNOWS", "a", "b")  # will be deleted
 
     result = db.batch_edges(
@@ -332,8 +339,8 @@ def test_batch_edges_happy_path(tmp_path):
 def test_batch_edges_bad_edge_is_atomic(tmp_path):
     """batch_edges with a nonexistent-node edge should error; inserts before it roll back."""
     db = GraphDb.open(str(tmp_path / "db"))
-    db.insert_node("a", "N", {})
-    db.insert_node("b", "N", {})
+    db.insert_node("N", "a", {})
+    db.insert_node("N", "b", {})
 
     # Insert a valid edge first to confirm it's absent after rollback
     with pytest.raises(Exception):

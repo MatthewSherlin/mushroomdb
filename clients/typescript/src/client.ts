@@ -15,14 +15,17 @@
 import {
   MushroomError,
   type AlgoReport,
-  type CellValue,
   type DegreeConfig,
   type DegreeReport,
+  type Explanation,
   type IngestReport,
   type IngestRequest,
+  type Neighborhood,
+  type NodeInfo,
   type PageRankConfig,
   type PageRankReport,
   type QueryResult,
+  type RuleDef,
   type Stats,
   type SuggestReport,
   type WccConfig,
@@ -41,13 +44,20 @@ export type {
   CellValue,
   DegreeConfig,
   DegreeReport,
+  Explanation,
   IngestEdge,
   IngestOptions,
   IngestReport,
   IngestRequest,
+  Neighborhood,
+  NodeInfo,
   PageRankConfig,
   PageRankReport,
+  PredicateKind,
+  PredicateSummary,
   QueryResult,
+  RuleDef,
+  RulePredicate,
   RuleStats,
   RuleSuggestion,
   Stats,
@@ -56,6 +66,15 @@ export type {
   WccReport,
 } from "./types.js";
 export { MushroomError };
+
+/** Optional constructor flags for {@link MushroomClient}. */
+export interface ClientOptions {
+  /**
+   * When set, sent as `Authorization: Bearer <token>` on every HTTP fetch.
+   * Cookie auth is a browser/explorer concern and is not implemented here.
+   */
+  token?: string;
+}
 
 /** Parameters for a Cypher query. Values must be JSON scalars. */
 export type QueryParams = Record<string, string | number | boolean>;
@@ -79,14 +98,17 @@ export interface QueryOptions {
 export class MushroomClient {
   private readonly baseUrl: string;
   private readonly wsBase: string;
+  private readonly token: string | undefined;
 
   /**
    * @param baseUrl  HTTP base URL of the mushroomdb server, e.g.
    *                 `"http://127.0.0.1:8080"`. Trailing slash is stripped.
+   * @param opts     Optional `{ token }` — sent as `Authorization: Bearer`.
    */
-  constructor(baseUrl: string) {
+  constructor(baseUrl: string, opts?: ClientOptions) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.wsBase = this.baseUrl.replace(/^http/, "ws");
+    this.token = opts?.token;
   }
 
   // -------------------------------------------------------------------------
@@ -99,6 +121,10 @@ export class MushroomClient {
 
   private wsUrl(path: string): string {
     return `${this.wsBase}${path}`;
+  }
+
+  private authHeaders(): Record<string, string> {
+    return this.token ? { Authorization: `Bearer ${this.token}` } : {};
   }
 
   /**
@@ -114,6 +140,7 @@ export class MushroomClient {
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
+        ...this.authHeaders(),
         ...(init?.headers ?? {}),
       },
     });
@@ -222,6 +249,76 @@ export class MushroomClient {
     });
   }
 
+  /**
+   * Explain rule-derived edges between two node keys.
+   *
+   * Wraps `GET /explain?a=&b=`.
+   */
+  async explain(a: string, b: string): Promise<Explanation[]> {
+    const qs = new URLSearchParams({ a, b });
+    return this.fetchJson<Explanation[]>(`/explain?${qs.toString()}`);
+  }
+
+  /**
+   * Create a derivation rule.
+   *
+   * Wraps `POST /rules`. The server acquires the write lock, validates the
+   * {@link RuleDef}, and backfills matching pairs.
+   */
+  async createRule(def: RuleDef): Promise<void> {
+    await this.fetchJson("/rules", {
+      method: "POST",
+      body: JSON.stringify(def),
+    });
+  }
+
+  /**
+   * Fetch a node by key.
+   *
+   * Wraps `GET /node/{key}`. Returns `null` when the server answers 404
+   * (unknown key). Other HTTP errors throw {@link MushroomError}.
+   */
+  async node(key: string): Promise<NodeInfo | null> {
+    const resp = await fetch(this.url(`/node/${encodeURIComponent(key)}`), {
+      headers: {
+        Accept: "application/json",
+        ...this.authHeaders(),
+      },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const body: any = await resp.json();
+    if (resp.status === 404) {
+      return null;
+    }
+    if (!resp.ok) {
+      const detail: string =
+        typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
+      throw new MushroomError(detail);
+    }
+    return body as NodeInfo;
+  }
+
+  /**
+   * Depth-N neighborhood of a node.
+   *
+   * Wraps `GET /node/{key}/neighborhood`. Default depth is the server's
+   * (1). Columns are `key`, `label`, `depth`.
+   */
+  async neighborhood(
+    key: string,
+    opts?: { depth?: number },
+  ): Promise<Neighborhood> {
+    const qs = new URLSearchParams();
+    if (opts?.depth !== undefined) {
+      qs.set("depth", String(opts.depth));
+    }
+    const query = qs.toString();
+    const path = `/node/${encodeURIComponent(key)}/neighborhood${
+      query ? `?${query}` : ""
+    }`;
+    return this.fetchJson<Neighborhood>(path);
+  }
+
   // -------------------------------------------------------------------------
   // WebSocket
   // -------------------------------------------------------------------------
@@ -256,7 +353,11 @@ export class MushroomClient {
     opts: SubscribeOptions,
     onEvent: (event: import("./types.js").DbEvent) => void,
   ): Promise<SubscribeHandle> {
-    return wsSubscribe(this.wsUrl("/subscribe"), opts, onEvent);
+    let url = this.wsUrl("/subscribe");
+    if (this.token) {
+      url += `?token=${encodeURIComponent(this.token)}`;
+    }
+    return wsSubscribe(url, opts, onEvent);
   }
 }
 
