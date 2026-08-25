@@ -176,7 +176,7 @@ The two-command flow uses the release binary with the UI embedded:
 
 ```text
 mushroomdb demo ./db
-mushroomdb serve ./db --addr 127.0.0.1:8080
+mushroomdb serve ./db
 ```
 
 Build the embedded binary first:
@@ -190,7 +190,7 @@ cp target/release/mushroomdb ~/.local/bin/  # or any directory on PATH
 Or run directly from the source tree (no copy needed):
 
 ```text
-./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db --addr 127.0.0.1:8080
+./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db
 ```
 
 Open `http://127.0.0.1:8080/`. When a token is configured, open
@@ -252,7 +252,7 @@ Six predicate kinds ship today. Predicates compose via `All(...)` (AND, score = 
 | Predicate | What it tests |
 |---|---|
 | `KeyMatch` | FK equality — source field matches destination key |
-| `FieldEqual` | Exact string match on a named field |
+| `FieldEqual` | Exact match on a named scalar field (string, int, float, bool) |
 | `Overlap` | Jaccard on list-valued fields, min threshold |
 | `NumericWithin` | Absolute numeric difference within a tolerance; score = `1 - |Δ|/tolerance` |
 | `GeoRadius` | Haversine distance on `[lat, lon]` fields within km; score = `1 - dist/radius` |
@@ -348,12 +348,12 @@ graph-db/
 │   ├── core-query        # pull-based interpreter; traversal ops + Cypher subset
 │   ├── core-api          # the one public Rust interface; typed error enums
 │   ├── arrow-bridge      # results ↔ Arrow buffers
-│   ├── bindings-python   # PyO3 thin wrapper over core-api
 │   ├── server            # axum HTTP + WebSocket; serves UI
+│   ├── cli               # mushroomdb binary
 │   └── sim-harness       # DST: virtual clock, fault-injecting IO, seeded runner
 ├── ui/                   # TypeScript + Vite graph explorer
-├── bindings/python/      # maturin package
-└── cli/                  # mushroomdb binary
+├── bindings/python/      # PyO3 / maturin
+└── clients/typescript/   # HTTP + WebSocket client
 ```
 
 Dependency rule (inward only):
@@ -367,8 +367,9 @@ on open by replaying rule application.
 Concurrency: single writer, many readers via `RwLock`-backed `SharedDb`.
 Lock-free epoch snapshot readers are on the roadmap.
 
-Results surface as Apache Arrow everywhere: zero-copy to pandas/polars in
-Python bindings, Arrow IPC over WebSocket to the UI.
+HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
+(pandas/polars zero-copy is not wired yet). JSON is available via
+`?format=json`.
 
 ---
 
@@ -381,7 +382,7 @@ Python bindings, Arrow IPC over WebSocket to the UI.
 | Approximate vector mode is opt-in | `approximate: true` enables IVF-Flat candidate selection. Per-query recall ≥ 0.90 quiesced; ≥ 0.85 post-rebuild. Review the recall trade-off before using it in completeness-critical workloads. |
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
-| Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE (manual edges only), MATCH…DETACH DELETE (node deletes), MATCH…DELETE (isolated-node or edge deletes), and MERGE (single-key match-or-create) are supported. SET RHS accepts a literal or a `$param` reference; expression RHS (`n.x + 1`) is rejected with a named error. Combined MATCH…SET…RETURN is rejected; multi-statement transactions are not supported. Each write statement produces one WAL Batch frame (one fsync). See [`docs/site/query.md`](docs/site/query.md) coverage table. |
+| Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE (manual edges only), MATCH…DETACH DELETE (node deletes), MATCH…DELETE (isolated-node or edge deletes), and MERGE (single-key match-or-create) are supported. SET RHS accepts a literal, `$param`, or arithmetic (`n.x + 1`). Combined MATCH…SET…RETURN is rejected (Phase 2). Multi-statement transactions are not supported. Each write statement produces one WAL Batch frame (one fsync). See [`docs/site/query.md`](docs/site/query.md) coverage table. |
 | Crash-atomic write batches; no interactive transactions or isolation | `db.write_batch(\|b\| { b.insert_node(...); b.set_prop(...); b.delete_node(...); })` commits all ops in one `WalRecord::Batch` frame (one fsync). On crash replay the frame is all-or-nothing: a torn frame replays as none-applied. Rules fire per op in order — semantically identical to sequential singles. Error semantics: validate-then-apply — if op N fails validation (duplicate key, unknown key, rule-owned edge) the entire batch is rejected and nothing is written or applied. **Not isolated:** readers may observe intermediate states while a committed batch is being applied in memory. Per-query Cypher writes (`query_write`) also produce one Batch frame per statement. Multi-statement BEGIN/COMMIT interactive transactions are not supported in v1. |
 | Cypher aggregations | `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` are supported both as single aggregates and as grouped aggregates (`RETURN a, COUNT(*)`). Multiple group keys and multiple aggregates per query are allowed. Group count is capped at 1,000,000 distinct keys. |
 | Variable-length paths: max hops capped at 10 | `-[r:TYPE*min..max]->` and `shortestPath` are supported. Max hops is hard-capped at 10; unbounded forms (`*min..`) are rejected at parse time. Intermediate results are capped at 1,000,000 rows. See [`docs/site/query.md`](docs/site/query.md). |
@@ -461,14 +462,14 @@ Full walkthrough, tool reference, and Claude Desktop setup:
 
 | Priority | Item |
 |---|---|
-| Medium | Differential-dataflow query subscriptions (incremental result-set updates, not just edge events) |
-| Medium | General view expressions (computed transforms and cross-label aggregates) |
-| Medium | mmap-backed storage (deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`) |
-| Medium | Lock-free epoch snapshot readers (deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`) |
-| Medium | Multi-statement transactions (BEGIN/COMMIT) |
-| Medium | Expanded Cypher surface (`CASE` expressions, subqueries, `IS NULL/IS NOT NULL`, `+`/`/` arithmetic) |
-| Low | Native TypeScript bindings (napi-rs; wait-list — HTTP `mushroomdb-client` is the TS surface) |
-| Low | WASM playground |
+| Next | Cypher paste-subset: `IN`, `DISTINCT`, `MATCH … SET … RETURN`, `MERGE ON CREATE` (`docs/superpowers/plans/2026-08-25-phase-2-app-query.md`) |
+| Next | `All` predicates intersect indexes (not `parts[0]` only) |
+| Medium | Packed CSR + real columns + fast snapshot open (storage physics) |
+| Medium | In-tree HNSW + `find_similar` from a raw vector |
+| Medium | 3-node / via-hop linking rules |
+| Medium | mmap snapshots; lock-free epoch readers |
+| Medium | Query result subscriptions; multi-statement `BEGIN/COMMIT` |
+| Low | `CASE` / subqueries / `UNION`; napi-rs; WASM |
 
 ---
 

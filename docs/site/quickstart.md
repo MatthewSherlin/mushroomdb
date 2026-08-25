@@ -25,7 +25,7 @@ Run the two-command flow:
 
 ```text
 ./target/release/mushroomdb demo ./db
-./target/release/mushroomdb serve ./db --addr 127.0.0.1:8080
+./target/release/mushroomdb serve ./db
 ```
 
 Open `http://127.0.0.1:8080/` in a browser. The explorer loads the demo
@@ -35,7 +35,7 @@ rule sets).
 You can combine both commands on one line:
 
 ```text
-./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db --addr 127.0.0.1:8080
+./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db
 ```
 
 Expected output:
@@ -121,8 +121,9 @@ Source: `crates/core-api/examples/quickstart.rs`.
 After the first tagged release, these one-liners will be available:
 
 ```text
-# Docker
-docker run --rm -p 8080:8080 ghcr.io/matthewsherlin/mushroomdb
+# Docker (non-loopback requires a token)
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=changeme ghcr.io/matthewsherlin/mushroomdb
+# then open http://localhost:8080/?token=changeme
 
 # npm
 npx mushroomdb --help
