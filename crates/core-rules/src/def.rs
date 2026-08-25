@@ -133,6 +133,32 @@ impl RuleDef {
 /// error when this cap is exceeded.
 pub const MAX_PREDICATE_NESTING_DEPTH: usize = 4;
 
+/// Per-source top-k when a scored (non-KeyMatch-rooted) rule omits `max_edges`.
+pub const DEFAULT_SCORED_TOP_K: u64 = 32;
+
+/// Per-source top-k when a KeyMatch-rooted rule omits `max_edges`.
+pub const DEFAULT_KEYMATCH_TOP_K: u64 = 1;
+
+/// KeyMatch itself, or `All` whose first element is KeyMatch-rooted.
+/// `Any` is never KeyMatch-rooted — the FK fast-path does not apply to OR.
+pub fn is_keymatch_rooted(p: &Predicate) -> bool {
+    match p {
+        Predicate::KeyMatch { .. } => true,
+        Predicate::All(parts) => !parts.is_empty() && is_keymatch_rooted(&parts[0]),
+        Predicate::Any(_) => false,
+        _ => false,
+    }
+}
+
+/// Default `RuleDef.max_edges` for suggest, auto-FK, demo, and HTTP omit.
+pub fn default_max_edges(predicate: &Predicate) -> u64 {
+    if is_keymatch_rooted(predicate) {
+        DEFAULT_KEYMATCH_TOP_K
+    } else {
+        DEFAULT_SCORED_TOP_K
+    }
+}
+
 /// Returns true when the predicate is `VectorSimilar` itself, or an `All`
 /// whose first element is `VectorSimilar` — the only predicates that may use
 /// the IVF-Flat approximate candidate path (`approximate: true`).
@@ -1245,6 +1271,44 @@ mod tests {
             min: 1.5,
         };
         assert!(bad_vec.validate().is_err());
+    }
+
+    #[test]
+    fn default_max_edges_keymatch_is_1_else_32() {
+        assert_eq!(DEFAULT_SCORED_TOP_K, 32);
+        assert_eq!(DEFAULT_KEYMATCH_TOP_K, 1);
+        assert_eq!(
+            default_max_edges(&Predicate::KeyMatch { field: "fk".into() }),
+            DEFAULT_KEYMATCH_TOP_K
+        );
+        assert_eq!(
+            default_max_edges(&Predicate::All(vec![Predicate::KeyMatch {
+                field: "fk".into()
+            }])),
+            DEFAULT_KEYMATCH_TOP_K
+        );
+        assert_eq!(
+            default_max_edges(&Predicate::All(vec![Predicate::All(vec![
+                Predicate::KeyMatch { field: "fk".into() }
+            ])])),
+            DEFAULT_KEYMATCH_TOP_K
+        );
+        assert_eq!(
+            default_max_edges(&Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            }),
+            DEFAULT_SCORED_TOP_K
+        );
+        assert_eq!(
+            default_max_edges(&Predicate::Any(vec![Predicate::KeyMatch {
+                field: "fk".into()
+            }])),
+            DEFAULT_SCORED_TOP_K
+        );
+        assert!(!is_keymatch_rooted(&Predicate::FieldEqual {
+            field: "f".into()
+        }));
     }
 }
 

@@ -1,6 +1,6 @@
 use core_api::{
-    Direction, Explanation, GraphDb as CoreDb, GraphError, NodeInfo, PredicateSummary, ResultSet,
-    RuleDef, Value,
+    default_max_edges, Direction, Explanation, GraphDb as CoreDb, GraphError, NodeInfo,
+    PredicateSummary, ResultSet, RuleDef, Value,
 };
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -482,10 +482,19 @@ fn dict_to_props(props: &Bound<'_, PyDict>) -> PyResult<Vec<(String, Value)>> {
 }
 
 fn rule_from_py(py: Python<'_>, rule: &Bound<'_, PyAny>) -> PyResult<RuleDef> {
+    let missing_max_edges = match rule.downcast::<PyDict>() {
+        Ok(d) => !d.contains("max_edges")?,
+        Err(_) => false,
+    };
     let json = py.import("json")?;
     let s: String = json.call_method1("dumps", (rule,))?.extract()?;
-    serde_json::from_str(&s)
-        .map_err(|e| PyValueError::new_err(format!("create_rule JSON does not match RuleDef: {e}")))
+    let mut def: RuleDef = serde_json::from_str(&s).map_err(|e| {
+        PyValueError::new_err(format!("create_rule JSON does not match RuleDef: {e}"))
+    })?;
+    if missing_max_edges {
+        def.max_edges = Some(default_max_edges(&def.predicate));
+    }
+    Ok(def)
 }
 
 fn result_set_to_rows(py: Python<'_>, rs: &ResultSet) -> PyResult<Vec<Py<PyDict>>> {

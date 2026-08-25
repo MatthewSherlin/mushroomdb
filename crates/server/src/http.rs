@@ -12,6 +12,7 @@
 
 use crate::json::{
     node_edges_json, node_info_json, params_from_json, parse_ingest_edges, result_set_json,
+    rule_def_from_json,
 };
 use crate::AppState;
 use arrow_bridge::to_ipc_bytes;
@@ -23,7 +24,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use core_api::{
     is_write_query, json_to_rows, AutoFk, DegreeConfig, Dir, GraphError, IngestOptions,
-    PageRankConfig, RuleDef, SharedDb, SuggestConfig, WccConfig, SUGGEST_DEFAULT_SEED,
+    PageRankConfig, SharedDb, SuggestConfig, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -524,9 +525,9 @@ async fn suggest(State(state): State<AppState>) -> Response {
 }
 
 async fn create_rule(State(state): State<AppState>, Json(body): Json<Js>) -> Response {
-    let def: RuleDef = match serde_json::from_value(body) {
+    let def = match rule_def_from_json(body) {
         Ok(d) => d,
-        Err(e) => return err_response(e.to_string()),
+        Err(e) => return err_response(e),
     };
     let name = def.name.clone();
     let res = {

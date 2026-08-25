@@ -518,7 +518,12 @@ pub fn compute_view_value(
     match &def.source {
         ViewSource::Degree { .. } => Some(Value::Int(neighbors.len() as i64)),
         ViewSource::NeighborAgg { agg, prop, .. } => match agg {
-            AggFn::Count => Some(Value::Int(neighbors.len() as i64)),
+            AggFn::Count => Some(Value::Int(
+                neighbors
+                    .iter()
+                    .filter(|&&n| props.get(n, prop).is_some())
+                    .count() as i64,
+            )),
             AggFn::Sum => {
                 let mut sum = 0.0f64;
                 for &nbr in neighbors {
@@ -615,11 +620,14 @@ fn update_node_view(
         ViewSource::NeighborAgg { agg, prop, .. } => {
             match agg {
                 AggFn::Count => {
+                    let has_prop = props.get(neighbor, prop).is_some();
                     let current = match props.get(subject, &def.view_prop) {
                         Some(Value::Int(n)) => *n,
                         _ => 0,
                     };
-                    let new_val = if inserted {
+                    let new_val = if !has_prop {
+                        current
+                    } else if inserted {
                         current + 1
                     } else {
                         (current - 1).max(0)
@@ -749,6 +757,28 @@ mod tests {
         let c0 = ids.get("c0").unwrap();
         // p0=3.0 + p1=7.0
         assert_eq!(props.get(c0, "score_sum"), Some(&Value::Float(10.0)));
+    }
+
+    #[test]
+    fn neighbor_agg_count_skips_missing_prop() {
+        let (mut vs, mut props, topo, ids, syms, labels) = make_setup();
+        let p1 = ids.get("p1").unwrap();
+        props.remove(p1, "score");
+        let def = ViewDef {
+            name: "city_score_n".into(),
+            label: "City".into(),
+            view_prop: "score_n".into(),
+            source: ViewSource::NeighborAgg {
+                edge_type: "LIVES_IN".into(),
+                direction: Direction::In,
+                agg: AggFn::Count,
+                prop: "score".into(),
+            },
+        };
+        vs.create_view(def, &mut props, &topo, &ids, &syms, &labels)
+            .unwrap();
+        let c0 = ids.get("c0").unwrap();
+        assert_eq!(props.get(c0, "score_n"), Some(&Value::Int(1)));
     }
 
     #[test]

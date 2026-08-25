@@ -31,7 +31,6 @@ def test_round_trip_numeric_within(tmp_path):
             },
             "edge_type": "FOUNDED_WITHIN",
             "weight_prop": "score",
-            "max_edges": None,
         }
     )
 

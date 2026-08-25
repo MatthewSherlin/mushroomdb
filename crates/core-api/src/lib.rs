@@ -10,8 +10,9 @@ pub use algo::{
 pub use core_query::{CmpOp, Dir, Filter, ResultSet};
 pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;
 pub use core_rules::{
-    AggFn, Predicate, RuleDef, RuleSuggestion, SuggestConfig, SuggestReport, ViewDef, ViewSource,
-    ViewStore,
+    default_max_edges, is_keymatch_rooted, AggFn, Predicate, RuleDef, RuleSuggestion,
+    SuggestConfig, SuggestReport, ViewDef, ViewSource, ViewStore, DEFAULT_KEYMATCH_TOP_K,
+    DEFAULT_SCORED_TOP_K,
 };
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{

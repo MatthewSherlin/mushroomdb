@@ -76,7 +76,7 @@ fn org_id_auto_links_and_later_insert_fires_rule() {
         }
     );
     assert_eq!(fk.weight_prop, None);
-    assert_eq!(fk.max_edges, None);
+    assert_eq!(fk.max_edges, Some(1));
 
     assert_eq!(
         db.neighbors("p1", "ORG", Direction::Out).unwrap(),
@@ -135,6 +135,30 @@ fn org_id_auto_links_and_later_insert_fires_rule() {
         db.neighbors("p4", "ORG", Direction::Out).unwrap(),
         vec!["beta".to_string()]
     );
+}
+
+#[test]
+fn auto_fk_keymatch_is_top_1() {
+    // existing ingest fixture; after ingest, rule auto_fk_person_org_id
+    let dir = tmp("ingest-auto-fk-topk");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "acme", vec![]).unwrap();
+    db.insert_node("Org", "beta", vec![]).unwrap();
+    db.ingest(
+        "Person",
+        vec![
+            row(&[("id", "p1"), ("org_id", "acme")]),
+            row(&[("id", "p2"), ("org_id", "beta")]),
+        ],
+        &IngestOptions::default(),
+    )
+    .unwrap();
+    let r = db
+        .rules()
+        .into_iter()
+        .find(|r| r.name == "auto_fk_person_org_id")
+        .unwrap();
+    assert_eq!(r.max_edges, Some(1));
 }
 
 /// Binding: matching keys under more than one label → no rule, reason reported.

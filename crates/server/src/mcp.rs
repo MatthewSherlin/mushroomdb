@@ -41,9 +41,10 @@
 
 use crate::json::{
     node_edges_json, node_info_json, params_from_json, parse_ingest_edges, result_set_json,
+    rule_def_from_json,
 };
 use core_api::{
-    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, RuleDef, SharedDb, Value,
+    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, SharedDb, Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -254,9 +255,9 @@ fn tool_ingest(db: &SharedDb, args: &Js) -> CallOutcome {
 }
 
 fn tool_create_rule(db: &SharedDb, args: &Js) -> CallOutcome {
-    let def: RuleDef = match serde_json::from_value(args.clone()) {
+    let def = match rule_def_from_json(args.clone()) {
         Ok(d) => d,
-        Err(e) => return CallOutcome::ToolErr(e.to_string()),
+        Err(e) => return CallOutcome::ToolErr(e),
     };
     let name = def.name.clone();
     let res = {

@@ -4,9 +4,9 @@
 //! prints what the lib functions return.
 
 use core_api::{
-    wal_commit_count_at, AlgoDir, DegreeConfig, Explanation, GraphDb, IngestOptions,
-    PageRankConfig, Predicate, ResultSet, RuleDef, RuleSuggestion, SharedDb, Stats, Value,
-    WccConfig,
+    default_max_edges, wal_commit_count_at, AlgoDir, DegreeConfig, Explanation, GraphDb,
+    IngestOptions, PageRankConfig, Predicate, ResultSet, RuleDef, RuleSuggestion, SharedDb, Stats,
+    Value, WccConfig,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -519,56 +519,64 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             }
             auto_fk_rules.extend(report.rules_created);
         }
+        let skill_fit = Predicate::Overlap {
+            field: "skills".into(),
+            min: 0.5,
+        };
+        let skill_fit_k = Some(default_max_edges(&skill_fit));
         w.create_rule(RuleDef {
             name: "skill_fit".into(),
             src_label: "Person".into(),
             dst_label: "Project".into(),
-            predicate: Predicate::Overlap {
-                field: "skills".into(),
-                min: 0.5,
-            },
+            predicate: skill_fit,
             edge_type: "FIT".into(),
             weight_prop: Some("score".into()),
-            max_edges: None,
+            max_edges: skill_fit_k,
             approximate: false,
         })?;
+        let founded_within = Predicate::NumericWithin {
+            field: "founded_year".into(),
+            tolerance: 2.0,
+        };
+        let founded_within_k = Some(default_max_edges(&founded_within));
         w.create_rule(RuleDef {
             name: "founded_within".into(),
             src_label: "Org".into(),
             dst_label: "Org".into(),
-            predicate: Predicate::NumericWithin {
-                field: "founded_year".into(),
-                tolerance: 2.0,
-            },
+            predicate: founded_within,
             edge_type: "FOUNDED_WITHIN".into(),
             weight_prop: Some("score".into()),
-            max_edges: None,
+            max_edges: founded_within_k,
             approximate: false,
         })?;
+        let nearby_office = Predicate::GeoRadius {
+            field: "office".into(),
+            km: 50.0,
+        };
+        let nearby_office_k = Some(default_max_edges(&nearby_office));
         w.create_rule(RuleDef {
             name: "nearby_office".into(),
             src_label: "Org".into(),
             dst_label: "Org".into(),
-            predicate: Predicate::GeoRadius {
-                field: "office".into(),
-                km: 50.0,
-            },
+            predicate: nearby_office,
             edge_type: "NEARBY_OFFICE".into(),
             weight_prop: Some("score".into()),
-            max_edges: None,
+            max_edges: nearby_office_k,
             approximate: false,
         })?;
+        let similar_interests = Predicate::VectorSimilar {
+            field: "embedding".into(),
+            min: 0.8,
+        };
+        let similar_interests_k = Some(default_max_edges(&similar_interests));
         w.create_rule(RuleDef {
             name: "similar_interests".into(),
             src_label: "Person".into(),
             dst_label: "Person".into(),
-            predicate: Predicate::VectorSimilar {
-                field: "embedding".into(),
-                min: 0.8,
-            },
+            predicate: similar_interests,
             edge_type: "SIMILAR".into(),
             weight_prop: Some("score".into()),
-            max_edges: None,
+            max_edges: similar_interests_k,
             approximate: false,
         })?;
     }

@@ -1,4 +1,4 @@
-use crate::def::{evaluate, NodeView, Predicate, RuleDef};
+use crate::def::{evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef};
 use crate::index::{candidate_spec, candidate_spec_approx, CandidateSpec, RuleIndex};
 use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -147,18 +147,6 @@ fn src_lookup_spec_for_pred(approximate: bool, p: &Predicate) -> CandidateSpec<'
     }
 }
 
-/// Returns true if the predicate (or its leading All part) is KeyMatch.
-fn predicate_is_keymatch(p: &Predicate) -> bool {
-    match p {
-        Predicate::KeyMatch { .. } => true,
-        Predicate::All(parts) => !parts.is_empty() && predicate_is_keymatch(&parts[0]),
-        // Any predicates use Union candidate specs for OR semantics; the FK
-        // fast-path does not apply even if a branch happens to be KeyMatch.
-        Predicate::Any(_) => false,
-        _ => false,
-    }
-}
-
 /// Extract the FK field name from a KeyMatch (or All-leading-KeyMatch) predicate.
 fn keymatch_field(p: &Predicate) -> Option<&str> {
     match p {
@@ -218,7 +206,7 @@ fn compute_desired(
     } else {
         // n is dst: probe src_side to find src candidates.
         let src_spec = src_lookup_spec_for(def);
-        if predicate_is_keymatch(&def.predicate) {
+        if is_keymatch_rooted(&def.predicate) {
             // Synthetic getter: returns n's key for the FK field so we find
             // src nodes whose FK value points to n.
             let key_getter = |_: &str| Some(Value::Str(n_key.to_string()));

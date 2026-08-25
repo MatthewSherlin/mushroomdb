@@ -507,3 +507,15 @@ fn suggestions_sorted_by_est_edges_desc() {
         );
     }
 }
+
+#[test]
+fn suggest_never_emits_uncapped_max_edges() {
+    // ingest a small two-label graph with overlapping tags
+    let dir = build_fixture("suggest-topk");
+    let db = GraphDb::open(&dir).unwrap();
+    let s = db.suggest_rules();
+    assert!(!s.is_empty());
+    for row in s {
+        assert!(row.def.max_edges.is_some(), "{}", row.def.name);
+    }
+}

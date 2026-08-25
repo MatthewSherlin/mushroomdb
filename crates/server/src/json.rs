@@ -3,7 +3,7 @@
 //! Cells are untagged JSON scalars (the inverse of [`core_api::json_to_value`]),
 //! not `Value`'s internally-tagged serde form.
 
-use core_api::{json_to_value, EdgeInfo, NodeInfo, ResultSet, Value};
+use core_api::{default_max_edges, json_to_value, EdgeInfo, NodeInfo, ResultSet, RuleDef, Value};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
 
@@ -108,4 +108,15 @@ pub(crate) fn parse_ingest_edges(v: &Js) -> Result<Vec<(String, String, String)>
         out.push((edge_type.to_string(), src.to_string(), dst.to_string()));
     }
     Ok(out)
+}
+
+/// Deserialize a `RuleDef` from HTTP/MCP JSON. Omitted or null `max_edges`
+/// fills `default_max_edges`. Do not add `#[serde(default)]` on
+/// `RuleDef.max_edges` — bincode is positional.
+pub(crate) fn rule_def_from_json(v: Js) -> Result<RuleDef, String> {
+    let mut def: RuleDef = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    if def.max_edges.is_none() {
+        def.max_edges = Some(default_max_edges(&def.predicate));
+    }
+    Ok(def)
 }

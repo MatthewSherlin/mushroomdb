@@ -992,6 +992,16 @@ async fn create_rule_http_and_validation() {
         json!({"ok": true, "name": "founded_within"})
     );
     assert!(db.read().rules().iter().any(|r| r.name == "founded_within"));
+    assert_eq!(
+        db.read()
+            .rules()
+            .iter()
+            .find(|r| r.name == "founded_within")
+            .unwrap()
+            .max_edges,
+        Some(32),
+        "JSON null max_edges fills default scored top-k"
+    );
 
     let (status, body, _) = send(
         app,
@@ -1016,6 +1026,47 @@ async fn create_rule_http_and_validation() {
     assert!(
         err.contains("invalid rule:"),
         "engine message verbatim, got {err}"
+    );
+}
+
+/// Binding: omitted JSON `max_edges` fills `default_max_edges` (scored=32, KeyMatch=1).
+#[tokio::test]
+async fn create_rule_http_omitted_max_edges_fills_default() {
+    let (app, db) = open("rules-omit-max");
+    db.write().insert_node("Org", "o1", vec![]).unwrap();
+    db.write()
+        .insert_node(
+            "Person",
+            "p1",
+            vec![("org_id".into(), Value::Str("o1".into()))],
+        )
+        .unwrap();
+
+    let (status, _, _) = send(
+        app.clone(),
+        json_req(
+            "POST",
+            "/rules",
+            json!({
+                "name": "works_at",
+                "src_label": "Person",
+                "dst_label": "Org",
+                "predicate": {"KeyMatch": {"field": "org_id"}},
+                "edge_type": "WORKS_AT",
+                "weight_prop": null
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        db.read()
+            .rules()
+            .iter()
+            .find(|r| r.name == "works_at")
+            .unwrap()
+            .max_edges,
+        Some(1)
     );
 }
 

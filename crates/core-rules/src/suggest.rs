@@ -3,7 +3,7 @@
 /// The database proposes its own schema: call [`suggest_rules`] to get a ranked list of
 /// candidate [`RuleDef`]s with estimated edge counts and example pairs. No rule is
 /// created automatically — the caller must call `db.create_rule(suggestion.def)` explicitly.
-use crate::def::{evaluate, NodeView, Predicate, RuleDef};
+use crate::def::{default_max_edges, evaluate, NodeView, Predicate, RuleDef};
 use core_storage::{list_tokens, Value, ValueKey};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -452,6 +452,7 @@ pub fn suggest_rules(
                         src_label.to_lowercase(),
                         dst_label.to_lowercase(),
                     );
+                    let max_edges = Some(default_max_edges(&pred));
                     let def = RuleDef {
                         name,
                         src_label: src_label.to_string(),
@@ -459,7 +460,7 @@ pub fn suggest_rules(
                         predicate: pred,
                         edge_type: format!("{base}_OF"),
                         weight_prop: None,
-                        max_edges: None,
+                        max_edges,
                         approximate: false,
                     };
                     let examples_preview: Vec<String> = fp
@@ -568,6 +569,7 @@ pub fn suggest_rules(
                         src_label.to_lowercase(),
                         dst_label.to_lowercase(),
                     );
+                    let max_edges = Some(default_max_edges(&pred));
                     let def = RuleDef {
                         name,
                         src_label: src_label.to_string(),
@@ -575,7 +577,7 @@ pub fn suggest_rules(
                         predicate: pred,
                         edge_type: format!("OVERLAPS_{}", field.to_uppercase()),
                         weight_prop: Some("score".into()),
-                        max_edges: None,
+                        max_edges,
                         approximate: false,
                     };
                     let rationale = format!(
@@ -653,6 +655,7 @@ pub fn suggest_rules(
                         src_label.to_lowercase(),
                         dst_label.to_lowercase(),
                     );
+                    let max_edges = Some(default_max_edges(&pred));
                     let def = RuleDef {
                         name,
                         src_label: src_label.to_string(),
@@ -660,7 +663,7 @@ pub fn suggest_rules(
                         predicate: pred,
                         edge_type: format!("SAME_{}", field.to_uppercase()),
                         weight_prop: None,
-                        max_edges: None,
+                        max_edges,
                         approximate: false,
                     };
                     let rationale = format!(
@@ -764,6 +767,7 @@ pub fn suggest_rules(
                         src_label.to_lowercase(),
                         dst_label.to_lowercase(),
                     );
+                    let max_edges = Some(default_max_edges(&pred));
                     let def = RuleDef {
                         name,
                         src_label: src_label.to_string(),
@@ -771,7 +775,7 @@ pub fn suggest_rules(
                         predicate: pred,
                         edge_type: format!("NEAR_{}", field.to_uppercase()),
                         weight_prop: Some("score".into()),
-                        max_edges: None,
+                        max_edges,
                         approximate: false,
                     };
                     let rationale = format!(
@@ -848,6 +852,7 @@ pub fn suggest_rules(
                         src_label.to_lowercase(),
                         dst_label.to_lowercase(),
                     );
+                    let max_edges = Some(default_max_edges(&pred));
                     let def = RuleDef {
                         name,
                         src_label: src_label.to_string(),
@@ -855,7 +860,7 @@ pub fn suggest_rules(
                         predicate: pred,
                         edge_type: format!("SIMILAR_{}", field.to_uppercase()),
                         weight_prop: Some("score".into()),
-                        max_edges: None,
+                        max_edges,
                         approximate,
                     };
                     let rationale = format!(
