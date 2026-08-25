@@ -44,6 +44,8 @@ pub struct Query {
     /// MATCH / UNWIND / WHERE that follow it.
     pub stages: Vec<WithStage>,
     pub returns: Vec<RetItem>,
+    /// `RETURN DISTINCT …` — executor hashes projected rows after `Project`.
+    pub distinct: bool,
     pub order_by: Vec<OrderItem>,
     pub skip: Option<LimitSkip>,
     pub limit: Option<LimitSkip>,
@@ -172,6 +174,11 @@ pub enum Expr {
     IsNull(Operand),
     /// `operand IS NOT NULL` — true iff the operand is non-null.
     IsNotNull(Operand),
+    /// `expr IN [a, b, $p]` or `expr IN $list` (`$list` is `Value::List`).
+    In {
+        expr: Operand,
+        list: Vec<Operand>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -305,12 +312,14 @@ pub struct CreateEdge {
     pub dst_var: String,
 }
 
-/// `MATCH patterns [WHERE expr] SET var.field = literal [, …]`
+/// `MATCH patterns [WHERE expr] SET var.field = literal [, …] [RETURN …]`
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchSetStmt {
     pub matches: Vec<Pattern>,
     pub where_expr: Option<Expr>,
     pub sets: Vec<SetClause>,
+    /// Optional RETURN clause: project matched bindings from post-write state.
+    pub returns: Option<Vec<RetItem>>,
 }
 
 /// One `var.field = literal_or_param` assignment in a SET clause.
@@ -364,12 +373,11 @@ pub struct MatchDeleteNodeStmt {
     pub detach: bool,
 }
 
-/// `MERGE (n:Label {id: 'x'}) [RETURN …]` — match-or-create by a single key property.
+/// `MERGE (n:Label {id: 'x'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]`
 ///
-/// Exactly one property is allowed (the key).  More properties, or `ON CREATE
-/// SET` / `ON MATCH SET` → named error at parse time.
-///
-/// `returns`, when `Some`, projects the merged/created node as a read result.
+/// Exactly one property is allowed (the key). More properties → named error.
+/// `ON CREATE SET` / `ON MATCH SET` apply inside the same write batch as the
+/// insert-or-skip. `returns`, when `Some`, projects the node after commit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeStmt {
     pub label: String,
@@ -378,6 +386,10 @@ pub struct MergeStmt {
     pub key_value: core_storage::Value,
     /// Optional bound variable for the MERGE node (for RETURN projection).
     pub var: Option<String>,
+    /// `ON CREATE SET` assignments, applied only when the node is inserted.
+    pub on_create: Vec<SetClause>,
+    /// `ON MATCH SET` assignments, applied only when the node already exists.
+    pub on_match: Vec<SetClause>,
     /// Optional RETURN clause: project the node after commit.
     pub returns: Option<Vec<RetItem>>,
 }

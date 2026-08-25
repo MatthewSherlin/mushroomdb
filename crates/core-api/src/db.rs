@@ -344,6 +344,21 @@ fn write_result_set() -> ResultSet {
     ])
 }
 
+fn resolve_merge_set_value(op: &Operand, params: &BTreeMap<String, Value>) -> Result<Value> {
+    match op {
+        Operand::Lit(v) => Ok(v.clone()),
+        Operand::Param(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| GraphError::QueryError {
+                detail: format!("missing parameter `{name}`"),
+            }),
+        _ => Err(GraphError::QueryError {
+            detail: "ON CREATE/ON MATCH SET value must be a literal or $parameter".into(),
+        }),
+    }
+}
+
 /// Single construction point for a `GraphMut` view over the split-borrowed graph fields.
 /// Callers use `std::mem::take` on the engine before calling this, then restore it after.
 fn make_graph_mut<'a>(
@@ -2526,11 +2541,10 @@ impl<F: Fs> GraphDb<F> {
     /// over `self.view()` — the borrow is dropped before the batch is opened.
     ///
     /// **Limitations (v1)**:
-    /// - SET RHS must be a literal; expression RHS → named error.
-    /// - Combined read-write (`MATCH…SET…RETURN`) → named error.
+    /// - SET RHS must be a literal, `$param`, or arithmetic; bare property copy → named error.
     /// - `DETACH DELETE n` → calls `delete_node` for each matched node (removes all edges).
     /// - Bare `DELETE n` → error if n has any incident edges; succeeds for isolated nodes.
-    /// - MERGE with ON CREATE/ON MATCH → named error.
+    /// - MERGE supports `ON CREATE SET` / `ON MATCH SET` in the same write batch.
     /// - Deleting a derived edge → named error "cannot delete derived edge".
     pub fn query_write(
         &mut self,
@@ -2642,6 +2656,7 @@ impl<F: Fs> GraphDb<F> {
                 post_unwind_where: None,
                 stages: vec![],
                 returns,
+                distinct: false,
                 order_by: vec![],
                 skip: None,
                 limit: None,
@@ -2670,6 +2685,7 @@ impl<F: Fs> GraphDb<F> {
         stmt: core_query::cypher::MatchSetStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        let project_returns = stmt.returns.clone();
         // Collect unique node vars targeted by SET clauses.
         let mut set_vars: Vec<String> = Vec::new();
         for s in &stmt.sets {
@@ -2681,7 +2697,7 @@ impl<F: Fs> GraphDb<F> {
         // Synthesize a read query: MATCH … WHERE … RETURN <set_vars>, <set_values…>
         // SET values are projected as ScalarExpr items so that arithmetic expressions
         // (e.g. `SET n.score = n.score * 1.5`) are evaluated in the matched-row context.
-        let mut returns: Vec<RetItem> = set_vars
+        let mut set_returns: Vec<RetItem> = set_vars
             .iter()
             .map(|v| RetItem {
                 value: RetVal::Var(v.clone()),
@@ -2696,20 +2712,21 @@ impl<F: Fs> GraphDb<F> {
             .map(|(i, _)| format!("__sv_{i}"))
             .collect();
         for (sc, col) in stmt.sets.iter().zip(&set_val_cols) {
-            returns.push(RetItem {
+            set_returns.push(RetItem {
                 value: RetVal::ScalarExpr(sc.value.clone()),
                 alias: Some(col.clone()),
             });
         }
 
         let read_q = Query {
-            matches: stmt.matches,
+            matches: stmt.matches.clone(),
             optional_clauses: vec![],
-            where_expr: stmt.where_expr,
+            where_expr: stmt.where_expr.clone(),
             unwinds: vec![],
             post_unwind_where: None,
             stages: vec![],
-            returns,
+            returns: set_returns,
+            distinct: false,
             order_by: vec![],
             skip: None,
             limit: None,
@@ -2762,6 +2779,30 @@ impl<F: Fs> GraphDb<F> {
         }
         batch.commit()?;
 
+        if let Some(returns) = project_returns {
+            let q = Query {
+                matches: stmt.matches,
+                optional_clauses: vec![],
+                where_expr: stmt.where_expr,
+                unwinds: vec![],
+                post_unwind_where: None,
+                stages: vec![],
+                returns,
+                distinct: false,
+                order_by: vec![],
+                skip: None,
+                limit: None,
+            };
+            let ops = plan(&q).map_err(|e| GraphError::QueryError {
+                detail: format!("plan: {e}"),
+            })?;
+            return execute(&self.view(), &ops, &Params(params)).map_err(|e| {
+                GraphError::QueryError {
+                    detail: format!("execute: {e}"),
+                }
+            });
+        }
+
         let mut rs = write_result_set();
         rs.push_row(vec![
             Some(Value::Int(0)),
@@ -2803,6 +2844,7 @@ impl<F: Fs> GraphDb<F> {
             post_unwind_where: None,
             stages: vec![],
             returns,
+            distinct: false,
             order_by: vec![],
             skip: None,
             limit: None,
@@ -2896,6 +2938,7 @@ impl<F: Fs> GraphDb<F> {
             post_unwind_where: None,
             stages: vec![],
             returns,
+            distinct: false,
             order_by: vec![],
             skip: None,
             limit: None,
@@ -2983,13 +3026,38 @@ impl<F: Fs> GraphDb<F> {
             }
         };
 
+        if let Some(var) = stmt.var.as_deref() {
+            for sc in stmt.on_create.iter().chain(&stmt.on_match) {
+                if sc.var != var {
+                    return Err(GraphError::QueryError {
+                        detail: format!(
+                            "SET variable '{}' does not match MERGE variable '{var}'",
+                            sc.var
+                        ),
+                    });
+                }
+            }
+        }
+
+        let existed = self.has_node(&key);
         let mut created = 0i64;
-        if !self.has_node(&key) {
-            let props = vec![(stmt.key_field.clone(), stmt.key_value.clone())];
-            self.batch()
-                .insert_node(&stmt.label, &key, props)
-                .commit()?;
-            created = 1;
+        if !existed || !stmt.on_match.is_empty() {
+            let mut batch = self.batch();
+            if !existed {
+                let props = vec![(stmt.key_field.clone(), stmt.key_value.clone())];
+                batch.insert_node(&stmt.label, &key, props);
+                for sc in &stmt.on_create {
+                    let value = resolve_merge_set_value(&sc.value, params)?;
+                    batch.set_prop(&key, &sc.field, value);
+                }
+                created = 1;
+            } else {
+                for sc in &stmt.on_match {
+                    let value = resolve_merge_set_value(&sc.value, params)?;
+                    batch.set_prop(&key, &sc.field, value);
+                }
+            }
+            batch.commit()?;
         }
 
         // Optional RETURN clause: project the node (created or matched) as a read result.
@@ -3011,6 +3079,7 @@ impl<F: Fs> GraphDb<F> {
                 post_unwind_where: None,
                 stages: vec![],
                 returns,
+                distinct: false,
                 order_by: vec![],
                 skip: None,
                 limit: None,

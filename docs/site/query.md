@@ -291,11 +291,11 @@ MATCH (n:Person {id: 'alice'})
 SET n.score = 99
 ```
 
-- SET RHS must be a literal (integer, float, string, boolean) or a `$param`
-  reference; expression RHS is rejected with a named error.
+- SET RHS must be a literal (integer, float, string, boolean), a `$param`
+  reference, or arithmetic (`n.x + 1`); bare property-to-property copy is a named error.
 - Multiple SET clauses in one statement are allowed.
-- Combined MATCH … SET … RETURN is not supported; use a separate MATCH … RETURN
-  query after the write.
+- Combined MATCH … SET … RETURN is supported: the write commits, then RETURN
+  projects from the post-write view.
 - When a SET touches a property that a rule evaluates, the rule engine
   re-evaluates incrementally: derived edges appear or retract within the same
   WAL frame.
@@ -340,7 +340,8 @@ MERGE (n:Person {id: 'alice'})
 ```
 
 - Match-or-create by a single key property only.
-- ON CREATE SET / ON MATCH SET clauses are not supported.
+- `ON CREATE SET` / `ON MATCH SET` apply inside the same write batch as the
+  insert-or-skip. Both may appear on one MERGE.
 - Multi-property maps are not supported.
 
 ---
@@ -491,6 +492,8 @@ clear, actionable message; **Absent** = not implemented (not tested here).
 | `MATCH (n)-[r:TYPE]-(m)` undirected edge | `MATCH (a)-[:KNOWS]-(b) RETURN a` |
 | `MATCH (n)-[r]->(m)` any relationship type | `MATCH (n)-[r]->(m) RETURN type(r)` |
 | `WHERE =, <>, <, >, <=, >=` | `WHERE n.age > 18` |
+| `WHERE n.prop IN [a, b]` / `IN $list` | `WHERE n.city IN ['Austin', $c]`; `$cities` is `Value::List` |
+| `RETURN DISTINCT` | `RETURN DISTINCT n.city` — hashed after Project; numeric Int/Float unify like grouping; cap 1,000,000 distinct rows |
 | `WHERE AND / OR` | `WHERE n.a = 1 AND n.b = 2` |
 | `ORDER BY prop ASC / DESC` | `ORDER BY n.name DESC` |
 | `SKIP n LIMIT n` | `SKIP 10 LIMIT 5` |
@@ -516,6 +519,8 @@ clear, actionable message; **Absent** = not implemented (not tested here).
 | `CREATE (a:L {id: 'x'})-[:T]->(b:L {id: 'y'})` | node-edge chain |
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
 | `MATCH … SET n.prop = $param` | `MATCH (n) WHERE n.id = $id SET n.score = $val` |
+| `MATCH … SET … RETURN` | `MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x` — write commits, then RETURN from post-write state |
+| `MERGE … ON CREATE SET` / `ON MATCH SET` | `MERGE (n:L {id:'new'}) ON CREATE SET n.born = 1 ON MATCH SET n.hit = 1 RETURN n` |
 | `MATCH … DELETE r` (manual edge) | `MATCH (a)-[r:KNOWS]->(b) DELETE r` |
 | `MATCH … DETACH DELETE n` | `MATCH (n) WHERE n.id = 'x' DETACH DELETE n` |
 | `MATCH … DELETE n` (isolated node) | `MATCH (n:Tmp) WHERE n.id = 'x' DELETE n` |
@@ -534,11 +539,12 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 
 | Form | Error message (excerpt) |
 |---|---|
-| `MERGE … ON CREATE SET / ON MATCH SET` | `ON CREATE SET / ON MATCH SET are not supported in MERGE (v1 limitation)` |
+| `UNION` | `UNION is not supported` |
+| `CASE WHEN … THEN … ELSE … END` | `CASE is not supported` |
+| `collect()` | `collect() is not supported` |
 | `MERGE (n:L {id: 'x', extra: 2})` (multi-property) | `MERGE supports exactly one key property (got 2)` |
 | `DELETE n` when node has incident edges | `Cannot delete node … because it still has incident edges. Use DETACH DELETE…` |
 | `DELETE r` on derived (rule-owned) edge | `cannot delete derived edge; retract via the rule or change the property` |
-| `MATCH … SET … RETURN` in one statement | `parse error: expected RETURN (found Set)` |
 | `CREATE (a), (b)` comma-separated form | `parse error: unexpected tokens after CREATE pattern (found Comma)` |
 | Variable-length `*0..n` (zero-length min) | `zero-length variable-length paths are not supported; minimum hop count is 1` |
 | Variable-length `*n..` (unbounded upper) | `variable-length paths are capped at 10 hops` |
@@ -561,7 +567,6 @@ unexpected-token parse error or other unspecified result.
 
 | Form |
 |---|
-| `CASE WHEN … THEN … ELSE … END` expressions |
 | Pattern comprehension `[(n)-[r]->(m) | m.prop]` |
 | List comprehension `[x IN list WHERE …]` |
 | `EXISTS { … }` subquery predicate |
@@ -575,11 +580,11 @@ unexpected-token parse error or other unspecified result.
 | Feature | Status |
 |---|---|
 | Multi-statement transactions | Not supported (one write statement per query in v1) |
-| Combined MATCH … SET … RETURN | Not supported; use two queries |
+| Combined MATCH … SET … RETURN | Supported — write commits, then RETURN projects from post-write state |
 | SET RHS expressions | Literals, `$param` references, and arithmetic expressions (`n.x + 1`, `n.score * 1.5`); bare property-to-property copy (`SET n.x = m.y`) is a named error |
 | MATCH … DETACH DELETE (node) | Supported — removes node + all edges |
 | Bare DELETE on node with edges | Error — use DETACH DELETE |
-| MERGE ON CREATE / ON MATCH | Not supported |
+| MERGE ON CREATE / ON MATCH | Supported in the same MERGE / write batch |
 | Grouped aggregation | Supported (multiple keys and multiple aggregates allowed; group count capped at 1,000,000) |
 | WITH pipeline stages | Supported — projection, aliasing, WHERE (HAVING), ORDER BY, LIMIT, and re-entry MATCH |
 | UNWIND | Supported — list literals, list-valued properties, and scalar aliases from prior WITH; non-list → named error |

@@ -577,21 +577,35 @@ fn merge_skips_when_present() {
 }
 
 #[test]
-fn merge_on_create_set_is_error() {
+fn merge_on_create_set() {
     let mut db = GraphDb::open(&tmp("merge-on-create")).unwrap();
-    let err = db
-        .query_write(
-            "MERGE (n:Person {id: 'x'}) ON CREATE SET n.x = 1",
-            &no_params(),
-        )
-        .unwrap_err();
-    let detail = match err {
-        GraphError::QueryError { detail } => detail,
-        other => panic!("expected QueryError, got {other:?}"),
-    };
-    assert!(
-        detail.contains("ON CREATE") || detail.contains("not supported"),
-        "error must mention ON CREATE limitation, got: {detail}"
+    db.query_write(
+        "MERGE (n:L {id:'new'}) ON CREATE SET n.born = 1 RETURN n",
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        db.node_info("new").unwrap().props.get("born"),
+        Some(&Value::Int(1))
+    );
+
+    // Same MERGE with both ON CREATE SET and ON MATCH SET: second call is a
+    // match, so ON MATCH fires and ON CREATE does not.
+    db.query_write(
+        "MERGE (n:L {id:'new'}) ON CREATE SET n.born = 99 ON MATCH SET n.hit = 1 RETURN n",
+        &Default::default(),
+    )
+    .unwrap();
+    let props = db.node_info("new").unwrap().props;
+    assert_eq!(
+        props.get("born"),
+        Some(&Value::Int(1)),
+        "ON CREATE SET must not run when the node already exists"
+    );
+    assert_eq!(
+        props.get("hit"),
+        Some(&Value::Int(1)),
+        "ON MATCH SET must run in the same MERGE as ON CREATE SET"
     );
 }
 
@@ -886,19 +900,22 @@ fn set_arithmetic_prop_increment() {
 // ─── Error cases for combined read-write ─────────────────────────────────────
 
 #[test]
-fn combined_match_set_return_is_error() {
+fn match_set_return_same_statement() {
     let mut db = GraphDb::open(&tmp("combined-rw")).unwrap();
-    let err = db
-        .query_write("MATCH (n:Person) SET n.x = 1 RETURN n", &no_params())
-        .unwrap_err();
-    let detail = match err {
-        GraphError::QueryError { detail } => detail,
-        other => panic!("expected QueryError, got {other:?}"),
-    };
-    assert!(
-        detail.contains("not supported") || detail.contains("RETURN"),
-        "combined read-write must be a named error, got: {detail}"
-    );
+    db.insert_node(
+        "Person",
+        "a",
+        vec![
+            ("id".into(), Value::Str("a".into())),
+            ("x".into(), Value::Int(1)),
+        ],
+    )
+    .unwrap();
+    let map = BTreeMap::new();
+    let rs = db
+        .query_write("MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x", &map)
+        .unwrap();
+    assert_eq!(rs.row(0)[0], Some(Value::Int(2)));
 }
 
 // ---------------------------------------------------------------------------

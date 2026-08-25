@@ -362,6 +362,13 @@ fn execute_inner(
             PlanOp::Project { items } => {
                 projected = Some(exec_project(view, &vars, &rows, items, params)?);
             }
+            PlanOp::Distinct => {
+                if let Some(table) = projected.as_mut() {
+                    exec_distinct(table)?;
+                } else {
+                    return Err("DISTINCT requires a Project".into());
+                }
+            }
             PlanOp::OrderBy { items } => {
                 if let Some(table) = projected.as_mut() {
                     exec_order_by(table, items)?;
@@ -863,6 +870,13 @@ fn collect_expr(
             collect_operand(op, names, seen);
             Ok(())
         }
+        Expr::In { expr, list } => {
+            collect_operand(expr, names, seen);
+            for item in list {
+                collect_operand(item, names, seen);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1135,6 +1149,12 @@ fn intern_expr(vars: &mut VarTable, expr: &Expr) {
         }
         Expr::Truthy(op) => intern_operand(vars, op),
         Expr::IsNull(op) | Expr::IsNotNull(op) => intern_operand(vars, op),
+        Expr::In { expr, list } => {
+            intern_operand(vars, expr);
+            for item in list {
+                intern_operand(vars, item);
+            }
+        }
     }
 }
 
@@ -2364,6 +2384,12 @@ fn agg_stream(
                     .to_string(),
             );
         }
+        PlanOp::Distinct => {
+            return Err(
+                "agg executor: Distinct in producer slice — plan is structurally malformed"
+                    .to_string(),
+            );
+        }
         PlanOp::OrderBy { .. } => {
             return Err(
                 "agg executor: OrderBy in producer slice — structurally malformed".to_string(),
@@ -2811,6 +2837,11 @@ fn group_stream(
                 "group executor: Project in producer slice — structurally malformed".to_string(),
             );
         }
+        PlanOp::Distinct => {
+            return Err(
+                "group executor: Distinct in producer slice — structurally malformed".to_string(),
+            );
+        }
         PlanOp::OrderBy { .. } => {
             return Err(
                 "group executor: OrderBy in producer slice — structurally malformed".to_string(),
@@ -3096,6 +3127,13 @@ fn pull_rows(
                     .to_string(),
             );
         }
+        PlanOp::Distinct => {
+            return Err(
+                "pull executor: Distinct reached pull_rows — DISTINCT queries must use \
+                 the staged path (row_bound returns None)"
+                    .to_string(),
+            );
+        }
         PlanOp::OrderBy { .. } => {
             return Err(
                 "pull executor: OrderBy reached pull_rows — queries with ORDER BY \
@@ -3222,7 +3260,60 @@ fn eval_expr(
             let val = resolve_operand(view, vars, row, op, params)?;
             Ok(val.is_some())
         }
+        Expr::In { expr, list } => eval_in(view, vars, row, expr, list, params),
     }
+}
+
+fn eval_in(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    expr: &Operand,
+    list: &[Operand],
+    params: &Params,
+) -> Result<bool, String> {
+    let Some(needle) = resolve_operand(view, vars, row, expr, params)? else {
+        return Ok(false);
+    };
+    for item_op in list {
+        match resolve_operand(view, vars, row, item_op, params)? {
+            None => {}
+            Some(Value::List(items)) => {
+                for item in items {
+                    if crate::filter::eval_cmp(&crate::filter::CmpOp::Eq, &needle, &item) {
+                        return Ok(true);
+                    }
+                }
+            }
+            Some(item) => {
+                if crate::filter::eval_cmp(&crate::filter::CmpOp::Eq, &needle, &item) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Deduplicate projected rows. Numeric Int/Float unify matches grouping.
+fn exec_distinct(table: &mut Projected) -> Result<(), String> {
+    let cap = max_intermediate_rows();
+    let mut seen: BTreeSet<Vec<Option<ValueKey>>> = BTreeSet::new();
+    let mut out = Vec::with_capacity(table.rows.len().min(cap));
+    for row in table.rows.drain(..) {
+        let key: Vec<Option<ValueKey>> = row
+            .iter()
+            .map(|cell| cell.as_ref().and_then(group_key_normalize))
+            .collect();
+        if seen.insert(key) {
+            if out.len() >= cap {
+                return Err(row_cap_err(cap));
+            }
+            out.push(row);
+        }
+    }
+    table.rows = out;
+    Ok(())
 }
 
 fn column_name(item: &RetItem) -> String {
@@ -5469,6 +5560,69 @@ LIMIT 10";
             "key column must display Int(1) (first-seen)"
         );
         assert_eq!(rs.row(0)[1], Some(i(2)), "unified group must have count=2");
+    }
+
+    #[test]
+    fn distinct_collapses_duplicate_projected_values() {
+        let mut fx = Fx::new();
+        fx.add("N", "a1", vec![("city", s("Austin"))]);
+        fx.add("N", "a2", vec![("city", s("Austin"))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(&v, "MATCH (n:N) RETURN DISTINCT n.city", &params).unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.row(0)[0], Some(s("Austin")));
+    }
+
+    #[test]
+    fn distinct_int_float_unify() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("score", i(1))]);
+        fx.add("N", "b", vec![("score", f(1.0))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let rs = run(&v, "MATCH (n:N) RETURN DISTINCT n.score", &params).unwrap();
+        assert_eq!(
+            rs.len(),
+            1,
+            "Int(1) and Float(1.0) must DISTINCT as one row"
+        );
+        assert_eq!(rs.row(0)[0], Some(i(1)), "first-seen Int(1) wins display");
+    }
+
+    #[test]
+    fn distinct_caps_at_intermediate_row_budget() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("city", s("Austin"))]);
+        fx.add("N", "b", vec![("city", s("Paris"))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let err = super::with_max_intermediate_rows(1, || {
+            run(&v, "MATCH (n:N) RETURN DISTINCT n.city", &params)
+        })
+        .expect_err("two distinct cities must exceed cap=1");
+        assert!(
+            err.contains("1") || err.contains("row"),
+            "cap error must mention the budget, got: {err}"
+        );
+    }
+
+    #[test]
+    fn where_in_list_filters_rows() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("city", s("Austin"))]);
+        fx.add("N", "p", vec![("city", s("Paris"))]);
+        fx.add("N", "l", vec![("city", s("London"))]);
+        let v = fx.view();
+        let mut params = BTreeMap::new();
+        params.insert("c".into(), s("Paris"));
+        let rs = run(
+            &v,
+            "MATCH (n:N) WHERE n.city IN ['Austin', $c] RETURN n.city",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 2);
     }
 
     #[test]
