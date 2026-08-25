@@ -16,7 +16,7 @@ use crate::json::{
 use crate::AppState;
 use arrow_bridge::to_ipc_bytes;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, Method, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -60,9 +60,13 @@ pub fn router_with_auth(db: SharedDb, token: Option<String>) -> Router {
     build_app(db, token, UiFallback::None)
 }
 
-/// Same as [`router`], then `ServeDir` as the fallback so API routes win.
-pub fn router_with_ui(db: SharedDb, ui_dir: impl AsRef<std::path::Path>) -> Router {
-    build_app(db, None, UiFallback::Dir(ui_dir.as_ref().to_path_buf()))
+/// Same as [`router_with_auth`], then `ServeDir` as the fallback so API routes win.
+pub fn router_with_ui(
+    db: SharedDb,
+    ui_dir: impl AsRef<std::path::Path>,
+    token: Option<String>,
+) -> Router {
+    build_app(db, token, UiFallback::Dir(ui_dir.as_ref().to_path_buf()))
 }
 
 #[cfg(feature = "embed-ui")]
@@ -225,20 +229,31 @@ async fn health() -> Response {
     json_ok(json!({"ok": true}))
 }
 
+const TOKEN_COOKIE: &str = "mushroomdb_token";
+
 async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let Some(expected) = state.token.as_deref().filter(|s| !s.is_empty()) else {
+    let Some(expected) = state.token.clone().filter(|s| !s.is_empty()) else {
         return next.run(req).await;
     };
     if req.method() == Method::GET && req.uri().path() == "/health" {
         return next.run(req).await;
     }
-    if request_token(&req).as_deref() == Some(expected) {
-        return next.run(req).await;
+    if request_token(&req).as_deref() != Some(expected.as_str()) {
+        return unauthorized();
     }
-    unauthorized()
+    let set_cookie = presented_bearer_or_query(&req).as_deref() == Some(expected.as_str());
+    let mut res = next.run(req).await;
+    if set_cookie && is_html_response(&res) {
+        attach_token_cookie(&mut res, &expected);
+    }
+    res
 }
 
 fn request_token(req: &Request) -> Option<String> {
+    presented_bearer_or_query(req).or_else(|| presented_cookie(req))
+}
+
+fn presented_bearer_or_query(req: &Request) -> Option<String> {
     if let Some(header) = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -249,6 +264,44 @@ fn request_token(req: &Request) -> Option<String> {
         }
     }
     query_param(req.uri().query().unwrap_or(""), "token").map(str::to_string)
+}
+
+fn presented_cookie(req: &Request) -> Option<String> {
+    let header = req.headers().get(header::COOKIE)?.to_str().ok()?;
+    cookie_named(header, TOKEN_COOKIE).map(str::to_string)
+}
+
+fn cookie_named<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    for part in header.split(';') {
+        let part = part.trim();
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        if k.trim() == name {
+            return Some(v.trim());
+        }
+    }
+    None
+}
+
+fn is_html_response(res: &Response) -> bool {
+    res.headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/html")
+        })
+}
+
+fn attach_token_cookie(res: &mut Response, token: &str) {
+    let value = format!("{TOKEN_COOKIE}={token}; Path=/; SameSite=Lax; HttpOnly");
+    if let Ok(hv) = HeaderValue::from_str(&value) {
+        res.headers_mut().insert(header::SET_COOKIE, hv);
+    }
 }
 
 fn bearer_token(header: &str) -> Option<&str> {

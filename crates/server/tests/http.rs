@@ -165,6 +165,93 @@ async fn watch_with_query_token_is_not_401_when_token_configured() {
     );
 }
 
+async fn send_headers(
+    app: Router,
+    req: Request<Body>,
+) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
+    let res = app.oneshot(req).await.unwrap();
+    let status = res.status();
+    let headers = res.headers().clone();
+    let body = to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, body, headers)
+}
+
+#[tokio::test]
+async fn html_query_token_sets_auth_cookie() {
+    let ui = tmp("ui-cookie");
+    std::fs::create_dir_all(&ui).unwrap();
+    std::fs::write(
+        ui.join("index.html"),
+        "<!doctype html><title>graph-db</title>",
+    )
+    .unwrap();
+    let db = SharedDb::open(&tmp("ui-cookie-db")).unwrap();
+    let app = router_with_ui(db, &ui, Some("t".into()));
+    let (status, _, headers) = send_headers(app, get("/?token=t")).await;
+    assert_eq!(status, StatusCode::OK);
+    let cookie = headers
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        cookie.contains("mushroomdb_token=t"),
+        "Set-Cookie must include mushroomdb_token=, got {cookie:?}"
+    );
+    assert!(
+        cookie.contains("Path=/"),
+        "Set-Cookie Path=/, got {cookie:?}"
+    );
+    assert!(
+        cookie.contains("SameSite=Lax"),
+        "Set-Cookie SameSite=Lax, got {cookie:?}"
+    );
+    assert!(
+        cookie.contains("HttpOnly"),
+        "Set-Cookie HttpOnly, got {cookie:?}"
+    );
+}
+
+#[tokio::test]
+async fn missing_asset_with_cookie_is_404_not_401() {
+    let db = SharedDb::open(&tmp("asset-cookie")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let req = Request::builder()
+        .method("GET")
+        .uri("/no-such.js")
+        .header(axum::http::header::COOKIE, "mushroomdb_token=t")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn missing_asset_without_auth_is_401() {
+    let db = SharedDb::open(&tmp("asset-noauth")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, _, _) = send(app, get("/no-such.js")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn stats_with_cookie_succeeds_when_token_configured() {
+    let db = SharedDb::open(&tmp("stats-cookie")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let req = Request::builder()
+        .method("GET")
+        .uri("/stats")
+        .header(axum::http::header::COOKIE, "mushroomdb_token=t")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert!(v.get("nodes_live").is_some(), "/stats JSON, got {v}");
+}
+
 /// Binding: POST /query default is Arrow IPC stream; StreamReader reads the batch.
 #[tokio::test]
 async fn query_default_returns_arrow_ipc() {
@@ -713,7 +800,7 @@ async fn ui_fallback_serves_static_and_stats_stays_json() {
     std::fs::write(ui.join("hello.txt"), "hello-static").unwrap();
 
     let db = SharedDb::open(&tmp("ui-api")).unwrap();
-    let app = router_with_ui(db, &ui);
+    let app = router_with_ui(db, &ui, None);
 
     let (st, body, _) = send(app.clone(), get("/hello.txt")).await;
     assert_eq!(st, StatusCode::OK);
