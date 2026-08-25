@@ -400,27 +400,69 @@ fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
     out
 }
 
-fn collect_unique_keys(rs: &ResultSet, var: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    for i in 0..rs.len() {
-        if let Some(Value::Str(k)) = rs.get(i, var) {
-            if !keys.contains(k) {
-                keys.push(k.clone());
+fn add_var(out: &mut Vec<String>, v: &str) {
+    if !out.iter().any(|x| x == v) {
+        out.push(v.to_string());
+    }
+}
+
+fn pattern_node_vars(pats: &[Pattern]) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in pats {
+        if let Some(v) = &p.start.var {
+            add_var(&mut out, v);
+        }
+        for (_, dest) in &p.chain {
+            if let Some(v) = &dest.var {
+                add_var(&mut out, v);
             }
         }
     }
-    keys
+    out
 }
 
-fn id_lookup_pattern(var: &str, key: &str) -> Pattern {
+fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in pats {
+        for (rel, _) in &p.chain {
+            if let Some(v) = &rel.var {
+                add_var(&mut out, v);
+            }
+        }
+    }
+    out
+}
+
+fn row_key(rs: &ResultSet, row: usize, var: &str) -> Option<String> {
+    match rs.get(row, var) {
+        Some(Value::Str(k)) => Some(k.clone()),
+        _ => None,
+    }
+}
+
+fn bind_node_id(node: &NodePat, match_rs: &ResultSet, row: usize) -> NodePat {
+    let props = node
+        .var
+        .as_deref()
+        .and_then(|v| row_key(match_rs, row, v))
+        .map(|k| vec![("id".to_string(), Operand::Lit(Value::Str(k)))])
+        .unwrap_or_default();
+    NodePat {
+        var: node.var.clone(),
+        label: None,
+        props,
+    }
+}
+
+fn bind_pattern_ids(pat: &Pattern, match_rs: &ResultSet, row: usize) -> Pattern {
     Pattern {
-        start: NodePat {
-            var: Some(var.to_string()),
-            label: None,
-            props: vec![("id".to_string(), Operand::Lit(Value::Str(key.to_string())))],
-        },
-        chain: vec![],
-        shortest: false,
+        start: bind_node_id(&pat.start, match_rs, row),
+        chain: pat
+            .chain
+            .iter()
+            .map(|(rel, dest)| (rel.clone(), bind_node_id(dest, match_rs, row)))
+            .collect(),
+        shortest: pat.shortest,
     }
 }
 
@@ -453,88 +495,57 @@ fn run_project_query<F: Fs>(
     })
 }
 
-/// Project RETURN items by IdMap key lookup. Omits the original WHERE and
-/// non-id pattern props so SET of a filtered property still returns the row.
+/// Empty-result query with the right RETURN columns (original WHERE omitted).
+fn empty_project_query(var: &str, returns: Vec<RetItem>) -> Query {
+    project_query(
+        vec![Pattern {
+            start: NodePat {
+                var: Some(var.to_string()),
+                label: None,
+                props: vec![],
+            },
+            chain: vec![],
+            shortest: false,
+        }],
+        Some(Expr::In {
+            expr: Operand::Prop {
+                var: var.to_string(),
+                field: "id".into(),
+            },
+            list: vec![],
+        }),
+        returns,
+    )
+}
+
+/// Project RETURN per original MATCH row: bind named nodes by IdMap key,
+/// keep the rel chain so `type(r)` works, omit original WHERE / non-id props.
 fn project_from_matched_keys<F: Fs>(
     db: &GraphDb<F>,
     vars: &[String],
+    matches: &[Pattern],
     match_rs: &ResultSet,
     returns: Vec<RetItem>,
     params: &BTreeMap<String, Value>,
 ) -> Result<ResultSet> {
-    let var = match vars.first() {
-        Some(v) => v,
+    let fallback_var = match vars.first() {
+        Some(v) => v.as_str(),
         None => {
             return Err(GraphError::QueryError {
                 detail: "SET … RETURN has no node variable to project".into(),
             })
         }
     };
-    if vars.len() == 1 {
-        let keys = collect_unique_keys(match_rs, var);
-        let q = match keys.as_slice() {
-            [] => project_query(
-                vec![Pattern {
-                    start: NodePat {
-                        var: Some(var.clone()),
-                        label: None,
-                        props: vec![],
-                    },
-                    chain: vec![],
-                    shortest: false,
-                }],
-                Some(Expr::In {
-                    expr: Operand::Prop {
-                        var: var.clone(),
-                        field: "id".into(),
-                    },
-                    list: vec![],
-                }),
-                returns,
-            ),
-            [one] => project_query(vec![id_lookup_pattern(var, one)], None, returns),
-            many => project_query(
-                vec![Pattern {
-                    start: NodePat {
-                        var: Some(var.clone()),
-                        label: None,
-                        props: vec![],
-                    },
-                    chain: vec![],
-                    shortest: false,
-                }],
-                Some(Expr::In {
-                    expr: Operand::Prop {
-                        var: var.clone(),
-                        field: "id".into(),
-                    },
-                    list: many
-                        .iter()
-                        .map(|k| Operand::Lit(Value::Str(k.clone())))
-                        .collect(),
-                }),
-                returns,
-            ),
-        };
-        return run_project_query(db, q, params);
+    if match_rs.is_empty() {
+        return run_project_query(db, empty_project_query(fallback_var, returns), params);
     }
 
     let mut out: Option<ResultSet> = None;
     for row_i in 0..match_rs.len() {
-        let mut patterns = Vec::with_capacity(vars.len());
-        let mut complete = true;
-        for v in vars {
-            match match_rs.get(row_i, v) {
-                Some(Value::Str(k)) => patterns.push(id_lookup_pattern(v, k)),
-                _ => {
-                    complete = false;
-                    break;
-                }
-            }
-        }
-        if !complete {
-            continue;
-        }
+        let patterns: Vec<Pattern> = matches
+            .iter()
+            .map(|p| bind_pattern_ids(p, match_rs, row_i))
+            .collect();
         let rs = run_project_query(db, project_query(patterns, None, returns.clone()), params)?;
         match out.as_mut() {
             None => out = Some(rs),
@@ -547,29 +558,7 @@ fn project_from_matched_keys<F: Fs>(
     }
     match out {
         Some(rs) => Ok(rs),
-        None => run_project_query(
-            db,
-            project_query(
-                vec![Pattern {
-                    start: NodePat {
-                        var: Some(var.clone()),
-                        label: None,
-                        props: vec![],
-                    },
-                    chain: vec![],
-                    shortest: false,
-                }],
-                Some(Expr::In {
-                    expr: Operand::Prop {
-                        var: var.clone(),
-                        field: "id".into(),
-                    },
-                    list: vec![],
-                }),
-                returns,
-            ),
-            params,
-        ),
+        None => run_project_query(db, empty_project_query(fallback_var, returns), params),
     }
 }
 
@@ -2908,11 +2897,15 @@ impl<F: Fs> GraphDb<F> {
                 set_vars.push(s.var.clone());
             }
         }
+        let rel_vars = pattern_rel_vars(&stmt.matches);
         let mut lookup_vars = set_vars.clone();
+        for v in pattern_node_vars(&stmt.matches) {
+            add_var(&mut lookup_vars, &v);
+        }
         if let Some(ref returns) = project_returns {
             for v in ret_node_vars(returns) {
-                if !lookup_vars.contains(&v) {
-                    lookup_vars.push(v);
+                if !rel_vars.iter().any(|r| r == &v) {
+                    add_var(&mut lookup_vars, &v);
                 }
             }
         }
@@ -3003,7 +2996,14 @@ impl<F: Fs> GraphDb<F> {
         batch.commit()?;
 
         if let Some(returns) = project_returns {
-            return project_from_matched_keys(self, &lookup_vars, &match_rs, returns, params);
+            return project_from_matched_keys(
+                self,
+                &lookup_vars,
+                &stmt.matches,
+                &match_rs,
+                returns,
+                params,
+            );
         }
 
         let mut rs = write_result_set();

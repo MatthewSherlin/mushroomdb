@@ -967,6 +967,54 @@ fn match_set_return_projects_after_inline_prop_changes() {
     assert_eq!(rs.row(0)[0], Some(Value::Int(2)));
 }
 
+#[test]
+fn match_set_return_preserves_edge_match_cardinality() {
+    let mut db = GraphDb::open(&tmp("set-ret-card")).unwrap();
+    db.insert_node("Person", "n", vec![("id".into(), Value::Str("n".into()))])
+        .unwrap();
+    db.insert_node("Person", "m1", vec![("id".into(), Value::Str("m1".into()))])
+        .unwrap();
+    db.insert_node("Person", "m2", vec![("id".into(), Value::Str("m2".into()))])
+        .unwrap();
+    db.insert_edge("KNOWS", "n", "m1").unwrap();
+    db.insert_edge("KNOWS", "n", "m2").unwrap();
+    let rs = db
+        .query_write(
+            "MATCH (n)-[:KNOWS]->(m) SET n.x = 1 RETURN n.id",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        2,
+        "two KNOWS edges must yield two RETURN rows, not one unique key"
+    );
+    assert_eq!(rs.row(0)[0], Some(Value::Str("n".into())));
+    assert_eq!(rs.row(1)[0], Some(Value::Str("n".into())));
+}
+
+#[test]
+fn match_set_return_projects_rel_type() {
+    let mut db = GraphDb::open(&tmp("set-ret-rel")).unwrap();
+    db.insert_node("Person", "n", vec![("id".into(), Value::Str("n".into()))])
+        .unwrap();
+    db.insert_node("Person", "m1", vec![("id".into(), Value::Str("m1".into()))])
+        .unwrap();
+    db.insert_node("Person", "m2", vec![("id".into(), Value::Str("m2".into()))])
+        .unwrap();
+    db.insert_edge("KNOWS", "n", "m1").unwrap();
+    db.insert_edge("KNOWS", "n", "m2").unwrap();
+    let rs = db
+        .query_write(
+            "MATCH (n)-[r:KNOWS]->(m) SET n.x = 1 RETURN type(r)",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 2, "rel RETURN must keep MATCH cardinality");
+    assert_eq!(rs.row(0)[0], Some(Value::Str("KNOWS".into())));
+    assert_eq!(rs.row(1)[0], Some(Value::Str("KNOWS".into())));
+}
+
 // ---------------------------------------------------------------------------
 // CREATE...RETURN with $param in RETURN expression
 // ---------------------------------------------------------------------------
