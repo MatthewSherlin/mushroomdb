@@ -319,6 +319,7 @@ pub struct RuleIndex {
     pub dst_side: SideIndex,
 }
 
+#[derive(Debug)]
 pub enum CandidateSpec<'a> {
     ByKey,
     Scalar {
@@ -354,12 +355,20 @@ pub enum CandidateSpec<'a> {
     /// set is their union.  Insert and remove recurse into every child spec so
     /// the index stays coherent for all branches simultaneously.
     Union(Vec<CandidateSpec<'a>>),
+    /// Intersection of multiple candidate specs, used for `All` predicates.
+    ///
+    /// Each conjunct contributes its own candidate set; the result is their
+    /// intersection (empty child → empty). `ScanAll` children are skipped at
+    /// probe time (they are the universe); if every child is `ScanAll`, the
+    /// spec stays a full scan. Insert/remove recurse into every child.
+    Intersect(Vec<CandidateSpec<'a>>),
 }
 
 /// Returns the exact candidate strategy derived from `p`.
 ///
-/// `All(parts)` delegates to `parts[0]`: order predicates most-selective-first;
-/// a leading `VectorSimilar` means full-scan (`ScanAll`) candidates.
+/// `All(parts)` returns `Intersect` of each part's spec. A leading
+/// `VectorSimilar` is `ScanAll` and is skipped at probe time when another
+/// conjunct has an index; candidates stay a superset of true matches.
 ///
 /// `Any(parts)` returns `Union` of each branch's candidate spec — the correct
 /// superset for OR semantics.
@@ -383,7 +392,7 @@ pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
                 !parts.is_empty(),
                 "candidate_spec requires a validated predicate"
             );
-            candidate_spec(&parts[0])
+            CandidateSpec::Intersect(parts.iter().map(candidate_spec).collect())
         }
         Predicate::Any(parts) => {
             debug_assert!(
@@ -398,9 +407,11 @@ pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
 /// Approximate candidate strategy: like `candidate_spec` but replaces
 /// `ScanAll` with `VectorClusters` for `VectorSimilar`-rooted predicates.
 ///
-/// Used when `RuleDef::approximate == true`.  Falls back to the exact
-/// `candidate_spec` for all other predicate variants so partial-approximate
-/// `All` predicates (first part is not `VectorSimilar`) are handled correctly.
+/// Used when `RuleDef::approximate == true`.  `All` still leads with
+/// `parts[0]` (the `VectorSimilar` conjunct): IVF stores cluster ids in
+/// `by_key` as `ValueKey::Int`, which would collide with `NumericBucket`
+/// if both were indexed on the same side. Exact `All` uses [`candidate_spec`]
+/// (`Intersect` of every conjunct).
 ///
 /// `Any` predicates cannot be `approximate=true` (validate() rejects them),
 /// so `Any` falls through to `candidate_spec` (exact Union path).
@@ -581,6 +592,30 @@ fn geo_probe_keys(lat: f64, lon: f64, km: f64) -> BTreeSet<ValueKey> {
 /// vector-bearing nodes; ANN is Plan 8+.
 const SCAN_ALL_SENTINEL: ValueKey = ValueKey::Bool(true);
 
+/// `ScanAll` is the universe in an `Intersect`: skip it when another child
+/// has an index. Nested `Intersect` of only `ScanAll` is itself a universe.
+fn spec_is_scan_all_universe(spec: &CandidateSpec<'_>) -> bool {
+    match spec {
+        CandidateSpec::ScanAll { .. } => true,
+        CandidateSpec::Intersect(parts) => {
+            !parts.is_empty() && parts.iter().all(spec_is_scan_all_universe)
+        }
+        _ => false,
+    }
+}
+
+/// `ByKey` is resolved by `compute_desired` (FK id lookup), not `by_key`.
+/// Nested `Intersect` of only `ByKey` is likewise external.
+fn spec_is_bykey_external(spec: &CandidateSpec<'_>) -> bool {
+    match spec {
+        CandidateSpec::ByKey => true,
+        CandidateSpec::Intersect(parts) => {
+            !parts.is_empty() && parts.iter().all(spec_is_bykey_external)
+        }
+        _ => false,
+    }
+}
+
 impl SideIndex {
     fn index_keys(spec: &CandidateSpec, get: &dyn Fn(&str) -> Option<Value>) -> BTreeSet<ValueKey> {
         match spec {
@@ -622,7 +657,7 @@ impl SideIndex {
             // here (they are handled by the early-return in insert()/remove()),
             // but Union-of-VectorClusters is not produced by candidate_spec for
             // Any (approximate=true is rejected for Any by validate()).
-            CandidateSpec::Union(specs) => {
+            CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) => {
                 let mut out = BTreeSet::new();
                 for s in specs {
                     out.extend(Self::index_keys(s, get));
@@ -655,8 +690,9 @@ impl SideIndex {
                 .collect(),
             // VectorClusters probing is handled by ivf_candidates(), not probe_keys().
             CandidateSpec::VectorClusters { .. } => BTreeSet::new(),
-            // Union: probe each child spec and take the union.
-            CandidateSpec::Union(specs) => {
+            // Union / Intersect: probe each child. `candidates()` intersects
+            // Intersect node-sets; mixing keys here is only for insert/remove.
+            CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) => {
                 let mut out = BTreeSet::new();
                 for s in specs {
                     out.extend(Self::probe_keys(s, get));
@@ -667,9 +703,9 @@ impl SideIndex {
     }
 
     pub fn insert(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
-        // Union: recurse into each child spec.  insert() is idempotent for
-        // ScanAll metadata (same-value overwrite), so overlapping children are safe.
-        if let CandidateSpec::Union(specs) = spec {
+        // Union / Intersect: recurse into each child spec. insert() is
+        // idempotent for ScanAll metadata (same-value overwrite).
+        if let CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) = spec {
             for s in specs {
                 self.insert(s, node, get);
             }
@@ -714,8 +750,8 @@ impl SideIndex {
     }
 
     pub fn remove(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
-        // Union: recurse into each child spec.
-        if let CandidateSpec::Union(specs) = spec {
+        // Union / Intersect: recurse into each child spec.
+        if let CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) = spec {
             for s in specs {
                 self.remove(s, node, get);
             }
@@ -845,6 +881,9 @@ impl SideIndex {
         if let CandidateSpec::Union(specs) = spec {
             return specs.iter().flat_map(|s| self.candidates(s, get)).collect();
         }
+        if let CandidateSpec::Intersect(specs) = spec {
+            return self.intersect_candidates(specs, get);
+        }
 
         let mut out = BTreeSet::new();
         for k in Self::probe_keys(spec, get) {
@@ -861,6 +900,53 @@ impl SideIndex {
             }
         }
         out
+    }
+
+    /// Intersect child candidate sets. `ScanAll` is the universe (skipped);
+    /// if every child is `ScanAll`, fall back to `ScanAll`. `ByKey` is resolved
+    /// outside the index. Empty child → empty.
+    fn intersect_candidates(
+        &self,
+        specs: &[CandidateSpec<'_>],
+        get: &dyn Fn(&str) -> Option<Value>,
+    ) -> BTreeSet<u32> {
+        let mut restrictive = Vec::new();
+        let mut scan_alls = Vec::new();
+        for s in specs {
+            if spec_is_scan_all_universe(s) {
+                scan_alls.push(s);
+            } else if spec_is_bykey_external(s) {
+                continue;
+            } else {
+                restrictive.push(s);
+            }
+        }
+        let to_intersect: &[&CandidateSpec<'_>] = if !restrictive.is_empty() {
+            &restrictive
+        } else if !scan_alls.is_empty() {
+            &scan_alls
+        } else {
+            return BTreeSet::new();
+        };
+        let mut iter = to_intersect.iter();
+        let Some(first) = iter.next() else {
+            return BTreeSet::new();
+        };
+        let mut acc = self.candidates(first, get);
+        if acc.is_empty() {
+            return acc;
+        }
+        for s in iter {
+            let other = self.candidates(s, get);
+            if other.is_empty() {
+                return BTreeSet::new();
+            }
+            acc = acc.intersection(&other).copied().collect();
+            if acc.is_empty() {
+                return acc;
+            }
+        }
+        acc
     }
 
     /// IVF candidate lookup: find the P nearest centroids to the query vector,
@@ -1130,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn all_uses_first_part_and_bykey_indexes_nothing() {
+    fn all_intersects_parts_and_bykey_indexes_nothing() {
         let all = Predicate::All(vec![
             Predicate::FieldEqual {
                 field: "ind".into(),
@@ -1140,10 +1226,10 @@ mod tests {
                 min: 0.5,
             },
         ]);
-        assert!(matches!(
-            candidate_spec(&all),
-            CandidateSpec::Scalar { field: "ind" }
-        ));
+        match candidate_spec(&all) {
+            CandidateSpec::Intersect(v) => assert_eq!(v.len(), 2),
+            other => panic!("{other:?}"),
+        }
         let km = Predicate::KeyMatch { field: "fk".into() };
         assert!(matches!(candidate_spec(&km), CandidateSpec::ByKey));
         let mut idx = SideIndex::default();
@@ -1447,20 +1533,97 @@ mod tests {
     }
 
     #[test]
-    fn all_delegates_to_first_part_including_vector() {
-        let all = Predicate::All(vec![
+    fn all_vector_then_field_equal_does_not_scan_all() {
+        let p = Predicate::All(vec![
+            Predicate::VectorSimilar {
+                field: "e".into(),
+                min: 0.8,
+            },
+            Predicate::FieldEqual {
+                field: "industry".into(),
+            },
+        ]);
+        match candidate_spec(&p) {
+            CandidateSpec::Intersect(v) => assert_eq!(v.len(), 2),
+            other => panic!("{other:?}"),
+        }
+
+        let spec = candidate_spec(&p);
+        let mut idx = SideIndex::default();
+        let mk = |industry: &str, e: &[f64]| {
+            [
+                ("industry".to_string(), Value::Str(industry.into())),
+                (
+                    "e".to_string(),
+                    Value::List(e.iter().copied().map(Value::Float).collect()),
+                ),
+            ]
+            .into()
+        };
+        let same: HashMap<_, _> = mk("tech", &[1.0, 0.0]);
+        let other_ind: HashMap<_, _> = mk("law", &[1.0, 0.0]);
+        let no_vec: HashMap<_, _> = [("industry".to_string(), Value::Str("tech".into()))].into();
+        idx.insert(&spec, 1, &getter(&same));
+        idx.insert(&spec, 2, &getter(&other_ind));
+        idx.insert(&spec, 3, &getter(&no_vec));
+
+        let hits = idx.candidates(&spec, &getter(&same));
+        assert!(hits.contains(&1), "matching industry must stay a candidate");
+        assert!(
+            !hits.contains(&2),
+            "different industry must not be scanned in via VectorSimilar"
+        );
+        assert!(
+            hits.contains(&3),
+            "ScanAll is universe: extra Scalar-only candidates are allowed"
+        );
+
+        let empty_ind: HashMap<_, _> = mk("finance", &[1.0, 0.0]);
+        assert!(
+            idx.candidates(&spec, &getter(&empty_ind)).is_empty(),
+            "empty Scalar child → empty intersect"
+        );
+    }
+
+    #[test]
+    fn all_of_scan_all_stays_scan_all() {
+        let p = Predicate::All(vec![
+            Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.5,
+            },
             Predicate::VectorSimilar {
                 field: "emb".into(),
                 min: 0.9,
             },
+        ]);
+        match candidate_spec(&p) {
+            CandidateSpec::Intersect(v) => assert_eq!(v.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        let spec = candidate_spec(&p);
+        let mut idx = SideIndex::default();
+        idx.insert(&spec, 1, &getter(&emb(&[1.0, 0.0])));
+        idx.insert(&spec, 2, &getter(&emb(&[0.0, 1.0])));
+        let hits = idx.candidates(&spec, &getter(&emb(&[1.0, 0.0])));
+        assert_eq!(hits.into_iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn any_stays_union() {
+        let p = Predicate::Any(vec![
             Predicate::FieldEqual {
-                field: "ind".into(),
+                field: "industry".into(),
+            },
+            Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
             },
         ]);
-        assert!(matches!(
-            candidate_spec(&all),
-            CandidateSpec::ScanAll { field: "emb" }
-        ));
+        match candidate_spec(&p) {
+            CandidateSpec::Union(v) => assert_eq!(v.len(), 2),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Checkpoints are populated at insert, torn out at remove,
