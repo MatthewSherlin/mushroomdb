@@ -94,6 +94,9 @@ fn overlap_rule(name: &str, etype: &str) -> RuleDef {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 

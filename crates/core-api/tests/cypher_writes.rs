@@ -34,6 +34,9 @@ fn overlap_rule(name: &str, field: &str, edge_type: &str) -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -296,6 +299,9 @@ fn set_overlap_on_off_via_cypher() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -486,6 +492,9 @@ fn detach_delete_node_via_cypher_fires_rules_on_reinsert() {
         max_edges: None,
         weight_prop: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     db.query_write("CREATE (n:N {id: 'a', k: 'x'})", &no_params())

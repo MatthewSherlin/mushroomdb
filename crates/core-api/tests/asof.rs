@@ -52,6 +52,9 @@ fn build_known_history(dir: &std::path::Path) {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     // commit 2 — rule fires (a and b share tag="x")
@@ -188,6 +191,9 @@ fn build_equivalence_history(dir: &std::path::Path) {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     db.insert_node("T", "y", vec![("tag".into(), Value::Str("hello".into()))])
@@ -445,6 +451,9 @@ fn mutation_refusal_sweep() {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })
         .unwrap_err();
     assert!(

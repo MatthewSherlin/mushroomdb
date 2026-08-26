@@ -54,6 +54,9 @@ fn any_two_branch_overlap_or_numeric_derives_edges() {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -152,6 +155,9 @@ fn any_nested_in_all_derives_edges() {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -244,6 +250,9 @@ fn any_score_is_max_over_satisfied_branches() {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -330,6 +339,9 @@ fn any_retraction_when_sole_branch_breaks() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -415,6 +427,9 @@ fn any_edge_retained_when_one_branch_holds() {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -529,6 +544,9 @@ fn any_with_max_edges_score_change_causes_evict_backfill() {
         weight_prop: Some("score".into()),
         max_edges: Some(1),
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -629,6 +647,9 @@ fn any_snapshot_v4_roundtrip() {
             weight_prop: Some("score".into()),
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })
         .unwrap();
 
@@ -710,6 +731,9 @@ fn any_bincode_roundtrip_and_old_records_still_decode() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     };
     let bytes = bincode::serialize(&rule).unwrap();
     let decoded: RuleDef = bincode::deserialize(&bytes).unwrap();
@@ -728,6 +752,9 @@ fn any_bincode_roundtrip_and_old_records_still_decode() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     };
     let old_bytes = bincode::serialize(&old).unwrap();
     let old_decoded: RuleDef = bincode::deserialize(&old_bytes).unwrap();

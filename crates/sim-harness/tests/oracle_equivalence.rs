@@ -57,6 +57,9 @@ fn rule_template(idx: u8) -> RuleDef {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         },
         1 => RuleDef {
             name: "r_fe".into(),
@@ -67,6 +70,9 @@ fn rule_template(idx: u8) -> RuleDef {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         },
         2 => RuleDef {
             name: "r_ov".into(),
@@ -80,6 +86,9 @@ fn rule_template(idx: u8) -> RuleDef {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         },
         3 => RuleDef {
             name: "r_all".into(),
@@ -96,6 +105,9 @@ fn rule_template(idx: u8) -> RuleDef {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         },
         // Template 4: shares edge_type "r_fe" with r_fe — exercises C1 (co-owned
         // edge type survival after rule deletion).  Different name and lower min
@@ -112,6 +124,9 @@ fn rule_template(idx: u8) -> RuleDef {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         },
         5 => RuleDef {
             name: "r_nw".into(),
@@ -125,6 +140,9 @@ fn rule_template(idx: u8) -> RuleDef {
             weight_prop: Some("score".into()),
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         },
         6 => RuleDef {
             name: "r_nz".into(),
@@ -138,6 +156,9 @@ fn rule_template(idx: u8) -> RuleDef {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         },
         7 => RuleDef {
             name: "r_geo".into(),
@@ -151,6 +172,9 @@ fn rule_template(idx: u8) -> RuleDef {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         },
         _ => RuleDef {
             name: "r_vec".into(),
@@ -164,6 +188,9 @@ fn rule_template(idx: u8) -> RuleDef {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         },
     }
 }
@@ -1219,6 +1246,9 @@ fn approximate_wal_replay_identity() {
         weight_prop: None,
         max_edges: None,
         approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -1315,6 +1345,9 @@ fn approximate_recall_above_floor_quiesced() {
         weight_prop: None,
         max_edges: None,
         approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -1421,6 +1454,9 @@ fn approximate_recall_above_floor_after_rebuild() {
         weight_prop: None,
         max_edges: None,
         approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -1563,6 +1599,9 @@ fn approximate_recall_above_floor_1536dim_1k() {
         weight_prop: None,
         max_edges: None,
         approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -1661,6 +1700,9 @@ fn approximate_recall_5k_timing() {
         weight_prop: None,
         max_edges: None,
         approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     let ivf_ms = t0.elapsed().as_millis();
@@ -1790,6 +1832,9 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
         weight_prop: None,
         max_edges: None,
         approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 

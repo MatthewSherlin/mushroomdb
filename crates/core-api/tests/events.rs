@@ -28,6 +28,9 @@ fn overlap_rule(name: &str, etype: &str) -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -342,6 +345,9 @@ fn subscribe_rule_events_arrive_after_commit_in_order() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -397,6 +403,9 @@ fn subscribe_lagged_when_queue_full() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -438,6 +447,9 @@ fn subscription_drop_unregisters_cleanly() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -470,6 +482,9 @@ fn replay_is_silent_for_subscriptions() {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
         db.create_rule(rule).unwrap();
         db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))])
@@ -507,6 +522,9 @@ fn subscribe_writes_receives_write_events_only() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     };
     db.create_rule(rule).unwrap();
     let sub = db.subscribe_writes().unwrap();
@@ -572,6 +590,9 @@ fn subscribe_rule_receives_retract_on_node_delete() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     };
     db.create_rule(rule).unwrap();
     db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))])

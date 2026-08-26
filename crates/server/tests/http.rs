@@ -567,6 +567,9 @@ async fn explain_happy_path() {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })
         .unwrap();
         w.insert_node(
@@ -631,6 +634,9 @@ async fn explain_predicate_all_json_shape() {
             weight_prop: Some("score".into()),
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })
         .unwrap();
         w.insert_node(
@@ -817,6 +823,9 @@ async fn node_edges_json_shape_user_and_derived() {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })
         .unwrap();
         w.insert_node(

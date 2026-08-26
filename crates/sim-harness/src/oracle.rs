@@ -149,47 +149,148 @@ impl Oracle {
     ///
     /// This is the oracle invariant for per-source top-k semantics: the derived
     /// set for a source must equal exactly this set at every quiescent point.
+    ///
+    /// For via-hop rules, the predicate is evaluated between (via, dst); the
+    /// score for a (src, dst) pair is the max over all via-nodes reachable from
+    /// src via `via_edge`.
     pub fn top_k_dsts_for_src(&self, rule: &RuleDef, k: u64, src_key: &str) -> BTreeSet<String> {
         let src_label = self.labels.get(src_key).map_or("", |l| l.as_str());
         if src_label != rule.src_label {
             return BTreeSet::new();
         }
-        let src_props = match self.nodes.get(src_key) {
-            Some(p) => p,
-            None => return BTreeSet::new(),
-        };
 
-        let mut candidates: Vec<(String, f64)> = Vec::new();
-        for (dst_key, dst_props) in &self.nodes {
-            if dst_key == src_key {
-                continue; // no self-edges
-            }
-            let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
-            if dst_label != rule.dst_label {
-                continue;
-            }
-            let sp = |f: &str| src_props.get(f).cloned();
-            let dp = |f: &str| dst_props.get(f).cloned();
-            let src_view = NodeView {
-                key: src_key,
-                props: &sp,
-            };
-            let dst_view = NodeView {
-                key: dst_key,
-                props: &dp,
-            };
-            if let Some(score) = evaluate(&rule.predicate, &src_view, &dst_view) {
-                candidates.push((dst_key.clone(), score));
-            }
-        }
+        let candidates = self.score_candidates_for_src(rule, src_key);
 
         // Sort by score DESC, then key ASC for deterministic tiebreak.
-        candidates.sort_by(|(ka, sa), (kb, sb)| sb.total_cmp(sa).then_with(|| ka.cmp(kb)));
-        candidates
+        let mut sorted: Vec<(String, f64)> = candidates.into_iter().collect();
+        sorted.sort_by(|(ka, sa), (kb, sb)| sb.total_cmp(sa).then_with(|| ka.cmp(kb)));
+        sorted
             .into_iter()
             .take(k as usize)
             .map(|(k, _)| k)
             .collect()
+    }
+
+    /// Returns (dst_key → max_score) for all dst nodes that match the rule
+    /// when evaluated from `src_key`. Handles both 2-node and via-hop rules.
+    fn score_candidates_for_src(&self, rule: &RuleDef, src_key: &str) -> HashMap<String, f64> {
+        if rule.via_label.is_some() {
+            self.via_hop_candidates_for_src(rule, src_key)
+        } else {
+            let src_props = match self.nodes.get(src_key) {
+                Some(p) => p,
+                None => return HashMap::new(),
+            };
+            let mut out = HashMap::new();
+            for (dst_key, dst_props) in &self.nodes {
+                if dst_key == src_key {
+                    continue;
+                }
+                let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
+                if dst_label != rule.dst_label {
+                    continue;
+                }
+                let sp = |f: &str| src_props.get(f).cloned();
+                let dp = |f: &str| dst_props.get(f).cloned();
+                let src_view = NodeView {
+                    key: src_key,
+                    props: &sp,
+                };
+                let dst_view = NodeView {
+                    key: dst_key,
+                    props: &dp,
+                };
+                if let Some(score) = evaluate(&rule.predicate, &src_view, &dst_view) {
+                    out.insert(dst_key.clone(), score);
+                }
+            }
+            out
+        }
+    }
+
+    /// Via-hop oracle: for each dst of dst_label, find all via-nodes of
+    /// via_label reachable from src via via_edge in via_dir, evaluate
+    /// predicate(via, dst), and return max score over all via-nodes.
+    fn via_hop_candidates_for_src(&self, rule: &RuleDef, src_key: &str) -> HashMap<String, f64> {
+        let via_label = match rule.via_label.as_deref() {
+            Some(l) => l,
+            None => return HashMap::new(),
+        };
+        let via_edge = match rule.via_edge.as_deref() {
+            Some(e) => e,
+            None => return HashMap::new(),
+        };
+        let via_dir_out = rule.via_dir.map(|d| d == Direction::Out).unwrap_or(true); // None treated as Out
+
+        // Find via-nodes reachable from src via via_edge in via_dir.
+        let via_nodes: Vec<&str> = self
+            .edges
+            .iter()
+            .filter_map(|(etype, edge_src, edge_dst)| {
+                if etype != via_edge {
+                    return None;
+                }
+                let via_key = if via_dir_out {
+                    // Out: src → via_node; edge_src == src_key
+                    if edge_src != src_key {
+                        return None;
+                    }
+                    edge_dst.as_str()
+                } else {
+                    // In: via_node → src; edge_dst == src_key
+                    if edge_dst != src_key {
+                        return None;
+                    }
+                    edge_src.as_str()
+                };
+                // Filter by via_label.
+                if self.labels.get(via_key).map_or("", |l| l.as_str()) != via_label {
+                    return None;
+                }
+                Some(via_key)
+            })
+            .collect();
+
+        if via_nodes.is_empty() {
+            return HashMap::new();
+        }
+
+        // For each dst, compute max score over all via-nodes.
+        let mut out: HashMap<String, f64> = HashMap::new();
+        for (dst_key, dst_props) in &self.nodes {
+            let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
+            if dst_label != rule.dst_label {
+                continue;
+            }
+            let dp = |f: &str| dst_props.get(f).cloned();
+            let dst_view = NodeView {
+                key: dst_key,
+                props: &dp,
+            };
+
+            let mut max_score: Option<f64> = None;
+            for via_key in &via_nodes {
+                let via_props = match self.nodes.get(*via_key) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let vp = |f: &str| via_props.get(f).cloned();
+                let via_view = NodeView {
+                    key: via_key,
+                    props: &vp,
+                };
+                if let Some(score) = evaluate(&rule.predicate, &via_view, &dst_view) {
+                    max_score = Some(match max_score {
+                        Some(prev) => prev.max(score),
+                        None => score,
+                    });
+                }
+            }
+            if let Some(score) = max_score {
+                out.insert(dst_key.clone(), score);
+            }
+        }
+        out
     }
 
     /// Returns user edges ∪ brute-force derived edges as (etype, src_key, dst_key) triples.
@@ -211,10 +312,6 @@ impl Oracle {
                 if src_label != rule.src_label {
                     continue;
                 }
-                let src_props = match self.nodes.get(src_key) {
-                    Some(p) => p,
-                    None => continue,
-                };
 
                 if let Some(k) = rule.max_edges {
                     // Top-k per-source: filter to best-k dsts.
@@ -222,8 +319,19 @@ impl Oracle {
                     for dst_key in top_k {
                         out.insert((rule.edge_type.clone(), src_key.clone(), dst_key));
                     }
+                } else if rule.via_label.is_some() {
+                    // Via-hop global-budget: use via-hop candidates (predicate
+                    // evaluated between via and dst, not src and dst).
+                    let candidates = self.via_hop_candidates_for_src(rule, src_key);
+                    for dst_key in candidates.into_keys() {
+                        out.insert((rule.edge_type.clone(), src_key.clone(), dst_key));
+                    }
                 } else {
                     // No cap: include all matching dsts.
+                    let src_props = match self.nodes.get(src_key) {
+                        Some(p) => p,
+                        None => continue,
+                    };
                     for (dst_key, dst_props) in &self.nodes {
                         if src_key == dst_key {
                             continue; // skip self-pairs
@@ -495,6 +603,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 
@@ -573,6 +684,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }));
         assert!(o.create_rule(RuleDef {
             name: "nz".into(),
@@ -586,6 +700,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }));
         let edges = o.all_edges();
         assert!(edges.contains(&("NW".into(), "a".into(), "b".into())));
@@ -614,6 +731,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }));
         let edges = o.all_edges();
         assert!(edges.contains(&("GEO".into(), "paris".into(), "london".into())));
@@ -643,6 +763,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }));
         let edges = o.all_edges();
         assert!(edges.contains(&("VEC".into(), "a".into(), "b".into())));

@@ -356,6 +356,9 @@ fn infer_auto_fk<F: Fs>(
                     weight_prop: None,
                     max_edges,
                     approximate: false,
+                    via_label: None,
+                    via_edge: None,
+                    via_dir: None,
                 });
             }
             _ => {

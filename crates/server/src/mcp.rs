@@ -478,10 +478,7 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
     // When a `vector` array is provided, use the HNSW / brute-force vector
     // similarity path instead of looking up pre-derived edges.
     if let Some(vec_js) = args.get("vector").and_then(Js::as_array) {
-        let q: Vec<f64> = vec_js
-            .iter()
-            .filter_map(|v| v.as_f64())
-            .collect();
+        let q: Vec<f64> = vec_js.iter().filter_map(|v| v.as_f64()).collect();
         if q.is_empty() {
             return CallOutcome::ToolErr("vector must be a non-empty array of numbers".into());
         }
@@ -489,19 +486,13 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
             .get("field")
             .and_then(Js::as_str)
             .unwrap_or("embedding");
-        let label = args
-            .get("label")
-            .and_then(Js::as_str)
-            .unwrap_or("");
+        let label = args.get("label").and_then(Js::as_str).unwrap_or("");
         let k = args
             .get("k")
             .and_then(Js::as_u64)
             .map(|n| n as usize)
             .unwrap_or(10);
-        let min = args
-            .get("min")
-            .and_then(Js::as_f64)
-            .unwrap_or(0.8);
+        let min = args.get("min").and_then(Js::as_f64).unwrap_or(0.8);
 
         let hits = {
             let g = db.read();
@@ -868,6 +859,9 @@ mod tests {
                 weight_prop: Some("score".into()),
                 max_edges: None,
                 approximate: false,
+                via_label: None,
+                via_edge: None,
+                via_dir: None,
             })
             .expect("rule");
         }
@@ -1243,11 +1237,11 @@ mod tests {
         let result = tool_text(&resp);
         let results = result["results"].as_array().expect("results array");
 
-        let keys: Vec<&str> = results
-            .iter()
-            .filter_map(|r| r["key"].as_str())
-            .collect();
-        assert!(keys.contains(&"close"), "close node (sim=1.0) must be included");
+        let keys: Vec<&str> = results.iter().filter_map(|r| r["key"].as_str()).collect();
+        assert!(
+            keys.contains(&"close"),
+            "close node (sim=1.0) must be included"
+        );
         assert!(
             !keys.contains(&"far"),
             "far node (sim=0.0) must be excluded by default min=0.8"

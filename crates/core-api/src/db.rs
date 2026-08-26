@@ -1150,6 +1150,37 @@ impl<F: Fs> GraphDb<F> {
                     &self.syms,
                     &self.labels,
                 );
+                // Rule engine: via-hop rules must update when user edges change.
+                let cursor = self.engine.pending_delta_count();
+                let mut eng = std::mem::take(&mut self.engine);
+                {
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
+                    eng.on_edge_changed(edge_type, src, dst, &mut gm);
+                }
+                self.engine = eng;
+                if !self.view_store.is_empty() {
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
+                        );
+                    }
+                }
             }
             WalRecord::SetProp { key, field, value } => {
                 let id = self.ids.get(key).ok_or_else(|| GraphError::Corrupt {
@@ -1330,6 +1361,40 @@ impl<F: Fs> GraphDb<F> {
                     &self.syms,
                     &self.labels,
                 );
+                // Rule engine: via-hop rules fire when user via-edges are inserted.
+                // Resolve etype back to string so on_edge_changed can match rules by name.
+                if let Some(etype_str) = self.syms.resolve(*etype).map(|s| s.to_string()) {
+                    let cursor = self.engine.pending_delta_count();
+                    let mut eng = std::mem::take(&mut self.engine);
+                    {
+                        let mut gm = make_graph_mut(
+                            &self.ids,
+                            &mut self.syms,
+                            &self.labels,
+                            &self.props,
+                            &mut self.topo,
+                            &mut self.edge_props,
+                        );
+                        eng.on_edge_changed(&etype_str, *src, *dst, &mut gm);
+                    }
+                    self.engine = eng;
+                    if !self.view_store.is_empty() {
+                        let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                        for d in &new_deltas {
+                            self.view_store.on_edge_changed(
+                                d.etype_sym,
+                                d.src_id,
+                                d.dst_id,
+                                d.fired,
+                                &mut self.props,
+                                &self.topo,
+                                &self.ids,
+                                &self.syms,
+                                &self.labels,
+                            );
+                        }
+                    }
+                }
             }
             WalRecord::SetPropId { id, field, value } => {
                 if self.ids.is_tombstoned(*id) || self.ids.key_of(*id).is_none() {
@@ -1579,8 +1644,37 @@ impl<F: Fs> GraphDb<F> {
                     &self.syms,
                     &self.labels,
                 );
-                // No rule callback: validated as not provenance-owned and not
-                // would_derive, so no rule needs to update its desired set.
+                // Rule engine: via-hop rules must retract when user via-edges are deleted.
+                let cursor = self.engine.pending_delta_count();
+                let mut eng = std::mem::take(&mut self.engine);
+                {
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
+                    eng.on_edge_changed(edge_type, src, dst, &mut gm);
+                }
+                self.engine = eng;
+                if !self.view_store.is_empty() {
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
+                        );
+                    }
+                }
             }
             WalRecord::DeleteNode { key } => {
                 // Recovery-safe: already-tombstoned / unknown key is a clean
@@ -3346,9 +3440,7 @@ impl<F: Fs> GraphDb<F> {
             let mut out: Vec<(String, f64)> = hits
                 .into_iter()
                 .filter(|&(_, sim)| sim >= min)
-                .filter_map(|(id, sim)| {
-                    self.ids.key_of(id).map(|key| (key.to_string(), sim))
-                })
+                .filter_map(|(id, sim)| self.ids.key_of(id).map(|key| (key.to_string(), sim)))
                 .collect();
             out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             out.truncate(k);
@@ -4888,6 +4980,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 

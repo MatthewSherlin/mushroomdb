@@ -28,6 +28,9 @@ fn numeric_rule() -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -44,6 +47,9 @@ fn geo_rule() -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -60,6 +66,9 @@ fn vec_rule() -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -396,6 +405,9 @@ fn vector_topk_per_source_caps_and_not_frozen() {
         weight_prop: Some("score".into()),
         max_edges: Some(2),
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     // 5 nodes all with emb=[1,0] → cosine sim=1.0 ≥ 0.9; top-2 per source.
@@ -463,6 +475,9 @@ fn delete_numeric_coetype_survivor_keeps_edges() {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     db.create_rule(RuleDef {
@@ -476,6 +491,9 @@ fn delete_numeric_coetype_survivor_keeps_edges() {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     assert_eq!(

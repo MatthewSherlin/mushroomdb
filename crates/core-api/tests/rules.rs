@@ -26,6 +26,9 @@ fn fk_rule() -> RuleDef {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -172,6 +175,9 @@ fn explain_reports_rule_provenance_and_weights() {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     db.insert_node(
@@ -252,6 +258,9 @@ fn explain_predicate_summary_key_match_and_all() {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     db.insert_node(
@@ -443,6 +452,9 @@ fn all_vector_then_field_equal_does_not_scan_all() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 
@@ -503,6 +515,9 @@ fn approx_vec_rule() -> RuleDef {
         weight_prop: None,
         max_edges: None,
         approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -694,4 +709,236 @@ fn find_similar_vector_without_edges() {
     // Label filter: only Items (no false positives from other labels).
     let filtered = db.find_similar_vector("emb", "Other", &query, 10, 0.0);
     assert!(filtered.is_empty(), "no Other-label nodes exist");
+}
+
+// ---------------------------------------------------------------------------
+// Task 2: 3-node via-hop linking rules
+// ---------------------------------------------------------------------------
+
+/// Scenario: Person -[WORKS_AT]-> Org, Org.industry == Project.industry → FIT.
+/// alice and bob both work at TechCorp (industry=tech).
+/// ProjectA has industry=tech (matches); ProjectB has industry=law (no match).
+/// Expected: FIT edges from alice→ProjectA and bob→ProjectA only.
+#[test]
+fn via_hop_rule_fires_only_matching_industry() {
+    let dir = tmp("via-hop-basic");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Nodes
+    db.insert_node(
+        "Org",
+        "techcorp",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node("Person", "bob", vec![]).unwrap();
+    db.insert_node(
+        "Project",
+        "proj_a",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Project",
+        "proj_b",
+        vec![("industry".into(), Value::Str("law".into()))],
+    )
+    .unwrap();
+
+    // Via edges: person -[WORKS_AT]-> org
+    db.insert_edge("WORKS_AT", "alice", "techcorp").unwrap();
+    db.insert_edge("WORKS_AT", "bob", "techcorp").unwrap();
+
+    // Via-hop rule: Person -[WORKS_AT/Out]-> Org, FieldEqual(industry), → FIT → Project
+    let rule = RuleDef {
+        name: "fit".into(),
+        src_label: "Person".into(),
+        dst_label: "Project".into(),
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
+        edge_type: "FIT".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("Org".into()),
+        via_edge: Some("WORKS_AT".into()),
+        via_dir: None, // defaults to Out
+    };
+    db.create_rule(rule).unwrap();
+
+    // Both alice and bob should have FIT→proj_a, neither should have FIT→proj_b.
+    let alice_fit = db.neighbors("alice", "FIT", Direction::Out).unwrap();
+    assert_eq!(alice_fit, vec!["proj_a"], "alice fits proj_a (tech)");
+
+    let bob_fit = db.neighbors("bob", "FIT", Direction::Out).unwrap();
+    assert_eq!(bob_fit, vec!["proj_a"], "bob fits proj_a (tech)");
+
+    // proj_b (law) must not be linked to anyone via FIT.
+    let proj_b_fit = db.neighbors("proj_b", "FIT", Direction::In).unwrap();
+    assert!(proj_b_fit.is_empty(), "proj_b (law) gets no FIT edges");
+}
+
+/// Validate: via_label and via_edge must both be set or both absent.
+#[test]
+fn via_hop_validate_rejects_half_set() {
+    let dir = tmp("via-hop-validate");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Only via_label set — should fail validate
+    let bad_label_only = RuleDef {
+        name: "r1".into(),
+        src_label: "A".into(),
+        dst_label: "B".into(),
+        predicate: Predicate::FieldEqual { field: "f".into() },
+        edge_type: "E".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("V".into()),
+        via_edge: None,
+        via_dir: None,
+    };
+    assert!(
+        db.create_rule(bad_label_only).is_err(),
+        "via_label without via_edge must be rejected"
+    );
+
+    // Only via_edge set — should fail validate
+    let bad_edge_only = RuleDef {
+        name: "r2".into(),
+        src_label: "A".into(),
+        dst_label: "B".into(),
+        predicate: Predicate::FieldEqual { field: "f".into() },
+        edge_type: "E".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: Some("VE".into()),
+        via_dir: None,
+    };
+    assert!(
+        db.create_rule(bad_edge_only).is_err(),
+        "via_edge without via_label must be rejected"
+    );
+}
+
+/// Incremental: when a via-edge is inserted after rule creation, the rule fires.
+#[test]
+fn via_hop_incremental_edge_insert() {
+    let dir = tmp("via-hop-edge-insert");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node(
+        "Org",
+        "techcorp",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node(
+        "Project",
+        "proj_a",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+
+    let rule = RuleDef {
+        name: "fit".into(),
+        src_label: "Person".into(),
+        dst_label: "Project".into(),
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
+        edge_type: "FIT".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("Org".into()),
+        via_edge: Some("WORKS_AT".into()),
+        via_dir: None,
+    };
+    db.create_rule(rule).unwrap();
+
+    // No WORKS_AT edge yet → no FIT edges
+    assert!(
+        db.neighbors("alice", "FIT", Direction::Out)
+            .unwrap()
+            .is_empty(),
+        "no FIT before WORKS_AT inserted"
+    );
+
+    // Insert the via edge → rule should fire
+    db.insert_edge("WORKS_AT", "alice", "techcorp").unwrap();
+
+    let fit = db.neighbors("alice", "FIT", Direction::Out).unwrap();
+    assert_eq!(fit, vec!["proj_a"], "FIT fires after WORKS_AT inserted");
+}
+
+/// Incremental: when via-node property changes, rule re-evaluates.
+#[test]
+fn via_hop_incremental_via_prop_change() {
+    let dir = tmp("via-hop-via-prop");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node(
+        "Org",
+        "techcorp",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node(
+        "Project",
+        "proj_a",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Project",
+        "proj_b",
+        vec![("industry".into(), Value::Str("law".into()))],
+    )
+    .unwrap();
+    db.insert_edge("WORKS_AT", "alice", "techcorp").unwrap();
+
+    let rule = RuleDef {
+        name: "fit".into(),
+        src_label: "Person".into(),
+        dst_label: "Project".into(),
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
+        edge_type: "FIT".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("Org".into()),
+        via_edge: Some("WORKS_AT".into()),
+        via_dir: None,
+    };
+    db.create_rule(rule).unwrap();
+
+    assert_eq!(
+        db.neighbors("alice", "FIT", Direction::Out).unwrap(),
+        vec!["proj_a"]
+    );
+
+    // Change techcorp industry to law → alice should now fit proj_b, not proj_a
+    db.set_prop("techcorp", "industry", Value::Str("law".into()))
+        .unwrap();
+
+    let fit = db.neighbors("alice", "FIT", Direction::Out).unwrap();
+    assert_eq!(
+        fit,
+        vec!["proj_b"],
+        "FIT updated after via-node prop change"
+    );
+    let proj_a_fit = db.neighbors("proj_a", "FIT", Direction::In).unwrap();
+    assert!(
+        proj_a_fit.is_empty(),
+        "proj_a FIT retracted after org industry changed"
+    );
 }

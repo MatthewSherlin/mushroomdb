@@ -268,6 +268,9 @@ fn tools_call_happy_path_for_each_tool() {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })
         .unwrap();
     }
@@ -379,6 +382,9 @@ fn node_info_and_edges_tool_parity() {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })
         .unwrap();
         w.insert_node(

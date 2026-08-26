@@ -222,10 +222,7 @@ impl HnswIndex {
             }
         }
 
-        w_heap
-            .into_iter()
-            .map(|(OrdF64(d), id)| (id, d))
-            .collect()
+        w_heap.into_iter().map(|(OrdF64(d), id)| (id, d)).collect()
     }
 
     /// Greedy 1-NN descent from `ep` at `layer`. Returns the nearest node
@@ -350,10 +347,12 @@ impl HnswIndex {
                         .iter()
                         .map(|&nid| {
                             let d = if nid == id {
-                                let dot: f64 = nb_vec.iter().zip(unit.iter()).map(|(a, b)| a * b).sum();
+                                let dot: f64 =
+                                    nb_vec.iter().zip(unit.iter()).map(|(a, b)| a * b).sum();
                                 (1.0 - dot.clamp(-1.0, 1.0)).max(0.0)
                             } else if let Some(n) = self.nodes.get(&nid) {
-                                let dot: f64 = nb_vec.iter().zip(n.vector.iter()).map(|(a, b)| a * b).sum();
+                                let dot: f64 =
+                                    nb_vec.iter().zip(n.vector.iter()).map(|(a, b)| a * b).sum();
                                 (1.0 - dot.clamp(-1.0, 1.0)).max(0.0)
                             } else {
                                 f64::MAX
@@ -362,7 +361,8 @@ impl HnswIndex {
                         })
                         .collect();
 
-                    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    scored
+                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                     scored.truncate(m_lc);
                     self.nodes.get_mut(&nb_id).unwrap().layers[lc] =
                         scored.into_iter().map(|(nid, _)| nid).collect();
@@ -628,8 +628,15 @@ mod tests {
         for q in &queries {
             let exact_set: std::collections::BTreeSet<usize> =
                 exact_knn(&vecs, q, K).into_iter().collect();
-            let approx_ids: Vec<usize> = idx.search(q, K).into_iter().map(|(id, _)| id as usize).collect();
-            let hits = approx_ids.iter().filter(|id| exact_set.contains(id)).count();
+            let approx_ids: Vec<usize> = idx
+                .search(q, K)
+                .into_iter()
+                .map(|(id, _)| id as usize)
+                .collect();
+            let hits = approx_ids
+                .iter()
+                .filter(|id| exact_set.contains(id))
+                .count();
             recalls.push(hits as f64 / K as f64);
         }
 

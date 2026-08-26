@@ -170,6 +170,9 @@ fn pagerank_over_derived_edges() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     // After rule fires: x→y and y→x exist as derived edges.
@@ -284,6 +287,9 @@ fn pagerank_derived_edge_type_filter() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     // Filter to only LINKED (derived) edges: z has no LINKED edge, so z should score lower.
@@ -903,6 +909,9 @@ fn pagerank_on_demo_graph() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 

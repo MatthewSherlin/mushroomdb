@@ -32,6 +32,9 @@ fn rule_fe_k1() -> RuleDef {
         weight_prop: None,
         max_edges: Some(1),
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -48,6 +51,9 @@ fn rule_nw_k3() -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: Some(3),
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -70,6 +76,9 @@ fn rule_any_k2() -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: Some(2),
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -355,6 +364,9 @@ fn topk_evicted_pair_has_no_explain_entry() {
         weight_prop: Some("score".into()),
         max_edges: Some(1),
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -483,6 +495,9 @@ fn topk_approx_recall_floor() {
         weight_prop: None,
         max_edges: Some(topk),
         approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 

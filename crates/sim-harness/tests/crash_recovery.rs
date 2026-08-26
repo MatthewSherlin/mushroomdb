@@ -169,6 +169,9 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })?;
 
     // --- 6 L1 nodes ---
@@ -208,6 +211,9 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })?;
 
     // DUMMY rule created and immediately deleted.
@@ -220,6 +226,9 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })?;
     db.delete_rule("dummy")?;
 
@@ -243,6 +252,9 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })?;
     db.create_rule(RuleDef {
         name: "nz".into(),
@@ -256,6 +268,9 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })?;
 
     // Geo: Paris/London cross-cell; ±180 at lat 70 (antimeridian wrap); NYC far.
@@ -276,6 +291,9 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })?;
 
     // Vector: [1,0] vs near-threshold 0.95; orthogonal [0,1] does not match.
@@ -298,6 +316,9 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })?;
 
     // Approximate vector rule (vec_approx): 8 VA nodes in 4 pairs across quadrants.
@@ -329,6 +350,9 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         weight_prop: None,
         max_edges: None,
         approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })?;
 
     // Snapshot while km, ov, and Plan-7 rules are live (no dummy rule).
@@ -967,6 +991,9 @@ fn delete_heavy_workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })?;
     db.create_rule(RuleDef {
         name: "dfe".into(),
@@ -977,6 +1004,9 @@ fn delete_heavy_workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })?;
 
     // Insert 6 more nodes: d6..d11.
@@ -1159,6 +1189,9 @@ fn write_batch_large_frame_dst_byte_sweep() {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })?;
         // 12-op write_batch: all-or-none atomicity gate
         db.write_batch(|b| {
@@ -1340,6 +1373,9 @@ fn write_batch_composition_sweep() {
             weight_prop: None,
             max_edges: Some(2),
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })?;
 
         // Phase 2: snapshot — captures nodes + rule + derived edges.
