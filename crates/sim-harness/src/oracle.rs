@@ -256,8 +256,12 @@ impl Oracle {
         }
 
         // For each dst, compute max score over all via-nodes.
+        // Skip self-pairs: the engine filters id != src in compute_desired_via.
         let mut out: HashMap<String, f64> = HashMap::new();
         for (dst_key, dst_props) in &self.nodes {
+            if dst_key == src_key {
+                continue;
+            }
             let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
             if dst_label != rule.dst_label {
                 continue;
