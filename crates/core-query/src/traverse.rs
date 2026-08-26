@@ -33,7 +33,7 @@ pub fn expand(view: &GraphView, id: u32, etypes: Option<&[u32]>, dir: Dir) -> Ve
     let mut seen = BTreeSet::new();
     for etype in types {
         if matches!(dir, Dir::Out | Dir::Both) {
-            for &dst in view.topo.neighbors(etype, Direction::Out, id) {
+            for &dst in view.topo.neighbors(etype, Direction::Out, id).as_ref() {
                 push_unique(
                     &mut out,
                     &mut seen,
@@ -46,7 +46,7 @@ pub fn expand(view: &GraphView, id: u32, etypes: Option<&[u32]>, dir: Dir) -> Ve
             }
         }
         if matches!(dir, Dir::In | Dir::Both) {
-            for &src in view.topo.neighbors(etype, Direction::In, id) {
+            for &src in view.topo.neighbors(etype, Direction::In, id).as_ref() {
                 push_unique(
                     &mut out,
                     &mut seen,

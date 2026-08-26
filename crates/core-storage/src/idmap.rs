@@ -1,5 +1,12 @@
+use crate::types::{GraphError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
+
+fn dense_id(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| GraphError::Corrupt {
+        detail: "id space exhausted".into(),
+    })
+}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct IdMap {
@@ -15,13 +22,19 @@ impl IdMap {
     }
 
     pub fn get_or_insert(&mut self, key: &str) -> u32 {
+        self.try_insert(key).expect("id space exhausted")
+    }
+
+    /// Allocate a dense id for `key`, or return the existing live id.
+    /// Fails before wrap when the next id would not fit in `u32`.
+    pub fn try_insert(&mut self, key: &str) -> Result<u32> {
         if let Some(&id) = self.to_id.get(key) {
-            return id;
+            return Ok(id);
         }
-        let id = self.to_key.len() as u32;
+        let id = dense_id(self.to_key.len())?;
         self.to_id.insert(key.to_string(), id);
         self.to_key.push(key.to_string());
-        id
+        Ok(id)
     }
 
     pub fn get(&self, key: &str) -> Option<u32> {
@@ -150,5 +163,15 @@ mod tests {
         assert_eq!(back.key_of(dead), None);
         assert_eq!(back.live_len(), 1);
         assert_eq!(back.len(), 2);
+    }
+
+    #[test]
+    fn try_insert_fails_when_u32_space_exhausted() {
+        assert!(dense_id(u32::MAX as usize + 1).is_err());
+        assert_eq!(dense_id(0).unwrap(), 0);
+        assert_eq!(dense_id(u32::MAX as usize).unwrap(), u32::MAX);
+        let mut m = IdMap::new();
+        assert_eq!(m.try_insert("a").unwrap(), 0);
+        assert_eq!(m.try_insert("a").unwrap(), 0);
     }
 }

@@ -248,17 +248,24 @@ fn wal_replay_rederives_identical_weights_and_does_not_log_edges() {
             vec![("founded_year".into(), Value::Float(2000.0))],
         )
         .unwrap();
-        let wal_after = std::fs::metadata(dir.join("wal.bin")).unwrap().len();
-        let node_only =
-            core_storage::wal::encode_record(&core_storage::wal::WalRecord::InsertNode {
-                label: "Person".into(),
-                key: "bob".into(),
-                props: vec![("founded_year".into(), Value::Float(2000.0))],
-            })
-            .len() as u64;
-        assert_eq!(
-            wal_after - wal_before,
-            node_only,
+        let wal_after = std::fs::read(dir.join("wal.bin")).unwrap();
+        assert!(wal_after.len() as u64 > wal_before);
+        let suffix = &wal_after[wal_before as usize..];
+        let (recs, _) = core_storage::wal::decode_all(suffix);
+        let has_edge = recs.iter().any(|r| match r {
+            core_storage::wal::WalRecord::InsertEdge { .. }
+            | core_storage::wal::WalRecord::InsertEdgeId { .. } => true,
+            core_storage::wal::WalRecord::Batch(inner) => inner.iter().any(|x| {
+                matches!(
+                    x,
+                    core_storage::wal::WalRecord::InsertEdge { .. }
+                        | core_storage::wal::WalRecord::InsertEdgeId { .. }
+                )
+            }),
+            _ => false,
+        });
+        assert!(
+            !has_edge,
             "derived FOUNDED_NEAR edges must not be WAL-logged"
         );
         db.insert_node(

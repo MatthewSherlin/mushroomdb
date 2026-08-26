@@ -4,6 +4,7 @@ pub mod fs;
 pub mod fulltext;
 pub mod idmap;
 pub mod interner;
+mod pack;
 pub mod snapshot;
 pub mod topology;
 pub mod types;

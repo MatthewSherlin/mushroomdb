@@ -90,12 +90,20 @@ fn node_node_edge_batch_is_one_wal_frame() {
     assert_eq!(recs.len(), 1);
     match &recs[0] {
         WalRecord::Batch(inner) => {
-            assert_eq!(inner.len(), 3);
-            assert!(matches!(&inner[0], WalRecord::InsertNode { key, .. } if key == "a"));
-            assert!(matches!(&inner[1], WalRecord::InsertNode { key, .. } if key == "b"));
             assert!(
-                matches!(&inner[2], WalRecord::InsertEdge { src_key, dst_key, .. } if src_key == "a" && dst_key == "b")
+                inner.len() >= 3,
+                "user ops plus any Intern records, got {}",
+                inner.len()
             );
+            assert!(inner
+                .iter()
+                .any(|r| matches!(r, WalRecord::InsertNodeId { key, .. } if key == "a")));
+            assert!(inner
+                .iter()
+                .any(|r| matches!(r, WalRecord::InsertNodeId { key, .. } if key == "b")));
+            assert!(inner
+                .iter()
+                .any(|r| matches!(r, WalRecord::InsertEdgeId { .. })));
         }
         other => panic!("expected Batch frame, got {other:?}"),
     }

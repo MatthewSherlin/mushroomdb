@@ -231,7 +231,7 @@ pub(crate) fn pagerank(
             match config.direction {
                 AlgoDir::Out => {
                     // Standard: node i sends to its out-neighbors.
-                    for &nbr in topo.neighbors(et, Direction::Out, id) {
+                    for &nbr in topo.neighbors(et, Direction::Out, id).as_ref() {
                         if let Some(&j) = id_to_idx.get(&nbr) {
                             if !send_to[i].contains(&j) {
                                 send_to[i].push(j);
@@ -241,7 +241,7 @@ pub(crate) fn pagerank(
                 }
                 AlgoDir::In => {
                     // Authority: node i sends to its in-neighbors (reversed).
-                    for &nbr in topo.neighbors(et, Direction::In, id) {
+                    for &nbr in topo.neighbors(et, Direction::In, id).as_ref() {
                         if let Some(&j) = id_to_idx.get(&nbr) {
                             if !send_to[i].contains(&j) {
                                 send_to[i].push(j);
@@ -252,7 +252,7 @@ pub(crate) fn pagerank(
                 AlgoDir::Both => {
                     // Undirected: union of out and in.
                     for dir in [Direction::Out, Direction::In] {
-                        for &nbr in topo.neighbors(et, dir, id) {
+                        for &nbr in topo.neighbors(et, dir, id).as_ref() {
                             if let Some(&j) = id_to_idx.get(&nbr) {
                                 if !send_to[i].contains(&j) {
                                     send_to[i].push(j);
@@ -465,7 +465,7 @@ pub(crate) fn wcc(
                 }
             }
             // Out-edges: union i with each out-neighbor.
-            for &nbr in topo.neighbors(et, Direction::Out, id) {
+            for &nbr in topo.neighbors(et, Direction::Out, id).as_ref() {
                 if let Some(&j) = id_to_idx.get(&nbr) {
                     uf.union(i, j);
                 }
@@ -473,7 +473,7 @@ pub(crate) fn wcc(
             // In-edges handled by the mirror out-edge from the other side,
             // but we also cover them here for safety (e.g., self-loops, or
             // nodes with only in-edges for a filtered etype).
-            for &nbr in topo.neighbors(et, Direction::In, id) {
+            for &nbr in topo.neighbors(et, Direction::In, id).as_ref() {
                 if let Some(&j) = id_to_idx.get(&nbr) {
                     uf.union(i, j);
                 }
