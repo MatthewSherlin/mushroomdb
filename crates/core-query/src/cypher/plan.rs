@@ -283,15 +283,19 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
 /// Allowlisted shapes (documented subset — not full Cypher):
 ///   • `MATCH (n:Label) WHERE … RETURN …`
 ///     → ScanLabel or ScanKey, optional LookupProps, optional Filter, Project,
-///       optional Skip/Limit.
+///       optional Limit.
 ///   • `MATCH (a)-[r:TYPE]->(b) RETURN …`
-///     → ScanLabel or ScanKey, single Expand, optional Filter, Project,
-///       optional Skip/Limit.
+///     → ScanLabel or ScanKey, exactly one Expand, optional Filter, Project,
+///       optional Limit.
 ///
-/// Everything else is rejected: ORDER BY, DISTINCT, aggregates, variable-length
-/// paths, OPTIONAL MATCH, WITH, UNWIND, JoinBound (multi-MATCH). Use LIMIT to
-/// bound re-execution cost (`subscribe_query` does a full re-run per commit).
+/// Everything else is rejected: SKIP (creates unstable offset windows), multi-hop
+/// Expand chains, ORDER BY, DISTINCT, aggregates, variable-length paths, OPTIONAL
+/// MATCH, WITH, UNWIND, JoinBound (multi-MATCH). Use LIMIT to bound re-execution
+/// cost (`subscribe_query` does a full re-run per commit).
 pub fn is_subscribable(ops: &[PlanOp]) -> bool {
+    // All ops must be from the allowlisted set. Skip is excluded: SKIP N shifts
+    // the result window on every commit, causing spurious Added/Removed churn for
+    // rows whose data never changed.
     ops.iter().all(|op| {
         matches!(
             op,
@@ -301,13 +305,21 @@ pub fn is_subscribable(ops: &[PlanOp]) -> bool {
                 | PlanOp::Expand { .. }
                 | PlanOp::Filter { .. }
                 | PlanOp::Project { .. }
-                | PlanOp::Skip(_)
                 | PlanOp::Limit(_)
         )
-    }) && ops
+    })
+    // At least one scan.
+    && ops
         .iter()
         .any(|op| matches!(op, PlanOp::ScanLabel { .. } | PlanOp::ScanKey { .. }))
-        && ops.iter().any(|op| matches!(op, PlanOp::Project { .. }))
+    // Exactly one Project (ensures it is a RETURN query).
+    && ops.iter().any(|op| matches!(op, PlanOp::Project { .. }))
+    // At most one Expand: multi-hop chains are outside the documented subset.
+    && ops
+        .iter()
+        .filter(|op| matches!(op, PlanOp::Expand { .. }))
+        .count()
+        <= 1
 }
 
 /// Compile `q` into a logical plan. Errors are contextual `String`s; never panics.
@@ -1837,5 +1849,68 @@ LIMIT 10";
             err.contains("minimum"),
             "error must mention minimum hop count, got: {err}"
         );
+    }
+
+    // ── is_subscribable tests ──────────────────────────────────────────────────
+
+    fn subscribable(src: &str) -> bool {
+        let ops = plan_src(src).expect("must plan");
+        super::is_subscribable(&ops)
+    }
+
+    #[test]
+    fn is_subscribable_passes_simple_label_scan() {
+        assert!(subscribable("MATCH (n:Person) RETURN n"));
+        assert!(subscribable("MATCH (n:Person) WHERE n.age > 18 RETURN n"));
+        assert!(subscribable("MATCH (n:Person) RETURN n LIMIT 100"));
+    }
+
+    #[test]
+    fn is_subscribable_passes_single_hop_expand() {
+        assert!(subscribable(
+            "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a"
+        ));
+        assert!(subscribable(
+            "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a LIMIT 50"
+        ));
+    }
+
+    #[test]
+    fn is_subscribable_rejects_multi_hop_expand() {
+        // Two Expand ops: outside the documented single-hop subset.
+        assert!(
+            !subscribable("MATCH (a:Person)-[r1:KNOWS]->(b:Person)-[r2:LIKES]->(c:Thing) RETURN a"),
+            "two-hop chain must be rejected"
+        );
+    }
+
+    #[test]
+    fn is_subscribable_rejects_skip() {
+        // SKIP creates unstable offset windows — explicitly excluded.
+        assert!(
+            !subscribable("MATCH (n:Person) RETURN n SKIP 10 LIMIT 50"),
+            "SKIP must be rejected"
+        );
+        assert!(
+            !subscribable("MATCH (n:Person) RETURN n SKIP 10"),
+            "bare SKIP must be rejected"
+        );
+    }
+
+    #[test]
+    fn is_subscribable_rejects_order_by() {
+        assert!(!subscribable("MATCH (n:Person) RETURN n ORDER BY n"));
+    }
+
+    #[test]
+    fn is_subscribable_rejects_aggregates() {
+        assert!(!subscribable("MATCH (n:Person) RETURN COUNT(*)"));
+    }
+
+    #[test]
+    fn is_subscribable_rejects_var_expand() {
+        assert!(!subscribable(
+            "MATCH (a:Person)-[r:KNOWS*1..3]->(b) RETURN b"
+        ));
     }
 }

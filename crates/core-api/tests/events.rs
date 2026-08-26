@@ -692,6 +692,40 @@ fn subscribe_query_rejects_non_allowlisted_plans() {
     );
 }
 
+/// Binding: multi-hop Expand chains are rejected (only single-hop is documented).
+#[test]
+fn subscribe_query_rejects_multi_hop_expand() {
+    let dir = tmp("sq-reject-multihop");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    let err = db
+        .subscribe_query("MATCH (a:Person)-[r1:KNOWS]->(b:Person)-[r2:LIKES]->(c:Thing) RETURN a")
+        .expect_err("two-hop MATCH must be rejected by subscribe_query");
+    assert!(
+        matches!(err, GraphError::QueryError { .. }),
+        "expected QueryError for multi-hop, got {err:?}"
+    );
+}
+
+/// Binding: SKIP is rejected (creates unstable offset windows on every commit).
+#[test]
+fn subscribe_query_rejects_skip() {
+    let dir = tmp("sq-reject-skip");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    let err = db
+        .subscribe_query("MATCH (n:Person) RETURN n SKIP 10 LIMIT 50")
+        .expect_err("SKIP must be rejected by subscribe_query");
+    assert!(
+        matches!(err, GraphError::QueryError { .. }),
+        "expected QueryError for SKIP, got {err:?}"
+    );
+
+    // LIMIT alone is fine — it is the documented cost-bounding mechanism.
+    db.subscribe_query("MATCH (n:Person) RETURN n LIMIT 1000")
+        .expect("LIMIT without SKIP must be accepted");
+}
+
 /// Binding: read-only as-of instances reject subscribe_query.
 #[test]
 fn subscribe_query_rejects_read_only() {

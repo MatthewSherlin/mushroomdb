@@ -2541,8 +2541,13 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Parses and plans `cypher`; rejects the query if the plan is not in the
     /// allowlisted subset (see [`core_query::cypher::is_subscribable`]):
-    ///   - `MATCH (n:Label) WHERE … RETURN …`
-    ///   - `MATCH (a)-[r:TYPE]->(b) RETURN …`
+    ///   - `MATCH (n:Label) WHERE … RETURN … [LIMIT n]`
+    ///   - `MATCH (a)-[r:TYPE]->(b) RETURN … [LIMIT n]`  (exactly one hop)
+    ///
+    /// SKIP is not supported — it shifts the result window on every commit,
+    /// causing spurious Added/Removed churn for rows whose data never changed.
+    /// Multi-hop Expand chains are not supported; each additional MATCH clause
+    /// widens scope beyond the documented single-scan / single-hop subset.
     ///
     /// After each successful commit, the plan is **fully re-executed** and the
     /// result is diffed against the previous run. Added rows produce
@@ -2575,10 +2580,11 @@ impl<F: Fs> GraphDb<F> {
         if !is_subscribable(&ops) {
             return Err(GraphError::QueryError {
                 detail: "subscribe_query only supports allowlisted plan shapes: \
-                         MATCH (n:Label) WHERE … RETURN … or \
-                         MATCH (a)-[r:TYPE]->(b) RETURN …; \
-                         ORDER BY, DISTINCT, aggregates, variable-length paths, \
-                         OPTIONAL MATCH, WITH, and UNWIND are not supported. \
+                         MATCH (n:Label) WHERE … RETURN … [LIMIT n] or \
+                         MATCH (a)-[r:TYPE]->(b) RETURN … [LIMIT n] (exactly one hop). \
+                         Not supported: multi-hop Expand chains, SKIP (creates \
+                         unstable offset windows), ORDER BY, DISTINCT, aggregates, \
+                         variable-length paths, OPTIONAL MATCH, WITH, UNWIND. \
                          Use LIMIT to bound re-execution cost."
                     .to_string(),
             });
