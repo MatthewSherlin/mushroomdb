@@ -501,7 +501,7 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
         let min = args
             .get("min")
             .and_then(Js::as_f64)
-            .unwrap_or(0.0);
+            .unwrap_or(0.8);
 
         let hits = {
             let g = db.read();
@@ -733,7 +733,7 @@ fn tools_list() -> Js {
                         "field": { "type": "string", "description": "Property field holding the embedding vectors (default: embedding). Used in vector-search mode." },
                         "label": { "type": "string", "description": "Restrict search to nodes with this label. Empty string means all labels. Used in vector-search mode." },
                         "k": { "type": "integer", "description": "Maximum results to return in vector-search mode (default: 10)." },
-                        "min": { "type": "number", "description": "Minimum cosine similarity threshold in vector-search mode (default: 0.0)." },
+                        "min": { "type": "number", "description": "Minimum cosine similarity threshold in vector-search mode (default: 0.8)." },
                         "key": { "type": "string", "description": "Source node key for edge-traversal mode." },
                         "edge_type": { "type": "string", "description": "Edge type to filter by in edge-traversal mode (default: SIMILAR)." },
                         "limit": { "type": "integer", "description": "Maximum neighbors to return in edge-traversal mode (default: 10)." }
@@ -1195,6 +1195,63 @@ mod tests {
         let result = tool_text(&resp);
         let similar = result["similar"].as_array().expect("similar array");
         assert_eq!(similar.len(), 0);
+    }
+
+    /// When `min` is omitted from a vector-mode find_similar call, the server
+    /// must apply the spec default of 0.8.  A node whose cosine similarity to
+    /// the query is 0.0 (orthogonal) must not appear in the results.
+    #[test]
+    fn test_find_similar_vector_default_min_is_0_8() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            // close: [1,0] → cosine 1.0 with query [1,0] (above 0.8)
+            g.insert_node(
+                "Item",
+                "close",
+                vec![(
+                    "emb".into(),
+                    Value::List(vec![Value::Float(1.0), Value::Float(0.0)]),
+                )],
+            )
+            .unwrap();
+            // far: [0,1] → cosine 0.0 with query [1,0] (below 0.8, must be excluded)
+            g.insert_node(
+                "Item",
+                "far",
+                vec![(
+                    "emb".into(),
+                    Value::List(vec![Value::Float(0.0), Value::Float(1.0)]),
+                )],
+            )
+            .unwrap();
+        }
+
+        // No `min` in the request — must default to 0.8.
+        let resp = tool_call(
+            &db,
+            1,
+            "find_similar",
+            json!({
+                "vector": [1.0, 0.0],
+                "field": "emb",
+                "label": "Item",
+                "k": 10
+            }),
+        );
+        assert!(!is_error(&resp), "vector search must not error");
+        let result = tool_text(&resp);
+        let results = result["results"].as_array().expect("results array");
+
+        let keys: Vec<&str> = results
+            .iter()
+            .filter_map(|r| r["key"].as_str())
+            .collect();
+        assert!(keys.contains(&"close"), "close node (sim=1.0) must be included");
+        assert!(
+            !keys.contains(&"far"),
+            "far node (sim=0.0) must be excluded by default min=0.8"
+        );
     }
 
     #[test]
