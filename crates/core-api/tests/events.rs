@@ -4,6 +4,7 @@ use core_api::{
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-events-{}-{}", name, std::process::id()));
@@ -612,4 +613,120 @@ fn subscribe_rule_receives_retract_on_node_delete() {
         has_retract,
         "expected EdgeRetracted after node delete, got {events:?}"
     );
+}
+
+// ── subscribe_query tests ─────────────────────────────────────────────────────
+
+/// Binding: insert a node → QueryRowAdded; delete it → QueryRowRemoved.
+#[test]
+fn subscribe_query_row_added_then_removed() {
+    let dir = tmp("sq-add-remove");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Pre-existing node; subscriber captures it as initial state (no event).
+    db.insert_node("Person", "alice", vec![]).unwrap();
+
+    let sub = db
+        .subscribe_query("MATCH (n:Person) RETURN n")
+        .expect("subscribe_query must succeed for allowlisted plan");
+
+    // Insert bob → QueryRowAdded for bob only (alice is in initial state).
+    db.insert_node("Person", "bob", vec![]).unwrap();
+    let ev = sub
+        .recv_timeout(Duration::from_secs(1))
+        .expect("expected QueryRowAdded event");
+    match &ev {
+        DbEvent::QueryRowAdded { columns, row } => {
+            assert_eq!(columns, &["n"], "column name must be 'n'");
+            assert_eq!(
+                row,
+                &[Some(Value::Str("bob".into()))],
+                "row must be bob's key"
+            );
+        }
+        other => panic!("expected QueryRowAdded, got {other:?}"),
+    }
+
+    // Delete bob → QueryRowRemoved.
+    db.delete_node("bob").unwrap();
+    let ev = sub
+        .recv_timeout(Duration::from_secs(1))
+        .expect("expected QueryRowRemoved event");
+    match &ev {
+        DbEvent::QueryRowRemoved { columns, row } => {
+            assert_eq!(columns, &["n"]);
+            assert_eq!(row, &[Some(Value::Str("bob".into()))]);
+        }
+        other => panic!("expected QueryRowRemoved, got {other:?}"),
+    }
+
+    // No more events (alice was in initial state throughout).
+    assert!(
+        sub.recv_timeout(Duration::from_millis(50)).is_none(),
+        "no extra events expected"
+    );
+}
+
+/// Binding: non-allowlisted plans are rejected at subscribe time.
+#[test]
+fn subscribe_query_rejects_non_allowlisted_plans() {
+    let dir = tmp("sq-reject");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // ORDER BY is not in the allowlist.
+    let err = db
+        .subscribe_query("MATCH (n:Person) RETURN n ORDER BY n")
+        .expect_err("ORDER BY plan must be rejected");
+    assert!(
+        matches!(err, GraphError::QueryError { .. }),
+        "expected QueryError, got {err:?}"
+    );
+
+    // Aggregate is not in the allowlist.
+    let err2 = db
+        .subscribe_query("MATCH (n:Person) RETURN COUNT(*)")
+        .expect_err("aggregate plan must be rejected");
+    assert!(
+        matches!(err2, GraphError::QueryError { .. }),
+        "expected QueryError, got {err2:?}"
+    );
+}
+
+/// Binding: read-only as-of instances reject subscribe_query.
+#[test]
+fn subscribe_query_rejects_read_only() {
+    let dir = tmp("sq-readonly");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Person", "seed", vec![]).unwrap();
+
+    // subscribe_query is a mutable method, so we'd need `mut ro`.
+    // open_at returns a read-only instance; subscribe_query must reject it.
+    let err = {
+        let mut ro = GraphDb::open_at(&dir, 0).unwrap();
+        ro.subscribe_query("MATCH (n:Person) RETURN n")
+            .expect_err("read-only instance must reject subscribe_query")
+    };
+    assert!(
+        matches!(err, GraphError::ReadOnly),
+        "expected ReadOnly, got {err:?}"
+    );
+}
+
+/// Binding: zero overhead when no query subscriptions are active.
+/// This test verifies subscribe_query cleanup on subscription drop.
+#[test]
+fn subscribe_query_no_overhead_after_drop() {
+    let dir = tmp("sq-drop");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    let sub = db
+        .subscribe_query("MATCH (n:Person) RETURN n")
+        .expect("subscribe_query must succeed");
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    // Consume the event so the queue is drained.
+    let _ = sub.recv_timeout(Duration::from_millis(100));
+    // Drop subscription — next commit should not re-execute the query.
+    drop(sub);
+    // No panic; the commit path must handle the dead Weak gracefully.
+    db.insert_node("Person", "bob", vec![]).unwrap();
 }

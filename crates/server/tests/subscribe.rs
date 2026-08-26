@@ -313,3 +313,74 @@ async fn subscribe_ws_unknown_rule_returns_error() {
         "expected error frame for unknown rule, got {ev}"
     );
 }
+
+/// Invariant: `{"cypher":"MATCH (n:Person) RETURN n"}` delivers query_row_added
+/// when a Person node is inserted and query_row_removed when it is deleted.
+#[tokio::test]
+async fn subscribe_ws_query_sub_round_trip() {
+    let db = SharedDb::open(&tmp("ws-query-sub")).unwrap();
+
+    // Pre-existing node is captured as initial state; no event is emitted for it.
+    db.write().insert_node("Person", "alice", vec![]).unwrap();
+
+    let addr = spawn_server(db.clone()).await;
+    let mut ws = connect_subscribe(addr, r#"{"cypher":"MATCH (n:Person) RETURN n"}"#).await;
+
+    // Insert bob → query_row_added
+    db.write().insert_node("Person", "bob", vec![]).unwrap();
+
+    let ev = next_text(&mut ws).await;
+    assert_eq!(
+        ev["type"], "query_row_added",
+        "expected query_row_added, got {ev}"
+    );
+    let columns = ev["columns"].as_array().expect("columns array");
+    assert!(
+        columns.iter().any(|c| c.as_str() == Some("n")),
+        "columns must include 'n', got {columns:?}"
+    );
+    // Value::Str serializes as {"Str": "bob"} (serde external enum tagging).
+    let row = ev["row"].as_array().expect("row array");
+    assert!(
+        row.iter().any(|v| v["Str"].as_str() == Some("bob")),
+        "row must contain bob as {{\"Str\":\"bob\"}}, got {row:?}"
+    );
+
+    // Delete bob → query_row_removed
+    db.write().delete_node("bob").unwrap();
+
+    let ev2 = next_text(&mut ws).await;
+    assert_eq!(
+        ev2["type"], "query_row_removed",
+        "expected query_row_removed, got {ev2}"
+    );
+    let row2 = ev2["row"].as_array().expect("row array");
+    assert!(
+        row2.iter().any(|v| v["Str"].as_str() == Some("bob")),
+        "row must contain bob as {{\"Str\":\"bob\"}}, got {row2:?}"
+    );
+}
+
+/// Invariant: an invalid cypher in the subscribe message returns an error frame.
+#[tokio::test]
+async fn subscribe_ws_query_sub_invalid_cypher_returns_error() {
+    let db = SharedDb::open(&tmp("ws-query-bad")).unwrap();
+    let addr = spawn_server(db.clone()).await;
+
+    let url = format!("ws://{addr}/subscribe");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    // ORDER BY is not in the subscribe_query allowlist.
+    ws.send(Message::Text(
+        r#"{"cypher":"MATCH (n:Person) RETURN n ORDER BY n"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let ev = next_text(&mut ws).await;
+    assert!(
+        ev.get("error").is_some(),
+        "expected error frame for non-allowlisted query, got {ev}"
+    );
+}

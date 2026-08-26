@@ -278,6 +278,38 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
     Some((skip_n as usize).saturating_add(limit_n as usize))
 }
 
+/// Returns `true` when the plan shape is supported by `subscribe_query`.
+///
+/// Allowlisted shapes (documented subset — not full Cypher):
+///   • `MATCH (n:Label) WHERE … RETURN …`
+///     → ScanLabel or ScanKey, optional LookupProps, optional Filter, Project,
+///       optional Skip/Limit.
+///   • `MATCH (a)-[r:TYPE]->(b) RETURN …`
+///     → ScanLabel or ScanKey, single Expand, optional Filter, Project,
+///       optional Skip/Limit.
+///
+/// Everything else is rejected: ORDER BY, DISTINCT, aggregates, variable-length
+/// paths, OPTIONAL MATCH, WITH, UNWIND, JoinBound (multi-MATCH). Use LIMIT to
+/// bound re-execution cost (`subscribe_query` does a full re-run per commit).
+pub fn is_subscribable(ops: &[PlanOp]) -> bool {
+    ops.iter().all(|op| {
+        matches!(
+            op,
+            PlanOp::ScanLabel { .. }
+                | PlanOp::ScanKey { .. }
+                | PlanOp::LookupProps { .. }
+                | PlanOp::Expand { .. }
+                | PlanOp::Filter { .. }
+                | PlanOp::Project { .. }
+                | PlanOp::Skip(_)
+                | PlanOp::Limit(_)
+        )
+    }) && ops
+        .iter()
+        .any(|op| matches!(op, PlanOp::ScanLabel { .. } | PlanOp::ScanKey { .. }))
+        && ops.iter().any(|op| matches!(op, PlanOp::Project { .. }))
+}
+
 /// Compile `q` into a logical plan. Errors are contextual `String`s; never panics.
 pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     let mut bound = BTreeSet::new();

@@ -13,4 +13,4 @@ pub use ast::{
 pub use exec::{execute, Params};
 pub use lexer::{lex, Tok};
 pub use parser::{is_write_tokens, parse, parse_write};
-pub use plan::{plan, PlanOp};
+pub use plan::{is_subscribable, plan, PlanOp};

@@ -29,6 +29,7 @@
 //! Rule-edge events and write-mutation events only. Incremental query
 //! subscriptions (differential dataflow) are roadmap (Plan-15 T3+).
 
+use core_storage::Value;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -106,6 +107,26 @@ pub enum DbEvent {
     /// The subscriber must re-read graph state to recover consistency for
     /// lossless consumers.  `missed` is the count of dropped events.
     Lagged { missed: u64 },
+    /// A row appeared in the result of a `subscribe_query` subscription.
+    ///
+    /// Emitted after each commit when a full re-run of the subscribed Cypher
+    /// query returns a row that was absent in the previous run.
+    ///
+    /// **Full re-run per commit; use LIMIT to bound execution cost.**
+    QueryRowAdded {
+        columns: Vec<String>,
+        row: Vec<Option<Value>>,
+    },
+    /// A row disappeared from the result of a `subscribe_query` subscription.
+    ///
+    /// Emitted after each commit when a row present in the previous run is
+    /// absent from the current run.
+    ///
+    /// **Full re-run per commit; use LIMIT to bound execution cost.**
+    QueryRowRemoved {
+        columns: Vec<String>,
+        row: Vec<Option<Value>>,
+    },
 }
 
 // ---------------------------------------------------------------------------

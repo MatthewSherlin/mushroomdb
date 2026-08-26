@@ -4,8 +4,8 @@ use crate::subscription::{
 };
 use core_query::cypher::ast::ArithOp;
 use core_query::cypher::{
-    execute, lex, parse, parse_write, plan, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern,
-    Query, RetItem, RetVal, WriteStatement,
+    execute, is_subscribable, lex, parse, parse_write, plan, MatchDeleteNodeStmt, NodePat, Operand,
+    Params, Pattern, PlanOp, Query, RetItem, RetVal, WriteStatement,
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
@@ -27,6 +27,26 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 thread_local! {
     static DELTA_COPY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Internal state for a single `subscribe_query` subscription.
+///
+/// On every commit, `distribute_events` re-executes `ops` against the current
+/// graph state, diffs the result against `prev_rows`, and pushes
+/// `DbEvent::QueryRowAdded` / `QueryRowRemoved` events to `inner`.
+///
+/// **Full re-run per commit; use LIMIT to bound execution cost.**
+/// (Differential evaluation is roadmap / Phase 5.)
+pub(crate) struct QuerySubEntry {
+    /// Compiled plan for the subscribed Cypher query.
+    ops: Vec<PlanOp>,
+    /// Column names from the first execution (fixed for the subscription lifetime).
+    columns: Vec<String>,
+    /// Serialized (JSON) row key → row data, representing the result set at
+    /// the end of the last commit. Used to diff against the new result.
+    prev_row_map: std::collections::HashMap<String, Vec<Option<Value>>>,
+    /// Weak pointer to the subscriber queue; dead Weak → subscription dropped.
+    inner: std::sync::Weak<SubInner>,
 }
 
 /// A post-commit mutation notification.
@@ -796,6 +816,9 @@ pub struct GraphDb<F: Fs> {
     /// Live subscriptions.  Entries with a dead `Weak` are pruned on the next
     /// distribute_events call.
     subscriptions: Vec<SubEntry>,
+    /// Live query subscriptions. Re-executed on every commit when non-empty.
+    /// Dead `Weak` entries are pruned inside `distribute_events`.
+    query_subscriptions: Vec<QuerySubEntry>,
     /// Queue capacity for new subscriptions created by this db.  Default is
     /// [`DEFAULT_SUB_CAPACITY`]; can be overridden via [`set_sub_capacity`]
     /// to test Lagged behaviour with small queues.
@@ -870,6 +893,7 @@ impl<F: Fs> GraphDb<F> {
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
             subscriptions: Vec::new(),
+            query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
             read_only: false,
             total_wal_commits: 0,
@@ -998,6 +1022,7 @@ impl<F: Fs> GraphDb<F> {
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
             subscriptions: Vec::new(),
+            query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
             read_only: false, // set to true after replay
             total_wal_commits: 0,
@@ -2221,71 +2246,127 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Called from `log_then_apply_with` after apply + fsync, before the
     /// legacy MutationEvent sink. Prunes dead `Weak` entries in-place.
+    ///
+    /// Query subscriptions (subscribe_query) re-execute their plan on every
+    /// call and diff the result against the previous run. Zero overhead when
+    /// no query subscriptions are active.
     fn distribute_events(&mut self, rec: &WalRecord, engine_deltas: &[EngineEdgeDelta], seq: u64) {
-        if self.subscriptions.is_empty() {
+        if self.subscriptions.is_empty() && self.query_subscriptions.is_empty() {
             return;
         }
 
-        // Build write events from the WAL record.
-        let write_events: Vec<DbEvent> =
-            Self::write_events_from_record(rec, seq, &self.syms, &self.ids);
+        if !self.subscriptions.is_empty() {
+            // Build write events from the WAL record.
+            let write_events: Vec<DbEvent> =
+                Self::write_events_from_record(rec, seq, &self.syms, &self.ids);
 
-        // Build edge events from engine deltas.  Weight is looked up from
-        // edge_props at distribution time (after apply), so it's always fresh.
-        let edge_events: Vec<DbEvent> = engine_deltas
-            .iter()
-            .map(|d| {
-                if d.fired {
-                    let weight = self
-                        .edge_props
-                        .get(d.etype_sym, d.src_id, d.dst_id, "weight")
-                        .and_then(|v| {
-                            if let core_storage::Value::Float(f) = v {
-                                Some(*f)
-                            } else {
-                                None
-                            }
+            // Build edge events from engine deltas.  Weight is looked up from
+            // edge_props at distribution time (after apply), so it's always fresh.
+            let edge_events: Vec<DbEvent> = engine_deltas
+                .iter()
+                .map(|d| {
+                    if d.fired {
+                        let weight = self
+                            .edge_props
+                            .get(d.etype_sym, d.src_id, d.dst_id, "weight")
+                            .and_then(|v| {
+                                if let core_storage::Value::Float(f) = v {
+                                    Some(*f)
+                                } else {
+                                    None
+                                }
+                            });
+                        DbEvent::EdgeFired {
+                            rule: d.rule.clone(),
+                            src_key: d.src_key.clone(),
+                            dst_key: d.dst_key.clone(),
+                            edge_type: d.edge_type.clone(),
+                            weight,
+                            commit_seq: seq,
+                        }
+                    } else {
+                        DbEvent::EdgeRetracted {
+                            rule: d.rule.clone(),
+                            src_key: d.src_key.clone(),
+                            dst_key: d.dst_key.clone(),
+                            edge_type: d.edge_type.clone(),
+                            commit_seq: seq,
+                        }
+                    }
+                })
+                .collect();
+
+            // Prune dead entries; push matching events to live ones.
+            self.subscriptions.retain(|entry| {
+                let Some(inner) = entry.inner.upgrade() else {
+                    return false;
+                };
+                for ev in &write_events {
+                    if event_matches(ev, &entry.filter) {
+                        inner.push(ev.clone());
+                    }
+                }
+                for ev in &edge_events {
+                    if event_matches(ev, &entry.filter) {
+                        inner.push(ev.clone());
+                    }
+                }
+                true
+            });
+
+            // Turn off delta accumulation if all subscribers dropped and no views remain.
+            if self.subscriptions.is_empty() && self.view_store.is_empty() {
+                self.engine.set_emit_deltas(false);
+            }
+        }
+
+        // Query subscriptions: full re-run per commit, then diff rows.
+        // IMPORTANT: full re-execution on every commit — use LIMIT to bound cost.
+        // Differential evaluation is roadmap / Phase 5.
+        if !self.query_subscriptions.is_empty() {
+            // Take the list out so we can call self.view() without borrow conflict.
+            let mut query_subs = std::mem::take(&mut self.query_subscriptions);
+            let empty_params = BTreeMap::new();
+            query_subs.retain_mut(|entry| {
+                let Some(inner) = entry.inner.upgrade() else {
+                    return false; // subscriber dropped — prune
+                };
+                let result = match execute(&self.view(), &entry.ops, &Params(&empty_params)) {
+                    Ok(r) => r,
+                    Err(_) => return true, // keep entry; skip diff on transient error
+                };
+                // Build new row map: serialized-key → row data.
+                let new_row_map: std::collections::HashMap<String, Vec<Option<Value>>> = (0
+                    ..result.len())
+                    .map(|i| {
+                        let row = result.row(i).to_vec();
+                        let key =
+                            serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
+                        (key, row)
+                    })
+                    .collect();
+                // Removed rows: in prev but not in new.
+                for (key, row) in &entry.prev_row_map {
+                    if !new_row_map.contains_key(key) {
+                        inner.push(DbEvent::QueryRowRemoved {
+                            columns: entry.columns.clone(),
+                            row: row.clone(),
                         });
-                    DbEvent::EdgeFired {
-                        rule: d.rule.clone(),
-                        src_key: d.src_key.clone(),
-                        dst_key: d.dst_key.clone(),
-                        edge_type: d.edge_type.clone(),
-                        weight,
-                        commit_seq: seq,
-                    }
-                } else {
-                    DbEvent::EdgeRetracted {
-                        rule: d.rule.clone(),
-                        src_key: d.src_key.clone(),
-                        dst_key: d.dst_key.clone(),
-                        edge_type: d.edge_type.clone(),
-                        commit_seq: seq,
                     }
                 }
-            })
-            .collect();
-
-        // Prune dead entries; push matching events to live ones.
-        self.subscriptions.retain(|entry| {
-            let Some(inner) = entry.inner.upgrade() else {
-                return false;
-            };
-            for ev in &write_events {
-                if event_matches(ev, &entry.filter) {
-                    inner.push(ev.clone());
+                // Added rows: in new but not in prev.
+                for (key, row) in &new_row_map {
+                    if !entry.prev_row_map.contains_key(key) {
+                        inner.push(DbEvent::QueryRowAdded {
+                            columns: entry.columns.clone(),
+                            row: row.clone(),
+                        });
+                    }
                 }
-            }
-            for ev in &edge_events {
-                if event_matches(ev, &entry.filter) {
-                    inner.push(ev.clone());
-                }
-            }
-            true
-        });
-        // Turn off delta accumulation if all subscribers dropped and no views remain.
-        if self.subscriptions.is_empty() && self.view_store.is_empty() {
-            self.engine.set_emit_deltas(false);
+                entry.prev_row_map = new_row_map;
+                true
+            });
+            self.query_subscriptions = query_subs;
         }
     }
 
@@ -2453,6 +2534,79 @@ impl<F: Fs> GraphDb<F> {
             inner: std::sync::Arc::downgrade(&inner),
         });
         self.engine.set_emit_deltas(true);
+        Ok(Subscription(inner))
+    }
+
+    /// Subscribe to incremental Cypher query results.
+    ///
+    /// Parses and plans `cypher`; rejects the query if the plan is not in the
+    /// allowlisted subset (see [`core_query::cypher::is_subscribable`]):
+    ///   - `MATCH (n:Label) WHERE … RETURN …`
+    ///   - `MATCH (a)-[r:TYPE]->(b) RETURN …`
+    ///
+    /// After each successful commit, the plan is **fully re-executed** and the
+    /// result is diffed against the previous run. Added rows produce
+    /// [`DbEvent::QueryRowAdded`]; removed rows produce
+    /// [`DbEvent::QueryRowRemoved`].
+    ///
+    /// **Full re-run per commit; use LIMIT to bound execution cost.**
+    /// The existing 1 M intermediate-row cap applies. Differential evaluation
+    /// is roadmap / Phase 5.
+    ///
+    /// Returns `Err(GraphError::ReadOnly)` if called on an as-of instance —
+    /// as-of instances never commit, so `distribute_events` never runs and the
+    /// subscription would never deliver events.
+    ///
+    /// Returns `Err(GraphError::QueryError)` if the query fails to parse, plan,
+    /// or if the plan shape is not in the allowlist.
+    pub fn subscribe_query(&mut self, cypher: &str) -> Result<Subscription> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
+            detail: format!("lex: {e}"),
+        })?;
+        let ast = parse(&tokens).map_err(|e| GraphError::QueryError {
+            detail: format!("parse: {e}"),
+        })?;
+        let ops = plan(&ast).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        if !is_subscribable(&ops) {
+            return Err(GraphError::QueryError {
+                detail: "subscribe_query only supports allowlisted plan shapes: \
+                         MATCH (n:Label) WHERE … RETURN … or \
+                         MATCH (a)-[r:TYPE]->(b) RETURN …; \
+                         ORDER BY, DISTINCT, aggregates, variable-length paths, \
+                         OPTIONAL MATCH, WITH, and UNWIND are not supported. \
+                         Use LIMIT to bound re-execution cost."
+                    .to_string(),
+            });
+        }
+        // Execute once to capture initial state (initial rows are not emitted as
+        // events — the subscriber learns the baseline via the first query call).
+        let empty_params = BTreeMap::new();
+        let initial = execute(&self.view(), &ops, &Params(&empty_params)).map_err(|e| {
+            GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            }
+        })?;
+        let columns = initial.columns().to_vec();
+        let prev_row_map: std::collections::HashMap<String, Vec<Option<Value>>> = (0..initial
+            .len())
+            .map(|i| {
+                let row = initial.row(i).to_vec();
+                let key = serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
+                (key, row)
+            })
+            .collect();
+        let inner = SubInner::new(self.sub_capacity());
+        self.query_subscriptions.push(QuerySubEntry {
+            ops,
+            columns,
+            prev_row_map,
+            inner: std::sync::Arc::downgrade(&inner),
+        });
         Ok(Subscription(inner))
     }
 

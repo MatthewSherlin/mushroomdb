@@ -59,12 +59,23 @@ use tokio::task;
 const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Client subscribe message.
+///
+/// All fields are optional. Example messages:
+/// ```json
+/// {"rules": ["skill_fit"], "writes": true}
+/// {"cypher": "MATCH (n:Person) RETURN n.id LIMIT 1000"}
+/// ```
+///
+/// `cypher` subscribes to incremental query results for an allowlisted plan
+/// shape (see `GraphDb::subscribe_query`). Full re-run per commit; use LIMIT.
 #[derive(Debug, Deserialize, Default)]
 struct SubscribeMsg {
     #[serde(default)]
     rules: Vec<String>,
     #[serde(default)]
     writes: bool,
+    /// Optional Cypher query for incremental result subscription.
+    cypher: Option<String>,
 }
 
 /// Upgrade to a WebSocket and stream `DbEvent` frames.
@@ -115,6 +126,14 @@ async fn run(mut socket: WebSocket, state: AppState) {
             match db.subscribe_writes() {
                 Ok(sub) => subs.push(sub),
                 Err(e) => err = Some(e.to_string()),
+            }
+        }
+        if err.is_none() {
+            if let Some(cypher) = &msg.cypher {
+                match db.subscribe_query(cypher) {
+                    Ok(sub) => subs.push(sub),
+                    Err(e) => err = Some(e.to_string()),
+                }
             }
         }
         drop(db);
