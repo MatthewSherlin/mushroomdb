@@ -1015,6 +1015,62 @@ fn match_set_return_projects_rel_type() {
     assert_eq!(rs.row(1)[0], Some(Value::Str("KNOWS".into())));
 }
 
+#[test]
+fn match_set_return_anonymous_end_keeps_cardinality() {
+    let mut db = GraphDb::open(&tmp("set-ret-anon")).unwrap();
+    db.insert_node("Person", "n", vec![("id".into(), Value::Str("n".into()))])
+        .unwrap();
+    db.insert_node("Person", "m1", vec![("id".into(), Value::Str("m1".into()))])
+        .unwrap();
+    db.insert_node("Person", "m2", vec![("id".into(), Value::Str("m2".into()))])
+        .unwrap();
+    db.insert_edge("KNOWS", "n", "m1").unwrap();
+    db.insert_edge("KNOWS", "n", "m2").unwrap();
+    let rs = db
+        .query_write(
+            "MATCH (n)-[:KNOWS]->() SET n.x = 1 RETURN n.id",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        2,
+        "anonymous dest rematch must not square cardinality (2 edges → 2 rows, not 4)"
+    );
+    assert_eq!(rs.row(0)[0], Some(Value::Str("n".into())));
+    assert_eq!(rs.row(1)[0], Some(Value::Str("n".into())));
+}
+
+#[test]
+fn match_set_return_untyped_rel_keeps_cardinality() {
+    let mut db = GraphDb::open(&tmp("set-ret-untyped")).unwrap();
+    db.insert_node("Person", "n", vec![("id".into(), Value::Str("n".into()))])
+        .unwrap();
+    db.insert_node("Person", "m", vec![("id".into(), Value::Str("m".into()))])
+        .unwrap();
+    db.insert_edge("KNOWS", "n", "m").unwrap();
+    db.insert_edge("LIKES", "n", "m").unwrap();
+    let rs = db
+        .query_write(
+            "MATCH (n)-[r]->(m) SET n.x = 1 RETURN type(r)",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        2,
+        "untyped rematch must not square cardinality (KNOWS+LIKES → 2 rows, not 4)"
+    );
+    let mut types: Vec<String> = (0..rs.len())
+        .map(|i| match rs.row(i)[0].as_ref() {
+            Some(Value::Str(s)) => s.clone(),
+            other => panic!("expected type string, got {other:?}"),
+        })
+        .collect();
+    types.sort();
+    assert_eq!(types, vec!["KNOWS".to_string(), "LIKES".to_string()]);
+}
+
 // ---------------------------------------------------------------------------
 // CREATE...RETURN with $param in RETURN expression
 // ---------------------------------------------------------------------------

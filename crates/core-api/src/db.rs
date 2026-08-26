@@ -2,9 +2,10 @@ use crate::ingest::{IngestOptions, IngestReport};
 use crate::subscription::{
     event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
 };
+use core_query::cypher::ast::ArithOp;
 use core_query::cypher::{
-    execute, lex, parse, parse_write, plan, Expr, MatchDeleteNodeStmt, NodePat, Operand, Params,
-    Pattern, Query, RetItem, RetVal, WriteStatement,
+    execute, lex, parse, parse_write, plan, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern,
+    Query, RetItem, RetVal, WriteStatement,
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
@@ -425,141 +426,282 @@ fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
     let mut out = Vec::new();
     for p in pats {
         for (rel, _) in &p.chain {
-            if let Some(v) = &rel.var {
-                add_var(&mut out, v);
+            if rel.hops.is_none() {
+                if let Some(v) = &rel.var {
+                    add_var(&mut out, v);
+                }
             }
         }
     }
     out
 }
 
-fn row_key(rs: &ResultSet, row: usize, var: &str) -> Option<String> {
-    match rs.get(row, var) {
-        Some(Value::Str(k)) => Some(k.clone()),
-        _ => None,
+fn rel_type_alias(var: &str) -> String {
+    format!("__rt_{var}")
+}
+
+fn ret_column_name(item: &RetItem) -> String {
+    if let Some(alias) = &item.alias {
+        return alias.clone();
+    }
+    match &item.value {
+        RetVal::Var(v) => v.clone(),
+        RetVal::Prop { var, field } => format!("{var}.{field}"),
+        RetVal::FuncCall { name, args } => {
+            let arg_strs: Vec<String> = args
+                .iter()
+                .map(|a| match a {
+                    Operand::Var(v) => v.clone(),
+                    Operand::Prop { var, field } => format!("{var}.{field}"),
+                    Operand::Lit(_) => "<lit>".to_string(),
+                    Operand::Param(p) => format!("${p}"),
+                    Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
+                    Operand::BinArith { .. } => "<arith>".to_string(),
+                })
+                .collect();
+            format!("{name}({})", arg_strs.join(", "))
+        }
+        RetVal::ScalarExpr(_) => "<expr>".to_string(),
+        RetVal::Agg { .. } => "<agg>".to_string(),
     }
 }
 
-fn bind_node_id(node: &NodePat, match_rs: &ResultSet, row: usize) -> NodePat {
-    let props = node
-        .var
-        .as_deref()
-        .and_then(|v| row_key(match_rs, row, v))
-        .map(|k| vec![("id".to_string(), Operand::Lit(Value::Str(k)))])
-        .unwrap_or_default();
-    NodePat {
-        var: node.var.clone(),
-        label: None,
-        props,
-    }
-}
-
-fn bind_pattern_ids(pat: &Pattern, match_rs: &ResultSet, row: usize) -> Pattern {
-    Pattern {
-        start: bind_node_id(&pat.start, match_rs, row),
-        chain: pat
-            .chain
-            .iter()
-            .map(|(rel, dest)| (rel.clone(), bind_node_id(dest, match_rs, row)))
-            .collect(),
-        shortest: pat.shortest,
-    }
-}
-
-fn project_query(matches: Vec<Pattern>, where_expr: Option<Expr>, returns: Vec<RetItem>) -> Query {
-    Query {
-        matches,
-        optional_clauses: vec![],
-        where_expr,
-        unwinds: vec![],
-        post_unwind_where: None,
-        stages: vec![],
-        returns,
-        distinct: false,
-        order_by: vec![],
-        skip: None,
-        limit: None,
-    }
-}
-
-fn run_project_query<F: Fs>(
+fn eval_set_return_operand<F: Fs>(
     db: &GraphDb<F>,
-    q: Query,
-    params: &BTreeMap<String, Value>,
-) -> Result<ResultSet> {
-    let ops = plan(&q).map_err(|e| GraphError::QueryError {
-        detail: format!("plan: {e}"),
-    })?;
-    execute(&db.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-        detail: format!("execute: {e}"),
-    })
-}
-
-/// Empty-result query with the right RETURN columns (original WHERE omitted).
-fn empty_project_query(var: &str, returns: Vec<RetItem>) -> Query {
-    project_query(
-        vec![Pattern {
-            start: NodePat {
-                var: Some(var.to_string()),
-                label: None,
-                props: vec![],
-            },
-            chain: vec![],
-            shortest: false,
-        }],
-        Some(Expr::In {
-            expr: Operand::Prop {
-                var: var.to_string(),
-                field: "id".into(),
-            },
-            list: vec![],
-        }),
-        returns,
-    )
-}
-
-/// Project RETURN per original MATCH row: bind named nodes by IdMap key,
-/// keep the rel chain so `type(r)` works, omit original WHERE / non-id props.
-fn project_from_matched_keys<F: Fs>(
-    db: &GraphDb<F>,
-    vars: &[String],
-    matches: &[Pattern],
     match_rs: &ResultSet,
-    returns: Vec<RetItem>,
+    row: usize,
+    rel_vars: &[String],
+    op: &Operand,
+    params: &BTreeMap<String, Value>,
+) -> Result<Option<Value>> {
+    match op {
+        Operand::Lit(v) => Ok(Some(v.clone())),
+        Operand::Param(name) => params.get(name).cloned().ok_or_else(|| GraphError::QueryError {
+            detail: format!("missing parameter `{name}`"),
+        }).map(Some),
+        Operand::Var(name) if rel_vars.iter().any(|r| r == name) => Err(GraphError::QueryError {
+            detail: format!(
+                "cannot return relationship variable '{name}' bare; return its properties ({name}.field) instead"
+            ),
+        }),
+        Operand::Var(name) => Ok(match_rs.get(row, name).cloned()),
+        Operand::Prop { var, field } => {
+            if rel_vars.iter().any(|r| r == var) {
+                return Ok(None);
+            }
+            let Some(Value::Str(key)) = match_rs.get(row, var) else {
+                return Ok(None);
+            };
+            Ok(db.get_prop(key, field).cloned())
+        }
+        Operand::FuncCall { name, args } => {
+            eval_set_return_func(db, match_rs, row, rel_vars, name, args, params)
+        }
+        Operand::BinArith { op, left, right } => {
+            let lv = eval_set_return_operand(db, match_rs, row, rel_vars, left, params)?;
+            let rv = eval_set_return_operand(db, match_rs, row, rel_vars, right, params)?;
+            eval_set_return_arith(op, lv, rv)
+        }
+    }
+}
+
+fn eval_set_return_arith(
+    op: &ArithOp,
+    lv: Option<Value>,
+    rv: Option<Value>,
+) -> Result<Option<Value>> {
+    match (lv, rv) {
+        (None, _) | (_, None) => Ok(None),
+        (Some(Value::Int(a)), Some(Value::Int(b))) => {
+            let result = match op {
+                ArithOp::Sub => a.saturating_sub(b),
+                ArithOp::Mul => a.saturating_mul(b),
+                ArithOp::Add => a.saturating_add(b),
+                ArithOp::Div => {
+                    if b == 0 {
+                        return Err(GraphError::QueryError {
+                            detail: "division by zero".into(),
+                        });
+                    }
+                    a.checked_div(b).unwrap_or(i64::MAX)
+                }
+            };
+            Ok(Some(Value::Int(result)))
+        }
+        (Some(lv), Some(rv)) => {
+            let a = match &lv {
+                Value::Float(f) => *f,
+                Value::Int(i) => *i as f64,
+                _ => {
+                    return Err(GraphError::QueryError {
+                        detail: format!("arithmetic operand must be numeric, got {lv:?}"),
+                    })
+                }
+            };
+            let b = match &rv {
+                Value::Float(f) => *f,
+                Value::Int(i) => *i as f64,
+                _ => {
+                    return Err(GraphError::QueryError {
+                        detail: format!("arithmetic operand must be numeric, got {rv:?}"),
+                    })
+                }
+            };
+            let result = match op {
+                ArithOp::Sub => a - b,
+                ArithOp::Mul => a * b,
+                ArithOp::Add => a + b,
+                ArithOp::Div => {
+                    if b == 0.0 {
+                        return Err(GraphError::QueryError {
+                            detail: "division by zero".into(),
+                        });
+                    }
+                    a / b
+                }
+            };
+            Ok(Some(Value::Float(result)))
+        }
+    }
+}
+
+fn eval_set_return_func<F: Fs>(
+    db: &GraphDb<F>,
+    match_rs: &ResultSet,
+    row: usize,
+    rel_vars: &[String],
+    name: &str,
+    args: &[Operand],
+    params: &BTreeMap<String, Value>,
+) -> Result<Option<Value>> {
+    let norm = name.to_ascii_lowercase();
+    if norm == "type" {
+        if args.len() != 1 {
+            return Err(GraphError::QueryError {
+                detail: format!("type() requires exactly 1 argument, got {}", args.len()),
+            });
+        }
+        let Operand::Var(rel) = &args[0] else {
+            return Err(GraphError::QueryError {
+                detail: "type() argument must be a relationship variable (e.g. type(r))".into(),
+            });
+        };
+        return Ok(match_rs.get(row, &rel_type_alias(rel)).cloned());
+    }
+    let mut vals = Vec::with_capacity(args.len());
+    for arg in args {
+        vals.push(eval_set_return_operand(
+            db, match_rs, row, rel_vars, arg, params,
+        )?);
+    }
+    match norm.as_str() {
+        "tolower" => {
+            if vals.len() != 1 {
+                return Err(GraphError::QueryError {
+                    detail: format!("toLower() requires exactly 1 argument, got {}", vals.len()),
+                });
+            }
+            Ok(vals[0].clone().map(|val| match val {
+                Value::Str(s) => Value::Str(s.to_ascii_lowercase()),
+                other => other,
+            }))
+        }
+        "toupper" => {
+            if vals.len() != 1 {
+                return Err(GraphError::QueryError {
+                    detail: format!("toUpper() requires exactly 1 argument, got {}", vals.len()),
+                });
+            }
+            Ok(vals[0].clone().map(|val| match val {
+                Value::Str(s) => Value::Str(s.to_ascii_uppercase()),
+                other => other,
+            }))
+        }
+        "size" => match vals.first().cloned().flatten() {
+            None => Ok(None),
+            Some(Value::Str(s)) => Ok(Some(Value::Int(s.len() as i64))),
+            Some(Value::List(items)) => Ok(Some(Value::Int(items.len() as i64))),
+            Some(_) => Ok(None),
+        },
+        "coalesce" => Ok(vals.into_iter().flatten().next()),
+        "abs" => match vals.first().cloned().flatten() {
+            None => Ok(None),
+            Some(Value::Int(n)) => Ok(Some(Value::Int(n.saturating_abs()))),
+            Some(Value::Float(f)) => Ok(Some(Value::Float(f.abs()))),
+            Some(_) => Ok(None),
+        },
+        "round" => match vals.first().cloned().flatten() {
+            None => Ok(None),
+            Some(Value::Float(f)) => Ok(Some(Value::Float(f.round()))),
+            Some(Value::Int(n)) => Ok(Some(Value::Int(n))),
+            Some(_) => Ok(None),
+        },
+        _ => Err(GraphError::QueryError {
+            detail: format!(
+                "unknown function `{name}`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches"
+            ),
+        }),
+    }
+}
+
+fn eval_set_return_item<F: Fs>(
+    db: &GraphDb<F>,
+    match_rs: &ResultSet,
+    row: usize,
+    rel_vars: &[String],
+    item: &RetItem,
+    params: &BTreeMap<String, Value>,
+) -> Result<Option<Value>> {
+    match &item.value {
+        RetVal::Var(v) => eval_set_return_operand(
+            db,
+            match_rs,
+            row,
+            rel_vars,
+            &Operand::Var(v.clone()),
+            params,
+        ),
+        RetVal::Prop { var, field } => eval_set_return_operand(
+            db,
+            match_rs,
+            row,
+            rel_vars,
+            &Operand::Prop {
+                var: var.clone(),
+                field: field.clone(),
+            },
+            params,
+        ),
+        RetVal::FuncCall { name, args } => {
+            eval_set_return_func(db, match_rs, row, rel_vars, name, args, params)
+        }
+        RetVal::ScalarExpr(op) => eval_set_return_operand(db, match_rs, row, rel_vars, op, params),
+        RetVal::Agg { .. } => Err(GraphError::QueryError {
+            detail: "aggregates are not supported in MATCH … SET … RETURN".into(),
+        }),
+    }
+}
+
+/// Project user RETURN from original MATCH rows after SET. No rematch.
+fn project_set_return_rows<F: Fs>(
+    db: &GraphDb<F>,
+    rel_vars: &[String],
+    match_rs: &ResultSet,
+    returns: &[RetItem],
     params: &BTreeMap<String, Value>,
 ) -> Result<ResultSet> {
-    let fallback_var = match vars.first() {
-        Some(v) => v.as_str(),
-        None => {
-            return Err(GraphError::QueryError {
-                detail: "SET … RETURN has no node variable to project".into(),
-            })
+    let columns: Vec<String> = returns.iter().map(ret_column_name).collect();
+    let mut out = ResultSet::new(columns);
+    for row in 0..match_rs.len() {
+        let mut cells = Vec::with_capacity(returns.len());
+        for item in returns {
+            cells.push(eval_set_return_item(
+                db, match_rs, row, rel_vars, item, params,
+            )?);
         }
-    };
-    if match_rs.is_empty() {
-        return run_project_query(db, empty_project_query(fallback_var, returns), params);
+        out.push_row(cells);
     }
-
-    let mut out: Option<ResultSet> = None;
-    for row_i in 0..match_rs.len() {
-        let patterns: Vec<Pattern> = matches
-            .iter()
-            .map(|p| bind_pattern_ids(p, match_rs, row_i))
-            .collect();
-        let rs = run_project_query(db, project_query(patterns, None, returns.clone()), params)?;
-        match out.as_mut() {
-            None => out = Some(rs),
-            Some(acc) => {
-                for i in 0..rs.len() {
-                    acc.push_row(rs.row(i).to_vec());
-                }
-            }
-        }
-    }
-    match out {
-        Some(rs) => Ok(rs),
-        None => run_project_query(db, empty_project_query(fallback_var, returns), params),
-    }
+    Ok(out)
 }
 
 /// Single construction point for a `GraphMut` view over the split-borrowed graph fields.
@@ -2933,6 +3075,16 @@ impl<F: Fs> GraphDb<F> {
                 alias: Some(col.clone()),
             });
         }
+        // Capture relationship types while r is bound; SET does not change them.
+        for r in &rel_vars {
+            set_returns.push(RetItem {
+                value: RetVal::FuncCall {
+                    name: "type".into(),
+                    args: vec![Operand::Var(r.clone())],
+                },
+                alias: Some(rel_type_alias(r)),
+            });
+        }
 
         let read_q = Query {
             matches: stmt.matches.clone(),
@@ -2996,14 +3148,7 @@ impl<F: Fs> GraphDb<F> {
         batch.commit()?;
 
         if let Some(returns) = project_returns {
-            return project_from_matched_keys(
-                self,
-                &lookup_vars,
-                &stmt.matches,
-                &match_rs,
-                returns,
-                params,
-            );
+            return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
         }
 
         let mut rs = write_result_set();
