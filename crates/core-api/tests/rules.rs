@@ -130,15 +130,22 @@ fn derived_edges_are_not_wal_logged() {
         vec![("org_id".into(), Value::Str("o1".into()))],
     )
     .unwrap();
-    let after = std::fs::metadata(dir.join("wal.bin")).unwrap().len();
-    // exactly one InsertNode record was appended — no edge records
-    let node_only = core_storage::wal::encode_record(&core_storage::wal::WalRecord::InsertNode {
-        label: "Person".into(),
-        key: "p1".into(),
-        props: vec![("org_id".into(), Value::Str("o1".into()))],
-    })
-    .len() as u64;
-    assert_eq!(after - before, node_only);
+    let wal = std::fs::read(dir.join("wal.bin")).unwrap();
+    assert!(wal.len() as u64 > before);
+    let (recs, _) = core_storage::wal::decode_all(&wal[before as usize..]);
+    let has_edge = recs.iter().any(|r| match r {
+        core_storage::wal::WalRecord::InsertEdge { .. }
+        | core_storage::wal::WalRecord::InsertEdgeId { .. } => true,
+        core_storage::wal::WalRecord::Batch(inner) => inner.iter().any(|x| {
+            matches!(
+                x,
+                core_storage::wal::WalRecord::InsertEdge { .. }
+                    | core_storage::wal::WalRecord::InsertEdgeId { .. }
+            )
+        }),
+        _ => false,
+    });
+    assert!(!has_edge, "derived edges must not be WAL-logged");
     assert_eq!(db.edge_count(), 1); // yet the derived edge exists
 }
 

@@ -71,6 +71,33 @@ pub enum WalRecord {
         label: String,
         field: String,
     },
+    // ── Dense-id variants (appended after full-text; discriminants 14–17) ──
+    /// Insert a node using interned label/field ids. Key remains a string once.
+    /// Discriminant 14.
+    InsertNodeId {
+        label: u32,
+        key: String,
+        props: Vec<(u32, Value)>,
+    },
+    /// Set a property using dense node id and interned field id. Discriminant 15.
+    SetPropId {
+        id: u32,
+        field: u32,
+        value: Value,
+    },
+    /// Insert an edge using interned etype and dense node ids. Discriminant 16.
+    InsertEdgeId {
+        etype: u32,
+        src: u32,
+        dst: u32,
+    },
+    /// Bind intern id `id` to `text` so subsequent `*Id` records can replay
+    /// without a snapshot intern table. Discriminant 17. Apply is idempotent
+    /// when the string is already bound to `id`.
+    Intern {
+        id: u32,
+        text: String,
+    },
 }
 
 /// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.
@@ -552,6 +579,45 @@ mod tests {
                 field: "b".into()
             }
         );
+    }
+
+    #[test]
+    fn roundtrip_dense_id_variants_append_after_fulltext() {
+        let recs = vec![
+            WalRecord::Intern {
+                id: 0,
+                text: "Person".into(),
+            },
+            WalRecord::InsertNodeId {
+                label: 0,
+                key: "a".into(),
+                props: vec![(1, Value::Int(1))],
+            },
+            WalRecord::SetPropId {
+                id: 0,
+                field: 1,
+                value: Value::Int(2),
+            },
+            WalRecord::InsertEdgeId {
+                etype: 2,
+                src: 0,
+                dst: 1,
+            },
+        ];
+        for r in &recs {
+            let bytes = encode_record(r);
+            let (got, n) = decode_all(&bytes);
+            assert_eq!(n, bytes.len());
+            assert_eq!(got, vec![r.clone()]);
+        }
+        let p = bincode::serialize(&recs[1]).unwrap();
+        assert_eq!(&p[0..4], &[14, 0, 0, 0], "InsertNodeId discriminant is 14");
+        let p = bincode::serialize(&recs[2]).unwrap();
+        assert_eq!(&p[0..4], &[15, 0, 0, 0], "SetPropId discriminant is 15");
+        let p = bincode::serialize(&recs[3]).unwrap();
+        assert_eq!(&p[0..4], &[16, 0, 0, 0], "InsertEdgeId discriminant is 16");
+        let p = bincode::serialize(&recs[0]).unwrap();
+        assert_eq!(&p[0..4], &[17, 0, 0, 0], "Intern discriminant is 17");
     }
 
     #[test]

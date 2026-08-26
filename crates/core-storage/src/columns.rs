@@ -1,4 +1,9 @@
-use crate::types::Value;
+use crate::pack::{
+    push_f64s, push_i64s, push_str, push_u32, push_u32s, read_exact, read_f64s, read_i64s,
+    read_str, read_u32, read_u32s,
+};
+use crate::types::Result as StoreResult;
+use crate::types::{GraphError, Value};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 
@@ -54,6 +59,27 @@ impl Bitmap {
             }
         }
     }
+
+    fn live_count(&self) -> usize {
+        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    fn pack(&self, out: &mut Vec<u8>) {
+        push_u32(out, self.bits.len() as u32);
+        for w in &self.bits {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+
+    fn unpack(src: &[u8], pos: &mut usize) -> StoreResult<Self> {
+        let n = read_u32(src, pos)? as usize;
+        let bytes = read_exact(src, pos, n.saturating_mul(8))?;
+        let mut bits = Vec::with_capacity(n);
+        for chunk in bytes.chunks_exact(8) {
+            bits.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        Ok(Self { bits })
+    }
 }
 
 /// Append-only intern of `Value::Str`. Homogeneous string columns store ids here.
@@ -80,6 +106,29 @@ impl StrIntern {
 
     fn get(&self, id: u32) -> &Value {
         &self.values[id as usize]
+    }
+
+    fn pack(&self, out: &mut Vec<u8>) {
+        push_u32(out, self.values.len() as u32);
+        for v in &self.values {
+            let Value::Str(s) = v else {
+                unreachable!("StrIntern values are always Value::Str");
+            };
+            push_str(out, s);
+        }
+    }
+
+    fn unpack(src: &[u8], pos: &mut usize) -> StoreResult<Self> {
+        let n = read_u32(src, pos)? as usize;
+        let mut intern = Self::default();
+        intern.values.reserve(n);
+        intern.to_id.reserve(n);
+        for i in 0..n {
+            let s = read_str(src, pos)?;
+            intern.to_id.insert(s.clone(), i as u32);
+            intern.values.push(Value::Str(s));
+        }
+        Ok(intern)
     }
 }
 
@@ -331,6 +380,104 @@ impl Column {
         }
     }
 
+    fn pack(&self, intern: &StrIntern, out: &mut Vec<u8>) {
+        match self {
+            Column::Int { data, present, .. } => {
+                out.push(0);
+                push_i64s(out, data);
+                present.pack(out);
+            }
+            Column::Float { data, present, .. } => {
+                out.push(1);
+                push_f64s(out, data);
+                present.pack(out);
+            }
+            Column::Bool { data, present, .. } => {
+                out.push(2);
+                push_u32(out, data.len() as u32);
+                out.reserve(data.len());
+                for b in data {
+                    out.push(u8::from(*b));
+                }
+                present.pack(out);
+            }
+            Column::Str { ids, present, .. } => {
+                out.push(3);
+                push_u32s(out, ids);
+                present.pack(out);
+            }
+            Column::Mixed(map) => {
+                out.push(4);
+                let blob = bincode::serialize(map).expect("mixed column serialize cannot fail");
+                push_u32(out, blob.len() as u32);
+                out.extend_from_slice(&blob);
+            }
+        }
+        let _ = intern;
+    }
+
+    fn unpack(src: &[u8], pos: &mut usize) -> StoreResult<Self> {
+        let tag = *read_exact(src, pos, 1)?.first().unwrap();
+        match tag {
+            0 => {
+                let data = read_i64s(src, pos)?;
+                let present = Bitmap::unpack(src, pos)?;
+                let live = present.live_count();
+                let adapter = data.iter().copied().map(Value::Int).collect();
+                Ok(Column::Int {
+                    data,
+                    present,
+                    adapter,
+                    live,
+                })
+            }
+            1 => {
+                let data = read_f64s(src, pos)?;
+                let present = Bitmap::unpack(src, pos)?;
+                let live = present.live_count();
+                let adapter = data.iter().copied().map(Value::Float).collect();
+                Ok(Column::Float {
+                    data,
+                    present,
+                    adapter,
+                    live,
+                })
+            }
+            2 => {
+                let n = read_u32(src, pos)? as usize;
+                let bytes = read_exact(src, pos, n)?;
+                let data: Vec<bool> = bytes.iter().map(|&b| b != 0).collect();
+                let present = Bitmap::unpack(src, pos)?;
+                let live = present.live_count();
+                let adapter = data.iter().copied().map(Value::Bool).collect();
+                Ok(Column::Bool {
+                    data,
+                    present,
+                    adapter,
+                    live,
+                })
+            }
+            3 => {
+                let ids = read_u32s(src, pos)?;
+                let present = Bitmap::unpack(src, pos)?;
+                let live = present.live_count();
+                Ok(Column::Str { ids, present, live })
+            }
+            4 => {
+                let n = read_u32(src, pos)? as usize;
+                let blob = read_exact(src, pos, n)?;
+                let map: HashMap<u32, Value> =
+                    bincode::deserialize(blob).map_err(|e| GraphError::Corrupt {
+                        detail: format!("snapshot: mixed column: {e}"),
+                    })?;
+                Ok(Column::Mixed(map))
+            }
+            other => Err(GraphError::Corrupt {
+                detail: format!("snapshot: unknown column tag {other}"),
+            }),
+        }
+    }
+
     fn to_map(&self, intern: &StrIntern) -> HashMap<u32, Value> {
         match self {
             Column::Mixed(map) => map.clone(),
@@ -489,10 +636,35 @@ impl ColumnStore {
     fn is_mixed(&self, field: &str) -> bool {
         matches!(self.cols.get(field), Some(Column::Mixed(_)))
     }
+
+    /// V7 packed columns: intern table, then sorted field name + typed payload.
+    pub(crate) fn pack(&self, out: &mut Vec<u8>) {
+        self.intern.pack(out);
+        let mut fields: Vec<&String> = self.cols.keys().collect();
+        fields.sort();
+        push_u32(out, fields.len() as u32);
+        for f in fields {
+            push_str(out, f);
+            self.cols[f].pack(&self.intern, out);
+        }
+    }
+
+    pub(crate) fn unpack(src: &[u8]) -> StoreResult<(Self, usize)> {
+        let mut pos = 0usize;
+        let intern = StrIntern::unpack(src, &mut pos)?;
+        let n = read_u32(src, &mut pos)? as usize;
+        let mut cols = HashMap::with_capacity(n);
+        for _ in 0..n {
+            let name = read_str(src, &mut pos)?;
+            let col = Column::unpack(src, &mut pos)?;
+            cols.insert(name, col);
+        }
+        Ok((Self { cols, intern }, pos))
+    }
 }
 
 impl Serialize for ColumnStore {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("ColumnStore", 1)?;
         state.serialize_field("cols", &self.to_wire())?;
@@ -501,7 +673,7 @@ impl Serialize for ColumnStore {
 }
 
 impl<'de> Deserialize<'de> for ColumnStore {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Wire {
             cols: HashMap<String, HashMap<u32, Value>>,
@@ -691,5 +863,35 @@ mod tests {
         assert_eq!(roundtrip.cols["mixed"][&0], Value::Int(1));
         assert_eq!(roundtrip.cols["mixed"][&1], Value::Str("x".into()));
         assert_eq!(roundtrip.cols["tags"][&2], Value::List(vec![Value::Int(1)]));
+    }
+
+    #[test]
+    fn pack_roundtrip_typed_mixed_and_intern() {
+        let mut c = ColumnStore::new();
+        c.set(0, "name", Value::Str("ada".into()));
+        c.set(1, "name", Value::Str("ada".into()));
+        c.set(0, "age", Value::Int(36));
+        c.set(0, "ok", Value::Bool(true));
+        c.set(2, "score", Value::Float(1.5));
+        c.set(0, "mix", Value::Int(1));
+        c.set(1, "mix", Value::Str("x".into()));
+        c.set(3, "tags", Value::List(vec![Value::Int(1)]));
+        let mut buf = Vec::new();
+        c.pack(&mut buf);
+        let (back, consumed) = ColumnStore::unpack(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(back.get(0, "name"), Some(&Value::Str("ada".into())));
+        assert!(std::ptr::eq(
+            back.get(0, "name").unwrap(),
+            back.get(1, "name").unwrap()
+        ));
+        assert_eq!(back.get(0, "age"), Some(&Value::Int(36)));
+        assert_eq!(back.get(0, "ok"), Some(&Value::Bool(true)));
+        assert_eq!(back.get(2, "score"), Some(&Value::Float(1.5)));
+        assert_eq!(back.get(0, "mix"), Some(&Value::Int(1)));
+        assert_eq!(back.get(1, "mix"), Some(&Value::Str("x".into())));
+        assert_eq!(back.get(3, "tags"), Some(&Value::List(vec![Value::Int(1)])));
+        assert!(back.is_mixed("mix"));
+        assert!(back.is_mixed("tags"));
     }
 }

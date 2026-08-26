@@ -1099,10 +1099,10 @@ fn v6_snapshot_roundtrip() {
     assert_eq!(db.node_count(), 3);
     assert_eq!(db.edge_count(), 1);
     assert_eq!(db.get_prop("a", "v"), Some(&Value::Int(7)));
-    // Verify the snapshot file actually uses V6 container.
+    // Verify the snapshot file actually uses V7 container.
     let snap = std::fs::read(dir.join("snapshot.bin")).unwrap();
     assert_eq!(&snap[0..4], b"GDB1");
-    assert_eq!(u16::from_le_bytes([snap[4], snap[5]]), 6);
+    assert_eq!(u16::from_le_bytes([snap[4], snap[5]]), 7);
 }
 
 /// V4-refuse is unchanged by V6: a V4-stamped snapshot must still be rejected.

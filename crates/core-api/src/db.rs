@@ -99,15 +99,23 @@ pub enum MutationEvent {
     },
 }
 
-fn event_from_record(rec: &WalRecord) -> Option<MutationEvent> {
+fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<MutationEvent> {
     match rec {
         WalRecord::InsertNode { label, key, .. } => Some(MutationEvent::NodeInserted {
             label: label.clone(),
             key: key.clone(),
         }),
+        WalRecord::InsertNodeId { label, key, .. } => Some(MutationEvent::NodeInserted {
+            label: intern.resolve(*label)?.to_string(),
+            key: key.clone(),
+        }),
         WalRecord::SetProp { key, field, .. } => Some(MutationEvent::PropSet {
             key: key.clone(),
             field: field.clone(),
+        }),
+        WalRecord::SetPropId { id, field, .. } => Some(MutationEvent::PropSet {
+            key: ids.key_of(*id)?.to_string(),
+            field: intern.resolve(*field)?.to_string(),
         }),
         WalRecord::RemoveProp { key, field } => Some(MutationEvent::PropRemoved {
             key: key.clone(),
@@ -121,6 +129,11 @@ fn event_from_record(rec: &WalRecord) -> Option<MutationEvent> {
             edge_type: edge_type.clone(),
             src: src_key.clone(),
             dst: dst_key.clone(),
+        }),
+        WalRecord::InsertEdgeId { etype, src, dst } => Some(MutationEvent::EdgeInserted {
+            edge_type: intern.resolve(*etype)?.to_string(),
+            src: ids.key_of(*src)?.to_string(),
+            dst: ids.key_of(*dst)?.to_string(),
         }),
         WalRecord::DeleteEdge {
             edge_type,
@@ -142,7 +155,8 @@ fn event_from_record(rec: &WalRecord) -> Option<MutationEvent> {
         | WalRecord::CreateView { .. }
         | WalRecord::DeleteView { .. }
         | WalRecord::EnableFulltext { .. }
-        | WalRecord::DisableFulltext { .. } => None,
+        | WalRecord::DisableFulltext { .. }
+        | WalRecord::Intern { .. } => None,
     }
 }
 
@@ -1008,7 +1022,7 @@ impl<F: Fs> GraphDb<F> {
     fn apply(&mut self, rec: &WalRecord) -> Result<()> {
         match rec {
             WalRecord::InsertNode { label, key, props } => {
-                let id = self.ids.get_or_insert(key);
+                let id = self.ids.try_insert(key)?;
                 let sym = self.syms.intern(label);
                 if self.labels.len() <= id as usize {
                     // gap slots are sentinels, never valid label symbols
@@ -1155,6 +1169,189 @@ impl<F: Fs> GraphDb<F> {
                         if self.fulltext.is_enabled(label, field) {
                             self.fulltext.remove_node_field(id, field);
                             self.fulltext.add_tokens(id, field, value);
+                        }
+                    }
+                }
+            }
+            WalRecord::Intern { id, text } => {
+                if let Some(existing) = self.syms.get(text) {
+                    if existing != *id {
+                        return Err(GraphError::Corrupt {
+                            detail: format!(
+                                "wal intern mismatch for {text:?}: have {existing}, record {id}"
+                            ),
+                        });
+                    }
+                } else {
+                    let got = self.syms.intern(text);
+                    if got != *id {
+                        return Err(GraphError::Corrupt {
+                            detail: format!(
+                                "wal intern assigned {got} for {text:?}, record wanted {id}"
+                            ),
+                        });
+                    }
+                }
+            }
+            WalRecord::InsertNodeId { label, key, props } => {
+                let id = self.ids.try_insert(key)?;
+                if self.labels.len() <= id as usize {
+                    self.labels.resize(id as usize + 1, u32::MAX);
+                }
+                self.labels[id as usize] = *label;
+                let label_str = self
+                    .syms
+                    .resolve(*label)
+                    .ok_or_else(|| GraphError::Corrupt {
+                        detail: format!("wal InsertNodeId unknown label intern {label}"),
+                    })?
+                    .to_string();
+                for (field_sym, value) in props {
+                    let field =
+                        self.syms
+                            .resolve(*field_sym)
+                            .ok_or_else(|| GraphError::Corrupt {
+                                detail: format!(
+                                    "wal InsertNodeId unknown field intern {field_sym}"
+                                ),
+                            })?;
+                    self.props.set(id, field, value.clone());
+                }
+                self.view_store
+                    .init_node_views(id, &mut self.props, &self.syms, &self.labels);
+                let cursor = self.engine.pending_delta_count();
+                let mut eng = std::mem::take(&mut self.engine);
+                {
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
+                    eng.on_node_changed(id, None, &mut gm);
+                }
+                self.engine = eng;
+                if !self.view_store.is_empty() {
+                    #[cfg(test)]
+                    DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
+                        );
+                    }
+                }
+                if self.fulltext.has_label(&label_str) {
+                    for (field_sym, value) in props {
+                        let Some(field) = self.syms.resolve(*field_sym) else {
+                            continue;
+                        };
+                        if self.fulltext.is_enabled(&label_str, field) {
+                            self.fulltext.add_tokens(id, field, value);
+                        }
+                    }
+                }
+            }
+            WalRecord::InsertEdgeId { etype, src, dst } => {
+                // Replay-over-snapshot: dense ids in the pre-snapshot WAL may
+                // already be tombstoned. Skip rather than attaching edges to
+                // dead ids (DeleteNode keys the live re-insert, not the old id).
+                if self.ids.is_tombstoned(*src)
+                    || self.ids.is_tombstoned(*dst)
+                    || self.ids.key_of(*src).is_none()
+                    || self.ids.key_of(*dst).is_none()
+                {
+                    return Ok(());
+                }
+                self.topo.add_edge(*etype, *src, *dst);
+                self.view_store.on_edge_changed(
+                    *etype,
+                    *src,
+                    *dst,
+                    true,
+                    &mut self.props,
+                    &self.topo,
+                    &self.ids,
+                    &self.syms,
+                    &self.labels,
+                );
+            }
+            WalRecord::SetPropId { id, field, value } => {
+                if self.ids.is_tombstoned(*id) || self.ids.key_of(*id).is_none() {
+                    return Ok(());
+                }
+                let field_str = self
+                    .syms
+                    .resolve(*field)
+                    .ok_or_else(|| GraphError::Corrupt {
+                        detail: format!("wal SetPropId unknown field intern {field}"),
+                    })?
+                    .to_string();
+                let old_value = self.props.get(*id, &field_str).cloned();
+                self.props.set(*id, &field_str, value.clone());
+                let cursor = self.engine.pending_delta_count();
+                let mut eng = std::mem::take(&mut self.engine);
+                {
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
+                    eng.on_node_changed(*id, Some((field_str.as_str(), old_value)), &mut gm);
+                }
+                self.engine = eng;
+                if !self.view_store.is_empty() {
+                    #[cfg(test)]
+                    DELTA_COPY_COUNT.with(|c| c.set(c.get() + 1));
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
+                        );
+                    }
+                }
+                self.view_store.on_prop_changed(
+                    *id,
+                    &field_str,
+                    &mut self.props,
+                    &self.topo,
+                    &self.ids,
+                    &self.syms,
+                    &self.labels,
+                );
+                if self.fulltext.field_indexed(&field_str) {
+                    let label_opt = self.labels.get(*id as usize).and_then(|&sym| {
+                        if sym == u32::MAX {
+                            None
+                        } else {
+                            self.syms.resolve(sym)
+                        }
+                    });
+                    if let Some(label) = label_opt {
+                        if self.fulltext.is_enabled(label, &field_str) {
+                            self.fulltext.remove_node_field(*id, &field_str);
+                            self.fulltext.add_tokens(*id, &field_str, value);
                         }
                     }
                 }
@@ -1559,6 +1756,115 @@ impl<F: Fs> GraphDb<F> {
         Ok(())
     }
 
+    /// Intern `s` in `syms` and emit a WAL `Intern` record so `*Id` records
+    /// replay on WAL-only `open_at` (no snapshot intern table). Apply is
+    /// idempotent when the string is already bound. Always emit: after
+    /// `snapshot()` the WAL is truncated and live intern is not on disk.
+    fn intern_wal(&mut self, s: &str) -> (u32, WalRecord) {
+        let id = if let Some(id) = self.syms.get(s) {
+            id
+        } else {
+            self.syms.intern(s)
+        };
+        (
+            id,
+            WalRecord::Intern {
+                id,
+                text: s.to_string(),
+            },
+        )
+    }
+
+    fn rewrite_wal_dense(&mut self, recs: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
+        let mut out = Vec::with_capacity(recs.len());
+        // Node ids allocated by later apply(InsertNodeId) in this same batch.
+        let mut pending: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut interned = std::collections::HashSet::<u32>::new();
+        let mut next = u32::try_from(self.ids.len()).map_err(|_| GraphError::Corrupt {
+            detail: "id space exhausted".into(),
+        })?;
+        let lookup = |ids: &IdMap,
+                      pending: &std::collections::HashMap<String, u32>,
+                      key: &str|
+         -> Option<u32> { ids.get(key).or_else(|| pending.get(key).copied()) };
+        for rec in recs {
+            match rec {
+                WalRecord::InsertNode { label, key, props } => {
+                    let (label_id, intern) = self.intern_wal(&label);
+                    if interned.insert(label_id) {
+                        out.push(intern);
+                    }
+                    let mut props_id = Vec::with_capacity(props.len());
+                    for (field, value) in props {
+                        let (field_id, intern) = self.intern_wal(&field);
+                        if interned.insert(field_id) {
+                            out.push(intern);
+                        }
+                        props_id.push((field_id, value));
+                    }
+                    if lookup(&self.ids, &pending, &key).is_none() {
+                        pending.insert(key.clone(), next);
+                        next = next.checked_add(1).ok_or_else(|| GraphError::Corrupt {
+                            detail: "id space exhausted".into(),
+                        })?;
+                    }
+                    out.push(WalRecord::InsertNodeId {
+                        label: label_id,
+                        key,
+                        props: props_id,
+                    });
+                }
+                WalRecord::SetProp { key, field, value } => {
+                    let id =
+                        lookup(&self.ids, &pending, &key).ok_or_else(|| GraphError::Corrupt {
+                            detail: format!("dense WAL rewrite missing key {key}"),
+                        })?;
+                    let (field_id, intern) = self.intern_wal(&field);
+                    if interned.insert(field_id) {
+                        out.push(intern);
+                    }
+                    out.push(WalRecord::SetPropId {
+                        id,
+                        field: field_id,
+                        value,
+                    });
+                }
+                WalRecord::InsertEdge {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                } => {
+                    let (etype, intern) = self.intern_wal(&edge_type);
+                    if interned.insert(etype) {
+                        out.push(intern);
+                    }
+                    let src = lookup(&self.ids, &pending, &src_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!("dense WAL rewrite missing src {src_key}"),
+                        }
+                    })?;
+                    let dst = lookup(&self.ids, &pending, &dst_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!("dense WAL rewrite missing dst {dst_key}"),
+                        }
+                    })?;
+                    out.push(WalRecord::InsertEdgeId { etype, src, dst });
+                }
+                other => out.push(other),
+            }
+        }
+        Ok(out)
+    }
+
+    fn log_dense(&mut self, recs: Vec<WalRecord>) -> Result<()> {
+        let recs = self.rewrite_wal_dense(recs)?;
+        match recs.len() {
+            0 => Ok(()),
+            1 => self.log_then_apply(recs.into_iter().next().unwrap()),
+            _ => self.log_then_apply(WalRecord::Batch(recs)),
+        }
+    }
+
     /// Durable write, then notify the event sink. Replay (`apply` during
     /// `open`) never enters this function, so it is the replay-silent seam.
     fn log_then_apply(&mut self, rec: WalRecord) -> Result<()> {
@@ -1569,7 +1875,17 @@ impl<F: Fs> GraphDb<F> {
         match policy {
             FsyncPolicy::Relaxed => false,
             FsyncPolicy::Strict => true,
-            FsyncPolicy::Batched => matches!(rec, WalRecord::Batch(_)),
+            FsyncPolicy::Batched => match rec {
+                // Intern + one mutation is the single-op rewrite, not a user batch.
+                WalRecord::Batch(inner) => {
+                    inner
+                        .iter()
+                        .filter(|r| !matches!(r, WalRecord::Intern { .. }))
+                        .count()
+                        > 1
+                }
+                _ => false,
+            },
         }
     }
 
@@ -1710,7 +2026,7 @@ impl<F: Fs> GraphDb<F> {
         match rec {
             WalRecord::Batch(inner) => {
                 for r in inner {
-                    if let Some(ev) = event_from_record(r) {
+                    if let Some(ev) = event_from_record(r, &self.syms, &self.ids) {
                         self.emit(ev);
                     }
                 }
@@ -1718,11 +2034,19 @@ impl<F: Fs> GraphDb<F> {
                     Some((label, inserted)) => {
                         self.emit(MutationEvent::Ingested { label, inserted })
                     }
-                    None => self.emit(MutationEvent::BatchApplied { ops: inner.len() }),
+                    None => {
+                        let ops = inner
+                            .iter()
+                            .filter(|r| !matches!(r, WalRecord::Intern { .. }))
+                            .count();
+                        if ops > 1 {
+                            self.emit(MutationEvent::BatchApplied { ops });
+                        }
+                    }
                 }
             }
             other => {
-                if let Some(ev) = event_from_record(other) {
+                if let Some(ev) = event_from_record(other, &self.syms, &self.ids) {
                     self.emit(ev);
                 }
             }
@@ -1743,7 +2067,8 @@ impl<F: Fs> GraphDb<F> {
         }
 
         // Build write events from the WAL record.
-        let write_events: Vec<DbEvent> = Self::write_events_from_record(rec, seq);
+        let write_events: Vec<DbEvent> =
+            Self::write_events_from_record(rec, seq, &self.syms, &self.ids);
 
         // Build edge events from engine deltas.  Weight is looked up from
         // edge_props at distribution time (after apply), so it's always fresh.
@@ -1815,16 +2140,31 @@ impl<F: Fs> GraphDb<F> {
     }
 
     /// Convert a WAL record into `DbEvent` write events with the given seq.
-    fn write_events_from_record(rec: &WalRecord, seq: u64) -> Vec<DbEvent> {
+    fn write_events_from_record(
+        rec: &WalRecord,
+        seq: u64,
+        intern: &Interner,
+        ids: &IdMap,
+    ) -> Vec<DbEvent> {
         match rec {
             WalRecord::InsertNode { label, key, .. } => vec![DbEvent::NodeInserted {
                 label: label.clone(),
                 key: key.clone(),
                 commit_seq: seq,
             }],
+            WalRecord::InsertNodeId { label, key, .. } => vec![DbEvent::NodeInserted {
+                label: intern.resolve(*label).unwrap_or("").to_string(),
+                key: key.clone(),
+                commit_seq: seq,
+            }],
             WalRecord::SetProp { key, field, .. } => vec![DbEvent::PropSet {
                 key: key.clone(),
                 field: field.clone(),
+                commit_seq: seq,
+            }],
+            WalRecord::SetPropId { id, field, .. } => vec![DbEvent::PropSet {
+                key: ids.key_of(*id).unwrap_or("").to_string(),
+                field: intern.resolve(*field).unwrap_or("").to_string(),
                 commit_seq: seq,
             }],
             WalRecord::RemoveProp { key, field } => vec![DbEvent::PropRemoved {
@@ -1840,6 +2180,12 @@ impl<F: Fs> GraphDb<F> {
                 edge_type: edge_type.clone(),
                 src: src_key.clone(),
                 dst: dst_key.clone(),
+                commit_seq: seq,
+            }],
+            WalRecord::InsertEdgeId { etype, src, dst } => vec![DbEvent::EdgeInserted {
+                edge_type: intern.resolve(*etype).unwrap_or("").to_string(),
+                src: ids.key_of(*src).unwrap_or("").to_string(),
+                dst: ids.key_of(*dst).unwrap_or("").to_string(),
                 commit_seq: seq,
             }],
             WalRecord::DeleteEdge {
@@ -1858,7 +2204,7 @@ impl<F: Fs> GraphDb<F> {
             }],
             WalRecord::Batch(inner) => inner
                 .iter()
-                .flat_map(|r| Self::write_events_from_record(r, seq))
+                .flat_map(|r| Self::write_events_from_record(r, seq, intern, ids))
                 .collect(),
             WalRecord::CreateRule { .. }
             | WalRecord::DeleteRule { .. }
@@ -1866,7 +2212,8 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::CreateView { .. }
             | WalRecord::DeleteView { .. }
             | WalRecord::EnableFulltext { .. }
-            | WalRecord::DisableFulltext { .. } => vec![],
+            | WalRecord::DisableFulltext { .. }
+            | WalRecord::Intern { .. } => vec![],
         }
     }
 
@@ -2159,13 +2506,24 @@ impl<F: Fs> GraphDb<F> {
         if recs.is_empty() {
             return Ok((0, 0));
         }
+        let recs = self.rewrite_wal_dense(recs)?;
         let nodes_inserted = recs
             .iter()
-            .filter(|r| matches!(r, WalRecord::InsertNode { .. }))
+            .filter(|r| {
+                matches!(
+                    r,
+                    WalRecord::InsertNode { .. } | WalRecord::InsertNodeId { .. }
+                )
+            })
             .count();
         let edges_inserted = recs
             .iter()
-            .filter(|r| matches!(r, WalRecord::InsertEdge { .. }))
+            .filter(|r| {
+                matches!(
+                    r,
+                    WalRecord::InsertEdge { .. } | WalRecord::InsertEdgeId { .. }
+                )
+            })
             .count();
         // Ingest / write_batch / query_write: one Batch frame. Strict and
         // Batched both fsync once at frame end; Relaxed still skips.
@@ -2191,11 +2549,11 @@ impl<F: Fs> GraphDb<F> {
             return Err(GraphError::ReadOnly);
         }
         MutPreview::new(self).check_insert_node(key)?;
-        self.log_then_apply(WalRecord::InsertNode {
+        self.log_dense(vec![WalRecord::InsertNode {
             label: label.into(),
             key: key.into(),
             props,
-        })
+        }])
     }
 
     pub fn insert_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
@@ -2205,11 +2563,11 @@ impl<F: Fs> GraphDb<F> {
         if !MutPreview::new(self).prepare_insert_edge(edge_type, src_key, dst_key)? {
             return Ok(false);
         }
-        self.log_then_apply(WalRecord::InsertEdge {
+        self.log_dense(vec![WalRecord::InsertEdge {
             edge_type: edge_type.into(),
             src_key: src_key.into(),
             dst_key: dst_key.into(),
-        })?;
+        }])?;
         Ok(true)
     }
 
@@ -2223,11 +2581,11 @@ impl<F: Fs> GraphDb<F> {
             });
         }
         MutPreview::new(self).check_live_key(key)?;
-        self.log_then_apply(WalRecord::SetProp {
+        self.log_dense(vec![WalRecord::SetProp {
             key: key.into(),
             field: field.into(),
             value,
-        })
+        }])
     }
 
     /// Remove a property. Returns `Ok(false)` (and does not log) if the field

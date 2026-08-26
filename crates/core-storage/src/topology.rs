@@ -1,3 +1,5 @@
+use crate::pack::{push_u32, push_u32s, push_u64, read_u32, read_u32s, read_u64};
+use crate::types::Result as StoreResult;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -64,7 +66,7 @@ impl AdjList {
 }
 
 impl Serialize for AdjList {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         if self.delta.is_empty() {
             self.frozen.serialize(serializer)
         } else {
@@ -74,7 +76,7 @@ impl Serialize for AdjList {
 }
 
 impl<'de> Deserialize<'de> for AdjList {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         Ok(Self {
             frozen: Vec::<u32>::deserialize(deserializer)?,
             delta: Vec::new(),
@@ -209,6 +211,75 @@ impl Topology {
             Direction::In => adj.inn.get(&v),
         })
     }
+
+    /// V7 packed CSR: etype count, then per etype (id, out map, in map), then edge_count.
+    /// Each adjacency map is vertex-count + (vertex, length-prefixed frozen neighbor array).
+    /// Deltas are merged into frozen on pack; unpack leaves deltas empty.
+    pub(crate) fn pack(&self, out: &mut Vec<u8>) {
+        let mut etypes: Vec<u32> = self.by_type.keys().copied().collect();
+        etypes.sort_unstable();
+        push_u32(out, etypes.len() as u32);
+        for et in etypes {
+            push_u32(out, et);
+            let adj = &self.by_type[&et];
+            pack_adj_map(out, &adj.out);
+            pack_adj_map(out, &adj.inn);
+        }
+        push_u64(out, self.edge_count);
+    }
+
+    pub(crate) fn unpack(src: &[u8]) -> StoreResult<(Self, usize)> {
+        let mut pos = 0usize;
+        let n_etypes = read_u32(src, &mut pos)? as usize;
+        let mut by_type = HashMap::with_capacity(n_etypes);
+        for _ in 0..n_etypes {
+            let et = read_u32(src, &mut pos)?;
+            let out = unpack_adj_map(src, &mut pos)?;
+            let inn = unpack_adj_map(src, &mut pos)?;
+            by_type.insert(et, TypedAdjacency { out, inn });
+        }
+        let edge_count = read_u64(src, &mut pos)?;
+        Ok((
+            Self {
+                by_type,
+                edge_count,
+            },
+            pos,
+        ))
+    }
+}
+
+fn pack_adj_map(out: &mut Vec<u8>, map: &HashMap<u32, AdjList>) {
+    let mut verts: Vec<u32> = map.keys().copied().collect();
+    verts.sort_unstable();
+    push_u32(out, verts.len() as u32);
+    for v in verts {
+        push_u32(out, v);
+        let list = &map[&v];
+        if list.delta.is_empty() {
+            push_u32s(out, &list.frozen);
+        } else {
+            let merged = list.merged();
+            push_u32s(out, &merged);
+        }
+    }
+}
+
+fn unpack_adj_map(src: &[u8], pos: &mut usize) -> StoreResult<HashMap<u32, AdjList>> {
+    let n = read_u32(src, pos)? as usize;
+    let mut map = HashMap::with_capacity(n);
+    for _ in 0..n {
+        let v = read_u32(src, pos)?;
+        let frozen = read_u32s(src, pos)?;
+        map.insert(
+            v,
+            AdjList {
+                frozen,
+                delta: Vec::new(),
+            },
+        );
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -401,5 +472,32 @@ mod tests {
         for dst in 0..10 {
             assert_eq!(dirty_wire.by_type[&1].inn[&dst], vec![0]);
         }
+    }
+
+    #[test]
+    fn pack_roundtrip_merges_delta_and_restores_frozen() {
+        let mut t = Topology::new();
+        for dst in (0u32..10).rev() {
+            t.add_edge(2, 1, dst);
+        }
+        t.add_edge(0, 5, 9);
+        assert!(matches!(t.neighbors(2, Direction::Out, 1), Cow::Owned(_)));
+        let mut buf = Vec::new();
+        t.pack(&mut buf);
+        let (back, consumed) = Topology::unpack(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(back.edge_count(), 11);
+        let expected: Vec<u32> = (0..10).collect();
+        assert_eq!(
+            back.neighbors(2, Direction::Out, 1).as_ref(),
+            expected.as_slice()
+        );
+        assert!(matches!(
+            back.neighbors(2, Direction::Out, 1),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(back.neighbors(0, Direction::Out, 5).as_ref(), &[9]);
+        assert_eq!(back.neighbors(0, Direction::In, 9).as_ref(), &[5]);
+        assert_eq!(back.etypes().collect::<Vec<_>>(), vec![0, 2]);
     }
 }
