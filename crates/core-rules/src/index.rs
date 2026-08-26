@@ -305,7 +305,8 @@ pub struct SideIndex {
     ivf_raw: BTreeMap<u32, Vec<f64>>,
     /// Fitted k-means centroids (empty until after first `fit_ivf_clusters` call).
     ivf_centroids: Vec<Vec<f64>>,
-    /// Per-node cluster assignment post-fit.  `by_key[Int(cluster)] → {node_ids}`.
+    /// Per-node cluster assignment post-fit.
+    /// `by_key[ivf_cluster_key(cluster)] → {node_ids}`.
     ivf_clusters: BTreeMap<u32, usize>,
     /// Count of vector inserts/removes since last fit.  When dst-side drift
     /// exceeds [`IVF_DRIFT_REBUILD`] on an approximate rule, apply queues a
@@ -407,11 +408,11 @@ pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
 /// Approximate candidate strategy: like `candidate_spec` but replaces
 /// `ScanAll` with `VectorClusters` for `VectorSimilar`-rooted predicates.
 ///
-/// Used when `RuleDef::approximate == true`.  `All` still leads with
-/// `parts[0]` (the `VectorSimilar` conjunct): IVF stores cluster ids in
-/// `by_key` as `ValueKey::Int`, which would collide with `NumericBucket`
-/// if both were indexed on the same side. Exact `All` uses [`candidate_spec`]
-/// (`Intersect` of every conjunct).
+/// Used when `RuleDef::approximate == true`.  `All` is `Intersect` of each
+/// child's approx spec (not `parts[0]`), so `FieldEqual` / `NumericWithin`
+/// conjuncts still probe their indexes. IVF cluster buckets use a reserved
+/// Str key so they do not collide with `NumericBucket` Int keys on the same
+/// side.
 ///
 /// `Any` predicates cannot be `approximate=true` (validate() rejects them),
 /// so `Any` falls through to `candidate_spec` (exact Union path).
@@ -429,7 +430,7 @@ pub fn candidate_spec_approx(p: &Predicate) -> CandidateSpec<'_> {
                 !parts.is_empty(),
                 "candidate_spec_approx requires a validated predicate"
             );
-            candidate_spec_approx(&parts[0])
+            CandidateSpec::Intersect(parts.iter().map(candidate_spec_approx).collect())
         }
         other => candidate_spec(other),
     }
@@ -592,6 +593,12 @@ fn geo_probe_keys(lat: f64, lon: f64, km: f64) -> BTreeSet<ValueKey> {
 /// vector-bearing nodes; ANN is Plan 8+.
 const SCAN_ALL_SENTINEL: ValueKey = ValueKey::Bool(true);
 
+/// IVF cluster buckets in `by_key`. SOH prefix keeps them off the Int space
+/// used by `NumericBucket` / integer `FieldEqual` and off token/geo Str keys.
+fn ivf_cluster_key(cluster: usize) -> ValueKey {
+    ValueKey::Str(format!("\u{1}ivf:{cluster}"))
+}
+
 /// `ScanAll` is the universe in an `Intersect`: skip it when another child
 /// has an index. Nested `Intersect` of only `ScanAll` is itself a universe.
 fn spec_is_scan_all_universe(spec: &CandidateSpec<'_>) -> bool {
@@ -721,7 +728,7 @@ impl SideIndex {
                         let c = nearest_centroid(&self.ivf_centroids, &unit);
                         self.ivf_clusters.insert(node, c);
                         self.by_key
-                            .entry(ValueKey::Int(c as i64))
+                            .entry(ivf_cluster_key(c))
                             .or_default()
                             .insert(node);
                     }
@@ -765,7 +772,7 @@ impl SideIndex {
             if self.ivf_raw.remove(&node).is_some() {
                 self.ivf_drift = self.ivf_drift.saturating_add(1);
                 if let Some(c) = self.ivf_clusters.remove(&node) {
-                    let key = ValueKey::Int(c as i64);
+                    let key = ivf_cluster_key(c);
                     if let Some(s) = self.by_key.get_mut(&key) {
                         s.remove(&node);
                         if s.is_empty() {
@@ -988,7 +995,7 @@ impl SideIndex {
 
         let mut out = BTreeSet::new();
         for (ci, _) in dists.iter().take(p) {
-            let key = ValueKey::Int(*ci as i64);
+            let key = ivf_cluster_key(*ci);
             if let Some(nodes) = self.by_key.get(&key) {
                 out.extend(nodes.iter().copied());
             }
@@ -1014,9 +1021,9 @@ impl SideIndex {
             return;
         }
 
-        // Clear old cluster → node mappings from by_key (cluster keys are Int).
+        // Clear old cluster → node mappings from by_key (namespaced IVF keys).
         for c in self.ivf_clusters.values() {
-            self.by_key.remove(&ValueKey::Int(*c as i64));
+            self.by_key.remove(&ivf_cluster_key(*c));
         }
         self.ivf_clusters.clear();
 
@@ -1041,7 +1048,7 @@ impl SideIndex {
             let c = nearest_centroid(&self.ivf_centroids, &unit);
             self.ivf_clusters.insert(*node, c);
             self.by_key
-                .entry(ValueKey::Int(c as i64))
+                .entry(ivf_cluster_key(c))
                 .or_default()
                 .insert(*node);
         }
@@ -1090,7 +1097,7 @@ impl SideIndex {
         // Precondition: ivf_clusters is empty when called from reindex_all_load_ivf (indexes reset to default); loop is defensive for any future direct-call path.
         // Remove old cluster bucket entries from by_key.
         for c in self.ivf_clusters.values() {
-            self.by_key.remove(&ValueKey::Int(*c as i64));
+            self.by_key.remove(&ivf_cluster_key(*c));
         }
         self.ivf_clusters.clear();
 
@@ -1105,7 +1112,7 @@ impl SideIndex {
             }
             self.ivf_clusters.insert(node, c);
             self.by_key
-                .entry(ValueKey::Int(c as i64))
+                .entry(ivf_cluster_key(c))
                 .or_default()
                 .insert(node);
         }
@@ -1582,6 +1589,46 @@ mod tests {
         assert!(
             idx.candidates(&spec, &getter(&empty_ind)).is_empty(),
             "empty Scalar child → empty intersect"
+        );
+    }
+
+    #[test]
+    fn all_approx_vector_then_field_equal_is_intersect() {
+        let p = Predicate::All(vec![
+            Predicate::VectorSimilar {
+                field: "e".into(),
+                min: 0.8,
+            },
+            Predicate::FieldEqual {
+                field: "industry".into(),
+            },
+        ]);
+        match candidate_spec_approx(&p) {
+            CandidateSpec::Intersect(v) => assert_eq!(v.len(), 2),
+            other => panic!("{other:?}"),
+        }
+
+        let spec = candidate_spec_approx(&p);
+        let mut idx = SideIndex::default();
+        let mk = |industry: &str, e: &[f64]| {
+            [
+                ("industry".to_string(), Value::Str(industry.into())),
+                (
+                    "e".to_string(),
+                    Value::List(e.iter().copied().map(Value::Float).collect()),
+                ),
+            ]
+            .into()
+        };
+        let same: HashMap<_, _> = mk("tech", &[1.0, 0.0]);
+        let other_ind: HashMap<_, _> = mk("law", &[1.0, 0.0]);
+        idx.insert(&spec, 1, &getter(&same));
+        idx.insert(&spec, 2, &getter(&other_ind));
+        let hits = idx.candidates(&spec, &getter(&same));
+        assert!(hits.contains(&1), "matching industry must stay a candidate");
+        assert!(
+            !hits.contains(&2),
+            "FieldEqual must be probed on the approximate All path"
         );
     }
 
