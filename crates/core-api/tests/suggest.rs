@@ -359,6 +359,9 @@ fn already_ruled_pair_not_re_suggested() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
 

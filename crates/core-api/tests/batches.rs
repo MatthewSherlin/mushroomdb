@@ -34,6 +34,9 @@ fn overlap_rule(name: &str, etype: &str) -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 

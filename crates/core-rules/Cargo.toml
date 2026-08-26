@@ -13,10 +13,10 @@ description = "Rule evaluation engine for mushroomdb: declarative predicates and
 name = "core_rules"
 
 [dependencies]
+bincode = { workspace = true }
 core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.1.0" }
 serde = { workspace = true }
 
 [dev-dependencies]
-bincode = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }

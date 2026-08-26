@@ -1,6 +1,7 @@
 use crate::def::{evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef};
 use crate::index::{
-    candidate_spec, candidate_spec_approx, ivf_drift_rebuild_threshold, CandidateSpec, RuleIndex,
+    candidate_spec, candidate_spec_approx_with_k, ivf_drift_rebuild_threshold, CandidateSpec,
+    RuleIndex,
 };
 use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -108,7 +109,10 @@ pub struct RuleEngine {
 /// `VectorClusters` for `approximate=true` (VectorSimilar-rooted predicates).
 fn candidate_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
     if def.approximate {
-        candidate_spec_approx(&def.predicate)
+        // k = max(max_edges, 64): return at least 64 candidates so evaluation
+        // has a meaningful pool; bounded by max_edges when set by the caller.
+        let k = def.max_edges.map(|me| me.max(64)).unwrap_or(64) as usize;
+        candidate_spec_approx_with_k(&def.predicate, k)
     } else {
         candidate_spec(&def.predicate)
     }
@@ -126,6 +130,17 @@ fn src_lookup_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
         CandidateSpec::Scalar { field }
     } else {
         candidate_spec_for(def)
+    }
+}
+
+/// True when `p` contains a `VectorSimilar { field: f }` where `f == field`.
+fn predicate_covers_field(p: &Predicate, field: &str) -> bool {
+    match p {
+        Predicate::VectorSimilar { field: f, .. } => f == field,
+        Predicate::All(parts) | Predicate::Any(parts) => {
+            parts.iter().any(|q| predicate_covers_field(q, field))
+        }
+        _ => false,
     }
 }
 
@@ -333,6 +348,165 @@ fn compute_desired(
         }
     }
     out
+}
+
+/// Compute the desired `(src, dst) → score` map for a **via-hop rule** where
+/// `def.via_label.is_some()`.
+///
+/// Semantics: src -[via_edge/via_dir]→ via(via_label), evaluate predicate
+/// between via and dst; fire src→dst if any via satisfies; score = max over via.
+///
+/// `anchor` selects which side of the computation to anchor:
+/// - `ViaAnchor::Src(src_id)`: expand from one specific src node.
+/// - `ViaAnchor::Dst(dst_id)`: n is a dst node; scan all src nodes and check
+///   if any via hop to them evaluates with n.
+///
+/// Always returns `(src, dst)` keyed pairs regardless of anchor.
+fn compute_desired_via(
+    def: &RuleDef,
+    anchor: ViaAnchor,
+    g: &GraphMut<'_>,
+) -> BTreeMap<(u32, u32), f64> {
+    let via_label = def.via_label.as_deref().unwrap();
+    let via_edge_str = def.via_edge.as_deref().unwrap();
+    let via_dir = def.via_dir.unwrap_or(core_storage::Direction::Out);
+
+    let src_sym = match g.syms.get(&def.src_label) {
+        Some(s) => s,
+        None => return BTreeMap::new(),
+    };
+    let via_sym = match g.syms.get(via_label) {
+        Some(s) => s,
+        None => return BTreeMap::new(),
+    };
+    let dst_sym = match g.syms.get(&def.dst_label) {
+        Some(s) => s,
+        None => return BTreeMap::new(),
+    };
+    let via_etype = match g.syms.get(via_edge_str) {
+        Some(e) => e,
+        None => return BTreeMap::new(),
+    };
+
+    // Determine which src ids to iterate over.
+    let srcs: Vec<u32> = match anchor {
+        ViaAnchor::Src(src_id) => {
+            if g.labels.get(src_id as usize).copied() == Some(src_sym) {
+                vec![src_id]
+            } else {
+                return BTreeMap::new();
+            }
+        }
+        ViaAnchor::Dst(_) => {
+            // Scan all src-label nodes.
+            (0..g.ids.len() as u32)
+                .filter(|&id| {
+                    matches!(
+                        g.labels.get(id as usize).copied(),
+                        Some(s) if s != u32::MAX && s == src_sym
+                    )
+                })
+                .collect()
+        }
+    };
+
+    // Collect dst candidates: all dst-label nodes (or just the anchored dst).
+    let anchored_dst: Option<u32> = match anchor {
+        ViaAnchor::Dst(dst_id) => {
+            if g.labels.get(dst_id as usize).copied() == Some(dst_sym) {
+                Some(dst_id)
+            } else {
+                return BTreeMap::new();
+            }
+        }
+        _ => None,
+    };
+
+    let mut out = BTreeMap::new();
+
+    for src in srcs {
+        let _src_key = match g.ids.key_of(src) {
+            Some(k) => k,
+            None => continue,
+        };
+        // Expand via hops from src.
+        let via_neighbors: Vec<u32> = g
+            .topo
+            .neighbors(via_etype, via_dir, src)
+            .iter()
+            .copied()
+            .filter(|&v| g.labels.get(v as usize).copied() == Some(via_sym))
+            .collect();
+
+        if via_neighbors.is_empty() {
+            continue;
+        }
+
+        // Collect dsts to evaluate: all dst-label nodes or just anchored one.
+        let dsts: Vec<u32> = if let Some(dst_id) = anchored_dst {
+            vec![dst_id]
+        } else {
+            (0..g.ids.len() as u32)
+                .filter(|&id| {
+                    id != src
+                        && matches!(
+                            g.labels.get(id as usize).copied(),
+                            Some(s) if s != u32::MAX && s == dst_sym
+                        )
+                })
+                .collect()
+        };
+
+        for dst in dsts {
+            if dst == src {
+                continue; // no self-edges
+            }
+            let dst_key = match g.ids.key_of(dst) {
+                Some(k) => k,
+                None => continue,
+            };
+            let dst_get = |f: &str| g.props.get(dst, f).cloned();
+            let dst_view = NodeView {
+                key: dst_key,
+                props: &dst_get,
+            };
+
+            // Score = max over via nodes that satisfy predicate(via, dst).
+            let mut best: Option<f64> = None;
+            for &via_id in &via_neighbors {
+                let via_key = match g.ids.key_of(via_id) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                let via_get = |f: &str| g.props.get(via_id, f).cloned();
+                let via_view = NodeView {
+                    key: via_key,
+                    props: &via_get,
+                };
+                if let Some(score) = evaluate(&def.predicate, &via_view, &dst_view) {
+                    best = Some(match best {
+                        None => score,
+                        Some(prev) => prev.max(score),
+                    });
+                }
+            }
+
+            if let Some(score) = best {
+                out.insert((src, dst), score);
+            }
+        }
+    }
+
+    out
+}
+
+/// Anchor point for `compute_desired_via`.
+enum ViaAnchor {
+    /// Expand from one src node (src prop change or src insert).
+    Src(u32),
+    /// Re-evaluate all srcs that can reach some via satisfying predicate with
+    /// this dst (dst prop change).
+    Dst(u32),
 }
 
 fn edge_budget(def: &RuleDef) -> u64 {
@@ -1246,6 +1420,16 @@ impl RuleEngine {
         // Collect rule names once outside the per-node loop to avoid repeated
         // allocation and to satisfy the borrow checker without cloning inside.
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
+
+        // Init HNSW for approximate rules before inserting nodes.
+        for name in &rule_names {
+            if self.rules[name].approximate {
+                let idx = self.indexes.get_mut(name).unwrap();
+                idx.src_side.init_hnsw(name);
+                idx.dst_side.init_hnsw(name);
+            }
+        }
+
         for id in 0..ids.len() as u32 {
             let label_sym = match labels.get(id as usize).copied() {
                 Some(s) if s != u32::MAX => s,
@@ -1258,6 +1442,7 @@ impl RuleEngine {
             }
         }
         // After all nodes are indexed, fit IVF clusters for approximate rules.
+        // HNSW was built incrementally; IVF kept as legacy fallback.
         for name in &rule_names {
             if self.rules[name].approximate {
                 let idx = self.indexes.get_mut(name).unwrap();
@@ -1288,6 +1473,17 @@ impl RuleEngine {
             *idx = RuleIndex::default();
         }
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
+
+        // Init HNSW for approximate rules before inserting nodes so each
+        // insert also populates the HNSW graph incrementally.
+        for name in &rule_names {
+            if self.rules[name].approximate {
+                let idx = self.indexes.get_mut(name).unwrap();
+                idx.src_side.init_hnsw(name);
+                idx.dst_side.init_hnsw(name);
+            }
+        }
+
         for id in 0..ids.len() as u32 {
             let label_sym = match labels.get(id as usize).copied() {
                 Some(s) if s != u32::MAX => s,
@@ -1300,6 +1496,8 @@ impl RuleEngine {
             }
         }
         // For approximate rules: restore persisted IVF state (no re-fit).
+        // HNSW was built incrementally; it will be replaced by `load_hnsw_state`
+        // in `restore_snapshot_state` when a snapshot blob is available.
         for name in &rule_names {
             if !self.rules[name].approximate {
                 continue;
@@ -1314,6 +1512,75 @@ impl RuleEngine {
                 idx.dst_side.fit_ivf_clusters(name);
             }
         }
+    }
+
+    /// Export HNSW graphs for all approximate rules as opaque bincoded blobs.
+    ///
+    /// Returns a map from rule name to `(src_blob, dst_blob)`.  An empty `Vec`
+    /// means the corresponding side has no initialized HNSW graph.
+    pub fn export_hnsw_state(&self) -> BTreeMap<String, (Vec<u8>, Vec<u8>)> {
+        let mut out = BTreeMap::new();
+        for (name, def) in &self.rules {
+            if def.approximate {
+                if let Some(idx) = self.indexes.get(name) {
+                    out.insert(
+                        name.clone(),
+                        (
+                            idx.src_side.export_hnsw_blob(),
+                            idx.dst_side.export_hnsw_blob(),
+                        ),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Restore HNSW graphs from bincoded blobs (overrides any incrementally built
+    /// graphs produced during `reindex_all_load_ivf`).
+    ///
+    /// Called from `restore_snapshot_state` in db.rs after reindex.
+    pub fn load_hnsw_state(&mut self, blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>) {
+        for (name, (src_blob, dst_blob)) in blobs {
+            if let Some(idx) = self.indexes.get_mut(&name) {
+                if !src_blob.is_empty() {
+                    idx.src_side.load_hnsw_blob(&src_blob);
+                }
+                if !dst_blob.is_empty() {
+                    idx.dst_side.load_hnsw_blob(&dst_blob);
+                }
+            }
+        }
+    }
+
+    /// Find approximate nearest-neighbor ids on the dst side of the first
+    /// approximate VectorSimilar rule covering `(dst_label, field)`.
+    ///
+    /// Returns `None` when no matching rule or HNSW index exists.
+    pub fn hnsw_search_dst(
+        &self,
+        field: &str,
+        dst_label: &str,
+        q: &[f64],
+        k: usize,
+    ) -> Option<Vec<(u32, f64)>> {
+        for (name, def) in &self.rules {
+            if !def.approximate || def.dst_label != dst_label {
+                continue;
+            }
+            // Check that the predicate covers this vector field.
+            if !predicate_covers_field(&def.predicate, field) {
+                continue;
+            }
+            if let Some(idx) = self.indexes.get(name) {
+                if let Some(h) = idx.dst_side.hnsw_ref() {
+                    if !h.is_empty() {
+                        return Some(h.search(q, k));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Register a rule and backfill existing nodes.
@@ -1333,6 +1600,15 @@ impl RuleEngine {
         // Phase 1: index all existing nodes for this rule.
         let n_total = g.ids.len() as u32;
         let def = self.rules[&name].clone();
+
+        // Phase 1a: init HNSW for approximate rules before inserting nodes so
+        // each insert also populates the HNSW graph incrementally.
+        if def.approximate {
+            let idx = self.indexes.get_mut(&name).unwrap();
+            idx.src_side.init_hnsw(&name);
+            idx.dst_side.init_hnsw(&name);
+        }
+
         for id in 0..n_total {
             let label_sym = match g.labels.get(id as usize).copied() {
                 Some(s) if s != u32::MAX => s,
@@ -1343,6 +1619,7 @@ impl RuleEngine {
         }
 
         // Phase 1b: fit IVF clusters for approximate rules (after all nodes indexed).
+        // HNSW was built incrementally above; IVF is kept as legacy fallback.
         if def.approximate {
             let idx = self.indexes.get_mut(&name).unwrap();
             idx.src_side.fit_ivf_clusters(&name);
@@ -1362,7 +1639,48 @@ impl RuleEngine {
             deltas: &mut self.pending_deltas,
             emit: self.emit_deltas,
         };
-        if let Some(k) = def.max_edges {
+        if def.via_label.is_some() {
+            // Via-hop backfill: bypass the candidate index; use compute_desired_via.
+            let budget = edge_budget(&def);
+            let et = g.syms.intern(&def.edge_type);
+            let src_sym = g.syms.get(&def.src_label);
+            let tripped = self.tripped.get_mut(&name).unwrap();
+            'via_outer: for id in 0..g.ids.len() as u32 {
+                let label_sym = match g.labels.get(id as usize).copied() {
+                    Some(s) if s != u32::MAX => s,
+                    _ => continue,
+                };
+                if src_sym != Some(label_sym) {
+                    continue;
+                }
+                let per_src = compute_desired_via(&def, ViaAnchor::Src(id), g);
+                if let Some(k) = def.max_edges {
+                    let top_k = filter_src_top_k(per_src, k, g.ids);
+                    apply_per_src_top_k(&def, id, top_k, &mut prov, g);
+                } else {
+                    for ((s, d), score) in per_src {
+                        let triple = (et, s, d);
+                        let already = prov.contains(&triple);
+                        if !already {
+                            if *tripped || prov.len() as u64 >= budget {
+                                *tripped = true;
+                                break 'via_outer;
+                            }
+                            let newly = g.topo.add_edge(et, s, d);
+                            if newly {
+                                prov.insert(&name, triple, g.ids, g.syms);
+                            }
+                        }
+                        let is_owned_here = already || prov.contains(&triple);
+                        if is_owned_here {
+                            if let Some(p) = &def.weight_prop {
+                                g.edge_props.set(et, s, d, p, Value::Float(score));
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(k) = def.max_edges {
             apply_streaming_create_top_k(&def, k, &self.indexes[&name], &mut prov, g);
         } else {
             let tripped = self.tripped.get_mut(&name).unwrap();
@@ -1426,6 +1744,11 @@ impl RuleEngine {
     /// - None: all rules where n's label matches either side fire; index gains n.
     /// - Some((field, old_value)): only rules watching `field` fire; index is
     ///   updated using old_value for removal so stale buckets are cleaned.
+    ///
+    /// For via-hop rules (`def.via_label.is_some()`), also fires when n carries
+    /// the via-label: finds all srcs that route through n and recomputes their
+    /// derived edges. Via-hop rules bypass the candidate index and use
+    /// `compute_desired_via` instead.
     pub fn on_node_changed(
         &mut self,
         n: u32,
@@ -1437,79 +1760,346 @@ impl RuleEngine {
 
         for rule_name in rule_names {
             let def = self.rules[&rule_name].clone();
-            let src_sym = g.syms.get(&def.src_label);
-            let dst_sym = g.syms.get(&def.dst_label);
-            let as_src = src_sym.is_some() && n_label == src_sym;
-            let as_dst = dst_sym.is_some() && n_label == dst_sym;
 
-            let fires = match changed {
-                None => as_src || as_dst,
-                Some((field, _)) => def.watched_fields().contains(field) && (as_src || as_dst),
+            if def.via_label.is_some() {
+                // --- Via-hop rule path ---
+                self.on_node_changed_via(&rule_name, &def, n, n_label, changed.clone(), g);
+            } else {
+                // --- Standard 2-node rule path ---
+                let src_sym = g.syms.get(&def.src_label);
+                let dst_sym = g.syms.get(&def.dst_label);
+                let as_src = src_sym.is_some() && n_label == src_sym;
+                let as_dst = dst_sym.is_some() && n_label == dst_sym;
+
+                let fires = match changed {
+                    None => as_src || as_dst,
+                    Some((field, _)) => def.watched_fields().contains(field) && (as_src || as_dst),
+                };
+                if !fires {
+                    continue;
+                }
+                *self.fires.entry(rule_name.clone()).or_default() += 1;
+
+                // --- Index maintenance ---
+                if let Some((field, ref old_val)) = changed {
+                    let old_val_cloned = old_val.clone();
+                    let old_getter = |f: &str| {
+                        if f == field {
+                            old_val_cloned.clone()
+                        } else {
+                            g.props.get(n, f).cloned()
+                        }
+                    };
+                    let idx = self.indexes.get_mut(&rule_name).unwrap();
+                    if as_src {
+                        let spec = src_lookup_spec_for(&def);
+                        idx.src_side.remove(&spec, n, &old_getter);
+                    }
+                    if as_dst {
+                        let spec = candidate_spec_for(&def);
+                        idx.dst_side.remove(&spec, n, &old_getter);
+                    }
+                }
+
+                {
+                    let cur_getter = |f: &str| g.props.get(n, f).cloned();
+                    let idx = self.indexes.get_mut(&rule_name).unwrap();
+                    if as_src {
+                        let spec = src_lookup_spec_for(&def);
+                        idx.src_side.insert(&spec, n, &cur_getter);
+                    }
+                    if as_dst {
+                        let spec = candidate_spec_for(&def);
+                        idx.dst_side.insert(&spec, n, &cur_getter);
+                    }
+                }
+
+                self.maybe_queue_ivf_rebuild(&rule_name, &def);
+
+                // --- Desired set + diff-apply ---
+                if let Some(k) = def.max_edges {
+                    let et = g.syms.intern(&def.edge_type);
+                    let affected_srcs_for_n_dst: BTreeSet<u32> = if as_dst {
+                        let rid = self.rule_intern.get(&def.name).copied();
+                        self.by_node
+                            .get(&n)
+                            .into_iter()
+                            .flatten()
+                            .filter(|(r, t, _s, d)| Some(*r) == rid && *t == et && *d == n)
+                            .map(|(_, _, s, _)| *s)
+                            .collect()
+                    } else {
+                        BTreeSet::new()
+                    };
+
+                    let mut prov = ProvSets {
+                        set: self.provenance.entry(rule_name.clone()).or_default(),
+                        owned: &mut self.owned,
+                        by_node: &mut self.by_node,
+                        rule_intern: &mut self.rule_intern,
+                        intern_rule: &mut self.intern_rule,
+                        deltas: &mut self.pending_deltas,
+                        emit: self.emit_deltas,
+                    };
+
+                    if as_src {
+                        let desired_n_src =
+                            compute_desired(&def, &self.indexes[&rule_name], n, true, g);
+                        let top_k = filter_src_top_k(desired_n_src, k, g.ids);
+                        apply_per_src_top_k(&def, n, top_k, &mut prov, g);
+                    }
+
+                    if as_dst {
+                        let new_desired =
+                            compute_desired(&def, &self.indexes[&rule_name], n, false, g);
+                        let new_srcs: BTreeSet<u32> = new_desired.keys().map(|(s, _)| *s).collect();
+                        let affected_srcs: BTreeSet<u32> =
+                            affected_srcs_for_n_dst.union(&new_srcs).copied().collect();
+                        for src in affected_srcs {
+                            if src == n {
+                                continue;
+                            }
+                            let desired_src =
+                                compute_desired(&def, &self.indexes[&rule_name], src, true, g);
+                            let top_k = filter_src_top_k(desired_src, k, g.ids);
+                            apply_per_src_top_k(&def, src, top_k, &mut prov, g);
+                        }
+                    }
+                } else {
+                    let mut desired = BTreeMap::new();
+                    if as_src {
+                        desired.extend(compute_desired(
+                            &def,
+                            &self.indexes[&rule_name],
+                            n,
+                            true,
+                            g,
+                        ));
+                    }
+                    if as_dst {
+                        desired.extend(compute_desired(
+                            &def,
+                            &self.indexes[&rule_name],
+                            n,
+                            false,
+                            g,
+                        ));
+                    }
+                    let tripped = self.tripped.entry(rule_name.clone()).or_default();
+                    apply_desired(
+                        &def,
+                        desired,
+                        Some(n),
+                        &mut ProvSets {
+                            set: self.provenance.entry(rule_name).or_default(),
+                            owned: &mut self.owned,
+                            by_node: &mut self.by_node,
+                            rule_intern: &mut self.rule_intern,
+                            intern_rule: &mut self.intern_rule,
+                            deltas: &mut self.pending_deltas,
+                            emit: self.emit_deltas,
+                        },
+                        tripped,
+                        g,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Inner handler for `on_node_changed` when the rule is a via-hop rule.
+    ///
+    /// For each role n can play (src, via, dst), computes and applies the
+    /// desired edge set using `compute_desired_via`. Via-hop rules bypass the
+    /// candidate index; no index maintenance is performed here.
+    ///
+    /// Incremental correctness by change class:
+    /// - **src prop / insert** (`as_src`): re-expand via from n, recompute all
+    ///   (n, dst) pairs. `apply_via_for_srcs([n])`.
+    /// - **via-node prop change** (`as_via`, field in watched_fields): find
+    ///   srcs that hop to n via `via_edge`, recompute their (src, dst) pairs.
+    ///   `apply_via_for_srcs(reverse_via_neighbors(n))`.
+    /// - **dst prop / insert** (`as_dst`): anchor on n, compute desired for all
+    ///   srcs. `apply_via_for_srcs(all_src_label_nodes)`.
+    fn on_node_changed_via(
+        &mut self,
+        rule_name: &str,
+        def: &RuleDef,
+        n: u32,
+        n_label: Option<u32>,
+        changed: Option<(&str, Option<Value>)>,
+        g: &mut GraphMut<'_>,
+    ) {
+        let src_sym = g.syms.get(&def.src_label);
+        let dst_sym = g.syms.get(&def.dst_label);
+        let via_sym = def.via_label.as_deref().and_then(|l| g.syms.get(l));
+
+        let as_src = src_sym.is_some() && n_label == src_sym;
+        let as_dst = dst_sym.is_some() && n_label == dst_sym;
+        let as_via = via_sym.is_some() && n_label == via_sym;
+
+        // Via-hop predicates are evaluated between via and dst, so watched_fields
+        // cover both via-node and dst-node fields (predicate fields come from the
+        // via→dst evaluation). A via-node prop change fires if its field is watched.
+        let fires = match changed {
+            None => as_src || as_via || as_dst,
+            Some((field, _)) => {
+                let wf = def.watched_fields();
+                (wf.contains(field)) && (as_src || as_via || as_dst)
+            }
+        };
+        if !fires {
+            return;
+        }
+        *self.fires.entry(rule_name.to_string()).or_default() += 1;
+
+        // Collect affected srcs: union of srcs identified from each role.
+        let mut affected_srcs: BTreeSet<u32> = BTreeSet::new();
+        if as_src {
+            affected_srcs.insert(n);
+        }
+        if as_via {
+            // Srcs that hop to this via-node via via_edge (reverse direction).
+            let via_edge_str = def.via_edge.as_deref().unwrap();
+            let via_dir = def.via_dir.unwrap_or(core_storage::Direction::Out);
+            let rev_dir = match via_dir {
+                core_storage::Direction::Out => core_storage::Direction::In,
+                core_storage::Direction::In => core_storage::Direction::Out,
             };
-            if !fires {
+            if let (Some(via_etype), Some(s_sym)) = (g.syms.get(via_edge_str), src_sym) {
+                for &src in g.topo.neighbors(via_etype, rev_dir, n).as_ref() {
+                    if g.labels.get(src as usize).copied() == Some(s_sym) {
+                        affected_srcs.insert(src);
+                    }
+                }
+            }
+        }
+        if as_dst {
+            // Recompute all srcs whose via-hops might produce edges to n.
+            let desired_touching_n = compute_desired_via(def, ViaAnchor::Dst(n), g);
+            for (src, _dst) in desired_touching_n.keys() {
+                affected_srcs.insert(*src);
+            }
+            // Also include any srcs that currently have provenance pointing to n.
+            let et = g.syms.intern(&def.edge_type);
+            let rid = self.rule_intern.get(rule_name).copied();
+            let old_srcs: Vec<u32> = self
+                .by_node
+                .get(&n)
+                .into_iter()
+                .flatten()
+                .filter(|(r, t, _s, d)| Some(*r) == rid && *t == et && *d == n)
+                .map(|(_, _, s, _)| *s)
+                .collect();
+            affected_srcs.extend(old_srcs);
+        }
+
+        // For each affected src, compute desired_via(Src) and apply.
+        let affected_srcs: Vec<u32> = affected_srcs.into_iter().collect();
+
+        if let Some(k) = def.max_edges {
+            let mut prov = ProvSets {
+                set: self.provenance.entry(rule_name.to_string()).or_default(),
+                owned: &mut self.owned,
+                by_node: &mut self.by_node,
+                rule_intern: &mut self.rule_intern,
+                intern_rule: &mut self.intern_rule,
+                deltas: &mut self.pending_deltas,
+                emit: self.emit_deltas,
+            };
+            for src in affected_srcs {
+                let desired_src = compute_desired_via(def, ViaAnchor::Src(src), g);
+                let top_k = filter_src_top_k(desired_src, k, g.ids);
+                apply_per_src_top_k(def, src, top_k, &mut prov, g);
+            }
+        } else {
+            let tripped = self.tripped.entry(rule_name.to_string()).or_default();
+            let budget = edge_budget(def);
+            // Apply per-src so each affected src retracts its stale edges and
+            // adds its new desired edges independently.
+            for src in affected_srcs {
+                let desired_src = compute_desired_via(def, ViaAnchor::Src(src), g);
+                if !*tripped {
+                    let mut prov = ProvSets {
+                        set: self.provenance.entry(rule_name.to_string()).or_default(),
+                        owned: &mut self.owned,
+                        by_node: &mut self.by_node,
+                        rule_intern: &mut self.rule_intern,
+                        intern_rule: &mut self.intern_rule,
+                        deltas: &mut self.pending_deltas,
+                        emit: self.emit_deltas,
+                    };
+                    apply_desired(def, desired_src, Some(src), &mut prov, tripped, g);
+                }
+                // If budget was just tripped inside apply_desired, stop adding
+                // but continue retracting stale edges for already-processed srcs
+                // (apply_desired handles retracts even when tripped).
+                let _ = budget;
+            }
+        }
+    }
+
+    /// Called when a user edge `(etype_str, src_id, dst_id)` is inserted or
+    /// deleted (not a derived edge — those are managed by provenance, not here).
+    ///
+    /// For any via-hop rule where `via_edge == etype_str` and src_id carries
+    /// `src_label`, the src_id's desired derived-edge set may have changed:
+    /// a new WORKS_AT edge makes a new Org reachable as a via-node, and a
+    /// deleted WORKS_AT removes a previously reachable Org.
+    ///
+    /// This is the only hook the engine exposes for topology changes. It is
+    /// called from `db.rs` on `WalRecord::InsertEdge` and `WalRecord::DeleteEdge`
+    /// immediately after the topo is updated (so `g.topo` already reflects the
+    /// new state).
+    pub fn on_edge_changed(
+        &mut self,
+        etype_str: &str,
+        src_id: u32,
+        dst_id: u32,
+        g: &mut GraphMut<'_>,
+    ) {
+        let rule_names: Vec<String> = self.rules.keys().cloned().collect();
+        for rule_name in rule_names {
+            let def = self.rules[&rule_name].clone();
+            let Some(ref via_edge) = def.via_edge else {
+                continue; // not a via-hop rule
+            };
+            if via_edge != etype_str {
+                continue; // edge type doesn't match this rule's via_edge
+            }
+
+            // Check that src_id carries src_label and dst_id carries via_label.
+            let src_sym = match g.syms.get(&def.src_label) {
+                Some(s) => s,
+                None => continue,
+            };
+            let via_sym = match def.via_label.as_deref().and_then(|l| g.syms.get(l)) {
+                Some(s) => s,
+                None => continue,
+            };
+            // via_dir == Out → the edge goes src_id → dst_id (src-label node to via-label node)
+            // via_dir == In  → the edge goes dst_id ← src_id, i.e., src_id is the via-label
+            //                  end and dst_id is the src-label end. Adjust accordingly.
+            let via_dir = def.via_dir.unwrap_or(core_storage::Direction::Out);
+            let (rule_src, rule_via) = match via_dir {
+                core_storage::Direction::Out => (src_id, dst_id),
+                core_storage::Direction::In => (dst_id, src_id),
+            };
+
+            if g.labels.get(rule_src as usize).copied() != Some(src_sym) {
                 continue;
             }
+            if g.labels.get(rule_via as usize).copied() != Some(via_sym) {
+                continue;
+            }
+
+            // Recompute derived edges for rule_src — its via-hop set just changed.
             *self.fires.entry(rule_name.clone()).or_default() += 1;
+            let desired_src = compute_desired_via(&def, ViaAnchor::Src(rule_src), g);
 
-            // --- Index maintenance ---
-            if let Some((field, ref old_val)) = changed {
-                // Remove using the OLD value so stale buckets are cleared.
-                let old_val_cloned = old_val.clone();
-                let old_getter = |f: &str| {
-                    if f == field {
-                        old_val_cloned.clone()
-                    } else {
-                        g.props.get(n, f).cloned()
-                    }
-                };
-                let idx = self.indexes.get_mut(&rule_name).unwrap();
-                if as_src {
-                    let spec = src_lookup_spec_for(&def);
-                    idx.src_side.remove(&spec, n, &old_getter);
-                }
-                if as_dst {
-                    let spec = candidate_spec_for(&def);
-                    idx.dst_side.remove(&spec, n, &old_getter);
-                }
-            }
-
-            // Insert with current props (idempotent on new-node path).
-            {
-                let cur_getter = |f: &str| g.props.get(n, f).cloned();
-                let idx = self.indexes.get_mut(&rule_name).unwrap();
-                if as_src {
-                    let spec = src_lookup_spec_for(&def);
-                    idx.src_side.insert(&spec, n, &cur_getter);
-                }
-                if as_dst {
-                    let spec = candidate_spec_for(&def);
-                    idx.dst_side.insert(&spec, n, &cur_getter);
-                }
-            }
-
-            self.maybe_queue_ivf_rebuild(&rule_name, &def);
-
-            // --- Desired set + diff-apply ---
             if let Some(k) = def.max_edges {
-                // Top-k per-source semantics.
-                // Collect affected srcs (existing provenance to n as dst) BEFORE
-                // taking the ProvSets borrow, so we can still read self.by_node.
-                let et = g.syms.intern(&def.edge_type);
-                let affected_srcs_for_n_dst: BTreeSet<u32> = if as_dst {
-                    let rid = self.rule_intern.get(&def.name).copied();
-                    self.by_node
-                        .get(&n)
-                        .into_iter()
-                        .flatten()
-                        .filter(|(r, t, _s, d)| Some(*r) == rid && *t == et && *d == n)
-                        .map(|(_, _, s, _)| *s)
-                        .collect()
-                } else {
-                    BTreeSet::new()
-                };
-
                 let mut prov = ProvSets {
-                    set: self.provenance.entry(rule_name.clone()).or_default(),
+                    set: self.provenance.entry(rule_name).or_default(),
                     owned: &mut self.owned,
                     by_node: &mut self.by_node,
                     rule_intern: &mut self.rule_intern,
@@ -1517,64 +2107,20 @@ impl RuleEngine {
                     deltas: &mut self.pending_deltas,
                     emit: self.emit_deltas,
                 };
-
-                if as_src {
-                    // n changed as src: recompute n's top-k destination set.
-                    let desired_n_src =
-                        compute_desired(&def, &self.indexes[&rule_name], n, true, g);
-                    let top_k = filter_src_top_k(desired_n_src, k, g.ids);
-                    apply_per_src_top_k(&def, n, top_k, &mut prov, g);
-                }
-
-                if as_dst {
-                    // n changed as dst: all srcs that currently have provenance to n
-                    // AND all srcs that newly match n must re-evaluate their top-k.
-                    let new_desired = compute_desired(&def, &self.indexes[&rule_name], n, false, g);
-                    let new_srcs: BTreeSet<u32> = new_desired.keys().map(|(s, _)| *s).collect();
-                    let affected_srcs: BTreeSet<u32> =
-                        affected_srcs_for_n_dst.union(&new_srcs).copied().collect();
-                    for src in affected_srcs {
-                        if src == n {
-                            continue; // no self-edges
-                        }
-                        let desired_src =
-                            compute_desired(&def, &self.indexes[&rule_name], src, true, g);
-                        let top_k = filter_src_top_k(desired_src, k, g.ids);
-                        apply_per_src_top_k(&def, src, top_k, &mut prov, g);
-                    }
-                }
+                let top_k = filter_src_top_k(desired_src, k, g.ids);
+                apply_per_src_top_k(&def, rule_src, top_k, &mut prov, g);
             } else {
-                // Global-budget semantics (unchanged).
-                let mut desired = BTreeMap::new();
-                if as_src {
-                    desired.extend(compute_desired(&def, &self.indexes[&rule_name], n, true, g));
-                }
-                if as_dst {
-                    desired.extend(compute_desired(
-                        &def,
-                        &self.indexes[&rule_name],
-                        n,
-                        false,
-                        g,
-                    ));
-                }
                 let tripped = self.tripped.entry(rule_name.clone()).or_default();
-                apply_desired(
-                    &def,
-                    desired,
-                    Some(n),
-                    &mut ProvSets {
-                        set: self.provenance.entry(rule_name).or_default(),
-                        owned: &mut self.owned,
-                        by_node: &mut self.by_node,
-                        rule_intern: &mut self.rule_intern,
-                        intern_rule: &mut self.intern_rule,
-                        deltas: &mut self.pending_deltas,
-                        emit: self.emit_deltas,
-                    },
-                    tripped,
-                    g,
-                );
+                let mut prov = ProvSets {
+                    set: self.provenance.entry(rule_name).or_default(),
+                    owned: &mut self.owned,
+                    by_node: &mut self.by_node,
+                    rule_intern: &mut self.rule_intern,
+                    intern_rule: &mut self.intern_rule,
+                    deltas: &mut self.pending_deltas,
+                    emit: self.emit_deltas,
+                };
+                apply_desired(&def, desired_src, Some(rule_src), &mut prov, tripped, g);
             }
         }
     }
@@ -1694,6 +2240,14 @@ impl RuleEngine {
 
         // Reindex this rule from scratch (indexes only).
         *self.indexes.get_mut(name).unwrap() = RuleIndex::default();
+
+        // Init HNSW before indexing so inserts populate the graph incrementally.
+        if def.approximate {
+            let idx = self.indexes.get_mut(name).unwrap();
+            idx.src_side.init_hnsw(name);
+            idx.dst_side.init_hnsw(name);
+        }
+
         let n_total = g.ids.len() as u32;
         for id in 0..n_total {
             let label_sym = match g.labels.get(id as usize).copied() {
@@ -1705,6 +2259,7 @@ impl RuleEngine {
         }
 
         // Fit IVF clusters for approximate rules after reindex (drift reset).
+        // HNSW was built incrementally; IVF kept as legacy fallback.
         if def.approximate {
             let idx = self.indexes.get_mut(name).unwrap();
             idx.src_side.fit_ivf_clusters(name);
@@ -1811,6 +2366,9 @@ mod tests {
             weight_prop: Some("score".into()),
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 
@@ -1831,6 +2389,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: true,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 
@@ -1954,6 +2515,9 @@ mod tests {
                     weight_prop: None,
                     max_edges: None,
                     approximate: false,
+                    via_label: None,
+                    via_edge: None,
+                    via_dir: None,
                 },
                 &mut g,
             )
@@ -1998,6 +2562,9 @@ mod tests {
                     weight_prop: Some("score".into()),
                     max_edges: None,
                     approximate: false,
+                    via_label: None,
+                    via_edge: None,
+                    via_dir: None,
                 },
                 &mut g,
             )
@@ -2061,6 +2628,9 @@ mod tests {
                     weight_prop: None,
                     max_edges: None,
                     approximate: false,
+                    via_label: None,
+                    via_edge: None,
+                    via_dir: None,
                 },
                 &mut g,
             )
@@ -2164,6 +2734,9 @@ mod tests {
                     weight_prop: None,
                     max_edges: None,
                     approximate: false,
+                    via_label: None,
+                    via_edge: None,
+                    via_dir: None,
                 },
                 &mut g,
             )
@@ -2182,6 +2755,9 @@ mod tests {
                     weight_prop: None,
                     max_edges: None,
                     approximate: false,
+                    via_label: None,
+                    via_edge: None,
+                    via_dir: None,
                 },
                 &mut g,
             )
@@ -2242,6 +2818,9 @@ mod tests {
             weight_prop: None,
             max_edges: Some(k),
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 
@@ -2314,6 +2893,9 @@ mod tests {
             weight_prop: Some("score".into()),
             max_edges: Some(1),
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
         let mut eng = RuleEngine::new();
         {
@@ -2365,6 +2947,9 @@ mod tests {
             weight_prop: Some("score".into()),
             max_edges: Some(1),
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
         let mut eng = RuleEngine::new();
 
@@ -2546,6 +3131,9 @@ mod tests {
             weight_prop: Some("score".into()),
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 
@@ -2562,6 +3150,9 @@ mod tests {
             weight_prop: Some("score".into()),
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 
@@ -2578,6 +3169,9 @@ mod tests {
             weight_prop: Some("score".into()),
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 
@@ -2689,6 +3283,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 
@@ -2825,6 +3422,9 @@ mod tests {
             weight_prop: None,
             max_edges: None, // global-budget path, DEFAULT_MAX_EDGES = 1_000_000
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
         {
             let mut g = fx.g();
@@ -3095,6 +3695,9 @@ mod tests {
                     weight_prop: None,
                     max_edges: Some(k),
                     approximate: false,
+                    via_label: None,
+                    via_edge: None,
+                    via_dir: None,
                 };
 
                 let build = || {
@@ -3143,6 +3746,9 @@ mod tests {
                     weight_prop: Some("score".into()),
                     max_edges: Some(k),
                     approximate: false,
+                    via_label: None,
+                    via_edge: None,
+                    via_dir: None,
                 };
 
                 let build = || {
@@ -3189,6 +3795,9 @@ mod tests {
                     weight_prop: None,
                     max_edges: Some(k),
                     approximate: false,
+                    via_label: None,
+                    via_edge: None,
+                    via_dir: None,
                 };
 
                 let build = || {
@@ -3246,6 +3855,9 @@ mod tests {
                     weight_prop: Some("score".into()),
                     max_edges: Some(k),
                     approximate: false,
+                    via_label: None,
+                    via_edge: None,
+                    via_dir: None,
                 };
 
                 let build = || {
@@ -3363,6 +3975,9 @@ mod tests {
             weight_prop: None,
             max_edges: Some(2), // top-k=2 per source; 500 * 2 = 1000 total edges
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
 
         // Baseline: RSS before any create_rule allocation.
@@ -3469,6 +4084,9 @@ mod tests {
             weight_prop: Some("score".into()),
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
 
         // Build three identical fixtures (independent topo state, same data).
@@ -3572,6 +4190,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
 
         let mut eng = RuleEngine::new();
@@ -3682,6 +4303,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
 
         // Three independent fixtures with the same razor pair.

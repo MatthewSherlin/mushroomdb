@@ -59,6 +59,9 @@ fn main() {
             weight_prop: Some("score".into()),
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })
         .unwrap();
     }

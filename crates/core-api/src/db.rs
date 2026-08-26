@@ -4,8 +4,8 @@ use crate::subscription::{
 };
 use core_query::cypher::ast::ArithOp;
 use core_query::cypher::{
-    execute, lex, parse, parse_write, plan, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern,
-    Query, RetItem, RetVal, WriteStatement,
+    execute, is_subscribable, lex, parse, parse_write, plan, MatchDeleteNodeStmt, NodePat, Operand,
+    Params, Pattern, PlanOp, Query, RetItem, RetVal, WriteStatement,
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
@@ -27,6 +27,26 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 thread_local! {
     static DELTA_COPY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Internal state for a single `subscribe_query` subscription.
+///
+/// On every commit, `distribute_events` re-executes `ops` against the current
+/// graph state, diffs the result against `prev_rows`, and pushes
+/// `DbEvent::QueryRowAdded` / `QueryRowRemoved` events to `inner`.
+///
+/// **Full re-run per commit; use LIMIT to bound execution cost.**
+/// (Differential evaluation is roadmap / Phase 5.)
+pub(crate) struct QuerySubEntry {
+    /// Compiled plan for the subscribed Cypher query.
+    ops: Vec<PlanOp>,
+    /// Column names from the first execution (fixed for the subscription lifetime).
+    columns: Vec<String>,
+    /// Serialized (JSON) row key → row data, representing the result set at
+    /// the end of the last commit. Used to diff against the new result.
+    prev_row_map: std::collections::HashMap<String, Vec<Option<Value>>>,
+    /// Weak pointer to the subscriber queue; dead Weak → subscription dropped.
+    inner: std::sync::Weak<SubInner>,
 }
 
 /// A post-commit mutation notification.
@@ -720,6 +740,22 @@ fn project_set_return_rows<F: Fs>(
 
 /// Single construction point for a `GraphMut` view over the split-borrowed graph fields.
 /// Callers use `std::mem::take` on the engine before calling this, then restore it after.
+/// Extract a `Vec<f64>` from a `Value::List` whose items are all numeric.
+/// Returns `None` for non-list values or lists with non-numeric elements.
+fn value_as_float_list(v: &Value) -> Option<Vec<f64>> {
+    match v {
+        Value::List(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Float(f) => Some(*f),
+                Value::Int(i) => Some(*i as f64),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
 fn make_graph_mut<'a>(
     ids: &'a IdMap,
     syms: &'a mut Interner,
@@ -780,6 +816,9 @@ pub struct GraphDb<F: Fs> {
     /// Live subscriptions.  Entries with a dead `Weak` are pruned on the next
     /// distribute_events call.
     subscriptions: Vec<SubEntry>,
+    /// Live query subscriptions. Re-executed on every commit when non-empty.
+    /// Dead `Weak` entries are pruned inside `distribute_events`.
+    query_subscriptions: Vec<QuerySubEntry>,
     /// Queue capacity for new subscriptions created by this db.  Default is
     /// [`DEFAULT_SUB_CAPACITY`]; can be overridden via [`set_sub_capacity`]
     /// to test Lagged behaviour with small queues.
@@ -854,6 +893,7 @@ impl<F: Fs> GraphDb<F> {
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
             subscriptions: Vec::new(),
+            query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
             read_only: false,
             total_wal_commits: 0,
@@ -946,6 +986,8 @@ impl<F: Fs> GraphDb<F> {
             &self.props,
             ivf_state,
         );
+        // Restore HNSW graphs from snapshot (V7).
+        self.engine.load_hnsw_state(state.hnsw_state);
         // Restore view defs from snapshot (V5).
         // The ColumnStore already contains view values from the snapshot;
         // use restore_view (no collision check, no backfill) so the store
@@ -980,6 +1022,7 @@ impl<F: Fs> GraphDb<F> {
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
             subscriptions: Vec::new(),
+            query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
             read_only: false, // set to true after replay
             total_wal_commits: 0,
@@ -1132,6 +1175,37 @@ impl<F: Fs> GraphDb<F> {
                     &self.syms,
                     &self.labels,
                 );
+                // Rule engine: via-hop rules must update when user edges change.
+                let cursor = self.engine.pending_delta_count();
+                let mut eng = std::mem::take(&mut self.engine);
+                {
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
+                    eng.on_edge_changed(edge_type, src, dst, &mut gm);
+                }
+                self.engine = eng;
+                if !self.view_store.is_empty() {
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
+                        );
+                    }
+                }
             }
             WalRecord::SetProp { key, field, value } => {
                 let id = self.ids.get(key).ok_or_else(|| GraphError::Corrupt {
@@ -1312,6 +1386,40 @@ impl<F: Fs> GraphDb<F> {
                     &self.syms,
                     &self.labels,
                 );
+                // Rule engine: via-hop rules fire when user via-edges are inserted.
+                // Resolve etype back to string so on_edge_changed can match rules by name.
+                if let Some(etype_str) = self.syms.resolve(*etype).map(|s| s.to_string()) {
+                    let cursor = self.engine.pending_delta_count();
+                    let mut eng = std::mem::take(&mut self.engine);
+                    {
+                        let mut gm = make_graph_mut(
+                            &self.ids,
+                            &mut self.syms,
+                            &self.labels,
+                            &self.props,
+                            &mut self.topo,
+                            &mut self.edge_props,
+                        );
+                        eng.on_edge_changed(&etype_str, *src, *dst, &mut gm);
+                    }
+                    self.engine = eng;
+                    if !self.view_store.is_empty() {
+                        let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                        for d in &new_deltas {
+                            self.view_store.on_edge_changed(
+                                d.etype_sym,
+                                d.src_id,
+                                d.dst_id,
+                                d.fired,
+                                &mut self.props,
+                                &self.topo,
+                                &self.ids,
+                                &self.syms,
+                                &self.labels,
+                            );
+                        }
+                    }
+                }
             }
             WalRecord::SetPropId { id, field, value } => {
                 if self.ids.is_tombstoned(*id) || self.ids.key_of(*id).is_none() {
@@ -1561,8 +1669,37 @@ impl<F: Fs> GraphDb<F> {
                     &self.syms,
                     &self.labels,
                 );
-                // No rule callback: validated as not provenance-owned and not
-                // would_derive, so no rule needs to update its desired set.
+                // Rule engine: via-hop rules must retract when user via-edges are deleted.
+                let cursor = self.engine.pending_delta_count();
+                let mut eng = std::mem::take(&mut self.engine);
+                {
+                    let mut gm = make_graph_mut(
+                        &self.ids,
+                        &mut self.syms,
+                        &self.labels,
+                        &self.props,
+                        &mut self.topo,
+                        &mut self.edge_props,
+                    );
+                    eng.on_edge_changed(edge_type, src, dst, &mut gm);
+                }
+                self.engine = eng;
+                if !self.view_store.is_empty() {
+                    let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+                    for d in &new_deltas {
+                        self.view_store.on_edge_changed(
+                            d.etype_sym,
+                            d.src_id,
+                            d.dst_id,
+                            d.fired,
+                            &mut self.props,
+                            &self.topo,
+                            &self.ids,
+                            &self.syms,
+                            &self.labels,
+                        );
+                    }
+                }
             }
             WalRecord::DeleteNode { key } => {
                 // Recovery-safe: already-tombstoned / unknown key is a clean
@@ -2109,71 +2246,127 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Called from `log_then_apply_with` after apply + fsync, before the
     /// legacy MutationEvent sink. Prunes dead `Weak` entries in-place.
+    ///
+    /// Query subscriptions (subscribe_query) re-execute their plan on every
+    /// call and diff the result against the previous run. Zero overhead when
+    /// no query subscriptions are active.
     fn distribute_events(&mut self, rec: &WalRecord, engine_deltas: &[EngineEdgeDelta], seq: u64) {
-        if self.subscriptions.is_empty() {
+        if self.subscriptions.is_empty() && self.query_subscriptions.is_empty() {
             return;
         }
 
-        // Build write events from the WAL record.
-        let write_events: Vec<DbEvent> =
-            Self::write_events_from_record(rec, seq, &self.syms, &self.ids);
+        if !self.subscriptions.is_empty() {
+            // Build write events from the WAL record.
+            let write_events: Vec<DbEvent> =
+                Self::write_events_from_record(rec, seq, &self.syms, &self.ids);
 
-        // Build edge events from engine deltas.  Weight is looked up from
-        // edge_props at distribution time (after apply), so it's always fresh.
-        let edge_events: Vec<DbEvent> = engine_deltas
-            .iter()
-            .map(|d| {
-                if d.fired {
-                    let weight = self
-                        .edge_props
-                        .get(d.etype_sym, d.src_id, d.dst_id, "weight")
-                        .and_then(|v| {
-                            if let core_storage::Value::Float(f) = v {
-                                Some(*f)
-                            } else {
-                                None
-                            }
+            // Build edge events from engine deltas.  Weight is looked up from
+            // edge_props at distribution time (after apply), so it's always fresh.
+            let edge_events: Vec<DbEvent> = engine_deltas
+                .iter()
+                .map(|d| {
+                    if d.fired {
+                        let weight = self
+                            .edge_props
+                            .get(d.etype_sym, d.src_id, d.dst_id, "weight")
+                            .and_then(|v| {
+                                if let core_storage::Value::Float(f) = v {
+                                    Some(*f)
+                                } else {
+                                    None
+                                }
+                            });
+                        DbEvent::EdgeFired {
+                            rule: d.rule.clone(),
+                            src_key: d.src_key.clone(),
+                            dst_key: d.dst_key.clone(),
+                            edge_type: d.edge_type.clone(),
+                            weight,
+                            commit_seq: seq,
+                        }
+                    } else {
+                        DbEvent::EdgeRetracted {
+                            rule: d.rule.clone(),
+                            src_key: d.src_key.clone(),
+                            dst_key: d.dst_key.clone(),
+                            edge_type: d.edge_type.clone(),
+                            commit_seq: seq,
+                        }
+                    }
+                })
+                .collect();
+
+            // Prune dead entries; push matching events to live ones.
+            self.subscriptions.retain(|entry| {
+                let Some(inner) = entry.inner.upgrade() else {
+                    return false;
+                };
+                for ev in &write_events {
+                    if event_matches(ev, &entry.filter) {
+                        inner.push(ev.clone());
+                    }
+                }
+                for ev in &edge_events {
+                    if event_matches(ev, &entry.filter) {
+                        inner.push(ev.clone());
+                    }
+                }
+                true
+            });
+
+            // Turn off delta accumulation if all subscribers dropped and no views remain.
+            if self.subscriptions.is_empty() && self.view_store.is_empty() {
+                self.engine.set_emit_deltas(false);
+            }
+        }
+
+        // Query subscriptions: full re-run per commit, then diff rows.
+        // IMPORTANT: full re-execution on every commit — use LIMIT to bound cost.
+        // Differential evaluation is roadmap / Phase 5.
+        if !self.query_subscriptions.is_empty() {
+            // Take the list out so we can call self.view() without borrow conflict.
+            let mut query_subs = std::mem::take(&mut self.query_subscriptions);
+            let empty_params = BTreeMap::new();
+            query_subs.retain_mut(|entry| {
+                let Some(inner) = entry.inner.upgrade() else {
+                    return false; // subscriber dropped — prune
+                };
+                let result = match execute(&self.view(), &entry.ops, &Params(&empty_params)) {
+                    Ok(r) => r,
+                    Err(_) => return true, // keep entry; skip diff on transient error
+                };
+                // Build new row map: serialized-key → row data.
+                let new_row_map: std::collections::HashMap<String, Vec<Option<Value>>> = (0
+                    ..result.len())
+                    .map(|i| {
+                        let row = result.row(i).to_vec();
+                        let key =
+                            serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
+                        (key, row)
+                    })
+                    .collect();
+                // Removed rows: in prev but not in new.
+                for (key, row) in &entry.prev_row_map {
+                    if !new_row_map.contains_key(key) {
+                        inner.push(DbEvent::QueryRowRemoved {
+                            columns: entry.columns.clone(),
+                            row: row.clone(),
                         });
-                    DbEvent::EdgeFired {
-                        rule: d.rule.clone(),
-                        src_key: d.src_key.clone(),
-                        dst_key: d.dst_key.clone(),
-                        edge_type: d.edge_type.clone(),
-                        weight,
-                        commit_seq: seq,
-                    }
-                } else {
-                    DbEvent::EdgeRetracted {
-                        rule: d.rule.clone(),
-                        src_key: d.src_key.clone(),
-                        dst_key: d.dst_key.clone(),
-                        edge_type: d.edge_type.clone(),
-                        commit_seq: seq,
                     }
                 }
-            })
-            .collect();
-
-        // Prune dead entries; push matching events to live ones.
-        self.subscriptions.retain(|entry| {
-            let Some(inner) = entry.inner.upgrade() else {
-                return false;
-            };
-            for ev in &write_events {
-                if event_matches(ev, &entry.filter) {
-                    inner.push(ev.clone());
+                // Added rows: in new but not in prev.
+                for (key, row) in &new_row_map {
+                    if !entry.prev_row_map.contains_key(key) {
+                        inner.push(DbEvent::QueryRowAdded {
+                            columns: entry.columns.clone(),
+                            row: row.clone(),
+                        });
+                    }
                 }
-            }
-            for ev in &edge_events {
-                if event_matches(ev, &entry.filter) {
-                    inner.push(ev.clone());
-                }
-            }
-            true
-        });
-        // Turn off delta accumulation if all subscribers dropped and no views remain.
-        if self.subscriptions.is_empty() && self.view_store.is_empty() {
-            self.engine.set_emit_deltas(false);
+                entry.prev_row_map = new_row_map;
+                true
+            });
+            self.query_subscriptions = query_subs;
         }
     }
 
@@ -2341,6 +2534,85 @@ impl<F: Fs> GraphDb<F> {
             inner: std::sync::Arc::downgrade(&inner),
         });
         self.engine.set_emit_deltas(true);
+        Ok(Subscription(inner))
+    }
+
+    /// Subscribe to incremental Cypher query results.
+    ///
+    /// Parses and plans `cypher`; rejects the query if the plan is not in the
+    /// allowlisted subset (see [`core_query::cypher::is_subscribable`]):
+    ///   - `MATCH (n:Label) WHERE … RETURN … [LIMIT n]`
+    ///   - `MATCH (a)-[r:TYPE]->(b) RETURN … [LIMIT n]`  (exactly one hop)
+    ///
+    /// SKIP is not supported — it shifts the result window on every commit,
+    /// causing spurious Added/Removed churn for rows whose data never changed.
+    /// Multi-hop Expand chains are not supported; each additional MATCH clause
+    /// widens scope beyond the documented single-scan / single-hop subset.
+    ///
+    /// After each successful commit, the plan is **fully re-executed** and the
+    /// result is diffed against the previous run. Added rows produce
+    /// [`DbEvent::QueryRowAdded`]; removed rows produce
+    /// [`DbEvent::QueryRowRemoved`].
+    ///
+    /// **Full re-run per commit; use LIMIT to bound execution cost.**
+    /// The existing 1 M intermediate-row cap applies. Differential evaluation
+    /// is roadmap / Phase 5.
+    ///
+    /// Returns `Err(GraphError::ReadOnly)` if called on an as-of instance —
+    /// as-of instances never commit, so `distribute_events` never runs and the
+    /// subscription would never deliver events.
+    ///
+    /// Returns `Err(GraphError::QueryError)` if the query fails to parse, plan,
+    /// or if the plan shape is not in the allowlist.
+    pub fn subscribe_query(&mut self, cypher: &str) -> Result<Subscription> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
+            detail: format!("lex: {e}"),
+        })?;
+        let ast = parse(&tokens).map_err(|e| GraphError::QueryError {
+            detail: format!("parse: {e}"),
+        })?;
+        let ops = plan(&ast).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        if !is_subscribable(&ops) {
+            return Err(GraphError::QueryError {
+                detail: "subscribe_query only supports allowlisted plan shapes: \
+                         MATCH (n:Label) WHERE … RETURN … [LIMIT n] or \
+                         MATCH (a)-[r:TYPE]->(b) RETURN … [LIMIT n] (exactly one hop). \
+                         Not supported: multi-hop Expand chains, SKIP (creates \
+                         unstable offset windows), ORDER BY, DISTINCT, aggregates, \
+                         variable-length paths, OPTIONAL MATCH, WITH, UNWIND. \
+                         Use LIMIT to bound re-execution cost."
+                    .to_string(),
+            });
+        }
+        // Execute once to capture initial state (initial rows are not emitted as
+        // events — the subscriber learns the baseline via the first query call).
+        let empty_params = BTreeMap::new();
+        let initial = execute(&self.view(), &ops, &Params(&empty_params)).map_err(|e| {
+            GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            }
+        })?;
+        let columns = initial.columns().to_vec();
+        let prev_row_map: std::collections::HashMap<String, Vec<Option<Value>>> = (0..initial
+            .len())
+            .map(|i| {
+                let row = initial.row(i).to_vec();
+                let key = serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
+                (key, row)
+            })
+            .collect();
+        let inner = SubInner::new(self.sub_capacity());
+        self.query_subscriptions.push(QuerySubEntry {
+            ops,
+            columns,
+            prev_row_map,
+            inner: std::sync::Arc::downgrade(&inner),
+        });
         Ok(Subscription(inner))
     }
 
@@ -3302,6 +3574,68 @@ impl<F: Fs> GraphDb<F> {
             .collect()
     }
 
+    /// Find nodes with the given `label` whose `field` vector is most similar
+    /// to `q` (cosine similarity), returning up to `k` results with similarity
+    /// ≥ `min`, sorted descending.
+    ///
+    /// Uses the HNSW index when one is available (fast path); otherwise falls
+    /// back to an O(n) brute-force scan over all nodes with that label (exact).
+    pub fn find_similar_vector(
+        &self,
+        field: &str,
+        label: &str,
+        q: &[f64],
+        k: usize,
+        min: f64,
+    ) -> Vec<(String, f64)> {
+        // L2-normalise query for cosine via dot product.
+        let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm == 0.0 {
+            return vec![];
+        }
+        let q_unit: Vec<f64> = q.iter().map(|x| x / norm).collect();
+
+        // Try HNSW fast path.
+        if let Some(hits) = self.engine.hnsw_search_dst(field, label, &q_unit, k) {
+            let mut out: Vec<(String, f64)> = hits
+                .into_iter()
+                .filter(|&(_, sim)| sim >= min)
+                .filter_map(|(id, sim)| self.ids.key_of(id).map(|key| (key.to_string(), sim)))
+                .collect();
+            out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            out.truncate(k);
+            return out;
+        }
+
+        // Brute-force fallback: O(n) scan.
+        let view = self.view();
+        let mut scored: Vec<(String, f64)> = view
+            .nodes_with_label(label)
+            .into_iter()
+            .filter_map(|id| {
+                let v = view.prop(id, field)?;
+                let xs = value_as_float_list(v)?;
+                let v_norm: f64 = xs.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if v_norm == 0.0 {
+                    return None;
+                }
+                let dot: f64 = q_unit
+                    .iter()
+                    .zip(xs.iter())
+                    .map(|(a, b)| a * (b / v_norm))
+                    .sum();
+                if dot < min {
+                    return None;
+                }
+                let key = self.ids.key_of(id)?.to_string();
+                Some((key, dot))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
+    }
+
     /// Lex → parse → plan → execute `cypher` over a read-only view.
     /// Every pipeline `Err(String)` becomes `GraphError::QueryError` with a
     /// stage prefix (`lex:` / `parse:` / `plan:` / `execute:`).
@@ -4100,6 +4434,7 @@ impl<F: Fs> GraphDb<F> {
             .map(|r| bincode::serialize(r).expect("RuleDef serialize cannot fail"))
             .collect();
         // Collect IVF state for approximate rules (V4).
+        let hnsw_state = self.engine.export_hnsw_state();
         let raw_ivf = self.engine.export_ivf_state();
         let ivf_state: BTreeMap<String, core_storage::snapshot::PerRuleIvfState> = raw_ivf
             .into_iter()
@@ -4138,6 +4473,7 @@ impl<F: Fs> GraphDb<F> {
             rule_tripped,
             rule_fires,
             ivf_state,
+            hnsw_state,
             view_defs,
             wal_truncated: !opts.keep_wal,
         };
@@ -4804,6 +5140,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 

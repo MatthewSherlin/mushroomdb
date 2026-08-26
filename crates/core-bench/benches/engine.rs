@@ -194,6 +194,9 @@ fn rule_works_at() -> RuleDef {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -209,6 +212,9 @@ fn rule_on_project() -> RuleDef {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -225,6 +231,9 @@ fn rule_skill_fit() -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -241,6 +250,9 @@ fn rule_vector_sim() -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -475,6 +487,9 @@ fn vector_semantic_backfill(c: &mut Criterion) {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     };
 
     c.bench_function("vector_semantic_backfill_500", |b| {
@@ -508,6 +523,9 @@ fn vector_semantic_backfill(c: &mut Criterion) {
         weight_prop: None,
         max_edges: None,
         approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     };
 
     c.bench_function("vector_semantic_backfill_500_approximate", |b| {

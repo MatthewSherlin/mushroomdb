@@ -475,8 +475,46 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
 /// is empty — no live cosine computation is performed here.
 /// Returns up to `limit` (default 10) neighbor entries.
 fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
+    // When a `vector` array is provided, use the HNSW / brute-force vector
+    // similarity path instead of looking up pre-derived edges.
+    if let Some(vec_js) = args.get("vector").and_then(Js::as_array) {
+        let q: Vec<f64> = vec_js.iter().filter_map(|v| v.as_f64()).collect();
+        if q.is_empty() {
+            return CallOutcome::ToolErr("vector must be a non-empty array of numbers".into());
+        }
+        let field = args
+            .get("field")
+            .and_then(Js::as_str)
+            .unwrap_or("embedding");
+        let label = args.get("label").and_then(Js::as_str).unwrap_or("");
+        let k = args
+            .get("k")
+            .and_then(Js::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(10);
+        let min = args.get("min").and_then(Js::as_f64).unwrap_or(0.8);
+
+        let hits = {
+            let g = db.read();
+            g.find_similar_vector(field, label, &q, k, min)
+        };
+        let results: Vec<Js> = hits
+            .into_iter()
+            .map(|(key, score)| json!({ "key": key, "score": score }))
+            .collect();
+        return CallOutcome::ToolOk(json!({
+            "mode": "vector",
+            "field": field,
+            "label": label,
+            "k": k,
+            "min": min,
+            "results": results
+        }));
+    }
+
+    // Edge-traversal path: return neighbors connected by the given edge type.
     let Some(key) = args.get("key").and_then(Js::as_str) else {
-        return CallOutcome::ToolErr("missing key".into());
+        return CallOutcome::ToolErr("missing key (or provide vector for vector search)".into());
     };
     let edge_type = args
         .get("edge_type")
@@ -674,15 +712,23 @@ fn tools_list() -> Js {
             },
             {
                 "name": "find_similar",
-                "description": "Return neighbors connected to a node by a given edge type. Results come from edges that were previously derived by a rule (e.g. a VectorSimilar rule); without a matching rule the result set is empty. Useful for agent-memory recall: find entities similar to a given key via a vector rule edge (e.g. SIMILAR, SEM_SIM).",
+                "description": "Two modes: (1) Vector search — provide `vector` (and optionally `field`, `label`, `k`, `min`) to find the k most similar nodes by cosine similarity using the HNSW index when available, brute-force otherwise. (2) Edge traversal — provide `key` (and optionally `edge_type`, `limit`) to return neighbors previously connected by a derived rule edge. Results from mode 2 come only from edges already derived by a VectorSimilar rule.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "key": { "type": "string", "description": "Source node key." },
-                        "edge_type": { "type": "string", "description": "Edge type to filter by (default: SIMILAR)." },
-                        "limit": { "type": "integer", "description": "Maximum neighbors to return (default: 10)." }
-                    },
-                    "required": ["key"]
+                        "vector": {
+                            "type": "array",
+                            "items": { "type": "number" },
+                            "description": "Query embedding vector for vector-similarity search. When present, vector-search mode is used and `key` is ignored."
+                        },
+                        "field": { "type": "string", "description": "Property field holding the embedding vectors (default: embedding). Used in vector-search mode." },
+                        "label": { "type": "string", "description": "Restrict search to nodes with this label. Empty string means all labels. Used in vector-search mode." },
+                        "k": { "type": "integer", "description": "Maximum results to return in vector-search mode (default: 10)." },
+                        "min": { "type": "number", "description": "Minimum cosine similarity threshold in vector-search mode (default: 0.8)." },
+                        "key": { "type": "string", "description": "Source node key for edge-traversal mode." },
+                        "edge_type": { "type": "string", "description": "Edge type to filter by in edge-traversal mode (default: SIMILAR)." },
+                        "limit": { "type": "integer", "description": "Maximum neighbors to return in edge-traversal mode (default: 10)." }
+                    }
                 }
             },
             {
@@ -813,6 +859,9 @@ mod tests {
                 weight_prop: Some("score".into()),
                 max_edges: None,
                 approximate: false,
+                via_label: None,
+                via_edge: None,
+                via_dir: None,
             })
             .expect("rule");
         }
@@ -1140,6 +1189,63 @@ mod tests {
         let result = tool_text(&resp);
         let similar = result["similar"].as_array().expect("similar array");
         assert_eq!(similar.len(), 0);
+    }
+
+    /// When `min` is omitted from a vector-mode find_similar call, the server
+    /// must apply the spec default of 0.8.  A node whose cosine similarity to
+    /// the query is 0.0 (orthogonal) must not appear in the results.
+    #[test]
+    fn test_find_similar_vector_default_min_is_0_8() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            // close: [1,0] → cosine 1.0 with query [1,0] (above 0.8)
+            g.insert_node(
+                "Item",
+                "close",
+                vec![(
+                    "emb".into(),
+                    Value::List(vec![Value::Float(1.0), Value::Float(0.0)]),
+                )],
+            )
+            .unwrap();
+            // far: [0,1] → cosine 0.0 with query [1,0] (below 0.8, must be excluded)
+            g.insert_node(
+                "Item",
+                "far",
+                vec![(
+                    "emb".into(),
+                    Value::List(vec![Value::Float(0.0), Value::Float(1.0)]),
+                )],
+            )
+            .unwrap();
+        }
+
+        // No `min` in the request — must default to 0.8.
+        let resp = tool_call(
+            &db,
+            1,
+            "find_similar",
+            json!({
+                "vector": [1.0, 0.0],
+                "field": "emb",
+                "label": "Item",
+                "k": 10
+            }),
+        );
+        assert!(!is_error(&resp), "vector search must not error");
+        let result = tool_text(&resp);
+        let results = result["results"].as_array().expect("results array");
+
+        let keys: Vec<&str> = results.iter().filter_map(|r| r["key"].as_str()).collect();
+        assert!(
+            keys.contains(&"close"),
+            "close node (sim=1.0) must be included"
+        );
+        assert!(
+            !keys.contains(&"far"),
+            "far node (sim=0.0) must be excluded by default min=0.8"
+        );
     }
 
     #[test]

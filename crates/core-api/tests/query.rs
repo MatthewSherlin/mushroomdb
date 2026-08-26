@@ -24,6 +24,9 @@ fn overlap(name: &str, field: &str, edge_type: &str) -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -332,6 +335,9 @@ fn harness_industry_alignment_timing() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     };
     let t_rule = std::time::Instant::now();
     db.create_rule(rule).expect("create IA rule");
@@ -1763,6 +1769,9 @@ fn fn_type_on_derived_edge() {
         weight_prop: None,
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     {

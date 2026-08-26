@@ -675,6 +675,9 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             weight_prop: Some("score".into()),
             max_edges: skill_fit_k,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })?;
         let founded_within = Predicate::NumericWithin {
             field: "founded_year".into(),
@@ -690,6 +693,9 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             weight_prop: Some("score".into()),
             max_edges: founded_within_k,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })?;
         let nearby_office = Predicate::GeoRadius {
             field: "office".into(),
@@ -705,6 +711,9 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             weight_prop: Some("score".into()),
             max_edges: nearby_office_k,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })?;
         let similar_interests = Predicate::VectorSimilar {
             field: "embedding".into(),
@@ -720,6 +729,9 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             weight_prop: Some("score".into()),
             max_edges: similar_interests_k,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         })?;
     }
 

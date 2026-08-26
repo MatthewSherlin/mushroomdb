@@ -35,6 +35,36 @@ pub struct RuleDef {
     /// decode. Accepted for pre-1.0 builds; no decoder compat.
     #[serde(default)]
     pub approximate: bool,
+    /// Optional intermediate hop. When set, src matches `via_label` via
+    /// `via_edge`, then the existing `predicate` is evaluated between
+    /// **via node** and **dst** (not src and dst). Derived edge is still
+    /// src → dst with `edge_type`.
+    ///
+    /// `via_label` and `via_edge` must both be `Some` or both `None`;
+    /// `validate()` rejects a half-set combination. `via_dir` defaults to
+    /// `Out` when the via fields are set (src → via); supply `Some(In)` to
+    /// reverse the hop (src ← via). Semantics: for each src, expand
+    /// `via_edge` one hop in `via_dir` to via-nodes carrying `via_label`;
+    /// run `predicate` between via and dst; fire src → dst if **any** via
+    /// satisfies; score = max over via; top-k still per src.
+    ///
+    /// APPENDED field — same pre-alpha no-migration ruling as `max_edges`
+    /// and `approximate`: WAL/snapshot records written before this field
+    /// break positional bincode decode. Accepted for pre-1.0 builds; no
+    /// decoder compat. `#[serde(default)]` covers JSON only.
+    #[serde(default)]
+    pub via_label: Option<String>,
+    /// See `via_label`.
+    ///
+    /// APPENDED field — same pre-alpha no-migration ruling as `via_label`.
+    #[serde(default)]
+    pub via_edge: Option<String>,
+    /// Direction to traverse `via_edge` from src. `None` treated as `Out`
+    /// (src → via) at evaluation time. See `via_label`.
+    ///
+    /// APPENDED field — same pre-alpha no-migration ruling as `via_label`.
+    #[serde(default)]
+    pub via_dir: Option<core_storage::Direction>,
 }
 
 /// Score-combination conventions for composed predicates:
@@ -114,6 +144,24 @@ impl RuleDef {
                  (VectorSimilar, or All whose first element is VectorSimilar)"
                     .into(),
             );
+        }
+        if self.via_label.is_some() && self.approximate {
+            return Err("via-hop rules do not support approximate: true".into());
+        }
+        // via_label and via_edge must both be Some or both None.
+        match (&self.via_label, &self.via_edge) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err("via_label and via_edge must both be set or both absent".into());
+            }
+            (Some(l), Some(e)) => {
+                if l.is_empty() {
+                    return Err("via_label must not be empty".into());
+                }
+                if e.is_empty() {
+                    return Err("via_edge must not be empty".into());
+                }
+            }
+            (None, None) => {}
         }
         Ok(())
     }
@@ -626,6 +674,9 @@ mod tests {
             weight_prop: Some("score".into()),
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
         assert!(ok.validate().is_ok());
         assert_eq!(
@@ -847,6 +898,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: true,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
         assert!(ok_vec.validate().is_ok());
 
@@ -868,6 +922,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: true,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
         assert!(ok_all.validate().is_ok());
 
@@ -881,6 +938,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: true,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
         assert!(bad_fe.validate().is_err());
 
@@ -897,6 +957,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: true,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
         assert!(bad_ov.validate().is_err());
 
@@ -916,8 +979,41 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: true,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         };
         assert!(bad_all_order.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_via_with_approximate() {
+        // via_label set + approximate=true → invalid (via bypasses HNSW entirely)
+        let bad = RuleDef {
+            name: "vbad".into(),
+            src_label: "A".into(),
+            dst_label: "B".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "VEC".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: true,
+            via_label: Some("Mid".into()),
+            via_edge: Some("hop".into()),
+            via_dir: None,
+        };
+        let err = bad.validate().unwrap_err();
+        assert_eq!(err, "via-hop rules do not support approximate: true");
+
+        // via_label set + approximate=false → still valid (only the via+approx combo is banned)
+        let ok = RuleDef {
+            approximate: false,
+            ..bad.clone()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     #[test]
@@ -955,6 +1051,9 @@ mod tests {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 
@@ -1326,6 +1425,9 @@ mod wire_pins {
             weight_prop: None,
             max_edges: None,
             approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 
@@ -1339,6 +1441,9 @@ mod wire_pins {
             weight_prop: None,
             max_edges: None,
             approximate: true,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
         }
     }
 
@@ -1346,14 +1451,16 @@ mod wire_pins {
     fn old_predicate_variants_keep_encoding() {
         // Captured before Plan 7 appends. Discriminants 0..=3 must not move.
         // Plan 11 T4: `approximate: false` appends one zero byte at the end
-        // of every existing record. Old WAL records written before this field
-        // break positional bincode decode — pre-alpha no-migration ruling.
+        // of every existing record. Plan 14 T2: `via_label`, `via_edge`,
+        // `via_dir` (all `None`) append three more zero bytes. Old WAL records
+        // written before these fields break positional bincode decode —
+        // pre-alpha no-migration ruling.
         assert_eq!(
             bincode::serialize(&pin(Predicate::KeyMatch { field: "fk".into() })).unwrap(),
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 102, 107, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0,
-                0
+                0, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -1364,7 +1471,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 105, 110, 100, 1, 0, 0, 0, 0, 0, 0, 0, 69,
-                0, 0, 0
+                0, 0, 0, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -1376,7 +1483,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 116, 97, 103, 115, 0, 0, 0, 0, 0, 0, 224,
-                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0
+                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -1392,13 +1499,14 @@ mod wire_pins {
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 102,
                 107, 2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 116, 97, 103, 115, 0, 0, 0, 0, 0, 0, 224,
-                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0
+                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0
             ]
         );
     }
 
     #[test]
     fn new_predicate_variants_have_pinned_encoding() {
+        // Trailing `0, 0, 0` = via_label/via_edge/via_dir all None (Plan 14 T2).
         assert_eq!(
             bincode::serialize(&pin(Predicate::NumericWithin {
                 field: "year".into(),
@@ -1408,7 +1516,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 4, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 121, 101, 97, 114, 0, 0, 0, 0, 0, 0, 0, 64,
-                1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0
+                1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -1420,7 +1528,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 5, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 108, 111, 99, 0, 0, 0, 0, 0, 0, 121, 64, 1,
-                0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0
+                0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -1432,7 +1540,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 6, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 101, 109, 98, 205, 204, 204, 204, 204, 204,
-                236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0
+                236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0
             ]
         );
     }
@@ -1453,6 +1561,7 @@ mod wire_pins {
         //   field "f"       → [1,0,0,0,0,0,0,0, 102]
         //   edge_type "E"   → [1,0,0,0,0,0,0,0, 69]
         //   weight/edges/approx → [0,0,0]
+        //   via_label/via_edge/via_dir (all None, Plan 14 T2) → [0,0,0]
         let any_fe = pin(Predicate::Any(vec![Predicate::FieldEqual {
             field: "f".into(),
         }]));
@@ -1461,33 +1570,36 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 102, 1,
-                0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0,
             ],
             "Any([FieldEqual{{f}}]) exact-bytes pin failed — discriminant or field layout changed"
         );
-        // Also verify round-trip.
+        // Verify round-trip.
         let decoded: RuleDef = bincode::deserialize(&bincode::serialize(&any_fe).unwrap()).unwrap();
         assert_eq!(decoded, any_fe, "Any must round-trip via bincode");
-        // Verify that RuleDefs with the old variants still decode after Any is appended.
-        let old = bincode::serialize(&pin(Predicate::VectorSimilar {
+        // Verify that VectorSimilar (old variant) still decodes cleanly — adding
+        // via fields does not change how the Predicate discriminant 6 is read.
+        let vs = pin(Predicate::VectorSimilar {
             field: "emb".into(),
             min: 0.9,
-        }))
-        .unwrap();
-        let old_decoded: RuleDef = bincode::deserialize(&old).unwrap();
+        });
+        let vs_bytes = bincode::serialize(&vs).unwrap();
+        let vs_decoded: RuleDef = bincode::deserialize(&vs_bytes).unwrap();
         assert_eq!(
-            old_decoded.predicate,
+            vs_decoded.predicate,
             Predicate::VectorSimilar {
                 field: "emb".into(),
                 min: 0.9
             },
-            "pre-Any VectorSimilar record must still decode"
+            "VectorSimilar record must still decode after via fields appended"
         );
     }
 
     #[test]
     fn approximate_variant_has_pinned_encoding() {
-        // Pin: VectorSimilar with approximate=true. Last byte is 1 (true) vs 0 (false).
+        // Pin: VectorSimilar with approximate=true.
+        // Layout: ... 69 (edge_type 'E') | 0 (weight None) | 0 (max_edges None)
+        //         | 1 (approximate=true) | 0 0 0 (via fields all None).
         assert_eq!(
             bincode::serialize(&pin_approx(Predicate::VectorSimilar {
                 field: "emb".into(),
@@ -1497,10 +1609,11 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 6, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 101, 109, 98, 205, 204, 204, 204, 204, 204,
-                236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 1
+                236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 1, 0, 0, 0
             ]
         );
-        // Same predicate with approximate=false (default) differs only in last byte.
+        // exact vs approx: same length; differ only at the `approximate` byte
+        // (4th from the end; last 3 bytes are via_label/via_edge/via_dir = None).
         let exact = bincode::serialize(&pin(Predicate::VectorSimilar {
             field: "emb".into(),
             min: 0.9,
@@ -1512,8 +1625,14 @@ mod wire_pins {
         }))
         .unwrap();
         assert_eq!(exact.len(), approx.len());
-        assert_eq!(&exact[..exact.len() - 1], &approx[..approx.len() - 1]);
-        assert_eq!(exact.last(), Some(&0u8));
-        assert_eq!(approx.last(), Some(&1u8));
+        let n = exact.len();
+        // Everything before `approximate` is identical.
+        assert_eq!(&exact[..n - 4], &approx[..n - 4]);
+        // `approximate` byte at index n-4.
+        assert_eq!(exact[n - 4], 0u8, "exact: approximate=false");
+        assert_eq!(approx[n - 4], 1u8, "approx: approximate=true");
+        // Trailing via bytes are both None.
+        assert_eq!(&exact[n - 3..], &[0u8, 0, 0]);
+        assert_eq!(&approx[n - 3..], &[0u8, 0, 0]);
     }
 }

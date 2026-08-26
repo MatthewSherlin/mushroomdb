@@ -1,4 +1,5 @@
 use crate::def::Predicate;
+use crate::hnsw::HnswIndex;
 use core_storage::{list_tokens, Value, ValueKey};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -312,6 +313,13 @@ pub struct SideIndex {
     /// exceeds [`IVF_DRIFT_REBUILD`] on an approximate rule, apply queues a
     /// `RebuildRule` second commit (fit resets this to zero).
     pub ivf_drift: u64,
+
+    // --- HNSW fields (default for approximate: true + VectorSimilar) ---
+    /// HNSW graph; `None` until `init_hnsw` is called.
+    hnsw: Option<HnswIndex>,
+    /// All node ids inserted via `CandidateSpec::Hnsw`.
+    /// Used as a full-scan fallback when `hnsw` is `None` or has no entry point.
+    hnsw_tracked: BTreeSet<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -340,7 +348,8 @@ pub enum CandidateSpec<'a> {
     ScanAll {
         field: &'a str,
     },
-    /// IVF-Flat approximate candidate selection (opt-in; `approximate: true`).
+    /// IVF-Flat approximate candidate selection (legacy; still supported as
+    /// direct fallback — no longer the default for `approximate: true`).
     ///
     /// k-means fitted over the indexed side's vectors; candidates are members
     /// of the P = `max(1, ceil(k/16))` nearest centroids to the query vector.
@@ -348,6 +357,18 @@ pub enum CandidateSpec<'a> {
     VectorClusters {
         field: &'a str,
         min: f64,
+    },
+    /// HNSW approximate candidate selection (default for `approximate: true`).
+    ///
+    /// Returns the `k` nearest vectors by cosine similarity from the in-tree
+    /// HNSW graph.  Falls back to returning all tracked nodes when the graph
+    /// has no entry point (e.g. before any node is inserted, or when used
+    /// without calling `init_hnsw`).
+    Hnsw {
+        field: &'a str,
+        /// Number of approximate candidates to return; typically
+        /// `max(max_edges, 64)` from the owning `RuleDef`.
+        k: usize,
     },
     /// Union of multiple candidate specs, used for `Any` predicates.
     ///
@@ -406,13 +427,16 @@ pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
 }
 
 /// Approximate candidate strategy: like `candidate_spec` but replaces
-/// `ScanAll` with `VectorClusters` for `VectorSimilar`-rooted predicates.
+/// `ScanAll` with `CandidateSpec::Hnsw` for `VectorSimilar`-rooted predicates.
 ///
 /// Used when `RuleDef::approximate == true`.  `All` is `Intersect` of each
 /// child's approx spec (not `parts[0]`), so `FieldEqual` / `NumericWithin`
-/// conjuncts still probe their indexes. IVF cluster buckets use a reserved
-/// Str key so they do not collide with `NumericBucket` Int keys on the same
-/// side.
+/// conjuncts still probe their indexes.
+///
+/// `k` is the number of HNSW candidates to return; callers should use
+/// `max(max_edges, 64)` from the owning `RuleDef`.  Use the public
+/// zero-argument wrapper (`candidate_spec_approx`) for tests that don't
+/// need a specific k (defaults to 64).
 ///
 /// `Any` predicates cannot be `approximate=true` (validate() rejects them),
 /// so `Any` falls through to `candidate_spec` (exact Union path).
@@ -421,16 +445,24 @@ pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
 ///
 /// Panics on `All([])` or `Any([])`. Predicates must pass `RuleDef::validate()` first.
 pub fn candidate_spec_approx(p: &Predicate) -> CandidateSpec<'_> {
+    candidate_spec_approx_with_k(p, 64)
+}
+
+/// Like `candidate_spec_approx` but with an explicit HNSW candidate count `k`.
+pub fn candidate_spec_approx_with_k(p: &Predicate, k: usize) -> CandidateSpec<'_> {
     match p {
-        Predicate::VectorSimilar { field, min } => {
-            CandidateSpec::VectorClusters { field, min: *min }
-        }
+        Predicate::VectorSimilar { field, .. } => CandidateSpec::Hnsw { field, k },
         Predicate::All(parts) => {
             debug_assert!(
                 !parts.is_empty(),
                 "candidate_spec_approx requires a validated predicate"
             );
-            CandidateSpec::Intersect(parts.iter().map(candidate_spec_approx).collect())
+            CandidateSpec::Intersect(
+                parts
+                    .iter()
+                    .map(|p| candidate_spec_approx_with_k(p, k))
+                    .collect(),
+            )
         }
         other => candidate_spec(other),
     }
@@ -659,11 +691,11 @@ impl SideIndex {
             // variant, so this arm is unreachable at runtime; it must be
             // present to satisfy exhaustiveness.
             CandidateSpec::VectorClusters { .. } => BTreeSet::new(),
+            // Hnsw uses the separate hnsw / hnsw_tracked fields, not by_key.
+            CandidateSpec::Hnsw { .. } => BTreeSet::new(),
             // Union: each branch contributes its own index keys; the result is
-            // their union.  VectorClusters children are intentionally excluded
-            // here (they are handled by the early-return in insert()/remove()),
-            // but Union-of-VectorClusters is not produced by candidate_spec for
-            // Any (approximate=true is rejected for Any by validate()).
+            // their union.  VectorClusters/Hnsw children are handled by the
+            // early-return in insert()/remove().
             CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) => {
                 let mut out = BTreeSet::new();
                 for s in specs {
@@ -697,6 +729,8 @@ impl SideIndex {
                 .collect(),
             // VectorClusters probing is handled by ivf_candidates(), not probe_keys().
             CandidateSpec::VectorClusters { .. } => BTreeSet::new(),
+            // Hnsw probing is handled by hnsw_candidates(), not probe_keys().
+            CandidateSpec::Hnsw { .. } => BTreeSet::new(),
             // Union / Intersect: probe each child. `candidates()` intersects
             // Intersect node-sets; mixing keys here is only for insert/remove.
             CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) => {
@@ -715,6 +749,16 @@ impl SideIndex {
         if let CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) = spec {
             for s in specs {
                 self.insert(s, node, get);
+            }
+            return;
+        }
+        // Hnsw: maintain hnsw_tracked for fallback, and hnsw graph if initialized.
+        if let CandidateSpec::Hnsw { field, .. } = spec {
+            if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
+                self.hnsw_tracked.insert(node);
+                if let Some(h) = &mut self.hnsw {
+                    h.insert(node, &xs);
+                }
             }
             return;
         }
@@ -761,6 +805,20 @@ impl SideIndex {
         if let CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) = spec {
             for s in specs {
                 self.remove(s, node, get);
+            }
+            return;
+        }
+        // Hnsw: remove from hnsw_tracked and hnsw graph.  Increment ivf_drift
+        // as a deletion counter so maybe_queue_ivf_rebuild fires at the same
+        // cadence it did for IVF rules; the resulting rebuild re-scans all nodes
+        // and optionally compacts the HNSW graph.
+        if let CandidateSpec::Hnsw { field, .. } = spec {
+            if get(field).as_ref().and_then(as_numeric_list).is_some() {
+                self.hnsw_tracked.remove(&node);
+                if let Some(h) = &mut self.hnsw {
+                    h.remove(node);
+                }
+                self.ivf_drift = self.ivf_drift.saturating_add(1);
             }
             return;
         }
@@ -880,6 +938,10 @@ impl SideIndex {
         spec: &CandidateSpec,
         get: &dyn Fn(&str) -> Option<Value>,
     ) -> BTreeSet<u32> {
+        // Hnsw: approximate nearest-neighbor search.
+        if let CandidateSpec::Hnsw { field, k } = spec {
+            return self.hnsw_candidates(field, *k, get);
+        }
         // VectorClusters: probe the P nearest centroids.
         if let CandidateSpec::VectorClusters { field, .. } = spec {
             return self.ivf_candidates(field, get);
@@ -1117,6 +1179,77 @@ impl SideIndex {
                 .insert(node);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // HNSW methods
+    // -----------------------------------------------------------------------
+
+    /// Initialise the HNSW graph for this side, seeding it with `FNV-1a(rule_name)`.
+    ///
+    /// Must be called before inserting nodes via `CandidateSpec::Hnsw`.
+    /// Idempotent: calling again with the same name replaces the existing graph.
+    pub fn init_hnsw(&mut self, rule_name: &str) {
+        let seed = fnv1a_u64(rule_name.as_bytes());
+        self.hnsw = Some(HnswIndex::new(seed));
+    }
+
+    /// HNSW candidate lookup: `k`-nearest-neighbor search using the built graph.
+    ///
+    /// Falls back to returning all tracked nodes when the HNSW is absent or
+    /// empty (e.g. before any insert or when used without `init_hnsw`).
+    fn hnsw_candidates(
+        &self,
+        field: &str,
+        k: usize,
+        get: &dyn Fn(&str) -> Option<Value>,
+    ) -> BTreeSet<u32> {
+        let Some(xs) = get(field).as_ref().and_then(as_numeric_list) else {
+            return BTreeSet::new();
+        };
+        if let Some(h) = &self.hnsw {
+            if !h.is_empty() {
+                return h.search(&xs, k).into_iter().map(|(id, _)| id).collect();
+            }
+        }
+        // Fallback: full scan of all tracked nodes (superset of true positives).
+        self.hnsw_tracked.clone()
+    }
+
+    /// Export the HNSW graph as an opaque bincoded blob.
+    ///
+    /// Returns an empty `Vec` when the HNSW is not initialized.
+    pub fn export_hnsw_blob(&self) -> Vec<u8> {
+        self.hnsw
+            .as_ref()
+            .and_then(|h| bincode::serialize(h).ok())
+            .unwrap_or_default()
+    }
+
+    /// Restore the HNSW graph from a previously exported blob.
+    ///
+    /// The `hnsw_tracked` set is populated from the restored graph's node ids
+    /// so candidates/remove work correctly after restore.
+    /// Silently ignores empty or corrupt blobs (HNSW stays uninitialized).
+    pub fn load_hnsw_blob(&mut self, blob: &[u8]) {
+        if blob.is_empty() {
+            return;
+        }
+        if let Ok(h) = bincode::deserialize::<HnswIndex>(blob) {
+            // Repopulate hnsw_tracked from the loaded graph.
+            self.hnsw_tracked = h.node_ids();
+            self.hnsw = Some(h);
+        }
+    }
+
+    /// True when the HNSW graph has been initialized and contains at least one node.
+    pub fn has_hnsw(&self) -> bool {
+        self.hnsw.as_ref().is_some_and(|h| !h.is_empty())
+    }
+
+    /// Borrow the HNSW index, if initialized.
+    pub fn hnsw_ref(&self) -> Option<&HnswIndex> {
+        self.hnsw.as_ref()
+    }
 }
 
 #[cfg(test)]
@@ -1143,13 +1276,16 @@ mod tests {
     /// Raw L2 would put `[3,0,0]` on a nearby large centroid while cosine (and
     /// the unit vector `[1,0,0]`) prefer the x-axis centroid. Assignment must
     /// L2-normalize first so scale-equivalent vectors share a cluster.
+    ///
+    /// Tests IVF directly (via `CandidateSpec::VectorClusters`) since
+    /// `candidate_spec_approx` now returns `CandidateSpec::Hnsw`.
     #[test]
     fn scaled_vector_joins_same_ivf_cluster_as_unit() {
-        let pred = Predicate::VectorSimilar {
-            field: "emb".into(),
+        // Use VectorClusters directly to test IVF cluster assignment.
+        let spec = CandidateSpec::VectorClusters {
+            field: "emb",
             min: 0.5,
         };
-        let spec = candidate_spec_approx(&pred);
         let mut idx = SideIndex::default();
         idx.load_ivf_state(
             vec![vec![1.0, 0.0, 0.0], vec![2.5, 0.1, 0.0]],
@@ -1610,6 +1746,8 @@ mod tests {
 
         let spec = candidate_spec_approx(&p);
         let mut idx = SideIndex::default();
+        // Initialize HNSW so insertions populate the graph.
+        idx.init_hnsw("test-rule");
         let mk = |industry: &str, e: &[f64]| {
             [
                 ("industry".to_string(), Value::Str(industry.into())),

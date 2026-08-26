@@ -24,6 +24,9 @@ fn overlap_rule(name: &str, etype: &str) -> RuleDef {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 
@@ -525,6 +528,9 @@ fn topk_eq_rule(k: u64) -> RuleDef {
         weight_prop: None,
         max_edges: Some(k),
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     }
 }
 

@@ -1,5 +1,6 @@
 pub mod def;
 pub mod engine;
+pub mod hnsw;
 pub mod index;
 pub mod suggest;
 pub mod views;
@@ -8,6 +9,7 @@ pub use def::{
     DEFAULT_KEYMATCH_TOP_K, DEFAULT_SCORED_TOP_K,
 };
 pub use engine::{EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport};
+pub use hnsw::HnswIndex;
 pub use index::{
     candidate_spec, with_ivf_drift_rebuild, CandidateSpec, RuleIndex, SideIndex, IVF_DRIFT_REBUILD,
 };

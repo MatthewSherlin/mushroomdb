@@ -34,6 +34,9 @@ fn open_fixture(name: &str) -> GraphDb<core_storage::fs::RealFs> {
         weight_prop: Some("score".into()),
         max_edges: None,
         approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
     })
     .unwrap();
     db.insert_node(
