@@ -137,3 +137,42 @@ process on the machine above, synthetic hash-chain embeddings.
 
 - Matcher backfill at 100k COMPLETED (T1 streaming). Rules: 9. Elapsed: 20.343 s.
 - semantic_match exact full backfill not attempted: projected wall=121.14 min Δrss=32.78 GiB (approximate semantic runs instead)
+
+## G3 reopen bench (Phase 3, 2026-08-26)
+
+Branch `feat/phase-3-storage-physics` @ `af9c682` (post-review fixes), release
+build, same host. Harness: `crates/core-api/examples/g3_reopen_bench.rs` run
+under `/usr/bin/time -l`; db dir copied so the original artifact is untouched.
+Note: the existing `scale-100000-db/snapshot.bin` header is **V5** (`GDB1`,
+version=5, uncompressed bincode), not V6 as the earlier reopen section says.
+
+| Format | Snapshot on disk | Cold open (3 runs) | Peak RSS (3 runs) |
+|---|---|---|---|
+| V5 (same binary) | 2.20 GiB | 10.44 / 9.93 s | 6.27 / 8.00 GiB |
+| V7 packed CSR+columns+zstd | 1.07 GiB | 11.11 / 10.98 / 10.66 s | 9.80 / 10.31 / 10.24 GiB |
+
+V7 write (from opened V5 state): 34.3-35.2 s, convert-process peak RSS
+7.4-7.5 GiB. Node/edge counts identical after reopen: nodes=100500
+edges=10009748. (First two V7 runs at `a21b6f2`; third at `af9c682` after
+the V7 meta gained the `wal_truncated` flag — within noise.)
+
+**G3 bar (< 1 s): FAIL — ~11 s, ~11x over.** V7 halves disk size but is
+~1 s slower to open and peaks 2-4 GiB higher than V5 on the same binary.
+
+Stage profile of the V7 open (`crates/core-storage/examples/v7_profile.rs`):
+
+- file 1.07 GiB → zstd decompress 1.68 s → 2.19 GiB uncompressed payload
+- payload split: packed topo 77.8 MiB; packed props 1.57 GiB; bincode meta
+  554 MiB (provenance BTreeSets + edge_props for 10M derived edges)
+- crc32 0.30 s; total `snapshot::decode` 6.08 s
+- remaining ~5 s of open: engine/provenance restore, view+fulltext
+  `rebuild_all` after decode
+
+**Why the bar is out of reach for this design:** open cost is dominated by
+data volume, not the old HashMap layouts. The 1536-dim embeddings alone are
+~1.2 GiB of raw f64 (100k x 1536 x 8 B) stored as `Value::List` per node, and
+10M derived edges carry ~550 MiB of provenance/edge-prop meta. Any owned
+decompress-and-deserialize open of this dataset pays multiple seconds before
+the first query; < 1 s needs zero-copy/lazy loading (mmap + packed columns
+read in place, deferred provenance) — explicitly deferred by the Phase 3 plan
+(no memmap2/rkyv without sign-off).
