@@ -654,3 +654,44 @@ fn auto_rebuild_wal_failure_does_not_fail_user_write() {
         "re-queued rebuild must run on a later write"
     );
 }
+
+/// `find_similar_vector` must rank nodes by cosine similarity even when no
+/// rule exists (brute-force fallback path).  Without any edges in the graph
+/// the HNSW fast path returns `None` and we fall through to the O(n) scan.
+#[test]
+fn find_similar_vector_without_edges() {
+    let dir = tmp("find-similar-vector-no-edges");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Insert three 2-D nodes.  The cosine angles are chosen so:
+    //   "a" ≈ [1,0]   →  exactly aligned with query [1,0]      → score 1.0
+    //   "b" ≈ [1,1]/√2 → 45° from query                        → score ≈ 0.707
+    //   "c" ≈ [0,1]   →  orthogonal to query                    → score 0.0
+    db.insert_node("Item", "a", vec![("emb".into(), emb(&[1.0, 0.0]))])
+        .unwrap();
+    db.insert_node("Item", "b", vec![("emb".into(), emb(&[1.0, 1.0]))])
+        .unwrap();
+    db.insert_node("Item", "c", vec![("emb".into(), emb(&[0.0, 1.0]))])
+        .unwrap();
+
+    let query = vec![1.0_f64, 0.0];
+
+    // k=2, min=0.5: should return "a" and "b" only (c is orthogonal).
+    let hits = db.find_similar_vector("emb", "Item", &query, 2, 0.5);
+    let keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["a", "b"], "top-2 with min=0.5");
+
+    // Scores must be in descending order and within valid range.
+    assert!(hits[0].1 > hits[1].1, "sorted descending");
+    assert!((hits[0].1 - 1.0).abs() < 1e-9, "a is perfectly aligned");
+
+    // k=3, min=0.0: all three nodes; c appears last with near-zero score.
+    let all = db.find_similar_vector("emb", "Item", &query, 3, 0.0);
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[2].0, "c");
+    assert!(all[2].1.abs() < 1e-9, "c is orthogonal");
+
+    // Label filter: only Items (no false positives from other labels).
+    let filtered = db.find_similar_vector("emb", "Other", &query, 10, 0.0);
+    assert!(filtered.is_empty(), "no Other-label nodes exist");
+}

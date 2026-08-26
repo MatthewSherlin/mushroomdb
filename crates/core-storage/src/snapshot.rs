@@ -69,6 +69,12 @@ pub struct SnapshotState {
     /// (decode of old formats leaves the default `false` = WAL-only as-of).
     #[serde(skip)]
     pub wal_truncated: bool,
+    /// Per-approximate-rule HNSW graph blobs: rule name → `(src_blob, dst_blob)`.
+    /// Each blob is an opaque bincoded `HnswIndex`.  Serialized in the V7 meta
+    /// section only; V5/V6 payloads never carried it — skipped here so their
+    /// bincode wire shape is frozen (missing → default empty map).
+    #[serde(skip)]
+    pub hnsw_state: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,6 +91,11 @@ struct V7Meta {
     view_defs: Vec<Vec<u8>>,
     /// See [`SnapshotState::wal_truncated`]. V7-only field.
     wal_truncated: bool,
+    /// Per-approximate-rule HNSW graph blobs: rule name → `(src_blob, dst_blob)`.
+    /// Added last so the field is easily skipped on old V7 blobs by setting a
+    /// default.  V7 is unreleased; the fixture is regenerated after this change.
+    #[serde(default)]
+    hnsw: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
 }
 
 fn wrap_zstd(version: u16, inner: Vec<u8>) -> Vec<u8> {
@@ -149,6 +160,7 @@ fn encode_v7(state: &SnapshotState) -> Result<Vec<u8>> {
         ivf_state: state.ivf_state.clone(),
         view_defs: state.view_defs.clone(),
         wal_truncated: state.wal_truncated,
+        hnsw: state.hnsw_state.clone(),
     };
     let meta_bytes = bincode::serialize(&meta).expect("snapshot meta serialize cannot fail");
     let mut payload = Vec::with_capacity(8 + topo.len() + props.len() + meta_bytes.len());
@@ -258,6 +270,7 @@ fn decode_v7(body: &[u8]) -> Result<Option<SnapshotState>> {
         ivf_state: meta.ivf_state,
         view_defs: meta.view_defs,
         wal_truncated: meta.wal_truncated,
+        hnsw_state: meta.hnsw,
     }))
 }
 
@@ -308,6 +321,7 @@ mod tests {
             ivf_state: BTreeMap::new(),
             view_defs: vec![],
             wal_truncated: true,
+            hnsw_state: BTreeMap::new(),
         }
     }
 

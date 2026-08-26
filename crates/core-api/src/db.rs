@@ -720,6 +720,22 @@ fn project_set_return_rows<F: Fs>(
 
 /// Single construction point for a `GraphMut` view over the split-borrowed graph fields.
 /// Callers use `std::mem::take` on the engine before calling this, then restore it after.
+/// Extract a `Vec<f64>` from a `Value::List` whose items are all numeric.
+/// Returns `None` for non-list values or lists with non-numeric elements.
+fn value_as_float_list(v: &Value) -> Option<Vec<f64>> {
+    match v {
+        Value::List(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Float(f) => Some(*f),
+                Value::Int(i) => Some(*i as f64),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
 fn make_graph_mut<'a>(
     ids: &'a IdMap,
     syms: &'a mut Interner,
@@ -946,6 +962,8 @@ impl<F: Fs> GraphDb<F> {
             &self.props,
             ivf_state,
         );
+        // Restore HNSW graphs from snapshot (V7).
+        self.engine.load_hnsw_state(state.hnsw_state);
         // Restore view defs from snapshot (V5).
         // The ColumnStore already contains view values from the snapshot;
         // use restore_view (no collision check, no backfill) so the store
@@ -3302,6 +3320,70 @@ impl<F: Fs> GraphDb<F> {
             .collect()
     }
 
+    /// Find nodes with the given `label` whose `field` vector is most similar
+    /// to `q` (cosine similarity), returning up to `k` results with similarity
+    /// ≥ `min`, sorted descending.
+    ///
+    /// Uses the HNSW index when one is available (fast path); otherwise falls
+    /// back to an O(n) brute-force scan over all nodes with that label (exact).
+    pub fn find_similar_vector(
+        &self,
+        field: &str,
+        label: &str,
+        q: &[f64],
+        k: usize,
+        min: f64,
+    ) -> Vec<(String, f64)> {
+        // L2-normalise query for cosine via dot product.
+        let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm == 0.0 {
+            return vec![];
+        }
+        let q_unit: Vec<f64> = q.iter().map(|x| x / norm).collect();
+
+        // Try HNSW fast path.
+        if let Some(hits) = self.engine.hnsw_search_dst(field, label, &q_unit, k) {
+            let mut out: Vec<(String, f64)> = hits
+                .into_iter()
+                .filter(|&(_, sim)| sim >= min)
+                .filter_map(|(id, sim)| {
+                    self.ids.key_of(id).map(|key| (key.to_string(), sim))
+                })
+                .collect();
+            out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            out.truncate(k);
+            return out;
+        }
+
+        // Brute-force fallback: O(n) scan.
+        let view = self.view();
+        let mut scored: Vec<(String, f64)> = view
+            .nodes_with_label(label)
+            .into_iter()
+            .filter_map(|id| {
+                let v = view.prop(id, field)?;
+                let xs = value_as_float_list(v)?;
+                let v_norm: f64 = xs.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if v_norm == 0.0 {
+                    return None;
+                }
+                let dot: f64 = q_unit
+                    .iter()
+                    .zip(xs.iter())
+                    .map(|(a, b)| a * (b / v_norm))
+                    .sum();
+                if dot < min {
+                    return None;
+                }
+                let key = self.ids.key_of(id)?.to_string();
+                Some((key, dot))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
+    }
+
     /// Lex → parse → plan → execute `cypher` over a read-only view.
     /// Every pipeline `Err(String)` becomes `GraphError::QueryError` with a
     /// stage prefix (`lex:` / `parse:` / `plan:` / `execute:`).
@@ -4100,6 +4182,7 @@ impl<F: Fs> GraphDb<F> {
             .map(|r| bincode::serialize(r).expect("RuleDef serialize cannot fail"))
             .collect();
         // Collect IVF state for approximate rules (V4).
+        let hnsw_state = self.engine.export_hnsw_state();
         let raw_ivf = self.engine.export_ivf_state();
         let ivf_state: BTreeMap<String, core_storage::snapshot::PerRuleIvfState> = raw_ivf
             .into_iter()
@@ -4138,6 +4221,7 @@ impl<F: Fs> GraphDb<F> {
             rule_tripped,
             rule_fires,
             ivf_state,
+            hnsw_state,
             view_defs,
             wal_truncated: !opts.keep_wal,
         };

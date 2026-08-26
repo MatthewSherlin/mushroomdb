@@ -1,6 +1,7 @@
 use crate::def::{evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef};
 use crate::index::{
-    candidate_spec, candidate_spec_approx, ivf_drift_rebuild_threshold, CandidateSpec, RuleIndex,
+    candidate_spec, candidate_spec_approx_with_k, ivf_drift_rebuild_threshold, CandidateSpec,
+    RuleIndex,
 };
 use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -108,7 +109,10 @@ pub struct RuleEngine {
 /// `VectorClusters` for `approximate=true` (VectorSimilar-rooted predicates).
 fn candidate_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
     if def.approximate {
-        candidate_spec_approx(&def.predicate)
+        // k = max(max_edges, 64): return at least 64 candidates so evaluation
+        // has a meaningful pool; bounded by max_edges when set by the caller.
+        let k = def.max_edges.map(|me| me.max(64)).unwrap_or(64) as usize;
+        candidate_spec_approx_with_k(&def.predicate, k)
     } else {
         candidate_spec(&def.predicate)
     }
@@ -126,6 +130,17 @@ fn src_lookup_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
         CandidateSpec::Scalar { field }
     } else {
         candidate_spec_for(def)
+    }
+}
+
+/// True when `p` contains a `VectorSimilar { field: f }` where `f == field`.
+fn predicate_covers_field(p: &Predicate, field: &str) -> bool {
+    match p {
+        Predicate::VectorSimilar { field: f, .. } => f == field,
+        Predicate::All(parts) | Predicate::Any(parts) => {
+            parts.iter().any(|q| predicate_covers_field(q, field))
+        }
+        _ => false,
     }
 }
 
@@ -1246,6 +1261,16 @@ impl RuleEngine {
         // Collect rule names once outside the per-node loop to avoid repeated
         // allocation and to satisfy the borrow checker without cloning inside.
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
+
+        // Init HNSW for approximate rules before inserting nodes.
+        for name in &rule_names {
+            if self.rules[name].approximate {
+                let idx = self.indexes.get_mut(name).unwrap();
+                idx.src_side.init_hnsw(name);
+                idx.dst_side.init_hnsw(name);
+            }
+        }
+
         for id in 0..ids.len() as u32 {
             let label_sym = match labels.get(id as usize).copied() {
                 Some(s) if s != u32::MAX => s,
@@ -1258,6 +1283,7 @@ impl RuleEngine {
             }
         }
         // After all nodes are indexed, fit IVF clusters for approximate rules.
+        // HNSW was built incrementally; IVF kept as legacy fallback.
         for name in &rule_names {
             if self.rules[name].approximate {
                 let idx = self.indexes.get_mut(name).unwrap();
@@ -1288,6 +1314,17 @@ impl RuleEngine {
             *idx = RuleIndex::default();
         }
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
+
+        // Init HNSW for approximate rules before inserting nodes so each
+        // insert also populates the HNSW graph incrementally.
+        for name in &rule_names {
+            if self.rules[name].approximate {
+                let idx = self.indexes.get_mut(name).unwrap();
+                idx.src_side.init_hnsw(name);
+                idx.dst_side.init_hnsw(name);
+            }
+        }
+
         for id in 0..ids.len() as u32 {
             let label_sym = match labels.get(id as usize).copied() {
                 Some(s) if s != u32::MAX => s,
@@ -1300,6 +1337,8 @@ impl RuleEngine {
             }
         }
         // For approximate rules: restore persisted IVF state (no re-fit).
+        // HNSW was built incrementally; it will be replaced by `load_hnsw_state`
+        // in `restore_snapshot_state` when a snapshot blob is available.
         for name in &rule_names {
             if !self.rules[name].approximate {
                 continue;
@@ -1314,6 +1353,75 @@ impl RuleEngine {
                 idx.dst_side.fit_ivf_clusters(name);
             }
         }
+    }
+
+    /// Export HNSW graphs for all approximate rules as opaque bincoded blobs.
+    ///
+    /// Returns a map from rule name to `(src_blob, dst_blob)`.  An empty `Vec`
+    /// means the corresponding side has no initialized HNSW graph.
+    pub fn export_hnsw_state(&self) -> BTreeMap<String, (Vec<u8>, Vec<u8>)> {
+        let mut out = BTreeMap::new();
+        for (name, def) in &self.rules {
+            if def.approximate {
+                if let Some(idx) = self.indexes.get(name) {
+                    out.insert(
+                        name.clone(),
+                        (
+                            idx.src_side.export_hnsw_blob(),
+                            idx.dst_side.export_hnsw_blob(),
+                        ),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Restore HNSW graphs from bincoded blobs (overrides any incrementally built
+    /// graphs produced during `reindex_all_load_ivf`).
+    ///
+    /// Called from `restore_snapshot_state` in db.rs after reindex.
+    pub fn load_hnsw_state(&mut self, blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>) {
+        for (name, (src_blob, dst_blob)) in blobs {
+            if let Some(idx) = self.indexes.get_mut(&name) {
+                if !src_blob.is_empty() {
+                    idx.src_side.load_hnsw_blob(&src_blob);
+                }
+                if !dst_blob.is_empty() {
+                    idx.dst_side.load_hnsw_blob(&dst_blob);
+                }
+            }
+        }
+    }
+
+    /// Find approximate nearest-neighbor ids on the dst side of the first
+    /// approximate VectorSimilar rule covering `(dst_label, field)`.
+    ///
+    /// Returns `None` when no matching rule or HNSW index exists.
+    pub fn hnsw_search_dst(
+        &self,
+        field: &str,
+        dst_label: &str,
+        q: &[f64],
+        k: usize,
+    ) -> Option<Vec<(u32, f64)>> {
+        for (name, def) in &self.rules {
+            if !def.approximate || def.dst_label != dst_label {
+                continue;
+            }
+            // Check that the predicate covers this vector field.
+            if !predicate_covers_field(&def.predicate, field) {
+                continue;
+            }
+            if let Some(idx) = self.indexes.get(name) {
+                if let Some(h) = idx.dst_side.hnsw_ref() {
+                    if !h.is_empty() {
+                        return Some(h.search(q, k));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Register a rule and backfill existing nodes.
@@ -1333,6 +1441,15 @@ impl RuleEngine {
         // Phase 1: index all existing nodes for this rule.
         let n_total = g.ids.len() as u32;
         let def = self.rules[&name].clone();
+
+        // Phase 1a: init HNSW for approximate rules before inserting nodes so
+        // each insert also populates the HNSW graph incrementally.
+        if def.approximate {
+            let idx = self.indexes.get_mut(&name).unwrap();
+            idx.src_side.init_hnsw(&name);
+            idx.dst_side.init_hnsw(&name);
+        }
+
         for id in 0..n_total {
             let label_sym = match g.labels.get(id as usize).copied() {
                 Some(s) if s != u32::MAX => s,
@@ -1343,6 +1460,7 @@ impl RuleEngine {
         }
 
         // Phase 1b: fit IVF clusters for approximate rules (after all nodes indexed).
+        // HNSW was built incrementally above; IVF is kept as legacy fallback.
         if def.approximate {
             let idx = self.indexes.get_mut(&name).unwrap();
             idx.src_side.fit_ivf_clusters(&name);
@@ -1694,6 +1812,14 @@ impl RuleEngine {
 
         // Reindex this rule from scratch (indexes only).
         *self.indexes.get_mut(name).unwrap() = RuleIndex::default();
+
+        // Init HNSW before indexing so inserts populate the graph incrementally.
+        if def.approximate {
+            let idx = self.indexes.get_mut(name).unwrap();
+            idx.src_side.init_hnsw(name);
+            idx.dst_side.init_hnsw(name);
+        }
+
         let n_total = g.ids.len() as u32;
         for id in 0..n_total {
             let label_sym = match g.labels.get(id as usize).copied() {
@@ -1705,6 +1831,7 @@ impl RuleEngine {
         }
 
         // Fit IVF clusters for approximate rules after reindex (drift reset).
+        // HNSW was built incrementally; IVF kept as legacy fallback.
         if def.approximate {
             let idx = self.indexes.get_mut(name).unwrap();
             idx.src_side.fit_ivf_clusters(name);
