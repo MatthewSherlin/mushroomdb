@@ -1922,6 +1922,138 @@ fn abs_binarith_param_arg_missing_is_error() {
     );
 }
 
+// ── IN / DISTINCT / still-named-errors ────────────────────────────────────────
+
+#[test]
+fn where_in_list_and_param() {
+    let dir = tmp("where_in_list");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node(
+            "Person",
+            "austin",
+            vec![
+                ("id".into(), Value::Str("austin".into())),
+                ("city".into(), Value::Str("Austin".into())),
+            ],
+        );
+        batch.insert_node(
+            "Person",
+            "paris",
+            vec![
+                ("id".into(), Value::Str("paris".into())),
+                ("city".into(), Value::Str("Paris".into())),
+            ],
+        );
+        batch.insert_node(
+            "Person",
+            "london",
+            vec![
+                ("id".into(), Value::Str("london".into())),
+                ("city".into(), Value::Str("London".into())),
+            ],
+        );
+        batch.commit().unwrap();
+    }
+    let mut params = BTreeMap::new();
+    params.insert("c".into(), Value::Str("Paris".into()));
+    let rs = db
+        .query(
+            "MATCH (n:Person) WHERE n.city IN ['Austin', $c] RETURN n.city AS city ORDER BY city",
+            &params,
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 2);
+    assert_eq!(get_val(&rs, 0, "city"), Some(Value::Str("Austin".into())));
+    assert_eq!(get_val(&rs, 1, "city"), Some(Value::Str("Paris".into())));
+
+    // `$cities` as Value::List
+    let mut list_params = BTreeMap::new();
+    list_params.insert(
+        "cities".into(),
+        Value::List(vec![
+            Value::Str("Austin".into()),
+            Value::Str("Paris".into()),
+        ]),
+    );
+    let rs2 = db
+        .query(
+            "MATCH (n:Person) WHERE n.city IN $cities RETURN n.city AS city ORDER BY city",
+            &list_params,
+        )
+        .unwrap();
+    assert_eq!(rs2.len(), 2);
+    assert_eq!(get_val(&rs2, 0, "city"), Some(Value::Str("Austin".into())));
+    assert_eq!(get_val(&rs2, 1, "city"), Some(Value::Str("Paris".into())));
+}
+
+#[test]
+fn return_distinct_cities() {
+    let dir = tmp("return_distinct");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        batch.insert_node(
+            "Person",
+            "a1",
+            vec![
+                ("id".into(), Value::Str("a1".into())),
+                ("city".into(), Value::Str("Austin".into())),
+            ],
+        );
+        batch.insert_node(
+            "Person",
+            "a2",
+            vec![
+                ("id".into(), Value::Str("a2".into())),
+                ("city".into(), Value::Str("Austin".into())),
+            ],
+        );
+        batch.commit().unwrap();
+    }
+    let rs = db
+        .query(
+            "MATCH (n:Person) RETURN DISTINCT n.city AS city",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "two Austin nodes must collapse to one DISTINCT row"
+    );
+    assert_eq!(get_val(&rs, 0, "city"), Some(Value::Str("Austin".into())));
+}
+
+#[test]
+fn union_case_collect_are_named_errors() {
+    let db = open_fixture("named-err-union");
+    for (cypher, needle) in [
+        (
+            "MATCH (n:Person) RETURN n UNION MATCH (m:Person) RETURN m",
+            "UNION",
+        ),
+        (
+            "MATCH (n:Person) RETURN CASE WHEN n.id = 't1' THEN 1 ELSE 0 END",
+            "CASE",
+        ),
+        ("MATCH (n:Person) RETURN collect(n)", "collect"),
+    ] {
+        let err = db.query(cypher, &BTreeMap::new()).expect_err(cypher);
+        let detail = match err {
+            GraphError::QueryError { detail } => detail,
+            other => panic!("{cypher}: expected QueryError, got {other:?}"),
+        };
+        assert!(
+            detail
+                .to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase()),
+            "{cypher}: error must name {needle}, got: {detail}"
+        );
+    }
+}
+
 /// Composite pin: float BinArith null propagation (Minor-3).
 /// `abs(n.missing_float - 1.5)` — left operand is null because the property
 /// is absent → the shared `(None, _) | (_, None) => Ok(None)` guard in

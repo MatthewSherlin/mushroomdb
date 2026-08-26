@@ -1,6 +1,9 @@
-use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value};
+use core_api::{
+    AutoFk, Direction, FsyncPolicy, GraphDb, GraphError, IngestOptions, Predicate, RuleDef, Value,
+};
+use core_storage::fs::{FileId, Fs, FsIntrospect};
 use core_storage::wal::{decode_all, WalRecord};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-{}-{}", name, std::process::id()));
@@ -431,4 +434,131 @@ fn create_rule_then_delete_edge_in_same_batch_is_dropped_not_rule_owned() {
     db.rebuild_rule("rel").unwrap();
     assert_eq!(db.edge_count(), before_count);
     assert_eq!(out_pairs(&db, &["a", "b"], "REL"), before_pairs);
+}
+
+#[derive(Default)]
+struct CountingFs {
+    files: HashMap<FileId, Vec<u8>>,
+    appended: usize,
+    syncs: usize,
+}
+
+impl Fs for CountingFs {
+    fn append(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
+        self.files.entry(file).or_default().extend_from_slice(data);
+        self.appended += data.len();
+        Ok(())
+    }
+
+    fn sync(&mut self, _file: FileId) -> std::io::Result<()> {
+        self.syncs += 1;
+        Ok(())
+    }
+
+    fn read(&self, file: FileId) -> std::io::Result<Vec<u8>> {
+        Ok(self.files.get(&file).cloned().unwrap_or_default())
+    }
+
+    fn write_atomic(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
+        self.files.insert(file, data.to_vec());
+        Ok(())
+    }
+}
+
+impl FsIntrospect for CountingFs {
+    fn total_appended(&self) -> usize {
+        self.appended
+    }
+
+    fn sync_count(&self) -> usize {
+        self.syncs
+    }
+}
+
+fn counting_db() -> GraphDb<CountingFs> {
+    GraphDb::open_with(CountingFs::default()).unwrap()
+}
+
+#[test]
+fn relaxed_policy_skips_sync_but_snapshot_is_durable() {
+    let mut db = counting_db();
+    db.set_fsync_policy(FsyncPolicy::Relaxed);
+    db.insert_node("A", "a", vec![]).unwrap();
+    db.insert_node("A", "b", vec![]).unwrap();
+    assert_eq!(db.fs_sync_count(), 0, "Relaxed must skip Fs::sync");
+    assert!(
+        db.fs_total_appended() > 0,
+        "WAL bytes must still be appended"
+    );
+    db.snapshot().unwrap();
+    assert_eq!(
+        db.fs_sync_count(),
+        0,
+        "snapshot durability is write_atomic, not Fs::sync"
+    );
+
+    let mut fs = db.into_fs();
+    assert!(
+        !fs.read(FileId::Snapshot).unwrap().is_empty(),
+        "snapshot must be written"
+    );
+    // Wipe WAL so reopen cannot recover from unsynced WAL bytes.
+    fs.write_atomic(FileId::Wal, &[]).unwrap();
+    let db2 = GraphDb::open_with(fs).unwrap();
+    assert!(db2.has_node("a"));
+    assert!(db2.has_node("b"));
+}
+
+#[test]
+fn strict_policy_syncs_each_single_op() {
+    let mut db = counting_db();
+    db.insert_node("A", "a", vec![]).unwrap();
+    db.insert_node("A", "b", vec![]).unwrap();
+    assert_eq!(db.fs_sync_count(), 2);
+}
+
+#[test]
+fn batched_policy_syncs_only_batch_frames() {
+    let mut db = counting_db();
+    db.set_fsync_policy(FsyncPolicy::Batched);
+    db.insert_node("A", "a", vec![]).unwrap();
+    db.insert_node("A", "b", vec![]).unwrap();
+    assert_eq!(
+        db.fs_sync_count(),
+        0,
+        "single-op path skips sync once Batched is set"
+    );
+    db.write_batch(|b| {
+        b.insert_node("A", "c", vec![]);
+        b.insert_node("A", "d", vec![]);
+    })
+    .unwrap();
+    assert_eq!(db.fs_sync_count(), 1);
+}
+
+#[test]
+fn ingest_batch_fsyncs_once_not_per_node() {
+    let mut db = counting_db();
+    let rows: Vec<BTreeMap<String, Value>> = (0..5)
+        .map(|i| {
+            let mut row = BTreeMap::new();
+            row.insert("id".into(), Value::Str(format!("n{i}")));
+            row
+        })
+        .collect();
+    db.ingest(
+        "A",
+        rows,
+        &IngestOptions {
+            key_field: "id".into(),
+            auto_fk: AutoFk::Off,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        db.fs_sync_count(),
+        1,
+        "ingest must be one Batch fsync, not a loop of insert_node"
+    );
+    assert_eq!(db.node_count(), 5);
 }

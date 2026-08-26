@@ -59,6 +59,10 @@ pub enum PlanOp {
     Project {
         items: Vec<RetItem>,
     },
+    /// Deduplicate projected rows (`RETURN DISTINCT`). Hashed with the same
+    /// numeric unify as `GroupAggregate`. Caps distinct rows at the
+    /// intermediate-row budget.
+    Distinct,
     /// After `plan`, every item's `target` is `OrderTarget::Alias(column)`
     /// where `column` is a projected column name. The executor resolves
     /// ORDER BY against the post-Project table only.
@@ -214,8 +218,11 @@ pub enum PlanOp {
 /// rows to apply the `SKIP` offset and still yield `LIMIT` final rows.
 /// Saturating addition is used to guard against pathological large values.
 pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
-    // ORDER BY requires full materialisation — bound cannot be pushed.
-    if ops.iter().any(|op| matches!(op, PlanOp::OrderBy { .. })) {
+    // ORDER BY and DISTINCT require full materialisation — bound cannot be pushed.
+    if ops
+        .iter()
+        .any(|op| matches!(op, PlanOp::OrderBy { .. } | PlanOp::Distinct))
+    {
         return None;
     }
     // Aggregate plans use the streaming accumulator path, not the pull path.
@@ -338,6 +345,15 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     check_return_bound(&q.returns, &bound, &rel_bound)?;
     check_duplicate_aliases(&q.returns)?;
     check_duplicate_columns(&q.returns)?;
+    if q.distinct
+        && q.returns
+            .iter()
+            .any(|r| matches!(&r.value, RetVal::Agg { .. }))
+    {
+        return Err(
+            "RETURN DISTINCT is not supported with aggregate functions; use grouping".to_string(),
+        );
+    }
 
     // Detect aggregate vs non-aggregate items in RETURN.
     // For pipeline plans (with stages or top-level UNWIND), single-aggregate
@@ -429,6 +445,9 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     ops.push(PlanOp::Project {
         items: q.returns.clone(),
     });
+    if q.distinct {
+        ops.push(PlanOp::Distinct);
+    }
 
     if !q.order_by.is_empty() {
         let mut items = Vec::with_capacity(q.order_by.len());
@@ -880,6 +899,13 @@ fn check_expr_bound(expr: &Expr, bound: &BTreeSet<String>) -> Result<(), String>
         }
         Expr::Truthy(op) => check_operand_bound(op, bound, "WHERE"),
         Expr::IsNull(op) | Expr::IsNotNull(op) => check_operand_bound(op, bound, "WHERE"),
+        Expr::In { expr, list } => {
+            check_operand_bound(expr, bound, "WHERE")?;
+            for item in list {
+                check_operand_bound(item, bound, "WHERE")?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1556,6 +1582,24 @@ LIMIT 10";
     }
 
     #[test]
+    fn return_distinct_emits_distinct_after_project() {
+        let ops = plan_src("MATCH (n) RETURN DISTINCT n").expect("DISTINCT must plan");
+        let proj = ops
+            .iter()
+            .position(|op| matches!(op, PlanOp::Project { .. }))
+            .expect("Project");
+        assert!(
+            matches!(ops.get(proj + 1), Some(PlanOp::Distinct)),
+            "DISTINCT must follow Project, got: {ops:?}"
+        );
+        let bounded = plan_src("MATCH (n) RETURN DISTINCT n LIMIT 1").unwrap();
+        assert!(
+            super::row_bound(&bounded).is_none(),
+            "DISTINCT + LIMIT must not push LIMIT into producers"
+        );
+    }
+
+    #[test]
     fn skip_then_limit_follow_project() {
         let got = plan_src("MATCH (a) RETURN a SKIP 2 LIMIT 3").unwrap();
         assert_eq!(
@@ -1608,6 +1652,7 @@ LIMIT 10";
             stages: vec![],
             returns: vec![],
             order_by: vec![],
+            distinct: false,
             skip: None,
             limit: None,
         };
@@ -1635,6 +1680,7 @@ LIMIT 10";
             post_unwind_where: None,
             stages: vec![],
             returns: vec![],
+            distinct: false,
             order_by: vec![OrderItem {
                 target: OrderTarget::Alias("missing".into()),
                 descending: true,

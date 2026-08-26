@@ -23,7 +23,7 @@ listener is accepting. Non-loopback `--addr` requires `--token` or
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Liveness stub `{"ok": true}` (no auth) |
+| `GET` | `/health` | Liveness + counts `{"ok":true,"nodes":N,"edges":N,"addr":"..."}` (no auth) |
 | `POST` | `/query` | Run a Cypher query |
 | `GET` | `/stats` | Database statistics |
 | `POST` | `/ingest` | Ingest nodes and/or edges |

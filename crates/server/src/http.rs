@@ -46,11 +46,11 @@ use tower_http::services::ServeDir;
 ///
 /// # Blocking
 ///
-/// [`SharedDb`] uses a std [`std::sync::RwLock`]. Under a tokio multi-thread
-/// runtime, `db.read()` / `db.write()` park the caller's worker thread for
-/// the duration of contention. That is acceptable at embedded v1 scale.
-/// Wrap these calls in `tokio::task::spawn_blocking` before exposing the
-/// server to concurrent multi-client load.
+/// [`SharedDb`] uses a std [`std::sync::RwLock`]. Write handlers
+/// (`query_write`, `/ingest`, `create_rule`) run in
+/// `tokio::task::spawn_blocking` and drop the write guard before `.await`.
+/// Reads stay on the worker (neighborhood is µs). `suggest` and `algo`
+/// already use the blocking pool.
 pub fn router(db: SharedDb) -> Router {
     router_with_auth(db, None)
 }
@@ -58,7 +58,7 @@ pub fn router(db: SharedDb) -> Router {
 /// [`router`] with an optional bearer/`?token=` requirement on every route
 /// except unauthenticated `GET /health`.
 pub fn router_with_auth(db: SharedDb, token: Option<String>) -> Router {
-    build_app(db, token, UiFallback::None)
+    build_app(db, token, UiFallback::None, default_advertise_addr())
 }
 
 /// Same as [`router_with_auth`], then `ServeDir` as the fallback so API routes win.
@@ -67,7 +67,12 @@ pub fn router_with_ui(
     ui_dir: impl AsRef<std::path::Path>,
     token: Option<String>,
 ) -> Router {
-    build_app(db, token, UiFallback::Dir(ui_dir.as_ref().to_path_buf()))
+    build_app(
+        db,
+        token,
+        UiFallback::Dir(ui_dir.as_ref().to_path_buf()),
+        default_advertise_addr(),
+    )
 }
 
 #[cfg(feature = "embed-ui")]
@@ -77,7 +82,7 @@ static EMBEDDED_UI: include_dir::Dir<'_> =
 /// [`router`] plus the `embed-ui` static tree as fallback.
 #[cfg(feature = "embed-ui")]
 pub fn router_with_embedded_ui(db: SharedDb) -> Router {
-    build_app(db, None, UiFallback::Embedded)
+    build_app(db, None, UiFallback::Embedded, default_advertise_addr())
 }
 
 #[cfg(feature = "embed-ui")]
@@ -177,11 +182,15 @@ async fn serve_inner(
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    let app = build_app(db, token, ui);
+    let app = build_app(db, token, ui, local);
     axum::serve(listener, app).await
 }
 
-fn build_app(db: SharedDb, token: Option<String>, ui: UiFallback) -> Router {
+fn default_advertise_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 8080))
+}
+
+fn build_app(db: SharedDb, token: Option<String>, ui: UiFallback, addr: SocketAddr) -> Router {
     debug_assert!(
         !db.read().has_event_sink(),
         "router() must be called at most once per SharedDb; a second call \
@@ -199,6 +208,7 @@ fn build_app(db: SharedDb, token: Option<String>, ui: UiFallback) -> Router {
         db,
         watch: tx,
         token,
+        addr,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -226,8 +236,32 @@ fn build_app(db: SharedDb, token: Option<String>, ui: UiFallback) -> Router {
     app.layer(middleware::from_fn_with_state(state, auth_middleware))
 }
 
-async fn health() -> Response {
-    json_ok(json!({"ok": true}))
+async fn health(State(state): State<AppState>) -> Response {
+    let (nodes, edges) = {
+        let g = state.db.read();
+        let s = g.stats();
+        (s.nodes_live, s.edges)
+    };
+    json_ok(json!({
+        "ok": true,
+        "nodes": nodes,
+        "edges": edges,
+        "addr": state.addr.to_string(),
+    }))
+}
+
+/// Run a GraphDb write on the blocking pool. The write guard lives only
+/// inside `f` and is dropped before this future awaits.
+async fn blocking_write<T, F>(f: F) -> std::result::Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce() -> core_api::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(graph_err(e)),
+        Err(_) => Err(err_response("write task panicked")),
+    }
 }
 
 const TOKEN_COOKIE: &str = "mushroomdb_token";
@@ -462,15 +496,16 @@ async fn query(
     };
 
     let rs = if is_write {
-        let mut g = state.db.write();
-        g.query_write(&cypher, &params)
+        let db = state.db.clone();
+        match blocking_write(move || db.write().query_write(&cypher, &params)).await {
+            Ok(rs) => rs,
+            Err(resp) => return resp,
+        }
     } else {
-        let g = state.db.read();
-        g.query(&cypher, &params)
-    };
-    let rs = match rs {
-        Ok(rs) => rs,
-        Err(e) => return graph_err(e),
+        match state.db.read().query(&cypher, &params) {
+            Ok(rs) => rs,
+            Err(e) => return graph_err(e),
+        }
     };
 
     match format {
@@ -524,17 +559,17 @@ async fn ingest(State(state): State<AppState>, Json(body): Json<Js>) -> Response
             Err(e) => return err_response(e),
         },
     };
-    let report = {
-        let mut g = state.db.write();
-        g.ingest_with_edges(&label, taken, &opts, &edges)
-    };
-    let report = report.map(|r| converted.into_report(r));
-    match report {
-        Ok(r) => match serde_json::to_value(&r) {
-            Ok(v) => json_ok(v),
-            Err(e) => err_response(e.to_string()),
-        },
-        Err(e) => graph_err(e),
+    let db = state.db.clone();
+    let report =
+        match blocking_write(move || db.write().ingest_with_edges(&label, taken, &opts, &edges))
+            .await
+        {
+            Ok(r) => converted.into_report(r),
+            Err(resp) => return resp,
+        };
+    match serde_json::to_value(&report) {
+        Ok(v) => json_ok(v),
+        Err(e) => err_response(e.to_string()),
     }
 }
 
@@ -568,13 +603,10 @@ async fn create_rule(State(state): State<AppState>, Json(body): Json<Js>) -> Res
         Err(e) => return err_response(e),
     };
     let name = def.name.clone();
-    let res = {
-        let mut g = state.db.write();
-        g.create_rule(def)
-    };
-    match res {
+    let db = state.db.clone();
+    match blocking_write(move || db.write().create_rule(def)).await {
         Ok(()) => json_ok(json!({"ok": true, "name": name})),
-        Err(e) => graph_err(e),
+        Err(resp) => resp,
     }
 }
 

@@ -2,6 +2,7 @@ use crate::ingest::{IngestOptions, IngestReport};
 use crate::subscription::{
     event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
 };
+use core_query::cypher::ast::ArithOp;
 use core_query::cypher::{
     execute, lex, parse, parse_write, plan, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern,
     Query, RetItem, RetVal, WriteStatement,
@@ -344,6 +345,365 @@ fn write_result_set() -> ResultSet {
     ])
 }
 
+fn resolve_merge_set_value(op: &Operand, params: &BTreeMap<String, Value>) -> Result<Value> {
+    match op {
+        Operand::Lit(v) => Ok(v.clone()),
+        Operand::Param(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| GraphError::QueryError {
+                detail: format!("missing parameter `{name}`"),
+            }),
+        _ => Err(GraphError::QueryError {
+            detail: "ON CREATE/ON MATCH SET value must be a literal or $parameter".into(),
+        }),
+    }
+}
+
+fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
+    match op {
+        Operand::Prop { var, .. } | Operand::Var(var) => {
+            if !out.contains(var) {
+                out.push(var.clone());
+            }
+        }
+        Operand::FuncCall { args, .. } => {
+            for arg in args {
+                operand_node_vars(arg, out);
+            }
+        }
+        Operand::BinArith { left, right, .. } => {
+            operand_node_vars(left, out);
+            operand_node_vars(right, out);
+        }
+        Operand::Lit(_) | Operand::Param(_) => {}
+    }
+}
+
+fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in items {
+        match &item.value {
+            RetVal::Var(v) | RetVal::Prop { var: v, .. } => {
+                if !out.contains(v) {
+                    out.push(v.clone());
+                }
+            }
+            RetVal::FuncCall { args, .. } => {
+                for arg in args {
+                    operand_node_vars(arg, &mut out);
+                }
+            }
+            RetVal::ScalarExpr(op) => operand_node_vars(op, &mut out),
+            RetVal::Agg { .. } => {}
+        }
+    }
+    out
+}
+
+fn add_var(out: &mut Vec<String>, v: &str) {
+    if !out.iter().any(|x| x == v) {
+        out.push(v.to_string());
+    }
+}
+
+fn pattern_node_vars(pats: &[Pattern]) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in pats {
+        if let Some(v) = &p.start.var {
+            add_var(&mut out, v);
+        }
+        for (_, dest) in &p.chain {
+            if let Some(v) = &dest.var {
+                add_var(&mut out, v);
+            }
+        }
+    }
+    out
+}
+
+fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in pats {
+        for (rel, _) in &p.chain {
+            if rel.hops.is_none() {
+                if let Some(v) = &rel.var {
+                    add_var(&mut out, v);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn rel_type_alias(var: &str) -> String {
+    format!("__rt_{var}")
+}
+
+fn ret_column_name(item: &RetItem) -> String {
+    if let Some(alias) = &item.alias {
+        return alias.clone();
+    }
+    match &item.value {
+        RetVal::Var(v) => v.clone(),
+        RetVal::Prop { var, field } => format!("{var}.{field}"),
+        RetVal::FuncCall { name, args } => {
+            let arg_strs: Vec<String> = args
+                .iter()
+                .map(|a| match a {
+                    Operand::Var(v) => v.clone(),
+                    Operand::Prop { var, field } => format!("{var}.{field}"),
+                    Operand::Lit(_) => "<lit>".to_string(),
+                    Operand::Param(p) => format!("${p}"),
+                    Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
+                    Operand::BinArith { .. } => "<arith>".to_string(),
+                })
+                .collect();
+            format!("{name}({})", arg_strs.join(", "))
+        }
+        RetVal::ScalarExpr(_) => "<expr>".to_string(),
+        RetVal::Agg { .. } => "<agg>".to_string(),
+    }
+}
+
+fn eval_set_return_operand<F: Fs>(
+    db: &GraphDb<F>,
+    match_rs: &ResultSet,
+    row: usize,
+    rel_vars: &[String],
+    op: &Operand,
+    params: &BTreeMap<String, Value>,
+) -> Result<Option<Value>> {
+    match op {
+        Operand::Lit(v) => Ok(Some(v.clone())),
+        Operand::Param(name) => params.get(name).cloned().ok_or_else(|| GraphError::QueryError {
+            detail: format!("missing parameter `{name}`"),
+        }).map(Some),
+        Operand::Var(name) if rel_vars.iter().any(|r| r == name) => Err(GraphError::QueryError {
+            detail: format!(
+                "cannot return relationship variable '{name}' bare; return its properties ({name}.field) instead"
+            ),
+        }),
+        Operand::Var(name) => Ok(match_rs.get(row, name).cloned()),
+        Operand::Prop { var, field } => {
+            if rel_vars.iter().any(|r| r == var) {
+                return Ok(None);
+            }
+            let Some(Value::Str(key)) = match_rs.get(row, var) else {
+                return Ok(None);
+            };
+            Ok(db.get_prop(key, field).cloned())
+        }
+        Operand::FuncCall { name, args } => {
+            eval_set_return_func(db, match_rs, row, rel_vars, name, args, params)
+        }
+        Operand::BinArith { op, left, right } => {
+            let lv = eval_set_return_operand(db, match_rs, row, rel_vars, left, params)?;
+            let rv = eval_set_return_operand(db, match_rs, row, rel_vars, right, params)?;
+            eval_set_return_arith(op, lv, rv)
+        }
+    }
+}
+
+fn eval_set_return_arith(
+    op: &ArithOp,
+    lv: Option<Value>,
+    rv: Option<Value>,
+) -> Result<Option<Value>> {
+    match (lv, rv) {
+        (None, _) | (_, None) => Ok(None),
+        (Some(Value::Int(a)), Some(Value::Int(b))) => {
+            let result = match op {
+                ArithOp::Sub => a.saturating_sub(b),
+                ArithOp::Mul => a.saturating_mul(b),
+                ArithOp::Add => a.saturating_add(b),
+                ArithOp::Div => {
+                    if b == 0 {
+                        return Err(GraphError::QueryError {
+                            detail: "division by zero".into(),
+                        });
+                    }
+                    a.checked_div(b).unwrap_or(i64::MAX)
+                }
+            };
+            Ok(Some(Value::Int(result)))
+        }
+        (Some(lv), Some(rv)) => {
+            let a = match &lv {
+                Value::Float(f) => *f,
+                Value::Int(i) => *i as f64,
+                _ => {
+                    return Err(GraphError::QueryError {
+                        detail: format!("arithmetic operand must be numeric, got {lv:?}"),
+                    })
+                }
+            };
+            let b = match &rv {
+                Value::Float(f) => *f,
+                Value::Int(i) => *i as f64,
+                _ => {
+                    return Err(GraphError::QueryError {
+                        detail: format!("arithmetic operand must be numeric, got {rv:?}"),
+                    })
+                }
+            };
+            let result = match op {
+                ArithOp::Sub => a - b,
+                ArithOp::Mul => a * b,
+                ArithOp::Add => a + b,
+                ArithOp::Div => {
+                    if b == 0.0 {
+                        return Err(GraphError::QueryError {
+                            detail: "division by zero".into(),
+                        });
+                    }
+                    a / b
+                }
+            };
+            Ok(Some(Value::Float(result)))
+        }
+    }
+}
+
+fn eval_set_return_func<F: Fs>(
+    db: &GraphDb<F>,
+    match_rs: &ResultSet,
+    row: usize,
+    rel_vars: &[String],
+    name: &str,
+    args: &[Operand],
+    params: &BTreeMap<String, Value>,
+) -> Result<Option<Value>> {
+    let norm = name.to_ascii_lowercase();
+    if norm == "type" {
+        if args.len() != 1 {
+            return Err(GraphError::QueryError {
+                detail: format!("type() requires exactly 1 argument, got {}", args.len()),
+            });
+        }
+        let Operand::Var(rel) = &args[0] else {
+            return Err(GraphError::QueryError {
+                detail: "type() argument must be a relationship variable (e.g. type(r))".into(),
+            });
+        };
+        return Ok(match_rs.get(row, &rel_type_alias(rel)).cloned());
+    }
+    let mut vals = Vec::with_capacity(args.len());
+    for arg in args {
+        vals.push(eval_set_return_operand(
+            db, match_rs, row, rel_vars, arg, params,
+        )?);
+    }
+    match norm.as_str() {
+        "tolower" => {
+            if vals.len() != 1 {
+                return Err(GraphError::QueryError {
+                    detail: format!("toLower() requires exactly 1 argument, got {}", vals.len()),
+                });
+            }
+            Ok(vals[0].clone().map(|val| match val {
+                Value::Str(s) => Value::Str(s.to_ascii_lowercase()),
+                other => other,
+            }))
+        }
+        "toupper" => {
+            if vals.len() != 1 {
+                return Err(GraphError::QueryError {
+                    detail: format!("toUpper() requires exactly 1 argument, got {}", vals.len()),
+                });
+            }
+            Ok(vals[0].clone().map(|val| match val {
+                Value::Str(s) => Value::Str(s.to_ascii_uppercase()),
+                other => other,
+            }))
+        }
+        "size" => match vals.first().cloned().flatten() {
+            None => Ok(None),
+            Some(Value::Str(s)) => Ok(Some(Value::Int(s.len() as i64))),
+            Some(Value::List(items)) => Ok(Some(Value::Int(items.len() as i64))),
+            Some(_) => Ok(None),
+        },
+        "coalesce" => Ok(vals.into_iter().flatten().next()),
+        "abs" => match vals.first().cloned().flatten() {
+            None => Ok(None),
+            Some(Value::Int(n)) => Ok(Some(Value::Int(n.saturating_abs()))),
+            Some(Value::Float(f)) => Ok(Some(Value::Float(f.abs()))),
+            Some(_) => Ok(None),
+        },
+        "round" => match vals.first().cloned().flatten() {
+            None => Ok(None),
+            Some(Value::Float(f)) => Ok(Some(Value::Float(f.round()))),
+            Some(Value::Int(n)) => Ok(Some(Value::Int(n))),
+            Some(_) => Ok(None),
+        },
+        _ => Err(GraphError::QueryError {
+            detail: format!(
+                "unknown function `{name}`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches"
+            ),
+        }),
+    }
+}
+
+fn eval_set_return_item<F: Fs>(
+    db: &GraphDb<F>,
+    match_rs: &ResultSet,
+    row: usize,
+    rel_vars: &[String],
+    item: &RetItem,
+    params: &BTreeMap<String, Value>,
+) -> Result<Option<Value>> {
+    match &item.value {
+        RetVal::Var(v) => eval_set_return_operand(
+            db,
+            match_rs,
+            row,
+            rel_vars,
+            &Operand::Var(v.clone()),
+            params,
+        ),
+        RetVal::Prop { var, field } => eval_set_return_operand(
+            db,
+            match_rs,
+            row,
+            rel_vars,
+            &Operand::Prop {
+                var: var.clone(),
+                field: field.clone(),
+            },
+            params,
+        ),
+        RetVal::FuncCall { name, args } => {
+            eval_set_return_func(db, match_rs, row, rel_vars, name, args, params)
+        }
+        RetVal::ScalarExpr(op) => eval_set_return_operand(db, match_rs, row, rel_vars, op, params),
+        RetVal::Agg { .. } => Err(GraphError::QueryError {
+            detail: "aggregates are not supported in MATCH … SET … RETURN".into(),
+        }),
+    }
+}
+
+/// Project user RETURN from original MATCH rows after SET. No rematch.
+fn project_set_return_rows<F: Fs>(
+    db: &GraphDb<F>,
+    rel_vars: &[String],
+    match_rs: &ResultSet,
+    returns: &[RetItem],
+    params: &BTreeMap<String, Value>,
+) -> Result<ResultSet> {
+    let columns: Vec<String> = returns.iter().map(ret_column_name).collect();
+    let mut out = ResultSet::new(columns);
+    for row in 0..match_rs.len() {
+        let mut cells = Vec::with_capacity(returns.len());
+        for item in returns {
+            cells.push(eval_set_return_item(
+                db, match_rs, row, rel_vars, item, params,
+            )?);
+        }
+        out.push_row(cells);
+    }
+    Ok(out)
+}
+
 /// Single construction point for a `GraphMut` view over the split-borrowed graph fields.
 /// Callers use `std::mem::take` on the engine before calling this, then restore it after.
 fn make_graph_mut<'a>(
@@ -364,6 +724,25 @@ fn make_graph_mut<'a>(
     }
 }
 
+/// When [`GraphDb`] calls `Fs::sync` after a WAL append.
+///
+/// Default is [`Strict`](FsyncPolicy::Strict): every `log_then_apply_with`
+/// fsyncs (single `insert_node` / `set_prop`). Ingest and `write_batch`
+/// emit one `WalRecord::Batch` and fsync once at that frame (Batched).
+/// [`Relaxed`](FsyncPolicy::Relaxed) skips WAL sync; [`GraphDb::snapshot`]
+/// is still durable via `write_atomic`. Crash-recovery DST stays Strict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FsyncPolicy {
+    /// Every WAL commit calls `fs.sync` (today's behavior).
+    #[default]
+    Strict,
+    /// Sync only at a `Batch` frame end. Single-op path stays Strict unless
+    /// this policy is set on the database.
+    Batched,
+    /// Never call `fs.sync`. [`GraphDb::snapshot`] still syncs via `write_atomic`.
+    Relaxed,
+}
+
 pub struct GraphDb<F: Fs> {
     fs: F,
     ids: IdMap,
@@ -378,6 +757,8 @@ pub struct GraphDb<F: Fs> {
     /// Rebuild-on-open: populated from WAL replay + rebuild_all at open end.
     fulltext: FulltextIndex,
     event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
+    /// WAL fsync cadence. Default [`FsyncPolicy::Strict`].
+    fsync: FsyncPolicy,
     /// Monotonically increasing per-commit counter.  A single `log_then_apply_with`
     /// call increments this once; all events emitted from that call share the same
     /// `commit_seq` value.
@@ -452,6 +833,7 @@ impl<F: Fs> GraphDb<F> {
             view_store: ViewStore::new(),
             fulltext: FulltextIndex::new(),
             event_sink: None,
+            fsync: FsyncPolicy::Strict,
             commit_seq: 0,
             subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -567,6 +949,7 @@ impl<F: Fs> GraphDb<F> {
             view_store: ViewStore::new(),
             fulltext: FulltextIndex::new(),
             event_sink: None,
+            fsync: FsyncPolicy::Strict,
             commit_seq: 0,
             subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -1179,7 +1562,15 @@ impl<F: Fs> GraphDb<F> {
     /// Durable write, then notify the event sink. Replay (`apply` during
     /// `open`) never enters this function, so it is the replay-silent seam.
     fn log_then_apply(&mut self, rec: WalRecord) -> Result<()> {
-        self.log_then_apply_with(rec, None)
+        self.log_then_apply_with(rec, None, self.fsync)
+    }
+
+    fn wal_needs_sync(policy: FsyncPolicy, rec: &WalRecord) -> bool {
+        match policy {
+            FsyncPolicy::Relaxed => false,
+            FsyncPolicy::Strict => true,
+            FsyncPolicy::Batched => matches!(rec, WalRecord::Batch(_)),
+        }
     }
 
     /// # Apply-infallibility invariant (load-bearing)
@@ -1207,6 +1598,7 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         rec: WalRecord,
         ingest: Option<(String, usize)>,
+        policy: FsyncPolicy,
     ) -> Result<()> {
         // Read-only guard: as-of instances must never write the WAL.
         if self.read_only {
@@ -1224,7 +1616,9 @@ impl<F: Fs> GraphDb<F> {
              the caller must drain_deltas() on any error path before returning"
         );
         self.fs.append(FileId::Wal, &encode_record(&rec))?;
-        self.fs.sync(FileId::Wal)?; // strict policy in plan 1
+        if Self::wal_needs_sync(policy, &rec) {
+            self.fs.sync(FileId::Wal)?;
+        }
         let apply_result = self.apply(&rec);
         // For Batch frames, post-validation apply must be infallible (see above).
         // A debug_assert here catches any future change that makes apply fallible
@@ -1299,6 +1693,11 @@ impl<F: Fs> GraphDb<F> {
     /// Whether a post-commit event sink is currently installed.
     pub fn has_event_sink(&self) -> bool {
         self.event_sink.is_some()
+    }
+
+    /// Set WAL fsync cadence. Default [`FsyncPolicy::Strict`].
+    pub fn set_fsync_policy(&mut self, p: FsyncPolicy) {
+        self.fsync = p;
     }
 
     fn emit(&self, ev: MutationEvent) {
@@ -1768,7 +2167,13 @@ impl<F: Fs> GraphDb<F> {
             .iter()
             .filter(|r| matches!(r, WalRecord::InsertEdge { .. }))
             .count();
-        self.log_then_apply_with(WalRecord::Batch(recs), ingest)?;
+        // Ingest / write_batch / query_write: one Batch frame. Strict and
+        // Batched both fsync once at frame end; Relaxed still skips.
+        let policy = match self.fsync {
+            FsyncPolicy::Relaxed => FsyncPolicy::Relaxed,
+            FsyncPolicy::Strict | FsyncPolicy::Batched => FsyncPolicy::Batched,
+        };
+        self.log_then_apply_with(WalRecord::Batch(recs), ingest, policy)?;
         Ok((nodes_inserted, edges_inserted))
     }
 
@@ -2526,11 +2931,10 @@ impl<F: Fs> GraphDb<F> {
     /// over `self.view()` — the borrow is dropped before the batch is opened.
     ///
     /// **Limitations (v1)**:
-    /// - SET RHS must be a literal; expression RHS → named error.
-    /// - Combined read-write (`MATCH…SET…RETURN`) → named error.
+    /// - SET RHS must be a literal, `$param`, or arithmetic; bare property copy → named error.
     /// - `DETACH DELETE n` → calls `delete_node` for each matched node (removes all edges).
     /// - Bare `DELETE n` → error if n has any incident edges; succeeds for isolated nodes.
-    /// - MERGE with ON CREATE/ON MATCH → named error.
+    /// - MERGE supports `ON CREATE SET` / `ON MATCH SET` in the same write batch.
     /// - Deleting a derived edge → named error "cannot delete derived edge".
     pub fn query_write(
         &mut self,
@@ -2642,6 +3046,7 @@ impl<F: Fs> GraphDb<F> {
                 post_unwind_where: None,
                 stages: vec![],
                 returns,
+                distinct: false,
                 order_by: vec![],
                 skip: None,
                 limit: None,
@@ -2670,18 +3075,32 @@ impl<F: Fs> GraphDb<F> {
         stmt: core_query::cypher::MatchSetStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
-        // Collect unique node vars targeted by SET clauses.
+        let project_returns = stmt.returns.clone();
+        // Collect unique node vars targeted by SET clauses, plus RETURN bindings
+        // so the post-write projection can look them up by key.
         let mut set_vars: Vec<String> = Vec::new();
         for s in &stmt.sets {
             if !set_vars.contains(&s.var) {
                 set_vars.push(s.var.clone());
             }
         }
+        let rel_vars = pattern_rel_vars(&stmt.matches);
+        let mut lookup_vars = set_vars.clone();
+        for v in pattern_node_vars(&stmt.matches) {
+            add_var(&mut lookup_vars, &v);
+        }
+        if let Some(ref returns) = project_returns {
+            for v in ret_node_vars(returns) {
+                if !rel_vars.iter().any(|r| r == &v) {
+                    add_var(&mut lookup_vars, &v);
+                }
+            }
+        }
 
-        // Synthesize a read query: MATCH … WHERE … RETURN <set_vars>, <set_values…>
+        // Synthesize a read query: MATCH … WHERE … RETURN <lookup_vars>, <set_values…>
         // SET values are projected as ScalarExpr items so that arithmetic expressions
         // (e.g. `SET n.score = n.score * 1.5`) are evaluated in the matched-row context.
-        let mut returns: Vec<RetItem> = set_vars
+        let mut set_returns: Vec<RetItem> = lookup_vars
             .iter()
             .map(|v| RetItem {
                 value: RetVal::Var(v.clone()),
@@ -2696,20 +3115,31 @@ impl<F: Fs> GraphDb<F> {
             .map(|(i, _)| format!("__sv_{i}"))
             .collect();
         for (sc, col) in stmt.sets.iter().zip(&set_val_cols) {
-            returns.push(RetItem {
+            set_returns.push(RetItem {
                 value: RetVal::ScalarExpr(sc.value.clone()),
                 alias: Some(col.clone()),
             });
         }
+        // Capture relationship types while r is bound; SET does not change them.
+        for r in &rel_vars {
+            set_returns.push(RetItem {
+                value: RetVal::FuncCall {
+                    name: "type".into(),
+                    args: vec![Operand::Var(r.clone())],
+                },
+                alias: Some(rel_type_alias(r)),
+            });
+        }
 
         let read_q = Query {
-            matches: stmt.matches,
+            matches: stmt.matches.clone(),
             optional_clauses: vec![],
-            where_expr: stmt.where_expr,
+            where_expr: stmt.where_expr.clone(),
             unwinds: vec![],
             post_unwind_where: None,
             stages: vec![],
-            returns,
+            returns: set_returns,
+            distinct: false,
             order_by: vec![],
             skip: None,
             limit: None,
@@ -2762,6 +3192,10 @@ impl<F: Fs> GraphDb<F> {
         }
         batch.commit()?;
 
+        if let Some(returns) = project_returns {
+            return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
+        }
+
         let mut rs = write_result_set();
         rs.push_row(vec![
             Some(Value::Int(0)),
@@ -2803,6 +3237,7 @@ impl<F: Fs> GraphDb<F> {
             post_unwind_where: None,
             stages: vec![],
             returns,
+            distinct: false,
             order_by: vec![],
             skip: None,
             limit: None,
@@ -2896,6 +3331,7 @@ impl<F: Fs> GraphDb<F> {
             post_unwind_where: None,
             stages: vec![],
             returns,
+            distinct: false,
             order_by: vec![],
             skip: None,
             limit: None,
@@ -2983,13 +3419,38 @@ impl<F: Fs> GraphDb<F> {
             }
         };
 
+        if let Some(var) = stmt.var.as_deref() {
+            for sc in stmt.on_create.iter().chain(&stmt.on_match) {
+                if sc.var != var {
+                    return Err(GraphError::QueryError {
+                        detail: format!(
+                            "SET variable '{}' does not match MERGE variable '{var}'",
+                            sc.var
+                        ),
+                    });
+                }
+            }
+        }
+
+        let existed = self.has_node(&key);
         let mut created = 0i64;
-        if !self.has_node(&key) {
-            let props = vec![(stmt.key_field.clone(), stmt.key_value.clone())];
-            self.batch()
-                .insert_node(&stmt.label, &key, props)
-                .commit()?;
-            created = 1;
+        if !existed || !stmt.on_match.is_empty() {
+            let mut batch = self.batch();
+            if !existed {
+                let props = vec![(stmt.key_field.clone(), stmt.key_value.clone())];
+                batch.insert_node(&stmt.label, &key, props);
+                for sc in &stmt.on_create {
+                    let value = resolve_merge_set_value(&sc.value, params)?;
+                    batch.set_prop(&key, &sc.field, value);
+                }
+                created = 1;
+            } else {
+                for sc in &stmt.on_match {
+                    let value = resolve_merge_set_value(&sc.value, params)?;
+                    batch.set_prop(&key, &sc.field, value);
+                }
+            }
+            batch.commit()?;
         }
 
         // Optional RETURN clause: project the node (created or matched) as a read result.
@@ -3011,6 +3472,7 @@ impl<F: Fs> GraphDb<F> {
                 post_unwind_where: None,
                 stages: vec![],
                 returns,
+                distinct: false,
                 order_by: vec![],
                 skip: None,
                 limit: None,
@@ -3174,6 +3636,14 @@ impl<F: Fs> GraphDb<F> {
         F: FsIntrospect,
     {
         self.fs.total_appended()
+    }
+
+    /// Test-support: successful `Fs::sync` calls (SimFs / counting fs).
+    pub fn fs_sync_count(&self) -> usize
+    where
+        F: FsIntrospect,
+    {
+        self.fs.sync_count()
     }
 
     /// Consume the db, returning its fs (for crash simulation).

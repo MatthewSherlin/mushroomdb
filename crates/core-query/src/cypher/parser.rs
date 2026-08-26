@@ -139,7 +139,7 @@ impl<'a> Parser<'a> {
         while self.peek() == Some(&Tok::With) {
             stages.push(self.with_stage()?);
         }
-        let returns = self.return_clause()?;
+        let (distinct, returns) = self.return_clause()?;
         let aliases: Vec<&str> = returns.iter().filter_map(|r| r.alias.as_deref()).collect();
         let order_by = if self.peek() == Some(&Tok::Order) {
             self.order_clause(&aliases)?
@@ -157,7 +157,7 @@ impl<'a> Parser<'a> {
             None
         };
         if self.pos < self.toks.len() {
-            return Err(self.err("unexpected tokens after query"));
+            return Err(self.unsupported_or_unexpected("unexpected tokens after query"));
         }
         Ok(Query {
             matches,
@@ -167,10 +167,37 @@ impl<'a> Parser<'a> {
             post_unwind_where,
             stages,
             returns,
+            distinct,
             order_by,
             skip,
             limit,
         })
+    }
+
+    /// Named errors for still-unsupported Cypher forms (`UNION`, `CASE`).
+    fn unsupported_or_unexpected(&self, msg: &str) -> String {
+        match self.peek() {
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("union") => {
+                "UNION is not supported".to_string()
+            }
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("case") => {
+                "CASE is not supported".to_string()
+            }
+            _ => self.err(msg),
+        }
+    }
+
+    /// Consume an identifier keyword (case-insensitive). Keywords that are
+    /// not lexer tokens (`IN`, `DISTINCT`, `ON`) stay `Ident` so they can
+    /// still be used as variable names in other positions.
+    fn eat_ident_kw(&mut self, kw: &str) -> bool {
+        if let Some(Tok::Ident(s)) = self.peek() {
+            if s.eq_ignore_ascii_case(kw) {
+                self.pos += 1;
+                return true;
+            }
+        }
+        false
     }
 
     /// Parse one `OPTIONAL MATCH pattern [WHERE expr]` clause.
@@ -606,6 +633,11 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        // `IN [a, b, $p]` or `IN $list`.
+        if self.eat_ident_kw("in") {
+            let list = self.in_list()?;
+            return Ok(Expr::In { expr: lhs, list });
+        }
         // If no comparison operator follows, treat the operand as a standalone
         // boolean predicate (Expr::Truthy).  This enables:
         //   WHERE textMatches(n.bio, 'query')
@@ -616,6 +648,26 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Cmp { lhs, op, rhs })
             }
             Err(_) => Ok(Expr::Truthy(lhs)),
+        }
+    }
+
+    /// Parse the list operand of `IN`: `[a, b, $p]` or a single operand (`$cities`).
+    fn in_list(&mut self) -> Result<Vec<Operand>, String> {
+        if self.eat(&Tok::LBracket) {
+            let mut items = Vec::new();
+            if !self.eat(&Tok::RBracket) {
+                loop {
+                    items.push(self.arith_expr()?);
+                    if self.eat(&Tok::Comma) {
+                        continue;
+                    }
+                    self.expect(&Tok::RBracket, "expected ']' to close IN list")?;
+                    break;
+                }
+            }
+            Ok(items)
+        } else {
+            Ok(vec![self.arith_expr()?])
         }
     }
 
@@ -751,6 +803,12 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::Ident(_)) => {
                 let name = self.ident("expected identifier")?;
+                if name.eq_ignore_ascii_case("case") {
+                    return Err("CASE is not supported".to_string());
+                }
+                if name.eq_ignore_ascii_case("collect") && self.peek() == Some(&Tok::LParen) {
+                    return Err("collect() is not supported".to_string());
+                }
                 if self.peek() == Some(&Tok::LParen) {
                     // Scalar function call: name(arg, ...)
                     // Function arguments may be arbitrary arithmetic expressions.
@@ -788,8 +846,19 @@ impl<'a> Parser<'a> {
         self.arith_expr()
     }
 
-    fn return_clause(&mut self) -> Result<Vec<RetItem>, String> {
-        self.expect(&Tok::Return, "expected RETURN")?;
+    fn return_clause(&mut self) -> Result<(bool, Vec<RetItem>), String> {
+        if !self.eat(&Tok::Return) {
+            return Err(self.unsupported_or_unexpected("expected RETURN"));
+        }
+        let distinct = self.eat_ident_kw("distinct");
+        let mut items = vec![self.ret_item()?];
+        while self.eat(&Tok::Comma) {
+            items.push(self.ret_item()?);
+        }
+        Ok((distinct, items))
+    }
+
+    fn return_items(&mut self) -> Result<Vec<RetItem>, String> {
         let mut items = vec![self.ret_item()?];
         while self.eat(&Tok::Comma) {
             items.push(self.ret_item()?);
@@ -929,11 +998,7 @@ impl<'a> Parser<'a> {
         let mut stmt = self.create_pattern()?;
         // Optional RETURN clause: `CREATE (n:L {…}) RETURN n` or `RETURN n.id AS id`.
         if self.eat(&Tok::Return) {
-            let mut items = vec![self.ret_item()?];
-            while self.eat(&Tok::Comma) {
-                items.push(self.ret_item()?);
-            }
-            stmt.returns = Some(items);
+            stmt.returns = Some(self.return_items()?);
         }
         if self.pos < self.toks.len() {
             return Err(self.err("unexpected tokens after CREATE"));
@@ -1132,27 +1197,27 @@ impl<'a> Parser<'a> {
             ));
         }
         self.expect(&Tok::RParen, "expected ')' to close MERGE pattern")?;
-        // ON CREATE / ON MATCH: not supported
-        if let Some(Tok::Ident(s)) = self.peek() {
-            if s.eq_ignore_ascii_case("on") {
-                return Err(
-                    "ON CREATE SET / ON MATCH SET are not supported in MERGE (v1 limitation)"
-                        .to_string(),
-                );
+        let mut on_create = Vec::new();
+        let mut on_match = Vec::new();
+        while self.eat_ident_kw("on") {
+            if self.eat(&Tok::Create) {
+                self.expect(&Tok::Set, "expected SET after ON CREATE")?;
+                on_create.extend(self.set_clauses()?);
+            } else if self.eat(&Tok::Match) {
+                self.expect(&Tok::Set, "expected SET after ON MATCH")?;
+                on_match.extend(self.set_clauses()?);
+            } else {
+                return Err(self.err("expected CREATE or MATCH after ON"));
             }
         }
         // Optional RETURN clause.
         let returns = if self.eat(&Tok::Return) {
-            let mut items = vec![self.ret_item()?];
-            while self.eat(&Tok::Comma) {
-                items.push(self.ret_item()?);
-            }
-            Some(items)
+            Some(self.return_items()?)
         } else {
             None
         };
         if self.pos < self.toks.len() {
-            return Err(self.err("unexpected tokens after MERGE"));
+            return Err(self.unsupported_or_unexpected("unexpected tokens after MERGE"));
         }
         let (key_field, key_value) = props.remove(0);
         Ok(WriteStatement::Merge(MergeStmt {
@@ -1160,6 +1225,8 @@ impl<'a> Parser<'a> {
             key_field,
             key_value,
             var,
+            on_create,
+            on_match,
             returns,
         }))
     }
@@ -1186,13 +1253,19 @@ impl<'a> Parser<'a> {
             Some(Tok::Set) => {
                 self.pos += 1; // consume SET
                 let sets = self.set_clauses()?;
+                let returns = if self.eat(&Tok::Return) {
+                    Some(self.return_items()?)
+                } else {
+                    None
+                };
                 if self.pos < self.toks.len() {
-                    return Err(self.err("unexpected tokens after SET; combined read-write (MATCH…SET…RETURN) is not supported in v1"));
+                    return Err(self.unsupported_or_unexpected("unexpected tokens after SET"));
                 }
                 Ok(WriteStatement::MatchSet(MatchSetStmt {
                     matches,
                     where_expr,
                     sets,
+                    returns,
                 }))
             }
             Some(Tok::Detach) => {
@@ -1564,6 +1637,7 @@ SKIP 1 LIMIT 5";
                     descending: false,
                 },
             ],
+            distinct: false,
             skip: Some(LimitSkip::Exact(1)),
             limit: Some(LimitSkip::Exact(5)),
         };
@@ -1780,6 +1854,7 @@ LIMIT 10";
                     descending: true,
                 },
             ],
+            distinct: false,
             skip: None,
             limit: Some(LimitSkip::Exact(10)),
         };
@@ -2007,6 +2082,103 @@ LIMIT 10";
             is_write_tokens(&toks),
             "CREATE...RETURN must still be classified as write"
         );
+    }
+
+    #[test]
+    fn where_in_list_and_param_parses() {
+        let q = parse_src("MATCH (n) WHERE n.city IN ['Austin', $c] RETURN n").unwrap();
+        match q.where_expr {
+            Some(Expr::In { expr, list }) => {
+                assert_eq!(
+                    expr,
+                    Operand::Prop {
+                        var: "n".into(),
+                        field: "city".into()
+                    }
+                );
+                assert_eq!(list.len(), 2);
+                assert_eq!(list[0], Operand::Lit(Value::Str("Austin".into())));
+                assert_eq!(list[1], Operand::Param("c".into()));
+            }
+            other => panic!("expected Expr::In, got {other:?}"),
+        }
+        let q2 = parse_src("MATCH (n) WHERE n.city IN $cities RETURN n").unwrap();
+        match q2.where_expr {
+            Some(Expr::In { list, .. }) => {
+                assert_eq!(list, vec![Operand::Param("cities".into())]);
+            }
+            other => panic!("expected Expr::In, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_distinct_parses() {
+        let q = parse_src("MATCH (n) RETURN DISTINCT n.city").unwrap();
+        assert!(q.distinct);
+        assert_eq!(q.returns.len(), 1);
+    }
+
+    #[test]
+    fn union_case_collect_are_named_errors() {
+        let err = parse_src("MATCH (n) RETURN n UNION MATCH (m) RETURN m").unwrap_err();
+        assert!(
+            err.contains("UNION"),
+            "UNION must be a named error, got: {err}"
+        );
+        let err = parse_src("MATCH (n) RETURN CASE WHEN n.x = 1 THEN 2 ELSE 3 END").unwrap_err();
+        assert!(
+            err.contains("CASE"),
+            "CASE must be a named error, got: {err}"
+        );
+        let err = parse_src("MATCH (n) RETURN collect(n)").unwrap_err();
+        assert!(
+            err.contains("collect"),
+            "collect() must be a named error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn match_set_return_parses() {
+        use super::parse_write;
+        use crate::cypher::ast::{RetVal, WriteStatement};
+
+        let toks = crate::cypher::lex("MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x").unwrap();
+        let stmt = parse_write(&toks).unwrap();
+        match stmt {
+            WriteStatement::MatchSet(s) => {
+                let returns = s.returns.expect("RETURN required");
+                assert_eq!(
+                    returns[0].value,
+                    RetVal::Prop {
+                        var: "n".into(),
+                        field: "x".into()
+                    }
+                );
+            }
+            other => panic!("expected MatchSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_on_create_and_on_match_parse() {
+        use super::parse_write;
+        use crate::cypher::ast::WriteStatement;
+
+        let toks = crate::cypher::lex(
+            "MERGE (n:L {id:'new'}) ON CREATE SET n.born = 1 ON MATCH SET n.hit = 1 RETURN n",
+        )
+        .unwrap();
+        let stmt = parse_write(&toks).unwrap();
+        match stmt {
+            WriteStatement::Merge(s) => {
+                assert_eq!(s.on_create.len(), 1);
+                assert_eq!(s.on_create[0].field, "born");
+                assert_eq!(s.on_match.len(), 1);
+                assert_eq!(s.on_match[0].field, "hit");
+                assert!(s.returns.is_some());
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
     }
 
     #[test]

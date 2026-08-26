@@ -413,6 +413,76 @@ fn emb(xs: &[f64]) -> Value {
     Value::List(xs.iter().copied().map(Value::Float).collect())
 }
 
+/// All(VectorSimilar, FieldEqual) must Intersect indexes, not ScanAll via parts[0].
+/// Extra candidates are allowed; missing a true match is not.
+#[test]
+fn all_vector_then_field_equal_does_not_scan_all() {
+    let dir = tmp("all-vec-fe");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_rule(RuleDef {
+        name: "fit".into(),
+        src_label: "Person".into(),
+        dst_label: "Org".into(),
+        predicate: Predicate::All(vec![
+            Predicate::VectorSimilar {
+                field: "e".into(),
+                min: 0.8,
+            },
+            Predicate::FieldEqual {
+                field: "industry".into(),
+            },
+        ]),
+        edge_type: "FIT".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+    })
+    .unwrap();
+
+    db.insert_node(
+        "Person",
+        "p",
+        vec![
+            ("e".into(), emb(&[1.0, 0.0])),
+            ("industry".into(), Value::Str("tech".into())),
+        ],
+    )
+    .unwrap();
+    // Matching industry, cosine 0 < 0.8 → no edge.
+    db.insert_node(
+        "Org",
+        "low_cos",
+        vec![
+            ("e".into(), emb(&[0.0, 1.0])),
+            ("industry".into(), Value::Str("tech".into())),
+        ],
+    )
+    .unwrap();
+    // Cosine 1.0, different industry → no edge.
+    db.insert_node(
+        "Org",
+        "wrong_ind",
+        vec![
+            ("e".into(), emb(&[1.0, 0.0])),
+            ("industry".into(), Value::Str("law".into())),
+        ],
+    )
+    .unwrap();
+    // Both match → edge.
+    db.insert_node(
+        "Org",
+        "both",
+        vec![
+            ("e".into(), emb(&[1.0, 0.0])),
+            ("industry".into(), Value::Str("tech".into())),
+        ],
+    )
+    .unwrap();
+
+    let out = db.neighbors("p", "FIT", Direction::Out).unwrap();
+    assert_eq!(out, vec!["both".to_string()]);
+}
+
 fn approx_vec_rule() -> RuleDef {
     RuleDef {
         name: "sim".into(),

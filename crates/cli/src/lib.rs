@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Deterministic demo: 10 Orgs, 20 Projects, 30 People.
 pub const N_ORGS: usize = 10;
@@ -58,6 +59,8 @@ pub enum Command {
         demo_if_empty: bool,
         /// Bearer token for non-loopback binds. Loopback may omit it.
         token: Option<String>,
+        /// Periodic snapshot cadence. `None` = off (default).
+        snapshot_every: Option<Duration>,
     },
     Mcp {
         db_dir: PathBuf,
@@ -143,7 +146,7 @@ pub fn usage() -> &'static str {
 mushroomdb — embedded graph database
 
 Usage:
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty]
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
   mushroomdb mcp <db-dir>
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
@@ -193,6 +196,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut saw_no_ui = false;
     let mut demo_if_empty = false;
     let mut token = None;
+    let mut snapshot_every = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -235,6 +239,16 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--token=") {
             token = Some(val.to_string());
             i += 1;
+        } else if a == "--snapshot-every" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --snapshot-every".to_string())?;
+            snapshot_every = Some(parse_snapshot_every(val)?);
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--snapshot-every=") {
+            snapshot_every = Some(parse_snapshot_every(val)?);
+            i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -254,7 +268,18 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         ui,
         demo_if_empty,
         token,
+        snapshot_every,
     })
+}
+
+fn parse_snapshot_every(val: &str) -> Result<Duration, String> {
+    let secs: u64 = val
+        .parse()
+        .map_err(|_| format!("invalid --snapshot-every: {val}"))?;
+    if secs == 0 {
+        return Err("--snapshot-every must be a positive number of seconds".into());
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 /// `--ui <dir>` must be a directory that contains `index.html`.
@@ -1119,12 +1144,14 @@ mod tests {
                         ui,
                         demo_if_empty,
                         token,
+                        snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, default_bind());
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
                         assert_eq!(token, None);
+                        assert_eq!(snapshot_every, None);
                     }
                     other => panic!("serve <dir> → Serve default addr, got {other:?}"),
                 },
@@ -1138,12 +1165,14 @@ mod tests {
                         ui,
                         demo_if_empty,
                         token,
+                        snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
                         assert_eq!(token, None);
+                        assert_eq!(snapshot_every, None);
                     }
                     other => panic!("serve --addr after dir, got {other:?}"),
                 },
@@ -1157,12 +1186,14 @@ mod tests {
                         ui,
                         demo_if_empty,
                         token,
+                        snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, "127.0.0.1:9090".parse().unwrap());
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
                         assert_eq!(token, None);
+                        assert_eq!(snapshot_every, None);
                     }
                     other => panic!("serve --addr=VALUE, got {other:?}"),
                 },
@@ -1341,12 +1372,14 @@ mod tests {
                         demo_if_empty,
                         ui,
                         token,
+                        snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/data"));
                         assert_eq!(addr, "0.0.0.0:8080".parse().unwrap());
                         assert!(demo_if_empty);
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert_eq!(token, None);
+                        assert_eq!(snapshot_every, None);
                     }
                     other => panic!("serve --demo-if-empty docker default, got {other:?}"),
                 },
@@ -1366,6 +1399,43 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn serve_snapshot_every_parses_seconds() {
+        match parse_args(&["serve", "/tmp/db", "--snapshot-every", "30"]).unwrap() {
+            Command::Serve { snapshot_every, .. } => {
+                assert_eq!(snapshot_every, Some(Duration::from_secs(30)));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db", "--snapshot-every=5"]).unwrap() {
+            Command::Serve { snapshot_every, .. } => {
+                assert_eq!(snapshot_every, Some(Duration::from_secs(5)));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db"]).unwrap() {
+            Command::Serve { snapshot_every, .. } => {
+                assert_eq!(snapshot_every, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        let err = parse_args(&["serve", "/tmp/db", "--snapshot-every"]).unwrap_err();
+        assert!(
+            err.contains("snapshot-every"),
+            "missing value should name the flag, got {err}"
+        );
+        let err = parse_args(&["serve", "/tmp/db", "--snapshot-every", "0"]).unwrap_err();
+        assert!(
+            err.contains("snapshot-every"),
+            "zero should be rejected, got {err}"
+        );
+        let err = parse_args(&["serve", "/tmp/db", "--snapshot-every", "nope"]).unwrap_err();
+        assert!(
+            err.contains("snapshot-every"),
+            "invalid value should name the flag, got {err}"
+        );
     }
 
     #[test]
@@ -1438,6 +1508,7 @@ mod tests {
             "--no-ui",
             "--demo-if-empty",
             "--token",
+            "--snapshot-every",
         ] {
             assert!(
                 text.contains(word),

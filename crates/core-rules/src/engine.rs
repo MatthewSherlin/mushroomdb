@@ -116,40 +116,16 @@ fn candidate_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
 
 /// Rule-aware src-side lookup spec. KeyMatch is still exact on the src side
 /// regardless of `approximate` (the approximation is on the dst candidate set).
-/// For KeyMatch, src side is indexed as Scalar (FK field value → node bucket).
-/// For all other predicates with `approximate=false`, delegates to `candidate_spec`;
-/// with `approximate=true`, delegates to `candidate_spec_approx`.
+/// For KeyMatch-rooted predicates, src side is indexed as Scalar (FK field
+/// value → node bucket) so reverse lookup uses the dst key. Non-KeyMatch
+/// `All` uses the full [`candidate_spec_for`] Intersect (not `parts[0]`).
 fn src_lookup_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
-    match &def.predicate {
-        Predicate::KeyMatch { field } => CandidateSpec::Scalar { field },
-        Predicate::All(parts) => {
-            debug_assert!(!parts.is_empty(), "validated predicate required");
-            src_lookup_spec_for_pred(def.approximate, &parts[0])
-        }
-        other => {
-            if def.approximate {
-                candidate_spec_approx(other)
-            } else {
-                candidate_spec(other)
-            }
-        }
-    }
-}
-
-fn src_lookup_spec_for_pred(approximate: bool, p: &Predicate) -> CandidateSpec<'_> {
-    match p {
-        Predicate::KeyMatch { field } => CandidateSpec::Scalar { field },
-        Predicate::All(parts) => {
-            debug_assert!(!parts.is_empty());
-            src_lookup_spec_for_pred(approximate, &parts[0])
-        }
-        other => {
-            if approximate {
-                candidate_spec_approx(other)
-            } else {
-                candidate_spec(other)
-            }
-        }
+    if is_keymatch_rooted(&def.predicate) {
+        let field =
+            keymatch_field(&def.predicate).expect("keymatch-rooted predicate has a KeyMatch field");
+        CandidateSpec::Scalar { field }
+    } else {
+        candidate_spec_for(def)
     }
 }
 
@@ -194,20 +170,20 @@ fn compute_desired(
 
     let spec = candidate_spec_for(def);
     let candidates: BTreeSet<u32> = if on_src_side {
-        match &spec {
-            CandidateSpec::ByKey => {
-                // KeyMatch src→dst: look up the dst node directly by FK field value.
-                let field =
-                    keymatch_field(&def.predicate).expect("ByKey always comes from KeyMatch");
-                match n_get(field) {
-                    Some(Value::Str(ref target_key)) => match g.ids.get(target_key) {
-                        Some(dst_id) => std::iter::once(dst_id).collect(),
-                        None => BTreeSet::new(),
-                    },
-                    _ => BTreeSet::new(),
-                }
+        if is_keymatch_rooted(&def.predicate) {
+            // KeyMatch src→dst: look up the dst node directly by FK field value.
+            // Covers `ByKey` and `All` whose first conjunct is KeyMatch
+            // (`Intersect([ByKey, …])`); evaluate() filters remaining conjuncts.
+            let field = keymatch_field(&def.predicate).expect("ByKey always comes from KeyMatch");
+            match n_get(field) {
+                Some(Value::Str(ref target_key)) => match g.ids.get(target_key) {
+                    Some(dst_id) => std::iter::once(dst_id).collect(),
+                    None => BTreeSet::new(),
+                },
+                _ => BTreeSet::new(),
             }
-            _ => index.dst_side.candidates(&spec, &n_get),
+        } else {
+            index.dst_side.candidates(&spec, &n_get)
         }
     } else {
         // n is dst: probe src_side to find src candidates.

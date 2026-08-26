@@ -577,21 +577,35 @@ fn merge_skips_when_present() {
 }
 
 #[test]
-fn merge_on_create_set_is_error() {
+fn merge_on_create_set() {
     let mut db = GraphDb::open(&tmp("merge-on-create")).unwrap();
-    let err = db
-        .query_write(
-            "MERGE (n:Person {id: 'x'}) ON CREATE SET n.x = 1",
-            &no_params(),
-        )
-        .unwrap_err();
-    let detail = match err {
-        GraphError::QueryError { detail } => detail,
-        other => panic!("expected QueryError, got {other:?}"),
-    };
-    assert!(
-        detail.contains("ON CREATE") || detail.contains("not supported"),
-        "error must mention ON CREATE limitation, got: {detail}"
+    db.query_write(
+        "MERGE (n:L {id:'new'}) ON CREATE SET n.born = 1 RETURN n",
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        db.node_info("new").unwrap().props.get("born"),
+        Some(&Value::Int(1))
+    );
+
+    // Same MERGE with both ON CREATE SET and ON MATCH SET: second call is a
+    // match, so ON MATCH fires and ON CREATE does not.
+    db.query_write(
+        "MERGE (n:L {id:'new'}) ON CREATE SET n.born = 99 ON MATCH SET n.hit = 1 RETURN n",
+        &Default::default(),
+    )
+    .unwrap();
+    let props = db.node_info("new").unwrap().props;
+    assert_eq!(
+        props.get("born"),
+        Some(&Value::Int(1)),
+        "ON CREATE SET must not run when the node already exists"
+    );
+    assert_eq!(
+        props.get("hit"),
+        Some(&Value::Int(1)),
+        "ON MATCH SET must run in the same MERGE as ON CREATE SET"
     );
 }
 
@@ -886,19 +900,175 @@ fn set_arithmetic_prop_increment() {
 // ─── Error cases for combined read-write ─────────────────────────────────────
 
 #[test]
-fn combined_match_set_return_is_error() {
+fn match_set_return_same_statement() {
     let mut db = GraphDb::open(&tmp("combined-rw")).unwrap();
-    let err = db
-        .query_write("MATCH (n:Person) SET n.x = 1 RETURN n", &no_params())
-        .unwrap_err();
-    let detail = match err {
-        GraphError::QueryError { detail } => detail,
-        other => panic!("expected QueryError, got {other:?}"),
-    };
-    assert!(
-        detail.contains("not supported") || detail.contains("RETURN"),
-        "combined read-write must be a named error, got: {detail}"
+    db.insert_node(
+        "Person",
+        "a",
+        vec![
+            ("id".into(), Value::Str("a".into())),
+            ("x".into(), Value::Int(1)),
+        ],
+    )
+    .unwrap();
+    let map = BTreeMap::new();
+    let rs = db
+        .query_write("MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x", &map)
+        .unwrap();
+    assert_eq!(rs.row(0)[0], Some(Value::Int(2)));
+}
+
+#[test]
+fn match_set_return_projects_after_where_property_changes() {
+    let mut db = GraphDb::open(&tmp("set-ret-where")).unwrap();
+    db.insert_node(
+        "Person",
+        "a",
+        vec![
+            ("id".into(), Value::Str("a".into())),
+            ("x".into(), Value::Int(1)),
+        ],
+    )
+    .unwrap();
+    let rs = db
+        .query_write(
+            "MATCH (n) WHERE n.x = 1 SET n.x = 2 RETURN n.x",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "SET of a WHERE'd property must still RETURN the matched row"
     );
+    assert_eq!(rs.row(0)[0], Some(Value::Int(2)));
+}
+
+#[test]
+fn match_set_return_projects_after_inline_prop_changes() {
+    let mut db = GraphDb::open(&tmp("set-ret-inline")).unwrap();
+    db.insert_node(
+        "Person",
+        "a",
+        vec![
+            ("id".into(), Value::Str("a".into())),
+            ("x".into(), Value::Int(1)),
+        ],
+    )
+    .unwrap();
+    let rs = db
+        .query_write("MATCH (n {x:1}) SET n.x = 2 RETURN n.x", &no_params())
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "SET of an inline pattern prop must still RETURN the matched row"
+    );
+    assert_eq!(rs.row(0)[0], Some(Value::Int(2)));
+}
+
+#[test]
+fn match_set_return_preserves_edge_match_cardinality() {
+    let mut db = GraphDb::open(&tmp("set-ret-card")).unwrap();
+    db.insert_node("Person", "n", vec![("id".into(), Value::Str("n".into()))])
+        .unwrap();
+    db.insert_node("Person", "m1", vec![("id".into(), Value::Str("m1".into()))])
+        .unwrap();
+    db.insert_node("Person", "m2", vec![("id".into(), Value::Str("m2".into()))])
+        .unwrap();
+    db.insert_edge("KNOWS", "n", "m1").unwrap();
+    db.insert_edge("KNOWS", "n", "m2").unwrap();
+    let rs = db
+        .query_write(
+            "MATCH (n)-[:KNOWS]->(m) SET n.x = 1 RETURN n.id",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        2,
+        "two KNOWS edges must yield two RETURN rows, not one unique key"
+    );
+    assert_eq!(rs.row(0)[0], Some(Value::Str("n".into())));
+    assert_eq!(rs.row(1)[0], Some(Value::Str("n".into())));
+}
+
+#[test]
+fn match_set_return_projects_rel_type() {
+    let mut db = GraphDb::open(&tmp("set-ret-rel")).unwrap();
+    db.insert_node("Person", "n", vec![("id".into(), Value::Str("n".into()))])
+        .unwrap();
+    db.insert_node("Person", "m1", vec![("id".into(), Value::Str("m1".into()))])
+        .unwrap();
+    db.insert_node("Person", "m2", vec![("id".into(), Value::Str("m2".into()))])
+        .unwrap();
+    db.insert_edge("KNOWS", "n", "m1").unwrap();
+    db.insert_edge("KNOWS", "n", "m2").unwrap();
+    let rs = db
+        .query_write(
+            "MATCH (n)-[r:KNOWS]->(m) SET n.x = 1 RETURN type(r)",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 2, "rel RETURN must keep MATCH cardinality");
+    assert_eq!(rs.row(0)[0], Some(Value::Str("KNOWS".into())));
+    assert_eq!(rs.row(1)[0], Some(Value::Str("KNOWS".into())));
+}
+
+#[test]
+fn match_set_return_anonymous_end_keeps_cardinality() {
+    let mut db = GraphDb::open(&tmp("set-ret-anon")).unwrap();
+    db.insert_node("Person", "n", vec![("id".into(), Value::Str("n".into()))])
+        .unwrap();
+    db.insert_node("Person", "m1", vec![("id".into(), Value::Str("m1".into()))])
+        .unwrap();
+    db.insert_node("Person", "m2", vec![("id".into(), Value::Str("m2".into()))])
+        .unwrap();
+    db.insert_edge("KNOWS", "n", "m1").unwrap();
+    db.insert_edge("KNOWS", "n", "m2").unwrap();
+    let rs = db
+        .query_write(
+            "MATCH (n)-[:KNOWS]->() SET n.x = 1 RETURN n.id",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        2,
+        "anonymous dest rematch must not square cardinality (2 edges → 2 rows, not 4)"
+    );
+    assert_eq!(rs.row(0)[0], Some(Value::Str("n".into())));
+    assert_eq!(rs.row(1)[0], Some(Value::Str("n".into())));
+}
+
+#[test]
+fn match_set_return_untyped_rel_keeps_cardinality() {
+    let mut db = GraphDb::open(&tmp("set-ret-untyped")).unwrap();
+    db.insert_node("Person", "n", vec![("id".into(), Value::Str("n".into()))])
+        .unwrap();
+    db.insert_node("Person", "m", vec![("id".into(), Value::Str("m".into()))])
+        .unwrap();
+    db.insert_edge("KNOWS", "n", "m").unwrap();
+    db.insert_edge("LIKES", "n", "m").unwrap();
+    let rs = db
+        .query_write(
+            "MATCH (n)-[r]->(m) SET n.x = 1 RETURN type(r)",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        2,
+        "untyped rematch must not square cardinality (KNOWS+LIKES → 2 rows, not 4)"
+    );
+    let mut types: Vec<String> = (0..rs.len())
+        .map(|i| match rs.row(i)[0].as_ref() {
+            Some(Value::Str(s)) => s.clone(),
+            other => panic!("expected type string, got {other:?}"),
+        })
+        .collect();
+    types.sort();
+    assert_eq!(types, vec!["KNOWS".to_string(), "LIKES".to_string()]);
 }
 
 // ---------------------------------------------------------------------------
