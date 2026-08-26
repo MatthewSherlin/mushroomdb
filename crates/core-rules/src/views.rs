@@ -526,7 +526,7 @@ pub fn compute_view_value(
             )),
             AggFn::Sum => {
                 let mut sum = 0.0f64;
-                for &nbr in neighbors {
+                for &nbr in neighbors.as_ref() {
                     if let Some(v) = props.get(nbr, prop) {
                         if let Some(n) = as_float(v) {
                             sum += n;
@@ -538,7 +538,7 @@ pub fn compute_view_value(
             AggFn::Avg => {
                 let mut sum = 0.0f64;
                 let mut count = 0usize;
-                for &nbr in neighbors {
+                for &nbr in neighbors.as_ref() {
                     if let Some(v) = props.get(nbr, prop) {
                         if let Some(n) = as_float(v) {
                             sum += n;
@@ -554,7 +554,7 @@ pub fn compute_view_value(
             }
             AggFn::Min => {
                 let mut best: Option<f64> = None;
-                for &nbr in neighbors {
+                for &nbr in neighbors.as_ref() {
                     if let Some(v) = props.get(nbr, prop) {
                         if let Some(n) = as_float(v) {
                             best = Some(best.map_or(n, |m: f64| m.min(n)));
@@ -565,7 +565,7 @@ pub fn compute_view_value(
             }
             AggFn::Max => {
                 let mut best: Option<f64> = None;
-                for &nbr in neighbors {
+                for &nbr in neighbors.as_ref() {
                     if let Some(v) = props.get(nbr, prop) {
                         if let Some(n) = as_float(v) {
                             best = Some(best.map_or(n, |m: f64| m.max(n)));

@@ -1395,10 +1395,10 @@ impl<F: Fs> GraphDb<F> {
                 let etypes: Vec<u32> = self.topo.etypes().collect();
                 let mut doomed = Vec::new();
                 for et in &etypes {
-                    for &dst in self.topo.neighbors(*et, Direction::Out, n) {
+                    for &dst in self.topo.neighbors(*et, Direction::Out, n).as_ref() {
                         doomed.push((*et, n, dst));
                     }
-                    for &src in self.topo.neighbors(*et, Direction::In, n) {
+                    for &src in self.topo.neighbors(*et, Direction::In, n).as_ref() {
                         doomed.push((*et, src, n));
                     }
                 }
@@ -2824,7 +2824,7 @@ impl<F: Fs> GraphDb<F> {
                 .expect("topology etype is interned")
                 .to_string();
             for dir in [Direction::Out, Direction::In] {
-                for &nbr in self.topo.neighbors(etype, dir, id) {
+                for &nbr in self.topo.neighbors(etype, dir, id).as_ref() {
                     let (src, dst, src_key, dst_key) = match dir {
                         Direction::Out => (
                             id,
