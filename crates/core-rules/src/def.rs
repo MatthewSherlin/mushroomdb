@@ -145,6 +145,9 @@ impl RuleDef {
                     .into(),
             );
         }
+        if self.via_label.is_some() && self.approximate {
+            return Err("via-hop rules do not support approximate: true".into());
+        }
         // via_label and via_edge must both be Some or both None.
         match (&self.via_label, &self.via_edge) {
             (Some(_), None) | (None, Some(_)) => {
@@ -981,6 +984,36 @@ mod tests {
             via_dir: None,
         };
         assert!(bad_all_order.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_via_with_approximate() {
+        // via_label set + approximate=true → invalid (via bypasses HNSW entirely)
+        let bad = RuleDef {
+            name: "vbad".into(),
+            src_label: "A".into(),
+            dst_label: "B".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "VEC".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: true,
+            via_label: Some("Mid".into()),
+            via_edge: Some("hop".into()),
+            via_dir: None,
+        };
+        let err = bad.validate().unwrap_err();
+        assert_eq!(err, "via-hop rules do not support approximate: true");
+
+        // via_label set + approximate=false → still valid (only the via+approx combo is banned)
+        let ok = RuleDef {
+            approximate: false,
+            ..bad.clone()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     #[test]
