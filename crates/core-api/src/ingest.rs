@@ -240,6 +240,7 @@ pub(crate) fn run<F: Fs>(
 
     let rules_created: Vec<String> = new_rules.iter().map(|r| r.name.clone()).collect();
 
+    // One `WalRecord::Batch` (Batched fsync), not a loop of `insert_node`.
     let mut batch = db.batch();
     for def in new_rules {
         batch.create_rule(def);

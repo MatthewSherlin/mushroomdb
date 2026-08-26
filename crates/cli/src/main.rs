@@ -9,6 +9,7 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -23,6 +24,7 @@ fn main() -> ExitCode {
             ui,
             demo_if_empty,
             token,
+            snapshot_every,
         }) => {
             let token = token.filter(|s| !s.is_empty()).or_else(|| {
                 std::env::var("MUSHROOMDB_TOKEN")
@@ -49,7 +51,7 @@ fn main() -> ExitCode {
                 },
                 other => other,
             };
-            exit(run_serve(db_dir, addr, ui, token))
+            exit(run_serve(db_dir, addr, ui, token, snapshot_every))
         }
         Ok(Command::Mcp { db_dir }) => exit(run_mcp(db_dir)),
         Ok(Command::Stats { db_dir }) => match read_stats(&db_dir) {
@@ -134,11 +136,29 @@ fn run_serve(
     addr: SocketAddr,
     ui: ServeUi,
     token: Option<String>,
+    snapshot_every: Option<Duration>,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async {
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
         let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Some(period) = snapshot_every {
+            let db_snap = db.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(period);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval.tick().await; // skip immediate fire
+                loop {
+                    interval.tick().await;
+                    let db_snap = db_snap.clone();
+                    match tokio::task::spawn_blocking(move || db_snap.write().snapshot()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => eprintln!("snapshot-every failed: {e}"),
+                        Err(e) => eprintln!("snapshot-every task panicked: {e}"),
+                    }
+                }
+            });
+        }
         let db_serve = db.clone();
         let mut serve = tokio::spawn(async move {
             match ui {

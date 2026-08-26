@@ -27,6 +27,8 @@ pub struct SimFs {
     // --- byte-mode fields ---
     crash_at: Option<usize>,
     appended: usize,
+    /// Successful `sync` calls (test introspect; not a crash-mode metric).
+    syncs: usize,
     /// Set when a torn append fires.  Blocks further `append` and `sync`.
     /// Does NOT affect `read` or `write_atomic`.
     byte_crashed: bool,
@@ -73,6 +75,11 @@ impl SimFs {
     /// Total bytes passed to successful `append` calls (byte-mode metric).
     pub fn total_appended(&self) -> usize {
         self.appended
+    }
+
+    /// Successful `sync` calls (Relaxed-policy tests).
+    pub fn sync_count(&self) -> usize {
+        self.syncs
     }
 
     /// Total Fs calls that returned `Ok` (op-mode metric).
@@ -145,6 +152,7 @@ impl Fs for SimFs {
             return Err(std::io::Error::other("simulated crash (byte-mode latch)"));
         }
         self.check_op_crash()?;
+        self.syncs += 1;
         self.tick_op();
         Ok(())
     }
@@ -178,6 +186,10 @@ impl Fs for SimFs {
 impl FsIntrospect for SimFs {
     fn total_appended(&self) -> usize {
         self.appended
+    }
+
+    fn sync_count(&self) -> usize {
+        self.syncs
     }
 }
 
@@ -256,5 +268,18 @@ mod tests {
         assert_eq!(fs.total_ops(), 1);
         let _ = fs.append(FileId::Wal, b"cd"); // tears after 1 byte, returns Err
         assert_eq!(fs.total_ops(), 1); // still 1 — torn call not counted
+    }
+
+    #[test]
+    fn successful_sync_increments_sync_count() {
+        let mut fs = SimFs::new();
+        assert_eq!(fs.sync_count(), 0);
+        fs.append(FileId::Wal, b"x").unwrap();
+        fs.sync(FileId::Wal).unwrap();
+        fs.sync(FileId::Wal).unwrap();
+        assert_eq!(fs.sync_count(), 2);
+        let mut crashing = SimFs::with_crash_after_ops(0);
+        assert!(crashing.sync(FileId::Wal).is_err());
+        assert_eq!(crashing.sync_count(), 0);
     }
 }

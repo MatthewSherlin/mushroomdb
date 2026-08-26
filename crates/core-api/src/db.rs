@@ -724,6 +724,25 @@ fn make_graph_mut<'a>(
     }
 }
 
+/// When [`GraphDb`] calls `Fs::sync` after a WAL append.
+///
+/// Default is [`Strict`](FsyncPolicy::Strict): every `log_then_apply_with`
+/// fsyncs (single `insert_node` / `set_prop`). Ingest and `write_batch`
+/// emit one `WalRecord::Batch` and fsync once at that frame (Batched).
+/// [`Relaxed`](FsyncPolicy::Relaxed) skips WAL sync; [`GraphDb::snapshot`]
+/// is still durable via `write_atomic`. Crash-recovery DST stays Strict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FsyncPolicy {
+    /// Every WAL commit calls `fs.sync` (today's behavior).
+    #[default]
+    Strict,
+    /// Sync only at a `Batch` frame end. Single-op path stays Strict unless
+    /// this policy is set on the database.
+    Batched,
+    /// Never call `fs.sync`. [`GraphDb::snapshot`] still syncs via `write_atomic`.
+    Relaxed,
+}
+
 pub struct GraphDb<F: Fs> {
     fs: F,
     ids: IdMap,
@@ -738,6 +757,8 @@ pub struct GraphDb<F: Fs> {
     /// Rebuild-on-open: populated from WAL replay + rebuild_all at open end.
     fulltext: FulltextIndex,
     event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
+    /// WAL fsync cadence. Default [`FsyncPolicy::Strict`].
+    fsync: FsyncPolicy,
     /// Monotonically increasing per-commit counter.  A single `log_then_apply_with`
     /// call increments this once; all events emitted from that call share the same
     /// `commit_seq` value.
@@ -812,6 +833,7 @@ impl<F: Fs> GraphDb<F> {
             view_store: ViewStore::new(),
             fulltext: FulltextIndex::new(),
             event_sink: None,
+            fsync: FsyncPolicy::Strict,
             commit_seq: 0,
             subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -927,6 +949,7 @@ impl<F: Fs> GraphDb<F> {
             view_store: ViewStore::new(),
             fulltext: FulltextIndex::new(),
             event_sink: None,
+            fsync: FsyncPolicy::Strict,
             commit_seq: 0,
             subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -1539,7 +1562,15 @@ impl<F: Fs> GraphDb<F> {
     /// Durable write, then notify the event sink. Replay (`apply` during
     /// `open`) never enters this function, so it is the replay-silent seam.
     fn log_then_apply(&mut self, rec: WalRecord) -> Result<()> {
-        self.log_then_apply_with(rec, None)
+        self.log_then_apply_with(rec, None, self.fsync)
+    }
+
+    fn wal_needs_sync(policy: FsyncPolicy, rec: &WalRecord) -> bool {
+        match policy {
+            FsyncPolicy::Relaxed => false,
+            FsyncPolicy::Strict => true,
+            FsyncPolicy::Batched => matches!(rec, WalRecord::Batch(_)),
+        }
     }
 
     /// # Apply-infallibility invariant (load-bearing)
@@ -1567,6 +1598,7 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         rec: WalRecord,
         ingest: Option<(String, usize)>,
+        policy: FsyncPolicy,
     ) -> Result<()> {
         // Read-only guard: as-of instances must never write the WAL.
         if self.read_only {
@@ -1584,7 +1616,9 @@ impl<F: Fs> GraphDb<F> {
              the caller must drain_deltas() on any error path before returning"
         );
         self.fs.append(FileId::Wal, &encode_record(&rec))?;
-        self.fs.sync(FileId::Wal)?; // strict policy in plan 1
+        if Self::wal_needs_sync(policy, &rec) {
+            self.fs.sync(FileId::Wal)?;
+        }
         let apply_result = self.apply(&rec);
         // For Batch frames, post-validation apply must be infallible (see above).
         // A debug_assert here catches any future change that makes apply fallible
@@ -1659,6 +1693,11 @@ impl<F: Fs> GraphDb<F> {
     /// Whether a post-commit event sink is currently installed.
     pub fn has_event_sink(&self) -> bool {
         self.event_sink.is_some()
+    }
+
+    /// Set WAL fsync cadence. Default [`FsyncPolicy::Strict`].
+    pub fn set_fsync_policy(&mut self, p: FsyncPolicy) {
+        self.fsync = p;
     }
 
     fn emit(&self, ev: MutationEvent) {
@@ -2128,7 +2167,13 @@ impl<F: Fs> GraphDb<F> {
             .iter()
             .filter(|r| matches!(r, WalRecord::InsertEdge { .. }))
             .count();
-        self.log_then_apply_with(WalRecord::Batch(recs), ingest)?;
+        // Ingest / write_batch / query_write: one Batch frame. Strict and
+        // Batched both fsync once at frame end; Relaxed still skips.
+        let policy = match self.fsync {
+            FsyncPolicy::Relaxed => FsyncPolicy::Relaxed,
+            FsyncPolicy::Strict | FsyncPolicy::Batched => FsyncPolicy::Batched,
+        };
+        self.log_then_apply_with(WalRecord::Batch(recs), ingest, policy)?;
         Ok((nodes_inserted, edges_inserted))
     }
 
@@ -3591,6 +3636,14 @@ impl<F: Fs> GraphDb<F> {
         F: FsIntrospect,
     {
         self.fs.total_appended()
+    }
+
+    /// Test-support: successful `Fs::sync` calls (SimFs / counting fs).
+    pub fn fs_sync_count(&self) -> usize
+    where
+        F: FsIntrospect,
+    {
+        self.fs.sync_count()
     }
 
     /// Consume the db, returning its fs (for crash simulation).

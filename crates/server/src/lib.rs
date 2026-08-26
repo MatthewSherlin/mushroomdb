@@ -16,6 +16,8 @@ struct AppState {
     db: SharedDb,
     watch: tokio::sync::broadcast::Sender<MutationEvent>,
     token: Option<String>,
+    /// Bind address advertised in `GET /health`.
+    addr: std::net::SocketAddr,
 }
 
 pub use http::{router, router_with_auth, router_with_ui, serve, serve_with_ui};

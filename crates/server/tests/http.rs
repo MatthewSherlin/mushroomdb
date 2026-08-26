@@ -77,7 +77,25 @@ async fn health_is_unauthenticated() {
     let (status, body, _) = send(app, get("/health")).await;
     assert_eq!(status, StatusCode::OK);
     let v = parse_json(&body);
-    assert_eq!(v, json!({"ok": true}));
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v["nodes"], json!(0));
+    assert_eq!(v["edges"], json!(0));
+    assert_eq!(v["addr"], json!("127.0.0.1:8080"));
+}
+
+#[tokio::test]
+async fn health_reports_counts() {
+    let (app, db) = open("health-counts");
+    seed_person(&db, "a");
+    seed_person(&db, "b");
+    db.write().insert_edge("KNOWS", "a", "b").unwrap();
+    let (status, body, _) = send(app, get("/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v["nodes"], json!(2));
+    assert_eq!(v["edges"], json!(1));
+    assert_eq!(v["addr"], json!("127.0.0.1:8080"));
 }
 
 #[tokio::test]
@@ -481,6 +499,30 @@ async fn ingest_happy_path() {
     assert_eq!(v["rules_created"], json!(["auto_fk_person_org_id"]));
     assert_eq!(v["skipped_fk_fields"], json!([]));
     assert!(db.read().has_node("p1"));
+}
+
+/// Binding: HTTP /ingest is one WAL commit, not a loop of insert_node.
+#[tokio::test]
+async fn ingest_many_rows_is_one_wal_commit() {
+    let dir = tmp("ingest-one-wal");
+    let db = SharedDb::open(&dir).unwrap();
+    let app = router(db.clone());
+    let (status, _, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/ingest",
+            json!({
+                "label": "Person",
+                "rows": [{"id": "a"}, {"id": "b"}, {"id": "c"}],
+                "options": {"auto_fk": "off"}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(core_api::wal_commit_count_at(&dir).unwrap(), 1);
+    assert_eq!(db.read().node_count(), 3);
 }
 
 /// Binding: ingest shape failures (not an array of objects) are 400 {"error": ...}.

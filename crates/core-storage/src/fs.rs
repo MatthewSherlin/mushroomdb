@@ -26,6 +26,9 @@ pub trait Fs {
 
 pub trait FsIntrospect {
     fn total_appended(&self) -> usize;
+    fn sync_count(&self) -> usize {
+        0
+    }
 }
 
 #[derive(Debug)]

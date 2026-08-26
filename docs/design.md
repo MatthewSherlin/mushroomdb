@@ -201,9 +201,10 @@ Not v1: general editing/admin UI, dashboards, saved queries.
   snapshot decompress + WAL replay. Current V6 zstd-bincode open is ~8.88 s at
   100k nodes. Sub-second (mmap) open is deferred; see
   `docs/superpowers/specs/2026-08-25-best-graph-db.md`.
-- **Fsync:** every WAL commit fsyncs (Darwin `F_FULLFSYNC` on the file).
-  `FsyncPolicy` `batched` / `relaxed` is deferred (Phase 2); there is no default
-  batched window. Do not treat `strict`/`batched`/`relaxed` as a live API.
+- **Fsync:** default `FsyncPolicy::Strict` — every WAL commit fsyncs (Darwin
+  `F_FULLFSYNC` on the file). Ingest/`write_batch` emit one `Batch` frame and
+  fsync once (`Batched`). `Relaxed` skips WAL `fs.sync`; `snapshot()` is still
+  durable via `write_atomic`. DST crash sweeps stay Strict.
 - **Ingest:** lenient by default (unknown fields → new columns; type conflicts →
   tagged mixed representation + counted warning). Declared schemas = hard errors
   with row detail. No silent drops; all coercions/skips queryable via

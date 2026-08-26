@@ -16,8 +16,8 @@ pub use core_rules::{
 };
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{
-    BatchBuilder, DeleteReport, EdgeInfo, Explanation, GraphDb, MutationEvent, NodeInfo, NodeRef,
-    PredicateSummary, RuleStats, SnapshotOptions, Stats,
+    BatchBuilder, DeleteReport, EdgeInfo, Explanation, FsyncPolicy, GraphDb, MutationEvent,
+    NodeInfo, NodeRef, PredicateSummary, RuleStats, SnapshotOptions, Stats,
 };
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
