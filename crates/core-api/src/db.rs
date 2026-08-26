@@ -814,12 +814,16 @@ impl GraphDb<RealFs> {
     /// after the first WAL frame, commit N-1 is the state after the N-th (most
     /// recent) frame.  Call [`GraphDb::open`] to read the full current state.
     ///
-    /// **WAL-only replay.** The snapshot file (if any) is ignored.  mushroomdb's
-    /// [`GraphDb::snapshot`] truncates the WAL to empty when it runs, so
-    /// as-of can only reach commits recorded in the current WAL (those written
-    /// after the most recent snapshot, or all commits if no snapshot was ever
-    /// taken).  Commit 0 in `open_at` always refers to the first frame in the
-    /// WAL that exists on disk, not the first ever write to the database.
+    /// **Replay base.** [`GraphDb::snapshot`] truncates the WAL when it runs,
+    /// so as-of can only reach commits recorded in the current WAL (those
+    /// written after the most recent snapshot, or all commits if no snapshot
+    /// was ever taken).  Commit 0 in `open_at` always refers to the first
+    /// frame in the WAL that exists on disk, not the first ever write to the
+    /// database.  When the on-disk snapshot recorded that it truncated the
+    /// WAL (V7, default `keep_wal: false`), it is loaded as the base state
+    /// before frame replay, so the as-of view includes all pre-snapshot data.
+    /// Snapshots written with `keep_wal: true` (and legacy V5/V6 snapshots)
+    /// are ignored and replay is WAL-only, as before.
     ///
     /// **Read-only.** Every mutation method and `snapshot()` on the returned
     /// instance returns [`GraphError::ReadOnly`].  Queries, `explain()`, and
@@ -856,59 +860,7 @@ impl<F: Fs> GraphDb<F> {
         };
         let snap_bytes = db.fs.read(FileId::Snapshot)?;
         if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
-            db.ids = state.ids;
-            db.syms = state.syms;
-            db.topo = state.topo;
-            db.props = state.props;
-            db.labels = state.labels;
-            db.edge_props = state.edge_props;
-            let defs: Vec<RuleDef> = state
-                .rule_defs
-                .iter()
-                .map(|b| {
-                    bincode::deserialize(b).map_err(|e| GraphError::Corrupt {
-                        detail: format!("snapshot rule_def deserialize: {e}"),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            db.engine = RuleEngine::from_persist(
-                defs,
-                state.provenance,
-                state.rule_tripped,
-                state.rule_fires,
-            );
-            // V5 snapshot carries IVF state: restore it instead of re-fitting.
-            // This turns the cold-start multi-minute re-fit into microseconds.
-            let ivf_state: BTreeMap<String, RuleIvfExport> = state
-                .ivf_state
-                .into_iter()
-                .map(|(name, ps)| {
-                    (
-                        name,
-                        (
-                            (ps.src.centroids, ps.src.clusters, ps.src.drift),
-                            (ps.dst.centroids, ps.dst.clusters, ps.dst.drift),
-                        ),
-                    )
-                })
-                .collect();
-            db.engine
-                .reindex_all_load_ivf(&db.ids, &db.syms, &db.labels, &db.props, ivf_state);
-            // Restore view defs from snapshot (V5).
-            // The ColumnStore already contains view values from the snapshot;
-            // use restore_view (no collision check, no backfill) so the store
-            // is aware of the definitions.  rebuild_all runs after WAL replay.
-            for def_bytes in &state.view_defs {
-                let def: ViewDef =
-                    bincode::deserialize(def_bytes).map_err(|e| GraphError::Corrupt {
-                        detail: format!("snapshot view_def deserialize: {e}"),
-                    })?;
-                db.view_store
-                    .restore_view(def)
-                    .map_err(|e| GraphError::Corrupt {
-                        detail: format!("snapshot view restore: {e}"),
-                    })?;
-            }
+            db.restore_snapshot_state(state)?;
         }
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
@@ -945,11 +897,73 @@ impl<F: Fs> GraphDb<F> {
         Ok(db)
     }
 
-    /// WAL-only as-of replay for [`GraphDb::open_at`].
-    ///
-    /// Snapshot is deliberately not loaded; see [`GraphDb::open_at`] for the
-    /// design rationale.  The per-frame drain mirrors `open_with` exactly so
-    /// pending_delta_count is 0 on exit.
+    /// As-of replay for [`GraphDb::open_at`]: snapshot base (only when the
+    /// snapshot truncated the WAL) plus the first `commit + 1` WAL frames;
+    /// see [`GraphDb::open_at`] for the semantics.  The per-frame drain
+    /// mirrors `open_with` exactly so pending_delta_count is 0 on exit.
+    /// Restore all persisted state from a decoded snapshot. Shared by
+    /// `open_with` and (when the snapshot truncated the WAL) `open_at_with`.
+    fn restore_snapshot_state(
+        &mut self,
+        state: core_storage::snapshot::SnapshotState,
+    ) -> Result<()> {
+        self.ids = state.ids;
+        self.syms = state.syms;
+        self.topo = state.topo;
+        self.props = state.props;
+        self.labels = state.labels;
+        self.edge_props = state.edge_props;
+        let defs: Vec<RuleDef> = state
+            .rule_defs
+            .iter()
+            .map(|b| {
+                bincode::deserialize(b).map_err(|e| GraphError::Corrupt {
+                    detail: format!("snapshot rule_def deserialize: {e}"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.engine =
+            RuleEngine::from_persist(defs, state.provenance, state.rule_tripped, state.rule_fires);
+        // V5 snapshot carries IVF state: restore it instead of re-fitting.
+        // This turns the cold-start multi-minute re-fit into microseconds.
+        let ivf_state: BTreeMap<String, RuleIvfExport> = state
+            .ivf_state
+            .into_iter()
+            .map(|(name, ps)| {
+                (
+                    name,
+                    (
+                        (ps.src.centroids, ps.src.clusters, ps.src.drift),
+                        (ps.dst.centroids, ps.dst.clusters, ps.dst.drift),
+                    ),
+                )
+            })
+            .collect();
+        self.engine.reindex_all_load_ivf(
+            &self.ids,
+            &self.syms,
+            &self.labels,
+            &self.props,
+            ivf_state,
+        );
+        // Restore view defs from snapshot (V5).
+        // The ColumnStore already contains view values from the snapshot;
+        // use restore_view (no collision check, no backfill) so the store
+        // is aware of the definitions.  rebuild_all runs after WAL replay.
+        for def_bytes in &state.view_defs {
+            let def: ViewDef =
+                bincode::deserialize(def_bytes).map_err(|e| GraphError::Corrupt {
+                    detail: format!("snapshot view_def deserialize: {e}"),
+                })?;
+            self.view_store
+                .restore_view(def)
+                .map_err(|e| GraphError::Corrupt {
+                    detail: format!("snapshot view restore: {e}"),
+                })?;
+        }
+        Ok(())
+    }
+
     fn open_at_with(fs: F, commit: u64) -> Result<Self> {
         let mut db = Self {
             fs,
@@ -970,6 +984,19 @@ impl<F: Fs> GraphDb<F> {
             read_only: false, // set to true after replay
             total_wal_commits: 0,
         };
+        // Base state: a truncating snapshot compacts all pre-truncation
+        // commits, so the on-disk WAL head coincides with the snapshot and
+        // frame replay must start from it — dense-id records (`Intern`,
+        // `*Id`) embed the live intern/id numbering, which only a snapshot
+        // base reproduces. `keep_wal` and legacy V5/V6 snapshots leave a WAL
+        // that reaches further back; for those the historical WAL-only
+        // replay applies (`wal_truncated` defaults to false on decode).
+        let snap_bytes = db.fs.read(FileId::Snapshot)?;
+        if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
+            if state.wal_truncated {
+                db.restore_snapshot_state(state)?;
+            }
+        }
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, _valid_len) = decode_all(&bytes);
         let total = records.len() as u64;
@@ -1775,7 +1802,20 @@ impl<F: Fs> GraphDb<F> {
         )
     }
 
+    /// Rewrite user-facing records into dense-id records. On `Err`, no live
+    /// state is left mutated: speculative interns made while building the
+    /// output are rolled back, so a later successful mutation cannot log an
+    /// `Intern` record whose id replay would never reproduce.
     fn rewrite_wal_dense(&mut self, recs: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
+        let syms_checkpoint = self.syms.len();
+        let result = self.rewrite_wal_dense_inner(recs);
+        if result.is_err() {
+            self.syms.truncate(syms_checkpoint);
+        }
+        result
+    }
+
+    fn rewrite_wal_dense_inner(&mut self, recs: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
         let mut out = Vec::with_capacity(recs.len());
         // Node ids allocated by later apply(InsertNodeId) in this same batch.
         let mut pending: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -1871,6 +1911,14 @@ impl<F: Fs> GraphDb<F> {
         self.log_then_apply_with(rec, None, self.fsync)
     }
 
+    /// Whether this frame must fsync under `policy`.
+    ///
+    /// Batched contract: user-visible batches (>1 mutation) fsync; single
+    /// mutations do not. The dense rewrite wraps a single mutation in a
+    /// `Batch([Intern.., <one *Id record>])`, so `Intern` records are excluded
+    /// from the count — removing that filter would make every single-op write
+    /// fsync under Batched (or, if the threshold were raised instead, skip a
+    /// needed fsync for real two-op batches).
     fn wal_needs_sync(policy: FsyncPolicy, rec: &WalRecord) -> bool {
         match policy {
             FsyncPolicy::Relaxed => false,
@@ -2152,21 +2200,34 @@ impl<F: Fs> GraphDb<F> {
                 key: key.clone(),
                 commit_seq: seq,
             }],
-            WalRecord::InsertNodeId { label, key, .. } => vec![DbEvent::NodeInserted {
-                label: intern.resolve(*label).unwrap_or("").to_string(),
-                key: key.clone(),
-                commit_seq: seq,
-            }],
+            // *Id arms run after a successful apply, so resolution can only
+            // fail on a programming error. Skip the event rather than emit a
+            // fabricated "" that clients can't tell from a real empty value
+            // (mirrors event_from_record returning None).
+            WalRecord::InsertNodeId { label, key, .. } => intern
+                .resolve(*label)
+                .map(|label| DbEvent::NodeInserted {
+                    label: label.to_string(),
+                    key: key.clone(),
+                    commit_seq: seq,
+                })
+                .into_iter()
+                .collect(),
             WalRecord::SetProp { key, field, .. } => vec![DbEvent::PropSet {
                 key: key.clone(),
                 field: field.clone(),
                 commit_seq: seq,
             }],
-            WalRecord::SetPropId { id, field, .. } => vec![DbEvent::PropSet {
-                key: ids.key_of(*id).unwrap_or("").to_string(),
-                field: intern.resolve(*field).unwrap_or("").to_string(),
-                commit_seq: seq,
-            }],
+            WalRecord::SetPropId { id, field, .. } => ids
+                .key_of(*id)
+                .zip(intern.resolve(*field))
+                .map(|(key, field)| DbEvent::PropSet {
+                    key: key.to_string(),
+                    field: field.to_string(),
+                    commit_seq: seq,
+                })
+                .into_iter()
+                .collect(),
             WalRecord::RemoveProp { key, field } => vec![DbEvent::PropRemoved {
                 key: key.clone(),
                 field: field.clone(),
@@ -2182,12 +2243,16 @@ impl<F: Fs> GraphDb<F> {
                 dst: dst_key.clone(),
                 commit_seq: seq,
             }],
-            WalRecord::InsertEdgeId { etype, src, dst } => vec![DbEvent::EdgeInserted {
-                edge_type: intern.resolve(*etype).unwrap_or("").to_string(),
-                src: ids.key_of(*src).unwrap_or("").to_string(),
-                dst: ids.key_of(*dst).unwrap_or("").to_string(),
-                commit_seq: seq,
-            }],
+            WalRecord::InsertEdgeId { etype, src, dst } => (|| {
+                Some(DbEvent::EdgeInserted {
+                    edge_type: intern.resolve(*etype)?.to_string(),
+                    src: ids.key_of(*src)?.to_string(),
+                    dst: ids.key_of(*dst)?.to_string(),
+                    commit_seq: seq,
+                })
+            })()
+            .into_iter()
+            .collect(),
             WalRecord::DeleteEdge {
                 edge_type,
                 src_key,
@@ -2506,24 +2571,16 @@ impl<F: Fs> GraphDb<F> {
         if recs.is_empty() {
             return Ok((0, 0));
         }
+        // rewrite_wal_dense converts every InsertNode/InsertEdge into its
+        // *Id form, so only the dense variants can appear in `recs` here.
         let recs = self.rewrite_wal_dense(recs)?;
         let nodes_inserted = recs
             .iter()
-            .filter(|r| {
-                matches!(
-                    r,
-                    WalRecord::InsertNode { .. } | WalRecord::InsertNodeId { .. }
-                )
-            })
+            .filter(|r| matches!(r, WalRecord::InsertNodeId { .. }))
             .count();
         let edges_inserted = recs
             .iter()
-            .filter(|r| {
-                matches!(
-                    r,
-                    WalRecord::InsertEdge { .. } | WalRecord::InsertEdgeId { .. }
-                )
-            })
+            .filter(|r| matches!(r, WalRecord::InsertEdgeId { .. }))
             .count();
         // Ingest / write_batch / query_write: one Batch frame. Strict and
         // Batched both fsync once at frame end; Relaxed still skips.
@@ -4082,9 +4139,10 @@ impl<F: Fs> GraphDb<F> {
             rule_fires,
             ivf_state,
             view_defs,
+            wal_truncated: !opts.keep_wal,
         };
         self.fs
-            .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state))?;
+            .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state)?)?;
 
         if opts.keep_wal {
             // keep_wal=true: WAL is left untouched.  The existing WAL already
@@ -5045,6 +5103,40 @@ mod tests {
             ),
             "subscribe_rule on as-of must return ReadOnly"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a failed dense WAL rewrite must not leave speculative
+    /// interns in `syms`. If it does, the next successful mutation logs an
+    /// `Intern` record with an inflated id; replay (which never saw the
+    /// orphans) assigns a smaller id and the WAL becomes unreplayable.
+    #[test]
+    fn dense_rewrite_error_rolls_back_speculative_interns() {
+        let dir = tmp_dir("dense-rewrite-rollback");
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            db.insert_node("Person", "a", vec![]).unwrap();
+
+            // Bypass MutPreview validation to hit the rewrite's own error path
+            // (same shape as an id-exhaustion failure mid-rewrite). The
+            // InsertEdge arm interns the edge type before it resolves keys.
+            let err = db.rewrite_wal_dense(vec![WalRecord::InsertEdge {
+                edge_type: "ORPHAN_TYPE".into(),
+                src_key: "missing".into(),
+                dst_key: "a".into(),
+            }]);
+            assert!(err.is_err(), "rewrite of a missing src key must fail");
+            assert_eq!(
+                db.syms.get("ORPHAN_TYPE"),
+                None,
+                "failed rewrite must roll back speculative interns"
+            );
+
+            // A later successful mutation must produce a replayable WAL.
+            db.set_prop("a", "later_field", Value::Int(2)).unwrap();
+        }
+        let db = GraphDb::open(&dir).expect("WAL must replay after failed rewrite");
+        assert_eq!(db.get_prop("a", "later_field"), Some(&Value::Int(2)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -61,6 +61,14 @@ pub struct SnapshotState {
     /// here; they are recomputed after open from the persisted topo + props.
     /// Added in VERSION 5.
     pub view_defs: Vec<Vec<u8>>,
+    /// True when the snapshot write truncated the WAL (`keep_wal: false`),
+    /// i.e. the on-disk WAL head coincides with this snapshot's state and
+    /// `open_at` must load the snapshot as its base before replaying frames.
+    /// Serialized in the V7 meta section only; V5/V6 payloads never carried
+    /// it, so it is skipped here to keep their bincode wire shape frozen
+    /// (decode of old formats leaves the default `false` = WAL-only as-of).
+    #[serde(skip)]
+    pub wal_truncated: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -75,6 +83,8 @@ struct V7Meta {
     rule_fires: BTreeMap<String, u64>,
     ivf_state: BTreeMap<String, PerRuleIvfState>,
     view_defs: Vec<Vec<u8>>,
+    /// See [`SnapshotState::wal_truncated`]. V7-only field.
+    wal_truncated: bool,
 }
 
 fn wrap_zstd(version: u16, inner: Vec<u8>) -> Vec<u8> {
@@ -99,7 +109,12 @@ fn crc_inner(payload: &[u8]) -> Vec<u8> {
 ///
 /// Wire format:
 ///   [4B magic][2B version=7][zstd-compressed([4B crc32][u32 topo_len][topo][u32 props_len][props][bincode meta])]
-pub fn encode(state: &SnapshotState) -> Vec<u8> {
+///
+/// # Errors
+/// [`GraphError::Corrupt`] if a packed section exceeds the format's 4 GiB
+/// (`u32`) length prefix — the packed-props section is ~1.6 GiB at the 100k
+/// dogfood shape, so this is a reachable ceiling, not a theoretical one.
+pub fn encode(state: &SnapshotState) -> Result<Vec<u8>> {
     encode_v7(state)
 }
 
@@ -109,7 +124,15 @@ pub fn encode_v6(state: &SnapshotState) -> Vec<u8> {
     wrap_zstd(VERSION_6, crc_inner(&payload))
 }
 
-fn encode_v7(state: &SnapshotState) -> Vec<u8> {
+fn section_len(name: &str, len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| GraphError::Corrupt {
+        detail: format!(
+            "snapshot: packed {name} section is {len} bytes, exceeds u32 length prefix"
+        ),
+    })
+}
+
+fn encode_v7(state: &SnapshotState) -> Result<Vec<u8>> {
     let mut topo = Vec::new();
     state.topo.pack(&mut topo);
     let mut props = Vec::new();
@@ -125,15 +148,16 @@ fn encode_v7(state: &SnapshotState) -> Vec<u8> {
         rule_fires: state.rule_fires.clone(),
         ivf_state: state.ivf_state.clone(),
         view_defs: state.view_defs.clone(),
+        wal_truncated: state.wal_truncated,
     };
     let meta_bytes = bincode::serialize(&meta).expect("snapshot meta serialize cannot fail");
     let mut payload = Vec::with_capacity(8 + topo.len() + props.len() + meta_bytes.len());
-    push_u32(&mut payload, topo.len() as u32);
+    push_u32(&mut payload, section_len("topology", topo.len())?);
     payload.extend_from_slice(&topo);
-    push_u32(&mut payload, props.len() as u32);
+    push_u32(&mut payload, section_len("columns", props.len())?);
     payload.extend_from_slice(&props);
     payload.extend_from_slice(&meta_bytes);
-    wrap_zstd(VERSION, crc_inner(&payload))
+    Ok(wrap_zstd(VERSION, crc_inner(&payload)))
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
@@ -233,6 +257,7 @@ fn decode_v7(body: &[u8]) -> Result<Option<SnapshotState>> {
         rule_fires: meta.rule_fires,
         ivf_state: meta.ivf_state,
         view_defs: meta.view_defs,
+        wal_truncated: meta.wal_truncated,
     }))
 }
 
@@ -282,6 +307,7 @@ mod tests {
             rule_fires: BTreeMap::new(),
             ivf_state: BTreeMap::new(),
             view_defs: vec![],
+            wal_truncated: true,
         }
     }
 
@@ -291,10 +317,14 @@ mod tests {
         let v6 = encode_v6(&state);
         assert_eq!(&v6[0..4], MAGIC);
         assert_eq!(u16::from_le_bytes([v6[4], v6[5]]), VERSION_6);
-        let v7 = encode(&state);
+        let v7 = encode(&state).unwrap();
         assert_eq!(u16::from_le_bytes([v7[4], v7[5]]), VERSION);
 
         let back6 = decode(&v6).unwrap().unwrap();
+        assert!(
+            !back6.wal_truncated,
+            "V6 payload never carried wal_truncated; decode must default false"
+        );
         assert_eq!(back6.ids.get("a"), Some(0));
         assert_eq!(back6.props.get(0, "v"), Some(&Value::Int(42)));
         assert_eq!(back6.topo.edge_count(), 1);
@@ -311,6 +341,10 @@ mod tests {
         );
 
         let back7 = decode(&v7).unwrap().unwrap();
+        assert!(
+            back7.wal_truncated,
+            "V7 meta must round-trip wal_truncated=true"
+        );
         assert_eq!(back7.ids.get("b"), Some(1));
         assert_eq!(back7.props.get(1, "name"), Some(&Value::Str("bob".into())));
         assert_eq!(back7.topo.edge_count(), 1);

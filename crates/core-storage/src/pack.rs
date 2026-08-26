@@ -10,8 +10,16 @@ pub fn push_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+/// Push a collection length as its u32 prefix. Lengths here are bounded by
+/// the u32 id space (element counts) or single-string sizes; the assert
+/// catches a silent wrap in debug/test builds before it corrupts an image.
+fn push_len(out: &mut Vec<u8>, len: usize) {
+    debug_assert!(len <= u32::MAX as usize, "packed length {len} exceeds u32");
+    push_u32(out, len as u32);
+}
+
 pub fn push_u32s(out: &mut Vec<u8>, v: &[u32]) {
-    push_u32(out, v.len() as u32);
+    push_len(out, v.len());
     out.reserve(v.len().saturating_mul(4));
     for x in v {
         push_u32(out, *x);
@@ -19,7 +27,7 @@ pub fn push_u32s(out: &mut Vec<u8>, v: &[u32]) {
 }
 
 pub fn push_i64s(out: &mut Vec<u8>, v: &[i64]) {
-    push_u32(out, v.len() as u32);
+    push_len(out, v.len());
     out.reserve(v.len().saturating_mul(8));
     for x in v {
         out.extend_from_slice(&x.to_le_bytes());
@@ -27,7 +35,7 @@ pub fn push_i64s(out: &mut Vec<u8>, v: &[i64]) {
 }
 
 pub fn push_f64s(out: &mut Vec<u8>, v: &[f64]) {
-    push_u32(out, v.len() as u32);
+    push_len(out, v.len());
     out.reserve(v.len().saturating_mul(8));
     for x in v {
         out.extend_from_slice(&x.to_le_bytes());
@@ -36,7 +44,7 @@ pub fn push_f64s(out: &mut Vec<u8>, v: &[f64]) {
 
 pub fn push_str(out: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
-    push_u32(out, b.len() as u32);
+    push_len(out, b.len());
     out.extend_from_slice(b);
 }
 

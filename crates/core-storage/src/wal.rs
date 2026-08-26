@@ -94,6 +94,10 @@ pub enum WalRecord {
     /// Bind intern id `id` to `text` so subsequent `*Id` records can replay
     /// without a snapshot intern table. Discriminant 17. Apply is idempotent
     /// when the string is already bound to `id`.
+    ///
+    /// Discriminant order is append-order, not emit-order: in a WAL stream
+    /// `Intern` always *precedes* the `*Id` records that reference it, even
+    /// though it carries the highest discriminant of the 14–17 group.
     Intern {
         id: u32,
         text: String,

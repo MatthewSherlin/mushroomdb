@@ -134,8 +134,9 @@ fn valid_snapshot_bytes() -> Vec<u8> {
         rule_fires,
         ivf_state: Default::default(),
         view_defs: vec![],
+        wal_truncated: true,
     };
-    snapshot::encode(&state)
+    snapshot::encode(&state).expect("fixture state fits u32 section lengths")
 }
 
 fn bit_flip(bytes: &[u8], entropy: &[u8]) -> Vec<u8> {

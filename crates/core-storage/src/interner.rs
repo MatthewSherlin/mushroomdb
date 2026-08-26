@@ -31,6 +31,28 @@ impl Interner {
     pub fn get(&self, s: &str) -> Option<u32> {
         self.to_sym.get(s).copied()
     }
+
+    /// Number of interned symbols (also the id `intern` assigns next).
+    pub fn len(&self) -> usize {
+        self.to_str.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.to_str.is_empty()
+    }
+
+    /// Roll back to the first `len` symbols. Ids are assigned densely and
+    /// never persisted before their WAL record, so dropping the tail is the
+    /// exact inverse of the speculative `intern` calls made since `len` was
+    /// captured. No-op if `len >= self.len()`.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.to_str.len() {
+            return;
+        }
+        for s in self.to_str.drain(len..) {
+            self.to_sym.remove(&s);
+        }
+    }
 }
 
 #[cfg(test)]

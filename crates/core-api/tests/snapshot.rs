@@ -1394,3 +1394,169 @@ fn default_snapshot_truncates_wal_history() {
         Err(e) => panic!("expected CommitOutOfRange, got {e:?}"),
     }
 }
+
+/// Golden V7 fixture pin: `snapshot()` writes VERSION=7 (packed CSR/columns,
+/// zstd). Decoding the committed fixture verifies the wire format is stable —
+/// changes to `pack.rs`, `Topology::pack`, or `ColumnStore::pack` that alter
+/// the byte layout will fail this test instead of silently corrupting
+/// existing on-disk databases.
+///
+/// To regenerate (only for an intentional VERSION bump):
+/// `cargo run -p mushroomdb --example gen_golden_fixture -- crates/core-api/tests/fixtures/golden_v7.bin`
+#[test]
+fn golden_v7_pin() {
+    let snap_bytes = include_bytes!("fixtures/golden_v7.bin");
+    assert_eq!(
+        &snap_bytes[0..4],
+        b"GDB1",
+        "V7 fixture must start with GDB1 magic"
+    );
+    assert_eq!(
+        u16::from_le_bytes([snap_bytes[4], snap_bytes[5]]),
+        7,
+        "V7 fixture version field must be 7"
+    );
+    let dir = tmp("golden-v7-pin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("snapshot.bin"), snap_bytes).unwrap();
+    std::fs::write(dir.join("wal.bin"), b"").unwrap();
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.node_count(), 2, "V7 fixture must decode to 2 nodes");
+    assert_eq!(db.edge_count(), 1, "V7 fixture must decode to 1 edge");
+    assert_eq!(
+        db.get_prop("a", "v"),
+        Some(&Value::Int(42)),
+        "V7 fixture must preserve prop v=42 on node 'a'"
+    );
+    assert_eq!(db.neighbors("a", "E", Direction::Out).unwrap(), vec!["b"]);
+}
+
+/// Snapshot taken while topology insert buffers are dirty: fewer than the
+/// 32-entry flush threshold per vertex, so every edge is still in an
+/// `AdjList` delta (not frozen) when `snapshot()` packs the CSR. Reopen must
+/// see all of them. Covers the Task 2 (buffered adjacency) → Task 3 (packed
+/// snapshot) seam end-to-end.
+#[test]
+fn snapshot_with_dirty_insert_buffers_roundtrips() {
+    let dir = tmp("snap-dirty-delta");
+    let keys: Vec<String> = (0..8).map(|i| format!("n{i}")).collect();
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for k in &keys {
+            db.insert_node("N", k, vec![]).unwrap();
+        }
+        // Hub with 7 out-edges (< 32: delta never flushes) plus a chain so
+        // several vertices hold small dirty deltas.
+        for k in &keys[1..] {
+            db.insert_edge("E", "n0", k).unwrap();
+        }
+        for w in keys.windows(2) {
+            db.insert_edge("CHAIN", &w[0], &w[1]).unwrap();
+        }
+        db.snapshot().unwrap();
+    }
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.node_count(), 8);
+    assert_eq!(db.edge_count(), 14);
+    let hub: Vec<String> = db.neighbors("n0", "E", Direction::Out).unwrap();
+    assert_eq!(
+        hub,
+        keys[1..].to_vec(),
+        "hub out-edges must survive, sorted"
+    );
+    for w in keys.windows(2) {
+        assert_eq!(
+            db.neighbors(&w[0], "CHAIN", Direction::Out).unwrap(),
+            vec![w[1].clone()],
+            "chain edge {} -> {} must survive snapshot of dirty delta",
+            w[0],
+            w[1]
+        );
+    }
+}
+
+/// `open_at` over dense-id records after a truncating snapshot. The dense
+/// records (`Intern`, `*Id`) embed the live intern/id numbering, which only
+/// exists in the snapshot — so `open_at` must load the snapshot as its base
+/// (the V7 `wal_truncated` flag) before replaying tail frames. Regression:
+/// WAL-only replay here used to fail Corrupt ("wal intern assigned 0 …
+/// record wanted 1") or, worse, rebind dense node ids to the wrong nodes.
+#[test]
+fn open_at_after_truncating_snapshot_replays_dense_id_records() {
+    let dir = tmp("open-at-dense-wal");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "pre", vec![]).unwrap();
+        db.snapshot().unwrap(); // truncating: WAL restarts at the snapshot
+        db.insert_node("M", "a", vec![("v".into(), Value::Int(1))])
+            .unwrap(); // commit 0 in the new WAL
+        db.insert_node("M", "b", vec![]).unwrap(); // commit 1
+        db.insert_edge("REL", "a", "b").unwrap(); // commit 2
+        db.set_prop("a", "w", Value::Int(9)).unwrap(); // commit 3
+        db.insert_edge("REL", "pre", "a").unwrap(); // commit 4: pre-snapshot src
+    }
+    let aof = GraphDb::open_at(&dir, 4).unwrap();
+    assert_eq!(
+        aof.node_count(),
+        3,
+        "as-of state must include the pre-snapshot node"
+    );
+    assert_eq!(
+        aof.get_prop("a", "v"),
+        Some(&Value::Int(1)),
+        "InsertNodeId props must replay via Intern-bound field ids"
+    );
+    assert_eq!(
+        aof.get_prop("a", "w"),
+        Some(&Value::Int(9)),
+        "SetPropId must replay via Intern-bound field id"
+    );
+    assert_eq!(
+        aof.neighbors("a", "REL", Direction::Out).unwrap(),
+        vec!["b"],
+        "InsertEdgeId must replay via Intern-bound etype"
+    );
+    assert_eq!(
+        aof.neighbors("pre", "REL", Direction::Out).unwrap(),
+        vec!["a"],
+        "edge from a pre-snapshot node must replay against the snapshot base"
+    );
+    // Earlier as-of point: snapshot base + commit 0 only.
+    let aof0 = GraphDb::open_at(&dir, 0).unwrap();
+    assert_eq!(aof0.node_count(), 2, "pre + a");
+    assert_eq!(aof0.get_prop("a", "v"), Some(&Value::Int(1)));
+    assert!(aof0
+        .neighbors("a", "REL", Direction::Out)
+        .unwrap()
+        .is_empty());
+}
+
+/// `open_at` over dense-id records with `keep_wal: true`: the WAL still
+/// reaches genesis, so WAL-only replay (snapshot ignored) reproduces the
+/// live numbering by itself, and pre-snapshot commits stay addressable.
+#[test]
+fn open_at_keep_wal_replays_dense_id_records_from_genesis() {
+    let dir = tmp("open-at-dense-keepwal");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![("v".into(), Value::Int(1))])
+            .unwrap(); // commit 0
+        db.insert_node("N", "b", vec![]).unwrap(); // commit 1
+        db.snapshot_with(SnapshotOptions { keep_wal: true })
+            .unwrap();
+        db.insert_edge("REL", "a", "b").unwrap(); // commit 2
+    }
+    let aof = GraphDb::open_at(&dir, 2).unwrap();
+    assert_eq!(aof.get_prop("a", "v"), Some(&Value::Int(1)));
+    assert_eq!(
+        aof.neighbors("a", "REL", Direction::Out).unwrap(),
+        vec!["b"]
+    );
+    // Pre-snapshot commit still addressable (WAL was kept).
+    let aof1 = GraphDb::open_at(&dir, 1).unwrap();
+    assert_eq!(aof1.node_count(), 2);
+    assert!(aof1
+        .neighbors("a", "REL", Direction::Out)
+        .unwrap()
+        .is_empty());
+}

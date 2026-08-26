@@ -663,23 +663,28 @@ fn open_at_works_after_snapshot_with_declarations() {
         GraphDb::open_at(&dir, 3),
         Err(GraphError::CommitOutOfRange { .. })
     ));
-    // At pos 2 (all WAL records), the WAL-replayed state has:
+    // At pos 2 (all WAL records), the as-of state has:
     //   - fulltext enabled (pos 0 baseline)
+    //   - a0 with "rust" (pre-snapshot, loaded from the snapshot base — a
+    //     truncating snapshot IS the WAL-head state)
     //   - a1 with "python" (pos 1)
     //   - a2 with "rust lang" (pos 2)
-    // open_at is WAL-only (no snapshot), so a0 (pre-snapshot) is not visible.
     let snap = GraphDb::open_at(&dir, 2).unwrap();
     assert!(
         snap.is_fulltext_enabled("Article", "bio"),
         "fulltext must be enabled at pos=2"
     );
-    let r = snap.search("bio", "rust");
+    let mut hits: Vec<String> = snap
+        .search("bio", "rust")
+        .into_iter()
+        .map(|r| r.0)
+        .collect();
+    hits.sort_unstable();
     assert_eq!(
-        r.len(),
-        1,
-        "only a2 should match 'rust' (a0 is pre-snapshot, not in WAL)"
+        hits,
+        vec!["a0".to_string(), "a2".to_string()],
+        "a0 (snapshot base) and a2 (WAL tail) must both match 'rust'"
     );
-    assert_eq!(r[0].0, "a2");
 }
 
 // ---------------------------------------------------------------------------
