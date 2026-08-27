@@ -445,10 +445,15 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
         return Ok(Value::List(out));
     }
-    if obj.is_instance_of::<PyDict>() {
-        return Err(PyTypeError::new_err(
-            "dict is not a Value; nested maps are not supported",
-        ));
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut map = BTreeMap::new();
+        for (k, v) in dict.iter() {
+            let key: String = k.extract().map_err(|_| {
+                PyTypeError::new_err("dict keys must be str to convert to Value::Map")
+            })?;
+            map.insert(key, py_to_value(&v)?);
+        }
+        return Ok(Value::Map(map));
     }
     Err(PyTypeError::new_err(format!(
         "cannot convert {} to Value (need str, int, float, bool, or list)",
@@ -468,6 +473,13 @@ fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
                 list.append(value_to_py(py, x)?)?;
             }
             Ok(list.into_any())
+        }
+        Value::Map(m) => {
+            let dict = PyDict::new(py);
+            for (k, v) in m {
+                dict.set_item(k, value_to_py(py, v)?)?;
+            }
+            Ok(dict.into_any())
         }
     }
 }
