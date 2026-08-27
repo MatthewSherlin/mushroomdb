@@ -642,4 +642,5 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 
 ## License
 
-Apache-2.0. Copyright 2026 Matthew Sherlin. See [`LICENSE`](LICENSE).
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Copyright 2026 Matthew Sherlin.

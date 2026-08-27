@@ -15,7 +15,7 @@ members = [
 [workspace.package]
 version = "0.1.2"
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/MatthewSherlin/mushroomdb"
 rust-version = "1.92.0"
 keywords = ["graph-database", "embedded", "cypher", "rules"]
