@@ -101,7 +101,8 @@ Output:
 | Old-format snapshot opened with `auto_migrate: true` | `.bak` written before new snapshot |
 | Clean open at current VERSION with `.bak` present | `.bak` deleted |
 | `auto_migrate: false` | `.bak` never touched |
-| `mushroomdb migrate` | `.bak` written; remains after CLI exits |
+| `mushroomdb migrate` (old-version snapshot) | `.bak` written; remains after CLI exits |
+| `mushroomdb migrate` (WAL-only store — no snapshot) | no `.bak` written (nothing to back up) |
 
 The `.bak` file is safe to delete manually once you have verified the migrated
 store is correct.

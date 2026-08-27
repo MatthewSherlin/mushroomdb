@@ -19,9 +19,9 @@ pub use core_rules::{
 };
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{
-    snapshot_version_at, BatchBuilder, DeleteReport, EdgeInfo, Explanation, FsyncPolicy, GraphDb,
-    MutationEvent, NodeInfo, NodeRef, OpenOptions, PredicateSummary, RuleStats, SnapshotOptions,
-    Stats,
+    snapshot_version_at, write_snapshot_bak, BatchBuilder, DeleteReport, EdgeInfo, Explanation,
+    FsyncPolicy, GraphDb, MutationEvent, NodeInfo, NodeRef, OpenOptions, PredicateSummary,
+    RuleStats, SnapshotOptions, Stats,
 };
 
 /// Current on-disk snapshot format version written by this build.

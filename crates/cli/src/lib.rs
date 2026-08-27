@@ -473,17 +473,11 @@ pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
     }
 
     // Write .bak before any modification (old-version stores only).
+    // Use write_snapshot_bak which calls RealFs::write_atomic: F_FULLFSYNC +
+    // rename + sync_dir — the plain sync_all path is insufficient.
     if from_ver.is_some() {
-        let snap_path = db_dir.join("snapshot.bin");
-        let snap_bytes = std::fs::read(&snap_path)?;
-        let bak_tmp = db_dir.join("snapshot.bin.bak.tmp");
-        let bak = db_dir.join("snapshot.bin.bak");
-        std::fs::write(&bak_tmp, &snap_bytes)?;
-        {
-            let f = std::fs::File::open(&bak_tmp)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&bak_tmp, &bak)?;
+        let snap_bytes = std::fs::read(db_dir.join("snapshot.bin"))?;
+        core_api::write_snapshot_bak(db_dir, &snap_bytes)?;
     }
 
     // Open with auto_migrate=false to avoid double-migration, then write

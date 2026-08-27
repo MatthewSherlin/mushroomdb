@@ -851,6 +851,21 @@ impl Default for OpenOptions {
     }
 }
 
+/// Write `bytes` to `snapshot.bin.bak` atomically with full fsync.
+///
+/// Uses [`RealFs::write_atomic`] which applies `F_FULLFSYNC` on macOS and
+/// `sync_all` on other platforms, then renames the `.tmp` file into place and
+/// syncs the directory entry. This is the only correct path for writing the
+/// `.bak` — plain `std::fs::write + sync_all` misses both `F_FULLFSYNC` and
+/// the directory sync.
+pub fn write_snapshot_bak(dir: &std::path::Path, bytes: &[u8]) -> crate::Result<()> {
+    use core_storage::fs::{FileId, Fs as _};
+    RealFs::new(dir)
+        .map_err(core_storage::GraphError::Io)?
+        .write_atomic(FileId::SnapshotBak, bytes)
+        .map_err(core_storage::GraphError::Io)
+}
+
 /// Return the on-disk snapshot format version without decoding the full snapshot.
 ///
 /// Reads only the 6-byte header (magic + version LE). Returns `None` when no
