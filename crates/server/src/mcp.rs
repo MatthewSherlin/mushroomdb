@@ -9,7 +9,7 @@
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
 //!   `serverInfo.name` `"mushroomdb"`
 //! - `notifications/initialized` — ignored
-//! - `tools/list` — the eleven tools below, each with a JSON Schema
+//! - `tools/list` — the twelve tools below, each with a JSON Schema
 //! - `tools/call` — dispatch; success is
 //!   `{content:[{type:"text", text:<json string>}]}`
 //!
