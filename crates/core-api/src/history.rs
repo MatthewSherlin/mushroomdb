@@ -34,6 +34,8 @@ pub enum HistoryChange {
     /// An edge involving this node was added.
     ///
     /// `outgoing` is `true` if this node is the source, `false` if it is the destination.
+    ///
+    /// Self-edges (src == dst == this node) produce a single entry with `outgoing: true`.
     EdgeAdded {
         edge_type: String,
         other: String,
@@ -42,6 +44,8 @@ pub enum HistoryChange {
     /// An edge involving this node was removed.
     ///
     /// `outgoing` is `true` if this node is the source, `false` if it is the destination.
+    ///
+    /// Self-edges (src == dst == this node) produce a single entry with `outgoing: true`.
     EdgeRemoved {
         edge_type: String,
         other: String,

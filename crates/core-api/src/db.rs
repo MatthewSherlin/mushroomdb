@@ -4484,6 +4484,12 @@ impl<F: Fs> GraphDb<F> {
     /// predate the deletion may not resolve (the id is tombstoned in the live map). The
     /// string-keyed `DeleteNode` record still matches and produces a `NodeDeleted` entry.
     /// Prop/edge history of a deleted node may therefore be partially unresolvable.
+    ///
+    /// ## Dense-id edge entries and tombstoned partners
+    ///
+    /// Edge entries from dense-id WAL records (`InsertEdgeId`) are omitted when the partner
+    /// endpoint's dense id is tombstoned. As a result, a live node's history can contain an
+    /// `EdgeRemoved` (string-keyed, always resolves) without a corresponding `EdgeAdded`.
     pub fn node_history(&self, key: &str) -> Result<Vec<crate::history::HistoryEntry>> {
         use crate::history::{HistoryChange, HistoryEntry};
         use core_storage::wal::WalRecord;

@@ -65,6 +65,17 @@ fn node_history_insert_prop_edge_sequence() {
     // history("b") sees NodeInserted + EdgeAdded{outgoing:false} + EdgeRemoved{outgoing:false}
     let history_b = db.node_history("b").unwrap();
     assert_eq!(history_b.len(), 3, "history_b: {history_b:?}");
+
+    // Commits are strictly increasing for b too.
+    for w in history_b.windows(2) {
+        assert!(
+            w[0].commit < w[1].commit,
+            "history_b commits not strictly increasing: {:?} >= {:?}",
+            w[0].commit,
+            w[1].commit
+        );
+    }
+
     assert!(
         matches!(&history_b[0].change, HistoryChange::NodeInserted { label } if label == "Person"),
         "expected NodeInserted got {:?}",
@@ -81,6 +92,36 @@ fn node_history_insert_prop_edge_sequence() {
             if edge_type == "Knows" && other == "a" && !outgoing),
         "expected EdgeRemoved{{outgoing:false}} got {:?}",
         history_b[2]
+    );
+}
+
+#[test]
+fn node_history_delete_node() {
+    let dir = tmp("deleted");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node("Thing", "x", vec![]).unwrap();
+    db.delete_node("x").unwrap();
+
+    let history = db.node_history("x").unwrap();
+
+    // NodeInserted then NodeDeleted.  Dense-id prop records for a tombstoned node are
+    // unresolvable (documented), so we don't set props here to keep the test unambiguous.
+    assert_eq!(history.len(), 2, "history: {history:?}");
+    assert!(
+        matches!(&history[0].change, HistoryChange::NodeInserted { label } if label == "Thing"),
+        "expected NodeInserted, got {:?}",
+        history[0]
+    );
+    assert!(
+        matches!(&history[1].change, HistoryChange::NodeDeleted),
+        "expected NodeDeleted, got {:?}",
+        history[1]
+    );
+    assert!(
+        history[0].commit < history[1].commit,
+        "commits not ordered: {:?}",
+        history
     );
 }
 
