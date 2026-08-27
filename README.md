@@ -48,9 +48,22 @@ rule fires, and new scored edges appear in the explorer:
 
 ![A SET statement deriving new scored edges live](docs/assets/demo-set-derives.gif)
 
-![Why panel showing overlap rule arithmetic](docs/assets/03-why-overlap.png)
+Open the Rules panel, pick a rule, and the Why slide-over shows the exact
+predicate arithmetic behind every derived edge:
 
-![Neighborhood with derived edges highlighted](docs/assets/02-neighborhood-gold.png)
+![Rules panel and Why slide-over showing overlap arithmetic](docs/assets/rules-why.gif)
+
+Run Cypher in the built-in console and add scored results straight to the
+canvas:
+
+![Cypher console: FIT query with scores added to the canvas](docs/assets/console-query.gif)
+
+A second client ingests a node while the canvas is open — the activity
+ticker fires and the graph grows live:
+
+![Live ingest: ticker event and canvas growth](docs/assets/live-ingest.gif)
+
+![Neighborhood with derived edges highlighted](docs/assets/demo-neighborhood.gif)
 
 ### Live rule and write subscriptions
 
