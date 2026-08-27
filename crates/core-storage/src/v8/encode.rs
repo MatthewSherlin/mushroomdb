@@ -79,7 +79,7 @@ pub fn encode_v8<W: Write>(
 
     // 1. Serialise each section to bytes.
     let topo_bytes = rkyv_encode(&topology_to_csr(overlay_topo))?;
-    let cols_bytes = rkyv_encode(&columnstore_to_data(overlay_props))?;
+    let cols_bytes = rkyv_encode(&columnstore_to_data(overlay_props)?)?;
     let ids_bytes = rkyv_encode(&idmap_to_data(overlay_ids))?;
     let syms_bytes = rkyv_encode(&interner_to_data(overlay_syms))?;
     let meta_bytes = bincode::serialize(meta).map_err(|e| GraphError::Corrupt {
@@ -143,9 +143,16 @@ pub fn encode_v8<W: Write>(
     out.write_all(&header).map_err(GraphError::Io)?;
 
     // 4. Write sections with 8-byte alignment padding between sections.
-    // The last section is NOT padded so the file ends exactly at the last
-    // section's final byte — ensuring every byte of the file is covered by
-    // a section CRC (or the header CRC), with no unchecked trailing bytes.
+    // Exactly what is CRC-covered:
+    //   • The 4 KB header page bytes [0 .. dir_end] are covered by the
+    //     whole-header CRC32 stored at header[dir_end..dir_end+4].
+    //   • Each section payload [offset .. offset+len] is covered by the
+    //     per-section CRC32 in its directory entry.
+    //   • The zero-pad bytes written between sections for 8-byte alignment
+    //     are NOT part of any section's [offset+len] range and are therefore
+    //     NOT covered by any CRC; they are always zero by construction.
+    //   • The last section is NOT padded: the file ends exactly at the last
+    //     section's final byte so there are no unchecked trailing bytes.
     let zero_pad = [0u8; 8];
     let last_idx = sections.len().saturating_sub(1);
     for (i, ((_, bytes), &offset)) in sections.iter().zip(offsets.iter()).enumerate() {
@@ -252,91 +259,79 @@ fn unpack_adj_rows(buf: &[u8], pos: &mut usize) -> CsrAdjMap {
     CsrAdjMap { rows }
 }
 
-fn columnstore_to_data(store: &ColumnStore) -> ColumnsData {
+fn columnstore_to_data(store: &ColumnStore) -> Result<ColumnsData> {
     let mut buf = Vec::new();
     store.pack(&mut buf);
     decode_all_columns(&buf)
 }
 
-fn decode_all_columns(buf: &[u8]) -> ColumnsData {
+fn decode_all_columns(buf: &[u8]) -> Result<ColumnsData> {
     use crate::pack::{read_exact, read_f64s, read_i64s, read_str, read_u32, read_u32s};
     let mut pos = 0usize;
 
     // StrIntern table: string count, then each string.
-    let n_intern = match read_u32(buf, &mut pos) {
-        Ok(n) => n as usize,
-        Err(_) => return ColumnsData { fields: vec![] },
-    };
+    let n_intern = read_u32(buf, &mut pos).map_err(|_| GraphError::Corrupt {
+        detail: "v8: columns pack: truncated intern-string count".into(),
+    })? as usize;
     let mut intern_strings: Vec<String> = Vec::with_capacity(n_intern);
-    for _ in 0..n_intern {
-        match read_str(buf, &mut pos) {
-            Ok(s) => intern_strings.push(s),
-            Err(_) => return ColumnsData { fields: vec![] },
-        }
+    for i in 0..n_intern {
+        intern_strings.push(read_str(buf, &mut pos).map_err(|_| GraphError::Corrupt {
+            detail: format!("v8: columns pack: truncated intern-string[{i}]"),
+        })?);
     }
 
-    let n_fields = match read_u32(buf, &mut pos) {
-        Ok(n) => n as usize,
-        Err(_) => return ColumnsData { fields: vec![] },
-    };
+    let n_fields = read_u32(buf, &mut pos).map_err(|_| GraphError::Corrupt {
+        detail: "v8: columns pack: truncated field count".into(),
+    })? as usize;
     let mut fields = Vec::with_capacity(n_fields);
 
-    for _ in 0..n_fields {
-        let fname = match read_str(buf, &mut pos) {
-            Ok(s) => s,
-            Err(_) => break,
-        };
-        let tag = match read_exact(buf, &mut pos, 1) {
-            Ok(b) => b[0],
-            Err(_) => break,
-        };
+    for field_idx in 0..n_fields {
+        let fname = read_str(buf, &mut pos).map_err(|_| GraphError::Corrupt {
+            detail: format!("v8: columns pack: truncated field name at index {field_idx}"),
+        })?;
+        let tag = read_exact(buf, &mut pos, 1).map_err(|_| GraphError::Corrupt {
+            detail: format!("v8: column '{fname}' pack decode: truncated tag byte"),
+        })?[0];
         let col = match tag {
             0 => {
-                let data = match read_i64s(buf, &mut pos) {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
-                let present = match unpack_bitmap(buf, &mut pos) {
-                    Some(v) => v,
-                    None => break,
-                };
+                let data = read_i64s(buf, &mut pos).map_err(|_| GraphError::Corrupt {
+                    detail: format!("v8: column '{fname}' pack decode: truncated Int data"),
+                })?;
+                let present = unpack_bitmap(buf, &mut pos).ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: column '{fname}' pack decode: truncated Int bitmap"),
+                })?;
                 ColumnData::Int { data, present }
             }
             1 => {
-                let data = match read_f64s(buf, &mut pos) {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
-                let present = match unpack_bitmap(buf, &mut pos) {
-                    Some(v) => v,
-                    None => break,
-                };
+                let data = read_f64s(buf, &mut pos).map_err(|_| GraphError::Corrupt {
+                    detail: format!("v8: column '{fname}' pack decode: truncated Float data"),
+                })?;
+                let present = unpack_bitmap(buf, &mut pos).ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: column '{fname}' pack decode: truncated Float bitmap"),
+                })?;
                 ColumnData::Float { data, present }
             }
             2 => {
-                let n = match read_u32(buf, &mut pos) {
-                    Ok(v) => v as usize,
-                    Err(_) => break,
-                };
-                let raw = match read_exact(buf, &mut pos, n) {
-                    Ok(v) => v.to_vec(),
-                    Err(_) => break,
-                };
-                let present = match unpack_bitmap(buf, &mut pos) {
-                    Some(v) => v,
-                    None => break,
-                };
+                let n = read_u32(buf, &mut pos).map_err(|_| GraphError::Corrupt {
+                    detail: format!("v8: column '{fname}' pack decode: truncated Bool length"),
+                })? as usize;
+                let raw = read_exact(buf, &mut pos, n)
+                    .map_err(|_| GraphError::Corrupt {
+                        detail: format!("v8: column '{fname}' pack decode: truncated Bool data"),
+                    })?
+                    .to_vec();
+                let present = unpack_bitmap(buf, &mut pos).ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: column '{fname}' pack decode: truncated Bool bitmap"),
+                })?;
                 ColumnData::Bool { data: raw, present }
             }
             3 => {
-                let ids = match read_u32s(buf, &mut pos) {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
-                let present = match unpack_bitmap(buf, &mut pos) {
-                    Some(v) => v,
-                    None => break,
-                };
+                let ids = read_u32s(buf, &mut pos).map_err(|_| GraphError::Corrupt {
+                    detail: format!("v8: column '{fname}' pack decode: truncated Str ids"),
+                })?;
+                let present = unpack_bitmap(buf, &mut pos).ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: column '{fname}' pack decode: truncated Str bitmap"),
+                })?;
                 ColumnData::Str {
                     ids,
                     present,
@@ -344,23 +339,30 @@ fn decode_all_columns(buf: &[u8]) -> ColumnsData {
                 }
             }
             4 => {
-                let blob_len = match read_u32(buf, &mut pos) {
-                    Ok(v) => v as usize,
-                    Err(_) => break,
-                };
-                let blob = match read_exact(buf, &mut pos, blob_len) {
-                    Ok(v) => v.to_vec(),
-                    Err(_) => break,
-                };
+                let blob_len = read_u32(buf, &mut pos).map_err(|_| GraphError::Corrupt {
+                    detail: format!("v8: column '{fname}' pack decode: truncated Mixed length"),
+                })? as usize;
+                let blob = read_exact(buf, &mut pos, blob_len)
+                    .map_err(|_| GraphError::Corrupt {
+                        detail: format!("v8: column '{fname}' pack decode: truncated Mixed data"),
+                    })?
+                    .to_vec();
                 ColumnData::Mixed(blob)
             }
-            _ => break,
+            other => {
+                return Err(GraphError::Corrupt {
+                    detail: format!(
+                        "v8: column '{fname}' pack decode: unknown tag byte {other} at field \
+                         index {field_idx}"
+                    ),
+                });
+            }
         };
         fields.push(FieldEntry { name: fname, col });
     }
 
     fields.sort_by(|a, b| a.name.cmp(&b.name));
-    ColumnsData { fields }
+    Ok(ColumnsData { fields })
 }
 
 fn unpack_bitmap(buf: &[u8], pos: &mut usize) -> Option<Vec<u64>> {

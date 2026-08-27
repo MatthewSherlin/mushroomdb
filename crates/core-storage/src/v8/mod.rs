@@ -87,7 +87,11 @@ impl MappedBase {
     /// first access.
     pub fn map(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(GraphError::Io)?;
-        // SAFETY: we hold the file open for the lifetime of the Mmap.
+        // SAFETY: `memmap2::Mmap` is created read-only (MAP_SHARED | PROT_READ).
+        // On Linux and macOS the kernel ref-counts the underlying vnode; the fd
+        // can be closed after mmap returns and the mapping remains valid for its
+        // lifetime.  No mutable aliasing is possible because we never take a
+        // `&mut` reference to the mapped bytes through this type.
         let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(GraphError::Io)?;
         let dir = parse_header(&mmap)?;
         Ok(Self {
@@ -134,6 +138,15 @@ impl MappedBase {
             })?;
         // Lazy CRC validation.
         let idx = section_id as usize;
+        // Any section id >= V8_MAGIC_SECTION_COUNT would silently bypass the
+        // lazy CRC array (the index would be out of bounds for the array).
+        // Guard against future callers adding new section ids without resizing
+        // the check_state array.
+        debug_assert!(
+            idx < V8_MAGIC_SECTION_COUNT,
+            "section_id {section_id} >= V8_MAGIC_SECTION_COUNT ({V8_MAGIC_SECTION_COUNT}); \
+             resize check_state before adding new section ids"
+        );
         if idx < V8_MAGIC_SECTION_COUNT {
             match self.check_state[idx].load(Ordering::Acquire) {
                 STATE_OK => {} // already verified

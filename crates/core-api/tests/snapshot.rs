@@ -2,6 +2,7 @@ use core_api::{
     Direction, GraphDb, GraphError, Predicate, RuleDef, SnapshotOptions, Value, ViewDef, ViewSource,
 };
 use core_storage::wal::decode_all;
+use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-{}-{}", name, std::process::id()));
@@ -1666,4 +1667,181 @@ fn open_at_keep_wal_replays_dense_id_records_from_genesis() {
         .neighbors("a", "REL", Direction::Out)
         .unwrap()
         .is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// V8 Cypher equivalence: seeded graph + query battery
+// ---------------------------------------------------------------------------
+
+/// Simple deterministic LCG used to generate reproducible test data without
+/// pulling in any external RNG crate.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
+    }
+    fn usize_bounded(&mut self, n: usize) -> usize {
+        (self.next() as usize) % n
+    }
+    fn bool_chance(&mut self, pct: u64) -> bool {
+        self.next() % 100 < pct
+    }
+}
+
+/// Build a substantial seeded graph: 200 nodes across 3 labels, mixed
+/// scalar/list/map props, ~350 directed edges across 3 edge types.
+///
+/// Returns the directory and the ground-truth set of query results collected
+/// BEFORE the snapshot so that they can be asserted identically AFTER a
+/// V8 snapshot + reopen.
+fn build_v8_equiv_graph(dir: &std::path::Path) -> Vec<(&'static str, Vec<Vec<Option<Value>>>)> {
+    let mut db = GraphDb::open(dir).unwrap();
+    let mut lcg = Lcg(0xdeadbeef_cafebabe);
+
+    const N: usize = 200;
+    let labels = ["Person", "Company", "Project"];
+    let etypes = ["KNOWS", "WORKS_AT", "OWNS"];
+
+    // Insert nodes with deterministic props.
+    for i in 0..N {
+        let label = labels[i % labels.len()];
+        let key = format!("n{i:03}");
+        let age = 20 + (lcg.next() % 40) as i64;
+        let score = (lcg.next() % 1000) as f64 / 100.0;
+        let tag = if lcg.bool_chance(60) { "alpha" } else { "beta" };
+        let tags = Value::List(vec![
+            Value::Str(tag.into()),
+            Value::Str(format!("t{}", i % 5).into()),
+        ]);
+        let meta = Value::Map(
+            [
+                ("rank".to_string(), Value::Int((i % 10) as i64)),
+                ("active".to_string(), Value::Bool(lcg.bool_chance(70))),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        db.insert_node(
+            label,
+            &key,
+            vec![
+                ("age".into(), Value::Int(age)),
+                ("score".into(), Value::Float(score)),
+                ("tag".into(), Value::Str(tag.into())),
+                ("tags".into(), tags),
+                ("meta".into(), meta),
+            ],
+        )
+        .unwrap();
+    }
+
+    // Insert ~350 directed edges.
+    let keys: Vec<String> = (0..N).map(|i| format!("n{i:03}")).collect();
+    for _ in 0..350 {
+        let src = lcg.usize_bounded(N);
+        let dst = lcg.usize_bounded(N);
+        if src == dst {
+            continue;
+        }
+        let et = etypes[lcg.usize_bounded(etypes.len())];
+        let _ = db.insert_edge(et, &keys[src], &keys[dst]);
+    }
+
+    // Collect ground-truth results for the query battery before snapshot.
+    let p = BTreeMap::new();
+
+    let rows = |rs: core_api::ResultSet| -> Vec<Vec<Option<Value>>> {
+        (0..rs.len()).map(|i| rs.row(i).to_vec()).collect()
+    };
+
+    let battery: Vec<(&'static str, Vec<Vec<Option<Value>>>)> = vec![
+        // Label scan.
+        (
+            "MATCH (n:Person) RETURN n ORDER BY n LIMIT 10",
+            rows(db.query("MATCH (n:Person) RETURN n ORDER BY n LIMIT 10", &p).unwrap()),
+        ),
+        // WHERE filter on scalar prop.
+        (
+            "MATCH (n:Company) WHERE n.age > 40 RETURN n ORDER BY n",
+            rows(db.query("MATCH (n:Company) WHERE n.age > 40 RETURN n ORDER BY n", &p).unwrap()),
+        ),
+        // Prop projection.
+        (
+            "MATCH (n:Project) RETURN n, n.score ORDER BY n LIMIT 20",
+            rows(db.query("MATCH (n:Project) RETURN n, n.score ORDER BY n LIMIT 20", &p).unwrap()),
+        ),
+        // Single-hop edge traversal.
+        (
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN a, b ORDER BY a, b LIMIT 20",
+            rows(db.query("MATCH (a:Person)-[:KNOWS]->(b) RETURN a, b ORDER BY a, b LIMIT 20", &p).unwrap()),
+        ),
+        // Multi-hop (2-hop).
+        (
+            "MATCH (a)-[:WORKS_AT]->(b)-[:OWNS]->(c) RETURN a, b, c ORDER BY a, b, c LIMIT 15",
+            rows(db.query("MATCH (a)-[:WORKS_AT]->(b)-[:OWNS]->(c) RETURN a, b, c ORDER BY a, b, c LIMIT 15", &p).unwrap()),
+        ),
+        // Variable-length path (1..2).
+        (
+            "MATCH (a:Person)-[:KNOWS*1..2]->(b:Person) RETURN a, b ORDER BY a, b LIMIT 20",
+            rows(db.query("MATCH (a:Person)-[:KNOWS*1..2]->(b:Person) RETURN a, b ORDER BY a, b LIMIT 20", &p).unwrap()),
+        ),
+        // Aggregate count.
+        (
+            "MATCH (n:Person) RETURN count(n)",
+            rows(db.query("MATCH (n:Person) RETURN count(n)", &p).unwrap()),
+        ),
+        // Aggregate on filtered.
+        (
+            "MATCH (n:Company) WHERE n.score > 5.0 RETURN count(n)",
+            rows(db.query("MATCH (n:Company) WHERE n.score > 5.0 RETURN count(n)", &p).unwrap()),
+        ),
+        // ORDER BY + LIMIT.
+        (
+            "MATCH (n) RETURN n, n.age ORDER BY n.age DESC LIMIT 5",
+            rows(db.query("MATCH (n) RETURN n, n.age ORDER BY n.age DESC LIMIT 5", &p).unwrap()),
+        ),
+        // Multi-label scan via undirected edge.
+        (
+            "MATCH (a:Person)-[:WORKS_AT]->(b:Company) RETURN a, b ORDER BY a, b LIMIT 15",
+            rows(db.query("MATCH (a:Person)-[:WORKS_AT]->(b:Company) RETURN a, b ORDER BY a, b LIMIT 15", &p).unwrap()),
+        ),
+    ];
+
+    db.snapshot().unwrap();
+    battery
+}
+
+/// V8 Cypher equivalence: build a seeded 200-node / ~350-edge graph, capture
+/// ground-truth results for a 10-query battery BEFORE snapshot, snapshot to V8,
+/// reopen, and assert every query returns an identical `ResultSet`.
+///
+/// This exercises the full `GraphView → TopologyView → Cypher executor` path
+/// across label scans, WHERE filters, multi-hop MATCH, var-length paths, and
+/// aggregates.
+#[test]
+fn v8_cypher_query_battery_survives_roundtrip() {
+    let dir = tmp("v8-cypher-equiv");
+    let battery = build_v8_equiv_graph(&dir);
+
+    let db2 = GraphDb::open(&dir).unwrap();
+    let p = BTreeMap::new();
+
+    let rows2 = |rs: core_api::ResultSet| -> Vec<Vec<Option<Value>>> {
+        (0..rs.len()).map(|i| rs.row(i).to_vec()).collect()
+    };
+
+    for (cypher, expected) in &battery {
+        let got = rows2(
+            db2.query(cypher, &p)
+                .unwrap_or_else(|e| panic!("query failed after V8 reopen: {cypher}\n{e}")),
+        );
+        assert_eq!(
+            got, *expected,
+            "V8 roundtrip changed ResultSet for:\n  {cypher}"
+        );
+    }
 }

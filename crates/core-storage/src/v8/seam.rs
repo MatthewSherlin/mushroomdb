@@ -65,7 +65,17 @@ impl<'a> TopologyView<'a> {
             return Cow::Owned(base_nbrs);
         }
 
-        // Merge two sorted-unique lists.
+        // TASK 3 REQUIRED: subtract overlay tombstones from base neighbors.
+        // When the overlay records an edge deletion it creates a tombstone entry
+        // that must be removed from `base_nbrs` before merging, otherwise
+        // deleted edges reappear after a V8 snapshot open.  This subtraction
+        // is deferred to Task 3 which restructures the overlay tombstone API.
+        // Until then, the base path is only exercised by Task-3 wiring (base is
+        // always None in Task 1 and Task 2), so no correctness regression exists
+        // in the deployed code path.
+        //
+        // When Task 3 un-ignores `neighbors_with_deletions_subtracts_from_base`
+        // below, remove this comment and implement the subtraction here.
         Cow::Owned(merge_sorted_unique(overlay_nbrs.as_ref(), &base_nbrs))
     }
 
@@ -167,6 +177,45 @@ fn merge_sorted_unique(a: &[u32], b: &[u32]) -> Vec<u32> {
 ///
 /// This type alias is exported to satisfy the Task-1 interface contract.
 pub type MergedNeighbors<'a> = Cow<'a, [u32]>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::Topology;
+
+    /// TASK 3: un-ignore this test and implement tombstone subtraction in
+    /// `TopologyView::neighbors` (see the TASK 3 REQUIRED comment above).
+    ///
+    /// Scenario: base CSR has edge A→B for etype E.  The overlay records a
+    /// deletion of A→B (tombstone).  After merging, B must NOT appear in
+    /// `neighbors(E, Out, A)`.
+    ///
+    /// Currently ignored because the overlay tombstone API is not yet wired to
+    /// the base merge path; the test asserts the correct post-Task-3 behavior.
+    #[test]
+    #[ignore = "Task 3 required: implement overlay tombstone subtraction from base neighbors"]
+    fn neighbors_with_deletions_subtracts_from_base() {
+        // Build a fresh topology to act as the overlay (will hold the deletion).
+        let overlay = Topology::new();
+        // For this test we need base to be Some(ArchivedCsr). Since we cannot
+        // construct ArchivedCsr directly without an encoded snapshot, this test
+        // documents the *contract* rather than a runnable fixture.  Task 3
+        // should replace this with a real encode+decode roundtrip that produces
+        // an ArchivedCsr with edge A→B, then records the overlay deletion and
+        // asserts B is absent from the merged result.
+        //
+        // Expected assertion (pseudo-code):
+        //   let view = TopologyView { overlay: &overlay, base: Some(&archived_csr) };
+        //   overlay.record_deletion(etype, a, b);  // API TBD in Task 3
+        //   assert!(!view.neighbors(etype, Direction::Out, a).contains(&b));
+        let view = TopologyView::owned(&overlay);
+        // Without base wiring this trivially passes — the real assertion lives
+        // in the Task 3 implementation.  The ignore attribute prevents it from
+        // silently passing without the subtraction being implemented.
+        let _ = view.neighbors(0, Direction::Out, 0);
+        panic!("Task 3 must implement tombstone subtraction and replace this body");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ColumnsView and ValueRef (defined; wired in Task 2)

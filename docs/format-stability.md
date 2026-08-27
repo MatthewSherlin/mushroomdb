@@ -21,9 +21,37 @@ document is the binding contract for how the snapshot and WAL formats evolve.
 |---------|-------------|
 | V5 | Uncompressed bincode payload with CRC32 header |
 | V6 | zstd-compressed V5 payload |
-| V7 (current) | zstd(CRC32 + packed CSR topology + packed columnar properties + bincode meta) |
+| V7 | zstd(CRC32 + packed CSR topology + packed columnar properties + bincode meta) |
+| V8 (current) | mmap-able zero-copy rkyv sections; see wire description below |
 
-The current encoder always writes **V7**. The decoder supports V5, V6, and V7.
+The current encoder always writes **V8**. The decoder supports V5, V6, V7, and V8.
+V5–V7 stores are **automatically migrated** to V8 on `GraphDb::open` (see Automatic migration below).
+
+#### V8 wire description
+
+```text
+[0..4]         magic "GDB1"
+[4..6]         VERSION = 8 (u16 LE)
+[6..8]         section_count (u16 LE) — currently 5
+[8..8+16*N]    section directory: N × { id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32 }
+[8+16*N..+4]   whole-header CRC32 (covers bytes [0..8+16*N])
+[..4096]       zero-pad to complete the 4 KB header page
+[4096..]       section payloads at 8-byte-aligned offsets; last section is NOT padded
+```
+
+Section ids (fixed):
+
+| ID | Name | Encoding |
+|----|------|----------|
+| 0  | TOPOLOGY | rkyv `CsrData` (zero-copy archived CSR) |
+| 1  | COLUMNS  | rkyv `ColumnsData` (zero-copy archived column store) |
+| 2  | IDS      | rkyv `IdMapData` (zero-copy archived id map) |
+| 3  | SYMS     | rkyv `InternerData` (zero-copy archived symbol interner) |
+| 4  | META     | bincode `V8Meta` (labels, edge_props, rule_defs, provenance, …) |
+
+CRC coverage: each section payload `[offset..offset+len]` is covered by its directory `crc32`.
+Alignment padding bytes between sections are written as zeros and are NOT covered by any CRC.
+The last section has no trailing pad so the file ends at exactly the last payload byte.
 
 ### WAL (`wal.bin`)
 
