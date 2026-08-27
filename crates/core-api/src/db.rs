@@ -1,4 +1,5 @@
 use crate::ingest::{IngestOptions, IngestReport};
+use crate::roles::{RoleDef, RolesFile};
 use crate::subscription::{
     event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
 };
@@ -813,6 +814,12 @@ pub struct GraphDb<F: Fs> {
     /// call increments this once; all events emitted from that call share the same
     /// `commit_seq` value.
     commit_seq: u64,
+    /// RBAC role definitions loaded from `roles.json` at open.
+    ///
+    /// `Some(roles)` — loaded successfully (may be empty when no roles are defined).
+    /// `None` — `roles.json` was present but corrupt; `mask_for_role` returns
+    /// `Err` for any request (fail-loud, never silently grant empty visibility).
+    roles: Option<Vec<RoleDef>>,
     /// Live subscriptions.  Entries with a dead `Weak` are pruned on the next
     /// distribute_events call.
     subscriptions: Vec<SubEntry>,
@@ -1000,6 +1007,7 @@ impl<F: Fs> GraphDb<F> {
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
+            roles: Some(vec![]),
             subscriptions: Vec::new(),
             query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -1042,6 +1050,9 @@ impl<F: Fs> GraphDb<F> {
         // per-record incremental apply during replay.
         db.fulltext
             .rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
+        // Load roles sidecar. Missing file = no roles (Some(vec![])).
+        // Corrupt/unparseable = poisoned (None); mask_for_role will fail-loud.
+        db.roles = Self::load_roles_from_fs(&db.fs)?;
         Ok(db)
     }
 
@@ -1129,6 +1140,7 @@ impl<F: Fs> GraphDb<F> {
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
+            roles: Some(vec![]),
             subscriptions: Vec::new(),
             query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -1179,6 +1191,8 @@ impl<F: Fs> GraphDb<F> {
         // Rebuild full-text index for as-of view (mirrors open_with pattern).
         db.fulltext
             .rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
+        // Load roles sidecar (current roles, not point-in-time).
+        db.roles = Self::load_roles_from_fs(&db.fs)?;
         db.read_only = true;
         db.total_wal_commits = total;
         Ok(db)
@@ -3639,6 +3653,100 @@ impl<F: Fs> GraphDb<F> {
     /// Borrow the raw id map. Used by `NodeMask::from_keys` to resolve keys.
     pub(crate) fn ids(&self) -> &IdMap {
         &self.ids
+    }
+
+    // -----------------------------------------------------------------------
+    // RBAC role resolution
+    // -----------------------------------------------------------------------
+
+    /// Parse `roles.json` bytes from `fs`. Returns `Ok(Some(roles))` on
+    /// success, `Ok(None)` when the file is absent, and `Ok(None)` with an
+    /// internal poisoned marker when the bytes are present but unparseable.
+    ///
+    /// Callers must treat the return value as:
+    ///   `Some(roles)` — healthy (may be empty)
+    ///   `None`        — file absent → no roles
+    /// … but the open path uses a separate sentinel so see `load_roles_from_fs`.
+    fn load_roles_from_fs(fs: &F) -> Result<Option<Vec<RoleDef>>> {
+        let bytes = fs.read(FileId::Roles).map_err(GraphError::Io)?;
+        if bytes.is_empty() {
+            // Missing file: no roles defined.
+            return Ok(Some(vec![]));
+        }
+        match serde_json::from_slice::<RolesFile>(&bytes) {
+            Ok(f) if f.version == 1 => Ok(Some(f.roles)),
+            // Corrupt or unrecognised version: poison the roles state.
+            _ => Ok(None),
+        }
+    }
+
+    /// Resolve a role to a node-visibility mask against the current graph state.
+    ///
+    /// Returns `Err` when:
+    /// - `roles.json` was present but corrupt at open (poisoned state), or
+    /// - `role` does not match any defined role name.
+    ///
+    /// The mask union is: explicit `keys` (unknown keys silently ignored) plus
+    /// all live nodes carrying any label in `labels`.  Label resolution is live
+    /// — new nodes of an allowed label are visible without re-applying the
+    /// schema.  An empty union = empty mask = sees nothing.
+    pub fn mask_for_role(&self, role: &str) -> Result<crate::mask::NodeMask> {
+        let roles = self.roles.as_ref().ok_or_else(|| GraphError::Corrupt {
+            detail: "roles.json was corrupt at open; fix the file and re-open to restore role access".into(),
+        })?;
+        let def = roles
+            .iter()
+            .find(|r| r.name == role)
+            .ok_or_else(|| GraphError::KeyNotFound {
+                key: format!("role:{role}"),
+            })?;
+
+        let mut visible = std::collections::HashSet::new();
+
+        // Key leg: resolve explicit keys to dense ids (unknown keys ignored).
+        for key in &def.keys {
+            if let Some(id) = self.ids.get(key) {
+                visible.insert(id);
+            }
+        }
+
+        // Label leg: live scan — iterate labels vec for matching symbol.
+        for label_name in &def.labels {
+            if let Some(sym) = self.syms.get(label_name) {
+                for (i, &s) in self.labels.iter().enumerate() {
+                    if s == sym {
+                        visible.insert(i as u32);
+                    }
+                }
+            }
+        }
+
+        Ok(crate::mask::NodeMask { visible })
+    }
+
+    /// Return the current list of role definitions.
+    ///
+    /// Returns an empty list when no roles are defined or when `roles.json`
+    /// was corrupt at open (check [`mask_for_role`](Self::mask_for_role) for
+    /// the fail-loud error in that case).
+    pub fn roles(&self) -> Vec<RoleDef> {
+        self.roles.as_deref().unwrap_or(&[]).to_vec()
+    }
+
+    /// Write `roles` to `roles.json` atomically and update the in-memory list.
+    ///
+    /// Called by `apply_schema` when roles change. Never called on unchanged
+    /// re-apply — this preserves byte-identical idempotency.
+    pub(crate) fn commit_roles(&mut self, roles: Vec<RoleDef>) -> Result<()> {
+        let file = RolesFile::v1(roles.clone());
+        let bytes = serde_json::to_vec(&file).map_err(|e| GraphError::Corrupt {
+            detail: format!("roles serialization: {e}"),
+        })?;
+        self.fs
+            .write_atomic(FileId::Roles, &bytes)
+            .map_err(GraphError::Io)?;
+        self.roles = Some(roles);
+        Ok(())
     }
 
     fn view(&self) -> GraphView<'_> {

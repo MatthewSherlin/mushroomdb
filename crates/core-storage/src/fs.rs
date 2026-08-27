@@ -10,6 +10,9 @@ pub enum FileId {
     /// the current format version. Written before any migration to preserve
     /// the original bytes if the migration step fails.
     SnapshotBak,
+    /// RBAC role definitions sidecar. Written atomically by `apply_schema`
+    /// when roles change; loaded at open. Never part of WAL/snapshot format.
+    Roles,
 }
 
 impl FileId {
@@ -18,6 +21,7 @@ impl FileId {
             FileId::Wal => "wal.bin",
             FileId::Snapshot => "snapshot.bin",
             FileId::SnapshotBak => "snapshot.bin.bak",
+            FileId::Roles => "roles.json",
         }
     }
 }
