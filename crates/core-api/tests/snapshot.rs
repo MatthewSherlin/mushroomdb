@@ -1715,7 +1715,7 @@ fn build_v8_equiv_graph(dir: &std::path::Path) -> Vec<(&'static str, Vec<Vec<Opt
         let tag = if lcg.bool_chance(60) { "alpha" } else { "beta" };
         let tags = Value::List(vec![
             Value::Str(tag.into()),
-            Value::Str(format!("t{}", i % 5).into()),
+            Value::Str(format!("t{}", i % 5)),
         ]);
         let meta = Value::Map(
             [
