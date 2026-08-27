@@ -23,4 +23,5 @@ embed-ui = ["server/embed-ui"]
 [dependencies]
 core-api = { package = "mushroomdb", path = "../core-api", version = "0.1.0" }
 server = { package = "mushroomdb-server", path = "../server", version = "0.1.0" }
+serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }

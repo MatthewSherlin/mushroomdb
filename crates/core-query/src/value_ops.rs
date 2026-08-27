@@ -12,6 +12,12 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(l, r)| values_equal(l, r))
         }
+        (Value::Map(x), Value::Map(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|((k1, v1), (k2, v2))| k1 == k2 && values_equal(v1, v2))
+        }
         _ => false,
     }
 }
@@ -22,6 +28,8 @@ fn class_rank(v: &Value) -> u8 {
         Value::Str(_) => 1,
         Value::Bool(_) => 2,
         Value::List(_) => 3,
+        // Map sorts after all other types.
+        Value::Map(_) => 4,
     }
 }
 
@@ -50,6 +58,20 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
                 let c = cmp_values(l, r);
                 if c != Ordering::Equal {
                     return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        (Value::Map(x), Value::Map(y)) => {
+            // BTreeMap iterates in key-sorted order; compare key then value.
+            for ((k1, v1), (k2, v2)) in x.iter().zip(y.iter()) {
+                let ck = k1.cmp(k2);
+                if ck != Ordering::Equal {
+                    return ck;
+                }
+                let cv = cmp_values(v1, v2);
+                if cv != Ordering::Equal {
+                    return cv;
                 }
             }
             x.len().cmp(&y.len())

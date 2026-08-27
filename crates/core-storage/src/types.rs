@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -7,6 +8,9 @@ pub enum Value {
     Str(String),
     Bool(bool),
     List(Vec<Value>),
+    /// Nested key-value map. Spills to the Mixed column path like `List`.
+    /// Never promotes a homogeneous typed column. Not fulltext-indexed.
+    Map(BTreeMap<String, Value>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -25,6 +29,8 @@ impl ValueKey {
             Value::Str(s) => Some(ValueKey::Str(s.clone())),
             Value::Bool(b) => Some(ValueKey::Bool(*b)),
             Value::List(_) => None,
+            // Maps are composite and cannot be reduced to a single index key.
+            Value::Map(_) => None,
         }
     }
 }

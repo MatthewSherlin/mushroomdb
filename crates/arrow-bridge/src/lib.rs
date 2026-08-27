@@ -65,6 +65,13 @@ fn canonical_display(v: &Value) -> String {
             let inner: Vec<String> = xs.iter().map(canonical_display).collect();
             format!("[{}]", inner.join(", "))
         }
+        Value::Map(m) => {
+            let inner: Vec<String> = m
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", canonical_display(v)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
     }
 }
 

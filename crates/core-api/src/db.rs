@@ -4,8 +4,8 @@ use crate::subscription::{
 };
 use core_query::cypher::ast::ArithOp;
 use core_query::cypher::{
-    execute, is_subscribable, lex, parse, parse_write, plan, MatchDeleteNodeStmt, NodePat, Operand,
-    Params, Pattern, PlanOp, Query, RetItem, RetVal, WriteStatement,
+    execute, is_subscribable, is_write_tokens, lex, parse, parse_write, plan, MatchDeleteNodeStmt,
+    NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem, RetVal, WriteStatement,
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
@@ -3277,6 +3277,74 @@ impl<F: Fs> GraphDb<F> {
         results
     }
 
+    /// Hybrid search: Reciprocal Rank Fusion (RRF) over fulltext + vector results.
+    ///
+    /// Takes up to `4*k` fulltext hits for `(text_field, query_text)` and up to
+    /// `4*k` vector hits for `(vector_field, query_vec, min=0.0)`, then fuses
+    /// them with RRF using a fixed constant of 60.
+    ///
+    /// ```text
+    /// score(d) = Σ  1 / (60 + rank_i(d))    (rank 1-based per list)
+    /// ```
+    ///
+    /// Returns the top `k` nodes by fused score, ties broken by node key
+    /// ascending (deterministic).
+    ///
+    /// # Vector leg fallback
+    ///
+    /// When `query_vec` is empty the vector leg is skipped entirely and
+    /// results are ranked by the text list alone through the same RRF path
+    /// (each text result scores `1/(60 + rank)` from that single list).
+    ///
+    /// When `label` is `None` and no HNSW rule covers `vector_field`, the
+    /// brute-force scan cannot enumerate a node universe; `find_similar_vector`
+    /// returns an empty result and the fused ranking is text-only.  Document
+    /// this in your application layer if you rely on it.
+    pub fn search_hybrid(
+        &self,
+        text_field: &str,
+        query_text: &str,
+        vector_field: &str,
+        query_vec: &[f64],
+        label: Option<&str>,
+        k: usize,
+    ) -> Vec<(String, f64)> {
+        use std::collections::HashMap;
+
+        const RRF_K: f64 = 60.0;
+        let pool = 4 * k.max(1);
+
+        // Accumulate per-node RRF scores.
+        let mut scores: HashMap<String, f64> = HashMap::new();
+
+        // Text leg.
+        let text_hits = self.search(text_field, query_text);
+        for (rank0, (key, _count)) in text_hits.into_iter().take(pool).enumerate() {
+            let rank = (rank0 + 1) as f64;
+            *scores.entry(key).or_insert(0.0) += 1.0 / (RRF_K + rank);
+        }
+
+        // Vector leg (skipped when query_vec is empty).
+        if !query_vec.is_empty() {
+            let lbl = label.unwrap_or("");
+            let vec_hits = self.find_similar_vector(vector_field, lbl, query_vec, pool, 0.0);
+            for (rank0, (key, _sim)) in vec_hits.into_iter().enumerate() {
+                let rank = (rank0 + 1) as f64;
+                *scores.entry(key).or_insert(0.0) += 1.0 / (RRF_K + rank);
+            }
+        }
+
+        // Sort: score DESC, then key ASC for deterministic tie-breaking.
+        let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        ranked.truncate(k);
+        ranked
+    }
+
     /// For DST/testing: scratch full-text search over live nodes without using
     /// the index.  Walks every live node, tokenizes the field value, and returns
     /// nodes matching the query.  Results are sorted match_count desc, key asc.
@@ -3461,6 +3529,11 @@ impl<F: Fs> GraphDb<F> {
         self.ids.get(key).is_some()
     }
 
+    /// Borrow the raw id map. Used by `NodeMask::from_keys` to resolve keys.
+    pub(crate) fn ids(&self) -> &IdMap {
+        &self.ids
+    }
+
     fn view(&self) -> GraphView<'_> {
         GraphView {
             ids: &self.ids,
@@ -3469,7 +3542,56 @@ impl<F: Fs> GraphDb<F> {
             props: &self.props,
             topo: &self.topo,
             edge_props: &self.edge_props,
+            mask: None,
         }
+    }
+
+    fn view_masked<'a>(&'a self, mask: &'a crate::mask::NodeMask) -> GraphView<'a> {
+        GraphView {
+            ids: &self.ids,
+            syms: &self.syms,
+            labels: &self.labels,
+            props: &self.props,
+            topo: &self.topo,
+            edge_props: &self.edge_props,
+            mask: Some(&mask.visible),
+        }
+    }
+
+    /// Execute a read-only Cypher query with a node visibility mask.
+    ///
+    /// Only nodes whose key is in `mask` are accessible: label scans, key
+    /// lookups, and neighbor expansions all respect the mask. Edges where
+    /// either endpoint is hidden are silently dropped.
+    ///
+    /// Returns `Err` with a "masked queries are read-only" message when
+    /// `cypher` is a write statement (CREATE / MERGE / MATCH…SET / DELETE).
+    pub fn query_masked(
+        &self,
+        cypher: &str,
+        params: &std::collections::BTreeMap<String, Value>,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<ResultSet> {
+        // Reject write statements up front.
+        let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
+            detail: format!("lex: {e}"),
+        })?;
+        if is_write_tokens(&tokens) {
+            return Err(GraphError::QueryError {
+                detail: "masked queries are read-only".into(),
+            });
+        }
+        let ast = parse(&tokens).map_err(|e| GraphError::QueryError {
+            detail: format!("parse: {e}"),
+        })?;
+        let ops = plan(&ast).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        execute(&self.view_masked(mask), &ops, &Params(params)).map_err(|e| {
+            GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            }
+        })
     }
 
     pub fn node_ref(&self, key: &str) -> Option<NodeRef<'_, F>> {
@@ -4341,6 +4463,177 @@ impl<F: Fs> GraphDb<F> {
 
     pub fn node_count(&self) -> usize {
         self.ids.len()
+    }
+
+    /// Return the per-node change history for `key` by scanning the on-disk WAL.
+    ///
+    /// ## Horizon
+    ///
+    /// History reaches back only to the last WAL-truncating snapshot, exactly like `open_at`.
+    /// Snapshots written with `keep_wal: true` preserve deeper history. This is the honest,
+    /// zero-cost contract; a durable history log is out of scope.
+    ///
+    /// ## Derived edges
+    ///
+    /// Rule-created (derived) edges are **not** in the WAL and therefore do not appear in
+    /// history. Only edges written directly by the application are recorded.
+    ///
+    /// ## Deleted nodes
+    ///
+    /// For nodes that have been deleted, dense-id records (SetPropId, InsertEdgeId) that
+    /// predate the deletion may not resolve (the id is tombstoned in the live map). The
+    /// string-keyed `DeleteNode` record still matches and produces a `NodeDeleted` entry.
+    /// Prop/edge history of a deleted node may therefore be partially unresolvable.
+    ///
+    /// ## Dense-id edge entries and tombstoned partners
+    ///
+    /// Edge entries from dense-id WAL records (`InsertEdgeId`) are omitted when the partner
+    /// endpoint's dense id is tombstoned. As a result, a live node's history can contain an
+    /// `EdgeRemoved` (string-keyed, always resolves) without a corresponding `EdgeAdded`.
+    pub fn node_history(&self, key: &str) -> Result<Vec<crate::history::HistoryEntry>> {
+        use crate::history::{HistoryChange, HistoryEntry};
+        use core_storage::wal::WalRecord;
+
+        let bytes = self.fs.read(FileId::Wal)?;
+        let (frames, _) = decode_all(&bytes);
+
+        let mut out: Vec<HistoryEntry> = Vec::new();
+
+        for (commit, frame) in frames.iter().enumerate() {
+            let commit = commit as u64;
+            // Collect the inner records to process — Batch is one commit, single records are one commit.
+            let records: &[WalRecord] = match frame {
+                WalRecord::Batch(inner) => inner.as_slice(),
+                single => std::slice::from_ref(single),
+            };
+
+            for rec in records {
+                let change = match rec {
+                    WalRecord::InsertNode { label, key: k, .. } if k == key => {
+                        Some(HistoryChange::NodeInserted {
+                            label: label.clone(),
+                        })
+                    }
+                    WalRecord::InsertNodeId { label, key: k, .. } if k == key => {
+                        let label_str = match self.syms.resolve(*label) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        Some(HistoryChange::NodeInserted { label: label_str })
+                    }
+                    WalRecord::SetProp {
+                        key: k,
+                        field,
+                        value,
+                    } if k == key => Some(HistoryChange::PropSet {
+                        field: field.clone(),
+                        value: value.clone(),
+                    }),
+                    WalRecord::SetPropId { id, field, value } => match self.ids.key_of(*id) {
+                        Some(resolved) if resolved == key => {
+                            let field_str = match self.syms.resolve(*field) {
+                                Some(s) => s.to_string(),
+                                None => continue,
+                            };
+                            Some(HistoryChange::PropSet {
+                                field: field_str,
+                                value: value.clone(),
+                            })
+                        }
+                        _ => None,
+                    },
+                    WalRecord::RemoveProp { key: k, field } if k == key => {
+                        Some(HistoryChange::PropRemoved {
+                            field: field.clone(),
+                        })
+                    }
+                    WalRecord::InsertEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        if src_key == key {
+                            Some(HistoryChange::EdgeAdded {
+                                edge_type: edge_type.clone(),
+                                other: dst_key.clone(),
+                                outgoing: true,
+                            })
+                        } else if dst_key == key {
+                            Some(HistoryChange::EdgeAdded {
+                                edge_type: edge_type.clone(),
+                                other: src_key.clone(),
+                                outgoing: false,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    WalRecord::InsertEdgeId { etype, src, dst } => {
+                        let etype_str = match self.syms.resolve(*etype) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        let src_key = self.ids.key_of(*src);
+                        let dst_key = self.ids.key_of(*dst);
+                        if src_key == Some(key) {
+                            let other = match dst_key {
+                                Some(s) => s.to_string(),
+                                None => continue,
+                            };
+                            Some(HistoryChange::EdgeAdded {
+                                edge_type: etype_str,
+                                other,
+                                outgoing: true,
+                            })
+                        } else if dst_key == Some(key) {
+                            let other = match src_key {
+                                Some(s) => s.to_string(),
+                                None => continue,
+                            };
+                            Some(HistoryChange::EdgeAdded {
+                                edge_type: etype_str,
+                                other,
+                                outgoing: false,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    WalRecord::DeleteEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        if src_key == key {
+                            Some(HistoryChange::EdgeRemoved {
+                                edge_type: edge_type.clone(),
+                                other: dst_key.clone(),
+                                outgoing: true,
+                            })
+                        } else if dst_key == key {
+                            Some(HistoryChange::EdgeRemoved {
+                                edge_type: edge_type.clone(),
+                                other: src_key.clone(),
+                                outgoing: false,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    WalRecord::DeleteNode { key: k } if k == key => {
+                        Some(HistoryChange::NodeDeleted)
+                    }
+                    // Skip: rule/view/fulltext/intern metadata; Batch wrapper handled above.
+                    _ => None,
+                };
+
+                if let Some(change) = change {
+                    out.push(HistoryEntry { commit, change });
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     pub fn edge_count(&self) -> u64 {

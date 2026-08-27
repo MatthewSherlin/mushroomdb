@@ -66,9 +66,15 @@ pub struct IngestReport {
 ///
 /// JSON `null` returns `None` so the caller can skip the field (not an error).
 /// Integral numbers become [`Value::Int`]; other numbers become [`Value::Float`].
-/// Arrays of scalars become [`Value::List`]. Nested objects and arrays that are
-/// not arrays of scalars also return `None`; [`GraphDb::ingest_json`] treats
-/// those as a per-row error rather than a skipped field.
+/// Arrays become [`Value::List`] by recursing through this function. If any
+/// element is JSON `null` the entire array field returns `None` and the caller
+/// silently skips the field (same null-drop policy as top-level fields). JSON
+/// objects become [`Value::Map`] recursively; `null` values inside an object
+/// are silently omitted from the map.
+///
+/// **Behavior change from pre-Map:** JSON objects previously returned `None`
+/// (treated as a skipped/error field by `ingest_json`). They now produce
+/// `Value::Map` so nested objects are stored faithfully.
 pub fn json_to_value(v: serde_json::Value) -> Option<Value> {
     match v {
         serde_json::Value::Null => None,
@@ -82,7 +88,15 @@ pub fn json_to_value(v: serde_json::Value) -> Option<Value> {
             }
             Some(Value::List(out))
         }
-        serde_json::Value::Object(_) => None,
+        serde_json::Value::Object(obj) => {
+            let mut map = std::collections::BTreeMap::new();
+            for (k, v) in obj {
+                if let Some(val) = json_to_value(v) {
+                    map.insert(k, val);
+                }
+            }
+            Some(Value::Map(map))
+        }
     }
 }
 
@@ -98,27 +112,11 @@ fn number_to_value(n: &serde_json::Number) -> Option<Value> {
     }
 }
 
-fn is_json_scalar(v: &serde_json::Value) -> bool {
-    matches!(
-        v,
-        serde_json::Value::Bool(_) | serde_json::Value::Number(_) | serde_json::Value::String(_)
-    )
-}
-
-fn field_shape_error(field: &str, v: &serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::Object(_) => Some(format!("nested object in field {field}")),
-        serde_json::Value::Array(items) => {
-            if items.iter().all(is_json_scalar) {
-                None
-            } else if items.iter().any(|x| x.is_object()) {
-                Some(format!("array of objects in field {field}"))
-            } else {
-                Some(format!("mixed or null element in array field {field}"))
-            }
-        }
-        _ => None,
-    }
+fn field_shape_error(_field: &str, _v: &serde_json::Value) -> Option<String> {
+    // All JSON shapes are now accepted: scalars, arrays (via List), and objects
+    // (via Map). `json_to_value` handles conversion recursively. `null` fields
+    // are silently dropped by the caller rather than reported as an error.
+    None
 }
 
 fn object_to_row(

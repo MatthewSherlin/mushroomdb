@@ -3,6 +3,7 @@
 //! The binary in `main.rs` stays thin — it dispatches on [`parse_args`] and
 //! prints what the lib functions return.
 
+use core_api::schema::Schema;
 use core_api::{
     default_max_edges, is_write_query, wal_commit_count_at, AlgoDir, DegreeConfig, Explanation,
     GraphDb, IngestOptions, PageRankConfig, Predicate, ResultSet, RuleDef, RuleSuggestion,
@@ -101,6 +102,11 @@ pub enum Command {
         db_dir: PathBuf,
         keep_wal: bool,
     },
+    /// Apply a JSON schema file idempotently (`schema apply <db-dir> <schema.json>`).
+    SchemaApply {
+        db_dir: PathBuf,
+        schema_file: PathBuf,
+    },
     Help,
 }
 
@@ -154,6 +160,7 @@ Usage:
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
   mushroomdb snapshot <db-dir> [--keep-wal]
+  mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb algo pagerank <db-dir> [--top N]
   mushroomdb algo wcc <db-dir> [--top N]
   mushroomdb algo degree <db-dir> [--top N]
@@ -180,6 +187,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "algo" => parse_algo(&args[1..]),
         "query" => parse_query(&args[1..]),
         "snapshot" => parse_snapshot(&args[1..]),
+        "schema" => parse_schema(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -454,6 +462,71 @@ pub fn run_snapshot(db_dir: &Path, keep_wal: bool) -> Result<String, CliError> {
         "snapshot written: {}\n",
         db_dir.join("snapshot.bin").display()
     ))
+}
+
+fn parse_schema(args: &[&str]) -> Result<Command, String> {
+    if args.is_empty() {
+        return Err("schema requires a subcommand: apply".to_string());
+    }
+    match args[0] {
+        "apply" => parse_schema_apply(&args[1..]),
+        other => Err(format!(
+            "unknown schema subcommand: {other}; expected apply"
+        )),
+    }
+}
+
+fn parse_schema_apply(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir = None;
+    let mut schema_file = None;
+    for a in args {
+        if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        }
+        if db_dir.is_none() {
+            db_dir = Some(PathBuf::from(*a));
+        } else if schema_file.is_none() {
+            schema_file = Some(PathBuf::from(*a));
+        } else {
+            return Err(format!("unexpected extra argument: {a}"));
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| "schema apply requires <db-dir>".to_string())?;
+    let schema_file =
+        schema_file.ok_or_else(|| "schema apply requires <schema.json>".to_string())?;
+    Ok(Command::SchemaApply {
+        db_dir,
+        schema_file,
+    })
+}
+
+/// Read `schema_file`, open `db_dir`, apply the schema, and return the diff
+/// as one line per entry: `"created rule:x"`, `"updated view:y"`, etc.
+pub fn run_schema_apply(db_dir: &Path, schema_file: &Path) -> Result<String, CliError> {
+    let json = std::fs::read_to_string(schema_file)
+        .map_err(|e| CliError(format!("cannot read {}: {e}", schema_file.display())))?;
+    let schema: Schema = serde_json::from_str(&json).map_err(|e| {
+        CliError(format!(
+            "invalid schema JSON in {}: {e}",
+            schema_file.display()
+        ))
+    })?;
+    let mut db = GraphDb::open(db_dir)?;
+    let diff = db.apply_schema(&schema)?;
+    let mut out = String::new();
+    for entry in &diff.created {
+        let _ = writeln!(out, "created {entry}");
+    }
+    for entry in &diff.updated {
+        let _ = writeln!(out, "updated {entry}");
+    }
+    for entry in &diff.unchanged {
+        let _ = writeln!(out, "unchanged {entry}");
+    }
+    if diff.created.is_empty() && diff.updated.is_empty() && diff.unchanged.is_empty() {
+        let _ = writeln!(out, "schema applied: nothing to do (empty schema)");
+    }
+    Ok(out)
 }
 
 fn format_result_set(rs: &ResultSet) -> String {
@@ -1031,6 +1104,13 @@ fn fmt_value(v: &Value) -> String {
         Value::List(xs) => {
             let inner: Vec<String> = xs.iter().map(fmt_value).collect();
             format!("[{}]", inner.join(", "))
+        }
+        Value::Map(m) => {
+            let inner: Vec<String> = m
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", fmt_value(v)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
         }
     }
 }

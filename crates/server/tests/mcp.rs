@@ -135,7 +135,7 @@ fn handshake_initialize_then_initialized_is_silent() {
     );
 }
 
-/// Binding: tools/list returns exactly the eleven tools with the specified schemas.
+/// Binding: tools/list returns exactly the twelve tools with the specified schemas.
 #[test]
 fn tools_list_returns_eight_tools_with_schemas() {
     let stdin = req(json!(1), "tools/list", None);
@@ -163,10 +163,11 @@ fn tools_list_returns_eight_tools_with_schemas() {
         "upsert_entity",
         "find_similar",
         "explain_association",
+        "hybrid_search",
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 12);
 
     let by_name = |n: &str| {
         tools
@@ -748,5 +749,154 @@ fn ingest_json_bad_edge_is_atomic() {
     assert!(
         !db.read().has_node("newbie"),
         "newbie must not persist after a rejected mixed batch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: hybrid_search MCP tool
+// ---------------------------------------------------------------------------
+
+/// hybrid_search returns fused results with both a text and vector match.
+/// Fixture: three "Doc" nodes:
+///   "both"   — body="hello", emb=[1,0] close to query [1,0].
+///   "t_only" — body="hello", emb=[-1,0] (antipodal → cosine -1 < 0 → filtered).
+///   "v_only" — body="other", emb=[1,0] exactly aligned with query.
+///
+/// Text ranking: both(rank 1), t_only(rank 2).
+/// Vector ranking: both(rank 1, cosine 1.0), v_only filtered? No wait —
+/// actually both=[1,0] and v_only=[1,0] tie at cosine 1.0.
+/// Use distinct vectors: both=[0.9, 0.436] (≈ 0.9 cosine) and v_only=[1,0].
+///
+/// Text: both rank 1, t_only rank 2.
+/// Vector: v_only rank 1, both rank 2.
+/// RRF: both = 1/61+1/62, v_only = 1/61, t_only = 1/62.
+/// Order: both > v_only > t_only.
+#[test]
+fn hybrid_search_round_trip() {
+    let db = open("mcp-hybrid");
+
+    // Enable fulltext.
+    {
+        let mut w = db.write();
+        w.enable_fulltext("Doc", "body").unwrap();
+        w.insert_node(
+            "Doc",
+            "both",
+            vec![
+                ("body".into(), Value::Str("hello".into())),
+                (
+                    "emb".into(),
+                    Value::List(vec![Value::Float(1.0), Value::Float(0.5)]),
+                ),
+            ],
+        )
+        .unwrap();
+        w.insert_node(
+            "Doc",
+            "t_only",
+            vec![
+                ("body".into(), Value::Str("hello".into())),
+                (
+                    "emb".into(),
+                    Value::List(vec![Value::Float(-1.0), Value::Float(0.0)]),
+                ),
+            ],
+        )
+        .unwrap();
+        w.insert_node(
+            "Doc",
+            "v_only",
+            vec![
+                ("body".into(), Value::Str("other".into())),
+                (
+                    "emb".into(),
+                    Value::List(vec![Value::Float(1.0), Value::Float(0.0)]),
+                ),
+            ],
+        )
+        .unwrap();
+    }
+
+    let stdin = call(
+        1,
+        "hybrid_search",
+        json!({
+            "query_text": "hello",
+            "text_field": "body",
+            "vector": [1.0, 0.0],
+            "vector_field": "emb",
+            "label": "Doc",
+            "k": 3
+        }),
+    );
+    let (res, out) = exchange(db, &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    assert_eq!(replies.len(), 1);
+
+    let payload = content_json(&replies[0]);
+    assert!(!replies[0]["result"]["isError"].as_bool().unwrap_or(false));
+
+    let results = payload["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3, "all three nodes returned");
+
+    // "both" must be first with the highest fused score.
+    assert_eq!(results[0]["key"], json!("both"), "both must rank first");
+    assert_eq!(
+        results[1]["key"],
+        json!("v_only"),
+        "v_only must rank second"
+    );
+    assert_eq!(results[2]["key"], json!("t_only"), "t_only must rank third");
+
+    let s_both = results[0]["score"].as_f64().expect("score float");
+    let s_v_only = results[1]["score"].as_f64().expect("score float");
+    let s_t_only = results[2]["score"].as_f64().expect("score float");
+    let expected_both = 1.0_f64 / 61.0 + 1.0_f64 / 62.0;
+    let expected_v_only = 1.0_f64 / 61.0;
+    let expected_t_only = 1.0_f64 / 62.0;
+    assert!((s_both - expected_both).abs() < 1e-12, "both score");
+    assert!((s_v_only - expected_v_only).abs() < 1e-12, "v_only score");
+    assert!((s_t_only - expected_t_only).abs() < 1e-12, "t_only score");
+}
+
+/// hybrid_search with no vector → text-only ranking; missing required fields → error.
+#[test]
+fn hybrid_search_text_only_and_missing_field_errors() {
+    let db = open("mcp-hybrid-errs");
+
+    {
+        let mut w = db.write();
+        w.enable_fulltext("Doc", "body").unwrap();
+        w.insert_node(
+            "Doc",
+            "alpha",
+            vec![("body".into(), Value::Str("foo".into()))],
+        )
+        .unwrap();
+    }
+
+    // Text-only (no vector field).
+    let stdin = call(
+        1,
+        "hybrid_search",
+        json!({ "query_text": "foo", "text_field": "body", "k": 5 }),
+    );
+    let (res, out) = exchange(db.clone(), &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    let payload = content_json(&replies[0]);
+    let results = payload["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["key"], json!("alpha"));
+
+    // Missing query_text → tool error.
+    let stdin2 = call(2, "hybrid_search", json!({ "text_field": "body" }));
+    let (_, out2) = exchange(db, &stdin2);
+    let replies2 = parse_lines(&out2);
+    assert_eq!(
+        replies2[0]["result"]["isError"],
+        json!(true),
+        "missing query_text must be an error"
     );
 }

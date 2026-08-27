@@ -44,7 +44,7 @@ use crate::json::{
     rule_def_from_json,
 };
 use core_api::{
-    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, SharedDb, Value,
+    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, NodeMask, SharedDb, Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -161,6 +161,7 @@ fn dispatch_call(db: &SharedDb, params: Option<&Js>) -> CallOutcome {
         "upsert_entity" => tool_upsert_entity(db, args),
         "find_similar" => tool_find_similar(db, args),
         "explain_association" => tool_explain(db, args),
+        "hybrid_search" => tool_hybrid_search(db, args),
         _ => protocol_invalid(),
     }
 }
@@ -180,6 +181,32 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
         Ok(p) => p,
         Err(e) => return CallOutcome::ToolErr(e),
     };
+
+    // Optional mask: when present, route to query_masked (read-only).
+    if let Some(mask_val) = args.get("mask") {
+        let keys = match mask_val.as_array() {
+            Some(arr) => {
+                let mut ks: Vec<String> = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v.as_str() {
+                        Some(s) => ks.push(s.to_string()),
+                        None => {
+                            return CallOutcome::ToolErr("mask must be an array of strings".into())
+                        }
+                    }
+                }
+                ks
+            }
+            None => return CallOutcome::ToolErr("mask must be an array of strings".into()),
+        };
+        let g = db.read();
+        let mask = NodeMask::from_keys(&*g, keys.iter().map(String::as_str));
+        return match g.query_masked(cypher, &params, &mask) {
+            Ok(rs) => CallOutcome::ToolOk(result_set_json(&rs)),
+            Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+        };
+    }
+
     let is_write = match core_api::is_write_query(cypher) {
         Ok(b) => b,
         Err(e) => return CallOutcome::ToolErr(e),
@@ -561,6 +588,51 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
     }
 }
 
+fn tool_hybrid_search(db: &SharedDb, args: &Js) -> CallOutcome {
+    let Some(query_text) = args.get("query_text").and_then(Js::as_str) else {
+        return CallOutcome::ToolErr("missing required field: query_text".into());
+    };
+    let Some(text_field) = args.get("text_field").and_then(Js::as_str) else {
+        return CallOutcome::ToolErr("missing required field: text_field".into());
+    };
+
+    let vector_field = args
+        .get("vector_field")
+        .and_then(Js::as_str)
+        .unwrap_or("embedding");
+    let label = args.get("label").and_then(Js::as_str);
+    let k = args
+        .get("k")
+        .and_then(Js::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(10);
+
+    let query_vec: Vec<f64> = args
+        .get("vector")
+        .and_then(Js::as_array)
+        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+        .unwrap_or_default();
+
+    let hits = {
+        let g = db.read();
+        g.search_hybrid(text_field, query_text, vector_field, &query_vec, label, k)
+    };
+
+    let results: Vec<Js> = hits
+        .into_iter()
+        .map(|(key, score)| json!({ "key": key, "score": score }))
+        .collect();
+
+    CallOutcome::ToolOk(json!({
+        "query_text": query_text,
+        "text_field": text_field,
+        "vector_field": vector_field,
+        "label": label,
+        "k": k,
+        "results": results
+    }))
+}
+
 fn graph_err_msg(e: GraphError) -> String {
     match e {
         GraphError::QueryError { detail } | GraphError::IngestError { detail } => detail,
@@ -581,7 +653,7 @@ fn tools_list() -> Js {
         "tools": [
             {
                 "name": "query",
-                "description": "Run a Cypher query (read or write) against the graph.",
+                "description": "Run a Cypher query (read or write) against the graph. When 'mask' is provided, only the listed node keys are visible (read-only).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -589,6 +661,11 @@ fn tools_list() -> Js {
                         "params": {
                             "type": "object",
                             "description": "Named JSON-scalar query parameters."
+                        },
+                        "mask": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional node key allow-list. When present, only these nodes are visible; write statements are rejected."
                         }
                     },
                     "required": ["cypher"]
@@ -741,6 +818,26 @@ fn tools_list() -> Js {
                         "b": { "type": "string", "minLength": 1 }
                     },
                     "required": ["a", "b"]
+                }
+            },
+            {
+                "name": "hybrid_search",
+                "description": "Reciprocal Rank Fusion (RRF) over fulltext + vector results. Provide `query_text` and `text_field` for the fulltext leg. Optionally provide `vector` (embedding array) and `vector_field` (default: embedding) for the vector leg; omitting `vector` gives text-only ranking through the same RRF path. `label` restricts the vector search to nodes with that label (required for brute-force; omit to rely on HNSW rules). `k` controls result count (default: 10). RRF constant is fixed at 60; scores are 1/(60+rank) summed over lists a node appears in.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query_text": { "type": "string", "description": "Fulltext query string." },
+                        "text_field": { "type": "string", "description": "Property field to search with fulltext." },
+                        "vector": {
+                            "type": "array",
+                            "items": { "type": "number" },
+                            "description": "Query embedding vector. Omit for text-only ranking."
+                        },
+                        "vector_field": { "type": "string", "description": "Property field holding embedding vectors (default: embedding)." },
+                        "label": { "type": "string", "description": "Restrict vector search to nodes with this label. Required when relying on brute-force (no HNSW rule covers the field)." },
+                        "k": { "type": "integer", "description": "Maximum results to return (default: 10)." }
+                    },
+                    "required": ["query_text", "text_field"]
                 }
             }
         ]
@@ -901,7 +998,7 @@ mod tests {
     // --- existing tools ---
 
     #[test]
-    fn test_tools_list_includes_all_eleven() {
+    fn test_tools_list_includes_all_twelve() {
         let db = demo_db();
         let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().expect("tools array");
@@ -921,13 +1018,14 @@ mod tests {
             "upsert_entity",
             "find_similar",
             "explain_association",
+            "hybrid_search",
         ] {
             assert!(names.contains(expected), "missing tool: {expected}");
         }
         assert_eq!(
             names.len(),
-            11,
-            "expected exactly 11 tools, got {}",
+            12,
+            "expected exactly 12 tools, got {}",
             names.len()
         );
     }
