@@ -1160,12 +1160,17 @@ fn intern_expr(vars: &mut VarTable, expr: &Expr) {
 }
 
 fn scan_ids(view: &GraphView, label: Option<&str>) -> Vec<u32> {
-    match label {
+    let ids = match label {
         Some(label) => view.nodes_with_label(label),
         // Real nodes always have labels; sentinel slots are gaps.
         None => (0..view.ids.len() as u32)
             .filter(|&id| view.label_of(id).is_some())
             .collect(),
+    };
+    if view.mask.is_some() {
+        ids.into_iter().filter(|&id| view.visible(id)).collect()
+    } else {
+        ids
     }
 }
 
@@ -1191,6 +1196,9 @@ fn resolve_scan_key_id(
     let Some(id) = view.node_id(&s) else {
         return Ok(None);
     };
+    if !view.visible(id) {
+        return Ok(None);
+    }
     if let Some(want) = label {
         match view.label_of(id) {
             Some(got) if got == want => {}
@@ -1698,6 +1706,9 @@ fn exec_expand(
                 continue;
             }
             let nbr = neighbor(from_id, &e, *dir);
+            if !view.visible(nbr) {
+                continue;
+            }
             if let Some(want) = bound_to {
                 if nbr != want {
                     continue;
@@ -3556,6 +3567,7 @@ mod tests {
                 props: &self.props,
                 topo: &self.topo,
                 edge_props: &self.eprops,
+                mask: None,
             }
         }
     }

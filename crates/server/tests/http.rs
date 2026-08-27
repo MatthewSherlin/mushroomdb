@@ -1427,3 +1427,42 @@ async fn http_params_write_set_is_durable() {
         "score must be 99 after re-open"
     );
 }
+
+#[tokio::test]
+async fn query_mask_filters_nodes() {
+    let (app, db) = open("mask-http");
+    db.write().insert_node("P", "alice", vec![]).unwrap();
+    db.write().insert_node("P", "bob", vec![]).unwrap();
+    db.write().insert_node("P", "carol", vec![]).unwrap();
+
+    // With mask: only alice+bob visible.
+    let req = json_req(
+        "POST",
+        "/query?format=json",
+        json!({"cypher": "MATCH (n:P) RETURN n.id", "mask": ["alice", "bob"]}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(v["rows"].as_array().unwrap().len(), 2);
+
+    // Write through mask → 400.
+    let req = json_req(
+        "POST",
+        "/query?format=json",
+        json!({"cypher": "CREATE (n:P {id: 'evil'})", "mask": ["alice"]}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "masked write must be 400: {}", String::from_utf8_lossy(&body));
+
+    // Without mask: all three visible.
+    let req = json_req(
+        "POST",
+        "/query?format=json",
+        json!({"cypher": "MATCH (n:P) RETURN n.id"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(v["rows"].as_array().unwrap().len(), 3);
+}

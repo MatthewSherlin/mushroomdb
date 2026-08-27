@@ -23,7 +23,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use core_api::{
-    is_write_query, json_to_rows, AutoFk, DegreeConfig, Dir, GraphError, IngestOptions,
+    is_write_query, json_to_rows, AutoFk, DegreeConfig, Dir, GraphError, IngestOptions, NodeMask,
     PageRankConfig, SharedDb, SuggestConfig, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
@@ -485,6 +485,46 @@ async fn query(
         Err(e) => return err_response(e),
     };
     let format = qs.get("format").map(String::as_str).unwrap_or("");
+
+    // Optional node mask: when present, route to query_masked (read-only).
+    let mask_keys: Option<Vec<String>> = match body.get("mask") {
+        None | Some(Js::Null) => None,
+        Some(Js::Array(arr)) => {
+            let mut keys = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v.as_str() {
+                    Some(s) => keys.push(s.to_string()),
+                    None => return err_response("mask must be an array of strings"),
+                }
+            }
+            Some(keys)
+        }
+        Some(_) => return err_response("mask must be an array of strings"),
+    };
+
+    // When a mask is provided, route to query_masked (rejects writes).
+    if let Some(ref keys) = mask_keys {
+        let mask = NodeMask::from_keys(&*state.db.read(), keys.iter().map(String::as_str));
+        return match state.db.read().query_masked(&cypher, &params, &mask) {
+            Ok(rs) => match format {
+                "" => match to_ipc_bytes(&rs) {
+                    Ok(bytes) => (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")],
+                        bytes,
+                    )
+                        .into_response(),
+                    Err(e) => err_response(e),
+                },
+                "json" => json_ok(result_set_json(&rs)),
+                other => err_response(format!("unknown format: {other}")),
+            },
+            Err(GraphError::QueryError { detail }) if detail.contains("masked queries are read-only") => {
+                (StatusCode::BAD_REQUEST, Json(json!({"error": detail}))).into_response()
+            }
+            Err(e) => graph_err(e),
+        };
+    }
 
     // Detect write statements at the token level to dispatch to the correct lock.
     // Write statements (CREATE / MATCH…SET / MATCH…DELETE / MERGE) need the

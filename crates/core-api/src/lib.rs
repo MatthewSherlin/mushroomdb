@@ -1,6 +1,7 @@
 pub mod algo;
 mod db;
 mod ingest;
+pub mod mask;
 mod shared;
 pub mod subscription;
 
@@ -19,6 +20,7 @@ pub use db::{
     BatchBuilder, DeleteReport, EdgeInfo, Explanation, FsyncPolicy, GraphDb, MutationEvent,
     NodeInfo, NodeRef, PredicateSummary, RuleStats, SnapshotOptions, Stats,
 };
+pub use mask::NodeMask;
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };

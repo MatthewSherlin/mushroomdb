@@ -44,7 +44,7 @@ use crate::json::{
     rule_def_from_json,
 };
 use core_api::{
-    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, SharedDb, Value,
+    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, NodeMask, SharedDb, Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -180,6 +180,30 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
         Ok(p) => p,
         Err(e) => return CallOutcome::ToolErr(e),
     };
+
+    // Optional mask: when present, route to query_masked (read-only).
+    if let Some(mask_val) = args.get("mask") {
+        let keys = match mask_val.as_array() {
+            Some(arr) => {
+                let mut ks: Vec<String> = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v.as_str() {
+                        Some(s) => ks.push(s.to_string()),
+                        None => return CallOutcome::ToolErr("mask must be an array of strings".into()),
+                    }
+                }
+                ks
+            }
+            None => return CallOutcome::ToolErr("mask must be an array of strings".into()),
+        };
+        let g = db.read();
+        let mask = NodeMask::from_keys(&*g, keys.iter().map(String::as_str));
+        return match g.query_masked(cypher, &params, &mask) {
+            Ok(rs) => CallOutcome::ToolOk(result_set_json(&rs)),
+            Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+        };
+    }
+
     let is_write = match core_api::is_write_query(cypher) {
         Ok(b) => b,
         Err(e) => return CallOutcome::ToolErr(e),
@@ -581,7 +605,7 @@ fn tools_list() -> Js {
         "tools": [
             {
                 "name": "query",
-                "description": "Run a Cypher query (read or write) against the graph.",
+                "description": "Run a Cypher query (read or write) against the graph. When 'mask' is provided, only the listed node keys are visible (read-only).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -589,6 +613,11 @@ fn tools_list() -> Js {
                         "params": {
                             "type": "object",
                             "description": "Named JSON-scalar query parameters."
+                        },
+                        "mask": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional node key allow-list. When present, only these nodes are visible; write statements are rejected."
                         }
                     },
                     "required": ["cypher"]

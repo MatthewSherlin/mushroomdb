@@ -152,6 +152,7 @@ mod tests {
                 props: &self.props,
                 topo: &self.topo,
                 edge_props: &self.eprops,
+                mask: None,
             }
         }
     }

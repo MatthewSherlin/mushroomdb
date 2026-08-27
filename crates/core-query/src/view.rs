@@ -1,4 +1,5 @@
 use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
+use std::collections::HashSet;
 
 /// Read-only twin of `GraphMut`. Holds only borrowed graph state.
 pub struct GraphView<'a> {
@@ -8,9 +9,19 @@ pub struct GraphView<'a> {
     pub props: &'a ColumnStore,
     pub topo: &'a Topology,
     pub edge_props: &'a EdgeProps,
+    /// Optional query-scoped node visibility set. `None` = all nodes visible.
+    /// When `Some(set)`, only dense ids present in `set` are accessible.
+    pub mask: Option<&'a HashSet<u32>>,
 }
 
 impl<'a> GraphView<'a> {
+    /// Returns `true` if `id` is visible under the current mask.
+    /// Always `true` when no mask is set.
+    #[inline]
+    pub fn visible(&self, id: u32) -> bool {
+        self.mask.map_or(true, |m| m.contains(&id))
+    }
+
     pub fn node_id(&self, key: &str) -> Option<u32> {
         self.ids.get(key)
     }
@@ -88,6 +99,7 @@ mod tests {
                 props: &self.props,
                 topo: &self.topo,
                 edge_props: &self.eprops,
+                mask: None,
             }
         }
     }

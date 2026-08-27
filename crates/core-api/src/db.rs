@@ -4,8 +4,8 @@ use crate::subscription::{
 };
 use core_query::cypher::ast::ArithOp;
 use core_query::cypher::{
-    execute, is_subscribable, lex, parse, parse_write, plan, MatchDeleteNodeStmt, NodePat, Operand,
-    Params, Pattern, PlanOp, Query, RetItem, RetVal, WriteStatement,
+    execute, is_subscribable, is_write_tokens, lex, parse, parse_write, plan, MatchDeleteNodeStmt,
+    NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem, RetVal, WriteStatement,
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
@@ -3461,6 +3461,11 @@ impl<F: Fs> GraphDb<F> {
         self.ids.get(key).is_some()
     }
 
+    /// Borrow the raw id map. Used by `NodeMask::from_keys` to resolve keys.
+    pub(crate) fn ids(&self) -> &IdMap {
+        &self.ids
+    }
+
     fn view(&self) -> GraphView<'_> {
         GraphView {
             ids: &self.ids,
@@ -3469,7 +3474,56 @@ impl<F: Fs> GraphDb<F> {
             props: &self.props,
             topo: &self.topo,
             edge_props: &self.edge_props,
+            mask: None,
         }
+    }
+
+    fn view_masked<'a>(&'a self, mask: &'a crate::mask::NodeMask) -> GraphView<'a> {
+        GraphView {
+            ids: &self.ids,
+            syms: &self.syms,
+            labels: &self.labels,
+            props: &self.props,
+            topo: &self.topo,
+            edge_props: &self.edge_props,
+            mask: Some(&mask.visible),
+        }
+    }
+
+    /// Execute a read-only Cypher query with a node visibility mask.
+    ///
+    /// Only nodes whose key is in `mask` are accessible: label scans, key
+    /// lookups, and neighbor expansions all respect the mask. Edges where
+    /// either endpoint is hidden are silently dropped.
+    ///
+    /// Returns `Err` with a "masked queries are read-only" message when
+    /// `cypher` is a write statement (CREATE / MERGE / MATCH…SET / DELETE).
+    pub fn query_masked(
+        &self,
+        cypher: &str,
+        params: &std::collections::BTreeMap<String, Value>,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<ResultSet> {
+        // Reject write statements up front.
+        let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
+            detail: format!("lex: {e}"),
+        })?;
+        if is_write_tokens(&tokens) {
+            return Err(GraphError::QueryError {
+                detail: "masked queries are read-only".into(),
+            });
+        }
+        let ast = parse(&tokens).map_err(|e| GraphError::QueryError {
+            detail: format!("parse: {e}"),
+        })?;
+        let ops = plan(&ast).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        execute(&self.view_masked(mask), &ops, &Params(params)).map_err(|e| {
+            GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            }
+        })
     }
 
     pub fn node_ref(&self, key: &str) -> Option<NodeRef<'_, F>> {
