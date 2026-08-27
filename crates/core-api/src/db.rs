@@ -4465,6 +4465,171 @@ impl<F: Fs> GraphDb<F> {
         self.ids.len()
     }
 
+    /// Return the per-node change history for `key` by scanning the on-disk WAL.
+    ///
+    /// ## Horizon
+    ///
+    /// History reaches back only to the last WAL-truncating snapshot, exactly like `open_at`.
+    /// Snapshots written with `keep_wal: true` preserve deeper history. This is the honest,
+    /// zero-cost contract; a durable history log is out of scope.
+    ///
+    /// ## Derived edges
+    ///
+    /// Rule-created (derived) edges are **not** in the WAL and therefore do not appear in
+    /// history. Only edges written directly by the application are recorded.
+    ///
+    /// ## Deleted nodes
+    ///
+    /// For nodes that have been deleted, dense-id records (SetPropId, InsertEdgeId) that
+    /// predate the deletion may not resolve (the id is tombstoned in the live map). The
+    /// string-keyed `DeleteNode` record still matches and produces a `NodeDeleted` entry.
+    /// Prop/edge history of a deleted node may therefore be partially unresolvable.
+    pub fn node_history(&self, key: &str) -> Result<Vec<crate::history::HistoryEntry>> {
+        use crate::history::{HistoryChange, HistoryEntry};
+        use core_storage::wal::WalRecord;
+
+        let bytes = self.fs.read(FileId::Wal)?;
+        let (frames, _) = decode_all(&bytes);
+
+        let mut out: Vec<HistoryEntry> = Vec::new();
+
+        for (commit, frame) in frames.iter().enumerate() {
+            let commit = commit as u64;
+            // Collect the inner records to process — Batch is one commit, single records are one commit.
+            let records: &[WalRecord] = match frame {
+                WalRecord::Batch(inner) => inner.as_slice(),
+                single => std::slice::from_ref(single),
+            };
+
+            for rec in records {
+                let change = match rec {
+                    WalRecord::InsertNode { label, key: k, .. } if k == key => {
+                        Some(HistoryChange::NodeInserted {
+                            label: label.clone(),
+                        })
+                    }
+                    WalRecord::InsertNodeId { label, key: k, .. } if k == key => {
+                        let label_str = match self.syms.resolve(*label) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        Some(HistoryChange::NodeInserted { label: label_str })
+                    }
+                    WalRecord::SetProp {
+                        key: k,
+                        field,
+                        value,
+                    } if k == key => Some(HistoryChange::PropSet {
+                        field: field.clone(),
+                        value: value.clone(),
+                    }),
+                    WalRecord::SetPropId { id, field, value } => match self.ids.key_of(*id) {
+                        Some(resolved) if resolved == key => {
+                            let field_str = match self.syms.resolve(*field) {
+                                Some(s) => s.to_string(),
+                                None => continue,
+                            };
+                            Some(HistoryChange::PropSet {
+                                field: field_str,
+                                value: value.clone(),
+                            })
+                        }
+                        _ => None,
+                    },
+                    WalRecord::RemoveProp { key: k, field } if k == key => {
+                        Some(HistoryChange::PropRemoved {
+                            field: field.clone(),
+                        })
+                    }
+                    WalRecord::InsertEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        if src_key == key {
+                            Some(HistoryChange::EdgeAdded {
+                                edge_type: edge_type.clone(),
+                                other: dst_key.clone(),
+                                outgoing: true,
+                            })
+                        } else if dst_key == key {
+                            Some(HistoryChange::EdgeAdded {
+                                edge_type: edge_type.clone(),
+                                other: src_key.clone(),
+                                outgoing: false,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    WalRecord::InsertEdgeId { etype, src, dst } => {
+                        let etype_str = match self.syms.resolve(*etype) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        let src_key = self.ids.key_of(*src);
+                        let dst_key = self.ids.key_of(*dst);
+                        if src_key == Some(key) {
+                            let other = match dst_key {
+                                Some(s) => s.to_string(),
+                                None => continue,
+                            };
+                            Some(HistoryChange::EdgeAdded {
+                                edge_type: etype_str,
+                                other,
+                                outgoing: true,
+                            })
+                        } else if dst_key == Some(key) {
+                            let other = match src_key {
+                                Some(s) => s.to_string(),
+                                None => continue,
+                            };
+                            Some(HistoryChange::EdgeAdded {
+                                edge_type: etype_str,
+                                other,
+                                outgoing: false,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    WalRecord::DeleteEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        if src_key == key {
+                            Some(HistoryChange::EdgeRemoved {
+                                edge_type: edge_type.clone(),
+                                other: dst_key.clone(),
+                                outgoing: true,
+                            })
+                        } else if dst_key == key {
+                            Some(HistoryChange::EdgeRemoved {
+                                edge_type: edge_type.clone(),
+                                other: src_key.clone(),
+                                outgoing: false,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    WalRecord::DeleteNode { key: k } if k == key => {
+                        Some(HistoryChange::NodeDeleted)
+                    }
+                    // Skip: rule/view/fulltext/intern metadata; Batch wrapper handled above.
+                    _ => None,
+                };
+
+                if let Some(change) = change {
+                    out.push(HistoryEntry { commit, change });
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     pub fn edge_count(&self) -> u64 {
         self.topo.edge_count()
     }

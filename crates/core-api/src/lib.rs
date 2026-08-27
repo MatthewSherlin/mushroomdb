@@ -1,5 +1,6 @@
 pub mod algo;
 mod db;
+pub mod history;
 mod ingest;
 pub mod mask;
 pub mod schema;
@@ -21,6 +22,7 @@ pub use db::{
     BatchBuilder, DeleteReport, EdgeInfo, Explanation, FsyncPolicy, GraphDb, MutationEvent,
     NodeInfo, NodeRef, PredicateSummary, RuleStats, SnapshotOptions, Stats,
 };
+pub use history::{HistoryChange, HistoryEntry};
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
