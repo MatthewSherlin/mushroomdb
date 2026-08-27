@@ -74,9 +74,11 @@ fn ingest_json_null_fields_are_skipped() {
     assert_eq!(db.get_prop("p1", "name"), None);
 }
 
-/// Binding: nested object (or array-of-objects) is a per-row error; row is skipped.
+/// Binding: nested JSON objects become `Value::Map` recursively (behavior change
+/// from the pre-Map era where nested objects were rejected as row errors).
 #[test]
-fn ingest_json_nested_object_is_row_error() {
+fn ingest_json_nested_object_becomes_map() {
+    use std::collections::BTreeMap;
     let dir = tmp("ingest-json-nested");
     let mut db = GraphDb::open(&dir).unwrap();
 
@@ -88,28 +90,30 @@ fn ingest_json_nested_object_is_row_error() {
         )
         .unwrap();
 
-    assert_eq!(report.inserted, 1);
+    assert_eq!(report.inserted, 3);
+    assert!(report.row_errors.is_empty());
+    assert!(db.has_node("p1"));
     assert!(db.has_node("p2"));
-    assert!(!db.has_node("p1"));
-    assert!(!db.has_node("p3"));
-    assert_eq!(report.row_errors.len(), 2);
-    assert_eq!(report.row_errors[0].0, 0);
-    assert!(
-        report.row_errors[0].1.contains("meta"),
-        "got {:?}",
-        report.row_errors[0]
-    );
-    assert_eq!(report.row_errors[1].0, 2);
-    assert!(
-        report.row_errors[1].1.contains("items"),
-        "got {:?}",
-        report.row_errors[1]
+    assert!(db.has_node("p3"));
+    // nested object stored as Map
+    let mut expected_meta = BTreeMap::new();
+    expected_meta.insert("x".to_string(), Value::Int(1));
+    assert_eq!(db.get_prop("p1", "meta"), Some(&Value::Map(expected_meta)));
+    // array of objects stored as List of Maps
+    let mut inner = BTreeMap::new();
+    inner.insert("a".to_string(), Value::Int(1));
+    assert_eq!(
+        db.get_prop("p3", "items"),
+        Some(&Value::List(vec![Value::Map(inner)]))
     );
 }
 
-/// Binding: `[1, null]` is a per-row error with a distinct mixed/null message.
+/// Binding: `[1, null]` causes the entire array field to be silently skipped
+/// (null makes `json_to_value` return `None` for the array); the row itself is
+/// still accepted. This is looser than the pre-Map era behavior that rejected
+/// the row outright.
 #[test]
-fn ingest_json_array_with_null_is_mixed_element_row_error() {
+fn ingest_json_array_with_null_skips_field() {
     let dir = tmp("ingest-json-mixed-arr");
     let mut db = GraphDb::open(&dir).unwrap();
 
@@ -121,18 +125,12 @@ fn ingest_json_array_with_null_is_mixed_element_row_error() {
         )
         .unwrap();
 
-    assert_eq!(report.inserted, 1);
+    // Both rows succeed; p1's "tags" field is dropped (null element aborts array).
+    assert_eq!(report.inserted, 2);
+    assert!(report.row_errors.is_empty());
+    assert!(db.has_node("p1"));
     assert!(db.has_node("p2"));
-    assert!(!db.has_node("p1"));
-    assert_eq!(report.row_errors.len(), 1);
-    assert_eq!(report.row_errors[0].0, 0);
-    assert!(
-        report.row_errors[0]
-            .1
-            .contains("mixed or null element in array field tags"),
-        "got {:?}",
-        report.row_errors[0]
-    );
+    assert_eq!(db.get_prop("p1", "tags"), None);
 }
 
 /// Binding: parse/shape failures are GraphError::IngestError, not applied.

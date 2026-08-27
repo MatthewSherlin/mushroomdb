@@ -570,6 +570,7 @@ fn execute_inner(
                                 Value::Str(_) => "Str",
                                 Value::Bool(_) => "Bool",
                                 Value::List(_) => unreachable!(),
+                                Value::Map(_) => "Map",
                             };
                             return Err(format!(
                                 "UNWIND requires a list; got {type_name} value for `{alias}`"
@@ -3250,6 +3251,7 @@ fn eval_expr(
                 Some(Value::Float(f)) => f != 0.0,
                 Some(Value::Str(s)) => !s.is_empty(),
                 Some(Value::List(v)) => !v.is_empty(),
+                Some(Value::Map(m)) => !m.is_empty(),
             })
         }
         Expr::IsNull(op) => {

@@ -29,6 +29,13 @@ fn fmt_value(v: &Value) -> String {
             let inner: Vec<String> = xs.iter().map(fmt_value).collect();
             format!("[{}]", inner.join(", "))
         }
+        Value::Map(m) => {
+            let inner: Vec<String> = m
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", fmt_value(v)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
     }
 }
 

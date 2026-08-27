@@ -196,6 +196,8 @@ impl Column {
                 live: 0,
             },
             Value::List(_) => Column::Mixed(HashMap::new()),
+            // Map spills to the Mixed path, like List. Never promotes a typed column.
+            Value::Map(_) => Column::Mixed(HashMap::new()),
         };
         col.set(node, value, intern);
         col
