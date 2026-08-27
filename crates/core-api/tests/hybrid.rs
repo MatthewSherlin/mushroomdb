@@ -25,7 +25,15 @@
 use core_api::{GraphDb, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("graphdb-hybrid-{}-{}", name, std::process::id()));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let d = std::env::temp_dir().join(format!(
+        "graphdb-hybrid-{}-{}-{}",
+        name,
+        n,
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
