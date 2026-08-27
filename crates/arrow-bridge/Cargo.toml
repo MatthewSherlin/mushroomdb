@@ -13,7 +13,7 @@ description = "Apache Arrow IPC bridge for mushroomdb query results"
 name = "arrow_bridge"
 
 [dependencies]
-core-query = { package = "mushroomdb-query", path = "../core-query", version = "0.1.0" }
+core-query = { package = "mushroomdb-query", path = "../core-query", version = "0.1.2" }
 arrow-array = { version = "59", default-features = false }
 arrow-schema = { version = "59", default-features = false }
 arrow-ipc = { version = "59", default-features = false }

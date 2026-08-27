@@ -14,12 +14,12 @@ readme = "../../README.md"
 name = "core_api"
 
 [dependencies]
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.1.0" }
-core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.1.0" }
-core-query = { package = "mushroomdb-query", path = "../core-query", version = "0.1.0" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.1.2" }
+core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.1.2" }
+core-query = { package = "mushroomdb-query", path = "../core-query", version = "0.1.2" }
 bincode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.1.0" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.1.2" }
