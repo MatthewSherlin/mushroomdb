@@ -44,6 +44,7 @@ fn name(f: FileId) -> &'static str {
     match f {
         FileId::Wal => "wal",
         FileId::Snapshot => "snapshot",
+        FileId::SnapshotBak => "snapshot_bak",
     }
 }
 

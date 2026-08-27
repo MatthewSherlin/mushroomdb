@@ -107,6 +107,10 @@ pub enum Command {
         db_dir: PathBuf,
         schema_file: PathBuf,
     },
+    /// Migrate an old-format snapshot to the current version and keep `.bak`.
+    Migrate {
+        db_dir: PathBuf,
+    },
     Help,
 }
 
@@ -160,6 +164,7 @@ Usage:
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
   mushroomdb snapshot <db-dir> [--keep-wal]
+  mushroomdb migrate <db-dir>
   mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb algo pagerank <db-dir> [--top N]
   mushroomdb algo wcc <db-dir> [--top N]
@@ -188,6 +193,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "query" => parse_query(&args[1..]),
         "snapshot" => parse_snapshot(&args[1..]),
         "schema" => parse_schema(&args[1..]),
+        "migrate" => parse_one_dir("migrate", &args[1..]).map(|db_dir| Command::Migrate { db_dir }),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -448,6 +454,53 @@ fn parse_snapshot(args: &[&str]) -> Result<Command, String> {
     }
     let db_dir = db_dir.ok_or_else(|| "snapshot requires <db-dir>".to_string())?;
     Ok(Command::Snapshot { db_dir, keep_wal })
+}
+
+/// Migrate the snapshot at `db_dir` to the current format version.
+///
+/// - If the snapshot is already at the current version, prints
+///   `already current (V<N>)`.
+/// - If the snapshot is an older version, writes `snapshot.bin.bak` (atomic +
+///   fsynced) then performs a truncating snapshot at the current version, and
+///   prints `migrated V<from> -> V<current>`.
+/// - WAL-only stores (no snapshot) are treated as needing a fresh snapshot.
+pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
+    let current = core_api::SNAPSHOT_VERSION;
+    let from_ver = core_api::snapshot_version_at(db_dir)?;
+
+    if from_ver == Some(current) {
+        return Ok(format!("already current (V{current})\n"));
+    }
+
+    // Write .bak before any modification (old-version stores only).
+    if from_ver.is_some() {
+        let snap_path = db_dir.join("snapshot.bin");
+        let snap_bytes = std::fs::read(&snap_path)?;
+        let bak_tmp = db_dir.join("snapshot.bin.bak.tmp");
+        let bak = db_dir.join("snapshot.bin.bak");
+        std::fs::write(&bak_tmp, &snap_bytes)?;
+        {
+            let f = std::fs::File::open(&bak_tmp)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&bak_tmp, &bak)?;
+    }
+
+    // Open with auto_migrate=false to avoid double-migration, then write
+    // the truncating snapshot (CLI migrate always truncates the WAL).
+    let mut db = GraphDb::open_with_options(
+        db_dir,
+        core_api::OpenOptions {
+            auto_migrate: false,
+        },
+    )?;
+    db.snapshot()?;
+
+    let msg = match from_ver {
+        Some(ver) => format!("migrated V{ver} -> V{current}\n"),
+        None => format!("migrated WAL-only -> V{current}\n"),
+    };
+    Ok(msg)
 }
 
 /// Open `dir` and write `snapshot.bin`. Default truncates the WAL.

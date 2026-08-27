@@ -832,6 +832,42 @@ pub struct GraphDb<F: Fs> {
     total_wal_commits: u64,
 }
 
+/// Options for [`GraphDb::open_with_options`].
+#[derive(Clone, Copy, Debug)]
+pub struct OpenOptions {
+    /// Rewrite an old-format snapshot to the current VERSION after a
+    /// successful load (default `true`). The old snapshot is kept as
+    /// `snapshot.bin.bak` until the next clean open at the current version,
+    /// at which point the `.bak` is deleted.
+    ///
+    /// Set to `false` to open a store without touching any on-disk files
+    /// (useful for read-only inspection of a store at an older format).
+    pub auto_migrate: bool,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self { auto_migrate: true }
+    }
+}
+
+/// Return the on-disk snapshot format version without decoding the full snapshot.
+///
+/// Reads only the 6-byte header (magic + version LE). Returns `None` when no
+/// snapshot file exists (WAL-only store). Returns an error if the header is
+/// malformed.
+pub fn snapshot_version_at(dir: &std::path::Path) -> crate::Result<Option<u16>> {
+    use std::io::Read as _;
+    let path = dir.join("snapshot.bin");
+    let mut header = [0u8; 6];
+    let n = match std::fs::File::open(&path) {
+        Ok(mut f) => f.read(&mut header).map_err(core_storage::GraphError::Io)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(core_storage::GraphError::Io(e)),
+    };
+    core_storage::snapshot::peek_version(&header[..n])
+}
+
 /// Options for [`GraphDb::snapshot_with`].
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotOptions {
@@ -843,8 +879,65 @@ pub struct SnapshotOptions {
 }
 
 impl GraphDb<RealFs> {
+    /// Open the database at `dir` with default options.
+    ///
+    /// Equivalent to `open_with_options(dir, OpenOptions::default())`.
+    /// Old-format snapshots (V5, V6) are automatically migrated to the
+    /// current version on a successful load (see [`OpenOptions::auto_migrate`]).
     pub fn open(dir: &std::path::Path) -> Result<Self> {
-        Self::open_with(RealFs::new(dir)?)
+        Self::open_with_options(dir, OpenOptions::default())
+    }
+
+    /// Open the database at `dir` with explicit options.
+    ///
+    /// When `opts.auto_migrate` is `true` (the default) and the on-disk
+    /// snapshot is an older format version, this function:
+    ///   1. Copies the current `snapshot.bin` to `snapshot.bin.bak` (atomic
+    ///      + fsynced) before any modification.
+    ///   2. Rewrites `snapshot.bin` at the current format version via
+    ///      [`GraphDb::snapshot_with`] with `keep_wal: true` (WAL preserved).
+    ///
+    /// If migration fails the error is returned and the original files are
+    /// intact (the `.bak` was written before the new snapshot was attempted).
+    ///
+    /// A clean open that finds the snapshot already at the current version
+    /// deletes any leftover `.bak` file.
+    ///
+    /// WAL-only stores (no snapshot) are never auto-migrated on open.
+    pub fn open_with_options(dir: &std::path::Path, opts: OpenOptions) -> Result<Self> {
+        // Header-only peek — 6 bytes, no full decode.
+        let snap_version = snapshot_version_at(dir)?;
+
+        // Full load: decode snapshot + replay WAL + rebuild indexes.
+        let mut db = Self::open_with(RealFs::new(dir)?)?;
+
+        if opts.auto_migrate {
+            match snap_version {
+                Some(ver) if ver < core_storage::snapshot::VERSION => {
+                    // Read the full snapshot bytes for the backup.
+                    let snap_bytes = std::fs::read(dir.join("snapshot.bin"))
+                        .map_err(core_storage::GraphError::Io)?;
+                    // Write .bak atomically (fsynced) BEFORE touching snapshot.bin.
+                    db.fs
+                        .write_atomic(FileId::SnapshotBak, &snap_bytes)
+                        .map_err(core_storage::GraphError::Io)?;
+                    // Rewrite snapshot at current version; keep WAL intact.
+                    db.snapshot_with(SnapshotOptions { keep_wal: true })?;
+                }
+                Some(_) => {
+                    // Already current version: remove any leftover .bak.
+                    let bak = dir.join("snapshot.bin.bak");
+                    if bak.exists() {
+                        std::fs::remove_file(&bak).map_err(core_storage::GraphError::Io)?;
+                    }
+                }
+                None => {
+                    // WAL-only store — nothing to migrate on open.
+                }
+            }
+        }
+
+        Ok(db)
     }
 
     /// Open a read-only view of the database as it existed after `commit`.
