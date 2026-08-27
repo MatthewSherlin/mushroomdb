@@ -60,6 +60,9 @@ pub enum Command {
         demo_if_empty: bool,
         /// Bearer token for non-loopback binds. Loopback may omit it.
         token: Option<String>,
+        /// Role-bound tokens from `--role-token TOKEN:ROLE` flags.
+        /// Merged with `MUSHROOMDB_ROLE_TOKENS` env var in main before serving.
+        role_tokens: Vec<(String, String)>,
         /// Periodic snapshot cadence. `None` = off (default).
         snapshot_every: Option<Duration>,
     },
@@ -210,6 +213,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut saw_no_ui = false;
     let mut demo_if_empty = false;
     let mut token = None;
+    let mut role_tokens: Vec<(String, String)> = Vec::new();
     let mut snapshot_every = None;
     let mut i = 0;
     while i < args.len() {
@@ -253,6 +257,18 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--token=") {
             token = Some(val.to_string());
             i += 1;
+        } else if a == "--role-token" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --role-token".to_string())?;
+            let (tok, role) = parse_role_token(val)?;
+            role_tokens.push((tok, role));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--role-token=") {
+            let (tok, role) = parse_role_token(val)?;
+            role_tokens.push((tok, role));
+            i += 1;
         } else if a == "--snapshot-every" {
             let val = args
                 .get(i + 1)
@@ -282,8 +298,22 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         ui,
         demo_if_empty,
         token,
+        role_tokens,
         snapshot_every,
     })
+}
+
+fn parse_role_token(val: &str) -> Result<(String, String), String> {
+    let (tok, role) = val
+        .split_once(':')
+        .ok_or_else(|| format!("--role-token requires TOKEN:ROLE format, got: {val}"))?;
+    if tok.is_empty() {
+        return Err("--role-token: TOKEN must not be empty".to_string());
+    }
+    if role.is_empty() {
+        return Err("--role-token: ROLE must not be empty".to_string());
+    }
+    Ok((tok.to_string(), role.to_string()))
 }
 
 fn parse_snapshot_every(val: &str) -> Result<Duration, String> {
@@ -1283,6 +1313,7 @@ mod tests {
                         ui,
                         demo_if_empty,
                         token,
+                        role_tokens,
                         snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
@@ -1290,6 +1321,7 @@ mod tests {
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
                         assert_eq!(token, None);
+                        assert!(role_tokens.is_empty());
                         assert_eq!(snapshot_every, None);
                     }
                     other => panic!("serve <dir> → Serve default addr, got {other:?}"),
@@ -1304,6 +1336,7 @@ mod tests {
                         ui,
                         demo_if_empty,
                         token,
+                        role_tokens,
                         snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
@@ -1311,6 +1344,7 @@ mod tests {
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
                         assert_eq!(token, None);
+                        assert!(role_tokens.is_empty());
                         assert_eq!(snapshot_every, None);
                     }
                     other => panic!("serve --addr after dir, got {other:?}"),
@@ -1325,6 +1359,7 @@ mod tests {
                         ui,
                         demo_if_empty,
                         token,
+                        role_tokens,
                         snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
@@ -1332,6 +1367,7 @@ mod tests {
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
                         assert_eq!(token, None);
+                        let _ = role_tokens; // empty, not asserted
                         assert_eq!(snapshot_every, None);
                     }
                     other => panic!("serve --addr=VALUE, got {other:?}"),
@@ -1512,6 +1548,7 @@ mod tests {
                         ui,
                         token,
                         snapshot_every,
+                        ..
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/data"));
                         assert_eq!(addr, "0.0.0.0:8080".parse().unwrap());

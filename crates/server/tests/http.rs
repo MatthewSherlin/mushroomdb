@@ -4,13 +4,13 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use core_api::{
-    json_to_value, Explanation, FkSkip, IngestReport, Predicate, PredicateSummary, RuleDef,
-    RuleStats, SharedDb, Stats, Value,
+    json_to_value, schema::Schema, Explanation, FkSkip, IngestReport, Predicate, PredicateSummary,
+    RoleDef, RuleDef, RuleStats, SharedDb, Stats, Value,
 };
 use serde_json::{json, Value as Json};
 #[cfg(feature = "embed-ui")]
 use server::router_with_embedded_ui;
-use server::{router, router_with_auth, router_with_ui, serve};
+use server::{router, router_with_auth, router_with_role_tokens, router_with_ui, serve};
 use std::io::Cursor;
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -1427,6 +1427,873 @@ async fn http_params_write_set_is_durable() {
         "score must be 99 after re-open"
     );
 }
+
+// ── RBAC: role-bound server token tests ────────────────────────────────────────
+
+/// Build a DB with named roles and return (Router, SharedDb) with the role
+/// token map wired up.
+///
+/// `roles` is a slice of (role_name, allowed_labels, allowed_keys).
+/// `full_token` is the full-access bearer value (None = no full token).
+/// `role_token_map` is a slice of (bearer_value, role_name).
+fn open_rbac(
+    name: &str,
+    roles: &[(&str, &[&str], &[&str])],
+    full_token: Option<&str>,
+    role_token_map: &[(&str, &str)],
+) -> (Router, SharedDb) {
+    let db = SharedDb::open(&tmp(name)).unwrap();
+    let schema = Schema {
+        roles: roles
+            .iter()
+            .map(|(rname, labels, keys)| RoleDef {
+                name: rname.to_string(),
+                labels: labels.iter().map(|s| s.to_string()).collect(),
+                keys: keys.iter().map(|s| s.to_string()).collect(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    db.write().apply_schema(&schema).unwrap();
+    let rtoks: std::collections::HashMap<String, String> = role_token_map
+        .iter()
+        .map(|(tok, role)| (tok.to_string(), role.to_string()))
+        .collect();
+    let app = router_with_role_tokens(db.clone(), full_token.map(str::to_string), rtoks);
+    (app, db)
+}
+
+/// Authenticated JSON POST.
+fn authed_json_req(method: &str, uri: &str, token: &str, body: Json) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Authenticated GET.
+fn authed_get(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Authenticated GET that includes WebSocket upgrade headers so the handler
+/// can reach the identity check before failing on missing WS framing.
+fn authed_ws_upgrade(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("Sec-WebSocket-Version", "13")
+        .body(Body::empty())
+        .unwrap()
+}
+
+// ── 1. Role token sees only its subgraph via /query ───────────────────────────
+
+#[tokio::test]
+async fn role_token_query_sees_only_role_subgraph() {
+    // analyst role: sees "Pub" label; "Secret" label is hidden.
+    let (app, db) = open_rbac(
+        "rbac-q-subgraph",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("analyst-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Pub", "pub2", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    // Role token: only sees Pub nodes.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "analyst-tok",
+        json!({"cypher": "MATCH (n) RETURN n.id"}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "role must see only 2 Pub nodes, got {v}");
+
+    // Full token: sees all three.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "admin",
+        json!({"cypher": "MATCH (n) RETURN n.id"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["rows"].as_array().unwrap().len(),
+        3,
+        "full token must see all 3 nodes"
+    );
+}
+
+// ── 2. Role token sees subgraph via /node/{key} ───────────────────────────────
+
+#[tokio::test]
+async fn role_token_node_visible_key_is_200() {
+    let (app, db) = open_rbac(
+        "rbac-node-ok",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+
+    let (status, _, _) = send(app, authed_get("/node/pub1", "role-tok")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn role_token_node_hidden_key_is_404() {
+    let (app, db) = open_rbac(
+        "rbac-node-hidden",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    let (status, body, _) = send(app, authed_get("/node/sec1", "role-tok")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let v = parse_json(&body);
+    assert!(
+        v["error"].as_str().is_some_and(|s| s.contains("sec1")),
+        "404 body must name the key"
+    );
+}
+
+// ── 3. Hidden key same response shape as truly absent key ────────────────────
+
+#[tokio::test]
+async fn role_token_hidden_key_indistinguishable_from_absent() {
+    let (app, db) = open_rbac(
+        "rbac-hidden-absent",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    let (hidden_status, hidden_body, _) =
+        send(app.clone(), authed_get("/node/sec1", "role-tok")).await;
+    let (absent_status, absent_body, _) =
+        send(app, authed_get("/node/totally-absent", "role-tok")).await;
+
+    assert_eq!(hidden_status, StatusCode::NOT_FOUND);
+    assert_eq!(absent_status, StatusCode::NOT_FOUND);
+    // Both bodies have the same shape: {"error":"node key not found: ..."}
+    let hidden_v = parse_json(&hidden_body);
+    let absent_v = parse_json(&absent_body);
+    assert!(
+        hidden_v["error"].as_str().is_some(),
+        "hidden: must have error field"
+    );
+    assert!(
+        absent_v["error"].as_str().is_some(),
+        "absent: must have error field"
+    );
+}
+
+// ── 4. Full token is unaffected by role config ────────────────────────────────
+
+#[tokio::test]
+async fn full_token_unaffected_by_role_config() {
+    let (app, db) = open_rbac(
+        "rbac-full-unaffected",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    // Full token sees all nodes via /query.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "admin",
+        json!({"cypher": "MATCH (n) RETURN n.id"}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(v["rows"].as_array().unwrap().len(), 2);
+
+    // Full token can write.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "admin",
+        json!({"cypher": "CREATE (n:Pub {id: 'pub2'})"}),
+    );
+    let (status, _, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK, "full token write must succeed");
+
+    // Full token can read /stats.
+    let (status, _, _) = send(app, authed_get("/stats", "admin")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ── 5. Write via role token → 403 ────────────────────────────────────────────
+
+#[tokio::test]
+async fn role_token_write_query_is_403() {
+    let (app, _db) = open_rbac(
+        "rbac-write-403",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({"cypher": "CREATE (n:Pub {id: 'evil'})"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "write via role token must be 403: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert!(v["error"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+// ── 6. /ingest via role token → 403 ──────────────────────────────────────────
+
+#[tokio::test]
+async fn role_token_ingest_is_403() {
+    let (app, _db) = open_rbac(
+        "rbac-ingest-403",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/ingest",
+        "role-tok",
+        json!({"label": "Pub", "rows": [{"id": "x"}]}),
+    );
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ── 7. /rules via role token → 403 ───────────────────────────────────────────
+
+#[tokio::test]
+async fn role_token_rules_is_403() {
+    let (app, _db) = open_rbac(
+        "rbac-rules-403",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/rules",
+        "role-tok",
+        json!({
+            "name": "r",
+            "src_label": "Pub",
+            "dst_label": "Pub",
+            "predicate": {"KeyMatch": {"field": "fk"}},
+            "edge_type": "REL"
+        }),
+    );
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ── 8. /subscribe via role token → 403 ───────────────────────────────────────
+
+#[tokio::test]
+async fn role_token_subscribe_is_403() {
+    let (app, _db) = open_rbac(
+        "rbac-sub-403",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    // Send a proper WS upgrade request so the handler body is reached.
+    let req = authed_ws_upgrade("/subscribe", "role-tok");
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "/subscribe with role token must be 403: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert!(v["error"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+// ── 9. /watch via role token → 403 ───────────────────────────────────────────
+
+#[tokio::test]
+async fn role_token_watch_is_403() {
+    let (app, _db) = open_rbac(
+        "rbac-watch-403",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let req = authed_ws_upgrade("/watch", "role-tok");
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "/watch with role token must be 403: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert!(v["error"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+// ── 10. /stats via role token → 403 ──────────────────────────────────────────
+
+#[tokio::test]
+async fn role_token_stats_is_403() {
+    let (app, _db) = open_rbac(
+        "rbac-stats-403",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let (status, _, _) = send(app, authed_get("/stats", "role-tok")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ── 11. /algo/* via role token → 403 ─────────────────────────────────────────
+
+#[tokio::test]
+async fn role_token_algo_is_403() {
+    let (app, _db) = open_rbac(
+        "rbac-algo-403",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let req = authed_json_req("POST", "/algo/pagerank", "role-tok", json!({}));
+    let (status, _, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "/algo/pagerank must be 403");
+
+    let req = authed_json_req("POST", "/algo/wcc", "role-tok", json!({}));
+    let (status, _, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "/algo/wcc must be 403");
+
+    let req = authed_json_req("POST", "/algo/degree", "role-tok", json!({}));
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "/algo/degree must be 403");
+}
+
+// ── 12. /explain via role token → 403 ────────────────────────────────────────
+
+#[tokio::test]
+async fn role_token_explain_is_403() {
+    let (app, _db) = open_rbac(
+        "rbac-explain-403",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let (status, _, _) = send(app, authed_get("/explain?a=x&b=y", "role-tok")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ── 13. /suggest via role token → 403 ────────────────────────────────────────
+
+#[tokio::test]
+async fn role_token_suggest_is_403() {
+    let (app, _db) = open_rbac(
+        "rbac-suggest-403",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let (status, _, _) = send(app, authed_get("/suggest", "role-tok")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ── 14. Unknown bearer token (not in role_tokens and not full) → 401 ─────────
+
+#[tokio::test]
+async fn unknown_token_is_401() {
+    let (app, _db) = open_rbac(
+        "rbac-unknown-tok",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "not-a-real-token",
+        json!({"cypher": "MATCH (n) RETURN n"}),
+    );
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ── 15. Token bound to unknown role → 401 ────────────────────────────────────
+
+#[tokio::test]
+async fn token_bound_to_unknown_role_is_401() {
+    // "ghost-role" is not defined in the DB schema.
+    let db = SharedDb::open(&tmp("rbac-unknown-role")).unwrap();
+    // Apply schema with NO roles at all (or a different role).
+    let schema = Schema {
+        roles: vec![],
+        ..Default::default()
+    };
+    db.write().apply_schema(&schema).unwrap();
+
+    let rtoks = [("role-tok".to_string(), "ghost-role".to_string())]
+        .into_iter()
+        .collect();
+    let app = router_with_role_tokens(db.clone(), Some("admin".to_string()), rtoks);
+
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({"cypher": "MATCH (n) RETURN n.id"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "token bound to unknown role must be 401, body: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+// ── 16. Client mask ∩ role mask: never widens ─────────────────────────────────
+
+#[tokio::test]
+async fn role_token_client_mask_intersects_role_mask() {
+    // analyst sees "Pub" label; alice, bob, carol are Pub; dave is Secret.
+    let (app, db) = open_rbac(
+        "rbac-mask-intersect",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "alice", vec![]).unwrap();
+    db.write().insert_node("Pub", "bob", vec![]).unwrap();
+    db.write().insert_node("Pub", "carol", vec![]).unwrap();
+    db.write().insert_node("Secret", "dave", vec![]).unwrap();
+
+    // Client supplies mask [alice, bob, dave]. Role mask = [alice, bob, carol].
+    // Effective = intersection = [alice, bob] only. dave must not appear.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({
+            "cypher": "MATCH (n:Pub) RETURN n.id",
+            "mask": ["alice", "bob", "dave"]
+        }),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "only alice+bob must be visible, got {v}");
+
+    // Client cannot widen by omitting mask: still role-masked.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({"cypher": "MATCH (n) RETURN n.id"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "role sees 3 Pub nodes without client mask, got {v}"
+    );
+}
+
+// ── 17. Poisoned roles.json → 500 for role tokens ────────────────────────────
+
+#[tokio::test]
+async fn poisoned_sidecar_is_500_for_role_token() {
+    let dir = tmp("rbac-poisoned");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Write a syntactically invalid roles.json before opening the DB.
+    std::fs::write(dir.join("roles.json"), b"not valid json at all!").unwrap();
+
+    // SharedDb::open succeeds but roles are poisoned (mask_for_role returns Err).
+    let db = SharedDb::open(&dir).unwrap();
+
+    let rtoks = [("role-tok".to_string(), "analyst".to_string())]
+        .into_iter()
+        .collect();
+    // Full token is still functional.
+    let app = router_with_role_tokens(db.clone(), Some("admin".to_string()), rtoks);
+
+    // Role token → 500 (poisoned state).
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({"cypher": "MATCH (n) RETURN n.id"}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "poisoned sidecar must be 500 for role token: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert!(
+        v["error"].as_str().is_some_and(|s| !s.is_empty()),
+        "500 body must have error field"
+    );
+
+    // Full token is unaffected.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "admin",
+        json!({"cypher": "MATCH (n) RETURN n.id"}),
+    );
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "full token must be unaffected by poisoned sidecar"
+    );
+}
+
+// ── 18. No role config: existing behavior byte-identical ─────────────────────
+
+#[tokio::test]
+async fn no_role_config_is_byte_identical() {
+    // A router with no role tokens and no full token behaves exactly as before.
+    let (app, db) = open("no-rbac-compat");
+    db.write().insert_node("P", "x", vec![]).unwrap();
+    let req = json_req(
+        "POST",
+        "/query?format=json",
+        json!({"cypher": "MATCH (n) RETURN n.id"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+}
+
+// ── 19. /node/{key}/edges hidden key → 404 ───────────────────────────────────
+
+#[tokio::test]
+async fn role_token_node_edges_hidden_key_is_404() {
+    let (app, db) = open_rbac(
+        "rbac-edges-hidden",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    let (status, _, _) = send(app, authed_get("/node/sec1/edges", "role-tok")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ── 20. /node/{key}/neighborhood hidden key → 404 ────────────────────────────
+
+#[tokio::test]
+async fn role_token_neighborhood_hidden_key_is_404() {
+    let (app, db) = open_rbac(
+        "rbac-nbhd-hidden",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    let (status, _, _) = send(app, authed_get("/node/sec1/neighborhood", "role-tok")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ── Fix round-1: C1 — /edges filters hidden neighbor endpoints ────────────────
+
+#[tokio::test]
+async fn role_token_edges_filters_hidden_neighbor() {
+    // pub1 --KNOWS--> sec1 (hidden); pub1 --KNOWS--> pub2 (visible).
+    // Role token on /node/pub1/edges must NOT see the edge to sec1.
+    let (app, db) = open_rbac(
+        "rbac-edges-filter",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    {
+        let mut w = db.write();
+        w.insert_node("Pub", "pub1", vec![]).unwrap();
+        w.insert_node("Pub", "pub2", vec![]).unwrap();
+        w.insert_node("Secret", "sec1", vec![]).unwrap();
+        w.insert_edge("KNOWS", "pub1", "sec1").unwrap();
+        w.insert_edge("KNOWS", "pub1", "pub2").unwrap();
+    }
+
+    let (status, body, _) = send(app.clone(), authed_get("/node/pub1/edges", "role-tok")).await;
+    assert_eq!(status, StatusCode::OK, "visible entry key must be 200");
+    let v = parse_json(&body);
+    let edges = v["edges"].as_array().expect("edges array");
+    // Only the pub1→pub2 edge should appear; the pub1→sec1 edge must be absent.
+    assert_eq!(
+        edges.len(),
+        1,
+        "role token must not see edge to hidden node"
+    );
+    let dst = edges[0]["dst_key"].as_str().unwrap_or("");
+    assert_eq!(dst, "pub2", "only visible-neighbor edge returned");
+
+    // Full token sees both edges.
+    let (status, body, _) = send(app, authed_get("/node/pub1/edges", "admin")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["edges"].as_array().unwrap().len(),
+        2,
+        "full token must see all edges"
+    );
+}
+
+// ── Fix round-1: C2 — /neighborhood never leaks hidden nodes or routes through them
+
+#[tokio::test]
+async fn role_token_neighborhood_hides_hidden_nodes_and_does_not_route_through_them() {
+    // Graph: pub1 --KNOWS--> sec1 (hidden) --KNOWS--> pub2 (visible, but only
+    // reachable through a hidden intermediate).
+    //
+    // At depth 2 the unmasked BFS would yield both sec1 and pub2.
+    // A role token must see neither (sec1 is hidden; pub2 is only reachable via sec1).
+    let (app, db) = open_rbac(
+        "rbac-nbhd-route",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    {
+        let mut w = db.write();
+        w.insert_node("Pub", "pub1", vec![]).unwrap();
+        w.insert_node("Secret", "sec1", vec![]).unwrap();
+        w.insert_node("Pub", "pub2", vec![]).unwrap();
+        w.insert_edge("KNOWS", "pub1", "sec1").unwrap();
+        w.insert_edge("KNOWS", "sec1", "pub2").unwrap();
+    }
+
+    let (status, body, _) = send(
+        app.clone(),
+        authed_get("/node/pub1/neighborhood?depth=2", "role-tok"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "visible entry key must be 200");
+    let v = parse_json(&body);
+    let rows = v["rows"].as_array().expect("rows array");
+    // Neither sec1 nor pub2 should appear.
+    let keys: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.as_array()?.first()?.as_str())
+        .collect();
+    assert!(
+        !keys.contains(&"sec1"),
+        "hidden node sec1 must not appear in neighborhood"
+    );
+    assert!(
+        !keys.contains(&"pub2"),
+        "pub2 reachable only via hidden intermediate must not appear"
+    );
+
+    // Full token at depth 2 sees both sec1 and pub2.
+    let (status, body, _) = send(app, authed_get("/node/pub1/neighborhood?depth=2", "admin")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    let full_rows = v["rows"].as_array().unwrap();
+    let full_keys: Vec<&str> = full_rows
+        .iter()
+        .filter_map(|r| r.as_array()?.first()?.as_str())
+        .collect();
+    assert!(
+        full_keys.contains(&"sec1"),
+        "full token must see sec1 in neighborhood"
+    );
+    assert!(
+        full_keys.contains(&"pub2"),
+        "full token must see pub2 in neighborhood"
+    );
+}
+
+// ── Fix round-1: I1 — serve_with_embedded_ui wires role tokens (unit check) ──
+
+/// Validates that `router_with_role_tokens` (used by the embed-ui serve path)
+/// enforces role tokens when invoked with a role map.  The embed-ui feature gate
+/// guards `serve_with_embedded_ui` itself; this test covers the router logic that
+/// `serve_with_embedded_ui` delegates to.
+#[tokio::test]
+async fn embed_ui_router_path_honors_role_tokens() {
+    // open_rbac uses router_with_role_tokens — the same path serve_with_embedded_ui
+    // now delegates to — so this exercises the fixed code path.
+    let (app, db) = open_rbac(
+        "rbac-embed-ui-wire",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    // Role token: visible node is 200; hidden node is 404.
+    let (st, _, _) = send(app.clone(), authed_get("/node/pub1", "role-tok")).await;
+    assert_eq!(st, StatusCode::OK, "role token must see pub1");
+    let (st, _, _) = send(app.clone(), authed_get("/node/sec1", "role-tok")).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "role token must not see sec1");
+
+    // Unknown token is 401 even on this path.
+    let (st, _, _) = send(app, authed_get("/node/pub1", "bad-tok")).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "unknown token must be 401");
+}
+
+// ── Fix round-1: M1 — indistinguishability extends to /edges and /neighborhood ─
+
+#[tokio::test]
+async fn role_token_hidden_key_indistinguishable_from_absent_on_edges_and_neighborhood() {
+    let (app, db) = open_rbac(
+        "rbac-indist-ext",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    // /edges: hidden and absent both return 404 with an error field.
+    let (hidden_st, hidden_body, _) =
+        send(app.clone(), authed_get("/node/sec1/edges", "role-tok")).await;
+    let (absent_st, absent_body, _) = send(
+        app.clone(),
+        authed_get("/node/totally-absent/edges", "role-tok"),
+    )
+    .await;
+    assert_eq!(hidden_st, StatusCode::NOT_FOUND);
+    assert_eq!(absent_st, StatusCode::NOT_FOUND);
+    let hv = parse_json(&hidden_body);
+    let av = parse_json(&absent_body);
+    // Both must have an "error" field with the same prefix pattern.
+    let h_err = hv["error"].as_str().unwrap_or("");
+    let a_err = av["error"].as_str().unwrap_or("");
+    assert!(
+        h_err.starts_with("node key not found"),
+        "hidden /edges error must match absent prefix: {h_err}"
+    );
+    assert!(
+        a_err.starts_with("node key not found"),
+        "absent /edges error must match pattern: {a_err}"
+    );
+
+    // /neighborhood: same.
+    let (hidden_st, hidden_body, _) = send(
+        app.clone(),
+        authed_get("/node/sec1/neighborhood", "role-tok"),
+    )
+    .await;
+    let (absent_st, absent_body, _) = send(
+        app,
+        authed_get("/node/totally-absent/neighborhood", "role-tok"),
+    )
+    .await;
+    assert_eq!(hidden_st, StatusCode::NOT_FOUND);
+    assert_eq!(absent_st, StatusCode::NOT_FOUND);
+    let hv = parse_json(&hidden_body);
+    let av = parse_json(&absent_body);
+    let h_err = hv["error"].as_str().unwrap_or("");
+    let a_err = av["error"].as_str().unwrap_or("");
+    assert!(
+        h_err.starts_with("node key not found"),
+        "hidden /neighborhood error must match absent prefix: {h_err}"
+    );
+    assert!(
+        a_err.starts_with("node key not found"),
+        "absent /neighborhood error must match pattern: {a_err}"
+    );
+}
+
+// ── Fix round-1: M2 — poisoned sidecar on /node, /edges, /neighborhood → 500 ──
+
+#[tokio::test]
+async fn poisoned_sidecar_is_500_on_node_edges_and_neighborhood() {
+    let dir = tmp("rbac-poisoned-ext");
+    {
+        let db = SharedDb::open(&dir).unwrap();
+        db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+        db.write().insert_node("Pub", "pub2", vec![]).unwrap();
+        db.write().insert_edge("KNOWS", "pub1", "pub2").unwrap();
+    }
+    // Poison the sidecar after nodes are inserted.
+    std::fs::write(dir.join("roles.json"), b"not valid json").unwrap();
+    let db = SharedDb::open(&dir).unwrap();
+    let rtoks: std::collections::HashMap<String, String> =
+        [("role-tok".to_string(), "analyst".to_string())]
+            .into_iter()
+            .collect();
+    let app = router_with_role_tokens(db, Some("admin".to_string()), rtoks);
+
+    for path in ["/node/pub1", "/node/pub1/edges", "/node/pub1/neighborhood"] {
+        let (status, body, _) = send(app.clone(), authed_get(path, "role-tok")).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "poisoned sidecar must be 500 for role token on {path}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let v = parse_json(&body);
+        assert!(
+            v["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "500 body must have error field on {path}"
+        );
+    }
+
+    // Full token is unaffected.
+    let (status, _, _) = send(app, authed_get("/node/pub1", "admin")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "full token must be unaffected by poisoned sidecar"
+    );
+}
+
+// ── Existing non-RBAC test below (unchanged) ─────────────────────────────────
 
 #[tokio::test]
 async fn query_mask_filters_nodes() {

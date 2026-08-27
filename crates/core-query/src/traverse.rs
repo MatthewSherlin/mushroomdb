@@ -87,8 +87,16 @@ pub fn neighborhood(
             continue;
         }
         for e in expand(view, id, etypes, dir) {
-            edges.insert(e);
             let nbr = if e.src == id { e.dst } else { e.src };
+            // Respect the view's node-visibility mask.  When `view` carries a
+            // mask (role-token path), hidden nodes are skipped entirely — they
+            // are not added to the result *and* not used as traversal
+            // intermediaries.  With no mask `view.visible` always returns true,
+            // so this branch is a no-op for the unmasked case.
+            if !view.visible(nbr) {
+                continue;
+            }
+            edges.insert(e);
             if visited.insert(nbr) {
                 let nd = d + 1;
                 nodes.push((nbr, nd));

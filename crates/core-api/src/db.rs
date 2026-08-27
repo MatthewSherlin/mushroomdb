@@ -1,4 +1,5 @@
 use crate::ingest::{IngestOptions, IngestReport};
+use crate::roles::{RoleDef, RolesFile};
 use crate::subscription::{
     event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
 };
@@ -813,6 +814,12 @@ pub struct GraphDb<F: Fs> {
     /// call increments this once; all events emitted from that call share the same
     /// `commit_seq` value.
     commit_seq: u64,
+    /// RBAC role definitions loaded from `roles.json` at open.
+    ///
+    /// `Some(roles)` — loaded successfully (may be empty when no roles are defined).
+    /// `None` — `roles.json` was present but corrupt; `mask_for_role` returns
+    /// `Err` for any request (fail-loud, never silently grant empty visibility).
+    roles: Option<Vec<RoleDef>>,
     /// Live subscriptions.  Entries with a dead `Weak` are pruned on the next
     /// distribute_events call.
     subscriptions: Vec<SubEntry>,
@@ -1000,6 +1007,7 @@ impl<F: Fs> GraphDb<F> {
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
+            roles: Some(vec![]),
             subscriptions: Vec::new(),
             query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -1042,6 +1050,9 @@ impl<F: Fs> GraphDb<F> {
         // per-record incremental apply during replay.
         db.fulltext
             .rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
+        // Load roles sidecar. Missing file = no roles (Some(vec![])).
+        // Corrupt/unparseable = poisoned (None); mask_for_role will fail-loud.
+        db.roles = Self::load_roles_from_fs(&db.fs)?;
         Ok(db)
     }
 
@@ -1129,6 +1140,7 @@ impl<F: Fs> GraphDb<F> {
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
+            roles: Some(vec![]),
             subscriptions: Vec::new(),
             query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -1179,6 +1191,8 @@ impl<F: Fs> GraphDb<F> {
         // Rebuild full-text index for as-of view (mirrors open_with pattern).
         db.fulltext
             .rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
+        // Load roles sidecar (current roles, not point-in-time).
+        db.roles = Self::load_roles_from_fs(&db.fs)?;
         db.read_only = true;
         db.total_wal_commits = total;
         Ok(db)
@@ -3641,6 +3655,105 @@ impl<F: Fs> GraphDb<F> {
         &self.ids
     }
 
+    // -----------------------------------------------------------------------
+    // RBAC role resolution
+    // -----------------------------------------------------------------------
+
+    /// Parse `roles.json` bytes from `fs`.
+    ///
+    /// Return values:
+    ///   `Ok(Some(roles))` — file present and valid (roles may be an empty vec)
+    ///   `Ok(Some(vec![]))` — file absent (fs returns empty bytes) → no roles defined
+    ///   `Ok(None)`        — file present but corrupt or unrecognised version
+    ///                       → poisoned state; `mask_for_role` will return `Err` for any role token
+    ///
+    /// Note: absent and healthy-but-empty both produce `Some`; `None` means
+    /// corrupt — the opposite of what an optional "file missing" convention would
+    /// suggest.  The open path stores this result on `db.roles` directly.
+    fn load_roles_from_fs(fs: &F) -> Result<Option<Vec<RoleDef>>> {
+        let bytes = fs.read(FileId::Roles).map_err(GraphError::Io)?;
+        if bytes.is_empty() {
+            // Missing file: no roles defined.
+            return Ok(Some(vec![]));
+        }
+        match serde_json::from_slice::<RolesFile>(&bytes) {
+            Ok(f) if f.version == 1 => Ok(Some(f.roles)),
+            // Corrupt or unrecognised version: poison the roles state.
+            _ => Ok(None),
+        }
+    }
+
+    /// Resolve a role to a node-visibility mask against the current graph state.
+    ///
+    /// Returns `Err` when:
+    /// - `roles.json` was present but corrupt at open (poisoned state), or
+    /// - `role` does not match any defined role name.
+    ///
+    /// The mask union is: explicit `keys` (unknown keys silently ignored) plus
+    /// all live nodes carrying any label in `labels`.  Label resolution is live
+    /// — new nodes of an allowed label are visible without re-applying the
+    /// schema.  An empty union = empty mask = sees nothing.
+    pub fn mask_for_role(&self, role: &str) -> Result<crate::mask::NodeMask> {
+        let roles = self.roles.as_ref().ok_or_else(|| GraphError::Corrupt {
+            detail:
+                "roles.json was corrupt at open; fix the file and re-open to restore role access"
+                    .into(),
+        })?;
+        let def = roles
+            .iter()
+            .find(|r| r.name == role)
+            .ok_or_else(|| GraphError::KeyNotFound {
+                key: format!("role:{role}"),
+            })?;
+
+        let mut visible = std::collections::HashSet::new();
+
+        // Key leg: resolve explicit keys to dense ids (unknown keys ignored).
+        for key in &def.keys {
+            if let Some(id) = self.ids.get(key) {
+                visible.insert(id);
+            }
+        }
+
+        // Label leg: live scan — iterate labels vec for matching symbol.
+        for label_name in &def.labels {
+            if let Some(sym) = self.syms.get(label_name) {
+                for (i, &s) in self.labels.iter().enumerate() {
+                    if s == sym {
+                        visible.insert(i as u32);
+                    }
+                }
+            }
+        }
+
+        Ok(crate::mask::NodeMask { visible })
+    }
+
+    /// Return the current list of role definitions.
+    ///
+    /// Returns an empty list when no roles are defined or when `roles.json`
+    /// was corrupt at open (check [`mask_for_role`](Self::mask_for_role) for
+    /// the fail-loud error in that case).
+    pub fn roles(&self) -> Vec<RoleDef> {
+        self.roles.as_deref().unwrap_or(&[]).to_vec()
+    }
+
+    /// Write `roles` to `roles.json` atomically and update the in-memory list.
+    ///
+    /// Called by `apply_schema` when roles change. Never called on unchanged
+    /// re-apply — this preserves byte-identical idempotency.
+    pub(crate) fn commit_roles(&mut self, roles: Vec<RoleDef>) -> Result<()> {
+        let file = RolesFile::v1(roles.clone());
+        let bytes = serde_json::to_vec(&file).map_err(|e| GraphError::Corrupt {
+            detail: format!("roles serialization: {e}"),
+        })?;
+        self.fs
+            .write_atomic(FileId::Roles, &bytes)
+            .map_err(GraphError::Io)?;
+        self.roles = Some(roles);
+        Ok(())
+    }
+
     fn view(&self) -> GraphView<'_> {
         GraphView {
             ids: &self.ids,
@@ -3704,6 +3817,43 @@ impl<F: Fs> GraphDb<F> {
     pub fn node_ref(&self, key: &str) -> Option<NodeRef<'_, F>> {
         let id = self.ids.get(key)?;
         Some(NodeRef { db: self, id })
+    }
+
+    /// BFS neighborhood expansion restricted to visible nodes in `mask`.
+    ///
+    /// Hidden nodes are neither returned nor used as traversal intermediaries —
+    /// a visible node reachable only through a hidden node will not appear.
+    /// Returns `None` when `key` does not exist (caller should 404).
+    pub fn neighborhood_masked(
+        &self,
+        key: &str,
+        depth: u32,
+        edge_types: Option<&[&str]>,
+        dir: Dir,
+        mask: &crate::mask::NodeMask,
+    ) -> Option<ResultSet> {
+        let id = self.ids.get(key)?;
+        let view = self.view_masked(mask);
+        let resolved: Option<Vec<u32>> = edge_types.map(|names| {
+            names
+                .iter()
+                .filter_map(|name| view.syms.get(name))
+                .collect()
+        });
+        let nb = neighborhood(&view, id, depth, resolved.as_deref(), dir);
+        let mut rs = ResultSet::new(vec!["key".into(), "label".into(), "depth".into()]);
+        for (nid, d) in nb.nodes {
+            let key = view.key_of(nid);
+            let label = view
+                .label_of(nid)
+                .expect("real nodes always have a label; u32::MAX sentinel cannot occur");
+            rs.push_row(vec![
+                Some(Value::Str(key.to_string())),
+                Some(Value::Str(label.to_string())),
+                Some(Value::Int(d as i64)),
+            ]);
+        }
+        Some(rs)
     }
 
     /// Live node's key, label, and columnar props. Unknown or tombstoned → `None`.

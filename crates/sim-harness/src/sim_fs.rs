@@ -45,6 +45,7 @@ fn name(f: FileId) -> &'static str {
         FileId::Wal => "wal",
         FileId::Snapshot => "snapshot",
         FileId::SnapshotBak => "snapshot_bak",
+        FileId::Roles => "roles",
     }
 }
 

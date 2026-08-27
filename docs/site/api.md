@@ -12,12 +12,52 @@ Python bindings (via PyO3 / maturin), and the
 Start the server:
 
 ```text
-mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty]
+mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] \
+  [--role-token TOKEN:ROLE]... [--ui <dist-dir>] [--no-ui] [--demo-if-empty]
 ```
 
 Default bind is `127.0.0.1:8080`. The bound address is printed after the
 listener is accepting. Non-loopback `--addr` requires `--token` or
 `MUSHROOMDB_TOKEN` (see `SECURITY.md`).
+
+### Authentication
+
+**Full-access token** (`--token` / `MUSHROOMDB_TOKEN`): bearer or `?token=`
+query param. Grants access to all endpoints.
+
+**Role-bound tokens** (`--role-token TOKEN:ROLE` / `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`):
+bearer-only. A role token receives a node-visibility mask derived from the
+named role's label selectors (defined in `schema.json` or `roles.json`). The
+mask is resolved live at request time against the same DB snapshot used for
+the query — one read-lock acquisition.
+
+Role-token behavior per endpoint:
+
+| Endpoint | Role-token response |
+|---|---|
+| `GET /health` | 200 (unauthenticated — no identity needed) |
+| `POST /query` (read) | 200 — rows filtered to visible nodes; client `mask` intersects role mask (never widens) |
+| `POST /query` (write: `CREATE`/`SET`/`DELETE`/`MERGE`) | 403 |
+| `GET /node/{key}` | 200 if visible; 404 if hidden or absent (indistinguishable) |
+| `GET /node/{key}/edges` | 200 if visible; 404 if hidden or absent |
+| `GET /node/{key}/neighborhood` | 200 if visible; 404 if hidden or absent |
+| `GET /stats` | 403 (counts leak graph size) |
+| `POST /ingest` | 403 |
+| `POST /rules` | 403 |
+| `GET /explain` | 403 |
+| `GET /suggest` | 403 |
+| `GET /algo/*` | 403 |
+| `GET /subscribe` | 403 |
+| `GET /watch` | 403 |
+
+**Never-widen invariant:** unknown token → 401; token bound to a role name not
+present in `roles.json` at request time → 401; corrupt `roles.json` → 500 for
+role tokens (full-access token unaffected); empty role → sees zero nodes.
+Role sidecar is stored in `<db-dir>/roles.json`.
+
+**MCP trust boundary:** The MCP interface (`mushroomdb mcp`) is a stdio
+JSON-RPC server intended for local agent use; it operates without bearer-token
+authentication and is not subject to role enforcement.
 
 ### Endpoints
 
