@@ -220,6 +220,17 @@ Open `http://127.0.0.1:8080/`. When a token is configured, open
 `http://host:8080/?token=…`. The demo graph has 10 Orgs, 20 Projects,
 30 People, and 334 edges — 304 of them derived by seven rule sets.
 
+**Role-bound tokens** limit a caller to a named subset of nodes. Define
+roles in `schema.json` under the `roles` key (each role has a `label`
+selector list), then pass `--role-token TOKEN:ROLE` (repeatable) when
+starting the server, or set `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`.
+A role token receives only the nodes matching its label selectors — read
+endpoints return rows filtered to the visible set; write, subscription, and
+analytics endpoints return 403. Unknown token or unknown role name: 401.
+Corrupt `roles.json`: 500 for role tokens (full-access token unaffected).
+The never-widen invariant is enforced in the server: a client-supplied mask
+is always intersected with the role mask, never bypassing it.
+
 `mushroomdb demo ./db` output:
 
 ```text
@@ -424,7 +435,7 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | Command | What it does |
 |---|---|
 | `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
-| `mushroomdb serve <dir>` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback) |
+| `mushroomdb serve <dir>` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE` for role-bound tokens) |
 | `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted) |
 | `mushroomdb snapshot <dir> [--keep-wal]` | Write `snapshot.bin` (truncates WAL unless `--keep-wal`) |
 | `mushroomdb mcp <dir>` | Start a stdio MCP JSON-RPC server for agent tools |

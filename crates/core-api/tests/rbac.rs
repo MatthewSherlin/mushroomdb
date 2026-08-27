@@ -85,7 +85,8 @@ fn apply_schema_roles_idempotent_and_byte_identical() {
 
     // Capture roles.json bytes after the first apply.
     let roles_path = dir.join("roles.json");
-    let bytes_after_first = std::fs::read(&roles_path).expect("roles.json must exist after first apply");
+    let bytes_after_first =
+        std::fs::read(&roles_path).expect("roles.json must exist after first apply");
 
     // Re-open and re-apply with the same schema.
     let mut db = GraphDb::open(&dir).unwrap();
@@ -144,8 +145,15 @@ fn apply_schema_role_change_triggers_update() {
 
     // In-memory roles must reflect the new key.
     let roles = db.roles();
-    let live = roles.iter().find(|r| r.name == "analyst").expect("analyst must exist");
-    assert_eq!(live.keys, vec!["bob"], "role keys must be updated in memory");
+    let live = roles
+        .iter()
+        .find(|r| r.name == "analyst")
+        .expect("analyst must exist");
+    assert_eq!(
+        live.keys,
+        vec!["bob"],
+        "role keys must be updated in memory"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +166,7 @@ fn mask_for_role_keys_and_labels_union() {
     let mut db = GraphDb::open(&dir).unwrap();
 
     db.insert_node("Public", "alice", vec![]).unwrap(); // label-visible
-    db.insert_node("Public", "bob", vec![]).unwrap();   // label-visible
+    db.insert_node("Public", "bob", vec![]).unwrap(); // label-visible
     db.insert_node("Private", "secret", vec![]).unwrap(); // neither key nor label
 
     // Role: explicit key "alice" (key leg) + label "Public" (label leg)
@@ -176,7 +184,11 @@ fn mask_for_role_keys_and_labels_union() {
     db.apply_schema(&schema).unwrap();
 
     let mask = db.mask_for_role("viewer").unwrap();
-    assert_eq!(mask.len(), 2, "union of key+label should give alice+bob (2 nodes)");
+    assert_eq!(
+        mask.len(),
+        2,
+        "union of key+label should give alice+bob (2 nodes)"
+    );
 
     // Query with mask: should see alice and bob, not secret.
     let rs = db
@@ -234,7 +246,11 @@ fn mask_for_role_label_resolves_live() {
     let rs = db
         .query_masked("MATCH (n:Public) RETURN n.id", &no_params(), &mask2)
         .unwrap();
-    assert_eq!(rs.len(), 2, "both alice and bob must appear in masked query");
+    assert_eq!(
+        rs.len(),
+        2,
+        "both alice and bob must appear in masked query"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +333,10 @@ fn corrupt_roles_json_open_succeeds_mask_for_role_errs() {
 
     // Unknown role also returns Err (same poisoned state).
     let result2 = db.mask_for_role("nonexistent");
-    assert!(result2.is_err(), "all role requests must fail when roles.json is corrupt");
+    assert!(
+        result2.is_err(),
+        "all role requests must fail when roles.json is corrupt"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -333,7 +352,11 @@ fn apply_schema_rejects_empty_role_name() {
         fulltext: vec![],
         rules: vec![],
         views: vec![],
-        roles: vec![RoleDef { name: "".into(), keys: vec![], labels: vec![] }],
+        roles: vec![RoleDef {
+            name: "".into(),
+            keys: vec![],
+            labels: vec![],
+        }],
     };
     assert!(
         db.apply_schema(&schema).is_err(),
@@ -352,8 +375,16 @@ fn apply_schema_rejects_duplicate_role_names() {
         rules: vec![],
         views: vec![],
         roles: vec![
-            RoleDef { name: "viewer".into(), keys: vec![], labels: vec![] },
-            RoleDef { name: "viewer".into(), keys: vec!["alice".into()], labels: vec![] },
+            RoleDef {
+                name: "viewer".into(),
+                keys: vec![],
+                labels: vec![],
+            },
+            RoleDef {
+                name: "viewer".into(),
+                keys: vec!["alice".into()],
+                labels: vec![],
+            },
         ],
     };
     assert!(

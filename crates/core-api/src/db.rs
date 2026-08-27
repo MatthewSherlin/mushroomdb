@@ -3692,7 +3692,9 @@ impl<F: Fs> GraphDb<F> {
     /// schema.  An empty union = empty mask = sees nothing.
     pub fn mask_for_role(&self, role: &str) -> Result<crate::mask::NodeMask> {
         let roles = self.roles.as_ref().ok_or_else(|| GraphError::Corrupt {
-            detail: "roles.json was corrupt at open; fix the file and re-open to restore role access".into(),
+            detail:
+                "roles.json was corrupt at open; fix the file and re-open to restore role access"
+                    .into(),
         })?;
         let def = roles
             .iter()

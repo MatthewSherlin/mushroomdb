@@ -46,12 +46,15 @@
 //! subscriptions while the first is quiet may experience up to ~100 ms of
 //! additional latency before the bridge wakes and drains them.
 
-use crate::AppState;
+use crate::{AppState, AuthIdentity};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::extract::{Extension, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use core_api::{DbEvent, Subscription};
 use serde::Deserialize;
+use serde_json::json;
 use std::time::Duration;
 use tokio::task;
 
@@ -79,8 +82,23 @@ struct SubscribeMsg {
 }
 
 /// Upgrade to a WebSocket and stream `DbEvent` frames.
-pub async fn subscribe(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+///
+/// Role-bound tokens are denied: event streams have no mask filter in v1,
+/// and denying beats leaking hidden-node events.
+pub async fn subscribe(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "role-bound token: /subscribe is not permitted"})),
+        )
+            .into_response();
+    }
     ws.on_upgrade(move |socket| run(socket, state))
+        .into_response()
 }
 
 async fn run(mut socket: WebSocket, state: AppState) {

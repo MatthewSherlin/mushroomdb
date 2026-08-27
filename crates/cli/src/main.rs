@@ -6,6 +6,7 @@ use cli::{
     run_suggest, usage, Command, ServeUi,
 };
 use core_api::SharedDb;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ fn main() -> ExitCode {
             ui,
             demo_if_empty,
             token,
+            role_tokens,
             snapshot_every,
         }) => {
             let token = token.filter(|s| !s.is_empty()).or_else(|| {
@@ -37,6 +39,26 @@ fn main() -> ExitCode {
                     "non-loopback --addr requires --token or MUSHROOMDB_TOKEN \
                      (see SECURITY.md)",
                 );
+            }
+            // Merge --role-token flags with MUSHROOMDB_ROLE_TOKENS env var.
+            // Format: "TOKEN1:ROLE1,TOKEN2:ROLE2". Flag entries win over env on
+            // collision (flags are inserted last; HashMap retains last writer).
+            let mut all_role_tokens: HashMap<String, String> = HashMap::new();
+            if let Ok(env_val) = std::env::var("MUSHROOMDB_ROLE_TOKENS") {
+                for pair in env_val.split(',') {
+                    let pair = pair.trim();
+                    if pair.is_empty() {
+                        continue;
+                    }
+                    if let Some((tok, role)) = pair.split_once(':') {
+                        if !tok.is_empty() && !role.is_empty() {
+                            all_role_tokens.insert(tok.to_string(), role.to_string());
+                        }
+                    }
+                }
+            }
+            for (tok, role) in role_tokens {
+                all_role_tokens.insert(tok, role);
             }
             if demo_if_empty {
                 match maybe_run_demo_if_empty(&db_dir) {
@@ -52,7 +74,14 @@ fn main() -> ExitCode {
                 },
                 other => other,
             };
-            exit(run_serve(db_dir, addr, ui, token, snapshot_every))
+            exit(run_serve(
+                db_dir,
+                addr,
+                ui,
+                token,
+                all_role_tokens,
+                snapshot_every,
+            ))
         }
         Ok(Command::Mcp { db_dir }) => exit(run_mcp(db_dir)),
         Ok(Command::Stats { db_dir }) => match read_stats(&db_dir) {
@@ -154,6 +183,7 @@ fn run_serve(
     addr: SocketAddr,
     ui: ServeUi,
     token: Option<String>,
+    role_tokens: HashMap<String, String>,
     snapshot_every: Option<Duration>,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
@@ -181,9 +211,19 @@ fn run_serve(
         let mut serve = tokio::spawn(async move {
             match ui {
                 ServeUi::Filesystem(dir) => {
-                    server::serve_with_ui(db_serve, addr, tx, dir, token).await
+                    server::serve_with_ui_and_role_tokens(
+                        db_serve,
+                        addr,
+                        tx,
+                        dir,
+                        token,
+                        role_tokens,
+                    )
+                    .await
                 }
-                ServeUi::None => server::serve(db_serve, addr, tx, token).await,
+                ServeUi::None => {
+                    server::serve_with_role_tokens(db_serve, addr, tx, token, role_tokens).await
+                }
                 ServeUi::Embedded => {
                     #[cfg(feature = "embed-ui")]
                     {
@@ -191,7 +231,7 @@ fn run_serve(
                     }
                     #[cfg(not(feature = "embed-ui"))]
                     {
-                        server::serve(db_serve, addr, tx, token).await
+                        server::serve_with_role_tokens(db_serve, addr, tx, token, role_tokens).await
                     }
                 }
             }

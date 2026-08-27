@@ -14,9 +14,9 @@ use crate::json::{
     node_edges_json, node_info_json, params_from_json, parse_ingest_edges, result_set_json,
     rule_def_from_json,
 };
-use crate::AppState;
+use crate::{AppState, AuthIdentity};
 use arrow_bridge::to_ipc_bytes;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -24,10 +24,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use core_api::{
     is_write_query, json_to_rows, AutoFk, DegreeConfig, Dir, GraphError, IngestOptions, NodeMask,
-    PageRankConfig, SharedDb, SuggestConfig, WccConfig, SUGGEST_DEFAULT_SEED,
+    PageRankConfig, ResultSet, SharedDb, SuggestConfig, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tower_http::services::ServeDir;
@@ -58,7 +58,32 @@ pub fn router(db: SharedDb) -> Router {
 /// [`router`] with an optional bearer/`?token=` requirement on every route
 /// except unauthenticated `GET /health`.
 pub fn router_with_auth(db: SharedDb, token: Option<String>) -> Router {
-    build_app(db, token, UiFallback::None, default_advertise_addr())
+    build_app(
+        db,
+        token,
+        HashMap::new(),
+        UiFallback::None,
+        default_advertise_addr(),
+    )
+}
+
+/// [`router`] with a full-access token and a map of role-bound tokens.
+///
+/// Role-bound tokens (`role_tokens`: bearer → role name) receive masked reads
+/// on `/query` and `/node/*`, and 403 on all write or subscription endpoints.
+/// Unknown token: 401.  Token bound to a role not in the DB at request time: 401.
+pub fn router_with_role_tokens(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+) -> Router {
+    build_app(
+        db,
+        token,
+        role_tokens,
+        UiFallback::None,
+        default_advertise_addr(),
+    )
 }
 
 /// Same as [`router_with_auth`], then `ServeDir` as the fallback so API routes win.
@@ -70,6 +95,7 @@ pub fn router_with_ui(
     build_app(
         db,
         token,
+        HashMap::new(),
         UiFallback::Dir(ui_dir.as_ref().to_path_buf()),
         default_advertise_addr(),
     )
@@ -82,7 +108,13 @@ static EMBEDDED_UI: include_dir::Dir<'_> =
 /// [`router`] plus the `embed-ui` static tree as fallback.
 #[cfg(feature = "embed-ui")]
 pub fn router_with_embedded_ui(db: SharedDb) -> Router {
-    build_app(db, None, UiFallback::Embedded, default_advertise_addr())
+    build_app(
+        db,
+        None,
+        HashMap::new(),
+        UiFallback::Embedded,
+        default_advertise_addr(),
+    )
 }
 
 #[cfg(feature = "embed-ui")]
@@ -137,7 +169,21 @@ pub async fn serve(
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
     token: Option<String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::None, token).await
+    serve_inner(db, addr, ready, UiFallback::None, token, HashMap::new()).await
+}
+
+/// [`serve`] with role-bound tokens in addition to the optional full-access token.
+///
+/// `role_tokens` maps bearer values to role names.  See [`router_with_role_tokens`]
+/// for the enforcement semantics.
+pub async fn serve_with_role_tokens(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+) -> std::io::Result<()> {
+    serve_inner(db, addr, ready, UiFallback::None, token, role_tokens).await
 }
 
 /// [`serve`] plus a UI dist directory mounted behind the API routes.
@@ -148,7 +194,27 @@ pub async fn serve_with_ui(
     ui_dir: PathBuf,
     token: Option<String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::Dir(ui_dir), token).await
+    serve_inner(
+        db,
+        addr,
+        ready,
+        UiFallback::Dir(ui_dir),
+        token,
+        HashMap::new(),
+    )
+    .await
+}
+
+/// [`serve_with_ui`] with role-bound tokens.
+pub async fn serve_with_ui_and_role_tokens(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    ui_dir: PathBuf,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+) -> std::io::Result<()> {
+    serve_inner(db, addr, ready, UiFallback::Dir(ui_dir), token, role_tokens).await
 }
 
 /// [`serve`] plus the compiled-in UI (no-op fallback if `embed-ui` is off).
@@ -159,7 +225,7 @@ pub async fn serve_with_embedded_ui(
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
     token: Option<String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::Embedded, token).await
+    serve_inner(db, addr, ready, UiFallback::Embedded, token, HashMap::new()).await
 }
 
 enum UiFallback {
@@ -175,6 +241,7 @@ async fn serve_inner(
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
     ui: UiFallback,
     token: Option<String>,
+    role_tokens: HashMap<String, String>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -182,7 +249,7 @@ async fn serve_inner(
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    let app = build_app(db, token, ui, local);
+    let app = build_app(db, token, role_tokens, ui, local);
     axum::serve(listener, app).await
 }
 
@@ -190,7 +257,13 @@ fn default_advertise_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 8080))
 }
 
-fn build_app(db: SharedDb, token: Option<String>, ui: UiFallback, addr: SocketAddr) -> Router {
+fn build_app(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    ui: UiFallback,
+    addr: SocketAddr,
+) -> Router {
     debug_assert!(
         !db.read().has_event_sink(),
         "router() must be called at most once per SharedDb; a second call \
@@ -208,6 +281,7 @@ fn build_app(db: SharedDb, token: Option<String>, ui: UiFallback, addr: SocketAd
         db,
         watch: tx,
         token,
+        role_tokens,
         addr,
     };
     let app = Router::new()
@@ -266,22 +340,54 @@ where
 
 const TOKEN_COOKIE: &str = "mushroomdb_token";
 
-async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let Some(expected) = state.token.clone().filter(|s| !s.is_empty()) else {
+async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    // No auth configured at all: every request is Full, no restriction.
+    if state.token.is_none() && state.role_tokens.is_empty() {
+        req.extensions_mut().insert(AuthIdentity::Full);
         return next.run(req).await;
-    };
+    }
+
+    // Health is always open regardless of token configuration.
     if req.method() == Method::GET && req.uri().path() == "/health" {
+        req.extensions_mut().insert(AuthIdentity::Full);
         return next.run(req).await;
     }
-    if request_token(&req).as_deref() != Some(expected.as_str()) {
-        return unauthorized();
+
+    let presented = request_token(&req);
+
+    // Check full-access token first.
+    if let Some(ref full_tok) = state.token.clone().filter(|s| !s.is_empty()) {
+        if presented.as_deref() == Some(full_tok.as_str()) {
+            let set_cookie = presented_bearer_or_query(&req).as_deref() == Some(full_tok.as_str());
+            req.extensions_mut().insert(AuthIdentity::Full);
+            let mut res = next.run(req).await;
+            if set_cookie && is_html_response(&res) {
+                attach_token_cookie(&mut res, full_tok);
+            }
+            return res;
+        }
     }
-    let set_cookie = presented_bearer_or_query(&req).as_deref() == Some(expected.as_str());
-    let mut res = next.run(req).await;
-    if set_cookie && is_html_response(&res) {
-        attach_token_cookie(&mut res, &expected);
+
+    // Check role-bound tokens.
+    if let Some(tok) = presented.as_deref() {
+        if let Some(role_name) = state.role_tokens.get(tok) {
+            // Early-deny paths whose handlers use WebSocket upgrade: the WS
+            // extraction consumes the request before the handler body runs, so
+            // the handler-level identity check is unreachable in those cases.
+            // Returning 403 here also removes the need for the handler to
+            // hold a read lock just to enforce this.
+            let path = req.uri().path();
+            if path == "/subscribe" || path == "/watch" {
+                return forbidden("role-bound token: this endpoint is not permitted");
+            }
+            req.extensions_mut()
+                .insert(AuthIdentity::Role(role_name.clone()));
+            return next.run(req).await;
+        }
     }
-    res
+
+    // Nothing matched → 401.
+    unauthorized()
 }
 
 fn request_token(req: &Request) -> Option<String> {
@@ -408,6 +514,30 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// 403 response for role-bound token operations that are denied in v1.
+fn forbidden(detail: &str) -> Response {
+    (StatusCode::FORBIDDEN, Json(json!({"error": detail}))).into_response()
+}
+
+/// Convert a `mask_for_role` error into an HTTP response.
+///
+/// - `GraphError::Corrupt` → 500: the roles sidecar is poisoned; the server
+///   refuses all role-token requests until the file is fixed and the DB is
+///   re-opened.  Full-access tokens are unaffected.
+/// - `GraphError::KeyNotFound` with a `role:` prefix → 401: the token is bound
+///   to a role that does not exist in the DB at this request time.
+fn role_mask_err(e: GraphError) -> Response {
+    match e {
+        GraphError::Corrupt { detail } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("roles misconfigured: {detail}")})),
+        )
+            .into_response(),
+        GraphError::KeyNotFound { key } if key.starts_with("role:") => unauthorized(),
+        other => graph_err(other),
+    }
+}
+
 fn err_response(detail: impl Into<String>) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -471,8 +601,26 @@ fn ingest_options(v: Option<&Js>) -> Result<IngestOptions, String> {
     Ok(opts)
 }
 
+/// Format a `ResultSet` as Arrow IPC or JSON depending on `format`.
+fn format_query_result(rs: ResultSet, format: &str) -> Response {
+    match format {
+        "" => match to_ipc_bytes(&rs) {
+            Ok(bytes) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")],
+                bytes,
+            )
+                .into_response(),
+            Err(e) => err_response(e),
+        },
+        "json" => json_ok(result_set_json(&rs)),
+        other => err_response(format!("unknown format: {other}")),
+    }
+}
+
 async fn query(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
     Query(qs): Query<BTreeMap<String, String>>,
     Json(body): Json<Js>,
 ) -> Response {
@@ -486,7 +634,7 @@ async fn query(
     };
     let format = qs.get("format").map(String::as_str).unwrap_or("");
 
-    // Optional node mask: when present, route to query_masked (read-only).
+    // Parse client-supplied mask (optional array of node keys).
     let mask_keys: Option<Vec<String>> = match body.get("mask") {
         None | Some(Js::Null) => None,
         Some(Js::Array(arr)) => {
@@ -502,26 +650,31 @@ async fn query(
         Some(_) => return err_response("mask must be an array of strings"),
     };
 
-    // When a mask is provided, route to query_masked (rejects writes).
-    // Hold a single read guard for both from_keys and query_masked so the mask
-    // and the query execute on the same database snapshot.
-    if let Some(ref keys) = mask_keys {
+    // Role token: writes are denied; reads are auto-masked by the role's
+    // visibility mask.  A client-supplied mask can only narrow, never widen.
+    // Single read guard for mask resolution + query (snapshot consistency).
+    if let AuthIdentity::Role(ref role_name) = identity {
+        let is_write = match is_write_query(&cypher) {
+            Ok(b) => b,
+            Err(e) => return err_response(e),
+        };
+        if is_write {
+            return forbidden("role-bound token: writes are not permitted");
+        }
         let db = state.db.read();
-        let mask = NodeMask::from_keys(&*db, keys.iter().map(String::as_str));
-        return match db.query_masked(&cypher, &params, &mask) {
-            Ok(rs) => match format {
-                "" => match to_ipc_bytes(&rs) {
-                    Ok(bytes) => (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")],
-                        bytes,
-                    )
-                        .into_response(),
-                    Err(e) => err_response(e),
-                },
-                "json" => json_ok(result_set_json(&rs)),
-                other => err_response(format!("unknown format: {other}")),
-            },
+        let role_mask = match db.mask_for_role(role_name) {
+            Ok(m) => m,
+            Err(e) => return role_mask_err(e),
+        };
+        let effective_mask = if let Some(ref keys) = mask_keys {
+            // Client mask intersects role mask — never widens visibility.
+            let client_mask = NodeMask::from_keys(&*db, keys.iter().map(String::as_str));
+            role_mask.intersect(&client_mask)
+        } else {
+            role_mask
+        };
+        return match db.query_masked(&cypher, &params, &effective_mask) {
+            Ok(rs) => format_query_result(rs, format),
             Err(GraphError::QueryError { detail })
                 if detail.contains("masked queries are read-only") =>
             {
@@ -531,7 +684,26 @@ async fn query(
         };
     }
 
-    // Detect write statements at the token level to dispatch to the correct lock.
+    // Full token: existing paths below.
+
+    // When a client-supplied mask is present, route to query_masked (read-only).
+    // Hold a single read guard for both from_keys and query_masked so the mask
+    // and the query execute on the same database snapshot.
+    if let Some(ref keys) = mask_keys {
+        let db = state.db.read();
+        let mask = NodeMask::from_keys(&*db, keys.iter().map(String::as_str));
+        return match db.query_masked(&cypher, &params, &mask) {
+            Ok(rs) => format_query_result(rs, format),
+            Err(GraphError::QueryError { detail })
+                if detail.contains("masked queries are read-only") =>
+            {
+                (StatusCode::BAD_REQUEST, Json(json!({"error": detail}))).into_response()
+            }
+            Err(e) => graph_err(e),
+        };
+    }
+
+    // Detect write statements to dispatch to the correct lock.
     // Write statements (CREATE / MATCH…SET / MATCH…DELETE / MERGE) need the
     // write lock so mutations flow through WAL + rule engine with fsync before
     // the response is sent.  Read queries (MATCH … RETURN …) use the read lock.
@@ -553,22 +725,17 @@ async fn query(
         }
     };
 
-    match format {
-        "" => match to_ipc_bytes(&rs) {
-            Ok(bytes) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")],
-                bytes,
-            )
-                .into_response(),
-            Err(e) => err_response(e),
-        },
-        "json" => json_ok(result_set_json(&rs)),
-        other => err_response(format!("unknown format: {other}")),
-    }
+    format_query_result(rs, format)
 }
 
-async fn stats(State(state): State<AppState>) -> Response {
+async fn stats(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    // v1: deny role tokens — raw counts leak graph size beyond the role's subgraph.
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: /stats requires a full-access token");
+    }
     let snap = {
         let g = state.db.read();
         g.stats()
@@ -579,7 +746,14 @@ async fn stats(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn ingest(State(state): State<AppState>, Json(body): Json<Js>) -> Response {
+async fn ingest(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
     let label = match body.get("label").and_then(Js::as_str) {
         Some(s) => s.to_string(),
         None => return err_response("missing label"),
@@ -628,7 +802,15 @@ async fn ingest(State(state): State<AppState>, Json(body): Json<Js>) -> Response
 /// `std::sync::RwLock` read guard is acquired and held inside the blocking task —
 /// reads don't block other reads; writes wait for the guard to drop. The global
 /// budget (`SuggestConfig::global_budget_ms`, default 5 s) caps lock-hold time.
-async fn suggest(State(state): State<AppState>) -> Response {
+async fn suggest(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    // v1: deny role tokens — suggest scans the full graph and would reveal
+    // existence of nodes outside the role's mask.
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: /suggest requires a full-access token");
+    }
     let db = state.db.clone();
     match tokio::task::spawn_blocking(move || {
         let config = SuggestConfig::default();
@@ -642,7 +824,14 @@ async fn suggest(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn create_rule(State(state): State<AppState>, Json(body): Json<Js>) -> Response {
+async fn create_rule(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
     let def = match rule_def_from_json(body) {
         Ok(d) => d,
         Err(e) => return err_response(e),
@@ -657,8 +846,16 @@ async fn create_rule(State(state): State<AppState>, Json(body): Json<Js>) -> Res
 
 async fn explain(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
     Query(qs): Query<BTreeMap<String, String>>,
 ) -> Response {
+    // v1: deny role tokens — explain reveals hidden-node linkage through rules.
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden(
+            "role-bound token: /explain requires a full-access token \
+             (v1: explain may reveal hidden-node linkage; revisit when stubs land)",
+        );
+    }
     let a = match qs.get("a") {
         Some(s) if !s.is_empty() => s.clone(),
         _ => return err_response("missing query param a"),
@@ -680,7 +877,27 @@ async fn explain(
     }
 }
 
-async fn node_info(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+async fn node_info(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(key): Path<String>,
+) -> Response {
+    if let AuthIdentity::Role(ref role_name) = identity {
+        // Single read guard for mask resolution + node lookup (snapshot consistency).
+        let g = state.db.read();
+        let role_mask = match g.mask_for_role(role_name) {
+            Ok(m) => m,
+            Err(e) => return role_mask_err(e),
+        };
+        // Hidden keys respond identically to absent keys — no "restricted" signal in v1.
+        if !role_mask.contains_node(&*g, &key) {
+            return key_not_found(key);
+        }
+        return match g.node_info(&key) {
+            Some(info) => json_ok(node_info_json(&info)),
+            None => key_not_found(key),
+        };
+    }
     let info = {
         let g = state.db.read();
         g.node_info(&key)
@@ -691,7 +908,26 @@ async fn node_info(State(state): State<AppState>, Path(key): Path<String>) -> Re
     }
 }
 
-async fn node_edges(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+async fn node_edges(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(key): Path<String>,
+) -> Response {
+    if let AuthIdentity::Role(ref role_name) = identity {
+        let g = state.db.read();
+        let role_mask = match g.mask_for_role(role_name) {
+            Ok(m) => m,
+            Err(e) => return role_mask_err(e),
+        };
+        if !role_mask.contains_node(&*g, &key) {
+            return key_not_found(key);
+        }
+        return match g.node_edges(&key) {
+            Ok(edges) => json_ok(node_edges_json(&edges)),
+            Err(GraphError::KeyNotFound { key }) => key_not_found(key),
+            Err(e) => graph_err(e),
+        };
+    }
     let out = {
         let g = state.db.read();
         g.node_edges(&key)
@@ -705,6 +941,7 @@ async fn node_edges(State(state): State<AppState>, Path(key): Path<String>) -> R
 
 async fn neighborhood(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(key): Path<String>,
     Query(qs): Query<BTreeMap<String, String>>,
 ) -> Response {
@@ -731,6 +968,22 @@ async fn neighborhood(
     let etype_refs: Option<Vec<&str>> = edge_type_names
         .as_ref()
         .map(|v| v.iter().map(String::as_str).collect());
+    if let AuthIdentity::Role(ref role_name) = identity {
+        // Single read guard for mask resolution + neighborhood lookup.
+        let g = state.db.read();
+        let role_mask = match g.mask_for_role(role_name) {
+            Ok(m) => m,
+            Err(e) => return role_mask_err(e),
+        };
+        if !role_mask.contains_node(&*g, &key) {
+            return key_not_found(key);
+        }
+        let rs = match g.node_ref(&key) {
+            Some(n) => n.neighborhood(depth, etype_refs.as_deref(), dir),
+            None => return key_not_found(key),
+        };
+        return json_ok(result_set_json(&rs));
+    }
     let rs = {
         let g = state.db.read();
         match g.node_ref(&key) {
@@ -754,8 +1007,13 @@ async fn neighborhood(
 /// The `budget_ms` field in [`PageRankConfig`] caps lock-hold time.
 async fn algo_pagerank(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // v1: deny role tokens — algo endpoints scan the full graph.
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: /algo/* requires a full-access token");
+    }
     let config: PageRankConfig = match serde_json::from_value(body) {
         Ok(c) => c,
         Err(e) => return err_response(format!("invalid pagerank config: {e}")),
@@ -771,7 +1029,14 @@ async fn algo_pagerank(
 ///
 /// Mirrors the `suggest` locking and blocking pattern exactly: spawn_blocking,
 /// read guard inside, `budget_ms` in config caps lock-hold time.
-async fn algo_wcc(State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Response {
+async fn algo_wcc(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: /algo/* requires a full-access token");
+    }
     let config: WccConfig = match serde_json::from_value(body) {
         Ok(c) => c,
         Err(e) => return err_response(format!("invalid wcc config: {e}")),
@@ -788,8 +1053,12 @@ async fn algo_wcc(State(state): State<AppState>, Json(body): Json<serde_json::Va
 /// Mirrors the `suggest` locking and blocking pattern exactly.
 async fn algo_degree(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: /algo/* requires a full-access token");
+    }
     let config: DegreeConfig = match serde_json::from_value(body) {
         Ok(c) => c,
         Err(e) => return err_response(format!("invalid degree config: {e}")),
