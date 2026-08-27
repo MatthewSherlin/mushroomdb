@@ -72,9 +72,9 @@ Relationship patterns `->`, `<-`, `-` with optional type and variable.
 - `MATCH … DELETE r` — delete a manual edge; error if derived
 - `MATCH (n) DETACH DELETE n` — delete node + all incident edges (derived edges retracted via rule engine; top-k backfill fires)
 - `MATCH (n) DELETE n` — delete isolated node (error if any edges remain — use DETACH DELETE)
-- `MERGE (n:Label {id: 'key'})` — match-or-create
+- `MERGE (n:Label {id: 'key'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]` — match-or-create with optional per-clause SET and projection
 
-**Single aggregate functions** in `RETURN`:
+**Aggregate functions** in `RETURN`:
 
 ```json
 {"cypher": "MATCH (p:Person) RETURN COUNT(*)"}
@@ -85,12 +85,18 @@ Relationship patterns `->`, `<-`, `-` with optional type and variable.
 
 Supported: `COUNT(*)`, `COUNT(var)` (non-null bindings), `SUM(n.prop)`,
 `AVG(n.prop)`, `MIN(n.prop)`, `MAX(n.prop)`. Null/non-numeric property
-values are silently skipped for SUM/AVG/MIN/MAX. Grouped aggregation
-(`RETURN a, COUNT(*)`) returns a `plan:` error — use the traversal API
-or filter to a single aggregate.
+values are silently skipped for SUM/AVG/MIN/MAX.
 
-`LIMIT`, `SKIP`, and `ORDER BY` are no-ops on aggregate queries in v1;
-the single result row is always returned regardless.
+**Grouped aggregation** — one or more non-aggregate items act as group keys:
+
+```json
+{"cypher": "MATCH (p:Person) RETURN p.city, COUNT(*) AS cnt ORDER BY cnt DESC LIMIT 5"}
+```
+
+Multiple group keys and multiple aggregates per query are allowed. Group count
+is capped at 1,000,000 distinct keys. `ORDER BY` + `LIMIT` sort the finished
+group table (top-k groups). `OPTIONAL MATCH` composes with grouped aggregation:
+edgeless-anchor rows produce `COUNT = 0` rather than being dropped.
 
 **Multi-hop LIMIT:** `MATCH (a)-[:T]->(b)-[:T]->(c) RETURN a, b, c LIMIT 100`
 runs with O(LIMIT) memory via the pull-based executor. Dense patterns
@@ -296,11 +302,11 @@ Response:
 
 ### Tools
 
-Eleven tools:
+Twelve tools:
 
 | Tool | Description |
 |---|---|
-| `query` | Run a Cypher query (read or write); params: `cypher`, `params?` |
+| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set) |
 | `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?` |
 | `create_rule` | Declare a linking rule; params: `RuleDef` fields |
 | `explain` | Explain edges; params: `a`, `b` |
@@ -309,8 +315,9 @@ Eleven tools:
 | `node_info` | Node info and props; params: `key` |
 | `node_edges` | Incident edges; params: `key` |
 | `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?` |
-| `find_similar` | Neighbors via a given edge type; params: `key`, `edge_type?`, `limit?` |
+| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?`; (2) edge traversal — `key`, `edge_type?`, `limit?` |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
+| `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
 
 ---
 

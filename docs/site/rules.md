@@ -25,7 +25,7 @@ pub struct RuleDef {
     pub edge_type: String,     // edge type written to the graph
     pub weight_prop: Option<String>, // if Some, score stored as this edge prop
     pub max_edges: Option<usize>,    // cap on derived edges per rule (recommended)
-    pub approximate: bool,     // IVF-Flat approximate mode (VectorSimilar only)
+    pub approximate: bool,     // HNSW approximate mode (VectorSimilar only)
 }
 ```
 
@@ -212,7 +212,7 @@ exceeded.
 ## Approximate mode (VectorSimilar only)
 
 Setting `approximate: true` on a VectorSimilar rule switches the candidate
-path from a full scan to IVF-Flat (Inverted File Index):
+path from a full scan to in-tree HNSW (Hierarchical Navigable Small World):
 
 ```rust
 RuleDef {
@@ -223,23 +223,26 @@ RuleDef {
 }
 ```
 
-**How it works:** at rule creation and rebuild time, k-means is fit over
-the destination-side vectors (k = ceil(√n), clamped to [4, 1024], 12
-iterations, seed derived from the rule name). On each lookup, P =
-max(1, ⌈k/16⌉) nearest centroids are probed. Centroid assignments are
-updated on insert; drift accumulates until the next `rebuild` re-fits.
+**How it works:** at rule creation time, an HNSW graph is built over the
+destination-side vectors (cosine similarity, in-tree implementation — no
+external ANN dependency). Each node insertion incrementally updates the HNSW
+graph. On each lookup, the HNSW index returns the approximate k nearest
+neighbors. IVF-Flat centroids are also maintained as a fallback; the primary
+candidate path is HNSW. The HNSW graph is persisted in V7 snapshots alongside
+IVF centroids so WAL replay and snapshot open avoid full re-fitting.
 
 **Trade-offs:**
 
 | Property | Exact (`approximate: false`) | Approximate (`approximate: true`) |
 |---|---|---|
-| Candidates | All vectors with the right label | Members of P nearest clusters |
-| Per-query edge recall | 1.00 (exact) | ≥ 0.90 quiesced; ≥ 0.85 post-rebuild |
-| Determinism | Yes | Yes — same rule + data → same clusters |
-| WAL replay | Identical | Identical (clusters re-fit on replay) |
+| Candidates | All vectors with the right label | HNSW approximate k-NN |
+| Per-query edge recall | 1.00 (exact) | min 0.90, mean 0.998 (5k/dim 1536, fixed-seed probe) |
+| Determinism | Yes | Yes — same rule + data → same graph |
+| WAL replay | Identical | Identical (HNSW rebuilt on replay) |
 
-Measured at 5k nodes, dim 1536: exact ~12 min backfill, approximate
-~17 s. Per-query recall measured at 0.991 (uncapped 5k probe).
+Measured at 5k nodes, dim 1536: exact ~12 min backfill. Approximate
+backfill time is substantially faster — the IVF-Flat-era measurement was
+~17 s; HNSW timing at this scale is not separately published (flag: unsure).
 
 Use approximate mode when backfill latency matters more than perfect
 recall. Do not use it when completeness is required (safety-critical
@@ -337,6 +340,7 @@ per-source cardinality control.
   API (`node_edges` / `neighborhood`) for multi-hop lookups on large
   graphs. LIMIT pushdown is on the roadmap.
 - WAL-only cold-start re-fires all rules from node data. At 100k nodes (9 rules), re-open takes
-  8.25 min; IVF-Flat re-derivation dominates. V5 snapshots persist derived edges and IVF centroids —
-  `open_with` from a V5 snapshot takes 8.7 s at 100k (snapshot write cost: 25 s). Call `snapshot()`
-  before close to avoid re-derivation on next open.
+  ~8.16 min; ANN index (HNSW) re-fitting dominates. V5/V6 snapshots persist derived edges and IVF
+  centroids; V7 snapshots additionally persist HNSW blobs — `open_with` from a V6 snapshot takes
+  8.88 s at 100k (V6 snapshot write cost: 22.5 s; V7 numbers not yet separately published). Call
+  `snapshot()` before close to avoid re-derivation on next open.

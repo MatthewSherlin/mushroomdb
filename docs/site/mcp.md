@@ -183,10 +183,11 @@ are 96% similar and they share the role `"engineer"`.
 | `upsert_entity` | Insert or update a node by key. Creates if absent, updates props if present. |
 | `ingest_json` | Batch-ingest an array of nodes of the same label from JSON. |
 | `create_rule` | Declare a derivation rule; backfills existing nodes immediately. |
-| `find_similar` | Return neighbors connected by a given edge type (default: `SIMILAR`). |
+| `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity using HNSW when available; (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). |
+| `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain_association` | Show which rules and scores produced edges between two nodes. |
 | `explain` | Alias for `explain_association`. |
-| `query` | Run a Cypher query (read or write). Writes (`CREATE`, `MERGE`, `SET`, `DELETE`) use the write lock and `query_write`. |
+| `query` | Run a Cypher query (read or write). Pass `mask` (array of node keys) for an ACL-scoped read — writes are rejected when `mask` is set. |
 | `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter. |
 | `node_info` | Return a node's key, label, and all properties. |
 | `node_edges` | Return all edges incident on a node. |

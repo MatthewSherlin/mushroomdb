@@ -5,9 +5,12 @@
 </td>
 <td>
 <h1>mushroomdb</h1>
-<p>An embedded Rust property-graph database with native incremental linking rules.
-You declare a predicate once; every later write maintains the matching edges
-(and retracts them when properties change). The graph builds itself.</p>
+<p><strong>The association engine for apps and AI agents.</strong>
+An embedded Rust graph database where edges are declared, not inserted:
+you write rules, the db creates, maintains, and retracts edges automatically
+and can explain() why any edge exists. SQLite for relationships.
+Built-in MCP server, explainable links, per-node history — a natural fit for
+agent memory and small internal apps where matching and relationships are the product.</p>
 </td>
 </tr>
 </table>
@@ -262,10 +265,10 @@ Auto-FK: fields ending in `_id` whose values match existing node keys get
 `KeyMatch` rules created automatically at ingest time.
 
 Approximate mode: `VectorSimilar` accepts `approximate: true`, which
-switches the candidate path to IVF-Flat. Per-query recall ≥ 0.90
-quiesced, ≥ 0.85 immediately post-rebuild. Measured at 5k nodes /
-dim 1536: exact ~12 min backfill, approximate ~17 s. Use it when
-backfill latency matters more than completeness; document the recall
+switches the candidate path to in-tree HNSW. Per-query recall: min 0.90,
+mean 0.998 at 5k nodes / dim 1536 (fixed-seed probe). Exact backfill at
+that scale takes ~12 min; approximate is substantially faster. Use it when
+backfill latency matters more than perfect recall; document the recall
 trade-off for your workload.
 
 Full predicate reference and examples: [`docs/site/rules.md`](docs/site/rules.md).
@@ -286,7 +289,7 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 | Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
 | Cypher scan-filter-project (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
 | Cypher two-hop join (200 rows) | **261.6 µs** ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
-| Cold-start: snapshot V6 open | **8.88 s** ▽ | — | — | — |
+| Cold-start: snapshot open | **8.88 s** ▽ | — | — | — |
 | Cold-start: WAL-only open | 8.16 min ▽ | — | — | — |
 | Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
@@ -316,11 +319,12 @@ two-rule backfill on 10k nodes: v2.4 baseline 928 ms + 2.221 s = 3.149 s (+8.8% 
 
 ▽ 100k cold-start (V6 snapshot, measured 2026-08-24, 100k-node representative matching workload, 9 backfill rules,
 ~10.5M derived edges in snapshot):
-**WAL-only open:** 8.16 min — WAL CreateRule records trigger full rule re-derivation; IVF-Flat
-re-fitting dominates (~7.68 min). **V6 snapshot open:** 8.88 s — `open_with` decompresses the V6
-snapshot; derived edges and IVF centroids load directly; no rule re-fire.
-**Snapshot write cost:** 22.563 s — `snapshot()` serializes and compresses derived edges + IVF centroids
-(V6 snapshot **1.1 GiB**, −50% vs V5 ~2.2 GiB; zstd level-3). **Backfill (9 rules, max_edges=1M each):**
+**WAL-only open:** 8.16 min — WAL CreateRule records trigger full rule re-derivation; ANN index
+re-fitting (HNSW) dominates. **V7 snapshot open:** 8.88 s (measured from V6 snapshot on
+2026-08-24; V7 with HNSW blobs may differ — flagged as unsure) — `open_with` decompresses the
+snapshot; derived edges and ANN index state load directly; no rule re-fire.
+**Snapshot write cost:** 22.563 s (V6 measurement) — `snapshot()` serializes and compresses derived
+edges + ANN state (zstd level-3). **Backfill (9 rules, max_edges=1M each):**
 20.343 s. Full methodology and numbers:
 [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
 
@@ -343,7 +347,7 @@ See [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-
 ```
 graph-db/
 ├── crates/
-│   ├── core-storage      # HashMap topology + HashMap columns + WAL + snapshots
+│   ├── core-storage      # Packed adjacency topology + columnar property store + WAL + snapshots
 │   ├── core-rules        # linking rules, per-rule indexes, incremental maintenance
 │   ├── core-query        # pull-based interpreter; traversal ops + Cypher subset
 │   ├── core-api          # the one public Rust interface; typed error enums
@@ -359,8 +363,9 @@ graph-db/
 Dependency rule (inward only):
 `bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
 
-Storage uses a CRC-checksummed WAL with per-commit fsync, plus versioned
-zstd-compressed bincode snapshots (V6); not mmap. Open = snapshot + WAL replay.
+Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy`),
+plus versioned zstd-compressed V7 packed snapshots (packed CSR topology + packed
+columnar properties + HNSW blobs); not mmap. Open = snapshot + WAL replay.
 Derived edges are not WAL-logged; they are re-materialized from node data
 on open by replaying rule application.
 
@@ -379,7 +384,7 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 |---|---|
 | Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
 | Cold start without a snapshot re-fires all rules | Snapshots (V6, zstd-compressed) persist derived edges, IVF state, and view definitions — opening from a snapshot skips re-derivation. V6 measured at 100k nodes: 8.88 s open from snapshot vs 8.16 min from WAL alone. Snapshot write cost: 22.563 s (1.1 GiB). Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
-| Approximate vector mode is opt-in | `approximate: true` enables IVF-Flat candidate selection. Per-query recall ≥ 0.90 quiesced; ≥ 0.85 post-rebuild. Review the recall trade-off before using it in completeness-critical workloads. |
+| Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection (in-tree, no external dependency). Per-query recall: min 0.90, mean 0.998 at 5k/dim 1536 (fixed-seed probe). Review the recall trade-off before using it in completeness-critical workloads. |
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
 | Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE (manual edges only), MATCH…DETACH DELETE (node deletes), MATCH…DELETE (isolated-node or edge deletes), and MERGE (single-key match-or-create, including `ON CREATE SET` / `ON MATCH SET`) are supported. SET RHS accepts a literal, `$param`, or arithmetic (`n.x + 1`). Combined MATCH…SET…RETURN commits the write then projects from post-write state. Multi-statement transactions are not supported. Each write statement produces one WAL Batch frame (one fsync). See [`docs/site/query.md`](docs/site/query.md) coverage table. |
@@ -408,6 +413,7 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | `mushroomdb algo pagerank <dir> --top 20` | Run PageRank over the unified topology (manual + derived edges) |
 | `mushroomdb algo wcc <dir> --top 50` | Find weakly-connected components |
 | `mushroomdb algo degree <dir> --top 20` | Degree centrality (out / in / both) |
+| `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff of created/updated/unchanged items |
 
 Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 
@@ -427,11 +433,24 @@ new facts arrive.
   shared field values, FK relationships, geographic proximity, and more.
   Declare a rule once; every write maintains the matching edges without any
   agent-side bookkeeping.
-- Recall is graph traversal: `find_similar` returns neighbors via rule-derived
-  edges; `query` runs Cypher for structured recall; `neighborhood` does
-  multi-hop exploration.
+- Recall has three modes: `find_similar` by query vector (HNSW index when
+  available, brute-force otherwise); `find_similar` by key (returns neighbors
+  from a rule-derived edge type); `query` runs Cypher for structured recall.
+- Hybrid search: `hybrid_search` fuses fulltext + vector results via Reciprocal
+  Rank Fusion (RRF) — provide `query_text` + `text_field` for text-only, add
+  `vector` for a combined ranking.
 - Explanations are built in: `explain_association` shows which rules and scores
   produced each link — an agent can cite evidence, not just conclusions.
+- Per-node history: `node_history(key)` returns every WAL-visible property
+  change for a node since the last truncating snapshot — useful for audit,
+  provenance, and change-triggered agent workflows.
+- Query subscriptions: `subscribe_query` delivers incremental Cypher result
+  sets after each commit (supported subset; full re-run per commit; use `LIMIT`).
+- Node masks (ACL primitive): pass `mask: [key1, key2, …]` to `query` to restrict
+  the visible node set; write statements are rejected on masked queries.
+- Schema-as-code: `apply_schema` (Rust) / `mushroomdb schema apply` (CLI)
+  idempotently applies a JSON schema file (rules, views, fulltext indexes) — no
+  WAL writes for items that already match; prints a created/updated/unchanged diff.
 
 **Claude Desktop config** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -453,6 +472,23 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
+**Agent memory quickstart** (all twelve MCP tools):
+
+| Tool | Purpose |
+|---|---|
+| `upsert_entity` | Insert or update a node by key (no existence check needed) |
+| `ingest_json` | Batch-ingest nodes of one label from a JSON array |
+| `create_rule` | Declare a derivation rule; backfills existing nodes immediately |
+| `find_similar` | Find similar nodes by query vector (HNSW) or by derived edge traversal |
+| `hybrid_search` | RRF over fulltext + vector results |
+| `explain_association` | Show rules and scores that link two nodes |
+| `explain` | Alias for `explain_association` |
+| `query` | Cypher query (read or write); pass `mask` for ACL-scoped read |
+| `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter |
+| `node_info` | Return a node's key, label, and properties |
+| `node_edges` | Return all edges incident on a node |
+| `stats` | Live node, edge, and rule counts |
+
 Full walkthrough, tool reference, and Claude Desktop setup:
 [`docs/site/mcp.md`](docs/site/mcp.md).
 
@@ -460,16 +496,14 @@ Full walkthrough, tool reference, and Claude Desktop setup:
 
 ## Roadmap
 
+Phases 1–4 and Plan 18 all landed. What remains:
+
 | Priority | Item |
 |---|---|
-| Next | Cypher paste-subset: `IN`, `DISTINCT`, `MATCH … SET … RETURN`, `MERGE ON CREATE` (`docs/superpowers/plans/2026-08-25-phase-2-app-query.md`) |
-| Next | `All` predicates intersect indexes (not `parts[0]` only) |
-| Medium | Packed CSR + real columns + fast snapshot open (storage physics) |
-| Medium | In-tree HNSW + `find_similar` from a raw vector |
-| Medium | 3-node / via-hop linking rules |
 | Medium | mmap snapshots; lock-free epoch readers |
-| Medium | Query result subscriptions; multi-statement `BEGIN/COMMIT` |
+| Medium | v1.0 format stability (snapshot + WAL semver guarantee) |
 | Low | `CASE` / subqueries / `UNION`; napi-rs; WASM |
+| Low | Multi-statement `BEGIN/COMMIT` interactive transactions |
 
 ---
 

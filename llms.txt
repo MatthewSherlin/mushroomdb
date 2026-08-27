@@ -1,0 +1,188 @@
+# mushroomdb
+
+> The association engine for apps and AI agents. An embedded Rust graph database
+> where edges are DECLARED, not inserted: you write rules, the db creates,
+> maintains, and retracts edges automatically and can explain() why any edge exists.
+
+## What it is
+
+mushroomdb is a single-file-dependency embedded graph database for Rust, Python,
+and TypeScript. Its differentiator is incremental linking rules: declare a predicate
+once (cosine similarity, field equality, Jaccard overlap, FK match, geographic radius,
+numeric range), and every subsequent write maintains the matching edges without any
+manual bookkeeping. Edges are retracted automatically when properties diverge.
+
+Primary audiences:
+1. AI agents and coding assistants building association graphs and agent memory
+   (built-in MCP server, explainable links, per-node history, hybrid search).
+2. Small internal apps where relationships and matching are the product.
+
+## Install / build
+
+```sh
+# Rust (from source — no crates.io release yet)
+cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
+cp target/release/mushroomdb ~/.local/bin/
+
+# Python (from source)
+cd bindings/python
+python -m venv .venv && .venv/bin/pip install -U pip maturin
+.venv/bin/maturin develop
+
+# TypeScript client (from repo)
+npm install /path/to/graph-db/clients/typescript
+```
+
+Docker (local build):
+```sh
+docker build -t mushroomdb:local .
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=secret mushroomdb:local
+```
+
+## Quick start (CLI)
+
+```sh
+mushroomdb demo ./db      # ingest demo graph (10 Orgs, 20 Projects, 30 People)
+mushroomdb serve ./db     # HTTP server + UI at http://127.0.0.1:8080
+mushroomdb mcp ./db       # stdio MCP JSON-RPC server for agent tools
+```
+
+## Key API (Rust)
+
+```rust
+use core_api::{GraphDb, RuleDef, Predicate};
+
+let mut db = GraphDb::open(&path)?;
+
+// Insert nodes
+db.insert_node("Person", "alice", vec![
+    ("skills".into(), Value::List(vec!["graph".into(), "rust".into()])),
+    ("embedding".into(), Value::List(vec![0.9f64.into(), 0.2.into()])),
+])?;
+
+// Declare a rule — fires on every subsequent write
+db.create_rule(RuleDef {
+    name: "skill_fit".into(),
+    src_label: "Person".into(),
+    dst_label: "Org".into(),
+    predicate: Predicate::Overlap { field: "skills".into(), min: 0.5 },
+    edge_type: "FIT".into(),
+    weight_prop: Some("score".into()),
+    max_edges: Some(5),
+    approximate: false,
+})?;
+
+// Cypher query
+let rows = db.query("MATCH (p:Person)-[r:FIT]->(o:Org) RETURN p, o, r.score", &Default::default())?;
+
+// Explain why an edge exists
+let exps = db.explain("alice", "acme")?;  // [{rule, edge_type, weight, ...}]
+
+// Per-node change history (WAL horizon since last snapshot)
+let history = db.node_history("alice")?;
+
+// Schema-as-code (idempotent apply)
+let diff = db.apply_schema(&schema)?;  // SchemaDiff { created, updated, unchanged }
+
+// Hybrid search (fulltext + vector via RRF)
+let hits = db.search_hybrid("rust graph", "bio", Some(&embedding), "embedding", Some("Person"), 10)?;
+
+// Subscribe to query results (incremental, allowlisted Cypher subset)
+let sub = db.subscribe_query("MATCH (p:Person)-[:FIT]->(o:Org) RETURN p, o LIMIT 20")?;
+
+// Node mask (ACL-scoped read)
+let mask = NodeMask::from_keys(&db, ["alice", "bob"]);
+let rows = db.query_masked("MATCH (p:Person) RETURN p", &Default::default(), &mask)?;
+```
+
+## MCP tools (12 total)
+
+| Tool | Description |
+|---|---|
+| `query` | Cypher query; `mask` param for ACL-scoped read |
+| `ingest_json` | Batch ingest nodes from JSON array |
+| `create_rule` | Declare a derivation rule |
+| `explain` | Explain rule-derived edges between two nodes |
+| `explain_association` | Alias of explain; semantic name for agent workflows |
+| `upsert_entity` | Insert or update a node by key (no existence check needed) |
+| `find_similar` | (1) Vector search via HNSW; (2) edge-traversal neighbors |
+| `hybrid_search` | RRF over fulltext + vector results |
+| `neighborhood` | Multi-hop graph traversal |
+| `node_info` | Node key, label, properties |
+| `node_edges` | Incident edges with derived flag |
+| `stats` | Live node/edge/rule counts |
+
+Claude Desktop config:
+```json
+{
+  "mcpServers": {
+    "mushroomdb": {
+      "command": "mushroomdb",
+      "args": ["mcp", "/path/to/your/db"]
+    }
+  }
+}
+```
+
+## Six predicate kinds
+
+| Predicate | Matches when |
+|---|---|
+| `KeyMatch` | source field value equals destination node key (FK) |
+| `FieldEqual` | named field is equal on both nodes |
+| `Overlap` | Jaccard similarity on list fields exceeds min threshold |
+| `NumericWithin` | absolute numeric difference within tolerance |
+| `GeoRadius` | Haversine distance on [lat, lon] within km |
+| `VectorSimilar` | cosine similarity on float arrays exceeds min |
+
+Predicates compose via `All(...)` (AND, score = min) and `Any(...)` (OR, score = max), nestable to depth 4.
+
+`approximate: true` on `VectorSimilar` uses in-tree HNSW (recall min 0.90, mean 0.998 at 5k/dim 1536, fixed-seed probe).
+
+## Cypher subset
+
+Supported: MATCH, WHERE (AND/OR/NOT, IN, IS NULL/IS NOT NULL), RETURN (DISTINCT), ORDER BY,
+SKIP, LIMIT, WITH pipeline, OPTIONAL MATCH, UNWIND, CREATE, MATCH…SET, MATCH…DELETE,
+MATCH…DETACH DELETE, MERGE (ON CREATE SET / ON MATCH SET), variable-length paths (*min..max, max 10),
+shortestPath, aggregations (COUNT/SUM/AVG/MIN/MAX, grouped), query parameters ($name),
+scalar functions (toLower, toUpper, size, coalesce, type(r), abs, round).
+
+Not supported: CASE, subqueries, UNION, multi-statement BEGIN/COMMIT transactions.
+
+## Storage
+
+- Dense-id WAL with per-commit fsync; configurable FsyncPolicy (strict/batched/relaxed)
+- V7 packed snapshot: packed CSR adjacency + columnar properties + HNSW blobs; zstd-compressed
+- V5/V6 snapshots read transparently; V3/V4 rejected
+- Not mmap. Single writer, many readers (RwLock-backed SharedDb)
+- RAM-bound; design target 10M nodes (~5–15 GiB with properties)
+- 100k nodes, V7 snapshot open: ~8.88 s (V6 measurement; V7 not separately published)
+- 100k nodes, WAL-only open: ~8.16 min (HNSW re-fitting dominates)
+
+## GitHub
+
+https://github.com/MatthewSherlin/mushroomdb
+
+## Docs
+
+- Rules: docs/site/rules.md
+- Cypher reference: docs/site/query.md
+- MCP / agent memory: docs/site/mcp.md
+- HTTP API: docs/site/api.md
+- Subscriptions: docs/site/subscriptions.md
+- Time travel: docs/site/timetravel.md
+- Materialized views: docs/site/views.md
+- Full-text search: docs/site/fulltext.md
+- Algorithms: docs/site/algorithms.md
+- Benchmarks: benchmarks/results/head-to-head-10k-v2.md
+
+## Limitations (be honest)
+
+- RAM-bound; no mmap yet
+- Single writer (no multi-writer, no clustering, no Neo4j parity)
+- No mmap, no differential dataflow
+- Dense patterns >1M intermediate rows require LIMIT
+- No multi-statement interactive transactions in v1
+- V7 snapshot open time at 100k nodes not yet measured separately (V6 was 8.88 s)
+- Approximate backfill time with HNSW not separately published (IVF-era was ~17 s at 5k/1536)
+- Pre-1.0 format policy: snapshot/WAL formats may change between v0.x minor versions
