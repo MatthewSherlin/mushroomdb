@@ -66,8 +66,11 @@ pub struct IngestReport {
 ///
 /// JSON `null` returns `None` so the caller can skip the field (not an error).
 /// Integral numbers become [`Value::Int`]; other numbers become [`Value::Float`].
-/// Arrays become [`Value::List`] (all element types allowed, recursing through
-/// this function). JSON objects become [`Value::Map`] recursively.
+/// Arrays become [`Value::List`] by recursing through this function. If any
+/// element is JSON `null` the entire array field returns `None` and the caller
+/// silently skips the field (same null-drop policy as top-level fields). JSON
+/// objects become [`Value::Map`] recursively; `null` values inside an object
+/// are silently omitted from the map.
 ///
 /// **Behavior change from pre-Map:** JSON objects previously returned `None`
 /// (treated as a skipped/error field by `ingest_json`). They now produce
