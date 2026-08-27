@@ -62,6 +62,7 @@ fn apply_schema_is_idempotent_and_diffs() {
         fulltext: vec![("A".into(), "body".into())],
         rules: vec![sample_rule("rel_rule")],
         views: vec![sample_view("deg_view")],
+        roles: vec![],
     };
 
     // First apply: everything is created.
@@ -125,6 +126,7 @@ fn apply_schema_update_replaces_changed_rule() {
         fulltext: vec![],
         rules: vec![sample_rule("link")],
         views: vec![sample_view("outdeg")],
+        roles: vec![],
     };
     let d1 = db.apply_schema(&schema_v1).unwrap();
     assert_eq!(d1.created.len(), 2);
@@ -137,6 +139,7 @@ fn apply_schema_update_replaces_changed_rule() {
         fulltext: vec![],
         rules: vec![changed_rule],
         views: vec![sample_view("outdeg")], // view unchanged
+        roles: vec![],
     };
     let d2 = db.apply_schema(&schema_v2).unwrap();
     assert!(
@@ -171,6 +174,7 @@ fn apply_schema_no_pruning() {
         fulltext: vec![],
         rules: vec![],
         views: vec![],
+        roles: vec![],
     };
     let d = db.apply_schema(&schema).unwrap();
     assert!(d.created.is_empty());
@@ -194,6 +198,7 @@ fn apply_schema_view_update() {
         fulltext: vec![],
         rules: vec![],
         views: vec![sample_view("degview")],
+        roles: vec![],
     };
     db.apply_schema(&schema_v1).unwrap();
 
@@ -211,6 +216,7 @@ fn apply_schema_view_update() {
         fulltext: vec![],
         rules: vec![],
         views: vec![changed_view],
+        roles: vec![],
     };
     let d = db.apply_schema(&schema_v2).unwrap();
     assert!(
@@ -231,6 +237,7 @@ fn apply_schema_invalid_rule_update_is_rejected_before_mutation() {
         fulltext: vec![],
         rules: vec![sample_rule("link")],
         views: vec![],
+        roles: vec![],
     };
     db.apply_schema(&schema_v1).unwrap();
 
@@ -246,6 +253,7 @@ fn apply_schema_invalid_rule_update_is_rejected_before_mutation() {
         fulltext: vec![],
         rules: vec![bad_rule],
         views: vec![],
+        roles: vec![],
     };
     let result = db.apply_schema(&schema_bad);
     assert!(result.is_err(), "invalid update must return Err");
@@ -282,6 +290,7 @@ fn apply_schema_invalid_view_update_is_rejected_before_mutation() {
         fulltext: vec![],
         rules: vec![],
         views: vec![sample_view("degview")],
+        roles: vec![],
     };
     db.apply_schema(&schema_v1).unwrap();
 
@@ -303,6 +312,7 @@ fn apply_schema_invalid_view_update_is_rejected_before_mutation() {
         fulltext: vec![],
         rules: vec![],
         views: vec![bad_view],
+        roles: vec![],
     };
     let result = db.apply_schema(&schema_bad);
     assert!(result.is_err(), "invalid view update must return Err");
@@ -331,6 +341,7 @@ fn schema_json_round_trips() {
         fulltext: vec![("Label".into(), "field".into())],
         rules: vec![sample_rule("r")],
         views: vec![sample_view("v")],
+        roles: vec![],
     };
     let json = serde_json::to_string(&schema).unwrap();
     let back: Schema = serde_json::from_str(&json).unwrap();

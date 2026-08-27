@@ -1,0 +1,7 @@
+{
+  "ingest_wall_s": 1.221288,
+  "rule_backfill_wall_s": 12.533991,
+  "snapshot_write_s": 1.045001,
+  "snapshot_open_s": 0.418092,
+  "query_p50_ms": 0.010920
+}

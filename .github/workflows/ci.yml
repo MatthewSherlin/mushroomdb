@@ -185,8 +185,8 @@ jobs:
         with:
           name: bench-results
           path: results.json
-      - name: compare against baseline (bootstrap mode — flip to enforcing once baseline is committed)
+      - name: compare against baseline (enforcing; baseline from run 33102838477, ubuntu-latest, 2026-08-27)
         run: |
           set -euo pipefail
           python3 benchmarks/ci/compare.py results.json benchmarks/baselines/ci.json \
-            --threshold 0.15 --bootstrap
+            --threshold 0.15

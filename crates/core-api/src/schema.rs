@@ -34,6 +34,7 @@
 //! untouched.  Destructive removal ("prune items not in the schema") waits for
 //! explicit demand — YAGNI for this plan.
 
+use crate::roles::RoleDef;
 use crate::{GraphDb, Result, RuleDef, ViewDef};
 use core_storage::{fs::Fs, GraphError};
 use serde::{Deserialize, Serialize};
@@ -44,7 +45,7 @@ use serde::{Deserialize, Serialize};
 
 /// A declarative description of the schema that should exist in a database.
 ///
-/// All three lists default to empty when absent from JSON, so a partial schema
+/// All lists default to empty when absent from JSON, so a partial schema
 /// that names only rules (for example) is valid.
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Schema {
@@ -57,6 +58,9 @@ pub struct Schema {
     /// Materialized view definitions.
     #[serde(default)]
     pub views: Vec<ViewDef>,
+    /// RBAC role definitions. Persisted as `roles.json` sidecar on apply.
+    #[serde(default)]
+    pub roles: Vec<RoleDef>,
 }
 
 /// The outcome of a single [`GraphDb::apply_schema`] call.
@@ -103,7 +107,7 @@ impl<F: Fs> GraphDb<F> {
     /// edges.  This can be expensive for large graphs; prefer stable rule
     /// definitions in production.
     pub fn apply_schema(&mut self, schema: &Schema) -> Result<SchemaDiff> {
-        // Pre-validation pass: validate every rule and view that would be
+        // Pre-validation pass: validate every rule, view, and role that would be
         // created or updated, before touching the database.  Unchanged items
         // are already valid (they passed validation when first created).
         let live_views = self.views();
@@ -130,6 +134,23 @@ impl<F: Fs> GraphDb<F> {
                 rule_def
                     .validate()
                     .map_err(|e| GraphError::RuleInvalid { detail: e })?;
+            }
+        }
+
+        // Validate roles: non-empty names, unique names within the schema.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for role_def in &schema.roles {
+                if role_def.name.is_empty() {
+                    return Err(GraphError::RuleInvalid {
+                        detail: "role name must not be empty".into(),
+                    });
+                }
+                if !seen.insert(role_def.name.as_str()) {
+                    return Err(GraphError::RuleInvalid {
+                        detail: format!("duplicate role name: {}", role_def.name),
+                    });
+                }
             }
         }
 
@@ -182,6 +203,39 @@ impl<F: Fs> GraphDb<F> {
             } else {
                 self.create_rule(rule_def.clone())?;
                 created.push(key);
+            }
+        }
+
+        // 4. Roles — sidecar only (no WAL records). Written atomically when
+        // any role is new or changed; unchanged roles leave the file untouched
+        // (byte-identical idempotency guarantee).
+        {
+            let live_roles = self.roles();
+            let mut new_roles: Vec<RoleDef> = live_roles.clone();
+            let mut roles_changed = false;
+
+            for role_def in &schema.roles {
+                let key = format!("role:{}", role_def.name);
+                if let Some(live) = live_roles.iter().find(|r| r.name == role_def.name) {
+                    if live == role_def {
+                        unchanged.push(key);
+                    } else {
+                        // Update the entry in new_roles.
+                        if let Some(slot) = new_roles.iter_mut().find(|r| r.name == role_def.name) {
+                            *slot = role_def.clone();
+                        }
+                        roles_changed = true;
+                        updated.push(key);
+                    }
+                } else {
+                    new_roles.push(role_def.clone());
+                    roles_changed = true;
+                    created.push(key);
+                }
+            }
+
+            if roles_changed {
+                self.commit_roles(new_roles)?;
             }
         }
 

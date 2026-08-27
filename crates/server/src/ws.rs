@@ -7,11 +7,14 @@
 //! cannot miss subsequent events. Lagged receivers then get a
 //! `{"lagged": n}` frame (`n` = skipped events) and continue.
 
-use crate::AppState;
+use crate::{AppState, AuthIdentity};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::extract::{Extension, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use core_api::MutationEvent;
+use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 
 /// First frame after upgrade. The receiver already exists when this is sent.
@@ -22,9 +25,24 @@ const SUBSCRIBED_ACK: &str = r#"{"subscribed":true}"#;
 /// `subscribe()` runs here, before `on_upgrade`'s future is scheduled, so
 /// the receiver exists before the ack and before any later `recv`. The
 /// first frame after upgrade is `{"subscribed":true}`; mutation frames follow.
-pub async fn watch(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+///
+/// Role-bound tokens are denied: the full mutation stream has no mask filter
+/// in v1 — denying beats leaking hidden-node events.
+pub async fn watch(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "role-bound token: /watch is not permitted"})),
+        )
+            .into_response();
+    }
     let rx = state.watch.subscribe();
     ws.on_upgrade(move |socket| write_events(socket, rx))
+        .into_response()
 }
 
 async fn write_events(
