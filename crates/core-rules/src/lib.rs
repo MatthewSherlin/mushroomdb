@@ -5,7 +5,7 @@ pub mod index;
 pub mod suggest;
 pub mod views;
 pub use def::{
-    default_max_edges, evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef,
+    decode_rule_def, default_max_edges, evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef,
     DEFAULT_KEYMATCH_TOP_K, DEFAULT_SCORED_TOP_K,
 };
 pub use engine::{EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport};

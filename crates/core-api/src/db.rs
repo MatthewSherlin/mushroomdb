@@ -9,8 +9,8 @@ use core_query::cypher::{
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
-    evaluate, EngineEdgeDelta, GraphMut, NodeView, Predicate, RuleDef, RuleEngine, RuleIvfExport,
-    ViewDef, ViewStore,
+    decode_rule_def, evaluate, EngineEdgeDelta, GraphMut, NodeView, Predicate, RuleDef, RuleEngine,
+    RuleIvfExport, ViewDef, ViewStore,
 };
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
@@ -166,7 +166,7 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         }),
         WalRecord::DeleteNode { key } => Some(MutationEvent::NodeDeleted { key: key.clone() }),
         WalRecord::CreateRule { def_bytes } => {
-            let def: RuleDef = bincode::deserialize(def_bytes).ok()?;
+            let def: RuleDef = decode_rule_def(def_bytes).ok()?;
             Some(MutationEvent::RuleCreated { name: def.name })
         }
         WalRecord::DeleteRule { name } => Some(MutationEvent::RuleDeleted { name: name.clone() }),
@@ -1065,7 +1065,7 @@ impl<F: Fs> GraphDb<F> {
             .rule_defs
             .iter()
             .map(|b| {
-                bincode::deserialize(b).map_err(|e| GraphError::Corrupt {
+                decode_rule_def(b).map_err(|e| GraphError::Corrupt {
                     detail: format!("snapshot rule_def deserialize: {e}"),
                 })
             })
@@ -1600,10 +1600,9 @@ impl<F: Fs> GraphDb<F> {
                 }
             }
             WalRecord::CreateRule { def_bytes } => {
-                let def: RuleDef =
-                    bincode::deserialize(def_bytes).map_err(|e| GraphError::Corrupt {
-                        detail: format!("CreateRule def_bytes deserialize failed: {e}"),
-                    })?;
+                let def: RuleDef = decode_rule_def(def_bytes).map_err(|e| GraphError::Corrupt {
+                    detail: format!("CreateRule def_bytes deserialize failed: {e}"),
+                })?;
                 // Replay-over-snapshot idempotency: the rule was captured in the snapshot
                 // so the engine already has it; silently skip to avoid a spurious
                 // RuleInvalid error in the crash window between snapshot write and WAL

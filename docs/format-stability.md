@@ -109,6 +109,24 @@ store is correct.
 
 ---
 
+## Rule wire-shape compatibility
+
+`RuleDef` is serialized with bincode inside WAL `CreateRule` records and
+snapshot `rule_defs` sections. Two wire shapes are recognized:
+
+| Wire shape | When written | Fields |
+|-----------|-------------|--------|
+| **Current** | v0.2+ (post-phase-4) | all fields including `via_label`, `via_edge`, `via_dir` |
+| **Pre-0.1.2 legacy** | releases ≤ 0.1.2 | all fields **except** `via_label`, `via_edge`, `via_dir` |
+
+When a pre-0.1.2 rule record is decoded, the missing `via_*` fields default to
+`None` (no via-hop behaviour). The two shapes are unambiguously distinguished by
+exact-consumption checks: a legacy record decoded as current-shape hits EOF on
+the missing `via_*` bytes; a current record decoded as legacy-shape has trailing
+bytes that the exact-consumption check rejects.
+
+---
+
 ## Honesty
 
 Performance claims in README and docs cite measured numbers with date and
