@@ -69,16 +69,27 @@ def test_round_trip_numeric_within(tmp_path):
     db.close()
 
 
-def test_value_mapping_rejects_dict(tmp_path):
+def test_value_mapping_dict_roundtrips(tmp_path):
+    """Nested dicts round-trip as Value::Map; non-str keys still raise TypeError."""
     db = GraphDb.open(str(tmp_path / "db"))
-    db.insert_node("Person", "p1", {"skills": ["rust", "graph"], "n": 1})
-    with pytest.raises(TypeError, match="dict"):
-        db.insert_node("Person", "p2", {"nested": {"a": 1}})
-    with pytest.raises(TypeError, match="dict"):
-        db.set_prop("p1", "meta", {"a": 1})
+
+    nested = {"a": 1, "b": [True, {"c": 0.5}]}
+    db.insert_node("Person", "p1", {"meta": nested, "n": 1})
+
+    # round-trip via node_info
     info = db.node_info("p1")
-    assert info["props"]["skills"] == ["rust", "graph"]
+    assert info["props"]["meta"] == nested
     assert info["props"]["n"] == 1
+
+    # round-trip via set_prop
+    db.set_prop("p1", "extra", {"x": "hello", "y": [1, 2]})
+    info2 = db.node_info("p1")
+    assert info2["props"]["extra"] == {"x": "hello", "y": [1, 2]}
+
+    # non-str key must still raise TypeError
+    with pytest.raises(TypeError):
+        db.set_prop("p1", "bad", {1: "int key not allowed"})
+
     db.close()
 
 
