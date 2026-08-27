@@ -220,6 +220,111 @@ fn apply_schema_view_update() {
 }
 
 #[test]
+fn apply_schema_invalid_rule_update_is_rejected_before_mutation() {
+    // A changed rule whose new definition fails validate() must: (a) return Err,
+    // (b) leave the original rule alive and unchanged, (c) emit zero new WAL commits.
+    let dir = tmp("invalid_rule_update");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Seed with a valid rule.
+    let schema_v1 = Schema {
+        fulltext: vec![],
+        rules: vec![sample_rule("link")],
+        views: vec![],
+    };
+    db.apply_schema(&schema_v1).unwrap();
+
+    drop(db);
+    let commits_before = core_api::wal_commit_count_at(&dir).unwrap();
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Build a changed rule with an invalid definition (empty edge_type fails validate()).
+    let mut bad_rule = sample_rule("link");
+    bad_rule.edge_type = String::new(); // validate() rejects empty edge_type
+
+    let schema_bad = Schema {
+        fulltext: vec![],
+        rules: vec![bad_rule],
+        views: vec![],
+    };
+    let result = db.apply_schema(&schema_bad);
+    assert!(result.is_err(), "invalid update must return Err");
+
+    // Original rule must still be live and unchanged.
+    let rules = db.rules();
+    let live = rules
+        .iter()
+        .find(|r| r.name == "link")
+        .expect("original rule must still exist");
+    assert_eq!(
+        live.edge_type, "REL",
+        "original rule edge_type must be unchanged"
+    );
+
+    // Zero new WAL commits — no mutation was made.
+    drop(db);
+    let commits_after = core_api::wal_commit_count_at(&dir).unwrap();
+    assert_eq!(
+        commits_after, commits_before,
+        "invalid update must not emit any WAL commits (before={commits_before}, after={commits_after})"
+    );
+}
+
+#[test]
+fn apply_schema_invalid_view_update_is_rejected_before_mutation() {
+    // A changed view whose new definition fails validate() must: (a) return Err,
+    // (b) leave the original view alive and unchanged, (c) emit zero new WAL commits.
+    let dir = tmp("invalid_view_update");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Seed with a valid view.
+    let schema_v1 = Schema {
+        fulltext: vec![],
+        rules: vec![],
+        views: vec![sample_view("degview")],
+    };
+    db.apply_schema(&schema_v1).unwrap();
+
+    drop(db);
+    let commits_before = core_api::wal_commit_count_at(&dir).unwrap();
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Build a changed view with an invalid definition (empty name fails validate()).
+    let bad_view = ViewDef {
+        name: "degview".into(),
+        label: String::new(), // validate() rejects empty label
+        view_prop: "degview_prop".into(),
+        source: ViewSource::Degree {
+            edge_type: "REL".into(),
+            direction: Direction::Out,
+        },
+    };
+    let schema_bad = Schema {
+        fulltext: vec![],
+        rules: vec![],
+        views: vec![bad_view],
+    };
+    let result = db.apply_schema(&schema_bad);
+    assert!(result.is_err(), "invalid view update must return Err");
+
+    // Original view must still be live.
+    let views = db.views();
+    let live = views
+        .iter()
+        .find(|v| v.name == "degview")
+        .expect("original view must still exist");
+    assert_eq!(live.label, "A", "original view label must be unchanged");
+
+    // Zero new WAL commits.
+    drop(db);
+    let commits_after = core_api::wal_commit_count_at(&dir).unwrap();
+    assert_eq!(
+        commits_after, commits_before,
+        "invalid view update must not emit any WAL commits (before={commits_before}, after={commits_after})"
+    );
+}
+
+#[test]
 fn schema_json_round_trips() {
     // Schema is serde-JSON round-trippable.
     let schema = Schema {

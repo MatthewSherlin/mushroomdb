@@ -35,7 +35,7 @@
 //! explicit demand — YAGNI for this plan.
 
 use crate::{GraphDb, Result, RuleDef, ViewDef};
-use core_storage::fs::Fs;
+use core_storage::{fs::Fs, GraphError};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -88,6 +88,14 @@ impl<F: Fs> GraphDb<F> {
     /// Items absent from `schema` but present in the database are left
     /// untouched (no pruning).
     ///
+    /// # Atomicity of validation
+    ///
+    /// All rules and views that would be created or updated are validated
+    /// **before** any mutation is made.  If any definition is invalid, the
+    /// function returns `Err` without touching the database.  This prevents
+    /// the partial-application hazard where the old item is already deleted
+    /// before the invalid replacement fails.
+    ///
     /// # Update cost
     ///
     /// Updating a rule (definition differs) triggers `delete_rule` +
@@ -95,6 +103,37 @@ impl<F: Fs> GraphDb<F> {
     /// edges.  This can be expensive for large graphs; prefer stable rule
     /// definitions in production.
     pub fn apply_schema(&mut self, schema: &Schema) -> Result<SchemaDiff> {
+        // Pre-validation pass: validate every rule and view that would be
+        // created or updated, before touching the database.  Unchanged items
+        // are already valid (they passed validation when first created).
+        let live_views = self.views();
+        let live_rules = self.rules();
+
+        for view_def in &schema.views {
+            let would_mutate = live_views
+                .iter()
+                .find(|v| v.name == view_def.name)
+                .map_or(true, |live| live != view_def);
+            if would_mutate {
+                view_def
+                    .validate()
+                    .map_err(|e| GraphError::RuleInvalid { detail: e })?;
+            }
+        }
+
+        for rule_def in &schema.rules {
+            let would_mutate = live_rules
+                .iter()
+                .find(|r| r.name == rule_def.name)
+                .map_or(true, |live| live != rule_def);
+            if would_mutate {
+                rule_def
+                    .validate()
+                    .map_err(|e| GraphError::RuleInvalid { detail: e })?;
+            }
+        }
+
+        // Mutation pass — all definitions are known-valid from here.
         let mut created = Vec::new();
         let mut updated = Vec::new();
         let mut unchanged = Vec::new();
@@ -111,7 +150,6 @@ impl<F: Fs> GraphDb<F> {
         }
 
         // 2. Views.
-        let live_views = self.views();
         for view_def in &schema.views {
             let key = format!("view:{}", view_def.name);
             if let Some(live) = live_views.iter().find(|v| v.name == view_def.name) {
@@ -130,7 +168,6 @@ impl<F: Fs> GraphDb<F> {
         }
 
         // 3. Rules — creating a rule triggers a full backfill (see module doc).
-        let live_rules = self.rules();
         for rule_def in &schema.rules {
             let key = format!("rule:{}", rule_def.name);
             if let Some(live) = live_rules.iter().find(|r| r.name == rule_def.name) {
