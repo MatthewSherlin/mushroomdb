@@ -2045,6 +2045,254 @@ async fn role_token_neighborhood_hidden_key_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+// ── Fix round-1: C1 — /edges filters hidden neighbor endpoints ────────────────
+
+#[tokio::test]
+async fn role_token_edges_filters_hidden_neighbor() {
+    // pub1 --KNOWS--> sec1 (hidden); pub1 --KNOWS--> pub2 (visible).
+    // Role token on /node/pub1/edges must NOT see the edge to sec1.
+    let (app, db) = open_rbac(
+        "rbac-edges-filter",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    {
+        let mut w = db.write();
+        w.insert_node("Pub", "pub1", vec![]).unwrap();
+        w.insert_node("Pub", "pub2", vec![]).unwrap();
+        w.insert_node("Secret", "sec1", vec![]).unwrap();
+        w.insert_edge("KNOWS", "pub1", "sec1").unwrap();
+        w.insert_edge("KNOWS", "pub1", "pub2").unwrap();
+    }
+
+    let (status, body, _) = send(app.clone(), authed_get("/node/pub1/edges", "role-tok")).await;
+    assert_eq!(status, StatusCode::OK, "visible entry key must be 200");
+    let v = parse_json(&body);
+    let edges = v["edges"].as_array().expect("edges array");
+    // Only the pub1→pub2 edge should appear; the pub1→sec1 edge must be absent.
+    assert_eq!(
+        edges.len(),
+        1,
+        "role token must not see edge to hidden node"
+    );
+    let dst = edges[0]["dst_key"].as_str().unwrap_or("");
+    assert_eq!(dst, "pub2", "only visible-neighbor edge returned");
+
+    // Full token sees both edges.
+    let (status, body, _) = send(app, authed_get("/node/pub1/edges", "admin")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["edges"].as_array().unwrap().len(),
+        2,
+        "full token must see all edges"
+    );
+}
+
+// ── Fix round-1: C2 — /neighborhood never leaks hidden nodes or routes through them
+
+#[tokio::test]
+async fn role_token_neighborhood_hides_hidden_nodes_and_does_not_route_through_them() {
+    // Graph: pub1 --KNOWS--> sec1 (hidden) --KNOWS--> pub2 (visible, but only
+    // reachable through a hidden intermediate).
+    //
+    // At depth 2 the unmasked BFS would yield both sec1 and pub2.
+    // A role token must see neither (sec1 is hidden; pub2 is only reachable via sec1).
+    let (app, db) = open_rbac(
+        "rbac-nbhd-route",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    {
+        let mut w = db.write();
+        w.insert_node("Pub", "pub1", vec![]).unwrap();
+        w.insert_node("Secret", "sec1", vec![]).unwrap();
+        w.insert_node("Pub", "pub2", vec![]).unwrap();
+        w.insert_edge("KNOWS", "pub1", "sec1").unwrap();
+        w.insert_edge("KNOWS", "sec1", "pub2").unwrap();
+    }
+
+    let (status, body, _) = send(
+        app.clone(),
+        authed_get("/node/pub1/neighborhood?depth=2", "role-tok"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "visible entry key must be 200");
+    let v = parse_json(&body);
+    let rows = v["rows"].as_array().expect("rows array");
+    // Neither sec1 nor pub2 should appear.
+    let keys: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.as_array()?.first()?.as_str())
+        .collect();
+    assert!(
+        !keys.contains(&"sec1"),
+        "hidden node sec1 must not appear in neighborhood"
+    );
+    assert!(
+        !keys.contains(&"pub2"),
+        "pub2 reachable only via hidden intermediate must not appear"
+    );
+
+    // Full token at depth 2 sees both sec1 and pub2.
+    let (status, body, _) = send(app, authed_get("/node/pub1/neighborhood?depth=2", "admin")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    let full_rows = v["rows"].as_array().unwrap();
+    let full_keys: Vec<&str> = full_rows
+        .iter()
+        .filter_map(|r| r.as_array()?.first()?.as_str())
+        .collect();
+    assert!(
+        full_keys.contains(&"sec1"),
+        "full token must see sec1 in neighborhood"
+    );
+    assert!(
+        full_keys.contains(&"pub2"),
+        "full token must see pub2 in neighborhood"
+    );
+}
+
+// ── Fix round-1: I1 — serve_with_embedded_ui wires role tokens (unit check) ──
+
+/// Validates that `router_with_role_tokens` (used by the embed-ui serve path)
+/// enforces role tokens when invoked with a role map.  The embed-ui feature gate
+/// guards `serve_with_embedded_ui` itself; this test covers the router logic that
+/// `serve_with_embedded_ui` delegates to.
+#[tokio::test]
+async fn embed_ui_router_path_honors_role_tokens() {
+    // open_rbac uses router_with_role_tokens — the same path serve_with_embedded_ui
+    // now delegates to — so this exercises the fixed code path.
+    let (app, db) = open_rbac(
+        "rbac-embed-ui-wire",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    // Role token: visible node is 200; hidden node is 404.
+    let (st, _, _) = send(app.clone(), authed_get("/node/pub1", "role-tok")).await;
+    assert_eq!(st, StatusCode::OK, "role token must see pub1");
+    let (st, _, _) = send(app.clone(), authed_get("/node/sec1", "role-tok")).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "role token must not see sec1");
+
+    // Unknown token is 401 even on this path.
+    let (st, _, _) = send(app, authed_get("/node/pub1", "bad-tok")).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "unknown token must be 401");
+}
+
+// ── Fix round-1: M1 — indistinguishability extends to /edges and /neighborhood ─
+
+#[tokio::test]
+async fn role_token_hidden_key_indistinguishable_from_absent_on_edges_and_neighborhood() {
+    let (app, db) = open_rbac(
+        "rbac-indist-ext",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    // /edges: hidden and absent both return 404 with an error field.
+    let (hidden_st, hidden_body, _) =
+        send(app.clone(), authed_get("/node/sec1/edges", "role-tok")).await;
+    let (absent_st, absent_body, _) = send(
+        app.clone(),
+        authed_get("/node/totally-absent/edges", "role-tok"),
+    )
+    .await;
+    assert_eq!(hidden_st, StatusCode::NOT_FOUND);
+    assert_eq!(absent_st, StatusCode::NOT_FOUND);
+    let hv = parse_json(&hidden_body);
+    let av = parse_json(&absent_body);
+    // Both must have an "error" field with the same prefix pattern.
+    let h_err = hv["error"].as_str().unwrap_or("");
+    let a_err = av["error"].as_str().unwrap_or("");
+    assert!(
+        h_err.starts_with("node key not found"),
+        "hidden /edges error must match absent prefix: {h_err}"
+    );
+    assert!(
+        a_err.starts_with("node key not found"),
+        "absent /edges error must match pattern: {a_err}"
+    );
+
+    // /neighborhood: same.
+    let (hidden_st, hidden_body, _) = send(
+        app.clone(),
+        authed_get("/node/sec1/neighborhood", "role-tok"),
+    )
+    .await;
+    let (absent_st, absent_body, _) = send(
+        app,
+        authed_get("/node/totally-absent/neighborhood", "role-tok"),
+    )
+    .await;
+    assert_eq!(hidden_st, StatusCode::NOT_FOUND);
+    assert_eq!(absent_st, StatusCode::NOT_FOUND);
+    let hv = parse_json(&hidden_body);
+    let av = parse_json(&absent_body);
+    let h_err = hv["error"].as_str().unwrap_or("");
+    let a_err = av["error"].as_str().unwrap_or("");
+    assert!(
+        h_err.starts_with("node key not found"),
+        "hidden /neighborhood error must match absent prefix: {h_err}"
+    );
+    assert!(
+        a_err.starts_with("node key not found"),
+        "absent /neighborhood error must match pattern: {a_err}"
+    );
+}
+
+// ── Fix round-1: M2 — poisoned sidecar on /node, /edges, /neighborhood → 500 ──
+
+#[tokio::test]
+async fn poisoned_sidecar_is_500_on_node_edges_and_neighborhood() {
+    let dir = tmp("rbac-poisoned-ext");
+    {
+        let db = SharedDb::open(&dir).unwrap();
+        db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+        db.write().insert_node("Pub", "pub2", vec![]).unwrap();
+        db.write().insert_edge("KNOWS", "pub1", "pub2").unwrap();
+    }
+    // Poison the sidecar after nodes are inserted.
+    std::fs::write(dir.join("roles.json"), b"not valid json").unwrap();
+    let db = SharedDb::open(&dir).unwrap();
+    let rtoks: std::collections::HashMap<String, String> =
+        [("role-tok".to_string(), "analyst".to_string())]
+            .into_iter()
+            .collect();
+    let app = router_with_role_tokens(db, Some("admin".to_string()), rtoks);
+
+    for path in ["/node/pub1", "/node/pub1/edges", "/node/pub1/neighborhood"] {
+        let (status, body, _) = send(app.clone(), authed_get(path, "role-tok")).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "poisoned sidecar must be 500 for role token on {path}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let v = parse_json(&body);
+        assert!(
+            v["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "500 body must have error field on {path}"
+        );
+    }
+
+    // Full token is unaffected.
+    let (status, _, _) = send(app, authed_get("/node/pub1", "admin")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "full token must be unaffected by poisoned sidecar"
+    );
+}
+
 // ── Existing non-RBAC test below (unchanged) ─────────────────────────────────
 
 #[tokio::test]

@@ -218,14 +218,18 @@ pub async fn serve_with_ui_and_role_tokens(
 }
 
 /// [`serve`] plus the compiled-in UI (no-op fallback if `embed-ui` is off).
+///
+/// `role_tokens` maps bearer values to role names; see [`router_with_role_tokens`]
+/// for enforcement semantics.  Pass `HashMap::new()` when no role tokens are needed.
 #[cfg(feature = "embed-ui")]
 pub async fn serve_with_embedded_ui(
     db: SharedDb,
     addr: SocketAddr,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
     token: Option<String>,
+    role_tokens: HashMap<String, String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::Embedded, token, HashMap::new()).await
+    serve_inner(db, addr, ready, UiFallback::Embedded, token, role_tokens).await
 }
 
 enum UiFallback {
@@ -923,7 +927,23 @@ async fn node_edges(
             return key_not_found(key);
         }
         return match g.node_edges(&key) {
-            Ok(edges) => json_ok(node_edges_json(&edges)),
+            Ok(edges) => {
+                // Filter out edges whose OTHER endpoint is hidden in the role
+                // mask.  A role token must not learn about hidden neighbors via
+                // the edge list even when the entry key itself is visible.
+                let visible: Vec<_> = edges
+                    .into_iter()
+                    .filter(|e| {
+                        let other = if e.src_key == key {
+                            &e.dst_key
+                        } else {
+                            &e.src_key
+                        };
+                        role_mask.contains_node(&*g, other)
+                    })
+                    .collect();
+                json_ok(node_edges_json(&visible))
+            }
             Err(GraphError::KeyNotFound { key }) => key_not_found(key),
             Err(e) => graph_err(e),
         };
@@ -978,8 +998,10 @@ async fn neighborhood(
         if !role_mask.contains_node(&*g, &key) {
             return key_not_found(key);
         }
-        let rs = match g.node_ref(&key) {
-            Some(n) => n.neighborhood(depth, etype_refs.as_deref(), dir),
+        // Use the mask-aware BFS: hidden nodes are excluded from results AND
+        // cannot be used as traversal intermediaries (never-leak invariant).
+        let rs = match g.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &role_mask) {
+            Some(rs) => rs,
             None => return key_not_found(key),
         };
         return json_ok(result_set_json(&rs));

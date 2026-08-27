@@ -3816,6 +3816,43 @@ impl<F: Fs> GraphDb<F> {
         Some(NodeRef { db: self, id })
     }
 
+    /// BFS neighborhood expansion restricted to visible nodes in `mask`.
+    ///
+    /// Hidden nodes are neither returned nor used as traversal intermediaries —
+    /// a visible node reachable only through a hidden node will not appear.
+    /// Returns `None` when `key` does not exist (caller should 404).
+    pub fn neighborhood_masked(
+        &self,
+        key: &str,
+        depth: u32,
+        edge_types: Option<&[&str]>,
+        dir: Dir,
+        mask: &crate::mask::NodeMask,
+    ) -> Option<ResultSet> {
+        let id = self.ids.get(key)?;
+        let view = self.view_masked(mask);
+        let resolved: Option<Vec<u32>> = edge_types.map(|names| {
+            names
+                .iter()
+                .filter_map(|name| view.syms.get(name))
+                .collect()
+        });
+        let nb = neighborhood(&view, id, depth, resolved.as_deref(), dir);
+        let mut rs = ResultSet::new(vec!["key".into(), "label".into(), "depth".into()]);
+        for (nid, d) in nb.nodes {
+            let key = view.key_of(nid);
+            let label = view
+                .label_of(nid)
+                .expect("real nodes always have a label; u32::MAX sentinel cannot occur");
+            rs.push_row(vec![
+                Some(Value::Str(key.to_string())),
+                Some(Value::Str(label.to_string())),
+                Some(Value::Int(d as i64)),
+            ]);
+        }
+        Some(rs)
+    }
+
     /// Live node's key, label, and columnar props. Unknown or tombstoned → `None`.
     pub fn node_info(&self, key: &str) -> Option<NodeInfo> {
         let n = self.node_ref(key)?;

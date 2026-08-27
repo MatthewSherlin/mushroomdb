@@ -227,7 +227,7 @@ fn run_serve(
                 ServeUi::Embedded => {
                     #[cfg(feature = "embed-ui")]
                     {
-                        server::serve_with_embedded_ui(db_serve, addr, tx, token).await
+                        server::serve_with_embedded_ui(db_serve, addr, tx, token, role_tokens).await
                     }
                     #[cfg(not(feature = "embed-ui"))]
                     {
