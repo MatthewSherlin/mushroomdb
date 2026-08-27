@@ -65,8 +65,10 @@ pub struct V8Meta {
 
 /// Encode an in-memory graph state as a V8 snapshot, writing to `out`.
 ///
-/// `base` is the existing mapped snapshot (for Task-3 merge path).  For the
-/// initial encode (Task 1), pass `None`.  Only the overlay fields are used.
+/// `base` is the existing mmap'd snapshot for the Task-3 merge path.
+/// When `Some`, the merged topology and columns (base + overlay, with tombstone
+/// subtraction) are encoded.  When `None`, the overlay is encoded standalone
+/// (initial snapshot, no prior base).
 pub fn encode_v8<W: Write>(
     base: Option<&crate::v8::MappedBase>,
     overlay_topo: &Topology,
@@ -76,12 +78,20 @@ pub fn encode_v8<W: Write>(
     meta: &V8Meta,
     out: &mut W,
 ) -> Result<()> {
-    // Base is reserved for the Task-3 merge path; full encode from overlay for now.
-    let _ = base;
-
     // 1. Serialise each section to bytes.
-    let topo_bytes = rkyv_encode(&topology_to_csr(overlay_topo))?;
-    let cols_bytes = rkyv_encode(&columnstore_to_data(overlay_props)?)?;
+    let topo_bytes = if let Some(b) = base {
+        let archived_csr = b.topology()?;
+        rkyv_encode(&topology_merge_to_csr(archived_csr, overlay_topo))?
+    } else {
+        rkyv_encode(&topology_to_csr(overlay_topo))?
+    };
+
+    let cols_bytes = if let Some(b) = base {
+        let archived_cols = b.columns()?;
+        rkyv_encode(&columns_merge_to_data(archived_cols, overlay_props)?)?
+    } else {
+        rkyv_encode(&columnstore_to_data(overlay_props)?)?
+    };
     let ids_bytes = rkyv_encode(&idmap_to_data(overlay_ids))?;
     let syms_bytes = rkyv_encode(&interner_to_data(overlay_syms))?;
     let meta_bytes = bincode::serialize(meta).map_err(|e| GraphError::Corrupt {
@@ -218,64 +228,311 @@ where
 // Build rkyv types from owned graph types
 // ---------------------------------------------------------------------------
 
+/// Build a `CsrData` directly from a `Topology` without going through the
+/// pack-format intermediate.  Replaces the previous `topology_to_csr` →
+/// `topology_from_pack` round-trip (pack-coupling fix, Task 3).
 fn topology_to_csr(topo: &Topology) -> CsrData {
-    let mut buf = Vec::new();
-    topo.pack(&mut buf);
-    topology_from_pack(&buf, topo.edge_count())
+    let mut etype_ids: Vec<u32> = topo.by_type.keys().copied().collect();
+    etype_ids.sort_unstable();
+
+    let etypes = etype_ids
+        .into_iter()
+        .map(|et| {
+            let adj = &topo.by_type[&et];
+            CsrEtype {
+                etype: et,
+                out_adj: adj_map_to_csr(&adj.out),
+                in_adj: adj_map_to_csr(&adj.inn),
+            }
+        })
+        .collect();
+
+    CsrData {
+        etypes,
+        edge_count: topo.edge_count(),
+    }
 }
 
-fn topology_from_pack(buf: &[u8], edge_count: u64) -> CsrData {
-    use crate::pack::{read_u32, read_u64};
-    let mut pos = 0usize;
-    let n_etypes = match read_u32(buf, &mut pos) {
-        Ok(n) => n as usize,
-        Err(_) => {
-            return CsrData {
-                etypes: vec![],
-                edge_count: 0,
+/// Build a `CsrAdjMap` from a `HashMap<u32, AdjList>`.
+/// Rows are sorted by vertex ascending so binary search in the archived form works.
+fn adj_map_to_csr(adj: &std::collections::HashMap<u32, crate::topology::AdjList>) -> CsrAdjMap {
+    let mut vertices: Vec<u32> = adj.keys().copied().collect();
+    vertices.sort_unstable();
+
+    let rows = vertices
+        .into_iter()
+        .filter_map(|v| {
+            let al = &adj[&v];
+            let neighbors = al.merged();
+            if neighbors.is_empty() {
+                None
+            } else {
+                Some(CsrRow {
+                    vertex: v,
+                    neighbors,
+                })
             }
-        }
-    };
-    let mut etypes = Vec::with_capacity(n_etypes);
-    for _ in 0..n_etypes {
-        let et = match read_u32(buf, &mut pos) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        let out_adj = unpack_adj_rows(buf, &mut pos);
-        let in_adj = unpack_adj_rows(buf, &mut pos);
-        etypes.push(CsrEtype {
-            etype: et,
-            out_adj,
-            in_adj,
-        });
+        })
+        .collect();
+
+    CsrAdjMap { rows }
+}
+
+/// Build a merged `CsrData` from an archived base CSR and an overlay `Topology`.
+///
+/// The merged result contains:
+///   - all base edges minus tombstoned edges (recorded via `overlay.remove_edge`),
+///   - plus all overlay edges.
+///
+/// This is the encode path for `snapshot()` when a non-None base is present.
+fn topology_merge_to_csr(base: &crate::v8::layout::ArchivedCsr, overlay: &Topology) -> CsrData {
+    use std::collections::BTreeSet;
+
+    // Collect all etype ids from both base and overlay.
+    let mut etype_set: BTreeSet<u32> = overlay.by_type.keys().copied().collect();
+    for et in base.etypes.iter() {
+        etype_set.insert(u32::from(et.etype));
     }
-    let _ = read_u64(buf, &mut pos); // skip pack's own edge_count
+
+    let etypes: Vec<CsrEtype> = etype_set
+        .into_iter()
+        .map(|et| {
+            let overlay_adj = overlay.by_type.get(&et);
+            let base_entry = base
+                .etypes
+                .binary_search_by_key(&et, |e| u32::from(e.etype))
+                .ok()
+                .map(|i| &base.etypes[i]);
+
+            let out_tombstones = overlay.out_tombstones.get(&et);
+            let in_tombstones = overlay.in_tombstones.get(&et);
+
+            let out_adj = merge_adj_map(
+                overlay_adj.map(|a| &a.out),
+                base_entry.map(|e| &e.out_adj),
+                out_tombstones,
+            );
+            let in_adj = merge_adj_map(
+                overlay_adj.map(|a| &a.inn),
+                base_entry.map(|e| &e.in_adj),
+                in_tombstones,
+            );
+
+            CsrEtype {
+                etype: et,
+                out_adj,
+                in_adj,
+            }
+        })
+        .collect();
+
+    // Merged edge count = base - tombstones + overlay.
+    let base_count = u64::from(base.edge_count);
+    let overlay_count = overlay.edge_count();
+    // Count unique tombstones (out-direction is the canonical set).
+    let tombstone_count: u64 = overlay
+        .out_tombstones
+        .values()
+        .flat_map(|m| m.values())
+        .map(|s| s.len() as u64)
+        .sum();
+    let edge_count = base_count.saturating_sub(tombstone_count) + overlay_count;
+
     CsrData { etypes, edge_count }
 }
 
-fn unpack_adj_rows(buf: &[u8], pos: &mut usize) -> CsrAdjMap {
-    use crate::pack::{read_u32, read_u32s};
-    let n = match read_u32(buf, pos) {
-        Ok(v) => v as usize,
-        Err(_) => return CsrAdjMap { rows: vec![] },
-    };
-    let mut rows = Vec::with_capacity(n);
-    for _ in 0..n {
-        let v = match read_u32(buf, pos) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        let neighbors = match read_u32s(buf, pos) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        rows.push(CsrRow {
-            vertex: v,
-            neighbors,
-        });
+/// Merge one direction's adjacency maps from overlay and base, applying tombstones.
+///
+/// `overlay_adj`: The overlay's `HashMap<u32, AdjList>` for one direction (may be None).
+/// `base_adj`:    The archived base `CsrAdjMap` for the same direction (may be None).
+/// `tombstones`:  Per-src tombstone sets for this etype+direction (may be None).
+fn merge_adj_map(
+    overlay_adj: Option<&std::collections::HashMap<u32, crate::topology::AdjList>>,
+    base_adj: Option<&crate::v8::layout::ArchivedCsrAdjMap>,
+    tombstones: Option<&std::collections::HashMap<u32, std::collections::BTreeSet<u32>>>,
+) -> CsrAdjMap {
+    use std::collections::BTreeSet;
+
+    let mut vertex_set: BTreeSet<u32> = BTreeSet::new();
+    if let Some(o) = overlay_adj {
+        vertex_set.extend(o.keys().copied());
     }
+    if let Some(b) = base_adj {
+        for row in b.rows.iter() {
+            vertex_set.insert(u32::from(row.vertex));
+        }
+    }
+
+    let rows: Vec<CsrRow> = vertex_set
+        .into_iter()
+        .filter_map(|v| {
+            let overlay_nbrs: Vec<u32> = overlay_adj
+                .and_then(|o| o.get(&v))
+                .map(|al| al.merged())
+                .unwrap_or_default();
+
+            let base_nbrs: Vec<u32> = base_adj
+                .and_then(|b| {
+                    b.rows
+                        .binary_search_by_key(&v, |r| u32::from(r.vertex))
+                        .ok()
+                        .map(|i| &b.rows[i])
+                })
+                .map(|row| row.neighbors.iter().map(|n| u32::from(*n)).collect())
+                .unwrap_or_default();
+
+            // Apply tombstones: remove tombstoned endpoints from base neighbors.
+            let filtered_base_nbrs: Vec<u32> = match tombstones.and_then(|t| t.get(&v)) {
+                None => base_nbrs,
+                Some(t) => base_nbrs.into_iter().filter(|n| !t.contains(n)).collect(),
+            };
+
+            // Merge overlay + filtered base (both sorted-unique).
+            let merged = merge_sorted_unique_vecs(&overlay_nbrs, &filtered_base_nbrs);
+            if merged.is_empty() {
+                None
+            } else {
+                Some(CsrRow {
+                    vertex: v,
+                    neighbors: merged,
+                })
+            }
+        })
+        .collect();
+
     CsrAdjMap { rows }
+}
+
+/// Merge two sorted-unique `Vec<u32>` slices into a sorted-unique `Vec<u32>`.
+fn merge_sorted_unique_vecs(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let mut ai = 0;
+    let mut bi = 0;
+    while ai < a.len() && bi < b.len() {
+        match a[ai].cmp(&b[bi]) {
+            std::cmp::Ordering::Less => {
+                out.push(a[ai]);
+                ai += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(b[bi]);
+                bi += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(a[ai]);
+                ai += 1;
+                bi += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[ai..]);
+    out.extend_from_slice(&b[bi..]);
+    out
+}
+
+/// Merge archived base columns with overlay column store.
+///
+/// Overlay values win per `(node, field)` pair.  Fields present only in the
+/// base are carried unchanged.  Fields present in both have their per-node
+/// values merged: overlay wins per node.
+///
+/// Implementation strategy: materialise the base into a `ColumnStore`, then
+/// apply all overlay (field, node, value) entries on top, then re-encode.
+/// This is O(base_size + overlay_size) and correct for the append-mostly case.
+fn columns_merge_to_data(
+    base: &crate::v8::layout::ArchivedColumns,
+    overlay: &ColumnStore,
+) -> Result<ColumnsData> {
+    // Materialise base into an owned ColumnStore.
+    let mut merged = archived_to_columnstore(base);
+
+    // Apply overlay entries: encode the overlay to ColumnsData, then iterate
+    // each field's typed data and write into the merged store.
+    let overlay_data = columnstore_to_data(overlay)?;
+    apply_columns_data_to_store(&overlay_data, &mut merged);
+
+    // Re-encode the merged store.
+    columnstore_to_data(&merged)
+}
+
+/// Apply all (field, node, value) entries from `data` into `store`.
+/// Overlay values overwrite existing store entries for the same key.
+fn apply_columns_data_to_store(data: &ColumnsData, store: &mut ColumnStore) {
+    for field in &data.fields {
+        let name = &field.name;
+        match &field.col {
+            ColumnData::Int { data, present } => {
+                bitmap_for_each_u64(present, |node| {
+                    let idx = node as usize;
+                    if idx < data.len() {
+                        store.set(node, name, Value::Int(data[idx]));
+                    }
+                });
+            }
+            ColumnData::Float { data, present } => {
+                bitmap_for_each_u64(present, |node| {
+                    let idx = node as usize;
+                    if idx < data.len() {
+                        store.set(node, name, Value::Float(data[idx]));
+                    }
+                });
+            }
+            ColumnData::Bool { data, present } => {
+                bitmap_for_each_u64(present, |node| {
+                    let idx = node as usize;
+                    if idx < data.len() {
+                        store.set(node, name, Value::Bool(data[idx] != 0));
+                    }
+                });
+            }
+            ColumnData::Str {
+                ids,
+                present,
+                strings,
+            } => {
+                bitmap_for_each_u64(present, |node| {
+                    let idx = node as usize;
+                    if idx < ids.len() {
+                        let sid = ids[idx] as usize;
+                        if sid < strings.len() {
+                            store.set(node, name, Value::Str(strings[sid].clone()));
+                        }
+                    }
+                });
+            }
+            ColumnData::Mixed(blob) => {
+                let map: HashMap<u32, Value> =
+                    bincode::deserialize(blob.as_slice()).unwrap_or_default();
+                for (node, v) in map {
+                    store.set(node, name, v);
+                }
+            }
+            ColumnData::Vector { dim, data, present } => {
+                let d = *dim as usize;
+                bitmap_for_each_u64(present, |node| {
+                    let start = node as usize * d;
+                    let end = start + d;
+                    if end <= data.len() {
+                        let floats: Vec<Value> =
+                            data[start..end].iter().map(|&f| Value::Float(f)).collect();
+                        store.set(node, name, Value::List(floats));
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Iterate set bits in a plain `Vec<u64>` bitmap (non-archived, from `decode_all_columns`).
+fn bitmap_for_each_u64<F: FnMut(u32)>(words: &[u64], mut f: F) {
+    for (wi, &word) in words.iter().enumerate() {
+        let mut w = word;
+        while w != 0 {
+            let bit = w.trailing_zeros();
+            f(wi as u32 * 64 + bit);
+            w &= w - 1;
+        }
+    }
 }
 
 fn columnstore_to_data(store: &ColumnStore) -> Result<ColumnsData> {

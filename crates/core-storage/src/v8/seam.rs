@@ -72,22 +72,24 @@ impl<'a> TopologyView<'a> {
         if base_nbrs.is_empty() {
             return overlay_nbrs;
         }
-        if overlay_nbrs.is_empty() {
-            return Cow::Owned(base_nbrs);
-        }
 
-        // TASK 3 REQUIRED: subtract overlay tombstones from base neighbors.
-        // When the overlay records an edge deletion it creates a tombstone entry
-        // that must be removed from `base_nbrs` before merging, otherwise
-        // deleted edges reappear after a V8 snapshot open.  This subtraction
-        // is deferred to Task 3 which restructures the overlay tombstone API.
-        // Until then, the base path is only exercised by Task-3 wiring (base is
-        // always None in Task 1 and Task 2), so no correctness regression exists
-        // in the deployed code path.
-        //
-        // When Task 3 un-ignores `neighbors_with_deletions_subtracts_from_base`
-        // below, remove this comment and implement the subtraction here.
-        Cow::Owned(merge_sorted_unique(overlay_nbrs.as_ref(), &base_nbrs))
+        // Subtract overlay tombstones from base neighbors before merging.
+        // When the overlay records an edge deletion for an edge that exists only
+        // in the base CSR, `remove_edge` writes a tombstone into the overlay.
+        // That tombstone must be filtered out here so deleted edges do not
+        // reappear after a V8 snapshot open.
+        let filtered_base_nbrs = subtract_tombstones(base_nbrs, etype, dir, v, self.overlay);
+
+        if filtered_base_nbrs.is_empty() {
+            return overlay_nbrs;
+        }
+        if overlay_nbrs.is_empty() {
+            return Cow::Owned(filtered_base_nbrs);
+        }
+        Cow::Owned(merge_sorted_unique(
+            overlay_nbrs.as_ref(),
+            &filtered_base_nbrs,
+        ))
     }
 
     /// Total edge count: overlay + base (no double-counting since both are
@@ -183,6 +185,29 @@ fn merge_sorted_unique(a: &[u32], b: &[u32]) -> Vec<u32> {
     out
 }
 
+/// Remove tombstoned neighbors from `nbrs` (already collected from the base CSR).
+///
+/// Reads the overlay's tombstone maps for `(etype, dir, v)` and filters out any
+/// neighbor that appears in the tombstone set.  Returns the original `nbrs` Vec
+/// unchanged (zero allocation) when there are no tombstones.
+fn subtract_tombstones(
+    nbrs: Vec<u32>,
+    etype: u32,
+    dir: Direction,
+    v: u32,
+    overlay: &Topology,
+) -> Vec<u32> {
+    let tombstones = match dir {
+        Direction::Out => overlay.out_tombstones_for(etype, v),
+        Direction::In => overlay.in_tombstones_for(etype, v),
+    };
+    match tombstones {
+        None => nbrs,
+        Some(t) if t.is_empty() => nbrs,
+        Some(t) => nbrs.into_iter().filter(|n| !t.contains(n)).collect(),
+    }
+}
+
 /// An iterator over the sorted-unique merged neighbor list.
 /// Produced by `TopologyView::neighbors`; callers use `.as_ref()`.
 ///
@@ -192,39 +217,128 @@ pub type MergedNeighbors<'a> = Cow<'a, [u32]>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::columns::ColumnStore;
+    use crate::idmap::IdMap;
+    use crate::interner::Interner;
     use crate::topology::Topology;
+    use crate::v8::encode::{encode_v8, V8Meta};
+    use crate::v8::MappedBase;
+    use std::collections::BTreeMap;
 
-    /// TASK 3: un-ignore this test and implement tombstone subtraction in
-    /// `TopologyView::neighbors` (see the TASK 3 REQUIRED comment above).
-    ///
-    /// Scenario: base CSR has edge A→B for etype E.  The overlay records a
-    /// deletion of A→B (tombstone).  After merging, B must NOT appear in
-    /// `neighbors(E, Out, A)`.
-    ///
-    /// Currently ignored because the overlay tombstone API is not yet wired to
-    /// the base merge path; the test asserts the correct post-Task-3 behavior.
+    fn tiny_meta() -> V8Meta {
+        V8Meta {
+            labels: vec![],
+            edge_props: crate::edge_props::EdgeProps::new(),
+            rule_defs: vec![],
+            provenance: BTreeMap::new(),
+            rule_tripped: BTreeMap::new(),
+            rule_fires: BTreeMap::new(),
+            ivf_state: BTreeMap::new(),
+            view_defs: vec![],
+            wal_truncated: false,
+            hnsw: BTreeMap::new(),
+        }
+    }
+
+    /// Tombstone subtraction: base CSR has edge A→B for etype E.  The overlay
+    /// records a deletion of A→B via `remove_edge` (tombstone).  After merging,
+    /// B must NOT appear in `neighbors(E, Out, A)`, and A must NOT appear in
+    /// `neighbors(E, In, B)`.
     #[test]
-    #[ignore = "Task 3 required: implement overlay tombstone subtraction from base neighbors"]
     fn neighbors_with_deletions_subtracts_from_base() {
-        // Build a fresh topology to act as the overlay (will hold the deletion).
-        let overlay = Topology::new();
-        // For this test we need base to be Some(ArchivedCsr). Since we cannot
-        // construct ArchivedCsr directly without an encoded snapshot, this test
-        // documents the *contract* rather than a runnable fixture.  Task 3
-        // should replace this with a real encode+decode roundtrip that produces
-        // an ArchivedCsr with edge A→B, then records the overlay deletion and
-        // asserts B is absent from the merged result.
-        //
-        // Expected assertion (pseudo-code):
-        //   let view = TopologyView { overlay: &overlay, base: Some(&archived_csr) };
-        //   overlay.record_deletion(etype, a, b);  // API TBD in Task 3
-        //   assert!(!view.neighbors(etype, Direction::Out, a).contains(&b));
-        let view = TopologyView::owned(&overlay);
-        // Without base wiring this trivially passes — the real assertion lives
-        // in the Task 3 implementation.  The ignore attribute prevents it from
-        // silently passing without the subtraction being implemented.
-        let _ = view.neighbors(0, Direction::Out, 0);
-        panic!("Task 3 must implement tombstone subtraction and replace this body");
+        // Encode a V8 snapshot containing a single edge A (id=0) → B (id=1).
+        let etype = 7u32;
+        let a = 0u32;
+        let b = 1u32;
+
+        let mut base_topo = Topology::new();
+        base_topo.add_edge(etype, a, b);
+
+        let mut ids = IdMap::new();
+        ids.get_or_insert("A");
+        ids.get_or_insert("B");
+
+        let meta = tiny_meta();
+        let mut snap_bytes = Vec::new();
+        encode_v8(
+            None,
+            &base_topo,
+            &ColumnStore::new(),
+            &ids,
+            &Interner::new(),
+            &meta,
+            &mut snap_bytes,
+        )
+        .expect("encode_v8");
+
+        // Map the snapshot bytes to get an ArchivedCsr (zero-copy base).
+        let mapped = MappedBase::from_bytes(snap_bytes).expect("from_bytes");
+        let archived_csr = mapped.topology().expect("topology section");
+
+        // The overlay starts empty; call remove_edge for the base-only edge.
+        // Since the edge is not in the overlay, this records a tombstone.
+        let mut overlay = Topology::new();
+        let was_in_overlay = overlay.remove_edge(etype, a, b);
+        assert!(!was_in_overlay, "edge was base-only, not in overlay");
+
+        // Build the merged view.
+        let view = TopologyView {
+            overlay: &overlay,
+            base: Some(archived_csr),
+        };
+
+        // Out-direction: B must NOT appear.
+        let out_nbrs = view.neighbors(etype, Direction::Out, a);
+        assert!(
+            !out_nbrs.contains(&b),
+            "tombstoned edge A→B must not appear in Out neighbors; got {out_nbrs:?}"
+        );
+
+        // In-direction: A must NOT appear.
+        let in_nbrs = view.neighbors(etype, Direction::In, b);
+        assert!(
+            !in_nbrs.contains(&a),
+            "tombstoned edge A→B must not appear in In neighbors of B; got {in_nbrs:?}"
+        );
+
+        // Verify: an un-tombstoned edge is still visible.
+        let c = 2u32;
+        let mut base_topo2 = Topology::new();
+        base_topo2.add_edge(etype, a, b);
+        base_topo2.add_edge(etype, a, c);
+        let mut snap2 = Vec::new();
+        let mut ids2 = IdMap::new();
+        ids2.get_or_insert("A");
+        ids2.get_or_insert("B");
+        ids2.get_or_insert("C");
+        encode_v8(
+            None,
+            &base_topo2,
+            &ColumnStore::new(),
+            &ids2,
+            &Interner::new(),
+            &tiny_meta(),
+            &mut snap2,
+        )
+        .expect("encode_v8 2");
+        let mapped2 = MappedBase::from_bytes(snap2).expect("from_bytes 2");
+        let archived_csr2 = mapped2.topology().expect("topology section 2");
+
+        let mut overlay2 = Topology::new();
+        overlay2.remove_edge(etype, a, b); // only tombstone B
+        let view2 = TopologyView {
+            overlay: &overlay2,
+            base: Some(archived_csr2),
+        };
+        let out_nbrs2 = view2.neighbors(etype, Direction::Out, a);
+        assert!(
+            !out_nbrs2.contains(&b),
+            "B must be hidden by tombstone; got {out_nbrs2:?}"
+        );
+        assert!(
+            out_nbrs2.contains(&c),
+            "C must still be visible (not tombstoned); got {out_nbrs2:?}"
+        );
     }
 }
 
