@@ -1135,10 +1135,10 @@ fn v6_snapshot_roundtrip() {
     assert_eq!(db.node_count(), 3);
     assert_eq!(db.edge_count(), 1);
     assert_eq!(db.get_prop("a", "v"), Some(&Value::Int(7)));
-    // Verify the snapshot file actually uses V7 container.
+    // Verify the snapshot file actually uses V8 container.
     let snap = std::fs::read(dir.join("snapshot.bin")).unwrap();
     assert_eq!(&snap[0..4], b"GDB1");
-    assert_eq!(u16::from_le_bytes([snap[4], snap[5]]), 7);
+    assert_eq!(u16::from_le_bytes([snap[4], snap[5]]), 8);
 }
 
 /// V4-refuse is unchanged by V6: a V4-stamped snapshot must still be rejected.
@@ -1468,6 +1468,74 @@ fn golden_v7_pin() {
         "V7 fixture must preserve prop v=42 on node 'a'"
     );
     assert_eq!(db.neighbors("a", "E", Direction::Out).unwrap(), vec!["b"]);
+}
+
+/// Golden V8 fixture pin: `snapshot()` writes VERSION=8 (mmap-able zero-copy
+/// rkyv sections). Decoding the committed fixture verifies the V8 wire format
+/// is stable — rkyv schema changes or section-layout changes that alter the
+/// byte layout will fail this test instead of silently corrupting existing
+/// on-disk databases. V7 snapshots are still decoded via the V7 path.
+///
+/// To regenerate (only for an intentional VERSION bump):
+/// `cargo run -p mushroomdb --example gen_golden_fixture -- crates/core-api/tests/fixtures/golden_v8.bin`
+#[test]
+fn golden_v8_pin() {
+    let snap_bytes = include_bytes!("fixtures/golden_v8.bin");
+    assert_eq!(
+        &snap_bytes[0..4],
+        b"GDB1",
+        "V8 fixture must start with GDB1 magic"
+    );
+    assert_eq!(
+        u16::from_le_bytes([snap_bytes[4], snap_bytes[5]]),
+        8,
+        "V8 fixture version field must be 8"
+    );
+    let dir = tmp("golden-v8-pin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("snapshot.bin"), snap_bytes).unwrap();
+    std::fs::write(dir.join("wal.bin"), b"").unwrap();
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.node_count(), 2, "V8 fixture must decode to 2 nodes");
+    assert_eq!(db.edge_count(), 1, "V8 fixture must decode to 1 edge");
+    assert_eq!(
+        db.get_prop("a", "v"),
+        Some(&Value::Int(42)),
+        "V8 fixture must preserve prop v=42 on node 'a'"
+    );
+    assert_eq!(db.neighbors("a", "E", Direction::Out).unwrap(), vec!["b"]);
+}
+
+/// V8 encode/decode equivalence: encode a graph as V8, decode back, assert all
+/// observable state matches the original. This exercises the full V8 round-trip
+/// path through `MappedBase::from_bytes` → `decode_v8_from_mapped` →
+/// owned SnapshotState → `restore_snapshot_state`.
+#[test]
+fn v8_encode_decode_equivalence() {
+    let dir = tmp("v8-equivalence");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Person", "alice", vec![("age".into(), Value::Int(30))])
+        .unwrap();
+    db.insert_node("Person", "bob", vec![("age".into(), Value::Int(25))])
+        .unwrap();
+    db.insert_node("Company", "acme", vec![]).unwrap();
+    db.insert_edge("KNOWS", "alice", "bob").unwrap();
+    db.insert_edge("WORKS_AT", "alice", "acme").unwrap();
+    db.snapshot().unwrap();
+
+    let db2 = GraphDb::open(&dir).unwrap();
+    assert_eq!(db2.node_count(), db.node_count());
+    assert_eq!(db2.edge_count(), db.edge_count());
+    assert_eq!(db2.get_prop("alice", "age"), Some(&Value::Int(30)));
+    assert_eq!(db2.get_prop("bob", "age"), Some(&Value::Int(25)));
+    assert_eq!(
+        db2.neighbors("alice", "KNOWS", Direction::Out).unwrap(),
+        vec!["bob"]
+    );
+    assert_eq!(
+        db2.neighbors("alice", "WORKS_AT", Direction::Out).unwrap(),
+        vec!["acme"]
+    );
 }
 
 /// Snapshot taken while topology insert buffers are dirty: fewer than the

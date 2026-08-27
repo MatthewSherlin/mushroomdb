@@ -18,6 +18,8 @@ bincode = { workspace = true }
 crc32fast = { workspace = true }
 zstd = { workspace = true }
 libc = "0.2"
+rkyv = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

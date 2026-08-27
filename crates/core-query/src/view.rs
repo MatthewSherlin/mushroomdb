@@ -1,4 +1,5 @@
-use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
+use core_storage::v8::seam::TopologyView;
+use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Value};
 use std::collections::HashSet;
 
 /// Read-only twin of `GraphMut`. Holds only borrowed graph state.
@@ -7,7 +8,11 @@ pub struct GraphView<'a> {
     pub syms: &'a Interner,
     pub labels: &'a [u32],
     pub props: &'a ColumnStore,
-    pub topo: &'a Topology,
+    /// Overlay-over-base topology view. For V5–V7 snapshots and fresh
+    /// databases, `base` is `None` and all topology reads go to the owned
+    /// overlay. For V8 snapshots, `base` holds the archived CSR from the
+    /// mmap, and WAL-replayed edges accumulate in the overlay.
+    pub topo: TopologyView<'a>,
     pub edge_props: &'a EdgeProps,
     /// Optional query-scoped node visibility set. `None` = all nodes visible.
     /// When `Some(set)`, only dense ids present in `set` are accessible.
@@ -57,6 +62,7 @@ impl<'a> GraphView<'a> {
 #[cfg(test)]
 mod tests {
     use super::GraphView;
+    use core_storage::v8::seam::TopologyView;
     use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 
     struct Fx {
@@ -97,7 +103,7 @@ mod tests {
                 syms: &self.syms,
                 labels: &self.labels,
                 props: &self.props,
-                topo: &self.topo,
+                topo: TopologyView::owned(&self.topo),
                 edge_props: &self.eprops,
                 mask: None,
             }

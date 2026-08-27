@@ -14,12 +14,14 @@ use core_rules::{
 };
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
+use core_storage::v8::seam::TopologyView;
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{
     ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 // Test-only: counts how many times `pending_deltas_since().to_vec()` actually
 // executes (i.e., at least one view is defined). Used to verify the fast-path
@@ -830,6 +832,11 @@ pub struct GraphDb<F: Fs> {
     /// Total WAL commit count at the time [`open_at`] was called.
     /// 0 for normal (non-as-of) instances.
     total_wal_commits: u64,
+    /// Immutable mmap-backed base snapshot for V8 format (Task 1: always
+    /// `None`; will be wired with persistent zero-copy topology in Task 3).
+    /// When `Some`, `TopologyView` in `view()` will merge base + overlay.
+    #[allow(dead_code)]
+    base: Option<Arc<core_storage::v8::MappedBase>>,
 }
 
 /// Options for [`GraphDb::open_with_options`].
@@ -1005,6 +1012,7 @@ impl<F: Fs> GraphDb<F> {
             sub_capacity: DEFAULT_SUB_CAPACITY,
             read_only: false,
             total_wal_commits: 0,
+            base: None,
         };
         let snap_bytes = db.fs.read(FileId::Snapshot)?;
         if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
@@ -1134,6 +1142,7 @@ impl<F: Fs> GraphDb<F> {
             sub_capacity: DEFAULT_SUB_CAPACITY,
             read_only: false, // set to true after replay
             total_wal_commits: 0,
+            base: None,
         };
         // Base state: a truncating snapshot compacts all pre-truncation
         // commits, so the on-disk WAL head coincides with the snapshot and
@@ -3647,7 +3656,7 @@ impl<F: Fs> GraphDb<F> {
             syms: &self.syms,
             labels: &self.labels,
             props: &self.props,
-            topo: &self.topo,
+            topo: TopologyView::owned(&self.topo),
             edge_props: &self.edge_props,
             mask: None,
         }
@@ -3659,7 +3668,7 @@ impl<F: Fs> GraphDb<F> {
             syms: &self.syms,
             labels: &self.labels,
             props: &self.props,
-            topo: &self.topo,
+            topo: TopologyView::owned(&self.topo),
             edge_props: &self.edge_props,
             mask: Some(&mask.visible),
         }

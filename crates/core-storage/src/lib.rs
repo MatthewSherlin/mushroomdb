@@ -8,6 +8,7 @@ mod pack;
 pub mod snapshot;
 pub mod topology;
 pub mod types;
+pub mod v8;
 pub mod wal;
 pub use columns::{ColumnHandle, ColumnStore};
 pub use edge_props::EdgeProps;

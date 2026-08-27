@@ -5,6 +5,7 @@ use crate::interner::Interner;
 use crate::pack::{push_u32, read_u32};
 use crate::topology::Topology;
 use crate::types::{GraphError, Result};
+use crate::v8::encode::V8Meta;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,7 +15,11 @@ pub const VERSION_5: u16 = 5;
 /// V6: zstd-compressed V5 payload in a container.
 pub const VERSION_6: u16 = 6;
 /// V7: zstd(crc + packed CSR + packed columns + bincode leftover).
-pub const VERSION: u16 = 7;
+pub const VERSION_7: u16 = 7;
+/// V8: 4KB header page + rkyv sections (mmap-able zero-copy).
+pub const VERSION_8: u16 = 8;
+/// Current default encoding version.
+pub const VERSION: u16 = VERSION_8;
 
 /// IVF state for one side (src or dst) of a single approximate rule.
 /// Persisted in V4 snapshots so `open()` can restore cluster assignments
@@ -116,17 +121,40 @@ fn crc_inner(payload: &[u8]) -> Vec<u8> {
     inner
 }
 
-/// Encode a snapshot as a V7 container (packed CSR/columns + zstd).
+/// Encode a snapshot as a V8 container (mmap-able zero-copy).
 ///
-/// Wire format:
-///   [4B magic][2B version=7][zstd-compressed([4B crc32][u32 topo_len][topo][u32 props_len][props][bincode meta])]
+/// V8 is the default format.  V7/V6/V5 are still decoded on open.
 ///
 /// # Errors
-/// [`GraphError::Corrupt`] if a packed section exceeds the format's 4 GiB
-/// (`u32`) length prefix — the packed-props section is ~1.6 GiB at the 100k
-/// dogfood shape, so this is a reachable ceiling, not a theoretical one.
+/// [`GraphError::Corrupt`] if any section exceeds 4 GiB.
 pub fn encode(state: &SnapshotState) -> Result<Vec<u8>> {
-    encode_v7(state)
+    encode_v8_from_state(state)
+}
+
+fn encode_v8_from_state(state: &SnapshotState) -> Result<Vec<u8>> {
+    let meta = V8Meta {
+        labels: state.labels.clone(),
+        edge_props: state.edge_props.clone(),
+        rule_defs: state.rule_defs.clone(),
+        provenance: state.provenance.clone(),
+        rule_tripped: state.rule_tripped.clone(),
+        rule_fires: state.rule_fires.clone(),
+        ivf_state: state.ivf_state.clone(),
+        view_defs: state.view_defs.clone(),
+        wal_truncated: state.wal_truncated,
+        hnsw: state.hnsw_state.clone(),
+    };
+    let mut out = Vec::new();
+    crate::v8::encode::encode_v8(
+        None,
+        &state.topo,
+        &state.props,
+        &state.ids,
+        &state.syms,
+        &meta,
+        &mut out,
+    )?;
+    Ok(out)
 }
 
 /// V6 encode kept so tests can pin `decode(v6_bytes)` after VERSION=7.
@@ -135,6 +163,7 @@ pub fn encode_v6(state: &SnapshotState) -> Vec<u8> {
     wrap_zstd(VERSION_6, crc_inner(&payload))
 }
 
+#[allow(dead_code)]
 fn section_len(name: &str, len: usize) -> Result<u32> {
     u32::try_from(len).map_err(|_| GraphError::Corrupt {
         detail: format!(
@@ -143,6 +172,7 @@ fn section_len(name: &str, len: usize) -> Result<u32> {
     })
 }
 
+#[allow(dead_code)]
 fn encode_v7(state: &SnapshotState) -> Result<Vec<u8>> {
     let mut topo = Vec::new();
     state.topo.pack(&mut topo);
@@ -202,12 +232,17 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
     match version {
         VERSION_5 => decode_v5(&bytes[6..]),
         VERSION_6 => decode_v6(&bytes[6..]),
-        VERSION => decode_v7(&bytes[6..]),
+        VERSION_7 => decode_v7(&bytes[6..]),
+        VERSION_8 => {
+            // V8 is a file-based format; decode via MappedBase from owned bytes.
+            let mapped = crate::v8::MappedBase::from_bytes(bytes.to_vec())?;
+            decode_v8_from_mapped(&mapped)
+        }
         other => {
             let hint = if other == 3 {
-                " — V3 snapshot is no longer supported; re-snapshot with a V7 binary"
+                " — V3 snapshot is no longer supported; re-snapshot with a V8 binary"
             } else if other == 4 {
-                " — V4 snapshot is no longer supported; re-snapshot with a V7 binary"
+                " — V4 snapshot is no longer supported; re-snapshot with a V8 binary"
             } else {
                 ""
             };
@@ -216,6 +251,48 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
             })
         }
     }
+}
+
+/// Reconstruct a full `SnapshotState` from a `MappedBase`.
+///
+/// Used by `decode()` and by `db.rs` after mapping a V8 snapshot from disk.
+pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<SnapshotState>> {
+    use crate::v8::encode::{
+        archived_to_columnstore, archived_to_idmap, archived_to_interner, csr_to_topology,
+        decode_meta,
+    };
+
+    let archived_topo = mapped.topology()?;
+    let topo = csr_to_topology(archived_topo);
+
+    let archived_cols = mapped.columns()?;
+    let props = archived_to_columnstore(archived_cols);
+
+    let archived_ids = mapped.ids()?;
+    let ids = archived_to_idmap(archived_ids);
+
+    let archived_syms = mapped.syms()?;
+    let syms = archived_to_interner(archived_syms);
+
+    let meta_bytes = mapped.meta_bytes()?;
+    let meta = decode_meta(meta_bytes)?;
+
+    Ok(Some(SnapshotState {
+        ids,
+        syms,
+        topo,
+        props,
+        labels: meta.labels,
+        edge_props: meta.edge_props,
+        rule_defs: meta.rule_defs,
+        provenance: meta.provenance,
+        rule_tripped: meta.rule_tripped,
+        rule_fires: meta.rule_fires,
+        ivf_state: meta.ivf_state,
+        view_defs: meta.view_defs,
+        wal_truncated: meta.wal_truncated,
+        hnsw_state: meta.hnsw,
+    }))
 }
 
 /// Decode a V5 (uncompressed) payload.  The 4-byte header has already been
@@ -343,13 +420,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_v6_bytes_still_works_after_version_7_default_encode() {
+    fn decode_v6_bytes_still_works_after_version_8_default_encode() {
         let state = tiny_state();
         let v6 = encode_v6(&state);
         assert_eq!(&v6[0..4], MAGIC);
         assert_eq!(u16::from_le_bytes([v6[4], v6[5]]), VERSION_6);
-        let v7 = encode(&state).unwrap();
-        assert_eq!(u16::from_le_bytes([v7[4], v7[5]]), VERSION);
+        let v8 = encode(&state).unwrap();
+        assert_eq!(u16::from_le_bytes([v8[4], v8[5]]), VERSION_8);
+        assert_eq!(VERSION, VERSION_8);
 
         let back6 = decode(&v6).unwrap().unwrap();
         assert!(
@@ -371,14 +449,14 @@ mod tests {
             &[1]
         );
 
-        let back7 = decode(&v7).unwrap().unwrap();
+        let back8 = decode(&v8).unwrap().unwrap();
         assert!(
-            back7.wal_truncated,
-            "V7 meta must round-trip wal_truncated=true"
+            back8.wal_truncated,
+            "V8 meta must round-trip wal_truncated=true"
         );
-        assert_eq!(back7.ids.get("b"), Some(1));
-        assert_eq!(back7.props.get(1, "name"), Some(&Value::Str("bob".into())));
-        assert_eq!(back7.topo.edge_count(), 1);
-        assert_eq!(back7.labels, vec![back7.syms.get("N").unwrap(); 2]);
+        assert_eq!(back8.ids.get("b"), Some(1));
+        assert_eq!(back8.props.get(1, "name"), Some(&Value::Str("bob".into())));
+        assert_eq!(back8.topo.edge_count(), 1);
+        assert_eq!(back8.labels, vec![back8.syms.get("N").unwrap(); 2]);
     }
 }

@@ -3541,6 +3541,7 @@ mod tests {
     use crate::cypher::{lex, parse, RelDir};
     use crate::result::ResultSet;
     use crate::view::GraphView;
+    use core_storage::v8::seam::TopologyView;
     use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
@@ -3591,7 +3592,7 @@ mod tests {
                 syms: &self.syms,
                 labels: &self.labels,
                 props: &self.props,
-                topo: &self.topo,
+                topo: TopologyView::owned(&self.topo),
                 edge_props: &self.eprops,
                 mask: None,
             }

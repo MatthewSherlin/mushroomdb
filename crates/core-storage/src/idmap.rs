@@ -68,6 +68,15 @@ impl IdMap {
         self.to_key.len()
     }
 
+    /// All allocated key slots in dense-id order (index = id).
+    ///
+    /// Tombstoned slots retain their original key string so the V8 encoder
+    /// can round-trip the full allocation history.  Callers must check
+    /// `is_tombstoned(id)` to distinguish live from retired slots.
+    pub(crate) fn all_keys(&self) -> &[String] {
+        &self.to_key
+    }
+
     pub fn is_empty(&self) -> bool {
         self.to_key.is_empty()
     }

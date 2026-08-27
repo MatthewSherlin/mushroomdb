@@ -1,14 +1,15 @@
 //! Regenerate the golden snapshot fixture for the *current* VERSION.
 //!
 //! ```text
-//! cargo run -p mushroomdb --example gen_golden_fixture -- crates/core-api/tests/fixtures/golden_v7.bin
+//! cargo run -p mushroomdb --example gen_golden_fixture -- crates/core-api/tests/fixtures/golden_v8.bin
 //! ```
 //!
 //! Builds the same tiny graph the `golden_v5_pin` / `golden_v6_pin` /
-//! `golden_v7_pin` tests assert (2 nodes, 1 edge, prop `a.v=42`), snapshots
-//! it, and copies the snapshot file to the given path. Run this ONLY when
-//! introducing a new snapshot VERSION — never to "fix" a failing pin test,
-//! which exists precisely to catch unintended byte-format drift.
+//! `golden_v7_pin` / `golden_v8_pin` tests assert (2 nodes, 1 edge, prop
+//! `a.v=42`), snapshots it, and copies the snapshot file to the given path.
+//! Run this ONLY when introducing a new snapshot VERSION — never to "fix" a
+//! failing pin test, which exists precisely to catch unintended byte-format
+//! drift.
 
 use core_api::{GraphDb, Value};
 
