@@ -148,15 +148,22 @@ jobs:
       - name: run + curl /stats and /
         run: |
           set -euo pipefail
-          docker run -d --name mushroomdb-ci -p 18080:8080 mushroomdb:ci
+          # G1: non-loopback bind refuses to start without a token, so the
+          # container gets one and every authenticated route sends it.
+          TOKEN=ci-smoke-token
+          AUTH="Authorization: Bearer $TOKEN"
+          docker run -d --name mushroomdb-ci -p 18080:8080 -e MUSHROOMDB_TOKEN="$TOKEN" mushroomdb:ci
           trap 'docker logs mushroomdb-ci || true; docker rm -f mushroomdb-ci >/dev/null 2>&1 || true' EXIT
           ok=0
           for i in $(seq 1 90); do
-            if curl -sf http://127.0.0.1:18080/stats >/dev/null; then ok=1; break; fi
+            if curl -sf http://127.0.0.1:18080/health >/dev/null; then ok=1; break; fi
             sleep 1
           done
           test "$ok" = 1
-          curl -sf http://127.0.0.1:18080/stats | grep -q nodes_live
-          curl -sf http://127.0.0.1:18080/stats | grep -q '"nodes_live":60'
-          curl -sf http://127.0.0.1:18080/ | grep -qi mushroomdb
-          curl -sf http://127.0.0.1:18080/ | grep -qi '<!doctype html'
+          curl -sf -H "$AUTH" http://127.0.0.1:18080/stats | grep -q nodes_live
+          curl -sf -H "$AUTH" http://127.0.0.1:18080/stats | grep -q '"nodes_live":60'
+          curl -sf -H "$AUTH" http://127.0.0.1:18080/ | grep -qi mushroomdb
+          curl -sf -H "$AUTH" http://127.0.0.1:18080/ | grep -qi '<!doctype html'
+          # tokenless request to an authenticated route must be rejected
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/stats)
+          test "$code" = 401
