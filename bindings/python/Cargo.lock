@@ -146,6 +146,7 @@ dependencies = [
 name = "mushroomdb-rules"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "mushroomdb-storage",
  "serde",
 ]
