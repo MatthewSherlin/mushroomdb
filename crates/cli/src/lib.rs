@@ -1307,7 +1307,10 @@ mod tests {
                         snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
-                        assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
+                        assert_eq!(
+                            addr,
+                            "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap()
+                        );
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
                         assert_eq!(token, None);
@@ -1328,7 +1331,10 @@ mod tests {
                         snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
-                        assert_eq!(addr, "127.0.0.1:9090".parse().unwrap());
+                        assert_eq!(
+                            addr,
+                            "127.0.0.1:9090".parse::<std::net::SocketAddr>().unwrap()
+                        );
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
                         assert_eq!(token, None);
@@ -1514,7 +1520,10 @@ mod tests {
                         snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/data"));
-                        assert_eq!(addr, "0.0.0.0:8080".parse().unwrap());
+                        assert_eq!(
+                            addr,
+                            "0.0.0.0:8080".parse::<std::net::SocketAddr>().unwrap()
+                        );
                         assert!(demo_if_empty);
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert_eq!(token, None);
@@ -1534,7 +1543,10 @@ mod tests {
     fn serve_default_addr_is_loopback_8080() {
         match parse_args(&["serve", "/tmp/db"]).unwrap() {
             Command::Serve { addr, .. } => {
-                assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
+                assert_eq!(
+                    addr,
+                    "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap()
+                );
             }
             other => panic!("{other:?}"),
         }
