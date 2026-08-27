@@ -6,6 +6,10 @@ use std::path::PathBuf;
 pub enum FileId {
     Wal,
     Snapshot,
+    /// Backup of the previous snapshot, kept until the next clean open at
+    /// the current format version. Written before any migration to preserve
+    /// the original bytes if the migration step fails.
+    SnapshotBak,
 }
 
 impl FileId {
@@ -13,6 +17,7 @@ impl FileId {
         match self {
             FileId::Wal => "wal.bin",
             FileId::Snapshot => "snapshot.bin",
+            FileId::SnapshotBak => "snapshot.bin.bak",
         }
     }
 }

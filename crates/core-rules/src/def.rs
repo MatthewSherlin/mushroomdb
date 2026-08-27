@@ -554,6 +554,87 @@ pub fn cosine_early_exit(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Backward-compatible RuleDef decoder
+// ---------------------------------------------------------------------------
+
+/// Pre-0.1.2 wire shape for `RuleDef`.
+///
+/// Stores created before the `via_label`/`via_edge`/`via_dir` fields were
+/// added (phase-4, post-release 0.1.2) encode `RuleDef` with only these eight
+/// fields.  This struct is the canonical decoder for that wire shape.
+///
+/// **FROZEN — never add, remove, or reorder fields.**  Its sole purpose is to
+/// match the exact positional bincode layout of the 0.1.2 release.  Any
+/// schema change must produce a new `LegacyRuleDef*` variant instead.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyRuleDefNoVia {
+    name: String,
+    src_label: String,
+    dst_label: String,
+    predicate: Predicate,
+    edge_type: String,
+    weight_prop: Option<String>,
+    max_edges: Option<u64>,
+    approximate: bool,
+}
+
+/// Decode a bincode-encoded `RuleDef` from persisted bytes.
+///
+/// Tries the current wire shape first (all fields including `via_label`,
+/// `via_edge`, `via_dir`).  If that fails, falls back to the pre-0.1.2 legacy
+/// shape (`LegacyRuleDefNoVia` — 8 fields, no `via_*`), mapping the missing
+/// fields to `None`.
+///
+/// Both decoders use `reject_trailing_bytes`, which makes the two wire shapes
+/// unambiguous:
+/// - Legacy bytes lack the three `via_*` Option fields; the current-shape
+///   decoder hits EOF trying to read them → falls through to legacy.
+/// - Current bytes with `via_*=None` carry three trailing `0x00` bytes; the
+///   legacy decoder would see trailing bytes and be rejected, so the
+///   current-shape decoder wins.
+///
+/// If both attempts fail, returns `Err` naming both error messages.
+pub fn decode_rule_def(bytes: &[u8]) -> Result<RuleDef, String> {
+    use bincode::Options as _;
+    // Use fixint encoding to match bincode::serialize / bincode::deserialize
+    // (the legacy default that all persisted bytes in this codebase use).
+    // reject_trailing_bytes makes the two wire shapes unambiguous: current
+    // bytes with via_*=None have 3 extra 0x00 bytes that the legacy decoder
+    // rejects; legacy bytes lack those bytes so current-shape decode hits EOF.
+    let opts = bincode::options()
+        .with_fixint_encoding()
+        .with_no_limit()
+        .reject_trailing_bytes();
+
+    // Current-shape decode (exact consumption required).
+    match opts.deserialize::<RuleDef>(bytes) {
+        Ok(def) => Ok(def),
+        Err(current_err) => {
+            // Fall through to legacy attempt; preserve error for final message.
+            match opts.deserialize::<LegacyRuleDefNoVia>(bytes) {
+                Ok(legacy) => Ok(RuleDef {
+                    name: legacy.name,
+                    src_label: legacy.src_label,
+                    dst_label: legacy.dst_label,
+                    predicate: legacy.predicate,
+                    edge_type: legacy.edge_type,
+                    weight_prop: legacy.weight_prop,
+                    max_edges: legacy.max_edges,
+                    approximate: legacy.approximate,
+                    via_label: None,
+                    via_edge: None,
+                    via_dir: None,
+                }),
+                Err(legacy_err) => Err(format!(
+                    "corrupt rule_def — current-shape: {current_err}; \
+                     legacy-shape (pre-0.1.2 no-via): {legacy_err}"
+                )),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1634,5 +1715,124 @@ mod wire_pins {
         // Trailing via bytes are both None.
         assert_eq!(&exact[n - 3..], &[0u8, 0, 0]);
         assert_eq!(&approx[n - 3..], &[0u8, 0, 0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_rule_def — backward-compat decoder tests
+    // -----------------------------------------------------------------------
+
+    fn base_legacy() -> LegacyRuleDefNoVia {
+        LegacyRuleDefNoVia {
+            name: "r".into(),
+            src_label: "A".into(),
+            dst_label: "B".into(),
+            predicate: Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+            edge_type: "E".into(),
+            weight_prop: None,
+            max_edges: Some(10),
+            approximate: false,
+        }
+    }
+
+    fn base_current() -> RuleDef {
+        RuleDef {
+            name: "r".into(),
+            src_label: "A".into(),
+            dst_label: "B".into(),
+            predicate: Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+            edge_type: "E".into(),
+            weight_prop: None,
+            max_edges: Some(10),
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        }
+    }
+
+    /// (a) Legacy bytes (pre-0.1.2 wire shape) decode successfully; via_* fields
+    /// default to None.
+    #[test]
+    fn decode_rule_def_legacy_roundtrip() {
+        let legacy_bytes = bincode::serialize(&base_legacy()).unwrap();
+        let got = decode_rule_def(&legacy_bytes).expect("legacy decode must succeed");
+        assert_eq!(got.name, "r");
+        assert_eq!(got.src_label, "A");
+        assert_eq!(got.max_edges, Some(10));
+        assert!(!got.approximate);
+        assert!(got.via_label.is_none(), "via_label must default to None");
+        assert!(got.via_edge.is_none(), "via_edge must default to None");
+        assert!(got.via_dir.is_none(), "via_dir must default to None");
+    }
+
+    /// (b) Current-shape bytes (with via fields) round-trip through decode_rule_def
+    /// exactly.
+    #[test]
+    fn decode_rule_def_current_shape_roundtrip() {
+        let current = RuleDef {
+            via_label: Some("Mid".into()),
+            via_edge: Some("hop".into()),
+            via_dir: Some(core_storage::Direction::Out),
+            ..base_current()
+        };
+        let bytes = bincode::serialize(&current).unwrap();
+        let got = decode_rule_def(&bytes).expect("current-shape decode must succeed");
+        assert_eq!(got, current);
+    }
+
+    /// (c) Garbage bytes produce a descriptive Err naming both attempted decoders.
+    #[test]
+    fn decode_rule_def_garbage_returns_err() {
+        let garbage = b"\xde\xad\xbe\xef\x00\x00\x00\x00";
+        let err = decode_rule_def(garbage).unwrap_err();
+        assert!(
+            err.contains("current-shape"),
+            "error must name current-shape attempt: {err}"
+        );
+        assert!(
+            err.contains("legacy-shape"),
+            "error must name legacy-shape attempt: {err}"
+        );
+    }
+
+    /// (d) CRITICAL disambiguation: bytes encoding a current-shape rule with
+    /// via_*=None carry three trailing `0x00` bytes that legacy-shape decode
+    /// would reject (trailing bytes), so they take the current-shape path.
+    /// Legacy bytes lack those trailing bytes so the current-shape decoder hits
+    /// EOF and they take the legacy path.  Both paths produce the same RuleDef.
+    #[test]
+    fn decode_rule_def_current_none_via_not_misidentified_as_legacy() {
+        let current = base_current(); // via_* = None
+        let legacy = base_legacy();
+        let current_bytes = bincode::serialize(&current).unwrap();
+        let legacy_bytes = bincode::serialize(&legacy).unwrap();
+
+        // The two encodings must differ (current has 3 extra Option::None bytes).
+        assert_ne!(
+            current_bytes, legacy_bytes,
+            "current and legacy encodings must not be byte-identical"
+        );
+        assert_eq!(
+            current_bytes.len(),
+            legacy_bytes.len() + 3,
+            "current is exactly 3 bytes longer (three Option::None fields)"
+        );
+
+        // Both decode to the same RuleDef.
+        let from_current =
+            decode_rule_def(&current_bytes).expect("current-shape must decode via current path");
+        let from_legacy =
+            decode_rule_def(&legacy_bytes).expect("legacy bytes must decode via legacy path");
+        assert_eq!(
+            from_current, from_legacy,
+            "both paths must produce the same RuleDef"
+        );
+        assert!(from_current.via_label.is_none());
+        assert!(from_current.via_edge.is_none());
+        assert!(from_current.via_dir.is_none());
     }
 }

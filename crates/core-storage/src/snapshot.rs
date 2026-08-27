@@ -172,6 +172,23 @@ fn encode_v7(state: &SnapshotState) -> Result<Vec<u8>> {
     Ok(wrap_zstd(VERSION, crc_inner(&payload)))
 }
 
+/// Peek at the on-disk snapshot format version without a full decode.
+///
+/// Reads only the 6-byte header (4 B magic + 2 B version LE).  Returns
+/// `None` if `bytes` is empty (absent snapshot), or an error if the magic
+/// is wrong or the header is truncated.  Does not validate the payload.
+pub fn peek_version(bytes: &[u8]) -> Result<Option<u16>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() < 6 || bytes[0..4] != MAGIC {
+        return Err(crate::types::GraphError::Corrupt {
+            detail: "snapshot: bad magic or truncated header".into(),
+        });
+    }
+    Ok(Some(u16::from_le_bytes(bytes[4..6].try_into().unwrap())))
+}
+
 pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
     if bytes.is_empty() {
         return Ok(None);

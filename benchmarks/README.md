@@ -155,4 +155,105 @@ benchmarks/
   results/
     sample-results.md   — committed sample (10k, ours-only, this machine)
     *.md                — other runs (gitignored)
+  ci/
+    run.sh              — CI bench harness (builds + runs ci_bench example)
+    compare.py          — regression gate (15% threshold, --bootstrap mode)
+    test_compare.py     — pytest: 3 comparator unit tests
+  baselines/
+    ci.json             — NOT YET COMMITTED; written after first post-merge CI run (see "How to flip to enforcing mode")
+```
+
+---
+
+## CI regression gate
+
+### What it measures
+
+The `bench` CI job runs `benchmarks/ci/run.sh`, which builds a release-mode
+Rust example (`crates/core-api/examples/ci_bench.rs`) and times five wall-clock
+metrics against a deterministic 10 000-node synthetic store (no external random
+library — properties derived arithmetically from node indices):
+
+| Metric | Description |
+|---|---|
+| `ingest_wall_s` | Wall time to ingest 10 000 Item nodes |
+| `rule_backfill_wall_s` | Wall time to create 2 rules and complete their backfill |
+| `snapshot_write_s` | Wall time to write a snapshot |
+| `snapshot_open_s` | Wall time to re-open the store from the snapshot in-process (OS page cache warm, Rust structures cold) |
+| `query_p50_ms` | p50 of 50 two-hop Cypher query executions (ms) |
+
+Results are written to `results.json` and uploaded as a CI artifact named
+`bench-results`.
+
+### Threshold: 15%
+
+The regression gate allows up to 15% slowdown relative to the committed
+baseline before failing.  This is intentionally wide to absorb the timing
+noise inherent on shared GitHub Actions runners (load spikes, cache hits,
+runner variance across pools).  Do not tighten the threshold without evidence
+that the runner class is stable enough to support it.
+
+### Runner-class caveat
+
+Baselines are captured on **ubuntu-latest GitHub Actions runners**.  Numbers
+are not portable between runner classes (e.g. larger runners, macOS, arm64).
+A baseline captured on one runner class will produce spurious failures if the
+job later moves to a different class.  If the runner class changes, re-capture
+the baseline on the new class before merging.
+
+### Baselines: captured deliberately, never silently
+
+Baselines live in `benchmarks/baselines/ci.json`.  They are committed by a
+human after a deliberate capture run, not written automatically on every push.
+
+The workflow currently runs in **bootstrap mode** (`--bootstrap`), which writes
+the baseline artifact and exits 0.  This is intentional: the baseline cannot
+exist before the CI runner has produced one.
+
+### How to flip to enforcing mode
+
+1. Merge this branch.  The first CI run writes `bench-results` (a GitHub
+   Actions artifact); download `results.json` from that run.
+2. Run a second workflow dispatch to warm any runner caches; download that
+   `results.json` (run 2 is the canonical baseline per the task brief).
+3. Copy it to `benchmarks/baselines/ci.json` and commit:
+   ```
+   cp /path/to/downloaded/results.json benchmarks/baselines/ci.json
+   git add benchmarks/baselines/ci.json
+   git commit -m "chore: commit CI bench baseline (ubuntu-latest runner)"
+   ```
+4. In `.github/workflows/ci.yml`, remove `--bootstrap` from the compare step
+   so it reads:
+   ```yaml
+   python3 benchmarks/ci/compare.py results.json benchmarks/baselines/ci.json \
+     --threshold 0.15
+   ```
+5. Push and confirm two consecutive main runs are green.
+
+### Verifying a regression
+
+To confirm the gate catches regressions, perturb `results.json` before
+comparing:
+
+```bash
+python3 -c "
+import json
+with open('results.json') as f: r = json.load(f)
+r['snapshot_open_s'] *= 1.20  # 20% slower — should fail
+with open('results_bad.json', 'w') as f: json.dump(r, f)
+"
+python3 benchmarks/ci/compare.py results_bad.json benchmarks/baselines/ci.json --threshold 0.15
+# exits 1 and prints the regressed metric
+```
+
+### Comparator tests
+
+Unit tests for `compare.py` live in `benchmarks/ci/test_compare.py` and run
+in the CI `python` job (which has pytest installed).  Three cases are covered:
+within-threshold pass, regression fail, and missing-metric fail.
+
+To run locally (requires `pip install pytest`):
+
+```bash
+python3 -m pytest benchmarks/ci/test_compare.py -v
 ```

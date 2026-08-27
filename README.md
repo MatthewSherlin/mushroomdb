@@ -387,7 +387,8 @@ Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy
 plus versioned zstd-compressed V7 packed snapshots (packed CSR topology + packed
 columnar properties + HNSW blobs); not mmap. Open = snapshot + WAL replay.
 Derived edges are not WAL-logged; they are re-materialized from node data
-on open by replaying rule application.
+on open by replaying rule application. See [`docs/format-stability.md`](docs/format-stability.md)
+for the format evolution contract (append-only WAL discriminants, migrate-on-open, V5+ support).
 
 Concurrency: single writer, many readers via `RwLock`-backed `SharedDb`.
 Lock-free epoch snapshot readers are on the roadmap.

@@ -19,9 +19,16 @@ pub use core_rules::{
 };
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{
-    BatchBuilder, DeleteReport, EdgeInfo, Explanation, FsyncPolicy, GraphDb, MutationEvent,
-    NodeInfo, NodeRef, PredicateSummary, RuleStats, SnapshotOptions, Stats,
+    snapshot_version_at, write_snapshot_bak, BatchBuilder, DeleteReport, EdgeInfo, Explanation,
+    FsyncPolicy, GraphDb, MutationEvent, NodeInfo, NodeRef, OpenOptions, PredicateSummary,
+    RuleStats, SnapshotOptions, Stats,
 };
+
+/// Current on-disk snapshot format version written by this build.
+///
+/// Exposed so CLI and tooling can print `V<SNAPSHOT_VERSION>` without depending
+/// directly on `core-storage`.
+pub const SNAPSHOT_VERSION: u16 = core_storage::snapshot::VERSION;
 pub use history::{HistoryChange, HistoryEntry};
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
