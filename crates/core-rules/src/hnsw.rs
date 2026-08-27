@@ -479,6 +479,13 @@ impl HnswIndex {
 /// Returns an empty vec if the blob is corrupt or `q` is the zero vector.
 /// Blobs are produced by `engine.rs` when it calls `bincode::serialize` on the
 /// index before handing it to the V8 encoder.
+///
+/// # Caller note
+///
+/// This function has no current caller in the codebase.  It is a Task-3 /
+/// future-use primitive: external callers with direct access to a V8 HNSW blob
+/// (e.g. snapshot introspection tools or the upcoming MCP search path) can use
+/// this to run an ANN query without a live `RuleEngine`.
 pub fn search_hnsw_blob(blob: &[u8], q: &[f64], k: usize) -> Vec<(u32, f64)> {
     let Ok(idx) = bincode::deserialize::<HnswIndex>(blob) else {
         return vec![];

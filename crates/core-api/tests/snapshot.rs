@@ -1845,3 +1845,90 @@ fn v8_cypher_query_battery_survives_roundtrip() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Open-path covering tests (Fix 1/2): lazy HNSW blob consumption
+// ---------------------------------------------------------------------------
+
+/// Clean-open path (no WAL): `find_similar_vector` on a fresh open must
+/// return the correct results without rebuilding indexes.  Before the fix,
+/// `ensure_hnsw_loaded` was never called and retained blobs were silently
+/// dropped, making the HNSW graph unreachable on read-only opens.
+///
+/// This test creates a DB, adds vector nodes, snapshots, then reopens WITHOUT
+/// writing anything (empty WAL) and calls `find_similar_vector`.  The result
+/// must match the pre-snapshot ground truth.
+#[test]
+fn clean_open_find_similar_does_not_require_mutation() {
+    let dir = tmp("clean-open-find-similar");
+
+    // Build and snapshot.
+    let expected_top: String;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("Item", "a", vec![("emb".into(), emb(&[1.0, 0.0]))])
+            .unwrap();
+        db.insert_node("Item", "b", vec![("emb".into(), emb(&[0.0, 1.0]))])
+            .unwrap();
+        db.insert_node("Item", "c", vec![("emb".into(), emb(&[0.8, 0.6]))])
+            .unwrap();
+        db.snapshot().unwrap();
+        // Verify ground truth before reopen.
+        let hits = db.find_similar_vector("emb", "Item", &[1.0, 0.0], 1, 0.0);
+        expected_top = hits.into_iter().next().map(|(k, _)| k).unwrap();
+        assert_eq!(expected_top, "a");
+    }
+
+    // Reopen (empty WAL — clean-open path).
+    let mut db2 = GraphDb::open(&dir).unwrap();
+    let hits = db2.find_similar_vector("emb", "Item", &[1.0, 0.0], 1, 0.0);
+    assert!(
+        !hits.is_empty(),
+        "find_similar_vector returned empty on clean reopen"
+    );
+    assert_eq!(
+        hits[0].0, expected_top,
+        "top hit changed between open paths"
+    );
+}
+
+/// WAL-present path: snapshot + WAL tail.  After reopening, the mutation that
+/// fires during WAL replay must NOT wipe the HNSW graph loaded from the
+/// snapshot.  The node added in the WAL tail must be visible in ANN results.
+///
+/// Before the fix, the first replayed WAL record triggered the lazy-init guard,
+/// which called `reindex_all` on an empty-after-open graph, wiping the IVF
+/// centroids and starting fresh — causing index incoherence.
+#[test]
+fn wal_present_open_preserves_hnsw_before_replay() {
+    let dir = tmp("wal-present-hnsw-preserved");
+
+    // Build base, snapshot, then add a WAL-tail node.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("Item", "a", vec![("emb".into(), emb(&[1.0, 0.0]))])
+            .unwrap();
+        db.insert_node("Item", "b", vec![("emb".into(), emb(&[0.0, 1.0]))])
+            .unwrap();
+        db.snapshot().unwrap();
+        // WAL tail: add "c" after snapshot (this record replays on next open).
+        db.insert_node("Item", "c", vec![("emb".into(), emb(&[0.6, 0.8]))])
+            .unwrap();
+    }
+
+    // Reopen: WAL has records → consume_retained_state_eager fires before replay.
+    let mut db2 = GraphDb::open(&dir).unwrap();
+
+    // "a" must still be top-1 for query [1,0].
+    let hits = db2.find_similar_vector("emb", "Item", &[1.0, 0.0], 3, 0.0);
+    let keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(
+        keys.contains(&"a"),
+        "snapshot node 'a' must be searchable after WAL-present open; got {keys:?}"
+    );
+    // WAL-tail node "c" must also be present in the graph after replay.
+    assert!(
+        db2.node_ref("c").is_some(),
+        "WAL-tail node 'c' must survive WAL-present open replay"
+    );
+}

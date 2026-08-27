@@ -130,4 +130,58 @@ mod tests {
         );
         assert!(v.prop(id, "missing").is_none());
     }
+
+    #[test]
+    fn graph_view_lookups() {
+        let mut fx = Fx::new();
+        let id = fx.add("Person", "ada", vec![("age", Value::Int(36))]);
+        let v = fx.view();
+        assert_eq!(v.node_id("ada"), Some(id));
+        assert_eq!(v.node_id("zzz"), None);
+        assert_eq!(v.key_of(id), "ada");
+        assert_eq!(v.label_of(id), Some("Person"));
+        assert_eq!(v.label_of(99), None);
+        assert_eq!(
+            v.prop(id, "age").map(|vr| vr.into_value()),
+            Some(Value::Int(36))
+        );
+        assert_eq!(v.prop(id, "missing"), None);
+    }
+
+    #[test]
+    fn gap_sentinel_is_not_a_label() {
+        let mut fx = Fx::new();
+        let kept = fx.add("Person", "ada", vec![]);
+        fx.ids.get_or_insert("ghost");
+        fx.labels.resize(2, u32::MAX);
+        let later = fx.add("Person", "bob", vec![]);
+        let v = fx.view();
+        assert_eq!(v.label_of(1), None);
+        assert_eq!(v.nodes_with_label("Person"), vec![kept, later]);
+    }
+
+    #[test]
+    fn nodes_with_label_skips_tombstoned_id() {
+        let mut fx = Fx::new();
+        let ada = fx.add("Person", "ada", vec![]);
+        let bob = fx.add("Person", "bob", vec![]);
+        fx.ids.delete("ada");
+        fx.labels[ada as usize] = u32::MAX;
+        let v = fx.view();
+        assert_eq!(v.node_id("ada"), None);
+        assert_eq!(v.label_of(ada), None);
+        assert_eq!(v.nodes_with_label("Person"), vec![bob]);
+    }
+
+    #[test]
+    fn nodes_with_label_dense_id_order_and_unknown_empty() {
+        let mut fx = Fx::new();
+        let bob = fx.add("Person", "bob", vec![]);
+        let ada = fx.add("Person", "ada", vec![]);
+        let _acme = fx.add("Company", "acme", vec![]);
+        let v = fx.view();
+        assert_eq!(v.nodes_with_label("Person"), vec![bob, ada]);
+        assert_eq!(v.nodes_with_label("Person"), vec![0, 1]);
+        assert!(v.nodes_with_label("Nope").is_empty());
+    }
 }

@@ -11,6 +11,12 @@
 //! `ValueRef::Owned(Value::List(...))`.  Callers that need vectors from both
 //! sources must fall back to `get()` when `vector()` returns `None`.
 
+// The zero-copy f64 transmute in `ColumnsView::vector` is only sound on
+// little-endian targets where `rkyv::Archived<f64>` == `rend::F64_le` has the
+// same wire representation as `f64`.  Fail at compile time on BE targets.
+#[cfg(not(target_endian = "little"))]
+compile_error!("core-storage v8 seam: zero-copy f64 transmute requires a little-endian target");
+
 use crate::columns::{ColumnHandle, ColumnStore};
 use crate::topology::{Direction, Topology};
 use crate::types::Value;
@@ -232,6 +238,7 @@ mod tests {
 /// (`&'a Value` into the `ColumnStore`).  `Owned` is returned when the value
 /// is materialized from the archived base section (e.g. a decoded scalar or a
 /// float list reconstructed from a `Vector` column).
+#[derive(Debug)]
 pub enum ValueRef<'a> {
     Borrowed(&'a Value),
     Owned(Value),
@@ -457,4 +464,99 @@ fn archived_bitmap_test(words: &[rkyv::Archived<u64>], id: u32) -> bool {
         return false;
     }
     (u64::from(words[word]) >> bit) & 1 == 1
+}
+
+#[cfg(test)]
+mod value_ref_tests {
+    use super::ValueRef;
+    use crate::types::Value;
+
+    fn borrowed(v: &Value) -> ValueRef<'_> {
+        ValueRef::Borrowed(v)
+    }
+
+    fn owned(v: Value) -> ValueRef<'static> {
+        ValueRef::Owned(v)
+    }
+
+    // All Value variants compared through ValueRef vs owned Value.
+    #[test]
+    fn value_ref_cross_type_equivalence_battery() {
+        use std::collections::BTreeMap;
+        let cases: Vec<Value> = vec![
+            Value::Int(0),
+            Value::Int(i64::MIN),
+            Value::Int(i64::MAX),
+            Value::Float(0.0),
+            Value::Float(f64::NAN), // NaN != NaN, so this tests the false branch
+            Value::Float(1.5),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Str("hello".into()),
+            Value::Str("".into()),
+            Value::List(vec![Value::Float(1.0), Value::Float(2.0)]),
+            Value::List(vec![]),
+            Value::Map(BTreeMap::new()),
+            Value::Map({
+                let mut m = BTreeMap::new();
+                m.insert("k".to_string(), Value::Int(1));
+                m
+            }),
+        ];
+
+        for val in &cases {
+            let b = borrowed(val);
+            let o = owned(val.clone());
+
+            // Borrowed == owned Value
+            assert_eq!(b, *val, "Borrowed(v) == v failed for {val:?}");
+            // Owned == owned Value
+            assert_eq!(o, *val, "Owned(v) == v failed for {val:?}");
+            // Borrowed == Borrowed
+            assert_eq!(b, borrowed(val), "Borrowed == Borrowed failed for {val:?}");
+            // Owned == Owned (NaN is the only exception)
+            if let Value::Float(f) = val {
+                if f.is_nan() {
+                    // NaN != NaN — verify the false branch
+                    assert_ne!(o, owned(val.clone()), "NaN should not equal NaN");
+                    continue;
+                }
+            }
+            assert_eq!(o, owned(val.clone()), "Owned == Owned failed for {val:?}");
+            // Borrowed == Owned
+            assert_eq!(b, o, "Borrowed == Owned failed for {val:?}");
+        }
+    }
+
+    #[test]
+    fn value_ref_cross_type_not_equal() {
+        // Different variant types must not compare equal.
+        let int_val = Value::Int(1);
+        let float_val = Value::Float(1.0);
+        assert_ne!(
+            borrowed(&int_val),
+            borrowed(&float_val),
+            "Int(1) must not equal Float(1.0)"
+        );
+        assert_ne!(
+            owned(Value::Bool(true)),
+            owned(Value::Int(1)),
+            "Bool(true) must not equal Int(1)"
+        );
+        assert_ne!(
+            owned(Value::Map(std::collections::BTreeMap::new())),
+            owned(Value::Str("".into())),
+            "Map(empty) must not equal Str(empty)"
+        );
+    }
+
+    #[test]
+    fn value_ref_into_value_roundtrip() {
+        let val = Value::Str("round-trip".into());
+        let b = borrowed(&val);
+        assert_eq!(b.into_value(), val);
+
+        let o = owned(Value::Int(42));
+        assert_eq!(o.into_value(), Value::Int(42));
+    }
 }

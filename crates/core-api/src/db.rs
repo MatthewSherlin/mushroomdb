@@ -1023,6 +1023,14 @@ impl<F: Fs> GraphDb<F> {
         if valid_len < bytes.len() {
             db.fs.write_atomic(FileId::Wal, &bytes[..valid_len])?;
         }
+        // WAL-present path: build indexes eagerly BEFORE replay so that the
+        // first replayed record does not trigger the lazy-init guard (which
+        // would call reindex_all_load_ivf on an empty graph, defeating the
+        // point of restoring IVF/HNSW blobs from the snapshot).
+        if !records.is_empty() {
+            db.engine
+                .consume_retained_state_eager(&db.ids, &db.syms, &db.labels, &db.props);
+        }
         for rec in records {
             db.apply(&rec)?;
             // Drain per-frame to keep pending_deltas O(1) during replay (I-2).
@@ -1081,10 +1089,13 @@ impl<F: Fs> GraphDb<F> {
         self.engine =
             RuleEngine::from_persist(defs, state.provenance, state.rule_tripped, state.rule_fires);
         // Candidate indexes are rebuilt lazily on the first mutation (see
-        // RuleEngine::on_node_changed).  This defers the O(n) scan from open
-        // time to first-write time.  For read-only workloads the cost is never
-        // paid.  HNSW graphs and IVF state ARE restored here since they come
-        // from persisted blobs and do not require a node scan.
+        // RuleEngine::on_node_changed).  HNSW blobs and IVF centroids from the
+        // snapshot are retained without deserializing so that:
+        //   - clean-open (empty WAL): indexes stay empty; blobs load on first
+        //     ANN query via ensure_hnsw_loaded, or on first mutation via the
+        //     lazy-init guard which calls reindex_all_load_ivf + load_hnsw_state.
+        //   - WAL-present: open_with calls consume_retained_state_eager before
+        //     replay so HNSW/IVF are live before any record fires the hooks.
         let ivf_state: BTreeMap<String, RuleIvfExport> = state
             .ivf_state
             .into_iter()
@@ -1098,10 +1109,9 @@ impl<F: Fs> GraphDb<F> {
                 )
             })
             .collect();
-        // Load persisted IVF cluster assignments without the O(n) node scan.
-        self.engine.load_ivf_state_only(ivf_state);
-        // Restore HNSW graphs from snapshot blobs (V7+).
-        self.engine.load_hnsw_state(state.hnsw_state);
+        // Store blobs without eagerly deserializing them.
+        self.engine
+            .store_snapshot_state(state.hnsw_state, ivf_state);
         // Restore view defs from snapshot (V5).
         // The ColumnStore already contains view values from the snapshot;
         // use restore_view (no collision check, no backfill) so the store
@@ -3415,7 +3425,7 @@ impl<F: Fs> GraphDb<F> {
     /// returns an empty result and the fused ranking is text-only.  Document
     /// this in your application layer if you rely on it.
     pub fn search_hybrid(
-        &self,
+        &mut self,
         text_field: &str,
         query_text: &str,
         vector_field: &str,
@@ -3821,13 +3831,16 @@ impl<F: Fs> GraphDb<F> {
     /// Uses the HNSW index when one is available (fast path); otherwise falls
     /// back to an O(n) brute-force scan over all nodes with that label (exact).
     pub fn find_similar_vector(
-        &self,
+        &mut self,
         field: &str,
         label: &str,
         q: &[f64],
         k: usize,
         min: f64,
     ) -> Vec<(String, f64)> {
+        // Ensure any HNSW blobs retained from the snapshot are deserialized
+        // before the first ANN query on a clean-open (no-WAL) path.
+        self.engine.ensure_hnsw_loaded();
         // L2-normalise query for cosine via dot product.
         let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
         if norm == 0.0 {

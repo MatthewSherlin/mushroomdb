@@ -102,9 +102,22 @@ pub struct RuleEngine {
     /// Whether candidate indexes have been populated.  Starts `false` after a
     /// snapshot restore that defers index building.  Set to `true` by
     /// `reindex_all`, `reindex_all_load_ivf`, and `create_rule`.  On the first
-    /// call to `on_node_changed` when this is `false`, a full O(n) scan runs
-    /// before processing the mutation (first-write cost).
+    /// mutation call when this is `false`, the full O(n) scan runs (first-write
+    /// cost), consuming and replacing `retained_hnsw_blobs`.
     indexes_populated: bool,
+    /// Raw HNSW blobs retained from the last snapshot, not yet deserialized.
+    ///
+    /// Populated by `store_snapshot_state`.  Consumed (deserialized into each
+    /// rule's `RuleIndex`) either eagerly in `consume_retained_state_eager` (WAL-
+    /// present open) or lazily on the first mutation or first ANN query
+    /// (`ensure_hnsw_loaded` / the lazy-init guard in the mutation hooks).
+    /// Empty on a fresh engine and after consumption.
+    retained_hnsw_blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
+    /// Persisted IVF cluster state retained from the last snapshot.
+    ///
+    /// Same lifecycle as `retained_hnsw_blobs`.  Passed to `reindex_all_load_ivf`
+    /// when the lazy init or eager init fires so k-means re-fit is skipped.
+    retained_ivf_state: BTreeMap<String, RuleIvfExport>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1347,9 +1360,12 @@ impl RuleEngine {
             pending_deltas: Vec::new(),
             emit_deltas: false,
             rebuild_needed: BTreeSet::new(),
-            // Candidate indexes start empty; caller must call reindex_all (or
-            // rely on the lazy build in on_node_changed for the first mutation).
+            // Candidate indexes start empty; caller must either call
+            // consume_retained_state_eager (WAL-present open) or rely on the
+            // lazy init in the mutation hooks (clean open, first-write cost).
             indexes_populated: false,
+            retained_hnsw_blobs: BTreeMap::new(),
+            retained_ivf_state: BTreeMap::new(),
         }
     }
 
@@ -1525,29 +1541,74 @@ impl RuleEngine {
         self.indexes_populated = true;
     }
 
-    /// Restore persisted IVF cluster state **without** scanning nodes.
+    /// Store HNSW blobs and IVF state from a snapshot **without deserializing**.
     ///
-    /// Call this instead of `reindex_all_load_ivf` when candidate indexes will
-    /// be built lazily on the first mutation.  HNSW is initialized so that
-    /// `load_hnsw_state` can load blobs directly into the slot.  The BTreeMap
-    /// candidate indexes remain empty until `on_node_changed` populates them.
-    pub fn load_ivf_state_only(&mut self, ivf_state: BTreeMap<String, RuleIvfExport>) {
-        let rule_names: Vec<String> = self.rules.keys().cloned().collect();
-        for name in &rule_names {
-            if !self.rules[name].approximate {
-                continue;
-            }
-            let idx = self.indexes.get_mut(name).unwrap();
-            // Init the HNSW slot so load_hnsw_state can fill it.
-            idx.src_side.init_hnsw(name);
-            idx.dst_side.init_hnsw(name);
-            // Restore IVF cluster assignments.
-            if let Some(((sc, sa, sd), (dc, da, dd))) = ivf_state.get(name) {
-                idx.src_side.load_ivf_state(sc.clone(), sa.clone(), *sd);
-                idx.dst_side.load_ivf_state(dc.clone(), da.clone(), *dd);
+    /// Called from `restore_snapshot_state` in db.rs.  Neither the HNSW graphs
+    /// nor the IVF centroids are materialized here; they are consumed lazily:
+    ///   - `consume_retained_state_eager` (WAL-present open, before WAL replay)
+    ///   - The mutation-hook lazy-init guard (clean open, first-write cost)
+    ///   - `ensure_hnsw_loaded` (first ANN query on a clean open)
+    pub fn store_snapshot_state(
+        &mut self,
+        hnsw_blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
+        ivf_state: BTreeMap<String, RuleIvfExport>,
+    ) {
+        self.retained_hnsw_blobs = hnsw_blobs;
+        self.retained_ivf_state = ivf_state;
+        // indexes_populated remains false.
+    }
+
+    /// Eagerly consume retained snapshot state before WAL replay.
+    ///
+    /// Call this in `open_with` when the WAL has records.  Runs the O(n) node
+    /// scan + restores persisted IVF centroids and HNSW blobs so that WAL
+    /// replay finds fully-populated indexes.  Marks `indexes_populated = true`.
+    pub fn consume_retained_state_eager(
+        &mut self,
+        ids: &IdMap,
+        syms: &Interner,
+        labels: &[u32],
+        props: &ColumnStore,
+    ) {
+        if self.indexes_populated {
+            return;
+        }
+        let hnsw = std::mem::take(&mut self.retained_hnsw_blobs);
+        let ivf = std::mem::take(&mut self.retained_ivf_state);
+        self.reindex_all_load_ivf(ids, syms, labels, props, ivf);
+        // Override the incrementally-built HNSW with the persisted blob (better).
+        self.load_hnsw_state(hnsw);
+    }
+
+    /// Deserialize retained HNSW blobs into each rule's index without running
+    /// the O(n) node scan.
+    ///
+    /// Called before the first ANN query on a clean-open (no WAL) store.
+    /// After this call, `hnsw_search_dst` returns results from the persisted
+    /// graph.  The BTreeMap candidate indexes remain empty until the first
+    /// mutation triggers the full lazy init.
+    pub fn ensure_hnsw_loaded(&mut self) {
+        if self.retained_hnsw_blobs.is_empty() {
+            return;
+        }
+        let blobs = std::mem::take(&mut self.retained_hnsw_blobs);
+        for (name, (src_blob, dst_blob)) in blobs {
+            if let Some(idx) = self.indexes.get_mut(&name) {
+                if !src_blob.is_empty() {
+                    idx.src_side.load_hnsw_blob(&src_blob);
+                }
+                if !dst_blob.is_empty() {
+                    idx.dst_side.load_hnsw_blob(&dst_blob);
+                }
             }
         }
-        // indexes_populated remains false; first on_node_changed will rebuild.
+        // retained_hnsw_blobs is now empty (consumed).
+    }
+
+    /// Returns `true` if candidate indexes have been built (either eagerly or
+    /// via the lazy mutation-hook trigger).
+    pub fn indexes_populated(&self) -> bool {
+        self.indexes_populated
     }
 
     /// Export HNSW graphs for all approximate rules as opaque bincoded blobs.
@@ -1799,8 +1860,13 @@ impl RuleEngine {
         // Lazy index build: on restore from a V8 snapshot, candidate indexes
         // start empty to avoid an O(n) scan at open time.  The first mutation
         // pays the cost instead.  Subsequent calls skip this branch.
+        // Retained HNSW/IVF blobs from the snapshot are consumed here so the
+        // reindex does NOT wipe the loaded HNSW graphs.
         if !self.indexes_populated && !self.rules.is_empty() {
-            self.reindex_all(g.ids, g.syms, g.labels, g.props);
+            let hnsw = std::mem::take(&mut self.retained_hnsw_blobs);
+            let ivf = std::mem::take(&mut self.retained_ivf_state);
+            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
+            self.load_hnsw_state(hnsw);
         }
 
         let n_label = g.labels.get(n as usize).copied();
@@ -2106,9 +2172,13 @@ impl RuleEngine {
         dst_id: u32,
         g: &mut GraphMut<'_>,
     ) {
-        // Lazy index build: same guard as on_node_changed.
+        // Lazy index build: same guard as on_node_changed.  Retained snapshot
+        // blobs are consumed to avoid wiping any HNSW graphs.
         if !self.indexes_populated && !self.rules.is_empty() {
-            self.reindex_all(g.ids, g.syms, g.labels, g.props);
+            let hnsw = std::mem::take(&mut self.retained_hnsw_blobs);
+            let ivf = std::mem::take(&mut self.retained_ivf_state);
+            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
+            self.load_hnsw_state(hnsw);
         }
 
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
@@ -2187,10 +2257,14 @@ impl RuleEngine {
     /// no-op (crash-window replay / absent state).
     pub fn on_node_removed(&mut self, n: u32, g: &mut GraphMut<'_>) {
         // Lazy index build: same guard as on_node_changed.  Top-k backfill
-        // (line 2260) calls compute_desired which consults the index; if the
-        // index is empty the backfill silently produces nothing.
+        // compute_desired consults the candidate index; an empty index would
+        // silently produce no backfill.  Consume retained snapshot blobs here
+        // rather than wiping any loaded HNSW graphs.
         if !self.indexes_populated && !self.rules.is_empty() {
-            self.reindex_all(g.ids, g.syms, g.labels, g.props);
+            let hnsw = std::mem::take(&mut self.retained_hnsw_blobs);
+            let ivf = std::mem::take(&mut self.retained_ivf_state);
+            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
+            self.load_hnsw_state(hnsw);
         }
 
         let n_label = g.labels.get(n as usize).copied();
