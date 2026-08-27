@@ -503,9 +503,12 @@ async fn query(
     };
 
     // When a mask is provided, route to query_masked (rejects writes).
+    // Hold a single read guard for both from_keys and query_masked so the mask
+    // and the query execute on the same database snapshot.
     if let Some(ref keys) = mask_keys {
-        let mask = NodeMask::from_keys(&*state.db.read(), keys.iter().map(String::as_str));
-        return match state.db.read().query_masked(&cypher, &params, &mask) {
+        let db = state.db.read();
+        let mask = NodeMask::from_keys(&*db, keys.iter().map(String::as_str));
+        return match db.query_masked(&cypher, &params, &mask) {
             Ok(rs) => match format {
                 "" => match to_ipc_bytes(&rs) {
                     Ok(bytes) => (
