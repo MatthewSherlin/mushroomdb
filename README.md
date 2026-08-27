@@ -289,7 +289,7 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 | Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
 | Cypher scan-filter-project (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
 | Cypher two-hop join (200 rows) | **261.6 µs** ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
-| Cold-start: snapshot open | **8.88 s** ▽ | — | — | — |
+| Cold-start: snapshot open | **~11 s** ▽ | — | — | — |
 | Cold-start: WAL-only open | 8.16 min ▽ | — | — | — |
 | Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
@@ -317,14 +317,14 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 Rule derivation (mushroomdb-only, excluded from cross-engine table):
 two-rule backfill on 10k nodes: v2.4 baseline 928 ms + 2.221 s = 3.149 s (+8.8% vs pre-eventing v2.3 baseline of 2.894 s). **v0.1.0 measured: 3.49–3.51 s** (two runs, 0.6% intrarun variance; +11% from v2.4). **v0.1.1 re-measured: 2.929 s** (single-pass 2026-08-24; N=5 criterion median 2.878 s — no residual regression vs 2.894 s pre-eventing baseline). A two-stage fix (is\_empty guard + emit\_deltas engine gate, commit d4d312c) recovered the original subscription overhead. Competitors have no auto-derivation equivalent.
 
-▽ 100k cold-start (V6 snapshot, measured 2026-08-24, 100k-node representative matching workload, 9 backfill rules,
-~10.5M derived edges in snapshot):
-**WAL-only open:** 8.16 min — WAL CreateRule records trigger full rule re-derivation; ANN index
-re-fitting (HNSW) dominates. **V7 snapshot open:** 8.88 s (measured from V6 snapshot on
-2026-08-24; V7 with HNSW blobs may differ — flagged as unsure) — `open_with` decompresses the
-snapshot; derived edges and ANN index state load directly; no rule re-fire.
-**Snapshot write cost:** 22.563 s (V6 measurement) — `snapshot()` serializes and compresses derived
-edges + ANN state (zstd level-3). **Backfill (9 rules, max_edges=1M each):**
+▽ 100k cold-start (100k-node representative matching workload, 9 backfill rules,
+~10M derived edges in snapshot):
+**WAL-only open:** 8.16 min (measured 2026-08-24) — WAL CreateRule records trigger full rule
+re-derivation; ANN index re-fitting dominates. **V7 snapshot open:** ~11 s (measured 2026-08-26,
+three runs 10.7–11.1 s) — `open_with` decompresses the packed snapshot; derived edges and ANN
+state load directly; no rule re-fire. V7 halves on-disk size vs the older format (1.07 GiB vs
+2.20 GiB) but open time is data-volume-bound; sub-second open is the headline goal of the
+v0.2 mmap/zero-copy work. **V7 snapshot write:** ~35 s. **Backfill (9 rules, max_edges=1M each):**
 20.343 s. Full methodology and numbers:
 [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
 
@@ -383,7 +383,7 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | Limitation | Detail |
 |---|---|
 | Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
-| Cold start without a snapshot re-fires all rules | Snapshots (V6, zstd-compressed) persist derived edges, IVF state, and view definitions — opening from a snapshot skips re-derivation. V6 measured at 100k nodes: 8.88 s open from snapshot vs 8.16 min from WAL alone. Snapshot write cost: 22.563 s (1.1 GiB). Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
+| Cold start without a snapshot re-fires all rules | Snapshots (V7, packed + zstd-compressed) persist derived edges, ANN state, and view definitions — opening from a snapshot skips re-derivation. Measured at 100k nodes: ~11 s open from snapshot vs 8.16 min from WAL alone. Snapshot write cost: ~35 s (1.07 GiB on disk). Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
 | Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection (in-tree, no external dependency). Per-query recall: min 0.90, mean 0.998 at 5k/dim 1536 (fixed-seed probe). Review the recall trade-off before using it in completeness-critical workloads. |
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
@@ -441,11 +441,12 @@ new facts arrive.
   `vector` for a combined ranking.
 - Explanations are built in: `explain_association` shows which rules and scores
   produced each link — an agent can cite evidence, not just conclusions.
-- Per-node history: `node_history(key)` returns every WAL-visible property
-  change for a node since the last truncating snapshot — useful for audit,
-  provenance, and change-triggered agent workflows.
-- Query subscriptions: `subscribe_query` delivers incremental Cypher result
-  sets after each commit (supported subset; full re-run per commit; use `LIMIT`).
+- Per-node history: `node_history(key)` (Rust API; MCP exposure planned)
+  returns every WAL-visible change for a node since the last truncating
+  snapshot — useful for audit, provenance, and change-triggered workflows.
+- Query subscriptions: `subscribe_query` (Rust API + WebSocket `/subscribe`)
+  delivers incremental Cypher result sets after each commit (supported
+  subset; full re-run per commit; use `LIMIT`).
 - Node masks (ACL primitive): pass `mask: [key1, key2, …]` to `query` to restrict
   the visible node set; write statements are rejected on masked queries.
 - Schema-as-code: `apply_schema` (Rust) / `mushroomdb schema apply` (CLI)
