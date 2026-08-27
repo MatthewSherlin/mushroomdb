@@ -3277,6 +3277,74 @@ impl<F: Fs> GraphDb<F> {
         results
     }
 
+    /// Hybrid search: Reciprocal Rank Fusion (RRF) over fulltext + vector results.
+    ///
+    /// Takes up to `4*k` fulltext hits for `(text_field, query_text)` and up to
+    /// `4*k` vector hits for `(vector_field, query_vec, min=0.0)`, then fuses
+    /// them with RRF using a fixed constant of 60.
+    ///
+    /// ```text
+    /// score(d) = Σ  1 / (60 + rank_i(d))    (rank 1-based per list)
+    /// ```
+    ///
+    /// Returns the top `k` nodes by fused score, ties broken by node key
+    /// ascending (deterministic).
+    ///
+    /// # Vector leg fallback
+    ///
+    /// When `query_vec` is empty the vector leg is skipped entirely and
+    /// results are ranked by the text list alone through the same RRF path
+    /// (each text result scores `1/(60 + rank)` from that single list).
+    ///
+    /// When `label` is `None` and no HNSW rule covers `vector_field`, the
+    /// brute-force scan cannot enumerate a node universe; `find_similar_vector`
+    /// returns an empty result and the fused ranking is text-only.  Document
+    /// this in your application layer if you rely on it.
+    pub fn search_hybrid(
+        &self,
+        text_field: &str,
+        query_text: &str,
+        vector_field: &str,
+        query_vec: &[f64],
+        label: Option<&str>,
+        k: usize,
+    ) -> Vec<(String, f64)> {
+        use std::collections::HashMap;
+
+        const RRF_K: f64 = 60.0;
+        let pool = 4 * k.max(1);
+
+        // Accumulate per-node RRF scores.
+        let mut scores: HashMap<String, f64> = HashMap::new();
+
+        // Text leg.
+        let text_hits = self.search(text_field, query_text);
+        for (rank0, (key, _count)) in text_hits.into_iter().take(pool).enumerate() {
+            let rank = (rank0 + 1) as f64;
+            *scores.entry(key).or_insert(0.0) += 1.0 / (RRF_K + rank);
+        }
+
+        // Vector leg (skipped when query_vec is empty).
+        if !query_vec.is_empty() {
+            let lbl = label.unwrap_or("");
+            let vec_hits = self.find_similar_vector(vector_field, lbl, query_vec, pool, 0.0);
+            for (rank0, (key, _sim)) in vec_hits.into_iter().enumerate() {
+                let rank = (rank0 + 1) as f64;
+                *scores.entry(key).or_insert(0.0) += 1.0 / (RRF_K + rank);
+            }
+        }
+
+        // Sort: score DESC, then key ASC for deterministic tie-breaking.
+        let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        ranked.truncate(k);
+        ranked
+    }
+
     /// For DST/testing: scratch full-text search over live nodes without using
     /// the index.  Walks every live node, tokenizes the field value, and returns
     /// nodes matching the query.  Results are sorted match_count desc, key asc.
