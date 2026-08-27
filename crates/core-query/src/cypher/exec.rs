@@ -1573,7 +1573,7 @@ fn resolve_prop(
         None => return Ok(None),
     };
     match cell {
-        Cell::Node(id) => Ok(view.prop(*id, field).cloned()),
+        Cell::Node(id) => Ok(view.prop(*id, field).map(|vr| vr.into_value())),
         Cell::Rel(e) => Ok(view.edge_props.get(e.etype, e.src, e.dst, field).cloned()),
         // Virtual path cell: only `length` is exposed.
         Cell::Path(hops) => {
@@ -1608,7 +1608,7 @@ fn node_matches(
             return Ok(false);
         };
         match view.prop(id, field) {
-            Some(got) if values_equal(got, &expected) => {}
+            Some(got) if values_equal(got.as_value(), &expected) => {}
             _ => return Ok(false),
         }
     }
@@ -2569,7 +2569,7 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
                     .and_then(|s| row.get(s))
                     .and_then(|c| c.as_ref())
                     .and_then(|c| match c {
-                        Cell::Node(id) => view.prop(*id, field).cloned(),
+                        Cell::Node(id) => view.prop(*id, field).map(|vr| vr.into_value()),
                         Cell::Rel(e) => view.edge_props.get(e.etype, e.src, e.dst, field).cloned(),
                         _ => None,
                     }),
@@ -3541,7 +3541,7 @@ mod tests {
     use crate::cypher::{lex, parse, RelDir};
     use crate::result::ResultSet;
     use crate::view::GraphView;
-    use core_storage::v8::seam::TopologyView;
+    use core_storage::v8::seam::{ColumnsView, TopologyView};
     use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
@@ -3591,7 +3591,7 @@ mod tests {
                 ids: &self.ids,
                 syms: &self.syms,
                 labels: &self.labels,
-                props: &self.props,
+                props: ColumnsView::owned(&self.props),
                 topo: TopologyView::owned(&self.topo),
                 edge_props: &self.eprops,
                 mask: None,

@@ -99,6 +99,12 @@ pub struct RuleEngine {
     /// [`crate::IVF_DRIFT_REBUILD`] during the last index maintenance.
     /// Drained by [`RuleEngine::take_rebuild_needed`] after apply.
     rebuild_needed: BTreeSet<String>,
+    /// Whether candidate indexes have been populated.  Starts `false` after a
+    /// snapshot restore that defers index building.  Set to `true` by
+    /// `reindex_all`, `reindex_all_load_ivf`, and `create_rule`.  On the first
+    /// call to `on_node_changed` when this is `false`, a full O(n) scan runs
+    /// before processing the mutation (first-write cost).
+    indexes_populated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,6 +1347,9 @@ impl RuleEngine {
             pending_deltas: Vec::new(),
             emit_deltas: false,
             rebuild_needed: BTreeSet::new(),
+            // Candidate indexes start empty; caller must call reindex_all (or
+            // rely on the lazy build in on_node_changed for the first mutation).
+            indexes_populated: false,
         }
     }
 
@@ -1450,6 +1459,7 @@ impl RuleEngine {
                 idx.dst_side.fit_ivf_clusters(name);
             }
         }
+        self.indexes_populated = true;
     }
 
     /// Like `reindex_all` but LOADS persisted IVF state for approximate rules
@@ -1512,6 +1522,32 @@ impl RuleEngine {
                 idx.dst_side.fit_ivf_clusters(name);
             }
         }
+        self.indexes_populated = true;
+    }
+
+    /// Restore persisted IVF cluster state **without** scanning nodes.
+    ///
+    /// Call this instead of `reindex_all_load_ivf` when candidate indexes will
+    /// be built lazily on the first mutation.  HNSW is initialized so that
+    /// `load_hnsw_state` can load blobs directly into the slot.  The BTreeMap
+    /// candidate indexes remain empty until `on_node_changed` populates them.
+    pub fn load_ivf_state_only(&mut self, ivf_state: BTreeMap<String, RuleIvfExport>) {
+        let rule_names: Vec<String> = self.rules.keys().cloned().collect();
+        for name in &rule_names {
+            if !self.rules[name].approximate {
+                continue;
+            }
+            let idx = self.indexes.get_mut(name).unwrap();
+            // Init the HNSW slot so load_hnsw_state can fill it.
+            idx.src_side.init_hnsw(name);
+            idx.dst_side.init_hnsw(name);
+            // Restore IVF cluster assignments.
+            if let Some(((sc, sa, sd), (dc, da, dd))) = ivf_state.get(name) {
+                idx.src_side.load_ivf_state(sc.clone(), sa.clone(), *sd);
+                idx.dst_side.load_ivf_state(dc.clone(), da.clone(), *dd);
+            }
+        }
+        // indexes_populated remains false; first on_node_changed will rebuild.
     }
 
     /// Export HNSW graphs for all approximate rules as opaque bincoded blobs.
@@ -1691,6 +1727,11 @@ impl RuleEngine {
         let fires = self.fires.get_mut(&name).unwrap();
         bump_fires_for_participants(&def, g, fires);
 
+        // This rule's index is now populated. If prior rules' indexes were
+        // already populated (or there are no other rules) mark the whole engine
+        // as ready; otherwise a later reindex_all call will set the flag.
+        self.indexes_populated = true;
+
         Ok(())
     }
 
@@ -1755,6 +1796,13 @@ impl RuleEngine {
         changed: Option<(&str, Option<Value>)>,
         g: &mut GraphMut<'_>,
     ) {
+        // Lazy index build: on restore from a V8 snapshot, candidate indexes
+        // start empty to avoid an O(n) scan at open time.  The first mutation
+        // pays the cost instead.  Subsequent calls skip this branch.
+        if !self.indexes_populated && !self.rules.is_empty() {
+            self.reindex_all(g.ids, g.syms, g.labels, g.props);
+        }
+
         let n_label = g.labels.get(n as usize).copied();
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
 
@@ -2058,6 +2106,11 @@ impl RuleEngine {
         dst_id: u32,
         g: &mut GraphMut<'_>,
     ) {
+        // Lazy index build: same guard as on_node_changed.
+        if !self.indexes_populated && !self.rules.is_empty() {
+            self.reindex_all(g.ids, g.syms, g.labels, g.props);
+        }
+
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
         for rule_name in rule_names {
             let def = self.rules[&rule_name].clone();
@@ -2133,6 +2186,13 @@ impl RuleEngine {
     /// BTree triple order. A second call on an already-retracted node is a
     /// no-op (crash-window replay / absent state).
     pub fn on_node_removed(&mut self, n: u32, g: &mut GraphMut<'_>) {
+        // Lazy index build: same guard as on_node_changed.  Top-k backfill
+        // (line 2260) calls compute_desired which consults the index; if the
+        // index is empty the backfill silently produces nothing.
+        if !self.indexes_populated && !self.rules.is_empty() {
+            self.reindex_all(g.ids, g.syms, g.labels, g.props);
+        }
+
         let n_label = g.labels.get(n as usize).copied();
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
 

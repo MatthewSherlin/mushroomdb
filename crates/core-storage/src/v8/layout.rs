@@ -47,8 +47,8 @@ pub struct CsrData {
 // ---------------------------------------------------------------------------
 
 /// Typed column payload.  Mixed/list columns fall back to a bincode blob.
-/// For Task 1, vectors are stored via the Mixed path; Task 2 adds a dedicated
-/// raw-f64 column type.
+/// Tag 5 (`Vector`) stores raw f64 runs for all-float list properties,
+/// enabling zero-copy `&[f64]` access without boxing through `Value`.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub enum ColumnData {
     /// Dense i64 column.  `present` is the presence bitmap as u64 words (LE).
@@ -65,6 +65,21 @@ pub enum ColumnData {
     },
     /// Mixed/list column: bincode-encoded `HashMap<u32, Value>`.
     Mixed(Vec<u8>),
+    /// Raw f64 vector column (B2).  `dim` floats per node, stored contiguously.
+    ///
+    /// Layout: `data[id * dim .. (id + 1) * dim]` = the vector for node `id`.
+    /// `present[word]` bit `bit` is set iff `id = word*64 + bit` has a value.
+    /// Zero-copy `&[f64]` access via `ColumnsView::vector(id, field)`.
+    ///
+    /// **Overlay/archive asymmetry:** vectors written after the last snapshot
+    /// live in the owned overlay as `Value::List([Value::Float, ...])` and are
+    /// not accessible through `vector()`.  Callers must fall back to
+    /// `ColumnsView::get()` which returns `ValueRef::Owned(Value::List(...))`.
+    Vector {
+        dim: u32,
+        data: Vec<f64>,
+        present: Vec<u64>,
+    },
 }
 
 /// One field entry: name + typed column.
@@ -105,6 +120,114 @@ pub struct InternerData {
 }
 
 // ---------------------------------------------------------------------------
+// Edge props (section 5)
+// ---------------------------------------------------------------------------
+
+/// One edge's property blob: (etype, src, dst) + bincode(BTreeMap<String, Value>).
+/// Entries in `EdgePropsData` are sorted by (etype, src, dst) for binary search.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct EdgePropEntry {
+    pub etype: u32,
+    pub src: u32,
+    pub dst: u32,
+    /// bincode-encoded `BTreeMap<String, Value>`.
+    pub props_blob: Vec<u8>,
+}
+
+/// All archived edge properties, sorted by (etype, src, dst).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct EdgePropsData {
+    pub entries: Vec<EdgePropEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// HNSW (section 6)
+// ---------------------------------------------------------------------------
+
+/// Blob-per-rule HNSW storage.  Each entry holds the bincoded `HnswIndex`
+/// for src and dst sides of one rule.  Stored as opaque bytes so core-storage
+/// remains independent of core-rules; zero-copy blob slicing avoids loading
+/// unused rules.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct HnswRuleEntry {
+    pub name: String,
+    /// bincoded `HnswIndex` for the source side.
+    pub src_blob: Vec<u8>,
+    /// bincoded `HnswIndex` for the destination side.
+    pub dst_blob: Vec<u8>,
+}
+
+/// All per-rule HNSW graph blobs, sorted by rule name.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct HnswSectionData {
+    pub rules: Vec<HnswRuleEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// Provenance (section 7)
+// ---------------------------------------------------------------------------
+
+/// A single provenance triple (etype, src, dst) serialized as three u32s.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct Triple {
+    pub etype: u32,
+    pub src: u32,
+    pub dst: u32,
+}
+
+/// Provenance triples for one rule, sorted by (etype, src, dst) ascending.
+/// Binary search replaces BTreeSet iteration on the read path.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ProvenanceEntry {
+    pub rule: String,
+    pub triples: Vec<Triple>,
+}
+
+/// All per-rule provenance entries, sorted by rule name.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ProvenanceSectionData {
+    pub entries: Vec<ProvenanceEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// Rules meta (section 8)
+// ---------------------------------------------------------------------------
+
+/// Tripped (budget-trip) flag for one rule.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RuleTripEntry {
+    pub rule: String,
+    pub tripped: bool,
+}
+
+/// Fire counter for one rule.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RuleFireEntry {
+    pub rule: String,
+    pub fires: u64,
+}
+
+/// All rule definitions, trip flags, and fire counters.
+/// Entries in each sub-list are sorted by rule name.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RulesMetaData {
+    /// One bincoded `RuleDef` per rule, in rule-name order.
+    pub rule_defs: Vec<Vec<u8>>,
+    pub tripped: Vec<RuleTripEntry>,
+    pub fires: Vec<RuleFireEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// Views (section 9)
+// ---------------------------------------------------------------------------
+
+/// All materialized view definitions (one bincoded `ViewDef` per entry).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ViewsSectionData {
+    pub view_defs: Vec<Vec<u8>>,
+}
+
+// ---------------------------------------------------------------------------
 // Type aliases matching the binding interface
 // ---------------------------------------------------------------------------
 
@@ -112,3 +235,8 @@ pub type ArchivedCsr = ArchivedCsrData;
 pub type ArchivedColumns = ArchivedColumnsData;
 pub type ArchivedIdMap = ArchivedIdMapData;
 pub type ArchivedInterner = ArchivedInternerData;
+pub type ArchivedEdgeProps = ArchivedEdgePropsData;
+pub type ArchivedHnsw = ArchivedHnswSectionData;
+pub type ArchivedProvenance = ArchivedProvenanceSectionData;
+pub type ArchivedRulesMeta = ArchivedRulesMetaData;
+pub type ArchivedViews = ArchivedViewsSectionData;

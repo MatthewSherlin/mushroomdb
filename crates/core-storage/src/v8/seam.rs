@@ -1,17 +1,22 @@
 //! View seams: overlay-over-base read paths for topology and columns.
 //!
 //! `TopologyView` is wired into `GraphView.topo` so all topology reads
-//! transparently consult overlay then base.  `ColumnsView` and `ValueRef`
-//! are defined here and available for callers that need merged column reads;
-//! `GraphView.props` is wired in Task 2 once the `ValueRef` API surface is
-//! finalised (see report DONE_WITH_CONCERNS).
+//! transparently consult overlay then base.  `ColumnsView` is wired into
+//! `GraphView.props` (Task 2) so column reads also consult overlay then base.
+//!
+//! **Overlay/archive asymmetry for vectors**: `ColumnsView::vector()` returns
+//! a zero-copy `&[f64]` slice for archived base data only.  Overlay vectors
+//! (written after the last snapshot) live as `Value::List([Value::Float, ...])`
+//! in the owned `ColumnStore` and are returned by `ColumnsView::get()` as
+//! `ValueRef::Owned(Value::List(...))`.  Callers that need vectors from both
+//! sources must fall back to `get()` when `vector()` returns `None`.
 
-use crate::columns::ColumnStore;
+use crate::columns::{ColumnHandle, ColumnStore};
 use crate::topology::{Direction, Topology};
 use crate::types::Value;
-use crate::v8::layout::ArchivedCsr;
+use crate::v8::layout::{ArchivedColumnData, ArchivedCsr};
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 // ---------------------------------------------------------------------------
 // TopologyView
@@ -218,13 +223,15 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// ColumnsView and ValueRef (defined; wired in Task 2)
+// ColumnsView and ValueRef
 // ---------------------------------------------------------------------------
 
 /// A borrowed or materialized column value.
 ///
-/// For the Task-1 owned path, only `Borrowed` is produced.  Task 2 adds
-/// `Owned` for values materialised from the archived column sections.
+/// `Borrowed` is returned when the value comes from the owned overlay
+/// (`&'a Value` into the `ColumnStore`).  `Owned` is returned when the value
+/// is materialized from the archived base section (e.g. a decoded scalar or a
+/// float list reconstructed from a `Vector` column).
 pub enum ValueRef<'a> {
     Borrowed(&'a Value),
     Owned(Value),
@@ -262,17 +269,24 @@ impl<'a> PartialEq for ValueRef<'a> {
 
 /// Overlay-over-base column store view.
 ///
-/// Task 1: `base` is always `None`; column reads go to overlay only.
-/// Task 2 wires `base` and routes reads through `get()` → `ValueRef`.
+/// Reads consult the owned overlay `ColumnStore` first; if the field/node is
+/// absent in the overlay, the archived base section is checked.  Writes always
+/// go through the WAL into the owned overlay (never through this view).
 ///
-/// `GraphView.props` remains `&'a ColumnStore` for Task 1 (see report).
+/// **Column handle**: `ColumnsView::column()` returns an overlay-backed
+/// `ColumnHandle`.  Base values are NOT visible through the column handle —
+/// only through the `get()` path.  This is acceptable because:
+///   (a) base is `None` for V5–V7 stores and for V8 stores before Task 3
+///       wires the persistent mmap (overlay starts empty after snapshot open);
+///   (b) callers that need a fused-scan path with base values should use
+///       `get()` directly.
 pub struct ColumnsView<'a> {
     pub overlay: &'a ColumnStore,
     pub base: Option<&'a crate::v8::layout::ArchivedColumns>,
 }
 
 impl<'a> ColumnsView<'a> {
-    /// Overlay-only constructor (V5–V7 and V8 Task-1 path).
+    /// Overlay-only constructor (V5–V7 and the no-base V8 path).
     pub fn owned(overlay: &'a ColumnStore) -> Self {
         Self {
             overlay,
@@ -282,21 +296,165 @@ impl<'a> ColumnsView<'a> {
 
     /// Look up a property value for `(id, field)`: overlay first, then base.
     ///
-    /// For Task 1 with `base = None`, this is identical to
-    /// `overlay.get(id, field)` wrapped in `ValueRef::Borrowed`.
+    /// Returns `ValueRef::Borrowed` for overlay hits (zero allocation) and
+    /// `ValueRef::Owned` for base hits (materialises from archived data).
     pub fn get(&self, id: u32, field: &str) -> Option<ValueRef<'_>> {
+        // Overlay first.
         if let Some(v) = self.overlay.get(id, field) {
             return Some(ValueRef::Borrowed(v));
         }
-        // Task 2: materialise from self.base when present.
-        let _base = self.base?;
-        None
+        // Base fallback.
+        let base = self.base?;
+        let field_entry = base.fields.iter().find(|e| e.name.as_str() == field)?;
+        match &field_entry.col {
+            ArchivedColumnData::Int { data, present } => {
+                if !archived_bitmap_test(present.as_slice(), id) {
+                    return None;
+                }
+                let idx = id as usize;
+                if idx >= data.len() {
+                    return None;
+                }
+                Some(ValueRef::Owned(Value::Int(i64::from(data[idx]))))
+            }
+            ArchivedColumnData::Float { data, present } => {
+                if !archived_bitmap_test(present.as_slice(), id) {
+                    return None;
+                }
+                let idx = id as usize;
+                if idx >= data.len() {
+                    return None;
+                }
+                Some(ValueRef::Owned(Value::Float(f64::from(data[idx]))))
+            }
+            ArchivedColumnData::Bool { data, present } => {
+                if !archived_bitmap_test(present.as_slice(), id) {
+                    return None;
+                }
+                let idx = id as usize;
+                if idx >= data.len() {
+                    return None;
+                }
+                Some(ValueRef::Owned(Value::Bool(data[idx] != 0)))
+            }
+            ArchivedColumnData::Str {
+                ids,
+                present,
+                strings,
+            } => {
+                if !archived_bitmap_test(present.as_slice(), id) {
+                    return None;
+                }
+                let idx = id as usize;
+                if idx >= ids.len() {
+                    return None;
+                }
+                let sid = u32::from(ids[idx]) as usize;
+                if sid >= strings.len() {
+                    return None;
+                }
+                Some(ValueRef::Owned(Value::Str(
+                    strings[sid].as_str().to_string(),
+                )))
+            }
+            ArchivedColumnData::Mixed(blob) => {
+                let map: HashMap<u32, Value> = bincode::deserialize(blob.as_slice()).ok()?;
+                map.get(&id).cloned().map(ValueRef::Owned)
+            }
+            ArchivedColumnData::Vector { dim, data, present } => {
+                if !archived_bitmap_test(present.as_slice(), id) {
+                    return None;
+                }
+                let dim_val = u32::from(*dim) as usize;
+                let start = id as usize * dim_val;
+                let end = start + dim_val;
+                if end > data.len() {
+                    return None;
+                }
+                let floats: Vec<Value> = data[start..end]
+                    .iter()
+                    .map(|f| Value::Float(f64::from(*f)))
+                    .collect();
+                Some(ValueRef::Owned(Value::List(floats)))
+            }
+        }
     }
 
-    /// Return the raw `f64` vector for `(id, field)` if the column is a
-    /// list of floats (Task 2; always `None` in Task 1).
+    /// Return the raw `f64` vector for `(id, field)` from the archived base.
+    ///
+    /// Returns `None` when:
+    ///   - there is no base (V5–V7 or V8 with empty base),
+    ///   - the field is not a `Vector` column in the base,
+    ///   - node `id` has no value for the field, or
+    ///   - the overlay has a value for `(id, field)` (overlay takes priority,
+    ///     but that value is accessible via `get()` as a `Value::List`).
+    ///
+    /// **Overlay/archive asymmetry**: vectors written after the last snapshot
+    /// live in the overlay as `Value::List([Value::Float, ...])`.  Callers
+    /// that need `&[f64]` for overlay vectors must call `get()` and convert
+    /// manually (`Value::List` → iterate `Value::Float` elements).
+    ///
+    /// # Safety of the returned slice
+    ///
+    /// On little-endian targets (the only supported platform, per the LE-pinned
+    /// format constraint) `rkyv::Archived<f64>` has the same bit representation
+    /// as `f64`.  The transmute in the implementation is sound under this
+    /// constraint.
     pub fn vector(&self, id: u32, field: &str) -> Option<&[f64]> {
-        let _ = (id, field);
-        None
+        // Overlay takes priority: if the overlay has data for (id, field), we
+        // do not fall through to base — but we cannot return &[f64] from a
+        // Value::List.  See the doc comment above for the asymmetry.
+        if self.overlay.get(id, field).is_some() {
+            return None;
+        }
+        let base = self.base?;
+        let field_entry = base.fields.iter().find(|e| e.name.as_str() == field)?;
+        let (dim, data, present) = match &field_entry.col {
+            ArchivedColumnData::Vector { dim, data, present } => (dim, data, present),
+            _ => return None,
+        };
+        if !archived_bitmap_test(present.as_slice(), id) {
+            return None;
+        }
+        let dim_val = u32::from(*dim) as usize;
+        if dim_val == 0 {
+            return None;
+        }
+        let start = id as usize * dim_val;
+        let end = start + dim_val;
+        let archived_slice = data.as_slice();
+        if end > archived_slice.len() {
+            return None;
+        }
+        let chunk = &archived_slice[start..end];
+        // SAFETY: On little-endian targets (our only supported platform, enforced
+        // by the LE-pinned V8 format constraint), `rkyv::Archived<f64>` (= the
+        // `rend::F64_le` type) has the same 8-byte IEEE-754 representation as
+        // `f64`.  The archived slice is guaranteed to be 8-byte aligned by rkyv's
+        // serializer.  Transmuting `&[Archived<f64>]` to `&[f64]` is therefore a
+        // no-op on LE hardware and produces a valid, properly aligned slice.
+        let f64_slice: &[f64] =
+            unsafe { std::slice::from_raw_parts(chunk.as_ptr() as *const f64, chunk.len()) };
+        Some(f64_slice)
     }
+
+    /// Return a pre-resolved column handle for `field`.
+    ///
+    /// The handle is backed by the overlay only.  Base values are NOT visible
+    /// through the returned handle — use `get()` for overlay-then-base reads.
+    /// This matches the fused-scan hot path in exec.rs which handles V5–V7 and
+    /// V8 post-snapshot overlay data; base reads happen via `get()`.
+    pub fn column(&self, field: &str) -> ColumnHandle<'_> {
+        self.overlay.column(field)
+    }
+}
+
+/// Test whether bit `id` is set in an archived bitmap (slice of `Archived<u64>`).
+fn archived_bitmap_test(words: &[rkyv::Archived<u64>], id: u32) -> bool {
+    let word = id as usize / 64;
+    let bit = id as usize % 64;
+    if word >= words.len() {
+        return false;
+    }
+    (u64::from(words[word]) >> bit) & 1 == 1
 }

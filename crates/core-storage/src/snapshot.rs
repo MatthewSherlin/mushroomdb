@@ -258,8 +258,9 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
 /// Used by `decode()` and by `db.rs` after mapping a V8 snapshot from disk.
 pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<SnapshotState>> {
     use crate::v8::encode::{
-        archived_to_columnstore, archived_to_idmap, archived_to_interner, csr_to_topology,
-        decode_meta,
+        archived_edge_props_to_owned, archived_hnsw_to_owned, archived_provenance_to_owned,
+        archived_rules_meta_to_owned, archived_to_columnstore, archived_to_idmap,
+        archived_to_interner, archived_views_to_owned, csr_to_topology, decode_meta,
     };
 
     let archived_topo = mapped.topology()?;
@@ -274,8 +275,18 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
     let archived_syms = mapped.syms()?;
     let syms = archived_to_interner(archived_syms);
 
+    // V8Meta still carries labels, ivf_state, and wal_truncated which have no
+    // dedicated section yet; read those from meta.  Fields that now have their
+    // own sections are decoded from the sections instead.
     let meta_bytes = mapped.meta_bytes()?;
     let meta = decode_meta(meta_bytes)?;
+
+    let edge_props = archived_edge_props_to_owned(mapped.edge_props_section()?);
+    let hnsw_state = archived_hnsw_to_owned(mapped.hnsw_section()?);
+    let provenance = archived_provenance_to_owned(mapped.provenance_section()?);
+    let (rule_defs, rule_tripped, rule_fires) =
+        archived_rules_meta_to_owned(mapped.rules_meta_section()?);
+    let view_defs = archived_views_to_owned(mapped.views_section()?);
 
     Ok(Some(SnapshotState {
         ids,
@@ -283,15 +294,15 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
         topo,
         props,
         labels: meta.labels,
-        edge_props: meta.edge_props,
-        rule_defs: meta.rule_defs,
-        provenance: meta.provenance,
-        rule_tripped: meta.rule_tripped,
-        rule_fires: meta.rule_fires,
+        edge_props,
+        rule_defs,
+        provenance,
+        rule_tripped,
+        rule_fires,
         ivf_state: meta.ivf_state,
-        view_defs: meta.view_defs,
+        view_defs,
         wal_truncated: meta.wal_truncated,
-        hnsw_state: meta.hnsw,
+        hnsw_state,
     }))
 }
 

@@ -1080,8 +1080,11 @@ impl<F: Fs> GraphDb<F> {
             .collect::<Result<Vec<_>>>()?;
         self.engine =
             RuleEngine::from_persist(defs, state.provenance, state.rule_tripped, state.rule_fires);
-        // V5 snapshot carries IVF state: restore it instead of re-fitting.
-        // This turns the cold-start multi-minute re-fit into microseconds.
+        // Candidate indexes are rebuilt lazily on the first mutation (see
+        // RuleEngine::on_node_changed).  This defers the O(n) scan from open
+        // time to first-write time.  For read-only workloads the cost is never
+        // paid.  HNSW graphs and IVF state ARE restored here since they come
+        // from persisted blobs and do not require a node scan.
         let ivf_state: BTreeMap<String, RuleIvfExport> = state
             .ivf_state
             .into_iter()
@@ -1095,14 +1098,9 @@ impl<F: Fs> GraphDb<F> {
                 )
             })
             .collect();
-        self.engine.reindex_all_load_ivf(
-            &self.ids,
-            &self.syms,
-            &self.labels,
-            &self.props,
-            ivf_state,
-        );
-        // Restore HNSW graphs from snapshot (V7).
+        // Load persisted IVF cluster assignments without the O(n) node scan.
+        self.engine.load_ivf_state_only(ivf_state);
+        // Restore HNSW graphs from snapshot blobs (V7+).
         self.engine.load_hnsw_state(state.hnsw_state);
         // Restore view defs from snapshot (V5).
         // The ColumnStore already contains view values from the snapshot;
@@ -3655,7 +3653,7 @@ impl<F: Fs> GraphDb<F> {
             ids: &self.ids,
             syms: &self.syms,
             labels: &self.labels,
-            props: &self.props,
+            props: core_storage::v8::seam::ColumnsView::owned(&self.props),
             topo: TopologyView::owned(&self.topo),
             edge_props: &self.edge_props,
             mask: None,
@@ -3667,7 +3665,7 @@ impl<F: Fs> GraphDb<F> {
             ids: &self.ids,
             syms: &self.syms,
             labels: &self.labels,
-            props: &self.props,
+            props: core_storage::v8::seam::ColumnsView::owned(&self.props),
             topo: TopologyView::owned(&self.topo),
             edge_props: &self.edge_props,
             mask: Some(&mask.visible),
@@ -3807,7 +3805,11 @@ impl<F: Fs> GraphDb<F> {
         let view = self.view();
         view.nodes_with_label(label)
             .into_iter()
-            .filter(|&id| eval_filter(filter, &|field| view.prop(id, field).cloned()))
+            .filter(|&id| {
+                eval_filter(filter, &|field| {
+                    view.prop(id, field).map(|vr| vr.into_value())
+                })
+            })
             .map(|id| NodeRef { db: self, id })
             .collect()
     }
@@ -3852,7 +3854,8 @@ impl<F: Fs> GraphDb<F> {
             .into_iter()
             .filter_map(|id| {
                 let v = view.prop(id, field)?;
-                let xs = value_as_float_list(v)?;
+                let v_owned = v.into_value();
+                let xs = value_as_float_list(&v_owned)?;
                 let v_norm: f64 = xs.iter().map(|x| x * x).sum::<f64>().sqrt();
                 if v_norm == 0.0 {
                     return None;

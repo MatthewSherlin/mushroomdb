@@ -471,6 +471,22 @@ impl HnswIndex {
 }
 
 // ---------------------------------------------------------------------------
+// Archived search helper
+// ---------------------------------------------------------------------------
+
+/// Deserialize an `HnswIndex` from a bincoded blob and search it.
+///
+/// Returns an empty vec if the blob is corrupt or `q` is the zero vector.
+/// Blobs are produced by `engine.rs` when it calls `bincode::serialize` on the
+/// index before handing it to the V8 encoder.
+pub fn search_hnsw_blob(blob: &[u8], q: &[f64], k: usize) -> Vec<(u32, f64)> {
+    let Ok(idx) = bincode::deserialize::<HnswIndex>(blob) else {
+        return vec![];
+    };
+    idx.search(q, k)
+}
+
+// ---------------------------------------------------------------------------
 // Vector helpers
 // ---------------------------------------------------------------------------
 

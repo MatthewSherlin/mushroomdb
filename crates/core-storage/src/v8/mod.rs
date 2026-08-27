@@ -16,7 +16,10 @@ pub mod layout;
 pub mod seam;
 
 use crate::types::{GraphError, Result};
-use crate::v8::layout::{ArchivedColumns, ArchivedCsr, ArchivedIdMap, ArchivedInterner};
+use crate::v8::layout::{
+    ArchivedColumns, ArchivedCsr, ArchivedEdgeProps, ArchivedHnsw, ArchivedIdMap, ArchivedInterner,
+    ArchivedProvenance, ArchivedRulesMeta, ArchivedViews,
+};
 use memmap2::MmapOptions;
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -44,15 +47,26 @@ impl std::ops::Deref for Backing {
 /// Size of the header page in bytes.
 pub const HEADER_SIZE: usize = 4096;
 
-/// Section id constants.
+/// Section id constants (sections 0-4 from Task 1, sections 5-9 from Task 2).
 pub const SECTION_TOPOLOGY: u8 = 0;
 pub const SECTION_COLUMNS: u8 = 1;
 pub const SECTION_IDS: u8 = 2;
 pub const SECTION_SYMS: u8 = 3;
 pub const SECTION_META: u8 = 4;
+/// Edge properties: sorted `EdgePropsData` (etype, src, dst → props blob).
+pub const SECTION_EDGE_PROPS: u8 = 5;
+/// Per-rule HNSW graph blobs: `HnswSectionData` sorted by rule name.
+pub const SECTION_HNSW: u8 = 6;
+/// Per-rule provenance sorted triples: `ProvenanceSectionData`.
+pub const SECTION_PROVENANCE: u8 = 7;
+/// Rule definitions, trip flags, fire counters: `RulesMetaData`.
+pub const SECTION_RULES_META: u8 = 8;
+/// Materialized view definitions: `ViewsSectionData`.
+pub const SECTION_VIEWS: u8 = 9;
 
 /// Total number of canonical section slots (used for atomic check_state array).
-pub const V8_MAGIC_SECTION_COUNT: usize = 5;
+/// Extended from 5 (Task 1) to 10 (Task 2: +edge_props, hnsw, provenance, rules_meta, views).
+pub const V8_MAGIC_SECTION_COUNT: usize = 10;
 
 /// Atomic check state values.
 const STATE_UNCHECKED: u8 = 0;
@@ -221,6 +235,51 @@ impl MappedBase {
     /// Raw bytes for the bincode meta section.
     pub fn meta_bytes(&self) -> Result<&[u8]> {
         self.section_bytes(SECTION_META)
+    }
+
+    /// Zero-copy access to the archived edge properties (section 5).
+    pub fn edge_props_section(&self) -> Result<&ArchivedEdgeProps> {
+        let bytes = self.section_bytes(SECTION_EDGE_PROPS)?;
+        rkyv::access::<crate::v8::layout::ArchivedEdgePropsData, rkyv::rancor::Error>(bytes)
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: edge_props rkyv access: {e}"),
+            })
+    }
+
+    /// Zero-copy access to the archived HNSW section (section 6).
+    pub fn hnsw_section(&self) -> Result<&ArchivedHnsw> {
+        let bytes = self.section_bytes(SECTION_HNSW)?;
+        rkyv::access::<crate::v8::layout::ArchivedHnswSectionData, rkyv::rancor::Error>(bytes)
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: hnsw rkyv access: {e}"),
+            })
+    }
+
+    /// Zero-copy access to the archived provenance (section 7).
+    pub fn provenance_section(&self) -> Result<&ArchivedProvenance> {
+        let bytes = self.section_bytes(SECTION_PROVENANCE)?;
+        rkyv::access::<crate::v8::layout::ArchivedProvenanceSectionData, rkyv::rancor::Error>(bytes)
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: provenance rkyv access: {e}"),
+            })
+    }
+
+    /// Zero-copy access to the archived rules meta (section 8).
+    pub fn rules_meta_section(&self) -> Result<&ArchivedRulesMeta> {
+        let bytes = self.section_bytes(SECTION_RULES_META)?;
+        rkyv::access::<crate::v8::layout::ArchivedRulesMetaData, rkyv::rancor::Error>(bytes)
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: rules_meta rkyv access: {e}"),
+            })
+    }
+
+    /// Zero-copy access to the archived views (section 9).
+    pub fn views_section(&self) -> Result<&ArchivedViews> {
+        let bytes = self.section_bytes(SECTION_VIEWS)?;
+        rkyv::access::<crate::v8::layout::ArchivedViewsSectionData, rkyv::rancor::Error>(bytes)
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: views rkyv access: {e}"),
+            })
     }
 }
 

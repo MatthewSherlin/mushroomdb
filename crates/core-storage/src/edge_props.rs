@@ -26,6 +26,22 @@ impl EdgeProps {
     pub fn remove_edge(&mut self, etype: u32, src: u32, dst: u32) {
         self.map.remove(&(etype, src, dst));
     }
+
+    /// Return all entries as a sorted Vec of (etype, src, dst, &BTreeMap<String, Value>).
+    /// Sorted by (etype, src, dst) ascending — BTreeMap iteration is already sorted.
+    pub fn sorted_entries(
+        &self,
+    ) -> Vec<(
+        u32,
+        u32,
+        u32,
+        &std::collections::BTreeMap<String, crate::types::Value>,
+    )> {
+        self.map
+            .iter()
+            .map(|((et, s, d), props)| (*et, *s, *d, props))
+            .collect()
+    }
 }
 
 #[cfg(test)]

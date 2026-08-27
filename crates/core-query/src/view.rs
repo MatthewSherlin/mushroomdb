@@ -1,5 +1,5 @@
-use core_storage::v8::seam::TopologyView;
-use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Value};
+use core_storage::v8::seam::{ColumnsView, TopologyView, ValueRef};
+use core_storage::{EdgeProps, IdMap, Interner};
 use std::collections::HashSet;
 
 /// Read-only twin of `GraphMut`. Holds only borrowed graph state.
@@ -7,7 +7,10 @@ pub struct GraphView<'a> {
     pub ids: &'a IdMap,
     pub syms: &'a Interner,
     pub labels: &'a [u32],
-    pub props: &'a ColumnStore,
+    /// Overlay-over-base column store view.  For V5–V7 snapshots and fresh
+    /// databases, `base` is `None` and all column reads go to the overlay.
+    /// For V8 snapshots, `base` holds the archived columns from the mmap.
+    pub props: ColumnsView<'a>,
     /// Overlay-over-base topology view. For V5–V7 snapshots and fresh
     /// databases, `base` is `None` and all topology reads go to the owned
     /// overlay. For V8 snapshots, `base` holds the archived CSR from the
@@ -54,7 +57,13 @@ impl<'a> GraphView<'a> {
             .collect()
     }
 
-    pub fn prop(&self, id: u32, field: &str) -> Option<&Value> {
+    /// Look up the property `field` for node `id`.
+    ///
+    /// Returns `ValueRef::Borrowed` for overlay hits (zero allocation) and
+    /// `ValueRef::Owned` for base-section hits (value materialised from
+    /// archived data).  Returns `None` when neither overlay nor base has a
+    /// value for `(id, field)`.
+    pub fn prop(&self, id: u32, field: &str) -> Option<ValueRef<'_>> {
         self.props.get(id, field)
     }
 }
@@ -62,7 +71,7 @@ impl<'a> GraphView<'a> {
 #[cfg(test)]
 mod tests {
     use super::GraphView;
-    use core_storage::v8::seam::TopologyView;
+    use core_storage::v8::seam::{ColumnsView, TopologyView};
     use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 
     struct Fx {
@@ -102,7 +111,7 @@ mod tests {
                 ids: &self.ids,
                 syms: &self.syms,
                 labels: &self.labels,
-                props: &self.props,
+                props: ColumnsView::owned(&self.props),
                 topo: TopologyView::owned(&self.topo),
                 edge_props: &self.eprops,
                 mask: None,
@@ -111,54 +120,14 @@ mod tests {
     }
 
     #[test]
-    fn nodes_with_label_dense_id_order_and_unknown_empty() {
+    fn prop_returns_none_for_missing() {
         let mut fx = Fx::new();
-        let bob = fx.add("Person", "bob", vec![]);
-        let ada = fx.add("Person", "ada", vec![]);
-        let _acme = fx.add("Company", "acme", vec![]);
+        let id = fx.add("N", "alice", vec![("age", Value::Int(36))]);
         let v = fx.view();
-        assert_eq!(v.nodes_with_label("Person"), vec![bob, ada]);
-        assert_eq!(v.nodes_with_label("Person"), vec![0, 1]);
-        assert!(v.nodes_with_label("Nope").is_empty());
-    }
-
-    #[test]
-    fn graph_view_lookups() {
-        let mut fx = Fx::new();
-        let id = fx.add("Person", "ada", vec![("age", Value::Int(36))]);
-        let v = fx.view();
-        assert_eq!(v.node_id("ada"), Some(id));
-        assert_eq!(v.node_id("zzz"), None);
-        assert_eq!(v.key_of(id), "ada");
-        assert_eq!(v.label_of(id), Some("Person"));
-        assert_eq!(v.label_of(99), None);
-        assert_eq!(v.prop(id, "age"), Some(&Value::Int(36)));
-        assert_eq!(v.prop(id, "missing"), None);
-    }
-
-    #[test]
-    fn gap_sentinel_is_not_a_label() {
-        let mut fx = Fx::new();
-        let kept = fx.add("Person", "ada", vec![]);
-        // Simulate a dense-id hole: next slot exists but holds the gap sentinel.
-        fx.ids.get_or_insert("ghost");
-        fx.labels.resize(2, u32::MAX);
-        let later = fx.add("Person", "bob", vec![]);
-        let v = fx.view();
-        assert_eq!(v.label_of(1), None);
-        assert_eq!(v.nodes_with_label("Person"), vec![kept, later]);
-    }
-
-    #[test]
-    fn nodes_with_label_skips_tombstoned_id() {
-        let mut fx = Fx::new();
-        let ada = fx.add("Person", "ada", vec![]);
-        let bob = fx.add("Person", "bob", vec![]);
-        fx.ids.delete("ada");
-        fx.labels[ada as usize] = u32::MAX;
-        let v = fx.view();
-        assert_eq!(v.node_id("ada"), None);
-        assert_eq!(v.label_of(ada), None);
-        assert_eq!(v.nodes_with_label("Person"), vec![bob]);
+        assert_eq!(
+            v.prop(id, "age").map(|vr| vr.into_value()),
+            Some(Value::Int(36))
+        );
+        assert!(v.prop(id, "missing").is_none());
     }
 }

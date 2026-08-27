@@ -28,11 +28,13 @@ use crate::snapshot::PerRuleIvfState;
 use crate::topology::Topology;
 use crate::types::{GraphError, Result, Value};
 use crate::v8::layout::{
-    ColumnData, ColumnsData, CsrAdjMap, CsrData, CsrEtype, CsrRow, FieldEntry, IdMapData,
-    InternerData,
+    ColumnData, ColumnsData, CsrAdjMap, CsrData, CsrEtype, CsrRow, EdgePropEntry, EdgePropsData,
+    FieldEntry, HnswRuleEntry, HnswSectionData, IdMapData, InternerData, ProvenanceEntry,
+    ProvenanceSectionData, RuleFireEntry, RuleTripEntry, RulesMetaData, Triple, ViewsSectionData,
 };
 use crate::v8::{
-    HEADER_SIZE, SECTION_COLUMNS, SECTION_IDS, SECTION_META, SECTION_SYMS, SECTION_TOPOLOGY,
+    HEADER_SIZE, SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_IDS, SECTION_META,
+    SECTION_PROVENANCE, SECTION_RULES_META, SECTION_SYMS, SECTION_TOPOLOGY, SECTION_VIEWS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -74,7 +76,7 @@ pub fn encode_v8<W: Write>(
     meta: &V8Meta,
     out: &mut W,
 ) -> Result<()> {
-    // Task 1: base is always ignored; full encode from overlay.
+    // Base is reserved for the Task-3 merge path; full encode from overlay for now.
     let _ = base;
 
     // 1. Serialise each section to bytes.
@@ -85,6 +87,18 @@ pub fn encode_v8<W: Write>(
     let meta_bytes = bincode::serialize(meta).map_err(|e| GraphError::Corrupt {
         detail: format!("v8: meta bincode serialize: {e}"),
     })?;
+    // New Task-2 sections (5-9):
+    let edge_props_bytes = rkyv_encode(&edge_props_to_data(&meta.edge_props))?;
+    let hnsw_bytes = rkyv_encode(&hnsw_to_data(&meta.hnsw))?;
+    let prov_bytes = rkyv_encode(&provenance_to_data(&meta.provenance))?;
+    let rules_meta_bytes = rkyv_encode(&rules_meta_to_data(
+        &meta.rule_defs,
+        &meta.rule_tripped,
+        &meta.rule_fires,
+    ))?;
+    let views_bytes = rkyv_encode(&ViewsSectionData {
+        view_defs: meta.view_defs.clone(),
+    })?;
 
     let sections: &[(u8, &[u8])] = &[
         (SECTION_TOPOLOGY, &topo_bytes),
@@ -92,6 +106,11 @@ pub fn encode_v8<W: Write>(
         (SECTION_IDS, &ids_bytes),
         (SECTION_SYMS, &syms_bytes),
         (SECTION_META, &meta_bytes),
+        (SECTION_EDGE_PROPS, &edge_props_bytes),
+        (SECTION_HNSW, &hnsw_bytes),
+        (SECTION_PROVENANCE, &prov_bytes),
+        (SECTION_RULES_META, &rules_meta_bytes),
+        (SECTION_VIEWS, &views_bytes),
     ];
     let n = sections.len();
 
@@ -262,7 +281,77 @@ fn unpack_adj_rows(buf: &[u8], pos: &mut usize) -> CsrAdjMap {
 fn columnstore_to_data(store: &ColumnStore) -> Result<ColumnsData> {
     let mut buf = Vec::new();
     store.pack(&mut buf);
-    decode_all_columns(&buf)
+    let mut data = decode_all_columns(&buf)?;
+    // Post-process: promote Mixed columns that are pure all-float lists of equal
+    // dimension to ColumnData::Vector for zero-copy raw-f64 access (B2).
+    for field in data.fields.iter_mut() {
+        if let ColumnData::Mixed(ref blob) = field.col {
+            let map: HashMap<u32, Value> =
+                bincode::deserialize(blob.as_slice()).unwrap_or_default();
+            if let Some(vec_col) = try_promote_to_vector(&map) {
+                field.col = vec_col;
+            }
+        }
+    }
+    Ok(data)
+}
+
+/// Try to promote a Mixed column map to `ColumnData::Vector` if all values are
+/// `Value::List([Value::Float, ...])` with the same non-zero dimension.
+///
+/// Returns `None` if the column cannot be promoted (empty map, mixed types,
+/// non-float list elements, or inconsistent dimension).
+fn try_promote_to_vector(map: &HashMap<u32, Value>) -> Option<ColumnData> {
+    if map.is_empty() {
+        return None;
+    }
+    // Determine dimension from the first entry.
+    let dim = map.values().next().and_then(|v| match v {
+        Value::List(items) => {
+            if items.iter().all(|i| matches!(i, Value::Float(_))) {
+                Some(items.len())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })?;
+    if dim == 0 {
+        return None;
+    }
+    // Validate all entries: must be float lists of the same dimension.
+    let max_id = *map.keys().max().unwrap_or(&0) as usize;
+    for v in map.values() {
+        match v {
+            Value::List(items)
+                if items.len() == dim && items.iter().all(|i| matches!(i, Value::Float(_))) => {}
+            _ => return None,
+        }
+    }
+    // Build the dense vector array.
+    let n_nodes = max_id + 1;
+    let mut data = vec![0.0f64; n_nodes * dim];
+    let mut present_words = vec![0u64; n_nodes.div_ceil(64)];
+    for (&id, v) in map {
+        let items = match v {
+            Value::List(items) => items,
+            _ => unreachable!(),
+        };
+        let start = id as usize * dim;
+        for (i, item) in items.iter().enumerate() {
+            if let Value::Float(f) = item {
+                data[start + i] = *f;
+            }
+        }
+        let word = id as usize / 64;
+        let bit = id as usize % 64;
+        present_words[word] |= 1u64 << bit;
+    }
+    Some(ColumnData::Vector {
+        dim: dim as u32,
+        data,
+        present: present_words,
+    })
 }
 
 fn decode_all_columns(buf: &[u8]) -> Result<ColumnsData> {
@@ -478,6 +567,20 @@ pub fn archived_to_columnstore(archived: &crate::v8::layout::ArchivedColumns) ->
                     store.set(node, name, v);
                 }
             }
+            crate::v8::layout::ArchivedColumnData::Vector { dim, data, present } => {
+                let dim_val = u32::from(*dim) as usize;
+                bitmap_for_each(present.as_slice(), |node| {
+                    let start = node as usize * dim_val;
+                    let end = start + dim_val;
+                    if end <= data.len() {
+                        let floats: Vec<Value> = data[start..end]
+                            .iter()
+                            .map(|f| Value::Float(f64::from(*f)))
+                            .collect();
+                        store.set(node, name, Value::List(floats));
+                    }
+                });
+            }
         }
     }
     store
@@ -524,4 +627,212 @@ pub fn decode_meta(bytes: &[u8]) -> Result<V8Meta> {
     bincode::deserialize(bytes).map_err(|e| GraphError::Corrupt {
         detail: format!("v8: meta bincode deserialize: {e}"),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Task-2 section encoders
+// ---------------------------------------------------------------------------
+
+/// Build `EdgePropsData` from owned `EdgeProps`.
+/// Entries are sorted by (etype, src, dst) for binary search on read.
+fn edge_props_to_data(ep: &EdgeProps) -> EdgePropsData {
+    let mut entries: Vec<EdgePropEntry> = ep
+        .sorted_entries()
+        .into_iter()
+        .map(|(etype, src, dst, props)| {
+            let props_blob = bincode::serialize(&props).unwrap_or_default();
+            EdgePropEntry {
+                etype,
+                src,
+                dst,
+                props_blob,
+            }
+        })
+        .collect();
+    entries.sort_by_key(|e| (e.etype, e.src, e.dst));
+    EdgePropsData { entries }
+}
+
+/// Build `HnswSectionData` from the blobs map in V8Meta.
+/// Rules are sorted by name.
+fn hnsw_to_data(hnsw: &BTreeMap<String, (Vec<u8>, Vec<u8>)>) -> HnswSectionData {
+    let mut rules: Vec<HnswRuleEntry> = hnsw
+        .iter()
+        .map(|(name, (src, dst))| HnswRuleEntry {
+            name: name.clone(),
+            src_blob: src.clone(),
+            dst_blob: dst.clone(),
+        })
+        .collect();
+    rules.sort_by(|a, b| a.name.cmp(&b.name));
+    HnswSectionData { rules }
+}
+
+/// Build `ProvenanceSectionData` from owned provenance map.
+/// Triples within each rule are sorted by (etype, src, dst).
+fn provenance_to_data(prov: &BTreeMap<String, BTreeSet<(u32, u32, u32)>>) -> ProvenanceSectionData {
+    let mut entries: Vec<ProvenanceEntry> = prov
+        .iter()
+        .map(|(rule, triples)| {
+            let mut sorted: Vec<Triple> = triples
+                .iter()
+                .map(|&(etype, src, dst)| Triple { etype, src, dst })
+                .collect();
+            // BTreeSet is already sorted, but make explicit for clarity.
+            sorted.sort_by_key(|t| (t.etype, t.src, t.dst));
+            ProvenanceEntry {
+                rule: rule.clone(),
+                triples: sorted,
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| a.rule.cmp(&b.rule));
+    ProvenanceSectionData { entries }
+}
+
+/// Build `RulesMetaData` from owned rule metadata.
+/// Entries sorted by rule name within each sub-list.
+fn rules_meta_to_data(
+    rule_defs: &[Vec<u8>],
+    tripped: &BTreeMap<String, bool>,
+    fires: &BTreeMap<String, u64>,
+) -> RulesMetaData {
+    let tripped_vec: Vec<RuleTripEntry> = tripped
+        .iter()
+        .map(|(rule, &t)| RuleTripEntry {
+            rule: rule.clone(),
+            tripped: t,
+        })
+        .collect();
+    let fires_vec: Vec<RuleFireEntry> = fires
+        .iter()
+        .map(|(rule, &f)| RuleFireEntry {
+            rule: rule.clone(),
+            fires: f,
+        })
+        .collect();
+    RulesMetaData {
+        rule_defs: rule_defs.to_vec(),
+        tripped: tripped_vec,
+        fires: fires_vec,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decode helpers for Task-2 sections
+// ---------------------------------------------------------------------------
+
+/// Decode `EdgePropsData` back into `EdgeProps`.
+pub fn archived_edge_props_to_owned(archived: &crate::v8::layout::ArchivedEdgeProps) -> EdgeProps {
+    let mut ep = EdgeProps::new();
+    for entry in archived.entries.iter() {
+        let etype = u32::from(entry.etype);
+        let src = u32::from(entry.src);
+        let dst = u32::from(entry.dst);
+        let props: std::collections::BTreeMap<String, Value> =
+            bincode::deserialize(entry.props_blob.as_slice()).unwrap_or_default();
+        for (field, value) in props {
+            ep.set(etype, src, dst, &field, value);
+        }
+    }
+    ep
+}
+
+/// Decode `ProvenanceSectionData` back into a `BTreeMap<String, BTreeSet<(u32,u32,u32)>>`.
+pub fn archived_provenance_to_owned(
+    archived: &crate::v8::layout::ArchivedProvenance,
+) -> BTreeMap<String, BTreeSet<(u32, u32, u32)>> {
+    let mut map = BTreeMap::new();
+    for entry in archived.entries.iter() {
+        let rule = entry.rule.as_str().to_string();
+        let triples: BTreeSet<(u32, u32, u32)> = entry
+            .triples
+            .iter()
+            .map(|t| (u32::from(t.etype), u32::from(t.src), u32::from(t.dst)))
+            .collect();
+        map.insert(rule, triples);
+    }
+    map
+}
+
+/// Return type for `archived_rules_meta_to_owned`.
+pub type RulesMetaOwned = (Vec<Vec<u8>>, BTreeMap<String, bool>, BTreeMap<String, u64>);
+
+/// Decode `RulesMetaData` back into separate collections.
+pub fn archived_rules_meta_to_owned(
+    archived: &crate::v8::layout::ArchivedRulesMeta,
+) -> RulesMetaOwned {
+    let rule_defs: Vec<Vec<u8>> = archived
+        .rule_defs
+        .iter()
+        .map(|b| b.as_slice().to_vec())
+        .collect();
+    let tripped: BTreeMap<String, bool> = archived
+        .tripped
+        .iter()
+        .map(|e| (e.rule.as_str().to_string(), e.tripped))
+        .collect();
+    let fires: BTreeMap<String, u64> = archived
+        .fires
+        .iter()
+        .map(|e| (e.rule.as_str().to_string(), u64::from(e.fires)))
+        .collect();
+    (rule_defs, tripped, fires)
+}
+
+/// Decode `ViewsSectionData` back into a `Vec<Vec<u8>>`.
+pub fn archived_views_to_owned(archived: &crate::v8::layout::ArchivedViews) -> Vec<Vec<u8>> {
+    archived
+        .view_defs
+        .iter()
+        .map(|b| b.as_slice().to_vec())
+        .collect()
+}
+
+/// Binary-search the archived provenance section for a specific triple.
+///
+/// Triples within each rule's entry are stored sorted by `(etype, src, dst)`,
+/// so containment is O(log n) without materialising a `BTreeSet`.
+///
+/// Returns `true` if `(etype, src, dst)` is recorded for `rule`.
+pub fn archived_provenance_contains(
+    archived: &crate::v8::layout::ArchivedProvenance,
+    rule: &str,
+    etype: u32,
+    src: u32,
+    dst: u32,
+) -> bool {
+    let entry = archived.entries.iter().find(|e| e.rule.as_str() == rule);
+    let Some(entry) = entry else {
+        return false;
+    };
+    // Triples are sorted; use binary search.
+    entry
+        .triples
+        .binary_search_by(|t| {
+            let te = u32::from(t.etype);
+            let ts = u32::from(t.src);
+            let td = u32::from(t.dst);
+            (te, ts, td).cmp(&(etype, src, dst))
+        })
+        .is_ok()
+}
+
+/// Decode `HnswSectionData` back into the `BTreeMap<String, (Vec<u8>, Vec<u8>)>` format.
+pub fn archived_hnsw_to_owned(
+    archived: &crate::v8::layout::ArchivedHnsw,
+) -> BTreeMap<String, (Vec<u8>, Vec<u8>)> {
+    archived
+        .rules
+        .iter()
+        .map(|e| {
+            (
+                e.name.as_str().to_string(),
+                (
+                    e.src_blob.as_slice().to_vec(),
+                    e.dst_blob.as_slice().to_vec(),
+                ),
+            )
+        })
+        .collect()
 }
