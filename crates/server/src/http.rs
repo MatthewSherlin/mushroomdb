@@ -519,7 +519,9 @@ async fn query(
                 "json" => json_ok(result_set_json(&rs)),
                 other => err_response(format!("unknown format: {other}")),
             },
-            Err(GraphError::QueryError { detail }) if detail.contains("masked queries are read-only") => {
+            Err(GraphError::QueryError { detail })
+                if detail.contains("masked queries are read-only") =>
+            {
                 (StatusCode::BAD_REQUEST, Json(json!({"error": detail}))).into_response()
             }
             Err(e) => graph_err(e),

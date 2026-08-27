@@ -1453,7 +1453,12 @@ async fn query_mask_filters_nodes() {
         json!({"cypher": "CREATE (n:P {id: 'evil'})", "mask": ["alice"]}),
     );
     let (status, body, _) = send(app.clone(), req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "masked write must be 400: {}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "masked write must be 400: {}",
+        String::from_utf8_lossy(&body)
+    );
 
     // Without mask: all three visible.
     let req = json_req(

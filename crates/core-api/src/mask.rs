@@ -20,14 +20,8 @@ impl NodeMask {
     /// Resolve string keys to dense ids and build a mask.
     ///
     /// Keys that do not exist in the database are ignored.
-    pub fn from_keys<'a, F: Fs>(
-        db: &GraphDb<F>,
-        keys: impl IntoIterator<Item = &'a str>,
-    ) -> Self {
-        let visible = keys
-            .into_iter()
-            .filter_map(|k| db.ids().get(k))
-            .collect();
+    pub fn from_keys<'a, F: Fs>(db: &GraphDb<F>, keys: impl IntoIterator<Item = &'a str>) -> Self {
+        let visible = keys.into_iter().filter_map(|k| db.ids().get(k)).collect();
         NodeMask { visible }
     }
 

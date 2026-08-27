@@ -1798,6 +1798,11 @@ fn exec_var_expand(
                         continue;
                     }
                     let nbr = neighbor(state.node, &e, dir);
+                    // Hidden nodes are non-existent under the mask — neither emit
+                    // nor continue expanding through them.
+                    if !view.visible(nbr) {
+                        continue;
+                    }
 
                     // Emit a result row if we're within the requested depth range
                     // and the destination matches any bound constraint.
@@ -1881,6 +1886,12 @@ fn exec_shortest_path(
             for &node in &frontier {
                 for e in expand(view, node, etypes.as_deref(), exp_dir) {
                     let nbr = neighbor(node, &e, dir);
+                    // Hidden nodes are non-existent under the mask — do not traverse
+                    // through them (paths through hidden nodes do not exist).
+                    // `to_id` is guaranteed visible by its prior masked binding.
+                    if !view.visible(nbr) {
+                        continue;
+                    }
                     if nbr == to_id {
                         // Found the shortest path at this depth — emit one row and stop.
                         let mut next = row.clone();
@@ -2290,6 +2301,9 @@ fn agg_stream(
                     continue;
                 }
                 let nbr = neighbor(from_id, &e, *dir);
+                if !ctx.view.visible(nbr) {
+                    continue;
+                }
                 if let Some(want) = bound_to {
                     if nbr != want {
                         continue;
@@ -2744,6 +2758,9 @@ fn group_stream(
                     continue;
                 }
                 let nbr = neighbor(from_id, &e, *dir);
+                if !ctx.view.visible(nbr) {
+                    continue;
+                }
                 if let Some(want) = bound_to {
                     if nbr != want {
                         continue;
@@ -2995,6 +3012,9 @@ fn pull_rows(
                         }
                     }
                     let id = i as u32;
+                    if !ctx.view.visible(id) {
+                        continue;
+                    }
                     if let Some(v) = col.get(id) {
                         if eval_cmp(cmp_op_ref, v, lit) {
                             row[slot] = Some(Cell::Node(id));
@@ -3019,7 +3039,11 @@ fn pull_rows(
                             continue;
                         }
                     }
-                    row[slot] = Some(Cell::Node(i as u32));
+                    let id = i as u32;
+                    if !ctx.view.visible(id) {
+                        continue;
+                    }
+                    row[slot] = Some(Cell::Node(id));
                     pull_rows(ctx, rest, row, result)?;
                 }
             }
@@ -3076,6 +3100,9 @@ fn pull_rows(
                     continue;
                 }
                 let nbr = neighbor(from_id, &e, *dir);
+                if !ctx.view.visible(nbr) {
+                    continue;
+                }
                 if let Some(want) = bound_to {
                     if nbr != want {
                         continue;
@@ -3298,11 +3325,10 @@ fn eval_in(
                     }
                 }
             }
-            Some(item) => {
-                if crate::filter::eval_cmp(&crate::filter::CmpOp::Eq, &needle, &item) {
-                    return Ok(true);
-                }
+            Some(item) if crate::filter::eval_cmp(&crate::filter::CmpOp::Eq, &needle, &item) => {
+                return Ok(true);
             }
+            Some(_) => {}
         }
     }
     Ok(false)

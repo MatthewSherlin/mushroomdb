@@ -189,7 +189,9 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
                 for v in arr {
                     match v.as_str() {
                         Some(s) => ks.push(s.to_string()),
-                        None => return CallOutcome::ToolErr("mask must be an array of strings".into()),
+                        None => {
+                            return CallOutcome::ToolErr("mask must be an array of strings".into())
+                        }
                     }
                 }
                 ks

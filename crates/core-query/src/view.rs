@@ -19,7 +19,7 @@ impl<'a> GraphView<'a> {
     /// Always `true` when no mask is set.
     #[inline]
     pub fn visible(&self, id: u32) -> bool {
-        self.mask.map_or(true, |m| m.contains(&id))
+        self.mask.is_none_or(|m| m.contains(&id))
     }
 
     pub fn node_id(&self, key: &str) -> Option<u32> {
