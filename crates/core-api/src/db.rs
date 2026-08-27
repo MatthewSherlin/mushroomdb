@@ -3659,14 +3659,17 @@ impl<F: Fs> GraphDb<F> {
     // RBAC role resolution
     // -----------------------------------------------------------------------
 
-    /// Parse `roles.json` bytes from `fs`. Returns `Ok(Some(roles))` on
-    /// success, `Ok(None)` when the file is absent, and `Ok(None)` with an
-    /// internal poisoned marker when the bytes are present but unparseable.
+    /// Parse `roles.json` bytes from `fs`.
     ///
-    /// Callers must treat the return value as:
-    ///   `Some(roles)` — healthy (may be empty)
-    ///   `None`        — file absent → no roles
-    /// … but the open path uses a separate sentinel so see `load_roles_from_fs`.
+    /// Return values:
+    ///   `Ok(Some(roles))` — file present and valid (roles may be an empty vec)
+    ///   `Ok(Some(vec![]))` — file absent (fs returns empty bytes) → no roles defined
+    ///   `Ok(None)`        — file present but corrupt or unrecognised version
+    ///                       → poisoned state; `mask_for_role` will return `Err` for any role token
+    ///
+    /// Note: absent and healthy-but-empty both produce `Some`; `None` means
+    /// corrupt — the opposite of what an optional "file missing" convention would
+    /// suggest.  The open path stores this result on `db.roles` directly.
     fn load_roles_from_fs(fs: &F) -> Result<Option<Vec<RoleDef>>> {
         let bytes = fs.read(FileId::Roles).map_err(GraphError::Io)?;
         if bytes.is_empty() {

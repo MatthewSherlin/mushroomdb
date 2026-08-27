@@ -55,6 +55,10 @@ present in `roles.json` at request time → 401; corrupt `roles.json` → 500 fo
 role tokens (full-access token unaffected); empty role → sees zero nodes.
 Role sidecar is stored in `<db-dir>/roles.json`.
 
+**MCP trust boundary:** The MCP interface (`mushroomdb mcp`) is a stdio
+JSON-RPC server intended for local agent use; it operates without bearer-token
+authentication and is not subject to role enforcement.
+
 ### Endpoints
 
 | Method | Path | Description |

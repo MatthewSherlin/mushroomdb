@@ -229,7 +229,9 @@ endpoints return rows filtered to the visible set; write, subscription, and
 analytics endpoints return 403. Unknown token or unknown role name: 401.
 Corrupt `roles.json`: 500 for role tokens (full-access token unaffected).
 The never-widen invariant is enforced in the server: a client-supplied mask
-is always intersected with the role mask, never bypassing it.
+is always intersected with the role mask, never bypassing it. The MCP
+interface (`mushroomdb mcp`) is a stdio JSON-RPC server for local agent use
+and is not subject to bearer-token or role enforcement.
 
 `mushroomdb demo ./db` output:
 

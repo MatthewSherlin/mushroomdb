@@ -57,6 +57,9 @@ pub fn router(db: SharedDb) -> Router {
 
 /// [`router`] with an optional bearer/`?token=` requirement on every route
 /// except unauthenticated `GET /health`.
+///
+/// Role enforcement is not active on this entry point; use
+/// [`router_with_role_tokens`] when role-bound tokens are required.
 pub fn router_with_auth(db: SharedDb, token: Option<String>) -> Router {
     build_app(
         db,
@@ -87,6 +90,9 @@ pub fn router_with_role_tokens(
 }
 
 /// Same as [`router_with_auth`], then `ServeDir` as the fallback so API routes win.
+///
+/// Role enforcement is not active on this entry point; use
+/// [`router_with_role_tokens`] when role-bound tokens are required.
 pub fn router_with_ui(
     db: SharedDb,
     ui_dir: impl AsRef<std::path::Path>,
@@ -163,6 +169,9 @@ fn embedded_ctype(path: &str) -> &'static str {
 ///
 /// Sends the resolved local address on `ready` once the listener is accepting.
 /// Does not hold a database lock.
+///
+/// Role enforcement is not active on this entry point; use
+/// [`serve_with_role_tokens`] when role-bound tokens are required.
 pub async fn serve(
     db: SharedDb,
     addr: SocketAddr,
@@ -187,6 +196,9 @@ pub async fn serve_with_role_tokens(
 }
 
 /// [`serve`] plus a UI dist directory mounted behind the API routes.
+///
+/// Role enforcement is not active on this entry point; use
+/// [`serve_with_ui_and_role_tokens`] when role-bound tokens are required.
 pub async fn serve_with_ui(
     db: SharedDb,
     addr: SocketAddr,
