@@ -48,10 +48,12 @@ change history.
   with either endpoint outside) do not exist. Write statements under a mask
   are rejected with a clear error.
 - Implementation shape: `GraphView` (a concrete struct with pub fields)
-  gains `mask: Option<&NodeMask>` + an inline `visible(u32) -> bool`;
-  the executor consults `visible` at its three node-binding sites
-  (label scan, key lookup, neighbor expansion). No per-operator
-  scattering beyond those binding sites.
+  gains `mask: Option<&HashSet<u32>>` (the raw id set — core-query cannot
+  depend on core-api's `NodeMask` without a crate cycle) + an inline
+  `visible(u32) -> bool`; the executor consults `visible` at EVERY node
+  binding site (label scans incl. fused/agg/group paths, key lookup,
+  expand, var-expand, shortest-path — hidden nodes are non-traversable,
+  including as path intermediates).
 - RULING: masks apply to `query`-style reads only. Rules, views, fulltext
   search, subscriptions, and algo APIs are out of scope for this plan.
 - Server: `POST /query` accepts optional `"mask": ["key", ...]`; MCP
@@ -98,8 +100,12 @@ change history.
   PropRemoved{field}, EdgeAdded{edge_type, other, direction},
   EdgeRemoved{edge_type, other, direction}, NodeDeleted.
 - Source of truth: the CURRENT on-disk WAL, scanned on demand (no new
-  in-memory state). Dense-id records are resolved by tracking Intern and
-  key→id bindings incrementally during the scan.
+  in-memory state). Dense-id records are resolved through the live
+  intern/id maps — the live instance replayed this exact WAL, so its
+  bindings are authoritative for every record in it. Edge entries from
+  dense-id records are omitted when the partner endpoint's dense id is
+  tombstoned (a live node's history can contain EdgeRemoved without the
+  corresponding EdgeAdded; documented on the method).
 - HORIZON (documented loudly): history reaches back to the last
   WAL-truncating snapshot, exactly like `open_at`. `keep_wal: true`
   snapshots preserve deeper history. This is the honest, zero-cost
