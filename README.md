@@ -182,7 +182,14 @@ mushroomdb demo ./db
 mushroomdb serve ./db
 ```
 
-Build the embedded binary first:
+Install from crates.io:
+
+```text
+cargo install mushroomdb-cli      # `mushroomdb` binary (no embedded UI)
+cargo add mushroomdb              # embedded Rust library
+```
+
+Or build the embedded-UI binary from source:
 
 ```text
 cd ui && npm ci && npm run build && cd ..

@@ -20,16 +20,17 @@ Primary audiences:
 ## Install / build
 
 ```sh
-# Rust (from source — no crates.io release yet)
-cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
-cp target/release/mushroomdb ~/.local/bin/
+# Rust library (crates.io)
+cargo add mushroomdb            # embedded GraphDb API
+# Rust CLI + server (crates.io)
+cargo install mushroomdb-cli    # `mushroomdb` binary: serve/query/demo/schema
 
-# Python (from source)
+# Python (from source until the PyPI wheel ships with the next release tag)
 cd bindings/python
 python -m venv .venv && .venv/bin/pip install -U pip maturin
 .venv/bin/maturin develop
 
-# TypeScript client (from repo)
+# TypeScript client (from repo until the npm publish lands)
 npm install /path/to/graph-db/clients/typescript
 ```
 
