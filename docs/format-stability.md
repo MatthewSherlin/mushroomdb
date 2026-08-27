@@ -72,6 +72,19 @@ re-snapshot before upgrading.
    log-and-continue is never used.
 4. The next clean open at the current VERSION deletes the `.bak`.
 
+> **Production note — ANN index re-fit cost.** Stores with approximate
+> (`approximate: true`) rules must re-fit k-means ANN indexes during migration
+> because the index structures are rebuilt in-process before the new snapshot is
+> written. On a 2.2 GiB V5 dogfood store with 9 rules (measured 2026-08-27,
+> Apple M-series, macOS), the first migrating open took **~10–11 minutes** with a
+> peak memory footprint of **~54 GB** (max RSS ~9.5 GB; the remainder is
+> VM/compressed memory pressure). On a 24 GB machine this left little headroom;
+> on a more memory-constrained host the OS may kill the process mid-migration.
+> The migration is crash-safe — originals and `.bak` remain intact; simply retry
+> or rerun. However, for production stores with large ANN indexes, run
+> `mushroomdb migrate <dir>` **offline before starting `serve`** so that the
+> serving process never blocks on or gets killed during a migration.
+
 To opt out of automatic migration use:
 ```rust
 GraphDb::open_with_options(dir, OpenOptions { auto_migrate: false })

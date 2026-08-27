@@ -160,7 +160,7 @@ benchmarks/
     compare.py          — regression gate (15% threshold, --bootstrap mode)
     test_compare.py     — pytest: 3 comparator unit tests
   baselines/
-    ci.json             — committed baseline (ubuntu-latest runner; see below)
+    ci.json             — NOT YET COMMITTED; written after first post-merge CI run (see "How to flip to enforcing mode")
 ```
 
 ---
