@@ -198,6 +198,19 @@ impl Topology {
         ids.into_iter()
     }
 
+    /// Iterate all directed out-edges as `(etype, src, dst)` triples.
+    ///
+    /// Yields every edge in the overlay topology in arbitrary order.  Used by
+    /// callers (e.g. `core-api`) that need to walk the full edge set without
+    /// direct access to the private `by_type` field.
+    pub fn all_edges(&self) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
+        self.by_type.iter().flat_map(|(&etype, adj)| {
+            adj.out.iter().flat_map(move |(&src, al)| {
+                al.merged().into_iter().map(move |dst| (etype, src, dst))
+            })
+        })
+    }
+
     pub fn remove_edge(&mut self, etype: u32, src: u32, dst: u32) -> bool {
         let found_in_overlay = (|| {
             let adj = self.by_type.get_mut(&etype)?;

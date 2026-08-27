@@ -15,6 +15,11 @@ use core_rules::{
 };
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
+use core_storage::v8::encode::{
+    archived_edge_props_to_owned, archived_hnsw_to_owned, archived_provenance_to_owned,
+    archived_rules_meta_to_owned, archived_to_columnstore, archived_to_idmap, archived_to_interner,
+    archived_views_to_owned, csr_to_topology, decode_meta, encode_v8, V8Meta,
+};
 use core_storage::v8::seam::TopologyView;
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{
@@ -839,10 +844,10 @@ pub struct GraphDb<F: Fs> {
     /// Total WAL commit count at the time [`open_at`] was called.
     /// 0 for normal (non-as-of) instances.
     total_wal_commits: u64,
-    /// Immutable mmap-backed base snapshot for V8 format (Task 1: always
-    /// `None`; will be wired with persistent zero-copy topology in Task 3).
-    /// When `Some`, `TopologyView` in `view()` will merge base + overlay.
-    #[allow(dead_code)]
+    /// Immutable mmap-backed base snapshot (V8).  When `Some`, `self.topo` is
+    /// the WAL-replay overlay (empty at open time, populated by apply()) and
+    /// reads go through a merged `TopologyView`.  `self.props` is always
+    /// fully materialized (base + WAL replay) for HNSW/IVF and view compat.
     base: Option<Arc<core_storage::v8::MappedBase>>,
 }
 
@@ -1023,7 +1028,23 @@ impl<F: Fs> GraphDb<F> {
             base: None,
         };
         let snap_bytes = db.fs.read(FileId::Snapshot)?;
-        if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
+        // V8 path: keep MappedBase alive for zero-copy topology reads.
+        // Non-V8 paths (fresh / V5-V7) fall through to the legacy decode path.
+        if snap_bytes.len() >= 6
+            && &snap_bytes[0..4] == b"GDB1"
+            && u16::from_le_bytes([snap_bytes[4], snap_bytes[5]])
+                == core_storage::snapshot::VERSION_8
+        {
+            let mapped = Arc::new(
+                core_storage::v8::MappedBase::from_bytes(snap_bytes).map_err(|e| {
+                    GraphError::Corrupt {
+                        detail: format!("v8: mmap open: {e:?}"),
+                    }
+                })?,
+            );
+            db.restore_v8_base(Arc::clone(&mapped))?;
+            db.base = Some(mapped);
+        } else if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
             db.restore_snapshot_state(state)?;
         }
         let bytes = db.fs.read(FileId::Wal)?;
@@ -1057,11 +1078,23 @@ impl<F: Fs> GraphDb<F> {
         // Any future as-of replay path (Plan-15 T2) must drain here to feed
         // replaying subscribers; the mechanism is already in place.
         let _ = db.engine.drain_deltas(); // belt-and-braces no-op after loop drain
-                                          // Rebuild view values after WAL replay so values are consistent with
-                                          // final topo+props state.  This is a full recompute that corrects any
-                                          // incremental drift accumulated during apply() replay.
-        db.view_store
-            .rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
+                                          // Rebuild view values after WAL replay.  When a V8 base is present,
+                                          // `db.topo` holds only the overlay; materialise a merged topology
+                                          // so that degree-based views reflect base + overlay edges.
+        if let Some(ref base) = db.base {
+            let archived_csr = base.topology().map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: topo for view rebuild: {e:?}"),
+            })?;
+            let mut merged_topo = csr_to_topology(archived_csr);
+            for (etype, src, dst) in db.topo.all_edges() {
+                merged_topo.add_edge(etype, src, dst);
+            }
+            db.view_store
+                .rebuild_all(&mut db.props, &merged_topo, &db.ids, &db.syms, &db.labels);
+        } else {
+            db.view_store
+                .rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
+        }
         // Rebuild full-text index after WAL replay.  Corrects drift from
         // per-record incremental apply during replay.
         db.fulltext
@@ -1139,6 +1172,121 @@ impl<F: Fs> GraphDb<F> {
                 })?;
         }
         Ok(())
+    }
+
+    /// Restore all persisted state from a V8 `MappedBase` snapshot, **except**
+    /// topology (`self.topo` stays empty and serves as the WAL-replay overlay).
+    ///
+    /// `self.props` IS fully materialised from the base so that HNSW/IVF blob
+    /// deserialization and view rebuild have access to all column data.
+    fn restore_v8_base(&mut self, mapped: Arc<core_storage::v8::MappedBase>) -> Result<()> {
+        self.ids = archived_to_idmap(mapped.ids().map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: ids section: {e:?}"),
+        })?);
+        self.syms = archived_to_interner(mapped.syms().map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: syms section: {e:?}"),
+        })?);
+
+        // Materialise columns into self.props (full state, not overlay-only).
+        // Required for HNSW/IVF consume_retained_state_eager and view rebuild.
+        self.props =
+            archived_to_columnstore(mapped.columns().map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: columns section: {e:?}"),
+            })?);
+
+        // self.topo deliberately left as Topology::new() — overlay path.
+
+        let meta = decode_meta(mapped.meta_bytes().map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: meta section: {e:?}"),
+        })?)
+        .map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: meta decode: {e:?}"),
+        })?;
+        self.labels = meta.labels;
+        self.edge_props =
+            archived_edge_props_to_owned(mapped.edge_props_section().map_err(|e| {
+                GraphError::Corrupt {
+                    detail: format!("v8: edge_props section: {e:?}"),
+                }
+            })?);
+
+        // Restore rule engine.
+        let (rule_def_bytes, rule_tripped, rule_fires) =
+            archived_rules_meta_to_owned(mapped.rules_meta_section().map_err(|e| {
+                GraphError::Corrupt {
+                    detail: format!("v8: rules_meta section: {e:?}"),
+                }
+            })?);
+        let defs: Vec<RuleDef> = rule_def_bytes
+            .iter()
+            .map(|b| {
+                decode_rule_def(b).map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8: rule_def deserialize: {e}"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let provenance =
+            archived_provenance_to_owned(mapped.provenance_section().map_err(|e| {
+                GraphError::Corrupt {
+                    detail: format!("v8: provenance section: {e:?}"),
+                }
+            })?);
+        self.engine = RuleEngine::from_persist(defs, provenance, rule_tripped, rule_fires);
+
+        // Retain HNSW/IVF blobs without eagerly deserialising (same semantics
+        // as restore_snapshot_state: lazy on clean open, eager before WAL replay).
+        let hnsw_state =
+            archived_hnsw_to_owned(mapped.hnsw_section().map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: hnsw section: {e:?}"),
+            })?);
+        let ivf_state: BTreeMap<String, RuleIvfExport> = meta
+            .ivf_state
+            .into_iter()
+            .map(|(name, ps)| {
+                (
+                    name,
+                    (
+                        (ps.src.centroids, ps.src.clusters, ps.src.drift),
+                        (ps.dst.centroids, ps.dst.clusters, ps.dst.drift),
+                    ),
+                )
+            })
+            .collect();
+        self.engine.store_snapshot_state(hnsw_state, ivf_state);
+
+        // Restore view definitions.
+        let view_defs =
+            archived_views_to_owned(mapped.views_section().map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: views section: {e:?}"),
+            })?);
+        for def_bytes in &view_defs {
+            let def: ViewDef =
+                bincode::deserialize(def_bytes).map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8: view_def deserialize: {e}"),
+                })?;
+            self.view_store
+                .restore_view(def)
+                .map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8: view restore: {e}"),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Return a `TopologyView` that merges the mmap'd base (when present) with
+    /// the in-memory WAL overlay.  Used by all read paths in db.rs that need
+    /// the full merged topology without going through `self.view()`.
+    fn topo_view(&self) -> TopologyView<'_> {
+        match self.base {
+            None => TopologyView::owned(&self.topo),
+            Some(ref base) => {
+                // SAFETY: base lives as long as self; CRC was verified at open.
+                let archived = base
+                    .topology()
+                    .expect("base topology CRC already verified at open");
+                TopologyView::with_base(&self.topo, archived)
+            }
+        }
     }
 
     fn open_at_with(fs: F, commit: u64) -> Result<Self> {
@@ -1301,6 +1449,18 @@ impl<F: Fs> GraphDb<F> {
                     detail: format!("wal replay references unknown key {dst_key}"),
                 })?;
                 let etype = self.syms.intern(edge_type);
+                // Skip if the edge is already visible in the merged base+overlay
+                // view.  This keeps WAL replay idempotent when the WAL contains
+                // pre-snapshot records that are already encoded in a V8 base
+                // (keep_wal=true opens and crash-before-truncation scenarios).
+                if self.base.is_some()
+                    && self
+                        .topo_view()
+                        .neighbors(etype, Direction::Out, src)
+                        .contains(&dst)
+                {
+                    return Ok(());
+                }
                 self.topo.add_edge(etype, src, dst);
                 // View maintenance for manual edge insert.
                 self.view_store.on_edge_changed(
@@ -1510,6 +1670,17 @@ impl<F: Fs> GraphDb<F> {
                     || self.ids.is_tombstoned(*dst)
                     || self.ids.key_of(*src).is_none()
                     || self.ids.key_of(*dst).is_none()
+                {
+                    return Ok(());
+                }
+                // Skip if already visible in the merged view (same idempotency
+                // guard as InsertEdge above: prevents double-counting when
+                // pre-snapshot WAL records are replayed over a V8 base).
+                if self.base.is_some()
+                    && self
+                        .topo_view()
+                        .neighbors(*etype, Direction::Out, *src)
+                        .contains(dst)
                 {
                     return Ok(());
                 }
@@ -3120,9 +3291,10 @@ impl<F: Fs> GraphDb<F> {
         let derived_edges = derived_set.len() as u64;
 
         let mut total_topo = 0u64;
-        for et in self.topo.etypes() {
-            total_topo += self.topo.neighbors(et, Direction::Out, id).len() as u64
-                + self.topo.neighbors(et, Direction::In, id).len() as u64;
+        let tv = self.topo_view();
+        for et in tv.etypes() {
+            total_topo += tv.neighbors(et, Direction::Out, id).len() as u64
+                + tv.neighbors(et, Direction::In, id).len() as u64;
         }
         // For symmetric rules (e.g. Overlap), a→b and b→a are two separate directed
         // triples in both the topo scan (Out and In from id) and in provenance_touching.
@@ -3570,17 +3742,37 @@ impl<F: Fs> GraphDb<F> {
     pub fn scratch_view_value(&self, key: &str, view_name: &str) -> Option<Value> {
         let node = self.ids.get(key)?;
         let def = self.view_store.views().find(|v| v.name == view_name)?;
-        // Direct scratch computation using the same internal function,
-        // reading from live props so NeighborAgg sees real neighbor values.
-        core_rules::views::compute_view_value(
-            def,
-            node,
-            &self.props,
-            &self.topo,
-            &self.ids,
-            &self.syms,
-            &self.labels,
-        )
+        // When a V8 base is open, self.topo only holds the WAL-replay overlay.
+        // Materialize the merged topology so NeighborAgg sees base + overlay
+        // edges (same as rebuild_all uses).
+        if let Some(ref base) = self.base {
+            let archived_csr = base
+                .topology()
+                .expect("base topology CRC already verified at open");
+            let mut merged = csr_to_topology(archived_csr);
+            for (etype, src, dst) in self.topo.all_edges() {
+                merged.add_edge(etype, src, dst);
+            }
+            core_rules::views::compute_view_value(
+                def,
+                node,
+                &self.props,
+                &merged,
+                &self.ids,
+                &self.syms,
+                &self.labels,
+            )
+        } else {
+            core_rules::views::compute_view_value(
+                def,
+                node,
+                &self.props,
+                &self.topo,
+                &self.ids,
+                &self.syms,
+                &self.labels,
+            )
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3777,7 +3969,7 @@ impl<F: Fs> GraphDb<F> {
             syms: &self.syms,
             labels: &self.labels,
             props: core_storage::v8::seam::ColumnsView::owned(&self.props),
-            topo: TopologyView::owned(&self.topo),
+            topo: self.topo_view(),
             edge_props: &self.edge_props,
             mask: None,
         }
@@ -3789,7 +3981,7 @@ impl<F: Fs> GraphDb<F> {
             syms: &self.syms,
             labels: &self.labels,
             props: core_storage::v8::seam::ColumnsView::owned(&self.props),
-            topo: TopologyView::owned(&self.topo),
+            topo: self.topo_view(),
             edge_props: &self.edge_props,
             mask: Some(&mask.visible),
         }
@@ -3900,14 +4092,15 @@ impl<F: Fs> GraphDb<F> {
             .map(|(_rule, etype, src, dst)| (etype, src, dst))
             .collect();
         let mut edges = Vec::new();
-        for etype in self.topo.etypes() {
+        let tv = self.topo_view();
+        for etype in tv.etypes() {
             let edge_type = self
                 .syms
                 .resolve(etype)
                 .expect("topology etype is interned")
                 .to_string();
             for dir in [Direction::Out, Direction::In] {
-                for &nbr in self.topo.neighbors(etype, dir, id).as_ref() {
+                for &nbr in tv.neighbors(etype, dir, id).as_ref() {
                     let (src, dst, src_key, dst_key) = match dir {
                         Direction::Out => (
                             id,
@@ -4513,9 +4706,10 @@ impl<F: Fs> GraphDb<F> {
             // openCypher bare DELETE: error if any matched node has incident edges.
             for key in &keys {
                 if let Some(id) = self.ids.get(key) {
-                    let has_edges = self.topo.etypes().any(|et| {
-                        !self.topo.neighbors(et, Direction::Out, id).is_empty()
-                            || !self.topo.neighbors(et, Direction::In, id).is_empty()
+                    let tv = self.topo_view();
+                    let has_edges = tv.etypes().any(|et| {
+                        !tv.neighbors(et, Direction::Out, id).is_empty()
+                            || !tv.neighbors(et, Direction::In, id).is_empty()
                     });
                     if has_edges {
                         return Err(GraphError::QueryError {
@@ -4729,7 +4923,7 @@ impl<F: Fs> GraphDb<F> {
         let Some(sym) = self.syms.get(edge_type) else {
             return Ok(Vec::new());
         };
-        self.topo
+        self.topo_view()
             .neighbors(sym, dir, id)
             .iter()
             .map(|&n| {
@@ -4919,7 +5113,7 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn edge_count(&self) -> u64 {
-        self.topo.edge_count()
+        self.topo_view().edge_count()
     }
 
     /// Live/tombstone/edge counts plus per-rule provenance size, trip latch,
@@ -4944,7 +5138,7 @@ impl<F: Fs> GraphDb<F> {
         Stats {
             nodes_live: self.ids.live_len(),
             nodes_tombstoned: self.ids.len() - self.ids.live_len(),
-            edges: self.topo.edge_count(),
+            edges: self.topo_view().edge_count(),
             rules,
         }
     }
@@ -5036,24 +5230,70 @@ impl<F: Fs> GraphDb<F> {
             .views()
             .map(|v| bincode::serialize(v).expect("ViewDef serialize cannot fail"))
             .collect();
-        let state = core_storage::snapshot::SnapshotState {
-            ids: self.ids.clone(),
-            syms: self.syms.clone(),
-            topo: self.topo.clone(),
-            props: self.props.clone(),
-            labels: self.labels.clone(),
-            edge_props: self.edge_props.clone(),
-            rule_defs,
-            provenance,
-            rule_tripped,
-            rule_fires,
-            ivf_state,
-            hnsw_state,
-            view_defs,
-            wal_truncated: !opts.keep_wal,
-        };
-        self.fs
-            .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state)?)?;
+        if self.base.is_some() {
+            // V8 merge-snapshot path: encode base+overlay into a new V8 snapshot,
+            // write it atomically, remap it as the new base, then clear the overlay.
+            let meta = V8Meta {
+                labels: self.labels.clone(),
+                edge_props: self.edge_props.clone(),
+                rule_defs,
+                provenance,
+                rule_tripped,
+                rule_fires,
+                ivf_state,
+                view_defs,
+                wal_truncated: !opts.keep_wal,
+                hnsw: hnsw_state,
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                // Clone the Arc so the old base stays alive while we encode.
+                // The borrow of archived_csr (into old_base's mmap) is released
+                // at the end of this block, before we replace self.base.
+                let old_base = self.base.clone().expect("is_some checked above");
+                let archived_csr = old_base.topology().map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8 snapshot: topology section: {e:?}"),
+                })?;
+                encode_v8(
+                    Some(archived_csr),
+                    &self.topo,
+                    &self.props,
+                    &self.ids,
+                    &self.syms,
+                    &meta,
+                    &mut buf,
+                )?;
+            }
+            self.fs.write_atomic(FileId::Snapshot, &buf)?;
+            // Remap the freshly-written snapshot as the new base.
+            let new_base =
+                core_storage::v8::MappedBase::from_bytes(buf).map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8 snapshot: remap new base: {e:?}"),
+                })?;
+            self.base = Some(Arc::new(new_base));
+            // Clear the overlay (and its tombstones) — all data is now in the base.
+            self.topo = Topology::new();
+        } else {
+            // Legacy path (V5–V7 stores without a V8 base).
+            let state = core_storage::snapshot::SnapshotState {
+                ids: self.ids.clone(),
+                syms: self.syms.clone(),
+                topo: self.topo.clone(),
+                props: self.props.clone(),
+                labels: self.labels.clone(),
+                edge_props: self.edge_props.clone(),
+                rule_defs,
+                provenance,
+                rule_tripped,
+                rule_fires,
+                ivf_state,
+                hnsw_state,
+                view_defs,
+                wal_truncated: !opts.keep_wal,
+            };
+            self.fs
+                .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state)?)?;
+        }
 
         if opts.keep_wal {
             // keep_wal=true: WAL is left untouched.  The existing WAL already

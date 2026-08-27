@@ -65,35 +65,32 @@ pub struct V8Meta {
 
 /// Encode an in-memory graph state as a V8 snapshot, writing to `out`.
 ///
-/// `base` is the existing mmap'd snapshot for the Task-3 merge path.
-/// When `Some`, the merged topology and columns (base + overlay, with tombstone
-/// subtraction) are encoded.  When `None`, the overlay is encoded standalone
-/// (initial snapshot, no prior base).
+/// `base_topo` is the archived CSR from an existing mmap'd V8 snapshot.
+/// When `Some`, the encoded topology section is the sorted-unique merge of the
+/// base CSR and the overlay topology (with tombstone subtraction applied).
+/// When `None`, the overlay topology is encoded standalone (initial snapshot,
+/// no prior base).
+///
+/// `cols` is always the full column store (base materialized + WAL mutations);
+/// it is encoded directly without a base merge.
 pub fn encode_v8<W: Write>(
-    base: Option<&crate::v8::MappedBase>,
-    overlay_topo: &Topology,
-    overlay_props: &ColumnStore,
-    overlay_ids: &IdMap,
-    overlay_syms: &Interner,
+    base_topo: Option<&crate::v8::layout::ArchivedCsr>,
+    topo: &Topology,
+    cols: &ColumnStore,
+    ids: &IdMap,
+    syms: &Interner,
     meta: &V8Meta,
     out: &mut W,
 ) -> Result<()> {
     // 1. Serialise each section to bytes.
-    let topo_bytes = if let Some(b) = base {
-        let archived_csr = b.topology()?;
-        rkyv_encode(&topology_merge_to_csr(archived_csr, overlay_topo))?
-    } else {
-        rkyv_encode(&topology_to_csr(overlay_topo))?
+    let topo_bytes = match base_topo {
+        Some(archived_csr) => rkyv_encode(&topology_merge_to_csr(archived_csr, topo))?,
+        None => rkyv_encode(&topology_to_csr(topo))?,
     };
 
-    let cols_bytes = if let Some(b) = base {
-        let archived_cols = b.columns()?;
-        rkyv_encode(&columns_merge_to_data(archived_cols, overlay_props)?)?
-    } else {
-        rkyv_encode(&columnstore_to_data(overlay_props)?)?
-    };
-    let ids_bytes = rkyv_encode(&idmap_to_data(overlay_ids))?;
-    let syms_bytes = rkyv_encode(&interner_to_data(overlay_syms))?;
+    let cols_bytes = rkyv_encode(&columnstore_to_data(cols)?)?;
+    let ids_bytes = rkyv_encode(&idmap_to_data(ids))?;
+    let syms_bytes = rkyv_encode(&interner_to_data(syms))?;
     let meta_bytes = bincode::serialize(meta).map_err(|e| GraphError::Corrupt {
         detail: format!("v8: meta bincode serialize: {e}"),
     })?;
@@ -428,111 +425,6 @@ fn merge_sorted_unique_vecs(a: &[u32], b: &[u32]) -> Vec<u32> {
     out.extend_from_slice(&a[ai..]);
     out.extend_from_slice(&b[bi..]);
     out
-}
-
-/// Merge archived base columns with overlay column store.
-///
-/// Overlay values win per `(node, field)` pair.  Fields present only in the
-/// base are carried unchanged.  Fields present in both have their per-node
-/// values merged: overlay wins per node.
-///
-/// Implementation strategy: materialise the base into a `ColumnStore`, then
-/// apply all overlay (field, node, value) entries on top, then re-encode.
-/// This is O(base_size + overlay_size) and correct for the append-mostly case.
-fn columns_merge_to_data(
-    base: &crate::v8::layout::ArchivedColumns,
-    overlay: &ColumnStore,
-) -> Result<ColumnsData> {
-    // Materialise base into an owned ColumnStore.
-    let mut merged = archived_to_columnstore(base);
-
-    // Apply overlay entries: encode the overlay to ColumnsData, then iterate
-    // each field's typed data and write into the merged store.
-    let overlay_data = columnstore_to_data(overlay)?;
-    apply_columns_data_to_store(&overlay_data, &mut merged);
-
-    // Re-encode the merged store.
-    columnstore_to_data(&merged)
-}
-
-/// Apply all (field, node, value) entries from `data` into `store`.
-/// Overlay values overwrite existing store entries for the same key.
-fn apply_columns_data_to_store(data: &ColumnsData, store: &mut ColumnStore) {
-    for field in &data.fields {
-        let name = &field.name;
-        match &field.col {
-            ColumnData::Int { data, present } => {
-                bitmap_for_each_u64(present, |node| {
-                    let idx = node as usize;
-                    if idx < data.len() {
-                        store.set(node, name, Value::Int(data[idx]));
-                    }
-                });
-            }
-            ColumnData::Float { data, present } => {
-                bitmap_for_each_u64(present, |node| {
-                    let idx = node as usize;
-                    if idx < data.len() {
-                        store.set(node, name, Value::Float(data[idx]));
-                    }
-                });
-            }
-            ColumnData::Bool { data, present } => {
-                bitmap_for_each_u64(present, |node| {
-                    let idx = node as usize;
-                    if idx < data.len() {
-                        store.set(node, name, Value::Bool(data[idx] != 0));
-                    }
-                });
-            }
-            ColumnData::Str {
-                ids,
-                present,
-                strings,
-            } => {
-                bitmap_for_each_u64(present, |node| {
-                    let idx = node as usize;
-                    if idx < ids.len() {
-                        let sid = ids[idx] as usize;
-                        if sid < strings.len() {
-                            store.set(node, name, Value::Str(strings[sid].clone()));
-                        }
-                    }
-                });
-            }
-            ColumnData::Mixed(blob) => {
-                let map: HashMap<u32, Value> =
-                    bincode::deserialize(blob.as_slice()).unwrap_or_default();
-                for (node, v) in map {
-                    store.set(node, name, v);
-                }
-            }
-            ColumnData::Vector { dim, data, present } => {
-                let d = *dim as usize;
-                bitmap_for_each_u64(present, |node| {
-                    let start = node as usize * d;
-                    let end = start + d;
-                    if end <= data.len() {
-                        let floats: Vec<Value> =
-                            data[start..end].iter().map(|&f| Value::Float(f)).collect();
-                        store.set(node, name, Value::List(floats));
-                    }
-                });
-            }
-        }
-    }
-}
-
-/// Iterate set bits in a plain `Vec<u64>` bitmap (non-archived, from `decode_all_columns`).
-fn bitmap_for_each_u64<F: FnMut(u32)>(words: &[u64], mut f: F) {
-    for (wi, &word) in words.iter().enumerate() {
-        let mut w = word;
-        while w != 0 {
-            let bit = w.trailing_zeros();
-            f(wi as u32 * 64 + bit);
-            w &= w - 1;
-        }
-    }
 }
 
 fn columnstore_to_data(store: &ColumnStore) -> Result<ColumnsData> {

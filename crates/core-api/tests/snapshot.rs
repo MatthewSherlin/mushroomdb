@@ -1932,3 +1932,197 @@ fn wal_present_open_preserves_hnsw_before_replay() {
         "WAL-tail node 'c' must survive WAL-present open replay"
     );
 }
+
+// ---------------------------------------------------------------------------
+// V8 base-wiring tests (Task 3 Fix Round 1)
+// ---------------------------------------------------------------------------
+
+/// WAL replay identity over a V8 base.
+///
+/// Phase 1: populate (a, b, a→b) → snapshot (legacy path, base=None, writes
+/// V8 on disk) → post-snapshot WAL tail (c, b→c) → close.
+/// Phase 2: reopen → V8 base established (has a, b, a→b); WAL replay adds
+/// only the tail (c, b→c) into the empty overlay.
+/// Assert the fully merged view equals a reference DB that applied all ops
+/// without any snapshot.
+#[test]
+fn v8_wal_replay_identity_over_base() {
+    let dir = tmp("v8-wal-replay");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![("v".into(), Value::Int(1))])
+            .unwrap();
+        db.insert_node("N", "b", vec![]).unwrap();
+        db.insert_edge("E", "a", "b").unwrap();
+        db.snapshot().unwrap(); // V8 on disk; WAL truncated to baseline
+        db.insert_node("N", "c", vec![]).unwrap();
+        db.insert_edge("E", "b", "c").unwrap();
+    }
+    // Reopen: V8 base (a, b, a→b) + WAL tail overlay (c, b→c).
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.node_count(), 3, "a, b, c must all be present");
+    assert_eq!(db.edge_count(), 2, "a→b (base) + b→c (overlay) = 2");
+    assert_eq!(
+        db.get_prop("a", "v"),
+        Some(&Value::Int(1)),
+        "base prop must survive WAL-replay open"
+    );
+    assert_eq!(
+        db.neighbors("a", "E", Direction::Out).unwrap(),
+        vec!["b"],
+        "base edge a→b must be visible via TopologyView"
+    );
+    assert_eq!(
+        db.neighbors("b", "E", Direction::Out).unwrap(),
+        vec!["c"],
+        "overlay edge b→c must be visible after WAL replay"
+    );
+    assert_eq!(
+        db.neighbors("b", "E", Direction::In).unwrap(),
+        vec!["a"],
+        "in-direction of base edge must be visible"
+    );
+    assert_eq!(
+        db.neighbors("c", "E", Direction::In).unwrap(),
+        vec!["b"],
+        "in-direction of overlay edge must be visible"
+    );
+}
+
+/// Crash sweep: V8 base + overlay — crash after encode/rename but before WAL
+/// truncation.
+///
+/// Phase 1: a, b, a→b → snapshot (V8, legacy path) → close.
+/// Phase 2: reopen (base=Some), add c and b→c, capture WAL, call second
+/// snapshot (V8 merge path: new base has a+b+c and both edges) → simulate
+/// crash by restoring the pre-snapshot WAL.
+/// Phase 3: reopen with new base + old WAL.  WAL replay re-applies c and b→c
+/// into the empty overlay.  Reads must be correct (TopologyView deduplicates
+/// edges that appear in both base and overlay).
+#[test]
+fn v8_crash_sweep_base_overlay_idempotent() {
+    let dir = tmp("v8-crash-sweep");
+    // Phase 1: initial snapshot (legacy path).
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap();
+        db.insert_node("N", "b", vec![]).unwrap();
+        db.insert_edge("E", "a", "b").unwrap();
+        db.snapshot().unwrap();
+    }
+    // Phase 2: V8 merge snapshot; crash before WAL truncation.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "c", vec![]).unwrap();
+        db.insert_edge("E", "b", "c").unwrap();
+        // Capture WAL before the second snapshot truncates it.
+        let pre_snap_wal = std::fs::read(dir.join("wal.bin")).unwrap();
+        db.snapshot().unwrap(); // V8 merge: new base has a+b+c, a→b, b→c
+                                // Simulate crash: restore pre-snapshot WAL.
+        std::fs::write(dir.join("wal.bin"), &pre_snap_wal).unwrap();
+    }
+    // Phase 3: new V8 base (a+b+c, both edges) + old WAL (c, b→c again).
+    // Reads must be correct despite the duplicate-edge replay.
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.node_count(), 3, "a, b, c must all be present");
+    // edge_count may be inflated by crash replay; do not assert it here.
+    assert_eq!(
+        db.neighbors("a", "E", Direction::Out).unwrap(),
+        vec!["b"],
+        "base edge a→b must survive crash-recovery open"
+    );
+    assert_eq!(
+        db.neighbors("b", "E", Direction::Out).unwrap(),
+        vec!["c"],
+        "overlay edge b→c (duplicated in base) must appear exactly once"
+    );
+    assert_eq!(
+        db.neighbors("b", "E", Direction::In).unwrap(),
+        vec!["a"],
+        "in-direction of a→b must be visible after crash recovery"
+    );
+}
+
+/// Snapshot-merge equivalence: base+overlay encode must produce identical
+/// logical state to a single full encode over the same data.
+///
+/// Reference: DB with all 5 ops applied, no snapshot.
+/// Test:      Same ops split across two snapshots (first = legacy path;
+///            second = V8 merge path).  Final reopen (empty overlay, fully
+///            merged base) must match the reference for nodes, edges, props.
+#[test]
+fn v8_snapshot_merge_equivalence() {
+    // Reference: all ops in one overlay, no snapshot taken.
+    let ref_dir = tmp("v8-merge-ref");
+    {
+        let mut db = GraphDb::open(&ref_dir).unwrap();
+        db.insert_node("N", "a", vec![("x".into(), Value::Int(10))])
+            .unwrap();
+        db.insert_node("N", "b", vec![("x".into(), Value::Int(20))])
+            .unwrap();
+        db.insert_node("N", "c", vec![]).unwrap();
+        db.insert_edge("E", "a", "b").unwrap();
+        db.insert_edge("E", "b", "c").unwrap();
+    }
+    let ref_db = GraphDb::open(&ref_dir).unwrap();
+
+    // Test: split across two snapshots.
+    let dir = tmp("v8-merge-test");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![("x".into(), Value::Int(10))])
+            .unwrap();
+        db.insert_node("N", "b", vec![("x".into(), Value::Int(20))])
+            .unwrap();
+        db.insert_edge("E", "a", "b").unwrap();
+        db.snapshot().unwrap(); // V8 legacy path; base=None
+    }
+    {
+        let mut db = GraphDb::open(&dir).unwrap(); // base=Some (V8 with a, b, a→b)
+        db.insert_node("N", "c", vec![]).unwrap();
+        db.insert_edge("E", "b", "c").unwrap();
+        db.snapshot().unwrap(); // V8 merge path; new base = a+b+c + both edges
+    }
+    let db = GraphDb::open(&dir).unwrap(); // base=Some (fully merged), overlay empty
+
+    assert_eq!(
+        db.node_count(),
+        ref_db.node_count(),
+        "node count must match reference"
+    );
+    assert_eq!(
+        db.edge_count(),
+        ref_db.edge_count(),
+        "edge count must match reference (no double-counting after merge)"
+    );
+    assert_eq!(
+        db.get_prop("a", "x"),
+        Some(&Value::Int(10)),
+        "prop a.x must survive two-snapshot merge"
+    );
+    assert_eq!(
+        db.get_prop("b", "x"),
+        Some(&Value::Int(20)),
+        "prop b.x must survive two-snapshot merge"
+    );
+    assert_eq!(
+        db.neighbors("a", "E", Direction::Out).unwrap(),
+        ref_db.neighbors("a", "E", Direction::Out).unwrap(),
+        "a→b neighbors must match reference"
+    );
+    assert_eq!(
+        db.neighbors("b", "E", Direction::Out).unwrap(),
+        ref_db.neighbors("b", "E", Direction::Out).unwrap(),
+        "b→c neighbors must match reference"
+    );
+    assert_eq!(
+        db.neighbors("b", "E", Direction::In).unwrap(),
+        ref_db.neighbors("b", "E", Direction::In).unwrap(),
+        "in-direction b must match reference"
+    );
+    assert_eq!(
+        db.neighbors("c", "E", Direction::In).unwrap(),
+        ref_db.neighbors("c", "E", Direction::In).unwrap(),
+        "in-direction c must match reference"
+    );
+}

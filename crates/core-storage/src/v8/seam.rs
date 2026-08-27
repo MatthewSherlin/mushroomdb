@@ -50,6 +50,17 @@ impl<'a> TopologyView<'a> {
         }
     }
 
+    /// Construct a view that merges an mmap'd V8 base with a WAL-replay overlay.
+    ///
+    /// Used when a V8 snapshot is open: the base holds the snapshot CSR and the
+    /// overlay holds only post-snapshot WAL mutations.
+    pub fn with_base(overlay: &'a Topology, base: &'a ArchivedCsr) -> Self {
+        Self {
+            overlay,
+            base: Some(base),
+        }
+    }
+
     /// Sorted unique neighbors of `v` for `(etype, dir)`.
     ///
     /// When base is present the result is the sorted-unique union of:
@@ -92,19 +103,28 @@ impl<'a> TopologyView<'a> {
         ))
     }
 
-    /// Total edge count: overlay + base (no double-counting since both are
-    /// disjoint at Task-1 open time).
+    /// Total edge count: (base - tombstones) + overlay.
+    ///
+    /// Tombstones in the overlay represent edges that were present only in the
+    /// base CSR and were subsequently deleted via `remove_edge`.  They must be
+    /// subtracted from the base count to avoid phantom edge counts.
     pub fn edge_count(&self) -> u64 {
         let ov = self.overlay.edge_count();
-        let bv = self
-            .base
-            .map(|b| {
-                // SAFETY: edge_count is a u64 archived in LE via rend; converting
-                // to native u64 is always correct.
-                u64::from(b.edge_count)
-            })
-            .unwrap_or(0);
-        ov + bv
+        match self.base {
+            None => ov,
+            Some(b) => {
+                let bv = u64::from(b.edge_count);
+                // Count tombstoned base edges (out-direction is canonical).
+                let tombstones: u64 = self
+                    .overlay
+                    .out_tombstones
+                    .values()
+                    .flat_map(|m| m.values())
+                    .map(|s| s.len() as u64)
+                    .sum();
+                bv.saturating_sub(tombstones) + ov
+            }
+        }
     }
 
     /// Edge-type ids present in overlay and/or base, sorted ascending.
