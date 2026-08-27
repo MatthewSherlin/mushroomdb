@@ -42,9 +42,11 @@ fn main() {
     let _guard = DirCleanup(db_path.clone());
 
     // ── 1. Ingest ────────────────────────────────────────────────────────────
+    // Open first (untimed — empty store, negligible) so the timer measures
+    // only the ingest call itself, matching the "ingest wall" spec metric.
     let json = build_nodes_json(N_NODES);
-    let t_ingest = Instant::now();
     let mut db = GraphDb::open(&db_path).expect("open");
+    let t_ingest = Instant::now();
     db.ingest_json("Item", &json, &IngestOptions::default())
         .expect("ingest");
     let ingest_wall_s = t_ingest.elapsed().as_secs_f64();
@@ -113,7 +115,8 @@ fn main() {
         })
         .collect();
     timings_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let query_p50_ms = timings_ms[N_QUERY_RUNS / 2];
+    // True median for even N: average the two middle values.
+    let query_p50_ms = (timings_ms[N_QUERY_RUNS / 2 - 1] + timings_ms[N_QUERY_RUNS / 2]) / 2.0;
 
     // ── Output ────────────────────────────────────────────────────────────────
     println!(

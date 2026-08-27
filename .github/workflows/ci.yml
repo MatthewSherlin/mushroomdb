@@ -181,6 +181,7 @@ jobs:
           set -euo pipefail
           bash benchmarks/ci/run.sh --output results.json
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: bench-results
           path: results.json

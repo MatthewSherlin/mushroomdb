@@ -179,7 +179,7 @@ library — properties derived arithmetically from node indices):
 | `ingest_wall_s` | Wall time to ingest 10 000 Item nodes |
 | `rule_backfill_wall_s` | Wall time to create 2 rules and complete their backfill |
 | `snapshot_write_s` | Wall time to write a snapshot |
-| `snapshot_open_s` | Wall time to open the store cold from the snapshot |
+| `snapshot_open_s` | Wall time to re-open the store from the snapshot in-process (OS page cache warm, Rust structures cold) |
 | `query_p50_ms` | p50 of 50 two-hop Cypher query executions (ms) |
 
 Results are written to `results.json` and uploaded as a CI artifact named
