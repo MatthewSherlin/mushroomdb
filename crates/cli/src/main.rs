@@ -2,7 +2,8 @@
 
 use cli::{
     format_demo, format_stats, format_suggest, maybe_run_demo_if_empty, parse_args, read_stats,
-    run_algo, run_asof, run_demo, run_query, run_snapshot, run_suggest, usage, Command, ServeUi,
+    run_algo, run_asof, run_demo, run_query, run_schema_apply, run_snapshot, run_suggest, usage,
+    Command, ServeUi,
 };
 use core_api::SharedDb;
 use std::io::{self, Write};
@@ -105,6 +106,16 @@ fn main() -> ExitCode {
             Err(e) => fail(&e.to_string()),
         },
         Ok(Command::Snapshot { db_dir, keep_wal }) => match run_snapshot(&db_dir, keep_wal) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
+        Ok(Command::SchemaApply {
+            db_dir,
+            schema_file,
+        }) => match run_schema_apply(&db_dir, &schema_file) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS

@@ -2,6 +2,7 @@ pub mod algo;
 mod db;
 mod ingest;
 pub mod mask;
+pub mod schema;
 mod shared;
 pub mod subscription;
 
@@ -24,6 +25,7 @@ pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
 pub use mask::NodeMask;
+pub use schema::{Schema, SchemaDiff};
 pub use shared::SharedDb;
 pub use subscription::{DbEvent, Subscription, DEFAULT_SUB_CAPACITY};
 
