@@ -113,7 +113,7 @@ impl<F: Fs> GraphDb<F> {
             let would_mutate = live_views
                 .iter()
                 .find(|v| v.name == view_def.name)
-                .map_or(true, |live| live != view_def);
+                .is_none_or(|live| live != view_def);
             if would_mutate {
                 view_def
                     .validate()
@@ -125,7 +125,7 @@ impl<F: Fs> GraphDb<F> {
             let would_mutate = live_rules
                 .iter()
                 .find(|r| r.name == rule_def.name)
-                .map_or(true, |live| live != rule_def);
+                .is_none_or(|live| live != rule_def);
             if would_mutate {
                 rule_def
                     .validate()
