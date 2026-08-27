@@ -505,6 +505,20 @@ mod value_ref_tests {
         ];
 
         for val in &cases {
+            // NaN must be handled first: IEEE 754 NaN != NaN for every comparison
+            // variant.  All four pairs must assert_ne, then skip the rest of the loop.
+            if let Value::Float(f) = val {
+                if f.is_nan() {
+                    let b = borrowed(val);
+                    let o = owned(val.clone());
+                    assert_ne!(b, *val, "NaN: Borrowed(v) must not equal v");
+                    assert_ne!(o, *val, "NaN: Owned(v) must not equal v");
+                    assert_ne!(b, borrowed(val), "NaN: Borrowed == Borrowed must be false");
+                    assert_ne!(o, owned(val.clone()), "NaN: Owned == Owned must be false");
+                    continue;
+                }
+            }
+
             let b = borrowed(val);
             let o = owned(val.clone());
 
@@ -514,14 +528,7 @@ mod value_ref_tests {
             assert_eq!(o, *val, "Owned(v) == v failed for {val:?}");
             // Borrowed == Borrowed
             assert_eq!(b, borrowed(val), "Borrowed == Borrowed failed for {val:?}");
-            // Owned == Owned (NaN is the only exception)
-            if let Value::Float(f) = val {
-                if f.is_nan() {
-                    // NaN != NaN — verify the false branch
-                    assert_ne!(o, owned(val.clone()), "NaN should not equal NaN");
-                    continue;
-                }
-            }
+            // Owned == Owned
             assert_eq!(o, owned(val.clone()), "Owned == Owned failed for {val:?}");
             // Borrowed == Owned
             assert_eq!(b, o, "Borrowed == Owned failed for {val:?}");
