@@ -903,6 +903,13 @@ pub struct GraphDb<F: Fs> {
     /// after WAL truncation.  All subsequent mutation attempts return an IO
     /// error until the database is reopened.
     degraded: bool,
+    /// Set to `true` after `ensure_v8_base_sections_loaded` has read provenance,
+    /// HNSW, and IVF sections from the mmap base into the engine's retained
+    /// fields.  `false` on all opens until first use; always `true` for non-V8
+    /// opens (base is None, fast-path sets flag immediately).
+    v8_sections_loaded: std::sync::atomic::AtomicBool,
+    /// Serializes the one-time section population in `ensure_v8_base_sections_loaded`.
+    v8_sections_mutex: std::sync::Mutex<()>,
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -1095,6 +1102,8 @@ impl<F: Fs> GraphDb<F> {
             defer_events: false,
             deferred_events: Vec::new(),
             degraded: false,
+            v8_sections_loaded: std::sync::atomic::AtomicBool::new(false),
+            v8_sections_mutex: std::sync::Mutex::new(()),
         };
         let snap_bytes = db.fs.read(FileId::Snapshot)?;
         // V8 path: keep MappedBase alive for zero-copy topology reads.
@@ -1131,6 +1140,7 @@ impl<F: Fs> GraphDb<F> {
         // would call reindex_all_load_ivf on an empty graph, defeating the
         // point of restoring IVF/HNSW blobs from the snapshot).
         if !records.is_empty() {
+            db.ensure_v8_base_sections_loaded();
             db.engine.consume_retained_state_eager(
                 &db.ids,
                 &db.syms,
@@ -1290,34 +1300,11 @@ impl<F: Fs> GraphDb<F> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        // C4: provenance bytes retained without decoding at open.
-        // The &self read path (stats, explain, provenance_touching) triggers a
-        // one-time lazy decode via ensure_provenance_loaded / OnceLock.
-        // The &mut self write path (first mutation) calls ensure_provenance_loaded_mut
-        // which consumes the bytes into the live mutable fields.
-        let provenance_bytes = mapped
-            .provenance_raw_bytes()
-            .map_err(|e| GraphError::Corrupt {
-                detail: format!("v8: provenance section: {e:?}"),
-            })?
-            .to_vec();
         self.engine = RuleEngine::from_persist(defs, BTreeMap::new(), rule_tripped, rule_fires);
-        self.engine.store_provenance_bytes(provenance_bytes);
-
-        // Retain HNSW blobs and raw IVF bytes without deserialising (same
-        // semantics: lazy on clean open, eager before WAL replay).
-        let hnsw_state =
-            archived_hnsw_to_owned(mapped.hnsw_section().map_err(|e| GraphError::Corrupt {
-                detail: format!("v8: hnsw section: {e:?}"),
-            })?);
-        // C5: IVF state retained as raw section-10 bincode bytes.
-        let ivf_bytes = mapped
-            .ivf_bytes()
-            .map_err(|e| GraphError::Corrupt {
-                detail: format!("v8: ivf section: {e:?}"),
-            })?
-            .to_vec();
-        self.engine.store_snapshot_state(hnsw_state, ivf_bytes);
+        // C4+C5: provenance, HNSW, and IVF sections are NOT read here.
+        // `ensure_v8_base_sections_loaded` reads them on first use from
+        // `self.base` (set by the caller immediately after this returns).
+        // A clean open touches only: header + IDS + SYMS + META + RULES_META.
 
         // Restore view definitions.
         let view_defs =
@@ -1335,7 +1322,62 @@ impl<F: Fs> GraphDb<F> {
                     detail: format!("v8: view restore: {e}"),
                 })?;
         }
+        // Validate that all deferred sections (provenance, HNSW, IVF) fit within
+        // the file.  Pure bounds check — no bytes read, no page faults triggered.
+        // Catches truncated snapshots at open time before the lazy deferred reads.
+        mapped.validate_section_bounds().map_err(|e| match e {
+            GraphError::Corrupt { detail } => GraphError::Corrupt {
+                detail: format!("v8: section bounds: {detail}"),
+            },
+            other => other,
+        })?;
         Ok(())
+    }
+
+    /// Read provenance, HNSW, and IVF sections from the mmap base into the
+    /// engine's retained fields on first call.  Subsequent calls are a no-op
+    /// (AtomicBool fast-path).
+    ///
+    /// Must be called before any code path that reads or mutates engine
+    /// provenance, HNSW, or IVF state:
+    /// - WAL replay (before `consume_retained_state_eager`)
+    /// - First mutation (`log_then_apply_with`)
+    /// - Read-only paths (`stats`, `explain`, `node_edges`)
+    /// - Snapshot (`snapshot_with`)
+    ///
+    /// No-op for fresh stores and V5-V7 opens (`self.base` is `None`).
+    fn ensure_v8_base_sections_loaded(&self) {
+        use std::sync::atomic::Ordering;
+        if self.v8_sections_loaded.load(Ordering::Acquire) {
+            return;
+        }
+        let _guard = self
+            .v8_sections_mutex
+            .lock()
+            .expect("v8 sections mutex poisoned");
+        if self.v8_sections_loaded.load(Ordering::Acquire) {
+            return; // another caller populated while we waited
+        }
+        if let Some(base) = &self.base {
+            // Provenance: raw rkyv bytes; CRC validated inside section_bytes.
+            // Bounds are already validated at open time (restore_v8_base →
+            // validate_section_bounds), so these calls only fail on CRC mismatch
+            // or rkyv format errors — treat as non-fatal for lazy callers.
+            let prov_bytes = base
+                .provenance_raw_bytes()
+                .map(|b| b.to_vec())
+                .unwrap_or_default();
+            self.engine.store_provenance_bytes(prov_bytes);
+            // HNSW: decode rkyv blobs into owned map.
+            let hnsw_state = base
+                .hnsw_section()
+                .map(archived_hnsw_to_owned)
+                .unwrap_or_default();
+            // IVF: raw bincode bytes; deserialized on first mutation/query.
+            let ivf_bytes = base.ivf_bytes().map(|b| b.to_vec()).unwrap_or_default();
+            self.engine.store_snapshot_state(hnsw_state, ivf_bytes);
+        }
+        self.v8_sections_loaded.store(true, Ordering::Release);
     }
 
     /// Return a `TopologyView` that merges the mmap'd base (when present) with
@@ -1415,6 +1457,8 @@ impl<F: Fs> GraphDb<F> {
             defer_events: false,
             deferred_events: Vec::new(),
             degraded: false,
+            v8_sections_loaded: std::sync::atomic::AtomicBool::new(false),
+            v8_sections_mutex: std::sync::Mutex::new(()),
         };
         // Base state: a truncating snapshot compacts all pre-truncation
         // commits, so the on-disk WAL head coincides with the snapshot and
@@ -2689,6 +2733,7 @@ impl<F: Fs> GraphDb<F> {
         // no-op if provenance was never stored (fresh store) or has already been
         // consumed (subsequent mutations).  WAL replay calls apply() directly
         // and is covered by consume_retained_state_eager before replay.
+        self.ensure_v8_base_sections_loaded();
         self.engine.ensure_provenance_loaded_mut();
         // Invariant (I-1): no stale deltas may enter from a previous apply.
         // If any engine method ever accumulates deltas before erroring, they would
@@ -4535,6 +4580,7 @@ impl<F: Fs> GraphDb<F> {
     /// Plan-8 `by_node` index). Sorted by `(edge_type, src_key, dst_key)`.
     /// Unknown key → [`GraphError::KeyNotFound`].
     pub fn node_edges(&self, key: &str) -> Result<Vec<EdgeInfo>> {
+        self.ensure_v8_base_sections_loaded();
         let id = self
             .ids
             .get(key)
@@ -5301,6 +5347,7 @@ impl<F: Fs> GraphDb<F> {
     /// Results are sorted by (rule, edge_type).
     /// Returns `Err(KeyNotFound)` if either key is unknown.
     pub fn explain(&self, key_a: &str, key_b: &str) -> Result<Vec<Explanation>> {
+        self.ensure_v8_base_sections_loaded();
         let id_a = self
             .ids
             .get(key_a)
@@ -5574,6 +5621,7 @@ impl<F: Fs> GraphDb<F> {
     /// Live/tombstone/edge counts plus per-rule provenance size, trip latch,
     /// and fire counter (includes rebuild evaluations). Rules are sorted by name.
     pub fn stats(&self) -> Stats {
+        self.ensure_v8_base_sections_loaded();
         let rules: Vec<RuleStats> = self
             .engine
             .rules()
@@ -5652,6 +5700,7 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        self.ensure_v8_base_sections_loaded();
         // Ensure provenance is decoded before to_persist() clones it.
         self.engine.ensure_provenance_loaded_mut();
         let (rule_defs_typed, provenance, rule_tripped, rule_fires) = self.engine.to_persist();
@@ -5659,33 +5708,42 @@ impl<F: Fs> GraphDb<F> {
             .iter()
             .map(|r| bincode::serialize(r).expect("RuleDef serialize cannot fail"))
             .collect();
-        // Collect HNSW state and IVF state as raw bincode bytes (section 10).
-        let hnsw_state = self.engine.export_hnsw_state();
-        let raw_ivf = self.engine.export_ivf_state();
-        let ivf_state_map: BTreeMap<String, core_storage::snapshot::PerRuleIvfState> = raw_ivf
-            .into_iter()
-            .map(|(name, ((sc, sa, sd), (dc, da, dd)))| {
-                (
-                    name,
-                    core_storage::snapshot::PerRuleIvfState {
-                        src: core_storage::snapshot::SideIvfState {
-                            centroids: sc,
-                            clusters: sa,
-                            drift: sd,
-                        },
-                        dst: core_storage::snapshot::SideIvfState {
-                            centroids: dc,
-                            clusters: da,
-                            drift: dd,
-                        },
-                    },
-                )
-            })
-            .collect();
-        let ivf_bytes = if ivf_state_map.is_empty() {
-            Vec::new()
+        // Collect HNSW state and IVF state.  When indexes are not yet
+        // populated (clean open, no mutation since open), pass the retained
+        // raw bytes through directly so that migrate/snapshot does not
+        // silently discard fitted approximate-rule indexes.
+        let hnsw_state = self.engine.export_hnsw_state_passthrough();
+        let ivf_bytes = if !self.engine.indexes_populated() {
+            // Pass retained IVF bytes through unchanged (no re-encode).
+            self.engine.retained_ivf_bytes_clone().unwrap_or_default()
         } else {
-            bincode::serialize(&ivf_state_map).expect("IVF state serialize cannot fail")
+            // Indexes live: encode from current state.
+            let raw_ivf = self.engine.export_ivf_state();
+            let ivf_state_map: BTreeMap<String, core_storage::snapshot::PerRuleIvfState> = raw_ivf
+                .into_iter()
+                .map(|(name, ((sc, sa, sd), (dc, da, dd)))| {
+                    (
+                        name,
+                        core_storage::snapshot::PerRuleIvfState {
+                            src: core_storage::snapshot::SideIvfState {
+                                centroids: sc,
+                                clusters: sa,
+                                drift: sd,
+                            },
+                            dst: core_storage::snapshot::SideIvfState {
+                                centroids: dc,
+                                clusters: da,
+                                drift: dd,
+                            },
+                        },
+                    )
+                })
+                .collect();
+            if ivf_state_map.is_empty() {
+                Vec::new()
+            } else {
+                bincode::serialize(&ivf_state_map).expect("IVF state serialize cannot fail")
+            }
         };
         let view_defs: Vec<Vec<u8>> = self
             .view_store

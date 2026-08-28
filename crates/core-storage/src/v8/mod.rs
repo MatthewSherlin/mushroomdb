@@ -145,6 +145,37 @@ impl MappedBase {
         })
     }
 
+    /// Check that every section listed in the directory fits within the backing
+    /// buffer.  Pure pointer arithmetic — no bytes are read, no CRCs are
+    /// computed, and no page faults are triggered.
+    ///
+    /// Used by `restore_v8_base` to detect truncated snapshots eagerly at
+    /// open time before the expensive section content reads are deferred.
+    pub fn validate_section_bounds(&self) -> Result<()> {
+        for entry in &self.dir {
+            let start = entry.offset as usize;
+            let end = start
+                .checked_add(entry.len as usize)
+                .ok_or_else(|| GraphError::Corrupt {
+                    detail: format!(
+                        "v8: section {} length overflow (offset={}, len={})",
+                        entry.id, entry.offset, entry.len
+                    ),
+                })?;
+            self.backing
+                .get(start..end)
+                .ok_or_else(|| GraphError::Corrupt {
+                    detail: format!(
+                        "v8: section {} extends beyond file (end={}, file_len={})",
+                        entry.id,
+                        end,
+                        self.backing.len()
+                    ),
+                })?;
+        }
+        Ok(())
+    }
+
     /// Return the raw bytes for `section_id`, validating its CRC32 lazily.
     fn section_bytes(&self, section_id: u8) -> Result<&[u8]> {
         let entry = self

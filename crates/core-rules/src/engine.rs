@@ -157,10 +157,11 @@ pub struct RuleEngine {
     /// Raw bincode bytes of the IVF cluster state retained from the last snapshot.
     ///
     /// Same lifecycle as `retained_hnsw_blobs` (mutation path only; consumed
-    /// under `&mut self` in `consume_retained_state_eager` or the lazy-init
-    /// guard in `on_node_changed`).  Decoded via `decode_ivf_bytes` on first
-    /// use instead of at open time to avoid the ~544 MiB bincode overhead.
-    retained_ivf_bytes: Option<Vec<u8>>,
+    /// in `consume_retained_state_eager` or the lazy-init guard in
+    /// `on_node_changed`).  Decoded via `decode_ivf_bytes` on first use
+    /// instead of at open time to avoid the ~544 MiB bincode overhead.
+    /// Wrapped in Mutex so `store_snapshot_state` can take `&self`.
+    retained_ivf_bytes: Mutex<Option<Vec<u8>>>,
     /// Raw rkyv bytes of the provenance section retained from the last snapshot.
     ///
     /// Wrapped in `Mutex` so the `&self` read path (`ensure_provenance_loaded`)
@@ -1472,7 +1473,7 @@ impl RuleEngine {
             // lazy init in the mutation hooks (clean open, first-write cost).
             indexes_populated: false,
             retained_hnsw_blobs: Mutex::new(BTreeMap::new()),
-            retained_ivf_bytes: None,
+            retained_ivf_bytes: Mutex::new(None),
             retained_provenance_bytes: Mutex::new(None),
             lazy_provenance: OnceLock::new(),
             lazy_hnsw: OnceLock::new(),
@@ -1659,7 +1660,7 @@ impl RuleEngine {
     ///   - The mutation-hook lazy-init guard (clean open, first-write cost)
     ///   - `ensure_hnsw_loaded` (first ANN query on a clean open)
     pub fn store_snapshot_state(
-        &mut self,
+        &self,
         hnsw_blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
         ivf_bytes: Vec<u8>,
     ) {
@@ -1667,7 +1668,10 @@ impl RuleEngine {
             .retained_hnsw_blobs
             .lock()
             .expect("retained_hnsw_blobs lock poisoned") = hnsw_blobs;
-        self.retained_ivf_bytes = if ivf_bytes.is_empty() {
+        *self
+            .retained_ivf_bytes
+            .lock()
+            .expect("retained_ivf_bytes lock poisoned") = if ivf_bytes.is_empty() {
             None
         } else {
             Some(ivf_bytes)
@@ -1681,7 +1685,7 @@ impl RuleEngine {
     /// decoded here; it is materialized lazily — either by the `&self` read path
     /// (`ensure_provenance_loaded`) for stats/explain, or by the `&mut self`
     /// write path (`ensure_provenance_loaded_mut`) on the first mutation.
-    pub fn store_provenance_bytes(&mut self, bytes: Vec<u8>) {
+    pub fn store_provenance_bytes(&self, bytes: Vec<u8>) {
         *self
             .retained_provenance_bytes
             .lock()
@@ -1766,7 +1770,12 @@ impl RuleEngine {
                 .lock()
                 .expect("retained_hnsw_blobs lock poisoned"),
         );
-        let ivf_bytes = self.retained_ivf_bytes.take().unwrap_or_default();
+        let ivf_bytes = self
+            .retained_ivf_bytes
+            .lock()
+            .expect("retained_ivf_bytes lock poisoned")
+            .take()
+            .unwrap_or_default();
         let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
         self.reindex_all_load_ivf(ids, syms, labels, props, ivf);
         // Override the incrementally-built HNSW with the persisted blob (better).
@@ -1846,6 +1855,34 @@ impl RuleEngine {
             }
         }
         out
+    }
+
+    /// Returns HNSW state for snapshotting.  When indexes are not yet populated
+    /// (clean open with no mutation), returns the retained raw blobs directly so
+    /// that a migrate/snapshot does not silently drop fitted indexes.
+    pub fn export_hnsw_state_passthrough(&self) -> BTreeMap<String, (Vec<u8>, Vec<u8>)> {
+        if !self.indexes_populated {
+            let guard = self
+                .retained_hnsw_blobs
+                .lock()
+                .expect("retained_hnsw_blobs lock poisoned");
+            if !guard.is_empty() {
+                return guard.clone();
+            }
+        }
+        self.export_hnsw_state()
+    }
+
+    /// Returns a clone of the retained raw IVF bincode bytes.
+    ///
+    /// Returns `None` if no bytes are retained (fresh store or indexes already
+    /// consumed by a mutation).  Used by `snapshot_with` for passthrough when
+    /// indexes have not yet been populated.
+    pub fn retained_ivf_bytes_clone(&self) -> Option<Vec<u8>> {
+        self.retained_ivf_bytes
+            .lock()
+            .expect("retained_ivf_bytes lock poisoned")
+            .clone()
     }
 
     /// Restore HNSW graphs from bincoded blobs (overrides any incrementally built
@@ -2095,7 +2132,12 @@ impl RuleEngine {
                     .lock()
                     .expect("retained_hnsw_blobs lock poisoned"),
             );
-            let ivf_bytes = self.retained_ivf_bytes.take().unwrap_or_default();
+            let ivf_bytes = self
+                .retained_ivf_bytes
+                .lock()
+                .expect("retained_ivf_bytes lock poisoned")
+                .take()
+                .unwrap_or_default();
             let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
             self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
             self.load_hnsw_state(hnsw);
@@ -2415,7 +2457,12 @@ impl RuleEngine {
                     .lock()
                     .expect("retained_hnsw_blobs lock poisoned"),
             );
-            let ivf_bytes = self.retained_ivf_bytes.take().unwrap_or_default();
+            let ivf_bytes = self
+                .retained_ivf_bytes
+                .lock()
+                .expect("retained_ivf_bytes lock poisoned")
+                .take()
+                .unwrap_or_default();
             let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
             self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
             self.load_hnsw_state(hnsw);
@@ -2509,7 +2556,12 @@ impl RuleEngine {
                     .lock()
                     .expect("retained_hnsw_blobs lock poisoned"),
             );
-            let ivf_bytes = self.retained_ivf_bytes.take().unwrap_or_default();
+            let ivf_bytes = self
+                .retained_ivf_bytes
+                .lock()
+                .expect("retained_ivf_bytes lock poisoned")
+                .take()
+                .unwrap_or_default();
             let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
             self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
             self.load_hnsw_state(hnsw);

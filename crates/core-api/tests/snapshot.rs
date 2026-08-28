@@ -2314,3 +2314,98 @@ fn v8_node_ref_props_visible_after_open() {
     );
     assert_eq!(bob_props.len(), 1, "bob must have exactly 1 prop");
 }
+
+/// Regression: clean-open snapshot (no mutation) must carry IVF/HNSW through.
+///
+/// Before fix: `snapshot_with` exported from live indexes (empty after a
+/// clean open) and wrote 0 bytes for the IVF section — migrate silently
+/// dropped fitted approximate-rule state.
+///
+/// After fix: passthrough methods detect `!indexes_populated` and forward
+/// the retained raw section bytes directly into the new snapshot.
+#[test]
+fn clean_open_snapshot_preserves_approx_rule_ivf_hnsw() {
+    let va_data: &[(&str, [f64; 2])] = &[
+        ("va0", [1.0, 0.0]),
+        ("va1", [0.98, 0.2]),
+        ("va2", [0.0, 1.0]),
+        ("va3", [-0.2, (1.0_f64 - 0.04_f64).sqrt()]),
+        ("va4", [-1.0, 0.0]),
+        ("va5", [-0.98, 0.2]),
+        ("va6", [0.0, -1.0]),
+        ("va7", [0.2, -0.98]),
+    ];
+
+    let dir = tmp("snap-passthrough");
+
+    // Phase 1: build store with approx rule, fit IVF, take first snapshot.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for (k, v) in va_data {
+            db.insert_node("VA", k, vec![("emb".into(), emb(v))])
+                .unwrap();
+        }
+        db.create_rule(RuleDef {
+            name: "vapprox".into(),
+            src_label: "VA".into(),
+            dst_label: "VA".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "VAPPROX".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: true,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })
+        .unwrap();
+        // Verify IVF produced edges before snapshotting.
+        let edges_before: Vec<String> = va_data
+            .iter()
+            .flat_map(|(k, _)| {
+                db.neighbors(k, "VAPPROX", Direction::Out)
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            !edges_before.is_empty(),
+            "approx rule must produce edges after fitting"
+        );
+        db.snapshot().unwrap(); // IVF/HNSW written to sections 10/6
+    }
+
+    // Phase 2: clean open + second snapshot with NO mutation.
+    // Before fix: snapshot_with exported from empty live indexes → 0 IVF bytes.
+    // After fix:  passthrough returns retained raw section bytes unchanged.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.snapshot_with(SnapshotOptions { keep_wal: false })
+            .unwrap();
+    }
+
+    // Phase 3: reopen from the second snapshot — edges must still be present.
+    let db = GraphDb::open(&dir).unwrap();
+    let edges_after: Vec<String> = va_data
+        .iter()
+        .flat_map(|(k, _)| {
+            db.neighbors(k, "VAPPROX", Direction::Out)
+                .unwrap_or_default()
+        })
+        .collect();
+    assert!(
+        !edges_after.is_empty(),
+        "approx rule edges must survive clean-open → snapshot passthrough; \
+         got 0 (IVF/HNSW was dropped)"
+    );
+
+    // Provenance must also be intact (stats().edges > 0).
+    let stats = db.stats();
+    let rule_stat = stats.rules.iter().find(|r| r.name == "vapprox").unwrap();
+    assert!(
+        rule_stat.edges > 0,
+        "provenance must be intact after clean-open snapshot; got 0 in stats"
+    );
+}
