@@ -104,6 +104,11 @@ pub enum Command {
     Snapshot {
         db_dir: PathBuf,
         keep_wal: bool,
+        /// Rename WAL to wal.<commit_seq>.archive before writing fresh baseline.
+        archive_wal: bool,
+        /// Keep the newest N archives; prune oldest at snapshot time.
+        /// None = unlimited. Applies only when archive_wal is true.
+        retention: Option<u32>,
     },
     /// Apply a JSON schema file idempotently (`schema apply <db-dir> <schema.json>`).
     SchemaApply {
@@ -473,11 +478,33 @@ pub fn run_query(db_dir: &Path, cypher: &str) -> Result<String, CliError> {
 fn parse_snapshot(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut keep_wal = false;
+    let mut archive_wal = false;
+    let mut retention: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
         if a == "--keep-wal" {
             keep_wal = true;
+            i += 1;
+        } else if a == "--archive-wal" {
+            archive_wal = true;
+            i += 1;
+        } else if a.starts_with("--retention=") {
+            let v = a.trim_start_matches("--retention=");
+            retention = Some(
+                v.parse::<u32>()
+                    .map_err(|_| format!("--retention= expects a u32, got: {v}"))?,
+            );
+            i += 1;
+        } else if a == "--retention" {
+            i += 1;
+            let v = args
+                .get(i)
+                .ok_or_else(|| "--retention requires a value".to_string())?;
+            retention = Some(
+                v.parse::<u32>()
+                    .map_err(|e| format!("--retention value error: {e}"))?,
+            );
             i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
@@ -489,7 +516,12 @@ fn parse_snapshot(args: &[&str]) -> Result<Command, String> {
         }
     }
     let db_dir = db_dir.ok_or_else(|| "snapshot requires <db-dir>".to_string())?;
-    Ok(Command::Snapshot { db_dir, keep_wal })
+    Ok(Command::Snapshot {
+        db_dir,
+        keep_wal,
+        archive_wal,
+        retention,
+    })
 }
 
 /// Migrate the snapshot at `db_dir` to the current format version.
@@ -573,10 +605,24 @@ pub fn run_verify(db_dir: &Path) -> Result<String, CliError> {
 }
 
 /// Open `dir` and write `snapshot.bin`. Default truncates the WAL.
-pub fn run_snapshot(db_dir: &Path, keep_wal: bool) -> Result<String, CliError> {
+pub fn run_snapshot(
+    db_dir: &Path,
+    keep_wal: bool,
+    archive_wal: bool,
+    retention: Option<u32>,
+) -> Result<String, CliError> {
     let mut db = GraphDb::open(db_dir)?;
-    if keep_wal {
-        db.snapshot_with(SnapshotOptions { keep_wal: true })?;
+    if archive_wal {
+        db.set_wal_archive_retention(retention);
+        db.snapshot_with(SnapshotOptions {
+            archive_wal: true,
+            keep_wal: false,
+        })?;
+    } else if keep_wal {
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: true,
+            archive_wal: false,
+        })?;
     } else {
         db.snapshot()?;
     }
@@ -2009,7 +2055,7 @@ mod tests {
             !dir.join("snapshot.bin").exists(),
             "GraphDb Drop must not snapshot"
         );
-        let out = run_snapshot(&dir, false).expect("snapshot");
+        let out = run_snapshot(&dir, false, false, None).expect("snapshot");
         assert!(
             dir.join("snapshot.bin").is_file(),
             "run_snapshot must write snapshot.bin"

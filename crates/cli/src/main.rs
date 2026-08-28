@@ -134,7 +134,12 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
-        Ok(Command::Snapshot { db_dir, keep_wal }) => match run_snapshot(&db_dir, keep_wal) {
+        Ok(Command::Snapshot {
+            db_dir,
+            keep_wal,
+            archive_wal,
+            retention,
+        }) => match run_snapshot(&db_dir, keep_wal, archive_wal, retention) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS

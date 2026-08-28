@@ -43,6 +43,11 @@ pub struct SimFs {
     /// Used by throughput benchmarks to simulate slow-storage (HDD / NVMe with
     /// flush guarantee) without requiring real disk I/O.  Zero by default.
     sync_delay_us: u64,
+    // --- WAL archive fields (Task 4) ---
+    /// In-memory WAL archives keyed by commit-seq N (wal.<N>.archive).
+    archives: HashMap<u64, Vec<u8>>,
+    /// Persisted horizon floor: first globally-indexed reachable commit.
+    horizon_floor: u64,
 }
 
 fn name(f: FileId) -> &'static str {
@@ -112,6 +117,8 @@ impl SimFs {
     pub fn surviving_state(&self) -> SimFs {
         SimFs {
             files: self.files.clone(),
+            archives: self.archives.clone(),
+            horizon_floor: self.horizon_floor,
             ..SimFs::default() // resets byte_crashed, op_crashed, ops, appended
         }
     }
@@ -203,6 +210,57 @@ impl Fs for SimFs {
         // NOT blocked by `byte_crashed`.
         self.check_op_crash()?;
         self.files.insert(name(file), data.to_vec());
+        self.tick_op();
+        Ok(())
+    }
+
+    // ── WAL archive methods ────────────────────────────────────────────────────
+
+    fn list_archives(&self) -> std::io::Result<Vec<u64>> {
+        // Op-mode participates; byte-mode does NOT block list_archives.
+        self.check_op_crash()?;
+        let mut ns: Vec<u64> = self.archives.keys().copied().collect();
+        ns.sort_unstable();
+        self.tick_op();
+        Ok(ns)
+    }
+
+    fn read_archive(&self, n: u64) -> std::io::Result<Vec<u8>> {
+        self.check_op_crash()?;
+        let data = self.archives.get(&n).cloned().unwrap_or_default();
+        self.tick_op();
+        Ok(data)
+    }
+
+    /// Atomically move the WAL bytes into the archives map (rename semantics:
+    /// old WAL disappears, archive appears atomically from the db's perspective).
+    /// Op-mode crash fires before any state is changed (whole-call failure).
+    fn archive_wal(&mut self, n: u64) -> std::io::Result<()> {
+        // NOT blocked by byte_crashed (rename is not an append/sync).
+        self.check_op_crash()?;
+        let wal = self.files.remove("wal").unwrap_or_default();
+        self.archives.insert(n, wal);
+        self.tick_op();
+        Ok(())
+    }
+
+    fn delete_archive(&mut self, n: u64) -> std::io::Result<()> {
+        self.check_op_crash()?;
+        self.archives.remove(&n);
+        self.tick_op();
+        Ok(())
+    }
+
+    fn read_horizon_floor(&self) -> std::io::Result<u64> {
+        self.check_op_crash()?;
+        let floor = self.horizon_floor;
+        self.tick_op();
+        Ok(floor)
+    }
+
+    fn write_horizon_floor(&mut self, floor: u64) -> std::io::Result<()> {
+        self.check_op_crash()?;
+        self.horizon_floor = floor;
         self.tick_op();
         Ok(())
     }
