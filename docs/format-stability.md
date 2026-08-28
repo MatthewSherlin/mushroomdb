@@ -96,6 +96,24 @@ WAL record discriminants 0–17 are append-only: once assigned, a discriminant
 is never reused for a different record shape. New record types receive the next
 available discriminant.
 
+### WAL archive sidecar files
+
+Stores that use `snapshot_with(archive_wal: true)` write additional sidecar
+files alongside `snapshot.bin` and `wal.bin`:
+
+| File | Written when | Purpose |
+|------|-------------|---------|
+| `wal.<N>.archive` | each `archive_wal` snapshot | renamed WAL file; N = cumulative end-frame index |
+| `wal.floor` | first retention prune | 8-byte LE u64 horizon floor |
+| `wal.genesis` | first archive, no prior truncation | empty marker: archive chain covers genesis |
+| `wal.truncated` | first `keep_wal=false` snapshot | write-once empty marker; persists across sessions to prevent a later archiving session from incorrectly claiming a complete genesis chain when the WAL history has a gap |
+
+`wal.truncated` is intentionally never deleted once written. Stores that predate
+this file (created before v0.2 archive support) and that are first archived
+under v0.2+ are treated conservatively: the genesis marker is not written and
+`open_at` returns `CommitOutOfRange` for archive-resident commits (safe
+refusal, not silent wrong data).
+
 ---
 
 ## Stability guarantees

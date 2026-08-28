@@ -709,6 +709,150 @@ fn legacy_store_conservative_no_genesis() {
     }
 }
 
+// ── Test 15: Cross-session archive names are monotonic ───────────────────────
+
+/// Verifies that archive names are globally monotonic across sessions, even
+/// when commit_seq is under-seeded from last_change on reopen.
+///
+/// Session 1: insert "a" (last_change[a]=1), insert "b" (last_change[b]=2),
+/// enable_fulltext (seq=3, no last_change update), disable_fulltext (seq=4,
+/// no last_change update), archive.  Baseline WAL is empty (fulltext disabled).
+///
+/// Session 2: reopens with commit_seq seeded from max(last_change)=2 plus 0
+/// baseline frames → commit_seq=2.  Inserts "c" → commit_seq=3.  Under the OLD
+/// naming (archive_n = commit_seq), this produces wal.3.archive, which sorts
+/// BEFORE session-1's archive — wrong temporal order.  Under the NEW naming
+/// (last_archive_n + live_frame_count), it produces a name strictly greater
+/// than session-1's archive.
+#[test]
+fn cross_session_archive_names_monotonic() {
+    let dir = tmp("monotonic");
+
+    // Session 1: 4 WAL frames, only 2 update last_change.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap(); // commit 0, last_change[a]=1
+        db.insert_node("N", "b", vec![]).unwrap(); // commit 1, last_change[b]=2
+        db.enable_fulltext("N", "tag").unwrap(); // commit 2 — no last_change update
+        db.disable_fulltext("N", "tag").unwrap(); // commit 3 — no last_change update
+                                                  // 4 live frames; archive_n_new = 0 + 4 = 4.
+                                                  // Baseline WAL: empty (fulltext disabled).
+        db.snapshot_with(opts_archive()).unwrap();
+    }
+
+    let s1_n: u64 = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".archive"))
+        .filter_map(|e| {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            s.strip_prefix("wal.")
+                .and_then(|r| r.strip_suffix(".archive"))
+                .and_then(|n| n.parse().ok())
+        })
+        .next()
+        .expect("session 1 must produce 1 archive");
+
+    // Session 2: commit_seq seeded from max(last_change)=2, 0 baseline frames.
+    // OLD scheme would produce archive_n = 3 (< s1_n); NEW scheme gives s1_n+1.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "c", vec![]).unwrap(); // 1 live frame
+        db.snapshot_with(opts_archive()).unwrap();
+    }
+
+    let mut archive_ns: Vec<u64> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".archive"))
+        .filter_map(|e| {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            s.strip_prefix("wal.")
+                .and_then(|r| r.strip_suffix(".archive"))
+                .and_then(|n| n.parse().ok())
+        })
+        .collect();
+    archive_ns.sort_unstable();
+    assert_eq!(archive_ns.len(), 2, "expected 2 archives: {archive_ns:?}");
+    assert!(
+        archive_ns[0] < archive_ns[1],
+        "archive names must be strictly increasing across sessions: {archive_ns:?}"
+    );
+    assert_eq!(archive_ns[0], s1_n, "first archive must be session-1's");
+
+    // History scan: all 3 nodes appear in correct temporal order.
+    let db = GraphDb::open(&dir).unwrap();
+    let ha = db.node_history("a").unwrap();
+    let hb = db.node_history("b").unwrap();
+    let hc = db.node_history("c").unwrap();
+    assert!(!ha.is_empty() && !hb.is_empty() && !hc.is_empty());
+    assert!(
+        ha[0].commit < hb[0].commit && hb[0].commit < hc[0].commit,
+        "history commits must be in temporal order: a={} b={} c={}",
+        ha[0].commit,
+        hb[0].commit,
+        hc[0].commit
+    );
+}
+
+// ── Test 16: Crash-window op-mode sweep through prune sequence ────────────────
+
+/// Sweeps all SimFs op crash points through a workload that includes
+/// retention-based archive pruning.  Every crash survivor must reopen without
+/// error (C1: floor written first before deletes), and the floor/total
+/// invariant must hold.  Commits below the floor always yield CommitOutOfRange.
+#[test]
+fn crash_window_prune_op_sweep() {
+    let total_ops = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        archive_prune_workload(&mut db).unwrap();
+        db.into_fs().total_ops()
+    };
+    assert!(
+        total_ops > 0,
+        "prune workload must perform at least one Fs op"
+    );
+
+    for crash_op in 0..=total_ops {
+        let survivor = match GraphDb::open_with(SimFs::with_crash_after_ops(crash_op)) {
+            Ok(mut db) => {
+                let _ = archive_prune_workload(&mut db);
+                db.into_fs().surviving_state()
+            }
+            Err(_) => SimFs::new(),
+        };
+
+        let db = GraphDb::open_with(survivor).unwrap_or_else(|e| {
+            panic!("crash_op={crash_op}: reopen after crash failed: {e}");
+        });
+
+        // Invariant: floor ≤ total_commits.
+        let floor = db.wal_horizon_floor();
+        let total = db.wal_total_commits().unwrap_or_else(|e| {
+            panic!("crash_op={crash_op}: wal_total_commits failed: {e}");
+        });
+        assert!(
+            floor <= total,
+            "crash_op={crash_op}: floor ({floor}) > total_commits ({total})"
+        );
+
+        // Invariant: commits below floor must yield CommitOutOfRange (never
+        // silently-wrong state).  was_linked checks floor before any node
+        // lookup, so this works even for non-existent node pairs.
+        for pruned in 0..floor {
+            match db.was_linked("x", "y", "E", pruned) {
+                Err(GraphError::CommitOutOfRange { .. }) => {}
+                other => panic!(
+                    "crash_op={crash_op}: was_linked at pruned commit {pruned} \
+                     expected CommitOutOfRange, got {other:?}"
+                ),
+            }
+        }
+    }
+}
+
 /// Minimal workload that exercises the archive_wal snapshot path.
 fn archive_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
     db.insert_node("N", "x", vec![])?;
@@ -719,5 +863,25 @@ fn archive_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::R
         ..SnapshotOptions::default()
     })?;
     db.insert_node("N", "z", vec![])?;
+    Ok(())
+}
+
+/// Workload that exercises the retention-prune path (two archives with
+/// retention=1, causing the first to be pruned when the second is taken).
+fn archive_prune_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    db.set_wal_archive_retention(Some(1));
+    // First archive: 2 frames.
+    db.insert_node("N", "x", vec![])?; // commit 0
+    db.insert_node("N", "y", vec![])?; // commit 1
+    db.snapshot_with(SnapshotOptions {
+        archive_wal: true,
+        ..SnapshotOptions::default()
+    })?;
+    // Second archive: 1 frame.  Prunes first archive → floor advances by 2.
+    db.insert_node("N", "z", vec![])?; // commit 2
+    db.snapshot_with(SnapshotOptions {
+        archive_wal: true,
+        ..SnapshotOptions::default()
+    })?;
     Ok(())
 }

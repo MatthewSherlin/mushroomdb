@@ -1239,6 +1239,12 @@ impl<F: Fs> GraphDb<F> {
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
         db.wal_ever_truncated = db.fs.has_truncation_marker();
+        // Opening cleanup: remove orphaned archives — archives whose frames all
+        // fall below the horizon floor.  Orphans arise when a crash interrupted
+        // the retention-prune sequence after the floor was written but before
+        // all surplus archives were deleted.  Safe to delete: floor already
+        // accounts for their frames.
+        db.cleanup_orphaned_archives()?;
         let _t0 = std::time::Instant::now();
         // Peek 6 bytes to determine snapshot version without reading the full
         // file. For RealFs this is a true partial read (O(1)); for SimFs the
@@ -1667,6 +1673,9 @@ impl<F: Fs> GraphDb<F> {
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
         db.wal_ever_truncated = db.fs.has_truncation_marker();
+        // Same orphaned-archive cleanup as open_with: floor was written first
+        // during pruning, so a crash may have left stale archives below floor.
+        db.cleanup_orphaned_archives()?;
         // Collect archive frames (oldest-first) and live WAL frames.
         // Archives represent pre-snapshot history; the snapshot captures the
         // cumulative state at the time of archiving.  Crash-window guarantee:
@@ -5949,6 +5958,36 @@ impl<F: Fs> GraphDb<F> {
         self.wal_archive_retention = keep;
     }
 
+    /// Delete any WAL archives that are fully below the current horizon floor.
+    ///
+    /// Orphaned archives arise when the floor is written first during retention
+    /// pruning and then a crash interrupts the archive-delete sequence.  The
+    /// opening cleanup ensures no subsequent read path sees stale data.
+    ///
+    /// Under the monotonic naming scheme, the archive name N equals the
+    /// cumulative end-frame index of the archive in global commit space (i.e.
+    /// the archive covers global frames `[prev_n, N)`).  An archive is
+    /// fully orphaned when `N <= wal_horizon_floor`: all of its frames fall
+    /// below the floor and have already been counted in it.
+    fn cleanup_orphaned_archives(&mut self) -> Result<()> {
+        if self.wal_horizon_floor == 0 {
+            // Floor at 0 means no pruning has ever occurred; nothing to clean.
+            return Ok(());
+        }
+        let archive_ns = self.fs.list_archives()?;
+        for n in archive_ns {
+            if n <= self.wal_horizon_floor {
+                // Archive N ends at global frame N; all its frames are below
+                // the floor (floor already accounts for them) → orphaned.
+                self.fs.delete_archive(n).map_err(GraphError::Io)?;
+            } else {
+                // Archives are sorted ascending; first one above floor stops scan.
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Collect all WAL frames from surviving archives (oldest-first) then the
     /// live WAL into one flat list, and return the total along with the number
     /// of archive frames at the front of the list.
@@ -6790,7 +6829,28 @@ impl<F: Fs> GraphDb<F> {
             let existing_archives = self.fs.list_archives()?;
             let is_first_archive = existing_archives.is_empty();
 
-            let archive_n = self.commit_seq;
+            // Compute a globally-monotonic archive name: the name equals the
+            // cumulative end-frame index of the archive in global commit space.
+            //
+            // Using `commit_seq` directly is UNSOUND across sessions: on reopen
+            // commit_seq is seeded from max(last_change), which underestimates
+            // the WAL depth when trailing commits (e.g. insert_edge) do not
+            // update last_change.  A session-2 archive could then receive a name
+            // ≤ the session-1 archive, causing incorrect sort order or collision.
+            //
+            // Instead: read and decode the live WAL here (before the rename) to
+            // get its exact frame count, then add it to the last known global
+            // end-frame index (the name of the most recent existing archive, or
+            // wal_horizon_floor if no archives exist).  This is O(WAL size) but
+            // snapshot is already serialising the full graph state, so the cost
+            // is dominated.
+            let live_wal_bytes_for_name = self.fs.read(FileId::Wal)?;
+            let (live_frames_for_name, _) = decode_all(&live_wal_bytes_for_name);
+            let archive_n = existing_archives
+                .last()
+                .copied()
+                .unwrap_or(self.wal_horizon_floor)
+                + live_frames_for_name.len() as u64;
             self.fs.archive_wal(archive_n)?;
 
             // Genesis marker: written once when the first archive is taken
@@ -6816,30 +6876,45 @@ impl<F: Fs> GraphDb<F> {
 
             // Retention pruning: keep newest `keep` archives; delete oldest.
             // Pruning is the ONLY deletion site for archives.
+            //
+            // Crash-safety ordering (C1 fix):
+            //   1. Count frames in surplus archives (reads only — no mutation).
+            //   2. Advance and PERSIST the horizon floor FIRST via write-then-
+            //      rename (atomic).  A crash after this point leaves orphaned
+            //      archives on disk, but the floor is correct.  The opening
+            //      cleanup sweep (`cleanup_orphaned_archives`) removes them on
+            //      the next open, so the store is always safe to reopen.
+            //   3. Delete the genesis marker (floor > 0 already blocks open_at
+            //      via the conjunctive gate; marker cleanup is belt-and-suspenders).
+            //   4. Delete surplus archives.  A crash between any two deletes
+            //      leaves the floor committed and orphaned archives cleaned at
+            //      next open — never a stale floor with a missing archive prefix.
             if let Some(keep) = self.wal_archive_retention {
                 if keep > 0 {
                     let archives = self.fs.list_archives()?;
                     // archives is sorted ascending (oldest first)
                     if archives.len() as u32 > keep {
                         let surplus = archives.len() - keep as usize;
-                        // Count frames in each archive BEFORE deleting so we
-                        // can advance the horizon floor by the exact pruned
-                        // frame count.
+                        // Step 1: count pruned frames (reads, no mutation).
                         let mut pruned_frames = 0u64;
                         for &n in &archives[..surplus] {
                             let bytes = self.fs.read_archive(n)?;
                             let (frames, _) = decode_all(&bytes);
                             pruned_frames += frames.len() as u64;
-                            self.fs.delete_archive(n)?;
                         }
+                        // Step 2: advance and persist floor FIRST.
                         self.wal_horizon_floor += pruned_frames;
-                        // Persist floor so it survives reopen.
                         self.fs.write_horizon_floor(self.wal_horizon_floor)?;
-                        // Pruning breaks the genesis chain: surviving archives
-                        // no longer begin at global index 0.
+                        // Step 3: delete genesis marker (floor > 0 already
+                        // blocks open_at; this is belt-and-suspenders cleanup).
                         if pruned_frames > 0 && self.archive_genesis_chain {
                             self.fs.delete_genesis_marker()?;
                             self.archive_genesis_chain = false;
+                        }
+                        // Step 4: delete surplus archives.  Crash here →
+                        // orphaned archives; cleaned at next open.
+                        for &n in &archives[..surplus] {
+                            self.fs.delete_archive(n)?;
                         }
                     }
                 }
