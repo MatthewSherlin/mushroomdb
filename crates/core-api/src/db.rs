@@ -5700,6 +5700,238 @@ impl<F: Fs> GraphDb<F> {
         Ok(out)
     }
 
+    /// Return the per-edge change history between nodes `a` and `b` by scanning
+    /// the on-disk WAL.
+    ///
+    /// ## Horizon
+    ///
+    /// History reaches back only to the last WAL-truncating snapshot, exactly
+    /// like `node_history` and `open_at`. The returned [`HistoryResult`] carries
+    /// `total_commits` (= number of WAL frames), which is the exclusive upper
+    /// bound for valid commit indices.
+    ///
+    /// ## Derived edges
+    ///
+    /// Rule-derived edges are **not** WAL-logged and therefore never appear in
+    /// the result. The `rule` field of every returned event is always `None`.
+    ///
+    /// ## DeleteNode
+    ///
+    /// When a node is deleted, its incident edges are swept inline without
+    /// emitting individual `DeleteEdge` WAL records. `edge_history` detects
+    /// `DeleteNode` events for either endpoint and synthesises `Retracted`
+    /// events for every edge between `a` and `b` that was active at that point.
+    ///
+    /// ## Masks
+    ///
+    /// Like `node_history`, this method has no mask parameter and returns WAL
+    /// history regardless of any role mask. For masked history semantics, apply
+    /// the mask at the caller level.
+    pub fn edge_history(
+        &self,
+        a: &str,
+        b: &str,
+    ) -> Result<crate::history::HistoryResult<crate::history::EdgeHistoryEvent>> {
+        use crate::history::{EdgeEvent, EdgeHistoryEvent, HistoryResult};
+        use core_storage::wal::WalRecord;
+
+        let bytes = self.fs.read(FileId::Wal)?;
+        let (frames, _) = decode_all(&bytes);
+        let total_commits = frames.len() as u64;
+
+        // Active edges between a and b tracked as (edge_type, src_key, dst_key)
+        // so we can emit synthetic Retracted events on DeleteNode.
+        let mut active: Vec<(String, String, String)> = Vec::new();
+        let mut out: Vec<EdgeHistoryEvent> = Vec::new();
+
+        for (commit, frame) in frames.iter().enumerate() {
+            let commit = commit as u64;
+            let records: &[WalRecord] = match frame {
+                WalRecord::Batch(inner) => inner.as_slice(),
+                single => std::slice::from_ref(single),
+            };
+
+            for rec in records {
+                match rec {
+                    WalRecord::InsertEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.push((edge_type.clone(), src_key.clone(), dst_key.clone()));
+                            out.push(EdgeHistoryEvent {
+                                edge_type: edge_type.clone(),
+                                commit,
+                                event: EdgeEvent::Added,
+                                rule: None,
+                            });
+                        }
+                    }
+                    WalRecord::InsertEdgeId { etype, src, dst } => {
+                        let etype_str = match self.syms.resolve(*etype) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        // Use key_of_historical so tombstoned nodes (deleted
+                        // later in the WAL) still resolve during the scan.
+                        let src_key = self.ids.key_of_historical(*src);
+                        let dst_key = self.ids.key_of_historical(*dst);
+                        let is_ab = src_key == Some(a) && dst_key == Some(b);
+                        let is_ba = src_key == Some(b) && dst_key == Some(a);
+                        if is_ab || is_ba {
+                            let src_str = src_key.unwrap().to_string();
+                            let dst_str = dst_key.unwrap().to_string();
+                            active.push((etype_str.clone(), src_str, dst_str));
+                            out.push(EdgeHistoryEvent {
+                                edge_type: etype_str,
+                                commit,
+                                event: EdgeEvent::Added,
+                                rule: None,
+                            });
+                        }
+                    }
+                    WalRecord::DeleteEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            // Remove the first matching active entry.
+                            if let Some(pos) = active.iter().position(|(et, s, d)| {
+                                et == edge_type && s == src_key && d == dst_key
+                            }) {
+                                active.remove(pos);
+                            }
+                            out.push(EdgeHistoryEvent {
+                                edge_type: edge_type.clone(),
+                                commit,
+                                event: EdgeEvent::Retracted,
+                                rule: None,
+                            });
+                        }
+                    }
+                    WalRecord::DeleteNode { key: k } if k == a || k == b => {
+                        // Sweep: all active edges involving the deleted node
+                        // are implicitly retracted without individual DeleteEdge
+                        // records. Emit synthetic Retracted for each.
+                        for (et, _, _) in active.drain(..) {
+                            out.push(EdgeHistoryEvent {
+                                edge_type: et,
+                                commit,
+                                event: EdgeEvent::Retracted,
+                                rule: None,
+                            });
+                        }
+                    }
+                    // All other records (InsertNode, SetProp, CreateRule, etc.)
+                    // do not affect edges between a and b.
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(HistoryResult {
+            items: out,
+            total_commits,
+        })
+    }
+
+    /// Return `true` iff an edge of `edge_type` existed between `a` and `b`
+    /// (in either direction) at the WAL commit `at_commit`.
+    ///
+    /// ## Horizon
+    ///
+    /// Valid commit indices are `0..total_commits` where `total_commits` is the
+    /// number of WAL frames. An `at_commit >= total_commits` is outside the
+    /// visible horizon and returns [`GraphError::CommitOutOfRange`].
+    ///
+    /// ## Derived edges
+    ///
+    /// Rule-derived edges are not WAL-logged and are therefore invisible to this
+    /// query, matching `edge_history`'s fidelity.
+    pub fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> Result<bool> {
+        use core_storage::wal::WalRecord;
+
+        let bytes = self.fs.read(FileId::Wal)?;
+        let (frames, _) = decode_all(&bytes);
+        let total_commits = frames.len() as u64;
+
+        if at_commit >= total_commits {
+            return Err(GraphError::CommitOutOfRange {
+                commit: at_commit,
+                total: total_commits,
+            });
+        }
+
+        // Replay frames 0..=at_commit, tracking active edges of the requested type.
+        let mut active: BTreeSet<(String, String, String)> = BTreeSet::new();
+
+        for (commit, frame) in frames.iter().enumerate().take((at_commit + 1) as usize) {
+            let _commit = commit as u64;
+            let records: &[WalRecord] = match frame {
+                WalRecord::Batch(inner) => inner.as_slice(),
+                single => std::slice::from_ref(single),
+            };
+
+            for rec in records {
+                match rec {
+                    WalRecord::InsertEdge {
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.insert((et.clone(), src_key.clone(), dst_key.clone()));
+                        }
+                    }
+                    WalRecord::InsertEdgeId { etype, src, dst } => {
+                        let etype_str = match self.syms.resolve(*etype) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        // Use key_of_historical so tombstoned nodes resolve.
+                        let src_key = self.ids.key_of_historical(*src);
+                        let dst_key = self.ids.key_of_historical(*dst);
+                        let is_ab = src_key == Some(a) && dst_key == Some(b);
+                        let is_ba = src_key == Some(b) && dst_key == Some(a);
+                        if is_ab || is_ba {
+                            active.insert((
+                                etype_str,
+                                src_key.unwrap().to_string(),
+                                dst_key.unwrap().to_string(),
+                            ));
+                        }
+                    }
+                    WalRecord::DeleteEdge {
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
+                        }
+                    }
+                    WalRecord::DeleteNode { key: k } if k == a || k == b => {
+                        // All edges touching the deleted node are gone.
+                        active.retain(|(_, s, d)| s != k && d != k);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(active.iter().any(|(et, _, _)| et == edge_type))
+    }
+
     pub fn edge_count(&self) -> u64 {
         self.topo_view().edge_count()
     }

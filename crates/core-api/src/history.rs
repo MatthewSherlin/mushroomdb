@@ -1,5 +1,44 @@
 use core_storage::Value;
 
+// ── Edge history types ────────────────────────────────────────────────────────
+
+/// Result wrapper for history queries. Carries the event list and the total
+/// number of WAL commits visible in the current horizon window.
+///
+/// Valid commit indices for `was_linked` are `0..total_commits`. Any index
+/// `>= total_commits` is outside the horizon and `was_linked` will return
+/// `CommitOutOfRange`.
+#[derive(Debug)]
+pub struct HistoryResult<T> {
+    pub items: Vec<T>,
+    /// Exclusive upper bound for valid commit indices (`frames.len()`).
+    /// The horizon window is `[0, total_commits)`.
+    pub total_commits: u64,
+}
+
+/// A single add-or-retract event for an edge between two nodes.
+#[derive(Debug, PartialEq)]
+pub struct EdgeHistoryEvent {
+    pub edge_type: String,
+    /// 0-based WAL frame index of the commit that produced this event.
+    pub commit: u64,
+    pub event: EdgeEvent,
+    /// `Some(rule_name)` for rule-derived edges, `None` for manually written
+    /// edges. In the current implementation this is always `None` because
+    /// derived edges are not WAL-logged (see `derived_edges_are_not_wal_logged`
+    /// test in rules.rs).
+    pub rule: Option<String>,
+}
+
+/// Whether an edge was added or retracted.
+#[derive(Debug, PartialEq)]
+pub enum EdgeEvent {
+    Added,
+    Retracted,
+}
+
+// ── Node history types ────────────────────────────────────────────────────────
+
 /// A single change event in a node's history, paired with the WAL commit that produced it.
 ///
 /// ## Horizon
