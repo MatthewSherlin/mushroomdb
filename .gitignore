@@ -18,3 +18,4 @@ ui/playwright/.cache/
 .DS_Store
 
 .worktrees/
+docs/registry-submissions/

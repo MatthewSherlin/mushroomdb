@@ -18,7 +18,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MatthewSherlin/mushroomdb"
 rust-version = "1.92.0"
-keywords = ["graph-database", "embedded", "cypher", "rules"]
+keywords = ["graph", "embedded", "database", "mcp", "agent-memory"]
 categories = ["database-implementations", "data-structures"]
 
 [workspace.dependencies]

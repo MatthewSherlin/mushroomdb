@@ -9,7 +9,7 @@ description = "LangChain GraphStore backed by the mushroomdb embedded graph data
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
-keywords = ["graph-database", "langchain", "knowledge-graph", "mushroomdb"]
+keywords = ["graph", "embedded", "database", "mcp", "agent-memory", "langchain", "knowledge-graph", "mushroomdb"]
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "License :: OSI Approved :: MIT License",
