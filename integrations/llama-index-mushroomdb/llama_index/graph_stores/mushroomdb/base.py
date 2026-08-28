@@ -610,8 +610,18 @@ class MushroomDBPropertyGraphStore(PropertyGraphStore):
     ) -> Tuple[List[LabelledNode], List[float]]:
         return self.vector_query(query, **kwargs)
 
-    def __del__(self) -> None:
+    def close(self) -> None:
+        """Flush and close the mushroomdb handle.
+
+        Prefer calling ``close()`` explicitly (or using ``try/finally``) over
+        relying on ``__del__``.  ``__del__`` is a backstop — the interpreter
+        does not guarantee when or whether it runs.  Calling ``close()`` twice
+        is safe (the second call is silently ignored).
+        """
         try:
             self._db.close()
         except Exception:
             pass
+
+    def __del__(self) -> None:
+        self.close()

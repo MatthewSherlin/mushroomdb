@@ -121,7 +121,7 @@ rows = store.structured_query(
 
 # Flush to snapshot
 store.persist("/ignored/path")
-store._db.close()
+store.close()
 ```
 
 ## Reserved internal property names
