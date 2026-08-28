@@ -5997,8 +5997,10 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// ## Derived edges
     ///
-    /// Rule-derived edges are not WAL-logged and are therefore invisible to this
-    /// query, matching `edge_history`'s fidelity.
+    /// Rule-derived edges are tracked via `DerivedEdgeAdded` / `DerivedEdgeRetracted`
+    /// WAL markers appended at firing time (Task 1). `was_linked` reads these markers
+    /// and therefore includes derived edges in its point-in-time evaluation,
+    /// matching `edge_history`'s fidelity.
     pub fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> Result<bool> {
         use core_storage::wal::WalRecord;
 

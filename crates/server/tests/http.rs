@@ -2483,6 +2483,12 @@ async fn role_token_node_history_hidden_key_is_404() {
         "hidden key must be 404: {}",
         String::from_utf8_lossy(&body)
     );
+    let v = parse_json(&body);
+    assert_eq!(
+        v,
+        json!({"error": "node key not found: sec1"}),
+        "body must match key_not_found shape"
+    );
 }
 
 #[tokio::test]
@@ -2526,30 +2532,118 @@ async fn role_token_edge_history_one_hidden_is_404() {
         "hidden endpoint must give 404: {}",
         String::from_utf8_lossy(&body)
     );
+    let v = parse_json(&body);
+    assert_eq!(
+        v,
+        json!({"error": "node key not found: sec1"}),
+        "body must match key_not_found shape"
+    );
 }
 
 #[tokio::test]
 async fn role_token_history_write_denied() {
-    // History endpoints are GET-only. Confirm a role token can't POST to them.
-    // (The route doesn't exist, so Axum returns 405 Method Not Allowed.)
+    // Confirm that a role token is rejected (403 FORBIDDEN) on write endpoints.
+    // POST /ingest is a real write endpoint guarded by RBAC — this tests the
+    // auth middleware, not Axum routing behaviour.
     let (app, _db) = open_rbac(
-        "hist-role-post",
+        "hist-role-write-denied",
         &[("analyst", &["Person"], &[])],
         Some("admin"),
         &[("role-tok", "analyst")],
     );
-    let req = Request::builder()
-        .method("POST")
-        .uri("/node/alice/history")
-        .header(axum::http::header::AUTHORIZATION, "Bearer role-tok")
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .body(Body::from("{}"))
-        .unwrap();
+    let req = authed_json_req(
+        "POST",
+        "/ingest",
+        "role-tok",
+        json!({"label": "Person", "rows": [{"id": "x"}]}),
+    );
     let (status, _, _) = send(app, req).await;
-    // Axum returns 405 for unregistered methods on a known path.
-    assert_ne!(
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "role token must be 403 on POST /ingest"
+    );
+}
+
+// ── Fix round-2: C1 — node_history Role branch must filter hidden edge neighbors
+
+/// C1 leak-repro: a VISIBLE node's history must NOT reveal hidden neighbor keys
+/// in EdgeAdded/EdgeRemoved entries when accessed by a role token.
+///
+/// Setup: visible Person/alice + hidden Secret/shadow + LINK edge alice→shadow.
+/// Role token (can see Person, not Secret): GET /node/alice/history must return
+/// history with no mention of "shadow" in any entry.
+/// Full token: the same request MUST include the EdgeAdded entry naming "shadow".
+#[tokio::test]
+async fn role_token_node_history_filters_hidden_edge_neighbor() {
+    let (app, db) = open_rbac(
+        "hist-nh-c1-leak",
+        &[("analyst", &["Person"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    {
+        let mut w = db.write();
+        w.insert_node("Person", "alice", vec![]).unwrap();
+        w.insert_node("Secret", "shadow", vec![]).unwrap();
+        w.insert_edge("LINK", "alice", "shadow").unwrap();
+    }
+
+    // Role token: alice is visible, shadow is not — the EdgeAdded entry for the
+    // LINK edge names "shadow" and must be stripped.
+    let (status, body, _) = send(app.clone(), authed_get("/node/alice/history", "role-tok")).await;
+    assert_eq!(
         status,
         StatusCode::OK,
-        "POST to read-only history endpoint must not succeed"
+        "visible node must be 200 for role token: {}",
+        String::from_utf8_lossy(&body)
     );
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        !body_str.contains("shadow"),
+        "role token response must NOT contain hidden key 'shadow': {body_str}"
+    );
+
+    // Full token: same node, same edge — the EdgeAdded entry naming "shadow"
+    // must be present (unfiltered).
+    let (status, body, _) = send(app, authed_get("/node/alice/history", "admin")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("shadow"),
+        "full token response MUST contain edge neighbor key 'shadow': {body_str}"
+    );
+}
+
+/// I2: GET /node/{key}/history for an absent key must return 404 (same as GET
+/// /node/{key}) for BOTH Full and Role identities.
+#[tokio::test]
+async fn node_history_absent_key_is_404_both_identities() {
+    let (app, _db) = open_rbac(
+        "hist-nh-absent-404",
+        &[("analyst", &["Person"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    // Full token: absent key → 404.
+    let (status, body, _) = send(app.clone(), authed_get("/node/ghost/history", "admin")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "full token: absent key must be 404: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert_eq!(v, json!({"error": "node key not found: ghost"}));
+
+    // Role token: absent key → 404 (indistinguishable from hidden).
+    let (status, body, _) = send(app, authed_get("/node/ghost/history", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "role token: absent key must be 404: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert_eq!(v, json!({"error": "node key not found: ghost"}));
 }

@@ -1344,10 +1344,26 @@ async fn node_history_handler(
             Ok(n) => n,
             Err(e) => return graph_err(e),
         };
-        return json_ok(node_history_json(&key, &entries, total_commits));
+        // Filter EdgeAdded/EdgeRemoved entries whose `other` endpoint is hidden.
+        // A role token must not learn about hidden nodes via edge history events —
+        // mirrors the same protection in `node_edges` (http.rs ~978-989).
+        use core_api::HistoryChange;
+        let visible: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| match &entry.change {
+                HistoryChange::EdgeAdded { other, .. }
+                | HistoryChange::EdgeRemoved { other, .. } => role_mask.contains_node(&*g, other),
+                _ => true,
+            })
+            .collect();
+        return json_ok(node_history_json(&key, &visible, total_commits));
     }
-    // Full identity: no masking.
+    // Full identity: no masking. Return 404 for absent keys (consistent with
+    // GET /node/{key} and the Role branch above).
     let g = state.db.read();
+    if !g.has_node(&key) {
+        return key_not_found(key);
+    }
     let entries = match g.node_history(&key) {
         Ok(e) => e,
         Err(e) => return graph_err(e),
