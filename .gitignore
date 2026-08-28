@@ -18,3 +18,7 @@ ui/playwright/.cache/
 .DS_Store
 
 .worktrees/
+
+# Internal process docs — local only, never shipped
+docs/superpowers/
+docs/registry-submissions/
