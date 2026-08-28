@@ -147,6 +147,55 @@ def test_upsert_relations_creates_placeholder_nodes(store):
     assert len(nodes) == 2
 
 
+def test_label_update_relations_then_nodes(store):
+    """upsert_relations first (placeholders) then upsert_nodes with real label.
+
+    LlamaIndex does not guarantee insertion order, so nodes may arrive after
+    the relations that reference them.  The placeholder has label "entity";
+    the real EntityNode may carry label "Person".  The store must update the
+    label and preserve the incident edges.
+    """
+    # 1. Relations arrive first — creates placeholder nodes with label "entity"
+    rel = _make_rel("Alice", "KNOWS", "Bob")
+    store.upsert_relations([rel])
+
+    placeholders = store.get(ids=["Alice", "Bob"])
+    assert all(n.label == "entity" for n in placeholders)
+
+    # 2. Real nodes arrive later with correct label
+    alice = EntityNode(name="Alice", label="Person", properties={"role": "admin"})
+    bob = EntityNode(name="Bob", label="Person")
+    store.upsert_nodes([alice, bob])
+
+    # Label must now reflect the real label
+    updated = store.get(ids=["Alice", "Bob"])
+    assert all(n.label == "Person" for n in updated), [n.label for n in updated]
+
+    # Edge must still be present after the label update
+    triplets = store.get_triplets(entity_names=["Alice"])
+    assert len(triplets) == 1
+    _, r, dst = triplets[0]
+    assert r.label == "KNOWS"
+    assert dst.id == "Bob"
+
+
+def test_label_update_preserves_properties(store):
+    """Label update via delete+reinsert must not lose existing user properties."""
+    # Placeholder created by upsert_relations
+    rel = _make_rel("Alice", "LIKES", "Carol")
+    store.upsert_relations([rel])
+
+    # Real node with same id but new label and added properties
+    alice = EntityNode(name="Alice", label="Person", properties={"age": 30})
+    store.upsert_nodes([alice])
+
+    retrieved = store.get(ids=["Alice"])
+    assert len(retrieved) == 1
+    node = retrieved[0]
+    assert node.label == "Person"
+    assert node.properties.get("age") == 30
+
+
 def test_upsert_relation_idempotent(store):
     """Upserting the same relation twice produces exactly one edge."""
     alice = _make_entity("Alice")

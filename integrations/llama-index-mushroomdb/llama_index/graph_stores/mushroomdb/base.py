@@ -7,8 +7,26 @@ Binding surface gaps worked around in this file:
   computed in Python over embeddings stored as list-valued node properties.
 - No MERGE Cypher keyword: upsert is implemented as insert_node + set_prop
   fallback when the key already exists.
+- No label-rename primitive: when upsert_nodes is called for a key that
+  already exists with a different label (e.g. a placeholder created by
+  upsert_relations with label "entity" is later updated with label "Person"),
+  the store performs a delete + reinsert, restoring all user-owned edges
+  afterwards. Rule-derived edges are not restored (they are re-derived by the
+  engine automatically).
 - 'id' is a reserved Cypher parameter name: query parameters use 'k', 'v',
   'p0'..'pN' as parameter names instead.
+
+Reserved sentinel properties
+-----------------------------
+The following property names are used internally and must not appear in
+user-supplied ``EntityNode.properties`` or ``ChunkNode.properties`` — they
+will be silently overwritten on every upsert:
+
+  ``__id__``        — the node's primary key (= LabelledNode.id)
+  ``__type__``      — "entity" or "chunk"
+  ``__name__``      — EntityNode.name
+  ``__text__``      — ChunkNode.text
+  ``__embedding__`` — the embedding vector (list of floats)
 """
 
 from __future__ import annotations
@@ -61,6 +79,32 @@ class MushroomDBPropertyGraphStore(PropertyGraphStore):
         Filesystem path where mushroomdb will store its WAL/snapshot files.
         The directory is created automatically by the binding if it does not
         exist.
+
+    Notes
+    -----
+    **Reserved sentinel properties** — the following property names are managed
+    by this class and must not be used in user-supplied node ``properties``
+    dicts (they are silently overwritten on every upsert):
+
+    ============ ==============================================================
+    ``__id__``        Primary key (= ``LabelledNode.id``)
+    ``__type__``      Node kind: ``"entity"`` or ``"chunk"``
+    ``__name__``      ``EntityNode.name``
+    ``__text__``      ``ChunkNode.text``
+    ``__embedding__`` Embedding vector (list of floats)
+    ============ ==============================================================
+
+    **Label updates** — the mushroomdb binding has no label-rename primitive.
+    When a node with an existing key is upserted with a *different* label (the
+    common case: a placeholder node created with label ``"entity"`` by
+    ``upsert_relations`` is later given its real label via ``upsert_nodes``),
+    the implementation deletes the node and reinserts it with the new label,
+    then restores all user-owned incident edges.  Rule-derived edges are NOT
+    restored (the engine re-derives them automatically).
+
+    **Vector queries** — ``vector_query`` scans all embedded nodes in Python
+    (no native ANN in the binding as of 0.1.2).  This is fine for typical
+    knowledge-graph sizes; it does not scale to millions of nodes.
     """
 
     supports_structured_queries: bool = True
@@ -120,11 +164,29 @@ class MushroomDBPropertyGraphStore(PropertyGraphStore):
 
     def _upsert_one_node(self, node: LabelledNode) -> None:
         props = self._node_to_props(node)
-        if self._db.node_info(node.id) is None:
+        existing = self._db.node_info(node.id)
+        if existing is None:
             self._db.insert_node(node.label, node.id, props)
-        else:
+        elif existing["label"] == node.label:
+            # Same label — just update properties in place.
             for k, v in props.items():
                 self._db.set_prop(node.id, k, v)
+        else:
+            # Label changed (common case: placeholder "entity" → real label).
+            # mushroomdb has no rename primitive, so we delete + reinsert and
+            # restore all user-owned incident edges.  Rule-derived edges are
+            # re-derived automatically by the engine.
+            edges = self._db.node_edges(node.id)
+            user_edges = [e for e in edges if not e["derived"]]
+            self._db.query_write(
+                f"MATCH (n) WHERE n.{_PROP_ID} = '{_escape_str(node.id)}' DETACH DELETE n"
+            )
+            # Merge stored props with the incoming props (incoming wins).
+            merged = dict(existing["props"])
+            merged.update(props)
+            self._db.insert_node(node.label, node.id, merged)
+            for e in user_edges:
+                self._db.insert_edge(e["edge_type"], e["src_key"], e["dst_key"])
 
     def _ensure_node(self, node_id: str) -> None:
         """Create a placeholder entity node if the key does not exist."""
@@ -378,9 +440,16 @@ class MushroomDBPropertyGraphStore(PropertyGraphStore):
     ) -> Any:
         """Pass a Cypher statement through to mushroomdb.
 
-        Both read and write queries are accepted; the method tries a read first
-        and falls back to a write query if the result set is empty and the
-        statement contains a write keyword.
+        Read queries (MATCH/RETURN) are sent via ``query`` /
+        ``query_with_params``.  If mushroomdb raises ``RuntimeError`` (which
+        it does for write statements sent to the read-only path), the method
+        automatically retries via ``query_write``.  This means both read and
+        write Cypher is accepted transparently — callers do not need to
+        distinguish between them.
+
+        Note: mushroomdb supports a subset of openCypher.  ``MERGE``, ``id()``,
+        and double-quoted string literals are not supported.  Parameters must
+        not use ``id`` as a name (it is a reserved keyword in the parser).
         """
         params = list((param_map or {}).items())
         try:

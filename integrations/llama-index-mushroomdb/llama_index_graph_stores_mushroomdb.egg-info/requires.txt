@@ -1,6 +1,0 @@
-llama-index-core>=0.10
-mushroomdb
-
-[dev]
-pytest>=7
-maturin
