@@ -584,3 +584,140 @@ fn group_commit_triggers_rule_markers_written() {
         "batch-commit marker must carry rule attribution"
     );
 }
+
+#[test]
+fn delete_node_with_live_derived_edge_single_retraction() {
+    // C1 regression: deleting a node while a derived edge is live must produce
+    // EXACTLY ONE Retracted event with rule attribution (Some("fk")), not two
+    // (a synthetic rule:None from the DeleteNode sweep + a marker rule:Some).
+    let dir = tmp("eh-delete-derived");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "o1", vec![]).unwrap();
+    db.create_rule(fk_rule()).unwrap();
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![("org_id".into(), Value::Str("o1".into()))],
+    )
+    .unwrap();
+    assert_eq!(db.edge_count(), 1, "derived edge exists before delete");
+
+    // Delete the src node — triggers DeleteNode WAL record immediately followed
+    // by a DerivedEdgeRetracted marker.
+    db.delete_node("p1").unwrap();
+
+    let result = db.edge_history("p1", "o1").unwrap();
+    assert_eq!(
+        result.items.len(),
+        2,
+        "expected Added + exactly one Retracted; got: {:?}",
+        result.items
+    );
+    assert_eq!(result.items[0].event, EdgeEvent::Added);
+    assert_eq!(result.items[0].rule, Some("fk".to_string()));
+    assert_eq!(result.items[1].event, EdgeEvent::Retracted);
+    assert_eq!(
+        result.items[1].rule,
+        Some("fk".to_string()),
+        "single Retracted must carry rule attribution, not rule:None from synthetic sweep"
+    );
+}
+
+#[test]
+fn was_linked_false_after_delete_node_removes_derived_edge() {
+    // was_linked must return false at the DeleteNode commit for a derived edge
+    // that was live on the deleted node.
+    let dir = tmp("wl-delete-derived");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "o1", vec![]).unwrap();
+    db.create_rule(fk_rule()).unwrap();
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![("org_id".into(), Value::Str("o1".into()))],
+    )
+    .unwrap();
+    assert_eq!(db.edge_count(), 1, "derived edge exists before delete");
+
+    // Locate the Added marker commit from edge_history.
+    let h = db.edge_history("p1", "o1").unwrap();
+    let added_commit = h.items[0].commit;
+    assert!(
+        db.was_linked("p1", "o1", "BelongsTo", added_commit)
+            .unwrap(),
+        "linked at Added commit"
+    );
+
+    db.delete_node("p1").unwrap();
+
+    // Re-read history to find the Retracted commit.
+    let h2 = db.edge_history("p1", "o1").unwrap();
+    assert_eq!(h2.items.len(), 2, "Added + Retracted: {:?}", h2.items);
+    let retracted_commit = h2.items[1].commit;
+
+    // At the Retracted commit: not linked.
+    assert!(
+        !db.was_linked("p1", "o1", "BelongsTo", retracted_commit)
+            .unwrap(),
+        "not linked at Retracted commit"
+    );
+}
+
+#[test]
+fn delete_node_with_mixed_manual_and_derived_edges() {
+    // When a node has both a manual edge and a derived edge, DeleteNode must
+    // emit exactly two Retracted events: one rule:None (manual) and one
+    // rule:Some (derived).  Order follows the WAL: manual sweep before marker.
+    let dir = tmp("eh-delete-mixed");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "o1", vec![]).unwrap();
+    db.insert_node("Org", "o2", vec![]).unwrap();
+    db.create_rule(fk_rule()).unwrap();
+    // Insert p1 with a FK to o1 (fires derived BelongsTo p1→o1).
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![("org_id".into(), Value::Str("o1".into()))],
+    )
+    .unwrap();
+    // Also manually link p1 to o2.
+    db.insert_edge("Link", "p1", "o2").unwrap();
+
+    // Verify both edges exist.
+    assert_eq!(db.edge_count(), 2, "one derived + one manual edge");
+
+    db.delete_node("p1").unwrap();
+
+    // Manual edge p1→o2: Added(rule:None) then Retracted(rule:None).
+    let manual = db.edge_history("p1", "o2").unwrap();
+    assert_eq!(
+        manual.items.len(),
+        2,
+        "manual edge history: {:?}",
+        manual.items
+    );
+    assert_eq!(manual.items[0].event, EdgeEvent::Added);
+    assert_eq!(manual.items[0].rule, None);
+    assert_eq!(manual.items[1].event, EdgeEvent::Retracted);
+    assert_eq!(
+        manual.items[1].rule, None,
+        "manual edge retraction must have rule:None"
+    );
+
+    // Derived edge p1→o1: Added(rule:Some) then Retracted(rule:Some).
+    let derived = db.edge_history("p1", "o1").unwrap();
+    assert_eq!(
+        derived.items.len(),
+        2,
+        "derived edge history: {:?}",
+        derived.items
+    );
+    assert_eq!(derived.items[0].event, EdgeEvent::Added);
+    assert_eq!(derived.items[0].rule, Some("fk".to_string()));
+    assert_eq!(derived.items[1].event, EdgeEvent::Retracted);
+    assert_eq!(
+        derived.items[1].rule,
+        Some("fk".to_string()),
+        "derived edge retraction must carry rule attribution"
+    );
+}

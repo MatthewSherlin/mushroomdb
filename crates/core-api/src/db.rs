@@ -2846,11 +2846,23 @@ impl<F: Fs> GraphDb<F> {
         // Marker writing always needs the engine deltas, but the engine only
         // accumulates them when emit_deltas is true (normally gated on subscribers
         // or views being present).  Enable emission for this apply if it is
-        // currently off, then restore the original state after draining.
-        let restore_emit = !self.engine.emit_deltas();
-        if restore_emit {
+        // currently off, then restore the original state unconditionally via an
+        // RAII guard — this prevents a panic in apply() from leaking the flag.
+        struct RestoreEmitDeltas(*mut RuleEngine, bool);
+        impl Drop for RestoreEmitDeltas {
+            fn drop(&mut self) {
+                // SAFETY: pointer into self (GraphDb); guard is dropped within
+                // this frame before log_then_apply_with returns.
+                unsafe { (*self.0).set_emit_deltas(self.1) };
+            }
+        }
+        let original_emit = self.engine.emit_deltas();
+        if !original_emit {
             self.engine.set_emit_deltas(true);
         }
+        // SAFETY: raw pointer into self; guard dropped within this frame.
+        let _emit_guard = RestoreEmitDeltas(&mut self.engine as *mut _, original_emit);
+
         let apply_result = self.apply(&rec);
         // For Batch frames, post-validation apply must be infallible (see above).
         // A debug_assert here catches any future change that makes apply fallible
@@ -2866,10 +2878,8 @@ impl<F: Fs> GraphDb<F> {
         if apply_result.is_err() {
             // Discard any partial deltas accumulated by the failed apply.
             // They must not ride the next commit's event stream (I-1).
+            // _emit_guard restores emit_deltas on drop automatically.
             let _ = self.engine.drain_deltas();
-            if restore_emit {
-                self.engine.set_emit_deltas(false);
-            }
             let _ = self.engine.take_rebuild_needed();
             apply_result?;
         }
@@ -2877,10 +2887,8 @@ impl<F: Fs> GraphDb<F> {
         let seq = self.commit_seq;
         // Drain engine deltas and distribute to subscribers before the existing
         // MutationEvent sink fires — both happen post-fsync, post-apply.
+        // _emit_guard restores emit_deltas after this line when it drops.
         let engine_deltas = self.engine.drain_deltas();
-        if restore_emit {
-            self.engine.set_emit_deltas(false);
-        }
 
         // Append history-marker WAL records for any derived-edge changes so
         // that `edge_history` and `was_linked` can surface rule-attributed
@@ -5773,15 +5781,20 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// ## Derived edges
     ///
-    /// Rule-derived edges are **not** WAL-logged and therefore never appear in
-    /// the result. The `rule` field of every returned event is always `None`.
+    /// Rule-derived edges appear via `DerivedEdgeAdded` / `DerivedEdgeRetracted`
+    /// WAL markers written by `log_then_apply_with` after each rule-firing
+    /// mutation. The `rule` field of those events carries the rule name.
     ///
     /// ## DeleteNode
     ///
-    /// When a node is deleted, its incident edges are swept inline without
-    /// emitting individual `DeleteEdge` WAL records. `edge_history` detects
-    /// `DeleteNode` events for either endpoint and synthesises `Retracted`
-    /// events for every edge between `a` and `b` that was active at that point.
+    /// When a node is deleted, its manual incident edges are swept inline without
+    /// individual `DeleteEdge` WAL records. `edge_history` detects `DeleteNode`
+    /// events for either endpoint and synthesises `Retracted(rule:None)` events
+    /// for each manual edge that was active at that point. Derived edges active at
+    /// the time of deletion are handled by the `DerivedEdgeRetracted` marker that
+    /// the engine appends immediately after the `DeleteNode` record; those events
+    /// carry correct rule attribution and are emitted by the marker arm, not the
+    /// synthetic sweep.
     ///
     /// ## Masks
     ///
@@ -5800,9 +5813,12 @@ impl<F: Fs> GraphDb<F> {
         let (frames, _) = decode_all(&bytes);
         let total_commits = frames.len() as u64;
 
-        // Active edges between a and b tracked as (edge_type, src_key, dst_key)
-        // so we can emit synthetic Retracted events on DeleteNode.
-        let mut active: Vec<(String, String, String)> = Vec::new();
+        // Active edges between a and b tracked as (edge_type, src_key, dst_key, is_derived).
+        // The is_derived flag is used by the DeleteNode sweep: manual edges are
+        // swept with a synthetic Retracted(rule:None); derived edges are skipped
+        // because the engine writes a DerivedEdgeRetracted marker immediately after
+        // the DeleteNode record, which carries the correct rule attribution.
+        let mut active: Vec<(String, String, String, bool)> = Vec::new();
         let mut out: Vec<EdgeHistoryEvent> = Vec::new();
 
         for (commit, frame) in frames.iter().enumerate() {
@@ -5822,7 +5838,12 @@ impl<F: Fs> GraphDb<F> {
                         let is_ab = src_key == a && dst_key == b;
                         let is_ba = src_key == b && dst_key == a;
                         if is_ab || is_ba {
-                            active.push((edge_type.clone(), src_key.clone(), dst_key.clone()));
+                            active.push((
+                                edge_type.clone(),
+                                src_key.clone(),
+                                dst_key.clone(),
+                                false,
+                            ));
                             out.push(EdgeHistoryEvent {
                                 edge_type: edge_type.clone(),
                                 commit,
@@ -5845,7 +5866,7 @@ impl<F: Fs> GraphDb<F> {
                         if is_ab || is_ba {
                             let src_str = src_key.unwrap().to_string();
                             let dst_str = dst_key.unwrap().to_string();
-                            active.push((etype_str.clone(), src_str, dst_str));
+                            active.push((etype_str.clone(), src_str, dst_str, false));
                             out.push(EdgeHistoryEvent {
                                 edge_type: etype_str,
                                 commit,
@@ -5862,8 +5883,8 @@ impl<F: Fs> GraphDb<F> {
                         let is_ab = src_key == a && dst_key == b;
                         let is_ba = src_key == b && dst_key == a;
                         if is_ab || is_ba {
-                            // Remove the first matching active entry.
-                            if let Some(pos) = active.iter().position(|(et, s, d)| {
+                            // Remove the first matching active entry (flag ignored).
+                            if let Some(pos) = active.iter().position(|(et, s, d, _)| {
                                 et == edge_type && s == src_key && d == dst_key
                             }) {
                                 active.remove(pos);
@@ -5877,16 +5898,23 @@ impl<F: Fs> GraphDb<F> {
                         }
                     }
                     WalRecord::DeleteNode { key: k } if k == a || k == b => {
-                        // Sweep: all active edges involving the deleted node
-                        // are implicitly retracted without individual DeleteEdge
-                        // records. Emit synthetic Retracted for each.
-                        for (et, _, _) in active.drain(..) {
-                            out.push(EdgeHistoryEvent {
-                                edge_type: et,
-                                commit,
-                                event: EdgeEvent::Retracted,
-                                rule: None,
-                            });
+                        // Sweep: implicitly retract only MANUAL active edges.
+                        // Derived active edges are skipped here because the rule
+                        // engine appends a DerivedEdgeRetracted marker immediately
+                        // after this DeleteNode record; that marker produces the
+                        // single correctly-attributed Retracted event.  Derived
+                        // entries are dropped from `active` (the marker arm's
+                        // idempotent retain finds nothing to remove).
+                        for (et, _, _, is_derived) in active.drain(..) {
+                            if !is_derived {
+                                out.push(EdgeHistoryEvent {
+                                    edge_type: et,
+                                    commit,
+                                    event: EdgeEvent::Retracted,
+                                    rule: None,
+                                });
+                            }
+                            // Derived: drop silently; marker carries the Retracted event.
                         }
                     }
                     WalRecord::DerivedEdgeAdded {
@@ -5898,7 +5926,7 @@ impl<F: Fs> GraphDb<F> {
                         let is_ab = src_key == a && dst_key == b;
                         let is_ba = src_key == b && dst_key == a;
                         if is_ab || is_ba {
-                            active.push((et.clone(), src_key.clone(), dst_key.clone()));
+                            active.push((et.clone(), src_key.clone(), dst_key.clone(), true));
                             out.push(EdgeHistoryEvent {
                                 edge_type: et.clone(),
                                 commit,
@@ -5916,12 +5944,13 @@ impl<F: Fs> GraphDb<F> {
                         let is_ab = src_key == a && dst_key == b;
                         let is_ba = src_key == b && dst_key == a;
                         if is_ab || is_ba {
-                            if let Some(pos) = active
-                                .iter()
-                                .position(|(aet, s, d)| aet == et && s == src_key && d == dst_key)
-                            {
-                                active.remove(pos);
-                            }
+                            // Push unconditionally: a derived edge whose Added marker
+                            // predates the history horizon has no `active` entry, but
+                            // the retraction is still a real in-window event.
+                            // Remove from active idempotently if present.
+                            active.retain(|(aet, s, d, _)| {
+                                !(aet == et && s == src_key && d == dst_key)
+                            });
                             out.push(EdgeHistoryEvent {
                                 edge_type: et.clone(),
                                 commit,

@@ -24,9 +24,10 @@ pub struct EdgeHistoryEvent {
     pub commit: u64,
     pub event: EdgeEvent,
     /// `Some(rule_name)` for rule-derived edges, `None` for manually written
-    /// edges. In the current implementation this is always `None` because
-    /// derived edges are not WAL-logged (see `derived_edges_are_not_wal_logged`
-    /// test in rules.rs).
+    /// edges. Derived edges are represented by `DerivedEdgeAdded` /
+    /// `DerivedEdgeRetracted` WAL markers (discriminants 18/19) written by
+    /// `log_then_apply_with` after each rule-firing mutation; see
+    /// `derived_edge_state_records_not_wal_logged_markers_are` in rules.rs.
     pub rule: Option<String>,
 }
 
@@ -49,8 +50,8 @@ pub enum EdgeEvent {
 ///
 /// ## Derived edges
 ///
-/// Rule-created (derived) edges are **not** in the WAL and therefore do not appear in
-/// history. Only edges written directly by the application are recorded.
+/// Rule-created (derived) edges appear in edge history via `DerivedEdgeAdded` /
+/// `DerivedEdgeRetracted` WAL markers; they do not appear in node history.
 #[derive(Debug, PartialEq)]
 pub struct HistoryEntry {
     /// 0-based WAL frame index of the commit that produced this change.

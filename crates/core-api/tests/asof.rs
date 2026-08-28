@@ -145,7 +145,7 @@ fn open_at_commit_2_edge_present_explain_shows_rule() {
 }
 
 #[test]
-fn open_at_commit_3_edge_retracted() {
+fn open_at_commit_4_setprop_edge_retracted() {
     // Commit 3 is the DerivedEdgeAdded marker frame (state no-op).
     // The SetProp that causes the retraction is at commit 4.
     // After replaying 0..=4, the edge is retracted.
