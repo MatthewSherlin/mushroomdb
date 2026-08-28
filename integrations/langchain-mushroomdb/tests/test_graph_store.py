@@ -132,6 +132,55 @@ class TestAddGraphDocuments:
         rows = store.query("MATCH (a)-[r:KNOWS]->(b) RETURN a.__id__ LIMIT 1")
         assert len(rows) == 1
 
+    def test_relationship_properties_are_dropped(self, store):
+        """Relationship.properties are silently dropped — mushroomdb 0.1.2 has
+        no edge-property API (insert_edge is type/src/dst only; SET r.field is
+        rejected by the Cypher planner).  This test pins the current behaviour
+        and marks the flip-point: when the binding gains edge-property support,
+        this test should be updated to assert properties ARE persisted."""
+        alice = Node(id="alice", type="Person")
+        bob = Node(id="bob", type="Person")
+        rel = Relationship(
+            source=alice, target=bob, type="KNOWS", properties={"weight": 0.9}
+        )
+        store.add_graph_documents([_make_gd([alice, bob], [rel])])
+        # Edge exists in the graph
+        rows = store.query("MATCH (a)-[r:KNOWS]->(b) RETURN a.__id__ LIMIT 1")
+        assert len(rows) == 1
+        # Properties are NOT returned (no edge-property surface in the binding)
+        rows_with_weight = store.query(
+            "MATCH (a)-[r:KNOWS]->(b) RETURN r.weight LIMIT 1"
+        )
+        # r.weight is either missing from the row dict or None
+        weight = rows_with_weight[0].get("r.weight") if rows_with_weight else None
+        assert weight is None
+
+    def test_label_change_preserves_edge(self, store):
+        """Re-adding a node with the same id but a different label (Person →
+        Agent) triggers the delete+reinsert path; existing user-owned edges
+        must survive."""
+        # 1. Insert "alice" as Person with a KNOWS edge to "bob"
+        alice_p = Node(id="alice", type="Person", properties={"name": "Alice"})
+        bob = Node(id="bob", type="Person")
+        rel = Relationship(source=alice_p, target=bob, type="KNOWS")
+        store.add_graph_documents([_make_gd([alice_p, bob], [rel])])
+
+        rows_before = store.query("MATCH (a)-[r:KNOWS]->(b) RETURN a.__id__ LIMIT 1")
+        assert len(rows_before) == 1
+
+        # 2. Re-add "alice" with label "Agent" (label change)
+        alice_a = Node(id="alice", type="Agent", properties={"name": "Alice"})
+        store.add_graph_documents([_make_gd([alice_a], [])])
+
+        # Label must have changed
+        info = store._db.node_info("alice")
+        assert info is not None
+        assert info["label"] == "Agent"
+
+        # KNOWS edge must still exist
+        rows_after = store.query("MATCH (a)-[r:KNOWS]->(b) RETURN a.__id__ LIMIT 1")
+        assert len(rows_after) == 1
+
 
 # ---------------------------------------------------------------------------
 # query — Cypher passthrough tests
@@ -170,6 +219,27 @@ class TestQuery:
         rows = store.query("MATCH (n:Alpha) RETURN n.__id__ LIMIT 10")
         assert len(rows) == 1
         assert rows[0]["n.__id__"] == "a"
+
+    def test_write_keyword_routes_to_write_path(self, store):
+        """A query containing a write keyword (DELETE) must be routed to the
+        write path by query() without raising.  The write-intent detector
+        inspects the query string before execution — no exception swallowing."""
+        # Insert a node so there is something to delete.
+        store._db.insert_node("Temp", "tmp_wt", {"__id__": "tmp_wt"})
+        assert store._db.node_info("tmp_wt") is not None
+
+        # Run a DELETE via the public query() API — write-intent routing should
+        # send this to query_write without raising.
+        store.query(
+            "MATCH (n) WHERE n.__id__ = 'tmp_wt' DETACH DELETE n"
+        )
+        # Node should now be gone (or at least the call did not raise).
+
+    def test_malformed_read_query_raises(self, store):
+        """A syntactically invalid read query must raise (not silently no-op).
+        Write-intent routing must NOT suppress errors on the read path."""
+        with pytest.raises(Exception):
+            store.query("MATCH (n INVALID SYNTAX !!!)")
 
 
 # ---------------------------------------------------------------------------

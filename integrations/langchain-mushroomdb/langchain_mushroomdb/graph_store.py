@@ -35,6 +35,7 @@ stored as a ``Document``-labelled node and each extracted entity node receives a
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 import mushroomdb
@@ -220,8 +221,18 @@ class MushroomDBGraphStore(GraphStore):
     # query — Cypher passthrough
     # ------------------------------------------------------------------
 
+    # Regex to classify a Cypher statement as a write operation before executing.
+    _WRITE_RE = re.compile(r"\b(CREATE|SET|DELETE|MERGE|REMOVE)\b", re.IGNORECASE)
+
     def query(self, query: str, params: dict = {}) -> List[Dict[str, Any]]:
         """Execute a Cypher query against mushroomdb.
+
+        Routing is decided by **write-intent detection** before execution, not
+        by catching exceptions.  If the query contains a write keyword
+        (``CREATE``, ``SET``, ``DELETE``, ``MERGE``, or ``REMOVE``), it is
+        sent via ``query_write``; otherwise it is sent via ``query`` /
+        ``query_with_params``.  This means a malformed read query will raise
+        rather than silently routing down the write path.
 
         Parameters
         ----------
@@ -237,22 +248,25 @@ class MushroomDBGraphStore(GraphStore):
         Returns
         -------
         List[Dict[str, Any]]
-            One dict per result row.  Write statements (``CREATE``,
-            ``DELETE``, ``SET``) that raise a ``RuntimeError`` on the
-            read path are automatically retried via ``query_write``.
+            One dict per result row.
+
+        Raises
+        ------
+        RuntimeError
+            Propagated from mushroomdb when the query is malformed or violates
+            a read-path constraint and is NOT a write statement.
         """
         param_list = list(params.items()) if params else []
-        try:
-            if param_list:
-                return self._db.query_with_params(query, param_list)
-            return self._db.query(query)
-        except RuntimeError:
+        if self._WRITE_RE.search(query):
             result = (
                 self._db.query_write(query, param_list)
                 if param_list
                 else self._db.query_write(query)
             )
             return result or []
+        if param_list:
+            return self._db.query_with_params(query, param_list)
+        return self._db.query(query)
 
     # ------------------------------------------------------------------
     # add_graph_documents
@@ -363,8 +377,19 @@ class MushroomDBGraphStore(GraphStore):
                 self._db.set_prop(key, k, v)
         return key
 
-    def __del__(self) -> None:
+    def close(self) -> None:
+        """Flush and close the mushroomdb handle.
+
+        Prefer calling ``close()`` explicitly (or using ``try/finally``) over
+        relying on ``__del__``.  ``__del__`` is a backstop — the interpreter
+        does not guarantee when or whether it runs.  Calling ``close()`` twice
+        is safe (the second call is silently ignored).
+        """
         try:
             self._db.close()
         except Exception:
             pass
+
+    def __del__(self) -> None:
+        # __del__ is a backstop; prefer explicit close(). See close() docstring.
+        self.close()

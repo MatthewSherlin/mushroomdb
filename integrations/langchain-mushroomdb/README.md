@@ -114,14 +114,31 @@ When `add_graph_documents(..., include_source=True)` is called, the `source` `Do
 | Feature | Supported | Notes |
 |---|---|---|
 | `add_graph_documents` | Yes | Nodes and edges; idempotent upsert; `include_source` creates Document node + MENTIONS edges |
-| `query` | Yes | Cypher passthrough; write statements auto-retried via `query_write` |
+| `query` | Yes | Cypher passthrough; write-intent detected up front (no silent exception-swallowing) |
 | `refresh_schema` | Yes | Scans all nodes and edges; updates `get_schema` and `get_structured_schema` |
 | `get_schema` | Yes | Human-readable string listing labels and relationship patterns |
 | `get_structured_schema` | Yes | Dict with `node_props`, `rel_props`, `relationships` |
 
+## Closing the store
+
+Call `store.close()` explicitly when you are done, or wrap usage in a `try/finally` block.  `__del__` closes the handle as a backstop but the interpreter does not guarantee when (or whether) `__del__` runs.  Calling `close()` more than once is safe.
+
+```python
+store = MushroomDBGraphStore("/tmp/mydb")
+try:
+    store.add_graph_documents([...])
+finally:
+    store.close()
+```
+
+## Upstream package status
+
+This package is built against `langchain-community 0.4.2`.  The `langchain-community` package is officially deprecated — see [langchain-ai/langchain-community#674](https://github.com/langchain-ai/langchain-community/issues/674) for the migration roadmap.  You may see a `DeprecationWarning` on import; this is expected.  Standalone integration packages like `langchain-mushroomdb` are the successor pattern the migration guide recommends.
+
 ## Known limitations
 
-- **Relation properties not persisted**: mushroomdb 0.1.2 has no edge-property API (`insert_edge` accepts only type/src/dst). `Relationship.properties` are silently dropped. This is a binding gap, not a design choice.
+- **Relation properties not persisted**: mushroomdb 0.1.2 has no edge-property API (`insert_edge` accepts only type/src/dst). `Relationship.properties` are silently dropped. This is a binding gap, not a design choice; it is the flip-point for future edge-property support.
 - **Cypher subset**: mushroomdb implements a subset of openCypher. Not supported: `MERGE`, `id()` function, double-quoted string literals, `id` as a parameter name (reserved by the parser). `DELETE r` on a relationship silently no-ops — use `delete_edge` directly.
+- **Write-intent routing**: `query()` inspects the query string for write keywords (`CREATE`, `SET`, `DELETE`, `MERGE`, `REMOVE`) and routes to `query_write` accordingly. A malformed read query raises rather than silently no-oping.
 - **Schema built by scan**: `refresh_schema()` scans all nodes and edges (up to 100 000 each). Suitable for knowledge-graph sizes; not for billion-node datasets.
 - **Single-process**: mushroomdb is embedded — open at most one store per database path per process.
