@@ -1880,7 +1880,7 @@ fn clean_open_find_similar_does_not_require_mutation() {
     }
 
     // Reopen (empty WAL — clean-open path).
-    let mut db2 = GraphDb::open(&dir).unwrap();
+    let db2 = GraphDb::open(&dir).unwrap();
     let hits = db2.find_similar_vector("emb", "Item", &[1.0, 0.0], 1, 0.0);
     assert!(
         !hits.is_empty(),
@@ -1917,7 +1917,7 @@ fn wal_present_open_preserves_hnsw_before_replay() {
     }
 
     // Reopen: WAL has records → consume_retained_state_eager fires before replay.
-    let mut db2 = GraphDb::open(&dir).unwrap();
+    let db2 = GraphDb::open(&dir).unwrap();
 
     // "a" must still be top-1 for query [1,0].
     let hits = db2.find_similar_vector("emb", "Item", &[1.0, 0.0], 3, 0.0);

@@ -91,7 +91,7 @@ fn make_db() -> GraphDb<core_storage::fs::RealFs> {
 
 #[test]
 fn hybrid_both_ranks_first_and_exact_scores() {
-    let mut db = make_db();
+    let db = make_db();
 
     let query_vec = vec![1.0_f64, 0.0];
     let results = db.search_hybrid("body", "unique", "emb", &query_vec, Some("Item"), 3);
@@ -134,7 +134,7 @@ fn hybrid_both_ranks_first_and_exact_scores() {
 
 #[test]
 fn hybrid_k_truncates_results() {
-    let mut db = make_db();
+    let db = make_db();
     let query_vec = vec![1.0_f64, 0.0];
 
     let results = db.search_hybrid("body", "unique", "emb", &query_vec, Some("Item"), 2);
@@ -191,7 +191,7 @@ fn hybrid_tie_broken_by_key_ascending() {
 #[test]
 fn hybrid_text_only_when_empty_vec() {
     // When query_vec is empty, the vector leg is skipped → text-only ranking via RRF.
-    let mut db = make_db();
+    let db = make_db();
     let results = db.search_hybrid("body", "unique", "emb", &[], Some("Item"), 10);
 
     // Only text-matching nodes appear: "both" and "t_only".
