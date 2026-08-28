@@ -1010,12 +1010,6 @@ pub struct GraphDb<F: Fs> {
     ///
     /// Persisted via the `wal.genesis` marker file; loaded from it at open.
     archive_genesis_chain: bool,
-    /// True in the current session if any WAL-truncating snapshot (`keep_wal=false`,
-    /// `archive_wal=false`) was taken before the first archive was created.
-    ///
-    /// In-memory only (not persisted).  Used at first-archive time to decide
-    /// whether to write the genesis marker.  Irrelevant after archives exist.
-    wal_ever_truncated: bool,
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -1234,11 +1228,9 @@ impl<F: Fs> GraphDb<F> {
             wal_archive_retention: None,
             wal_horizon_floor: 0,
             archive_genesis_chain: false,
-            wal_ever_truncated: false,
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
-        db.wal_ever_truncated = db.fs.has_truncation_marker();
         // Opening cleanup: remove orphaned archives — archives whose frames all
         // fall below the horizon floor.  Orphans arise when a crash interrupted
         // the retention-prune sequence after the floor was written but before
@@ -1668,11 +1660,9 @@ impl<F: Fs> GraphDb<F> {
             wal_archive_retention: None,
             wal_horizon_floor: 0,
             archive_genesis_chain: false,
-            wal_ever_truncated: false,
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
-        db.wal_ever_truncated = db.fs.has_truncation_marker();
         // Same orphaned-archive cleanup as open_with: floor was written first
         // during pruning, so a crash may have left stale archives below floor.
         db.cleanup_orphaned_archives()?;
@@ -6858,18 +6848,21 @@ impl<F: Fs> GraphDb<F> {
             // When present, `open_at` may replay archive-resident commits from
             // empty state (the archive chain covers from global index 0).
             //
-            // Three conditions must ALL hold:
+            // Two conditions must ALL hold:
             //   1. This is the first archive (existing_archives was empty).
-            //   2. No WAL-truncating snapshot was taken (wal_ever_truncated=false,
-            //      which is loaded from the persisted wal.truncated marker at open).
-            //   3. No snapshot.bin existed before this operation (had_prior_snapshot).
-            //      If snapshot.bin already existed but wal.truncated is absent, this
-            //      could be a legacy store that was truncated before the wal.truncated
-            //      feature was introduced — we cannot prove the chain is complete.
-            //      Conservative refusal: cost = no as-of-through-archives; never
-            //      correctness.  On SimFs (snapshot_path() == None) this is always
-            //      false, so SimFs always passes this check.
-            if is_first_archive && !self.wal_ever_truncated && !had_prior_snapshot {
+            //   2. No snapshot.bin existed before this operation (had_prior_snapshot=false).
+            //      A WAL-truncating snapshot (keep_wal=false) always writes snapshot.bin
+            //      before truncating the WAL, so if any prior truncating snapshot was taken
+            //      — even in a previous session — snapshot.bin is present and this condition
+            //      is false.  This subsumes the cross-session truncation case without
+            //      requiring a separate wal.truncated sidecar file.
+            //      For legacy stores (snapshot.bin written by an older code version that
+            //      may have truncated the WAL), the same conservative refusal applies:
+            //      we cannot prove the chain is complete, so we refuse genesis (cost =
+            //      no as-of-through-archives; never silent wrong data).
+            //      On SimFs (snapshot_path() == None) had_prior_snapshot is always false,
+            //      so SimFs always passes this check.
+            if is_first_archive && !had_prior_snapshot {
                 self.fs.write_genesis_marker()?;
                 self.archive_genesis_chain = true;
             }
@@ -6948,15 +6941,11 @@ impl<F: Fs> GraphDb<F> {
             //
             // Genesis chain: a WAL-truncating snapshot breaks the archive chain
             // for any archives taken AFTER this point (their WAL slices would
-            // not start at genesis).  Persist the truncation durably via
-            // wal.truncated so future sessions detect it on reopen, then clear
-            // the in-memory flag and delete any existing genesis marker so that
-            // open_at refuses archive-resident commits.
-            if !self.wal_ever_truncated {
-                // Write-once: skip if already written to avoid redundant fsyncs.
-                self.fs.write_truncation_marker()?;
-            }
-            self.wal_ever_truncated = true;
+            // not start at genesis).  Delete any existing genesis marker so that
+            // open_at refuses archive-resident commits.  Future sessions are
+            // covered by had_prior_snapshot: snapshot.bin written here persists
+            // across sessions and prevents a later archiving session from
+            // incorrectly claiming a complete genesis chain.
             if self.archive_genesis_chain {
                 self.fs.delete_genesis_marker()?;
                 self.archive_genesis_chain = false;

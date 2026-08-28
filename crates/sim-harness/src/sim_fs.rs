@@ -52,10 +52,6 @@ pub struct SimFs {
     /// `true` when the surviving archive chain forms a complete WAL history
     /// from the store's first commit.
     genesis_marker: bool,
-    /// Truncation marker (mirrors `wal.truncated` in RealFs).
-    /// Set to `true` on the first WAL-truncating snapshot.  Write-once; never
-    /// cleared so that cross-session truncation is detectable on reopen.
-    truncation_marker: bool,
 }
 
 fn name(f: FileId) -> &'static str {
@@ -128,7 +124,6 @@ impl SimFs {
             archives: self.archives.clone(),
             horizon_floor: self.horizon_floor,
             genesis_marker: self.genesis_marker,
-            truncation_marker: self.truncation_marker,
             ..SimFs::default() // resets byte_crashed, op_crashed, ops, appended
         }
     }
@@ -290,18 +285,6 @@ impl Fs for SimFs {
     fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
         self.check_op_crash()?;
         self.genesis_marker = false;
-        self.tick_op();
-        Ok(())
-    }
-
-    fn has_truncation_marker(&self) -> bool {
-        // Read — does not go through check_op_crash (consistent with `read` behavior).
-        self.truncation_marker
-    }
-
-    fn write_truncation_marker(&mut self) -> std::io::Result<()> {
-        self.check_op_crash()?;
-        self.truncation_marker = true;
         self.tick_op();
         Ok(())
     }
