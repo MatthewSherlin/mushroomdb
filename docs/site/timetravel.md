@@ -78,6 +78,13 @@ edges, `null` for manually written edges.
 Answers whether an edge of a given type was active between two nodes at a
 specific WAL commit.
 
+> **Index spaces:** `at_commit` is a **0-based frame index** (the same space
+> as `edge_history` event commits and `total_commits`). `last_changed()`
+> returns a **1-based commit sequence** from the CAS machinery — a different
+> counter. Do not pass `last_changed(key)` directly as `at_commit`; to probe
+> "at the moment of the last change", use the commit values reported by
+> `edge_history`/`node_history` events instead.
+
 **MCP:** `was_linked(a, b, edge_type, at_commit)` → `{linked}` or error when
 outside horizon
 
