@@ -1,7 +1,7 @@
 {
-  "ingest_wall_s": 1.127402,
-  "rule_backfill_wall_s": 13.745302,
-  "snapshot_write_s": 0.440227,
-  "snapshot_open_s": 0.002044,
-  "query_p50_ms": 0.010329
+  "ingest_wall_s": 1.134343,
+  "rule_backfill_wall_s": 13.767794,
+  "snapshot_write_s": 0.728758,
+  "snapshot_open_s": 0.002227,
+  "query_p50_ms": 0.012519
 }
