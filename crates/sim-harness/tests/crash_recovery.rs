@@ -1999,3 +1999,98 @@ fn keep_wal_dst_op_sweep() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// ND-2 regression: V8 SetProp WAL replay reads old_value from seam, not overlay
+// ---------------------------------------------------------------------------
+
+/// Minimal workload: two nodes + a KeyMatch rule that fires a derived KM edge,
+/// then a V8 snapshot, then a set_prop that changes the matching field so the
+/// rule retracts the derived edge.
+///
+/// The critical window is: V8 snapshot written (base has the KM edge), then
+/// `set_prop` WAL record logged (derived DeleteEdge is in-memory only, never
+/// WAL-logged). If recovery replays SetProp and reads `old_value` from the
+/// overlay (empty after V8 open) rather than from the base, it sees old=None,
+/// the retraction is not triggered, and the KM edge survives incorrectly.
+fn workload_with_v8_setprop_retract<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    db.insert_node(
+        "P",
+        "src",
+        vec![("key".into(), Value::Str("target".into()))],
+    )?;
+    db.insert_node("P", "target", vec![])?;
+    db.create_rule(RuleDef {
+        name: "km".into(),
+        src_label: "P".into(),
+        dst_label: "P".into(),
+        predicate: Predicate::KeyMatch {
+            field: "key".into(),
+        },
+        edge_type: "KM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })?;
+    // KM edge src→target is now derived (src.key == "target" == dst key).
+    db.snapshot()?;
+    // Change the matching field: rule must retract the KM edge.
+    // The derived DeleteEdge is applied in-memory and never WAL-logged separately.
+    db.set_prop("src", "key", Value::Str("other".into()))?;
+    Ok(())
+}
+
+/// ND-2 regression: byte-sweep crash over V8 snapshot + prop-change-rule-retract.
+///
+/// At crash points after the V8 snapshot is written but before set_prop is
+/// durable, the V8 base contains the KM edge.  When set_prop is in the WAL,
+/// replay must read old_value through the seam (base ∪ overlay) so the rule
+/// engine sees the prior key value and correctly retracts the derived edge.
+#[test]
+fn recovery_v8_setprop_retract_crash_sweep() {
+    let total_bytes = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        workload_with_v8_setprop_retract(&mut db).unwrap();
+        db.into_fs().total_appended()
+    };
+    assert!(total_bytes > 0, "workload must append at least one byte");
+
+    for crash_at in 0..=total_bytes {
+        let mut db = GraphDb::open_with(SimFs::with_crash_after(crash_at)).unwrap();
+        let _ = workload_with_v8_setprop_retract(&mut db);
+        let survivor = db.into_fs().surviving_state();
+
+        let recovered = GraphDb::open_with(survivor).unwrap();
+
+        // Invariant: if src and target both exist and the km rule is live,
+        // the KM edge presence must be consistent with src.key.
+        if recovered.has_node("src")
+            && recovered.has_node("target")
+            && recovered.rules().iter().any(|r| r.name == "km")
+        {
+            let src_key_val = recovered.get_prop("src", "key");
+            let km_nbrs = recovered
+                .neighbors("src", "KM", Direction::Out)
+                .unwrap_or_default();
+            match &src_key_val {
+                Some(Value::Str(s)) if s == "target" => {
+                    assert!(
+                        km_nbrs.contains(&"target".to_string()),
+                        "crash_at={crash_at}: src.key='target' but KM edge src→target is absent"
+                    );
+                }
+                Some(Value::Str(s)) if s == "other" => {
+                    assert!(
+                        !km_nbrs.contains(&"target".to_string()),
+                        "crash_at={crash_at}: src.key='other' but KM edge src→target still exists \
+                         (rule retraction failed; old_value likely read from empty overlay)"
+                    );
+                }
+                _ => {} // key absent or intermediate state: no rule-consistency assertion
+            }
+        }
+    }
+}

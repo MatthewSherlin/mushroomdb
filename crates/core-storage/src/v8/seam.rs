@@ -568,6 +568,11 @@ impl<'a> ColumnsView<'a> {
         if self.overlay.get(id, field).is_some() {
             return None;
         }
+        // Prop tombstone check: a RemoveProp for a base-only vector records a
+        // tombstone so that subsequent reads correctly see the value as absent.
+        if self.overlay.is_tombstoned(id, field) {
+            return None;
+        }
         let base = self.base?;
         let field_entry = base.fields.iter().find(|e| e.name.as_str() == field)?;
         let (dim, data, present) = match &field_entry.col {
@@ -597,6 +602,25 @@ impl<'a> ColumnsView<'a> {
         let f64_slice: &[f64] =
             unsafe { std::slice::from_raw_parts(chunk.as_ptr() as *const f64, chunk.len()) };
         Some(f64_slice)
+    }
+
+    /// Return all field names visible through this view: overlay ∪ base,
+    /// deduplicated and sorted.
+    ///
+    /// Does not filter per-node tombstones — the caller should call `get(id,
+    /// field)` for each field, which applies tombstone masking.  Fields that
+    /// are tombstoned for a given node will return `None` from `get()`.
+    pub fn field_names(&self) -> Vec<String> {
+        let mut seen = BTreeSet::new();
+        for f in self.overlay.fields() {
+            seen.insert(f.to_string());
+        }
+        if let Some(base) = self.base {
+            for e in base.fields.iter() {
+                seen.insert(e.name.as_str().to_string());
+            }
+        }
+        seen.into_iter().collect()
     }
 
     /// Return a pre-resolved column handle for `field`.

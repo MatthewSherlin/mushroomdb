@@ -2218,3 +2218,54 @@ fn v8_delete_edge_crash_replay_no_phantom_tombstone() {
         "a→b must not exist after delete"
     );
 }
+
+/// ND-1 regression: node_ref().props() must return all fields stored in the V8
+/// base, not just overlay fields.
+///
+/// After a V8 snapshot open with no post-snapshot writes the overlay is empty.
+/// The old implementation iterated `self.db.props.fields()` (overlay only) so
+/// every node returned an empty map.  The fix enumerates base ∪ overlay field
+/// names via `ColumnsView::field_names()`.
+#[test]
+fn v8_node_ref_props_visible_after_open() {
+    let dir = tmp("v8-node-ref-props");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node(
+            "P",
+            "alice",
+            vec![
+                ("age".into(), Value::Int(30)),
+                ("bio".into(), Value::Str("engineer".into())),
+            ],
+        )
+        .unwrap();
+        db.insert_node("P", "bob", vec![("age".into(), Value::Int(25))])
+            .unwrap();
+        db.snapshot().unwrap();
+    }
+    // Reopen: V8 base is live, overlay is empty.
+    let db = GraphDb::open(&dir).unwrap();
+    let alice = db.node_ref("alice").expect("alice must exist after reopen");
+    let props = alice.props();
+    assert_eq!(
+        props.get("age"),
+        Some(&Value::Int(30)),
+        "alice.age must be visible via node_ref().props() after V8 reopen"
+    );
+    assert_eq!(
+        props.get("bio"),
+        Some(&Value::Str("engineer".into())),
+        "alice.bio must be visible via node_ref().props() after V8 reopen"
+    );
+    assert_eq!(props.len(), 2, "alice must have exactly 2 props");
+
+    let bob = db.node_ref("bob").expect("bob must exist after reopen");
+    let bob_props = bob.props();
+    assert_eq!(
+        bob_props.get("age"),
+        Some(&Value::Int(25)),
+        "bob.age must be visible via node_ref().props() after V8 reopen"
+    );
+    assert_eq!(bob_props.len(), 1, "bob must have exactly 1 prop");
+}

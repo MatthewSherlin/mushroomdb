@@ -1583,7 +1583,9 @@ impl<F: Fs> GraphDb<F> {
                 let id = self.ids.get(key).ok_or_else(|| GraphError::Corrupt {
                     detail: format!("wal replay references unknown key {key}"),
                 })?;
-                let old_value = self.props.get(id, field).cloned();
+                let old_value = build_props_view(&self.props, &self.base)
+                    .get(id, field)
+                    .map(|vr| vr.into_value());
                 self.props.set(id, field, value.clone());
                 // Fire rules for the changed field.
                 let cursor = self.engine.pending_delta_count();
@@ -1835,7 +1837,9 @@ impl<F: Fs> GraphDb<F> {
                         detail: format!("wal SetPropId unknown field intern {field}"),
                     })?
                     .to_string();
-                let old_value = self.props.get(*id, &field_str).cloned();
+                let old_value = build_props_view(&self.props, &self.base)
+                    .get(*id, &field_str)
+                    .map(|vr| vr.into_value());
                 self.props.set(*id, &field_str, value.clone());
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
@@ -2355,8 +2359,10 @@ impl<F: Fs> GraphDb<F> {
                     if lbl != label {
                         continue;
                     }
-                    if let Some(value) = self.props.get(id, field) {
-                        let value = value.clone();
+                    if let Some(value) = build_props_view(&self.props, &self.base)
+                        .get(id, field)
+                        .map(|vr| vr.into_value())
+                    {
                         self.fulltext.add_tokens(id, field, &value);
                     }
                 }
@@ -3559,12 +3565,13 @@ impl<F: Fs> GraphDb<F> {
                 .push((id, key.to_string()));
         }
 
-        let all_fields: Vec<String> = self.props.fields().map(String::from).collect();
         let existing = self.rules();
+        let pv = build_props_view(&self.props, &self.base);
+        let all_fields: Vec<String> = pv.field_names();
 
         core_rules::suggest::suggest_rules(
             &label_nodes,
-            &|id, field| self.props.get(id, field).cloned(),
+            &|id, field| pv.get(id, field).map(|vr| vr.into_value()),
             &all_fields,
             &existing,
             config,
@@ -6031,12 +6038,15 @@ impl<'a, F: Fs> NodeRef<'a, F> {
     }
 
     /// All stored fields for this node, sorted by field name.
+    ///
+    /// Reads from the full base+overlay view so that props stored only in the
+    /// V8 snapshot base (i.e. before any post-snapshot WAL writes) are visible.
     pub fn props(&self) -> BTreeMap<String, Value> {
         let mut out = BTreeMap::new();
-        for field in self.db.props.fields() {
-            let pv = self.db.props_view();
-            if let Some(vr) = pv.get(self.id, field) {
-                out.insert(field.to_string(), vr.into_value());
+        let pv = self.db.props_view();
+        for field in pv.field_names() {
+            if let Some(vr) = pv.get(self.id, &field) {
+                out.insert(field, vr.into_value());
             }
         }
         out
