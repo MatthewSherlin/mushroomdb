@@ -143,7 +143,7 @@ overwritten** if present in user-supplied `EntityNode.properties` or
 | Feature | Supported | Notes |
 |---|---|---|
 | `upsert_nodes` | Yes | EntityNode and ChunkNode; idempotent; label updates via delete+reinsert |
-| `upsert_relations` | Yes | Creates placeholder nodes for unknown endpoints |
+| `upsert_relations` | Yes | Creates placeholder nodes for unknown endpoints; **Relation.properties dropped** (binding gap) |
 | `get` | Yes | By id or by property filter |
 | `get_triplets` | Yes | Filter by entity name, relation type, id, or property |
 | `get_rel_map` | Yes | BFS traversal to configurable depth |
@@ -155,6 +155,7 @@ overwritten** if present in user-supplied `EntityNode.properties` or
 
 ## Known limitations
 
+- **Relation properties not persisted**: the mushroomdb 0.1.2 binding has no edge-property API (`insert_edge` accepts only type/src/dst; `SET r.field` is rejected by the Cypher planner). `Relation.properties` passed to `upsert_relations` are silently dropped; `get_triplets` and `get_rel_map` always return relations with `properties={}`. This is a binding gap queued alongside ANN.
 - **No native ANN / `find_similar`**: `vector_query` scans all embeddings in Python. Suitable for knowledge-graph sizes (thousands of nodes); not for million-scale vector workloads.
 - **Cypher subset**: mushroomdb implements a subset of openCypher. `MERGE`, `id()`, double-quoted string literals, and `id` as a parameter name are not available.
 - **Single-process**: mushroomdb is an embedded store — one process per database path at a time.

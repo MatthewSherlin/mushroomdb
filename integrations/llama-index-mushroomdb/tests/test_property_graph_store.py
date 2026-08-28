@@ -209,6 +209,33 @@ def test_upsert_relation_idempotent(store):
     assert len(triplets) == 1
 
 
+def test_relation_properties_are_dropped(store):
+    """Relation.properties are silently dropped — binding gap, not a design choice.
+
+    The mushroomdb 0.1.2 binding has no edge-property API (insert_edge takes
+    only type/src/dst; SET r.field is rejected by the Cypher planner).
+    This test pins the current behavior so that when the binding gains edge-
+    property support this test is the obvious place to flip.
+    """
+    alice = _make_entity("Alice")
+    bob = _make_entity("Bob")
+    store.upsert_nodes([alice, bob])
+
+    rel = Relation(
+        label="KNOWS",
+        source_id=alice.id,
+        target_id=bob.id,
+        properties={"weight": 0.9, "since": "2024"},
+    )
+    store.upsert_relations([rel])
+
+    triplets = store.get_triplets(entity_names=["Alice"])
+    assert len(triplets) == 1
+    _, r, _ = triplets[0]
+    # Properties are NOT round-tripped — binding gap.
+    assert r.properties == {}
+
+
 # ---------------------------------------------------------------------------
 # 4. get — by id and by property
 # ---------------------------------------------------------------------------

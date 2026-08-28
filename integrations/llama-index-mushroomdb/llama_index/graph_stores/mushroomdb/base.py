@@ -105,6 +105,15 @@ class MushroomDBPropertyGraphStore(PropertyGraphStore):
     **Vector queries** — ``vector_query`` scans all embedded nodes in Python
     (no native ANN in the binding as of 0.1.2).  This is fine for typical
     knowledge-graph sizes; it does not scale to millions of nodes.
+
+    **Relation properties are not persisted** — the mushroomdb binding (0.1.2)
+    has no edge-property API (``insert_edge`` accepts only type/src/dst;
+    ``SET r.field`` is rejected by the Cypher planner; no ``set_edge_prop``
+    method exists).  ``Relation.properties`` supplied to ``upsert_relations``
+    are silently dropped.  ``get_triplets`` and ``get_rel_map`` always return
+    ``Relation`` objects with ``properties={}``.  This is a binding gap, not a
+    design choice; it will be fixed when native edge-property support is added
+    to the binding (queued alongside ANN).
     """
 
     supports_structured_queries: bool = True
@@ -186,6 +195,8 @@ class MushroomDBPropertyGraphStore(PropertyGraphStore):
             merged.update(props)
             self._db.insert_node(node.label, node.id, merged)
             for e in user_edges:
+                # Edge properties are not restored — the binding has no
+                # edge-property API, so they were never stored to begin with.
                 self._db.insert_edge(e["edge_type"], e["src_key"], e["dst_key"])
 
     def _ensure_node(self, node_id: str) -> None:
@@ -231,10 +242,19 @@ class MushroomDBPropertyGraphStore(PropertyGraphStore):
             self._upsert_one_node(node)
 
     def upsert_relations(self, relations: List[Relation]) -> None:
+        """Upsert relations into the graph.
+
+        .. warning::
+            ``Relation.properties`` are **silently dropped**.  The mushroomdb
+            0.1.2 binding has no edge-property API (``insert_edge`` accepts
+            only type/src/dst; no ``set_edge_prop`` exists).  This is a
+            binding gap queued for a future release.
+        """
         for rel in relations:
             self._ensure_node(rel.source_id)
             self._ensure_node(rel.target_id)
             # insert_edge returns False (not an error) for duplicate edges.
+            # rel.properties are not persisted — binding gap, see class docstring.
             self._db.insert_edge(rel.label, rel.source_id, rel.target_id)
 
     def get(
