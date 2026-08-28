@@ -146,6 +146,30 @@ pub trait Fs {
     fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// Return `true` when the `wal.truncated` marker file is present.
+    ///
+    /// The marker is written once on every WAL-truncating snapshot
+    /// (`keep_wal=false`) and is NEVER deleted.  It records permanently that
+    /// this store's WAL history contains a gap, preventing a later archive
+    /// session from falsely claiming a complete genesis chain via the
+    /// `wal.genesis` marker.
+    ///
+    /// Default: `false` (no truncation recorded / no archive support).
+    fn has_truncation_marker(&self) -> bool {
+        false
+    }
+
+    /// Durably write the `wal.truncated` marker file.
+    ///
+    /// Called once per WAL-truncating snapshot (idempotent — subsequent calls
+    /// are no-ops at the filesystem level because the file already exists).
+    /// There is intentionally no corresponding delete method.
+    ///
+    /// Default: no-op.
+    fn write_truncation_marker(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub trait FsIntrospect {
@@ -315,6 +339,20 @@ impl Fs for RealFs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    fn has_truncation_marker(&self) -> bool {
+        self.dir.join("wal.truncated").exists()
+    }
+
+    fn write_truncation_marker(&mut self) -> std::io::Result<()> {
+        let path = self.dir.join("wal.truncated");
+        {
+            let mut f = File::create(&path)?;
+            f.write_all(b"")?;
+            full_sync(&f)?;
+        }
+        sync_dir(&self.dir)
     }
 }
 

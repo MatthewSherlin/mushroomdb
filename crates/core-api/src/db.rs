@@ -1238,6 +1238,7 @@ impl<F: Fs> GraphDb<F> {
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
+        db.wal_ever_truncated = db.fs.has_truncation_marker();
         let _t0 = std::time::Instant::now();
         // Peek 6 bytes to determine snapshot version without reading the full
         // file. For RealFs this is a true partial read (O(1)); for SimFs the
@@ -1665,6 +1666,7 @@ impl<F: Fs> GraphDb<F> {
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
+        db.wal_ever_truncated = db.fs.has_truncation_marker();
         // Collect archive frames (oldest-first) and live WAL frames.
         // Archives represent pre-snapshot history; the snapshot captures the
         // cumulative state at the time of archiving.  Crash-window guarantee:
@@ -6570,6 +6572,13 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // Capture whether snapshot.bin already existed BEFORE this snapshot write.
+        // Used by the archive path's conservative genesis-chain check: if a prior
+        // snapshot exists but wal.truncated does not, we cannot distinguish a
+        // legacy store (may have been truncated in an older code version) from a
+        // new store that only used keep_wal=true.  Conservative: refuse genesis in
+        // both cases.  Must be sampled here, before the snapshot write below.
+        let had_prior_snapshot = self.fs.snapshot_path().map(|p| p.exists()).unwrap_or(false);
         self.ensure_v8_base_sections_loaded();
         // Ensure provenance is decoded before to_persist() clones it.
         self.engine.ensure_provenance_loaded_mut();
@@ -6788,7 +6797,19 @@ impl<F: Fs> GraphDb<F> {
             // from a store that has never undergone a WAL-truncating snapshot.
             // When present, `open_at` may replay archive-resident commits from
             // empty state (the archive chain covers from global index 0).
-            if is_first_archive && !self.wal_ever_truncated {
+            //
+            // Three conditions must ALL hold:
+            //   1. This is the first archive (existing_archives was empty).
+            //   2. No WAL-truncating snapshot was taken (wal_ever_truncated=false,
+            //      which is loaded from the persisted wal.truncated marker at open).
+            //   3. No snapshot.bin existed before this operation (had_prior_snapshot).
+            //      If snapshot.bin already existed but wal.truncated is absent, this
+            //      could be a legacy store that was truncated before the wal.truncated
+            //      feature was introduced — we cannot prove the chain is complete.
+            //      Conservative refusal: cost = no as-of-through-archives; never
+            //      correctness.  On SimFs (snapshot_path() == None) this is always
+            //      false, so SimFs always passes this check.
+            if is_first_archive && !self.wal_ever_truncated && !had_prior_snapshot {
                 self.fs.write_genesis_marker()?;
                 self.archive_genesis_chain = true;
             }
@@ -6852,9 +6873,14 @@ impl<F: Fs> GraphDb<F> {
             //
             // Genesis chain: a WAL-truncating snapshot breaks the archive chain
             // for any archives taken AFTER this point (their WAL slices would
-            // not start at genesis).  Record the truncation so the first-archive
-            // path can omit the genesis marker, and delete any existing marker
-            // so future open_at calls refuse archive-resident commits.
+            // not start at genesis).  Persist the truncation durably via
+            // wal.truncated so future sessions detect it on reopen, then clear
+            // the in-memory flag and delete any existing genesis marker so that
+            // open_at refuses archive-resident commits.
+            if !self.wal_ever_truncated {
+                // Write-once: skip if already written to avoid redundant fsyncs.
+                self.fs.write_truncation_marker()?;
+            }
             self.wal_ever_truncated = true;
             if self.archive_genesis_chain {
                 self.fs.delete_genesis_marker()?;

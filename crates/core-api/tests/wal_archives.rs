@@ -583,6 +583,133 @@ fn crash_window_archive_op_sweep() {
     }
 }
 
+// ── Test 13: Cross-session truncation detected via wal.truncated ─────────────
+
+/// Session 1 takes a WAL-truncating snapshot (keep_wal=false), which writes
+/// the persistent `wal.truncated` marker.  Session 2 reopens, loads the marker
+/// (wal_ever_truncated=true), and takes the first archive.  The cross-session
+/// truncation must be detected: genesis marker must NOT be written, and
+/// archive-resident commits must return CommitOutOfRange.  History scans still work.
+#[test]
+fn cross_session_truncate_then_archive() {
+    let dir = tmp("cross-session");
+
+    // Session 1: write 3 nodes, take WAL-truncating (keep_wal=false) snapshot.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap(); // commit 0
+        db.insert_node("N", "b", vec![]).unwrap(); // commit 1
+        db.insert_node("N", "c", vec![]).unwrap(); // commit 2
+                                                   // Default opts: keep_wal=false, archive_wal=false → truncating snapshot.
+        db.snapshot_with(SnapshotOptions::default()).unwrap();
+    }
+
+    // wal.truncated must be on disk after session 1.
+    assert!(
+        dir.join("wal.truncated").exists(),
+        "wal.truncated must be written by a keep_wal=false snapshot"
+    );
+
+    // Session 2: reopen (wal_ever_truncated loaded from wal.truncated), write 1
+    // node, take the first archive.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "d", vec![]).unwrap(); // commit 0 in new WAL epoch
+        db.snapshot_with(opts_archive()).unwrap(); // first archive
+
+        // wal.truncated must still be present (write-once, never deleted).
+        assert!(
+            dir.join("wal.truncated").exists(),
+            "wal.truncated must persist after the archive snapshot"
+        );
+        // Genesis marker must NOT be present: cross-session truncation detected.
+        assert!(
+            !dir.join("wal.genesis").exists(),
+            "wal.genesis must NOT be written when prior truncation is detected via wal.truncated"
+        );
+    }
+
+    // Archive-resident commit at global index 0 (floor=0, local=0 < archive frames):
+    // without genesis marker, open_at must return CommitOutOfRange, not silently wrong state.
+    match GraphDb::open_at(&dir, 0).err() {
+        Some(GraphError::CommitOutOfRange { .. }) => {}
+        other => panic!(
+            "expected CommitOutOfRange for archive-resident commit after cross-session \
+             truncation, got {other:?}"
+        ),
+    }
+
+    // History scan via node_history: "d" was inserted in the archived WAL slice
+    // (frame record present) → must appear in node_history despite no genesis chain.
+    let db = GraphDb::open(&dir).unwrap();
+    let hist = db.node_history("d").unwrap();
+    assert!(
+        !hist.is_empty(),
+        "node 'd' inserted in archived WAL must appear in node_history (scan-based, not state-replay)"
+    );
+}
+
+// ── Test 14: Legacy-store conservative no-genesis rule ───────────────────────
+
+/// A store with snapshot.bin but no wal.truncated simulates a legacy store
+/// (predating the wal.truncated feature) that may or may not have been truncated.
+/// The conservative rule: if snapshot.bin exists before the first archive but
+/// wal.truncated is absent, do NOT write the genesis marker.  Correctness is
+/// preserved; the only cost is that open_at cannot reach archive-resident commits.
+#[test]
+fn legacy_store_conservative_no_genesis() {
+    let dir = tmp("legacy-conservative");
+
+    // Simulate legacy store: take a keep_wal=true snapshot.  This writes
+    // snapshot.bin but NOT wal.truncated — identical to what an old code version
+    // would leave behind for a store that had any prior snapshot.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap(); // commit 0
+        db.insert_node("N", "b", vec![]).unwrap(); // commit 1
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: true,
+            archive_wal: false,
+            ..SnapshotOptions::default()
+        })
+        .unwrap();
+    }
+
+    // Verify legacy-store precondition: snapshot.bin present, wal.truncated absent.
+    assert!(dir.join("snapshot.bin").exists(), "snapshot.bin must exist");
+    assert!(
+        !dir.join("wal.truncated").exists(),
+        "wal.truncated must NOT exist (simulating legacy store)"
+    );
+
+    // Second session: reopen and take the first archive.
+    // had_prior_snapshot=true (snapshot.bin exists from session 1),
+    // wal_ever_truncated=false (no wal.truncated on disk).
+    // Conservative rule: refuse genesis marker.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "c", vec![]).unwrap(); // commit 2
+        db.snapshot_with(opts_archive()).unwrap(); // first archive
+    }
+
+    // Genesis marker must NOT be written.
+    assert!(
+        !dir.join("wal.genesis").exists(),
+        "wal.genesis must NOT be written: snapshot.bin existed without wal.truncated \
+         (conservative legacy-store rule)"
+    );
+
+    // open_at for an archive-resident commit must return CommitOutOfRange.
+    // (Archives cover commits 0,1,2; without genesis marker, open_at refuses.)
+    match GraphDb::open_at(&dir, 1).err() {
+        Some(GraphError::CommitOutOfRange { .. }) => {}
+        other => panic!(
+            "expected CommitOutOfRange for archive commit without genesis chain \
+             (legacy store conservative rule), got {other:?}"
+        ),
+    }
+}
+
 /// Minimal workload that exercises the archive_wal snapshot path.
 fn archive_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
     db.insert_node("N", "x", vec![])?;
