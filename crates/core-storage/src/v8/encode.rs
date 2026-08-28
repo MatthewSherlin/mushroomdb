@@ -13,12 +13,18 @@
 //! sections at 8-byte aligned offsets from file start (>= 4096)
 //! ```
 //!
-//! Section ids:
+//! Section ids (T5 layout):
 //!   0 = CSR topology (rkyv)
 //!   1 = columns (rkyv)
 //!   2 = id map (rkyv)
 //!   3 = interner (rkyv)
-//!   4 = meta (bincode V8Meta)
+//!   4 = META (bincode V8Meta — only labels + wal_truncated; large fields have own sections)
+//!   5 = EDGE_PROPS (rkyv; overlay merged with base at snapshot time)
+//!   6 = HNSW (rkyv blobs)
+//!   7 = PROVENANCE (rkyv; retained undecoded at open)
+//!   8 = RULES_META (rkyv)
+//!   9 = VIEWS (rkyv)
+//!  10 = IVF_STATE (bincode BTreeMap<String,PerRuleIvfState>; retained undecoded at open)
 
 use crate::columns::ColumnStore;
 use crate::edge_props::EdgeProps;
@@ -33,8 +39,9 @@ use crate::v8::layout::{
     ProvenanceSectionData, RuleFireEntry, RuleTripEntry, RulesMetaData, Triple, ViewsSectionData,
 };
 use crate::v8::{
-    HEADER_SIZE, SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_IDS, SECTION_META,
-    SECTION_PROVENANCE, SECTION_RULES_META, SECTION_SYMS, SECTION_TOPOLOGY, SECTION_VIEWS,
+    HEADER_SIZE, SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_IDS, SECTION_IVF_STATE,
+    SECTION_META, SECTION_PROVENANCE, SECTION_RULES_META, SECTION_SYMS, SECTION_TOPOLOGY,
+    SECTION_VIEWS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -44,19 +51,43 @@ use std::io::Write;
 // V8Meta — bincode-serialized section 4
 // ---------------------------------------------------------------------------
 
-/// Metadata that does not fit in the rkyv sections; serialized as bincode.
+/// Metadata serialized as bincode into section 4.
+///
+/// T5 lean layout: only `labels` and `wal_truncated` live here.
+/// All large fields (edge_props, provenance, hnsw, rule_defs, rule_tripped,
+/// rule_fires, view_defs) have dedicated rkyv sections (5–9) and are encoded
+/// directly from the corresponding fields in `encode_v8`.  `ivf_state` is in
+/// section 10.  The `edge_props`, `hnsw`, `rule_defs`, `rule_tripped`,
+/// `rule_fires`, `view_defs`, and `provenance` fields below are kept in
+/// `V8Meta` solely as a convenient carrier passed to `encode_v8` so callers
+/// don't need to pass a dozen separate arguments; they are NOT written to the
+/// bincode META section (marked `#[serde(skip)]`).
 #[derive(Serialize, Deserialize, Default)]
 pub struct V8Meta {
+    /// Node-id → label-symbol mapping.
     pub labels: Vec<u32>,
-    pub edge_props: EdgeProps,
-    pub rule_defs: Vec<Vec<u8>>,
-    pub provenance: BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
-    pub rule_tripped: BTreeMap<String, bool>,
-    pub rule_fires: BTreeMap<String, u64>,
-    pub ivf_state: BTreeMap<String, PerRuleIvfState>,
-    pub view_defs: Vec<Vec<u8>>,
+    /// Snapshot-truncated-WAL flag.
     pub wal_truncated: bool,
+    // -- Fields below are encode-path only; NOT in the bincode META section. --
+    #[serde(skip)]
+    pub edge_props: EdgeProps,
+    #[serde(skip)]
+    pub rule_defs: Vec<Vec<u8>>,
+    #[serde(skip)]
+    pub provenance: BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
+    #[serde(skip)]
+    pub rule_tripped: BTreeMap<String, bool>,
+    #[serde(skip)]
+    pub rule_fires: BTreeMap<String, u64>,
+    #[serde(skip)]
+    pub view_defs: Vec<Vec<u8>>,
+    #[serde(skip)]
     pub hnsw: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
+    /// Raw bincode bytes of `BTreeMap<String, PerRuleIvfState>`.
+    /// Written as section 10.  Retained undecoded at open for lazy init.
+    /// An empty Vec means no approximate rules exist.
+    #[serde(skip)]
+    pub ivf_bytes: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -76,10 +107,22 @@ pub struct V8Meta {
 /// (minus prop tombstones recorded in `cols.prop_tombstones`) with the overlay
 /// `cols`.  When `None`, `cols` is encoded directly (initial snapshot or
 /// V5–V7 legacy path).
+///
+/// `base_edge_props` controls section 5 (EDGE_PROPS):
+///   - `None`: encode from `meta.edge_props` overlay alone (initial snapshot or V5-V7 path).
+///   - `Some((archived, raw))` with `meta.edge_props.is_clean()`: passthrough `raw` bytes
+///     byte-identical (no decode + re-encode of the 500 MiB section).
+///   - `Some((archived, _))` with dirty overlay: merge archived base + overlay.
+///
+/// `base_provenance_raw` controls section 7 (PROVENANCE):
+///   - `Some(raw)` and provenance unchanged: passthrough raw bytes.
+///   - Otherwise: encode from `meta.provenance`.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_v8<W: Write>(
     base_topo: Option<&crate::v8::layout::ArchivedCsr>,
     base_cols: Option<&crate::v8::layout::ArchivedColumns>,
+    base_edge_props: Option<(&crate::v8::layout::ArchivedEdgeProps, &[u8])>,
+    base_provenance_raw: Option<&[u8]>,
     topo: &Topology,
     cols: &ColumnStore,
     ids: &IdMap,
@@ -102,10 +145,43 @@ pub fn encode_v8<W: Write>(
     let meta_bytes = bincode::serialize(meta).map_err(|e| GraphError::Corrupt {
         detail: format!("v8: meta bincode serialize: {e}"),
     })?;
-    // New Task-2 sections (5-9):
-    let edge_props_bytes = rkyv_encode(&edge_props_to_data(&meta.edge_props))?;
+
+    // Section 5: EDGE_PROPS — passthrough, merge, or fresh encode.
+    let edge_props_bytes_owned: Vec<u8>;
+    let edge_props_bytes: &[u8] = match base_edge_props {
+        Some((_archived, raw)) if meta.edge_props.is_clean() => {
+            // No overlay changes → passthrough base section bytes byte-identical.
+            raw
+        }
+        Some((archived, _)) => {
+            // Overlay has changes or tombstones → merge base + overlay.
+            edge_props_bytes_owned =
+                rkyv_encode(&edge_props_merge_to_data(archived, &meta.edge_props))?;
+            &edge_props_bytes_owned
+        }
+        None => {
+            // No base (initial snapshot or V5–V7 migration path).
+            edge_props_bytes_owned = rkyv_encode(&edge_props_to_data(&meta.edge_props))?;
+            &edge_props_bytes_owned
+        }
+    };
+
     let hnsw_bytes = rkyv_encode(&hnsw_to_data(&meta.hnsw))?;
-    let prov_bytes = rkyv_encode(&provenance_to_data(&meta.provenance))?;
+
+    // Section 7: PROVENANCE — passthrough or fresh encode.
+    let prov_bytes_owned: Vec<u8>;
+    let prov_bytes: &[u8] = match base_provenance_raw {
+        Some(raw) if meta.provenance.is_empty() => {
+            // Provenance was never loaded/changed → passthrough base bytes.
+            // A truly empty provenance (no rules) also passes through correctly.
+            raw
+        }
+        _ => {
+            prov_bytes_owned = rkyv_encode(&provenance_to_data(&meta.provenance))?;
+            &prov_bytes_owned
+        }
+    };
+
     let rules_meta_bytes = rkyv_encode(&rules_meta_to_data(
         &meta.rule_defs,
         &meta.rule_tripped,
@@ -114,6 +190,9 @@ pub fn encode_v8<W: Write>(
     let views_bytes = rkyv_encode(&ViewsSectionData {
         view_defs: meta.view_defs.clone(),
     })?;
+    // Section 10: IVF_STATE — raw bincode bytes (may be empty for stores with no
+    // approximate rules; empty bytes decode as an empty map).
+    let ivf_bytes: &[u8] = &meta.ivf_bytes;
 
     let sections: &[(u8, &[u8])] = &[
         (SECTION_TOPOLOGY, &topo_bytes),
@@ -121,11 +200,12 @@ pub fn encode_v8<W: Write>(
         (SECTION_IDS, &ids_bytes),
         (SECTION_SYMS, &syms_bytes),
         (SECTION_META, &meta_bytes),
-        (SECTION_EDGE_PROPS, &edge_props_bytes),
+        (SECTION_EDGE_PROPS, edge_props_bytes),
         (SECTION_HNSW, &hnsw_bytes),
-        (SECTION_PROVENANCE, &prov_bytes),
+        (SECTION_PROVENANCE, prov_bytes),
         (SECTION_RULES_META, &rules_meta_bytes),
         (SECTION_VIEWS, &views_bytes),
+        (SECTION_IVF_STATE, ivf_bytes),
     ];
     let n = sections.len();
 
@@ -821,6 +901,18 @@ pub fn decode_meta(bytes: &[u8]) -> Result<V8Meta> {
     })
 }
 
+/// Decode IVF state from raw section-10 bytes.
+///
+/// Returns an empty map for a zero-length slice (stores with no approximate
+/// rules write an empty IVF section).  Corrupt bytes are treated the same as
+/// an absent map (non-fatal: the engine will re-fit clusters on first use).
+pub fn decode_ivf_bytes(bytes: &[u8]) -> BTreeMap<String, PerRuleIvfState> {
+    if bytes.is_empty() {
+        return BTreeMap::new();
+    }
+    bincode::deserialize(bytes).unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Task-2 section encoders
 // ---------------------------------------------------------------------------
@@ -841,6 +933,64 @@ fn edge_props_to_data(ep: &EdgeProps) -> EdgePropsData {
             }
         })
         .collect();
+    entries.sort_by_key(|e| (e.etype, e.src, e.dst));
+    EdgePropsData { entries }
+}
+
+/// Merge an archived base `EdgePropsData` with an in-memory overlay, producing
+/// the `EdgePropsData` for the next snapshot.
+///
+/// Algorithm:
+/// 1. Emit all base entries whose key `(etype, src, dst)` is NOT tombstoned in
+///    the overlay and NOT superseded by an overlay entry (base entry wins only
+///    when absent from overlay map).
+/// 2. Emit all overlay entries (overlay wins over base for the same key).
+///
+/// Entries in the result are sorted by (etype, src, dst) ascending.
+fn edge_props_merge_to_data(
+    base: &crate::v8::layout::ArchivedEdgeProps,
+    overlay: &EdgeProps,
+) -> EdgePropsData {
+    use std::collections::BTreeSet as BSet;
+
+    // Collect overlay keys for supersedure check.
+    let overlay_keys: BSet<(u32, u32, u32)> = overlay
+        .sorted_entries()
+        .iter()
+        .map(|&(et, s, d, _)| (et, s, d))
+        .collect();
+    let tombstoned_keys: BSet<(u32, u32, u32)> = overlay.tombstoned_keys().collect();
+
+    let mut entries: Vec<EdgePropEntry> = Vec::new();
+
+    // Base entries not tombstoned and not superseded by overlay.
+    for entry in base.entries.iter() {
+        let et = u32::from(entry.etype);
+        let s = u32::from(entry.src);
+        let d = u32::from(entry.dst);
+        let key = (et, s, d);
+        if tombstoned_keys.contains(&key) || overlay_keys.contains(&key) {
+            continue;
+        }
+        entries.push(EdgePropEntry {
+            etype: et,
+            src: s,
+            dst: d,
+            props_blob: entry.props_blob.as_slice().to_vec(),
+        });
+    }
+
+    // Overlay entries (these take priority over any matching base entry).
+    for (et, s, d, props) in overlay.sorted_entries() {
+        let props_blob = bincode::serialize(props).unwrap_or_default();
+        entries.push(EdgePropEntry {
+            etype: et,
+            src: s,
+            dst: d,
+            props_blob,
+        });
+    }
+
     entries.sort_by_key(|e| (e.etype, e.src, e.dst));
     EdgePropsData { entries }
 }
@@ -945,6 +1095,25 @@ pub fn archived_provenance_to_owned(
         map.insert(rule, triples);
     }
     map
+}
+
+/// Decode raw provenance section bytes (rkyv) into a map.
+///
+/// Returns an empty map for a zero-length slice (stores with no rules write
+/// an empty provenance section). Corrupt bytes are treated as absent
+/// (non-fatal: the engine will start from empty provenance).
+pub fn decode_provenance_bytes(
+    bytes: &[u8],
+) -> BTreeMap<String, std::collections::BTreeSet<(u32, u32, u32)>> {
+    if bytes.is_empty() {
+        return BTreeMap::new();
+    }
+    match rkyv::access::<crate::v8::layout::ArchivedProvenanceSectionData, rkyv::rancor::Error>(
+        bytes,
+    ) {
+        Ok(archived) => archived_provenance_to_owned(archived),
+        Err(_) => BTreeMap::new(),
+    }
 }
 
 /// Return type for `archived_rules_meta_to_owned`.

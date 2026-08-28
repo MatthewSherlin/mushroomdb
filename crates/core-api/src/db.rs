@@ -11,17 +11,17 @@ use core_query::cypher::{
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
     decode_rule_def, evaluate, EngineEdgeDelta, GraphMut, NodeView, Predicate, RuleDef, RuleEngine,
-    RuleIvfExport, ViewDef, ViewStore,
+    ViewDef, ViewStore,
 };
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
 use core_storage::v8::encode::{
-    archived_edge_props_to_owned, archived_hnsw_to_owned, archived_provenance_to_owned,
-    archived_rules_meta_to_owned, archived_to_idmap, archived_to_interner, archived_views_to_owned,
-    decode_meta, encode_v8, V8Meta,
+    archived_hnsw_to_owned, archived_rules_meta_to_owned, archived_to_idmap, archived_to_interner,
+    archived_views_to_owned, decode_meta, encode_v8, V8Meta,
 };
 use core_storage::v8::seam::TopologyView;
 use core_storage::wal::{decode_all, encode_record, WalRecord};
+use core_storage::EdgePropsView;
 use core_storage::{
     ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
 };
@@ -1219,22 +1219,14 @@ impl<F: Fs> GraphDb<F> {
         //     lazy-init guard which calls reindex_all_load_ivf + load_hnsw_state.
         //   - WAL-present: open_with calls consume_retained_state_eager before
         //     replay so HNSW/IVF are live before any record fires the hooks.
-        let ivf_state: BTreeMap<String, RuleIvfExport> = state
-            .ivf_state
-            .into_iter()
-            .map(|(name, ps)| {
-                (
-                    name,
-                    (
-                        (ps.src.centroids, ps.src.clusters, ps.src.drift),
-                        (ps.dst.centroids, ps.dst.clusters, ps.dst.drift),
-                    ),
-                )
-            })
-            .collect();
+        let ivf_bytes = if state.ivf_state.is_empty() {
+            Vec::new()
+        } else {
+            bincode::serialize(&state.ivf_state).expect("IVF state serialize cannot fail")
+        };
         // Store blobs without eagerly deserializing them.
         self.engine
-            .store_snapshot_state(state.hnsw_state, ivf_state);
+            .store_snapshot_state(state.hnsw_state, ivf_bytes);
         // Restore view defs from snapshot (V5).
         // The ColumnStore already contains view values from the snapshot;
         // use restore_view (no collision check, no backfill) so the store
@@ -1279,12 +1271,9 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("v8: meta decode: {e:?}"),
         })?;
         self.labels = meta.labels;
-        self.edge_props =
-            archived_edge_props_to_owned(mapped.edge_props_section().map_err(|e| {
-                GraphError::Corrupt {
-                    detail: format!("v8: edge_props section: {e:?}"),
-                }
-            })?);
+        // C3: self.edge_props stays as an empty overlay.  Reads go through
+        // edge_props_view() which consults the mmap'd base section zero-copy
+        // via EdgePropsView::with_base.  No heap decode at open time.
 
         // Restore rule engine.
         let (rule_def_bytes, rule_tripped, rule_fires) =
@@ -1301,34 +1290,34 @@ impl<F: Fs> GraphDb<F> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let provenance =
-            archived_provenance_to_owned(mapped.provenance_section().map_err(|e| {
-                GraphError::Corrupt {
-                    detail: format!("v8: provenance section: {e:?}"),
-                }
-            })?);
-        self.engine = RuleEngine::from_persist(defs, provenance, rule_tripped, rule_fires);
+        // C4: provenance bytes retained without decoding at open.
+        // The &self read path (stats, explain, provenance_touching) triggers a
+        // one-time lazy decode via ensure_provenance_loaded / OnceLock.
+        // The &mut self write path (first mutation) calls ensure_provenance_loaded_mut
+        // which consumes the bytes into the live mutable fields.
+        let provenance_bytes = mapped
+            .provenance_raw_bytes()
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: provenance section: {e:?}"),
+            })?
+            .to_vec();
+        self.engine = RuleEngine::from_persist(defs, BTreeMap::new(), rule_tripped, rule_fires);
+        self.engine.store_provenance_bytes(provenance_bytes);
 
-        // Retain HNSW/IVF blobs without eagerly deserialising (same semantics
-        // as restore_snapshot_state: lazy on clean open, eager before WAL replay).
+        // Retain HNSW blobs and raw IVF bytes without deserialising (same
+        // semantics: lazy on clean open, eager before WAL replay).
         let hnsw_state =
             archived_hnsw_to_owned(mapped.hnsw_section().map_err(|e| GraphError::Corrupt {
                 detail: format!("v8: hnsw section: {e:?}"),
             })?);
-        let ivf_state: BTreeMap<String, RuleIvfExport> = meta
-            .ivf_state
-            .into_iter()
-            .map(|(name, ps)| {
-                (
-                    name,
-                    (
-                        (ps.src.centroids, ps.src.clusters, ps.src.drift),
-                        (ps.dst.centroids, ps.dst.clusters, ps.dst.drift),
-                    ),
-                )
-            })
-            .collect();
-        self.engine.store_snapshot_state(hnsw_state, ivf_state);
+        // C5: IVF state retained as raw section-10 bincode bytes.
+        let ivf_bytes = mapped
+            .ivf_bytes()
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: ivf section: {e:?}"),
+            })?
+            .to_vec();
+        self.engine.store_snapshot_state(hnsw_state, ivf_bytes);
 
         // Restore view definitions.
         let view_defs =
@@ -1376,6 +1365,24 @@ impl<F: Fs> GraphDb<F> {
                     .columns()
                     .expect("base columns CRC already verified at open");
                 core_storage::v8::seam::ColumnsView::with_base(&self.props, archived)
+            }
+        }
+    }
+
+    /// Return an `EdgePropsView` that merges the mmap'd base edge-props section
+    /// (when a V8 snapshot is open) with the in-memory WAL overlay.
+    ///
+    /// Reads consult the overlay first (for post-snapshot mutations), then fall
+    /// through to the archived base section zero-copy.  Tombstones in the
+    /// overlay mask deleted-from-base entries.
+    fn edge_props_view(&self) -> EdgePropsView<'_> {
+        match self.base {
+            None => EdgePropsView::owned(&self.edge_props),
+            Some(ref base) => {
+                let archived = base
+                    .edge_props_section()
+                    .expect("base edge_props CRC already verified at open");
+                EdgePropsView::with_base(&self.edge_props, archived)
             }
         }
     }
@@ -2677,6 +2684,12 @@ impl<F: Fs> GraphDb<F> {
                 "database degraded after group-commit fsync failure; reopen required",
             )));
         }
+        // Ensure retained provenance bytes are decoded into the live mutable
+        // fields before any mutation touches self.engine.provenance.  This is a
+        // no-op if provenance was never stored (fresh store) or has already been
+        // consumed (subsequent mutations).  WAL replay calls apply() directly
+        // and is covered by consume_retained_state_eager before replay.
+        self.engine.ensure_provenance_loaded_mut();
         // Invariant (I-1): no stale deltas may enter from a previous apply.
         // If any engine method ever accumulates deltas before erroring, they would
         // contaminate the *next* commit's event stream. This assert fires in debug
@@ -3430,6 +3443,9 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // Ensure provenance is decoded before MutPreview accesses it
+        // (note_delete_rule / is_rule_owned may call engine.provenance()).
+        self.engine.ensure_provenance_loaded_mut();
         let recs = {
             let mut preview = MutPreview::new(self);
             let mut recs = Vec::with_capacity(ops.len());
@@ -3719,6 +3735,8 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // Provenance must be loaded before we query provenance_touching.
+        self.engine.ensure_provenance_loaded_mut();
         let id = self
             .ids
             .get(key)
@@ -4405,7 +4423,7 @@ impl<F: Fs> GraphDb<F> {
             labels: &self.labels,
             props: self.props_view(),
             topo: self.topo_view(),
-            edge_props: &self.edge_props,
+            edge_props: self.edge_props_view(),
             mask: None,
         }
     }
@@ -4417,7 +4435,7 @@ impl<F: Fs> GraphDb<F> {
             labels: &self.labels,
             props: self.props_view(),
             topo: self.topo_view(),
-            edge_props: &self.edge_props,
+            edge_props: self.edge_props_view(),
             mask: Some(&mask.visible),
         }
     }
@@ -5325,13 +5343,15 @@ impl<F: Fs> GraphDb<F> {
                 .expect("provenance ids always resolvable")
                 .to_string();
             let weight = rule_def.weight_prop.as_deref().and_then(|prop| {
-                self.edge_props.get(etype, src, dst, prop).and_then(|v| {
-                    if let Value::Float(f) = v {
-                        Some(*f)
-                    } else {
-                        None
-                    }
-                })
+                self.edge_props_view()
+                    .get(etype, src, dst, prop)
+                    .and_then(|v| {
+                        if let Value::Float(f) = v {
+                            Some(f)
+                        } else {
+                            None
+                        }
+                    })
             });
             results.push(Explanation {
                 rule: rule_name.to_string(),
@@ -5632,15 +5652,17 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // Ensure provenance is decoded before to_persist() clones it.
+        self.engine.ensure_provenance_loaded_mut();
         let (rule_defs_typed, provenance, rule_tripped, rule_fires) = self.engine.to_persist();
         let rule_defs = rule_defs_typed
             .iter()
             .map(|r| bincode::serialize(r).expect("RuleDef serialize cannot fail"))
             .collect();
-        // Collect IVF state for approximate rules (V4).
+        // Collect HNSW state and IVF state as raw bincode bytes (section 10).
         let hnsw_state = self.engine.export_hnsw_state();
         let raw_ivf = self.engine.export_ivf_state();
-        let ivf_state: BTreeMap<String, core_storage::snapshot::PerRuleIvfState> = raw_ivf
+        let ivf_state_map: BTreeMap<String, core_storage::snapshot::PerRuleIvfState> = raw_ivf
             .into_iter()
             .map(|(name, ((sc, sa, sd), (dc, da, dd)))| {
                 (
@@ -5660,6 +5682,11 @@ impl<F: Fs> GraphDb<F> {
                 )
             })
             .collect();
+        let ivf_bytes = if ivf_state_map.is_empty() {
+            Vec::new()
+        } else {
+            bincode::serialize(&ivf_state_map).expect("IVF state serialize cannot fail")
+        };
         let view_defs: Vec<Vec<u8>> = self
             .view_store
             .views()
@@ -5675,7 +5702,7 @@ impl<F: Fs> GraphDb<F> {
                 provenance,
                 rule_tripped,
                 rule_fires,
-                ivf_state,
+                ivf_bytes,
                 view_defs,
                 wal_truncated: !opts.keep_wal,
                 hnsw: hnsw_state,
@@ -5692,9 +5719,29 @@ impl<F: Fs> GraphDb<F> {
                 let archived_cols = old_base.columns().map_err(|e| GraphError::Corrupt {
                     detail: format!("v8 snapshot: columns section: {e:?}"),
                 })?;
+                let archived_edge_props =
+                    old_base
+                        .edge_props_section()
+                        .map_err(|e| GraphError::Corrupt {
+                            detail: format!("v8 snapshot: edge_props section: {e:?}"),
+                        })?;
+                let edge_props_raw =
+                    old_base
+                        .edge_props_raw_bytes()
+                        .map_err(|e| GraphError::Corrupt {
+                            detail: format!("v8 snapshot: edge_props raw bytes: {e:?}"),
+                        })?;
+                let prov_raw =
+                    old_base
+                        .provenance_raw_bytes()
+                        .map_err(|e| GraphError::Corrupt {
+                            detail: format!("v8 snapshot: provenance raw bytes: {e:?}"),
+                        })?;
                 encode_v8(
                     Some(archived_csr),
                     Some(archived_cols),
+                    Some((archived_edge_props, edge_props_raw)),
+                    Some(prov_raw),
                     &self.topo,
                     &self.props,
                     &self.ids,
@@ -5720,6 +5767,14 @@ impl<F: Fs> GraphDb<F> {
             self.props = core_storage::columns::ColumnStore::new();
         } else {
             // Legacy path (V5–V7 stores without a V8 base).
+            // Convert ivf_bytes back to the SnapshotState map format.
+            let ivf_state: BTreeMap<String, core_storage::snapshot::PerRuleIvfState> =
+                if ivf_bytes.is_empty() {
+                    BTreeMap::new()
+                } else {
+                    bincode::deserialize(&ivf_bytes)
+                        .expect("ivf_bytes just serialized — cannot fail to deserialize")
+                };
             let state = core_storage::snapshot::SnapshotState {
                 ids: self.ids.clone(),
                 syms: self.syms.clone(),

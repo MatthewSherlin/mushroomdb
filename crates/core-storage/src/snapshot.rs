@@ -132,6 +132,11 @@ pub fn encode(state: &SnapshotState) -> Result<Vec<u8>> {
 }
 
 fn encode_v8_from_state(state: &SnapshotState) -> Result<Vec<u8>> {
+    let ivf_bytes = if state.ivf_state.is_empty() {
+        Vec::new()
+    } else {
+        bincode::serialize(&state.ivf_state).expect("IVF state serialize cannot fail")
+    };
     let meta = V8Meta {
         labels: state.labels.clone(),
         edge_props: state.edge_props.clone(),
@@ -139,13 +144,15 @@ fn encode_v8_from_state(state: &SnapshotState) -> Result<Vec<u8>> {
         provenance: state.provenance.clone(),
         rule_tripped: state.rule_tripped.clone(),
         rule_fires: state.rule_fires.clone(),
-        ivf_state: state.ivf_state.clone(),
+        ivf_bytes,
         view_defs: state.view_defs.clone(),
         wal_truncated: state.wal_truncated,
         hnsw: state.hnsw_state.clone(),
     };
     let mut out = Vec::new();
     crate::v8::encode::encode_v8(
+        None,
+        None,
         None,
         None,
         &state.topo,
@@ -261,7 +268,8 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
     use crate::v8::encode::{
         archived_edge_props_to_owned, archived_hnsw_to_owned, archived_provenance_to_owned,
         archived_rules_meta_to_owned, archived_to_columnstore, archived_to_idmap,
-        archived_to_interner, archived_views_to_owned, csr_to_topology, decode_meta,
+        archived_to_interner, archived_views_to_owned, csr_to_topology, decode_ivf_bytes,
+        decode_meta,
     };
 
     let archived_topo = mapped.topology()?;
@@ -276,9 +284,8 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
     let archived_syms = mapped.syms()?;
     let syms = archived_to_interner(archived_syms);
 
-    // V8Meta still carries labels, ivf_state, and wal_truncated which have no
-    // dedicated section yet; read those from meta.  Fields that now have their
-    // own sections are decoded from the sections instead.
+    // V8Meta now carries only labels and wal_truncated in the bincode section.
+    // IVF state is read from section 10 directly.
     let meta_bytes = mapped.meta_bytes()?;
     let meta = decode_meta(meta_bytes)?;
 
@@ -288,6 +295,7 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
     let (rule_defs, rule_tripped, rule_fires) =
         archived_rules_meta_to_owned(mapped.rules_meta_section()?);
     let view_defs = archived_views_to_owned(mapped.views_section()?);
+    let ivf_state = decode_ivf_bytes(mapped.ivf_bytes()?);
 
     Ok(Some(SnapshotState {
         ids,
@@ -300,7 +308,7 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
         provenance,
         rule_tripped,
         rule_fires,
-        ivf_state: meta.ivf_state,
+        ivf_state,
         view_defs,
         wal_truncated: meta.wal_truncated,
         hnsw_state,

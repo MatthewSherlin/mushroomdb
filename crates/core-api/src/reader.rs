@@ -23,7 +23,8 @@ use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::v8::MappedBase;
 use core_storage::wal::WalRecord;
 use core_storage::{
-    ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
+    ColumnStore, Direction, EdgeProps, EdgePropsView, GraphError, IdMap, Interner, Result,
+    Topology, Value,
 };
 
 use crate::db::{EdgeInfo, NodeInfo};
@@ -105,6 +106,21 @@ fn build_cv<'a>(props: &'a ColumnStore, base: &'a Option<Arc<MappedBase>>) -> Co
     }
 }
 
+fn build_epv<'a>(
+    edge_props: &'a EdgeProps,
+    base: &'a Option<Arc<MappedBase>>,
+) -> EdgePropsView<'a> {
+    match base {
+        None => EdgePropsView::owned(edge_props),
+        Some(b) => {
+            let archived = b
+                .edge_props_section()
+                .expect("base edge_props CRC already verified at open");
+            EdgePropsView::with_base(edge_props, archived)
+        }
+    }
+}
+
 fn make_view<'a>(
     state: &'a FrozenOverlay,
     base: &'a Option<Arc<MappedBase>>,
@@ -116,7 +132,7 @@ fn make_view<'a>(
         labels: &state.labels,
         props: build_cv(&state.props, base),
         topo: build_tv(&state.topo, base),
-        edge_props: &state.edge_props,
+        edge_props: build_epv(&state.edge_props, base),
         mask,
     }
 }

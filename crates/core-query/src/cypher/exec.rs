@@ -1574,7 +1574,7 @@ fn resolve_prop(
     };
     match cell {
         Cell::Node(id) => Ok(view.prop(*id, field).map(|vr| vr.into_value())),
-        Cell::Rel(e) => Ok(view.edge_props.get(e.etype, e.src, e.dst, field).cloned()),
+        Cell::Rel(e) => Ok(view.edge_props.get(e.etype, e.src, e.dst, field)),
         // Virtual path cell: only `length` is exposed.
         Cell::Path(hops) => {
             if field == "length" {
@@ -2570,7 +2570,7 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
                     .and_then(|c| c.as_ref())
                     .and_then(|c| match c {
                         Cell::Node(id) => view.prop(*id, field).map(|vr| vr.into_value()),
-                        Cell::Rel(e) => view.edge_props.get(e.etype, e.src, e.dst, field).cloned(),
+                        Cell::Rel(e) => view.edge_props.get(e.etype, e.src, e.dst, field),
                         _ => None,
                     }),
             };
@@ -3541,7 +3541,7 @@ mod tests {
     use crate::cypher::{lex, parse, RelDir};
     use crate::result::ResultSet;
     use crate::view::GraphView;
-    use core_storage::v8::seam::{ColumnsView, TopologyView};
+    use core_storage::v8::seam::{ColumnsView, EdgePropsView, TopologyView};
     use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
@@ -3593,7 +3593,7 @@ mod tests {
                 labels: &self.labels,
                 props: ColumnsView::owned(&self.props),
                 topo: TopologyView::owned(&self.topo),
-                edge_props: &self.eprops,
+                edge_props: EdgePropsView::owned(&self.eprops),
                 mask: None,
             }
         }

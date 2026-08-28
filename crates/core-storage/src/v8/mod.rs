@@ -4,12 +4,25 @@
 //! ```text
 //! [0..4]   MAGIC "GDB1"
 //! [4..6]   VERSION = 8 (u16 LE)
-//! [6..8]   section_count (u16 LE)
+//! [6..8]   section_count (u16 LE) — currently 11
 //! [8..8+16*N] SectionEntry * N  -- {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}
 //! [8+16*N..8+16*N+4]  whole-header CRC32
 //! [..4096]  zero-pad
 //! sections start at 8-byte aligned offsets (from file start, after the header page)
 //! ```
+//!
+//! Section ids (T5 layout):
+//!   0 = CSR topology (rkyv CsrData)
+//!   1 = columns (rkyv ColumnsData)
+//!   2 = id map (rkyv IdMapData)
+//!   3 = interner (rkyv InternerData)
+//!   4 = META (bincode V8Meta — labels + wal_truncated only; large fields moved to own sections)
+//!   5 = EDGE_PROPS (rkyv EdgePropsData, sorted by (etype,src,dst))
+//!   6 = HNSW (rkyv HnswSectionData, opaque blobs)
+//!   7 = PROVENANCE (rkyv ProvenanceSectionData; retained as undecoded bytes at open)
+//!   8 = RULES_META (rkyv RulesMetaData)
+//!   9 = VIEWS (rkyv ViewsSectionData)
+//!  10 = IVF_STATE (bincode BTreeMap<String,PerRuleIvfState>; retained as undecoded bytes at open)
 
 pub mod encode;
 pub mod layout;
@@ -63,10 +76,13 @@ pub const SECTION_PROVENANCE: u8 = 7;
 pub const SECTION_RULES_META: u8 = 8;
 /// Materialized view definitions: `ViewsSectionData`.
 pub const SECTION_VIEWS: u8 = 9;
+/// Per-approximate-rule IVF cluster state: bincode `BTreeMap<String, PerRuleIvfState>`.
+/// Retained as undecoded bytes at open; consumed lazily on first mutation or WAL replay.
+pub const SECTION_IVF_STATE: u8 = 10;
 
 /// Total number of canonical section slots (used for atomic check_state array).
-/// Extended from 5 (Task 1) to 10 (Task 2: +edge_props, hnsw, provenance, rules_meta, views).
-pub const V8_MAGIC_SECTION_COUNT: usize = 10;
+/// Extended from 10 (Task 2) to 11 (Task 5: +ivf_state).
+pub const V8_MAGIC_SECTION_COUNT: usize = 11;
 
 /// Atomic check state values.
 const STATE_UNCHECKED: u8 = 0;
@@ -281,6 +297,32 @@ impl MappedBase {
                 detail: format!("v8: views rkyv access: {e}"),
             })
     }
+
+    /// Raw bytes for the IVF-state section (section 10).
+    ///
+    /// The caller retains these bytes without decoding until first use.
+    /// Returns `Ok(&[])` when the section is absent from the directory
+    /// (pre-T5 stores migrated from V5–V7 have no IVF section; treat as empty).
+    /// Any other error (truncation, CRC mismatch) is propagated so that torn
+    /// writes are detected rather than silently returning an empty map.
+    pub fn ivf_bytes(&self) -> Result<&[u8]> {
+        if self.dir.iter().all(|e| e.id != SECTION_IVF_STATE) {
+            return Ok(&[]);
+        }
+        self.section_bytes(SECTION_IVF_STATE)
+    }
+
+    /// Raw bytes for the edge-props section (section 5).
+    /// Used for byte-identical passthrough when the overlay has no changes.
+    pub fn edge_props_raw_bytes(&self) -> Result<&[u8]> {
+        self.section_bytes(SECTION_EDGE_PROPS)
+    }
+
+    /// Raw bytes for the provenance section (section 7).
+    /// Retained without decoding until first provenance access.
+    pub fn provenance_raw_bytes(&self) -> Result<&[u8]> {
+        self.section_bytes(SECTION_PROVENANCE)
+    }
 }
 
 /// Parse and validate the V8 header page.
@@ -372,7 +414,7 @@ mod tests {
             provenance: BTreeMap::new(),
             rule_tripped: BTreeMap::new(),
             rule_fires: BTreeMap::new(),
-            ivf_state: BTreeMap::new(),
+            ivf_bytes: Vec::new(),
             view_defs: vec![],
             wal_truncated: false,
             hnsw: BTreeMap::new(),
@@ -391,7 +433,10 @@ mod tests {
         props.set(0, "v", Value::Int(42));
         let meta = tiny_v8_meta();
         let mut out = Vec::new();
-        encode_v8(None, None, &topo, &props, &ids, &syms, &meta, &mut out).expect("encode_v8");
+        encode_v8(
+            None, None, None, None, &topo, &props, &ids, &syms, &meta, &mut out,
+        )
+        .expect("encode_v8");
         out
     }
 

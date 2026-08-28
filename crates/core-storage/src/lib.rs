@@ -17,4 +17,5 @@ pub use idmap::IdMap;
 pub use interner::Interner;
 pub use topology::{Direction, Topology};
 pub use types::{list_tokens, GraphError, Result, Value, ValueKey};
+pub use v8::seam::EdgePropsView;
 pub use wal::{decode_all, encode_record, WalRecord};

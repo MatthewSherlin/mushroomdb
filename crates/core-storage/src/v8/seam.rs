@@ -18,9 +18,10 @@
 compile_error!("core-storage v8 seam: zero-copy f64 transmute requires a little-endian target");
 
 use crate::columns::{ColumnHandle, ColumnStore};
+use crate::edge_props::EdgeProps;
 use crate::topology::{Direction, Topology};
 use crate::types::Value;
-use crate::v8::layout::{ArchivedColumnData, ArchivedColumns, ArchivedCsr};
+use crate::v8::layout::{ArchivedColumnData, ArchivedColumns, ArchivedCsr, ArchivedEdgeProps};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
@@ -253,7 +254,7 @@ mod tests {
             provenance: BTreeMap::new(),
             rule_tripped: BTreeMap::new(),
             rule_fires: BTreeMap::new(),
-            ivf_state: BTreeMap::new(),
+            ivf_bytes: Vec::new(),
             view_defs: vec![],
             wal_truncated: false,
             hnsw: BTreeMap::new(),
@@ -281,6 +282,8 @@ mod tests {
         let meta = tiny_meta();
         let mut snap_bytes = Vec::new();
         encode_v8(
+            None,
+            None,
             None,
             None,
             &base_topo,
@@ -333,6 +336,8 @@ mod tests {
         ids2.get_or_insert("B");
         ids2.get_or_insert("C");
         encode_v8(
+            None,
+            None,
             None,
             None,
             &base_topo2,
@@ -631,6 +636,73 @@ impl<'a> ColumnsView<'a> {
     /// V8 post-snapshot overlay data; base reads happen via `get()`.
     pub fn column(&self, field: &str) -> ColumnHandle<'_> {
         self.overlay.column(field)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EdgePropsView
+// ---------------------------------------------------------------------------
+
+/// Overlay-over-base edge-property view.
+///
+/// After a V8 snapshot open the base edge props live in the zero-copy
+/// `ArchivedEdgeProps` section.  Only post-snapshot changes are in `overlay`.
+/// Tombstones in `overlay` mask base entries for deleted edges.
+///
+/// This type is `Copy` (two references) and intended to be passed by value.
+#[derive(Copy, Clone)]
+pub struct EdgePropsView<'a> {
+    pub overlay: &'a EdgeProps,
+    pub base: Option<&'a ArchivedEdgeProps>,
+}
+
+impl<'a> EdgePropsView<'a> {
+    /// Overlay-only constructor (no V8 base, or V8 with no prior snapshot).
+    pub fn owned(overlay: &'a EdgeProps) -> Self {
+        Self {
+            overlay,
+            base: None,
+        }
+    }
+
+    /// Overlay + archived base constructor.
+    pub fn with_base(overlay: &'a EdgeProps, base: &'a ArchivedEdgeProps) -> Self {
+        Self {
+            overlay,
+            base: Some(base),
+        }
+    }
+
+    /// Look up a field value for `(etype, src, dst)`.
+    ///
+    /// 1. If tombstoned in overlay → `None` (deletion masking).
+    /// 2. If present in overlay map → return overlay value (owned clone).
+    /// 3. Binary-search the archived base (zero-copy decode on hit).
+    /// 4. `None` if absent everywhere.
+    pub fn get(&self, etype: u32, src: u32, dst: u32, field: &str) -> Option<Value> {
+        // Tombstone check — masks both overlay and base entries.
+        if self.overlay.is_tombstoned(etype, src, dst) {
+            return None;
+        }
+        // Overlay lookup.
+        if let Some(v) = self.overlay.get(etype, src, dst, field) {
+            return Some(v.clone());
+        }
+        // Archive fallback.
+        let base = self.base?;
+        let entry = base.entries.binary_search_by(|e| {
+            let ke = u32::from(e.etype);
+            let ks = u32::from(e.src);
+            let kd = u32::from(e.dst);
+            (ke, ks, kd).cmp(&(etype, src, dst))
+        });
+        let entry = match entry {
+            Ok(i) => &base.entries[i],
+            Err(_) => return None,
+        };
+        let props: std::collections::BTreeMap<String, Value> =
+            bincode::deserialize(entry.props_blob.as_slice()).ok()?;
+        props.get(field).cloned()
     }
 }
 
