@@ -1617,27 +1617,36 @@ impl RuleEngine {
     /// Called before the first ANN query on a clean-open (no WAL) store.
     pub fn ensure_hnsw_loaded(&self) {
         self.lazy_hnsw.get_or_init(|| {
-            let blobs = self
-                .retained_hnsw_blobs
-                .lock()
-                .expect("retained_hnsw_blobs lock poisoned");
-            if blobs.is_empty() {
-                return BTreeMap::new();
-            }
-            blobs
-                .iter()
-                .map(|(name, (sb, db))| {
+            // Snapshot blob entries into a local Vec, then release the Mutex
+            // before deserialization so the lock is not held across potentially
+            // expensive bincode::deserialize calls.
+            let snapshot: Vec<(String, Vec<u8>, Vec<u8>)> = {
+                let guard = self
+                    .retained_hnsw_blobs
+                    .lock()
+                    .expect("retained_hnsw_blobs lock poisoned");
+                if guard.is_empty() {
+                    return BTreeMap::new();
+                }
+                guard
+                    .iter()
+                    .map(|(name, (sb, db))| (name.clone(), sb.clone(), db.clone()))
+                    .collect()
+            }; // lock released here
+            snapshot
+                .into_iter()
+                .map(|(name, sb, db)| {
                     let src = if !sb.is_empty() {
-                        bincode::deserialize::<HnswIndex>(sb).ok()
+                        bincode::deserialize::<HnswIndex>(&sb).ok()
                     } else {
                         None
                     };
                     let dst = if !db.is_empty() {
-                        bincode::deserialize::<HnswIndex>(db).ok()
+                        bincode::deserialize::<HnswIndex>(&db).ok()
                     } else {
                         None
                     };
-                    (name.clone(), (src, dst))
+                    (name, (src, dst))
                 })
                 .collect()
         });

@@ -1475,14 +1475,13 @@ impl<F: Fs> GraphDb<F> {
     /// handful of `Arc` handles). Subsequent query operations run without any
     /// lock.
     pub fn reader(&self) -> crate::reader::ReaderSnapshot {
-        crate::reader::ReaderSnapshot {
-            frozen: self
-                .fold_overlay
+        crate::reader::ReaderSnapshot::new(
+            self.fold_overlay
                 .clone()
                 .expect("fold_overlay is always Some after open_with; call reader() after open"),
-            base: self.base.clone(),
-            deltas: self.delta_tail.clone(),
-        }
+            self.base.clone(),
+            self.delta_tail.clone(),
+        )
     }
 
     /// Total number of WAL commits at the time [`open_at`] was called.

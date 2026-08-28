@@ -14,7 +14,7 @@
 //!    (fold resets the counter synchronously on the write path).
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use core_query::cypher::{execute, is_write_tokens, lex, parse, plan, Params};
 use core_query::{neighborhood, Dir, GraphView, ResultSet};
@@ -71,6 +71,14 @@ pub struct ReaderSnapshot {
     pub base: Option<Arc<MappedBase>>,
     /// Commits since the last fold, in arrival order. Length ≤ `FOLD_EVERY_K − 1`.
     pub deltas: Vec<Arc<CommitDelta>>,
+    /// Cached materialized overlay (frozen + deltas applied).
+    ///
+    /// Computed at most once per `ReaderSnapshot` on the first call to
+    /// [`Self::effective`] when `deltas` is non-empty.  Stores `Err(String)` if
+    /// WAL application fails so the error is returned to every subsequent caller
+    /// without re-attempting.  When `deltas` is empty this field is never
+    /// populated — `effective` returns `&frozen` directly.
+    cache: OnceLock<std::result::Result<FrozenOverlay, String>>,
 }
 
 // ── Private view-building helpers ─────────────────────────────────────────────
@@ -121,11 +129,13 @@ fn make_view<'a>(
 /// Note: fulltext is updated incrementally here for correctness; after all deltas
 /// are applied the caller should call `fulltext.rebuild_all` to correct drift from
 /// multi-field updates and out-of-order incremental additions.
+#[allow(clippy::too_many_arguments)]
 fn apply_one(
     ids: &mut IdMap,
     syms: &mut Interner,
     topo: &mut Topology,
     props: &mut ColumnStore,
+    edge_props: &mut EdgeProps,
     labels: &mut Vec<u32>,
     fulltext: &mut FulltextIndex,
     rec: &WalRecord,
@@ -232,6 +242,23 @@ fn apply_one(
                 if let Some(slot) = labels.get_mut(node_id as usize) {
                     *slot = u32::MAX;
                 }
+                // Sweep all edges incident on this node to prevent phantom
+                // adjacency. db.rs deletes these edges inline without emitting
+                // DeleteEdge WAL records, so we must mirror that sweep here.
+                let etypes: Vec<u32> = topo.etypes().collect();
+                let mut doomed = Vec::new();
+                for et in &etypes {
+                    for &dst in topo.neighbors(*et, Direction::Out, node_id).as_ref() {
+                        doomed.push((*et, node_id, dst));
+                    }
+                    for &src in topo.neighbors(*et, Direction::In, node_id).as_ref() {
+                        doomed.push((*et, src, node_id));
+                    }
+                }
+                for (et, s, d) in doomed {
+                    topo.remove_edge(et, s, d);
+                    edge_props.remove_edge(et, s, d);
+                }
             }
         }
 
@@ -272,7 +299,7 @@ fn apply_one(
 
         WalRecord::Batch(inner) => {
             for r in inner {
-                apply_one(ids, syms, topo, props, labels, fulltext, r)?;
+                apply_one(ids, syms, topo, props, edge_props, labels, fulltext, r)?;
             }
         }
 
@@ -331,6 +358,7 @@ impl ReaderSnapshot {
                     &mut w.syms,
                     &mut w.topo,
                     &mut w.props,
+                    &mut w.edge_props,
                     &mut w.labels,
                     &mut w.fulltext,
                     rec,
@@ -352,34 +380,61 @@ impl ReaderSnapshot {
         Ok(w)
     }
 
+    /// Construct a `ReaderSnapshot` from its constituent parts.
+    ///
+    /// Used by [`crate::db::GraphDb::reader`] — the only site that builds a
+    /// snapshot — so the private `cache` field stays encapsulated here.
+    pub(crate) fn new(
+        frozen: Arc<FrozenOverlay>,
+        base: Option<Arc<MappedBase>>,
+        deltas: Vec<Arc<CommitDelta>>,
+    ) -> Self {
+        Self {
+            frozen,
+            base,
+            deltas,
+            cache: OnceLock::new(),
+        }
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Return a reference to the current effective state.
+    ///
+    /// When the delta tail is empty this is a zero-copy borrow of `frozen`.
+    /// Otherwise the delta tail is applied to a clone of `frozen` exactly once
+    /// (cached in `self.cache`) so that all operations within a single
+    /// `ReaderSnapshot` share the same materialized view (F3: no triple
+    /// materialize per request).
+    fn effective(&self) -> Result<&FrozenOverlay> {
+        if self.deltas.is_empty() {
+            return Ok(&self.frozen);
+        }
+        let cached = self
+            .cache
+            .get_or_init(|| self.materialize().map_err(|e| e.to_string()));
+        cached
+            .as_ref()
+            .map_err(|e| GraphError::Corrupt { detail: e.clone() })
+    }
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     /// Resolve a role name to a node visibility mask.
     ///
-    /// Coherent with [`Self::query_masked`]: both materialize from the same
-    /// frozen base + delta tail, so the mask is never stale relative to the
-    /// query data.  When the delta tail is empty the frozen state is used
-    /// directly (zero-copy).
+    /// Coherent with [`Self::query_masked`]: both read from the same effective
+    /// state (frozen or cached materialization), so the mask is never stale
+    /// relative to the query data.
     pub fn mask_for_role(&self, role: &str) -> Result<NodeMask> {
-        if self.deltas.is_empty() {
-            mask_for_role_from(&self.frozen, role)
-        } else {
-            let working = self.materialize()?;
-            mask_for_role_from(&working, role)
-        }
+        mask_for_role_from(self.effective()?, role)
     }
 
     /// Resolve a node key to its dense id.
     ///
-    /// Checks the delta tail when present so that nodes inserted since the last
-    /// fold are visible.
+    /// Checks the delta tail (via the cached materialization) so that nodes
+    /// inserted since the last fold are visible.
     pub fn resolve_key(&self, key: &str) -> Option<u32> {
-        if self.deltas.is_empty() {
-            self.frozen.ids.get(key)
-        } else {
-            // materialize to pick up ids that arrived in the delta tail
-            self.materialize().ok().and_then(|w| w.ids.get(key))
-        }
+        self.effective().ok()?.ids.get(key)
     }
 
     /// Execute a read-only Cypher query over the epoch snapshot.
@@ -393,18 +448,11 @@ impl ReaderSnapshot {
         let ops = plan(&ast).map_err(|e| GraphError::QueryError {
             detail: format!("plan: {e}"),
         })?;
-        if self.deltas.is_empty() {
-            let view = make_view(&self.frozen, &self.base, None);
-            execute(&view, &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            })
-        } else {
-            let working = self.materialize()?;
-            let view = make_view(&working, &self.base, None);
-            execute(&view, &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            })
-        }
+        let state = self.effective()?;
+        let view = make_view(state, &self.base, None);
+        execute(&view, &ops, &Params(params)).map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })
     }
 
     /// Execute a read-only Cypher query with a node visibility mask.
@@ -430,28 +478,16 @@ impl ReaderSnapshot {
         let ops = plan(&ast).map_err(|e| GraphError::QueryError {
             detail: format!("plan: {e}"),
         })?;
-        if self.deltas.is_empty() {
-            let view = make_view(&self.frozen, &self.base, Some(&mask.visible));
-            execute(&view, &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            })
-        } else {
-            let working = self.materialize()?;
-            let view = make_view(&working, &self.base, Some(&mask.visible));
-            execute(&view, &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            })
-        }
+        let state = self.effective()?;
+        let view = make_view(state, &self.base, Some(&mask.visible));
+        execute(&view, &ops, &Params(params)).map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })
     }
 
     /// Live node info from the epoch snapshot. `None` if key is absent or tombstoned.
     pub fn node_info(&self, key: &str) -> Option<NodeInfo> {
-        if self.deltas.is_empty() {
-            node_info_from(key, &self.frozen, &self.base)
-        } else {
-            let working = self.materialize().ok()?;
-            node_info_from(key, &working, &self.base)
-        }
+        node_info_from(key, self.effective().ok()?, &self.base)
     }
 
     /// Every directed edge incident on `key`. `derived` is always `false` since
@@ -459,12 +495,7 @@ impl ReaderSnapshot {
     ///
     /// Unknown key → `Err(GraphError::KeyNotFound)`.
     pub fn node_edges(&self, key: &str) -> Result<Vec<EdgeInfo>> {
-        if self.deltas.is_empty() {
-            node_edges_from(key, &self.frozen, &self.base)
-        } else {
-            let working = self.materialize()?;
-            node_edges_from(key, &working, &self.base)
-        }
+        node_edges_from(key, self.effective()?, &self.base)
     }
 
     /// BFS neighborhood expansion restricted to `mask`-visible nodes.
@@ -479,12 +510,15 @@ impl ReaderSnapshot {
         dir: Dir,
         mask: &NodeMask,
     ) -> Option<ResultSet> {
-        if self.deltas.is_empty() {
-            neighborhood_masked_from(key, &self.frozen, &self.base, depth, edge_types, dir, mask)
-        } else {
-            let working = self.materialize().ok()?;
-            neighborhood_masked_from(key, &working, &self.base, depth, edge_types, dir, mask)
-        }
+        neighborhood_masked_from(
+            key,
+            self.effective().ok()?,
+            &self.base,
+            depth,
+            edge_types,
+            dir,
+            mask,
+        )
     }
 }
 
