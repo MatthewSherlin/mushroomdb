@@ -54,6 +54,14 @@ def main() -> int:
     with open(args.baseline) as f:
         baseline: dict = json.load(f)
 
+    # fsync-bound metrics vary with the shared runner's disk neighbors far
+    # beyond CPU-bound run-to-run variance (observed medians 0.71/0.73/0.85s
+    # for identical code while CPU-bound metrics stayed flat).  They keep a
+    # looser gate that still catches real breaks; CPU-bound metrics keep the
+    # strict default threshold.
+    FSYNC_BOUND_THRESHOLD = 0.60
+    FSYNC_BOUND = {"snapshot_write_s", "snapshot_open_s"}
+
     failures = []
     for metric, base_val in baseline.items():
         if metric not in results:
@@ -66,12 +74,15 @@ def main() -> int:
             ratio = (measured - base_val) / base_val
         else:
             ratio = 0.0
-        if ratio > args.threshold:
+        threshold = (
+            FSYNC_BOUND_THRESHOLD if metric in FSYNC_BOUND else args.threshold
+        )
+        if ratio > threshold:
             pct = ratio * 100
             failures.append(
                 f"  REGRESSED  {metric}  "
                 f"baseline={base_val:.6g}  measured={measured:.6g}  "
-                f"change=+{pct:.1f}%  (threshold={args.threshold * 100:.0f}%)"
+                f"change=+{pct:.1f}%  (threshold={threshold * 100:.0f}%)"
             )
 
     if failures:
