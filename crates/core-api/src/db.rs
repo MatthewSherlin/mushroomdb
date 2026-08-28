@@ -1234,6 +1234,21 @@ impl<F: Fs> GraphDb<F> {
         // commit would save last_change["a"]=1, then on reopen the first WAL
         // frame would replay at seq=1 again — colliding and making WAL-tail
         // mutations indistinguishable from the snapshot baseline.
+        //
+        // Safety invariant (seq-recycling):
+        //   Recycled seqs (those below the seeded baseline) were NEVER stored in
+        //   last_change because they belonged to a previous db lifetime — a new
+        //   db starts at commit_seq=0 with an empty last_change.  Therefore no
+        //   CAS precondition can carry a recycled seq as its `expected` value
+        //   and accidentally match a live node's last_change entry.
+        //
+        // `expected:0` on a deleted-then-reinserted node:
+        //   After deletion, last_changed() returns None; callers that call
+        //   last_changed() and then use NodeUnchangedSince get None.unwrap_or(0)
+        //   = 0.  The reinserted node gets seq > 0, so a subsequent CAS with
+        //   expected=0 correctly conflicts.  The only way to observe actual=0 in
+        //   a CasConflict would be a caller that invented expected=0 without ever
+        //   calling last_changed() — unreachable via the documented API contract.
         if let Some(&max_seq) = db.last_change.values().max() {
             db.commit_seq = db.commit_seq.max(max_seq);
         }

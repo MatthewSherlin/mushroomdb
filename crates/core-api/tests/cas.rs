@@ -183,11 +183,14 @@ fn cas_node_absent_succeeds_for_missing_node() {
 
 #[test]
 fn cas_failing_precond_does_not_write_wal_frame() {
+    // Multi-op batch with one failing precondition: NEITHER op must be applied
+    // and NO WAL frame must be written.
     let dir = tmp("cas-nowal");
     let wal_len_before;
     {
         let mut db = GraphDb::open(&dir).unwrap();
         db.insert_node("N", "a", vec![]).unwrap();
+        db.insert_node("N", "b", vec![]).unwrap();
         db.snapshot().unwrap(); // flush WAL
         wal_len_before = std::fs::metadata(dir.join("wal.bin"))
             .map(|m| m.len())
@@ -198,8 +201,28 @@ fn cas_failing_precond_does_not_write_wal_frame() {
         key: "a".into(),
         expected: 0, // always stale since seq >= 1
     }];
-    let ops = set_prop_op("a", "x", Value::Int(1));
-    let _ = db.write_batch_cas(preconds, ops);
+    // Two ops in the batch: neither must apply on conflict
+    let ops = vec![
+        BatchOp::SetProp {
+            key: "a".into(),
+            field: "x".into(),
+            value: Value::Int(1),
+        },
+        BatchOp::SetProp {
+            key: "b".into(),
+            field: "y".into(),
+            value: Value::Int(2),
+        },
+    ];
+    let err = db.write_batch_cas(preconds, ops).unwrap_err();
+    assert!(
+        matches!(err, GraphError::CasConflict { .. }),
+        "expected CasConflict, got {err:?}"
+    );
+    // State unchanged: neither prop must have been written
+    assert_eq!(db.get_prop("a", "x"), None, "op 1 must not have applied");
+    assert_eq!(db.get_prop("b", "y"), None, "op 2 must not have applied");
+    // WAL must not have grown
     let wal_len_after = std::fs::metadata(dir.join("wal.bin"))
         .map(|m| m.len())
         .unwrap_or(0);
@@ -214,25 +237,28 @@ fn cas_failing_precond_does_not_write_wal_frame() {
 #[test]
 fn last_change_survives_snapshot_and_reopen() {
     let dir = tmp("lc-snapshot");
-    let expected_seq;
+    let expected_seq_a;
+    let expected_seq_b;
     {
         let mut db = GraphDb::open(&dir).unwrap();
         db.insert_node("N", "a", vec![]).unwrap();
         db.insert_node("N", "b", vec![]).unwrap();
         db.set_prop("a", "x", Value::Int(1)).unwrap();
-        expected_seq = db.last_changed("a").unwrap();
+        expected_seq_a = db.last_changed("a").unwrap();
+        expected_seq_b = db.last_changed("b").unwrap();
         db.snapshot().unwrap();
     }
     // Reopen: should load LAST_CHANGE from V8 section 11
     let db = GraphDb::open(&dir).unwrap();
     assert_eq!(
         db.last_changed("a"),
-        Some(expected_seq),
+        Some(expected_seq_a),
         "last_changed for 'a' must match after snapshot + reopen"
     );
-    assert!(
-        db.last_changed("b").is_some(),
-        "last_changed for 'b' must survive reopen"
+    assert_eq!(
+        db.last_changed("b"),
+        Some(expected_seq_b),
+        "last_changed for 'b' must match exactly after snapshot + reopen"
     );
 }
 
@@ -344,5 +370,135 @@ fn shared_cas_race_only_one_writer_wins() {
         conflicts,
         n_threads - 1,
         "remaining threads must get CasConflict; got {conflicts}"
+    );
+}
+
+// --- M3: delete_node behavior and ABA pattern ---
+
+#[test]
+fn delete_node_returns_none_for_last_changed() {
+    let dir = tmp("lc-delete");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "a", vec![]).unwrap();
+    assert!(
+        db.last_changed("a").is_some(),
+        "node must have a seq before deletion"
+    );
+    db.delete_node("a").unwrap();
+    assert_eq!(
+        db.last_changed("a"),
+        None,
+        "last_changed must return None for a deleted node"
+    );
+}
+
+#[test]
+fn cas_aba_reinserted_node_conflicts_with_old_seq() {
+    // ABA pattern: insert → delete → reinsert with same key.
+    // A CAS with the pre-delete seq must conflict with the new post-reinsert seq.
+    let dir = tmp("cas-aba");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node("N", "a", vec![]).unwrap();
+    let pre_delete_seq = db.last_changed("a").unwrap();
+
+    db.delete_node("a").unwrap();
+    // Node is gone; last_changed returns None.
+    assert_eq!(db.last_changed("a"), None);
+
+    db.insert_node("N", "a", vec![]).unwrap();
+    let post_reinsert_seq = db.last_changed("a").unwrap();
+    assert!(
+        post_reinsert_seq > pre_delete_seq,
+        "reinserted node must get a strictly higher seq"
+    );
+
+    // CAS with the pre-delete seq must conflict with the new seq.
+    let preconds = vec![Precondition::NodeUnchangedSince {
+        key: "a".into(),
+        expected: pre_delete_seq,
+    }];
+    let ops = set_prop_op("a", "x", Value::Int(99));
+    let err = db.write_batch_cas(preconds, ops).unwrap_err();
+    match err {
+        GraphError::CasConflict {
+            key,
+            expected,
+            actual,
+        } => {
+            assert_eq!(key, "a");
+            assert_eq!(expected, pre_delete_seq);
+            assert_eq!(actual, post_reinsert_seq);
+        }
+        other => panic!("expected CasConflict on ABA pattern, got {other:?}"),
+    }
+}
+
+// --- I2: drain loop preserves group batching for non-CAS submissions ---
+
+#[test]
+fn non_cas_submissions_batched_into_single_group_call() {
+    // N concurrent non-CAS submit_batch calls must land as N WAL Batch frames
+    // and complete with all nodes committed — the same observable state as N
+    // sequential single writes, regardless of internal batching structure.
+    use core_storage::wal::decode_all;
+
+    let dir = tmp("drain-batching");
+    let db = SharedDb::open(&dir).unwrap();
+
+    // Pre-insert a root node so the DB directory is initialized.
+    db.write().insert_node("N", "root", vec![]).unwrap();
+    db.write().snapshot().unwrap(); // truncate WAL to zero known length
+
+    let n = 8usize;
+    let barrier = Arc::new(Barrier::new(n));
+    let db = Arc::new(db);
+
+    let handles: Vec<_> = (0..n)
+        .map(|i| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait(); // all threads start simultaneously → land in same drain group
+                let ops = vec![BatchOp::InsertNode {
+                    label: "N".into(),
+                    key: format!("n{i}"),
+                    props: vec![],
+                }];
+                db.submit_batch(ops)
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert!(
+        results.iter().all(|r| r.is_ok()),
+        "all non-CAS submissions must succeed: {results:?}"
+    );
+
+    // Verify all nodes committed.
+    let db = match Arc::try_unwrap(db) {
+        Ok(d) => d,
+        Err(_) => panic!("Arc still held — bug in test setup"),
+    };
+    let guard = db.read();
+    for i in 0..n {
+        assert!(
+            guard.has_node(&format!("n{i}")),
+            "node n{i} must be committed"
+        );
+    }
+    drop(guard);
+
+    // Verify WAL frame count = N (one Batch frame per submission).
+    let wal = std::fs::read(dir.join("wal.bin")).unwrap();
+    let (records, _) = decode_all(&wal);
+    let batch_frames = records
+        .iter()
+        .filter(|r| matches!(r, core_storage::wal::WalRecord::Batch(_)))
+        .count();
+    assert_eq!(
+        batch_frames, n,
+        "N non-CAS submissions must produce exactly N WAL Batch frames; got {batch_frames}"
     );
 }

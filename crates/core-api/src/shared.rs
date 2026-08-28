@@ -527,28 +527,43 @@ fn drain_loop(
             if sync_needed {
                 db.set_deferred_events_mode(true);
             }
-            // Apply each submission.  For CAS submissions, check preconditions
-            // under the same write guard (no TOCTOU) before calling the nosync
-            // apply path.  A failing precondition returns Err without writing
-            // any WAL frame for that submission.
-            let mut r = Vec::with_capacity(submissions.len());
+            // Apply submissions in FIFO order.
+            //
+            // Non-CAS submissions are coalesced into a single commit_group_nosync
+            // call (preserving the T4b group-write batching intent — one write
+            // boundary per drain group, not per submission).  CAS submissions
+            // break the coalescing because their preconditions must be evaluated
+            // AFTER all prior submissions in the group have been applied (no
+            // TOCTOU); they are processed individually between coalesced non-CAS
+            // runs.
+            let mut r: Vec<Result<(usize, usize)>> = Vec::with_capacity(submissions.len());
+            let mut pending_non_cas: Vec<Vec<BatchOp>> = Vec::new();
+
             for (preconds, ops) in submissions {
-                let result = if preconds.is_empty() {
-                    db.commit_group_nosync(vec![ops])
-                        .into_iter()
-                        .next()
-                        .unwrap_or(Ok((0, 0)))
+                if preconds.is_empty() {
+                    // Non-CAS: accumulate for a batched commit_group_nosync call.
+                    pending_non_cas.push(ops);
                 } else {
-                    match db.check_preconditions(&preconds) {
+                    // CAS: flush accumulated non-CAS batch first so that precond
+                    // evaluation sees their writes already applied.
+                    if !pending_non_cas.is_empty() {
+                        let batch = std::mem::take(&mut pending_non_cas);
+                        r.extend(db.commit_group_nosync(batch));
+                    }
+                    let result = match db.check_preconditions(&preconds) {
                         Ok(()) => db
                             .commit_group_nosync(vec![ops])
                             .into_iter()
                             .next()
                             .unwrap_or(Ok((0, 0))),
                         Err(e) => Err(e),
-                    }
-                };
-                r.push(result);
+                    };
+                    r.push(result);
+                }
+            }
+            // Flush any remaining non-CAS submissions.
+            if !pending_non_cas.is_empty() {
+                r.extend(db.commit_group_nosync(pending_non_cas));
             }
             (r, sync_needed)
             // ← RwLock write guard released here; wal_mu still held

@@ -32,7 +32,7 @@ V5–V7 stores are **automatically migrated** to V8 on `GraphDb::open` (see Auto
 ```text
 [0..4]         magic "GDB1"
 [4..6]         VERSION = 8 (u16 LE)
-[6..8]         section_count (u16 LE) — currently 11
+[6..8]         section_count (u16 LE) — currently 12
 [8..8+16*N]    section directory: N × { id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32 }
 [8+16*N..+4]   whole-header CRC32 (covers bytes [0..8+16*N])
 [..4096]       zero-pad to complete the 4 KB header page
@@ -54,6 +54,7 @@ Section ids (fixed):
 | 8  | RULES_META | rkyv `RulesMetaData` (rule definitions, trip flags, fire counts) |
 | 9  | VIEWS      | rkyv `ViewsSectionData` (view definition bincode blobs) |
 | 10 | IVF_STATE  | bincode `BTreeMap<String, PerRuleIvfState>` (IVF centroid + cluster state per approximate rule) |
+| 11 | LAST_CHANGE | bincode `HashMap<u32, u64>` (per-node-id → last-commit-seq; used for CAS precondition checks) |
 
 CRC coverage: each section payload `[offset..offset+len]` is covered by its directory `crc32`.
 Alignment padding bytes between sections are written as zeros and are NOT covered by any CRC.
@@ -86,7 +87,7 @@ mushroomdb verify <db-dir>
 
 Reads every section, computes CRC32, and reports any mismatch. Exits 2 on the
 first corrupt section, 0 if all sections are intact. Measured at 0.26 s on
-a 1.8 GiB snapshot (11 sections). Run this after any external modification of
+a 1.8 GiB snapshot (12 sections). Run this after any external modification of
 the snapshot file, or periodically as a sanity check on storage hardware.
 
 ### WAL (`wal.bin`)
