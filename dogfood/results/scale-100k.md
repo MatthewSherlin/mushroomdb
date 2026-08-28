@@ -224,7 +224,7 @@ a one-time OS cost. Subsequent runs of the same binary are 0.02 s.
 mushroomdb verify ./scale-100000-db
 ```
 
-- 12 sections OK; 0 corrupt
+- 11 sections OK; 0 corrupt
 - Wall time: 0.26 s on the 1.8 GiB snapshot
 - Exit 0
 

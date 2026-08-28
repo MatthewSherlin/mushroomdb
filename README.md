@@ -363,7 +363,7 @@ full rule re-derivation; ANN index re-fitting dominates. **V8 snapshot size:**
 1.8 GiB (18% smaller than V5's 2.2 GiB; V5 stored IVF state as uncompressed
 inline bincode in its meta blob — V8 moves it to a dedicated compact section).
 **V8 snapshot write:** ~35 s. **Backfill (9 rules, max_edges=1M each):** 20.343 s.
-`mushroomdb verify <db-dir>` audits all 12 sections with full CRC32 and exits 2
+`mushroomdb verify <db-dir>` audits all 11 sections with full CRC32 and exits 2
 on any mismatch (0.26 s on the 1.8 GiB store; large sections skip CRC on the
 normal query path — see `docs/format-stability.md` for the trust model).
 Full trajectory and methodology:
@@ -457,7 +457,7 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | `mushroomdb algo pagerank <dir> --top 20` | Run PageRank over the unified topology (manual + derived edges) |
 | `mushroomdb algo wcc <dir> --top 50` | Find weakly-connected components |
 | `mushroomdb algo degree <dir> --top 20` | Degree centrality (out / in / both) |
-| `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch (large sections skip CRC on the normal query path; this command reads them all) |
+| `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 11 sections, exit 2 on any mismatch (large sections skip CRC on the normal query path; this command reads them all) |
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff of created/updated/unchanged items |
 
 Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).

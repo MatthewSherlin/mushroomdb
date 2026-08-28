@@ -249,6 +249,11 @@ fn apply_one(
         WalRecord::RemoveProp { key, field } => {
             if let Some(node_id) = ids.get(key) {
                 props.remove(node_id, field);
+                // A base-resident prop must be masked or ColumnsView falls
+                // through to the archived value (mirrors db.rs WAL replay).
+                // Tombstoning a prop absent from the base is a harmless
+                // false-mask: the overlay short-circuit never reaches it.
+                props.record_prop_tombstone(node_id, field);
                 fulltext.remove_node_field(node_id, field);
             }
         }

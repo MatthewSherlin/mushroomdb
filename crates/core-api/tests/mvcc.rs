@@ -397,3 +397,57 @@ fn mvcc_concurrent_reads_during_writes() {
     });
     println!("{}", serde_json::to_string_pretty(&summary).unwrap());
 }
+
+// ── Final-review fix: RemoveProp over a V8-base prop must tombstone ───────────
+
+/// A `RemoveProp` delta applied during reader materialization must mask a
+/// base-resident prop, not just clear the overlay — otherwise the archived
+/// V8 base value resurrects in `ReaderSnapshot` results (final-review L1).
+#[test]
+fn reader_remove_prop_over_v8_base_does_not_resurrect() {
+    let dir = tmp("removeprop-base");
+
+    // Build a store with a base-resident prop and snapshot to V8.
+    {
+        let db = SharedDb::open(&dir).unwrap();
+        db.write()
+            .insert_node(
+                "Person",
+                "ada",
+                vec![("score".into(), core_api::Value::Int(42))],
+            )
+            .unwrap();
+        db.write().snapshot().unwrap();
+    }
+
+    // Reopen: "score" now lives in the mmap base, overlay empty.
+    let db = SharedDb::open(&dir).unwrap();
+    let params = BTreeMap::new();
+
+    // Sanity: reader sees the base value.
+    let pre = db.reader();
+    let rs = pre
+        .query("MATCH (n:Person) WHERE n.score = 42 RETURN n", &params)
+        .unwrap();
+    assert_eq!(rs.len(), 1, "base prop must be visible pre-removal");
+
+    // Remove the prop; the delta lands in the reader's tail (post-fold).
+    db.write().remove_prop("ada", "score").unwrap();
+
+    // A fresh reader materializes the RemoveProp delta over the base.
+    let post = db.reader();
+    let rs = post
+        .query("MATCH (n:Person) WHERE n.score = 42 RETURN n", &params)
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        0,
+        "removed base prop must not resurrect through ReaderSnapshot"
+    );
+
+    // The pre-removal snapshot is unaffected (epoch isolation).
+    let rs = pre
+        .query("MATCH (n:Person) WHERE n.score = 42 RETURN n", &params)
+        .unwrap();
+    assert_eq!(rs.len(), 1, "old epoch must still see the prop");
+}

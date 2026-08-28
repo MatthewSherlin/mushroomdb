@@ -163,7 +163,7 @@ Not supported: CASE, subqueries, UNION, multi-statement BEGIN/COMMIT transaction
   (warm file cache, cold process; measured 2026-08-28, Apple M4 Pro, release build)
 - 100k nodes, WAL-only open: ~8.16 min (HNSW re-fitting dominates; measured 2026-08-24)
 - V8 snapshot size: 1.8 GiB (same 100k dataset; 18% smaller than V5's 2.2 GiB)
-- mushroomdb verify <db-dir>: CRC32 audit of all 12 sections; 0.26 s on 1.8 GiB; exits 2 on mismatch
+- mushroomdb verify <db-dir>: CRC32 audit of all 11 sections; 0.26 s on 1.8 GiB; exits 2 on mismatch
 
 ## GitHub
 
