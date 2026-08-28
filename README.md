@@ -107,17 +107,36 @@ localhost: **86 µs / 226 µs**. Clock: `std::time::Instant` (monotonic).
 
 See [docs/site/subscriptions.md](docs/site/subscriptions.md) for the full API reference.
 
-### Replay to any commit since your last snapshot
+### What was connected when, and why — the temporal story
 
-mushroomdb's WAL records every write since the last snapshot. `open_at` replays
-that window to any past commit, giving you a read-only view of the graph exactly
-as it existed after that write — including which derived edges existed and why:
+mushroomdb's differentiator over memory stores like Zep is rule attribution
+across time: not just *what* was connected, but *which rule* created each link
+and *at which commit* it was added or retracted. Every rule-derived edge writes
+a HISTORY-MARKER WAL record at the moment it fires, carrying the rule name as
+ground truth. These markers are state no-ops on replay (derived edges are
+re-derived from rules deterministically), but they are read by the history APIs
+as the authoritative record of *when* and *why* each derived link existed.
 
 ```rust
-// Open a read-only view at commit 5 (since last snapshot).
-let db = GraphDb::open_at(&dir, 5)?;
+// What edges existed between alice and bob, and when, and why?
+let history = db.edge_history("alice", "bob")?;
+// [{edge_type: "SIMILAR", commit: 3, event: Added, rule: Some("sim_emb")},
+//  {edge_type: "SIMILAR", commit: 7, event: Retracted, rule: Some("sim_emb")}]
 
-// Why did this edge exist then?
+// Was SIMILAR active between alice and bob at commit 4?
+let linked = db.was_linked("alice", "bob", "SIMILAR", 4)?; // true
+```
+
+Over MCP (`edge_history`, `was_linked`, `node_history`) or HTTP
+(`GET /history/edge`, `GET /history/was_linked`, `GET /node/{key}/history`),
+with role-token masking: hidden nodes return 404, never content.
+
+**As-of time travel:** `open_at` replays the WAL to any past commit, giving a
+read-only view of the full graph state at that moment — including which derived
+edges existed and why:
+
+```rust
+let db = GraphDb::open_at(&dir, 5)?;
 let exps = db.explain("alice", "bob")?;
 // → [{rule: "skill_fit", edge_type: "FIT", weight: 0.87, …}]
 ```
@@ -131,11 +150,19 @@ mushroomdb asof ./db --commit 5 --query "MATCH (n:Person)-[r:FIT]->(p:Project) R
 #   n=alice  p=proj-01  score=0.87
 ```
 
-**Scope:** `open_at` reaches commits recorded in the current WAL — those written
-since the last `snapshot()`. `snapshot()` truncates the WAL: faster cold starts,
-but as-of history restarts from that point. See
-[docs/site/timetravel.md](docs/site/timetravel.md) for the full tradeoff and
-replay-cost caveats.
+**Scope:** `open_at` reaches commits in the current WAL (since the last
+truncating `snapshot()`). With `archive_wal: true` and an intact genesis chain,
+it also reaches archived WAL segments. Pruned or incomplete genesis chains
+return `CommitOutOfRange` — never silently wrong data.
+
+**Compare-and-set writes:** `write_batch_cas` lets concurrent writers check
+that a node has not changed since they last read it before committing an update.
+`last_changed(key)` returns the commit sequence number of the last write that
+touched that node (persisted in V8 snapshot section 11, LAST_CHANGE).
+
+See [docs/site/timetravel.md](docs/site/timetravel.md) for the full temporal
+story: history APIs, rule attribution, CAS, archives, retention, and the
+horizon contract.
 
 ### Live degree counts and neighbor aggregates, no triggers
 
@@ -487,9 +514,13 @@ new facts arrive.
   `vector` for a combined ranking.
 - Explanations are built in: `explain_association` shows which rules and scores
   produced each link — an agent can cite evidence, not just conclusions.
-- Per-node history: `node_history(key)` (Rust API; MCP exposure planned)
-  returns every WAL-visible change for a node since the last truncating
-  snapshot — useful for audit, provenance, and change-triggered workflows.
+- Temporal history: `node_history(key)`, `edge_history(a, b)`, and
+  `was_linked(a, b, edge_type, at_commit)` return per-node and per-edge WAL
+  history with rule attribution — which rule created each derived link, at
+  which commit, and when it was retracted. Available over Rust API, MCP tools
+  (3 tools), and HTTP (`GET /node/{key}/history`, `GET /history/edge`,
+  `GET /history/was_linked`). Useful for audit, provenance, agent replay, and
+  change-triggered workflows.
 - Query subscriptions: `subscribe_query` (Rust API + WebSocket `/subscribe`)
   delivers incremental Cypher result sets after each commit (supported
   subset; full re-run per commit; use `LIMIT`).
@@ -519,7 +550,7 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
-**Agent memory quickstart** (all twelve MCP tools):
+**Agent memory quickstart** (all fifteen MCP tools):
 
 | Tool | Purpose |
 |---|---|
@@ -535,6 +566,9 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
 | `node_info` | Return a node's key, label, and properties |
 | `node_edges` | Return all edges incident on a node |
 | `stats` | Live node, edge, and rule counts |
+| `node_history` | WAL change history for a node (since last truncating snapshot) |
+| `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
+| `was_linked` | Point-in-time edge check: was an edge active at a given commit? |
 
 Full walkthrough, tool reference, and Claude Desktop setup:
 [`docs/site/mcp.md`](docs/site/mcp.md).
