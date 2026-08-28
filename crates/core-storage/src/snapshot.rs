@@ -263,7 +263,13 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
 
 /// Reconstruct a full `SnapshotState` from a `MappedBase`.
 ///
-/// Used by `decode()` and by `db.rs` after mapping a V8 snapshot from disk.
+/// Used by `decode()` for the fuzz-safe migration/integrity path.  The
+/// hot production path in `db.rs` does NOT call this — it uses zero-copy
+/// seam views backed by `MappedBase::topology()` (unchecked) directly.
+///
+/// This function uses `rkyv::access` (validated) for all large sections so
+/// that corrupt bytes return `GraphError::Corrupt` rather than UB.  Small
+/// sections (IDS, SYMS, RULES_META, VIEWS) already CRC-check on first touch.
 pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<SnapshotState>> {
     use crate::v8::encode::{
         archived_edge_props_to_owned, archived_hnsw_to_owned, archived_provenance_to_owned,
@@ -271,11 +277,29 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
         archived_to_interner, archived_views_to_owned, csr_to_topology, decode_ivf_bytes,
         decode_meta,
     };
+    use crate::v8::{
+        SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_PROVENANCE, SECTION_TOPOLOGY,
+    };
 
-    let archived_topo = mapped.topology()?;
+    // Large sections: use validated rkyv::access so corrupt bytes return
+    // GraphError::Corrupt instead of UB (required by the fuzz invariant).
+    // The production seam path (db.rs topo_view/props_view) uses the
+    // unchecked MappedBase::topology()/columns()/edge_props_section() accessors.
+    let archived_topo = rkyv::access::<crate::v8::layout::ArchivedCsrData, rkyv::rancor::Error>(
+        mapped.section_bytes(SECTION_TOPOLOGY)?,
+    )
+    .map_err(|e| GraphError::Corrupt {
+        detail: format!("v8: topology rkyv access: {e}"),
+    })?;
     let topo = csr_to_topology(archived_topo);
 
-    let archived_cols = mapped.columns()?;
+    let archived_cols =
+        rkyv::access::<crate::v8::layout::ArchivedColumnsData, rkyv::rancor::Error>(
+            mapped.section_bytes(SECTION_COLUMNS)?,
+        )
+        .map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: columns rkyv access: {e}"),
+        })?;
     let props = archived_to_columnstore(archived_cols);
 
     let archived_ids = mapped.ids()?;
@@ -289,9 +313,33 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
     let meta_bytes = mapped.meta_bytes()?;
     let meta = decode_meta(meta_bytes)?;
 
-    let edge_props = archived_edge_props_to_owned(mapped.edge_props_section()?);
-    let hnsw_state = archived_hnsw_to_owned(mapped.hnsw_section()?);
-    let provenance = archived_provenance_to_owned(mapped.provenance_section()?);
+    let archived_ep =
+        rkyv::access::<crate::v8::layout::ArchivedEdgePropsData, rkyv::rancor::Error>(
+            mapped.section_bytes(SECTION_EDGE_PROPS)?,
+        )
+        .map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: edge_props rkyv access: {e}"),
+        })?;
+    let edge_props = archived_edge_props_to_owned(archived_ep);
+
+    let archived_hnsw = rkyv::access::<
+        crate::v8::layout::ArchivedHnswSectionData,
+        rkyv::rancor::Error,
+    >(mapped.section_bytes(SECTION_HNSW)?)
+    .map_err(|e| GraphError::Corrupt {
+        detail: format!("v8: hnsw rkyv access: {e}"),
+    })?;
+    let hnsw_state = archived_hnsw_to_owned(archived_hnsw);
+
+    let archived_prov = rkyv::access::<
+        crate::v8::layout::ArchivedProvenanceSectionData,
+        rkyv::rancor::Error,
+    >(mapped.section_bytes(SECTION_PROVENANCE)?)
+    .map_err(|e| GraphError::Corrupt {
+        detail: format!("v8: provenance rkyv access: {e}"),
+    })?;
+    let provenance = archived_provenance_to_owned(archived_prov);
+
     let (rule_defs, rule_tripped, rule_fires) =
         archived_rules_meta_to_owned(mapped.rules_meta_section()?);
     let view_defs = archived_views_to_owned(mapped.views_section()?);

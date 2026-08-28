@@ -809,7 +809,7 @@ fn build_props_view<'a>(
         Some(b) => {
             let archived = b
                 .columns()
-                .expect("base columns CRC already verified at open");
+                .expect("base columns section bounds validated at open");
             core_storage::v8::seam::ColumnsView::with_base(props, archived)
         }
     }
@@ -824,7 +824,7 @@ fn build_topo_view<'a>(
         Some(b) => {
             let archived_csr = b
                 .topology()
-                .expect("base topology CRC already verified at open");
+                .expect("base topology section bounds validated at open");
             core_storage::v8::seam::TopologyView::with_base(overlay, archived_csr)
         }
     }
@@ -1414,10 +1414,11 @@ impl<F: Fs> GraphDb<F> {
         match self.base {
             None => TopologyView::owned(&self.topo),
             Some(ref base) => {
-                // SAFETY: base lives as long as self; CRC was verified at open.
+                // SAFETY: base lives as long as self; section bounds validated at open.
+                // topology() uses access_unchecked; all field reads are bounds-checked in seam.rs.
                 let archived = base
                     .topology()
-                    .expect("base topology CRC already verified at open");
+                    .expect("base topology section bounds validated at open");
                 TopologyView::with_base(&self.topo, archived)
             }
         }
@@ -1430,9 +1431,10 @@ impl<F: Fs> GraphDb<F> {
         match self.base {
             None => core_storage::v8::seam::ColumnsView::owned(&self.props),
             Some(ref base) => {
+                // columns() uses access_unchecked; field reads are bounds-checked in seam.rs.
                 let archived = base
                     .columns()
-                    .expect("base columns CRC already verified at open");
+                    .expect("base columns section bounds validated at open");
                 core_storage::v8::seam::ColumnsView::with_base(&self.props, archived)
             }
         }
@@ -1448,9 +1450,10 @@ impl<F: Fs> GraphDb<F> {
         match self.base {
             None => EdgePropsView::owned(&self.edge_props),
             Some(ref base) => {
+                // edge_props_section() uses access_unchecked; field reads bounds-checked in seam.rs.
                 let archived = base
                     .edge_props_section()
-                    .expect("base edge_props CRC already verified at open");
+                    .expect("base edge_props section bounds validated at open");
                 EdgePropsView::with_base(&self.edge_props, archived)
             }
         }
@@ -1647,7 +1650,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             self.base.as_ref().map(|b| {
                                 b.columns()
-                                    .expect("base columns CRC already verified at open")
+                                    .expect("base columns section bounds validated at open")
                             }),
                         );
                     }
@@ -1699,7 +1702,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.labels,
                     self.base.as_ref().map(|b| {
                         b.columns()
-                            .expect("base columns CRC already verified at open")
+                            .expect("base columns section bounds validated at open")
                     }),
                 );
                 // Rule engine: via-hop rules must update when user edges change.
@@ -1732,7 +1735,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             self.base.as_ref().map(|b| {
                                 b.columns()
-                                    .expect("base columns CRC already verified at open")
+                                    .expect("base columns section bounds validated at open")
                             }),
                         );
                     }
@@ -1779,7 +1782,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             self.base.as_ref().map(|b| {
                                 b.columns()
-                                    .expect("base columns CRC already verified at open")
+                                    .expect("base columns section bounds validated at open")
                             }),
                         );
                     }
@@ -1795,7 +1798,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.labels,
                     self.base.as_ref().map(|b| {
                         b.columns()
-                            .expect("base columns CRC already verified at open")
+                            .expect("base columns section bounds validated at open")
                     }),
                 );
                 // Full-text index maintenance: update tokens for this field if indexed.
@@ -1892,7 +1895,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             self.base.as_ref().map(|b| {
                                 b.columns()
-                                    .expect("base columns CRC already verified at open")
+                                    .expect("base columns section bounds validated at open")
                             }),
                         );
                     }
@@ -1943,7 +1946,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.labels,
                     self.base.as_ref().map(|b| {
                         b.columns()
-                            .expect("base columns CRC already verified at open")
+                            .expect("base columns section bounds validated at open")
                     }),
                 );
                 // Rule engine: via-hop rules fire when user via-edges are inserted.
@@ -1978,7 +1981,7 @@ impl<F: Fs> GraphDb<F> {
                                 &self.labels,
                                 self.base.as_ref().map(|b| {
                                     b.columns()
-                                        .expect("base columns CRC already verified at open")
+                                        .expect("base columns section bounds validated at open")
                                 }),
                             );
                         }
@@ -2031,7 +2034,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             self.base.as_ref().map(|b| {
                                 b.columns()
-                                    .expect("base columns CRC already verified at open")
+                                    .expect("base columns section bounds validated at open")
                             }),
                         );
                     }
@@ -2046,7 +2049,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.labels,
                     self.base.as_ref().map(|b| {
                         b.columns()
-                            .expect("base columns CRC already verified at open")
+                            .expect("base columns section bounds validated at open")
                     }),
                 );
                 if self.fulltext.field_indexed(&field_str) {
@@ -2110,7 +2113,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             self.base.as_ref().map(|b| {
                                 b.columns()
-                                    .expect("base columns CRC already verified at open")
+                                    .expect("base columns section bounds validated at open")
                             }),
                         );
                     }
@@ -2157,7 +2160,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             self.base.as_ref().map(|b| {
                                 b.columns()
-                                    .expect("base columns CRC already verified at open")
+                                    .expect("base columns section bounds validated at open")
                             }),
                         );
                     }
@@ -2222,7 +2225,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             self.base.as_ref().map(|b| {
                                 b.columns()
-                                    .expect("base columns CRC already verified at open")
+                                    .expect("base columns section bounds validated at open")
                             }),
                         );
                     }
@@ -2238,7 +2241,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.labels,
                     self.base.as_ref().map(|b| {
                         b.columns()
-                            .expect("base columns CRC already verified at open")
+                            .expect("base columns section bounds validated at open")
                     }),
                 );
                 // Full-text index maintenance: remove tokens for this field.
@@ -2290,7 +2293,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.labels,
                     self.base.as_ref().map(|b| {
                         b.columns()
-                            .expect("base columns CRC already verified at open")
+                            .expect("base columns section bounds validated at open")
                     }),
                 );
                 // Rule engine: via-hop rules must retract when user via-edges are deleted.
@@ -2323,7 +2326,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             self.base.as_ref().map(|b| {
                                 b.columns()
-                                    .expect("base columns CRC already verified at open")
+                                    .expect("base columns section bounds validated at open")
                             }),
                         );
                     }
@@ -2375,7 +2378,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             self.base.as_ref().map(|b| {
                                 b.columns()
-                                    .expect("base columns CRC already verified at open")
+                                    .expect("base columns section bounds validated at open")
                             }),
                         );
                     }
@@ -2412,7 +2415,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         self.base.as_ref().map(|b| {
                             b.columns()
-                                .expect("base columns CRC already verified at open")
+                                .expect("base columns section bounds validated at open")
                         }),
                     );
                 }
@@ -2474,7 +2477,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             self.base.as_ref().map(|b| {
                                 b.columns()
-                                    .expect("base columns CRC already verified at open")
+                                    .expect("base columns section bounds validated at open")
                             }),
                         );
                     }

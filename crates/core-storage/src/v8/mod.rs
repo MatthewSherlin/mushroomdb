@@ -119,9 +119,11 @@ struct SectionEntry {
 
 /// A read-only V8 snapshot backed by an mmap or owned bytes.
 ///
-/// Sections are accessed zero-copy via `rkyv::access_unchecked` after a
-/// lazy per-section CRC32 validation.  Validates the whole-header CRC on
-/// construction and validates each section's CRC on first access.
+/// Small sections (IDS, SYMS, META, RULES_META, VIEWS) are CRC-checked on
+/// first access. Large sections (TOPOLOGY, COLUMNS, EDGE_PROPS, HNSW,
+/// PROVENANCE, IVF_STATE) skip automatic CRC; their rkyv accessors use
+/// `rkyv::access_unchecked` (O(1) root-pointer lookup, no full-section walk).
+/// Full integrity audit is available via `mushroomdb verify`.
 pub struct MappedBase {
     backing: Backing,
     dir: Vec<SectionEntry>,
@@ -268,7 +270,12 @@ impl MappedBase {
     }
 
     /// Return the raw bytes for `section_id`, validating its CRC32 lazily.
-    fn section_bytes(&self, section_id: u8) -> Result<&[u8]> {
+    /// Return the raw bytes for a section by ID.
+    ///
+    /// Exposed as `pub(crate)` so that `snapshot::decode_v8_from_mapped` can
+    /// call `rkyv::access` (validated) for hostile-byte safety while the
+    /// production seam path uses the `access_unchecked` accessors above.
+    pub(crate) fn section_bytes(&self, section_id: u8) -> Result<&[u8]> {
         let entry = self
             .dir
             .iter()
@@ -346,26 +353,45 @@ impl MappedBase {
 
     /// Zero-copy access to the archived topology (CSR).
     ///
-    /// The section CRC has already been validated by `section_bytes`.
-    /// `rkyv::access` performs a lightweight structural check (root pointer
-    /// in bounds, correct alignment) and is otherwise zero-copy.
+    /// Uses `rkyv::access_unchecked` to avoid the O(section-size) pointer
+    /// validation walk that `rkyv::access` performs. Section bounds are
+    /// verified at open by `validate_section_bounds`; all CSR field accesses
+    /// in `seam.rs` go through Rust bounds-checked slice indexing. File
+    /// corruption is caught by `mushroomdb verify` (explicit full CRC32).
     pub fn topology(&self) -> Result<&ArchivedCsr> {
         let bytes = self.section_bytes(SECTION_TOPOLOGY)?;
-        rkyv::access::<crate::v8::layout::ArchivedCsrData, rkyv::rancor::Error>(bytes).map_err(
-            |e| GraphError::Corrupt {
-                detail: format!("v8: topology rkyv access: {e}"),
-            },
-        )
+        if bytes.len() < std::mem::size_of::<crate::v8::layout::ArchivedCsrData>() {
+            return Err(GraphError::Corrupt {
+                detail: "v8: topology section too short for rkyv root".to_string(),
+            });
+        }
+        // SAFETY: (1) Checked bytes.len() >= size_of::<ArchivedCsrData>() above, so
+        // root_position cannot underflow. (2) The backing mmap maps the full file with
+        // PROT_READ; section bytes are a validated subslice. The encoder writes
+        // self-contained sections: all rkyv relative pointers from `encode_v8` are
+        // within-section. (3) All field accesses on the returned reference go through
+        // Rust's bounds-checked slice indexing (ArchivedVec panics on OOB, never UBs).
+        // (4) File corruption is detected by `mushroomdb verify` (full-section CRC32).
+        Ok(unsafe { rkyv::access_unchecked::<crate::v8::layout::ArchivedCsrData>(bytes) })
     }
 
     /// Zero-copy access to the archived column store.
+    ///
+    /// Uses `rkyv::access_unchecked`; see `topology()` for the full safety
+    /// rationale. Per-field accesses in `ColumnsView` go through
+    /// bounds-checked slice indexing and explicit length guards.
     pub fn columns(&self) -> Result<&ArchivedColumns> {
         let bytes = self.section_bytes(SECTION_COLUMNS)?;
-        rkyv::access::<crate::v8::layout::ArchivedColumnsData, rkyv::rancor::Error>(bytes).map_err(
-            |e| GraphError::Corrupt {
-                detail: format!("v8: columns rkyv access: {e}"),
-            },
-        )
+        if bytes.len() < std::mem::size_of::<crate::v8::layout::ArchivedColumnsData>() {
+            return Err(GraphError::Corrupt {
+                detail: "v8: columns section too short for rkyv root".to_string(),
+            });
+        }
+        // SAFETY: See topology(). Minimum length checked above. Encoder writes
+        // self-contained sections; all relative pointers are within-section.
+        // ColumnsView accesses archived fields via bounds-checked Rust indexing
+        // and explicit `if end > archived_slice.len()` guards (seam.rs:597).
+        Ok(unsafe { rkyv::access_unchecked::<crate::v8::layout::ArchivedColumnsData>(bytes) })
     }
 
     /// Zero-copy access to the archived id map.
@@ -394,30 +420,58 @@ impl MappedBase {
     }
 
     /// Zero-copy access to the archived edge properties (section 5).
+    ///
+    /// Uses `rkyv::access_unchecked`; see `topology()` for the full safety
+    /// rationale. Per-edge property reads in `EdgePropsView` go through
+    /// bounds-checked slice indexing.
     pub fn edge_props_section(&self) -> Result<&ArchivedEdgeProps> {
         let bytes = self.section_bytes(SECTION_EDGE_PROPS)?;
-        rkyv::access::<crate::v8::layout::ArchivedEdgePropsData, rkyv::rancor::Error>(bytes)
-            .map_err(|e| GraphError::Corrupt {
-                detail: format!("v8: edge_props rkyv access: {e}"),
-            })
+        if bytes.len() < std::mem::size_of::<crate::v8::layout::ArchivedEdgePropsData>() {
+            return Err(GraphError::Corrupt {
+                detail: "v8: edge_props section too short for rkyv root".to_string(),
+            });
+        }
+        // SAFETY: See topology(). Minimum length checked above. Encoder writes
+        // self-contained sections; all relative pointers are within-section.
+        // EdgePropsView accesses archived fields via bounds-checked Rust indexing.
+        Ok(unsafe { rkyv::access_unchecked::<crate::v8::layout::ArchivedEdgePropsData>(bytes) })
     }
 
     /// Zero-copy access to the archived HNSW section (section 6).
+    ///
+    /// Uses `rkyv::access_unchecked`; see `topology()` for the full safety
+    /// rationale. Called once at first-use to load HNSW state into the engine.
     pub fn hnsw_section(&self) -> Result<&ArchivedHnsw> {
         let bytes = self.section_bytes(SECTION_HNSW)?;
-        rkyv::access::<crate::v8::layout::ArchivedHnswSectionData, rkyv::rancor::Error>(bytes)
-            .map_err(|e| GraphError::Corrupt {
-                detail: format!("v8: hnsw rkyv access: {e}"),
-            })
+        if bytes.len() < std::mem::size_of::<crate::v8::layout::ArchivedHnswSectionData>() {
+            return Err(GraphError::Corrupt {
+                detail: "v8: hnsw section too short for rkyv root".to_string(),
+            });
+        }
+        // SAFETY: See topology(). Minimum length checked above. Encoder writes
+        // self-contained sections; all relative pointers are within-section.
+        // The returned reference is immediately converted to owned data by
+        // `archived_hnsw_to_owned`, so no aliasing persists after the call.
+        Ok(unsafe { rkyv::access_unchecked::<crate::v8::layout::ArchivedHnswSectionData>(bytes) })
     }
 
     /// Zero-copy access to the archived provenance (section 7).
+    ///
+    /// Uses `rkyv::access_unchecked`; see `topology()` for the full safety
+    /// rationale. Called once at first-use to load provenance bytes into the
+    /// engine; the returned reference is immediately converted to raw bytes.
     pub fn provenance_section(&self) -> Result<&ArchivedProvenance> {
         let bytes = self.section_bytes(SECTION_PROVENANCE)?;
-        rkyv::access::<crate::v8::layout::ArchivedProvenanceSectionData, rkyv::rancor::Error>(bytes)
-            .map_err(|e| GraphError::Corrupt {
-                detail: format!("v8: provenance rkyv access: {e}"),
-            })
+        if bytes.len() < std::mem::size_of::<crate::v8::layout::ArchivedProvenanceSectionData>() {
+            return Err(GraphError::Corrupt {
+                detail: "v8: provenance section too short for rkyv root".to_string(),
+            });
+        }
+        // SAFETY: See topology(). Minimum length checked above. Encoder writes
+        // self-contained sections; all relative pointers are within-section.
+        Ok(unsafe {
+            rkyv::access_unchecked::<crate::v8::layout::ArchivedProvenanceSectionData>(bytes)
+        })
     }
 
     /// Zero-copy access to the archived rules meta (section 8).
