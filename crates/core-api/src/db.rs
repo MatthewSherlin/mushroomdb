@@ -2011,12 +2011,24 @@ impl<F: Fs> GraphDb<F> {
                 let Some(id) = self.ids.get(key) else {
                     return Ok(());
                 };
-                // Check overlay first; if value is in base only, record a
-                // tombstone so ColumnsView::get masks it on future reads.
-                let in_overlay = self.props.get(id, field).is_some();
-                let old = self.props_view().get(id, field).map(|vr| vr.into_value());
+                // Read old value through the seam for rule retraction.
+                let old = build_props_view(&self.props, &self.base)
+                    .get(id, field)
+                    .map(|vr| vr.into_value());
                 self.props.remove(id, field);
-                if !in_overlay && old.is_some() {
+                // If the base still supplies the value after the overlay removal,
+                // record a tombstone so ColumnsView::get does not resurrect it.
+                // This covers both the base-only case AND the both-resident case:
+                //   base-only (in_overlay=false): old prop was only in base, remove
+                //     is a no-op on overlay, base still visible → tombstone needed.
+                //   both-resident (in_overlay=true): overlay had v2, base has v1;
+                //     removing overlay uncovers v1 → tombstone needed.
+                // Idempotent on double-replay: second pass sees the tombstone →
+                // get() returns None → condition is false → no duplicate tombstone.
+                if build_props_view(&self.props, &self.base)
+                    .get(id, field)
+                    .is_some()
+                {
                     self.props.record_prop_tombstone(id, field);
                 }
                 let cursor = self.engine.pending_delta_count();

@@ -2137,7 +2137,7 @@ fn v8_snapshot_merge_equivalence() {
 /// next props_view() read.
 #[test]
 fn v8_prop_tombstone_survives_snapshot_cycle() {
-    let dir = tmp("v8-prop-tombstone");
+    let dir = tmp("v8-prop-tombstone-base-only");
     // Phase 1: initial (legacy) snapshot with a prop.
     {
         let mut db = GraphDb::open(&dir).unwrap();
@@ -2167,6 +2167,51 @@ fn v8_prop_tombstone_survives_snapshot_cycle() {
         db.get_prop("a", "score"),
         None,
         "deleted prop must remain absent after snapshot merge and reopen"
+    );
+}
+
+/// ND-2 addendum / both-resident resurrection guard: when a prop exists in
+/// BOTH the V8 base (v1) and the overlay (v2), removing it must leave the prop
+/// absent — not resurrect v1 from the base after the overlay write is cleared.
+///
+/// Scenario:
+///   base holds v1 (from snapshot) → set_prop writes v2 (overlay) →
+///   remove_prop clears overlay → without a tombstone ColumnsView falls through
+///   to base and resurrects v1.
+///
+/// The fix: RemoveProp WAL replay records a tombstone whenever the base still
+/// supplies the value after the overlay removal, regardless of whether the prop
+/// was previously in the overlay.
+#[test]
+fn v8_remove_prop_both_resident_no_resurrection() {
+    let dir = tmp("v8-remove-both-resident");
+    // Phase 1: snapshot with v1.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![("score".into(), Value::Int(1))])
+            .unwrap();
+        db.snapshot().unwrap(); // V8 base: a.score = 1
+    }
+    // Phase 2: overwrite to v2, then remove.  After remove, prop must be absent.
+    // Then snapshot (V8 merge: base has no score) and close.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        assert_eq!(db.get_prop("a", "score"), Some(Value::Int(1)));
+        db.set_prop("a", "score", Value::Int(2)).unwrap(); // overlay: score = 2
+        db.remove_prop("a", "score").unwrap(); // removes overlay; base still has 1
+        assert_eq!(
+            db.get_prop("a", "score"),
+            None,
+            "prop must be absent immediately after remove (both-resident case)"
+        );
+        db.snapshot().unwrap(); // V8 merge: tombstone consumed; new base has no score
+    }
+    // Phase 3: reopen — new base must not have score.
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.get_prop("a", "score"),
+        None,
+        "prop must remain absent after snapshot merge and reopen (both-resident resurrection guard)"
     );
 }
 
