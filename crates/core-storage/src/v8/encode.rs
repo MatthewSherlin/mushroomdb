@@ -71,10 +71,15 @@ pub struct V8Meta {
 /// When `None`, the overlay topology is encoded standalone (initial snapshot,
 /// no prior base).
 ///
-/// `cols` is always the full column store (base materialized + WAL mutations);
-/// it is encoded directly without a base merge.
+/// `base_cols` is the archived columns section from the same mmap'd V8 snapshot.
+/// When `Some`, the encoded columns section is the merge of the base columns
+/// (minus prop tombstones recorded in `cols.prop_tombstones`) with the overlay
+/// `cols`.  When `None`, `cols` is encoded directly (initial snapshot or
+/// V5–V7 legacy path).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_v8<W: Write>(
     base_topo: Option<&crate::v8::layout::ArchivedCsr>,
+    base_cols: Option<&crate::v8::layout::ArchivedColumns>,
     topo: &Topology,
     cols: &ColumnStore,
     ids: &IdMap,
@@ -88,7 +93,10 @@ pub fn encode_v8<W: Write>(
         None => rkyv_encode(&topology_to_csr(topo))?,
     };
 
-    let cols_bytes = rkyv_encode(&columnstore_to_data(cols)?)?;
+    let cols_bytes = match base_cols {
+        Some(archived) => rkyv_encode(&columns_merge_to_data(archived, cols)?)?,
+        None => rkyv_encode(&columnstore_to_data(cols)?)?,
+    };
     let ids_bytes = rkyv_encode(&idmap_to_data(ids))?;
     let syms_bytes = rkyv_encode(&interner_to_data(syms))?;
     let meta_bytes = bincode::serialize(meta).map_err(|e| GraphError::Corrupt {
@@ -425,6 +433,41 @@ fn merge_sorted_unique_vecs(a: &[u32], b: &[u32]) -> Vec<u32> {
     out.extend_from_slice(&a[ai..]);
     out.extend_from_slice(&b[bi..]);
     out
+}
+
+/// Merge a V8 base columns section with an in-memory overlay, producing the
+/// `ColumnsData` for the next snapshot.
+///
+/// Algorithm:
+/// 1. Materialize the archived base into an owned `ColumnStore`.
+/// 2. Apply prop tombstones recorded in `overlay.prop_tombstones` (base-only
+///    values that were subsequently deleted via the WAL).
+/// 3. Apply all overlay values (last writer wins per field/node).
+/// 4. Encode the merged store via `columnstore_to_data`.
+///
+/// Called at V8 snapshot merge time.  The O(base) materialization cost is
+/// acceptable here (merge is periodic) — what we avoid is the same cost at
+/// every V8 open (the main C1 win).
+fn columns_merge_to_data(
+    base: &crate::v8::layout::ArchivedColumns,
+    overlay: &ColumnStore,
+) -> Result<ColumnsData> {
+    // 1. Materialise base.
+    let mut merged = archived_to_columnstore(base);
+    // 2. Apply tombstones (base-only props deleted since last snapshot).
+    for (node, fields) in &overlay.prop_tombstones {
+        for field in fields {
+            merged.remove(*node, field);
+        }
+    }
+    // 3. Apply overlay values via to_wire() which gives us the full (field, node, value) map.
+    for (field_name, node_map) in overlay.to_wire() {
+        for (node, value) in node_map {
+            merged.set(node, &field_name, value);
+        }
+    }
+    // 4. Encode.
+    columnstore_to_data(&merged)
 }
 
 fn columnstore_to_data(store: &ColumnStore) -> Result<ColumnsData> {

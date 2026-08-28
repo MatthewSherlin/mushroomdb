@@ -33,7 +33,7 @@ fn map_value_roundtrips_through_wal_and_snapshot() {
     }
     // WAL replay
     let db = GraphDb::open(&dir).unwrap();
-    assert_eq!(db.get_prop("a", "meta"), Some(&nested));
+    assert_eq!(db.get_prop("a", "meta"), Some(nested.clone()));
     drop(db);
     // snapshot (V7 pack) roundtrip
     {
@@ -41,7 +41,7 @@ fn map_value_roundtrips_through_wal_and_snapshot() {
         db.snapshot().unwrap();
     }
     let db = GraphDb::open(&dir).unwrap();
-    assert_eq!(db.get_prop("a", "meta"), Some(&nested));
+    assert_eq!(db.get_prop("a", "meta"), Some(nested.clone()));
 }
 
 #[test]

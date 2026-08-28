@@ -59,7 +59,7 @@ fn create_single_node() {
     assert!(db.has_node("alice"));
     assert_eq!(
         db.get_prop("alice", "name"),
-        Some(&Value::Str("Alice".into()))
+        Some(Value::Str("Alice".into()))
     );
 }
 
@@ -167,7 +167,7 @@ fn match_set_basic() {
         )
         .unwrap();
     assert_eq!(rs.get(0, "properties_set"), Some(&Value::Int(1)));
-    assert_eq!(db.get_prop("alice", "age"), Some(&Value::Int(30)));
+    assert_eq!(db.get_prop("alice", "age"), Some(Value::Int(30)));
 }
 
 /// Showcase: SET a rule-relevant property → derived edge appears / retracts.
@@ -355,8 +355,8 @@ fn set_multiple_props_one_statement() {
         )
         .unwrap();
     assert_eq!(rs.get(0, "properties_set"), Some(&Value::Int(2)));
-    assert_eq!(db.get_prop("alice", "age"), Some(&Value::Int(25)));
-    assert_eq!(db.get_prop("alice", "score"), Some(&Value::Int(10)));
+    assert_eq!(db.get_prop("alice", "age"), Some(Value::Int(25)));
+    assert_eq!(db.get_prop("alice", "score"), Some(Value::Int(10)));
 }
 
 #[test]
@@ -732,7 +732,7 @@ fn cypher_write_survives_wal_replay() {
     // Reopen and verify state replayed from WAL.
     let db2 = GraphDb::open(&dir).unwrap();
     assert!(db2.has_node("persist-me"));
-    assert_eq!(db2.get_prop("persist-me", "score"), Some(&Value::Int(42)));
+    assert_eq!(db2.get_prop("persist-me", "score"), Some(Value::Int(42)));
 }
 
 // ─── Cross-feature composites (final-review pins) ────────────────────────────
@@ -883,7 +883,7 @@ fn set_arithmetic_rhs_literal_expr() {
     .unwrap();
     assert_eq!(
         db.get_prop("c1", "count"),
-        Some(&Value::Int(15)),
+        Some(Value::Int(15)),
         "SET with arithmetic literal must write the computed value"
     );
 }
@@ -901,7 +901,7 @@ fn set_arithmetic_prop_increment() {
     .unwrap();
     assert_eq!(
         db.get_prop("c2", "count"),
-        Some(&Value::Int(8)),
+        Some(Value::Int(8)),
         "n.count + 1 must increment from 7 to 8"
     );
 }

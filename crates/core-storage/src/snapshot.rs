@@ -147,6 +147,7 @@ fn encode_v8_from_state(state: &SnapshotState) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     crate::v8::encode::encode_v8(
         None,
+        None,
         &state.topo,
         &state.props,
         &state.ids,

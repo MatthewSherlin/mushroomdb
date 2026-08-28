@@ -86,17 +86,17 @@ fn degree_view_backfill_and_incremental() {
     ))
     .unwrap();
     let c1_id = "c1";
-    assert_eq!(db.get_prop(c1_id, "pop"), Some(&Value::Int(0)));
+    assert_eq!(db.get_prop(c1_id, "pop"), Some(Value::Int(0)));
 
     // Add edges incrementally.
     db.insert_edge("LIVES_IN", "p1", "c1").unwrap();
-    assert_eq!(db.get_prop(c1_id, "pop"), Some(&Value::Int(1)));
+    assert_eq!(db.get_prop(c1_id, "pop"), Some(Value::Int(1)));
     db.insert_edge("LIVES_IN", "p2", "c1").unwrap();
-    assert_eq!(db.get_prop(c1_id, "pop"), Some(&Value::Int(2)));
+    assert_eq!(db.get_prop(c1_id, "pop"), Some(Value::Int(2)));
 
     // Delete an edge — decrement.
     db.delete_edge("LIVES_IN", "p1", "c1").unwrap();
-    assert_eq!(db.get_prop(c1_id, "pop"), Some(&Value::Int(1)));
+    assert_eq!(db.get_prop(c1_id, "pop"), Some(Value::Int(1)));
 }
 
 #[test]
@@ -114,11 +114,11 @@ fn degree_view_out_direction() {
         Direction::Out,
     ))
     .unwrap();
-    assert_eq!(db.get_prop("p1", "num_cities"), Some(&Value::Int(0)));
+    assert_eq!(db.get_prop("p1", "num_cities"), Some(Value::Int(0)));
     db.insert_edge("LIVES_IN", "p1", "c1").unwrap();
-    assert_eq!(db.get_prop("p1", "num_cities"), Some(&Value::Int(1)));
+    assert_eq!(db.get_prop("p1", "num_cities"), Some(Value::Int(1)));
     db.insert_edge("LIVES_IN", "p1", "c2").unwrap();
-    assert_eq!(db.get_prop("p1", "num_cities"), Some(&Value::Int(2)));
+    assert_eq!(db.get_prop("p1", "num_cities"), Some(Value::Int(2)));
 }
 
 // ---------------------------------------------------------------------------
@@ -149,15 +149,15 @@ fn neighbor_sum_backfill_and_incremental() {
         "score",
     ))
     .unwrap();
-    assert_eq!(db.get_prop("c1", "score_sum"), Some(&Value::Float(10.0)));
+    assert_eq!(db.get_prop("c1", "score_sum"), Some(Value::Float(10.0)));
 
     // Remove p1's edge — Sum decrements by 3.
     db.delete_edge("LIVES_IN", "p1", "c1").unwrap();
-    assert_eq!(db.get_prop("c1", "score_sum"), Some(&Value::Float(7.0)));
+    assert_eq!(db.get_prop("c1", "score_sum"), Some(Value::Float(7.0)));
 
     // Add it back.
     db.insert_edge("LIVES_IN", "p1", "c1").unwrap();
-    assert_eq!(db.get_prop("c1", "score_sum"), Some(&Value::Float(10.0)));
+    assert_eq!(db.get_prop("c1", "score_sum"), Some(Value::Float(10.0)));
 }
 
 #[test]
@@ -194,31 +194,31 @@ fn neighbor_count_skips_missing_prop() {
     ))
     .unwrap();
 
-    assert_eq!(db.get_prop("c1", "weight_n"), Some(&Value::Int(1)));
-    assert_eq!(db.get_prop("c1", "pop"), Some(&Value::Int(2)));
+    assert_eq!(db.get_prop("c1", "weight_n"), Some(Value::Int(1)));
+    assert_eq!(db.get_prop("c1", "pop"), Some(Value::Int(2)));
     assert_eq!(
-        db.get_prop("c1", "weight_n").cloned(),
+        db.get_prop("c1", "weight_n"),
         db.scratch_view_value("c1", "city_weight_count"),
         "incremental Count must match scratch recompute"
     );
 
     db.set_prop("p2", "weight", Value::Float(2.0)).unwrap();
-    assert_eq!(db.get_prop("c1", "weight_n"), Some(&Value::Int(2)));
+    assert_eq!(db.get_prop("c1", "weight_n"), Some(Value::Int(2)));
     db.remove_prop("p1", "weight").unwrap();
-    assert_eq!(db.get_prop("c1", "weight_n"), Some(&Value::Int(1)));
-    assert_eq!(db.get_prop("c1", "pop"), Some(&Value::Int(2)));
+    assert_eq!(db.get_prop("c1", "weight_n"), Some(Value::Int(1)));
+    assert_eq!(db.get_prop("c1", "pop"), Some(Value::Int(2)));
 
     db.insert_node("Person", "p3", vec![("weight".into(), Value::Float(3.0))])
         .unwrap();
     db.insert_edge("LIVES_IN", "p3", "c1").unwrap();
     db.insert_node("Person", "p4", vec![]).unwrap();
     db.insert_edge("LIVES_IN", "p4", "c1").unwrap();
-    assert_eq!(db.get_prop("c1", "weight_n"), Some(&Value::Int(2)));
-    assert_eq!(db.get_prop("c1", "pop"), Some(&Value::Int(4)));
+    assert_eq!(db.get_prop("c1", "weight_n"), Some(Value::Int(2)));
+    assert_eq!(db.get_prop("c1", "pop"), Some(Value::Int(4)));
     db.delete_edge("LIVES_IN", "p3", "c1").unwrap();
-    assert_eq!(db.get_prop("c1", "weight_n"), Some(&Value::Int(1)));
+    assert_eq!(db.get_prop("c1", "weight_n"), Some(Value::Int(1)));
     assert_eq!(
-        db.get_prop("c1", "weight_n").cloned(),
+        db.get_prop("c1", "weight_n"),
         db.scratch_view_value("c1", "city_weight_count")
     );
 }
@@ -247,17 +247,17 @@ fn neighbor_avg_updates_on_prop_change() {
     ))
     .unwrap();
     // avg = (4+6)/2 = 5
-    assert_eq!(db.get_prop("c1", "score_avg"), Some(&Value::Float(5.0)));
+    assert_eq!(db.get_prop("c1", "score_avg"), Some(Value::Float(5.0)));
 
     // Change p1's score — avg should update.
     db.set_prop("p1", "score", Value::Float(10.0)).unwrap();
     // avg = (10+6)/2 = 8
-    assert_eq!(db.get_prop("c1", "score_avg"), Some(&Value::Float(8.0)));
+    assert_eq!(db.get_prop("c1", "score_avg"), Some(Value::Float(8.0)));
 
     // Remove p1's score entirely — only p2 contributes.
     db.remove_prop("p1", "score").unwrap();
     // avg = 6/1 = 6
-    assert_eq!(db.get_prop("c1", "score_avg"), Some(&Value::Float(6.0)));
+    assert_eq!(db.get_prop("c1", "score_avg"), Some(Value::Float(6.0)));
 }
 
 #[test]
@@ -287,12 +287,12 @@ fn min_retraction_recomputes_correctly() {
     ))
     .unwrap();
     // min = 20.0 (p1)
-    assert_eq!(db.get_prop("c1", "min_age"), Some(&Value::Float(20.0)));
+    assert_eq!(db.get_prop("c1", "min_age"), Some(Value::Float(20.0)));
 
     // Delete p1 (the min holder) → should recompute from remaining: min of 30, 25 = 25.
     db.delete_node("p1").unwrap();
     // O(degree) recompute triggered.
-    assert_eq!(db.get_prop("c1", "min_age"), Some(&Value::Float(25.0)));
+    assert_eq!(db.get_prop("c1", "min_age"), Some(Value::Float(25.0)));
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +332,7 @@ fn degree_view_over_derived_edges_fire_and_retract() {
         Direction::In,
     ))
     .unwrap();
-    assert_eq!(db.get_prop("o1", "headcount"), Some(&Value::Int(0)));
+    assert_eq!(db.get_prop("o1", "headcount"), Some(Value::Int(0)));
 
     // Insert person → rule fires → derived WORKS_AT edge → headcount ++
     db.insert_node(
@@ -341,11 +341,11 @@ fn degree_view_over_derived_edges_fire_and_retract() {
         vec![("org_id".into(), Value::Str("o1".into()))],
     )
     .unwrap();
-    assert_eq!(db.get_prop("o1", "headcount"), Some(&Value::Int(1)));
+    assert_eq!(db.get_prop("o1", "headcount"), Some(Value::Int(1)));
 
     // Delete person → rule retracts → headcount --
     db.delete_node("alice").unwrap();
-    assert_eq!(db.get_prop("o1", "headcount"), Some(&Value::Int(0)));
+    assert_eq!(db.get_prop("o1", "headcount"), Some(Value::Int(0)));
 }
 
 // ---------------------------------------------------------------------------
@@ -493,18 +493,18 @@ fn reopen_rebuild_matches_live() {
         ))
         .unwrap();
         vec![
-            db.get_prop("c1", "pop").cloned(),
-            db.get_prop("c2", "pop").cloned(),
-            db.get_prop("c1", "score_sum").cloned(),
+            db.get_prop("c1", "pop"),
+            db.get_prop("c2", "pop"),
+            db.get_prop("c1", "score_sum"),
         ]
     };
 
     // Reopen and check values are identical.
     let db2 = GraphDb::open(&dir).unwrap();
     let vals_reopen = vec![
-        db2.get_prop("c1", "pop").cloned(),
-        db2.get_prop("c2", "pop").cloned(),
-        db2.get_prop("c1", "score_sum").cloned(),
+        db2.get_prop("c1", "pop"),
+        db2.get_prop("c2", "pop"),
+        db2.get_prop("c1", "score_sum"),
     ];
 
     assert_eq!(
@@ -543,7 +543,7 @@ fn delete_view_removes_values() {
 
     // View prop is now writable again.
     db.set_prop("c1", "pop", Value::Int(99)).unwrap();
-    assert_eq!(db.get_prop("c1", "pop"), Some(&Value::Int(99)));
+    assert_eq!(db.get_prop("c1", "pop"), Some(Value::Int(99)));
 }
 
 // ---------------------------------------------------------------------------
@@ -571,13 +571,13 @@ fn dst_oracle_degree_matches_scratch() {
     ))
     .unwrap();
 
-    let live = db.get_prop("c1", "pop").cloned();
+    let live = db.get_prop("c1", "pop");
     let scratch = db.scratch_view_value("c1", "city_pop");
     assert_eq!(live, scratch, "live value must equal scratch recompute");
 
     // Delete one edge and re-check.
     db.delete_edge("LIVES_IN", "p2", "c1").unwrap();
-    let live2 = db.get_prop("c1", "pop").cloned();
+    let live2 = db.get_prop("c1", "pop");
     let scratch2 = db.scratch_view_value("c1", "city_pop");
     assert_eq!(
         live2, scratch2,
@@ -608,13 +608,13 @@ fn dst_oracle_neighbor_sum_matches_scratch() {
     ))
     .unwrap();
 
-    let live = db.get_prop("c1", "score_sum").cloned();
+    let live = db.get_prop("c1", "score_sum");
     let scratch = db.scratch_view_value("c1", "city_sum");
     assert_eq!(live, scratch);
 
     // Change a prop and check again.
     db.set_prop("p1", "score", Value::Float(50.0)).unwrap();
-    let live2 = db.get_prop("c1", "score_sum").cloned();
+    let live2 = db.get_prop("c1", "score_sum");
     let scratch2 = db.scratch_view_value("c1", "city_sum");
     assert_eq!(live2, scratch2);
 }
@@ -650,28 +650,22 @@ fn snapshot_preserves_views_and_values_rebuild() {
             "score",
         ))
         .unwrap();
-        let vals = vec![
-            db.get_prop("c1", "pop").cloned(),
-            db.get_prop("c1", "score_sum").cloned(),
-        ];
+        let vals = vec![db.get_prop("c1", "pop"), db.get_prop("c1", "score_sum")];
         db.snapshot().unwrap();
         vals
     };
 
     // Reopen after snapshot — views must still be present and values correct.
     let mut db2 = GraphDb::open(&dir).unwrap();
-    let post_snap = vec![
-        db2.get_prop("c1", "pop").cloned(),
-        db2.get_prop("c1", "score_sum").cloned(),
-    ];
+    let post_snap = vec![db2.get_prop("c1", "pop"), db2.get_prop("c1", "score_sum")];
     assert_eq!(pre_snap, post_snap, "values match after snapshot+reopen");
 
     // Views still operational after reopen.
     db2.insert_node("Person", "p2", vec![("score".into(), Value::Float(3.0))])
         .unwrap();
     db2.insert_edge("LIVES_IN", "p2", "c1").unwrap();
-    assert_eq!(db2.get_prop("c1", "pop"), Some(&Value::Int(2)));
-    assert_eq!(db2.get_prop("c1", "score_sum"), Some(&Value::Float(10.0)));
+    assert_eq!(db2.get_prop("c1", "pop"), Some(Value::Int(2)));
+    assert_eq!(db2.get_prop("c1", "score_sum"), Some(Value::Float(10.0)));
 }
 
 // ---------------------------------------------------------------------------
@@ -759,11 +753,11 @@ fn pending_deltas_are_clean_through_view_heavy_workload() {
         )
         .unwrap();
     }
-    assert_eq!(db.get_prop("o1", "headcount"), Some(&Value::Int(10)));
+    assert_eq!(db.get_prop("o1", "headcount"), Some(Value::Int(10)));
 
     // Delete all persons → rule retracts → view decrements.
     for i in 0..10u32 {
         db.delete_node(&format!("p{i}")).unwrap();
     }
-    assert_eq!(db.get_prop("o1", "headcount"), Some(&Value::Int(0)));
+    assert_eq!(db.get_prop("o1", "headcount"), Some(Value::Int(0)));
 }

@@ -3,7 +3,8 @@ use crate::index::{
     candidate_spec, candidate_spec_approx_with_k, ivf_drift_rebuild_threshold, CandidateSpec,
     RuleIndex,
 };
-use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
+use core_storage::v8::seam::ColumnsView;
+use core_storage::{EdgeProps, IdMap, Interner, Topology, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A single derived-edge fire or retract captured during a commit.
@@ -39,7 +40,7 @@ pub struct GraphMut<'a> {
     pub ids: &'a IdMap,
     pub syms: &'a mut Interner,
     pub labels: &'a [u32],
-    pub props: &'a ColumnStore,
+    pub props: ColumnsView<'a>,
     pub topo: &'a mut Topology,
     pub edge_props: &'a mut EdgeProps,
 }
@@ -200,7 +201,7 @@ fn compute_desired(
         Some(k) => k,
         None => return BTreeMap::new(),
     };
-    let n_get = |f: &str| g.props.get(n, f).cloned();
+    let n_get = |f: &str| g.props.get(n, f).map(|vr| vr.into_value());
 
     let spec = candidate_spec_for(def);
     let candidates: BTreeSet<u32> = if on_src_side {
@@ -289,7 +290,7 @@ fn compute_desired(
             Some(k) => k,
             None => continue,
         };
-        let m_get = |f: &str| g.props.get(m, f).cloned();
+        let m_get = |f: &str| g.props.get(m, f).map(|vr| vr.into_value());
         let (s_view, d_view, s_id, d_id) = if on_src_side {
             (
                 NodeView {
@@ -484,7 +485,7 @@ fn compute_desired_via(
                 Some(k) => k,
                 None => continue,
             };
-            let dst_get = |f: &str| g.props.get(dst, f).cloned();
+            let dst_get = |f: &str| g.props.get(dst, f).map(|vr| vr.into_value());
             let dst_view = NodeView {
                 key: dst_key,
                 props: &dst_get,
@@ -497,7 +498,7 @@ fn compute_desired_via(
                     Some(k) => k,
                     None => continue,
                 };
-                let via_get = |f: &str| g.props.get(via_id, f).cloned();
+                let via_get = |f: &str| g.props.get(via_id, f).map(|vr| vr.into_value());
                 let via_view = NodeView {
                     key: via_key,
                     props: &via_get,
@@ -922,8 +923,8 @@ fn pair_still_desired(def: &RuleDef, s: u32, d: u32, g: &GraphMut<'_>) -> bool {
         Some(k) => k,
         None => return false,
     };
-    let s_get = |f: &str| g.props.get(s, f).cloned();
-    let d_get = |f: &str| g.props.get(d, f).cloned();
+    let s_get = |f: &str| g.props.get(s, f).map(|vr| vr.into_value());
+    let d_get = |f: &str| g.props.get(d, f).map(|vr| vr.into_value());
     evaluate(
         &def.predicate,
         &NodeView {
@@ -1202,9 +1203,9 @@ fn index_node_for_rule(
     def: &RuleDef,
     index: &mut RuleIndex,
     syms: &Interner,
-    props: &ColumnStore,
+    props: ColumnsView<'_>,
 ) {
-    let get = |f: &str| props.get(id, f).cloned();
+    let get = |f: &str| props.get(id, f).map(|vr| vr.into_value());
     if syms.get(&def.src_label) == Some(label_sym) {
         let spec = src_lookup_spec_for(def);
         index.src_side.insert(&spec, id, &get);
@@ -1437,7 +1438,7 @@ impl RuleEngine {
         ids: &IdMap,
         syms: &Interner,
         labels: &[u32],
-        props: &ColumnStore,
+        props: ColumnsView<'_>,
     ) {
         for idx in self.indexes.values_mut() {
             *idx = RuleIndex::default();
@@ -1492,7 +1493,7 @@ impl RuleEngine {
         ids: &IdMap,
         syms: &Interner,
         labels: &[u32],
-        props: &ColumnStore,
+        props: ColumnsView<'_>,
         ivf_state: BTreeMap<String, RuleIvfExport>,
     ) {
         for idx in self.indexes.values_mut() {
@@ -1568,7 +1569,7 @@ impl RuleEngine {
         ids: &IdMap,
         syms: &Interner,
         labels: &[u32],
-        props: &ColumnStore,
+        props: ColumnsView<'_>,
     ) {
         if self.indexes_populated {
             return;
@@ -1901,7 +1902,7 @@ impl RuleEngine {
                         if f == field {
                             old_val_cloned.clone()
                         } else {
-                            g.props.get(n, f).cloned()
+                            g.props.get(n, f).map(|vr| vr.into_value())
                         }
                     };
                     let idx = self.indexes.get_mut(&rule_name).unwrap();
@@ -1916,7 +1917,7 @@ impl RuleEngine {
                 }
 
                 {
-                    let cur_getter = |f: &str| g.props.get(n, f).cloned();
+                    let cur_getter = |f: &str| g.props.get(n, f).map(|vr| vr.into_value());
                     let idx = self.indexes.get_mut(&rule_name).unwrap();
                     if as_src {
                         let spec = src_lookup_spec_for(&def);
@@ -2278,7 +2279,7 @@ impl RuleEngine {
             let as_dst = dst_sym.is_some() && n_label == dst_sym;
 
             {
-                let cur_getter = |f: &str| g.props.get(n, f).cloned();
+                let cur_getter = |f: &str| g.props.get(n, f).map(|vr| vr.into_value());
                 let idx = self.indexes.get_mut(&rule_name).unwrap();
                 if as_src {
                     let spec = src_lookup_spec_for(&def);
@@ -2476,7 +2477,7 @@ mod tests {
                 ids: &self.ids,
                 syms: &mut self.syms,
                 labels: &self.labels,
-                props: &self.props,
+                props: ColumnsView::owned(&self.props),
                 topo: &mut self.topo,
                 edge_props: &mut self.eprops,
             }
@@ -3766,7 +3767,14 @@ mod tests {
                     Some(s) if s != u32::MAX => s,
                     _ => continue,
                 };
-                index_node_for_rule(id, label_sym, rule, &mut idx, &fx.syms, &fx.props);
+                index_node_for_rule(
+                    id,
+                    label_sym,
+                    rule,
+                    &mut idx,
+                    &fx.syms,
+                    ColumnsView::owned(&fx.props),
+                );
             }
             let src_sym = fx.syms.get(&rule.src_label);
             let mut out = BTreeSet::new();
@@ -3783,7 +3791,7 @@ mod tests {
                     ids: &fx.ids,
                     syms: &mut fx.syms,
                     labels: &fx.labels,
-                    props: &fx.props,
+                    props: ColumnsView::owned(&fx.props),
                     topo: &mut fx.topo,
                     edge_props: &mut fx.eprops,
                 };

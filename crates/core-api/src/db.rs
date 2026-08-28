@@ -17,8 +17,8 @@ use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
 use core_storage::v8::encode::{
     archived_edge_props_to_owned, archived_hnsw_to_owned, archived_provenance_to_owned,
-    archived_rules_meta_to_owned, archived_to_columnstore, archived_to_idmap, archived_to_interner,
-    archived_views_to_owned, csr_to_topology, decode_meta, encode_v8, V8Meta,
+    archived_rules_meta_to_owned, archived_to_idmap, archived_to_interner, archived_views_to_owned,
+    decode_meta, encode_v8, V8Meta,
 };
 use core_storage::v8::seam::TopologyView;
 use core_storage::wal::{decode_all, encode_record, WalRecord};
@@ -534,7 +534,7 @@ fn eval_set_return_operand<F: Fs>(
             let Some(Value::Str(key)) = match_rs.get(row, var) else {
                 return Ok(None);
             };
-            Ok(db.get_prop(key, field).cloned())
+            Ok(db.get_prop(key, field))
         }
         Operand::FuncCall { name, args } => {
             eval_set_return_func(db, match_rs, row, rel_vars, name, args, params)
@@ -768,7 +768,7 @@ fn make_graph_mut<'a>(
     ids: &'a IdMap,
     syms: &'a mut Interner,
     labels: &'a [u32],
-    props: &'a ColumnStore,
+    props: core_storage::v8::seam::ColumnsView<'a>,
     topo: &'a mut Topology,
     edge_props: &'a mut EdgeProps,
 ) -> GraphMut<'a> {
@@ -779,6 +779,40 @@ fn make_graph_mut<'a>(
         props,
         topo,
         edge_props,
+    }
+}
+
+/// Build a `ColumnsView` from the disjoint `props` overlay and optional V8 base.
+///
+/// Takes explicit field references rather than `&self` so the caller can hold
+/// simultaneous mutable borrows of other fields (e.g. `syms`, `topo`).
+fn build_props_view<'a>(
+    props: &'a ColumnStore,
+    base: &'a Option<std::sync::Arc<core_storage::v8::MappedBase>>,
+) -> core_storage::v8::seam::ColumnsView<'a> {
+    match base {
+        None => core_storage::v8::seam::ColumnsView::owned(props),
+        Some(b) => {
+            let archived = b
+                .columns()
+                .expect("base columns CRC already verified at open");
+            core_storage::v8::seam::ColumnsView::with_base(props, archived)
+        }
+    }
+}
+
+fn build_topo_view<'a>(
+    overlay: &'a Topology,
+    base: &'a Option<std::sync::Arc<core_storage::v8::MappedBase>>,
+) -> core_storage::v8::seam::TopologyView<'a> {
+    match base {
+        None => core_storage::v8::seam::TopologyView::owned(overlay),
+        Some(b) => {
+            let archived_csr = b
+                .topology()
+                .expect("base topology CRC already verified at open");
+            core_storage::v8::seam::TopologyView::with_base(overlay, archived_csr)
+        }
     }
 }
 
@@ -1035,11 +1069,16 @@ impl<F: Fs> GraphDb<F> {
             && u16::from_le_bytes([snap_bytes[4], snap_bytes[5]])
                 == core_storage::snapshot::VERSION_8
         {
+            // C2: use file mmap on RealFs (zero-copy, no heap copy); fall back to
+            // from_bytes on SimFs (in-memory, path unavailable).
             let mapped = Arc::new(
-                core_storage::v8::MappedBase::from_bytes(snap_bytes).map_err(|e| {
-                    GraphError::Corrupt {
-                        detail: format!("v8: mmap open: {e:?}"),
-                    }
+                if let Some(snap_path) = db.fs.snapshot_path() {
+                    core_storage::v8::MappedBase::map(&snap_path)
+                } else {
+                    core_storage::v8::MappedBase::from_bytes(snap_bytes)
+                }
+                .map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8: mmap open: {e:?}"),
                 })?,
             );
             db.restore_v8_base(Arc::clone(&mapped))?;
@@ -1057,8 +1096,12 @@ impl<F: Fs> GraphDb<F> {
         // would call reindex_all_load_ivf on an empty graph, defeating the
         // point of restoring IVF/HNSW blobs from the snapshot).
         if !records.is_empty() {
-            db.engine
-                .consume_retained_state_eager(&db.ids, &db.syms, &db.labels, &db.props);
+            db.engine.consume_retained_state_eager(
+                &db.ids,
+                &db.syms,
+                &db.labels,
+                build_props_view(&db.props, &db.base),
+            );
         }
         for rec in records {
             db.apply(&rec)?;
@@ -1078,27 +1121,26 @@ impl<F: Fs> GraphDb<F> {
         // Any future as-of replay path (Plan-15 T2) must drain here to feed
         // replaying subscribers; the mechanism is already in place.
         let _ = db.engine.drain_deltas(); // belt-and-braces no-op after loop drain
-                                          // Rebuild view values after WAL replay.  When a V8 base is present,
-                                          // `db.topo` holds only the overlay; materialise a merged topology
-                                          // so that degree-based views reflect base + overlay edges.
-        if let Some(ref base) = db.base {
-            let archived_csr = base.topology().map_err(|e| GraphError::Corrupt {
-                detail: format!("v8: topo for view rebuild: {e:?}"),
-            })?;
-            let mut merged_topo = csr_to_topology(archived_csr);
-            for (etype, src, dst) in db.topo.all_edges() {
-                merged_topo.add_edge(etype, src, dst);
-            }
+                                          // Rebuild view values after WAL replay only when there is no V8 base.
+                                          // With a V8 base, view values are correct in the snapshot and are updated
+                                          // incrementally during WAL replay (on_edge_changed / on_prop_changed).
+                                          // A full rebuild would read overlay-only props (empty after restore_v8_base)
+                                          // and overwrite correct base values with wrong results (e.g. NeighborAgg
+                                          // Sum reads no "score" in overlay → writes 0.0, shadowing the correct
+                                          // base value).
+        if db.base.is_none() {
+            let topo_view = TopologyView::owned(&db.topo);
             db.view_store
-                .rebuild_all(&mut db.props, &merged_topo, &db.ids, &db.syms, &db.labels);
-        } else {
-            db.view_store
-                .rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
+                .rebuild_all(&mut db.props, &topo_view, &db.ids, &db.syms, &db.labels);
         }
         // Rebuild full-text index after WAL replay.  Corrects drift from
         // per-record incremental apply during replay.
-        db.fulltext
-            .rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
+        db.fulltext.rebuild_all(
+            &db.ids,
+            &db.labels,
+            &db.syms,
+            build_props_view(&db.props, &db.base),
+        );
         // Load roles sidecar. Missing file = no roles (Some(vec![])).
         // Corrupt/unparseable = poisoned (None); mask_for_role will fail-loud.
         db.roles = Self::load_roles_from_fs(&db.fs)?;
@@ -1187,12 +1229,9 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("v8: syms section: {e:?}"),
         })?);
 
-        // Materialise columns into self.props (full state, not overlay-only).
-        // Required for HNSW/IVF consume_retained_state_eager and view rebuild.
-        self.props =
-            archived_to_columnstore(mapped.columns().map_err(|e| GraphError::Corrupt {
-                detail: format!("v8: columns section: {e:?}"),
-            })?);
+        // C1: self.props is left as an empty overlay. Column reads go through
+        // props_view() (ColumnsView::with_base), which consults the archived base
+        // section zero-copy. This avoids the O(columns) heap copy at every open.
 
         // self.topo deliberately left as Topology::new() — overlay path.
 
@@ -1289,6 +1328,21 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
+    /// Return a `ColumnsView` that merges the mmap'd base columns (when a V8
+    /// snapshot is open) with the in-memory WAL overlay.  Reads consult the
+    /// overlay first, then fall through to the archived base section zero-copy.
+    fn props_view(&self) -> core_storage::v8::seam::ColumnsView<'_> {
+        match self.base {
+            None => core_storage::v8::seam::ColumnsView::owned(&self.props),
+            Some(ref base) => {
+                let archived = base
+                    .columns()
+                    .expect("base columns CRC already verified at open");
+                core_storage::v8::seam::ColumnsView::with_base(&self.props, archived)
+            }
+        }
+    }
+
     fn open_at_with(fs: F, commit: u64) -> Result<Self> {
         let mut db = Self {
             fs,
@@ -1349,13 +1403,20 @@ impl<F: Fs> GraphDb<F> {
         );
         let _ = db.engine.drain_deltas(); // belt-and-braces no-op
                                           // Rebuild view values after WAL replay so derived-edge-driven views
-                                          // reflect the as-of state, not just the initial backfill at CreateView.
-                                          // Mirrors the open_with rebuild_all call at db.rs:528.
-        db.view_store
-            .rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
+                                          // reflect the as-of state.  open_at always uses the legacy path (no V8
+                                          // base), so topo_view is always owned.
+        {
+            let topo_view = TopologyView::owned(&db.topo);
+            db.view_store
+                .rebuild_all(&mut db.props, &topo_view, &db.ids, &db.syms, &db.labels);
+        }
         // Rebuild full-text index for as-of view (mirrors open_with pattern).
-        db.fulltext
-            .rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
+        db.fulltext.rebuild_all(
+            &db.ids,
+            &db.labels,
+            &db.syms,
+            build_props_view(&db.props, &db.base),
+        );
         // Load roles sidecar (current roles, not point-in-time).
         db.roles = Self::load_roles_from_fs(&db.fs)?;
         db.read_only = true;
@@ -1401,7 +1462,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1421,10 +1482,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns CRC already verified at open")
+                            }),
                         );
                     }
                 }
@@ -1469,10 +1534,14 @@ impl<F: Fs> GraphDb<F> {
                     dst,
                     true,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns CRC already verified at open")
+                    }),
                 );
                 // Rule engine: via-hop rules must update when user edges change.
                 let cursor = self.engine.pending_delta_count();
@@ -1482,7 +1551,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1498,10 +1567,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns CRC already verified at open")
+                            }),
                         );
                     }
                 }
@@ -1520,7 +1593,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1539,10 +1612,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns CRC already verified at open")
+                            }),
                         );
                     }
                 }
@@ -1551,10 +1628,14 @@ impl<F: Fs> GraphDb<F> {
                     id,
                     field,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns CRC already verified at open")
+                    }),
                 );
                 // Full-text index maintenance: update tokens for this field if indexed.
                 if self.fulltext.field_indexed(field) {
@@ -1626,7 +1707,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1644,10 +1725,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns CRC already verified at open")
+                            }),
                         );
                     }
                 }
@@ -1691,10 +1776,14 @@ impl<F: Fs> GraphDb<F> {
                     *dst,
                     true,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns CRC already verified at open")
+                    }),
                 );
                 // Rule engine: via-hop rules fire when user via-edges are inserted.
                 // Resolve etype back to string so on_edge_changed can match rules by name.
@@ -1706,7 +1795,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &mut self.syms,
                             &self.labels,
-                            &self.props,
+                            build_props_view(&self.props, &self.base),
                             &mut self.topo,
                             &mut self.edge_props,
                         );
@@ -1722,10 +1811,14 @@ impl<F: Fs> GraphDb<F> {
                                 d.dst_id,
                                 d.fired,
                                 &mut self.props,
-                                &self.topo,
+                                &build_topo_view(&self.topo, &self.base),
                                 &self.ids,
                                 &self.syms,
                                 &self.labels,
+                                self.base.as_ref().map(|b| {
+                                    b.columns()
+                                        .expect("base columns CRC already verified at open")
+                                }),
                             );
                         }
                     }
@@ -1751,7 +1844,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1769,10 +1862,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns CRC already verified at open")
+                            }),
                         );
                     }
                 }
@@ -1780,10 +1877,14 @@ impl<F: Fs> GraphDb<F> {
                     *id,
                     &field_str,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns CRC already verified at open")
+                    }),
                 );
                 if self.fulltext.field_indexed(&field_str) {
                     let label_opt = self.labels.get(*id as usize).and_then(|&sym| {
@@ -1819,7 +1920,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1840,10 +1941,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns CRC already verified at open")
+                            }),
                         );
                     }
                 }
@@ -1863,7 +1968,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1883,10 +1988,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns CRC already verified at open")
+                            }),
                         );
                     }
                 }
@@ -1898,8 +2007,14 @@ impl<F: Fs> GraphDb<F> {
                 let Some(id) = self.ids.get(key) else {
                     return Ok(());
                 };
-                let old = self.props.get(id, field).cloned();
+                // Check overlay first; if value is in base only, record a
+                // tombstone so ColumnsView::get masks it on future reads.
+                let in_overlay = self.props.get(id, field).is_some();
+                let old = self.props_view().get(id, field).map(|vr| vr.into_value());
                 self.props.remove(id, field);
+                if !in_overlay && old.is_some() {
+                    self.props.record_prop_tombstone(id, field);
+                }
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
@@ -1907,7 +2022,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1926,10 +2041,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns CRC already verified at open")
+                            }),
                         );
                     }
                 }
@@ -1938,10 +2057,14 @@ impl<F: Fs> GraphDb<F> {
                     id,
                     field,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns CRC already verified at open")
+                    }),
                 );
                 // Full-text index maintenance: remove tokens for this field.
                 if self.fulltext.field_indexed(field) {
@@ -1964,6 +2087,19 @@ impl<F: Fs> GraphDb<F> {
                 let Some(etype) = self.syms.get(edge_type) else {
                     return Ok(());
                 };
+                // I3: phantom-tombstone guard.  When a V8 base is present, a
+                // DeleteEdge WAL record for an edge that was already absorbed into
+                // the new base (i.e. neither in overlay nor in base) must be skipped.
+                // Without this guard, remove_edge records a tombstone for an edge
+                // that no longer exists, incorrectly understating edge_count.
+                if self.base.is_some()
+                    && !self
+                        .topo_view()
+                        .neighbors(etype, core_storage::topology::Direction::Out, src)
+                        .contains(&dst)
+                {
+                    return Ok(());
+                }
                 self.topo.remove_edge(etype, src, dst);
                 self.edge_props.remove_edge(etype, src, dst);
                 // View maintenance for manual edge delete (topo already updated above).
@@ -1973,10 +2109,14 @@ impl<F: Fs> GraphDb<F> {
                     dst,
                     false,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns CRC already verified at open")
+                    }),
                 );
                 // Rule engine: via-hop rules must retract when user via-edges are deleted.
                 let cursor = self.engine.pending_delta_count();
@@ -1986,7 +2126,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -2002,10 +2142,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns CRC already verified at open")
+                            }),
                         );
                     }
                 }
@@ -2031,7 +2175,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -2050,10 +2194,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns CRC already verified at open")
+                            }),
                         );
                     }
                 }
@@ -2083,10 +2231,14 @@ impl<F: Fs> GraphDb<F> {
                         d,
                         false,
                         &mut self.props,
-                        &self.topo,
+                        &build_topo_view(&self.topo, &self.base),
                         &self.ids,
                         &self.syms,
                         &self.labels,
+                        self.base.as_ref().map(|b| {
+                            b.columns()
+                                .expect("base columns CRC already verified at open")
+                        }),
                     );
                 }
 
@@ -2121,7 +2273,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -2141,10 +2293,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns CRC already verified at open")
+                            }),
                         );
                     }
                 }
@@ -2162,7 +2318,7 @@ impl<F: Fs> GraphDb<F> {
                     .create_view(
                         def,
                         &mut self.props,
-                        &self.topo,
+                        &build_topo_view(&self.topo, &self.base),
                         &self.ids,
                         &self.syms,
                         &self.labels,
@@ -3684,10 +3840,10 @@ impl<F: Fs> GraphDb<F> {
             if !self.fulltext.is_enabled(label, field) {
                 continue;
             }
-            let Some(value) = self.props.get(id, field) else {
+            let Some(value) = self.props_view().get(id, field).map(|vr| vr.into_value()) else {
                 continue;
             };
-            let node_tokens: BTreeSet<String> = match value {
+            let node_tokens: BTreeSet<String> = match &value {
                 Value::Str(s) => tokenize(s).into_iter().collect(),
                 Value::List(items) => items
                     .iter()
@@ -3730,8 +3886,11 @@ impl<F: Fs> GraphDb<F> {
 
     /// Return the current view-maintained value of `view_prop` for node `key`.
     /// Equivalent to `get_prop` but documents that it reads a view-managed column.
-    pub fn get_view_prop(&self, key: &str, view_prop: &str) -> Option<&Value> {
-        self.props.get(self.ids.get(key)?, view_prop)
+    pub fn get_view_prop(&self, key: &str, view_prop: &str) -> Option<Value> {
+        let id = self.ids.get(key)?;
+        self.props_view()
+            .get(id, view_prop)
+            .map(|vr| vr.into_value())
     }
 
     /// For testing / DST oracle: scratch recompute of a view value for one node.
@@ -3742,37 +3901,18 @@ impl<F: Fs> GraphDb<F> {
     pub fn scratch_view_value(&self, key: &str, view_name: &str) -> Option<Value> {
         let node = self.ids.get(key)?;
         let def = self.view_store.views().find(|v| v.name == view_name)?;
-        // When a V8 base is open, self.topo only holds the WAL-replay overlay.
-        // Materialize the merged topology so NeighborAgg sees base + overlay
-        // edges (same as rebuild_all uses).
-        if let Some(ref base) = self.base {
-            let archived_csr = base
-                .topology()
-                .expect("base topology CRC already verified at open");
-            let mut merged = csr_to_topology(archived_csr);
-            for (etype, src, dst) in self.topo.all_edges() {
-                merged.add_edge(etype, src, dst);
-            }
-            core_rules::views::compute_view_value(
-                def,
-                node,
-                &self.props,
-                &merged,
-                &self.ids,
-                &self.syms,
-                &self.labels,
-            )
-        } else {
-            core_rules::views::compute_view_value(
-                def,
-                node,
-                &self.props,
-                &self.topo,
-                &self.ids,
-                &self.syms,
-                &self.labels,
-            )
-        }
+        // Use TopologyView so that NeighborAgg sees base + overlay edges
+        // without materialising a temporary Topology (I1).
+        let topo_view = self.topo_view();
+        core_rules::views::compute_view_value(
+            def,
+            node,
+            self.props_view(),
+            &topo_view,
+            &self.ids,
+            &self.syms,
+            &self.labels,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -3851,8 +3991,13 @@ impl<F: Fs> GraphDb<F> {
         Ok(())
     }
 
-    pub fn get_prop(&self, key: &str, field: &str) -> Option<&Value> {
-        self.props.get(self.ids.get(key)?, field)
+    /// Return the value of `field` for the node with key `key`, or `None` if
+    /// the node or field is absent.  Reads through the overlay-over-base
+    /// `ColumnsView`, materialising base values on demand (zero heap cost for
+    /// overlay hits; one clone per base hit).
+    pub fn get_prop(&self, key: &str, field: &str) -> Option<Value> {
+        let id = self.ids.get(key)?;
+        self.props_view().get(id, field).map(|vr| vr.into_value())
     }
 
     pub fn has_node(&self, key: &str) -> bool {
@@ -3968,7 +4113,7 @@ impl<F: Fs> GraphDb<F> {
             ids: &self.ids,
             syms: &self.syms,
             labels: &self.labels,
-            props: core_storage::v8::seam::ColumnsView::owned(&self.props),
+            props: self.props_view(),
             topo: self.topo_view(),
             edge_props: &self.edge_props,
             mask: None,
@@ -3980,7 +4125,7 @@ impl<F: Fs> GraphDb<F> {
             ids: &self.ids,
             syms: &self.syms,
             labels: &self.labels,
-            props: core_storage::v8::seam::ColumnsView::owned(&self.props),
+            props: self.props_view(),
             topo: self.topo_view(),
             edge_props: &self.edge_props,
             mask: Some(&mask.visible),
@@ -5254,8 +5399,12 @@ impl<F: Fs> GraphDb<F> {
                 let archived_csr = old_base.topology().map_err(|e| GraphError::Corrupt {
                     detail: format!("v8 snapshot: topology section: {e:?}"),
                 })?;
+                let archived_cols = old_base.columns().map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8 snapshot: columns section: {e:?}"),
+                })?;
                 encode_v8(
                     Some(archived_csr),
+                    Some(archived_cols),
                     &self.topo,
                     &self.props,
                     &self.ids,
@@ -5266,13 +5415,19 @@ impl<F: Fs> GraphDb<F> {
             }
             self.fs.write_atomic(FileId::Snapshot, &buf)?;
             // Remap the freshly-written snapshot as the new base.
-            let new_base =
-                core_storage::v8::MappedBase::from_bytes(buf).map_err(|e| GraphError::Corrupt {
-                    detail: format!("v8 snapshot: remap new base: {e:?}"),
-                })?;
+            // C2: use file mmap on RealFs; fall back to from_bytes on SimFs.
+            let new_base = if let Some(snap_path) = self.fs.snapshot_path() {
+                core_storage::v8::MappedBase::map(&snap_path)
+            } else {
+                core_storage::v8::MappedBase::from_bytes(buf)
+            }
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8 snapshot: remap new base: {e:?}"),
+            })?;
             self.base = Some(Arc::new(new_base));
-            // Clear the overlay (and its tombstones) — all data is now in the base.
+            // Clear the overlay and prop tombstones — all data is now in the new base.
             self.topo = Topology::new();
+            self.props = core_storage::columns::ColumnStore::new();
         } else {
             // Legacy path (V5–V7 stores without a V8 base).
             let state = core_storage::snapshot::SnapshotState {
@@ -5448,7 +5603,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             return false;
         };
         self.db
-            .topo
+            .topo_view()
             .neighbors(sym, Direction::Out, src)
             .binary_search(&dst)
             .is_ok()
@@ -5631,7 +5786,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         if self.overlay.extra_keys.contains(key) {
             return None;
         }
-        self.db.get_prop(key, field).cloned()
+        self.db.get_prop(key, field)
     }
 
     fn check_create_rule(&self, def: &RuleDef) -> Result<()> {
@@ -5868,16 +6023,20 @@ impl<'a, F: Fs> NodeRef<'a, F> {
         self.db.syms.resolve(sym).expect("interned label symbol")
     }
 
-    pub fn prop(&self, field: &str) -> Option<&Value> {
-        self.db.props.get(self.id, field)
+    pub fn prop(&self, field: &str) -> Option<Value> {
+        self.db
+            .props_view()
+            .get(self.id, field)
+            .map(|vr| vr.into_value())
     }
 
     /// All stored fields for this node, sorted by field name.
     pub fn props(&self) -> BTreeMap<String, Value> {
         let mut out = BTreeMap::new();
         for field in self.db.props.fields() {
-            if let Some(v) = self.db.props.get(self.id, field) {
-                out.insert(field.to_string(), v.clone());
+            let pv = self.db.props_view();
+            if let Some(vr) = pv.get(self.id, field) {
+                out.insert(field.to_string(), vr.into_value());
             }
         }
         out
@@ -6189,7 +6348,7 @@ mod tests {
             .unwrap();
             // Sanity: normal open sees degree = 3.
             assert_eq!(
-                db.get_view_prop("o1", "emp").cloned(),
+                db.get_view_prop("o1", "emp"),
                 Some(Value::Int(3)),
                 "normal db must show degree 3 after 3 derived edges"
             );
@@ -6197,7 +6356,7 @@ mod tests {
 
         // Re-open normally to get the authoritative reference value.
         let normal_db = GraphDb::open(&dir).unwrap();
-        let normal_emp = normal_db.get_view_prop("o1", "emp").cloned();
+        let normal_emp = normal_db.get_view_prop("o1", "emp");
         assert_eq!(
             normal_emp,
             Some(Value::Int(3)),
@@ -6207,7 +6366,7 @@ mod tests {
         // Latest as-of (commit 5 = frames 0..=5): must match the normal open.
         let aof_latest = GraphDb::open_at(&dir, 5).unwrap();
         assert_eq!(
-            aof_latest.get_view_prop("o1", "emp").cloned(),
+            aof_latest.get_view_prop("o1", "emp"),
             normal_emp,
             "open_at latest: derived-edge view must equal normal open (rebuild_all required)"
         );
@@ -6215,7 +6374,7 @@ mod tests {
         // Mid-history as-of (commit 3 = frames 0..=3): only p1; degree = 1.
         let aof_mid = GraphDb::open_at(&dir, 3).unwrap();
         assert_eq!(
-            aof_mid.get_view_prop("o1", "emp").cloned(),
+            aof_mid.get_view_prop("o1", "emp"),
             Some(Value::Int(1)),
             "open_at mid-history: only p1 exists at frame 3, degree must be 1"
         );
@@ -6290,7 +6449,7 @@ mod tests {
             db.set_prop("a", "later_field", Value::Int(2)).unwrap();
         }
         let db = GraphDb::open(&dir).expect("WAL must replay after failed rewrite");
-        assert_eq!(db.get_prop("a", "later_field"), Some(&Value::Int(2)));
+        assert_eq!(db.get_prop("a", "later_field"), Some(Value::Int(2)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

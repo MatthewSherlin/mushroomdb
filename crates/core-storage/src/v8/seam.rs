@@ -20,7 +20,7 @@ compile_error!("core-storage v8 seam: zero-copy f64 transmute requires a little-
 use crate::columns::{ColumnHandle, ColumnStore};
 use crate::topology::{Direction, Topology};
 use crate::types::Value;
-use crate::v8::layout::{ArchivedColumnData, ArchivedCsr};
+use crate::v8::layout::{ArchivedColumnData, ArchivedColumns, ArchivedCsr};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
@@ -282,6 +282,7 @@ mod tests {
         let mut snap_bytes = Vec::new();
         encode_v8(
             None,
+            None,
             &base_topo,
             &ColumnStore::new(),
             &ids,
@@ -332,6 +333,7 @@ mod tests {
         ids2.get_or_insert("B");
         ids2.get_or_insert("C");
         encode_v8(
+            None,
             None,
             &base_topo2,
             &ColumnStore::new(),
@@ -421,6 +423,7 @@ impl<'a> PartialEq for ValueRef<'a> {
 ///       wires the persistent mmap (overlay starts empty after snapshot open);
 ///   (b) callers that need a fused-scan path with base values should use
 ///       `get()` directly.
+#[derive(Copy, Clone)]
 pub struct ColumnsView<'a> {
     pub overlay: &'a ColumnStore,
     pub base: Option<&'a crate::v8::layout::ArchivedColumns>,
@@ -435,6 +438,18 @@ impl<'a> ColumnsView<'a> {
         }
     }
 
+    /// Construct a view that merges an mmap'd V8 base with a WAL-replay overlay.
+    ///
+    /// Used when a V8 snapshot is open: `overlay` starts empty (or holds only
+    /// post-snapshot mutations) and `base` is the zero-copy archived columns
+    /// section from the V8 mmap.
+    pub fn with_base(overlay: &'a ColumnStore, base: &'a ArchivedColumns) -> Self {
+        Self {
+            overlay,
+            base: Some(base),
+        }
+    }
+
     /// Look up a property value for `(id, field)`: overlay first, then base.
     ///
     /// Returns `ValueRef::Borrowed` for overlay hits (zero allocation) and
@@ -443,6 +458,11 @@ impl<'a> ColumnsView<'a> {
         // Overlay first.
         if let Some(v) = self.overlay.get(id, field) {
             return Some(ValueRef::Borrowed(v));
+        }
+        // Prop tombstone check: a RemoveProp for a base-only value records a
+        // tombstone so that subsequent reads correctly see the value as absent.
+        if self.overlay.is_tombstoned(id, field) {
+            return None;
         }
         // Base fallback.
         let base = self.base?;

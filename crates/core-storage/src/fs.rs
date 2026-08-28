@@ -31,6 +31,14 @@ pub trait Fs {
     fn sync(&mut self, file: FileId) -> std::io::Result<()>;
     fn read(&self, file: FileId) -> std::io::Result<Vec<u8>>;
     fn write_atomic(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()>;
+    /// Return the on-disk path of the snapshot file, if any.
+    ///
+    /// `Some` for `RealFs` (used by `MappedBase::map` for true file mmap).
+    /// `None` for `SimFs` and other in-memory implementations (falls back to
+    /// `MappedBase::from_bytes`).
+    fn snapshot_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 pub trait FsIntrospect {
@@ -93,6 +101,10 @@ impl Fs for RealFs {
         }
         std::fs::rename(&tmp, self.path(file))?;
         sync_dir(&self.dir)
+    }
+
+    fn snapshot_path(&self) -> Option<std::path::PathBuf> {
+        Some(self.path(FileId::Snapshot))
     }
 }
 

@@ -671,7 +671,7 @@ fn recovery_is_consistent_at_every_crash_offset() {
             );
             assert_eq!(
                 recovered.get_prop(&format!("n{i}"), "i"),
-                Some(&Value::Int(i)),
+                Some(Value::Int(i)),
                 "crash_at={crash_at}: node exists but its logged props are missing"
             );
         }
@@ -771,7 +771,7 @@ fn cypher_write_dst_byte_sweep() {
         }
         if let Some(score) = recovered.get_prop("dst_alice", "score") {
             assert_eq!(
-                *score,
+                score,
                 Value::Int(42),
                 "crash_at={crash_at}: dst_alice.score must be 42 when present"
             );
@@ -1245,7 +1245,7 @@ fn write_batch_large_frame_dst_byte_sweep() {
             // Batch landed: batch props and delete must be visible.
             assert_eq!(
                 recovered.get_prop("pre0", "name"),
-                Some(&Value::Str("upd".into())),
+                Some(Value::Str("upd".into())),
                 "crash_at={crash_at}: pre0.name must be 'upd' after batch"
             );
             assert!(
@@ -1279,12 +1279,12 @@ fn write_batch_large_frame_dst_byte_sweep() {
             if recovered.has_node("del_target") {
                 assert_eq!(
                     recovered.get_prop("del_target", "flag"),
-                    Some(&Value::Bool(true)),
+                    Some(Value::Bool(true)),
                     "crash_at={crash_at}: del_target.flag must be true before batch"
                 );
                 assert_eq!(
                     recovered.get_prop("del_target", "v"),
-                    Some(&Value::Int(7)),
+                    Some(Value::Int(7)),
                     "crash_at={crash_at}: del_target.v must be 7 before batch"
                 );
             }
@@ -1467,7 +1467,7 @@ fn write_batch_composition_sweep() {
             );
             assert_eq!(
                 recovered.get_prop("c2", "note"),
-                Some(&Value::Str("updated".into())),
+                Some(Value::Str("updated".into())),
                 "crash_at={crash_at}: c2.note must be set when second write_batch landed"
             );
         }
@@ -1568,7 +1568,7 @@ fn recovery_byte_sweep_views() {
                 if !recovered.has_node(key) {
                     continue;
                 }
-                let stored = recovered.get_view_prop(key, &view_def.view_prop).cloned();
+                let stored = recovered.get_view_prop(key, &view_def.view_prop);
                 let scratch = recovered.scratch_view_value(key, &view_def.name);
                 match &view_def.source {
                     ViewSource::NeighborAgg {

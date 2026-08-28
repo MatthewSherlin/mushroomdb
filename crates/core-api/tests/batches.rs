@@ -132,8 +132,8 @@ fn invalid_middle_op_rejects_batch_wal_and_state_unchanged() {
     let before_wal = wal_len(&dir);
     let before_nodes = db.node_count();
     let before_edges = db.edge_count();
-    let before_name = db.get_prop("a", "name").cloned();
-    let before_age = db.get_prop("a", "age").cloned();
+    let before_name = db.get_prop("a", "name");
+    let before_age = db.get_prop("a", "age");
 
     let err = db
         .batch()
@@ -150,8 +150,8 @@ fn invalid_middle_op_rejects_batch_wal_and_state_unchanged() {
     assert_eq!(wal_len(&dir), before_wal);
     assert_eq!(db.node_count(), before_nodes);
     assert_eq!(db.edge_count(), before_edges);
-    assert_eq!(db.get_prop("a", "name").cloned(), before_name);
-    assert_eq!(db.get_prop("a", "age").cloned(), before_age);
+    assert_eq!(db.get_prop("a", "name"), before_name);
+    assert_eq!(db.get_prop("a", "age"), before_age);
     assert!(!db.has_node("x"));
     assert!(!db.has_node("y"));
     assert!(db.has_node("a"));
@@ -189,7 +189,7 @@ fn intra_batch_edge_and_delete_reinsert_fresh_identity() {
     );
 
     assert!(db.has_node("a"));
-    assert_eq!(db.get_prop("a", "name"), Some(&Value::Str("fresh".into())));
+    assert_eq!(db.get_prop("a", "name"), Some(Value::Str("fresh".into())));
     assert_eq!(db.get_prop("a", "tags"), None);
     assert!(db.neighbors("a", "REL", Direction::Out).unwrap().is_empty());
     assert!(db
@@ -226,7 +226,7 @@ fn torn_mid_batch_frame_drops_whole_batch_on_reopen() {
 
     let db = GraphDb::open(&dir).unwrap();
     assert!(db.has_node("keep"));
-    assert_eq!(db.get_prop("keep", "v"), Some(&Value::Int(1)));
+    assert_eq!(db.get_prop("keep", "v"), Some(Value::Int(1)));
     assert!(!db.has_node("x"));
     assert!(!db.has_node("y"));
     assert_eq!(db.edge_count(), 0);
@@ -296,7 +296,7 @@ fn crash_window_replays_batch_idempotently() {
             .unwrap();
 
         expected_edges = out_pairs(&db, &["a", "b", "c", "u"], "REL");
-        expected_name = db.get_prop("a", "name").cloned();
+        expected_name = db.get_prop("a", "name");
         assert_eq!(db.get_prop("u", "n"), None);
         assert!(db
             .neighbors("a", "KNOWS", Direction::Out)
@@ -309,7 +309,7 @@ fn crash_window_replays_batch_idempotently() {
     }
     let db = GraphDb::open(&dir).unwrap();
     assert!(db.has_node("c"));
-    assert_eq!(db.get_prop("a", "name"), expected_name.as_ref());
+    assert_eq!(db.get_prop("a", "name"), expected_name);
     assert_eq!(db.get_prop("u", "n"), None);
     assert!(db
         .neighbors("a", "KNOWS", Direction::Out)

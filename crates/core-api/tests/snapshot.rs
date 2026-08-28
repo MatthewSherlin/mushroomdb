@@ -27,7 +27,7 @@ fn snapshot_plus_wal_tail_recovers_everything() {
     let db = GraphDb::open(&dir).unwrap();
     assert_eq!(db.node_count(), 3);
     assert_eq!(db.edge_count(), 2);
-    assert_eq!(db.get_prop("a", "v"), Some(&Value::Int(1)));
+    assert_eq!(db.get_prop("a", "v"), Some(Value::Int(1)));
     assert_eq!(db.neighbors("b", "E", Direction::Out).unwrap(), vec!["c"]);
 }
 
@@ -1034,7 +1034,7 @@ fn golden_v5_pin() {
     assert_eq!(db.edge_count(), 1, "V5 fixture must decode to 1 edge");
     assert_eq!(
         db.get_prop("a", "v"),
-        Some(&Value::Int(42)),
+        Some(Value::Int(42)),
         "V5 fixture must preserve prop v=42 on node 'a'"
     );
 }
@@ -1068,7 +1068,7 @@ fn golden_v6_pin() {
     assert_eq!(db.edge_count(), 1, "V6 fixture must decode to 1 edge");
     assert_eq!(
         db.get_prop("a", "v"),
-        Some(&Value::Int(42)),
+        Some(Value::Int(42)),
         "V6 fixture must preserve prop v=42 on node 'a'"
     );
 }
@@ -1135,7 +1135,7 @@ fn v6_snapshot_roundtrip() {
     let db = GraphDb::open(&dir).unwrap();
     assert_eq!(db.node_count(), 3);
     assert_eq!(db.edge_count(), 1);
-    assert_eq!(db.get_prop("a", "v"), Some(&Value::Int(7)));
+    assert_eq!(db.get_prop("a", "v"), Some(Value::Int(7)));
     // Verify the snapshot file actually uses V8 container.
     let snap = std::fs::read(dir.join("snapshot.bin")).unwrap();
     assert_eq!(&snap[0..4], b"GDB1");
@@ -1301,7 +1301,7 @@ fn keep_wal_reopen_equivalence() {
     );
     assert_eq!(
         db.get_prop("a", "v"),
-        Some(&Value::Int(1)),
+        Some(Value::Int(1)),
         "prop must survive keep_wal round-trip"
     );
     assert_eq!(
@@ -1347,7 +1347,7 @@ fn keep_wal_open_at_reaches_pre_snapshot_commits() {
     );
     assert_eq!(
         at0.get_prop("a", "v"),
-        Some(&Value::Int(10)),
+        Some(Value::Int(10)),
         "prop on 'a' must be correct at commit 0"
     );
 
@@ -1465,7 +1465,7 @@ fn golden_v7_pin() {
     assert_eq!(db.edge_count(), 1, "V7 fixture must decode to 1 edge");
     assert_eq!(
         db.get_prop("a", "v"),
-        Some(&Value::Int(42)),
+        Some(Value::Int(42)),
         "V7 fixture must preserve prop v=42 on node 'a'"
     );
     assert_eq!(db.neighbors("a", "E", Direction::Out).unwrap(), vec!["b"]);
@@ -1501,7 +1501,7 @@ fn golden_v8_pin() {
     assert_eq!(db.edge_count(), 1, "V8 fixture must decode to 1 edge");
     assert_eq!(
         db.get_prop("a", "v"),
-        Some(&Value::Int(42)),
+        Some(Value::Int(42)),
         "V8 fixture must preserve prop v=42 on node 'a'"
     );
     assert_eq!(db.neighbors("a", "E", Direction::Out).unwrap(), vec!["b"]);
@@ -1527,8 +1527,8 @@ fn v8_encode_decode_equivalence() {
     let db2 = GraphDb::open(&dir).unwrap();
     assert_eq!(db2.node_count(), db.node_count());
     assert_eq!(db2.edge_count(), db.edge_count());
-    assert_eq!(db2.get_prop("alice", "age"), Some(&Value::Int(30)));
-    assert_eq!(db2.get_prop("bob", "age"), Some(&Value::Int(25)));
+    assert_eq!(db2.get_prop("alice", "age"), Some(Value::Int(30)));
+    assert_eq!(db2.get_prop("bob", "age"), Some(Value::Int(25)));
     assert_eq!(
         db2.neighbors("alice", "KNOWS", Direction::Out).unwrap(),
         vec!["bob"]
@@ -1611,12 +1611,12 @@ fn open_at_after_truncating_snapshot_replays_dense_id_records() {
     );
     assert_eq!(
         aof.get_prop("a", "v"),
-        Some(&Value::Int(1)),
+        Some(Value::Int(1)),
         "InsertNodeId props must replay via Intern-bound field ids"
     );
     assert_eq!(
         aof.get_prop("a", "w"),
-        Some(&Value::Int(9)),
+        Some(Value::Int(9)),
         "SetPropId must replay via Intern-bound field id"
     );
     assert_eq!(
@@ -1632,7 +1632,7 @@ fn open_at_after_truncating_snapshot_replays_dense_id_records() {
     // Earlier as-of point: snapshot base + commit 0 only.
     let aof0 = GraphDb::open_at(&dir, 0).unwrap();
     assert_eq!(aof0.node_count(), 2, "pre + a");
-    assert_eq!(aof0.get_prop("a", "v"), Some(&Value::Int(1)));
+    assert_eq!(aof0.get_prop("a", "v"), Some(Value::Int(1)));
     assert!(aof0
         .neighbors("a", "REL", Direction::Out)
         .unwrap()
@@ -1655,7 +1655,7 @@ fn open_at_keep_wal_replays_dense_id_records_from_genesis() {
         db.insert_edge("REL", "a", "b").unwrap(); // commit 2
     }
     let aof = GraphDb::open_at(&dir, 2).unwrap();
-    assert_eq!(aof.get_prop("a", "v"), Some(&Value::Int(1)));
+    assert_eq!(aof.get_prop("a", "v"), Some(Value::Int(1)));
     assert_eq!(
         aof.neighbors("a", "REL", Direction::Out).unwrap(),
         vec!["b"]
@@ -1964,7 +1964,7 @@ fn v8_wal_replay_identity_over_base() {
     assert_eq!(db.edge_count(), 2, "a→b (base) + b→c (overlay) = 2");
     assert_eq!(
         db.get_prop("a", "v"),
-        Some(&Value::Int(1)),
+        Some(Value::Int(1)),
         "base prop must survive WAL-replay open"
     );
     assert_eq!(
@@ -2025,7 +2025,9 @@ fn v8_crash_sweep_base_overlay_idempotent() {
     // Reads must be correct despite the duplicate-edge replay.
     let db = GraphDb::open(&dir).unwrap();
     assert_eq!(db.node_count(), 3, "a, b, c must all be present");
-    // edge_count may be inflated by crash replay; do not assert it here.
+    // With the I3 DeleteEdge guard, phantom tombstones cannot form, so
+    // the idempotency guard prevents double-counting on WAL replay.
+    assert_eq!(db.edge_count(), 2);
     assert_eq!(
         db.neighbors("a", "E", Direction::Out).unwrap(),
         vec!["b"],
@@ -2097,12 +2099,12 @@ fn v8_snapshot_merge_equivalence() {
     );
     assert_eq!(
         db.get_prop("a", "x"),
-        Some(&Value::Int(10)),
+        Some(Value::Int(10)),
         "prop a.x must survive two-snapshot merge"
     );
     assert_eq!(
         db.get_prop("b", "x"),
-        Some(&Value::Int(20)),
+        Some(Value::Int(20)),
         "prop b.x must survive two-snapshot merge"
     );
     assert_eq!(
@@ -2124,5 +2126,95 @@ fn v8_snapshot_merge_equivalence() {
         db.neighbors("c", "E", Direction::In).unwrap(),
         ref_db.neighbors("c", "E", Direction::In).unwrap(),
         "in-direction c must match reference"
+    );
+}
+
+/// C1 prop-tombstone deletion mask:
+/// set prop → V8 snapshot → delete prop → read (absent) → snapshot → reopen → still absent.
+///
+/// Without the tombstone mechanism a RemoveProp WAL record applied after a V8 open
+/// would only remove from the empty overlay, leaving the base value visible on the
+/// next props_view() read.
+#[test]
+fn v8_prop_tombstone_survives_snapshot_cycle() {
+    let dir = tmp("v8-prop-tombstone");
+    // Phase 1: initial (legacy) snapshot with a prop.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![("score".into(), Value::Int(42))])
+            .unwrap();
+        db.snapshot().unwrap(); // V8 base: a.score = 42
+    }
+    // Phase 2: open V8 base, delete the prop, read absent, V8 merge snapshot.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        assert_eq!(
+            db.get_prop("a", "score"),
+            Some(Value::Int(42)),
+            "base prop must be visible before deletion"
+        );
+        db.remove_prop("a", "score").unwrap();
+        assert_eq!(
+            db.get_prop("a", "score"),
+            None,
+            "prop must be absent immediately after removal"
+        );
+        db.snapshot().unwrap(); // V8 merge: tombstone consumed, new base has no score
+    }
+    // Phase 3: reopen — new base should not have the prop.
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.get_prop("a", "score"),
+        None,
+        "deleted prop must remain absent after snapshot merge and reopen"
+    );
+}
+
+/// I3 phantom-tombstone guard: replaying a DeleteEdge WAL record for an edge
+/// that was already folded into a new V8 base (no longer in overlay or base)
+/// must not create a phantom tombstone that understates edge_count.
+///
+/// Scenario: V8 merge snapshot folds edge a→b into the new base.  The pre-
+/// snapshot WAL is restored (crash before WAL truncation), so DeleteEdge for
+/// the same edge is replayed over the new base.  edge_count must not drop below
+/// the correct value.
+#[test]
+fn v8_delete_edge_crash_replay_no_phantom_tombstone() {
+    let dir = tmp("v8-del-edge-phantom");
+    // Phase 1: legacy snapshot with a→b.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap();
+        db.insert_node("N", "b", vec![]).unwrap();
+        db.insert_edge("E", "a", "b").unwrap();
+        db.snapshot().unwrap();
+    }
+    // Phase 2: add b→c, capture WAL, delete a→b, V8 merge (new base: a,b,c; edges: b→c).
+    // Then restore old WAL (which still has the DeleteEdge a→b record).
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "c", vec![]).unwrap();
+        db.insert_edge("E", "b", "c").unwrap();
+        db.delete_edge("E", "a", "b").unwrap();
+        let pre_snap_wal = std::fs::read(dir.join("wal.bin")).unwrap();
+        db.snapshot().unwrap(); // V8 merge: base={a,b,c; b→c}; a→b absent
+        std::fs::write(dir.join("wal.bin"), &pre_snap_wal).unwrap();
+    }
+    // Phase 3: WAL replay includes InsertEdge(b→c) + DeleteEdge(a→b) over new base.
+    // DeleteEdge(a→b) must be a no-op (edge not in base or overlay after merge).
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.edge_count(),
+        1,
+        "only b→c must exist; phantom tombstone for a→b must not understate count"
+    );
+    assert_eq!(
+        db.neighbors("b", "E", Direction::Out).unwrap(),
+        vec!["c"],
+        "b→c must be present"
+    );
+    assert!(
+        db.neighbors("a", "E", Direction::Out).unwrap().is_empty(),
+        "a→b must not exist after delete"
     );
 }

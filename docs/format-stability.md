@@ -32,7 +32,7 @@ V5–V7 stores are **automatically migrated** to V8 on `GraphDb::open` (see Auto
 ```text
 [0..4]         magic "GDB1"
 [4..6]         VERSION = 8 (u16 LE)
-[6..8]         section_count (u16 LE) — currently 5
+[6..8]         section_count (u16 LE) — currently 10
 [8..8+16*N]    section directory: N × { id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32 }
 [8+16*N..+4]   whole-header CRC32 (covers bytes [0..8+16*N])
 [..4096]       zero-pad to complete the 4 KB header page
@@ -43,11 +43,16 @@ Section ids (fixed):
 
 | ID | Name | Encoding |
 |----|------|----------|
-| 0  | TOPOLOGY | rkyv `CsrData` (zero-copy archived CSR) |
-| 1  | COLUMNS  | rkyv `ColumnsData` (zero-copy archived column store) |
-| 2  | IDS      | rkyv `IdMapData` (zero-copy archived id map) |
-| 3  | SYMS     | rkyv `InternerData` (zero-copy archived symbol interner) |
-| 4  | META     | bincode `V8Meta` (labels, edge_props, rule_defs, provenance, …) |
+| 0  | TOPOLOGY   | rkyv `CsrData` (zero-copy archived CSR) |
+| 1  | COLUMNS    | rkyv `ColumnsData` (zero-copy archived column store) |
+| 2  | IDS        | rkyv `IdMapData` (zero-copy archived id map) |
+| 3  | SYMS       | rkyv `InternerData` (zero-copy archived symbol interner) |
+| 4  | META       | bincode `V8Meta` (labels, edge_props, rule_defs, provenance, …) |
+| 5  | EDGE_PROPS | rkyv `EdgePropsData` (per-edge property blobs, sorted by (etype,src,dst)) |
+| 6  | HNSW       | rkyv `HnswSectionData` (HNSW graph blobs per rule name) |
+| 7  | PROVENANCE | rkyv `ProvenanceSectionData` (rule-derived edge provenance) |
+| 8  | RULES_META | rkyv `RulesMetaData` (rule definitions, trip flags, fire counts) |
+| 9  | VIEWS      | rkyv `ViewsSectionData` (view definition bincode blobs) |
 
 CRC coverage: each section payload `[offset..offset+len]` is covered by its directory `crc32`.
 Alignment padding bytes between sections are written as zeros and are NOT covered by any CRC.

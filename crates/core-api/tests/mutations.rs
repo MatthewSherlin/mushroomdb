@@ -208,7 +208,7 @@ fn crash_window_replays_remove_prop_and_delete_edge_idempotently() {
     }
     let mut db = GraphDb::open(&dir).unwrap();
     assert_eq!(db.get_prop("a", "tags"), None);
-    assert_eq!(db.get_prop("b", "tags"), Some(&tags(&["x"])));
+    assert_eq!(db.get_prop("b", "tags"), Some(tags(&["x"])));
     assert_eq!(db.edge_count(), 0);
     assert!(db
         .neighbors("u1", "KNOWS", Direction::Out)
@@ -240,7 +240,7 @@ fn reopen_replays_deletions_identically() {
     }
     let db = GraphDb::open(&dir).unwrap();
     assert_eq!(db.get_prop("a", "tags"), None);
-    assert_eq!(db.get_prop("b", "tags"), Some(&tags(&["x"])));
+    assert_eq!(db.get_prop("b", "tags"), Some(tags(&["x"])));
     assert_eq!(db.edge_count(), 0);
     assert!(db
         .neighbors("u1", "KNOWS", Direction::Out)

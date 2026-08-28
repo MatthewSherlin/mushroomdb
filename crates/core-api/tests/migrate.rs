@@ -34,7 +34,7 @@ fn v5_store_auto_migrates_on_open_with_bak() {
     let db = GraphDb::open(&dir).unwrap();
     assert_eq!(
         db.get_prop("a", "v"),
-        Some(&Value::Int(42)),
+        Some(Value::Int(42)),
         "property v=42 on node 'a' must survive migration"
     );
     // Second clean open at current version must remove .bak.
@@ -168,7 +168,7 @@ fn v7_store_auto_migrates_to_v8_with_bak() {
     let db = GraphDb::open(&dir).unwrap();
     assert_eq!(
         db.get_prop("a", "v"),
-        Some(&Value::Int(42)),
+        Some(Value::Int(42)),
         "property v=42 on node 'a' must survive V7→V8 migration"
     );
     assert_eq!(

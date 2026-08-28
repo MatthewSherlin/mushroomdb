@@ -29,7 +29,7 @@ fn ingest_json_happy_path_auto_fk() {
         vec!["auto_fk_person_org_id".to_string()]
     );
     assert!(db.has_node("p1"));
-    assert_eq!(db.get_prop("p1", "name"), Some(&Value::Str("ada".into())));
+    assert_eq!(db.get_prop("p1", "name"), Some(Value::Str("ada".into())));
     assert_eq!(
         db.neighbors("p1", "ORG", Direction::Out).unwrap(),
         vec!["acme".to_string()]
@@ -49,9 +49,9 @@ fn ingest_json_int_and_float_coercion() {
     )
     .unwrap();
 
-    assert_eq!(db.get_prop("p1", "age"), Some(&Value::Int(30)));
-    assert_eq!(db.get_prop("p1", "score"), Some(&Value::Float(1.5)));
-    assert_eq!(db.get_prop("p1", "ok"), Some(&Value::Bool(true)));
+    assert_eq!(db.get_prop("p1", "age"), Some(Value::Int(30)));
+    assert_eq!(db.get_prop("p1", "score"), Some(Value::Float(1.5)));
+    assert_eq!(db.get_prop("p1", "ok"), Some(Value::Bool(true)));
 }
 
 /// Binding: JSON null fields are silently skipped — not stored, not a row error.
@@ -70,7 +70,7 @@ fn ingest_json_null_fields_are_skipped() {
 
     assert_eq!(report.inserted, 1);
     assert!(report.row_errors.is_empty());
-    assert_eq!(db.get_prop("p1", "age"), Some(&Value::Int(1)));
+    assert_eq!(db.get_prop("p1", "age"), Some(Value::Int(1)));
     assert_eq!(db.get_prop("p1", "name"), None);
 }
 
@@ -98,13 +98,13 @@ fn ingest_json_nested_object_becomes_map() {
     // nested object stored as Map
     let mut expected_meta = BTreeMap::new();
     expected_meta.insert("x".to_string(), Value::Int(1));
-    assert_eq!(db.get_prop("p1", "meta"), Some(&Value::Map(expected_meta)));
+    assert_eq!(db.get_prop("p1", "meta"), Some(Value::Map(expected_meta)));
     // array of objects stored as List of Maps
     let mut inner = BTreeMap::new();
     inner.insert("a".to_string(), Value::Int(1));
     assert_eq!(
         db.get_prop("p3", "items"),
-        Some(&Value::List(vec![Value::Map(inner)]))
+        Some(Value::List(vec![Value::Map(inner)]))
     );
 }
 

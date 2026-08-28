@@ -391,7 +391,7 @@ mod tests {
         props.set(0, "v", Value::Int(42));
         let meta = tiny_v8_meta();
         let mut out = Vec::new();
-        encode_v8(None, &topo, &props, &ids, &syms, &meta, &mut out).expect("encode_v8");
+        encode_v8(None, None, &topo, &props, &ids, &syms, &meta, &mut out).expect("encode_v8");
         out
     }
 
