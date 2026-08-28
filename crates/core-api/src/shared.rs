@@ -62,10 +62,14 @@
 //! # Event ordering (Strict policy, R2)
 //!
 //! Under `FsyncPolicy::Strict` or `Batched`, subscription events are deferred
-//! until after the group fsync.  The drain thread reacquires the write lock
-//! briefly to call [`GraphDb::flush_deferred_events`], then releases `wal_mu`,
-//! then signals submitters.  Under `Relaxed`, events fire immediately (no
-//! fsync to wait for).
+//! until after the group fsync.  The drain thread then reacquires the write lock
+//! (while still holding `wal_mu`) to call [`GraphDb::flush_deferred_events`],
+//! releases the write lock, releases `wal_mu`, and finally signals submitters.
+//! Flushing events while `wal_mu` is held prevents a concurrent direct writer
+//! from slipping in between the group fsync and the event flush and delivering
+//! its event before the group's events — preserving a global monotone event
+//! order across both the drain path and the direct write path.
+//! Under `Relaxed`, events fire immediately (no fsync to wait for).
 //!
 //! # Event delivery and crashes (R2)
 //!
@@ -537,19 +541,23 @@ fn drain_loop(
 
         // ── Step 5: Flush deferred events AFTER successful fsync (R2) ────────
         //
-        // Release wal_mu first: event delivery is pure in-memory (subscriber
-        // callbacks only); no WAL I/O occurs in flush_deferred_events.
-        // Releasing wal_mu here unblocks any direct writer that was waiting,
-        // keeping write-path latency minimal.
-        drop(wal_guard);
-
+        // Flush events while wal_mu is still held so no direct writer can slip
+        // between this group's fsync and its event delivery.  Lock order is
+        // wal_mu (held) → inner.write() — the same order enforced everywhere
+        // else; no deadlock: the drain thread never holds inner while waiting
+        // for wal_mu.  Event delivery is pure in-memory (subscriber callbacks
+        // only); no WAL I/O occurs in flush_deferred_events.
         if should_sync {
-            // Reacquire the write lock briefly so distribute_events /
-            // emit_committed run on the GraphDb's subscriber lists.
             let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
             db.flush_deferred_events();
             db.set_deferred_events_mode(false);
+            // inner.write() released here (RAII) before wal_mu below.
         }
+
+        // Release WAL mutex after events are flushed.  Unblocks any direct
+        // writer that was waiting for wal_mu; they will observe the correct
+        // event order when they subsequently deliver their own events.
+        drop(wal_guard);
 
         // ── Step 6: Signal each submitter ────────────────────────────────────
         for (sub, result) in group.into_iter().zip(results) {

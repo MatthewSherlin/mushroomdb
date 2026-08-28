@@ -14,6 +14,7 @@
 //! 11. group_commit_simfs_amortization_bench (ignored) — SimFs gate: 8 writers >= 3x serial
 //! 12. shared_db_fsync_failure_degrades_and_truncates_wal — F1(c) integration via SharedDb
 //! 13. direct_write_before_group_survives_group_fsync_failure — F1(c) concurrent variant
+//! 14. write_batch_strict_always_fsyncs — N single-op + one 5-op batch → correct fsync count
 
 use core_api::{BatchOp, FsyncPolicy, GraphDb, MutationEvent, SharedDb};
 use core_storage::fs::{FileId, Fs, FsIntrospect};
@@ -545,14 +546,11 @@ fn deferred_events_discarded_on_failure() {
 /// gate lives in `group_commit_simfs_amortization_bench` (test 11) which uses
 /// SimFs with injected fsync latency and is environment-independent.
 ///
-/// # Pre-existing durability finding (not introduced by task 4b)
+/// # Serial baseline
 ///
-/// `write_batch(FsyncPolicy::Strict)` for a single-op batch internally maps to
-/// `FsyncPolicy::Batched` and skips fsync when the batch contains only one
-/// non-`Intern` WAL record.  A prior bench that used `write_batch` as the
-/// serial baseline was therefore measuring no-fsync writes, explaining the
-/// implausible 51 k ops/s result.  This bench corrects the baseline to
-/// `insert_node(FsyncPolicy::Strict)`, which always fsyncs.
+/// Uses `db.write().insert_node()` under `FsyncPolicy::Strict`.  `write_batch`
+/// would be equally correct now that the single-op batch durability bug is fixed
+/// (see test 14), but `insert_node` is kept here for continuity.
 ///
 /// Run manually with: `cargo test --release group_commit_throughput_bench -- --ignored --nocapture`
 #[test]
@@ -568,8 +566,6 @@ fn group_commit_throughput_bench() {
     //
     // Uses db.write().insert_node() under FsyncPolicy::Strict so each call
     // acquires the write lock AND fsyncs exactly once before returning.
-    // write_batch is NOT used here because a single-op batch under FsyncPolicy::Strict
-    // maps to Batched internally and skips the fsync (count-gt-1 condition is false).
     let dir_serial = tmp("bench-serial");
     let db_serial = SharedDb::open(&dir_serial).unwrap();
     // Warm up OS page cache / WAL file.
@@ -960,4 +956,48 @@ fn direct_write_before_group_survives_group_fsync_failure() {
         !db2.read().has_node("group-fail"),
         "failed group node must be absent on replay"
     );
+}
+
+// ── Test 14: write_batch Strict always fsyncs ─────────────────────────────────
+
+/// Verifies the fix for the single-op write_batch durability bug:
+/// under `FsyncPolicy::Strict`, every `write_batch` call must issue exactly
+/// one fsync, regardless of how many ops the batch contains.
+///
+/// Checks two sub-cases:
+/// - N=5 single-op batches → exactly 5 fsyncs.
+/// - One 5-op batch → exactly 1 fsync.
+#[test]
+fn write_batch_strict_always_fsyncs() {
+    // ── 5 single-op write_batch calls → 5 fsyncs ────────────────────────────
+    let mut db = counting_db();
+    // Default policy is Strict.
+    assert_eq!(db.fsync_policy(), FsyncPolicy::Strict);
+
+    for i in 0..5usize {
+        db.write_batch(|b| {
+            b.insert_node("X", &format!("single{i}"), vec![]);
+        })
+        .expect("write_batch must succeed");
+    }
+    assert_eq!(
+        db.fs_sync_count(),
+        5,
+        "5 single-op write_batch calls under Strict must produce exactly 5 fsyncs"
+    );
+    assert_eq!(db.node_count(), 5);
+
+    // ── One 5-op write_batch → exactly 1 fsync (cumulative: 6) ─────────────
+    db.write_batch(|b| {
+        for j in 0..5usize {
+            b.insert_node("X", &format!("multi{j}"), vec![]);
+        }
+    })
+    .expect("5-op write_batch must succeed");
+    assert_eq!(
+        db.fs_sync_count(),
+        6,
+        "one 5-op write_batch under Strict must produce exactly 1 additional fsync (total 6)"
+    );
+    assert_eq!(db.node_count(), 10);
 }

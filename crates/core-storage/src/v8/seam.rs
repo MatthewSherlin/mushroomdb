@@ -241,7 +241,7 @@ mod tests {
     use crate::columns::ColumnStore;
     use crate::idmap::IdMap;
     use crate::interner::Interner;
-    use crate::topology::Topology;
+    use crate::topology::{RemoveEdgeOutcome, Topology};
     use crate::v8::encode::{encode_v8, V8Meta};
     use crate::v8::MappedBase;
     use std::collections::BTreeMap;
@@ -302,8 +302,12 @@ mod tests {
         // The overlay starts empty; call remove_edge for the base-only edge.
         // Since the edge is not in the overlay, this records a tombstone.
         let mut overlay = Topology::new();
-        let was_in_overlay = overlay.remove_edge(etype, a, b);
-        assert!(!was_in_overlay, "edge was base-only, not in overlay");
+        let outcome = overlay.remove_edge(etype, a, b);
+        assert_eq!(
+            outcome,
+            RemoveEdgeOutcome::TombstonedBase,
+            "edge was base-only, not in overlay"
+        );
 
         // Build the merged view.
         let view = TopologyView {
@@ -555,18 +559,15 @@ impl<'a> ColumnsView<'a> {
     ///   - the overlay has a value for `(id, field)` (overlay takes priority,
     ///     but that value is accessible via `get()` as a `Value::List`).
     ///
+    /// Returns `Cow::Borrowed` when the archived data happens to be 8-byte
+    /// aligned (zero-copy fast path), or `Cow::Owned` when it is not
+    /// (element-wise copy via `read_unaligned`).
+    ///
     /// **Overlay/archive asymmetry**: vectors written after the last snapshot
     /// live in the overlay as `Value::List([Value::Float, ...])`.  Callers
     /// that need `&[f64]` for overlay vectors must call `get()` and convert
     /// manually (`Value::List` → iterate `Value::Float` elements).
-    ///
-    /// # Safety of the returned slice
-    ///
-    /// On little-endian targets (the only supported platform, per the LE-pinned
-    /// format constraint) `rkyv::Archived<f64>` has the same bit representation
-    /// as `f64`.  The transmute in the implementation is sound under this
-    /// constraint.
-    pub fn vector(&self, id: u32, field: &str) -> Option<&[f64]> {
+    pub fn vector(&self, id: u32, field: &str) -> Option<Cow<'_, [f64]>> {
         // Overlay takes priority: if the overlay has data for (id, field), we
         // do not fall through to base — but we cannot return &[f64] from a
         // Value::List.  See the doc comment above for the asymmetry.
@@ -598,15 +599,27 @@ impl<'a> ColumnsView<'a> {
             return None;
         }
         let chunk = &archived_slice[start..end];
-        // SAFETY: On little-endian targets (our only supported platform, enforced
-        // by the LE-pinned V8 format constraint), `rkyv::Archived<f64>` (= the
-        // `rend::F64_le` type) has the same 8-byte IEEE-754 representation as
-        // `f64`.  The archived slice is guaranteed to be 8-byte aligned by rkyv's
-        // serializer.  Transmuting `&[Archived<f64>]` to `&[f64]` is therefore a
-        // no-op on LE hardware and produces a valid, properly aligned slice.
-        let f64_slice: &[f64] =
-            unsafe { std::slice::from_raw_parts(chunk.as_ptr() as *const f64, chunk.len()) };
-        Some(f64_slice)
+        // `rend::F64_le` has align(1), so rkyv does not guarantee 8-byte alignment.
+        // Fast path: if the pointer is 8-byte aligned, a zero-copy transmute is sound
+        // because the LE compile guard above ensures `Archived<f64>` == `rend::F64_le`
+        // has the same wire bytes as `f64` on this target.
+        // Slow path: copy each element via `read_unaligned` to avoid UB from a
+        // misaligned `&f64` reference — correct and safe on all supported targets.
+        let ptr = chunk.as_ptr() as *const f64;
+        let result = if ptr.align_offset(std::mem::align_of::<f64>()) == 0 {
+            // SAFETY: LE compile guard (line 17-18) ensures same bit representation.
+            // Alignment verified above.  Slice length matches chunk.len() elements.
+            Cow::Borrowed(unsafe { std::slice::from_raw_parts(ptr, chunk.len()) })
+        } else {
+            let vec: Vec<f64> = (0..chunk.len())
+                .map(|i|
+                    // SAFETY: ptr+i is within chunk (bounds checked above).
+                    // read_unaligned handles the misaligned access correctly.
+                    unsafe { std::ptr::read_unaligned(ptr.add(i)) })
+                .collect();
+            Cow::Owned(vec)
+        };
+        Some(result)
     }
 
     /// Return all field names visible through this view: overlay ∪ base,

@@ -348,7 +348,7 @@ fn adj_map_to_csr(adj: &std::collections::HashMap<u32, crate::topology::AdjList>
         .into_iter()
         .filter_map(|v| {
             let al = &adj[&v];
-            let neighbors = al.merged();
+            let neighbors = al.merged().into_owned();
             if neighbors.is_empty() {
                 None
             } else {
@@ -453,7 +453,7 @@ fn merge_adj_map(
         .filter_map(|v| {
             let overlay_nbrs: Vec<u32> = overlay_adj
                 .and_then(|o| o.get(&v))
-                .map(|al| al.merged())
+                .map(|al| al.merged().into_owned())
                 .unwrap_or_default();
 
             let base_nbrs: Vec<u32> = base_adj

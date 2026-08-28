@@ -3663,13 +3663,13 @@ impl<F: Fs> GraphDb<F> {
             .iter()
             .filter(|r| matches!(r, WalRecord::InsertEdgeId { .. }))
             .count();
-        // Ingest / write_batch / query_write: one Batch frame. Strict and
-        // Batched both fsync once at frame end; Relaxed still skips.
-        let policy = match self.fsync {
-            FsyncPolicy::Relaxed => FsyncPolicy::Relaxed,
-            FsyncPolicy::Strict | FsyncPolicy::Batched => FsyncPolicy::Batched,
-        };
-        self.log_then_apply_with(WalRecord::Batch(recs), ingest, policy)?;
+        // Ingest / write_batch / query_write: one Batch frame, one fsync per call
+        // under Strict.  Pass self.fsync directly so Strict stays Strict —
+        // wal_needs_sync(Strict, _) always returns true regardless of op count.
+        // Mapping Strict → Batched (the prior bug) caused wal_needs_sync to
+        // short-circuit on single-op batches and silently skip the fsync.
+        // Batched fsyncs only for multi-op batches; Relaxed always skips.
+        self.log_then_apply_with(WalRecord::Batch(recs), ingest, self.fsync)?;
         Ok((nodes_inserted, edges_inserted))
     }
 

@@ -65,6 +65,9 @@ pub struct FrozenOverlay {
 /// Obtained cheaply via [`crate::SharedDb::reader`], which acquires the read lock
 /// only long enough to clone the `Arc` fields. Subsequent query operations run
 /// without any lock.
+///
+/// **Memory bound**: holds at most `FOLD_EVERY_K − 1` [`CommitDelta`] `Arc`s in
+/// its delta tail; the fold that resets the tail runs synchronously on the write path.
 pub struct ReaderSnapshot {
     /// Most-recent fold of the overlay state.
     pub frozen: Arc<FrozenOverlay>,
