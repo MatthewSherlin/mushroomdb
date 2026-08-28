@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.matthewsherlin/mushroomdb",
+  "name": "io.github.MatthewSherlin/mushroomdb",
   "description": "Embedded graph database for agents: declare association rules once, edges maintain themselves.",
   "repository": {
     "url": "https://github.com/MatthewSherlin/mushroomdb",
