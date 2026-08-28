@@ -1,0 +1,36 @@
+{
+  "name": "io.github.matthewsherlin/mushroomdb",
+  "description": "Embedded Rust graph database with incremental linking rules and a built-in MCP stdio server. Agents declare association rules once; edges are created, maintained, and retracted automatically. Built-in explain(), per-node history, hybrid search (fulltext + HNSW vector), and a Cypher subset.",
+  "repository": {
+    "url": "https://github.com/MatthewSherlin/mushroomdb",
+    "source": "github",
+    "id": "1334631677"
+  },
+  "version": "0.1.2",
+  "packages": [
+    {
+      "registryType": "cargo",
+      "identifier": "mushroomdb-cli",
+      "version": "0.1.2",
+      "runtimeHint": "cargo",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "valueHint": "subcommand"
+        },
+        {
+          "type": "positional",
+          "description": "Path to the database directory",
+          "isRequired": true,
+          "format": "filepath",
+          "placeholder": "/path/to/your/db",
+          "valueHint": "db_dir"
+        }
+      ]
+    }
+  ]
+}

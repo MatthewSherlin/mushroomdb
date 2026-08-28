@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llama-index-graph-stores-mushroomdb"
+version = "0.1.0"
+description = "LlamaIndex PropertyGraphStore backed by the mushroomdb embedded graph database"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["graph", "embedded", "database", "mcp", "agent-memory", "llama-index", "knowledge-graph", "mushroomdb"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "llama-index-core>=0.14",
+    "mushroomdb",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "maturin"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llama_index*"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]

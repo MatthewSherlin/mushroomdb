@@ -36,6 +36,15 @@
     "vitest": "^4.1.10",
     "ws": "^8.18.0"
   },
+  "keywords": [
+    "graph",
+    "embedded",
+    "database",
+    "mcp",
+    "agent-memory",
+    "graph-database",
+    "association"
+  ],
   "engines": {
     "node": ">=18"
   }
