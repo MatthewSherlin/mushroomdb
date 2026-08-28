@@ -191,6 +191,6 @@ https://github.com/MatthewSherlin/mushroomdb
 - No multi-statement interactive transactions in v1
 - V8 open numbers (0.02 s / 31–41 MiB) are warm-file-cache, cold-process; cold-cache
   numbers not measured (require sudo purge)
-- Migration footprint (V5→V8) at 100k nodes: ~30 s, peak ~54 GB VM pressure; run
+- Migration footprint (V5→V8) at 100k nodes: ~30 s, peak ~35 GB VM footprint, ~8.3 GB max RSS (2026-08-28, post-diet); run
   mushroomdb migrate offline on constrained hosts
 - Pre-1.0 format policy: snapshot/WAL formats may change between v0.x minor versions

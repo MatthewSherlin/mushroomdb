@@ -141,7 +141,7 @@ re-snapshot before upgrading.
 > because the index structures are rebuilt in-process before the new snapshot is
 > written. On a 2.2 GiB V5 dogfood store with 9 rules (measured 2026-08-27,
 > Apple M-series, macOS), the first migrating open took **~10–11 minutes** with a
-> peak memory footprint of **~54 GB** (max RSS ~9.5 GB; the remainder is
+> peak memory footprint of **~35 GB** (max RSS **~8.3 GB** as of 2026-08-28 — fits a 16 GB machine without heavy swap; the VM-footprint remainder is
 > VM/compressed memory pressure). On a 24 GB machine this left little headroom;
 > on a more memory-constrained host the OS may kill the process mid-migration.
 > The migration is crash-safe — originals and `.bak` remain intact; simply retry

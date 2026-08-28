@@ -231,7 +231,7 @@ mushroomdb verify ./scale-100000-db
 ### Migration footprint (V5 → V8)
 
 - Wall time: ~30 s (M-series, macOS, sufficient swap)
-- Peak memory: ~54 GB (max RSS ~9.5 GB; remainder is VM/compressed-memory pressure)
+- Peak memory (2026-08-28, post memory-diet): ~35 GB VM footprint, ~8.3 GB max RSS — down from the pre-diet ~54 GB footprint; .bak now fs::copy, encode borrows instead of cloning, decoded V5 state freed after remap. Remaining floor is the V5 bincode decode itself (streaming decode = backlog, no installed base).
 - On 24 GiB hosts, migration leaves little headroom and may OOM on more constrained hosts.
   Run `mushroomdb migrate <dir>` offline before starting `serve`. The migration is
   crash-safe — original files and `.bak` remain intact on failure.
