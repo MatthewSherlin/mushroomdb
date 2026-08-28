@@ -1,4 +1,5 @@
 use crate::def::{evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef};
+use crate::hnsw::HnswIndex;
 use crate::index::{
     candidate_spec, candidate_spec_approx_with_k, ivf_drift_rebuild_threshold, CandidateSpec,
     RuleIndex,
@@ -6,6 +7,7 @@ use crate::index::{
 use core_storage::v8::seam::ColumnsView;
 use core_storage::{EdgeProps, IdMap, Interner, Topology, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, OnceLock};
 
 /// A single derived-edge fire or retract captured during a commit.
 ///
@@ -112,13 +114,21 @@ pub struct RuleEngine {
     /// rule's `RuleIndex`) either eagerly in `consume_retained_state_eager` (WAL-
     /// present open) or lazily on the first mutation or first ANN query
     /// (`ensure_hnsw_loaded` / the lazy-init guard in the mutation hooks).
-    /// Empty on a fresh engine and after consumption.
-    retained_hnsw_blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
+    /// Wrapped in Mutex so `ensure_hnsw_loaded` can be called from `&self`
+    /// (shared-read ANN path in `find_similar_vector` / `search_hybrid`).
+    retained_hnsw_blobs: Mutex<BTreeMap<String, (Vec<u8>, Vec<u8>)>>,
     /// Persisted IVF cluster state retained from the last snapshot.
     ///
-    /// Same lifecycle as `retained_hnsw_blobs`.  Passed to `reindex_all_load_ivf`
-    /// when the lazy init or eager init fires so k-means re-fit is skipped.
+    /// Same lifecycle as `retained_hnsw_blobs` (mutation path only; consumed
+    /// under `&mut self` in `consume_retained_state_eager`).
     retained_ivf_state: BTreeMap<String, RuleIvfExport>,
+    /// Lazily-loaded HNSW graphs for the clean-open (no-WAL) ANN read path.
+    ///
+    /// Populated once by `ensure_hnsw_loaded` on the first ANN query after a
+    /// snapshot open with no WAL.  `OnceLock` guarantees exactly-once init
+    /// even under concurrent shared-read access.  After the first mutation the
+    /// mutation-path HNSW in `indexes` takes over; this field is never cleared.
+    lazy_hnsw: OnceLock<BTreeMap<String, (Option<HnswIndex>, Option<HnswIndex>)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1365,8 +1375,9 @@ impl RuleEngine {
             // consume_retained_state_eager (WAL-present open) or rely on the
             // lazy init in the mutation hooks (clean open, first-write cost).
             indexes_populated: false,
-            retained_hnsw_blobs: BTreeMap::new(),
+            retained_hnsw_blobs: Mutex::new(BTreeMap::new()),
             retained_ivf_state: BTreeMap::new(),
+            lazy_hnsw: OnceLock::new(),
         }
     }
 
@@ -1554,7 +1565,10 @@ impl RuleEngine {
         hnsw_blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
         ivf_state: BTreeMap<String, RuleIvfExport>,
     ) {
-        self.retained_hnsw_blobs = hnsw_blobs;
+        *self
+            .retained_hnsw_blobs
+            .lock()
+            .expect("retained_hnsw_blobs lock poisoned") = hnsw_blobs;
         self.retained_ivf_state = ivf_state;
         // indexes_populated remains false.
     }
@@ -1574,36 +1588,54 @@ impl RuleEngine {
         if self.indexes_populated {
             return;
         }
-        let hnsw = std::mem::take(&mut self.retained_hnsw_blobs);
+        let hnsw = std::mem::take(
+            &mut *self
+                .retained_hnsw_blobs
+                .lock()
+                .expect("retained_hnsw_blobs lock poisoned"),
+        );
         let ivf = std::mem::take(&mut self.retained_ivf_state);
         self.reindex_all_load_ivf(ids, syms, labels, props, ivf);
         // Override the incrementally-built HNSW with the persisted blob (better).
         self.load_hnsw_state(hnsw);
     }
 
-    /// Deserialize retained HNSW blobs into each rule's index without running
-    /// the O(n) node scan.
+    /// Deserialize retained HNSW blobs into `lazy_hnsw` for the clean-open ANN
+    /// read path.  Takes `&self` so it can be called from `find_similar_vector`
+    /// and `search_hybrid` under a shared (`db.read()`) lock.
+    ///
+    /// Uses `OnceLock` to guarantee exactly-once initialization even under
+    /// concurrent shared access.  The retained blobs are borrowed (not consumed)
+    /// so that a subsequent first-mutation call to `consume_retained_state_eager`
+    /// can still load the persisted HNSW graphs into `self.indexes`.
     ///
     /// Called before the first ANN query on a clean-open (no WAL) store.
-    /// After this call, `hnsw_search_dst` returns results from the persisted
-    /// graph.  The BTreeMap candidate indexes remain empty until the first
-    /// mutation triggers the full lazy init.
-    pub fn ensure_hnsw_loaded(&mut self) {
-        if self.retained_hnsw_blobs.is_empty() {
-            return;
-        }
-        let blobs = std::mem::take(&mut self.retained_hnsw_blobs);
-        for (name, (src_blob, dst_blob)) in blobs {
-            if let Some(idx) = self.indexes.get_mut(&name) {
-                if !src_blob.is_empty() {
-                    idx.src_side.load_hnsw_blob(&src_blob);
-                }
-                if !dst_blob.is_empty() {
-                    idx.dst_side.load_hnsw_blob(&dst_blob);
-                }
+    pub fn ensure_hnsw_loaded(&self) {
+        self.lazy_hnsw.get_or_init(|| {
+            let blobs = self
+                .retained_hnsw_blobs
+                .lock()
+                .expect("retained_hnsw_blobs lock poisoned");
+            if blobs.is_empty() {
+                return BTreeMap::new();
             }
-        }
-        // retained_hnsw_blobs is now empty (consumed).
+            blobs
+                .iter()
+                .map(|(name, (sb, db))| {
+                    let src = if !sb.is_empty() {
+                        bincode::deserialize::<HnswIndex>(sb).ok()
+                    } else {
+                        None
+                    };
+                    let dst = if !db.is_empty() {
+                        bincode::deserialize::<HnswIndex>(db).ok()
+                    } else {
+                        None
+                    };
+                    (name.clone(), (src, dst))
+                })
+                .collect()
+        });
     }
 
     /// Returns `true` if candidate indexes have been built (either eagerly or
@@ -1672,6 +1704,15 @@ impl RuleEngine {
             }
             if let Some(idx) = self.indexes.get(name) {
                 if let Some(h) = idx.dst_side.hnsw_ref() {
+                    if !h.is_empty() {
+                        return Some(h.search(q, k));
+                    }
+                }
+            }
+            // Fallback: blobs deserialized via ensure_hnsw_loaded (read path,
+            // no mutation has populated self.indexes yet).
+            if let Some(lazy) = self.lazy_hnsw.get() {
+                if let Some((_, Some(h))) = lazy.get(name) {
                     if !h.is_empty() {
                         return Some(h.search(q, k));
                     }
@@ -1864,7 +1905,12 @@ impl RuleEngine {
         // Retained HNSW/IVF blobs from the snapshot are consumed here so the
         // reindex does NOT wipe the loaded HNSW graphs.
         if !self.indexes_populated && !self.rules.is_empty() {
-            let hnsw = std::mem::take(&mut self.retained_hnsw_blobs);
+            let hnsw = std::mem::take(
+                &mut *self
+                    .retained_hnsw_blobs
+                    .lock()
+                    .expect("retained_hnsw_blobs lock poisoned"),
+            );
             let ivf = std::mem::take(&mut self.retained_ivf_state);
             self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
             self.load_hnsw_state(hnsw);
@@ -2176,7 +2222,12 @@ impl RuleEngine {
         // Lazy index build: same guard as on_node_changed.  Retained snapshot
         // blobs are consumed to avoid wiping any HNSW graphs.
         if !self.indexes_populated && !self.rules.is_empty() {
-            let hnsw = std::mem::take(&mut self.retained_hnsw_blobs);
+            let hnsw = std::mem::take(
+                &mut *self
+                    .retained_hnsw_blobs
+                    .lock()
+                    .expect("retained_hnsw_blobs lock poisoned"),
+            );
             let ivf = std::mem::take(&mut self.retained_ivf_state);
             self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
             self.load_hnsw_state(hnsw);
@@ -2262,7 +2313,12 @@ impl RuleEngine {
         // silently produce no backfill.  Consume retained snapshot blobs here
         // rather than wiping any loaded HNSW graphs.
         if !self.indexes_populated && !self.rules.is_empty() {
-            let hnsw = std::mem::take(&mut self.retained_hnsw_blobs);
+            let hnsw = std::mem::take(
+                &mut *self
+                    .retained_hnsw_blobs
+                    .lock()
+                    .expect("retained_hnsw_blobs lock poisoned"),
+            );
             let ivf = std::mem::take(&mut self.retained_ivf_state);
             self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
             self.load_hnsw_state(hnsw);

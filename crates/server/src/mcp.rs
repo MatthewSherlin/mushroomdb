@@ -522,7 +522,7 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
         let min = args.get("min").and_then(Js::as_f64).unwrap_or(0.8);
 
         let hits = {
-            let mut g = db.write();
+            let g = db.read();
             g.find_similar_vector(field, label, &q, k, min)
         };
         let results: Vec<Js> = hits
@@ -614,7 +614,7 @@ fn tool_hybrid_search(db: &SharedDb, args: &Js) -> CallOutcome {
         .unwrap_or_default();
 
     let hits = {
-        let mut g = db.write();
+        let g = db.read();
         g.search_hybrid(text_field, query_text, vector_field, &query_vec, label, k)
     };
 

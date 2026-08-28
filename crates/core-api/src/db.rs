@@ -3786,7 +3786,7 @@ impl<F: Fs> GraphDb<F> {
     /// returns an empty result and the fused ranking is text-only.  Document
     /// this in your application layer if you rely on it.
     pub fn search_hybrid(
-        &mut self,
+        &self,
         text_field: &str,
         query_text: &str,
         vector_field: &str,
@@ -4338,7 +4338,7 @@ impl<F: Fs> GraphDb<F> {
     /// Uses the HNSW index when one is available (fast path); otherwise falls
     /// back to an O(n) brute-force scan over all nodes with that label (exact).
     pub fn find_similar_vector(
-        &mut self,
+        &self,
         field: &str,
         label: &str,
         q: &[f64],

@@ -156,7 +156,7 @@ pub fn eval_query(node_tokens: &BTreeSet<String>, query: &str) -> bool {
 /// Index maintenance is incremental: set_prop / delete / remove_prop
 /// update only the affected postings.  WAL replay calls [`FulltextIndex::rebuild_all`]
 /// after full replay to correct any drift accumulated during per-record `apply` calls.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FulltextIndex {
     /// Enabled `(label, field)` pairs.
     enabled: BTreeSet<(String, String)>,
