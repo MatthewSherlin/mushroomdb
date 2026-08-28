@@ -670,7 +670,6 @@ fn legacy_store_conservative_no_genesis() {
         db.snapshot_with(SnapshotOptions {
             keep_wal: true,
             archive_wal: false,
-            ..SnapshotOptions::default()
         })
         .unwrap();
     }
