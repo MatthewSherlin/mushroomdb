@@ -83,7 +83,7 @@ mushroomdb verify <db-dir>
 
 Reads every section, computes CRC32, and reports any mismatch. Exits 2 on the
 first corrupt section, 0 if all sections are intact. Measured at 0.26 s on
-a 1.9 GiB snapshot (12 sections). Run this after any external modification of
+a 1.8 GiB snapshot (12 sections). Run this after any external modification of
 the snapshot file, or periodically as a sanity check on storage hardware.
 
 ### WAL (`wal.bin`)

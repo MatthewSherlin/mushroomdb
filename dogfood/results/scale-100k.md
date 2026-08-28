@@ -188,8 +188,8 @@ read in place, deferred provenance) — explicitly deferred by the Phase 3 plan
 ### Methodology
 
 - **Host:** same machine (Apple M4 Pro 12-core, 24 GiB RAM, macOS 15.7.3 arm64)
-- **Store:** 1.9 GiB V8 snapshot of the 100k-node dogfood dataset (same nodes/edges;
-  V8 is 1.9 GiB vs the V5 baseline's 2.2 GiB — ~14% smaller; V5→V8 re-encodes
+- **Store:** 1.8 GiB V8 snapshot of the 100k-node dogfood dataset (same nodes/edges;
+  V8 is 1.8 GiB vs the V5 baseline's 2.2 GiB — 18% smaller; V5→V8 re-encodes
   IVF centroids from JSON-in-bincode to rkyv, which accounts for most of the shrink)
 - **Measurement:** `/usr/bin/time -l` (Darwin `ru_maxrss`); three runs per query type;
   warm file cache, cold process. **Cold-cache numbers not measured** (requires `sudo purge`);
@@ -225,7 +225,7 @@ mushroomdb verify ./scale-100000-db
 ```
 
 - 12 sections OK; 0 corrupt
-- Wall time: 0.26 s on the 1.9 GiB snapshot
+- Wall time: 0.26 s on the 1.8 GiB snapshot
 - Exit 0
 
 ### Migration footprint (V5 → V8)

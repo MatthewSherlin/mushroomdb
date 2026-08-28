@@ -360,10 +360,11 @@ two-rule backfill on 10k nodes: v2.4 baseline 928 ms + 2.221 s = 3.149 s (+8.8% 
 10.7–11.1 s; V7 decompresses packed snapshot on open; no rule re-fire).
 **WAL-only open:** 8.16 min (measured 2026-08-24) — CreateRule WAL records trigger
 full rule re-derivation; ANN index re-fitting dominates. **V8 snapshot size:**
-1.9 GiB (~14% smaller than V5's 2.2 GiB; IVF centroids re-encoded as rkyv).
+1.8 GiB (18% smaller than V5's 2.2 GiB; V5 stored IVF state as uncompressed
+inline bincode in its meta blob — V8 moves it to a dedicated compact section).
 **V8 snapshot write:** ~35 s. **Backfill (9 rules, max_edges=1M each):** 20.343 s.
 `mushroomdb verify <db-dir>` audits all 12 sections with full CRC32 and exits 2
-on any mismatch (0.26 s on the 1.9 GiB store; large sections skip CRC on the
+on any mismatch (0.26 s on the 1.8 GiB store; large sections skip CRC on the
 normal query path — see `docs/format-stability.md` for the trust model).
 Full trajectory and methodology:
 [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
@@ -426,7 +427,7 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | Limitation | Detail |
 |---|---|
 | Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
-| Cold start without a snapshot re-fires all rules | Snapshots (V8 mmap, v0.2+) persist derived edges, ANN state, and view definitions — opening from a snapshot skips re-derivation. Measured at 100k nodes / ~10M derived edges (2026-08-28, warm file cache, cold process): **0.02 s, 31–41 MiB RSS** (V8 mmap). WAL-only open: **8.16 min** (ANN re-fit dominates). Snapshot write cost: ~35 s (1.9 GiB on disk). Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
+| Cold start without a snapshot re-fires all rules | Snapshots (V8 mmap, v0.2+) persist derived edges, ANN state, and view definitions — opening from a snapshot skips re-derivation. Measured at 100k nodes / ~10M derived edges (2026-08-28, warm file cache, cold process): **0.02 s, 31–41 MiB RSS** (V8 mmap). WAL-only open: **8.16 min** (ANN re-fit dominates). Snapshot write cost: ~35 s (1.8 GiB on disk). Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
 | Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection (in-tree, no external dependency). Per-query recall: min 0.90, mean 0.998 at 5k/dim 1536 (fixed-seed probe). Review the recall trade-off before using it in completeness-critical workloads. |
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
