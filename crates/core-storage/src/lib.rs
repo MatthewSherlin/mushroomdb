@@ -12,7 +12,7 @@ pub mod v8;
 pub mod wal;
 pub use columns::{ColumnHandle, ColumnStore};
 pub use edge_props::EdgeProps;
-pub use fs::{FileId, Fs, RealFs};
+pub use fs::{sync_wal_at, FileId, Fs, RealFs};
 pub use idmap::IdMap;
 pub use interner::Interner;
 pub use topology::{Direction, Topology};

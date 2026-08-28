@@ -3433,6 +3433,81 @@ impl<F: Fs> GraphDb<F> {
         self.commit_logged_batch(ops, None)
     }
 
+    /// Commit one submission WITHOUT an fsync — for use inside `commit_group`
+    /// and the group-commit drain thread, which do a single group fsync later.
+    fn commit_batch_nosync(&mut self, ops: Vec<BatchOp>) -> Result<(usize, usize)> {
+        let saved = self.fsync;
+        self.fsync = FsyncPolicy::Relaxed;
+        let result = self.commit_logged_batch(ops, None);
+        self.fsync = saved;
+        result
+    }
+
+    /// Commit multiple op-batches as a **group**: each submission gets its own
+    /// WAL `Batch` frame, but there is exactly **one** `Fs::sync` for the whole
+    /// group (under `Strict` / `Batched` policy; `Relaxed` skips all syncs).
+    ///
+    /// # Durability semantics
+    ///
+    /// A crash before the group fsync may lose **all** submissions in the group.
+    /// A crash after the group fsync preserves all of them.  No submission is
+    /// ever torn: each WAL frame is either fully applied on replay or dropped
+    /// in its entirety (CRC-protected frame boundaries).
+    ///
+    /// Events and subscription notifications fire per-submission immediately
+    /// after apply, which may be before the group fsync.  From a subscriber's
+    /// perspective this is equivalent to the `Relaxed` durability window.
+    /// Submitters using [`SharedDb::submit_batch`] only unblock after the group
+    /// fsync, so from their perspective durability is fully guaranteed.
+    ///
+    /// # MVCC interplay
+    ///
+    /// Each submission records its own `CommitDelta`; the fold-every-K counter
+    /// increments per submission (not per group), preserving existing reader
+    /// snapshot semantics.
+    ///
+    /// # Returns
+    ///
+    /// One `Result<(nodes_inserted, edges_inserted)>` per input group element,
+    /// in order.  Failures are per-submission (validation errors); the group
+    /// fsync error (if any) is returned as the second tuple element.
+    pub fn commit_group(
+        &mut self,
+        groups: Vec<Vec<BatchOp>>,
+    ) -> (Vec<Result<(usize, usize)>>, Option<GraphError>) {
+        let mut results = Vec::with_capacity(groups.len());
+        for ops in groups {
+            results.push(self.commit_batch_nosync(ops));
+        }
+        let any_ok = results.iter().any(|r| r.is_ok());
+        let sync_err = if self.fsync != FsyncPolicy::Relaxed && any_ok {
+            self.fs
+                .sync(core_storage::fs::FileId::Wal)
+                .map_err(GraphError::Io)
+                .err()
+        } else {
+            None
+        };
+        (results, sync_err)
+    }
+
+    /// Like [`commit_group`] but skips the group fsync entirely.
+    ///
+    /// Used by the drain thread to apply submissions under the write lock and
+    /// then perform the single fsync OUTSIDE the lock (via
+    /// `core_storage::sync_wal_at`), reducing the write-lock hold time visible
+    /// to concurrent readers.
+    pub fn commit_group_nosync(
+        &mut self,
+        groups: Vec<Vec<BatchOp>>,
+    ) -> Vec<Result<(usize, usize)>> {
+        let mut results = Vec::with_capacity(groups.len());
+        for ops in groups {
+            results.push(self.commit_batch_nosync(ops));
+        }
+        results
+    }
+
     pub fn insert_node(
         &mut self,
         label: &str,
@@ -5587,8 +5662,12 @@ impl<F: Fs> GraphDb<F> {
     }
 }
 
-/// Queued mutation for a [`BatchBuilder`].
-enum BatchOp {
+/// Queued mutation for a [`BatchBuilder`] or [`GraphDb::commit_group`].
+///
+/// The `submit_batch` / `commit_group` APIs accept `Vec<BatchOp>` so that
+/// callers can build a set of mutations without holding `&mut GraphDb` and
+/// hand them off to the group-committing writer for durable, batched I/O.
+pub enum BatchOp {
     InsertNode {
         label: String,
         key: String,

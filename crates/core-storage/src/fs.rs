@@ -125,6 +125,23 @@ fn full_sync(file: &File) -> std::io::Result<()> {
     }
 }
 
+/// Sync the WAL file at `dir/wal.bin` to persistent storage without
+/// requiring a `&mut Fs`.  Used by the group-commit drain thread to fsync
+/// outside the exclusive write-lock window (reducing reader-visible latency).
+///
+/// On macOS, uses `F_FULLFSYNC` for true durability.  On other platforms,
+/// falls back to `fdatasync` / `fsync`.  Returns `Ok(())` if the WAL file
+/// does not exist (nothing to sync).
+pub fn sync_wal_at(dir: &std::path::Path) -> std::io::Result<()> {
+    let path = dir.join(FileId::Wal.name());
+    let f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    full_sync(&f)
+}
+
 fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     let d = File::open(dir)?;
     d.sync_all()

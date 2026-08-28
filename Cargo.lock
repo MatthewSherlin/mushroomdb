@@ -949,6 +949,7 @@ dependencies = [
  "mushroomdb-storage",
  "serde",
  "serde_json",
+ "sim-harness",
 ]
 
 [[package]]
