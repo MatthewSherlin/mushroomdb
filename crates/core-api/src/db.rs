@@ -17,7 +17,7 @@ use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
 use core_storage::v8::encode::{
     archived_hnsw_to_owned, archived_rules_meta_to_owned, archived_to_idmap, archived_to_interner,
-    archived_views_to_owned, decode_meta, encode_v8, V8Meta,
+    archived_views_to_owned, decode_last_change_bytes, decode_meta, encode_v8, V8Meta,
 };
 use core_storage::v8::seam::TopologyView;
 use core_storage::wal::{decode_all, encode_record, WalRecord};
@@ -26,7 +26,7 @@ use core_storage::{
     ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// Print a timing checkpoint when MUSHROOMDB_TRACE_OPEN is set.
@@ -867,6 +867,46 @@ pub enum FsyncPolicy {
     Relaxed,
 }
 
+/// A precondition for a compare-and-set batch write.
+///
+/// All preconditions in a [`GraphDb::write_batch_cas`] or
+/// [`crate::SharedDb::submit_batch_cas`] call are checked atomically before
+/// any operation in the batch is applied.  If any precondition fails, the
+/// entire batch is rejected with [`GraphError::CasConflict`] and no WAL frame
+/// is written.
+///
+/// # Touch definition
+///
+/// A node's last-change commit (`last_changed`) is updated when any of the
+/// following state-changing WAL records touch it:
+///
+/// - `InsertNode` / `InsertNodeId` — the newly-inserted node.
+/// - `SetProp` / `SetPropId` / `RemoveProp` — the property-bearing node.
+/// - `InsertEdge` / `InsertEdgeId` / `DeleteEdge` — **both** src and dst
+///   endpoints (an edge change touches both sides).
+/// - `DeleteNode` — the node is tombstoned; `last_changed` returns `None`
+///   for deleted keys so the pre-deletion entry is never observed.
+///
+/// History markers (`DerivedEdgeAdded` / `DerivedEdgeRetracted`) are
+/// state no-ops.  The underlying mutation that triggered rule firing already
+/// updated the relevant nodes' last-change entries.  Rule-management records
+/// (`CreateRule`, `DeleteRule`, `RebuildRule`) and view/full-text declarations
+/// do not touch any node's last-change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Precondition {
+    /// The node's last-change commit must equal `expected`.
+    ///
+    /// Fails with [`GraphError::CasConflict`] when:
+    /// - The node does not exist (`last_changed` returns `None`), or
+    /// - The recorded commit seq does not match `expected`.
+    NodeUnchangedSince { key: String, expected: u64 },
+    /// The node must not exist (not inserted, or already deleted).
+    ///
+    /// Fails with [`GraphError::CasConflict`] (expected=`u64::MAX`,
+    /// actual=`last_changed(key).unwrap_or(0)`) when the node is live.
+    NodeAbsent { key: String },
+}
+
 pub struct GraphDb<F: Fs> {
     fs: F,
     ids: IdMap,
@@ -942,6 +982,15 @@ pub struct GraphDb<F: Fs> {
     v8_sections_loaded: std::sync::atomic::AtomicBool,
     /// Serializes the one-time section population in `ensure_v8_base_sections_loaded`.
     v8_sections_mutex: std::sync::Mutex<()>,
+    /// Per-node last-change commit sequence.  `last_change[node_id] = seq` means
+    /// the node was last modified by commit `seq`.
+    ///
+    /// Loaded from V8 section 11 at open; updated on every state-changing commit
+    /// and WAL replay frame.  V5-V7 stores start with an empty map; pre-WAL-horizon
+    /// nodes return `None` from `last_changed` until they are next mutated.
+    ///
+    /// See [`Precondition`] for the full touch definition.
+    last_change: HashMap<u32, u64>,
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -1141,6 +1190,7 @@ impl<F: Fs> GraphDb<F> {
             degraded: false,
             v8_sections_loaded: std::sync::atomic::AtomicBool::new(false),
             v8_sections_mutex: std::sync::Mutex::new(()),
+            last_change: HashMap::new(),
         };
         let _t0 = std::time::Instant::now();
         // Peek 6 bytes to determine snapshot version without reading the full
@@ -1177,6 +1227,16 @@ impl<F: Fs> GraphDb<F> {
             }
         }
         // else: snap_header is empty = no snapshot file, fresh store.
+        //
+        // Seed commit_seq from the highest seq persisted in last_change so that
+        // WAL-replay frames (which start at commit_seq+1) always exceed any seq
+        // already stored in the snapshot.  Without this, a db with one snapshot
+        // commit would save last_change["a"]=1, then on reopen the first WAL
+        // frame would replay at seq=1 again — colliding and making WAL-tail
+        // mutations indistinguishable from the snapshot baseline.
+        if let Some(&max_seq) = db.last_change.values().max() {
+            db.commit_seq = db.commit_seq.max(max_seq);
+        }
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
         if valid_len < bytes.len() {
@@ -1201,6 +1261,13 @@ impl<F: Fs> GraphDb<F> {
             // Drain per-frame to keep pending_deltas O(1) during replay (I-2).
             // No subscriber exists yet; discard is correct.
             let _ = db.engine.drain_deltas();
+            // Track commit_seq during replay so last_change entries are
+            // consistent with the seqs assigned by log_then_apply_with on
+            // subsequent live commits.  After N replayed frames, commit_seq=N;
+            // live commits begin at N+1.
+            db.commit_seq += 1;
+            let replay_seq = db.commit_seq;
+            db.update_last_change_from_rec(&rec, replay_seq);
         }
         // Enforce I-2: if the per-frame drain above is ever removed or skipped,
         // this assert catches the regression in debug builds immediately.
@@ -1372,6 +1439,16 @@ impl<F: Fs> GraphDb<F> {
                     detail: format!("v8: view restore: {e}"),
                 })?;
         }
+        // Load the last-change map from section 11 (small section; load eagerly).
+        // Pre-Task-3 snapshots lack this section; `last_change_bytes` returns &[]
+        // in that case and `decode_last_change_bytes` returns an empty map.
+        let last_change_raw = mapped
+            .last_change_bytes()
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: last_change section: {e:?}"),
+            })?;
+        self.last_change = decode_last_change_bytes(last_change_raw);
+
         // Validate that all deferred sections (provenance, HNSW, IVF) fit within
         // the file.  Pure bounds check — no bytes read, no page faults triggered.
         // Catches truncated snapshots at open time before the lazy deferred reads.
@@ -1519,6 +1596,7 @@ impl<F: Fs> GraphDb<F> {
             degraded: false,
             v8_sections_loaded: std::sync::atomic::AtomicBool::new(false),
             v8_sections_mutex: std::sync::Mutex::new(()),
+            last_change: HashMap::new(),
         };
         // Base state: a truncating snapshot compacts all pre-truncation
         // commits, so the on-disk WAL head coincides with the snapshot and
@@ -2885,6 +2963,9 @@ impl<F: Fs> GraphDb<F> {
         }
         self.commit_seq += 1;
         let seq = self.commit_seq;
+        // Update per-node last-change map for the committed record.
+        // Must happen after commit_seq is incremented so the seq is correct.
+        self.update_last_change_from_rec(&rec, seq);
         // Drain engine deltas and distribute to subscribers before the existing
         // MutationEvent sink fires — both happen post-fsync, post-apply.
         // _emit_guard restores emit_deltas after this line when it drops.
@@ -5594,6 +5675,153 @@ impl<F: Fs> GraphDb<F> {
             .collect::<Result<Vec<_>>>()
     }
 
+    /// Return the last-change commit sequence for `key`, or `None` if the node
+    /// does not exist or has never been mutated since the last V5-V7 snapshot
+    /// (horizon-bounded for legacy stores).
+    ///
+    /// The returned sequence is a monotonically increasing counter that starts
+    /// at 1 for the first commit after `open` and increments with every
+    /// successful write.  WAL replay at open also assigns sequences (1..N for N
+    /// replayed frames), so sequences are consistent across snapshot+WAL cycles.
+    ///
+    /// For V5-V7 stores opened without a V8 snapshot, nodes that were present
+    /// in the snapshot but not touched by any WAL frame will return `None`
+    /// (horizon-bounded: CAS against such nodes is only safe after the first
+    /// V8 snapshot or after the node is next mutated).
+    pub fn last_changed(&self, key: &str) -> Option<u64> {
+        let id = self.ids.get(key)?;
+        self.last_change.get(&id).copied()
+    }
+
+    /// The current commit sequence (number of successful commits since open,
+    /// including WAL replay frames).  Useful for recording a baseline before
+    /// a read-modify-write cycle.
+    pub fn commit_seq(&self) -> u64 {
+        self.commit_seq
+    }
+
+    /// Check that all `preconds` are satisfied against the current db state.
+    /// Returns `Err(GraphError::CasConflict)` on the first failing precondition.
+    pub(crate) fn check_preconditions(&self, preconds: &[Precondition]) -> Result<()> {
+        for precond in preconds {
+            match precond {
+                Precondition::NodeUnchangedSince { key, expected } => {
+                    // Missing entry means the node predates the WAL window or
+                    // does not exist; treat as 0 (before any commit).
+                    let actual = self.last_changed(key).unwrap_or_default();
+                    if actual != *expected {
+                        return Err(GraphError::CasConflict {
+                            key: key.clone(),
+                            expected: *expected,
+                            actual,
+                        });
+                    }
+                }
+                Precondition::NodeAbsent { key } => {
+                    // Node must not exist (not live).
+                    if self.ids.get(key).is_some() {
+                        let actual = self.last_changed(key).unwrap_or(0);
+                        return Err(GraphError::CasConflict {
+                            key: key.clone(),
+                            expected: u64::MAX,
+                            actual,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a batch of mutations with compare-and-set preconditions.
+    ///
+    /// All preconditions are checked atomically before any operation is applied.
+    /// If any precondition fails, the entire batch is rejected with
+    /// [`GraphError::CasConflict`] and no WAL frame is written.
+    ///
+    /// # Returns
+    /// `(nodes_inserted, edges_inserted)` on success, same as [`write_batch`].
+    ///
+    /// # Errors
+    /// - [`GraphError::CasConflict`] if any precondition is not satisfied.
+    /// - Any error that [`write_batch`] would return for the ops themselves.
+    pub fn write_batch_cas(
+        &mut self,
+        preconds: Vec<Precondition>,
+        ops: Vec<BatchOp>,
+    ) -> Result<(usize, usize)> {
+        self.check_preconditions(&preconds)?;
+        self.commit_logged_batch(ops, None)
+    }
+
+    /// Update the per-node last-change map for a WAL record at commit `seq`.
+    ///
+    /// Called after a successful apply to record which nodes were touched.
+    /// For replay, called with the WAL-frame's replayed seq.
+    ///
+    /// Touch definition (see [`Precondition`] doc):
+    /// - InsertNode / InsertNodeId / SetProp / SetPropId / RemoveProp → the node.
+    /// - InsertEdge / InsertEdgeId / DeleteEdge → both src and dst.
+    /// - DeleteNode → node tombstoned; last_changed() returns None so no update needed.
+    /// - DerivedEdge markers, Intern, rule/view records → no-ops.
+    /// - Batch → recurse into inner records.
+    fn update_last_change_from_rec(&mut self, rec: &WalRecord, seq: u64) {
+        match rec {
+            WalRecord::InsertNode { key, .. }
+            | WalRecord::SetProp { key, .. }
+            | WalRecord::RemoveProp { key, .. } => {
+                if let Some(id) = self.ids.get(key) {
+                    self.last_change.insert(id, seq);
+                }
+            }
+            WalRecord::InsertNodeId { key, .. } => {
+                if let Some(id) = self.ids.get(key) {
+                    self.last_change.insert(id, seq);
+                }
+            }
+            WalRecord::SetPropId { id, .. } => {
+                self.last_change.insert(*id, seq);
+            }
+            WalRecord::InsertEdge {
+                src_key, dst_key, ..
+            }
+            | WalRecord::DeleteEdge {
+                src_key, dst_key, ..
+            } => {
+                if let Some(src_id) = self.ids.get(src_key) {
+                    self.last_change.insert(src_id, seq);
+                }
+                if let Some(dst_id) = self.ids.get(dst_key) {
+                    self.last_change.insert(dst_id, seq);
+                }
+            }
+            WalRecord::InsertEdgeId { src, dst, .. } => {
+                self.last_change.insert(*src, seq);
+                self.last_change.insert(*dst, seq);
+            }
+            // DeleteNode: node is tombstoned; last_changed(key) returns None for
+            // deleted keys (ids.get() returns None post-tombstone), so no update needed.
+            // History markers: state no-ops; the underlying mutation already
+            // touched the relevant nodes' last_change entries.
+            WalRecord::DeleteNode { .. }
+            | WalRecord::DerivedEdgeAdded { .. }
+            | WalRecord::DerivedEdgeRetracted { .. }
+            | WalRecord::Intern { .. }
+            | WalRecord::CreateRule { .. }
+            | WalRecord::DeleteRule { .. }
+            | WalRecord::RebuildRule { .. }
+            | WalRecord::CreateView { .. }
+            | WalRecord::DeleteView { .. }
+            | WalRecord::EnableFulltext { .. }
+            | WalRecord::DisableFulltext { .. } => {}
+            WalRecord::Batch(inner) => {
+                for inner_rec in inner {
+                    self.update_last_change_from_rec(inner_rec, seq);
+                }
+            }
+        }
+    }
+
     pub fn node_count(&self) -> usize {
         self.ids.len()
     }
@@ -6253,6 +6481,7 @@ impl<F: Fs> GraphDb<F> {
                 view_defs,
                 wal_truncated: !opts.keep_wal,
                 hnsw: hnsw_state,
+                last_change: self.last_change.clone(),
             };
             let mut buf: Vec<u8> = Vec::new();
             {
@@ -6339,6 +6568,7 @@ impl<F: Fs> GraphDb<F> {
                 ivf_bytes,
                 view_defs,
                 hnsw: hnsw_state,
+                last_change: self.last_change.clone(),
             };
             let mut buf = Vec::new();
             encode_v8(

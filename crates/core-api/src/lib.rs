@@ -22,7 +22,7 @@ pub use core_rules::{
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{
     snapshot_version_at, write_snapshot_bak, BatchBuilder, BatchOp, DeleteReport, EdgeInfo,
-    Explanation, FsyncPolicy, GraphDb, MutationEvent, NodeInfo, NodeRef, OpenOptions,
+    Explanation, FsyncPolicy, GraphDb, MutationEvent, NodeInfo, NodeRef, OpenOptions, Precondition,
     PredicateSummary, RuleStats, SnapshotOptions, Stats,
 };
 

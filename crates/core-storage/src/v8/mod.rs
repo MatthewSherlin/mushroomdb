@@ -79,10 +79,14 @@ pub const SECTION_VIEWS: u8 = 9;
 /// Per-approximate-rule IVF cluster state: bincode `BTreeMap<String, PerRuleIvfState>`.
 /// Retained as undecoded bytes at open; consumed lazily on first mutation or WAL replay.
 pub const SECTION_IVF_STATE: u8 = 10;
+/// Per-node last-change commit sequence: bincode `HashMap<u32, u64>` (node_id → commit_seq).
+/// Small section (8-16 bytes/node); loaded eagerly at open.  Missing in pre-Task-3 snapshots
+/// (treated as absent; the live map is rebuilt from WAL replay only).
+pub const SECTION_LAST_CHANGE: u8 = 11;
 
 /// Total number of canonical section slots (used for atomic check_state array).
-/// Extended from 10 (Task 2) to 11 (Task 5: +ivf_state).
-pub const V8_MAGIC_SECTION_COUNT: usize = 11;
+/// Extended from 11 (Task 5: +ivf_state) to 12 (Task 3: +last_change).
+pub const V8_MAGIC_SECTION_COUNT: usize = 12;
 
 /// Returns `true` for sections whose content is large enough that a
 /// full-section CRC at first touch would cost tens or hundreds of
@@ -222,6 +226,7 @@ impl MappedBase {
             SECTION_RULES_META => "rules_meta",
             SECTION_VIEWS => "views",
             SECTION_IVF_STATE => "ivf_state",
+            SECTION_LAST_CHANGE => "last_change",
             _ => "unknown",
         };
         self.dir
@@ -498,6 +503,18 @@ impl MappedBase {
         self.section_bytes(SECTION_IVF_STATE)
     }
 
+    /// Raw bytes for the last-change section (section 11).
+    ///
+    /// Returns `Ok(&[])` when the section is absent from the directory
+    /// (pre-Task-3 snapshots have no LAST_CHANGE section; treat as empty map).
+    /// Any other error (truncation, CRC mismatch) is propagated.
+    pub fn last_change_bytes(&self) -> Result<&[u8]> {
+        if self.dir.iter().all(|e| e.id != SECTION_LAST_CHANGE) {
+            return Ok(&[]);
+        }
+        self.section_bytes(SECTION_LAST_CHANGE)
+    }
+
     /// Raw bytes for the edge-props section (section 5).
     /// Used for byte-identical passthrough when the overlay has no changes.
     pub fn edge_props_raw_bytes(&self) -> Result<&[u8]> {
@@ -590,7 +607,7 @@ mod tests {
     use crate::topology::Topology;
     use crate::types::Value;
     use crate::v8::encode::{encode_v8, V8Meta};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn tiny_v8_meta() -> V8Meta {
         V8Meta {
@@ -604,6 +621,7 @@ mod tests {
             view_defs: vec![],
             wal_truncated: false,
             hnsw: BTreeMap::new(),
+            last_change: HashMap::new(),
         }
     }
 

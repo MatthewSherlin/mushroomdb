@@ -40,8 +40,8 @@ use crate::v8::layout::{
 };
 use crate::v8::{
     HEADER_SIZE, SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_IDS, SECTION_IVF_STATE,
-    SECTION_META, SECTION_PROVENANCE, SECTION_RULES_META, SECTION_SYMS, SECTION_TOPOLOGY,
-    SECTION_VIEWS,
+    SECTION_LAST_CHANGE, SECTION_META, SECTION_PROVENANCE, SECTION_RULES_META, SECTION_SYMS,
+    SECTION_TOPOLOGY, SECTION_VIEWS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -88,6 +88,11 @@ pub struct V8Meta {
     /// An empty Vec means no approximate rules exist.
     #[serde(skip)]
     pub ivf_bytes: Vec<u8>,
+    /// Per-node last-change commit sequence map: node_id → commit_seq.
+    /// Written as section 11 (bincode `HashMap<u32, u64>`).
+    /// Empty for legacy or freshly-opened stores with no mutations.
+    #[serde(skip)]
+    pub last_change: HashMap<u32, u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +199,14 @@ pub fn encode_v8<W: Write>(
     // approximate rules; empty bytes decode as an empty map).
     let ivf_bytes: &[u8] = &meta.ivf_bytes;
 
+    // Section 11: LAST_CHANGE — bincode HashMap<u32, u64> (node_id → commit_seq).
+    // Always encoded from the live map (small section; not passed through from base).
+    let last_change_bytes_owned: Vec<u8> =
+        bincode::serialize(&meta.last_change).map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: last_change bincode serialize: {e}"),
+        })?;
+    let last_change_bytes: &[u8] = &last_change_bytes_owned;
+
     let sections: &[(u8, &[u8])] = &[
         (SECTION_TOPOLOGY, &topo_bytes),
         (SECTION_COLUMNS, &cols_bytes),
@@ -206,6 +219,7 @@ pub fn encode_v8<W: Write>(
         (SECTION_RULES_META, &rules_meta_bytes),
         (SECTION_VIEWS, &views_bytes),
         (SECTION_IVF_STATE, ivf_bytes),
+        (SECTION_LAST_CHANGE, last_change_bytes),
     ];
     let n = sections.len();
 
@@ -899,6 +913,18 @@ pub fn decode_meta(bytes: &[u8]) -> Result<V8Meta> {
     bincode::deserialize(bytes).map_err(|e| GraphError::Corrupt {
         detail: format!("v8: meta bincode deserialize: {e}"),
     })
+}
+
+/// Decode the last-change map from raw section-11 bytes.
+///
+/// Returns an empty map for a zero-length slice (pre-Task-3 snapshots and fresh
+/// stores have no LAST_CHANGE section).  Corrupt bytes are treated the same as
+/// an absent map (non-fatal: the map is rebuilt from WAL replay on next open).
+pub fn decode_last_change_bytes(bytes: &[u8]) -> HashMap<u32, u64> {
+    if bytes.is_empty() {
+        return HashMap::new();
+    }
+    bincode::deserialize(bytes).unwrap_or_default()
 }
 
 /// Decode IVF state from raw section-10 bytes.

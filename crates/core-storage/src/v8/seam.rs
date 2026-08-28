@@ -247,6 +247,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn tiny_meta() -> V8Meta {
+        use std::collections::HashMap;
         V8Meta {
             labels: vec![],
             edge_props: crate::edge_props::EdgeProps::new(),
@@ -258,6 +259,7 @@ mod tests {
             view_defs: vec![],
             wal_truncated: false,
             hnsw: BTreeMap::new(),
+            last_change: HashMap::new(),
         }
     }
 

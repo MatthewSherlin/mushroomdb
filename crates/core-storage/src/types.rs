@@ -80,6 +80,16 @@ pub enum GraphError {
     ViewPropReadOnly {
         view_name: String,
     },
+    /// A compare-and-set precondition was not satisfied.
+    ///
+    /// `expected` is the commit seq the caller expected to see; `actual` is the
+    /// commit seq recorded in the last-change map (or `u64::MAX` for
+    /// `NodeAbsent` conflicts where the node unexpectedly exists).
+    CasConflict {
+        key: String,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 impl std::fmt::Display for GraphError {
@@ -103,6 +113,14 @@ impl std::fmt::Display for GraphError {
                 f,
                 "property is managed by view {:?} and cannot be written directly",
                 view_name
+            ),
+            GraphError::CasConflict {
+                key,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "CAS conflict on key {key:?}: expected commit {expected}, actual {actual}"
             ),
         }
     }
