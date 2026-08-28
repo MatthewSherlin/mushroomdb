@@ -43,6 +43,20 @@ macro_rules! trace_open {
     };
 }
 
+/// Print a migration phase checkpoint when MUSHROOMDB_TRACE_MIGRATE is set.
+/// Zero-cost when the env var is absent (the var check is O(1) after first call).
+macro_rules! trace_migrate {
+    ($phase:literal, $t:expr) => {
+        if std::env::var("MUSHROOMDB_TRACE_MIGRATE").is_ok() {
+            eprintln!(
+                "[MUSHROOMDB_TRACE_MIGRATE] {:40} {:>9.3?}",
+                $phase,
+                $t.elapsed()
+            );
+        }
+    };
+}
+
 // Test-only: counts how many times `pending_deltas_since().to_vec()` actually
 // executes (i.e., at least one view is defined). Used to verify the fast-path
 // guard skips the allocation when `view_store.is_empty()`.
@@ -1032,15 +1046,20 @@ impl GraphDb<RealFs> {
         if opts.auto_migrate {
             match snap_version {
                 Some(ver) if ver < core_storage::snapshot::VERSION => {
-                    // Read the full snapshot bytes for the backup.
-                    let snap_bytes = std::fs::read(dir.join("snapshot.bin"))
+                    let _tm = std::time::Instant::now();
+                    // Copy the original snapshot to .bak at OS level — no in-memory
+                    // buffer required for a 2+ GiB file.
+                    //
+                    // Crash-safety: snapshot.bin remains intact (write_atomic inside
+                    // snapshot_with uses a .tmp+rename) until the V8 write succeeds.
+                    // A torn .bak on crash is acceptable because the original
+                    // snapshot.bin is the authoritative source until after the rename.
+                    std::fs::copy(dir.join("snapshot.bin"), dir.join("snapshot.bin.bak"))
                         .map_err(core_storage::GraphError::Io)?;
-                    // Write .bak atomically (fsynced) BEFORE touching snapshot.bin.
-                    db.fs
-                        .write_atomic(FileId::SnapshotBak, &snap_bytes)
-                        .map_err(core_storage::GraphError::Io)?;
+                    trace_migrate!("bak copy done", _tm);
                     // Rewrite snapshot at current version; keep WAL intact.
                     db.snapshot_with(SnapshotOptions { keep_wal: true })?;
+                    trace_migrate!("snapshot_with done", _tm);
                 }
                 Some(_) => {
                     // Already current version: remove any leftover .bak.
@@ -5892,32 +5911,67 @@ impl<F: Fs> GraphDb<F> {
             self.props = core_storage::columns::ColumnStore::new();
         } else {
             // Legacy path (V5–V7 stores without a V8 base).
-            // Convert ivf_bytes back to the SnapshotState map format.
-            let ivf_state: BTreeMap<String, core_storage::snapshot::PerRuleIvfState> =
-                if ivf_bytes.is_empty() {
-                    BTreeMap::new()
-                } else {
-                    bincode::deserialize(&ivf_bytes)
-                        .expect("ivf_bytes just serialized — cannot fail to deserialize")
-                };
-            let state = core_storage::snapshot::SnapshotState {
-                ids: self.ids.clone(),
-                syms: self.syms.clone(),
-                topo: self.topo.clone(),
-                props: self.props.clone(),
+            //
+            // Memory-diet path: build V8Meta directly from &self — no SnapshotState
+            // clone and no encode_v8_from_state intermediate clones.  The big
+            // structures (self.topo, self.props) are borrowed, not cloned.
+            // self.edge_props is moved (not cloned) because we immediately clear it
+            // when we remap the new V8 snapshot as self.base (see below).
+            //
+            // Eliminates from peak RSS vs. the old SnapshotState path:
+            //   • self.topo.clone()      (~topology HashMap footprint)
+            //   • self.props.clone()     (~column-store footprint)
+            //   • encode_v8_from_state V8Meta secondary clones (labels, edge_props, …)
+            let meta = V8Meta {
                 labels: self.labels.clone(),
-                edge_props: self.edge_props.clone(),
+                wal_truncated: !opts.keep_wal,
+                // Move edge_props out so the large overlay is freed when meta
+                // drops at end of this block (self.edge_props is now empty; reads
+                // after base assignment go through the mmap'd base section).
+                edge_props: std::mem::take(&mut self.edge_props),
                 rule_defs,
                 provenance,
                 rule_tripped,
                 rule_fires,
-                ivf_state,
-                hnsw_state,
+                ivf_bytes,
                 view_defs,
-                wal_truncated: !opts.keep_wal,
+                hnsw: hnsw_state,
             };
-            self.fs
-                .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state)?)?;
+            let mut buf = Vec::new();
+            encode_v8(
+                None,
+                None,
+                None,
+                None,
+                &self.topo,
+                &self.props,
+                &self.ids,
+                &self.syms,
+                &meta,
+                &mut buf,
+            )?;
+            // meta (and the moved edge_props inside it) is no longer needed;
+            // drop it before the write to keep the peak window narrow.
+            drop(meta);
+            self.fs.write_atomic(FileId::Snapshot, &buf)?;
+            // Remap the freshly-written V8 snapshot as self.base.
+            // On RealFs: drop the encode buffer before mmap to recover ~1.9 GiB.
+            // On SimFs (tests): pass buf to from_bytes.
+            let new_base = if let Some(snap_path) = self.fs.snapshot_path() {
+                drop(buf);
+                core_storage::v8::MappedBase::map(&snap_path)
+            } else {
+                core_storage::v8::MappedBase::from_bytes(buf)
+            }
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8 snapshot: remap new base (legacy path): {e:?}"),
+            })?;
+            self.base = Some(Arc::new(new_base));
+            // Free the large heap-allocated decoded state — all data is now in the
+            // mmap'd base.  Mirrors the V8 merge-snapshot path (see above).
+            // self.edge_props was already moved into meta and is effectively empty.
+            self.topo = Topology::new();
+            self.props = core_storage::columns::ColumnStore::new();
         }
 
         if opts.keep_wal {
