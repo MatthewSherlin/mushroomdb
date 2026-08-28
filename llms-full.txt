@@ -116,17 +116,36 @@ localhost: **86 µs / 226 µs**. Clock: `std::time::Instant` (monotonic).
 
 See [docs/site/subscriptions.md](docs/site/subscriptions.md) for the full API reference.
 
-### Replay to any commit since your last snapshot
+### What was connected when, and why — the temporal story
 
-mushroomdb's WAL records every write since the last snapshot. `open_at` replays
-that window to any past commit, giving you a read-only view of the graph exactly
-as it existed after that write — including which derived edges existed and why:
+mushroomdb's differentiator over memory stores like Zep is rule attribution
+across time: not just *what* was connected, but *which rule* created each link
+and *at which commit* it was added or retracted. Every rule-derived edge writes
+a HISTORY-MARKER WAL record at the moment it fires, carrying the rule name as
+ground truth. These markers are state no-ops on replay (derived edges are
+re-derived from rules deterministically), but they are read by the history APIs
+as the authoritative record of *when* and *why* each derived link existed.
 
 ```rust
-// Open a read-only view at commit 5 (since last snapshot).
-let db = GraphDb::open_at(&dir, 5)?;
+// What edges existed between alice and bob, and when, and why?
+let history = db.edge_history("alice", "bob")?;
+// [{edge_type: "SIMILAR", commit: 3, event: Added, rule: Some("sim_emb")},
+//  {edge_type: "SIMILAR", commit: 7, event: Retracted, rule: Some("sim_emb")}]
 
-// Why did this edge exist then?
+// Was SIMILAR active between alice and bob at commit 4?
+let linked = db.was_linked("alice", "bob", "SIMILAR", 4)?; // true
+```
+
+Over MCP (`edge_history`, `was_linked`, `node_history`) or HTTP
+(`GET /history/edge`, `GET /history/was_linked`, `GET /node/{key}/history`),
+with role-token masking: hidden nodes return 404, never content.
+
+**As-of time travel:** `open_at` replays the WAL to any past commit, giving a
+read-only view of the full graph state at that moment — including which derived
+edges existed and why:
+
+```rust
+let db = GraphDb::open_at(&dir, 5)?;
 let exps = db.explain("alice", "bob")?;
 // → [{rule: "skill_fit", edge_type: "FIT", weight: 0.87, …}]
 ```
@@ -140,11 +159,19 @@ mushroomdb asof ./db --commit 5 --query "MATCH (n:Person)-[r:FIT]->(p:Project) R
 #   n=alice  p=proj-01  score=0.87
 ```
 
-**Scope:** `open_at` reaches commits recorded in the current WAL — those written
-since the last `snapshot()`. `snapshot()` truncates the WAL: faster cold starts,
-but as-of history restarts from that point. See
-[docs/site/timetravel.md](docs/site/timetravel.md) for the full tradeoff and
-replay-cost caveats.
+**Scope:** `open_at` reaches commits in the current WAL (since the last
+truncating `snapshot()`). With `archive_wal: true` and an intact genesis chain,
+it also reaches archived WAL segments. Pruned or incomplete genesis chains
+return `CommitOutOfRange` — never silently wrong data.
+
+**Compare-and-set writes:** `write_batch_cas` lets concurrent writers check
+that a node has not changed since they last read it before committing an update.
+`last_changed(key)` returns the commit sequence number of the last write that
+touched that node (persisted in V8 snapshot section 11, LAST_CHANGE).
+
+See [docs/site/timetravel.md](docs/site/timetravel.md) for the full temporal
+story: history APIs, rule attribution, CAS, archives, retention, and the
+horizon contract.
 
 ### Live degree counts and neighbor aggregates, no triggers
 
@@ -372,7 +399,7 @@ full rule re-derivation; ANN index re-fitting dominates. **V8 snapshot size:**
 1.8 GiB (18% smaller than V5's 2.2 GiB; V5 stored IVF state as uncompressed
 inline bincode in its meta blob — V8 moves it to a dedicated compact section).
 **V8 snapshot write:** ~35 s. **Backfill (9 rules, max_edges=1M each):** 20.343 s.
-`mushroomdb verify ` audits all 11 sections with full CRC32 and exits 2
+`mushroomdb verify ` audits all 12 sections with full CRC32 and exits 2
 on any mismatch (0.26 s on the 1.8 GiB store; large sections skip CRC on the
 normal query path — see `docs/format-stability.md` for the trust model).
 Full trajectory and methodology:
@@ -414,8 +441,9 @@ Dependency rule (inward only):
 `bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
 
 Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy`),
-plus mmap-able V8 rkyv snapshots (11 sections: CSR topology, columnar properties,
-HNSW blobs, provenance, IVF state, and more — zero-copy, no heap allocation on open).
+plus mmap-able V8 rkyv snapshots (12 sections: CSR topology, columnar properties,
+HNSW blobs, provenance, IVF state, per-node last-change index, and more — zero-copy,
+no heap allocation on open).
 V5/V6/V7 stores are auto-migrated to V8 on `GraphDb::open`. Open = mmap header +
 lazy section reads; derived edges and ANN state load from snapshot without rule re-fire.
 Derived edges are not WAL-logged; they are restored directly from the mmap'd sections.
@@ -466,7 +494,7 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | `mushroomdb algo pagerank  --top 20` | Run PageRank over the unified topology (manual + derived edges) |
 | `mushroomdb algo wcc  --top 50` | Find weakly-connected components |
 | `mushroomdb algo degree  --top 20` | Degree centrality (out / in / both) |
-| `mushroomdb verify ` | Audit snapshot integrity: CRC32 all 11 sections, exit 2 on any mismatch (large sections skip CRC on the normal query path; this command reads them all) |
+| `mushroomdb verify ` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch (large sections skip CRC on the normal query path; this command reads them all) |
 | `mushroomdb schema apply  ` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff of created/updated/unchanged items |
 
 Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
@@ -495,9 +523,13 @@ new facts arrive.
   `vector` for a combined ranking.
 - Explanations are built in: `explain_association` shows which rules and scores
   produced each link — an agent can cite evidence, not just conclusions.
-- Per-node history: `node_history(key)` (Rust API; MCP exposure planned)
-  returns every WAL-visible change for a node since the last truncating
-  snapshot — useful for audit, provenance, and change-triggered workflows.
+- Temporal history: `node_history(key)`, `edge_history(a, b)`, and
+  `was_linked(a, b, edge_type, at_commit)` return per-node and per-edge WAL
+  history with rule attribution — which rule created each derived link, at
+  which commit, and when it was retracted. Available over Rust API, MCP tools
+  (3 tools), and HTTP (`GET /node/{key}/history`, `GET /history/edge`,
+  `GET /history/was_linked`). Useful for audit, provenance, agent replay, and
+  change-triggered workflows.
 - Query subscriptions: `subscribe_query` (Rust API + WebSocket `/subscribe`)
   delivers incremental Cypher result sets after each commit (supported
   subset; full re-run per commit; use `LIMIT`).
@@ -527,7 +559,7 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
-**Agent memory quickstart** (all twelve MCP tools):
+**Agent memory quickstart** (all fifteen MCP tools):
 
 | Tool | Purpose |
 |---|---|
@@ -543,6 +575,9 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
 | `node_info` | Return a node's key, label, and properties |
 | `node_edges` | Return all edges incident on a node |
 | `stats` | Live node, edge, and rule counts |
+| `node_history` | WAL change history for a node (since last truncating snapshot) |
+| `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
+| `was_linked` | Point-in-time edge check: was an edge active at a given commit? |
 
 Full walkthrough, tool reference, and Claude Desktop setup:
 [`docs/site/mcp.md`](docs/site/mcp.md).
@@ -1513,6 +1548,36 @@ variable-length paths and `shortestPath`.
 
 ---
 
+## Key idiom — how to filter and read node keys
+
+**Node keys are NOT properties.** There is no `id` property and no `key()`
+function. Accessing `n.id` returns `null` (or `None` in Python); filtering with
+`{id: 'alice'}` matches nothing because the key is not stored as a property
+named `id`.
+
+**To filter by key:** use `WHERE n = 'alice'` (equality between a node variable
+and a string literal matches on the node key).
+
+**To read the key:** use a bare `RETURN n`. The result row value for a node
+variable is the key string, not a node object.
+
+```cypher
+-- correct: filter by key
+MATCH (n:Person) WHERE n = 'alice' RETURN n
+
+-- correct: read key and a property
+MATCH (n:Person)-[:KNOWS]->(m:Person)
+WHERE n = 'alice'
+RETURN n, m, m.age
+
+-- WRONG: n.id is always null
+MATCH (n:Person) WHERE n.id = 'alice' RETURN n   -- returns nothing
+```
+
+In Python: `row["n"]` is the key string `"alice"`, not a dict.
+
+---
+
 ## Basic patterns
 
 ```cypher
@@ -1531,7 +1596,7 @@ LIMIT 10
 
 - `var` — optional binding name
 - `:Label` — optional label filter
-- `{key: 'value'}` — zero or more property equality filters
+- `{key: 'value'}` — zero or more property equality filters (not the node key — see Key idiom above)
 
 ### Relationship patterns
 
@@ -2308,7 +2373,14 @@ Body is a `RuleDef` object:
 Omitted or JSON-null `max_edges` fills the default after deserialize: **32**
 for scored predicates, **1** for KeyMatch (and KeyMatch-rooted `All`). Rust
 `max_edges: None` remains the 1,000,000 global-budget hatch; HTTP cannot
-express that hatch (null fills the default).
+express that hatch (null fills the default). Python `None` and a missing key
+behave the same as HTTP null — both fill the predicate default.
+
+**Symmetric predicates:** when `src_label == dst_label`, the rule fires in both
+directions (the updated node is evaluated as source AND as destination). This
+creates edges in both directions. An undirected Cypher pattern
+(`MATCH (a)-[:T]-(b)`) then double-counts rows. Prefer directed patterns
+(`-[:T]->`) or add `RETURN DISTINCT a, b`.
 
 Returns 400 with `{"error": "..."}` on validation failure (unknown field
 type, missing required field, duplicate rule name).
@@ -2398,6 +2470,85 @@ ingest or the edges field of `/ingest`.
 
 ---
 
+### GET /node/{key}/history
+
+Return the WAL change history for a node.
+
+Response:
+```json
+{
+  "key": "alice",
+  "history": [
+    { "commit": 0, "change": { "type": "NodeInserted", "label": "Person" } },
+    { "commit": 1, "change": { "type": "PropSet", "field": "age", "value": 30 } },
+    { "commit": 2, "change": { "type": "EdgeAdded", "edge_type": "KNOWS", "other": "bob", "outgoing": true } }
+  ],
+  "total_commits": 3
+}
+```
+
+`total_commits` is the horizon upper bound (exclusive) — the number of WAL frames
+visible in the current window. History before the last WAL-truncating snapshot is not
+visible. See [Horizon contract](#horizon-contract) below.
+
+Role tokens: if the requested key is outside the role's visibility mask, the response
+is identical to querying an absent key (404) — no existence oracle.
+
+---
+
+### GET /history/edge?a=&b=
+
+Return the full add/retract lifecycle for edges between two nodes.
+
+Response:
+```json
+{
+  "a": "alice",
+  "b": "bob",
+  "events": [
+    { "edge_type": "KNOWS", "commit": 2, "event": "Added", "rule": null },
+    { "edge_type": "SIMILAR", "commit": 3, "event": "Added", "rule": "sim_emb" }
+  ],
+  "total_commits": 4
+}
+```
+
+`event` is `"Added"` or `"Retracted"`. `rule` is the rule name for derived edges,
+`null` for manually written edges. `total_commits` is the horizon upper bound.
+
+Role tokens: BOTH `a` AND `b` must be visible in the role mask. If either is hidden,
+the response is 404 for that key (no existence oracle).
+
+---
+
+### GET /history/was_linked?a=&b=&edge_type=&at_commit=
+
+Point-in-time check: was an edge of `edge_type` between `a` and `b` active at WAL
+commit `at_commit` (0-based)?
+
+Response:
+```json
+{ "a": "alice", "b": "bob", "edge_type": "KNOWS", "at_commit": 2, "linked": true }
+```
+
+Returns 400 (not 500) when `at_commit` is outside the visible horizon:
+```json
+{ "error": "commit 999 is out of range" }
+```
+
+Role tokens: BOTH `a` AND `b` must be visible (same-as-absent rule applies).
+
+#### Horizon contract
+
+All three history endpoints include `total_commits` in their response. This is the
+exclusive upper bound for valid commit indices (`0..total_commits`). When the WAL is
+empty (after a truncating snapshot and before any new writes), `total_commits` is 0.
+Pre-snapshot commits are not visible — history restarts from the first WAL frame after
+the snapshot. Use `snapshot_with(SnapshotOptions { keep_wal: true })` to preserve
+deep history across snapshots.
+
+---
+
 ### GET /watch (WebSocket)
 
 Connect with any WebSocket client. After upgrade the first text frame is
@@ -2446,7 +2597,7 @@ Response:
 
 ### Tools
 
-Twelve tools:
+Fifteen tools:
 
 | Tool | Description |
 |---|---|
@@ -2462,6 +2613,9 @@ Twelve tools:
 | `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?`; (2) edge traversal — `key`, `edge_type?`, `limit?` |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
+| `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits}` |
+| `edge_history` | Add/retract lifecycle for edges between two nodes; params: `a`, `b`. Returns `{a, b, events, total_commits}` |
+| `was_linked` | Point-in-time edge check; params: `a`, `b`, `edge_type`, `at_commit`. Returns `{linked}` or error when outside horizon |
 
 ---
 
@@ -2484,6 +2638,9 @@ import mushroomdb
 
 db = mushroomdb.GraphDb.open("/path/to/db")
 ```
+
+`GraphDb.open` creates the database directory if it does not already exist — no
+manual `mkdir` is required.
 
 ### Insert nodes
 
@@ -2516,6 +2673,19 @@ db.create_rule({
 })
 ```
 
+**`max_edges` semantics:** Python `None` and a missing key both fill the
+predicate default (32 for scored predicates, 1 for KeyMatch). This is the same
+as HTTP `null` — neither Python nor HTTP can express the Rust `max_edges: None`
+global-budget hatch (1,000,000 per source). Use the Rust API directly if you
+need the uncapped budget.
+
+**Symmetric predicates:** when `src_label == dst_label` (e.g., Person-to-Person
+similarity), the rule fires in **both directions** — a property change on any
+node triggers candidate scanning from that node as both source and destination.
+An undirected Cypher pattern like `MATCH (a)-[:SIMILAR]-(b)` double-counts rows
+because both `a→b` and `b→a` edges exist. Use directed patterns
+(`MATCH (a)-[:SIMILAR]->(b)`) or `RETURN DISTINCT a, b` to avoid duplicates.
+
 ### Query
 
 ```python
@@ -2523,10 +2693,14 @@ result = db.query(
     "MATCH (p:Person)-[r:FIT]->(o:Org) RETURN p, o, r.score AS score",
     {}
 )
-# result is a list of dicts
+# result is a list of dicts; dict keys are the RETURN aliases
 for row in result:
-    print(row)
+    print(row["p"], row["o"], row["score"])
 ```
+
+The dict keys in each row are the **RETURN aliases** from the query — `p`, `o`,
+and `score` in the example above. Bare `RETURN n` yields `{"n": ...}`; `RETURN
+n.age AS age` yields `{"age": ...}`.
 
 ### Traversal
 
@@ -2553,13 +2727,13 @@ s = db.stats()
 ### Snapshot
 
 ```python
-db.snapshot()  # write V6 (zstd-compressed) snapshot and truncate WAL
+db.snapshot()  # write V8 (mmap rkyv) snapshot and truncate WAL
 ```
 
-`snapshot()` writes the current state as a V6 (zstd-compressed) snapshot and
-then truncates the WAL to a minimal baseline. Faster cold starts, but as-of
-history (`open_at`) restarts from that point — commits before the snapshot are
-no longer reachable via time travel.
+`snapshot()` writes the current state as a V8 mmap snapshot (12 rkyv sections,
+zero-copy open) and then truncates the WAL to a minimal baseline. Faster cold
+starts, but as-of history (`open_at`) restarts from that point — commits before
+the snapshot are no longer reachable via time travel.
 
 **Keep WAL (Rust API):**
 
@@ -2568,17 +2742,17 @@ use core_api::{SnapshotOptions};
 db.snapshot_with(SnapshotOptions { keep_wal: true })?;
 ```
 
-`keep_wal: true` writes the V6 snapshot but leaves the WAL intact. `open_at`
+`keep_wal: true` writes the V8 snapshot but leaves the WAL intact. `open_at`
 can still reach pre-snapshot commits. The WAL replay over the snapshot is
 idempotent — no manual recovery is needed. The WAL grows until an explicit
 `snapshot()` (with default `keep_wal: false`) truncates it.
 
-**V6 snapshot format:** magic + version header uncompressed (6 bytes); the
-rest is zstd-compressed (level 3). Measured at 5k nodes: 62 KiB on disk,
-16 ms to write, 2 ms to open. V5 snapshots (from v0.1.0) are read
-transparently — no migration required. 100k-node numbers: 1.1 GiB on disk
-(−50% vs V5), 22.563 s write, 8.880 s open — see
-[`benchmarks/results/regression-v0.1.1-20260824.md`](../../benchmarks/results/regression-v0.1.1-20260824.md).
+**V8 snapshot format:** mmap-able rkyv sections (12 total); zero-copy open via
+mmap; no heap allocation for section data. V5/V6/V7 stores are auto-migrated to
+V8 on open. See [`docs/format-stability.md`](../format-stability.md) for the
+full section table and migration notes. 100k nodes (v0.2, ~10M derived edges):
+V8 snapshot open 0.02 s / 31–41 MiB RSS (warm file cache, cold process,
+2026-08-28, Apple M4 Pro).
 
 ### Atomic write batches (Rust API)
 
@@ -2622,6 +2796,53 @@ The following ops are supported inside `write_batch`:
 
 The method-chaining `db.batch()` builder is equivalent; `write_batch` is a
 convenience wrapper that auto-commits.
+
+### Compare-and-set write batches (Rust API)
+
+`write_batch_cas` is the optimistic-concurrency entry point. All preconditions
+are checked atomically under the write lock before any operation is applied; if
+any precondition fails, the entire batch is rejected with `GraphError::CasConflict`
+and no WAL frame is written.
+
+```rust
+use core_api::{Precondition, GraphError};
+
+// Read the current last-changed commit for a node.
+let seq = db.last_changed("alice")?; // Some(commit_seq) or None if absent/deleted
+
+let result = db.write_batch_cas(
+    vec![Precondition::NodeUnchangedSince {
+        key: "alice".into(),
+        expected: seq.unwrap_or(0),
+    }],
+    |b| {
+        b.set_prop("alice", "role", Value::Str("admin".into()));
+    },
+);
+match result {
+    Ok(_) => { /* applied */ }
+    Err(GraphError::CasConflict { key, expected, actual }) => {
+        // alice was modified between last_changed() and write_batch_cas().
+    }
+    Err(e) => { /* other error */ }
+}
+```
+
+**Precondition types:**
+
+| Precondition | Fails when |
+|---|---|
+| `NodeUnchangedSince { key, expected }` | Node does not exist, or `last_changed(key) != expected` |
+| `NodeAbsent { key }` | Node exists (for insert-only semantics) |
+
+**Touch definition:** `last_changed` is updated on `InsertNode`, `SetProp`,
+`RemoveProp`, `InsertEdge` (both endpoints), `DeleteEdge` (both endpoints),
+`DeleteNode` (entry removed; `last_changed` returns `None` thereafter). History
+markers and rule-management records do not update `last_changed`. Values are
+persisted in V8 snapshot section 11 (LAST_CHANGE) and survive restarts.
+
+`SharedDb::submit_batch_cas` provides the same guarantee over the shared-writer
+async interface. See [timetravel.md](timetravel.md) for the full semantics.
 
 ### Exposed surface
 
@@ -2759,63 +2980,251 @@ The server disconnects only on a write error; slow consumers receive `{"type":"l
 
 ## docs/site/timetravel.md
 
-# Time travel: as-of queries
+# Temporal history: what was connected when, and why
 
-mushroomdb supports read-only views of the database at any past commit via
-WAL replay. Open the database at commit N and every query, `explain()`, and
-`stats()` reflects the graph as it existed the moment that commit was applied.
+mushroomdb records every write — including when derived edges were created or
+retracted by rules — and lets you query that history at any granularity: per
+node, per edge pair, or as a point-in-time read-only snapshot of the whole
+graph. This is the temporal story: history APIs with rule attribution, as-of
+time travel, compare-and-set writes, and WAL archives.
 
-## How it works
+---
 
-Every write to mushroomdb appends a frame to the Write-Ahead Log (WAL). A
-`Batch` frame is one commit; a single-op frame (InsertNode, SetProp, …) is
-also one commit. Commits are numbered 0-based: commit 0 is the state after
-the first WAL frame, commit N-1 is the state after the most recent frame.
+## History APIs
+
+Three read surfaces expose the recorded timeline. All three scan the on-disk
+WAL and include a `total_commits` horizon field so callers can always determine
+which portion of history is visible.
+
+### node_history — per-node change log
+
+Returns every WAL-visible change for a node since the last WAL-truncating
+snapshot.
+
+**MCP:** `node_history(key)` → `{key, history, total_commits}`
+
+**HTTP:** `GET /node/{key}/history`
+
+```json
+{
+  "key": "alice",
+  "history": [
+    { "commit": 0, "change": { "type": "NodeInserted", "label": "Person" } },
+    { "commit": 1, "change": { "type": "PropSet", "field": "age", "value": 30 } },
+    { "commit": 2, "change": { "type": "EdgeAdded", "edge_type": "KNOWS", "other": "bob", "outgoing": true } }
+  ],
+  "total_commits": 3
+}
+```
+
+Change types: `NodeInserted`, `PropSet`, `PropRemoved`, `EdgeAdded`,
+`EdgeRemoved`, `NodeDeleted`.
+
+### edge_history — add/retract lifecycle with rule attribution
+
+Returns the full add/retract history for all edges between two nodes. Includes
+**derived edges** — those created by rules — with the rule name attributed via
+`rule`. This is the Zep-class differentiator: not just *what* was connected,
+but *why* (which rule fired) and *when* (at which commit).
+
+**How rule attribution works:** When the rule engine fires or retracts a
+derived edge, a `DerivedEdgeAdded` (WAL discriminant 18) or
+`DerivedEdgeRetracted` (discriminant 19) HISTORY-MARKER record is appended in
+the same commit frame as the triggering mutation. These markers are pure
+history — they are state no-ops on replay (derived edges are re-derived from
+rules deterministically). History scans read them as ground truth of when the
+edge was created or retracted and by which rule.
+
+**MCP:** `edge_history(a, b)` → `{a, b, events, total_commits}`
+
+**HTTP:** `GET /history/edge?a=&b=`
+
+```json
+{
+  "a": "alice",
+  "b": "bob",
+  "events": [
+    { "edge_type": "KNOWS",   "commit": 2, "event": "Added",     "rule": null },
+    { "edge_type": "SIMILAR", "commit": 3, "event": "Added",     "rule": "sim_emb" },
+    { "edge_type": "SIMILAR", "commit": 7, "event": "Retracted", "rule": "sim_emb" }
+  ],
+  "total_commits": 10
+}
+```
+
+`event` is `"Added"` or `"Retracted"`. `rule` is the rule name for derived
+edges, `null` for manually written edges.
+
+### was_linked — point-in-time edge check
+
+Answers whether an edge of a given type was active between two nodes at a
+specific WAL commit.
+
+> **Index spaces:** `at_commit` is a **0-based frame index** (the same space
+> as `edge_history` event commits and `total_commits`). `last_changed()`
+> returns a **1-based commit sequence** from the CAS machinery — a different
+> counter. Do not pass `last_changed(key)` directly as `at_commit`; to probe
+> "at the moment of the last change", use the commit values reported by
+> `edge_history`/`node_history` events instead.
+
+**MCP:** `was_linked(a, b, edge_type, at_commit)` → `{linked}` or error when
+outside horizon
+
+**HTTP:** `GET /history/was_linked?a=&b=&edge_type=&at_commit=`
+
+```json
+{ "a": "alice", "b": "bob", "edge_type": "SIMILAR", "at_commit": 4, "linked": true }
+```
+
+Returns 400 (not 500) when `at_commit` is outside the visible horizon:
+
+```json
+{ "error": "commit 999 is out of range" }
+```
+
+### Horizon contract
+
+All three history endpoints include `total_commits` in their response. This is
+the exclusive upper bound for valid commit indices (`0..total_commits`). When
+the WAL is empty (immediately after a WAL-truncating snapshot and before any
+new writes), `total_commits` is 0 and the history list is empty. Commits before
+the last truncating snapshot are not visible.
+
+This field is the **honesty contract**: clients can always determine what
+portion of history is visible and whether their query covers the full timeline.
+
+### Role-token masking
+
+Role tokens may call all three history endpoints. Masking follows the
+same-as-absent rule:
+
+- `node_history`: if the target key is outside the role's visibility mask, the
+  response is 404 — identical to querying an absent key (no existence oracle).
+- `edge_history`: BOTH `a` AND `b` must be visible. If either is hidden, 404
+  for that key.
+- `was_linked`: same two-key visibility requirement as `edge_history`.
+
+Write endpoints (POST/PUT/DELETE) remain 403 for role tokens.
+
+---
+
+## Compare-and-set writes
+
+mushroomdb supports optimistic concurrency via compare-and-set (CAS)
+preconditions on write batches. A CAS batch atomically checks that all
+preconditions hold before applying any operation; if any precondition fails,
+the entire batch is rejected and no WAL frame is written.
+
+### last_changed and commit_seq
+
+`db.last_changed(key)` returns `Some(commit_seq)` — the sequence number of the
+commit that last touched the node — or `None` if the node does not exist or has
+been deleted. The commit_seq is a monotonically increasing counter (1-based;
+every WAL frame advances it).
+
+**Touch definition:** a node's `last_changed` is updated when:
+- `InsertNode` — the newly-inserted node
+- `SetProp` / `RemoveProp` — the property-bearing node
+- `InsertEdge` / `DeleteEdge` — **both** src and dst endpoints (an edge change
+  touches both sides)
+- `DeleteNode` — node is tombstoned; `last_changed` then returns `None`
+
+History markers (`DerivedEdgeAdded` / `DerivedEdgeRetracted`) are state no-ops
+and do **not** update `last_changed`.
+
+### Precondition types
+
+```rust
+use core_api::Precondition;
+
+// Fails if the node was modified since `expected` (or does not exist).
+Precondition::NodeUnchangedSince { key: "alice".into(), expected: seq }
+
+// Fails if the node exists (for insert-only semantics).
+Precondition::NodeAbsent { key: "alice".into() }
+```
+
+### write_batch_cas (Rust API)
+
+```rust
+let seq = db.last_changed("alice").unwrap_or(0);
+
+let result = db.write_batch_cas(
+    vec![Precondition::NodeUnchangedSince { key: "alice".into(), expected: seq }],
+    |b| {
+        b.set_prop("alice", "role", Value::Str("admin".into()));
+    },
+)?;
+// On success: Ok((nodes_written, edges_written))
+// On precondition failure: Err(GraphError::CasConflict { key, expected, actual })
+```
+
+All preconditions are checked atomically under the write lock before any
+operation is applied. If any precondition fails, the entire batch is rejected:
+no WAL bytes written, no in-memory state changes.
+
+### submit_batch_cas (SharedDb / async API)
+
+```rust
+shared_db.submit_batch_cas(preconditions, ops).await?;
+```
+
+The same atomicity guarantee holds: preconditions are evaluated under the same
+write guard as apply, so there is no TOCTOU window.
+
+### CasConflict error
+
+```rust
+GraphError::CasConflict { key: String, expected: u64, actual: u64 }
+```
+
+`actual` is the current `last_changed` value at the time of the check.
+`NodeAbsent` failures use `expected=u64::MAX, actual=last_changed.unwrap_or(0)`.
+
+### Persistence
+
+`last_changed` values are stored in V8 snapshot section 11 (LAST_CHANGE,
+`HashMap`) so they survive snapshots. CAS preconditions
+remain trustworthy across restarts.
+
+---
+
+## As-of time travel
 
 `GraphDb::open_at(dir, commit)` replays WAL frames 0 through `commit`
 (inclusive) into a fresh in-memory graph, then marks the instance read-only.
 Every mutation method on the returned instance returns `GraphError::ReadOnly`.
 
-## WAL retention and snapshot interaction
+### WAL retention and snapshot interaction
 
-`GraphDb::snapshot()` writes the current state to `snapshot.bin` and then
+Every write appends a frame to the WAL. Commits are numbered 0-based: commit 0
+is the state after the first WAL frame.
+
+`GraphDb::snapshot()` writes the current state to `snapshot.bin` and
 **truncates the WAL to empty**. After a snapshot:
 
 - `GraphDb::open()` loads from the snapshot plus any post-snapshot WAL frames.
 - `GraphDb::open_at()` loads from WAL only (snapshot is ignored). Commit 0
-  refers to the first WAL frame written after the snapshot. Pre-snapshot
-  history is not available.
+  refers to the first WAL frame after the snapshot. Pre-snapshot history is
+  not available.
 
-If the WAL is empty (i.e., snapshot was just taken and no new writes have
-occurred), `open_at` returns `GraphError::CommitOutOfRange { commit, total: 0 }`.
+`snapshot_with(SnapshotOptions { keep_wal: true })` writes the snapshot but
+leaves the WAL intact, so `open_at` can reach all WAL commits including those
+before the snapshot.
 
-**Snapshot tradeoff:** `snapshot()` truncates the WAL — faster cold starts, but
-as-of history restarts from that point. These goals are in direct tension.
-`snapshot_with(SnapshotOptions { keep_wal: true })` is now the answer: the V6
-snapshot is written, but the WAL is left intact. `open_at` can reach commits
-from before the snapshot; cold-start loads the snapshot and then replays the
-full WAL idempotently (recovery guards in `apply()` skip already-reflected ops).
 Choose based on operational priorities:
-- **Need as-of history across all time:** use `snapshot_with(SnapshotOptions { keep_wal: true })` regularly; `open_at` can reach all WAL commits.
-- **Need fast startup with a short WAL:** use `snapshot()` (default); WAL is truncated; `open_at` can only reach post-snapshot commits.
-- **Both:** use `keep_wal=true` for checkpoints; WAL grows until you explicitly truncate it with a standard `snapshot()`.
 
-The WAL grows without bound until a standard `snapshot()` truncates it. For
-large databases this may be gigabytes over long operational periods.
+| Goal | Method |
+|---|---|
+| Preserve full as-of history | `snapshot_with(keep_wal: true)`; WAL grows until an explicit truncating `snapshot()` |
+| Fast startup, short WAL | `snapshot()` (default); as-of history restarts from that point |
+| Both: rolling checkpoints + eventual truncation | `keep_wal=true` for routine checkpoints; standard `snapshot()` when you decide to prune |
 
-**Torn WAL tail:** if the WAL has a partial frame at the end (e.g., after a
-crash mid-write), `open_at` silently treats it as fewer commits — only complete,
+**Torn WAL tail:** if the WAL has a partial frame (e.g., after a crash
+mid-write), `open_at` silently treats it as fewer commits — only complete,
 valid frames are counted. No error is returned; the valid prefix is replayed.
 
-## Replay cost
-
-`open_at` replays rules incrementally, exactly as live writes do. On a database
-with many commits, this can be slow — rule evaluation re-runs for every node
-touched by every commit in the replay window. A 100,000-commit database with
-complex rules may take minutes to replay. The replay is CPU-bound and does not
-involve disk I/O beyond the initial WAL read.
-
-## Rust API
+### Rust API
 
 ```rust
 use core_api::{GraphDb, GraphError};
@@ -2828,7 +3237,6 @@ let db = GraphDb::open_at(&dir, 3)?;
 
 // Queries and explain work normally.
 let rs = db.query("MATCH (n:Person) RETURN n", &Default::default())?;
-let explanations = db.explain("alice", "bob")?;
 
 // Mutations return ReadOnly.
 let err = db.insert_node("Person", "charlie", vec![]).unwrap_err();
@@ -2839,34 +3247,117 @@ let err = GraphDb::open_at(&dir, 999).unwrap_err();
 assert!(matches!(err, GraphError::CommitOutOfRange { .. }));
 ```
 
-## CLI
-
-```
-mushroomdb asof  --commit N [--query "MATCH ..."]
-```
-
-Prints the header `as-of commit N of M` (where M is the total WAL commit
-count) followed by query results if `--query` is supplied.
+### CLI
 
 ```sh
-$ mushroomdb asof ./db --commit 5 --query "MATCH (n:Person) RETURN n"
-as-of commit 5 of 42
-columns: n
-  n=alice
-  n=bob
+mushroomdb asof ./db --commit 5 --query "MATCH (n:Person)-[r:FIT]->(p:Project) RETURN n, p, r.score"
+# as-of commit 5 of 42
+# columns: n, p, score
+#   n=alice  p=proj-01  score=0.87
 ```
 
-## HTTP server
+### Replay cost
 
-Server-side as-of is not yet implemented. Each HTTP request to `/query` reads
-current state. As-of over HTTP is on the roadmap.
+`open_at` replays rules incrementally, exactly as live writes do. On a database
+with many commits this can be slow — rule evaluation re-runs for every node
+touched by every commit in the replay window. The replay is CPU-bound and does
+not involve disk I/O beyond the initial WAL read.
+
+---
+
+## WAL archives and retention
+
+Archives let you retain long-horizon history across truncating snapshots by
+keeping old WAL files as numbered sidecars instead of deleting them.
+
+### Enabling archives
+
+```rust
+use core_api::{SnapshotOptions, GraphDb};
+
+db.snapshot_with(SnapshotOptions {
+    keep_wal: false,   // truncating snapshot (default)
+    archive_wal: true, // rename the live WAL to wal..archive before truncating
+})?;
+```
+
+When `archive_wal: true`, the live `wal.bin` is renamed to
+`wal..archive` before the snapshot is written. Subsequent
+writes go to a new `wal.bin`. The archive files live alongside `snapshot.bin`
+in the database directory.
+
+### Sidecar files
+
+| File | Written when | Purpose |
+|---|---|---|
+| `wal..archive` | each `archive_wal` snapshot | renamed WAL segment; N = cumulative end-frame index |
+| `wal.floor` | first retention prune | 8-byte LE u64; archives at or below this floor are deleted |
+| `wal.genesis` | first archive, no prior truncation | empty marker; signals that the archive chain covers genesis |
+| `wal.truncated` | first `keep_wal=false` snapshot | write-once empty marker; persists across sessions |
+
+`wal.truncated` is intentionally never deleted once written.
+
+**Upgrade note:** `wal.truncated` is a new file introduced in v0.2. It is
+written the first time a store that was previously using standard (truncating)
+`snapshot()` calls takes a snapshot under v0.2+. The file is harmless and
+requires no action. Its presence is what prevents a later archiving session
+from incorrectly claiming a complete genesis chain when WAL history has a gap.
+
+### Archive reachability — stated plainly
+
+Archives extend **two different guarantees** and they differ:
+
+**History scans always reach archives.** `node_history`, `edge_history`, and
+`was_linked` scan WAL records directly (record-scanning is prefix-independent).
+Archives are included in all history scans regardless of whether the genesis
+chain is intact. If you need deep per-node or per-edge history, archives are
+always useful.
+
+**As-of time travel (`open_at`) requires an unpruned genesis chain.** `open_at`
+replays the WAL from scratch to reconstruct graph state at a point in time. It
+can only replay correctly if it has every frame from the very beginning. The
+genesis chain is intact when ALL of these are true:
+- `wal.genesis` marker is present (first archive was created before any
+  truncating snapshot)
+- `wal.floor` is 0 or absent (no archives have been pruned)
+- `wal.truncated` is absent (no prior truncating snapshot before archiving began)
+
+When the genesis chain is NOT intact (pruned archives, or archiving started
+after a prior truncating snapshot), `open_at` for archive-resident commits
+returns `GraphError::CommitOutOfRange` — a clean refusal, never silently wrong
+data. Live-WAL commits (commits in the current `wal.bin`) are always reachable.
+
+Summary:
+
+| Operation | Live WAL commits | Archive commits (intact genesis chain) | Archive commits (pruned/incomplete) |
+|---|---|---|---|
+| `node_history` / `edge_history` / `was_linked` | Always reachable | Always reachable | Always reachable |
+| `open_at` (as-of) | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
+
+### Retention and pruning
+
+Pruning removes archives whose end-frame index falls at or below a retention
+floor. This is controlled by `wal.floor`: when the floor is written, all
+archive files at or below that floor are deleted.
+
+The floor is written **before** archive deletion (crash-safe ordering): if a
+crash occurs mid-prune, orphaned archive files above the new floor are cleaned
+up on the next `GraphDb::open`. No archive is ever deleted without the floor
+being persisted first.
+
+**Effect on as-of:** pruning archives breaks the genesis chain. After any
+prune, `open_at` for pruned-archive commits returns `CommitOutOfRange`. History
+scans are unaffected.
+
+---
 
 ## Error reference
 
 | Error | Meaning |
 |---|---|
 | `GraphError::ReadOnly` | Mutation attempted on an as-of instance. |
-| `GraphError::CommitOutOfRange { commit, total }` | `commit >= total`; valid range is `0..total`. |
+| `GraphError::CommitOutOfRange { commit, total }` | `commit >= total`; valid range is `0..total`. Also returned for archive-resident commits when the genesis chain is pruned or incomplete. |
+| `GraphError::CasConflict { key, expected, actual }` | A `Precondition` failed; the batch was not applied. |
 
 ---
 
