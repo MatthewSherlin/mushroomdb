@@ -113,6 +113,39 @@ pub trait Fs {
     fn write_horizon_floor(&mut self, _floor: u64) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// Return `true` when the `wal.genesis` marker file is present.
+    ///
+    /// The marker signals that the surviving archive chain forms a complete,
+    /// uninterrupted WAL history starting from the store's first-ever commit
+    /// (the genesis chain).  When absent, archive-resident commits are not
+    /// safe to replay from empty state and `open_at` must refuse them.
+    ///
+    /// Default: `false` (no genesis chain / no archive support).
+    fn has_genesis_marker(&self) -> bool {
+        false
+    }
+
+    /// Durably create the `wal.genesis` marker file.
+    ///
+    /// Written exactly once, when the first WAL archive is taken from a store
+    /// that has never undergone a WAL-truncating snapshot.
+    ///
+    /// Default: no-op.
+    fn write_genesis_marker(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Remove the `wal.genesis` marker file.
+    ///
+    /// Called when the genesis chain is broken: either by archive pruning
+    /// (floor advances past 0) or by a WAL-truncating snapshot taken after
+    /// archives already exist.  No-op if the marker is absent.
+    ///
+    /// Default: no-op.
+    fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub trait FsIntrospect {
@@ -260,6 +293,28 @@ impl Fs for RealFs {
         }
         std::fs::rename(&tmp, self.dir.join("wal.floor"))?;
         sync_dir(&self.dir)
+    }
+
+    fn has_genesis_marker(&self) -> bool {
+        self.dir.join("wal.genesis").exists()
+    }
+
+    fn write_genesis_marker(&mut self) -> std::io::Result<()> {
+        let path = self.dir.join("wal.genesis");
+        {
+            let mut f = File::create(&path)?;
+            f.write_all(b"")?;
+            full_sync(&f)?;
+        }
+        sync_dir(&self.dir)
+    }
+
+    fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
+        match std::fs::remove_file(self.dir.join("wal.genesis")) {
+            Ok(()) => sync_dir(&self.dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 

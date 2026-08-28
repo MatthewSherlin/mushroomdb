@@ -410,57 +410,144 @@ fn open_at_first_live_wal_commit() {
 
 // ── Test 10: Pruned-archive horizon honesty ──────────────────────────────────
 
-/// After pruning, commits below wal_horizon_floor must yield CommitOutOfRange
-/// rather than silently returning wrong state.
-/// was_linked and open_at must both honour the floor.
+/// Pins the full reachability contract:
+///
+/// (a) Commits below wal_horizon_floor → CommitOutOfRange (pruned; gone).
+/// (b) Surviving-archive commits when floor > 0 or genesis chain is broken →
+///     open_at returns CommitOutOfRange (prefix needed for reconstruction is
+///     absent; refuse rather than return wrong state).
+/// (c) Surviving-archive commits → was_linked still works (scan-based, no
+///     state reconstruction) and returns an honest answer over surviving data.
+/// (d) Live WAL commits → always reachable via open_at (snapshot is their base).
 #[test]
 fn pruned_archive_horizon_honesty() {
     let dir = tmp("horizon-honesty");
     let mut db = GraphDb::open(&dir).unwrap();
-    db.set_wal_archive_retention(Some(1)); // keep only 1 archive
+    db.set_wal_archive_retention(Some(1)); // keep only 1 newest archive
 
+    // First archive: 3 frames.  Genesis marker written (no prior truncation).
     db.insert_node("N", "a", vec![]).unwrap(); // commit 0
     db.insert_node("N", "b", vec![]).unwrap(); // commit 1
     db.insert_edge("Knows", "a", "b").unwrap(); // commit 2
-    db.snapshot_with(opts_archive()).unwrap(); // wal.3.archive (3 frames)
+    db.snapshot_with(opts_archive()).unwrap(); // wal.3.archive (genesis), floor=0
 
+    // Second archive: 1 frame.  Prunes wal.3.archive → floor=3, genesis=false.
     db.insert_node("N", "c", vec![]).unwrap(); // commit 3
-    db.snapshot_with(opts_archive()).unwrap(); // wal.4.archive; prune wal.3.archive (3 frames)
+    db.snapshot_with(opts_archive()).unwrap(); // wal.4.archive; prune wal.3
 
-    // After pruning: floor = 3.
-    assert_eq!(db.wal_horizon_floor(), 3, "floor must be 3 after pruning");
+    assert_eq!(
+        db.wal_horizon_floor(),
+        3,
+        "floor must be 3 after pruning 3 frames"
+    );
 
-    // was_linked at a pruned commit → CommitOutOfRange.
+    // One live-WAL commit so we can verify the live-WAL reachable path.
+    db.insert_node("N", "d", vec![]).unwrap(); // commit 4 (live WAL)
+
+    // ── (a) Pruned commits: was_linked → CommitOutOfRange ──────────────────
     let total = db.wal_total_commits().unwrap();
-    match db.was_linked("a", "b", "Knows", 2) {
-        Err(GraphError::CommitOutOfRange { commit: 2, .. }) => {}
-        other => {
-            panic!("expected CommitOutOfRange for pruned commit 2 (total={total}), got {other:?}")
+    for pruned in [0u64, 1, 2] {
+        match db.was_linked("a", "b", "Knows", pruned) {
+            Err(GraphError::CommitOutOfRange { commit, .. }) if commit == pruned => {}
+            other => panic!(
+                "expected CommitOutOfRange for pruned commit {pruned} (total={total}), \
+                 got {other:?}"
+            ),
         }
     }
 
-    // Commit at the floor itself is the first surviving commit.
-    // (If live WAL is empty and only wal.4.archive survives, commit 3 is first.)
+    // ── (b) Surviving-archive commit (global 3): open_at → CommitOutOfRange ─
+    // floor > 0, genesis chain broken by pruning → open_at must refuse.
+    match GraphDb::open_at(&dir, 3).err() {
+        Some(GraphError::CommitOutOfRange { commit: 3, .. }) => {}
+        other => panic!(
+            "expected CommitOutOfRange for open_at(3) (surviving archive, pruned prefix), \
+             got {other:?}"
+        ),
+    }
+
+    // ── (c) Surviving-archive commit: was_linked still works (scan-based) ───
+    // wal.4.archive contains only the insert of "c"; the edge Knows(a,b) is in
+    // the pruned archive.  was_linked scans surviving data and honestly returns
+    // false — it does not error.
     match db.was_linked("a", "b", "Knows", 3) {
-        // "a" and "b" are NOT visible from the surviving archive alone when
-        // replayed from empty (pruned history means incomplete state).
-        // But the call must NOT return CommitOutOfRange for commit 3.
-        Ok(_) => {} // Any bool result is acceptable for surviving commits.
-        Err(GraphError::CommitOutOfRange { commit: 3, .. }) => {
-            panic!("commit 3 is at the floor and must not be CommitOutOfRange")
+        Ok(false) => {} // honest: edge not in surviving records
+        Err(GraphError::CommitOutOfRange { .. }) => {
+            panic!("was_linked must not return CommitOutOfRange for a surviving commit (commit 3 >= floor 3)")
         }
-        Err(e) => panic!("unexpected error for commit 3: {e:?}"),
+        other => panic!("unexpected result for was_linked at surviving commit 3: {other:?}"),
     }
 
-    // open_at for a pruned commit → CommitOutOfRange.
-    match GraphDb::open_at(&dir, 0).err() {
-        Some(GraphError::CommitOutOfRange { commit: 0, .. }) => {}
-        other => panic!("expected CommitOutOfRange for open_at(0), got {other:?}"),
+    // ── (d) Live WAL commit (global 4): open_at succeeds ────────────────────
+    // Live WAL commits are always reachable: snapshot is their reconstruction base.
+    let db4 = GraphDb::open_at(&dir, 4).unwrap();
+    // Snapshot (taken at 2nd archive) captured a, b, c.  Live WAL adds d.
+    assert!(db4.has_node("a") && db4.has_node("b") && db4.has_node("c"));
+    assert!(db4.has_node("d"), "live WAL commit 4: 'd' must be visible");
+
+    // Pruned commits via open_at also give CommitOutOfRange.
+    for pruned in [0u64, 1, 2] {
+        match GraphDb::open_at(&dir, pruned).err() {
+            Some(GraphError::CommitOutOfRange { commit, .. }) if commit == pruned => {}
+            other => panic!("open_at({pruned}) expected CommitOutOfRange (pruned), got {other:?}"),
+        }
     }
-    match GraphDb::open_at(&dir, 2).err() {
-        Some(GraphError::CommitOutOfRange { commit: 2, .. }) => {}
-        other => panic!("expected CommitOutOfRange for open_at(2), got {other:?}"),
+}
+
+// ── Test 12: Genesis-chain open_at equivalence ───────────────────────────────
+
+/// For a fresh store with no prior truncating snapshot, `archive_genesis_chain`
+/// is set and open_at must return CORRECT states at commits in BOTH archives
+/// and in the live WAL.
+///
+/// Verified by building a reference GraphDb with the same commit history and
+/// comparing node membership at each open_at target.
+#[test]
+fn genesis_chain_open_at_equivalence() {
+    let dir = tmp("genesis-equiv");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        // No prior truncating snapshot → genesis chain.
+        db.insert_node("N", "r0", vec![("v".into(), Value::Int(0))])
+            .unwrap(); // commit 0
+        db.insert_node("N", "r1", vec![]).unwrap(); // commit 1
+        db.snapshot_with(opts_archive()).unwrap(); // wal.2.archive (commits 0,1)
+
+        db.insert_node("N", "r2", vec![]).unwrap(); // commit 2
+        db.snapshot_with(opts_archive()).unwrap(); // wal.3.archive (commit 2)
+
+        db.insert_node("N", "r3", vec![]).unwrap(); // commit 3 (live WAL)
     }
+
+    // Genesis chain must be intact: floor=0, no pruning.
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.wal_horizon_floor(), 0);
+    assert_eq!(db.wal_total_commits().unwrap(), 4);
+
+    // Commit 0 (first archive, first frame): only r0.
+    let db0 = GraphDb::open_at(&dir, 0).unwrap();
+    assert!(db0.has_node("r0"), "commit 0: r0 must be visible");
+    assert!(!db0.has_node("r1"), "commit 0: r1 not yet inserted");
+    assert!(!db0.has_node("r2"), "commit 0: r2 not yet inserted");
+    assert!(!db0.has_node("r3"), "commit 0: r3 not yet inserted");
+    assert_eq!(db0.get_prop("r0", "v"), Some(Value::Int(0)));
+
+    // Commit 1 (first archive, second frame): r0 and r1.
+    let db1 = GraphDb::open_at(&dir, 1).unwrap();
+    assert!(db1.has_node("r0") && db1.has_node("r1"));
+    assert!(!db1.has_node("r2") && !db1.has_node("r3"));
+
+    // Commit 2 (second archive): r0, r1, r2.
+    let db2 = GraphDb::open_at(&dir, 2).unwrap();
+    assert!(db2.has_node("r0") && db2.has_node("r1") && db2.has_node("r2"));
+    assert!(!db2.has_node("r3"));
+
+    // Commit 3 (live WAL): all four nodes.
+    let db3 = GraphDb::open_at(&dir, 3).unwrap();
+    assert!(db3.has_node("r0") && db3.has_node("r1") && db3.has_node("r2") && db3.has_node("r3"));
+
+    // Out of range → CommitOutOfRange.
+    assert!(GraphDb::open_at(&dir, 4).is_err());
 }
 
 // ── Test 11: Crash-window op-mode sweep ──────────────────────────────────────

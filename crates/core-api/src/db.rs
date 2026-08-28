@@ -999,6 +999,23 @@ pub struct GraphDb<F: Fs> {
     /// surviving archives.  Persisted to `wal.floor` sidecar when pruning occurs.
     /// Default 0 = all history reachable.
     wal_horizon_floor: u64,
+    /// True when the surviving archive chain forms a continuous WAL history
+    /// starting from the store's first commit (the genesis chain).
+    ///
+    /// `open_at` may replay archive-resident commits from empty state only when
+    /// this flag is true AND `wal_horizon_floor == 0`.  Cleared whenever:
+    ///   - a WAL-truncating snapshot (`keep_wal=false`) is taken after archives
+    ///     already exist (breaks the chain for subsequent archives), or
+    ///   - any archive is pruned (floor advances past zero).
+    ///
+    /// Persisted via the `wal.genesis` marker file; loaded from it at open.
+    archive_genesis_chain: bool,
+    /// True in the current session if any WAL-truncating snapshot (`keep_wal=false`,
+    /// `archive_wal=false`) was taken before the first archive was created.
+    ///
+    /// In-memory only (not persisted).  Used at first-archive time to decide
+    /// whether to write the genesis marker.  Irrelevant after archives exist.
+    wal_ever_truncated: bool,
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -1216,8 +1233,11 @@ impl<F: Fs> GraphDb<F> {
             last_change: HashMap::new(),
             wal_archive_retention: None,
             wal_horizon_floor: 0,
+            archive_genesis_chain: false,
+            wal_ever_truncated: false,
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
+        db.archive_genesis_chain = db.fs.has_genesis_marker();
         let _t0 = std::time::Instant::now();
         // Peek 6 bytes to determine snapshot version without reading the full
         // file. For RealFs this is a true partial read (O(1)); for SimFs the
@@ -1640,8 +1660,11 @@ impl<F: Fs> GraphDb<F> {
             last_change: HashMap::new(),
             wal_archive_retention: None,
             wal_horizon_floor: 0,
+            archive_genesis_chain: false,
+            wal_ever_truncated: false,
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
+        db.archive_genesis_chain = db.fs.has_genesis_marker();
         // Collect archive frames (oldest-first) and live WAL frames.
         // Archives represent pre-snapshot history; the snapshot captures the
         // cumulative state at the time of archiving.  Crash-window guarantee:
@@ -1676,12 +1699,19 @@ impl<F: Fs> GraphDb<F> {
         let local = commit - db.wal_horizon_floor;
 
         if local < total_archive_frames {
-            // Target commit is in an archive: replay from scratch (no snapshot).
+            // Target commit is in an archive.  Correct replay from empty state
+            // is only possible when the archive chain is an uninterrupted
+            // genesis chain (first archive taken from a fresh store, no prior
+            // WAL truncation) and no archives have been pruned (floor == 0).
             //
-            // We must replay all prior archives before the target's archive so
-            // that dense-id intern tables are built up in order.  The archive
-            // bytes form a valid WAL stream that replays correctly from an
-            // empty state.
+            // If either condition is violated the prefix needed to reconstruct
+            // the requested state is gone; refuse rather than return wrong data.
+            if db.wal_horizon_floor > 0 || !db.archive_genesis_chain {
+                return Err(GraphError::CommitOutOfRange { commit, total });
+            }
+            // Replay all archive frames up to and including the target commit
+            // from an empty database state.  Archives must be replayed in order
+            // so that dense-id intern tables are built up correctly.
             for rec in archive_frames_all.into_iter().take((local + 1) as usize) {
                 db.apply(&rec)?;
                 let _ = db.engine.drain_deltas();
@@ -6738,12 +6768,30 @@ impl<F: Fs> GraphDb<F> {
             //      absent.  Reopen: snapshot loaded (full state), no WAL
             //      replay.  Archive is NOT replayed into live state — it is
             //      pre-snapshot by construction.  Safe.
-            //   3. Prune old archives (retention), update horizon floor.
-            //   4. Write new minimal baseline WAL (write_atomic).
+            //   3. Optionally write genesis marker (first archive only, no
+            //      prior WAL truncation).
+            //   4. Prune old archives (retention), update horizon floor.
+            //      Pruning invalidates the genesis chain; delete marker.
+            //   5. Write new minimal baseline WAL (write_atomic).
             //      Crash window C: crash here leaves new archive plus no live
             //      WAL.  Same as window B — handled above.
+            //
+            // Sample existing archives BEFORE the rename so we can detect
+            // whether this is the first archive.
+            let existing_archives = self.fs.list_archives()?;
+            let is_first_archive = existing_archives.is_empty();
+
             let archive_n = self.commit_seq;
             self.fs.archive_wal(archive_n)?;
+
+            // Genesis marker: written once when the first archive is taken
+            // from a store that has never undergone a WAL-truncating snapshot.
+            // When present, `open_at` may replay archive-resident commits from
+            // empty state (the archive chain covers from global index 0).
+            if is_first_archive && !self.wal_ever_truncated {
+                self.fs.write_genesis_marker()?;
+                self.archive_genesis_chain = true;
+            }
 
             // Retention pruning: keep newest `keep` archives; delete oldest.
             // Pruning is the ONLY deletion site for archives.
@@ -6766,6 +6814,12 @@ impl<F: Fs> GraphDb<F> {
                         self.wal_horizon_floor += pruned_frames;
                         // Persist floor so it survives reopen.
                         self.fs.write_horizon_floor(self.wal_horizon_floor)?;
+                        // Pruning breaks the genesis chain: surviving archives
+                        // no longer begin at global index 0.
+                        if pruned_frames > 0 && self.archive_genesis_chain {
+                            self.fs.delete_genesis_marker()?;
+                            self.archive_genesis_chain = false;
+                        }
                     }
                 }
             }
@@ -6795,6 +6849,17 @@ impl<F: Fs> GraphDb<F> {
             //   • Crash after snapshot write but before this WAL write → full
             //     pre-snapshot WAL still present; open_with replays idempotently.
             //   • Crash after both writes → normal post-snapshot state.
+            //
+            // Genesis chain: a WAL-truncating snapshot breaks the archive chain
+            // for any archives taken AFTER this point (their WAL slices would
+            // not start at genesis).  Record the truncation so the first-archive
+            // path can omit the genesis marker, and delete any existing marker
+            // so future open_at calls refuse archive-resident commits.
+            self.wal_ever_truncated = true;
+            if self.archive_genesis_chain {
+                self.fs.delete_genesis_marker()?;
+                self.archive_genesis_chain = false;
+            }
             let mut baseline_wal: Vec<u8> = Vec::new();
             for (label, field) in self.fulltext.enabled_pairs() {
                 let rec = WalRecord::EnableFulltext {

@@ -48,6 +48,10 @@ pub struct SimFs {
     archives: HashMap<u64, Vec<u8>>,
     /// Persisted horizon floor: first globally-indexed reachable commit.
     horizon_floor: u64,
+    /// Genesis-chain marker (mirrors `wal.genesis` in RealFs).
+    /// `true` when the surviving archive chain forms a complete WAL history
+    /// from the store's first commit.
+    genesis_marker: bool,
 }
 
 fn name(f: FileId) -> &'static str {
@@ -119,6 +123,7 @@ impl SimFs {
             files: self.files.clone(),
             archives: self.archives.clone(),
             horizon_floor: self.horizon_floor,
+            genesis_marker: self.genesis_marker,
             ..SimFs::default() // resets byte_crashed, op_crashed, ops, appended
         }
     }
@@ -261,6 +266,25 @@ impl Fs for SimFs {
     fn write_horizon_floor(&mut self, floor: u64) -> std::io::Result<()> {
         self.check_op_crash()?;
         self.horizon_floor = floor;
+        self.tick_op();
+        Ok(())
+    }
+
+    fn has_genesis_marker(&self) -> bool {
+        // Reads are not blocked by op-mode crashes (same as `read`).
+        self.genesis_marker
+    }
+
+    fn write_genesis_marker(&mut self) -> std::io::Result<()> {
+        self.check_op_crash()?;
+        self.genesis_marker = true;
+        self.tick_op();
+        Ok(())
+    }
+
+    fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
+        self.check_op_crash()?;
+        self.genesis_marker = false;
         self.tick_op();
         Ok(())
     }
