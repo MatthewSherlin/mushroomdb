@@ -105,14 +105,16 @@ files alongside `snapshot.bin` and `wal.bin`:
 |------|-------------|---------|
 | `wal.<N>.archive` | each `archive_wal` snapshot | renamed WAL file; N = cumulative end-frame index |
 | `wal.floor` | first retention prune | 8-byte LE u64 horizon floor |
-| `wal.genesis` | first archive, no prior truncation | empty marker: archive chain covers genesis |
-| `wal.truncated` | first `keep_wal=false` snapshot | write-once empty marker; persists across sessions to prevent a later archiving session from incorrectly claiming a complete genesis chain when the WAL history has a gap |
+| `wal.genesis` | first archive, also the store's first-ever snapshot | empty marker: archive chain covers genesis |
 
-`wal.truncated` is intentionally never deleted once written. Stores that predate
-this file (created before v0.2 archive support) and that are first archived
-under v0.2+ are treated conservatively: the genesis marker is not written and
-`open_at` returns `CommitOutOfRange` for archive-resident commits (safe
-refusal, not silent wrong data).
+The genesis marker is written only when the first archive snapshot is also the
+store's very first snapshot (no `snapshot.bin` existed before it).  This rule
+is conservative and covers both cross-session truncation and legacy stores:
+a `keep_wal=false` snapshot always writes `snapshot.bin` before truncating the
+WAL, so any later archiving session sees `snapshot.bin` present and refuses the
+marker.  Stores that predate archive support and have a prior `snapshot.bin` are
+treated identically: `open_at` returns `CommitOutOfRange` for archive-resident
+commits (safe refusal, never silent wrong data).
 
 ---
 
