@@ -153,12 +153,17 @@ Not supported: CASE, subqueries, UNION, multi-statement BEGIN/COMMIT transaction
 ## Storage
 
 - Dense-id WAL with per-commit fsync; configurable FsyncPolicy (strict/batched/relaxed)
-- V7 packed snapshot: packed CSR adjacency + columnar properties + HNSW blobs; zstd-compressed
-- V5/V6 snapshots read transparently; V3/V4 rejected
-- Not mmap. Single writer, many readers (RwLock-backed SharedDb)
+- V8 mmap snapshot (v0.2+): 11 rkyv sections (TOPOLOGY, COLUMNS, IDS, SYMS, META,
+  EDGE_PROPS, HNSW, PROVENANCE, RULES_META, VIEWS, IVF_STATE); zero-copy open via
+  mmap; no heap allocation for section data; O(1) per-query section access
+- V5/V6/V7 snapshots auto-migrated to V8 on open; V3/V4 rejected
+- Single writer, many readers (RwLock-backed SharedDb)
 - RAM-bound; design target 10M nodes (~5–15 GiB with properties)
-- 100k nodes, V7 snapshot open: ~8.88 s (V6 measurement; V7 not separately published)
-- 100k nodes, WAL-only open: ~8.16 min (HNSW re-fitting dominates)
+- 100k nodes (~10M derived edges), V8 snapshot open: **0.02 s, 31–41 MiB RSS**
+  (warm file cache, cold process; measured 2026-08-28, Apple M4 Pro, release build)
+- 100k nodes, WAL-only open: ~8.16 min (HNSW re-fitting dominates; measured 2026-08-24)
+- V8 snapshot size: 1.9 GiB (same 100k dataset; ~14% smaller than V5's 2.2 GiB)
+- mushroomdb verify <db-dir>: CRC32 audit of all 12 sections; 0.26 s on 1.9 GiB; exits 2 on mismatch
 
 ## GitHub
 
@@ -179,11 +184,13 @@ https://github.com/MatthewSherlin/mushroomdb
 
 ## Limitations (be honest)
 
-- RAM-bound; no mmap yet
+- RAM-bound (mmap is read-only for the snapshot base; in-flight writes are in-memory)
 - Single writer (no multi-writer, no clustering, no Neo4j parity)
-- No mmap, no differential dataflow
+- No differential dataflow
 - Dense patterns >1M intermediate rows require LIMIT
 - No multi-statement interactive transactions in v1
-- V7 snapshot open time at 100k nodes not yet measured separately (V6 was 8.88 s)
-- Approximate backfill time with HNSW not separately published (IVF-era was ~17 s at 5k/1536)
+- V8 open numbers (0.02 s / 31–41 MiB) are warm-file-cache, cold-process; cold-cache
+  numbers not measured (require sudo purge)
+- Migration footprint (V5→V8) at 100k nodes: ~30 s, peak ~54 GB VM pressure; run
+  mushroomdb migrate offline on constrained hosts
 - Pre-1.0 format policy: snapshot/WAL formats may change between v0.x minor versions

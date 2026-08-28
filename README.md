@@ -322,7 +322,7 @@ Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 | Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
 | Cypher scan-filter-project (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
 | Cypher two-hop join (200 rows) | **261.6 µs** ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
-| Cold-start: snapshot open | **~11 s** ▽ | — | — | — |
+| Cold-start: V8 snapshot open | **0.02 s** ▽ | — | — | — |
 | Cold-start: WAL-only open | 8.16 min ▽ | — | — | — |
 | Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
@@ -351,14 +351,21 @@ Rule derivation (mushroomdb-only, excluded from cross-engine table):
 two-rule backfill on 10k nodes: v2.4 baseline 928 ms + 2.221 s = 3.149 s (+8.8% vs pre-eventing v2.3 baseline of 2.894 s). **v0.1.0 measured: 3.49–3.51 s** (two runs, 0.6% intrarun variance; +11% from v2.4). **v0.1.1 re-measured: 2.929 s** (single-pass 2026-08-24; N=5 criterion median 2.878 s — no residual regression vs 2.894 s pre-eventing baseline). A two-stage fix (is\_empty guard + emit\_deltas engine gate, commit d4d312c) recovered the original subscription overhead. Competitors have no auto-derivation equivalent.
 
 ▽ 100k cold-start (100k-node representative matching workload, 9 backfill rules,
-~10M derived edges in snapshot):
-**WAL-only open:** 8.16 min (measured 2026-08-24) — WAL CreateRule records trigger full rule
-re-derivation; ANN index re-fitting dominates. **V7 snapshot open:** ~11 s (measured 2026-08-26,
-three runs 10.7–11.1 s) — `open_with` decompresses the packed snapshot; derived edges and ANN
-state load directly; no rule re-fire. V7 halves on-disk size vs the older format (1.07 GiB vs
-2.20 GiB) but open time is data-volume-bound; sub-second open is the headline goal of the
-v0.2 mmap/zero-copy work. **V7 snapshot write:** ~35 s. **Backfill (9 rules, max_edges=1M each):**
-20.343 s. Full methodology and numbers:
+~10M derived edges in snapshot; warm file cache, cold process; measured
+2026-08-28 with `/usr/bin/time -l`, release build, Apple M4 Pro):
+**V8 snapshot open:** **0.02 s** (runs 2–3; 0.25 s on first-ever dyld-cold run),
+**31–41 MiB RSS** depending on query type — V8 mmap format (v0.2,
+`feat/v0.2-phase-b-physics` @ `b0798a1`). Cold-cache not measured (requires
+`sudo purge`). **V7 snapshot open:** ~11 s (measured 2026-08-26, three runs
+10.7–11.1 s; V7 decompresses packed snapshot on open; no rule re-fire).
+**WAL-only open:** 8.16 min (measured 2026-08-24) — CreateRule WAL records trigger
+full rule re-derivation; ANN index re-fitting dominates. **V8 snapshot size:**
+1.9 GiB (~14% smaller than V5's 2.2 GiB; IVF centroids re-encoded as rkyv).
+**V8 snapshot write:** ~35 s. **Backfill (9 rules, max_edges=1M each):** 20.343 s.
+`mushroomdb verify <db-dir>` audits all 12 sections with full CRC32 and exits 2
+on any mismatch (0.26 s on the 1.9 GiB store; large sections skip CRC on the
+normal query path — see `docs/format-stability.md` for the trust model).
+Full trajectory and methodology:
 [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
 
 Rule engine vs hand-rolled maintenance (three-way, measured 2026-08-21): on 10k nodes with
@@ -397,11 +404,13 @@ Dependency rule (inward only):
 `bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
 
 Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy`),
-plus versioned zstd-compressed V7 packed snapshots (packed CSR topology + packed
-columnar properties + HNSW blobs); not mmap. Open = snapshot + WAL replay.
-Derived edges are not WAL-logged; they are re-materialized from node data
-on open by replaying rule application. See [`docs/format-stability.md`](docs/format-stability.md)
-for the format evolution contract (append-only WAL discriminants, migrate-on-open, V5+ support).
+plus mmap-able V8 rkyv snapshots (11 sections: CSR topology, columnar properties,
+HNSW blobs, provenance, IVF state, and more — zero-copy, no heap allocation on open).
+V5/V6/V7 stores are auto-migrated to V8 on `GraphDb::open`. Open = mmap header +
+lazy section reads; derived edges and ANN state load from snapshot without rule re-fire.
+Derived edges are not WAL-logged; they are restored directly from the mmap'd sections.
+See [`docs/format-stability.md`](docs/format-stability.md) for the format evolution
+contract (append-only WAL discriminants, migrate-on-open, V5+ support, verify command).
 
 Concurrency: single writer, many readers via `RwLock`-backed `SharedDb`.
 Lock-free epoch snapshot readers are on the roadmap.
@@ -417,7 +426,7 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | Limitation | Detail |
 |---|---|
 | Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
-| Cold start without a snapshot re-fires all rules | Snapshots (V7, packed + zstd-compressed) persist derived edges, ANN state, and view definitions — opening from a snapshot skips re-derivation. Measured at 100k nodes: ~11 s open from snapshot vs 8.16 min from WAL alone. Snapshot write cost: ~35 s (1.07 GiB on disk). Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
+| Cold start without a snapshot re-fires all rules | Snapshots (V8 mmap, v0.2+) persist derived edges, ANN state, and view definitions — opening from a snapshot skips re-derivation. Measured at 100k nodes / ~10M derived edges (2026-08-28, warm file cache, cold process): **0.02 s, 31–41 MiB RSS** (V8 mmap). WAL-only open: **8.16 min** (ANN re-fit dominates). Snapshot write cost: ~35 s (1.9 GiB on disk). Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
 | Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection (in-tree, no external dependency). Per-query recall: min 0.90, mean 0.998 at 5k/dim 1536 (fixed-seed probe). Review the recall trade-off before using it in completeness-critical workloads. |
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
@@ -447,6 +456,7 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | `mushroomdb algo pagerank <dir> --top 20` | Run PageRank over the unified topology (manual + derived edges) |
 | `mushroomdb algo wcc <dir> --top 50` | Find weakly-connected components |
 | `mushroomdb algo degree <dir> --top 20` | Degree centrality (out / in / both) |
+| `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch (large sections skip CRC on the normal query path; this command reads them all) |
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff of created/updated/unchanged items |
 
 Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
