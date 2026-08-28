@@ -53,7 +53,7 @@ def test_within_threshold_passes():
 
 
 def test_regression_fails():
-    """A metric that is >15% slower than baseline — must exit non-zero."""
+    """A cpu-bound metric >15% slower than baseline — must exit non-zero."""
     baseline = {
         "ingest_wall_s": 1.0,
         "rule_backfill_wall_s": 2.0,
@@ -61,12 +61,34 @@ def test_regression_fails():
         "snapshot_open_s": 0.3,
         "query_p50_ms": 10.0,
     }
-    # snapshot_open_s regresses by 20% — should fail.
+    # query_p50_ms (strict 15% band) regresses by 20% — should fail.
     results = dict(baseline)
-    results["snapshot_open_s"] = baseline["snapshot_open_s"] * 1.20
+    results["query_p50_ms"] = baseline["query_p50_ms"] * 1.20
     rc, out = _run(results, baseline)
     assert rc != 0, f"expected non-zero exit for regression, got {rc}:\n{out}"
-    assert "snapshot_open_s" in out, f"expected regressed metric name in output:\n{out}"
+    assert "query_p50_ms" in out, f"expected regressed metric name in output:\n{out}"
+
+
+def test_fsync_bound_band():
+    """fsync-bound metrics gate at 60%: +20% passes, +70% fails."""
+    baseline = {
+        "ingest_wall_s": 1.0,
+        "rule_backfill_wall_s": 2.0,
+        "snapshot_write_s": 0.5,
+        "snapshot_open_s": 0.3,
+        "query_p50_ms": 10.0,
+    }
+    # +20% on fsync-bound metrics: within the 60% band — passes.
+    results = dict(baseline)
+    results["snapshot_open_s"] = baseline["snapshot_open_s"] * 1.20
+    results["snapshot_write_s"] = baseline["snapshot_write_s"] * 1.20
+    rc, out = _run(results, baseline)
+    assert rc == 0, f"+20% fsync-bound should pass the 60% band, got {rc}:\n{out}"
+    # +70% on an fsync-bound metric: beyond the band — fails.
+    results["snapshot_write_s"] = baseline["snapshot_write_s"] * 1.70
+    rc, out = _run(results, baseline)
+    assert rc != 0, f"+70% fsync-bound should fail, got {rc}:\n{out}"
+    assert "snapshot_write_s" in out
 
 
 def test_missing_metric_fails():
