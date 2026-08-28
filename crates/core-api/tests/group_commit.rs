@@ -6,14 +6,16 @@
 //!  3. fifo_within_caller — sequential submits preserve commit ordering
 //!  4. concurrent_submitters_all_commit — 8 threads submit concurrently, all land
 //!  5. crash_before_group_fsync_loses_group — unsynced group is lost on crash
-//!  6. crash_mid_submission_frame_is_dropped — torn WAL frame never applies
+//!  6. intra_group_prefix_survives_crash — frame-1 of 2-sub group survives crash mid-frame-2
 //!  7. direct_api_unchanged — write/read/write_batch/insert_node still work
-//!  8. group_commit_throughput_bench (ignored) — 8 writers vs serial, Strict fsync
+//!  8. deferred_events_fire_after_flush — events buffered until flush (R2)
+//!  9. deferred_events_discarded_on_failure — events discarded when fsync fails (R2)
+//! 10. group_commit_throughput_bench (ignored) — 8 writers vs serial direct path
 
-use core_api::{BatchOp, FsyncPolicy, GraphDb, SharedDb};
+use core_api::{BatchOp, FsyncPolicy, GraphDb, MutationEvent, SharedDb};
 use core_storage::fs::{FileId, Fs, FsIntrospect};
 use std::collections::HashMap;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
@@ -335,60 +337,75 @@ fn crash_before_group_fsync_loses_unsynced_group() {
     );
 }
 
-// ── Test 6: torn WAL frame within a group drops that submission on recovery ───
+// ── Test 6: intra-group prefix survival — frame-1 survives crash mid-frame-2 ──
+//
+// When a group has 2+ submissions and the process crashes mid-second-frame,
+// the first submission's WAL frame is complete and must survive replay.  The
+// second frame is torn at the CRC boundary and must be dropped whole.
 
 #[test]
-fn torn_submission_frame_dropped_on_recovery() {
+fn intra_group_prefix_survives_crash() {
     use sim_harness::SimFs;
 
-    // Measure how many bytes a single-submission group1 WAL frame occupies.
+    // Probe: measure the byte size of one Batch frame (one InsertNode).
     let probe_fs = SimFs::new();
     let mut probe = GraphDb::open_with(probe_fs).unwrap();
-    let g1 = vec![vec![BatchOp::InsertNode {
-        label: "A".into(),
-        key: "baseline".into(),
-        props: vec![],
-    }]];
-    probe.commit_group(g1);
-    let g1_bytes = probe.fs_total_appended();
+    probe
+        .commit_group_nosync(vec![vec![BatchOp::InsertNode {
+            label: "A".into(),
+            key: "s1".into(),
+            props: vec![],
+        }]])
+        .into_iter()
+        .for_each(|r| {
+            r.unwrap();
+        });
+    let frame1_bytes = probe.fs_total_appended(); // bytes for exactly one Batch frame
     drop(probe);
 
-    // Crash mid-g2 frame (3 bytes into the new frame — tears the CRC).
-    let crash_at = g1_bytes + 3;
+    // Set up SimFs to crash 3 bytes into the SECOND frame (tears its CRC).
+    let crash_at = frame1_bytes + 3;
     let fs = SimFs::with_crash_after(crash_at);
     let mut db = GraphDb::open_with(fs).unwrap();
 
-    // Group 1 succeeds (fits within crash threshold).
-    let (r1, _) = db.commit_group(vec![vec![BatchOp::InsertNode {
-        label: "A".into(),
-        key: "baseline".into(),
-        props: vec![],
-    }]]);
-    assert!(r1[0].is_ok(), "group 1 must succeed");
+    // Commit both submissions in one group_nosync call.
+    // Frame 1 fits within crash_at; frame 2 is torn.
+    let results = db.commit_group_nosync(vec![
+        vec![BatchOp::InsertNode {
+            label: "A".into(),
+            key: "s1".into(),
+            props: vec![],
+        }],
+        vec![BatchOp::InsertNode {
+            label: "A".into(),
+            key: "s2".into(),
+            props: vec![],
+        }],
+    ]);
+    // Frame 1 should succeed; frame 2 may err (crash mid-append) or appear
+    // to succeed (crash after append but before in-process acknowledgement).
+    let _ = results;
 
-    // Group 2 crashes mid-append — commit_group_nosync returns Err for g2.
-    let g2_result = db.commit_group_nosync(vec![vec![BatchOp::InsertNode {
-        label: "A".into(),
-        key: "torn".into(),
-        props: vec![],
-    }]]);
-    // The append may fail (crash) or succeed with a torn frame.
-    // Either way, on recovery the torn frame is dropped.
-
+    // Replay from the surviving WAL (SimFs preserves up to crash_at bytes).
     let fs = db.into_fs();
     let survivor = fs.surviving_state();
     let db2 = GraphDb::open_with(survivor).unwrap();
 
-    assert!(db2.has_node("baseline"), "baseline (group 1) must survive");
-    // If g2 was torn by byte-crash, it won't be present after recovery.
-    // If g2 errored without appending, also not present.
-    let torn_present = db2.has_node("torn");
-    // Either the torn frame was silently discarded (ok) or never written (ok).
-    // Both outcomes are acceptable — the submission result told the caller.
-    let _ = g2_result;
-    let _ = torn_present;
-    // The key invariant: whatever was committed in group 1 is intact.
-    assert_eq!(db2.node_count(), 1, "only baseline survives");
+    // Frame 1 is fully within crash_at → its ops must be present.
+    assert!(
+        db2.has_node("s1"),
+        "first submission frame (before crash point) must survive"
+    );
+    // Frame 2 is torn → CRC mismatch → dropped on recovery.
+    assert!(
+        !db2.has_node("s2"),
+        "torn second-frame submission must be dropped on recovery"
+    );
+    assert_eq!(
+        db2.node_count(),
+        1,
+        "only the complete first frame survives"
+    );
 }
 
 // ── Test 7: direct &mut self APIs unchanged ───────────────────────────────────
@@ -426,10 +443,104 @@ fn direct_apis_unchanged_alongside_queue() {
     assert_eq!(n, 5, "direct + queued + batch all committed");
 }
 
-// ── Test 8: throughput bench (ignored) ───────────────────────────────────────
+// ── Test 8: deferred events fire after flush (R2) ─────────────────────────────
+//
+// Under Strict policy the drain thread defers subscriber events until after
+// the group fsync.  Test the mechanism via commit_group_nosync + explicit
+// deferred-events API on GraphDb (unit-level, no drain thread involvement).
+
+#[test]
+fn deferred_events_fire_after_flush() {
+    use sim_harness::SimFs;
+
+    let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let received2 = Arc::clone(&received);
+
+    let fs = SimFs::new();
+    let mut db = GraphDb::open_with(fs).unwrap();
+    db.set_event_sink(Box::new(move |ev| {
+        if let MutationEvent::NodeInserted { key, .. } = ev {
+            received2.lock().unwrap().push(key);
+        }
+    }));
+
+    // Enable deferred mode — simulates what the drain thread does.
+    db.set_deferred_events_mode(true);
+
+    // Commit; events must NOT fire yet.
+    db.commit_group_nosync(vec![
+        vec![BatchOp::InsertNode {
+            label: "A".into(),
+            key: "ev1".into(),
+            props: vec![],
+        }],
+        vec![BatchOp::InsertNode {
+            label: "A".into(),
+            key: "ev2".into(),
+            props: vec![],
+        }],
+    ]);
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "events must not fire before flush"
+    );
+
+    // Flush — simulates what the drain thread does after a successful fsync.
+    db.flush_deferred_events();
+    db.set_deferred_events_mode(false);
+
+    let keys = received.lock().unwrap().clone();
+    assert!(keys.contains(&"ev1".to_string()), "ev1 must be delivered");
+    assert!(keys.contains(&"ev2".to_string()), "ev2 must be delivered");
+}
+
+// ── Test 9: deferred events discarded on fsync failure (R2) ──────────────────
+
+#[test]
+fn deferred_events_discarded_on_failure() {
+    use sim_harness::SimFs;
+
+    let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let received2 = Arc::clone(&received);
+
+    let fs = SimFs::new();
+    let mut db = GraphDb::open_with(fs).unwrap();
+    db.set_event_sink(Box::new(move |ev| {
+        if let MutationEvent::NodeInserted { key, .. } = ev {
+            received2.lock().unwrap().push(key);
+        }
+    }));
+
+    // Enable deferred mode and commit.
+    db.set_deferred_events_mode(true);
+    db.commit_group_nosync(vec![vec![BatchOp::InsertNode {
+        label: "A".into(),
+        key: "lost".into(),
+        props: vec![],
+    }]]);
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "events must not fire before discard"
+    );
+
+    // Discard — simulates what the drain thread does on fsync failure.
+    db.discard_deferred_events();
+    db.set_deferred_events_mode(false);
+
+    // Even after discard+mode-off, no event must have been delivered.
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "discarded events must never be delivered to subscribers"
+    );
+}
+
+// ── Test 10: throughput bench (ignored) ───────────────────────────────────────
 
 /// Group-commit throughput gate (spec B3.5):
 /// 8 concurrent writers >= 3x serialized-writer throughput at Strict fsync.
+///
+/// Baseline: direct `db.write().write_batch()` path (FsyncPolicy::Strict,
+/// one fsync per call) — this is the pre-group-commit production baseline.
 ///
 /// Run manually with: `cargo test --release group_commit_throughput_bench -- --ignored --nocapture`
 #[test]
@@ -441,35 +552,37 @@ fn group_commit_throughput_bench() {
     const OPS_PER_WRITER: usize = 200;
     const TOTAL_OPS: usize = WRITERS * OPS_PER_WRITER;
 
-    // ── Serialized-writer baseline ─────────────────────────────────────────
+    // ── Serialized-writer baseline (direct path, one fsync per write_batch) ──
+    //
+    // Uses db.write().write_batch() so each call acquires the write lock AND
+    // fsyncs before returning — the pre-4b production contract.  This is what
+    // 8 concurrent users experienced before group-commit landed.
     let dir_serial = tmp("bench-serial");
-    {
-        let db = SharedDb::open(&dir_serial).unwrap();
-        // Warm up.
-        db.submit_batch(vec![BatchOp::InsertNode {
-            label: "W".into(),
-            key: "warm".into(),
-            props: vec![],
-        }])
+    let db_serial_warmup = SharedDb::open(&dir_serial).unwrap();
+    // Warm up OS page cache / WAL file.
+    db_serial_warmup
+        .write()
+        .write_batch(|b| {
+            b.insert_node("W", "warm", vec![]);
+        })
         .unwrap();
-    }
+    drop(db_serial_warmup);
 
-    let dir_serial = tmp("bench-serial2");
-    let db_serial = SharedDb::open(&dir_serial).unwrap();
+    let dir_serial2 = tmp("bench-serial2");
+    let db_serial = SharedDb::open(&dir_serial2).unwrap();
     let t0 = Instant::now();
     for i in 0..TOTAL_OPS {
         db_serial
-            .submit_batch(vec![BatchOp::InsertNode {
-                label: "W".into(),
-                key: format!("s{i}"),
-                props: vec![],
-            }])
+            .write()
+            .write_batch(|b| {
+                b.insert_node("W", &format!("s{i}"), vec![]);
+            })
             .unwrap();
     }
     let serial_elapsed = t0.elapsed();
     let serial_ops_per_s = TOTAL_OPS as f64 / serial_elapsed.as_secs_f64();
 
-    // ── 8-concurrent-writer path ───────────────────────────────────────────
+    // ── 8-concurrent-writer path (group-commit queue) ─────────────────────
     let dir_conc = tmp("bench-conc");
     let db_conc = SharedDb::open(&dir_conc).unwrap();
 
@@ -594,8 +707,6 @@ fn group_commit_throughput_bench() {
     assert!(
         ratio >= 3.0,
         "8 concurrent writers ({conc_ops_per_s:.0} ops/s) must be >= 3x \
-         serialized ({serial_ops_per_s:.0} ops/s); ratio = {ratio:.2}"
+         serialized direct-path ({serial_ops_per_s:.0} ops/s); ratio = {ratio:.2}"
     );
 }
-
-use std::sync::Mutex;

@@ -892,6 +892,26 @@ pub struct GraphDb<F: Fs> {
     delta_tail: Vec<Arc<crate::reader::CommitDelta>>,
     /// How many commits have occurred since the last fold.
     commits_since_fold: usize,
+    /// When true, `log_then_apply_with` buffers event notifications instead of
+    /// firing them immediately.  Used by the group-commit drain thread to defer
+    /// events until after the group fsync (R2: durability before notification).
+    /// Cleared to false once the drain thread flushes or discards the buffer.
+    defer_events: bool,
+    /// Buffered events accumulated while `defer_events` is true.
+    deferred_events: Vec<DeferredEvent>,
+    /// Set to true by the group-commit drain thread when a group fsync fails
+    /// after WAL truncation.  All subsequent mutation attempts return an IO
+    /// error until the database is reopened.
+    degraded: bool,
+}
+
+/// One group of deferred event notifications, held until the group fsync
+/// completes.  Replayed by [`GraphDb::flush_deferred_events`].
+struct DeferredEvent {
+    rec: core_storage::WalRecord,
+    engine_deltas: Vec<EngineEdgeDelta>,
+    seq: u64,
+    ingest: Option<(String, usize)>,
 }
 
 /// Options for [`GraphDb::open_with_options`].
@@ -1072,6 +1092,9 @@ impl<F: Fs> GraphDb<F> {
             fold_overlay: None,
             delta_tail: Vec::new(),
             commits_since_fold: 0,
+            defer_events: false,
+            deferred_events: Vec::new(),
+            degraded: false,
         };
         let snap_bytes = db.fs.read(FileId::Snapshot)?;
         // V8 path: keep MappedBase alive for zero-copy topology reads.
@@ -1382,6 +1405,9 @@ impl<F: Fs> GraphDb<F> {
             fold_overlay: None,
             delta_tail: Vec::new(),
             commits_since_fold: 0,
+            defer_events: false,
+            deferred_events: Vec::new(),
+            degraded: false,
         };
         // Base state: a truncating snapshot compacts all pre-truncation
         // commits, so the on-disk WAL head coincides with the snapshot and
@@ -2643,6 +2669,14 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // Degraded guard: fsync failure left WAL truncated; in-memory state
+        // is ahead of the on-disk WAL, so further mutations would deepen the
+        // divergence.  Reopen the database to recover.
+        if self.degraded {
+            return Err(GraphError::Io(std::io::Error::other(
+                "database degraded after group-commit fsync failure; reopen required",
+            )));
+        }
         // Invariant (I-1): no stale deltas may enter from a previous apply.
         // If any engine method ever accumulates deltas before erroring, they would
         // contaminate the *next* commit's event stream. This assert fires in debug
@@ -2709,8 +2743,19 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        self.distribute_events(&rec, &engine_deltas, seq);
-        self.emit_committed(&rec, ingest);
+        if self.defer_events {
+            // Group-commit drain thread: hold events until after the group
+            // fsync so subscribers only observe durable data (R2).
+            self.deferred_events.push(DeferredEvent {
+                rec: rec.clone(),
+                engine_deltas,
+                seq,
+                ingest,
+            });
+        } else {
+            self.distribute_events(&rec, &engine_deltas, seq);
+            self.emit_committed(&rec, ingest);
+        }
         // Drift is only known after apply, so auto-rebuild cannot join the
         // triggering op's WAL frame. Issue RebuildRule as a second commit.
         // Skip when `rec` is itself RebuildRule: rebuild resets drift, so a
@@ -2764,6 +2809,58 @@ impl<F: Fs> GraphDb<F> {
     /// Set WAL fsync cadence. Default [`FsyncPolicy::Strict`].
     pub fn set_fsync_policy(&mut self, p: FsyncPolicy) {
         self.fsync = p;
+    }
+
+    /// Return the current WAL fsync cadence.
+    pub fn fsync_policy(&self) -> FsyncPolicy {
+        self.fsync
+    }
+
+    // ── Group-commit event deferral ───────────────────────────────────────────
+
+    /// Enable or disable deferred event mode.
+    ///
+    /// When `true`, event notifications (subscription `DbEvent`s and legacy
+    /// `MutationEvent` sink calls) are buffered rather than fired immediately.
+    /// Call [`flush_deferred_events`] after the group fsync to deliver them,
+    /// or [`discard_deferred_events`] if the fsync failed and the group must
+    /// be treated as lost.
+    pub fn set_deferred_events_mode(&mut self, defer: bool) {
+        self.defer_events = defer;
+    }
+
+    /// Fire all buffered events accumulated since [`set_deferred_events_mode`]
+    /// was set to true.  Clears the buffer.
+    ///
+    /// Called by the drain thread AFTER a successful group fsync, so
+    /// subscribers observe only data that is durably on disk.
+    pub fn flush_deferred_events(&mut self) {
+        let events = std::mem::take(&mut self.deferred_events);
+        for de in events {
+            self.distribute_events(&de.rec, &de.engine_deltas, de.seq);
+            self.emit_committed(&de.rec, de.ingest);
+        }
+    }
+
+    /// Discard all buffered events without firing them.
+    ///
+    /// Called by the drain thread when a group fsync fails: the WAL has been
+    /// truncated back to the pre-group offset, so the committed-but-unsynced
+    /// ops must not be observable to subscribers.
+    pub fn discard_deferred_events(&mut self) {
+        self.deferred_events.clear();
+    }
+
+    // ── Degraded state ────────────────────────────────────────────────────────
+
+    /// Mark this database as degraded.
+    ///
+    /// Called by the group-commit drain thread after a group fsync failure and
+    /// WAL truncation: the in-memory state is now ahead of the on-disk WAL, so
+    /// further mutations would deepen the divergence.  All subsequent calls to
+    /// [`log_then_apply_with`] return `Err` until the database is reopened.
+    pub fn set_degraded(&mut self) {
+        self.degraded = true;
     }
 
     fn emit(&self, ev: MutationEvent) {
@@ -3436,11 +3533,25 @@ impl<F: Fs> GraphDb<F> {
     /// Commit one submission WITHOUT an fsync — for use inside `commit_group`
     /// and the group-commit drain thread, which do a single group fsync later.
     fn commit_batch_nosync(&mut self, ops: Vec<BatchOp>) -> Result<(usize, usize)> {
+        // Restore fsync policy even on panic via a raw-pointer drop guard.
+        // A panic here would poison the RwLock anyway, but the correct policy
+        // must be in place if the guard is ever unwrapped.
+        struct RestoreFsync(*mut FsyncPolicy, FsyncPolicy);
+        impl Drop for RestoreFsync {
+            fn drop(&mut self) {
+                // SAFETY: the pointer is valid for the full duration of
+                // commit_batch_nosync; the guard is dropped before the frame
+                // returns, and GraphDb outlives this frame.
+                unsafe {
+                    *self.0 = self.1;
+                }
+            }
+        }
         let saved = self.fsync;
+        // SAFETY: raw pointer into self; guard dropped within this frame.
+        let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
         self.fsync = FsyncPolicy::Relaxed;
-        let result = self.commit_logged_batch(ops, None);
-        self.fsync = saved;
-        result
+        self.commit_logged_batch(ops, None)
     }
 
     /// Commit multiple op-batches as a **group**: each submission gets its own

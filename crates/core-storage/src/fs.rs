@@ -142,6 +142,26 @@ pub fn sync_wal_at(dir: &std::path::Path) -> std::io::Result<()> {
     full_sync(&f)
 }
 
+/// Truncate the WAL file at `dir/wal.bin` to exactly `len` bytes and fsync
+/// the truncation to persistent storage.
+///
+/// Used by the group-commit drain thread when a group fsync fails: truncating
+/// the WAL back to the last known-good synced offset removes the unsynced
+/// frames, ensuring a crash-then-replay cannot silently make the failed group
+/// durable via a later successful fsync flushing the whole inode.
+///
+/// Returns `Ok(())` if the file does not exist (nothing to truncate).
+pub fn truncate_wal_at(dir: &std::path::Path, len: u64) -> std::io::Result<()> {
+    let path = dir.join(FileId::Wal.name());
+    let f = match OpenOptions::new().write(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    f.set_len(len)?;
+    f.sync_all() // plain sync_all is sufficient for a truncation barrier
+}
+
 fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     let d = File::open(dir)?;
     d.sync_all()

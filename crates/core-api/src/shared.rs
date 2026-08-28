@@ -21,16 +21,44 @@
 //! contract as `FsyncPolicy::Relaxed` — but submitters only receive `Ok`
 //! after the fsync, so durability is fully guaranteed from their perspective.
 //!
+//! # Fsync-failure contract
+//!
+//! If the group fsync fails the drain thread immediately:
+//! 1. **Truncates** the WAL file back to the pre-group offset — this prevents
+//!    a later successful fsync from silently making the failed group durable
+//!    by flushing the full inode page cache.
+//! 2. **Discards** buffered event notifications (no subscriber sees un-durable
+//!    data).
+//! 3. **Marks** the database degraded via [`GraphDb::set_degraded`] — all
+//!    subsequent [`submit_batch`] and `db.write()` mutation attempts return
+//!    an IO error until the database is reopened.
+//! 4. **Signals** all submitters in the failed group with an IO error.
+//! 5. **Exits** the drain loop.
+//!
+//! Readers may have already observed the failed group's data (between the
+//! write-lock release and the truncation); that window is equivalent to the
+//! `Relaxed` durability contract.
+//!
+//! # Event ordering (Strict policy, R2)
+//!
+//! Under `FsyncPolicy::Strict` or `Batched`, subscription events are deferred
+//! until after the group fsync.  The drain thread reacquires the write lock
+//! briefly to call [`GraphDb::flush_deferred_events`], then signals submitters.
+//! Under `Relaxed`, events fire immediately (no fsync to wait for).
+//!
 //! # Shutdown
 //!
-//! When the last `SharedDb` clone is dropped, `DrainHandle::drop` signals the
-//! drain thread (via the `shutdown` flag + condvar wake) and joins it.  Any
-//! submissions still queued at shutdown time receive an explicit IO error.
+//! `SharedDb` clones the drain handle via an `Arc`; the last clone to drop
+//! triggers `DrainHandle::drop`, which signals shutdown + joins the thread.
+//! The drain loop drains the queue to empty before exiting, so no submission
+//! that was enqueued before the last `SharedDb` clone is dropped can be
+//! silently lost — the enqueue call blocks until the channel is received.
 
-use crate::db::BatchOp;
+use crate::db::{BatchOp, FsyncPolicy};
 use crate::reader::ReaderSnapshot;
 use crate::GraphDb;
 use core_storage::sync_wal_at;
+use core_storage::truncate_wal_at;
 use core_storage::GraphError;
 use core_storage::RealFs;
 use core_storage::Result;
@@ -59,6 +87,10 @@ struct WriteQueue {
     pending: Mutex<Vec<Submission>>,
     notify: Condvar,
     shutdown: AtomicBool,
+    /// Set by the drain thread on a group fsync failure.  Non-None means the
+    /// drain thread has exited; future `submit_batch` calls return Err immediately
+    /// rather than blocking forever on a dead drain thread.
+    degraded_msg: Mutex<Option<String>>,
 }
 
 impl WriteQueue {
@@ -67,6 +99,7 @@ impl WriteQueue {
             pending: Mutex::new(Vec::new()),
             notify: Condvar::new(),
             shutdown: AtomicBool::new(false),
+            degraded_msg: Mutex::new(None),
         })
     }
 
@@ -81,6 +114,17 @@ impl WriteQueue {
     fn signal_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         self.notify.notify_all();
+    }
+
+    fn set_degraded(&self, msg: String) {
+        *self.degraded_msg.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+    }
+
+    fn degraded_message(&self) -> Option<String> {
+        self.degraded_msg
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Block until work is available or shutdown; return at most `MAX_GROUP_SIZE`
@@ -225,11 +269,23 @@ impl SharedDb {
     /// - Each submission becomes a separate WAL `Batch` frame.
     /// - All frames in a group share one fsync — the caller unblocks only
     ///   after that fsync.
+    /// - **Fsync failure**: the drain thread truncates the WAL back to the
+    ///   pre-group offset and marks the database degraded.  All submitters in
+    ///   the failed group and all subsequent callers receive `Err`.  Data that
+    ///   was already in readers' snapshots (observed between write-lock release
+    ///   and truncation) is not rolled back — equivalent to the `Relaxed`
+    ///   window for in-flight readers.  Reopen the database to recover.
     /// - A crash between group fsyncs loses the entire unfsynced group, but
     ///   never tears an individual submission (CRC-protected frame boundaries).
     ///
     /// Under `Relaxed` policy (set via `db.write().set_fsync_policy`):
     /// - WAL frames are appended but NOT synced; caller unblocks after apply.
+    ///
+    /// # Event ordering
+    ///
+    /// Under `Strict` / `Batched` policy, subscription events fire AFTER the
+    /// group fsync (durability before notification).  Under `Relaxed`, events
+    /// fire immediately after apply.
     ///
     /// # FIFO ordering
     ///
@@ -242,6 +298,11 @@ impl SharedDb {
     /// `(nodes_inserted, edges_inserted)` on success.  An all-noop batch
     /// returns `(0, 0)`.
     pub fn submit_batch(&self, ops: Vec<BatchOp>) -> Result<(usize, usize)> {
+        // Fast-path rejection: if the drain thread already exited due to a
+        // fsync failure, return Err immediately rather than blocking forever.
+        if let Some(msg) = self.queue.degraded_message() {
+            return Err(GraphError::Io(std::io::Error::other(msg)));
+        }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.queue.enqueue(Submission { ops, done: tx });
         rx.recv().unwrap_or_else(|_| {
@@ -268,14 +329,32 @@ fn drain_loop(
 
         // ── Apply all submissions under the write lock, NO fsync ─────────────
         //
-        // Each submission's ops are moved out to avoid a clone.
+        // Each submission's ops are moved out to avoid a clone.  We also
+        // capture the WAL file size BEFORE the commit so we can truncate it
+        // back on fsync failure (F1 invariant: Err means not committed).
+        //
+        // For Strict / Batched policy we enable deferred event mode so that
+        // subscription notifications only fire after the group fsync (R2:
+        // durability before notification).  For Relaxed policy events fire
+        // immediately (no fsync to wait for).
         let ops_batches: Vec<Vec<BatchOp>> = group
             .iter_mut()
             .map(|s| std::mem::take(&mut s.ops))
             .collect();
-        let results: Vec<Result<(usize, usize)>> = {
+
+        let (results, pre_group_wal_len, should_sync): (Vec<Result<(usize, usize)>>, u64, bool) = {
             let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
-            db.commit_group_nosync(ops_batches)
+            // Snapshot WAL size inside the write lock — no concurrent writer
+            // can change it here.
+            let pre_len = std::fs::metadata(dir.join("wal.bin"))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let sync_needed = db.fsync_policy() != FsyncPolicy::Relaxed;
+            if sync_needed {
+                db.set_deferred_events_mode(true);
+            }
+            let r = db.commit_group_nosync(ops_batches);
+            (r, pre_len, sync_needed)
             // ← write lock released here; readers unblock before fsync
         };
 
@@ -284,24 +363,53 @@ fn drain_loop(
         // Readers may see committed-but-unfsynced data between here and the
         // fsync below (same contract as Relaxed).  Submitters unblock only
         // after the fsync, guaranteeing durability from their perspective.
-        let sync_result: Result<()> = if results.iter().any(|r| r.is_ok()) {
+        let sync_result: Result<()> = if should_sync && results.iter().any(|r| r.is_ok()) {
             sync_wal_at(&dir).map_err(GraphError::Io)
         } else {
-            Ok(()) // all submissions failed validation — nothing synced
+            Ok(()) // Relaxed policy or all submissions failed validation
         };
+
+        // ── Handle fsync failure (F1) ─────────────────────────────────────────
+        if let Err(ref io_err) = sync_result {
+            if results.iter().any(|r| r.is_ok()) {
+                // Truncate WAL to pre-group size.  Removes the unsynced frames
+                // so a later successful fsync (e.g. on the next group) cannot
+                // accidentally make this group durable via OS inode cache flush.
+                let _ = truncate_wal_at(&dir, pre_group_wal_len);
+            }
+            // Discard deferred events — callers must not observe un-durable data.
+            {
+                let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+                db.discard_deferred_events();
+                db.set_deferred_events_mode(false);
+                // Mark degraded so db.write().insert_node(...) etc. also fail.
+                db.set_degraded();
+            }
+            // Propagate the failure message to the queue so submit_batch fast-
+            // rejects future callers without blocking.
+            queue.set_degraded(io_err.to_string());
+            // Signal each submitter with an IO error.
+            for sub in group {
+                let _ = sub.done.send(Err(GraphError::Io(std::io::Error::other(
+                    "group-commit fsync failed; database is degraded, reopen required",
+                ))));
+            }
+            return; // drain loop exits; no further groups accepted
+        }
+
+        // ── Flush deferred events AFTER successful fsync (R2) ────────────────
+        //
+        // Reacquire the write lock briefly so distribute_events / emit_committed
+        // run on the GraphDb's subscriber lists.
+        if should_sync {
+            let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+            db.flush_deferred_events();
+            db.set_deferred_events_mode(false);
+        }
 
         // ── Signal each submitter ────────────────────────────────────────────
         for (sub, result) in group.into_iter().zip(results) {
-            let final_result = match &sync_result {
-                Ok(()) => result,
-                Err(io_err) if result.is_ok() => {
-                    // Committed to WAL but fsync failed.  Data is in kernel
-                    // buffer but durability not guaranteed.  Report IO error.
-                    Err(GraphError::Io(std::io::Error::other(io_err.to_string())))
-                }
-                Err(_) => result, // validation error stands
-            };
-            let _ = sub.done.send(final_result);
+            let _ = sub.done.send(result);
         }
     }
 }
