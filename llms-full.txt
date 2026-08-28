@@ -3292,16 +3292,13 @@ in the database directory.
 |---|---|---|
 | `wal..archive` | each `archive_wal` snapshot | renamed WAL segment; N = cumulative end-frame index |
 | `wal.floor` | first retention prune | 8-byte LE u64; archives at or below this floor are deleted |
-| `wal.genesis` | first archive, no prior truncation | empty marker; signals that the archive chain covers genesis |
-| `wal.truncated` | first `keep_wal=false` snapshot | write-once empty marker; persists across sessions |
+| `wal.genesis` | first archive, also the store's first-ever snapshot | empty marker; signals that the archive chain covers genesis |
 
-`wal.truncated` is intentionally never deleted once written.
-
-**Upgrade note:** `wal.truncated` is a new file introduced in v0.2. It is
-written the first time a store that was previously using standard (truncating)
-`snapshot()` calls takes a snapshot under v0.2+. The file is harmless and
-requires no action. Its presence is what prevents a later archiving session
-from incorrectly claiming a complete genesis chain when WAL history has a gap.
+The genesis marker is written only when the first archive snapshot is also the
+store's very first snapshot.  A `keep_wal=false` snapshot always writes
+`snapshot.bin` before truncating the WAL, so any later archiving session in a
+new session sees `snapshot.bin` present and conservatively refuses the marker.
+Legacy stores (any prior `snapshot.bin`) are treated identically.
 
 ### Archive reachability — stated plainly
 
@@ -3317,10 +3314,10 @@ always useful.
 replays the WAL from scratch to reconstruct graph state at a point in time. It
 can only replay correctly if it has every frame from the very beginning. The
 genesis chain is intact when ALL of these are true:
-- `wal.genesis` marker is present (first archive was created before any
-  truncating snapshot)
+- `wal.genesis` marker is present (the first archive was also the store's
+  first-ever snapshot — no prior `snapshot.bin` existed, which rules out both
+  prior truncating snapshots and legacy stores)
 - `wal.floor` is 0 or absent (no archives have been pruned)
-- `wal.truncated` is absent (no prior truncating snapshot before archiving began)
 
 When the genesis chain is NOT intact (pruned archives, or archiving started
 after a prior truncating snapshot), `open_at` for archive-resident commits
