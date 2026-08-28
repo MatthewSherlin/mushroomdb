@@ -212,7 +212,11 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         | WalRecord::DeleteView { .. }
         | WalRecord::EnableFulltext { .. }
         | WalRecord::DisableFulltext { .. }
-        | WalRecord::Intern { .. } => None,
+        | WalRecord::Intern { .. }
+        // History markers are no-ops for mutation events — they carry no new
+        // state and rules re-derive deterministically on replay.
+        | WalRecord::DerivedEdgeAdded { .. }
+        | WalRecord::DerivedEdgeRetracted { .. } => None,
     }
 }
 
@@ -2617,6 +2621,9 @@ impl<F: Fs> GraphDb<F> {
                 }
                 self.fulltext.disable(label, field);
             }
+            // History markers carry no replay state — rules re-derive edges
+            // deterministically on open/replay. Skip unconditionally.
+            WalRecord::DerivedEdgeAdded { .. } | WalRecord::DerivedEdgeRetracted { .. } => {}
         }
         Ok(())
     }
@@ -2836,6 +2843,14 @@ impl<F: Fs> GraphDb<F> {
         if Self::wal_needs_sync(policy, &rec) {
             self.fs.sync(FileId::Wal)?;
         }
+        // Marker writing always needs the engine deltas, but the engine only
+        // accumulates them when emit_deltas is true (normally gated on subscribers
+        // or views being present).  Enable emission for this apply if it is
+        // currently off, then restore the original state after draining.
+        let restore_emit = !self.engine.emit_deltas();
+        if restore_emit {
+            self.engine.set_emit_deltas(true);
+        }
         let apply_result = self.apply(&rec);
         // For Batch frames, post-validation apply must be infallible (see above).
         // A debug_assert here catches any future change that makes apply fallible
@@ -2852,6 +2867,9 @@ impl<F: Fs> GraphDb<F> {
             // Discard any partial deltas accumulated by the failed apply.
             // They must not ride the next commit's event stream (I-1).
             let _ = self.engine.drain_deltas();
+            if restore_emit {
+                self.engine.set_emit_deltas(false);
+            }
             let _ = self.engine.take_rebuild_needed();
             apply_result?;
         }
@@ -2860,6 +2878,45 @@ impl<F: Fs> GraphDb<F> {
         // Drain engine deltas and distribute to subscribers before the existing
         // MutationEvent sink fires — both happen post-fsync, post-apply.
         let engine_deltas = self.engine.drain_deltas();
+        if restore_emit {
+            self.engine.set_emit_deltas(false);
+        }
+
+        // Append history-marker WAL records for any derived-edge changes so
+        // that `edge_history` and `was_linked` can surface rule-attributed
+        // events. Markers are STATE NO-OPS during replay; they are written
+        // without an additional fsync (the triggering commit's sync already
+        // happened; the next commit's sync covers these lazily).
+        if !engine_deltas.is_empty() {
+            let markers: Vec<WalRecord> = engine_deltas
+                .iter()
+                .map(|d| {
+                    if d.fired {
+                        WalRecord::DerivedEdgeAdded {
+                            rule: d.rule.clone(),
+                            edge_type: d.edge_type.clone(),
+                            src_key: d.src_key.clone(),
+                            dst_key: d.dst_key.clone(),
+                        }
+                    } else {
+                        WalRecord::DerivedEdgeRetracted {
+                            rule: d.rule.clone(),
+                            edge_type: d.edge_type.clone(),
+                            src_key: d.src_key.clone(),
+                            dst_key: d.dst_key.clone(),
+                        }
+                    }
+                })
+                .collect();
+            let marker_frame = if markers.len() == 1 {
+                markers.into_iter().next().unwrap()
+            } else {
+                WalRecord::Batch(markers)
+            };
+            // Ignore append errors: markers are best-effort history
+            // annotations. Losing them does not affect state correctness.
+            let _ = self.fs.append(FileId::Wal, &encode_record(&marker_frame));
+        }
 
         // Record MVCC CommitDelta for the epoch reader.  The WAL record is
         // stored as-is (including any nested Batch / Intern records); the
@@ -3277,7 +3334,11 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::DeleteView { .. }
             | WalRecord::EnableFulltext { .. }
             | WalRecord::DisableFulltext { .. }
-            | WalRecord::Intern { .. } => vec![],
+            | WalRecord::Intern { .. }
+            // History markers produce no DbEvent — the engine delta already
+            // fired the EdgeFired/EdgeRetracted subscription events.
+            | WalRecord::DerivedEdgeAdded { .. }
+            | WalRecord::DerivedEdgeRetracted { .. } => vec![],
         }
     }
 
@@ -5828,6 +5889,47 @@ impl<F: Fs> GraphDb<F> {
                             });
                         }
                     }
+                    WalRecord::DerivedEdgeAdded {
+                        rule,
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.push((et.clone(), src_key.clone(), dst_key.clone()));
+                            out.push(EdgeHistoryEvent {
+                                edge_type: et.clone(),
+                                commit,
+                                event: EdgeEvent::Added,
+                                rule: Some(rule.clone()),
+                            });
+                        }
+                    }
+                    WalRecord::DerivedEdgeRetracted {
+                        rule,
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            if let Some(pos) = active
+                                .iter()
+                                .position(|(aet, s, d)| aet == et && s == src_key && d == dst_key)
+                            {
+                                active.remove(pos);
+                            }
+                            out.push(EdgeHistoryEvent {
+                                edge_type: et.clone(),
+                                commit,
+                                event: EdgeEvent::Retracted,
+                                rule: Some(rule.clone()),
+                            });
+                        }
+                    }
                     // All other records (InsertNode, SetProp, CreateRule, etc.)
                     // do not affect edges between a and b.
                     _ => {}
@@ -5923,6 +6025,30 @@ impl<F: Fs> GraphDb<F> {
                     WalRecord::DeleteNode { key: k } if k == a || k == b => {
                         // All edges touching the deleted node are gone.
                         active.retain(|(_, s, d)| s != k && d != k);
+                    }
+                    WalRecord::DerivedEdgeAdded {
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                        ..
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.insert((et.clone(), src_key.clone(), dst_key.clone()));
+                        }
+                    }
+                    WalRecord::DerivedEdgeRetracted {
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                        ..
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
+                        }
                     }
                     _ => {}
                 }
@@ -7061,13 +7187,17 @@ mod tests {
     /// derived-edge-driven view values reflect the as-of state rather than just
     /// the initial backfill written at `CreateView` time.
     ///
-    /// History (6 WAL frames, indices 0..=5):
+    /// Base WAL frames (indices 0..=5 before history markers):
     ///   0: insert Org "o1"
     ///   1: create_view "employee_count" (Degree / WORKS_AT / In) on Org
     ///   2: create_rule fk_rule (WORKS_AT, Person→Org via org_id)
     ///   3: insert Person "p1" → rule fires WORKS_AT p1→o1 (degree = 1)  ← mid
     ///   4: insert Person "p2" → rule fires WORKS_AT p2→o1 (degree = 2)
     ///   5: insert Person "p3" → rule fires WORKS_AT p3→o1 (degree = 3)  ← latest
+    ///
+    /// Each rule-fire also appends a DerivedEdgeAdded history-marker frame (state
+    /// no-op), so the total commit count is higher than the base frame count.
+    /// The "latest" open_at commit is computed dynamically via `wal_commit_count_at`.
     ///
     /// Without `rebuild_all`, the as-of instance's "emp" view stays at the
     /// initial backfill value (0) instead of reflecting the replayed derived edges.
@@ -7130,15 +7260,20 @@ mod tests {
             "re-opened normal db must show degree 3"
         );
 
-        // Latest as-of (commit 5 = frames 0..=5): must match the normal open.
-        let aof_latest = GraphDb::open_at(&dir, 5).unwrap();
+        // Latest as-of (last WAL commit): must match the normal open.
+        // History-marker frames are appended after each rule-fire, so the total
+        // commit count is computed dynamically rather than hardcoded.
+        let total = crate::wal_commit_count_at(&dir).unwrap();
+        let aof_latest = GraphDb::open_at(&dir, total - 1).unwrap();
         assert_eq!(
             aof_latest.get_view_prop("o1", "emp"),
             normal_emp,
             "open_at latest: derived-edge view must equal normal open (rebuild_all required)"
         );
 
-        // Mid-history as-of (commit 3 = frames 0..=3): only p1; degree = 1.
+        // Mid-history as-of (commit 3 = p1 insert Batch frame): only p1; degree = 1.
+        // The DerivedEdgeAdded marker for p1 is at frame 4 (state no-op on replay),
+        // so replaying 0..=3 correctly re-derives only the p1→o1 edge.
         let aof_mid = GraphDb::open_at(&dir, 3).unwrap();
         assert_eq!(
             aof_mid.get_view_prop("o1", "emp"),

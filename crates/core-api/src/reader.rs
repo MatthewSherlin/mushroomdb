@@ -333,7 +333,12 @@ fn apply_one(
         | WalRecord::DeleteRule { .. }
         | WalRecord::RebuildRule { .. }
         | WalRecord::CreateView { .. }
-        | WalRecord::DeleteView { .. } => {}
+        | WalRecord::DeleteView { .. }
+        // History markers are no-ops in the read path. Rules re-derive their
+        // edges when the ReaderSnapshot queries the live engine; markers only
+        // serve edge_history / was_linked WAL scans.
+        | WalRecord::DerivedEdgeAdded { .. }
+        | WalRecord::DerivedEdgeRetracted { .. } => {}
     }
     Ok(())
 }

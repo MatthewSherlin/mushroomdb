@@ -32,9 +32,15 @@ fn tmp(name: &str) -> PathBuf {
 /// Commit layout (0-indexed WAL frames):
 ///   0: InsertNode "a" label="T" tag="x"
 ///   1: CreateRule "r1" (FieldEqual "tag", T→T→SAME)
-///   2: InsertNode "b" label="T" tag="x"  → rule fires: a-[SAME]→b derived
-///   3: SetProp "b".tag = "y"             → rule retracts a-[SAME]→b
-///   4: DeleteNode "a"
+///   2: InsertNode "b" label="T" tag="x"  → rule fires: a-[SAME]→b (and b→a)
+///   3: DerivedEdgeAdded history markers  (STATE NO-OP; markers only)
+///   4: SetProp "b".tag = "y"             → rule retracts a-[SAME]→b (and b→a)
+///   5: DerivedEdgeRetracted history markers (STATE NO-OP; markers only)
+///   6: DeleteNode "a"
+///
+/// Total: 7 WAL frames (commits 0..=6). Commits 3 and 5 are history-marker
+/// frames appended by the rule engine after each rule fire/retract; they carry
+/// zero replay state and are skipped by `apply()` / `apply_one()`.
 fn build_known_history(dir: &std::path::Path) {
     let mut db = GraphDb::open(dir).unwrap();
     // commit 0
@@ -57,19 +63,23 @@ fn build_known_history(dir: &std::path::Path) {
         via_dir: None,
     })
     .unwrap();
-    // commit 2 — rule fires (a and b share tag="x")
+    // commit 2 — rule fires (a and b share tag="x"); commit 3 = DerivedEdgeAdded markers
     db.insert_node("T", "b", vec![("tag".into(), Value::Str("x".into()))])
         .unwrap();
-    // commit 3 — tag changes, rule retracts
+    // commit 4 — tag changes, rule retracts; commit 5 = DerivedEdgeRetracted markers
     db.set_prop("b", "tag", Value::Str("y".into())).unwrap();
-    // commit 4 — delete a
+    // commit 6 — delete a
     db.delete_node("a").unwrap();
 }
 
 // ── Golden commit-count test ────────────────────────────────────────────────
 
 /// Pin that wal_commits() counts every WAL frame as one commit (both Batch
-/// and single-op), and that the known-history db has exactly 5 commits.
+/// and single-op), and that the known-history db has exactly 7 commits.
+///
+/// Frame 3 (DerivedEdgeAdded) and frame 5 (DerivedEdgeRetracted) are history-
+/// marker frames appended after each rule fire/retract.  They are STATE NO-OPS
+/// on replay but are counted as commits by wal_commits().
 ///
 /// This is the stable commit-count golden test required by Task 2 scope.
 #[test]
@@ -79,8 +89,9 @@ fn wal_commits_golden_count() {
     let bytes = std::fs::read(dir.join("wal.bin")).unwrap();
     let n = wal_commits(&bytes);
     assert_eq!(
-        n, 5,
-        "known-history db must have exactly 5 WAL frames (commits 0..=4)"
+        n, 7,
+        "known-history db must have exactly 7 WAL frames (commits 0..=6; \
+         commits 3 and 5 are history-marker frames)"
     );
 }
 
@@ -100,8 +111,8 @@ fn open_at_commit_0_only_node_a() {
     assert!(db.is_read_only(), "open_at result must be read-only");
     assert_eq!(
         db.total_wal_commits(),
-        5,
-        "total_wal_commits must reflect the full WAL count"
+        7,
+        "total_wal_commits must reflect the full WAL count including history-marker frames"
     );
 }
 
@@ -135,35 +146,39 @@ fn open_at_commit_2_edge_present_explain_shows_rule() {
 
 #[test]
 fn open_at_commit_3_edge_retracted() {
+    // Commit 3 is the DerivedEdgeAdded marker frame (state no-op).
+    // The SetProp that causes the retraction is at commit 4.
+    // After replaying 0..=4, the edge is retracted.
     let dir = tmp("at-3");
     build_known_history(&dir);
 
-    let db = GraphDb::open_at(&dir, 3).unwrap();
-    assert!(db.has_node("a"), "commit 3: a exists");
-    assert!(db.has_node("b"), "commit 3: b exists");
+    let db = GraphDb::open_at(&dir, 4).unwrap();
+    assert!(db.has_node("a"), "commit 4: a exists");
+    assert!(db.has_node("b"), "commit 4: b exists");
 
     let nbrs = db.neighbors("a", "SAME", Direction::Out).unwrap();
     assert!(
         nbrs.is_empty(),
-        "commit 3: edge must be retracted after tag change"
+        "commit 4: edge must be retracted after tag change at commit 4"
     );
 
     // explain returns empty for a pair with no derived edge
     let exps = db.explain("a", "b").unwrap();
     assert!(
         exps.is_empty(),
-        "commit 3: no derived edge, explain must be empty"
+        "commit 4: no derived edge, explain must be empty"
     );
 }
 
 #[test]
 fn open_at_commit_4_node_a_deleted() {
+    // DeleteNode "a" moved to commit 6 due to history-marker frames at commits 3 and 5.
     let dir = tmp("at-4");
     build_known_history(&dir);
 
-    let db = GraphDb::open_at(&dir, 4).unwrap();
-    assert!(!db.has_node("a"), "commit 4: node a must be deleted");
-    assert!(db.has_node("b"), "commit 4: node b still present");
+    let db = GraphDb::open_at(&dir, 6).unwrap();
+    assert!(!db.has_node("a"), "commit 6: node a must be deleted");
+    assert!(db.has_node("b"), "commit 6: node b still present");
 }
 
 // ── open_at(latest) == normal open equivalence ──────────────────────────────
@@ -287,14 +302,14 @@ fn open_at_out_of_range_returns_error() {
     let dir = tmp("oor");
     build_known_history(&dir);
 
-    // commit 5 is one past the last valid (0..=4)
-    let err = GraphDb::open_at(&dir, 5).err().expect("should err");
+    // commit 7 is one past the last valid (0..=6); total is 7 (includes marker frames)
+    let err = GraphDb::open_at(&dir, 7).err().expect("should err");
     match err {
         GraphError::CommitOutOfRange {
-            commit: 5,
-            total: 5,
+            commit: 7,
+            total: 7,
         } => {}
-        other => panic!("expected CommitOutOfRange{{5,5}}, got {other:?}"),
+        other => panic!("expected CommitOutOfRange{{7,7}}, got {other:?}"),
     }
 
     // Empty db: any commit is out of range

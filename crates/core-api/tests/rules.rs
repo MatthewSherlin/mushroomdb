@@ -121,7 +121,11 @@ fn delete_rule_removes_only_derived_edges_and_bad_rules_rejected() {
 }
 
 #[test]
-fn derived_edges_are_not_wal_logged() {
+fn derived_edge_state_records_not_wal_logged_markers_are() {
+    // State records (InsertEdge / InsertEdgeId) must NOT appear in the WAL for
+    // derived edges — rules re-derive them deterministically on replay.
+    // History markers (DerivedEdgeAdded) MUST appear so that edge_history and
+    // was_linked can surface rule attribution.
     let dir = tmp("rules-walsize");
     let mut db = GraphDb::open(&dir).unwrap();
     db.insert_node("Org", "o1", vec![]).unwrap();
@@ -136,20 +140,34 @@ fn derived_edges_are_not_wal_logged() {
     let wal = std::fs::read(dir.join("wal.bin")).unwrap();
     assert!(wal.len() as u64 > before);
     let (recs, _) = core_storage::wal::decode_all(&wal[before as usize..]);
-    let has_edge = recs.iter().any(|r| match r {
-        core_storage::wal::WalRecord::InsertEdge { .. }
-        | core_storage::wal::WalRecord::InsertEdgeId { .. } => true,
-        core_storage::wal::WalRecord::Batch(inner) => inner.iter().any(|x| {
-            matches!(
-                x,
-                core_storage::wal::WalRecord::InsertEdge { .. }
-                    | core_storage::wal::WalRecord::InsertEdgeId { .. }
-            )
-        }),
-        _ => false,
+
+    let all_inner: Vec<&WalRecord> = recs
+        .iter()
+        .flat_map(|r| match r {
+            WalRecord::Batch(inner) => inner.iter().collect::<Vec<_>>(),
+            other => vec![other],
+        })
+        .collect();
+
+    // State records must not be written for derived edges.
+    let has_state_edge = all_inner.iter().any(|r| {
+        matches!(
+            r,
+            WalRecord::InsertEdge { .. } | WalRecord::InsertEdgeId { .. }
+        )
     });
-    assert!(!has_edge, "derived edges must not be WAL-logged");
-    assert_eq!(db.edge_count(), 1); // yet the derived edge exists
+    assert!(
+        !has_state_edge,
+        "derived edge state records must not be WAL-logged"
+    );
+
+    // History markers must be written.
+    let has_marker = all_inner
+        .iter()
+        .any(|r| matches!(r, WalRecord::DerivedEdgeAdded { .. }));
+    assert!(has_marker, "DerivedEdgeAdded marker must be WAL-logged");
+
+    assert_eq!(db.edge_count(), 1); // the derived edge still exists in-memory
 }
 
 #[test]
@@ -544,18 +562,25 @@ fn approximate_rule_rebuilds_after_drift_threshold() {
     with_ivf_drift_rebuild(1, || {
         let before = wal_commit_count_at(&dir).unwrap();
         db.delete_node("v0").unwrap();
+        // Each mutation that triggers rule retractions writes an additional
+        // DerivedEdgeRetracted history-marker frame (state no-op).
+        // first delete: DeleteNode + DerivedEdgeRetracted marker = 2 commits.
         assert_eq!(
             wal_commit_count_at(&dir).unwrap(),
-            before + 1,
-            "first delete is under threshold; single commit"
+            before + 2,
+            "first delete is under threshold; DeleteNode + DerivedEdgeRetracted marker"
         );
         assert_eq!(db.ivf_dst_drift("sim"), Some(1));
 
         db.delete_node("v1").unwrap();
+        // second delete: DeleteNode(1) + DerivedEdgeRetracted marker(1) = 2 more commits for v1.
+        //              + RebuildRule(1) = 1 more commit; no rebuild marker because the
+        //                streaming rebuild finds the graph already correct (no net edge changes).
+        // Total: first_delete(2) + second_delete(2) + rebuild(1) = before + 5.
         assert_eq!(
             wal_commit_count_at(&dir).unwrap(),
-            before + 3,
-            "second delete trips drift > 1; user op + RebuildRule as two commits"
+            before + 5,
+            "second delete trips drift > 1; DeleteNode + marker + RebuildRule (no rebuild marker)"
         );
         assert_eq!(
             db.ivf_dst_drift("sim"),
@@ -575,12 +600,13 @@ fn approximate_rule_rebuilds_after_drift_threshold() {
     );
 
     // Explicit RebuildRule must not enqueue another rebuild (rebuild resets drift).
+    // No rebuild marker because streaming rebuild detects graph already correct.
     let before = wal_commit_count_at(&dir).unwrap();
     db.rebuild_rule("sim").unwrap();
     assert_eq!(
         wal_commit_count_at(&dir).unwrap(),
         before + 1,
-        "RebuildRule must not retrigger another RebuildRule"
+        "RebuildRule must not retrigger another RebuildRule; exactly 1 commit"
     );
     assert_eq!(db.ivf_dst_drift("sim"), Some(0));
 }
@@ -648,10 +674,13 @@ fn auto_rebuild_wal_failure_does_not_fail_user_write() {
             !db.has_node("v1"),
             "user delete is durable when rebuild WAL fails"
         );
+        // DeleteNode(1) + DerivedEdgeRetracted marker(1) = 2 commits.
+        // RebuildRule was rejected by FailRebuildWal so no rebuild commit.
         assert_eq!(
             wal_commit_count_at(&dir).unwrap(),
-            before + 1,
-            "RebuildRule must not be committed when its WAL append fails"
+            before + 2,
+            "RebuildRule must not be committed when its WAL append fails; \
+             only DeleteNode + DerivedEdgeRetracted marker"
         );
         assert_eq!(
             db.ivf_dst_drift("sim"),

@@ -1,4 +1,4 @@
-use core_api::{EdgeEvent, GraphDb, GraphError, HistoryChange, Value};
+use core_api::{EdgeEvent, GraphDb, GraphError, HistoryChange, Predicate, RuleDef, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-history-{}-{}", name, std::process::id()));
@@ -329,27 +329,13 @@ fn edge_history_no_mask_filtering_consistent_with_node_history() {
     assert_eq!(result.items[0].event, EdgeEvent::Added);
 }
 
-#[test]
-fn edge_history_derived_edges_not_present() {
-    // Derived edges are not WAL-logged; rule: Some(...) entries cannot
-    // appear via WAL scan. This test documents the limitation.
-    use core_api::RuleDef;
-    let dir = tmp("eh-derived");
-    let mut db = GraphDb::open(&dir).unwrap();
-    db.insert_node("Org", "o1", vec![]).unwrap();
-    db.insert_node(
-        "Person",
-        "p1",
-        vec![("org_id".into(), Value::Str("o1".into()))],
-    )
-    .unwrap();
-    // A simple KeyMatch rule: Person→Org via org_id==key.
-    let rule = RuleDef {
+fn fk_rule() -> RuleDef {
+    RuleDef {
         name: "fk".into(),
         src_label: "Person".into(),
         dst_label: "Org".into(),
         edge_type: "BelongsTo".into(),
-        predicate: core_api::Predicate::KeyMatch {
+        predicate: Predicate::KeyMatch {
             field: "org_id".into(),
         },
         max_edges: None,
@@ -358,15 +344,243 @@ fn edge_history_derived_edges_not_present() {
         via_label: None,
         via_edge: None,
         via_dir: None,
-    };
-    db.create_rule(rule).unwrap();
+    }
+}
+
+#[test]
+fn edge_history_derived_edge_fire_has_rule_attribution() {
+    // When a rule fires on insert, DerivedEdgeAdded marker is written to the WAL.
+    // edge_history must surface it with rule: Some("fk") and event: Added.
+    let dir = tmp("eh-derived-attr");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "o1", vec![]).unwrap();
+    db.create_rule(fk_rule()).unwrap();
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![("org_id".into(), Value::Str("o1".into()))],
+    )
+    .unwrap();
     // The derived edge exists in the graph.
     assert_eq!(db.edge_count(), 1);
-    // But edge_history has no WAL record for it.
+    // edge_history must now show the marker with rule attribution.
     let result = db.edge_history("p1", "o1").unwrap();
-    assert!(
-        result.items.is_empty(),
-        "derived edges must not appear in edge_history WAL scan: {:?}",
+    assert_eq!(
+        result.items.len(),
+        1,
+        "expected one Added marker, got: {:?}",
         result.items
+    );
+    assert_eq!(result.items[0].event, EdgeEvent::Added);
+    assert_eq!(result.items[0].edge_type, "BelongsTo");
+    assert_eq!(
+        result.items[0].rule,
+        Some("fk".to_string()),
+        "derived edge must carry rule attribution"
+    );
+}
+
+#[test]
+fn edge_history_derived_edge_retraction_has_rule_attribution() {
+    // When a prop update causes a derived edge to be retracted and a new one fired,
+    // edge_history shows Retracted(Some("fk")) for the old pair and Added(Some("fk"))
+    // for the new pair.
+    let dir = tmp("eh-derived-retract");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "o1", vec![]).unwrap();
+    db.insert_node("Org", "o2", vec![]).unwrap();
+    db.create_rule(fk_rule()).unwrap();
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![("org_id".into(), Value::Str("o1".into()))],
+    )
+    .unwrap();
+    // Now redirect p1's FK to o2; the rule should retract p1→o1 and fire p1→o2.
+    db.set_prop("p1", "org_id", Value::Str("o2".into()))
+        .unwrap();
+    assert_eq!(db.edge_count(), 1, "only one derived edge after redirect");
+
+    // p1→o1 history: Added then Retracted, both with rule attribution.
+    let result_o1 = db.edge_history("p1", "o1").unwrap();
+    assert_eq!(
+        result_o1.items.len(),
+        2,
+        "p1→o1 history: {:?}",
+        result_o1.items
+    );
+    assert_eq!(result_o1.items[0].event, EdgeEvent::Added);
+    assert_eq!(result_o1.items[0].rule, Some("fk".to_string()));
+    assert_eq!(result_o1.items[1].event, EdgeEvent::Retracted);
+    assert_eq!(
+        result_o1.items[1].rule,
+        Some("fk".to_string()),
+        "retraction must carry rule attribution"
+    );
+    assert!(
+        result_o1.items[0].commit < result_o1.items[1].commit,
+        "Added before Retracted in commit order"
+    );
+
+    // p1→o2 history: only Added.
+    let result_o2 = db.edge_history("p1", "o2").unwrap();
+    assert_eq!(
+        result_o2.items.len(),
+        1,
+        "p1→o2 history: {:?}",
+        result_o2.items
+    );
+    assert_eq!(result_o2.items[0].event, EdgeEvent::Added);
+    assert_eq!(result_o2.items[0].rule, Some("fk".to_string()));
+}
+
+#[test]
+fn replay_identity_with_markers() {
+    // Markers (DerivedEdgeAdded/Retracted) are STATE NO-OPS on WAL replay.
+    // After close and reopen, derived edges must be re-derived identically
+    // and edge_history must still return the correct marker items.
+    let dir = tmp("eh-replay");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("Org", "o1", vec![]).unwrap();
+        db.create_rule(fk_rule()).unwrap();
+        db.insert_node(
+            "Person",
+            "p1",
+            vec![("org_id".into(), Value::Str("o1".into()))],
+        )
+        .unwrap();
+        assert_eq!(db.edge_count(), 1);
+    }
+    // Reopen: markers in the WAL are skipped as state no-ops; rule re-derives the edge.
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.edge_count(), 1, "derived edge survives reopen");
+    // edge_history still surfaces the marker with rule attribution.
+    let result = db.edge_history("p1", "o1").unwrap();
+    assert_eq!(
+        result.items.len(),
+        1,
+        "marker survives reopen: {:?}",
+        result.items
+    );
+    assert_eq!(result.items[0].event, EdgeEvent::Added);
+    assert_eq!(result.items[0].rule, Some("fk".to_string()));
+}
+
+#[test]
+fn reader_markers_are_no_op() {
+    // open_at (ReaderSnapshot) replaying a WAL tail that contains DerivedEdgeAdded
+    // markers must treat them as no-ops — derived edge state comes from the rule engine,
+    // not from the marker.
+    let dir = tmp("eh-reader-noop");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "o1", vec![]).unwrap(); // commit 0
+    db.create_rule(fk_rule()).unwrap(); // commit 1
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![("org_id".into(), Value::Str("o1".into()))],
+    )
+    .unwrap(); // commit 2 (InsertNode) + commit 3 (DerivedEdgeAdded marker)
+    db.set_prop("p1", "color", Value::Str("blue".into()))
+        .unwrap(); // commit 4
+
+    // Open at commit 4 (which is after the marker frame at commit 3).
+    // The reader must not double-insert the derived edge from the marker.
+    let ro = GraphDb::open_at(&dir, 4).unwrap();
+    // The rule engine re-derives the edge; adjacency must be correct.
+    assert_eq!(ro.edge_count(), 1, "one derived edge at commit 4");
+    // Prop must be visible.
+    assert_eq!(ro.get_prop("p1", "color"), Some(Value::Str("blue".into())));
+}
+
+#[test]
+fn was_linked_derived_edge_lifetime() {
+    // was_linked must work across a derived edge's WAL lifetime.
+    // The DerivedEdgeAdded marker is the commit at which the edge is "linked".
+    let dir = tmp("wl-derived");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "o1", vec![]).unwrap(); // commit 0
+    db.insert_node("Org", "o2", vec![]).unwrap(); // commit 1
+    db.create_rule(fk_rule()).unwrap(); // commit 2
+                                        // insert_node fires the rule → InsertNode at commit 3, DerivedEdgeAdded at commit 4.
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![("org_id".into(), Value::Str("o1".into()))],
+    )
+    .unwrap();
+    // set_prop retracts p1→o1 and fires p1→o2.
+    // SetProp at commit 5, Batch[DerivedEdgeRetracted(p1→o1), DerivedEdgeAdded(p1→o2)] at commit 6.
+    db.set_prop("p1", "org_id", Value::Str("o2".into()))
+        .unwrap();
+
+    // Determine exact commit of the DerivedEdgeAdded marker by checking edge_history.
+    let h = db.edge_history("p1", "o1").unwrap();
+    assert_eq!(h.items.len(), 2, "p1→o1 history: {:?}", h.items);
+    let added_commit = h.items[0].commit;
+    let retracted_commit = h.items[1].commit;
+
+    // Before the added commit: not linked.
+    if added_commit > 0 {
+        assert!(
+            !db.was_linked("p1", "o1", "BelongsTo", added_commit - 1)
+                .unwrap(),
+            "before marker: not linked"
+        );
+    }
+    // At added commit: linked.
+    assert!(
+        db.was_linked("p1", "o1", "BelongsTo", added_commit)
+            .unwrap(),
+        "at added commit: linked"
+    );
+    // Between added and retracted: still linked (if there are commits between).
+    if retracted_commit > added_commit + 1 {
+        assert!(
+            db.was_linked("p1", "o1", "BelongsTo", retracted_commit - 1)
+                .unwrap(),
+            "before retract: linked"
+        );
+    }
+    // At retracted commit: no longer linked.
+    assert!(
+        !db.was_linked("p1", "o1", "BelongsTo", retracted_commit)
+            .unwrap(),
+        "at retracted commit: not linked"
+    );
+}
+
+#[test]
+fn group_commit_triggers_rule_markers_written() {
+    // write_batch (group-commit path) must also write DerivedEdgeAdded markers
+    // when a rule fires during the batch commit.
+    let dir = tmp("eh-batch-markers");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Org", "o1", vec![]).unwrap();
+    db.create_rule(fk_rule()).unwrap();
+    // Trigger rule via write_batch (one Batch WAL frame).
+    db.write_batch(|b| {
+        b.insert_node(
+            "Person",
+            "p1",
+            vec![("org_id".into(), Value::Str("o1".into()))],
+        );
+    })
+    .unwrap();
+    assert_eq!(db.edge_count(), 1, "derived edge created via batch");
+    // edge_history must show the DerivedEdgeAdded marker with rule attribution.
+    let result = db.edge_history("p1", "o1").unwrap();
+    assert_eq!(
+        result.items.len(),
+        1,
+        "marker from batch commit: {:?}",
+        result.items
+    );
+    assert_eq!(result.items[0].event, EdgeEvent::Added);
+    assert_eq!(
+        result.items[0].rule,
+        Some("fk".to_string()),
+        "batch-commit marker must carry rule attribution"
     );
 }

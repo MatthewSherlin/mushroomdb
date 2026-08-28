@@ -102,6 +102,32 @@ pub enum WalRecord {
         id: u32,
         text: String,
     },
+    // ── History-marker variants (appended after Intern; discriminants 18–19) ──
+    //
+    // These are HISTORY MARKERS only — they record that a rule-derived edge was
+    // added or retracted at a given commit.  They carry **zero replay semantics**:
+    // every apply/replay site must treat them as no-ops (rules re-derive
+    // deterministically on open/replay). Their sole purpose is to make
+    // `edge_history` and `was_linked` aware of derived-edge lifetimes without
+    // adding any new state.
+    //
+    // Note: churny top-k rules write one marker per edge-fire/retract per
+    // commit.  Snapshot truncation bounds the WAL size; Task 4's archive
+    // support will retain markers across snapshot boundaries.
+    /// A rule-derived edge was added.  Discriminant 18.
+    DerivedEdgeAdded {
+        rule: String,
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+    },
+    /// A rule-derived edge was retracted.  Discriminant 19.
+    DerivedEdgeRetracted {
+        rule: String,
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+    },
 }
 
 /// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.

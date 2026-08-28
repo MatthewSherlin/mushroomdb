@@ -412,16 +412,35 @@ fn create_rule_then_delete_edge_in_same_batch_is_dropped_not_rule_owned() {
         .unwrap();
 
     // Delete was dropped: WAL Batch contains CreateRule only.
+    // After the batch commit, the rule fires (a and b share "x" tag), so one or more
+    // DerivedEdgeAdded history-marker frames are appended after the batch frame.
     let wal = std::fs::read(dir.join("wal.bin")).unwrap();
     let suffix = &wal[before as usize..];
     let (recs, _) = decode_all(suffix);
-    assert_eq!(recs.len(), 1);
+    assert!(!recs.is_empty(), "must have at least the Batch frame");
     match &recs[0] {
         WalRecord::Batch(inner) => {
             assert_eq!(inner.len(), 1);
             assert!(matches!(inner[0], WalRecord::CreateRule { .. }));
         }
         other => panic!("expected Batch, got {other:?}"),
+    }
+    // Any additional frames must be history-marker records only (state no-ops).
+    for r in &recs[1..] {
+        let all_markers = match r {
+            WalRecord::Batch(inner) => inner.iter().all(|x| {
+                matches!(
+                    x,
+                    WalRecord::DerivedEdgeAdded { .. } | WalRecord::DerivedEdgeRetracted { .. }
+                )
+            }),
+            WalRecord::DerivedEdgeAdded { .. } | WalRecord::DerivedEdgeRetracted { .. } => true,
+            _ => false,
+        };
+        assert!(
+            all_markers,
+            "extra WAL frames after the batch must be history markers only, got: {r:?}"
+        );
     }
 
     assert_eq!(
