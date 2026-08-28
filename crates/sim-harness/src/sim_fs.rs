@@ -1,6 +1,7 @@
 use core_storage::fs::{FileId, Fs, FsIntrospect};
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// In-memory filesystem for deterministic simulation testing.
 ///
@@ -38,6 +39,10 @@ pub struct SimFs {
     ops: Cell<usize>,
     /// Set when the op limit fires.  Blocks all four methods.
     op_crashed: Cell<bool>,
+    /// Optional artificial latency injected into each successful `sync` call.
+    /// Used by throughput benchmarks to simulate slow-storage (HDD / NVMe with
+    /// flush guarantee) without requiring real disk I/O.  Zero by default.
+    sync_delay_us: u64,
 }
 
 fn name(f: FileId) -> &'static str {
@@ -70,6 +75,20 @@ impl SimFs {
     pub fn with_crash_after_ops(n_ops: usize) -> Self {
         Self {
             crash_after_ops: Some(n_ops),
+            ..Self::default()
+        }
+    }
+
+    /// Slow-storage simulation: each successful `sync` call sleeps for
+    /// `delay_us` microseconds before returning.
+    ///
+    /// Used by environment-independent throughput benchmarks to prove the
+    /// group-commit amortization property without real disk I/O.  A delay of
+    /// 5 ms (~5_000 µs) approximates a spinning disk or NVMe with
+    /// `F_FULLFSYNC` / `fdatasync` enforcement.
+    pub fn with_sync_delay_us(delay_us: u64) -> Self {
+        Self {
+            sync_delay_us: delay_us,
             ..Self::default()
         }
     }
@@ -156,6 +175,10 @@ impl Fs for SimFs {
         self.check_op_crash()?;
         self.syncs += 1;
         self.tick_op();
+        // Artificial latency: simulates slow storage for environment-independent benches.
+        if self.sync_delay_us > 0 {
+            std::thread::sleep(Duration::from_micros(self.sync_delay_us));
+        }
         Ok(())
     }
 
