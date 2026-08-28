@@ -102,6 +102,32 @@ pub enum WalRecord {
         id: u32,
         text: String,
     },
+    // ── History-marker variants (appended after Intern; discriminants 18–19) ──
+    //
+    // These are HISTORY MARKERS only — they record that a rule-derived edge was
+    // added or retracted at a given commit.  They carry **zero replay semantics**:
+    // every apply/replay site must treat them as no-ops (rules re-derive
+    // deterministically on open/replay). Their sole purpose is to make
+    // `edge_history` and `was_linked` aware of derived-edge lifetimes without
+    // adding any new state.
+    //
+    // Note: churny top-k rules write one marker per edge-fire/retract per
+    // commit.  Snapshot truncation bounds the WAL size; Task 4's archive
+    // support will retain markers across snapshot boundaries.
+    /// A rule-derived edge was added.  Discriminant 18.
+    DerivedEdgeAdded {
+        rule: String,
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+    },
+    /// A rule-derived edge was retracted.  Discriminant 19.
+    DerivedEdgeRetracted {
+        rule: String,
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+    },
 }
 
 /// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.
@@ -622,6 +648,61 @@ mod tests {
         assert_eq!(&p[0..4], &[16, 0, 0, 0], "InsertEdgeId discriminant is 16");
         let p = bincode::serialize(&recs[0]).unwrap();
         assert_eq!(&p[0..4], &[17, 0, 0, 0], "Intern discriminant is 17");
+    }
+
+    #[test]
+    fn history_marker_discriminants_pinned() {
+        // DerivedEdgeAdded and DerivedEdgeRetracted are history-marker variants
+        // appended to the WAL for rule attribution; their discriminants must
+        // never shift (any insertion before them would corrupt existing WAL files).
+        let added = WalRecord::DerivedEdgeAdded {
+            rule: "r".into(),
+            edge_type: "T".into(),
+            src_key: "a".into(),
+            dst_key: "b".into(),
+        };
+        let retracted = WalRecord::DerivedEdgeRetracted {
+            rule: "r".into(),
+            edge_type: "T".into(),
+            src_key: "a".into(),
+            dst_key: "b".into(),
+        };
+        let pa = bincode::serialize(&added).unwrap();
+        assert_eq!(
+            &pa[0..4],
+            &[18, 0, 0, 0],
+            "DerivedEdgeAdded discriminant changed — a variant was inserted before position 18"
+        );
+        let pr = bincode::serialize(&retracted).unwrap();
+        assert_eq!(
+            &pr[0..4],
+            &[19, 0, 0, 0],
+            "DerivedEdgeRetracted discriminant changed — a variant was inserted before position 19"
+        );
+        // Roundtrip both through encode_record / decode_all.
+        let mut buf = encode_record(&added);
+        buf.extend(encode_record(&retracted));
+        let (recs, consumed) = decode_all(&buf);
+        assert_eq!(consumed, buf.len());
+        assert_eq!(recs.len(), 2);
+        assert_eq!(
+            recs[0],
+            WalRecord::DerivedEdgeAdded {
+                rule: "r".into(),
+                edge_type: "T".into(),
+                src_key: "a".into(),
+                dst_key: "b".into(),
+            }
+        );
+        assert_eq!(
+            recs[1],
+            WalRecord::DerivedEdgeRetracted {
+                rule: "r".into(),
+                edge_type: "T".into(),
+                src_key: "a".into(),
+                dst_key: "b".into(),
+            }
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ pub use core_rules::{
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{
     snapshot_version_at, write_snapshot_bak, BatchBuilder, BatchOp, DeleteReport, EdgeInfo,
-    Explanation, FsyncPolicy, GraphDb, MutationEvent, NodeInfo, NodeRef, OpenOptions,
+    Explanation, FsyncPolicy, GraphDb, MutationEvent, NodeInfo, NodeRef, OpenOptions, Precondition,
     PredicateSummary, RuleStats, SnapshotOptions, Stats,
 };
 
@@ -31,7 +31,7 @@ pub use db::{
 /// Exposed so CLI and tooling can print `V<SNAPSHOT_VERSION>` without depending
 /// directly on `core-storage`.
 pub const SNAPSHOT_VERSION: u16 = core_storage::snapshot::VERSION;
-pub use history::{HistoryChange, HistoryEntry};
+pub use history::{EdgeEvent, EdgeHistoryEvent, HistoryChange, HistoryEntry, HistoryResult};
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };

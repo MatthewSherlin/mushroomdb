@@ -7,6 +7,36 @@ variable-length paths and `shortestPath`.
 
 ---
 
+## Key idiom — how to filter and read node keys
+
+**Node keys are NOT properties.** There is no `id` property and no `key()`
+function. Accessing `n.id` returns `null` (or `None` in Python); filtering with
+`{id: 'alice'}` matches nothing because the key is not stored as a property
+named `id`.
+
+**To filter by key:** use `WHERE n = 'alice'` (equality between a node variable
+and a string literal matches on the node key).
+
+**To read the key:** use a bare `RETURN n`. The result row value for a node
+variable is the key string, not a node object.
+
+```cypher
+-- correct: filter by key
+MATCH (n:Person) WHERE n = 'alice' RETURN n
+
+-- correct: read key and a property
+MATCH (n:Person)-[:KNOWS]->(m:Person)
+WHERE n = 'alice'
+RETURN n, m, m.age
+
+-- WRONG: n.id is always null
+MATCH (n:Person) WHERE n.id = 'alice' RETURN n   -- returns nothing
+```
+
+In Python: `row["n"]` is the key string `"alice"`, not a dict.
+
+---
+
 ## Basic patterns
 
 ```cypher
@@ -25,7 +55,7 @@ LIMIT 10
 
 - `var` — optional binding name
 - `:Label` — optional label filter
-- `{key: 'value'}` — zero or more property equality filters
+- `{key: 'value'}` — zero or more property equality filters (not the node key — see Key idiom above)
 
 ### Relationship patterns
 

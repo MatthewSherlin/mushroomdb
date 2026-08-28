@@ -96,7 +96,7 @@ let mask = NodeMask::from_keys(&db, ["alice", "bob"]);
 let rows = db.query_masked("MATCH (p:Person) RETURN p", &Default::default(), &mask)?;
 ```
 
-## MCP tools (12 total)
+## MCP tools (15 total)
 
 | Tool | Description |
 |---|---|
@@ -112,6 +112,9 @@ let rows = db.query_masked("MATCH (p:Person) RETURN p", &Default::default(), &ma
 | `node_info` | Node key, label, properties |
 | `node_edges` | Incident edges with derived flag |
 | `stats` | Live node/edge/rule counts |
+| `node_history` | WAL change history for a node; returns {key, history, total_commits} |
+| `edge_history` | Add/retract lifecycle for edges between two nodes with rule attribution; returns {a, b, events, total_commits} |
+| `was_linked` | Point-in-time edge check; returns {linked} or error when outside horizon |
 
 Claude Desktop config:
 ```json
@@ -140,6 +143,20 @@ Predicates compose via `All(...)` (AND, score = min) and `Any(...)` (OR, score =
 
 `approximate: true` on `VectorSimilar` uses in-tree HNSW (recall min 0.90, mean 0.998 at 5k/dim 1536, fixed-seed probe).
 
+## Cypher key idiom
+
+Node keys are NOT stored as a property. `n.id` is always null. There is no `key()` function.
+
+- Filter by key: `WHERE n = 'alice'` (node variable equals a string literal)
+- Read the key: bare `RETURN n` — the result value for a node variable is the key string
+
+```cypher
+MATCH (n:Person) WHERE n = 'alice' RETURN n   -- correct
+MATCH (n:Person) WHERE n.id = 'alice' RETURN n -- WRONG: n.id is null
+```
+
+In Python, `row["n"]` gives the key string `"alice"`, not a dict.
+
 ## Cypher subset
 
 Supported: MATCH, WHERE (AND/OR/NOT, IN, IS NULL/IS NOT NULL), RETURN (DISTINCT), ORDER BY,
@@ -150,12 +167,68 @@ scalar functions (toLower, toUpper, size, coalesce, type(r), abs, round).
 
 Not supported: CASE, subqueries, UNION, multi-statement BEGIN/COMMIT transactions.
 
+Query result dict keys (Python): the dict keys in each result row are the RETURN aliases
+from the query. `RETURN p, o, r.score AS score` produces rows with keys `"p"`, `"o"`, `"score"`.
+
+## Symmetric predicates
+
+When `src_label == dst_label` (e.g., Person-to-Person similarity), the rule fires in both
+directions — a property change on any node evaluates that node as both source and destination.
+This creates edges in both directions (a→b and b→a). An undirected Cypher pattern
+`MATCH (a)-[:SIMILAR]-(b)` double-counts rows. Use directed patterns `MATCH (a)-[:SIMILAR]->(b)`
+or `RETURN DISTINCT a, b` to avoid duplicates.
+
+## Python API notes
+
+`GraphDb.open(path)` creates the database directory if it does not already exist — no
+manual mkdir required.
+
+`max_edges` in `create_rule`: Python `None` and a missing key both fill the predicate
+default (32 for scored predicates, 1 for KeyMatch). This is the same as HTTP null.
+Neither Python nor HTTP can express the Rust `max_edges: None` global-budget hatch
+(1,000,000 per source); use the Rust API directly for that.
+
+`query()` result rows are dicts; keys are the RETURN aliases from the Cypher query.
+
+## Temporal history and compare-and-set
+
+Three history APIs expose the WAL timeline with rule attribution:
+
+- `node_history(key)` — every change for a node since the last truncating snapshot
+- `edge_history(a, b)` — add/retract lifecycle for all edges between two nodes;
+  `rule` field names the rule for derived edges, null for manual edges
+- `was_linked(a, b, edge_type, at_commit)` — point-in-time edge existence check
+
+Available over: Rust API, MCP tools (`node_history`, `edge_history`, `was_linked`),
+and HTTP (`GET /node/{key}/history`, `GET /history/edge`, `GET /history/was_linked`).
+
+Rule attribution: when the rule engine fires or retracts a derived edge, a
+HISTORY-MARKER WAL record (DerivedEdgeAdded discriminant 18, DerivedEdgeRetracted
+discriminant 19) is appended in the same commit frame. These markers are state no-ops
+on replay (derived edges re-derive from rules deterministically) but are read by
+history scans as the authoritative record of when and why each link was created or
+retracted.
+
+Horizon contract: all history endpoints return `total_commits` (exclusive upper bound
+for valid commit indices). Pre-truncating-snapshot commits are not visible.
+
+Compare-and-set writes (`write_batch_cas` / `submit_batch_cas`): check that nodes
+have not changed before committing. `last_changed(key)` returns `Some(commit_seq)` or
+`None`. Preconditions are checked atomically; failure → `GraphError::CasConflict`.
+`last_changed` values are persisted in V8 snapshot section 11 (LAST_CHANGE).
+
+WAL archives (`archive_wal: true`): renamed WAL segments kept as sidecar files.
+Archives always extend history scans (record-scanning is prefix-independent).
+Archives extend `open_at` time travel ONLY on an unpruned genesis chain
+(wal.genesis present, wal.floor == 0, wal.truncated absent). Pruned or incomplete
+genesis chains → CommitOutOfRange for archive-resident commits (never wrong data).
+
 ## Storage
 
 - Dense-id WAL with per-commit fsync; configurable FsyncPolicy (strict/batched/relaxed)
-- V8 mmap snapshot (v0.2+): 11 rkyv sections (TOPOLOGY, COLUMNS, IDS, SYMS, META,
-  EDGE_PROPS, HNSW, PROVENANCE, RULES_META, VIEWS, IVF_STATE); zero-copy open via
-  mmap; no heap allocation for section data; O(1) per-query section access
+- V8 mmap snapshot (v0.2+): 12 rkyv sections (TOPOLOGY, COLUMNS, IDS, SYMS, META,
+  EDGE_PROPS, HNSW, PROVENANCE, RULES_META, VIEWS, IVF_STATE, LAST_CHANGE); zero-copy
+  open via mmap; no heap allocation for section data; O(1) per-query section access
 - V5/V6/V7 snapshots auto-migrated to V8 on open; V3/V4 rejected
 - Single writer, many readers (RwLock-backed SharedDb)
 - RAM-bound; design target 10M nodes (~5–15 GiB with properties)
@@ -163,7 +236,7 @@ Not supported: CASE, subqueries, UNION, multi-statement BEGIN/COMMIT transaction
   (warm file cache, cold process; measured 2026-08-28, Apple M4 Pro, release build)
 - 100k nodes, WAL-only open: ~8.16 min (HNSW re-fitting dominates; measured 2026-08-24)
 - V8 snapshot size: 1.8 GiB (same 100k dataset; 18% smaller than V5's 2.2 GiB)
-- mushroomdb verify <db-dir>: CRC32 audit of all 11 sections; 0.26 s on 1.8 GiB; exits 2 on mismatch
+- mushroomdb verify <db-dir>: CRC32 audit of all 12 sections; 0.26 s on 1.8 GiB; exits 2 on mismatch
 
 ## GitHub
 

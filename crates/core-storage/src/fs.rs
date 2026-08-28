@@ -52,6 +52,124 @@ pub trait Fs {
         bytes.truncate(n);
         Ok(bytes)
     }
+
+    // ── WAL archive methods (Task 4: history-preserving snapshots) ─────────────
+
+    /// List all WAL archive identifiers, sorted ascending (oldest first).
+    ///
+    /// Each archive created by [`archive_wal`] with commit-seq `N` appears as `N`.
+    /// Returns an empty list when no archives exist.
+    ///
+    /// Default: no archive support — returns empty.
+    fn list_archives(&self) -> std::io::Result<Vec<u64>> {
+        Ok(vec![])
+    }
+
+    /// Read the byte contents of WAL archive `n`.
+    ///
+    /// Returns an empty `Vec` when the archive does not exist.
+    ///
+    /// Default: no archive support — returns empty.
+    fn read_archive(&self, _n: u64) -> std::io::Result<Vec<u8>> {
+        Ok(vec![])
+    }
+
+    /// Atomically rename the current WAL to `wal.<n>.archive` (same directory,
+    /// same filesystem — the rename is guaranteed atomic at the OS level).
+    ///
+    /// The caller ensures the snapshot has been durably written before calling
+    /// this method.  After a successful rename the old WAL no longer exists as
+    /// `wal.bin`; a subsequent [`write_atomic`] on `FileId::Wal` creates a new
+    /// empty WAL.
+    ///
+    /// Returns `Err` if the operation is not supported or fails.
+    fn archive_wal(&mut self, _n: u64) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "archive_wal not supported by this Fs implementation",
+        ))
+    }
+
+    /// Delete archive `n`.  No-op if it does not exist.
+    ///
+    /// Retention pruning (inside `snapshot_with`) is the only call site.
+    ///
+    /// Default: no-op.
+    fn delete_archive(&mut self, _n: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Return the persisted horizon floor — the global frame index of the
+    /// first commit that is still reachable through surviving archives.
+    ///
+    /// Defaults to `0` (all history reachable / no pruning ever performed).
+    fn read_horizon_floor(&self) -> std::io::Result<u64> {
+        Ok(0)
+    }
+
+    /// Atomically persist `floor` so that a subsequent [`read_horizon_floor`]
+    /// after reopen returns the same value.
+    ///
+    /// Default: no-op (in-memory only; override in durable implementations).
+    fn write_horizon_floor(&mut self, _floor: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Return `true` when the `wal.genesis` marker file is present.
+    ///
+    /// The marker signals that the surviving archive chain forms a complete,
+    /// uninterrupted WAL history starting from the store's first-ever commit
+    /// (the genesis chain).  When absent, archive-resident commits are not
+    /// safe to replay from empty state and `open_at` must refuse them.
+    ///
+    /// Default: `false` (no genesis chain / no archive support).
+    fn has_genesis_marker(&self) -> bool {
+        false
+    }
+
+    /// Durably create the `wal.genesis` marker file.
+    ///
+    /// Written exactly once, when the first WAL archive is taken from a store
+    /// that has never undergone a WAL-truncating snapshot.
+    ///
+    /// Default: no-op.
+    fn write_genesis_marker(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Remove the `wal.genesis` marker file.
+    ///
+    /// Called when the genesis chain is broken: either by archive pruning
+    /// (floor advances past 0) or by a WAL-truncating snapshot taken after
+    /// archives already exist.  No-op if the marker is absent.
+    ///
+    /// Default: no-op.
+    fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Return `true` when the `wal.truncated` marker file is present.
+    ///
+    /// The marker is written once on every WAL-truncating snapshot
+    /// (`keep_wal=false`) and is NEVER deleted.  It records permanently that
+    /// this store's WAL history contains a gap, preventing a later archive
+    /// session from falsely claiming a complete genesis chain via the
+    /// `wal.genesis` marker.
+    ///
+    /// Default: `false` (no truncation recorded / no archive support).
+    fn has_truncation_marker(&self) -> bool {
+        false
+    }
+
+    /// Durably write the `wal.truncated` marker file.
+    ///
+    /// Called once per WAL-truncating snapshot (idempotent — subsequent calls
+    /// are no-ops at the filesystem level because the file already exists).
+    /// There is intentionally no corresponding delete method.
+    ///
+    /// Default: no-op.
+    fn write_truncation_marker(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub trait FsIntrospect {
@@ -132,6 +250,109 @@ impl Fs for RealFs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e),
         }
+    }
+
+    fn list_archives(&self) -> std::io::Result<Vec<u64>> {
+        let mut ns = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            if let Some(mid) = s
+                .strip_prefix("wal.")
+                .and_then(|r| r.strip_suffix(".archive"))
+            {
+                if let Ok(n) = mid.parse::<u64>() {
+                    ns.push(n);
+                }
+            }
+        }
+        ns.sort_unstable();
+        Ok(ns)
+    }
+
+    fn read_archive(&self, n: u64) -> std::io::Result<Vec<u8>> {
+        let path = self.dir.join(format!("wal.{n}.archive"));
+        match std::fs::read(&path) {
+            Ok(b) => Ok(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn archive_wal(&mut self, n: u64) -> std::io::Result<()> {
+        let wal_path = self.path(FileId::Wal);
+        let archive_path = self.dir.join(format!("wal.{n}.archive"));
+        std::fs::rename(&wal_path, &archive_path)?;
+        sync_dir(&self.dir)
+    }
+
+    fn delete_archive(&mut self, n: u64) -> std::io::Result<()> {
+        let path = self.dir.join(format!("wal.{n}.archive"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => sync_dir(&self.dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn read_horizon_floor(&self) -> std::io::Result<u64> {
+        let path = self.dir.join("wal.floor");
+        match std::fs::read(&path) {
+            Ok(b) if b.len() >= 8 => Ok(u64::from_le_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ])),
+            Ok(_) => Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn write_horizon_floor(&mut self, floor: u64) -> std::io::Result<()> {
+        let tmp = self.dir.join("wal.floor.tmp");
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&floor.to_le_bytes())?;
+            full_sync(&f)?;
+        }
+        std::fs::rename(&tmp, self.dir.join("wal.floor"))?;
+        sync_dir(&self.dir)
+    }
+
+    fn has_genesis_marker(&self) -> bool {
+        self.dir.join("wal.genesis").exists()
+    }
+
+    fn write_genesis_marker(&mut self) -> std::io::Result<()> {
+        let path = self.dir.join("wal.genesis");
+        {
+            let mut f = File::create(&path)?;
+            f.write_all(b"")?;
+            full_sync(&f)?;
+        }
+        sync_dir(&self.dir)
+    }
+
+    fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
+        match std::fs::remove_file(self.dir.join("wal.genesis")) {
+            Ok(()) => sync_dir(&self.dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn has_truncation_marker(&self) -> bool {
+        self.dir.join("wal.truncated").exists()
+    }
+
+    fn write_truncation_marker(&mut self) -> std::io::Result<()> {
+        let path = self.dir.join("wal.truncated");
+        {
+            let mut f = File::create(&path)?;
+            f.write_all(b"")?;
+            full_sync(&f)?;
+        }
+        sync_dir(&self.dir)
     }
 }
 

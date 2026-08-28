@@ -40,8 +40,8 @@
 //! EOF on `reader` returns `Ok(())`. Read/write I/O errors propagate.
 
 use crate::json::{
-    node_edges_json, node_info_json, params_from_json, parse_ingest_edges, result_set_json,
-    rule_def_from_json,
+    edge_history_result_json, node_edges_json, node_history_json, node_info_json, params_from_json,
+    parse_ingest_edges, result_set_json, rule_def_from_json,
 };
 use core_api::{
     json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, NodeMask, SharedDb, Value,
@@ -162,6 +162,9 @@ fn dispatch_call(db: &SharedDb, params: Option<&Js>) -> CallOutcome {
         "find_similar" => tool_find_similar(db, args),
         "explain_association" => tool_explain(db, args),
         "hybrid_search" => tool_hybrid_search(db, args),
+        "node_history" => tool_node_history(db, args),
+        "edge_history" => tool_edge_history(db, args),
+        "was_linked" => tool_was_linked(db, args),
         _ => protocol_invalid(),
     }
 }
@@ -633,6 +636,73 @@ fn tool_hybrid_search(db: &SharedDb, args: &Js) -> CallOutcome {
     }))
 }
 
+fn tool_node_history(db: &SharedDb, args: &Js) -> CallOutcome {
+    let Some(key) = args.get("key").and_then(Js::as_str) else {
+        return CallOutcome::ToolErr("missing key".into());
+    };
+    let g = db.read();
+    let entries = match g.node_history(key) {
+        Ok(e) => e,
+        Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+    };
+    let total_commits = match g.wal_total_commits() {
+        Ok(n) => n,
+        Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+    };
+    CallOutcome::ToolOk(node_history_json(key, &entries, total_commits))
+}
+
+fn tool_edge_history(db: &SharedDb, args: &Js) -> CallOutcome {
+    let Some(a) = args.get("a").and_then(Js::as_str).filter(|s| !s.is_empty()) else {
+        return CallOutcome::ToolErr("missing a".into());
+    };
+    let Some(b) = args.get("b").and_then(Js::as_str).filter(|s| !s.is_empty()) else {
+        return CallOutcome::ToolErr("missing b".into());
+    };
+    let result = {
+        let g = db.read();
+        g.edge_history(a, b)
+    };
+    match result {
+        Ok(hr) => CallOutcome::ToolOk(edge_history_result_json(a, b, &hr)),
+        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+    }
+}
+
+fn tool_was_linked(db: &SharedDb, args: &Js) -> CallOutcome {
+    let Some(a) = args.get("a").and_then(Js::as_str).filter(|s| !s.is_empty()) else {
+        return CallOutcome::ToolErr("missing a".into());
+    };
+    let Some(b) = args.get("b").and_then(Js::as_str).filter(|s| !s.is_empty()) else {
+        return CallOutcome::ToolErr("missing b".into());
+    };
+    let Some(edge_type) = args
+        .get("edge_type")
+        .and_then(Js::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return CallOutcome::ToolErr("missing edge_type".into());
+    };
+    let at_commit = match args.get("at_commit").and_then(Js::as_u64) {
+        Some(n) => n,
+        None => return CallOutcome::ToolErr("missing or invalid at_commit".into()),
+    };
+    let result = {
+        let g = db.read();
+        g.was_linked(a, b, edge_type, at_commit)
+    };
+    match result {
+        Ok(linked) => CallOutcome::ToolOk(json!({
+            "a": a,
+            "b": b,
+            "edge_type": edge_type,
+            "at_commit": at_commit,
+            "linked": linked,
+        })),
+        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+    }
+}
+
 fn graph_err_msg(e: GraphError) -> String {
     match e {
         GraphError::QueryError { detail } | GraphError::IngestError { detail } => detail,
@@ -839,6 +909,43 @@ fn tools_list() -> Js {
                     },
                     "required": ["query_text", "text_field"]
                 }
+            },
+            {
+                "name": "node_history",
+                "description": "Return the WAL change history for a node. Events include NodeInserted, PropSet, PropRemoved, EdgeAdded, EdgeRemoved, and NodeDeleted. The response includes `total_commits` (the horizon upper bound). History is WAL-scoped — pre-snapshot commits are not visible.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string", "description": "Node key to look up." }
+                    },
+                    "required": ["key"]
+                }
+            },
+            {
+                "name": "edge_history",
+                "description": "Return the full add/retract lifecycle for edges between nodes `a` and `b`. Includes derived (rule-attributed) edges via DerivedEdgeAdded/DerivedEdgeRetracted WAL markers. The response includes `total_commits` (the horizon upper bound).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "a": { "type": "string", "minLength": 1, "description": "First node key." },
+                        "b": { "type": "string", "minLength": 1, "description": "Second node key." }
+                    },
+                    "required": ["a", "b"]
+                }
+            },
+            {
+                "name": "was_linked",
+                "description": "Return whether an edge of `edge_type` existed between nodes `a` and `b` (either direction) at WAL commit `at_commit`. Returns an error when `at_commit` is outside the visible horizon (`0..total_commits`).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "a": { "type": "string", "minLength": 1, "description": "First node key." },
+                        "b": { "type": "string", "minLength": 1, "description": "Second node key." },
+                        "edge_type": { "type": "string", "minLength": 1, "description": "Edge type to check." },
+                        "at_commit": { "type": "integer", "minimum": 0, "description": "0-based WAL commit index to query." }
+                    },
+                    "required": ["a", "b", "edge_type", "at_commit"]
+                }
             }
         ]
     })
@@ -998,7 +1105,7 @@ mod tests {
     // --- existing tools ---
 
     #[test]
-    fn test_tools_list_includes_all_twelve() {
+    fn test_tools_list_includes_all_fifteen() {
         let db = demo_db();
         let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().expect("tools array");
@@ -1019,13 +1126,16 @@ mod tests {
             "find_similar",
             "explain_association",
             "hybrid_search",
+            "node_history",
+            "edge_history",
+            "was_linked",
         ] {
             assert!(names.contains(expected), "missing tool: {expected}");
         }
         assert_eq!(
             names.len(),
-            12,
-            "expected exactly 12 tools, got {}",
+            15,
+            "expected exactly 15 tools, got {}",
             names.len()
         );
     }
@@ -1363,5 +1473,130 @@ mod tests {
         ));
         // Both tools return identical results.
         assert_eq!(explain, assoc);
+    }
+
+    // ── history tools ──────────────────────────────────────────────────────────
+
+    /// `edge_history` must return the derived-edge lifecycle (Added event with
+    /// rule attribution) and include the `total_commits` horizon field.
+    #[test]
+    fn test_edge_history_returns_derived_lifecycle_with_rule() {
+        let db = demo_db(); // alice+bob + sim_emb rule → SIMILAR derived edge
+        let resp = tool_call(&db, 1, "edge_history", json!({ "a": "alice", "b": "bob" }));
+        assert!(!is_error(&resp), "edge_history must not error: {resp}");
+        let result = tool_text(&resp);
+
+        // Must carry horizon metadata.
+        let total = result["total_commits"].as_u64().expect("total_commits");
+        assert!(total > 0, "total_commits must be > 0 after ingest + rule");
+
+        // Must have at least one event (the SIMILAR derived-edge addition).
+        let events = result["events"].as_array().expect("events array");
+        assert!(!events.is_empty(), "expected at least one edge event");
+
+        // At least one event must be Added with a non-null rule (derived edge).
+        let derived_added = events
+            .iter()
+            .any(|ev| ev["event"].as_str() == Some("Added") && !ev["rule"].is_null());
+        assert!(
+            derived_added,
+            "expected a derived Added event with rule attribution: {events:?}"
+        );
+    }
+
+    /// `was_linked` must return `true` for an edge that was active at the given commit,
+    /// and the response must include the echo fields.
+    #[test]
+    fn test_was_linked_at_valid_commit() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            let opts = IngestOptions {
+                key_field: "id".into(),
+                auto_fk: AutoFk::Off,
+            };
+            let rows: Vec<BTreeMap<String, Value>> = vec![
+                [("id", Value::Str("x".into()))]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+                [("id", Value::Str("y".into()))]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            ];
+            g.ingest("N", rows, &opts).expect("ingest");
+            g.insert_edge("LINK", "x", "y").expect("edge");
+        }
+        // There are now at least 2 commits (ingest + edge). Check at the last one.
+        let g = db.read();
+        let total = g.wal_total_commits().expect("wal_total_commits");
+        drop(g);
+
+        let resp = tool_call(
+            &db,
+            1,
+            "was_linked",
+            json!({ "a": "x", "b": "y", "edge_type": "LINK", "at_commit": total - 1 }),
+        );
+        assert!(!is_error(&resp), "was_linked must not error: {resp}");
+        let result = tool_text(&resp);
+        assert_eq!(result["linked"], true);
+        assert_eq!(result["a"], "x");
+        assert_eq!(result["edge_type"], "LINK");
+    }
+
+    /// `was_linked` with an out-of-horizon commit must return a tool error (not
+    /// a protocol error), and the error message must mention the commit range.
+    #[test]
+    fn test_was_linked_out_of_horizon_returns_tool_error() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            g.insert_node("N", "a", vec![]).expect("node a");
+            g.insert_node("N", "b", vec![]).expect("node b");
+        }
+        // Commit 999 is well beyond the WAL.
+        let resp = tool_call(
+            &db,
+            1,
+            "was_linked",
+            json!({ "a": "a", "b": "b", "edge_type": "X", "at_commit": 999 }),
+        );
+        // isError true = tool-level error (not a JSON-RPC protocol error).
+        assert!(
+            is_error(&resp),
+            "out-of-range commit must be a tool error: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().expect("text");
+        assert!(
+            text.contains("out of range") || text.contains("range"),
+            "error must mention range: {text}"
+        );
+    }
+
+    /// `node_history` tool must return the node's WAL history and the
+    /// `total_commits` horizon field.
+    #[test]
+    fn test_node_history_via_mcp() {
+        let db = demo_db(); // alice + bob, with a SIMILAR rule
+        let resp = tool_call(&db, 1, "node_history", json!({ "key": "alice" }));
+        assert!(!is_error(&resp), "node_history must not error: {resp}");
+        let result = tool_text(&resp);
+
+        assert_eq!(result["key"], "alice");
+        let total = result["total_commits"].as_u64().expect("total_commits");
+        assert!(total > 0, "total_commits must be > 0");
+
+        let history = result["history"].as_array().expect("history array");
+        assert!(
+            !history.is_empty(),
+            "alice should have at least one history entry"
+        );
+
+        // First event should be a NodeInserted.
+        let first_change = &history[0]["change"];
+        assert_eq!(first_change["type"], "NodeInserted");
+        assert_eq!(first_change["label"], "Person");
     }
 }

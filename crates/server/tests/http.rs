@@ -2338,3 +2338,312 @@ async fn query_mask_filters_nodes() {
     let v = parse_json(&body);
     assert_eq!(v["rows"].as_array().unwrap().len(), 3);
 }
+
+// ── History endpoints ─────────────────────────────────────────────────────────
+
+/// Build a DB with two Person nodes and a manual LINK edge for history tests.
+fn open_history_db(name: &str) -> (Router, SharedDb) {
+    let db = SharedDb::open(&tmp(name)).unwrap();
+    db.write()
+        .insert_node("Person", "alice", vec![("age".into(), Value::Int(30))])
+        .unwrap();
+    db.write().insert_node("Person", "bob", vec![]).unwrap();
+    db.write().insert_edge("LINK", "alice", "bob").unwrap();
+    (router(db.clone()), db)
+}
+
+// ── Full-token happy paths ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn node_history_full_token_happy_path() {
+    let (app, _db) = open_history_db("hist-nh-full");
+    let (status, body, _) = send(app, get("/node/alice/history")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+
+    assert_eq!(v["key"], "alice");
+    let total = v["total_commits"].as_u64().expect("total_commits present");
+    assert!(total > 0, "total_commits must be > 0");
+
+    let history = v["history"].as_array().expect("history array");
+    assert!(
+        !history.is_empty(),
+        "alice must have at least one history event"
+    );
+
+    // First event is NodeInserted.
+    assert_eq!(history[0]["change"]["type"], "NodeInserted");
+    assert_eq!(history[0]["change"]["label"], "Person");
+}
+
+#[tokio::test]
+async fn edge_history_full_token_happy_path() {
+    let (app, _db) = open_history_db("hist-eh-full");
+    let (status, body, _) = send(app, get("/history/edge?a=alice&b=bob")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+
+    assert_eq!(v["a"], "alice");
+    assert_eq!(v["b"], "bob");
+    let total = v["total_commits"].as_u64().expect("total_commits present");
+    assert!(total > 0, "total_commits must be > 0");
+
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        !events.is_empty(),
+        "alice-bob must have at least one edge event"
+    );
+
+    // The LINK edge must appear as Added.
+    let has_link = events
+        .iter()
+        .any(|ev| ev["edge_type"] == "LINK" && ev["event"] == "Added");
+    assert!(has_link, "expected LINK Added event: {events:?}");
+}
+
+#[tokio::test]
+async fn was_linked_full_token_happy_path() {
+    let (app, db) = open_history_db("hist-wl-full");
+    let total = db.read().wal_total_commits().unwrap();
+    let (status, body, _) = send(
+        app,
+        get(&format!(
+            "/history/was_linked?a=alice&b=bob&edge_type=LINK&at_commit={}",
+            total - 1
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(v["linked"], true);
+    assert_eq!(v["a"], "alice");
+    assert_eq!(v["edge_type"], "LINK");
+}
+
+#[tokio::test]
+async fn was_linked_out_of_horizon_is_400_not_500() {
+    let (app, _db) = open_history_db("hist-wl-oob");
+    let (status, body, _) = send(
+        app,
+        get("/history/was_linked?a=alice&b=bob&edge_type=LINK&at_commit=99999"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "out-of-horizon must be 400: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("range") || s.contains("out of")),
+        "error must mention range: {v}"
+    );
+}
+
+// ── Role-token cases ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn role_token_node_history_visible_key_is_200() {
+    let (app, db) = open_rbac(
+        "hist-nh-role-ok",
+        &[("analyst", &["Person"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Person", "alice", vec![]).unwrap();
+
+    let (status, body, _) = send(app, authed_get("/node/alice/history", "role-tok")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(v["key"], "alice");
+    assert!(
+        v["total_commits"].as_u64().is_some(),
+        "horizon field must be present"
+    );
+}
+
+#[tokio::test]
+async fn role_token_node_history_hidden_key_is_404() {
+    let (app, db) = open_rbac(
+        "hist-nh-role-hidden",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    let (status, body, _) = send(app, authed_get("/node/sec1/history", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "hidden key must be 404: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert_eq!(
+        v,
+        json!({"error": "node key not found: sec1"}),
+        "body must match key_not_found shape"
+    );
+}
+
+#[tokio::test]
+async fn role_token_edge_history_both_visible_is_200() {
+    let (app, db) = open_rbac(
+        "hist-eh-role-ok",
+        &[("analyst", &["Person"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Person", "alice", vec![]).unwrap();
+    db.write().insert_node("Person", "bob", vec![]).unwrap();
+    db.write().insert_edge("KNOWS", "alice", "bob").unwrap();
+
+    let (status, body, _) = send(app, authed_get("/history/edge?a=alice&b=bob", "role-tok")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert!(
+        v["total_commits"].as_u64().is_some(),
+        "horizon field must be present"
+    );
+}
+
+#[tokio::test]
+async fn role_token_edge_history_one_hidden_is_404() {
+    let (app, db) = open_rbac(
+        "hist-eh-role-hidden",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+    db.write().insert_edge("LINK", "pub1", "sec1").unwrap();
+
+    // sec1 is hidden for the role token; should get 404 (same-as-absent).
+    let (status, body, _) = send(app, authed_get("/history/edge?a=pub1&b=sec1", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "hidden endpoint must give 404: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert_eq!(
+        v,
+        json!({"error": "node key not found: sec1"}),
+        "body must match key_not_found shape"
+    );
+}
+
+#[tokio::test]
+async fn role_token_history_write_denied() {
+    // Confirm that a role token is rejected (403 FORBIDDEN) on write endpoints.
+    // POST /ingest is a real write endpoint guarded by RBAC — this tests the
+    // auth middleware, not Axum routing behaviour.
+    let (app, _db) = open_rbac(
+        "hist-role-write-denied",
+        &[("analyst", &["Person"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/ingest",
+        "role-tok",
+        json!({"label": "Person", "rows": [{"id": "x"}]}),
+    );
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "role token must be 403 on POST /ingest"
+    );
+}
+
+// ── Fix round-2: C1 — node_history Role branch must filter hidden edge neighbors
+
+/// C1 leak-repro: a VISIBLE node's history must NOT reveal hidden neighbor keys
+/// in EdgeAdded/EdgeRemoved entries when accessed by a role token.
+///
+/// Setup: visible Person/alice + hidden Secret/shadow + LINK edge alice→shadow.
+/// Role token (can see Person, not Secret): GET /node/alice/history must return
+/// history with no mention of "shadow" in any entry.
+/// Full token: the same request MUST include the EdgeAdded entry naming "shadow".
+#[tokio::test]
+async fn role_token_node_history_filters_hidden_edge_neighbor() {
+    let (app, db) = open_rbac(
+        "hist-nh-c1-leak",
+        &[("analyst", &["Person"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    {
+        let mut w = db.write();
+        w.insert_node("Person", "alice", vec![]).unwrap();
+        w.insert_node("Secret", "shadow", vec![]).unwrap();
+        w.insert_edge("LINK", "alice", "shadow").unwrap();
+    }
+
+    // Role token: alice is visible, shadow is not — the EdgeAdded entry for the
+    // LINK edge names "shadow" and must be stripped.
+    let (status, body, _) = send(app.clone(), authed_get("/node/alice/history", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "visible node must be 200 for role token: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        !body_str.contains("shadow"),
+        "role token response must NOT contain hidden key 'shadow': {body_str}"
+    );
+
+    // Full token: same node, same edge — the EdgeAdded entry naming "shadow"
+    // must be present (unfiltered).
+    let (status, body, _) = send(app, authed_get("/node/alice/history", "admin")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("shadow"),
+        "full token response MUST contain edge neighbor key 'shadow': {body_str}"
+    );
+}
+
+/// I2: GET /node/{key}/history for an absent key must return 404 (same as GET
+/// /node/{key}) for BOTH Full and Role identities.
+#[tokio::test]
+async fn node_history_absent_key_is_404_both_identities() {
+    let (app, _db) = open_rbac(
+        "hist-nh-absent-404",
+        &[("analyst", &["Person"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    // Full token: absent key → 404.
+    let (status, body, _) = send(app.clone(), authed_get("/node/ghost/history", "admin")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "full token: absent key must be 404: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert_eq!(v, json!({"error": "node key not found: ghost"}));
+
+    // Role token: absent key → 404 (indistinguishable from hidden).
+    let (status, body, _) = send(app, authed_get("/node/ghost/history", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "role token: absent key must be 404: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert_eq!(v, json!({"error": "node key not found: ghost"}));
+}

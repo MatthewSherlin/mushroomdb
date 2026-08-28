@@ -86,7 +86,7 @@
 //! `Arc<Inner>` is held by every clone); no submission enqueued before the
 //! last clone is dropped can be silently lost.
 
-use crate::db::{BatchOp, FsyncPolicy};
+use crate::db::{BatchOp, FsyncPolicy, Precondition};
 use crate::reader::ReaderSnapshot;
 use crate::GraphDb;
 use core_storage::sync_wal_at;
@@ -119,6 +119,10 @@ type SyncWalFn = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
 
 struct Submission {
     ops: Vec<BatchOp>,
+    /// Compare-and-set preconditions.  Empty for plain `submit_batch` calls;
+    /// non-empty for `submit_batch_cas` calls.  The drain thread checks these
+    /// under the same write guard as the batch apply (no TOCTOU).
+    preconds: Vec<Precondition>,
     done: std::sync::mpsc::SyncSender<Result<(usize, usize)>>,
 }
 
@@ -430,7 +434,40 @@ impl SharedDb {
             return Err(GraphError::Io(std::io::Error::other(msg)));
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.queue.enqueue(Submission { ops, done: tx });
+        self.queue.enqueue(Submission {
+            ops,
+            preconds: Vec::new(),
+            done: tx,
+        });
+        rx.recv().unwrap_or_else(|_| {
+            Err(GraphError::Io(std::io::Error::other(
+                "group-commit drain thread terminated unexpectedly",
+            )))
+        })
+    }
+
+    /// Like [`submit_batch`] but with compare-and-set preconditions.
+    ///
+    /// The preconditions are evaluated by the drain thread under the **same**
+    /// write guard as the batch apply — there is no TOCTOU window.  If any
+    /// precondition fails, the entire batch is rejected with
+    /// [`core_storage::GraphError::CasConflict`] and no WAL frame is written.
+    ///
+    /// See [`crate::Precondition`] for the full semantics.
+    pub fn submit_batch_cas(
+        &self,
+        preconds: Vec<Precondition>,
+        ops: Vec<BatchOp>,
+    ) -> Result<(usize, usize)> {
+        if let Some(msg) = self.queue.degraded_message() {
+            return Err(GraphError::Io(std::io::Error::other(msg)));
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.queue.enqueue(Submission {
+            ops,
+            preconds,
+            done: tx,
+        });
         rx.recv().unwrap_or_else(|_| {
             Err(GraphError::Io(std::io::Error::other(
                 "group-commit drain thread terminated unexpectedly",
@@ -455,9 +492,10 @@ fn drain_loop(
             return; // shutdown + nothing pending
         }
 
-        let ops_batches: Vec<Vec<BatchOp>> = group
+        // Extract ops and preconditions together; keep alignment with group index.
+        let submissions: Vec<(Vec<Precondition>, Vec<BatchOp>)> = group
             .iter_mut()
-            .map(|s| std::mem::take(&mut s.ops))
+            .map(|s| (std::mem::take(&mut s.preconds), std::mem::take(&mut s.ops)))
             .collect();
 
         // ── Step 1: Acquire WAL mutex BEFORE the write lock ─────────────────
@@ -489,7 +527,44 @@ fn drain_loop(
             if sync_needed {
                 db.set_deferred_events_mode(true);
             }
-            let r = db.commit_group_nosync(ops_batches);
+            // Apply submissions in FIFO order.
+            //
+            // Non-CAS submissions are coalesced into a single commit_group_nosync
+            // call (preserving the T4b group-write batching intent — one write
+            // boundary per drain group, not per submission).  CAS submissions
+            // break the coalescing because their preconditions must be evaluated
+            // AFTER all prior submissions in the group have been applied (no
+            // TOCTOU); they are processed individually between coalesced non-CAS
+            // runs.
+            let mut r: Vec<Result<(usize, usize)>> = Vec::with_capacity(submissions.len());
+            let mut pending_non_cas: Vec<Vec<BatchOp>> = Vec::new();
+
+            for (preconds, ops) in submissions {
+                if preconds.is_empty() {
+                    // Non-CAS: accumulate for a batched commit_group_nosync call.
+                    pending_non_cas.push(ops);
+                } else {
+                    // CAS: flush accumulated non-CAS batch first so that precond
+                    // evaluation sees their writes already applied.
+                    if !pending_non_cas.is_empty() {
+                        let batch = std::mem::take(&mut pending_non_cas);
+                        r.extend(db.commit_group_nosync(batch));
+                    }
+                    let result = match db.check_preconditions(&preconds) {
+                        Ok(()) => db
+                            .commit_group_nosync(vec![ops])
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Ok((0, 0))),
+                        Err(e) => Err(e),
+                    };
+                    r.push(result);
+                }
+            }
+            // Flush any remaining non-CAS submissions.
+            if !pending_non_cas.is_empty() {
+                r.extend(db.commit_group_nosync(pending_non_cas));
+            }
             (r, sync_needed)
             // ← RwLock write guard released here; wal_mu still held
         };

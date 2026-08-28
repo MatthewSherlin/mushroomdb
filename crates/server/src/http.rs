@@ -11,8 +11,8 @@
 //! [`tokio::sync::broadcast::error::RecvError::Closed`].
 
 use crate::json::{
-    node_edges_json, node_info_json, params_from_json, parse_ingest_edges, result_set_json,
-    rule_def_from_json,
+    edge_history_result_json, node_edges_json, node_history_json, node_info_json, params_from_json,
+    parse_ingest_edges, result_set_json, rule_def_from_json,
 };
 use crate::{AppState, AuthIdentity};
 use arrow_bridge::to_ipc_bytes;
@@ -313,6 +313,9 @@ fn build_app(
         .route("/node/{key}", axum::routing::delete(delete_node))
         .route("/node/{key}/edges", get(node_edges))
         .route("/node/{key}/neighborhood", get(neighborhood))
+        .route("/node/{key}/history", get(node_history_handler))
+        .route("/history/edge", get(edge_history_handler))
+        .route("/history/was_linked", get(was_linked_handler))
         .route(
             "/node/{key}/prop/{field}",
             axum::routing::put(set_node_prop),
@@ -1300,6 +1303,193 @@ async fn set_node_prop(
     {
         Ok(_) => json_ok(json!({"ok": true})),
         Err(resp) => resp,
+    }
+}
+
+// ── History endpoints ─────────────────────────────────────────────────────────
+//
+// These are cold-path diagnostic endpoints. They scan the on-disk WAL and
+// must NOT extend ReaderSnapshot — they use db.read() directly per the
+// controller ruling (see module doc and task-2-brief.md).
+//
+// Role masking: node visibility is checked under the SAME read guard as the
+// history call (coherent snapshot). A node outside the role's mask responds
+// identically to an absent node — no existence oracle.
+
+/// `GET /node/{key}/history` — return the WAL change history for `key`.
+///
+/// Response: `{ key, history: [{commit, change}], total_commits }`.
+/// Role tokens: if `key` is hidden by the role mask, responds with 404
+/// (same shape as querying an absent key — no existence oracle).
+async fn node_history_handler(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(key): Path<String>,
+) -> Response {
+    if let AuthIdentity::Role(ref role_name) = identity {
+        let g = state.db.read();
+        let role_mask = match g.mask_for_role(role_name) {
+            Ok(m) => m,
+            Err(e) => return role_mask_err(e),
+        };
+        // Hidden keys must respond identically to absent keys (no oracle).
+        if !role_mask.contains_node(&*g, &key) {
+            return key_not_found(key);
+        }
+        let entries = match g.node_history(&key) {
+            Ok(e) => e,
+            Err(e) => return graph_err(e),
+        };
+        let total_commits = match g.wal_total_commits() {
+            Ok(n) => n,
+            Err(e) => return graph_err(e),
+        };
+        // Filter EdgeAdded/EdgeRemoved entries whose `other` endpoint is hidden.
+        // A role token must not learn about hidden nodes via edge history events —
+        // mirrors the same protection in `node_edges` (http.rs ~978-989).
+        use core_api::HistoryChange;
+        let visible: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| match &entry.change {
+                HistoryChange::EdgeAdded { other, .. }
+                | HistoryChange::EdgeRemoved { other, .. } => role_mask.contains_node(&*g, other),
+                _ => true,
+            })
+            .collect();
+        return json_ok(node_history_json(&key, &visible, total_commits));
+    }
+    // Full identity: no masking. Return 404 for absent keys (consistent with
+    // GET /node/{key} and the Role branch above).
+    let g = state.db.read();
+    if !g.has_node(&key) {
+        return key_not_found(key);
+    }
+    let entries = match g.node_history(&key) {
+        Ok(e) => e,
+        Err(e) => return graph_err(e),
+    };
+    let total_commits = match g.wal_total_commits() {
+        Ok(n) => n,
+        Err(e) => return graph_err(e),
+    };
+    json_ok(node_history_json(&key, &entries, total_commits))
+}
+
+/// `GET /history/edge?a=&b=` — return the edge lifecycle between two nodes.
+///
+/// Response: `{ a, b, events: [{edge_type, commit, event, rule}], total_commits }`.
+/// Role tokens: BOTH `a` AND `b` must be visible in the role mask, otherwise
+/// responds with 404 for the first invisible key (no existence oracle).
+async fn edge_history_handler(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Query(qs): Query<BTreeMap<String, String>>,
+) -> Response {
+    let a = match qs.get("a").filter(|s| !s.is_empty()) {
+        Some(s) => s.clone(),
+        None => return err_response("missing query param a"),
+    };
+    let b = match qs.get("b").filter(|s| !s.is_empty()) {
+        Some(s) => s.clone(),
+        None => return err_response("missing query param b"),
+    };
+    if let AuthIdentity::Role(ref role_name) = identity {
+        let g = state.db.read();
+        let role_mask = match g.mask_for_role(role_name) {
+            Ok(m) => m,
+            Err(e) => return role_mask_err(e),
+        };
+        // BOTH endpoints must be visible (no oracle for either).
+        if !role_mask.contains_node(&*g, &a) {
+            return key_not_found(a);
+        }
+        if !role_mask.contains_node(&*g, &b) {
+            return key_not_found(b);
+        }
+        let result = match g.edge_history(&a, &b) {
+            Ok(r) => r,
+            Err(e) => return graph_err(e),
+        };
+        return json_ok(edge_history_result_json(&a, &b, &result));
+    }
+    // Full identity: no masking.
+    let g = state.db.read();
+    let result = match g.edge_history(&a, &b) {
+        Ok(r) => r,
+        Err(e) => return graph_err(e),
+    };
+    json_ok(edge_history_result_json(&a, &b, &result))
+}
+
+/// `GET /history/was_linked?a=&b=&edge_type=&at_commit=` — point-in-time edge check.
+///
+/// Response: `{ a, b, edge_type, at_commit, linked }`.
+/// Returns 400 (not 500) when `at_commit` is outside the visible horizon.
+/// Role tokens: BOTH `a` AND `b` must be visible, same-as-absent otherwise.
+async fn was_linked_handler(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Query(qs): Query<BTreeMap<String, String>>,
+) -> Response {
+    let a = match qs.get("a").filter(|s| !s.is_empty()) {
+        Some(s) => s.clone(),
+        None => return err_response("missing query param a"),
+    };
+    let b = match qs.get("b").filter(|s| !s.is_empty()) {
+        Some(s) => s.clone(),
+        None => return err_response("missing query param b"),
+    };
+    let edge_type = match qs.get("edge_type").filter(|s| !s.is_empty()) {
+        Some(s) => s.clone(),
+        None => return err_response("missing query param edge_type"),
+    };
+    let at_commit: u64 = match qs.get("at_commit") {
+        Some(s) => match s.parse() {
+            Ok(n) => n,
+            Err(_) => return err_response("at_commit must be a non-negative integer"),
+        },
+        None => return err_response("missing query param at_commit"),
+    };
+
+    if let AuthIdentity::Role(ref role_name) = identity {
+        let g = state.db.read();
+        let role_mask = match g.mask_for_role(role_name) {
+            Ok(m) => m,
+            Err(e) => return role_mask_err(e),
+        };
+        if !role_mask.contains_node(&*g, &a) {
+            return key_not_found(a);
+        }
+        if !role_mask.contains_node(&*g, &b) {
+            return key_not_found(b);
+        }
+        return match g.was_linked(&a, &b, &edge_type, at_commit) {
+            Ok(linked) => json_ok(json!({
+                "a": a, "b": b, "edge_type": edge_type,
+                "at_commit": at_commit, "linked": linked,
+            })),
+            Err(GraphError::CommitOutOfRange { .. }) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("commit {at_commit} is out of range")})),
+            )
+                .into_response(),
+            Err(e) => graph_err(e),
+        };
+    }
+
+    // Full identity: no masking.
+    let g = state.db.read();
+    match g.was_linked(&a, &b, &edge_type, at_commit) {
+        Ok(linked) => json_ok(json!({
+            "a": a, "b": b, "edge_type": edge_type,
+            "at_commit": at_commit, "linked": linked,
+        })),
+        Err(GraphError::CommitOutOfRange { .. }) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("commit {at_commit} is out of range")})),
+        )
+            .into_response(),
+        Err(e) => graph_err(e),
     }
 }
 

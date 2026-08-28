@@ -17,7 +17,7 @@ use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
 use core_storage::v8::encode::{
     archived_hnsw_to_owned, archived_rules_meta_to_owned, archived_to_idmap, archived_to_interner,
-    archived_views_to_owned, decode_meta, encode_v8, V8Meta,
+    archived_views_to_owned, decode_last_change_bytes, decode_meta, encode_v8, V8Meta,
 };
 use core_storage::v8::seam::TopologyView;
 use core_storage::wal::{decode_all, encode_record, WalRecord};
@@ -26,7 +26,7 @@ use core_storage::{
     ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// Print a timing checkpoint when MUSHROOMDB_TRACE_OPEN is set.
@@ -212,7 +212,11 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         | WalRecord::DeleteView { .. }
         | WalRecord::EnableFulltext { .. }
         | WalRecord::DisableFulltext { .. }
-        | WalRecord::Intern { .. } => None,
+        | WalRecord::Intern { .. }
+        // History markers are no-ops for mutation events — they carry no new
+        // state and rules re-derive deterministically on replay.
+        | WalRecord::DerivedEdgeAdded { .. }
+        | WalRecord::DerivedEdgeRetracted { .. } => None,
     }
 }
 
@@ -863,6 +867,46 @@ pub enum FsyncPolicy {
     Relaxed,
 }
 
+/// A precondition for a compare-and-set batch write.
+///
+/// All preconditions in a [`GraphDb::write_batch_cas`] or
+/// [`crate::SharedDb::submit_batch_cas`] call are checked atomically before
+/// any operation in the batch is applied.  If any precondition fails, the
+/// entire batch is rejected with [`GraphError::CasConflict`] and no WAL frame
+/// is written.
+///
+/// # Touch definition
+///
+/// A node's last-change commit (`last_changed`) is updated when any of the
+/// following state-changing WAL records touch it:
+///
+/// - `InsertNode` / `InsertNodeId` — the newly-inserted node.
+/// - `SetProp` / `SetPropId` / `RemoveProp` — the property-bearing node.
+/// - `InsertEdge` / `InsertEdgeId` / `DeleteEdge` — **both** src and dst
+///   endpoints (an edge change touches both sides).
+/// - `DeleteNode` — the node is tombstoned; `last_changed` returns `None`
+///   for deleted keys so the pre-deletion entry is never observed.
+///
+/// History markers (`DerivedEdgeAdded` / `DerivedEdgeRetracted`) are
+/// state no-ops.  The underlying mutation that triggered rule firing already
+/// updated the relevant nodes' last-change entries.  Rule-management records
+/// (`CreateRule`, `DeleteRule`, `RebuildRule`) and view/full-text declarations
+/// do not touch any node's last-change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Precondition {
+    /// The node's last-change commit must equal `expected`.
+    ///
+    /// Fails with [`GraphError::CasConflict`] when:
+    /// - The node does not exist (`last_changed` returns `None`), or
+    /// - The recorded commit seq does not match `expected`.
+    NodeUnchangedSince { key: String, expected: u64 },
+    /// The node must not exist (not inserted, or already deleted).
+    ///
+    /// Fails with [`GraphError::CasConflict`] (expected=`u64::MAX`,
+    /// actual=`last_changed(key).unwrap_or(0)`) when the node is live.
+    NodeAbsent { key: String },
+}
+
 pub struct GraphDb<F: Fs> {
     fs: F,
     ids: IdMap,
@@ -938,6 +982,40 @@ pub struct GraphDb<F: Fs> {
     v8_sections_loaded: std::sync::atomic::AtomicBool,
     /// Serializes the one-time section population in `ensure_v8_base_sections_loaded`.
     v8_sections_mutex: std::sync::Mutex<()>,
+    /// Per-node last-change commit sequence.  `last_change[node_id] = seq` means
+    /// the node was last modified by commit `seq`.
+    ///
+    /// Loaded from V8 section 11 at open; updated on every state-changing commit
+    /// and WAL replay frame.  V5-V7 stores start with an empty map; pre-WAL-horizon
+    /// nodes return `None` from `last_changed` until they are next mutated.
+    ///
+    /// See [`Precondition`] for the full touch definition.
+    last_change: HashMap<u32, u64>,
+    /// WAL archive retention policy set by [`set_wal_archive_retention`].
+    /// `None` = unlimited (keep all archives); `Some(N)` = keep N newest archives,
+    /// pruning older ones at snapshot time.  0 is treated as unlimited.
+    wal_archive_retention: Option<u32>,
+    /// Global frame index of the first commit that is still reachable through
+    /// surviving archives.  Persisted to `wal.floor` sidecar when pruning occurs.
+    /// Default 0 = all history reachable.
+    wal_horizon_floor: u64,
+    /// True when the surviving archive chain forms a continuous WAL history
+    /// starting from the store's first commit (the genesis chain).
+    ///
+    /// `open_at` may replay archive-resident commits from empty state only when
+    /// this flag is true AND `wal_horizon_floor == 0`.  Cleared whenever:
+    ///   - a WAL-truncating snapshot (`keep_wal=false`) is taken after archives
+    ///     already exist (breaks the chain for subsequent archives), or
+    ///   - any archive is pruned (floor advances past zero).
+    ///
+    /// Persisted via the `wal.genesis` marker file; loaded from it at open.
+    archive_genesis_chain: bool,
+    /// True in the current session if any WAL-truncating snapshot (`keep_wal=false`,
+    /// `archive_wal=false`) was taken before the first archive was created.
+    ///
+    /// In-memory only (not persisted).  Used at first-archive time to decide
+    /// whether to write the genesis marker.  Irrelevant after archives exist.
+    wal_ever_truncated: bool,
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -1008,6 +1086,18 @@ pub struct SnapshotOptions {
     /// When `false` (the default), the WAL is truncated to a minimal
     /// baseline so cold-start replay stays fast.
     pub keep_wal: bool,
+    /// When `true`, the current WAL is renamed to `wal.<commit_seq>.archive`
+    /// before a fresh WAL baseline is written (history-preserving snapshot).
+    ///
+    /// This is the feature opt-in: `false` (the default) leaves the existing
+    /// truncation / keep-wal behaviour byte-identical.  `archive_wal` takes
+    /// precedence over `keep_wal` when both are set.
+    ///
+    /// Archives can be scanned by [`GraphDb::node_history`],
+    /// [`GraphDb::edge_history`], [`GraphDb::was_linked`], and
+    /// [`GraphDb::open_at`], extending the reachable history horizon across
+    /// snapshot boundaries.
+    pub archive_wal: bool,
 }
 
 impl GraphDb<RealFs> {
@@ -1058,7 +1148,10 @@ impl GraphDb<RealFs> {
                         .map_err(core_storage::GraphError::Io)?;
                     trace_migrate!("bak copy done", _tm);
                     // Rewrite snapshot at current version; keep WAL intact.
-                    db.snapshot_with(SnapshotOptions { keep_wal: true })?;
+                    db.snapshot_with(SnapshotOptions {
+                        keep_wal: true,
+                        ..SnapshotOptions::default()
+                    })?;
                     trace_migrate!("snapshot_with done", _tm);
                 }
                 Some(_) => {
@@ -1137,7 +1230,21 @@ impl<F: Fs> GraphDb<F> {
             degraded: false,
             v8_sections_loaded: std::sync::atomic::AtomicBool::new(false),
             v8_sections_mutex: std::sync::Mutex::new(()),
+            last_change: HashMap::new(),
+            wal_archive_retention: None,
+            wal_horizon_floor: 0,
+            archive_genesis_chain: false,
+            wal_ever_truncated: false,
         };
+        db.wal_horizon_floor = db.fs.read_horizon_floor()?;
+        db.archive_genesis_chain = db.fs.has_genesis_marker();
+        db.wal_ever_truncated = db.fs.has_truncation_marker();
+        // Opening cleanup: remove orphaned archives — archives whose frames all
+        // fall below the horizon floor.  Orphans arise when a crash interrupted
+        // the retention-prune sequence after the floor was written but before
+        // all surplus archives were deleted.  Safe to delete: floor already
+        // accounts for their frames.
+        db.cleanup_orphaned_archives()?;
         let _t0 = std::time::Instant::now();
         // Peek 6 bytes to determine snapshot version without reading the full
         // file. For RealFs this is a true partial read (O(1)); for SimFs the
@@ -1173,6 +1280,31 @@ impl<F: Fs> GraphDb<F> {
             }
         }
         // else: snap_header is empty = no snapshot file, fresh store.
+        //
+        // Seed commit_seq from the highest seq persisted in last_change so that
+        // WAL-replay frames (which start at commit_seq+1) always exceed any seq
+        // already stored in the snapshot.  Without this, a db with one snapshot
+        // commit would save last_change["a"]=1, then on reopen the first WAL
+        // frame would replay at seq=1 again — colliding and making WAL-tail
+        // mutations indistinguishable from the snapshot baseline.
+        //
+        // Safety invariant (seq-recycling):
+        //   Recycled seqs (those below the seeded baseline) were NEVER stored in
+        //   last_change because they belonged to a previous db lifetime — a new
+        //   db starts at commit_seq=0 with an empty last_change.  Therefore no
+        //   CAS precondition can carry a recycled seq as its `expected` value
+        //   and accidentally match a live node's last_change entry.
+        //
+        // `expected:0` on a deleted-then-reinserted node:
+        //   After deletion, last_changed() returns None; callers that call
+        //   last_changed() and then use NodeUnchangedSince get None.unwrap_or(0)
+        //   = 0.  The reinserted node gets seq > 0, so a subsequent CAS with
+        //   expected=0 correctly conflicts.  The only way to observe actual=0 in
+        //   a CasConflict would be a caller that invented expected=0 without ever
+        //   calling last_changed() — unreachable via the documented API contract.
+        if let Some(&max_seq) = db.last_change.values().max() {
+            db.commit_seq = db.commit_seq.max(max_seq);
+        }
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
         if valid_len < bytes.len() {
@@ -1197,6 +1329,13 @@ impl<F: Fs> GraphDb<F> {
             // Drain per-frame to keep pending_deltas O(1) during replay (I-2).
             // No subscriber exists yet; discard is correct.
             let _ = db.engine.drain_deltas();
+            // Track commit_seq during replay so last_change entries are
+            // consistent with the seqs assigned by log_then_apply_with on
+            // subsequent live commits.  After N replayed frames, commit_seq=N;
+            // live commits begin at N+1.
+            db.commit_seq += 1;
+            let replay_seq = db.commit_seq;
+            db.update_last_change_from_rec(&rec, replay_seq);
         }
         // Enforce I-2: if the per-frame drain above is ever removed or skipped,
         // this assert catches the regression in debug builds immediately.
@@ -1368,6 +1507,16 @@ impl<F: Fs> GraphDb<F> {
                     detail: format!("v8: view restore: {e}"),
                 })?;
         }
+        // Load the last-change map from section 11 (small section; load eagerly).
+        // Pre-Task-3 snapshots lack this section; `last_change_bytes` returns &[]
+        // in that case and `decode_last_change_bytes` returns an empty map.
+        let last_change_raw = mapped
+            .last_change_bytes()
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: last_change section: {e:?}"),
+            })?;
+        self.last_change = decode_last_change_bytes(last_change_raw);
+
         // Validate that all deferred sections (provenance, HNSW, IVF) fit within
         // the file.  Pure bounds check — no bytes read, no page faults triggered.
         // Catches truncated snapshots at open time before the lazy deferred reads.
@@ -1515,63 +1664,113 @@ impl<F: Fs> GraphDb<F> {
             degraded: false,
             v8_sections_loaded: std::sync::atomic::AtomicBool::new(false),
             v8_sections_mutex: std::sync::Mutex::new(()),
+            last_change: HashMap::new(),
+            wal_archive_retention: None,
+            wal_horizon_floor: 0,
+            archive_genesis_chain: false,
+            wal_ever_truncated: false,
         };
-        // Base state: a truncating snapshot compacts all pre-truncation
-        // commits, so the on-disk WAL head coincides with the snapshot and
-        // frame replay must start from it — dense-id records (`Intern`,
-        // `*Id`) embed the live intern/id numbering, which only a snapshot
-        // base reproduces. `keep_wal` and legacy V5/V6 snapshots leave a WAL
-        // that reaches further back; for those the historical WAL-only
-        // replay applies (`wal_truncated` defaults to false on decode).
-        // Peek version without a full 2.4GB heap read (same pattern as open_with).
-        let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
-        let is_v8 = snap_header.len() >= 6
-            && &snap_header[0..4] == b"GDB1"
-            && u16::from_le_bytes([snap_header[4], snap_header[5]])
-                == core_storage::snapshot::VERSION_8;
-        if is_v8 {
-            // V8: map the file (RealFs) or read full bytes (SimFs), then do a
-            // full structural decode. open_at needs owned topo/props for WAL
-            // replay mutation so we can't use the zero-copy seam here.
-            let state = if let Some(snap_path) = db.fs.snapshot_path() {
-                let mapped = core_storage::v8::MappedBase::map(&snap_path).map_err(|e| {
-                    GraphError::Corrupt {
-                        detail: format!("v8: open_at mmap: {e:?}"),
-                    }
-                })?;
-                core_storage::snapshot::decode_v8_from_mapped(&mapped)?
-            } else {
-                let snap_bytes = db.fs.read(FileId::Snapshot)?;
-                core_storage::snapshot::decode(&snap_bytes)?
-            };
-            if let Some(state) = state {
-                if state.wal_truncated {
-                    db.restore_snapshot_state(state)?;
-                }
-            }
-        } else if !snap_header.is_empty() {
-            // Legacy V5-V7: full read required for decode.
-            let snap_bytes = db.fs.read(FileId::Snapshot)?;
-            if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
-                if state.wal_truncated {
-                    db.restore_snapshot_state(state)?;
-                }
-            }
+        db.wal_horizon_floor = db.fs.read_horizon_floor()?;
+        db.archive_genesis_chain = db.fs.has_genesis_marker();
+        db.wal_ever_truncated = db.fs.has_truncation_marker();
+        // Same orphaned-archive cleanup as open_with: floor was written first
+        // during pruning, so a crash may have left stale archives below floor.
+        db.cleanup_orphaned_archives()?;
+        // Collect archive frames (oldest-first) and live WAL frames.
+        // Archives represent pre-snapshot history; the snapshot captures the
+        // cumulative state at the time of archiving.  Crash-window guarantee:
+        //   A: crash before rename → WAL intact, no archive. Reopen: normal.
+        //   B: crash after rename, before new WAL → archive present, WAL
+        //      absent. Reopen: snapshot loaded (full state), no WAL replay.
+        //   C: crash after new baseline WAL written → normal post-archive.
+        let archive_ns = db.fs.list_archives()?;
+        let mut archive_frames_all: Vec<WalRecord> = Vec::new();
+        for n in &archive_ns {
+            let arc_bytes = db.fs.read_archive(*n)?;
+            let (arc_frames, _) = decode_all(&arc_bytes);
+            archive_frames_all.extend(arc_frames);
         }
-        // else: snap_header empty = no snapshot file.
-        let bytes = db.fs.read(FileId::Wal)?;
-        let (records, _valid_len) = decode_all(&bytes);
-        let total = records.len() as u64;
+        let total_archive_frames = archive_frames_all.len() as u64;
+
+        let live_bytes = db.fs.read(FileId::Wal)?;
+        let (live_records, _valid_len) = decode_all(&live_bytes);
+        let total_surviving = total_archive_frames + live_records.len() as u64;
+        // Global total including any pruned history below the horizon floor.
+        let total = db.wal_horizon_floor + total_surviving;
+
+        // Horizon and range check.
+        if commit < db.wal_horizon_floor {
+            return Err(GraphError::CommitOutOfRange { commit, total });
+        }
         if commit >= total {
             return Err(GraphError::CommitOutOfRange { commit, total });
         }
-        // Replay frames 0..=commit — identical drain pattern to open_with so
-        // the pending_delta_count == 0 invariant holds.
-        for rec in records.into_iter().take((commit + 1) as usize) {
-            db.apply(&rec)?;
-            // Drain per-frame: no subscriber exists; discard is correct.
-            // This keeps memory O(1) and mirrors the open_with seam exactly.
-            let _ = db.engine.drain_deltas();
+
+        // Local index into surviving frames (0 = first frame of oldest archive).
+        let local = commit - db.wal_horizon_floor;
+
+        if local < total_archive_frames {
+            // Target commit is in an archive.  Correct replay from empty state
+            // is only possible when the archive chain is an uninterrupted
+            // genesis chain (first archive taken from a fresh store, no prior
+            // WAL truncation) and no archives have been pruned (floor == 0).
+            //
+            // If either condition is violated the prefix needed to reconstruct
+            // the requested state is gone; refuse rather than return wrong data.
+            if db.wal_horizon_floor > 0 || !db.archive_genesis_chain {
+                return Err(GraphError::CommitOutOfRange { commit, total });
+            }
+            // Replay all archive frames up to and including the target commit
+            // from an empty database state.  Archives must be replayed in order
+            // so that dense-id intern tables are built up correctly.
+            for rec in archive_frames_all.into_iter().take((local + 1) as usize) {
+                db.apply(&rec)?;
+                let _ = db.engine.drain_deltas();
+            }
+        } else {
+            // Target commit is in the live WAL: load snapshot as base, then
+            // replay the needed live WAL prefix.
+            //
+            // Base state: a truncating snapshot (wal_truncated=true) compacts
+            // all pre-truncation / pre-archive commits.  Dense-id records in
+            // the live WAL reference ids/interns that the snapshot provides.
+            // Peek 6 bytes (same pattern as open_with).
+            let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
+            let is_v8 = snap_header.len() >= 6
+                && &snap_header[0..4] == b"GDB1"
+                && u16::from_le_bytes([snap_header[4], snap_header[5]])
+                    == core_storage::snapshot::VERSION_8;
+            if is_v8 {
+                let state = if let Some(snap_path) = db.fs.snapshot_path() {
+                    let mapped = core_storage::v8::MappedBase::map(&snap_path).map_err(|e| {
+                        GraphError::Corrupt {
+                            detail: format!("v8: open_at mmap: {e:?}"),
+                        }
+                    })?;
+                    core_storage::snapshot::decode_v8_from_mapped(&mapped)?
+                } else {
+                    let snap_bytes = db.fs.read(FileId::Snapshot)?;
+                    core_storage::snapshot::decode(&snap_bytes)?
+                };
+                if let Some(state) = state {
+                    if state.wal_truncated {
+                        db.restore_snapshot_state(state)?;
+                    }
+                }
+            } else if !snap_header.is_empty() {
+                let snap_bytes = db.fs.read(FileId::Snapshot)?;
+                if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
+                    if state.wal_truncated {
+                        db.restore_snapshot_state(state)?;
+                    }
+                }
+            }
+            // else: snap_header empty = no snapshot file.
+            let live_local = local - total_archive_frames;
+            for rec in live_records.into_iter().take((live_local + 1) as usize) {
+                db.apply(&rec)?;
+                let _ = db.engine.drain_deltas();
+            }
         }
         // Pin: pending_delta_count must be 0 after as-of replay, mirroring T1's
         // post-loop assert in open_with.
@@ -2617,6 +2816,9 @@ impl<F: Fs> GraphDb<F> {
                 }
                 self.fulltext.disable(label, field);
             }
+            // History markers carry no replay state — rules re-derive edges
+            // deterministically on open/replay. Skip unconditionally.
+            WalRecord::DerivedEdgeAdded { .. } | WalRecord::DerivedEdgeRetracted { .. } => {}
         }
         Ok(())
     }
@@ -2836,6 +3038,26 @@ impl<F: Fs> GraphDb<F> {
         if Self::wal_needs_sync(policy, &rec) {
             self.fs.sync(FileId::Wal)?;
         }
+        // Marker writing always needs the engine deltas, but the engine only
+        // accumulates them when emit_deltas is true (normally gated on subscribers
+        // or views being present).  Enable emission for this apply if it is
+        // currently off, then restore the original state unconditionally via an
+        // RAII guard — this prevents a panic in apply() from leaking the flag.
+        struct RestoreEmitDeltas(*mut RuleEngine, bool);
+        impl Drop for RestoreEmitDeltas {
+            fn drop(&mut self) {
+                // SAFETY: pointer into self (GraphDb); guard is dropped within
+                // this frame before log_then_apply_with returns.
+                unsafe { (*self.0).set_emit_deltas(self.1) };
+            }
+        }
+        let original_emit = self.engine.emit_deltas();
+        if !original_emit {
+            self.engine.set_emit_deltas(true);
+        }
+        // SAFETY: raw pointer into self; guard dropped within this frame.
+        let _emit_guard = RestoreEmitDeltas(&mut self.engine as *mut _, original_emit);
+
         let apply_result = self.apply(&rec);
         // For Batch frames, post-validation apply must be infallible (see above).
         // A debug_assert here catches any future change that makes apply fallible
@@ -2851,15 +3073,56 @@ impl<F: Fs> GraphDb<F> {
         if apply_result.is_err() {
             // Discard any partial deltas accumulated by the failed apply.
             // They must not ride the next commit's event stream (I-1).
+            // _emit_guard restores emit_deltas on drop automatically.
             let _ = self.engine.drain_deltas();
             let _ = self.engine.take_rebuild_needed();
             apply_result?;
         }
         self.commit_seq += 1;
         let seq = self.commit_seq;
+        // Update per-node last-change map for the committed record.
+        // Must happen after commit_seq is incremented so the seq is correct.
+        self.update_last_change_from_rec(&rec, seq);
         // Drain engine deltas and distribute to subscribers before the existing
         // MutationEvent sink fires — both happen post-fsync, post-apply.
+        // _emit_guard restores emit_deltas after this line when it drops.
         let engine_deltas = self.engine.drain_deltas();
+
+        // Append history-marker WAL records for any derived-edge changes so
+        // that `edge_history` and `was_linked` can surface rule-attributed
+        // events. Markers are STATE NO-OPS during replay; they are written
+        // without an additional fsync (the triggering commit's sync already
+        // happened; the next commit's sync covers these lazily).
+        if !engine_deltas.is_empty() {
+            let markers: Vec<WalRecord> = engine_deltas
+                .iter()
+                .map(|d| {
+                    if d.fired {
+                        WalRecord::DerivedEdgeAdded {
+                            rule: d.rule.clone(),
+                            edge_type: d.edge_type.clone(),
+                            src_key: d.src_key.clone(),
+                            dst_key: d.dst_key.clone(),
+                        }
+                    } else {
+                        WalRecord::DerivedEdgeRetracted {
+                            rule: d.rule.clone(),
+                            edge_type: d.edge_type.clone(),
+                            src_key: d.src_key.clone(),
+                            dst_key: d.dst_key.clone(),
+                        }
+                    }
+                })
+                .collect();
+            let marker_frame = if markers.len() == 1 {
+                markers.into_iter().next().unwrap()
+            } else {
+                WalRecord::Batch(markers)
+            };
+            // Ignore append errors: markers are best-effort history
+            // annotations. Losing them does not affect state correctness.
+            let _ = self.fs.append(FileId::Wal, &encode_record(&marker_frame));
+        }
 
         // Record MVCC CommitDelta for the epoch reader.  The WAL record is
         // stored as-is (including any nested Batch / Intern records); the
@@ -3277,7 +3540,11 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::DeleteView { .. }
             | WalRecord::EnableFulltext { .. }
             | WalRecord::DisableFulltext { .. }
-            | WalRecord::Intern { .. } => vec![],
+            | WalRecord::Intern { .. }
+            // History markers produce no DbEvent — the engine delta already
+            // fired the EdgeFired/EdgeRetracted subscription events.
+            | WalRecord::DerivedEdgeAdded { .. }
+            | WalRecord::DerivedEdgeRetracted { .. } => vec![],
         }
     }
 
@@ -5525,8 +5792,240 @@ impl<F: Fs> GraphDb<F> {
             .collect::<Result<Vec<_>>>()
     }
 
+    /// Return the last-change commit sequence for `key`, or `None` if the node
+    /// does not exist or has never been mutated since the last V5-V7 snapshot
+    /// (horizon-bounded for legacy stores).
+    ///
+    /// The returned sequence is a monotonically increasing counter that starts
+    /// at 1 for the first commit after `open` and increments with every
+    /// successful write.  WAL replay at open also assigns sequences (1..N for N
+    /// replayed frames), so sequences are consistent across snapshot+WAL cycles.
+    ///
+    /// For V5-V7 stores opened without a V8 snapshot, nodes that were present
+    /// in the snapshot but not touched by any WAL frame will return `None`
+    /// (horizon-bounded: CAS against such nodes is only safe after the first
+    /// V8 snapshot or after the node is next mutated).
+    pub fn last_changed(&self, key: &str) -> Option<u64> {
+        let id = self.ids.get(key)?;
+        self.last_change.get(&id).copied()
+    }
+
+    /// The current commit sequence (number of successful commits since open,
+    /// including WAL replay frames).  Useful for recording a baseline before
+    /// a read-modify-write cycle.
+    pub fn commit_seq(&self) -> u64 {
+        self.commit_seq
+    }
+
+    /// Check that all `preconds` are satisfied against the current db state.
+    /// Returns `Err(GraphError::CasConflict)` on the first failing precondition.
+    pub(crate) fn check_preconditions(&self, preconds: &[Precondition]) -> Result<()> {
+        for precond in preconds {
+            match precond {
+                Precondition::NodeUnchangedSince { key, expected } => {
+                    // Missing entry means the node predates the WAL window or
+                    // does not exist; treat as 0 (before any commit).
+                    let actual = self.last_changed(key).unwrap_or_default();
+                    if actual != *expected {
+                        return Err(GraphError::CasConflict {
+                            key: key.clone(),
+                            expected: *expected,
+                            actual,
+                        });
+                    }
+                }
+                Precondition::NodeAbsent { key } => {
+                    // Node must not exist (not live).
+                    if self.ids.get(key).is_some() {
+                        let actual = self.last_changed(key).unwrap_or(0);
+                        return Err(GraphError::CasConflict {
+                            key: key.clone(),
+                            expected: u64::MAX,
+                            actual,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a batch of mutations with compare-and-set preconditions.
+    ///
+    /// All preconditions are checked atomically before any operation is applied.
+    /// If any precondition fails, the entire batch is rejected with
+    /// [`GraphError::CasConflict`] and no WAL frame is written.
+    ///
+    /// # Returns
+    /// `(nodes_inserted, edges_inserted)` on success, same as [`write_batch`].
+    ///
+    /// # Errors
+    /// - [`GraphError::CasConflict`] if any precondition is not satisfied.
+    /// - Any error that [`write_batch`] would return for the ops themselves.
+    pub fn write_batch_cas(
+        &mut self,
+        preconds: Vec<Precondition>,
+        ops: Vec<BatchOp>,
+    ) -> Result<(usize, usize)> {
+        self.check_preconditions(&preconds)?;
+        self.commit_logged_batch(ops, None)
+    }
+
+    /// Update the per-node last-change map for a WAL record at commit `seq`.
+    ///
+    /// Called after a successful apply to record which nodes were touched.
+    /// For replay, called with the WAL-frame's replayed seq.
+    ///
+    /// Touch definition (see [`Precondition`] doc):
+    /// - InsertNode / InsertNodeId / SetProp / SetPropId / RemoveProp → the node.
+    /// - InsertEdge / InsertEdgeId / DeleteEdge → both src and dst.
+    /// - DeleteNode → node tombstoned; last_changed() returns None so no update needed.
+    /// - DerivedEdge markers, Intern, rule/view records → no-ops.
+    /// - Batch → recurse into inner records.
+    fn update_last_change_from_rec(&mut self, rec: &WalRecord, seq: u64) {
+        match rec {
+            WalRecord::InsertNode { key, .. }
+            | WalRecord::SetProp { key, .. }
+            | WalRecord::RemoveProp { key, .. } => {
+                if let Some(id) = self.ids.get(key) {
+                    self.last_change.insert(id, seq);
+                }
+            }
+            WalRecord::InsertNodeId { key, .. } => {
+                if let Some(id) = self.ids.get(key) {
+                    self.last_change.insert(id, seq);
+                }
+            }
+            WalRecord::SetPropId { id, .. } => {
+                self.last_change.insert(*id, seq);
+            }
+            WalRecord::InsertEdge {
+                src_key, dst_key, ..
+            }
+            | WalRecord::DeleteEdge {
+                src_key, dst_key, ..
+            } => {
+                if let Some(src_id) = self.ids.get(src_key) {
+                    self.last_change.insert(src_id, seq);
+                }
+                if let Some(dst_id) = self.ids.get(dst_key) {
+                    self.last_change.insert(dst_id, seq);
+                }
+            }
+            WalRecord::InsertEdgeId { src, dst, .. } => {
+                self.last_change.insert(*src, seq);
+                self.last_change.insert(*dst, seq);
+            }
+            // DeleteNode: node is tombstoned; last_changed(key) returns None for
+            // deleted keys (ids.get() returns None post-tombstone), so no update needed.
+            // History markers: state no-ops; the underlying mutation already
+            // touched the relevant nodes' last_change entries.
+            WalRecord::DeleteNode { .. }
+            | WalRecord::DerivedEdgeAdded { .. }
+            | WalRecord::DerivedEdgeRetracted { .. }
+            | WalRecord::Intern { .. }
+            | WalRecord::CreateRule { .. }
+            | WalRecord::DeleteRule { .. }
+            | WalRecord::RebuildRule { .. }
+            | WalRecord::CreateView { .. }
+            | WalRecord::DeleteView { .. }
+            | WalRecord::EnableFulltext { .. }
+            | WalRecord::DisableFulltext { .. } => {}
+            WalRecord::Batch(inner) => {
+                for inner_rec in inner {
+                    self.update_last_change_from_rec(inner_rec, seq);
+                }
+            }
+        }
+    }
+
     pub fn node_count(&self) -> usize {
         self.ids.len()
+    }
+
+    /// Configure archive retention: keep the `N` newest WAL archives at each
+    /// [`snapshot_with`] call when `archive_wal: true`.
+    ///
+    /// `Some(N)` where N > 0 → prune oldest archives keeping the newest N.
+    /// `Some(0)` or `None` → unlimited (no pruning).
+    ///
+    /// Pruning only ever happens inside [`snapshot_with`]; this method only
+    /// stores the policy.  Archives below the retention limit are deleted
+    /// oldest-first.  The horizon floor is updated so that
+    /// [`was_linked`] / history APIs return `CommitOutOfRange` for commits
+    /// in pruned archives rather than silently returning wrong data.
+    pub fn set_wal_archive_retention(&mut self, keep: Option<u32>) {
+        self.wal_archive_retention = keep;
+    }
+
+    /// Delete any WAL archives that are fully below the current horizon floor.
+    ///
+    /// Orphaned archives arise when the floor is written first during retention
+    /// pruning and then a crash interrupts the archive-delete sequence.  The
+    /// opening cleanup ensures no subsequent read path sees stale data.
+    ///
+    /// Under the monotonic naming scheme, the archive name N equals the
+    /// cumulative end-frame index of the archive in global commit space (i.e.
+    /// the archive covers global frames `[prev_n, N)`).  An archive is
+    /// fully orphaned when `N <= wal_horizon_floor`: all of its frames fall
+    /// below the floor and have already been counted in it.
+    fn cleanup_orphaned_archives(&mut self) -> Result<()> {
+        if self.wal_horizon_floor == 0 {
+            // Floor at 0 means no pruning has ever occurred; nothing to clean.
+            return Ok(());
+        }
+        let archive_ns = self.fs.list_archives()?;
+        for n in archive_ns {
+            if n <= self.wal_horizon_floor {
+                // Archive N ends at global frame N; all its frames are below
+                // the floor (floor already accounts for them) → orphaned.
+                self.fs.delete_archive(n).map_err(GraphError::Io)?;
+            } else {
+                // Archives are sorted ascending; first one above floor stops scan.
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect all WAL frames from surviving archives (oldest-first) then the
+    /// live WAL into one flat list, and return the total along with the number
+    /// of archive frames at the front of the list.
+    ///
+    /// Commit indices into the returned list are LOCAL (0 = first frame of
+    /// oldest surviving archive).  To obtain the GLOBAL index add
+    /// `self.wal_horizon_floor`.
+    fn all_frames(&self) -> Result<(Vec<WalRecord>, u64)> {
+        let archive_ns = self.fs.list_archives()?;
+        let mut all: Vec<WalRecord> = Vec::new();
+        for n in archive_ns {
+            let bytes = self.fs.read_archive(n)?;
+            let (frames, _) = decode_all(&bytes);
+            all.extend(frames);
+        }
+        let archive_count = all.len() as u64;
+        let live_bytes = self.fs.read(FileId::Wal)?;
+        let (live_frames, _) = decode_all(&live_bytes);
+        all.extend(live_frames);
+        Ok((all, archive_count))
+    }
+
+    /// Return the total number of committed WAL frames visible in the current
+    /// horizon window, including frames in surviving WAL archives.
+    ///
+    /// This is the exclusive upper bound for valid `at_commit` indices in
+    /// `was_linked`. Valid indices are `wal_horizon_floor()..wal_total_commits()`.
+    ///
+    /// Returns the horizon floor when all surviving history is empty.
+    pub fn wal_total_commits(&self) -> Result<u64> {
+        let (frames, _) = self.all_frames()?;
+        Ok(self.wal_horizon_floor + frames.len() as u64)
+    }
+
+    /// The global frame index of the first commit reachable through surviving
+    /// archives (0 when no archives have been pruned).
+    pub fn wal_horizon_floor(&self) -> u64 {
+        self.wal_horizon_floor
     }
 
     /// Return the per-node change history for `key` by scanning the on-disk WAL.
@@ -5558,13 +6057,12 @@ impl<F: Fs> GraphDb<F> {
         use crate::history::{HistoryChange, HistoryEntry};
         use core_storage::wal::WalRecord;
 
-        let bytes = self.fs.read(FileId::Wal)?;
-        let (frames, _) = decode_all(&bytes);
+        let (frames, _) = self.all_frames()?;
 
         let mut out: Vec<HistoryEntry> = Vec::new();
 
-        for (commit, frame) in frames.iter().enumerate() {
-            let commit = commit as u64;
+        for (local_i, frame) in frames.iter().enumerate() {
+            let commit = self.wal_horizon_floor + local_i as u64;
             // Collect the inner records to process — Batch is one commit, single records are one commit.
             let records: &[WalRecord] = match frame {
                 WalRecord::Batch(inner) => inner.as_slice(),
@@ -5700,6 +6198,333 @@ impl<F: Fs> GraphDb<F> {
         Ok(out)
     }
 
+    /// Return the per-edge change history between nodes `a` and `b` by scanning
+    /// the on-disk WAL.
+    ///
+    /// ## Horizon
+    ///
+    /// History reaches back only to the last WAL-truncating snapshot, exactly
+    /// like `node_history` and `open_at`. The returned [`HistoryResult`] carries
+    /// `total_commits` (= number of WAL frames), which is the exclusive upper
+    /// bound for valid commit indices.
+    ///
+    /// ## Derived edges
+    ///
+    /// Rule-derived edges appear via `DerivedEdgeAdded` / `DerivedEdgeRetracted`
+    /// WAL markers written by `log_then_apply_with` after each rule-firing
+    /// mutation. The `rule` field of those events carries the rule name.
+    ///
+    /// ## DeleteNode
+    ///
+    /// When a node is deleted, its manual incident edges are swept inline without
+    /// individual `DeleteEdge` WAL records. `edge_history` detects `DeleteNode`
+    /// events for either endpoint and synthesises `Retracted(rule:None)` events
+    /// for each manual edge that was active at that point. Derived edges active at
+    /// the time of deletion are handled by the `DerivedEdgeRetracted` marker that
+    /// the engine appends immediately after the `DeleteNode` record; those events
+    /// carry correct rule attribution and are emitted by the marker arm, not the
+    /// synthetic sweep.
+    ///
+    /// ## Masks
+    ///
+    /// Like `node_history`, this method has no mask parameter and returns WAL
+    /// history regardless of any role mask. For masked history semantics, apply
+    /// the mask at the caller level.
+    pub fn edge_history(
+        &self,
+        a: &str,
+        b: &str,
+    ) -> Result<crate::history::HistoryResult<crate::history::EdgeHistoryEvent>> {
+        use crate::history::{EdgeEvent, EdgeHistoryEvent, HistoryResult};
+        use core_storage::wal::WalRecord;
+
+        let (frames, _) = self.all_frames()?;
+        let total_commits = self.wal_horizon_floor + frames.len() as u64;
+
+        // Active edges between a and b tracked as (edge_type, src_key, dst_key, is_derived).
+        // The is_derived flag is used by the DeleteNode sweep: manual edges are
+        // swept with a synthetic Retracted(rule:None); derived edges are skipped
+        // because the engine writes a DerivedEdgeRetracted marker immediately after
+        // the DeleteNode record, which carries the correct rule attribution.
+        let mut active: Vec<(String, String, String, bool)> = Vec::new();
+        let mut out: Vec<EdgeHistoryEvent> = Vec::new();
+
+        for (local_i, frame) in frames.iter().enumerate() {
+            let commit = self.wal_horizon_floor + local_i as u64;
+            let records: &[WalRecord] = match frame {
+                WalRecord::Batch(inner) => inner.as_slice(),
+                single => std::slice::from_ref(single),
+            };
+
+            for rec in records {
+                match rec {
+                    WalRecord::InsertEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.push((
+                                edge_type.clone(),
+                                src_key.clone(),
+                                dst_key.clone(),
+                                false,
+                            ));
+                            out.push(EdgeHistoryEvent {
+                                edge_type: edge_type.clone(),
+                                commit,
+                                event: EdgeEvent::Added,
+                                rule: None,
+                            });
+                        }
+                    }
+                    WalRecord::InsertEdgeId { etype, src, dst } => {
+                        let etype_str = match self.syms.resolve(*etype) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        // Use key_of_historical so tombstoned nodes (deleted
+                        // later in the WAL) still resolve during the scan.
+                        let src_key = self.ids.key_of_historical(*src);
+                        let dst_key = self.ids.key_of_historical(*dst);
+                        let is_ab = src_key == Some(a) && dst_key == Some(b);
+                        let is_ba = src_key == Some(b) && dst_key == Some(a);
+                        if is_ab || is_ba {
+                            let src_str = src_key.unwrap().to_string();
+                            let dst_str = dst_key.unwrap().to_string();
+                            active.push((etype_str.clone(), src_str, dst_str, false));
+                            out.push(EdgeHistoryEvent {
+                                edge_type: etype_str,
+                                commit,
+                                event: EdgeEvent::Added,
+                                rule: None,
+                            });
+                        }
+                    }
+                    WalRecord::DeleteEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            // Remove the first matching active entry (flag ignored).
+                            if let Some(pos) = active.iter().position(|(et, s, d, _)| {
+                                et == edge_type && s == src_key && d == dst_key
+                            }) {
+                                active.remove(pos);
+                            }
+                            out.push(EdgeHistoryEvent {
+                                edge_type: edge_type.clone(),
+                                commit,
+                                event: EdgeEvent::Retracted,
+                                rule: None,
+                            });
+                        }
+                    }
+                    WalRecord::DeleteNode { key: k } if k == a || k == b => {
+                        // Sweep: implicitly retract only MANUAL active edges.
+                        // Derived active edges are skipped here because the rule
+                        // engine appends a DerivedEdgeRetracted marker immediately
+                        // after this DeleteNode record; that marker produces the
+                        // single correctly-attributed Retracted event.  Derived
+                        // entries are dropped from `active` (the marker arm's
+                        // idempotent retain finds nothing to remove).
+                        for (et, _, _, is_derived) in active.drain(..) {
+                            if !is_derived {
+                                out.push(EdgeHistoryEvent {
+                                    edge_type: et,
+                                    commit,
+                                    event: EdgeEvent::Retracted,
+                                    rule: None,
+                                });
+                            }
+                            // Derived: drop silently; marker carries the Retracted event.
+                        }
+                    }
+                    WalRecord::DerivedEdgeAdded {
+                        rule,
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.push((et.clone(), src_key.clone(), dst_key.clone(), true));
+                            out.push(EdgeHistoryEvent {
+                                edge_type: et.clone(),
+                                commit,
+                                event: EdgeEvent::Added,
+                                rule: Some(rule.clone()),
+                            });
+                        }
+                    }
+                    WalRecord::DerivedEdgeRetracted {
+                        rule,
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            // Push unconditionally: a derived edge whose Added marker
+                            // predates the history horizon has no `active` entry, but
+                            // the retraction is still a real in-window event.
+                            // Remove from active idempotently if present.
+                            active.retain(|(aet, s, d, _)| {
+                                !(aet == et && s == src_key && d == dst_key)
+                            });
+                            out.push(EdgeHistoryEvent {
+                                edge_type: et.clone(),
+                                commit,
+                                event: EdgeEvent::Retracted,
+                                rule: Some(rule.clone()),
+                            });
+                        }
+                    }
+                    // All other records (InsertNode, SetProp, CreateRule, etc.)
+                    // do not affect edges between a and b.
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(HistoryResult {
+            items: out,
+            total_commits,
+        })
+    }
+
+    /// Return `true` iff an edge of `edge_type` existed between `a` and `b`
+    /// (in either direction) at the WAL commit `at_commit`.
+    ///
+    /// ## Horizon
+    ///
+    /// Valid commit indices are `0..total_commits` where `total_commits` is the
+    /// number of WAL frames. An `at_commit >= total_commits` is outside the
+    /// visible horizon and returns [`GraphError::CommitOutOfRange`].
+    ///
+    /// ## Derived edges
+    ///
+    /// Rule-derived edges are tracked via `DerivedEdgeAdded` / `DerivedEdgeRetracted`
+    /// WAL markers appended at firing time (Task 1). `was_linked` reads these markers
+    /// and therefore includes derived edges in its point-in-time evaluation,
+    /// matching `edge_history`'s fidelity.
+    pub fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> Result<bool> {
+        use core_storage::wal::WalRecord;
+
+        let (frames, _) = self.all_frames()?;
+        let total_commits = self.wal_horizon_floor + frames.len() as u64;
+
+        // Horizon floor: commits in pruned archives are unreachable.
+        if at_commit < self.wal_horizon_floor {
+            return Err(GraphError::CommitOutOfRange {
+                commit: at_commit,
+                total: total_commits,
+            });
+        }
+        if at_commit >= total_commits {
+            return Err(GraphError::CommitOutOfRange {
+                commit: at_commit,
+                total: total_commits,
+            });
+        }
+
+        // Local index into surviving frames (0 = first frame of oldest archive).
+        let local_commit = at_commit - self.wal_horizon_floor;
+
+        // Replay local frames 0..=local_commit, tracking active edges.
+        let mut active: BTreeSet<(String, String, String)> = BTreeSet::new();
+
+        for (_local_i, frame) in frames.iter().enumerate().take((local_commit + 1) as usize) {
+            let records: &[WalRecord] = match frame {
+                WalRecord::Batch(inner) => inner.as_slice(),
+                single => std::slice::from_ref(single),
+            };
+
+            for rec in records {
+                match rec {
+                    WalRecord::InsertEdge {
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.insert((et.clone(), src_key.clone(), dst_key.clone()));
+                        }
+                    }
+                    WalRecord::InsertEdgeId { etype, src, dst } => {
+                        let etype_str = match self.syms.resolve(*etype) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        // Use key_of_historical so tombstoned nodes resolve.
+                        let src_key = self.ids.key_of_historical(*src);
+                        let dst_key = self.ids.key_of_historical(*dst);
+                        let is_ab = src_key == Some(a) && dst_key == Some(b);
+                        let is_ba = src_key == Some(b) && dst_key == Some(a);
+                        if is_ab || is_ba {
+                            active.insert((
+                                etype_str,
+                                src_key.unwrap().to_string(),
+                                dst_key.unwrap().to_string(),
+                            ));
+                        }
+                    }
+                    WalRecord::DeleteEdge {
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
+                        }
+                    }
+                    WalRecord::DeleteNode { key: k } if k == a || k == b => {
+                        // All edges touching the deleted node are gone.
+                        active.retain(|(_, s, d)| s != k && d != k);
+                    }
+                    WalRecord::DerivedEdgeAdded {
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                        ..
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.insert((et.clone(), src_key.clone(), dst_key.clone()));
+                        }
+                    }
+                    WalRecord::DerivedEdgeRetracted {
+                        edge_type: et,
+                        src_key,
+                        dst_key,
+                        ..
+                    } => {
+                        let is_ab = src_key == a && dst_key == b;
+                        let is_ba = src_key == b && dst_key == a;
+                        if is_ab || is_ba {
+                            active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(active.iter().any(|(et, _, _)| et == edge_type))
+    }
+
     pub fn edge_count(&self) -> u64 {
         self.topo_view().edge_count()
     }
@@ -5786,6 +6611,13 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // Capture whether snapshot.bin already existed BEFORE this snapshot write.
+        // Used by the archive path's conservative genesis-chain check: if a prior
+        // snapshot exists but wal.truncated does not, we cannot distinguish a
+        // legacy store (may have been truncated in an older code version) from a
+        // new store that only used keep_wal=true.  Conservative: refuse genesis in
+        // both cases.  Must be sampled here, before the snapshot write below.
+        let had_prior_snapshot = self.fs.snapshot_path().map(|p| p.exists()).unwrap_or(false);
         self.ensure_v8_base_sections_loaded();
         // Ensure provenance is decoded before to_persist() clones it.
         self.engine.ensure_provenance_loaded_mut();
@@ -5850,6 +6682,7 @@ impl<F: Fs> GraphDb<F> {
                 view_defs,
                 wal_truncated: !opts.keep_wal,
                 hnsw: hnsw_state,
+                last_change: self.last_change.clone(),
             };
             let mut buf: Vec<u8> = Vec::new();
             {
@@ -5936,6 +6769,7 @@ impl<F: Fs> GraphDb<F> {
                 ivf_bytes,
                 view_defs,
                 hnsw: hnsw_state,
+                last_change: self.last_change.clone(),
             };
             let mut buf = Vec::new();
             encode_v8(
@@ -5974,7 +6808,129 @@ impl<F: Fs> GraphDb<F> {
             self.props = core_storage::columns::ColumnStore::new();
         }
 
-        if opts.keep_wal {
+        if opts.archive_wal {
+            // History-preserving snapshot (Task 4):
+            //   1. Snapshot already written above (write_atomic → fsynced).
+            //   2. Rename WAL → wal.<commit_seq>.archive  (atomic, same fs).
+            //      Crash window B: crash here leaves archive present, WAL
+            //      absent.  Reopen: snapshot loaded (full state), no WAL
+            //      replay.  Archive is NOT replayed into live state — it is
+            //      pre-snapshot by construction.  Safe.
+            //   3. Optionally write genesis marker (first archive only, no
+            //      prior WAL truncation).
+            //   4. Prune old archives (retention), update horizon floor.
+            //      Pruning invalidates the genesis chain; delete marker.
+            //   5. Write new minimal baseline WAL (write_atomic).
+            //      Crash window C: crash here leaves new archive plus no live
+            //      WAL.  Same as window B — handled above.
+            //
+            // Sample existing archives BEFORE the rename so we can detect
+            // whether this is the first archive.
+            let existing_archives = self.fs.list_archives()?;
+            let is_first_archive = existing_archives.is_empty();
+
+            // Compute a globally-monotonic archive name: the name equals the
+            // cumulative end-frame index of the archive in global commit space.
+            //
+            // Using `commit_seq` directly is UNSOUND across sessions: on reopen
+            // commit_seq is seeded from max(last_change), which underestimates
+            // the WAL depth when trailing commits (e.g. insert_edge) do not
+            // update last_change.  A session-2 archive could then receive a name
+            // ≤ the session-1 archive, causing incorrect sort order or collision.
+            //
+            // Instead: read and decode the live WAL here (before the rename) to
+            // get its exact frame count, then add it to the last known global
+            // end-frame index (the name of the most recent existing archive, or
+            // wal_horizon_floor if no archives exist).  This is O(WAL size) but
+            // snapshot is already serialising the full graph state, so the cost
+            // is dominated.
+            let live_wal_bytes_for_name = self.fs.read(FileId::Wal)?;
+            let (live_frames_for_name, _) = decode_all(&live_wal_bytes_for_name);
+            let archive_n = existing_archives
+                .last()
+                .copied()
+                .unwrap_or(self.wal_horizon_floor)
+                + live_frames_for_name.len() as u64;
+            self.fs.archive_wal(archive_n)?;
+
+            // Genesis marker: written once when the first archive is taken
+            // from a store that has never undergone a WAL-truncating snapshot.
+            // When present, `open_at` may replay archive-resident commits from
+            // empty state (the archive chain covers from global index 0).
+            //
+            // Three conditions must ALL hold:
+            //   1. This is the first archive (existing_archives was empty).
+            //   2. No WAL-truncating snapshot was taken (wal_ever_truncated=false,
+            //      which is loaded from the persisted wal.truncated marker at open).
+            //   3. No snapshot.bin existed before this operation (had_prior_snapshot).
+            //      If snapshot.bin already existed but wal.truncated is absent, this
+            //      could be a legacy store that was truncated before the wal.truncated
+            //      feature was introduced — we cannot prove the chain is complete.
+            //      Conservative refusal: cost = no as-of-through-archives; never
+            //      correctness.  On SimFs (snapshot_path() == None) this is always
+            //      false, so SimFs always passes this check.
+            if is_first_archive && !self.wal_ever_truncated && !had_prior_snapshot {
+                self.fs.write_genesis_marker()?;
+                self.archive_genesis_chain = true;
+            }
+
+            // Retention pruning: keep newest `keep` archives; delete oldest.
+            // Pruning is the ONLY deletion site for archives.
+            //
+            // Crash-safety ordering (C1 fix):
+            //   1. Count frames in surplus archives (reads only — no mutation).
+            //   2. Advance and PERSIST the horizon floor FIRST via write-then-
+            //      rename (atomic).  A crash after this point leaves orphaned
+            //      archives on disk, but the floor is correct.  The opening
+            //      cleanup sweep (`cleanup_orphaned_archives`) removes them on
+            //      the next open, so the store is always safe to reopen.
+            //   3. Delete the genesis marker (floor > 0 already blocks open_at
+            //      via the conjunctive gate; marker cleanup is belt-and-suspenders).
+            //   4. Delete surplus archives.  A crash between any two deletes
+            //      leaves the floor committed and orphaned archives cleaned at
+            //      next open — never a stale floor with a missing archive prefix.
+            if let Some(keep) = self.wal_archive_retention {
+                if keep > 0 {
+                    let archives = self.fs.list_archives()?;
+                    // archives is sorted ascending (oldest first)
+                    if archives.len() as u32 > keep {
+                        let surplus = archives.len() - keep as usize;
+                        // Step 1: count pruned frames (reads, no mutation).
+                        let mut pruned_frames = 0u64;
+                        for &n in &archives[..surplus] {
+                            let bytes = self.fs.read_archive(n)?;
+                            let (frames, _) = decode_all(&bytes);
+                            pruned_frames += frames.len() as u64;
+                        }
+                        // Step 2: advance and persist floor FIRST.
+                        self.wal_horizon_floor += pruned_frames;
+                        self.fs.write_horizon_floor(self.wal_horizon_floor)?;
+                        // Step 3: delete genesis marker (floor > 0 already
+                        // blocks open_at; this is belt-and-suspenders cleanup).
+                        if pruned_frames > 0 && self.archive_genesis_chain {
+                            self.fs.delete_genesis_marker()?;
+                            self.archive_genesis_chain = false;
+                        }
+                        // Step 4: delete surplus archives.  Crash here →
+                        // orphaned archives; cleaned at next open.
+                        for &n in &archives[..surplus] {
+                            self.fs.delete_archive(n)?;
+                        }
+                    }
+                }
+            }
+
+            // Write new minimal baseline WAL (mirrors the keep_wal=false path).
+            let mut baseline_wal: Vec<u8> = Vec::new();
+            for (label, field) in self.fulltext.enabled_pairs() {
+                let rec = WalRecord::EnableFulltext {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
+        } else if opts.keep_wal {
             // keep_wal=true: WAL is left untouched.  The existing WAL already
             // contains the EnableFulltext records from the original enable calls;
             // replay is idempotent (guards in apply() skip already-live entries).
@@ -5989,6 +6945,22 @@ impl<F: Fs> GraphDb<F> {
             //   • Crash after snapshot write but before this WAL write → full
             //     pre-snapshot WAL still present; open_with replays idempotently.
             //   • Crash after both writes → normal post-snapshot state.
+            //
+            // Genesis chain: a WAL-truncating snapshot breaks the archive chain
+            // for any archives taken AFTER this point (their WAL slices would
+            // not start at genesis).  Persist the truncation durably via
+            // wal.truncated so future sessions detect it on reopen, then clear
+            // the in-memory flag and delete any existing genesis marker so that
+            // open_at refuses archive-resident commits.
+            if !self.wal_ever_truncated {
+                // Write-once: skip if already written to avoid redundant fsyncs.
+                self.fs.write_truncation_marker()?;
+            }
+            self.wal_ever_truncated = true;
+            if self.archive_genesis_chain {
+                self.fs.delete_genesis_marker()?;
+                self.archive_genesis_chain = false;
+            }
             let mut baseline_wal: Vec<u8> = Vec::new();
             for (label, field) in self.fulltext.enabled_pairs() {
                 let rec = WalRecord::EnableFulltext {
@@ -6829,13 +7801,17 @@ mod tests {
     /// derived-edge-driven view values reflect the as-of state rather than just
     /// the initial backfill written at `CreateView` time.
     ///
-    /// History (6 WAL frames, indices 0..=5):
+    /// Base WAL frames (indices 0..=5 before history markers):
     ///   0: insert Org "o1"
     ///   1: create_view "employee_count" (Degree / WORKS_AT / In) on Org
     ///   2: create_rule fk_rule (WORKS_AT, Person→Org via org_id)
     ///   3: insert Person "p1" → rule fires WORKS_AT p1→o1 (degree = 1)  ← mid
     ///   4: insert Person "p2" → rule fires WORKS_AT p2→o1 (degree = 2)
     ///   5: insert Person "p3" → rule fires WORKS_AT p3→o1 (degree = 3)  ← latest
+    ///
+    /// Each rule-fire also appends a DerivedEdgeAdded history-marker frame (state
+    /// no-op), so the total commit count is higher than the base frame count.
+    /// The "latest" open_at commit is computed dynamically via `wal_commit_count_at`.
     ///
     /// Without `rebuild_all`, the as-of instance's "emp" view stays at the
     /// initial backfill value (0) instead of reflecting the replayed derived edges.
@@ -6898,15 +7874,20 @@ mod tests {
             "re-opened normal db must show degree 3"
         );
 
-        // Latest as-of (commit 5 = frames 0..=5): must match the normal open.
-        let aof_latest = GraphDb::open_at(&dir, 5).unwrap();
+        // Latest as-of (last WAL commit): must match the normal open.
+        // History-marker frames are appended after each rule-fire, so the total
+        // commit count is computed dynamically rather than hardcoded.
+        let total = crate::wal_commit_count_at(&dir).unwrap();
+        let aof_latest = GraphDb::open_at(&dir, total - 1).unwrap();
         assert_eq!(
             aof_latest.get_view_prop("o1", "emp"),
             normal_emp,
             "open_at latest: derived-edge view must equal normal open (rebuild_all required)"
         );
 
-        // Mid-history as-of (commit 3 = frames 0..=3): only p1; degree = 1.
+        // Mid-history as-of (commit 3 = p1 insert Batch frame): only p1; degree = 1.
+        // The DerivedEdgeAdded marker for p1 is at frame 4 (state no-op on replay),
+        // so replaying 0..=3 correctly re-derives only the p1→o1 edge.
         let aof_mid = GraphDb::open_at(&dir, 3).unwrap();
         assert_eq!(
             aof_mid.get_view_prop("o1", "emp"),

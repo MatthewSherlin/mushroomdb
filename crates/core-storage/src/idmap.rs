@@ -49,6 +49,15 @@ impl IdMap {
         self.to_key.get(id as usize).map(|s| s.as_str())
     }
 
+    /// Like `key_of`, but also resolves tombstoned ids.
+    ///
+    /// Use only for historical WAL scan paths (e.g. `edge_history`) where the
+    /// goal is to reconstruct what existed in the past, not the current live
+    /// state. All other callers should use `key_of`.
+    pub fn key_of_historical(&self, id: u32) -> Option<&str> {
+        self.to_key.get(id as usize).map(|s| s.as_str())
+    }
+
     /// Remove `key` from the live map, permanently tombstone its dense id, and
     /// return that id. Returns `None` if the key is not present.
     pub fn delete(&mut self, key: &str) -> Option<u32> {

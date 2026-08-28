@@ -1911,7 +1911,10 @@ fn keep_wal_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::
     db.insert_node("KW", "kw1", vec![("v".into(), Value::Int(1))])?;
     db.insert_edge("KWE", "kw0", "kw1")?;
     // keep_wal snapshot: WAL is preserved after snapshot write.
-    db.snapshot_with(SnapshotOptions { keep_wal: true })?;
+    db.snapshot_with(SnapshotOptions {
+        keep_wal: true,
+        ..SnapshotOptions::default()
+    })?;
     // Post-snapshot writes.
     db.insert_node("KW", "kw2", vec![("v".into(), Value::Int(2))])?;
     db.insert_edge("KWE", "kw1", "kw2")?;

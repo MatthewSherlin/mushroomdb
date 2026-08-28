@@ -204,7 +204,14 @@ Body is a `RuleDef` object:
 Omitted or JSON-null `max_edges` fills the default after deserialize: **32**
 for scored predicates, **1** for KeyMatch (and KeyMatch-rooted `All`). Rust
 `max_edges: None` remains the 1,000,000 global-budget hatch; HTTP cannot
-express that hatch (null fills the default).
+express that hatch (null fills the default). Python `None` and a missing key
+behave the same as HTTP null — both fill the predicate default.
+
+**Symmetric predicates:** when `src_label == dst_label`, the rule fires in both
+directions (the updated node is evaluated as source AND as destination). This
+creates edges in both directions. An undirected Cypher pattern
+(`MATCH (a)-[:T]-(b)`) then double-counts rows. Prefer directed patterns
+(`-[:T]->`) or add `RETURN DISTINCT a, b`.
 
 Returns 400 with `{"error": "..."}` on validation failure (unknown field
 type, missing required field, duplicate rule name).
@@ -294,6 +301,85 @@ ingest or the edges field of `/ingest`.
 
 ---
 
+### GET /node/{key}/history
+
+Return the WAL change history for a node.
+
+Response:
+```json
+{
+  "key": "alice",
+  "history": [
+    { "commit": 0, "change": { "type": "NodeInserted", "label": "Person" } },
+    { "commit": 1, "change": { "type": "PropSet", "field": "age", "value": 30 } },
+    { "commit": 2, "change": { "type": "EdgeAdded", "edge_type": "KNOWS", "other": "bob", "outgoing": true } }
+  ],
+  "total_commits": 3
+}
+```
+
+`total_commits` is the horizon upper bound (exclusive) — the number of WAL frames
+visible in the current window. History before the last WAL-truncating snapshot is not
+visible. See [Horizon contract](#horizon-contract) below.
+
+Role tokens: if the requested key is outside the role's visibility mask, the response
+is identical to querying an absent key (404) — no existence oracle.
+
+---
+
+### GET /history/edge?a=&b=
+
+Return the full add/retract lifecycle for edges between two nodes.
+
+Response:
+```json
+{
+  "a": "alice",
+  "b": "bob",
+  "events": [
+    { "edge_type": "KNOWS", "commit": 2, "event": "Added", "rule": null },
+    { "edge_type": "SIMILAR", "commit": 3, "event": "Added", "rule": "sim_emb" }
+  ],
+  "total_commits": 4
+}
+```
+
+`event` is `"Added"` or `"Retracted"`. `rule` is the rule name for derived edges,
+`null` for manually written edges. `total_commits` is the horizon upper bound.
+
+Role tokens: BOTH `a` AND `b` must be visible in the role mask. If either is hidden,
+the response is 404 for that key (no existence oracle).
+
+---
+
+### GET /history/was_linked?a=&b=&edge_type=&at_commit=
+
+Point-in-time check: was an edge of `edge_type` between `a` and `b` active at WAL
+commit `at_commit` (0-based)?
+
+Response:
+```json
+{ "a": "alice", "b": "bob", "edge_type": "KNOWS", "at_commit": 2, "linked": true }
+```
+
+Returns 400 (not 500) when `at_commit` is outside the visible horizon:
+```json
+{ "error": "commit 999 is out of range" }
+```
+
+Role tokens: BOTH `a` AND `b` must be visible (same-as-absent rule applies).
+
+#### Horizon contract
+
+All three history endpoints include `total_commits` in their response. This is the
+exclusive upper bound for valid commit indices (`0..total_commits`). When the WAL is
+empty (after a truncating snapshot and before any new writes), `total_commits` is 0.
+Pre-snapshot commits are not visible — history restarts from the first WAL frame after
+the snapshot. Use `snapshot_with(SnapshotOptions { keep_wal: true })` to preserve
+deep history across snapshots.
+
+---
+
 ### GET /watch (WebSocket)
 
 Connect with any WebSocket client. After upgrade the first text frame is
@@ -342,7 +428,7 @@ Response:
 
 ### Tools
 
-Twelve tools:
+Fifteen tools:
 
 | Tool | Description |
 |---|---|
@@ -358,6 +444,9 @@ Twelve tools:
 | `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?`; (2) edge traversal — `key`, `edge_type?`, `limit?` |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
+| `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits}` |
+| `edge_history` | Add/retract lifecycle for edges between two nodes; params: `a`, `b`. Returns `{a, b, events, total_commits}` |
+| `was_linked` | Point-in-time edge check; params: `a`, `b`, `edge_type`, `at_commit`. Returns `{linked}` or error when outside horizon |
 
 ---
 
@@ -380,6 +469,9 @@ import mushroomdb
 
 db = mushroomdb.GraphDb.open("/path/to/db")
 ```
+
+`GraphDb.open` creates the database directory if it does not already exist — no
+manual `mkdir` is required.
 
 ### Insert nodes
 
@@ -412,6 +504,19 @@ db.create_rule({
 })
 ```
 
+**`max_edges` semantics:** Python `None` and a missing key both fill the
+predicate default (32 for scored predicates, 1 for KeyMatch). This is the same
+as HTTP `null` — neither Python nor HTTP can express the Rust `max_edges: None`
+global-budget hatch (1,000,000 per source). Use the Rust API directly if you
+need the uncapped budget.
+
+**Symmetric predicates:** when `src_label == dst_label` (e.g., Person-to-Person
+similarity), the rule fires in **both directions** — a property change on any
+node triggers candidate scanning from that node as both source and destination.
+An undirected Cypher pattern like `MATCH (a)-[:SIMILAR]-(b)` double-counts rows
+because both `a→b` and `b→a` edges exist. Use directed patterns
+(`MATCH (a)-[:SIMILAR]->(b)`) or `RETURN DISTINCT a, b` to avoid duplicates.
+
 ### Query
 
 ```python
@@ -419,10 +524,14 @@ result = db.query(
     "MATCH (p:Person)-[r:FIT]->(o:Org) RETURN p, o, r.score AS score",
     {}
 )
-# result is a list of dicts
+# result is a list of dicts; dict keys are the RETURN aliases
 for row in result:
-    print(row)
+    print(row["p"], row["o"], row["score"])
 ```
+
+The dict keys in each row are the **RETURN aliases** from the query — `p`, `o`,
+and `score` in the example above. Bare `RETURN n` yields `{"n": ...}`; `RETURN
+n.age AS age` yields `{"age": ...}`.
 
 ### Traversal
 
@@ -449,13 +558,13 @@ s = db.stats()
 ### Snapshot
 
 ```python
-db.snapshot()  # write V6 (zstd-compressed) snapshot and truncate WAL
+db.snapshot()  # write V8 (mmap rkyv) snapshot and truncate WAL
 ```
 
-`snapshot()` writes the current state as a V6 (zstd-compressed) snapshot and
-then truncates the WAL to a minimal baseline. Faster cold starts, but as-of
-history (`open_at`) restarts from that point — commits before the snapshot are
-no longer reachable via time travel.
+`snapshot()` writes the current state as a V8 mmap snapshot (12 rkyv sections,
+zero-copy open) and then truncates the WAL to a minimal baseline. Faster cold
+starts, but as-of history (`open_at`) restarts from that point — commits before
+the snapshot are no longer reachable via time travel.
 
 **Keep WAL (Rust API):**
 
@@ -464,17 +573,17 @@ use core_api::{SnapshotOptions};
 db.snapshot_with(SnapshotOptions { keep_wal: true })?;
 ```
 
-`keep_wal: true` writes the V6 snapshot but leaves the WAL intact. `open_at`
+`keep_wal: true` writes the V8 snapshot but leaves the WAL intact. `open_at`
 can still reach pre-snapshot commits. The WAL replay over the snapshot is
 idempotent — no manual recovery is needed. The WAL grows until an explicit
 `snapshot()` (with default `keep_wal: false`) truncates it.
 
-**V6 snapshot format:** magic + version header uncompressed (6 bytes); the
-rest is zstd-compressed (level 3). Measured at 5k nodes: 62 KiB on disk,
-16 ms to write, 2 ms to open. V5 snapshots (from v0.1.0) are read
-transparently — no migration required. 100k-node numbers: 1.1 GiB on disk
-(−50% vs V5), 22.563 s write, 8.880 s open — see
-[`benchmarks/results/regression-v0.1.1-20260824.md`](../../benchmarks/results/regression-v0.1.1-20260824.md).
+**V8 snapshot format:** mmap-able rkyv sections (12 total); zero-copy open via
+mmap; no heap allocation for section data. V5/V6/V7 stores are auto-migrated to
+V8 on open. See [`docs/format-stability.md`](../format-stability.md) for the
+full section table and migration notes. 100k nodes (v0.2, ~10M derived edges):
+V8 snapshot open 0.02 s / 31–41 MiB RSS (warm file cache, cold process,
+2026-08-28, Apple M4 Pro).
 
 ### Atomic write batches (Rust API)
 
@@ -518,6 +627,53 @@ The following ops are supported inside `write_batch`:
 
 The method-chaining `db.batch()` builder is equivalent; `write_batch` is a
 convenience wrapper that auto-commits.
+
+### Compare-and-set write batches (Rust API)
+
+`write_batch_cas` is the optimistic-concurrency entry point. All preconditions
+are checked atomically under the write lock before any operation is applied; if
+any precondition fails, the entire batch is rejected with `GraphError::CasConflict`
+and no WAL frame is written.
+
+```rust
+use core_api::{Precondition, GraphError};
+
+// Read the current last-changed commit for a node.
+let seq = db.last_changed("alice")?; // Some(commit_seq) or None if absent/deleted
+
+let result = db.write_batch_cas(
+    vec![Precondition::NodeUnchangedSince {
+        key: "alice".into(),
+        expected: seq.unwrap_or(0),
+    }],
+    |b| {
+        b.set_prop("alice", "role", Value::Str("admin".into()));
+    },
+);
+match result {
+    Ok(_) => { /* applied */ }
+    Err(GraphError::CasConflict { key, expected, actual }) => {
+        // alice was modified between last_changed() and write_batch_cas().
+    }
+    Err(e) => { /* other error */ }
+}
+```
+
+**Precondition types:**
+
+| Precondition | Fails when |
+|---|---|
+| `NodeUnchangedSince { key, expected }` | Node does not exist, or `last_changed(key) != expected` |
+| `NodeAbsent { key }` | Node exists (for insert-only semantics) |
+
+**Touch definition:** `last_changed` is updated on `InsertNode`, `SetProp`,
+`RemoveProp`, `InsertEdge` (both endpoints), `DeleteEdge` (both endpoints),
+`DeleteNode` (entry removed; `last_changed` returns `None` thereafter). History
+markers and rule-management records do not update `last_changed`. Values are
+persisted in V8 snapshot section 11 (LAST_CHANGE) and survive restarts.
+
+`SharedDb::submit_batch_cas` provides the same guarantee over the shared-writer
+async interface. See [timetravel.md](timetravel.md) for the full semantics.
 
 ### Exposed surface
 

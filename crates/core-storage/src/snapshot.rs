@@ -7,7 +7,7 @@ use crate::topology::Topology;
 use crate::types::{GraphError, Result};
 use crate::v8::encode::V8Meta;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const MAGIC: [u8; 4] = *b"GDB1";
 /// V5: uncompressed bincode payload with CRC32 header.
@@ -148,6 +148,7 @@ fn encode_v8_from_state(state: &SnapshotState) -> Result<Vec<u8>> {
         view_defs: state.view_defs.clone(),
         wal_truncated: state.wal_truncated,
         hnsw: state.hnsw_state.clone(),
+        last_change: HashMap::new(),
     };
     let mut out = Vec::new();
     crate::v8::encode::encode_v8(

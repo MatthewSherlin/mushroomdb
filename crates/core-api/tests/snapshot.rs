@@ -1278,8 +1278,11 @@ fn keep_wal_reopen_equivalence() {
         db.insert_node("N", "b", vec![]).unwrap();
         db.insert_edge("E", "a", "b").unwrap();
         // Snapshot with keep_wal=true — WAL is preserved.
-        db.snapshot_with(SnapshotOptions { keep_wal: true })
-            .unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: true,
+            ..SnapshotOptions::default()
+        })
+        .unwrap();
         // Post-snapshot writes, same as reference.
         db.insert_node("N", "c", vec![]).unwrap();
         db.insert_edge("E", "b", "c").unwrap();
@@ -1330,8 +1333,11 @@ fn keep_wal_open_at_reaches_pre_snapshot_commits() {
         // WAL now has 2 frames (commits 0 and 1).
         wal_commit_before_snap = 0; // commit 0 = first WAL frame
                                     // Snapshot with keep_wal=true — commits 0 and 1 stay in WAL.
-        db.snapshot_with(SnapshotOptions { keep_wal: true })
-            .unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: true,
+            ..SnapshotOptions::default()
+        })
+        .unwrap();
         // Post-snapshot commits.
         db.insert_node("N", "c", vec![]).unwrap(); // commit 2
         db.insert_node("N", "d", vec![]).unwrap(); // commit 3
@@ -1381,8 +1387,11 @@ fn keep_wal_fulltext_baseline_not_doubled() {
         .unwrap();
         // Enable fulltext for 1 pair → 1 EnableFulltext record written to WAL.
         db.enable_fulltext("N", "text").unwrap();
-        db.snapshot_with(SnapshotOptions { keep_wal: true })
-            .unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: true,
+            ..SnapshotOptions::default()
+        })
+        .unwrap();
     }
 
     // Read WAL and count EnableFulltext records.
@@ -1650,8 +1659,11 @@ fn open_at_keep_wal_replays_dense_id_records_from_genesis() {
         db.insert_node("N", "a", vec![("v".into(), Value::Int(1))])
             .unwrap(); // commit 0
         db.insert_node("N", "b", vec![]).unwrap(); // commit 1
-        db.snapshot_with(SnapshotOptions { keep_wal: true })
-            .unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: true,
+            ..SnapshotOptions::default()
+        })
+        .unwrap();
         db.insert_edge("REL", "a", "b").unwrap(); // commit 2
     }
     let aof = GraphDb::open_at(&dir, 2).unwrap();
@@ -2387,8 +2399,11 @@ fn clean_open_snapshot_preserves_approx_rule_ivf_hnsw() {
     // After fix:  passthrough returns retained raw section bytes unchanged.
     {
         let mut db = GraphDb::open(&dir).unwrap();
-        db.snapshot_with(SnapshotOptions { keep_wal: false })
-            .unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            ..SnapshotOptions::default()
+        })
+        .unwrap();
     }
 
     // Phase 3: reopen from the second snapshot — edge set must equal Phase 1 exactly.

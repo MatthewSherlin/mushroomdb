@@ -1,5 +1,45 @@
 use core_storage::Value;
 
+// ── Edge history types ────────────────────────────────────────────────────────
+
+/// Result wrapper for history queries. Carries the event list and the total
+/// number of WAL commits visible in the current horizon window.
+///
+/// Valid commit indices for `was_linked` are `0..total_commits`. Any index
+/// `>= total_commits` is outside the horizon and `was_linked` will return
+/// `CommitOutOfRange`.
+#[derive(Debug)]
+pub struct HistoryResult<T> {
+    pub items: Vec<T>,
+    /// Exclusive upper bound for valid commit indices (`frames.len()`).
+    /// The horizon window is `[0, total_commits)`.
+    pub total_commits: u64,
+}
+
+/// A single add-or-retract event for an edge between two nodes.
+#[derive(Debug, PartialEq)]
+pub struct EdgeHistoryEvent {
+    pub edge_type: String,
+    /// 0-based WAL frame index of the commit that produced this event.
+    pub commit: u64,
+    pub event: EdgeEvent,
+    /// `Some(rule_name)` for rule-derived edges, `None` for manually written
+    /// edges. Derived edges are represented by `DerivedEdgeAdded` /
+    /// `DerivedEdgeRetracted` WAL markers (discriminants 18/19) written by
+    /// `log_then_apply_with` after each rule-firing mutation; see
+    /// `derived_edge_state_records_not_wal_logged_markers_are` in rules.rs.
+    pub rule: Option<String>,
+}
+
+/// Whether an edge was added or retracted.
+#[derive(Debug, PartialEq)]
+pub enum EdgeEvent {
+    Added,
+    Retracted,
+}
+
+// ── Node history types ────────────────────────────────────────────────────────
+
 /// A single change event in a node's history, paired with the WAL commit that produced it.
 ///
 /// ## Horizon
@@ -10,8 +50,8 @@ use core_storage::Value;
 ///
 /// ## Derived edges
 ///
-/// Rule-created (derived) edges are **not** in the WAL and therefore do not appear in
-/// history. Only edges written directly by the application are recorded.
+/// Rule-created (derived) edges appear in edge history via `DerivedEdgeAdded` /
+/// `DerivedEdgeRetracted` WAL markers; they do not appear in node history.
 #[derive(Debug, PartialEq)]
 pub struct HistoryEntry {
     /// 0-based WAL frame index of the commit that produced this change.
