@@ -298,6 +298,20 @@ proptest! {
     }
 }
 
+// Coverage gap: production `access_unchecked` seams
+// ---------------------------------------------------------------------------
+// The blocks below exercise `snapshot::decode`, which uses validated
+// `rkyv::access` on every section. The production hot path (MappedBase::topology,
+// MappedBase::columns, MappedBase::edge_props_section) uses `rkyv::access_unchecked`
+// and has NO hostile-bytes proptest coverage here. All fuzz routes go through the
+// validated `decode_v8_from_mapped` path.
+//
+// `catch_unwind` cannot defend a UB path: if a corrupt relative-pointer field
+// causes `ArchivedVec::as_slice` to resolve an out-of-bounds address, Rust's
+// unsafety guarantee is violated before any panic handler can fire.
+// The appropriate defence is Miri or ASAN (see .github/workflows/ci.yml TODO).
+// ---------------------------------------------------------------------------
+
 // Block (c): mutations of valid encodings — no panic, WAL is a prefix.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]

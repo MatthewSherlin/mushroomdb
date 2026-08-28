@@ -1389,8 +1389,8 @@ impl<F: Fs> GraphDb<F> {
         if let Some(base) = &self.base {
             // Provenance: raw rkyv bytes; CRC validated inside section_bytes.
             // Bounds are already validated at open time (restore_v8_base →
-            // validate_section_bounds), so these calls only fail on CRC mismatch
-            // or rkyv format errors — treat as non-fatal for lazy callers.
+            // validate_section_bounds) — unreachable post-validate_section_bounds;
+            // unwrap_or_default is a safety belt against impossible errors.
             let prov_bytes = base
                 .provenance_raw_bytes()
                 .map(|b| b.to_vec())

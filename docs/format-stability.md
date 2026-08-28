@@ -66,14 +66,17 @@ on first access.
 
 Large sections (TOPOLOGY=0, COLUMNS=1, EDGE_PROPS=5, HNSW=6, PROVENANCE=7,
 IVF_STATE=10) **skip** the per-touch CRC on the normal query path. A full-section
-hash of hundreds of MiB costs 50–200 ms per section and is not required for
-memory safety: section bounds are validated at open time; rkyv archived data is
-accessed via `access_unchecked` (O(1) root-pointer lookup, no pointer-walk) on
-the hot path, with all downstream field accesses going through Rust's
-bounds-checked slice indexing. Wrong-but-in-bounds byte values resulting from
-undetected corruption would produce incorrect query results, not memory safety
-violations. The `snapshot::decode` path (used during migration and offline decode)
-retains validated `rkyv::access` for full hostile-byte safety.
+hash of hundreds of MiB costs 50–200 ms per section. Section bounds are validated
+at open time; rkyv archived data on the hot path uses `access_unchecked` (O(1)
+root-pointer lookup, no pointer-walk). This is sound for encoder-produced
+uncorrupted data, but a bit-flip on a relative-pointer field causes
+`ArchivedVec::as_slice` to resolve an out-of-bounds address before any length
+check — genuine UB, not a panic. Within-payload corruption that does not affect
+relative pointers yields wrong query results rather than a safety violation.
+Mitigated by `mushroomdb verify` (full-section CRC32 audit on demand) and
+planned Miri/ASAN CI coverage. The `snapshot::decode` path (used during
+migration and offline decode) retains validated `rkyv::access` for full
+hostile-byte safety.
 
 To audit large-section integrity explicitly:
 

@@ -2339,7 +2339,8 @@ fn clean_open_snapshot_preserves_approx_rule_ivf_hnsw() {
     let dir = tmp("snap-passthrough");
 
     // Phase 1: build store with approx rule, fit IVF, take first snapshot.
-    {
+    // Capture the exact (src, dst) edge set so Phase 3 can assert equality.
+    let edges_phase1: std::collections::BTreeSet<(String, String)> = {
         let mut db = GraphDb::open(&dir).unwrap();
         for (k, v) in va_data {
             db.insert_node("VA", k, vec![("emb".into(), emb(v))])
@@ -2363,19 +2364,23 @@ fn clean_open_snapshot_preserves_approx_rule_ivf_hnsw() {
         })
         .unwrap();
         // Verify IVF produced edges before snapshotting.
-        let edges_before: Vec<String> = va_data
+        let set: std::collections::BTreeSet<(String, String)> = va_data
             .iter()
             .flat_map(|(k, _)| {
+                let src = k.to_string();
                 db.neighbors(k, "VAPPROX", Direction::Out)
                     .unwrap_or_default()
+                    .into_iter()
+                    .map(move |dst| (src.clone(), dst))
             })
             .collect();
         assert!(
-            !edges_before.is_empty(),
+            !set.is_empty(),
             "approx rule must produce edges after fitting"
         );
         db.snapshot().unwrap(); // IVF/HNSW written to sections 10/6
-    }
+        set
+    };
 
     // Phase 2: clean open + second snapshot with NO mutation.
     // Before fix: snapshot_with exported from empty live indexes → 0 IVF bytes.
@@ -2386,19 +2391,22 @@ fn clean_open_snapshot_preserves_approx_rule_ivf_hnsw() {
             .unwrap();
     }
 
-    // Phase 3: reopen from the second snapshot — edges must still be present.
+    // Phase 3: reopen from the second snapshot — edge set must equal Phase 1 exactly.
     let db = GraphDb::open(&dir).unwrap();
-    let edges_after: Vec<String> = va_data
+    let edges_phase3: std::collections::BTreeSet<(String, String)> = va_data
         .iter()
         .flat_map(|(k, _)| {
+            let src = k.to_string();
             db.neighbors(k, "VAPPROX", Direction::Out)
                 .unwrap_or_default()
+                .into_iter()
+                .map(move |dst| (src.clone(), dst))
         })
         .collect();
-    assert!(
-        !edges_after.is_empty(),
+    assert_eq!(
+        edges_phase3, edges_phase1,
         "approx rule edges must survive clean-open → snapshot passthrough; \
-         got 0 (IVF/HNSW was dropped)"
+         edge set changed (IVF/HNSW was dropped or mutated)"
     );
 
     // Provenance must also be intact (stats().edges > 0).
