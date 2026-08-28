@@ -12,6 +12,8 @@
 //!  9. deferred_events_discarded_on_failure — events discarded when fsync fails (R2)
 //! 10. group_commit_throughput_bench (ignored) — RealFs informational bench
 //! 11. group_commit_simfs_amortization_bench (ignored) — SimFs gate: 8 writers >= 3x serial
+//! 12. shared_db_fsync_failure_degrades_and_truncates_wal — F1(c) integration via SharedDb
+//! 13. direct_write_before_group_survives_group_fsync_failure — F1(c) concurrent variant
 
 use core_api::{BatchOp, FsyncPolicy, GraphDb, MutationEvent, SharedDb};
 use core_storage::fs::{FileId, Fs, FsIntrospect};
@@ -810,5 +812,152 @@ fn group_commit_simfs_amortization_bench() {
         "group-commit ({group_ops_per_s:.0} ops/s) must be >= 3x serial \
          ({serial_ops_per_s:.0} ops/s) under {FSYNC_DELAY_US}µs injected fsync \
          latency; ratio = {ratio:.2}"
+    );
+}
+
+// ── Test 12: F1(c) — SharedDb fsync-failure integration (single submitter) ───
+
+/// Full fsync-failure contract exercised through the live drain thread
+/// (not GraphDb methods directly).
+///
+/// Verifies:
+/// - Group submitter receives Err on fsync failure.
+/// - WAL is truncated to the pre-group offset after failure.
+/// - Subsequent `submit_batch` returns Err(degraded).
+/// - Reopen/replay: failed group absent, pre-group data intact.
+#[test]
+fn shared_db_fsync_failure_degrades_and_truncates_wal() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tmp("f1c-single");
+    let fail = Arc::new(AtomicBool::new(false));
+    let fail2 = Arc::clone(&fail);
+
+    let db = SharedDb::open_with_test_sync(&dir, move |path| {
+        if fail2.load(Ordering::Acquire) {
+            Err(std::io::Error::other("injected fsync failure"))
+        } else {
+            core_storage::sync_wal_at(path)
+        }
+    })
+    .unwrap();
+
+    // Normal submission — must succeed.
+    db.submit_batch(vec![BatchOp::InsertNode {
+        label: "A".into(),
+        key: "pre".into(),
+        props: vec![],
+    }])
+    .unwrap();
+
+    let pre_group_wal_len = std::fs::metadata(dir.join("wal.bin")).unwrap().len();
+
+    // Enable fsync failure for the next group.
+    fail.store(true, Ordering::Release);
+
+    let result = db.submit_batch(vec![BatchOp::InsertNode {
+        label: "A".into(),
+        key: "fail-group".into(),
+        props: vec![],
+    }]);
+    assert!(result.is_err(), "group with failing fsync must return Err");
+
+    // WAL must be truncated back to pre-group length.
+    let post_wal_len = std::fs::metadata(dir.join("wal.bin")).unwrap().len();
+    assert_eq!(
+        post_wal_len, pre_group_wal_len,
+        "WAL must be truncated to pre-group length after fsync failure"
+    );
+
+    // Subsequent submit must fail with degraded error.
+    let result2 = db.submit_batch(vec![BatchOp::InsertNode {
+        label: "A".into(),
+        key: "post-fail".into(),
+        props: vec![],
+    }]);
+    assert!(
+        result2.is_err(),
+        "subsequent submit_batch must return Err after degradation"
+    );
+
+    // Reopen and replay — failed group must be absent, pre-group data intact.
+    drop(db);
+    let db2 = SharedDb::open(&dir).unwrap();
+    assert!(
+        db2.read().has_node("pre"),
+        "pre-group node must survive replay"
+    );
+    assert!(
+        !db2.read().has_node("fail-group"),
+        "failed-group node must be absent on replay"
+    );
+}
+
+// ── Test 13: F1(c) variant — direct write before group survives failure ───────
+
+/// Regression test for the truncation race (F1(d)):
+/// a direct write acknowledged Ok before the group commit is NOT wiped
+/// by the drain's truncation on group fsync failure.
+///
+/// With the WAL mutex, the direct write and the group commit are fully
+/// serialized: the direct write's frames land at WAL positions below
+/// `pre_group_wal_len`, so `truncate_wal_at(pre_len)` leaves them intact.
+///
+/// Verifies on reopen: the directly-acknowledged write survives replay
+/// and the failed group node is absent.
+#[test]
+fn direct_write_before_group_survives_group_fsync_failure() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tmp("f1c-concurrent");
+    let fail = Arc::new(AtomicBool::new(false));
+    let fail2 = Arc::clone(&fail);
+
+    let db = SharedDb::open_with_test_sync(&dir, move |path| {
+        if fail2.load(Ordering::Acquire) {
+            Err(std::io::Error::other("injected fsync failure"))
+        } else {
+            core_storage::sync_wal_at(path)
+        }
+    })
+    .unwrap();
+
+    // Direct write: durably acknowledged before any group failure.
+    // The WAL mutex ensures this write's append + fsync is atomic with
+    // respect to any subsequent drain group.
+    db.write().insert_node("A", "direct-ok", vec![]).unwrap();
+
+    // Record WAL offset AFTER the direct write: the group's frames will
+    // land here, and truncation reverts to exactly this position.
+    let pre_group_wal_len = std::fs::metadata(dir.join("wal.bin")).unwrap().len();
+
+    // Enable fsync failure for the next drain group.
+    fail.store(true, Ordering::Release);
+
+    let result = db.submit_batch(vec![BatchOp::InsertNode {
+        label: "A".into(),
+        key: "group-fail".into(),
+        props: vec![],
+    }]);
+    assert!(result.is_err(), "group fsync failure must return Err");
+
+    // WAL must be truncated to pre-group boundary.
+    // The direct write's frames (before pre_group_wal_len) are untouched.
+    let post_wal_len = std::fs::metadata(dir.join("wal.bin")).unwrap().len();
+    assert_eq!(
+        post_wal_len, pre_group_wal_len,
+        "WAL truncated to pre-group boundary; direct write frames are preserved"
+    );
+
+    // Reopen: direct write survives; failed group node is absent.
+    drop(db);
+    let db2 = SharedDb::open(&dir).unwrap();
+    assert!(
+        db2.read().has_node("direct-ok"),
+        "directly-acknowledged write must survive replay"
+    );
+    assert!(
+        !db2.read().has_node("group-fail"),
+        "failed group node must be absent on replay"
     );
 }

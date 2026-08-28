@@ -21,17 +21,37 @@
 //! contract as `FsyncPolicy::Relaxed` — but submitters only receive `Ok`
 //! after the fsync, so durability is fully guaranteed from their perspective.
 //!
+//! # WAL I/O lock order (load-bearing)
+//!
+//! A WAL mutex (`SharedDb::wal_mu`) serialises all WAL I/O — appends, fsyncs,
+//! and truncations — across the drain thread and direct writers.
+//!
+//! **Required acquisition order (must be consistent in all code paths):**
+//!
+//! 1. `wal_mu`  — acquired first
+//! 2. `inner` (RwLock write guard) — acquired second, while holding `wal_mu`
+//!
+//! [`SharedDb::write`] enforces this by acquiring `wal_mu` before the RwLock.
+//! The drain thread acquires `wal_mu` before `inner.write()`.
+//! Readers NEVER acquire `wal_mu` — their p95 latency is unaffected.
+//!
+//! Holding `wal_mu` from before [append group frames] through [fsync OR
+//! truncation resolution] closes the truncation race: no concurrent direct
+//! write can insert WAL frames between the group's append and its fsync
+//! outcome, so `truncate_wal_at(pre_len)` is always a safe tail-trim.
+//!
 //! # Fsync-failure contract
 //!
 //! If the group fsync fails the drain thread immediately:
 //! 1. **Truncates** the WAL file back to the pre-group offset — this prevents
 //!    a later successful fsync from silently making the failed group durable
-//!    by flushing the full inode page cache.
-//! 2. **Discards** buffered event notifications (no subscriber sees un-durable
-//!    data).
-//! 3. **Marks** the database degraded via [`GraphDb::set_degraded`] — all
+//!    by flushing the full inode page cache.  The truncation is safe because
+//!    `wal_mu` prevents any concurrent write from appending after `pre_len`.
+//! 2. **Marks** the database degraded via [`GraphDb::set_degraded`] — all
 //!    subsequent [`submit_batch`] and `db.write()` mutation attempts return
 //!    an IO error until the database is reopened.
+//! 3. **Discards** buffered event notifications (no subscriber sees un-durable
+//!    data).
 //! 4. **Signals** all submitters in the failed group with an IO error.
 //! 5. **Exits** the drain loop.
 //!
@@ -43,16 +63,24 @@
 //!
 //! Under `FsyncPolicy::Strict` or `Batched`, subscription events are deferred
 //! until after the group fsync.  The drain thread reacquires the write lock
-//! briefly to call [`GraphDb::flush_deferred_events`], then signals submitters.
-//! Under `Relaxed`, events fire immediately (no fsync to wait for).
+//! briefly to call [`GraphDb::flush_deferred_events`], then releases `wal_mu`,
+//! then signals submitters.  Under `Relaxed`, events fire immediately (no
+//! fsync to wait for).
+//!
+//! # Event delivery and crashes (R2)
+//!
+//! Subscription events are best-effort post-durability notifications.  A crash
+//! between a successful group fsync and the `flush_deferred_events` call drops
+//! those events — a strictly narrower loss window than pre-4b (where events
+//! could fire before any fsync).
 //!
 //! # Shutdown
 //!
 //! `SharedDb` clones the drain handle via an `Arc`; the last clone to drop
 //! triggers `DrainHandle::drop`, which signals shutdown + joins the thread.
-//! The drain loop drains the queue to empty before exiting, so no submission
-//! that was enqueued before the last `SharedDb` clone is dropped can be
-//! silently lost — the enqueue call blocks until the channel is received.
+//! The drain thread can never exit while any `SharedDb` clone exists (the
+//! `Arc<Inner>` is held by every clone); no submission enqueued before the
+//! last clone is dropped can be silently lost.
 
 use crate::db::{BatchOp, FsyncPolicy};
 use crate::reader::ReaderSnapshot;
@@ -73,6 +101,15 @@ use std::thread;
 /// Maximum submissions coalesced into one group.  Caps write-lock hold time
 /// under extreme write bursts.
 const MAX_GROUP_SIZE: usize = 256;
+
+// ── WAL sync function type ────────────────────────────────────────────────────
+
+/// A callable that syncs the WAL at a given directory path.
+///
+/// In production this is always `sync_wal_at`.  Tests may inject a failing
+/// implementation via [`SharedDb::open_with_test_sync`] to exercise the
+/// fsync-failure contract through the live drain thread.
+type SyncWalFn = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
 
 // ── Submission type ───────────────────────────────────────────────────────────
 
@@ -163,6 +200,38 @@ impl Drop for DrainHandle {
     }
 }
 
+// ── WriteGuard ────────────────────────────────────────────────────────────────
+
+/// Compound write guard returned by [`SharedDb::write`].
+///
+/// Holds both the WAL mutex and the RwLock write guard.  Fields are declared
+/// in drop order — `inner` (RwLock) releases first, then `_wal` (WAL mutex)
+/// — preserving the lock-release ordering required by the WAL I/O discipline.
+///
+/// # Lock order
+///
+/// Acquisition: `wal_mu` → `inner` (RwLock write).
+/// Release (RAII, struct field declaration order): `inner` → `wal_mu`.
+pub struct WriteGuard<'a> {
+    /// RwLock write guard — dropped first (field declared first).
+    inner: std::sync::RwLockWriteGuard<'a, GraphDb<RealFs>>,
+    /// WAL mutex guard — dropped second (field declared second).
+    _wal: std::sync::MutexGuard<'a, ()>,
+}
+
+impl<'a> Deref for WriteGuard<'a> {
+    type Target = GraphDb<RealFs>;
+    fn deref(&self) -> &GraphDb<RealFs> {
+        &self.inner
+    }
+}
+
+impl<'a> DerefMut for WriteGuard<'a> {
+    fn deref_mut(&mut self) -> &mut GraphDb<RealFs> {
+        &mut self.inner
+    }
+}
+
 // ── SharedDb ──────────────────────────────────────────────────────────────────
 
 /// Shared handle to an on-disk [`GraphDb`]. [`Clone`] is cheap and shares state.
@@ -176,9 +245,9 @@ impl Drop for DrainHandle {
 /// # Direct write path
 ///
 /// [`SharedDb::write`] gives exclusive `&mut GraphDb` access for callers that
-/// already hold the lock or need complex multi-step mutations (e.g. Cypher
-/// write queries).  The `&mut self` API on `GraphDb` is unchanged and is the
-/// fast path for embedded / single-writer use.
+/// need complex multi-step mutations (e.g. Cypher write queries).  It acquires
+/// the WAL mutex first, then the RwLock write guard, satisfying the lock-order
+/// discipline described in the module doc.
 ///
 /// # Event-sink deadlock
 ///
@@ -191,6 +260,10 @@ pub struct SharedDb {
     queue: Arc<WriteQueue>,
     /// Keeps the drain thread alive; signals + joins on last drop.
     _drain: Arc<DrainHandle>,
+    /// WAL I/O mutex.  Serialises all WAL appends, fsyncs, and truncations
+    /// across the drain thread and direct writers.  See module-level doc for
+    /// the required acquisition order.
+    wal_mu: Arc<Mutex<()>>,
 }
 
 const _: () = {
@@ -201,21 +274,57 @@ const _: () = {
 impl SharedDb {
     pub fn open(dir: &Path) -> Result<Self> {
         let db = GraphDb::open(dir)?;
-        Ok(Self::from_db_and_dir(db, dir.to_path_buf()))
+        Ok(Self::from_db_and_dir_with_sync(
+            db,
+            dir.to_path_buf(),
+            Arc::new(sync_wal_at),
+        ))
     }
 
-    fn from_db_and_dir(db: GraphDb<RealFs>, dir: std::path::PathBuf) -> Self {
+    /// Open with an injectable WAL sync function.
+    ///
+    /// Allows tests to inject fsync failures through the live drain thread
+    /// without requiring real filesystem manipulation.  Not intended for
+    /// production use; the `test_sync` name signals its purpose.
+    pub fn open_with_test_sync(
+        dir: &Path,
+        sync: impl Fn(&Path) -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let db = GraphDb::open(dir)?;
+        Ok(Self::from_db_and_dir_with_sync(
+            db,
+            dir.to_path_buf(),
+            Arc::new(sync),
+        ))
+    }
+
+    fn from_db_and_dir_with_sync(
+        db: GraphDb<RealFs>,
+        dir: std::path::PathBuf,
+        sync_fn: SyncWalFn,
+    ) -> Self {
         let inner = Arc::new(RwLock::new(db));
         let queue = WriteQueue::new();
+        let wal_mu = Arc::new(Mutex::new(()));
         let dir_arc = Arc::new(dir);
 
         let drain_inner = Arc::clone(&inner);
         let drain_queue = Arc::clone(&queue);
         let drain_dir = Arc::clone(&dir_arc);
+        let drain_wal_mu = Arc::clone(&wal_mu);
+        let drain_sync_fn = Arc::clone(&sync_fn);
 
         let handle = thread::Builder::new()
             .name("groupcommit-drain".into())
-            .spawn(move || drain_loop(drain_inner, drain_queue, drain_dir))
+            .spawn(move || {
+                drain_loop(
+                    drain_inner,
+                    drain_queue,
+                    drain_dir,
+                    drain_wal_mu,
+                    drain_sync_fn,
+                )
+            })
             .expect("failed to spawn group-commit drain thread");
 
         SharedDb {
@@ -225,10 +334,14 @@ impl SharedDb {
                 queue,
                 handle: Some(handle),
             }),
+            wal_mu,
         }
     }
 
     /// Shared read access. Many readers may hold this concurrently.
+    ///
+    /// Readers never acquire the WAL mutex — their p95 latency is unaffected
+    /// by concurrent write or fsync activity.
     ///
     /// # Deadlock warning
     ///
@@ -238,15 +351,24 @@ impl SharedDb {
         self.inner.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Exclusive write access. Blocks until no other readers or writers hold
-    /// the lock.
+    /// Exclusive write access.
+    ///
+    /// Acquires the WAL mutex first, then the RwLock write guard, satisfying
+    /// the lock order required by the fsync-failure contract (see module doc).
+    /// The returned [`WriteGuard`] releases the RwLock before the WAL mutex
+    /// on drop.
     ///
     /// # Deadlock warning
     ///
     /// Do not hold a returned guard while calling any method on the same
     /// [`SharedDb`]; the [`RwLock`] is not re-entrant; doing so deadlocks.
-    pub fn write(&self) -> impl DerefMut<Target = GraphDb<RealFs>> + '_ {
-        self.inner.write().unwrap_or_else(|e| e.into_inner())
+    pub fn write(&self) -> WriteGuard<'_> {
+        // Acquire wal_mu BEFORE the RwLock write guard.  This matches the
+        // drain thread's acquisition order and prevents the truncation race:
+        // no direct write can interleave WAL I/O with an in-progress group.
+        let _wal = self.wal_mu.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        WriteGuard { inner, _wal }
     }
 
     /// Capture a lock-free [`ReaderSnapshot`] of the current db state.
@@ -319,6 +441,8 @@ fn drain_loop(
     inner: Arc<RwLock<GraphDb<RealFs>>>,
     queue: Arc<WriteQueue>,
     dir: Arc<std::path::PathBuf>,
+    wal_mu: Arc<Mutex<()>>,
+    sync_fn: SyncWalFn,
 ) {
     loop {
         // Wait for work (or shutdown with empty queue).
@@ -327,57 +451,68 @@ fn drain_loop(
             return; // shutdown + nothing pending
         }
 
-        // ── Apply all submissions under the write lock, NO fsync ─────────────
-        //
-        // Each submission's ops are moved out to avoid a clone.  We also
-        // capture the WAL file size BEFORE the commit so we can truncate it
-        // back on fsync failure (F1 invariant: Err means not committed).
-        //
-        // For Strict / Batched policy we enable deferred event mode so that
-        // subscription notifications only fire after the group fsync (R2:
-        // durability before notification).  For Relaxed policy events fire
-        // immediately (no fsync to wait for).
         let ops_batches: Vec<Vec<BatchOp>> = group
             .iter_mut()
             .map(|s| std::mem::take(&mut s.ops))
             .collect();
 
-        let (results, pre_group_wal_len, should_sync): (Vec<Result<(usize, usize)>>, u64, bool) = {
+        // ── Step 1: Acquire WAL mutex BEFORE the write lock ─────────────────
+        //
+        // Lock order: wal_mu → RwLock write guard.
+        //
+        // Holding wal_mu from here through [fsync OR truncation resolution]
+        // closes the truncation race: no concurrent db.write() caller can
+        // append WAL frames between the group's own appends and its fsync
+        // outcome.  truncate_wal_at(pre_len) is therefore always a safe
+        // tail-trim with no risk of wiping acknowledged direct writes.
+        let wal_guard = wal_mu.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Snapshot WAL size while holding wal_mu — no concurrent WAL append
+        // is possible, so this offset is a stable pre-group boundary.
+        let pre_group_wal_len = std::fs::metadata(dir.join("wal.bin"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        // ── Step 2: Apply all submissions under the write lock, NO fsync ────
+        //
+        // For Strict / Batched policy we enable deferred event mode so that
+        // subscription notifications only fire after the group fsync (R2:
+        // durability before notification).  For Relaxed policy events fire
+        // immediately (no fsync to wait for).
+        let (results, should_sync): (Vec<Result<(usize, usize)>>, bool) = {
             let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
-            // Snapshot WAL size inside the write lock — no concurrent writer
-            // can change it here.
-            let pre_len = std::fs::metadata(dir.join("wal.bin"))
-                .map(|m| m.len())
-                .unwrap_or(0);
             let sync_needed = db.fsync_policy() != FsyncPolicy::Relaxed;
             if sync_needed {
                 db.set_deferred_events_mode(true);
             }
             let r = db.commit_group_nosync(ops_batches);
-            (r, pre_len, sync_needed)
-            // ← write lock released here; readers unblock before fsync
+            (r, sync_needed)
+            // ← RwLock write guard released here; wal_mu still held
         };
 
-        // ── ONE fsync for the group, OUTSIDE the write lock ──────────────────
+        // ── Step 3: ONE fsync for the group, OUTSIDE the write lock ─────────
         //
         // Readers may see committed-but-unfsynced data between here and the
         // fsync below (same contract as Relaxed).  Submitters unblock only
         // after the fsync, guaranteeing durability from their perspective.
+        // wal_mu remains held so no concurrent writer can extend the WAL tail.
         let sync_result: Result<()> = if should_sync && results.iter().any(|r| r.is_ok()) {
-            sync_wal_at(&dir).map_err(GraphError::Io)
+            sync_fn(&dir).map_err(GraphError::Io)
         } else {
             Ok(()) // Relaxed policy or all submissions failed validation
         };
 
-        // ── Handle fsync failure (F1) ─────────────────────────────────────────
+        // ── Step 4: Handle fsync failure ─────────────────────────────────────
         if let Err(ref io_err) = sync_result {
             if results.iter().any(|r| r.is_ok()) {
-                // Truncate WAL to pre-group size.  Removes the unsynced frames
-                // so a later successful fsync (e.g. on the next group) cannot
-                // accidentally make this group durable via OS inode cache flush.
+                // Truncate WAL to the pre-group boundary.  Safe because wal_mu
+                // is held — no other writer can have appended since pre_len was
+                // measured, so this always removes exactly the failed group's
+                // frames and nothing else.
                 let _ = truncate_wal_at(&dir, pre_group_wal_len);
             }
-            // Discard deferred events — callers must not observe un-durable data.
+            // Acquire write lock to update in-memory degraded state.
+            // Lock order maintained: wal_mu (held) → RwLock write.
             {
                 let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
                 db.discard_deferred_events();
@@ -385,9 +520,12 @@ fn drain_loop(
                 // Mark degraded so db.write().insert_node(...) etc. also fail.
                 db.set_degraded();
             }
-            // Propagate the failure message to the queue so submit_batch fast-
-            // rejects future callers without blocking.
+            // Propagate failure to queue BEFORE releasing wal_mu so any
+            // direct writer waiting for wal_mu sees the degraded flag when
+            // it wakes (and log_then_apply_with will return Err(degraded)).
             queue.set_degraded(io_err.to_string());
+            // Release WAL mutex — no more WAL I/O will happen.
+            drop(wal_guard);
             // Signal each submitter with an IO error.
             for sub in group {
                 let _ = sub.done.send(Err(GraphError::Io(std::io::Error::other(
@@ -397,17 +535,23 @@ fn drain_loop(
             return; // drain loop exits; no further groups accepted
         }
 
-        // ── Flush deferred events AFTER successful fsync (R2) ────────────────
+        // ── Step 5: Flush deferred events AFTER successful fsync (R2) ────────
         //
-        // Reacquire the write lock briefly so distribute_events / emit_committed
-        // run on the GraphDb's subscriber lists.
+        // Release wal_mu first: event delivery is pure in-memory (subscriber
+        // callbacks only); no WAL I/O occurs in flush_deferred_events.
+        // Releasing wal_mu here unblocks any direct writer that was waiting,
+        // keeping write-path latency minimal.
+        drop(wal_guard);
+
         if should_sync {
+            // Reacquire the write lock briefly so distribute_events /
+            // emit_committed run on the GraphDb's subscriber lists.
             let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
             db.flush_deferred_events();
             db.set_deferred_events_mode(false);
         }
 
-        // ── Signal each submitter ────────────────────────────────────────────
+        // ── Step 6: Signal each submitter ────────────────────────────────────
         for (sub, result) in group.into_iter().zip(results) {
             let _ = sub.done.send(result);
         }
