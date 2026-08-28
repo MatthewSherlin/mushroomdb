@@ -88,13 +88,10 @@ fn org_id_auto_links_and_later_insert_fires_rule() {
     );
     assert_eq!(
         db.get_prop("p1", "id"),
-        Some(&Value::Str("p1".into())),
+        Some(Value::Str("p1".into())),
         "key_field is stored as a normal prop"
     );
-    assert_eq!(
-        db.get_prop("p1", "org_id"),
-        Some(&Value::Str("acme".into()))
-    );
+    assert_eq!(db.get_prop("p1", "org_id"), Some(Value::Str("acme".into())));
 
     let ex = db.explain("p1", "acme").unwrap();
     assert_eq!(ex.len(), 1);
@@ -255,7 +252,7 @@ fn missing_key_field_rows_are_counted_not_fatal() {
     assert!(db.has_node("p1"));
     assert!(db.has_node("p2"));
     assert!(!db.has_node("anon"));
-    assert_eq!(db.get_prop("p1", "name"), Some(&Value::Str("ada".into())));
+    assert_eq!(db.get_prop("p1", "name"), Some(Value::Str("ada".into())));
 }
 
 /// Binding: duplicate vs existing db and vs an earlier accepted row → row errors.

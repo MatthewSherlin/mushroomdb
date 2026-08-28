@@ -1,10 +1,31 @@
 use crate::def::{evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef};
+use crate::hnsw::HnswIndex;
 use crate::index::{
     candidate_spec, candidate_spec_approx_with_k, ivf_drift_rebuild_threshold, CandidateSpec,
     RuleIndex,
 };
-use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
+use core_storage::v8::encode::{decode_ivf_bytes, decode_provenance_bytes};
+use core_storage::v8::seam::ColumnsView;
+use core_storage::{EdgeProps, IdMap, Interner, Topology, Value};
+
+/// Decode raw IVF section bytes into the `RuleIvfExport` format consumed by
+/// `reindex_all_load_ivf`.  Returns an empty map when `bytes` is empty.
+fn decode_ivf_bytes_to_export(bytes: &[u8]) -> BTreeMap<String, RuleIvfExport> {
+    decode_ivf_bytes(bytes)
+        .into_iter()
+        .map(|(name, ps)| {
+            (
+                name,
+                (
+                    (ps.src.centroids, ps.src.clusters, ps.src.drift),
+                    (ps.dst.centroids, ps.dst.clusters, ps.dst.drift),
+                ),
+            )
+        })
+        .collect()
+}
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, OnceLock};
 
 /// A single derived-edge fire or retract captured during a commit.
 ///
@@ -39,7 +60,7 @@ pub struct GraphMut<'a> {
     pub ids: &'a IdMap,
     pub syms: &'a mut Interner,
     pub labels: &'a [u32],
-    pub props: &'a ColumnStore,
+    pub props: ColumnsView<'a>,
     pub topo: &'a mut Topology,
     pub edge_props: &'a mut EdgeProps,
 }
@@ -57,6 +78,25 @@ type Touch = (u32, u32, u32, u32);
 pub type SideIvfExport = (Vec<Vec<f64>>, BTreeMap<u32, usize>, u64);
 /// IVF state for both sides (src, dst) of one approximate rule.
 pub type RuleIvfExport = (SideIvfExport, SideIvfExport);
+
+/// Raw (src-graph, dst-graph) HNSW blobs retained from the last snapshot.
+type HnswBlobMap = BTreeMap<String, (Vec<u8>, Vec<u8>)>;
+/// Lazily-decoded HNSW graph pair (src-side, dst-side) keyed by rule name.
+type LazyHnswMap = BTreeMap<String, (Option<HnswIndex>, Option<HnswIndex>)>;
+
+/// Lazily-decoded provenance state used by `&self` read paths
+/// (`stats()`, `explain()`, `provenance_touching`).
+///
+/// Populated once from the retained section-7 bytes via `ensure_provenance_loaded`.
+/// After the first `&mut self` mutation (which calls `ensure_provenance_loaded_mut`
+/// and installs into the live `RuleEngine` fields), read paths switch to the live
+/// fields and this struct is no longer consulted.
+#[derive(Debug, Default)]
+struct LazyProvenance {
+    provenance: BTreeMap<String, BTreeSet<Triple>>,
+    by_node: BTreeMap<u32, BTreeSet<Touch>>,
+    intern_rule: Vec<String>,
+}
 
 #[derive(Debug, Default)]
 pub struct RuleEngine {
@@ -99,6 +139,53 @@ pub struct RuleEngine {
     /// [`crate::IVF_DRIFT_REBUILD`] during the last index maintenance.
     /// Drained by [`RuleEngine::take_rebuild_needed`] after apply.
     rebuild_needed: BTreeSet<String>,
+    /// Whether candidate indexes have been populated.  Starts `false` after a
+    /// snapshot restore that defers index building.  Set to `true` by
+    /// `reindex_all`, `reindex_all_load_ivf`, and `create_rule`.  On the first
+    /// mutation call when this is `false`, the full O(n) scan runs (first-write
+    /// cost), consuming and replacing `retained_hnsw_blobs`.
+    indexes_populated: bool,
+    /// Raw HNSW blobs retained from the last snapshot, not yet deserialized.
+    ///
+    /// Populated by `store_snapshot_state`.  Consumed (deserialized into each
+    /// rule's `RuleIndex`) either eagerly in `consume_retained_state_eager` (WAL-
+    /// present open) or lazily on the first mutation or first ANN query
+    /// (`ensure_hnsw_loaded` / the lazy-init guard in the mutation hooks).
+    /// Wrapped in Mutex so `ensure_hnsw_loaded` can be called from `&self`
+    /// (shared-read ANN path in `find_similar_vector` / `search_hybrid`).
+    retained_hnsw_blobs: Mutex<HnswBlobMap>,
+    /// Raw bincode bytes of the IVF cluster state retained from the last snapshot.
+    ///
+    /// Same lifecycle as `retained_hnsw_blobs` (mutation path only; consumed
+    /// in `consume_retained_state_eager` or the lazy-init guard in
+    /// `on_node_changed`).  Decoded via `decode_ivf_bytes` on first use
+    /// instead of at open time to avoid the ~544 MiB bincode overhead.
+    /// Wrapped in Mutex so `store_snapshot_state` can take `&self`.
+    retained_ivf_bytes: Mutex<Option<Vec<u8>>>,
+    /// Raw rkyv bytes of the provenance section retained from the last snapshot.
+    ///
+    /// Wrapped in `Mutex` so the `&self` read path (`ensure_provenance_loaded`)
+    /// can access it without `&mut self`.  The bytes are NOT cleared by
+    /// `ensure_provenance_loaded`; they are consumed (set to `None`) only by
+    /// `ensure_provenance_loaded_mut` on the first mutation.  This mirrors the
+    /// `retained_hnsw_blobs` lifetime so the write path can still consume the
+    /// raw bytes to install into the live mutable fields.
+    retained_provenance_bytes: Mutex<Option<Vec<u8>>>,
+    /// Lazily-decoded provenance for `&self` read paths (clean-open, no-WAL).
+    ///
+    /// Populated at most once via `OnceLock::get_or_init` inside
+    /// `ensure_provenance_loaded`.  After the first mutation
+    /// `ensure_provenance_loaded_mut` installs provenance into the live struct
+    /// fields and clears `retained_provenance_bytes`; subsequent reads detect
+    /// `retained_provenance_bytes.is_none()` and go directly to the live fields.
+    lazy_provenance: OnceLock<LazyProvenance>,
+    /// Lazily-loaded HNSW graphs for the clean-open (no-WAL) ANN read path.
+    ///
+    /// Populated once by `ensure_hnsw_loaded` on the first ANN query after a
+    /// snapshot open with no WAL.  `OnceLock` guarantees exactly-once init
+    /// even under concurrent shared-read access.  After the first mutation the
+    /// mutation-path HNSW in `indexes` takes over; this field is never cleared.
+    lazy_hnsw: OnceLock<LazyHnswMap>,
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +268,7 @@ fn compute_desired(
         Some(k) => k,
         None => return BTreeMap::new(),
     };
-    let n_get = |f: &str| g.props.get(n, f).cloned();
+    let n_get = |f: &str| g.props.get(n, f).map(|vr| vr.into_value());
 
     let spec = candidate_spec_for(def);
     let candidates: BTreeSet<u32> = if on_src_side {
@@ -270,7 +357,7 @@ fn compute_desired(
             Some(k) => k,
             None => continue,
         };
-        let m_get = |f: &str| g.props.get(m, f).cloned();
+        let m_get = |f: &str| g.props.get(m, f).map(|vr| vr.into_value());
         let (s_view, d_view, s_id, d_id) = if on_src_side {
             (
                 NodeView {
@@ -465,7 +552,7 @@ fn compute_desired_via(
                 Some(k) => k,
                 None => continue,
             };
-            let dst_get = |f: &str| g.props.get(dst, f).cloned();
+            let dst_get = |f: &str| g.props.get(dst, f).map(|vr| vr.into_value());
             let dst_view = NodeView {
                 key: dst_key,
                 props: &dst_get,
@@ -478,7 +565,7 @@ fn compute_desired_via(
                     Some(k) => k,
                     None => continue,
                 };
-                let via_get = |f: &str| g.props.get(via_id, f).cloned();
+                let via_get = |f: &str| g.props.get(via_id, f).map(|vr| vr.into_value());
                 let via_view = NodeView {
                     key: via_key,
                     props: &via_get,
@@ -903,8 +990,8 @@ fn pair_still_desired(def: &RuleDef, s: u32, d: u32, g: &GraphMut<'_>) -> bool {
         Some(k) => k,
         None => return false,
     };
-    let s_get = |f: &str| g.props.get(s, f).cloned();
-    let d_get = |f: &str| g.props.get(d, f).cloned();
+    let s_get = |f: &str| g.props.get(s, f).map(|vr| vr.into_value());
+    let d_get = |f: &str| g.props.get(d, f).map(|vr| vr.into_value());
     evaluate(
         &def.predicate,
         &NodeView {
@@ -1183,9 +1270,9 @@ fn index_node_for_rule(
     def: &RuleDef,
     index: &mut RuleIndex,
     syms: &Interner,
-    props: &ColumnStore,
+    props: ColumnsView<'_>,
 ) {
-    let get = |f: &str| props.get(id, f).cloned();
+    let get = |f: &str| props.get(id, f).map(|vr| vr.into_value());
     if syms.get(&def.src_label) == Some(label_sym) {
         let spec = src_lookup_spec_for(def);
         index.src_side.insert(&spec, id, &get);
@@ -1213,26 +1300,66 @@ impl RuleEngine {
         self.owned.contains(&(etype, src, dst))
     }
 
+    /// Whether provenance bytes are still retained (not yet consumed by a mutation).
+    ///
+    /// When `true`, `provenance()` and `provenance_touching*` dispatch to
+    /// `lazy_provenance`; when `false` they use the live mutable fields.
+    fn provenance_is_retained(&self) -> bool {
+        self.retained_provenance_bytes
+            .lock()
+            .expect("lock poisoned")
+            .is_some()
+    }
+
     /// Read-only view of the provenance map: rule name → set of (etype_sym, src, dst).
+    ///
+    /// Triggers a one-time lazy decode from retained bytes when called before
+    /// the first mutation on a clean-open (no-WAL) store.
     pub fn provenance(&self) -> &BTreeMap<String, BTreeSet<(u32, u32, u32)>> {
-        &self.provenance
+        if self.provenance_is_retained() {
+            self.ensure_provenance_loaded();
+            &self.lazy_provenance.get().unwrap().provenance
+        } else {
+            &self.provenance
+        }
     }
 
     /// O(degree) reverse-index lookup: every provenance triple that touches `node`.
+    ///
+    /// Dispatches to the lazy-decoded or live index depending on whether
+    /// retained bytes have already been consumed by a mutation.
     pub fn provenance_touching(
         &self,
         node: u32,
     ) -> impl Iterator<Item = (&str, u32, u32, u32)> + '_ {
-        self.by_node
+        let use_lazy = self.provenance_is_retained();
+        let (by_node, intern_rule): (&BTreeMap<u32, BTreeSet<Touch>>, &Vec<String>) = if use_lazy {
+            self.ensure_provenance_loaded();
+            let lp = self.lazy_provenance.get().unwrap();
+            (&lp.by_node, &lp.intern_rule)
+        } else {
+            (&self.by_node, &self.intern_rule)
+        };
+        by_node
             .get(&node)
             .into_iter()
             .flatten()
-            .map(|&(rid, t, s, d)| (self.intern_rule[rid as usize].as_str(), t, s, d))
+            .map(move |&(rid, t, s, d)| (intern_rule[rid as usize].as_str(), t, s, d))
     }
 
     /// Number of provenance triples incident on `node`.
     pub fn provenance_touching_len(&self, node: u32) -> usize {
-        self.by_node.get(&node).map_or(0, BTreeSet::len)
+        if self.provenance_is_retained() {
+            self.ensure_provenance_loaded();
+            self.lazy_provenance
+                .get()
+                .unwrap()
+                .by_node
+                .get(&node)
+                .map_or(0, BTreeSet::len)
+        } else {
+            self.by_node.get(&node).map_or(0, BTreeSet::len)
+        }
     }
 
     /// One-way latch: `true` after a budget breach until [`Self::rebuild`]
@@ -1341,6 +1468,15 @@ impl RuleEngine {
             pending_deltas: Vec::new(),
             emit_deltas: false,
             rebuild_needed: BTreeSet::new(),
+            // Candidate indexes start empty; caller must either call
+            // consume_retained_state_eager (WAL-present open) or rely on the
+            // lazy init in the mutation hooks (clean open, first-write cost).
+            indexes_populated: false,
+            retained_hnsw_blobs: Mutex::new(BTreeMap::new()),
+            retained_ivf_bytes: Mutex::new(None),
+            retained_provenance_bytes: Mutex::new(None),
+            lazy_provenance: OnceLock::new(),
+            lazy_hnsw: OnceLock::new(),
         }
     }
 
@@ -1412,7 +1548,7 @@ impl RuleEngine {
         ids: &IdMap,
         syms: &Interner,
         labels: &[u32],
-        props: &ColumnStore,
+        props: ColumnsView<'_>,
     ) {
         for idx in self.indexes.values_mut() {
             *idx = RuleIndex::default();
@@ -1450,6 +1586,7 @@ impl RuleEngine {
                 idx.dst_side.fit_ivf_clusters(name);
             }
         }
+        self.indexes_populated = true;
     }
 
     /// Like `reindex_all` but LOADS persisted IVF state for approximate rules
@@ -1466,7 +1603,7 @@ impl RuleEngine {
         ids: &IdMap,
         syms: &Interner,
         labels: &[u32],
-        props: &ColumnStore,
+        props: ColumnsView<'_>,
         ivf_state: BTreeMap<String, RuleIvfExport>,
     ) {
         for idx in self.indexes.values_mut() {
@@ -1512,6 +1649,190 @@ impl RuleEngine {
                 idx.dst_side.fit_ivf_clusters(name);
             }
         }
+        self.indexes_populated = true;
+    }
+
+    /// Store HNSW blobs and raw IVF bytes from a snapshot **without deserializing**.
+    ///
+    /// Called from `restore_snapshot_state` in db.rs.  Neither the HNSW graphs
+    /// nor the IVF centroids are materialized here; they are consumed lazily:
+    ///   - `consume_retained_state_eager` (WAL-present open, before WAL replay)
+    ///   - The mutation-hook lazy-init guard (clean open, first-write cost)
+    ///   - `ensure_hnsw_loaded` (first ANN query on a clean open)
+    pub fn store_snapshot_state(
+        &self,
+        hnsw_blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
+        ivf_bytes: Vec<u8>,
+    ) {
+        *self
+            .retained_hnsw_blobs
+            .lock()
+            .expect("retained_hnsw_blobs lock poisoned") = hnsw_blobs;
+        *self
+            .retained_ivf_bytes
+            .lock()
+            .expect("retained_ivf_bytes lock poisoned") = if ivf_bytes.is_empty() {
+            None
+        } else {
+            Some(ivf_bytes)
+        };
+        // indexes_populated remains false.
+    }
+
+    /// Store raw rkyv provenance bytes retained from a V8 snapshot.
+    ///
+    /// Called from `restore_v8_base` in db.rs after open.  Provenance is not
+    /// decoded here; it is materialized lazily — either by the `&self` read path
+    /// (`ensure_provenance_loaded`) for stats/explain, or by the `&mut self`
+    /// write path (`ensure_provenance_loaded_mut`) on the first mutation.
+    pub fn store_provenance_bytes(&self, bytes: Vec<u8>) {
+        *self
+            .retained_provenance_bytes
+            .lock()
+            .expect("lock poisoned") = if bytes.is_empty() { None } else { Some(bytes) };
+    }
+
+    /// Populate `lazy_provenance` from retained bytes for `&self` read paths.
+    ///
+    /// Uses `OnceLock` for exactly-once initialization.  The retained bytes are
+    /// NOT consumed here; `ensure_provenance_loaded_mut` still has access to them
+    /// for the write path.  After the first mutation, `retained_provenance_bytes`
+    /// is `None` and callers switch to the live `self.provenance` field instead.
+    pub fn ensure_provenance_loaded(&self) {
+        self.lazy_provenance.get_or_init(|| {
+            // Hold the Mutex across decode to avoid cloning 115 MiB.  This is a
+            // one-time cost; subsequent calls return immediately via OnceLock.
+            let guard = self
+                .retained_provenance_bytes
+                .lock()
+                .expect("retained_provenance_bytes lock poisoned");
+            let bytes = match &*guard {
+                Some(b) if !b.is_empty() => b,
+                _ => return LazyProvenance::default(),
+            };
+            let prov = decode_provenance_bytes(bytes);
+            let (by_node, _rule_intern, intern_rule) = rebuild_by_node(&prov);
+            LazyProvenance {
+                provenance: prov,
+                by_node,
+                intern_rule,
+            }
+        });
+    }
+
+    /// Decode and install retained provenance bytes into the live mutable fields.
+    ///
+    /// No-op if bytes have already been consumed or were never stored.
+    /// Must be called under `&mut self` before any operation that reads or
+    /// diffs against `self.provenance`, `self.owned`, or `self.by_node`.
+    pub fn ensure_provenance_loaded_mut(&mut self) {
+        let bytes = match self
+            .retained_provenance_bytes
+            .lock()
+            .expect("lock poisoned")
+            .take()
+        {
+            Some(b) => b,
+            None => return,
+        };
+        let prov = decode_provenance_bytes(&bytes);
+        for set in prov.values() {
+            self.owned.extend(set.iter().copied());
+        }
+        let (by_node, rule_intern, intern_rule) = rebuild_by_node(&prov);
+        self.provenance = prov;
+        self.by_node = by_node;
+        self.rule_intern = rule_intern;
+        self.intern_rule = intern_rule;
+    }
+
+    /// Eagerly consume retained snapshot state before WAL replay.
+    ///
+    /// Call this in `open_with` when the WAL has records.  Runs the O(n) node
+    /// scan + restores persisted IVF centroids and HNSW blobs so that WAL
+    /// replay finds fully-populated indexes.  Marks `indexes_populated = true`.
+    pub fn consume_retained_state_eager(
+        &mut self,
+        ids: &IdMap,
+        syms: &Interner,
+        labels: &[u32],
+        props: ColumnsView<'_>,
+    ) {
+        if self.indexes_populated {
+            return;
+        }
+        // Also ensure provenance is loaded before WAL replay so diffs apply
+        // against the correct pre-snapshot provenance state.
+        self.ensure_provenance_loaded_mut();
+        let hnsw = std::mem::take(
+            &mut *self
+                .retained_hnsw_blobs
+                .lock()
+                .expect("retained_hnsw_blobs lock poisoned"),
+        );
+        let ivf_bytes = self
+            .retained_ivf_bytes
+            .lock()
+            .expect("retained_ivf_bytes lock poisoned")
+            .take()
+            .unwrap_or_default();
+        let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
+        self.reindex_all_load_ivf(ids, syms, labels, props, ivf);
+        // Override the incrementally-built HNSW with the persisted blob (better).
+        self.load_hnsw_state(hnsw);
+    }
+
+    /// Deserialize retained HNSW blobs into `lazy_hnsw` for the clean-open ANN
+    /// read path.  Takes `&self` so it can be called from `find_similar_vector`
+    /// and `search_hybrid` under a shared (`db.read()`) lock.
+    ///
+    /// Uses `OnceLock` to guarantee exactly-once initialization even under
+    /// concurrent shared access.  The retained blobs are borrowed (not consumed)
+    /// so that a subsequent first-mutation call to `consume_retained_state_eager`
+    /// can still load the persisted HNSW graphs into `self.indexes`.
+    ///
+    /// Called before the first ANN query on a clean-open (no WAL) store.
+    pub fn ensure_hnsw_loaded(&self) {
+        self.lazy_hnsw.get_or_init(|| {
+            // Snapshot blob entries into a local Vec, then release the Mutex
+            // before deserialization so the lock is not held across potentially
+            // expensive bincode::deserialize calls.
+            let snapshot: Vec<(String, Vec<u8>, Vec<u8>)> = {
+                let guard = self
+                    .retained_hnsw_blobs
+                    .lock()
+                    .expect("retained_hnsw_blobs lock poisoned");
+                if guard.is_empty() {
+                    return BTreeMap::new();
+                }
+                guard
+                    .iter()
+                    .map(|(name, (sb, db))| (name.clone(), sb.clone(), db.clone()))
+                    .collect()
+            }; // lock released here
+            snapshot
+                .into_iter()
+                .map(|(name, sb, db)| {
+                    let src = if !sb.is_empty() {
+                        bincode::deserialize::<HnswIndex>(&sb).ok()
+                    } else {
+                        None
+                    };
+                    let dst = if !db.is_empty() {
+                        bincode::deserialize::<HnswIndex>(&db).ok()
+                    } else {
+                        None
+                    };
+                    (name, (src, dst))
+                })
+                .collect()
+        });
+    }
+
+    /// Returns `true` if candidate indexes have been built (either eagerly or
+    /// via the lazy mutation-hook trigger).
+    pub fn indexes_populated(&self) -> bool {
+        self.indexes_populated
     }
 
     /// Export HNSW graphs for all approximate rules as opaque bincoded blobs.
@@ -1534,6 +1855,34 @@ impl RuleEngine {
             }
         }
         out
+    }
+
+    /// Returns HNSW state for snapshotting.  When indexes are not yet populated
+    /// (clean open with no mutation), returns the retained raw blobs directly so
+    /// that a migrate/snapshot does not silently drop fitted indexes.
+    pub fn export_hnsw_state_passthrough(&self) -> BTreeMap<String, (Vec<u8>, Vec<u8>)> {
+        if !self.indexes_populated {
+            let guard = self
+                .retained_hnsw_blobs
+                .lock()
+                .expect("retained_hnsw_blobs lock poisoned");
+            if !guard.is_empty() {
+                return guard.clone();
+            }
+        }
+        self.export_hnsw_state()
+    }
+
+    /// Returns a clone of the retained raw IVF bincode bytes.
+    ///
+    /// Returns `None` if no bytes are retained (fresh store or indexes already
+    /// consumed by a mutation).  Used by `snapshot_with` for passthrough when
+    /// indexes have not yet been populated.
+    pub fn retained_ivf_bytes_clone(&self) -> Option<Vec<u8>> {
+        self.retained_ivf_bytes
+            .lock()
+            .expect("retained_ivf_bytes lock poisoned")
+            .clone()
     }
 
     /// Restore HNSW graphs from bincoded blobs (overrides any incrementally built
@@ -1574,6 +1923,15 @@ impl RuleEngine {
             }
             if let Some(idx) = self.indexes.get(name) {
                 if let Some(h) = idx.dst_side.hnsw_ref() {
+                    if !h.is_empty() {
+                        return Some(h.search(q, k));
+                    }
+                }
+            }
+            // Fallback: blobs deserialized via ensure_hnsw_loaded (read path,
+            // no mutation has populated self.indexes yet).
+            if let Some(lazy) = self.lazy_hnsw.get() {
+                if let Some((_, Some(h))) = lazy.get(name) {
                     if !h.is_empty() {
                         return Some(h.search(q, k));
                     }
@@ -1691,6 +2049,11 @@ impl RuleEngine {
         let fires = self.fires.get_mut(&name).unwrap();
         bump_fires_for_participants(&def, g, fires);
 
+        // This rule's index is now populated. If prior rules' indexes were
+        // already populated (or there are no other rules) mark the whole engine
+        // as ready; otherwise a later reindex_all call will set the flag.
+        self.indexes_populated = true;
+
         Ok(())
     }
 
@@ -1755,6 +2118,31 @@ impl RuleEngine {
         changed: Option<(&str, Option<Value>)>,
         g: &mut GraphMut<'_>,
     ) {
+        // Ensure provenance is decoded before diffing against existing edges.
+        self.ensure_provenance_loaded_mut();
+        // Lazy index build: on restore from a V8 snapshot, candidate indexes
+        // start empty to avoid an O(n) scan at open time.  The first mutation
+        // pays the cost instead.  Subsequent calls skip this branch.
+        // Retained HNSW/IVF blobs from the snapshot are consumed here so the
+        // reindex does NOT wipe the loaded HNSW graphs.
+        if !self.indexes_populated && !self.rules.is_empty() {
+            let hnsw = std::mem::take(
+                &mut *self
+                    .retained_hnsw_blobs
+                    .lock()
+                    .expect("retained_hnsw_blobs lock poisoned"),
+            );
+            let ivf_bytes = self
+                .retained_ivf_bytes
+                .lock()
+                .expect("retained_ivf_bytes lock poisoned")
+                .take()
+                .unwrap_or_default();
+            let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
+            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
+            self.load_hnsw_state(hnsw);
+        }
+
         let n_label = g.labels.get(n as usize).copied();
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
 
@@ -1787,7 +2175,7 @@ impl RuleEngine {
                         if f == field {
                             old_val_cloned.clone()
                         } else {
-                            g.props.get(n, f).cloned()
+                            g.props.get(n, f).map(|vr| vr.into_value())
                         }
                     };
                     let idx = self.indexes.get_mut(&rule_name).unwrap();
@@ -1802,7 +2190,7 @@ impl RuleEngine {
                 }
 
                 {
-                    let cur_getter = |f: &str| g.props.get(n, f).cloned();
+                    let cur_getter = |f: &str| g.props.get(n, f).map(|vr| vr.into_value());
                     let idx = self.indexes.get_mut(&rule_name).unwrap();
                     if as_src {
                         let spec = src_lookup_spec_for(&def);
@@ -2058,6 +2446,28 @@ impl RuleEngine {
         dst_id: u32,
         g: &mut GraphMut<'_>,
     ) {
+        // Ensure provenance is decoded before diffing against existing edges.
+        self.ensure_provenance_loaded_mut();
+        // Lazy index build: same guard as on_node_changed.  Retained snapshot
+        // blobs are consumed to avoid wiping any HNSW graphs.
+        if !self.indexes_populated && !self.rules.is_empty() {
+            let hnsw = std::mem::take(
+                &mut *self
+                    .retained_hnsw_blobs
+                    .lock()
+                    .expect("retained_hnsw_blobs lock poisoned"),
+            );
+            let ivf_bytes = self
+                .retained_ivf_bytes
+                .lock()
+                .expect("retained_ivf_bytes lock poisoned")
+                .take()
+                .unwrap_or_default();
+            let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
+            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
+            self.load_hnsw_state(hnsw);
+        }
+
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
         for rule_name in rule_names {
             let def = self.rules[&rule_name].clone();
@@ -2133,6 +2543,30 @@ impl RuleEngine {
     /// BTree triple order. A second call on an already-retracted node is a
     /// no-op (crash-window replay / absent state).
     pub fn on_node_removed(&mut self, n: u32, g: &mut GraphMut<'_>) {
+        // Ensure provenance is decoded before diffing against existing edges.
+        self.ensure_provenance_loaded_mut();
+        // Lazy index build: same guard as on_node_changed.  Top-k backfill
+        // compute_desired consults the candidate index; an empty index would
+        // silently produce no backfill.  Consume retained snapshot blobs here
+        // rather than wiping any loaded HNSW graphs.
+        if !self.indexes_populated && !self.rules.is_empty() {
+            let hnsw = std::mem::take(
+                &mut *self
+                    .retained_hnsw_blobs
+                    .lock()
+                    .expect("retained_hnsw_blobs lock poisoned"),
+            );
+            let ivf_bytes = self
+                .retained_ivf_bytes
+                .lock()
+                .expect("retained_ivf_bytes lock poisoned")
+                .take()
+                .unwrap_or_default();
+            let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
+            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
+            self.load_hnsw_state(hnsw);
+        }
+
         let n_label = g.labels.get(n as usize).copied();
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
 
@@ -2144,7 +2578,7 @@ impl RuleEngine {
             let as_dst = dst_sym.is_some() && n_label == dst_sym;
 
             {
-                let cur_getter = |f: &str| g.props.get(n, f).cloned();
+                let cur_getter = |f: &str| g.props.get(n, f).map(|vr| vr.into_value());
                 let idx = self.indexes.get_mut(&rule_name).unwrap();
                 if as_src {
                     let spec = src_lookup_spec_for(&def);
@@ -2342,7 +2776,7 @@ mod tests {
                 ids: &self.ids,
                 syms: &mut self.syms,
                 labels: &self.labels,
-                props: &self.props,
+                props: ColumnsView::owned(&self.props),
                 topo: &mut self.topo,
                 edge_props: &mut self.eprops,
             }
@@ -3632,7 +4066,14 @@ mod tests {
                     Some(s) if s != u32::MAX => s,
                     _ => continue,
                 };
-                index_node_for_rule(id, label_sym, rule, &mut idx, &fx.syms, &fx.props);
+                index_node_for_rule(
+                    id,
+                    label_sym,
+                    rule,
+                    &mut idx,
+                    &fx.syms,
+                    ColumnsView::owned(&fx.props),
+                );
             }
             let src_sym = fx.syms.get(&rule.src_label);
             let mut out = BTreeSet::new();
@@ -3649,7 +4090,7 @@ mod tests {
                     ids: &fx.ids,
                     syms: &mut fx.syms,
                     labels: &fx.labels,
-                    props: &fx.props,
+                    props: ColumnsView::owned(&fx.props),
                     topo: &mut fx.topo,
                     edge_props: &mut fx.eprops,
                 };

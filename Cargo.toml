@@ -28,6 +28,8 @@ bincode = "1"
 crc32fast = "1"
 proptest = "1"
 zstd = "0.13"
+rkyv = "0.8"
+memmap2 = "0.9"
 # Bench-only. Consumed as a dev-dep by core-bench; do not take it as a
 # runtime dependency.
 criterion = "0.8"

@@ -176,3 +176,69 @@ decompress-and-deserialize open of this dataset pays multiple seconds before
 the first query; < 1 s needs zero-copy/lazy loading (mmap + packed columns
 read in place, deferred provenance) — explicitly deferred by the Phase 3 plan
 (no memmap2/rkyv without sign-off).
+
+**G3 gate: RESOLVED BY V8.** See the GB gate section below.
+
+---
+
+## GB gate: V8 mmap zero-copy open (Phase B, 2026-08-28)
+
+**Gates (spec §Phase-B gate GB):** open-to-first-query < 100 ms; RSS < 500 MiB.
+
+### Methodology
+
+- **Host:** same machine (Apple M4 Pro 12-core, 24 GiB RAM, macOS 15.7.3 arm64)
+- **Store:** 1.8 GiB V8 snapshot of the 100k-node dogfood dataset (same nodes/edges;
+  V8 is 1.8 GiB vs the V5 baseline's 2.2 GiB — 18% smaller; V5→V8 re-encodes
+  IVF centroids from JSON-in-bincode to rkyv, which accounts for most of the shrink)
+- **Measurement:** `/usr/bin/time -l` (Darwin `ru_maxrss`); three runs per query type;
+  warm file cache, cold process. **Cold-cache numbers not measured** (requires `sudo purge`);
+  every number below is stated on a warm-file-cache / cold-process basis.
+- **Binary:** release build from `feat/v0.2-phase-b-physics` @ `b0798a1`
+
+### Trajectory table
+
+| Milestone | Commit | Open-to-first-query | Peak RSS |
+|---|---|---|---|
+| V7 baseline (G3 miss) | `af9c682` | ~11 s (10.7–11.1 s, 3 runs) | ~9.5–10.3 GiB |
+| V8 initial (full read + validated rkyv) | `e782bbc` | 17.6 s | ~12 GiB |
+| Fix 1: lazy IVF/HNSW/provenance | `49c0002` | 0.47 s | ~3.0 GiB |
+| Fix 2: skip CRC for large sections | `3fb7ca6` | 0.23 s | 1.94 GiB |
+| Fix 3a: access_unchecked (no rkyv walk) | `e27c2f7` | 0.22 s | 1.88 GiB |
+| Fix 3b: 6-byte version sniff (no 2.4 GB read) | `b0798a1` | **0.02 s** (runs 2–3) | **31–41 MiB** |
+
+Run 1 (dyld/linker cold, first-ever process on this binary) was 0.25 s and ~120 MiB —
+a one-time OS cost. Subsequent runs of the same binary are 0.02 s.
+
+### Per-query RSS (runs 2–3, warm file cache, cold process)
+
+| Query | RSS |
+|---|---|
+| `LIMIT 1` neighbor lookup | 31 MiB |
+| `count(n)` aggregate | 32 MiB |
+| `mushroomdb algo degree --top 5` | 41 MiB |
+
+### mushroomdb verify (integrity audit)
+
+```
+mushroomdb verify ./scale-100000-db
+```
+
+- 11 sections OK; 0 corrupt
+- Wall time: 0.26 s on the 1.8 GiB snapshot
+- Exit 0
+
+### Migration footprint (V5 → V8)
+
+- Wall time: ~30 s (M-series, macOS, sufficient swap)
+- Peak memory (2026-08-28, post memory-diet): ~35 GB VM footprint, ~8.3 GB max RSS — down from the pre-diet ~54 GB footprint; .bak now fs::copy, encode borrows instead of cloning, decoded V5 state freed after remap. Remaining floor is the V5 bincode decode itself (streaming decode = backlog, no installed base).
+- On 24 GiB hosts, migration leaves little headroom and may OOM on more constrained hosts.
+  Run `mushroomdb migrate <dir>` offline before starting `serve`. The migration is
+  crash-safe — original files and `.bak` remain intact on failure.
+
+### Trust model
+
+Large sections (TOPOLOGY, COLUMNS, EDGE_PROPS, HNSW, PROVENANCE, IVF_STATE) skip
+per-access CRC on the hot query path; the mmap read is bounds-checked at open. To
+explicitly audit integrity at any time run `mushroomdb verify <db-dir>` (reads all
+sections, CRC-checks each, exits 2 on any mismatch).

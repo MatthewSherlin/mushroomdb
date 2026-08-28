@@ -25,6 +25,16 @@ impl NodeMask {
         NodeMask { visible }
     }
 
+    /// Build a mask from an already-resolved iterator of dense node ids.
+    ///
+    /// Used by `ReaderSnapshot` handlers that resolve keys against the frozen
+    /// state without a `GraphDb` reference.
+    pub fn from_ids(ids: impl IntoIterator<Item = u32>) -> Self {
+        NodeMask {
+            visible: ids.into_iter().collect(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.visible.len()
     }
@@ -42,6 +52,14 @@ impl NodeMask {
         NodeMask {
             visible: self.visible.intersection(&other.visible).copied().collect(),
         }
+    }
+
+    /// Return `true` if the dense node id is visible in this mask.
+    ///
+    /// Used by `ReaderSnapshot` handlers where the key has already been resolved
+    /// to a dense id (avoids a second lookup into a `GraphDb`).
+    pub fn contains_id(&self, id: u32) -> bool {
+        self.visible.contains(&id)
     }
 
     /// Return `true` if the node identified by `key` is visible in this mask.

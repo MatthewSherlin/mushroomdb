@@ -3,7 +3,7 @@
 use cli::{
     format_demo, format_stats, format_suggest, maybe_run_demo_if_empty, parse_args, read_stats,
     run_algo, run_asof, run_demo, run_migrate, run_query, run_schema_apply, run_snapshot,
-    run_suggest, usage, Command, ServeUi,
+    run_suggest, run_verify, usage, Command, ServeUi,
 };
 use core_api::SharedDb;
 use std::collections::HashMap;
@@ -157,6 +157,16 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => fail(&e.to_string()),
+        },
+        Ok(Command::Verify { db_dir }) => match run_verify(&db_dir) {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                ExitCode::from(1)
+            }
         },
         Err(e) => {
             let _ = writeln!(io::stderr(), "{e}");

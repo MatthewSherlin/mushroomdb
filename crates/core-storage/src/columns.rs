@@ -5,7 +5,7 @@ use crate::pack::{
 use crate::types::Result as StoreResult;
 use crate::types::{GraphError, Value};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Presence bitmap: bit i is set iff node i has a value. Unset bits are nulls.
 #[derive(Debug, Default, Clone)]
@@ -557,6 +557,10 @@ impl<'a> ColumnHandle<'a> {
 pub struct ColumnStore {
     cols: HashMap<String, Column>,
     intern: StrIntern,
+    /// Deleted prop keys for nodes whose value lives only in the V8 mmap'd base.
+    /// Consulted by `ColumnsView::get` before falling through to the base section.
+    /// Cleared at V8 snapshot merge (all data folds into the new base snapshot).
+    pub(crate) prop_tombstones: HashMap<u32, BTreeSet<String>>,
 }
 
 impl ColumnStore {
@@ -565,7 +569,7 @@ impl ColumnStore {
     }
 
     pub fn set(&mut self, node: u32, field: &str, value: Value) {
-        let ColumnStore { cols, intern } = self;
+        let ColumnStore { cols, intern, .. } = self;
         if let Some(col) = cols.get_mut(field) {
             col.set(node, value, intern);
         } else {
@@ -596,7 +600,7 @@ impl ColumnStore {
     /// Remove the value stored at `(node, field)` and return it, or `None` if absent.
     /// Prunes the column's inner map entry when it becomes empty.
     pub fn remove(&mut self, node: u32, field: &str) -> Option<Value> {
-        let ColumnStore { cols, intern } = self;
+        let ColumnStore { cols, intern, .. } = self;
         let old = cols.get_mut(field)?.remove(node, intern)?;
         if cols.get(field).is_some_and(Column::is_empty) {
             cols.remove(field);
@@ -609,14 +613,35 @@ impl ColumnStore {
     /// after rule retraction and user-edge sweep. Field iteration order is not
     /// observable — the resulting store is identical regardless of HashMap order.
     pub fn remove_all(&mut self, node: u32) {
-        let ColumnStore { cols, intern } = self;
+        let ColumnStore { cols, intern, .. } = self;
         cols.retain(|_, col| {
             col.remove(node, intern);
             !col.is_empty()
         });
     }
 
-    fn to_wire(&self) -> HashMap<String, HashMap<u32, Value>> {
+    /// True when `(node, field)` has been recorded as deleted in the prop
+    /// tombstone map.  Used by `ColumnsView::get` to mask base-only props that
+    /// were subsequently removed via the WAL.
+    pub(crate) fn is_tombstoned(&self, node: u32, field: &str) -> bool {
+        self.prop_tombstones
+            .get(&node)
+            .is_some_and(|fields| fields.contains(field))
+    }
+
+    /// Record that the base-only prop `(node, field)` was deleted via the WAL.
+    ///
+    /// This tombstone is consulted by `ColumnsView::get` before falling through
+    /// to the archived base section, ensuring that removed base props are not
+    /// resurrected by base fallback reads.  Consumed (cleared) at snapshot merge.
+    pub fn record_prop_tombstone(&mut self, node: u32, field: &str) {
+        self.prop_tombstones
+            .entry(node)
+            .or_default()
+            .insert(field.to_string());
+    }
+
+    pub(crate) fn to_wire(&self) -> HashMap<String, HashMap<u32, Value>> {
         let mut cols = HashMap::with_capacity(self.cols.len());
         for (field, col) in &self.cols {
             cols.insert(field.clone(), col.to_map(&self.intern));
@@ -661,7 +686,14 @@ impl ColumnStore {
             let col = Column::unpack(src, &mut pos)?;
             cols.insert(name, col);
         }
-        Ok((Self { cols, intern }, pos))
+        Ok((
+            Self {
+                cols,
+                intern,
+                prop_tombstones: HashMap::new(),
+            },
+            pos,
+        ))
     }
 }
 

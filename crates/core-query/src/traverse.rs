@@ -121,6 +121,7 @@ fn push_unique(out: &mut Vec<EdgeRef>, seen: &mut BTreeSet<EdgeRef>, e: EdgeRef)
 mod tests {
     use super::{expand, neighborhood, Dir, EdgeRef};
     use crate::view::GraphView;
+    use core_storage::v8::seam::{ColumnsView, EdgePropsView, TopologyView};
     use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology};
 
     struct Fx {
@@ -157,9 +158,9 @@ mod tests {
                 ids: &self.ids,
                 syms: &self.syms,
                 labels: &self.labels,
-                props: &self.props,
-                topo: &self.topo,
-                edge_props: &self.eprops,
+                props: ColumnsView::owned(&self.props),
+                topo: TopologyView::owned(&self.topo),
+                edge_props: EdgePropsView::owned(&self.eprops),
                 mask: None,
             }
         }

@@ -11,16 +11,51 @@ use core_query::cypher::{
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
     decode_rule_def, evaluate, EngineEdgeDelta, GraphMut, NodeView, Predicate, RuleDef, RuleEngine,
-    RuleIvfExport, ViewDef, ViewStore,
+    ViewDef, ViewStore,
 };
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
+use core_storage::v8::encode::{
+    archived_hnsw_to_owned, archived_rules_meta_to_owned, archived_to_idmap, archived_to_interner,
+    archived_views_to_owned, decode_meta, encode_v8, V8Meta,
+};
+use core_storage::v8::seam::TopologyView;
 use core_storage::wal::{decode_all, encode_record, WalRecord};
+use core_storage::EdgePropsView;
 use core_storage::{
     ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+/// Print a timing checkpoint when MUSHROOMDB_TRACE_OPEN is set.
+/// Zero-cost when the env var is absent (the var check is O(1) after first call).
+macro_rules! trace_open {
+    ($phase:literal, $t:expr) => {
+        if std::env::var("MUSHROOMDB_TRACE_OPEN").is_ok() {
+            eprintln!(
+                "[MUSHROOMDB_TRACE_OPEN] {:40} {:>9.3?}",
+                $phase,
+                $t.elapsed()
+            );
+        }
+    };
+}
+
+/// Print a migration phase checkpoint when MUSHROOMDB_TRACE_MIGRATE is set.
+/// Zero-cost when the env var is absent (the var check is O(1) after first call).
+macro_rules! trace_migrate {
+    ($phase:literal, $t:expr) => {
+        if std::env::var("MUSHROOMDB_TRACE_MIGRATE").is_ok() {
+            eprintln!(
+                "[MUSHROOMDB_TRACE_MIGRATE] {:40} {:>9.3?}",
+                $phase,
+                $t.elapsed()
+            );
+        }
+    };
+}
 
 // Test-only: counts how many times `pending_deltas_since().to_vec()` actually
 // executes (i.e., at least one view is defined). Used to verify the fast-path
@@ -527,7 +562,7 @@ fn eval_set_return_operand<F: Fs>(
             let Some(Value::Str(key)) = match_rs.get(row, var) else {
                 return Ok(None);
             };
-            Ok(db.get_prop(key, field).cloned())
+            Ok(db.get_prop(key, field))
         }
         Operand::FuncCall { name, args } => {
             eval_set_return_func(db, match_rs, row, rel_vars, name, args, params)
@@ -761,7 +796,7 @@ fn make_graph_mut<'a>(
     ids: &'a IdMap,
     syms: &'a mut Interner,
     labels: &'a [u32],
-    props: &'a ColumnStore,
+    props: core_storage::v8::seam::ColumnsView<'a>,
     topo: &'a mut Topology,
     edge_props: &'a mut EdgeProps,
 ) -> GraphMut<'a> {
@@ -772,6 +807,40 @@ fn make_graph_mut<'a>(
         props,
         topo,
         edge_props,
+    }
+}
+
+/// Build a `ColumnsView` from the disjoint `props` overlay and optional V8 base.
+///
+/// Takes explicit field references rather than `&self` so the caller can hold
+/// simultaneous mutable borrows of other fields (e.g. `syms`, `topo`).
+fn build_props_view<'a>(
+    props: &'a ColumnStore,
+    base: &'a Option<std::sync::Arc<core_storage::v8::MappedBase>>,
+) -> core_storage::v8::seam::ColumnsView<'a> {
+    match base {
+        None => core_storage::v8::seam::ColumnsView::owned(props),
+        Some(b) => {
+            let archived = b
+                .columns()
+                .expect("base columns section bounds validated at open");
+            core_storage::v8::seam::ColumnsView::with_base(props, archived)
+        }
+    }
+}
+
+fn build_topo_view<'a>(
+    overlay: &'a Topology,
+    base: &'a Option<std::sync::Arc<core_storage::v8::MappedBase>>,
+) -> core_storage::v8::seam::TopologyView<'a> {
+    match base {
+        None => core_storage::v8::seam::TopologyView::owned(overlay),
+        Some(b) => {
+            let archived_csr = b
+                .topology()
+                .expect("base topology section bounds validated at open");
+            core_storage::v8::seam::TopologyView::with_base(overlay, archived_csr)
+        }
     }
 }
 
@@ -837,6 +906,47 @@ pub struct GraphDb<F: Fs> {
     /// Total WAL commit count at the time [`open_at`] was called.
     /// 0 for normal (non-as-of) instances.
     total_wal_commits: u64,
+    /// Immutable mmap-backed base snapshot (V8).  When `Some`, `self.topo` is
+    /// the WAL-replay overlay (empty at open time, populated by apply()) and
+    /// reads go through a merged `TopologyView`.  `self.props` is always
+    /// fully materialized (base + WAL replay) for HNSW/IVF and view compat.
+    base: Option<Arc<core_storage::v8::MappedBase>>,
+    // ── MVCC epoch reader state ───────────────────────────────────────────────
+    /// Most-recent full overlay clone.  Initialized at end of `open_with` /
+    /// `open_at_with`; refreshed every `FOLD_EVERY_K` commits.
+    /// `None` only between struct creation and the first fold.
+    fold_overlay: Option<Arc<crate::reader::FrozenOverlay>>,
+    /// Per-commit deltas accumulated since the last fold.
+    delta_tail: Vec<Arc<crate::reader::CommitDelta>>,
+    /// How many commits have occurred since the last fold.
+    commits_since_fold: usize,
+    /// When true, `log_then_apply_with` buffers event notifications instead of
+    /// firing them immediately.  Used by the group-commit drain thread to defer
+    /// events until after the group fsync (R2: durability before notification).
+    /// Cleared to false once the drain thread flushes or discards the buffer.
+    defer_events: bool,
+    /// Buffered events accumulated while `defer_events` is true.
+    deferred_events: Vec<DeferredEvent>,
+    /// Set to true by the group-commit drain thread when a group fsync fails
+    /// after WAL truncation.  All subsequent mutation attempts return an IO
+    /// error until the database is reopened.
+    degraded: bool,
+    /// Set to `true` after `ensure_v8_base_sections_loaded` has read provenance,
+    /// HNSW, and IVF sections from the mmap base into the engine's retained
+    /// fields.  `false` on all opens until first use; always `true` for non-V8
+    /// opens (base is None, fast-path sets flag immediately).
+    v8_sections_loaded: std::sync::atomic::AtomicBool,
+    /// Serializes the one-time section population in `ensure_v8_base_sections_loaded`.
+    v8_sections_mutex: std::sync::Mutex<()>,
+}
+
+/// One group of deferred event notifications, held until the group fsync
+/// completes.  Replayed by [`GraphDb::flush_deferred_events`].
+struct DeferredEvent {
+    rec: core_storage::WalRecord,
+    engine_deltas: Vec<EngineEdgeDelta>,
+    seq: u64,
+    ingest: Option<(String, usize)>,
 }
 
 /// Options for [`GraphDb::open_with_options`].
@@ -936,15 +1046,20 @@ impl GraphDb<RealFs> {
         if opts.auto_migrate {
             match snap_version {
                 Some(ver) if ver < core_storage::snapshot::VERSION => {
-                    // Read the full snapshot bytes for the backup.
-                    let snap_bytes = std::fs::read(dir.join("snapshot.bin"))
+                    let _tm = std::time::Instant::now();
+                    // Copy the original snapshot to .bak at OS level — no in-memory
+                    // buffer required for a 2+ GiB file.
+                    //
+                    // Crash-safety: snapshot.bin remains intact (write_atomic inside
+                    // snapshot_with uses a .tmp+rename) until the V8 write succeeds.
+                    // A torn .bak on crash is acceptable because the original
+                    // snapshot.bin is the authoritative source until after the rename.
+                    std::fs::copy(dir.join("snapshot.bin"), dir.join("snapshot.bin.bak"))
                         .map_err(core_storage::GraphError::Io)?;
-                    // Write .bak atomically (fsynced) BEFORE touching snapshot.bin.
-                    db.fs
-                        .write_atomic(FileId::SnapshotBak, &snap_bytes)
-                        .map_err(core_storage::GraphError::Io)?;
+                    trace_migrate!("bak copy done", _tm);
                     // Rewrite snapshot at current version; keep WAL intact.
                     db.snapshot_with(SnapshotOptions { keep_wal: true })?;
+                    trace_migrate!("snapshot_with done", _tm);
                 }
                 Some(_) => {
                     // Already current version: remove any leftover .bak.
@@ -1013,15 +1128,69 @@ impl<F: Fs> GraphDb<F> {
             sub_capacity: DEFAULT_SUB_CAPACITY,
             read_only: false,
             total_wal_commits: 0,
+            base: None,
+            fold_overlay: None,
+            delta_tail: Vec::new(),
+            commits_since_fold: 0,
+            defer_events: false,
+            deferred_events: Vec::new(),
+            degraded: false,
+            v8_sections_loaded: std::sync::atomic::AtomicBool::new(false),
+            v8_sections_mutex: std::sync::Mutex::new(()),
         };
-        let snap_bytes = db.fs.read(FileId::Snapshot)?;
-        if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
-            db.restore_snapshot_state(state)?;
+        let _t0 = std::time::Instant::now();
+        // Peek 6 bytes to determine snapshot version without reading the full
+        // file. For RealFs this is a true partial read (O(1)); for SimFs the
+        // default impl reads all bytes and truncates (still correct).
+        let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
+        let is_v8 = snap_header.len() >= 6
+            && &snap_header[0..4] == b"GDB1"
+            && u16::from_le_bytes([snap_header[4], snap_header[5]])
+                == core_storage::snapshot::VERSION_8;
+        if is_v8 {
+            // V8: map the file zero-copy (RealFs) or read full bytes (SimFs).
+            // No 2.4GB heap Vec is allocated on RealFs.
+            let mapped = Arc::new(
+                if let Some(snap_path) = db.fs.snapshot_path() {
+                    core_storage::v8::MappedBase::map(&snap_path)
+                } else {
+                    let snap_bytes = db.fs.read(FileId::Snapshot)?;
+                    core_storage::v8::MappedBase::from_bytes(snap_bytes)
+                }
+                .map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8: mmap open: {e:?}"),
+                })?,
+            );
+            db.restore_v8_base(Arc::clone(&mapped))?;
+            trace_open!("restore_v8_base", _t0);
+            db.base = Some(mapped);
+            trace_open!("base assigned", _t0);
+        } else if !snap_header.is_empty() {
+            // Legacy V5-V7: full read required for decode.
+            let snap_bytes = db.fs.read(FileId::Snapshot)?;
+            if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
+                db.restore_snapshot_state(state)?;
+            }
         }
+        // else: snap_header is empty = no snapshot file, fresh store.
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
         if valid_len < bytes.len() {
             db.fs.write_atomic(FileId::Wal, &bytes[..valid_len])?;
+        }
+        // WAL-present path: build indexes eagerly BEFORE replay so that the
+        // first replayed record does not trigger the lazy-init guard (which
+        // would call reindex_all_load_ivf on an empty graph, defeating the
+        // point of restoring IVF/HNSW blobs from the snapshot).
+        if !records.is_empty() {
+            db.ensure_v8_base_sections_loaded();
+            trace_open!("lazy sections loaded (WAL path)", _t0);
+            db.engine.consume_retained_state_eager(
+                &db.ids,
+                &db.syms,
+                &db.labels,
+                build_props_view(&db.props, &db.base),
+            );
         }
         for rec in records {
             db.apply(&rec)?;
@@ -1041,18 +1210,33 @@ impl<F: Fs> GraphDb<F> {
         // Any future as-of replay path (Plan-15 T2) must drain here to feed
         // replaying subscribers; the mechanism is already in place.
         let _ = db.engine.drain_deltas(); // belt-and-braces no-op after loop drain
-                                          // Rebuild view values after WAL replay so values are consistent with
-                                          // final topo+props state.  This is a full recompute that corrects any
-                                          // incremental drift accumulated during apply() replay.
-        db.view_store
-            .rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
+        trace_open!("wal replay done", _t0);
+        // Rebuild view values after WAL replay only when there is no V8 base.
+        // With a V8 base, view values are correct in the snapshot and are updated
+        // incrementally during WAL replay (on_edge_changed / on_prop_changed).
+        // A full rebuild would read overlay-only props (empty after restore_v8_base)
+        // and overwrite correct base values with wrong results (e.g. NeighborAgg
+        // Sum reads no "score" in overlay → writes 0.0, shadowing the correct
+        // base value).
+        if db.base.is_none() {
+            let topo_view = TopologyView::owned(&db.topo);
+            db.view_store
+                .rebuild_all(&mut db.props, &topo_view, &db.ids, &db.syms, &db.labels);
+        }
         // Rebuild full-text index after WAL replay.  Corrects drift from
         // per-record incremental apply during replay.
-        db.fulltext
-            .rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
+        db.fulltext.rebuild_all(
+            &db.ids,
+            &db.labels,
+            &db.syms,
+            build_props_view(&db.props, &db.base),
+        );
         // Load roles sidecar. Missing file = no roles (Some(vec![])).
         // Corrupt/unparseable = poisoned (None); mask_for_role will fail-loud.
         db.roles = Self::load_roles_from_fs(&db.fs)?;
+        // Capture the initial MVCC fold so reader() is ready immediately.
+        db.fold_now();
+        trace_open!("open_with complete", _t0);
         Ok(db)
     }
 
@@ -1083,30 +1267,22 @@ impl<F: Fs> GraphDb<F> {
             .collect::<Result<Vec<_>>>()?;
         self.engine =
             RuleEngine::from_persist(defs, state.provenance, state.rule_tripped, state.rule_fires);
-        // V5 snapshot carries IVF state: restore it instead of re-fitting.
-        // This turns the cold-start multi-minute re-fit into microseconds.
-        let ivf_state: BTreeMap<String, RuleIvfExport> = state
-            .ivf_state
-            .into_iter()
-            .map(|(name, ps)| {
-                (
-                    name,
-                    (
-                        (ps.src.centroids, ps.src.clusters, ps.src.drift),
-                        (ps.dst.centroids, ps.dst.clusters, ps.dst.drift),
-                    ),
-                )
-            })
-            .collect();
-        self.engine.reindex_all_load_ivf(
-            &self.ids,
-            &self.syms,
-            &self.labels,
-            &self.props,
-            ivf_state,
-        );
-        // Restore HNSW graphs from snapshot (V7).
-        self.engine.load_hnsw_state(state.hnsw_state);
+        // Candidate indexes are rebuilt lazily on the first mutation (see
+        // RuleEngine::on_node_changed).  HNSW blobs and IVF centroids from the
+        // snapshot are retained without deserializing so that:
+        //   - clean-open (empty WAL): indexes stay empty; blobs load on first
+        //     ANN query via ensure_hnsw_loaded, or on first mutation via the
+        //     lazy-init guard which calls reindex_all_load_ivf + load_hnsw_state.
+        //   - WAL-present: open_with calls consume_retained_state_eager before
+        //     replay so HNSW/IVF are live before any record fires the hooks.
+        let ivf_bytes = if state.ivf_state.is_empty() {
+            Vec::new()
+        } else {
+            bincode::serialize(&state.ivf_state).expect("IVF state serialize cannot fail")
+        };
+        // Store blobs without eagerly deserializing them.
+        self.engine
+            .store_snapshot_state(state.hnsw_state, ivf_bytes);
         // Restore view defs from snapshot (V5).
         // The ColumnStore already contains view values from the snapshot;
         // use restore_view (no collision check, no backfill) so the store
@@ -1123,6 +1299,190 @@ impl<F: Fs> GraphDb<F> {
                 })?;
         }
         Ok(())
+    }
+
+    /// Restore all persisted state from a V8 `MappedBase` snapshot, **except**
+    /// topology (`self.topo` stays empty and serves as the WAL-replay overlay).
+    ///
+    /// `self.props` IS fully materialised from the base so that HNSW/IVF blob
+    /// deserialization and view rebuild have access to all column data.
+    fn restore_v8_base(&mut self, mapped: Arc<core_storage::v8::MappedBase>) -> Result<()> {
+        self.ids = archived_to_idmap(mapped.ids().map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: ids section: {e:?}"),
+        })?);
+        self.syms = archived_to_interner(mapped.syms().map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: syms section: {e:?}"),
+        })?);
+
+        // C1: self.props is left as an empty overlay. Column reads go through
+        // props_view() (ColumnsView::with_base), which consults the archived base
+        // section zero-copy. This avoids the O(columns) heap copy at every open.
+
+        // self.topo deliberately left as Topology::new() — overlay path.
+
+        let meta = decode_meta(mapped.meta_bytes().map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: meta section: {e:?}"),
+        })?)
+        .map_err(|e| GraphError::Corrupt {
+            detail: format!("v8: meta decode: {e:?}"),
+        })?;
+        self.labels = meta.labels;
+        // C3: self.edge_props stays as an empty overlay.  Reads go through
+        // edge_props_view() which consults the mmap'd base section zero-copy
+        // via EdgePropsView::with_base.  No heap decode at open time.
+
+        // Restore rule engine.
+        let (rule_def_bytes, rule_tripped, rule_fires) =
+            archived_rules_meta_to_owned(mapped.rules_meta_section().map_err(|e| {
+                GraphError::Corrupt {
+                    detail: format!("v8: rules_meta section: {e:?}"),
+                }
+            })?);
+        let defs: Vec<RuleDef> = rule_def_bytes
+            .iter()
+            .map(|b| {
+                decode_rule_def(b).map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8: rule_def deserialize: {e}"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.engine = RuleEngine::from_persist(defs, BTreeMap::new(), rule_tripped, rule_fires);
+        // C4+C5: provenance, HNSW, and IVF sections are NOT read here.
+        // `ensure_v8_base_sections_loaded` reads them on first use from
+        // `self.base` (set by the caller immediately after this returns).
+        // A clean open touches only: header + IDS + SYMS + META + RULES_META.
+
+        // Restore view definitions.
+        let view_defs =
+            archived_views_to_owned(mapped.views_section().map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: views section: {e:?}"),
+            })?);
+        for def_bytes in &view_defs {
+            let def: ViewDef =
+                bincode::deserialize(def_bytes).map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8: view_def deserialize: {e}"),
+                })?;
+            self.view_store
+                .restore_view(def)
+                .map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8: view restore: {e}"),
+                })?;
+        }
+        // Validate that all deferred sections (provenance, HNSW, IVF) fit within
+        // the file.  Pure bounds check — no bytes read, no page faults triggered.
+        // Catches truncated snapshots at open time before the lazy deferred reads.
+        mapped.validate_section_bounds().map_err(|e| match e {
+            GraphError::Corrupt { detail } => GraphError::Corrupt {
+                detail: format!("v8: section bounds: {detail}"),
+            },
+            other => other,
+        })?;
+        Ok(())
+    }
+
+    /// Read provenance, HNSW, and IVF sections from the mmap base into the
+    /// engine's retained fields on first call.  Subsequent calls are a no-op
+    /// (AtomicBool fast-path).
+    ///
+    /// Must be called before any code path that reads or mutates engine
+    /// provenance, HNSW, or IVF state:
+    /// - WAL replay (before `consume_retained_state_eager`)
+    /// - First mutation (`log_then_apply_with`)
+    /// - Read-only paths (`stats`, `explain`, `node_edges`)
+    /// - Snapshot (`snapshot_with`)
+    ///
+    /// No-op for fresh stores and V5-V7 opens (`self.base` is `None`).
+    fn ensure_v8_base_sections_loaded(&self) {
+        use std::sync::atomic::Ordering;
+        if self.v8_sections_loaded.load(Ordering::Acquire) {
+            return;
+        }
+        let _guard = self
+            .v8_sections_mutex
+            .lock()
+            .expect("v8 sections mutex poisoned");
+        if self.v8_sections_loaded.load(Ordering::Acquire) {
+            return; // another caller populated while we waited
+        }
+        let _t = std::time::Instant::now();
+        if let Some(base) = &self.base {
+            // Provenance: raw rkyv bytes; CRC validated inside section_bytes.
+            // Bounds are already validated at open time (restore_v8_base →
+            // validate_section_bounds) — unreachable post-validate_section_bounds;
+            // unwrap_or_default is a safety belt against impossible errors.
+            let prov_bytes = base
+                .provenance_raw_bytes()
+                .map(|b| b.to_vec())
+                .unwrap_or_default();
+            self.engine.store_provenance_bytes(prov_bytes);
+            // HNSW: decode rkyv blobs into owned map.
+            let hnsw_state = base
+                .hnsw_section()
+                .map(archived_hnsw_to_owned)
+                .unwrap_or_default();
+            // IVF: raw bincode bytes; deserialized on first mutation/query.
+            let ivf_bytes = base.ivf_bytes().map(|b| b.to_vec()).unwrap_or_default();
+            self.engine.store_snapshot_state(hnsw_state, ivf_bytes);
+        }
+        self.v8_sections_loaded.store(true, Ordering::Release);
+        if std::env::var("MUSHROOMDB_TRACE_OPEN").is_ok() {
+            eprintln!(
+                "[MUSHROOMDB_TRACE_OPEN] ensure_v8_base_sections_loaded: {:>9.3?}",
+                _t.elapsed()
+            );
+        }
+    }
+
+    /// Return a `TopologyView` that merges the mmap'd base (when present) with
+    /// the in-memory WAL overlay.  Used by all read paths in db.rs that need
+    /// the full merged topology without going through `self.view()`.
+    fn topo_view(&self) -> TopologyView<'_> {
+        match self.base {
+            None => TopologyView::owned(&self.topo),
+            Some(ref base) => {
+                // SAFETY: base lives as long as self; section bounds validated at open.
+                // topology() uses access_unchecked; all field reads are bounds-checked in seam.rs.
+                let archived = base
+                    .topology()
+                    .expect("base topology section bounds validated at open");
+                TopologyView::with_base(&self.topo, archived)
+            }
+        }
+    }
+
+    /// Return a `ColumnsView` that merges the mmap'd base columns (when a V8
+    /// snapshot is open) with the in-memory WAL overlay.  Reads consult the
+    /// overlay first, then fall through to the archived base section zero-copy.
+    fn props_view(&self) -> core_storage::v8::seam::ColumnsView<'_> {
+        match self.base {
+            None => core_storage::v8::seam::ColumnsView::owned(&self.props),
+            Some(ref base) => {
+                // columns() uses access_unchecked; field reads are bounds-checked in seam.rs.
+                let archived = base
+                    .columns()
+                    .expect("base columns section bounds validated at open");
+                core_storage::v8::seam::ColumnsView::with_base(&self.props, archived)
+            }
+        }
+    }
+
+    /// Return an `EdgePropsView` that merges the mmap'd base edge-props section
+    /// (when a V8 snapshot is open) with the in-memory WAL overlay.
+    ///
+    /// Reads consult the overlay first (for post-snapshot mutations), then fall
+    /// through to the archived base section zero-copy.  Tombstones in the
+    /// overlay mask deleted-from-base entries.
+    fn edge_props_view(&self) -> EdgePropsView<'_> {
+        match self.base {
+            None => EdgePropsView::owned(&self.edge_props),
+            Some(ref base) => {
+                // edge_props_section() uses access_unchecked; field reads bounds-checked in seam.rs.
+                let archived = base
+                    .edge_props_section()
+                    .expect("base edge_props section bounds validated at open");
+                EdgePropsView::with_base(&self.edge_props, archived)
+            }
+        }
     }
 
     fn open_at_with(fs: F, commit: u64) -> Result<Self> {
@@ -1146,6 +1506,15 @@ impl<F: Fs> GraphDb<F> {
             sub_capacity: DEFAULT_SUB_CAPACITY,
             read_only: false, // set to true after replay
             total_wal_commits: 0,
+            base: None,
+            fold_overlay: None,
+            delta_tail: Vec::new(),
+            commits_since_fold: 0,
+            defer_events: false,
+            deferred_events: Vec::new(),
+            degraded: false,
+            v8_sections_loaded: std::sync::atomic::AtomicBool::new(false),
+            v8_sections_mutex: std::sync::Mutex::new(()),
         };
         // Base state: a truncating snapshot compacts all pre-truncation
         // commits, so the on-disk WAL head coincides with the snapshot and
@@ -1154,12 +1523,42 @@ impl<F: Fs> GraphDb<F> {
         // base reproduces. `keep_wal` and legacy V5/V6 snapshots leave a WAL
         // that reaches further back; for those the historical WAL-only
         // replay applies (`wal_truncated` defaults to false on decode).
-        let snap_bytes = db.fs.read(FileId::Snapshot)?;
-        if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
-            if state.wal_truncated {
-                db.restore_snapshot_state(state)?;
+        // Peek version without a full 2.4GB heap read (same pattern as open_with).
+        let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
+        let is_v8 = snap_header.len() >= 6
+            && &snap_header[0..4] == b"GDB1"
+            && u16::from_le_bytes([snap_header[4], snap_header[5]])
+                == core_storage::snapshot::VERSION_8;
+        if is_v8 {
+            // V8: map the file (RealFs) or read full bytes (SimFs), then do a
+            // full structural decode. open_at needs owned topo/props for WAL
+            // replay mutation so we can't use the zero-copy seam here.
+            let state = if let Some(snap_path) = db.fs.snapshot_path() {
+                let mapped = core_storage::v8::MappedBase::map(&snap_path).map_err(|e| {
+                    GraphError::Corrupt {
+                        detail: format!("v8: open_at mmap: {e:?}"),
+                    }
+                })?;
+                core_storage::snapshot::decode_v8_from_mapped(&mapped)?
+            } else {
+                let snap_bytes = db.fs.read(FileId::Snapshot)?;
+                core_storage::snapshot::decode(&snap_bytes)?
+            };
+            if let Some(state) = state {
+                if state.wal_truncated {
+                    db.restore_snapshot_state(state)?;
+                }
+            }
+        } else if !snap_header.is_empty() {
+            // Legacy V5-V7: full read required for decode.
+            let snap_bytes = db.fs.read(FileId::Snapshot)?;
+            if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
+                if state.wal_truncated {
+                    db.restore_snapshot_state(state)?;
+                }
             }
         }
+        // else: snap_header empty = no snapshot file.
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, _valid_len) = decode_all(&bytes);
         let total = records.len() as u64;
@@ -1184,23 +1583,68 @@ impl<F: Fs> GraphDb<F> {
         );
         let _ = db.engine.drain_deltas(); // belt-and-braces no-op
                                           // Rebuild view values after WAL replay so derived-edge-driven views
-                                          // reflect the as-of state, not just the initial backfill at CreateView.
-                                          // Mirrors the open_with rebuild_all call at db.rs:528.
-        db.view_store
-            .rebuild_all(&mut db.props, &db.topo, &db.ids, &db.syms, &db.labels);
+                                          // reflect the as-of state.  open_at always uses the legacy path (no V8
+                                          // base), so topo_view is always owned.
+        {
+            let topo_view = TopologyView::owned(&db.topo);
+            db.view_store
+                .rebuild_all(&mut db.props, &topo_view, &db.ids, &db.syms, &db.labels);
+        }
         // Rebuild full-text index for as-of view (mirrors open_with pattern).
-        db.fulltext
-            .rebuild_all(&db.ids, &db.labels, &db.syms, &db.props);
+        db.fulltext.rebuild_all(
+            &db.ids,
+            &db.labels,
+            &db.syms,
+            build_props_view(&db.props, &db.base),
+        );
         // Load roles sidecar (current roles, not point-in-time).
         db.roles = Self::load_roles_from_fs(&db.fs)?;
         db.read_only = true;
         db.total_wal_commits = total;
+        // Capture initial fold so reader() is immediately usable.
+        db.fold_now();
         Ok(db)
     }
 
     /// Whether this instance is a read-only as-of view.
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    // ── MVCC epoch reader ─────────────────────────────────────────────────────
+
+    /// Clone the current overlay state into a new `FrozenOverlay` and reset
+    /// the delta tail. Called automatically every `FOLD_EVERY_K` commits and at
+    /// the end of `open_with` / `open_at_with` to prime the reader.
+    fn fold_now(&mut self) {
+        let frozen = crate::reader::FrozenOverlay {
+            ids: self.ids.clone(),
+            syms: self.syms.clone(),
+            topo: self.topo.clone(),
+            props: self.props.clone(),
+            labels: self.labels.clone(),
+            edge_props: self.edge_props.clone(),
+            roles: self.roles.clone(),
+            fulltext: self.fulltext.clone(),
+        };
+        self.fold_overlay = Some(Arc::new(frozen));
+        self.delta_tail.clear();
+        self.commits_since_fold = 0;
+    }
+
+    /// Capture a lock-free reader snapshot of the current db state.
+    ///
+    /// The read lock is held only for the duration of this call (to clone a
+    /// handful of `Arc` handles). Subsequent query operations run without any
+    /// lock.
+    pub fn reader(&self) -> crate::reader::ReaderSnapshot {
+        crate::reader::ReaderSnapshot::new(
+            self.fold_overlay
+                .clone()
+                .expect("fold_overlay is always Some after open_with; call reader() after open"),
+            self.base.clone(),
+            self.delta_tail.clone(),
+        )
     }
 
     /// Total number of WAL commits at the time [`open_at`] was called.
@@ -1236,7 +1680,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1256,10 +1700,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns section bounds validated at open")
+                            }),
                         );
                     }
                 }
@@ -1284,6 +1732,18 @@ impl<F: Fs> GraphDb<F> {
                     detail: format!("wal replay references unknown key {dst_key}"),
                 })?;
                 let etype = self.syms.intern(edge_type);
+                // Skip if the edge is already visible in the merged base+overlay
+                // view.  This keeps WAL replay idempotent when the WAL contains
+                // pre-snapshot records that are already encoded in a V8 base
+                // (keep_wal=true opens and crash-before-truncation scenarios).
+                if self.base.is_some()
+                    && self
+                        .topo_view()
+                        .neighbors(etype, Direction::Out, src)
+                        .contains(&dst)
+                {
+                    return Ok(());
+                }
                 self.topo.add_edge(etype, src, dst);
                 // View maintenance for manual edge insert.
                 self.view_store.on_edge_changed(
@@ -1292,10 +1752,14 @@ impl<F: Fs> GraphDb<F> {
                     dst,
                     true,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns section bounds validated at open")
+                    }),
                 );
                 // Rule engine: via-hop rules must update when user edges change.
                 let cursor = self.engine.pending_delta_count();
@@ -1305,7 +1769,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1321,10 +1785,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns section bounds validated at open")
+                            }),
                         );
                     }
                 }
@@ -1333,7 +1801,9 @@ impl<F: Fs> GraphDb<F> {
                 let id = self.ids.get(key).ok_or_else(|| GraphError::Corrupt {
                     detail: format!("wal replay references unknown key {key}"),
                 })?;
-                let old_value = self.props.get(id, field).cloned();
+                let old_value = build_props_view(&self.props, &self.base)
+                    .get(id, field)
+                    .map(|vr| vr.into_value());
                 self.props.set(id, field, value.clone());
                 // Fire rules for the changed field.
                 let cursor = self.engine.pending_delta_count();
@@ -1343,7 +1813,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1362,10 +1832,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns section bounds validated at open")
+                            }),
                         );
                     }
                 }
@@ -1374,10 +1848,14 @@ impl<F: Fs> GraphDb<F> {
                     id,
                     field,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns section bounds validated at open")
+                    }),
                 );
                 // Full-text index maintenance: update tokens for this field if indexed.
                 if self.fulltext.field_indexed(field) {
@@ -1449,7 +1927,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1467,10 +1945,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns section bounds validated at open")
+                            }),
                         );
                     }
                 }
@@ -1496,6 +1978,17 @@ impl<F: Fs> GraphDb<F> {
                 {
                     return Ok(());
                 }
+                // Skip if already visible in the merged view (same idempotency
+                // guard as InsertEdge above: prevents double-counting when
+                // pre-snapshot WAL records are replayed over a V8 base).
+                if self.base.is_some()
+                    && self
+                        .topo_view()
+                        .neighbors(*etype, Direction::Out, *src)
+                        .contains(dst)
+                {
+                    return Ok(());
+                }
                 self.topo.add_edge(*etype, *src, *dst);
                 self.view_store.on_edge_changed(
                     *etype,
@@ -1503,10 +1996,14 @@ impl<F: Fs> GraphDb<F> {
                     *dst,
                     true,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns section bounds validated at open")
+                    }),
                 );
                 // Rule engine: via-hop rules fire when user via-edges are inserted.
                 // Resolve etype back to string so on_edge_changed can match rules by name.
@@ -1518,7 +2015,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &mut self.syms,
                             &self.labels,
-                            &self.props,
+                            build_props_view(&self.props, &self.base),
                             &mut self.topo,
                             &mut self.edge_props,
                         );
@@ -1534,10 +2031,14 @@ impl<F: Fs> GraphDb<F> {
                                 d.dst_id,
                                 d.fired,
                                 &mut self.props,
-                                &self.topo,
+                                &build_topo_view(&self.topo, &self.base),
                                 &self.ids,
                                 &self.syms,
                                 &self.labels,
+                                self.base.as_ref().map(|b| {
+                                    b.columns()
+                                        .expect("base columns section bounds validated at open")
+                                }),
                             );
                         }
                     }
@@ -1554,7 +2055,9 @@ impl<F: Fs> GraphDb<F> {
                         detail: format!("wal SetPropId unknown field intern {field}"),
                     })?
                     .to_string();
-                let old_value = self.props.get(*id, &field_str).cloned();
+                let old_value = build_props_view(&self.props, &self.base)
+                    .get(*id, &field_str)
+                    .map(|vr| vr.into_value());
                 self.props.set(*id, &field_str, value.clone());
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
@@ -1563,7 +2066,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1581,10 +2084,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns section bounds validated at open")
+                            }),
                         );
                     }
                 }
@@ -1592,10 +2099,14 @@ impl<F: Fs> GraphDb<F> {
                     *id,
                     &field_str,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns section bounds validated at open")
+                    }),
                 );
                 if self.fulltext.field_indexed(&field_str) {
                     let label_opt = self.labels.get(*id as usize).and_then(|&sym| {
@@ -1631,7 +2142,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1652,10 +2163,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns section bounds validated at open")
+                            }),
                         );
                     }
                 }
@@ -1675,7 +2190,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1695,10 +2210,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns section bounds validated at open")
+                            }),
                         );
                     }
                 }
@@ -1710,8 +2229,26 @@ impl<F: Fs> GraphDb<F> {
                 let Some(id) = self.ids.get(key) else {
                     return Ok(());
                 };
-                let old = self.props.get(id, field).cloned();
+                // Read old value through the seam for rule retraction.
+                let old = build_props_view(&self.props, &self.base)
+                    .get(id, field)
+                    .map(|vr| vr.into_value());
                 self.props.remove(id, field);
+                // If the base still supplies the value after the overlay removal,
+                // record a tombstone so ColumnsView::get does not resurrect it.
+                // This covers both the base-only case AND the both-resident case:
+                //   base-only (in_overlay=false): old prop was only in base, remove
+                //     is a no-op on overlay, base still visible → tombstone needed.
+                //   both-resident (in_overlay=true): overlay had v2, base has v1;
+                //     removing overlay uncovers v1 → tombstone needed.
+                // Idempotent on double-replay: second pass sees the tombstone →
+                // get() returns None → condition is false → no duplicate tombstone.
+                if build_props_view(&self.props, &self.base)
+                    .get(id, field)
+                    .is_some()
+                {
+                    self.props.record_prop_tombstone(id, field);
+                }
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
@@ -1719,7 +2256,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1738,10 +2275,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns section bounds validated at open")
+                            }),
                         );
                     }
                 }
@@ -1750,10 +2291,14 @@ impl<F: Fs> GraphDb<F> {
                     id,
                     field,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns section bounds validated at open")
+                    }),
                 );
                 // Full-text index maintenance: remove tokens for this field.
                 if self.fulltext.field_indexed(field) {
@@ -1776,6 +2321,19 @@ impl<F: Fs> GraphDb<F> {
                 let Some(etype) = self.syms.get(edge_type) else {
                     return Ok(());
                 };
+                // I3: phantom-tombstone guard.  When a V8 base is present, a
+                // DeleteEdge WAL record for an edge that was already absorbed into
+                // the new base (i.e. neither in overlay nor in base) must be skipped.
+                // Without this guard, remove_edge records a tombstone for an edge
+                // that no longer exists, incorrectly understating edge_count.
+                if self.base.is_some()
+                    && !self
+                        .topo_view()
+                        .neighbors(etype, core_storage::topology::Direction::Out, src)
+                        .contains(&dst)
+                {
+                    return Ok(());
+                }
                 self.topo.remove_edge(etype, src, dst);
                 self.edge_props.remove_edge(etype, src, dst);
                 // View maintenance for manual edge delete (topo already updated above).
@@ -1785,10 +2343,14 @@ impl<F: Fs> GraphDb<F> {
                     dst,
                     false,
                     &mut self.props,
-                    &self.topo,
+                    &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
                     &self.labels,
+                    self.base.as_ref().map(|b| {
+                        b.columns()
+                            .expect("base columns section bounds validated at open")
+                    }),
                 );
                 // Rule engine: via-hop rules must retract when user via-edges are deleted.
                 let cursor = self.engine.pending_delta_count();
@@ -1798,7 +2360,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1814,10 +2376,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns section bounds validated at open")
+                            }),
                         );
                     }
                 }
@@ -1843,7 +2409,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1862,10 +2428,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns section bounds validated at open")
+                            }),
                         );
                     }
                 }
@@ -1895,10 +2465,14 @@ impl<F: Fs> GraphDb<F> {
                         d,
                         false,
                         &mut self.props,
-                        &self.topo,
+                        &build_topo_view(&self.topo, &self.base),
                         &self.ids,
                         &self.syms,
                         &self.labels,
+                        self.base.as_ref().map(|b| {
+                            b.columns()
+                                .expect("base columns section bounds validated at open")
+                        }),
                     );
                 }
 
@@ -1933,7 +2507,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &mut self.syms,
                         &self.labels,
-                        &self.props,
+                        build_props_view(&self.props, &self.base),
                         &mut self.topo,
                         &mut self.edge_props,
                     );
@@ -1953,10 +2527,14 @@ impl<F: Fs> GraphDb<F> {
                             d.dst_id,
                             d.fired,
                             &mut self.props,
-                            &self.topo,
+                            &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
                             &self.labels,
+                            self.base.as_ref().map(|b| {
+                                b.columns()
+                                    .expect("base columns section bounds validated at open")
+                            }),
                         );
                     }
                 }
@@ -1974,7 +2552,7 @@ impl<F: Fs> GraphDb<F> {
                     .create_view(
                         def,
                         &mut self.props,
-                        &self.topo,
+                        &build_topo_view(&self.topo, &self.base),
                         &self.ids,
                         &self.syms,
                         &self.labels,
@@ -2011,8 +2589,10 @@ impl<F: Fs> GraphDb<F> {
                     if lbl != label {
                         continue;
                     }
-                    if let Some(value) = self.props.get(id, field) {
-                        let value = value.clone();
+                    if let Some(value) = build_props_view(&self.props, &self.base)
+                        .get(id, field)
+                        .map(|vr| vr.into_value())
+                    {
                         self.fulltext.add_tokens(id, field, &value);
                     }
                 }
@@ -2226,6 +2806,21 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // Degraded guard: fsync failure left WAL truncated; in-memory state
+        // is ahead of the on-disk WAL, so further mutations would deepen the
+        // divergence.  Reopen the database to recover.
+        if self.degraded {
+            return Err(GraphError::Io(std::io::Error::other(
+                "database degraded after group-commit fsync failure; reopen required",
+            )));
+        }
+        // Ensure retained provenance bytes are decoded into the live mutable
+        // fields before any mutation touches self.engine.provenance.  This is a
+        // no-op if provenance was never stored (fresh store) or has already been
+        // consumed (subsequent mutations).  WAL replay calls apply() directly
+        // and is covered by consume_retained_state_eager before replay.
+        self.ensure_v8_base_sections_loaded();
+        self.engine.ensure_provenance_loaded_mut();
         // Invariant (I-1): no stale deltas may enter from a previous apply.
         // If any engine method ever accumulates deltas before erroring, they would
         // contaminate the *next* commit's event stream. This assert fires in debug
@@ -2265,8 +2860,46 @@ impl<F: Fs> GraphDb<F> {
         // Drain engine deltas and distribute to subscribers before the existing
         // MutationEvent sink fires — both happen post-fsync, post-apply.
         let engine_deltas = self.engine.drain_deltas();
-        self.distribute_events(&rec, &engine_deltas, seq);
-        self.emit_committed(&rec, ingest);
+
+        // Record MVCC CommitDelta for the epoch reader.  The WAL record is
+        // stored as-is (including any nested Batch / Intern records); the
+        // ReaderSnapshot's apply_one function handles all variants.
+        {
+            let derived_inserts = engine_deltas
+                .iter()
+                .filter(|d| d.fired)
+                .map(|d| (d.etype_sym, d.src_id, d.dst_id))
+                .collect();
+            let derived_deletes = engine_deltas
+                .iter()
+                .filter(|d| !d.fired)
+                .map(|d| (d.etype_sym, d.src_id, d.dst_id))
+                .collect();
+            let delta = Arc::new(crate::reader::CommitDelta {
+                records: vec![rec.clone()],
+                derived_inserts,
+                derived_deletes,
+            });
+            self.delta_tail.push(delta);
+            self.commits_since_fold += 1;
+            if self.commits_since_fold >= crate::reader::FOLD_EVERY_K {
+                self.fold_now();
+            }
+        }
+
+        if self.defer_events {
+            // Group-commit drain thread: hold events until after the group
+            // fsync so subscribers only observe durable data (R2).
+            self.deferred_events.push(DeferredEvent {
+                rec: rec.clone(),
+                engine_deltas,
+                seq,
+                ingest,
+            });
+        } else {
+            self.distribute_events(&rec, &engine_deltas, seq);
+            self.emit_committed(&rec, ingest);
+        }
         // Drift is only known after apply, so auto-rebuild cannot join the
         // triggering op's WAL frame. Issue RebuildRule as a second commit.
         // Skip when `rec` is itself RebuildRule: rebuild resets drift, so a
@@ -2320,6 +2953,58 @@ impl<F: Fs> GraphDb<F> {
     /// Set WAL fsync cadence. Default [`FsyncPolicy::Strict`].
     pub fn set_fsync_policy(&mut self, p: FsyncPolicy) {
         self.fsync = p;
+    }
+
+    /// Return the current WAL fsync cadence.
+    pub fn fsync_policy(&self) -> FsyncPolicy {
+        self.fsync
+    }
+
+    // ── Group-commit event deferral ───────────────────────────────────────────
+
+    /// Enable or disable deferred event mode.
+    ///
+    /// When `true`, event notifications (subscription `DbEvent`s and legacy
+    /// `MutationEvent` sink calls) are buffered rather than fired immediately.
+    /// Call [`flush_deferred_events`] after the group fsync to deliver them,
+    /// or [`discard_deferred_events`] if the fsync failed and the group must
+    /// be treated as lost.
+    pub fn set_deferred_events_mode(&mut self, defer: bool) {
+        self.defer_events = defer;
+    }
+
+    /// Fire all buffered events accumulated since [`set_deferred_events_mode`]
+    /// was set to true.  Clears the buffer.
+    ///
+    /// Called by the drain thread AFTER a successful group fsync, so
+    /// subscribers observe only data that is durably on disk.
+    pub fn flush_deferred_events(&mut self) {
+        let events = std::mem::take(&mut self.deferred_events);
+        for de in events {
+            self.distribute_events(&de.rec, &de.engine_deltas, de.seq);
+            self.emit_committed(&de.rec, de.ingest);
+        }
+    }
+
+    /// Discard all buffered events without firing them.
+    ///
+    /// Called by the drain thread when a group fsync fails: the WAL has been
+    /// truncated back to the pre-group offset, so the committed-but-unsynced
+    /// ops must not be observable to subscribers.
+    pub fn discard_deferred_events(&mut self) {
+        self.deferred_events.clear();
+    }
+
+    // ── Degraded state ────────────────────────────────────────────────────────
+
+    /// Mark this database as degraded.
+    ///
+    /// Called by the group-commit drain thread after a group fsync failure and
+    /// WAL truncation: the in-memory state is now ahead of the on-disk WAL, so
+    /// further mutations would deepen the divergence.  All subsequent calls to
+    /// [`log_then_apply_with`] return `Err` until the database is reopened.
+    pub fn set_degraded(&mut self) {
+        self.degraded = true;
     }
 
     fn emit(&self, ev: MutationEvent) {
@@ -2889,6 +3574,9 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // Ensure provenance is decoded before MutPreview accesses it
+        // (note_delete_rule / is_rule_owned may call engine.provenance()).
+        self.engine.ensure_provenance_loaded_mut();
         let recs = {
             let mut preview = MutPreview::new(self);
             let mut recs = Vec::with_capacity(ops.len());
@@ -2975,18 +3663,107 @@ impl<F: Fs> GraphDb<F> {
             .iter()
             .filter(|r| matches!(r, WalRecord::InsertEdgeId { .. }))
             .count();
-        // Ingest / write_batch / query_write: one Batch frame. Strict and
-        // Batched both fsync once at frame end; Relaxed still skips.
-        let policy = match self.fsync {
-            FsyncPolicy::Relaxed => FsyncPolicy::Relaxed,
-            FsyncPolicy::Strict | FsyncPolicy::Batched => FsyncPolicy::Batched,
-        };
-        self.log_then_apply_with(WalRecord::Batch(recs), ingest, policy)?;
+        // Ingest / write_batch / query_write: one Batch frame, one fsync per call
+        // under Strict.  Pass self.fsync directly so Strict stays Strict —
+        // wal_needs_sync(Strict, _) always returns true regardless of op count.
+        // Mapping Strict → Batched (the prior bug) caused wal_needs_sync to
+        // short-circuit on single-op batches and silently skip the fsync.
+        // Batched fsyncs only for multi-op batches; Relaxed always skips.
+        self.log_then_apply_with(WalRecord::Batch(recs), ingest, self.fsync)?;
         Ok((nodes_inserted, edges_inserted))
     }
 
     fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<(usize, usize)> {
         self.commit_logged_batch(ops, None)
+    }
+
+    /// Commit one submission WITHOUT an fsync — for use inside `commit_group`
+    /// and the group-commit drain thread, which do a single group fsync later.
+    fn commit_batch_nosync(&mut self, ops: Vec<BatchOp>) -> Result<(usize, usize)> {
+        // Restore fsync policy even on panic via a raw-pointer drop guard.
+        // A panic here would poison the RwLock anyway, but the correct policy
+        // must be in place if the guard is ever unwrapped.
+        struct RestoreFsync(*mut FsyncPolicy, FsyncPolicy);
+        impl Drop for RestoreFsync {
+            fn drop(&mut self) {
+                // SAFETY: the pointer is valid for the full duration of
+                // commit_batch_nosync; the guard is dropped before the frame
+                // returns, and GraphDb outlives this frame.
+                unsafe {
+                    *self.0 = self.1;
+                }
+            }
+        }
+        let saved = self.fsync;
+        // SAFETY: raw pointer into self; guard dropped within this frame.
+        let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
+        self.fsync = FsyncPolicy::Relaxed;
+        self.commit_logged_batch(ops, None)
+    }
+
+    /// Commit multiple op-batches as a **group**: each submission gets its own
+    /// WAL `Batch` frame, but there is exactly **one** `Fs::sync` for the whole
+    /// group (under `Strict` / `Batched` policy; `Relaxed` skips all syncs).
+    ///
+    /// # Durability semantics
+    ///
+    /// A crash before the group fsync may lose **all** submissions in the group.
+    /// A crash after the group fsync preserves all of them.  No submission is
+    /// ever torn: each WAL frame is either fully applied on replay or dropped
+    /// in its entirety (CRC-protected frame boundaries).
+    ///
+    /// Events and subscription notifications fire per-submission immediately
+    /// after apply, which may be before the group fsync.  From a subscriber's
+    /// perspective this is equivalent to the `Relaxed` durability window.
+    /// Submitters using [`SharedDb::submit_batch`] only unblock after the group
+    /// fsync, so from their perspective durability is fully guaranteed.
+    ///
+    /// # MVCC interplay
+    ///
+    /// Each submission records its own `CommitDelta`; the fold-every-K counter
+    /// increments per submission (not per group), preserving existing reader
+    /// snapshot semantics.
+    ///
+    /// # Returns
+    ///
+    /// One `Result<(nodes_inserted, edges_inserted)>` per input group element,
+    /// in order.  Failures are per-submission (validation errors); the group
+    /// fsync error (if any) is returned as the second tuple element.
+    pub fn commit_group(
+        &mut self,
+        groups: Vec<Vec<BatchOp>>,
+    ) -> (Vec<Result<(usize, usize)>>, Option<GraphError>) {
+        let mut results = Vec::with_capacity(groups.len());
+        for ops in groups {
+            results.push(self.commit_batch_nosync(ops));
+        }
+        let any_ok = results.iter().any(|r| r.is_ok());
+        let sync_err = if self.fsync != FsyncPolicy::Relaxed && any_ok {
+            self.fs
+                .sync(core_storage::fs::FileId::Wal)
+                .map_err(GraphError::Io)
+                .err()
+        } else {
+            None
+        };
+        (results, sync_err)
+    }
+
+    /// Like [`commit_group`] but skips the group fsync entirely.
+    ///
+    /// Used by the drain thread to apply submissions under the write lock and
+    /// then perform the single fsync OUTSIDE the lock (via
+    /// `core_storage::sync_wal_at`), reducing the write-lock hold time visible
+    /// to concurrent readers.
+    pub fn commit_group_nosync(
+        &mut self,
+        groups: Vec<Vec<BatchOp>>,
+    ) -> Vec<Result<(usize, usize)>> {
+        let mut results = Vec::with_capacity(groups.len());
+        for ops in groups {
+            results.push(self.commit_batch_nosync(ops));
+        }
+        results
     }
 
     pub fn insert_node(
@@ -3089,6 +3866,8 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // Provenance must be loaded before we query provenance_touching.
+        self.engine.ensure_provenance_loaded_mut();
         let id = self
             .ids
             .get(key)
@@ -3103,9 +3882,10 @@ impl<F: Fs> GraphDb<F> {
         let derived_edges = derived_set.len() as u64;
 
         let mut total_topo = 0u64;
-        for et in self.topo.etypes() {
-            total_topo += self.topo.neighbors(et, Direction::Out, id).len() as u64
-                + self.topo.neighbors(et, Direction::In, id).len() as u64;
+        let tv = self.topo_view();
+        for et in tv.etypes() {
+            total_topo += tv.neighbors(et, Direction::Out, id).len() as u64
+                + tv.neighbors(et, Direction::In, id).len() as u64;
         }
         // For symmetric rules (e.g. Overlap), a→b and b→a are two separate directed
         // triples in both the topo scan (Out and In from id) and in provenance_touching.
@@ -3214,12 +3994,13 @@ impl<F: Fs> GraphDb<F> {
                 .push((id, key.to_string()));
         }
 
-        let all_fields: Vec<String> = self.props.fields().map(String::from).collect();
         let existing = self.rules();
+        let pv = build_props_view(&self.props, &self.base);
+        let all_fields: Vec<String> = pv.field_names();
 
         core_rules::suggest::suggest_rules(
             &label_nodes,
-            &|id, field| self.props.get(id, field).cloned(),
+            &|id, field| pv.get(id, field).map(|vr| vr.into_value()),
             &all_fields,
             &existing,
             config,
@@ -3495,10 +4276,10 @@ impl<F: Fs> GraphDb<F> {
             if !self.fulltext.is_enabled(label, field) {
                 continue;
             }
-            let Some(value) = self.props.get(id, field) else {
+            let Some(value) = self.props_view().get(id, field).map(|vr| vr.into_value()) else {
                 continue;
             };
-            let node_tokens: BTreeSet<String> = match value {
+            let node_tokens: BTreeSet<String> = match &value {
                 Value::Str(s) => tokenize(s).into_iter().collect(),
                 Value::List(items) => items
                     .iter()
@@ -3541,8 +4322,11 @@ impl<F: Fs> GraphDb<F> {
 
     /// Return the current view-maintained value of `view_prop` for node `key`.
     /// Equivalent to `get_prop` but documents that it reads a view-managed column.
-    pub fn get_view_prop(&self, key: &str, view_prop: &str) -> Option<&Value> {
-        self.props.get(self.ids.get(key)?, view_prop)
+    pub fn get_view_prop(&self, key: &str, view_prop: &str) -> Option<Value> {
+        let id = self.ids.get(key)?;
+        self.props_view()
+            .get(id, view_prop)
+            .map(|vr| vr.into_value())
     }
 
     /// For testing / DST oracle: scratch recompute of a view value for one node.
@@ -3553,13 +4337,14 @@ impl<F: Fs> GraphDb<F> {
     pub fn scratch_view_value(&self, key: &str, view_name: &str) -> Option<Value> {
         let node = self.ids.get(key)?;
         let def = self.view_store.views().find(|v| v.name == view_name)?;
-        // Direct scratch computation using the same internal function,
-        // reading from live props so NeighborAgg sees real neighbor values.
+        // Use TopologyView so that NeighborAgg sees base + overlay edges
+        // without materialising a temporary Topology (I1).
+        let topo_view = self.topo_view();
         core_rules::views::compute_view_value(
             def,
             node,
-            &self.props,
-            &self.topo,
+            self.props_view(),
+            &topo_view,
             &self.ids,
             &self.syms,
             &self.labels,
@@ -3642,8 +4427,13 @@ impl<F: Fs> GraphDb<F> {
         Ok(())
     }
 
-    pub fn get_prop(&self, key: &str, field: &str) -> Option<&Value> {
-        self.props.get(self.ids.get(key)?, field)
+    /// Return the value of `field` for the node with key `key`, or `None` if
+    /// the node or field is absent.  Reads through the overlay-over-base
+    /// `ColumnsView`, materialising base values on demand (zero heap cost for
+    /// overlay hits; one clone per base hit).
+    pub fn get_prop(&self, key: &str, field: &str) -> Option<Value> {
+        let id = self.ids.get(key)?;
+        self.props_view().get(id, field).map(|vr| vr.into_value())
     }
 
     pub fn has_node(&self, key: &str) -> bool {
@@ -3751,6 +4541,9 @@ impl<F: Fs> GraphDb<F> {
             .write_atomic(FileId::Roles, &bytes)
             .map_err(GraphError::Io)?;
         self.roles = Some(roles);
+        // Refresh the MVCC frozen overlay so that reader() immediately sees the
+        // updated role definitions without waiting for the next K-commit fold.
+        self.fold_now();
         Ok(())
     }
 
@@ -3759,9 +4552,9 @@ impl<F: Fs> GraphDb<F> {
             ids: &self.ids,
             syms: &self.syms,
             labels: &self.labels,
-            props: &self.props,
-            topo: &self.topo,
-            edge_props: &self.edge_props,
+            props: self.props_view(),
+            topo: self.topo_view(),
+            edge_props: self.edge_props_view(),
             mask: None,
         }
     }
@@ -3771,9 +4564,9 @@ impl<F: Fs> GraphDb<F> {
             ids: &self.ids,
             syms: &self.syms,
             labels: &self.labels,
-            props: &self.props,
-            topo: &self.topo,
-            edge_props: &self.edge_props,
+            props: self.props_view(),
+            topo: self.topo_view(),
+            edge_props: self.edge_props_view(),
             mask: Some(&mask.visible),
         }
     }
@@ -3873,6 +4666,7 @@ impl<F: Fs> GraphDb<F> {
     /// Plan-8 `by_node` index). Sorted by `(edge_type, src_key, dst_key)`.
     /// Unknown key → [`GraphError::KeyNotFound`].
     pub fn node_edges(&self, key: &str) -> Result<Vec<EdgeInfo>> {
+        self.ensure_v8_base_sections_loaded();
         let id = self
             .ids
             .get(key)
@@ -3883,14 +4677,15 @@ impl<F: Fs> GraphDb<F> {
             .map(|(_rule, etype, src, dst)| (etype, src, dst))
             .collect();
         let mut edges = Vec::new();
-        for etype in self.topo.etypes() {
+        let tv = self.topo_view();
+        for etype in tv.etypes() {
             let edge_type = self
                 .syms
                 .resolve(etype)
                 .expect("topology etype is interned")
                 .to_string();
             for dir in [Direction::Out, Direction::In] {
-                for &nbr in self.topo.neighbors(etype, dir, id).as_ref() {
+                for &nbr in tv.neighbors(etype, dir, id).as_ref() {
                     let (src, dst, src_key, dst_key) = match dir {
                         Direction::Out => (
                             id,
@@ -3948,7 +4743,11 @@ impl<F: Fs> GraphDb<F> {
         let view = self.view();
         view.nodes_with_label(label)
             .into_iter()
-            .filter(|&id| eval_filter(filter, &|field| view.prop(id, field).cloned()))
+            .filter(|&id| {
+                eval_filter(filter, &|field| {
+                    view.prop(id, field).map(|vr| vr.into_value())
+                })
+            })
             .map(|id| NodeRef { db: self, id })
             .collect()
     }
@@ -3967,6 +4766,9 @@ impl<F: Fs> GraphDb<F> {
         k: usize,
         min: f64,
     ) -> Vec<(String, f64)> {
+        // Ensure any HNSW blobs retained from the snapshot are deserialized
+        // before the first ANN query on a clean-open (no-WAL) path.
+        self.engine.ensure_hnsw_loaded();
         // L2-normalise query for cosine via dot product.
         let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
         if norm == 0.0 {
@@ -3993,7 +4795,8 @@ impl<F: Fs> GraphDb<F> {
             .into_iter()
             .filter_map(|id| {
                 let v = view.prop(id, field)?;
-                let xs = value_as_float_list(v)?;
+                let v_owned = v.into_value();
+                let xs = value_as_float_list(&v_owned)?;
                 let v_norm: f64 = xs.iter().map(|x| x * x).sum::<f64>().sqrt();
                 if v_norm == 0.0 {
                     return None;
@@ -4488,9 +5291,10 @@ impl<F: Fs> GraphDb<F> {
             // openCypher bare DELETE: error if any matched node has incident edges.
             for key in &keys {
                 if let Some(id) = self.ids.get(key) {
-                    let has_edges = self.topo.etypes().any(|et| {
-                        !self.topo.neighbors(et, Direction::Out, id).is_empty()
-                            || !self.topo.neighbors(et, Direction::In, id).is_empty()
+                    let tv = self.topo_view();
+                    let has_edges = tv.etypes().any(|et| {
+                        !tv.neighbors(et, Direction::Out, id).is_empty()
+                            || !tv.neighbors(et, Direction::In, id).is_empty()
                     });
                     if has_edges {
                         return Err(GraphError::QueryError {
@@ -4629,6 +5433,7 @@ impl<F: Fs> GraphDb<F> {
     /// Results are sorted by (rule, edge_type).
     /// Returns `Err(KeyNotFound)` if either key is unknown.
     pub fn explain(&self, key_a: &str, key_b: &str) -> Result<Vec<Explanation>> {
+        self.ensure_v8_base_sections_loaded();
         let id_a = self
             .ids
             .get(key_a)
@@ -4671,13 +5476,15 @@ impl<F: Fs> GraphDb<F> {
                 .expect("provenance ids always resolvable")
                 .to_string();
             let weight = rule_def.weight_prop.as_deref().and_then(|prop| {
-                self.edge_props.get(etype, src, dst, prop).and_then(|v| {
-                    if let Value::Float(f) = v {
-                        Some(*f)
-                    } else {
-                        None
-                    }
-                })
+                self.edge_props_view()
+                    .get(etype, src, dst, prop)
+                    .and_then(|v| {
+                        if let Value::Float(f) = v {
+                            Some(f)
+                        } else {
+                            None
+                        }
+                    })
             });
             results.push(Explanation {
                 rule: rule_name.to_string(),
@@ -4704,7 +5511,7 @@ impl<F: Fs> GraphDb<F> {
         let Some(sym) = self.syms.get(edge_type) else {
             return Ok(Vec::new());
         };
-        self.topo
+        self.topo_view()
             .neighbors(sym, dir, id)
             .iter()
             .map(|&n| {
@@ -4894,12 +5701,13 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn edge_count(&self) -> u64 {
-        self.topo.edge_count()
+        self.topo_view().edge_count()
     }
 
     /// Live/tombstone/edge counts plus per-rule provenance size, trip latch,
     /// and fire counter (includes rebuild evaluations). Rules are sorted by name.
     pub fn stats(&self) -> Stats {
+        self.ensure_v8_base_sections_loaded();
         let rules: Vec<RuleStats> = self
             .engine
             .rules()
@@ -4919,7 +5727,7 @@ impl<F: Fs> GraphDb<F> {
         Stats {
             nodes_live: self.ids.live_len(),
             nodes_tombstoned: self.ids.len() - self.ids.live_len(),
-            edges: self.topo.edge_count(),
+            edges: self.topo_view().edge_count(),
             rules,
         }
     }
@@ -4978,57 +5786,193 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        self.ensure_v8_base_sections_loaded();
+        // Ensure provenance is decoded before to_persist() clones it.
+        self.engine.ensure_provenance_loaded_mut();
         let (rule_defs_typed, provenance, rule_tripped, rule_fires) = self.engine.to_persist();
         let rule_defs = rule_defs_typed
             .iter()
             .map(|r| bincode::serialize(r).expect("RuleDef serialize cannot fail"))
             .collect();
-        // Collect IVF state for approximate rules (V4).
-        let hnsw_state = self.engine.export_hnsw_state();
-        let raw_ivf = self.engine.export_ivf_state();
-        let ivf_state: BTreeMap<String, core_storage::snapshot::PerRuleIvfState> = raw_ivf
-            .into_iter()
-            .map(|(name, ((sc, sa, sd), (dc, da, dd)))| {
-                (
-                    name,
-                    core_storage::snapshot::PerRuleIvfState {
-                        src: core_storage::snapshot::SideIvfState {
-                            centroids: sc,
-                            clusters: sa,
-                            drift: sd,
+        // Collect HNSW state and IVF state.  When indexes are not yet
+        // populated (clean open, no mutation since open), pass the retained
+        // raw bytes through directly so that migrate/snapshot does not
+        // silently discard fitted approximate-rule indexes.
+        let hnsw_state = self.engine.export_hnsw_state_passthrough();
+        let ivf_bytes = if !self.engine.indexes_populated() {
+            // Pass retained IVF bytes through unchanged (no re-encode).
+            self.engine.retained_ivf_bytes_clone().unwrap_or_default()
+        } else {
+            // Indexes live: encode from current state.
+            let raw_ivf = self.engine.export_ivf_state();
+            let ivf_state_map: BTreeMap<String, core_storage::snapshot::PerRuleIvfState> = raw_ivf
+                .into_iter()
+                .map(|(name, ((sc, sa, sd), (dc, da, dd)))| {
+                    (
+                        name,
+                        core_storage::snapshot::PerRuleIvfState {
+                            src: core_storage::snapshot::SideIvfState {
+                                centroids: sc,
+                                clusters: sa,
+                                drift: sd,
+                            },
+                            dst: core_storage::snapshot::SideIvfState {
+                                centroids: dc,
+                                clusters: da,
+                                drift: dd,
+                            },
                         },
-                        dst: core_storage::snapshot::SideIvfState {
-                            centroids: dc,
-                            clusters: da,
-                            drift: dd,
-                        },
-                    },
-                )
-            })
-            .collect();
+                    )
+                })
+                .collect();
+            if ivf_state_map.is_empty() {
+                Vec::new()
+            } else {
+                bincode::serialize(&ivf_state_map).expect("IVF state serialize cannot fail")
+            }
+        };
         let view_defs: Vec<Vec<u8>> = self
             .view_store
             .views()
             .map(|v| bincode::serialize(v).expect("ViewDef serialize cannot fail"))
             .collect();
-        let state = core_storage::snapshot::SnapshotState {
-            ids: self.ids.clone(),
-            syms: self.syms.clone(),
-            topo: self.topo.clone(),
-            props: self.props.clone(),
-            labels: self.labels.clone(),
-            edge_props: self.edge_props.clone(),
-            rule_defs,
-            provenance,
-            rule_tripped,
-            rule_fires,
-            ivf_state,
-            hnsw_state,
-            view_defs,
-            wal_truncated: !opts.keep_wal,
-        };
-        self.fs
-            .write_atomic(FileId::Snapshot, &core_storage::snapshot::encode(&state)?)?;
+        if self.base.is_some() {
+            // V8 merge-snapshot path: encode base+overlay into a new V8 snapshot,
+            // write it atomically, remap it as the new base, then clear the overlay.
+            let meta = V8Meta {
+                labels: self.labels.clone(),
+                edge_props: self.edge_props.clone(),
+                rule_defs,
+                provenance,
+                rule_tripped,
+                rule_fires,
+                ivf_bytes,
+                view_defs,
+                wal_truncated: !opts.keep_wal,
+                hnsw: hnsw_state,
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                // Clone the Arc so the old base stays alive while we encode.
+                // The borrow of archived_csr (into old_base's mmap) is released
+                // at the end of this block, before we replace self.base.
+                let old_base = self.base.clone().expect("is_some checked above");
+                let archived_csr = old_base.topology().map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8 snapshot: topology section: {e:?}"),
+                })?;
+                let archived_cols = old_base.columns().map_err(|e| GraphError::Corrupt {
+                    detail: format!("v8 snapshot: columns section: {e:?}"),
+                })?;
+                let archived_edge_props =
+                    old_base
+                        .edge_props_section()
+                        .map_err(|e| GraphError::Corrupt {
+                            detail: format!("v8 snapshot: edge_props section: {e:?}"),
+                        })?;
+                let edge_props_raw =
+                    old_base
+                        .edge_props_raw_bytes()
+                        .map_err(|e| GraphError::Corrupt {
+                            detail: format!("v8 snapshot: edge_props raw bytes: {e:?}"),
+                        })?;
+                let prov_raw =
+                    old_base
+                        .provenance_raw_bytes()
+                        .map_err(|e| GraphError::Corrupt {
+                            detail: format!("v8 snapshot: provenance raw bytes: {e:?}"),
+                        })?;
+                encode_v8(
+                    Some(archived_csr),
+                    Some(archived_cols),
+                    Some((archived_edge_props, edge_props_raw)),
+                    Some(prov_raw),
+                    &self.topo,
+                    &self.props,
+                    &self.ids,
+                    &self.syms,
+                    &meta,
+                    &mut buf,
+                )?;
+            }
+            self.fs.write_atomic(FileId::Snapshot, &buf)?;
+            // Remap the freshly-written snapshot as the new base.
+            // C2: use file mmap on RealFs; fall back to from_bytes on SimFs.
+            let new_base = if let Some(snap_path) = self.fs.snapshot_path() {
+                core_storage::v8::MappedBase::map(&snap_path)
+            } else {
+                core_storage::v8::MappedBase::from_bytes(buf)
+            }
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8 snapshot: remap new base: {e:?}"),
+            })?;
+            self.base = Some(Arc::new(new_base));
+            // Clear the overlay and prop tombstones — all data is now in the new base.
+            self.topo = Topology::new();
+            self.props = core_storage::columns::ColumnStore::new();
+        } else {
+            // Legacy path (V5–V7 stores without a V8 base).
+            //
+            // Memory-diet path: build V8Meta directly from &self — no SnapshotState
+            // clone and no encode_v8_from_state intermediate clones.  The big
+            // structures (self.topo, self.props) are borrowed, not cloned.
+            // self.edge_props is moved (not cloned) because we immediately clear it
+            // when we remap the new V8 snapshot as self.base (see below).
+            //
+            // Eliminates from peak RSS vs. the old SnapshotState path:
+            //   • self.topo.clone()      (~topology HashMap footprint)
+            //   • self.props.clone()     (~column-store footprint)
+            //   • encode_v8_from_state V8Meta secondary clones (labels, edge_props, …)
+            let meta = V8Meta {
+                labels: self.labels.clone(),
+                wal_truncated: !opts.keep_wal,
+                // Move edge_props out so the large overlay is freed when meta
+                // drops at end of this block (self.edge_props is now empty; reads
+                // after base assignment go through the mmap'd base section).
+                edge_props: std::mem::take(&mut self.edge_props),
+                rule_defs,
+                provenance,
+                rule_tripped,
+                rule_fires,
+                ivf_bytes,
+                view_defs,
+                hnsw: hnsw_state,
+            };
+            let mut buf = Vec::new();
+            encode_v8(
+                None,
+                None,
+                None,
+                None,
+                &self.topo,
+                &self.props,
+                &self.ids,
+                &self.syms,
+                &meta,
+                &mut buf,
+            )?;
+            // meta (and the moved edge_props inside it) is no longer needed;
+            // drop it before the write to keep the peak window narrow.
+            drop(meta);
+            self.fs.write_atomic(FileId::Snapshot, &buf)?;
+            // Remap the freshly-written V8 snapshot as self.base.
+            // On RealFs: drop the encode buffer before mmap to recover ~1.9 GiB.
+            // On SimFs (tests): pass buf to from_bytes.
+            let new_base = if let Some(snap_path) = self.fs.snapshot_path() {
+                drop(buf);
+                core_storage::v8::MappedBase::map(&snap_path)
+            } else {
+                core_storage::v8::MappedBase::from_bytes(buf)
+            }
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8 snapshot: remap new base (legacy path): {e:?}"),
+            })?;
+            self.base = Some(Arc::new(new_base));
+            // Free the large heap-allocated decoded state — all data is now in the
+            // mmap'd base.  Mirrors the V8 merge-snapshot path (see above).
+            // self.edge_props was already moved into meta and is effectively empty.
+            self.topo = Topology::new();
+            self.props = core_storage::columns::ColumnStore::new();
+        }
 
         if opts.keep_wal {
             // keep_wal=true: WAL is left untouched.  The existing WAL already
@@ -5055,12 +5999,20 @@ impl<F: Fs> GraphDb<F> {
             }
             self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
         }
+        // After snapshot the overlay may have changed (V8 merge path clears
+        // self.topo and self.props). Refresh the MVCC fold so future readers
+        // see the post-snapshot state rather than stale overlay data.
+        self.fold_now();
         Ok(())
     }
 }
 
-/// Queued mutation for a [`BatchBuilder`].
-enum BatchOp {
+/// Queued mutation for a [`BatchBuilder`] or [`GraphDb::commit_group`].
+///
+/// The `submit_batch` / `commit_group` APIs accept `Vec<BatchOp>` so that
+/// callers can build a set of mutations without holding `&mut GraphDb` and
+/// hand them off to the group-committing writer for durable, batched I/O.
+pub enum BatchOp {
     InsertNode {
         label: String,
         key: String,
@@ -5183,7 +6135,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             return false;
         };
         self.db
-            .topo
+            .topo_view()
             .neighbors(sym, Direction::Out, src)
             .binary_search(&dst)
             .is_ok()
@@ -5366,7 +6318,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         if self.overlay.extra_keys.contains(key) {
             return None;
         }
-        self.db.get_prop(key, field).cloned()
+        self.db.get_prop(key, field)
     }
 
     fn check_create_rule(&self, def: &RuleDef) -> Result<()> {
@@ -5603,16 +6555,23 @@ impl<'a, F: Fs> NodeRef<'a, F> {
         self.db.syms.resolve(sym).expect("interned label symbol")
     }
 
-    pub fn prop(&self, field: &str) -> Option<&Value> {
-        self.db.props.get(self.id, field)
+    pub fn prop(&self, field: &str) -> Option<Value> {
+        self.db
+            .props_view()
+            .get(self.id, field)
+            .map(|vr| vr.into_value())
     }
 
     /// All stored fields for this node, sorted by field name.
+    ///
+    /// Reads from the full base+overlay view so that props stored only in the
+    /// V8 snapshot base (i.e. before any post-snapshot WAL writes) are visible.
     pub fn props(&self) -> BTreeMap<String, Value> {
         let mut out = BTreeMap::new();
-        for field in self.db.props.fields() {
-            if let Some(v) = self.db.props.get(self.id, field) {
-                out.insert(field.to_string(), v.clone());
+        let pv = self.db.props_view();
+        for field in pv.field_names() {
+            if let Some(vr) = pv.get(self.id, &field) {
+                out.insert(field, vr.into_value());
             }
         }
         out
@@ -5924,7 +6883,7 @@ mod tests {
             .unwrap();
             // Sanity: normal open sees degree = 3.
             assert_eq!(
-                db.get_view_prop("o1", "emp").cloned(),
+                db.get_view_prop("o1", "emp"),
                 Some(Value::Int(3)),
                 "normal db must show degree 3 after 3 derived edges"
             );
@@ -5932,7 +6891,7 @@ mod tests {
 
         // Re-open normally to get the authoritative reference value.
         let normal_db = GraphDb::open(&dir).unwrap();
-        let normal_emp = normal_db.get_view_prop("o1", "emp").cloned();
+        let normal_emp = normal_db.get_view_prop("o1", "emp");
         assert_eq!(
             normal_emp,
             Some(Value::Int(3)),
@@ -5942,7 +6901,7 @@ mod tests {
         // Latest as-of (commit 5 = frames 0..=5): must match the normal open.
         let aof_latest = GraphDb::open_at(&dir, 5).unwrap();
         assert_eq!(
-            aof_latest.get_view_prop("o1", "emp").cloned(),
+            aof_latest.get_view_prop("o1", "emp"),
             normal_emp,
             "open_at latest: derived-edge view must equal normal open (rebuild_all required)"
         );
@@ -5950,7 +6909,7 @@ mod tests {
         // Mid-history as-of (commit 3 = frames 0..=3): only p1; degree = 1.
         let aof_mid = GraphDb::open_at(&dir, 3).unwrap();
         assert_eq!(
-            aof_mid.get_view_prop("o1", "emp").cloned(),
+            aof_mid.get_view_prop("o1", "emp"),
             Some(Value::Int(1)),
             "open_at mid-history: only p1 exists at frame 3, degree must be 1"
         );
@@ -6025,7 +6984,7 @@ mod tests {
             db.set_prop("a", "later_field", Value::Int(2)).unwrap();
         }
         let db = GraphDb::open(&dir).expect("WAL must replay after failed rewrite");
-        assert_eq!(db.get_prop("a", "later_field"), Some(&Value::Int(2)));
+        assert_eq!(db.get_prop("a", "later_field"), Some(Value::Int(2)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

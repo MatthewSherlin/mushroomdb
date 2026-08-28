@@ -713,8 +713,8 @@ fn write_scores_roundtrip() {
     let scores = vec![("a".to_string(), 0.9), ("b".to_string(), 0.5)];
     db.write_scores("rank", &scores).expect("write_scores ok");
     // Read back and verify.
-    let a_val = db.get_prop("a", "rank").cloned();
-    let b_val = db.get_prop("b", "rank").cloned();
+    let a_val = db.get_prop("a", "rank");
+    let b_val = db.get_prop("b", "rank");
     assert_eq!(a_val, Some(Value::Float(0.9)));
     assert_eq!(b_val, Some(Value::Float(0.5)));
     let _ = std::fs::remove_dir_all(&dir);

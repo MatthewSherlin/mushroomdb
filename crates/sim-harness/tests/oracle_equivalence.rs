@@ -1051,8 +1051,9 @@ proptest! {
         for n in 0..=255u8 {
             let key = format!("k{n}");
             for field in &["seed", "p", "f", "tags", "year", "loc", "emb"] {
+                let db_prop = db.get_prop(&key, field);
                 prop_assert_eq!(
-                    db.get_prop(&key, field),
+                    db_prop.as_ref(),
                     oracle.get_prop(&key, field),
                     "prop mismatch key={} field={}",
                     key,
@@ -1070,7 +1071,7 @@ proptest! {
                 if !db.has_node(&key) {
                     continue;
                 }
-                let stored = db.get_view_prop(&key, &view_def.view_prop).cloned();
+                let stored = db.get_view_prop(&key, &view_def.view_prop);
                 let scratch = db.scratch_view_value(&key, &view_def.name);
                 let is_float_agg = matches!(
                     &view_def.source,

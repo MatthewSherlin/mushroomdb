@@ -21,9 +21,73 @@ document is the binding contract for how the snapshot and WAL formats evolve.
 |---------|-------------|
 | V5 | Uncompressed bincode payload with CRC32 header |
 | V6 | zstd-compressed V5 payload |
-| V7 (current) | zstd(CRC32 + packed CSR topology + packed columnar properties + bincode meta) |
+| V7 | zstd(CRC32 + packed CSR topology + packed columnar properties + bincode meta) |
+| V8 (current) | mmap-able zero-copy rkyv sections; see wire description below |
 
-The current encoder always writes **V7**. The decoder supports V5, V6, and V7.
+The current encoder always writes **V8**. The decoder supports V5, V6, V7, and V8.
+V5–V7 stores are **automatically migrated** to V8 on `GraphDb::open` (see Automatic migration below).
+
+#### V8 wire description
+
+```text
+[0..4]         magic "GDB1"
+[4..6]         VERSION = 8 (u16 LE)
+[6..8]         section_count (u16 LE) — currently 11
+[8..8+16*N]    section directory: N × { id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32 }
+[8+16*N..+4]   whole-header CRC32 (covers bytes [0..8+16*N])
+[..4096]       zero-pad to complete the 4 KB header page
+[4096..]       section payloads at 8-byte-aligned offsets; last section is NOT padded
+```
+
+Section ids (fixed):
+
+| ID | Name | Encoding |
+|----|------|----------|
+| 0  | TOPOLOGY   | rkyv `CsrData` (zero-copy archived CSR) |
+| 1  | COLUMNS    | rkyv `ColumnsData` (zero-copy archived column store) |
+| 2  | IDS        | rkyv `IdMapData` (zero-copy archived id map) |
+| 3  | SYMS       | rkyv `InternerData` (zero-copy archived symbol interner) |
+| 4  | META       | bincode `V8Meta` (labels, edge_props, rule_defs, provenance, …) |
+| 5  | EDGE_PROPS | rkyv `EdgePropsData` (per-edge property blobs, sorted by (etype,src,dst)) |
+| 6  | HNSW       | rkyv `HnswSectionData` (HNSW graph blobs per rule name) |
+| 7  | PROVENANCE | rkyv `ProvenanceSectionData` (rule-derived edge provenance) |
+| 8  | RULES_META | rkyv `RulesMetaData` (rule definitions, trip flags, fire counts) |
+| 9  | VIEWS      | rkyv `ViewsSectionData` (view definition bincode blobs) |
+| 10 | IVF_STATE  | bincode `BTreeMap<String, PerRuleIvfState>` (IVF centroid + cluster state per approximate rule) |
+
+CRC coverage: each section payload `[offset..offset+len]` is covered by its directory `crc32`.
+Alignment padding bytes between sections are written as zeros and are NOT covered by any CRC.
+The last section has no trailing pad so the file ends at exactly the last payload byte.
+
+#### Section-CRC hot-path deferral and trust model (v0.2.0+)
+
+Small sections (IDS=2, SYMS=3, META=4, RULES_META=8, VIEWS=9) validate their CRC32
+on first access.
+
+Large sections (TOPOLOGY=0, COLUMNS=1, EDGE_PROPS=5, HNSW=6, PROVENANCE=7,
+IVF_STATE=10) **skip** the per-touch CRC on the normal query path. A full-section
+hash of hundreds of MiB costs 50–200 ms per section. Section bounds are validated
+at open time; rkyv archived data on the hot path uses `access_unchecked` (O(1)
+root-pointer lookup, no pointer-walk). This is sound for encoder-produced
+uncorrupted data, but a bit-flip on a relative-pointer field causes
+`ArchivedVec::as_slice` to resolve an out-of-bounds address before any length
+check — genuine UB, not a panic. Within-payload corruption that does not affect
+relative pointers yields wrong query results rather than a safety violation.
+Mitigated by `mushroomdb verify` (full-section CRC32 audit on demand) and
+planned Miri/ASAN CI coverage. The `snapshot::decode` path (used during
+migration and offline decode) retains validated `rkyv::access` for full
+hostile-byte safety.
+
+To audit large-section integrity explicitly:
+
+```
+mushroomdb verify <db-dir>
+```
+
+Reads every section, computes CRC32, and reports any mismatch. Exits 2 on the
+first corrupt section, 0 if all sections are intact. Measured at 0.26 s on
+a 1.8 GiB snapshot (11 sections). Run this after any external modification of
+the snapshot file, or periodically as a sanity check on storage hardware.
 
 ### WAL (`wal.bin`)
 
@@ -77,7 +141,7 @@ re-snapshot before upgrading.
 > because the index structures are rebuilt in-process before the new snapshot is
 > written. On a 2.2 GiB V5 dogfood store with 9 rules (measured 2026-08-27,
 > Apple M-series, macOS), the first migrating open took **~10–11 minutes** with a
-> peak memory footprint of **~54 GB** (max RSS ~9.5 GB; the remainder is
+> peak memory footprint of **~35 GB** (max RSS **~8.3 GB** as of 2026-08-28 — fits a 16 GB machine without heavy swap; the VM-footprint remainder is
 > VM/compressed memory pressure). On a 24 GB machine this left little headroom;
 > on a more memory-constrained host the OS may kill the process mid-migration.
 > The migration is crash-safe — originals and `.bak` remain intact; simply retry

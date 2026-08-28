@@ -23,8 +23,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use core_api::{
-    is_write_query, json_to_rows, AutoFk, DegreeConfig, Dir, GraphError, IngestOptions, NodeMask,
-    PageRankConfig, ResultSet, SharedDb, SuggestConfig, WccConfig, SUGGEST_DEFAULT_SEED,
+    is_write_query, json_to_rows, json_to_value, AutoFk, BatchOp, DegreeConfig, Dir, GraphError,
+    IngestOptions, NodeMask, PageRankConfig, ResultSet, SharedDb, SuggestConfig, Value, WccConfig,
+    SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -309,8 +310,26 @@ fn build_app(
         .route("/suggest", get(suggest))
         .route("/explain", get(explain))
         .route("/node/{key}", get(node_info))
+        .route("/node/{key}", axum::routing::delete(delete_node))
         .route("/node/{key}/edges", get(node_edges))
         .route("/node/{key}/neighborhood", get(neighborhood))
+        .route(
+            "/node/{key}/prop/{field}",
+            axum::routing::put(set_node_prop),
+        )
+        .route(
+            "/node/{key}/prop/{field}",
+            axum::routing::delete(remove_node_prop),
+        )
+        // Simple BatchOp-mapped endpoints — routed through the group-commit
+        // queue (submit_batch) so concurrent node/edge CRUD does not hold
+        // the write lock during fsync.
+        .route("/nodes", post(create_node))
+        .route("/edges", post(create_edge))
+        .route(
+            "/edges/{etype}/{src}/{dst}",
+            axum::routing::delete(delete_edge),
+        )
         .route("/algo/pagerank", post(algo_pagerank))
         .route("/algo/wcc", post(algo_wcc))
         .route("/algo/degree", post(algo_degree))
@@ -668,7 +687,8 @@ async fn query(
 
     // Role token: writes are denied; reads are auto-masked by the role's
     // visibility mask.  A client-supplied mask can only narrow, never widen.
-    // Single read guard for mask resolution + query (snapshot consistency).
+    // Lock-free epoch snapshot: mask and query execute on the same frozen state
+    // (constraint 2 — RBAC mask coherence), without holding the read lock.
     if let AuthIdentity::Role(ref role_name) = identity {
         let is_write = match is_write_query(&cypher) {
             Ok(b) => b,
@@ -677,19 +697,19 @@ async fn query(
         if is_write {
             return forbidden("role-bound token: writes are not permitted");
         }
-        let db = state.db.read();
-        let role_mask = match db.mask_for_role(role_name) {
+        let snap = state.db.reader();
+        let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
         let effective_mask = if let Some(ref keys) = mask_keys {
             // Client mask intersects role mask — never widens visibility.
-            let client_mask = NodeMask::from_keys(&*db, keys.iter().map(String::as_str));
+            let client_mask = NodeMask::from_ids(keys.iter().filter_map(|k| snap.resolve_key(k)));
             role_mask.intersect(&client_mask)
         } else {
             role_mask
         };
-        return match db.query_masked(&cypher, &params, &effective_mask) {
+        return match snap.query_masked(&cypher, &params, &effective_mask) {
             Ok(rs) => format_query_result(rs, format),
             Err(GraphError::QueryError { detail })
                 if detail.contains("masked queries are read-only") =>
@@ -899,17 +919,21 @@ async fn node_info(
     Path(key): Path<String>,
 ) -> Response {
     if let AuthIdentity::Role(ref role_name) = identity {
-        // Single read guard for mask resolution + node lookup (snapshot consistency).
-        let g = state.db.read();
-        let role_mask = match g.mask_for_role(role_name) {
+        // Lock-free epoch snapshot: mask and node lookup on same frozen state
+        // (constraint 2 — RBAC mask coherence).
+        let snap = state.db.reader();
+        let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
         // Hidden keys respond identically to absent keys — no "restricted" signal in v1.
-        if !role_mask.contains_node(&*g, &key) {
+        if !snap
+            .resolve_key(&key)
+            .is_some_and(|id| role_mask.contains_id(id))
+        {
             return key_not_found(key);
         }
-        return match g.node_info(&key) {
+        return match snap.node_info(&key) {
             Some(info) => json_ok(node_info_json(&info)),
             None => key_not_found(key),
         };
@@ -930,15 +954,20 @@ async fn node_edges(
     Path(key): Path<String>,
 ) -> Response {
     if let AuthIdentity::Role(ref role_name) = identity {
-        let g = state.db.read();
-        let role_mask = match g.mask_for_role(role_name) {
+        // Lock-free epoch snapshot: mask and edge lookup on same frozen state
+        // (constraint 2 — RBAC mask coherence).
+        let snap = state.db.reader();
+        let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
-        if !role_mask.contains_node(&*g, &key) {
+        if !snap
+            .resolve_key(&key)
+            .is_some_and(|id| role_mask.contains_id(id))
+        {
             return key_not_found(key);
         }
-        return match g.node_edges(&key) {
+        return match snap.node_edges(&key) {
             Ok(edges) => {
                 // Filter out edges whose OTHER endpoint is hidden in the role
                 // mask.  A role token must not learn about hidden neighbors via
@@ -951,7 +980,8 @@ async fn node_edges(
                         } else {
                             &e.src_key
                         };
-                        role_mask.contains_node(&*g, other)
+                        snap.resolve_key(other)
+                            .is_some_and(|id| role_mask.contains_id(id))
                     })
                     .collect();
                 json_ok(node_edges_json(&visible))
@@ -1001,18 +1031,23 @@ async fn neighborhood(
         .as_ref()
         .map(|v| v.iter().map(String::as_str).collect());
     if let AuthIdentity::Role(ref role_name) = identity {
-        // Single read guard for mask resolution + neighborhood lookup.
-        let g = state.db.read();
-        let role_mask = match g.mask_for_role(role_name) {
+        // Lock-free epoch snapshot: mask and neighborhood BFS on same frozen state
+        // (constraint 2 — RBAC mask coherence).
+        let snap = state.db.reader();
+        let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
-        if !role_mask.contains_node(&*g, &key) {
+        if !snap
+            .resolve_key(&key)
+            .is_some_and(|id| role_mask.contains_id(id))
+        {
             return key_not_found(key);
         }
         // Use the mask-aware BFS: hidden nodes are excluded from results AND
         // cannot be used as traversal intermediaries (never-leak invariant).
-        let rs = match g.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &role_mask) {
+        let rs = match snap.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &role_mask)
+        {
             Some(rs) => rs,
             None => return key_not_found(key),
         };
@@ -1101,6 +1136,186 @@ async fn algo_degree(
     match tokio::task::spawn_blocking(move || db.read().degree_centrality(&config)).await {
         Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
         Err(_) => err_response("degree task panicked"),
+    }
+}
+
+// ── Simple BatchOp-mapped endpoints ──────────────────────────────────────────
+//
+// These endpoints map 1:1 to BatchOp variants and route through submit_batch
+// so concurrent writes share one WAL fsync per drain group, keeping reader
+// p95 latency low under write bursts.  Auth checks (role tokens → 403) run
+// before enqueue so RBAC enforcement is unchanged.
+//
+// Complex paths (/query Cypher writes, /ingest bulk JSON) stay on db.write()
+// because they are multi-step operations that cannot be pre-expressed as a
+// Vec<BatchOp> without redesigning the query executor.
+
+/// Parse a JSON object into a `Vec<(String, Value)>` prop list.
+fn props_from_json_obj(v: &serde_json::Value) -> Result<Vec<(String, Value)>, String> {
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return Err("props must be a JSON object".into()),
+    };
+    let mut out = Vec::with_capacity(obj.len());
+    for (k, val) in obj {
+        if let Some(v) = json_to_value(val.clone()) {
+            out.push((k.clone(), v));
+        }
+    }
+    Ok(out)
+}
+
+/// `POST /nodes` — create or upsert a node via the group-commit queue.
+///
+/// Body: `{"label": "Person", "key": "alice", "props": {"age": 30}}`
+async fn create_node(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
+    let label = match body.get("label").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing label"),
+    };
+    let key = match body.get("key").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing key"),
+    };
+    let props = match body.get("props") {
+        None | Some(Js::Null) => vec![],
+        Some(v) => match props_from_json_obj(v) {
+            Ok(p) => p,
+            Err(e) => return err_response(e),
+        },
+    };
+    let db = state.db.clone();
+    match blocking_write(move || db.submit_batch(vec![BatchOp::InsertNode { label, key, props }]))
+        .await
+    {
+        Ok((nodes, edges)) => json_ok(json!({"ok": true, "nodes": nodes, "edges": edges})),
+        Err(resp) => resp,
+    }
+}
+
+/// `DELETE /node/{key}` — delete a node via the group-commit queue.
+async fn delete_node(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(key): Path<String>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
+    let db = state.db.clone();
+    match blocking_write(move || db.submit_batch(vec![BatchOp::DeleteNode { key }])).await {
+        Ok(_) => json_ok(json!({"ok": true})),
+        Err(resp) => resp,
+    }
+}
+
+/// `POST /edges` — create an edge via the group-commit queue.
+///
+/// Body: `{"type": "KNOWS", "src": "alice", "dst": "bob"}`
+async fn create_edge(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
+    let edge_type = match body.get("type").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing type"),
+    };
+    let src = match body.get("src").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing src"),
+    };
+    let dst = match body.get("dst").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing dst"),
+    };
+    let db = state.db.clone();
+    match blocking_write(move || {
+        db.submit_batch(vec![BatchOp::InsertEdge {
+            edge_type,
+            src_key: src,
+            dst_key: dst,
+        }])
+    })
+    .await
+    {
+        Ok(_) => json_ok(json!({"ok": true})),
+        Err(resp) => resp,
+    }
+}
+
+/// `DELETE /edges/{etype}/{src}/{dst}` — delete an edge via the group-commit queue.
+async fn delete_edge(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path((etype, src, dst)): Path<(String, String, String)>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
+    let db = state.db.clone();
+    match blocking_write(move || {
+        db.submit_batch(vec![BatchOp::DeleteEdge {
+            edge_type: etype,
+            src_key: src,
+            dst_key: dst,
+        }])
+    })
+    .await
+    {
+        Ok(_) => json_ok(json!({"ok": true})),
+        Err(resp) => resp,
+    }
+}
+
+/// `PUT /node/{key}/prop/{field}` — set a property via the group-commit queue.
+///
+/// Body: `{"value": 42}`
+async fn set_node_prop(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path((key, field)): Path<(String, String)>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
+    let value = match body.get("value").and_then(|v| json_to_value(v.clone())) {
+        Some(v) => v,
+        None => return err_response("missing or null value"),
+    };
+    let db = state.db.clone();
+    match blocking_write(move || db.submit_batch(vec![BatchOp::SetProp { key, field, value }]))
+        .await
+    {
+        Ok(_) => json_ok(json!({"ok": true})),
+        Err(resp) => resp,
+    }
+}
+
+/// `DELETE /node/{key}/prop/{field}` — remove a property via the group-commit queue.
+async fn remove_node_prop(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path((key, field)): Path<(String, String)>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
+    let db = state.db.clone();
+    match blocking_write(move || db.submit_batch(vec![BatchOp::RemoveProp { key, field }])).await {
+        Ok(_) => json_ok(json!({"ok": true})),
+        Err(resp) => resp,
     }
 }
 

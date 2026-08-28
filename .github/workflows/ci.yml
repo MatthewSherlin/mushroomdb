@@ -18,6 +18,11 @@ jobs:
       - run: cargo test --workspace
       # Compile-only: CI runners are too noisy for timing gates.
       - run: cargo bench --no-run
+      # TODO: add a Miri job for crates/core-storage (MappedBase::topology/columns/
+      # edge_props_section access_unchecked seams). These seams have no proptest
+      # hostile-bytes coverage; Miri is the appropriate defence against corrupt
+      # relative-pointer UB. Blocked on Miri's limited mmap support — track as
+      # a separate job once mmap stubs land in the Miri tree.
 
   ui:
     runs-on: ubuntu-latest

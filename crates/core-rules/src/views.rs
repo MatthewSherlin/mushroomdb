@@ -34,7 +34,9 @@
 //! entry remains green through view-heavy workloads because view updates
 //! bypass the engine's delta path entirely.
 
-use core_storage::{ColumnStore, Direction, IdMap, Interner, Topology, Value};
+use core_storage::v8::layout::ArchivedColumns;
+use core_storage::v8::seam::{ColumnsView, TopologyView};
+use core_storage::{ColumnStore, Direction, IdMap, Interner, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -171,7 +173,7 @@ impl ViewStore {
         &mut self,
         def: ViewDef,
         props: &mut ColumnStore,
-        topo: &Topology,
+        topo: &TopologyView<'_>,
         ids: &IdMap,
         syms: &Interner,
         labels: &[u32],
@@ -269,10 +271,11 @@ impl ViewStore {
         dst: u32,
         inserted: bool,
         props: &mut ColumnStore,
-        topo: &Topology,
+        topo: &TopologyView<'_>,
         ids: &IdMap,
         syms: &Interner,
         labels: &[u32],
+        base_cols: Option<&ArchivedColumns>,
     ) {
         for def in self.views.values() {
             let Some(et_sym) = syms.get(def.edge_type()) else {
@@ -295,7 +298,7 @@ impl ViewStore {
                 Direction::In => src,
             };
             update_node_view(
-                def, subject, neighbor, inserted, props, topo, ids, syms, labels,
+                def, subject, neighbor, inserted, props, topo, ids, syms, labels, base_cols,
             );
         }
     }
@@ -308,10 +311,11 @@ impl ViewStore {
         changed_node: u32,
         field: &str,
         props: &mut ColumnStore,
-        topo: &Topology,
+        topo: &TopologyView<'_>,
         ids: &IdMap,
         syms: &Interner,
         labels: &[u32],
+        base_cols: Option<&ArchivedColumns>,
     ) {
         for def in self.views.values() {
             let ViewSource::NeighborAgg {
@@ -338,12 +342,18 @@ impl ViewStore {
             };
             let subjects: Vec<u32> = topo.neighbors(et_sym, reverse_dir, changed_node).to_vec();
             for subject in subjects {
-                // Full recompute for the subject's view value.
-                if let Some(val) = compute_view_value(def, subject, props, topo, ids, syms, labels)
-                {
-                    props.set(subject, &def.view_prop, val);
-                } else {
-                    props.remove(subject, &def.view_prop);
+                // Full recompute using the full base+overlay props view.
+                // Build the ColumnsView in a block so the immutable borrow of `props`
+                // ends before we write back.
+                let val = {
+                    let pv = build_cols_view(props, base_cols);
+                    compute_view_value(def, subject, pv, topo, ids, syms, labels)
+                };
+                match val {
+                    Some(v) => props.set(subject, &def.view_prop, v),
+                    None => {
+                        props.remove(subject, &def.view_prop);
+                    }
                 }
             }
         }
@@ -406,7 +416,7 @@ impl ViewStore {
     pub fn rebuild_all(
         &self,
         props: &mut ColumnStore,
-        topo: &Topology,
+        topo: &TopologyView<'_>,
         ids: &IdMap,
         syms: &Interner,
         labels: &[u32],
@@ -421,11 +431,25 @@ impl ViewStore {
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/// Build a `ColumnsView` that reads from both overlay props and (when present)
+/// the archived base columns.  Used in update/recompute paths so view values
+/// that live in the base after a V8 snapshot open are visible alongside
+/// overlay-only props added during WAL replay or live mutations.
+fn build_cols_view<'a>(
+    overlay: &'a ColumnStore,
+    base_cols: Option<&'a ArchivedColumns>,
+) -> ColumnsView<'a> {
+    match base_cols {
+        None => ColumnsView::owned(overlay),
+        Some(b) => ColumnsView::with_base(overlay, b),
+    }
+}
+
 /// Compute and store the view value for every node matching `def.label`.
 fn backfill_view(
     def: &ViewDef,
     props: &mut ColumnStore,
-    topo: &Topology,
+    topo: &TopologyView<'_>,
     ids: &IdMap,
     syms: &Interner,
     labels: &[u32],
@@ -462,11 +486,19 @@ fn backfill_view(
         if labels.get(id as usize).copied() != Some(label_sym) {
             continue;
         }
-        match compute_view_value(def, id, props, topo, ids, syms, labels) {
+        match compute_view_value(
+            def,
+            id,
+            ColumnsView::owned(&*props),
+            topo,
+            ids,
+            syms,
+            labels,
+        ) {
             Some(val) => props.set(id, &def.view_prop, val),
             None => {
                 props.remove(id, &def.view_prop);
-                // Degree and Count should always yield Some; only Avg/Min/Max
+                // Degree and Count always yield Some; only Avg/Min/Max
                 // return None when there are no qualifying neighbors.
             }
         }
@@ -482,8 +514,8 @@ fn backfill_view(
 pub fn compute_view_value(
     def: &ViewDef,
     node: u32,
-    props: &ColumnStore,
-    topo: &Topology,
+    props: ColumnsView<'_>,
+    topo: &TopologyView<'_>,
     _ids: &IdMap,
     syms: &Interner,
     labels: &[u32],
@@ -527,8 +559,8 @@ pub fn compute_view_value(
             AggFn::Sum => {
                 let mut sum = 0.0f64;
                 for &nbr in neighbors.as_ref() {
-                    if let Some(v) = props.get(nbr, prop) {
-                        if let Some(n) = as_float(v) {
+                    if let Some(vr) = props.get(nbr, prop) {
+                        if let Some(n) = as_float(vr.as_value()) {
                             sum += n;
                         }
                     }
@@ -539,8 +571,8 @@ pub fn compute_view_value(
                 let mut sum = 0.0f64;
                 let mut count = 0usize;
                 for &nbr in neighbors.as_ref() {
-                    if let Some(v) = props.get(nbr, prop) {
-                        if let Some(n) = as_float(v) {
+                    if let Some(vr) = props.get(nbr, prop) {
+                        if let Some(n) = as_float(vr.as_value()) {
                             sum += n;
                             count += 1;
                         }
@@ -555,8 +587,8 @@ pub fn compute_view_value(
             AggFn::Min => {
                 let mut best: Option<f64> = None;
                 for &nbr in neighbors.as_ref() {
-                    if let Some(v) = props.get(nbr, prop) {
-                        if let Some(n) = as_float(v) {
+                    if let Some(vr) = props.get(nbr, prop) {
+                        if let Some(n) = as_float(vr.as_value()) {
                             best = Some(best.map_or(n, |m: f64| m.min(n)));
                         }
                     }
@@ -566,8 +598,8 @@ pub fn compute_view_value(
             AggFn::Max => {
                 let mut best: Option<f64> = None;
                 for &nbr in neighbors.as_ref() {
-                    if let Some(v) = props.get(nbr, prop) {
-                        if let Some(n) = as_float(v) {
+                    if let Some(vr) = props.get(nbr, prop) {
+                        if let Some(n) = as_float(vr.as_value()) {
                             best = Some(best.map_or(n, |m: f64| m.max(n)));
                         }
                     }
@@ -578,11 +610,13 @@ pub fn compute_view_value(
     }
 }
 
-/// Update `subject`'s view value incrementally after one edge change.
+/// Update `subject`'s view value after one edge change.
 /// `neighbor` is the endpoint whose property is read for NeighborAgg.
 /// `inserted`: true = edge was added, false = edge was removed.
 ///
 /// The topo must already reflect the new state before this is called.
+/// Uses full recompute from `topo` (base+overlay) and `base_cols` (for reading
+/// neighbor props from base when the overlay is empty after a V8 snapshot open).
 #[allow(clippy::too_many_arguments)]
 fn update_node_view(
     def: &ViewDef,
@@ -590,10 +624,11 @@ fn update_node_view(
     neighbor: u32,
     inserted: bool,
     props: &mut ColumnStore,
-    topo: &Topology,
+    topo: &TopologyView<'_>,
     ids: &IdMap,
     syms: &Interner,
     labels: &[u32],
+    base_cols: Option<&ArchivedColumns>,
 ) {
     // Label check: only subjects with the matching label get this view.
     let Some(label_sym) = syms.get(&def.label) else {
@@ -604,65 +639,39 @@ fn update_node_view(
     }
 
     match &def.source {
-        ViewSource::Degree { .. } => {
-            // Degree: increment or decrement the stored count.
-            let current = match props.get(subject, &def.view_prop) {
-                Some(Value::Int(n)) => *n,
-                _ => 0,
+        ViewSource::Degree { direction, .. } => {
+            // Degree: full recompute from topo so the count is always correct
+            // even when the current value lives in the base (V8 snapshot open).
+            let et_sym = match syms.get(def.edge_type()) {
+                Some(s) => s,
+                None => {
+                    props.set(subject, &def.view_prop, Value::Int(0));
+                    return;
+                }
             };
-            let new_val = if inserted {
-                current + 1
-            } else {
-                (current - 1).max(0)
-            };
-            props.set(subject, &def.view_prop, Value::Int(new_val));
+            let count = topo.neighbors(et_sym, *direction, subject).len() as i64;
+            props.set(subject, &def.view_prop, Value::Int(count));
         }
-        ViewSource::NeighborAgg { agg, prop, .. } => {
-            match agg {
-                AggFn::Count => {
-                    let has_prop = props.get(neighbor, prop).is_some();
-                    let current = match props.get(subject, &def.view_prop) {
-                        Some(Value::Int(n)) => *n,
-                        _ => 0,
-                    };
-                    let new_val = if !has_prop {
-                        current
-                    } else if inserted {
-                        current + 1
-                    } else {
-                        (current - 1).max(0)
-                    };
-                    props.set(subject, &def.view_prop, Value::Int(new_val));
-                }
-                AggFn::Sum => {
-                    let delta = match props.get(neighbor, prop) {
-                        Some(v) => as_float(v).unwrap_or(0.0),
-                        None => 0.0,
-                    };
-                    let current = match props.get(subject, &def.view_prop) {
-                        Some(Value::Float(f)) => *f,
-                        Some(Value::Int(n)) => *n as f64,
-                        _ => 0.0,
-                    };
-                    let new_val = if inserted {
-                        current + delta
-                    } else {
-                        current - delta
-                    };
-                    props.set(subject, &def.view_prop, Value::Float(new_val));
-                }
-                // Avg, Min, Max: full recompute from topo (O(degree)).
-                AggFn::Avg | AggFn::Min | AggFn::Max => {
-                    match compute_view_value(def, subject, props, topo, ids, syms, labels) {
-                        Some(val) => props.set(subject, &def.view_prop, val),
-                        None => {
-                            props.remove(subject, &def.view_prop);
-                        }
-                    }
+        ViewSource::NeighborAgg { .. } => {
+            // Full recompute using the merged base+overlay props view.
+            // Build the ColumnsView in a block so the immutable borrow of `props`
+            // ends before the write, satisfying the borrow checker under NLL.
+            let val = {
+                let pv = build_cols_view(props, base_cols);
+                compute_view_value(def, subject, pv, topo, ids, syms, labels)
+            };
+            match val {
+                Some(v) => props.set(subject, &def.view_prop, v),
+                None => {
+                    props.remove(subject, &def.view_prop);
                 }
             }
+            // Ensure Degree/Count/Sum always have a value even when the
+            // agg result is absent (e.g. Sum=0.0 when no neighbors yet).
+            // compute_view_value already returns Some for those cases.
         }
     }
+    let _ = (neighbor, inserted); // consumed by full-recompute path above
 }
 
 fn as_float(v: &Value) -> Option<f64> {
@@ -732,8 +741,15 @@ mod tests {
                 direction: Direction::In,
             },
         };
-        vs.create_view(def, &mut props, &topo, &ids, &syms, &labels)
-            .unwrap();
+        vs.create_view(
+            def,
+            &mut props,
+            &TopologyView::owned(&topo),
+            &ids,
+            &syms,
+            &labels,
+        )
+        .unwrap();
         let c0 = ids.get("c0").unwrap();
         assert_eq!(props.get(c0, "in_deg"), Some(&Value::Int(2)));
     }
@@ -752,8 +768,15 @@ mod tests {
                 prop: "score".into(),
             },
         };
-        vs.create_view(def, &mut props, &topo, &ids, &syms, &labels)
-            .unwrap();
+        vs.create_view(
+            def,
+            &mut props,
+            &TopologyView::owned(&topo),
+            &ids,
+            &syms,
+            &labels,
+        )
+        .unwrap();
         let c0 = ids.get("c0").unwrap();
         // p0=3.0 + p1=7.0
         assert_eq!(props.get(c0, "score_sum"), Some(&Value::Float(10.0)));
@@ -775,8 +798,15 @@ mod tests {
                 prop: "score".into(),
             },
         };
-        vs.create_view(def, &mut props, &topo, &ids, &syms, &labels)
-            .unwrap();
+        vs.create_view(
+            def,
+            &mut props,
+            &TopologyView::owned(&topo),
+            &ids,
+            &syms,
+            &labels,
+        )
+        .unwrap();
         let c0 = ids.get("c0").unwrap();
         assert_eq!(props.get(c0, "score_n"), Some(&Value::Int(1)));
     }
@@ -797,7 +827,14 @@ mod tests {
             },
         };
         let err = vs
-            .create_view(def, &mut props, &topo, &ids, &syms, &labels)
+            .create_view(
+                def,
+                &mut props,
+                &TopologyView::owned(&topo),
+                &ids,
+                &syms,
+                &labels,
+            )
             .unwrap_err();
         assert!(
             err.contains("conflicts with an existing node property"),
@@ -817,8 +854,15 @@ mod tests {
                 direction: Direction::In,
             },
         };
-        vs.create_view(def, &mut props, &topo, &ids, &syms, &labels)
-            .unwrap();
+        vs.create_view(
+            def,
+            &mut props,
+            &TopologyView::owned(&topo),
+            &ids,
+            &syms,
+            &labels,
+        )
+        .unwrap();
         let c0 = ids.get("c0").unwrap();
         assert!(props.get(c0, "in_deg").is_some());
         vs.delete_view("city_pop", &mut props, &ids, &labels, &syms)

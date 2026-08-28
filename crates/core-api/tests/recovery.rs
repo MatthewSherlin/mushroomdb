@@ -24,7 +24,7 @@ fn basic_write_and_read() {
         Err(GraphError::KeyNotFound { .. })
     ));
     db.set_prop("u2", "name", Value::Str("bo".into())).unwrap();
-    assert_eq!(db.get_prop("u1", "age"), Some(&Value::Int(30)));
+    assert_eq!(db.get_prop("u1", "age"), Some(Value::Int(30)));
     assert_eq!(
         db.neighbors("u1", "KNOWS", Direction::Out).unwrap(),
         vec!["u2"]
@@ -49,7 +49,7 @@ fn state_survives_reopen() {
     } // drop = crash without shutdown ceremony
     let db = GraphDb::open(&dir).unwrap();
     assert!(db.has_node("u1"));
-    assert_eq!(db.get_prop("u2", "x"), Some(&Value::Bool(true)));
+    assert_eq!(db.get_prop("u2", "x"), Some(Value::Bool(true)));
     assert_eq!(
         db.neighbors("u1", "KNOWS", Direction::Out).unwrap(),
         vec!["u2"]

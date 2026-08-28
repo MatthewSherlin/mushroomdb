@@ -90,7 +90,7 @@ fn rules_compose_with_grouped_and_neighborhood() {
     let ada = db.node_ref("ada").expect("ada inserted");
     assert_eq!(ada.key(), "ada");
     assert_eq!(ada.label(), "Member");
-    assert_eq!(ada.prop("years"), Some(&Value::Int(8)));
+    assert_eq!(ada.prop("years"), Some(Value::Int(8)));
 
     // Spec §6 grouped fetch: neighbors bucketed by edge-type name.
     let grouped = ada.grouped_by_edge_type();

@@ -3,6 +3,7 @@ mod db;
 pub mod history;
 mod ingest;
 pub mod mask;
+pub mod reader;
 pub mod roles;
 pub mod schema;
 mod shared;
@@ -20,9 +21,9 @@ pub use core_rules::{
 };
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{
-    snapshot_version_at, write_snapshot_bak, BatchBuilder, DeleteReport, EdgeInfo, Explanation,
-    FsyncPolicy, GraphDb, MutationEvent, NodeInfo, NodeRef, OpenOptions, PredicateSummary,
-    RuleStats, SnapshotOptions, Stats,
+    snapshot_version_at, write_snapshot_bak, BatchBuilder, BatchOp, DeleteReport, EdgeInfo,
+    Explanation, FsyncPolicy, GraphDb, MutationEvent, NodeInfo, NodeRef, OpenOptions,
+    PredicateSummary, RuleStats, SnapshotOptions, Stats,
 };
 
 /// Current on-disk snapshot format version written by this build.
@@ -35,10 +36,30 @@ pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
 pub use mask::NodeMask;
+pub use reader::{CommitDelta, FrozenOverlay, ReaderSnapshot, FOLD_EVERY_K};
 pub use roles::RoleDef;
 pub use schema::{Schema, SchemaDiff};
 pub use shared::SharedDb;
 pub use subscription::{DbEvent, Subscription, DEFAULT_SUB_CAPACITY};
+
+/// One verification entry per section: `(section_id, section_name, bytes_checked, result)`.
+///
+/// Returned by [`verify_snapshot`].
+pub type SectionVerifyResult = (u8, &'static str, usize, std::result::Result<(), String>);
+
+/// Validate the CRC32 integrity of every section in the V8 snapshot at `dir`.
+///
+/// Returns one entry per section directory entry (see [`SectionVerifyResult`]).
+///
+/// Large sections (TOPOLOGY, COLUMNS, EDGE_PROPS, HNSW, PROVENANCE, IVF_STATE)
+/// skip CRC on the normal hot query path; this function always checks them.
+/// Use it to implement `mushroomdb verify` without depending on `core-storage`
+/// directly.
+pub fn verify_snapshot(dir: &std::path::Path) -> crate::Result<Vec<SectionVerifyResult>> {
+    let snap_path = dir.join("snapshot.bin");
+    let mapped = core_storage::v8::MappedBase::map(&snap_path)?;
+    Ok(mapped.verify_integrity())
+}
 
 /// Return `true` if `cypher` is a write statement (CREATE / MERGE / MATCH…SET /
 /// MATCH…DELETE).  Returns `Err` only when the string fails to lex.

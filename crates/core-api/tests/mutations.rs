@@ -208,7 +208,7 @@ fn crash_window_replays_remove_prop_and_delete_edge_idempotently() {
     }
     let mut db = GraphDb::open(&dir).unwrap();
     assert_eq!(db.get_prop("a", "tags"), None);
-    assert_eq!(db.get_prop("b", "tags"), Some(&tags(&["x"])));
+    assert_eq!(db.get_prop("b", "tags"), Some(tags(&["x"])));
     assert_eq!(db.edge_count(), 0);
     assert!(db
         .neighbors("u1", "KNOWS", Direction::Out)
@@ -240,7 +240,7 @@ fn reopen_replays_deletions_identically() {
     }
     let db = GraphDb::open(&dir).unwrap();
     assert_eq!(db.get_prop("a", "tags"), None);
-    assert_eq!(db.get_prop("b", "tags"), Some(&tags(&["x"])));
+    assert_eq!(db.get_prop("b", "tags"), Some(tags(&["x"])));
     assert_eq!(db.edge_count(), 0);
     assert!(db
         .neighbors("u1", "KNOWS", Direction::Out)
@@ -575,7 +575,7 @@ fn topk_field_equal_cap_per_source_and_stats_survive_recovery() {
         let s = db.stats();
         assert_eq!(s.nodes_live, 5);
         assert_eq!(s.edges, 10, "5 nodes × top-2 each = 10 edges");
-        assert_eq!(GraphDb::<core_storage::fs::RealFs>::format_version(), 7);
+        assert_eq!(GraphDb::<core_storage::fs::RealFs>::format_version(), 8);
         assert_eq!(s.rules.len(), 1);
         assert_eq!(s.rules[0].name, "eq");
         assert_eq!(s.rules[0].edges, 10);

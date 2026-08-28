@@ -114,6 +114,10 @@ pub enum Command {
     Migrate {
         db_dir: PathBuf,
     },
+    /// Validate CRC32 integrity of every section in the V8 snapshot.
+    Verify {
+        db_dir: PathBuf,
+    },
     Help,
 }
 
@@ -168,6 +172,7 @@ Usage:
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
   mushroomdb snapshot <db-dir> [--keep-wal]
   mushroomdb migrate <db-dir>
+  mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
   mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb algo pagerank <db-dir> [--top N]
   mushroomdb algo wcc <db-dir> [--top N]
@@ -197,6 +202,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "snapshot" => parse_snapshot(&args[1..]),
         "schema" => parse_schema(&args[1..]),
         "migrate" => parse_one_dir("migrate", &args[1..]).map(|db_dir| Command::Migrate { db_dir }),
+        "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -502,12 +508,12 @@ pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
         return Ok(format!("already current (V{current})\n"));
     }
 
-    // Write .bak before any modification (old-version stores only).
-    // Use write_snapshot_bak which calls RealFs::write_atomic: F_FULLFSYNC +
-    // rename + sync_dir — the plain sync_all path is insufficient.
+    // Copy the original snapshot to .bak at OS level — no in-memory buffer
+    // required for a 2+ GiB file.  The original snapshot.bin is authoritative
+    // until snapshot_with's write_atomic (tmp+rename) succeeds, so a torn .bak
+    // on crash is acceptable.
     if from_ver.is_some() {
-        let snap_bytes = std::fs::read(db_dir.join("snapshot.bin"))?;
-        core_api::write_snapshot_bak(db_dir, &snap_bytes)?;
+        std::fs::copy(db_dir.join("snapshot.bin"), db_dir.join("snapshot.bin.bak"))?;
     }
 
     // Open with auto_migrate=false to avoid double-migration, then write
@@ -525,6 +531,45 @@ pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
         None => format!("migrated WAL-only -> V{current}\n"),
     };
     Ok(msg)
+}
+
+/// Validate the CRC32 integrity of every section in a V8 snapshot.
+///
+/// Exits with a non-zero code if any section is corrupt.  This is the
+/// explicit integrity audit path; mushroomdb does NOT CRC-check large
+/// sections on the hot query path (see format-stability.md).
+pub fn run_verify(db_dir: &Path) -> Result<String, CliError> {
+    let results = core_api::verify_snapshot(db_dir)
+        .map_err(|e| CliError(format!("verify: cannot open snapshot: {e}")))?;
+    let mut any_fail = false;
+    let mut out = String::new();
+    for (id, section_name, byte_len, result) in &results {
+        match result {
+            Ok(()) => {
+                let _ = writeln!(
+                    out,
+                    "  section {:2} ({:<12}) {:>10} bytes  OK",
+                    id, section_name, byte_len
+                );
+            }
+            Err(msg) => {
+                let _ = writeln!(
+                    out,
+                    "  section {:2} ({:<12}) {:>10} bytes  CORRUPT: {msg}",
+                    id, section_name, byte_len
+                );
+                any_fail = true;
+            }
+        }
+    }
+    if any_fail {
+        Err(CliError(format!("integrity check FAILED:\n{out}")))
+    } else {
+        Ok(format!(
+            "integrity check OK ({} sections):\n{out}",
+            results.len()
+        ))
+    }
 }
 
 /// Open `dir` and write `snapshot.bin`. Default truncates the WAL.
@@ -1340,7 +1385,10 @@ mod tests {
                         snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
-                        assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
+                        assert_eq!(
+                            addr,
+                            "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap()
+                        );
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
                         assert_eq!(token, None);
@@ -1363,7 +1411,10 @@ mod tests {
                         snapshot_every,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
-                        assert_eq!(addr, "127.0.0.1:9090".parse().unwrap());
+                        assert_eq!(
+                            addr,
+                            "127.0.0.1:9090".parse::<std::net::SocketAddr>().unwrap()
+                        );
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert!(!demo_if_empty);
                         assert_eq!(token, None);
@@ -1551,7 +1602,10 @@ mod tests {
                         ..
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/data"));
-                        assert_eq!(addr, "0.0.0.0:8080".parse().unwrap());
+                        assert_eq!(
+                            addr,
+                            "0.0.0.0:8080".parse::<std::net::SocketAddr>().unwrap()
+                        );
                         assert!(demo_if_empty);
                         assert_eq!(ui, super::ServeUi::Embedded);
                         assert_eq!(token, None);
@@ -1571,7 +1625,10 @@ mod tests {
     fn serve_default_addr_is_loopback_8080() {
         match parse_args(&["serve", "/tmp/db"]).unwrap() {
             Command::Serve { addr, .. } => {
-                assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
+                assert_eq!(
+                    addr,
+                    "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap()
+                );
             }
             other => panic!("{other:?}"),
         }

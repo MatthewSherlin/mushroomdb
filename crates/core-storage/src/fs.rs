@@ -31,6 +31,27 @@ pub trait Fs {
     fn sync(&mut self, file: FileId) -> std::io::Result<()>;
     fn read(&self, file: FileId) -> std::io::Result<Vec<u8>>;
     fn write_atomic(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()>;
+    /// Return the on-disk path of the snapshot file, if any.
+    ///
+    /// `Some` for `RealFs` (used by `MappedBase::map` for true file mmap).
+    /// `None` for `SimFs` and other in-memory implementations (falls back to
+    /// `MappedBase::from_bytes`).
+    fn snapshot_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+    /// Read at most `n` bytes from the beginning of `file` without loading
+    /// the full contents.
+    ///
+    /// Used by the open path to sniff the 6-byte magic+version header before
+    /// deciding whether to mmap (V8) or full-read (legacy V5-V7).
+    ///
+    /// The default implementation calls `read()` and truncates; override in
+    /// `RealFs` for a true partial read.
+    fn read_prefix(&self, file: FileId, n: usize) -> std::io::Result<Vec<u8>> {
+        let mut bytes = self.read(file)?;
+        bytes.truncate(n);
+        Ok(bytes)
+    }
 }
 
 pub trait FsIntrospect {
@@ -94,6 +115,24 @@ impl Fs for RealFs {
         std::fs::rename(&tmp, self.path(file))?;
         sync_dir(&self.dir)
     }
+
+    fn snapshot_path(&self) -> Option<std::path::PathBuf> {
+        Some(self.path(FileId::Snapshot))
+    }
+
+    fn read_prefix(&self, file: FileId, n: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        match File::open(self.path(file)) {
+            Ok(mut f) => {
+                let mut buf = vec![0u8; n];
+                let read = f.read(&mut buf)?;
+                buf.truncate(read);
+                Ok(buf)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 fn full_sync(file: &File) -> std::io::Result<()> {
@@ -111,6 +150,43 @@ fn full_sync(file: &File) -> std::io::Result<()> {
     {
         file.sync_all()
     }
+}
+
+/// Sync the WAL file at `dir/wal.bin` to persistent storage without
+/// requiring a `&mut Fs`.  Used by the group-commit drain thread to fsync
+/// outside the exclusive write-lock window (reducing reader-visible latency).
+///
+/// On macOS, uses `F_FULLFSYNC` for true durability.  On other platforms,
+/// falls back to `fdatasync` / `fsync`.  Returns `Ok(())` if the WAL file
+/// does not exist (nothing to sync).
+pub fn sync_wal_at(dir: &std::path::Path) -> std::io::Result<()> {
+    let path = dir.join(FileId::Wal.name());
+    let f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    full_sync(&f)
+}
+
+/// Truncate the WAL file at `dir/wal.bin` to exactly `len` bytes and fsync
+/// the truncation to persistent storage.
+///
+/// Used by the group-commit drain thread when a group fsync fails: truncating
+/// the WAL back to the last known-good synced offset removes the unsynced
+/// frames, ensuring a crash-then-replay cannot silently make the failed group
+/// durable via a later successful fsync flushing the whole inode.
+///
+/// Returns `Ok(())` if the file does not exist (nothing to truncate).
+pub fn truncate_wal_at(dir: &std::path::Path, len: u64) -> std::io::Result<()> {
+    let path = dir.join(FileId::Wal.name());
+    let f = match OpenOptions::new().write(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    f.set_len(len)?;
+    f.sync_all() // plain sync_all is sufficient for a truncation barrier
 }
 
 fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {

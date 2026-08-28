@@ -12,7 +12,6 @@
 /// For a corpus of N nodes each averaging T distinct tokens per field, memory is
 /// O(N × T) per indexed field. No cap is enforced in v1 — callers should consider
 /// selective enable_fulltext declarations on high-value fields only.
-use crate::columns::ColumnStore;
 use crate::idmap::IdMap;
 use crate::interner::Interner;
 use crate::types::Value;
@@ -157,7 +156,7 @@ pub fn eval_query(node_tokens: &BTreeSet<String>, query: &str) -> bool {
 /// Index maintenance is incremental: set_prop / delete / remove_prop
 /// update only the affected postings.  WAL replay calls [`FulltextIndex::rebuild_all`]
 /// after full replay to correct any drift accumulated during per-record `apply` calls.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FulltextIndex {
     /// Enabled `(label, field)` pairs.
     enabled: BTreeSet<(String, String)>,
@@ -318,7 +317,7 @@ impl FulltextIndex {
         ids: &IdMap,
         labels: &[u32],
         syms: &Interner,
-        props: &ColumnStore,
+        props: crate::v8::seam::ColumnsView<'_>,
     ) {
         if self.enabled.is_empty() {
             return;
@@ -342,8 +341,9 @@ impl FulltextIndex {
             };
             for (lbl, field) in &enabled_vec {
                 if lbl == label {
-                    if let Some(value) = props.get(id, field) {
-                        self.add_tokens(id, field, value);
+                    if let Some(vr) = props.get(id, field) {
+                        let value = vr.into_value();
+                        self.add_tokens(id, field, &value);
                     }
                 }
             }
@@ -384,6 +384,7 @@ fn and_match(col: &BTreeMap<String, BTreeSet<u32>>, terms: &[Term]) -> BTreeSet<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::columns::ColumnStore;
 
     fn toks(s: &str) -> Vec<String> {
         tokenize(s)
@@ -576,7 +577,12 @@ mod tests {
         // Intentionally do NOT add_tokens — rebuild should restore
         assert!(idx.search("bio", "rust").is_empty());
 
-        idx.rebuild_all(&ids, &labels, &syms, &props);
+        idx.rebuild_all(
+            &ids,
+            &labels,
+            &syms,
+            crate::v8::seam::ColumnsView::owned(&props),
+        );
         let r = idx.search("bio", "rust");
         assert_eq!(r.len(), 1);
     }

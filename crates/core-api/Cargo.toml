@@ -23,3 +23,5 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.1.2" }
+sim-harness = { path = "../sim-harness", version = "0.1.2" }
+serde_json = { workspace = true }

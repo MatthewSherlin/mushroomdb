@@ -3,12 +3,25 @@ use crate::types::Result as StoreResult;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     Out,
     In,
+}
+
+/// Outcome of [`Topology::remove_edge`], distinguishing the two "not removed from overlay"
+/// cases that have different semantics for callers aware of a base CSR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveEdgeOutcome {
+    /// Edge was present in the overlay and has been removed. `edge_count` was decremented.
+    RemovedFromOverlay,
+    /// Edge was NOT present in the overlay. A tombstone has been recorded in both
+    /// `out_tombstones` and `in_tombstones` so `TopologyView::neighbors` will subtract
+    /// it from the base CSR during reads and snapshot-merges. The edge may or may not
+    /// exist in the base CSR — the tombstone is a no-op if it does not.
+    TombstonedBase,
 }
 
 /// Flush the per-vertex insert buffer into the frozen block once it exceeds this.
@@ -17,9 +30,9 @@ const INSERT_BUFFER: usize = 32;
 /// Sorted frozen neighbors plus an unsorted insert buffer. Serializes as `Vec<u32>`
 /// (merged, sorted, unique) so V6 snapshots stay HashMap-of-HashMap-of-Vec.
 #[derive(Debug, Default, Clone)]
-struct AdjList {
-    frozen: Vec<u32>,
-    delta: Vec<u32>,
+pub(crate) struct AdjList {
+    pub(crate) frozen: Vec<u32>,
+    pub(crate) delta: Vec<u32>,
 }
 
 impl AdjList {
@@ -48,8 +61,16 @@ impl AdjList {
         self.delta.clear();
     }
 
-    fn merged(&self) -> Vec<u32> {
-        merge_sorted_unique(&self.frozen, &self.delta)
+    /// Return a sorted-unique merged view of frozen + delta.
+    ///
+    /// Borrows `frozen` directly when `delta` is empty (no allocation); allocates
+    /// only when delta is non-empty.
+    pub(crate) fn merged(&self) -> Cow<'_, [u32]> {
+        if self.delta.is_empty() {
+            Cow::Borrowed(&self.frozen)
+        } else {
+            Cow::Owned(merge_sorted_unique(&self.frozen, &self.delta))
+        }
     }
 
     fn remove(&mut self, id: u32) -> bool {
@@ -67,11 +88,7 @@ impl AdjList {
 
 impl Serialize for AdjList {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        if self.delta.is_empty() {
-            self.frozen.serialize(serializer)
-        } else {
-            self.merged().serialize(serializer)
-        }
+        self.merged().serialize(serializer)
     }
 }
 
@@ -120,9 +137,9 @@ fn merge_sorted_unique(frozen: &[u32], delta: &[u32]) -> Vec<u32> {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct TypedAdjacency {
-    out: HashMap<u32, AdjList>,
-    inn: HashMap<u32, AdjList>,
+pub(crate) struct TypedAdjacency {
+    pub(crate) out: HashMap<u32, AdjList>,
+    pub(crate) inn: HashMap<u32, AdjList>,
 }
 
 /// Typed adjacency: per `(etype, dir, vertex)` a frozen sorted block plus an
@@ -132,8 +149,23 @@ struct TypedAdjacency {
 /// On-disk (V6) shape is still `HashMap<u32, {out, inn: HashMap<u32, Vec<u32>>}>`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Topology {
-    by_type: HashMap<u32, TypedAdjacency>,
+    pub(crate) by_type: HashMap<u32, TypedAdjacency>,
     edge_count: u64,
+    /// Out-direction tombstones: edges deleted from the base CSR that are absent
+    /// from the overlay.  Keyed by `(etype → src → {deleted dst ids})`.
+    ///
+    /// Populated by `remove_edge` when the edge is not found in the overlay —
+    /// this records a deletion of a base-only edge so `TopologyView::neighbors`
+    /// can subtract it from the base CSR when merging.
+    ///
+    /// Not serialised: tombstones are eliminated at snapshot-merge time
+    /// (encode_v8 subtracts them when building the merged CSR section).
+    #[serde(skip)]
+    pub(crate) out_tombstones: HashMap<u32, HashMap<u32, BTreeSet<u32>>>,
+    /// In-direction tombstones: symmetric index of `out_tombstones`.
+    /// Keyed by `(etype → dst → {deleted src ids})` for O(log n) In lookups.
+    #[serde(skip)]
+    pub(crate) in_tombstones: HashMap<u32, HashMap<u32, BTreeSet<u32>>>,
 }
 
 impl Topology {
@@ -161,8 +193,7 @@ impl Topology {
     pub fn neighbors(&self, etype: u32, dir: Direction, v: u32) -> Cow<'_, [u32]> {
         match self.adj_list(etype, dir, v) {
             None => Cow::Borrowed(&[]),
-            Some(n) if n.delta.is_empty() => Cow::Borrowed(&n.frozen),
-            Some(n) => Cow::Owned(n.merged()),
+            Some(n) => n.merged(),
         }
     }
 
@@ -183,26 +214,82 @@ impl Topology {
         ids.into_iter()
     }
 
-    pub fn remove_edge(&mut self, etype: u32, src: u32, dst: u32) -> bool {
-        let Some(adj) = self.by_type.get_mut(&etype) else {
-            return false;
-        };
-        let Some(dsts) = adj.out.get_mut(&src) else {
-            return false;
-        };
-        if !dsts.remove(dst) {
-            return false;
+    /// Iterate all directed out-edges as `(etype, src, dst)` triples.
+    ///
+    /// Yields every edge in the overlay topology in arbitrary order.  Used by
+    /// callers (e.g. `core-api`) that need to walk the full edge set without
+    /// direct access to the private `by_type` field.
+    pub fn all_edges(&self) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
+        self.by_type.iter().flat_map(|(&etype, adj)| {
+            adj.out.iter().flat_map(move |(&src, al)| {
+                al.merged()
+                    .into_owned()
+                    .into_iter()
+                    .map(move |dst| (etype, src, dst))
+            })
+        })
+    }
+
+    /// Remove an edge and return the outcome.
+    ///
+    /// - [`RemoveEdgeOutcome::RemovedFromOverlay`]: edge was in the overlay and has been
+    ///   removed; `edge_count` was decremented.
+    /// - [`RemoveEdgeOutcome::TombstonedBase`]: edge was NOT in the overlay; a tombstone
+    ///   was recorded in `out_tombstones` / `in_tombstones` so `TopologyView::neighbors`
+    ///   will subtract it from the base CSR.  The tombstone is harmless if the edge does
+    ///   not exist in the base CSR either.
+    pub fn remove_edge(&mut self, etype: u32, src: u32, dst: u32) -> RemoveEdgeOutcome {
+        let found_in_overlay = (|| {
+            let adj = self.by_type.get_mut(&etype)?;
+            let dsts = adj.out.get_mut(&src)?;
+            if !dsts.remove(dst) {
+                return None;
+            }
+            let srcs = adj
+                .inn
+                .get_mut(&dst)
+                .expect("invariant: inn bucket must exist when out contains dst");
+            assert!(
+                srcs.remove(src),
+                "invariant: inn must contain src when out contained dst"
+            );
+            self.edge_count -= 1;
+            Some(())
+        })()
+        .is_some();
+
+        if !found_in_overlay {
+            // The edge was not in the overlay (may be present only in the mmap'd base
+            // CSR).  Record a tombstone so `TopologyView::neighbors` can subtract it
+            // from the base when merging overlay + base for reads and for snapshot-merge.
+            self.out_tombstones
+                .entry(etype)
+                .or_default()
+                .entry(src)
+                .or_default()
+                .insert(dst);
+            self.in_tombstones
+                .entry(etype)
+                .or_default()
+                .entry(dst)
+                .or_default()
+                .insert(src);
+            RemoveEdgeOutcome::TombstonedBase
+        } else {
+            RemoveEdgeOutcome::RemovedFromOverlay
         }
-        let srcs = adj
-            .inn
-            .get_mut(&dst)
-            .expect("invariant: inn bucket must exist when out contains dst");
-        assert!(
-            srcs.remove(src),
-            "invariant: inn must contain src when out contained dst"
-        );
-        self.edge_count -= 1;
-        true
+    }
+
+    /// Return the set of `dst` ids tombstoned for `(etype, Direction::Out, src)`.
+    ///
+    /// Used by `TopologyView::neighbors` to subtract deleted edges from the base CSR.
+    pub fn out_tombstones_for(&self, etype: u32, src: u32) -> Option<&BTreeSet<u32>> {
+        self.out_tombstones.get(&etype)?.get(&src)
+    }
+
+    /// Return the set of `src` ids tombstoned for `(etype, Direction::In, dst)`.
+    pub fn in_tombstones_for(&self, etype: u32, dst: u32) -> Option<&BTreeSet<u32>> {
+        self.in_tombstones.get(&etype)?.get(&dst)
     }
 
     fn adj_list(&self, etype: u32, dir: Direction, v: u32) -> Option<&AdjList> {
@@ -243,6 +330,8 @@ impl Topology {
             Self {
                 by_type,
                 edge_count,
+                out_tombstones: HashMap::new(),
+                in_tombstones: HashMap::new(),
             },
             pos,
         ))
@@ -256,12 +345,7 @@ fn pack_adj_map(out: &mut Vec<u8>, map: &HashMap<u32, AdjList>) {
     for v in verts {
         push_u32(out, v);
         let list = &map[&v];
-        if list.delta.is_empty() {
-            push_u32s(out, &list.frozen);
-        } else {
-            let merged = list.merged();
-            push_u32s(out, &merged);
-        }
+        push_u32s(out, list.merged().as_ref());
     }
 }
 
@@ -305,9 +389,12 @@ mod tests {
         let mut t = Topology::new();
         t.add_edge(0, 1, 2);
         t.add_edge(0, 1, 3);
-        assert!(t.remove_edge(0, 1, 2));
-        assert!(!t.remove_edge(0, 1, 2)); // idempotent-false
-        assert!(!t.remove_edge(9, 1, 2)); // unknown type
+        assert_eq!(
+            t.remove_edge(0, 1, 2),
+            RemoveEdgeOutcome::RemovedFromOverlay
+        );
+        assert_eq!(t.remove_edge(0, 1, 2), RemoveEdgeOutcome::TombstonedBase); // idempotent → tombstone
+        assert_eq!(t.remove_edge(9, 1, 2), RemoveEdgeOutcome::TombstonedBase); // unknown type → tombstone
         assert_eq!(t.neighbors(0, Direction::Out, 1).as_ref(), &[3]);
         assert_eq!(t.neighbors(0, Direction::In, 2).as_ref(), &[] as &[u32]);
         assert_eq!(t.edge_count(), 1);
@@ -379,8 +466,11 @@ mod tests {
             assert!(t.add_edge(0, 1, dst));
         }
         assert!(matches!(t.neighbors(0, Direction::Out, 1), Cow::Owned(_)));
-        assert!(t.remove_edge(0, 1, 7));
-        assert!(!t.remove_edge(0, 1, 7));
+        assert_eq!(
+            t.remove_edge(0, 1, 7),
+            RemoveEdgeOutcome::RemovedFromOverlay
+        );
+        assert_eq!(t.remove_edge(0, 1, 7), RemoveEdgeOutcome::TombstonedBase);
         assert_eq!(t.neighbors(0, Direction::In, 7).as_ref(), &[] as &[u32]);
         assert_eq!(
             t.neighbors(0, Direction::Out, 1).as_ref(),
@@ -398,8 +488,14 @@ mod tests {
             t.neighbors(0, Direction::Out, 1),
             Cow::Borrowed(_)
         ));
-        assert!(t.remove_edge(0, 1, 0));
-        assert!(t.remove_edge(0, 1, 32));
+        assert_eq!(
+            t.remove_edge(0, 1, 0),
+            RemoveEdgeOutcome::RemovedFromOverlay
+        );
+        assert_eq!(
+            t.remove_edge(0, 1, 32),
+            RemoveEdgeOutcome::RemovedFromOverlay
+        );
         assert_eq!(t.edge_count(), 31);
         assert_eq!(t.neighbors(0, Direction::In, 0).as_ref(), &[] as &[u32]);
         assert_eq!(t.neighbors(0, Direction::In, 16).as_ref(), &[1]);
