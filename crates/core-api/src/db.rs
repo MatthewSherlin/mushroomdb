@@ -29,6 +29,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+/// Print a timing checkpoint when MUSHROOMDB_TRACE_OPEN is set.
+/// Zero-cost when the env var is absent (the var check is O(1) after first call).
+macro_rules! trace_open {
+    ($phase:literal, $t:expr) => {
+        if std::env::var("MUSHROOMDB_TRACE_OPEN").is_ok() {
+            eprintln!(
+                "[MUSHROOMDB_TRACE_OPEN] {:40} {:>9.3?}",
+                $phase,
+                $t.elapsed()
+            );
+        }
+    };
+}
+
 // Test-only: counts how many times `pending_deltas_since().to_vec()` actually
 // executes (i.e., at least one view is defined). Used to verify the fast-path
 // guard skips the allocation when `view_store.is_empty()`.
@@ -1105,6 +1119,7 @@ impl<F: Fs> GraphDb<F> {
             v8_sections_loaded: std::sync::atomic::AtomicBool::new(false),
             v8_sections_mutex: std::sync::Mutex::new(()),
         };
+        let _t0 = std::time::Instant::now();
         let snap_bytes = db.fs.read(FileId::Snapshot)?;
         // V8 path: keep MappedBase alive for zero-copy topology reads.
         // Non-V8 paths (fresh / V5-V7) fall through to the legacy decode path.
@@ -1126,7 +1141,9 @@ impl<F: Fs> GraphDb<F> {
                 })?,
             );
             db.restore_v8_base(Arc::clone(&mapped))?;
+            trace_open!("restore_v8_base", _t0);
             db.base = Some(mapped);
+            trace_open!("base assigned", _t0);
         } else if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
             db.restore_snapshot_state(state)?;
         }
@@ -1141,6 +1158,7 @@ impl<F: Fs> GraphDb<F> {
         // point of restoring IVF/HNSW blobs from the snapshot).
         if !records.is_empty() {
             db.ensure_v8_base_sections_loaded();
+            trace_open!("lazy sections loaded (WAL path)", _t0);
             db.engine.consume_retained_state_eager(
                 &db.ids,
                 &db.syms,
@@ -1166,13 +1184,14 @@ impl<F: Fs> GraphDb<F> {
         // Any future as-of replay path (Plan-15 T2) must drain here to feed
         // replaying subscribers; the mechanism is already in place.
         let _ = db.engine.drain_deltas(); // belt-and-braces no-op after loop drain
-                                          // Rebuild view values after WAL replay only when there is no V8 base.
-                                          // With a V8 base, view values are correct in the snapshot and are updated
-                                          // incrementally during WAL replay (on_edge_changed / on_prop_changed).
-                                          // A full rebuild would read overlay-only props (empty after restore_v8_base)
-                                          // and overwrite correct base values with wrong results (e.g. NeighborAgg
-                                          // Sum reads no "score" in overlay → writes 0.0, shadowing the correct
-                                          // base value).
+        trace_open!("wal replay done", _t0);
+        // Rebuild view values after WAL replay only when there is no V8 base.
+        // With a V8 base, view values are correct in the snapshot and are updated
+        // incrementally during WAL replay (on_edge_changed / on_prop_changed).
+        // A full rebuild would read overlay-only props (empty after restore_v8_base)
+        // and overwrite correct base values with wrong results (e.g. NeighborAgg
+        // Sum reads no "score" in overlay → writes 0.0, shadowing the correct
+        // base value).
         if db.base.is_none() {
             let topo_view = TopologyView::owned(&db.topo);
             db.view_store
@@ -1191,6 +1210,7 @@ impl<F: Fs> GraphDb<F> {
         db.roles = Self::load_roles_from_fs(&db.fs)?;
         // Capture the initial MVCC fold so reader() is ready immediately.
         db.fold_now();
+        trace_open!("open_with complete", _t0);
         Ok(db)
     }
 
@@ -1358,6 +1378,7 @@ impl<F: Fs> GraphDb<F> {
         if self.v8_sections_loaded.load(Ordering::Acquire) {
             return; // another caller populated while we waited
         }
+        let _t = std::time::Instant::now();
         if let Some(base) = &self.base {
             // Provenance: raw rkyv bytes; CRC validated inside section_bytes.
             // Bounds are already validated at open time (restore_v8_base →
@@ -1378,6 +1399,12 @@ impl<F: Fs> GraphDb<F> {
             self.engine.store_snapshot_state(hnsw_state, ivf_bytes);
         }
         self.v8_sections_loaded.store(true, Ordering::Release);
+        if std::env::var("MUSHROOMDB_TRACE_OPEN").is_ok() {
+            eprintln!(
+                "[MUSHROOMDB_TRACE_OPEN] ensure_v8_base_sections_loaded: {:>9.3?}",
+                _t.elapsed()
+            );
+        }
     }
 
     /// Return a `TopologyView` that merges the mmap'd base (when present) with

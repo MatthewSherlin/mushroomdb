@@ -58,6 +58,26 @@ CRC coverage: each section payload `[offset..offset+len]` is covered by its dire
 Alignment padding bytes between sections are written as zeros and are NOT covered by any CRC.
 The last section has no trailing pad so the file ends at exactly the last payload byte.
 
+#### Section-CRC hot-path deferral (v0.2.0+)
+
+Small sections (IDS=2, SYMS=3, META=4, RULES_META=8, VIEWS=9) validate their CRC32
+on first access, as before.
+
+Large sections (TOPOLOGY=0, COLUMNS=1, EDGE_PROPS=5, HNSW=6, PROVENANCE=7,
+IVF_STATE=10) **skip** the per-touch CRC on the normal query path because a
+full-section hash of hundreds of MiB costs 50–200 ms and is not required for
+memory safety (section bounds are validated at open time; rkyv access is
+bounds-checked against the returned byte slice).
+
+To audit large-section integrity explicitly use:
+
+```
+mushroomdb verify <db-dir>
+```
+
+This reads every section and computes its CRC, reporting any mismatch.
+The command exits with a non-zero status if any section is corrupt.
+
 ### WAL (`wal.bin`)
 
 WAL record discriminants 0–17 are append-only: once assigned, a discriminant

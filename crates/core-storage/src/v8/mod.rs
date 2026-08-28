@@ -84,6 +84,26 @@ pub const SECTION_IVF_STATE: u8 = 10;
 /// Extended from 10 (Task 2) to 11 (Task 5: +ivf_state).
 pub const V8_MAGIC_SECTION_COUNT: usize = 11;
 
+/// Returns `true` for sections whose content is large enough that a
+/// full-section CRC at first touch would cost tens or hundreds of
+/// milliseconds.  Integrity for these sections is deferred to the explicit
+/// `mushroomdb verify` command.  Bounds are still validated at open time via
+/// `validate_section_bounds`.
+///
+/// Small sections (IDS, SYMS, META, RULES_META, VIEWS) retain eager per-touch
+/// CRC because their size is below 3 MiB and the cost is negligible.
+fn is_large_section(id: u8) -> bool {
+    matches!(
+        id,
+        SECTION_TOPOLOGY
+            | SECTION_COLUMNS
+            | SECTION_EDGE_PROPS
+            | SECTION_HNSW
+            | SECTION_PROVENANCE
+            | SECTION_IVF_STATE
+    )
+}
+
 /// Atomic check state values.
 const STATE_UNCHECKED: u8 = 0;
 const STATE_OK: u8 = 1;
@@ -176,6 +196,77 @@ impl MappedBase {
         Ok(())
     }
 
+    /// Validate the CRC32 of every section and check rkyv-accessible sections
+    /// for structural integrity.
+    ///
+    /// This is the on-demand integrity check exposed by `mushroomdb verify`.
+    /// Large sections skip automatic CRC during normal operation; this method
+    /// runs it explicitly.
+    ///
+    /// Returns one entry per directory section:
+    /// `(section_id, section_name, bytes_checked, Ok(()) | Err(msg))`.
+    pub fn verify_integrity(
+        &self,
+    ) -> Vec<(u8, &'static str, usize, std::result::Result<(), String>)> {
+        let name = |id| match id {
+            SECTION_TOPOLOGY => "topology",
+            SECTION_COLUMNS => "columns",
+            SECTION_IDS => "ids",
+            SECTION_SYMS => "syms",
+            SECTION_META => "meta",
+            SECTION_EDGE_PROPS => "edge_props",
+            SECTION_HNSW => "hnsw",
+            SECTION_PROVENANCE => "provenance",
+            SECTION_RULES_META => "rules_meta",
+            SECTION_VIEWS => "views",
+            SECTION_IVF_STATE => "ivf_state",
+            _ => "unknown",
+        };
+        self.dir
+            .iter()
+            .map(|entry| {
+                let id = entry.id;
+                let start = entry.offset as usize;
+                let end = match start.checked_add(entry.len as usize) {
+                    Some(e) => e,
+                    None => {
+                        return (
+                            id,
+                            name(id),
+                            0,
+                            Err(format!("section {id}: length overflow")),
+                        )
+                    }
+                };
+                let bytes = match self.backing.get(start..end) {
+                    Some(b) => b,
+                    None => {
+                        return (
+                            id,
+                            name(id),
+                            0,
+                            Err(format!("section {id}: extends beyond file")),
+                        )
+                    }
+                };
+                let computed = crc32fast::hash(bytes);
+                if computed != entry.crc32 {
+                    (
+                        id,
+                        name(id),
+                        bytes.len(),
+                        Err(format!(
+                            "CRC mismatch (expected {:08x}, computed {:08x})",
+                            entry.crc32, computed
+                        )),
+                    )
+                } else {
+                    (id, name(id), bytes.len(), Ok(()))
+                }
+            })
+            .collect()
+    }
+
     /// Return the raw bytes for `section_id`, validating its CRC32 lazily.
     fn section_bytes(&self, section_id: u8) -> Result<&[u8]> {
         let entry = self
@@ -197,40 +288,58 @@ impl MappedBase {
             .ok_or_else(|| GraphError::Corrupt {
                 detail: format!("v8: section {section_id} extends beyond file"),
             })?;
-        // Lazy CRC validation.
-        let idx = section_id as usize;
-        // Any section id >= V8_MAGIC_SECTION_COUNT would silently bypass the
-        // lazy CRC array (the index would be out of bounds for the array).
-        // Guard against future callers adding new section ids without resizing
-        // the check_state array.
-        debug_assert!(
-            idx < V8_MAGIC_SECTION_COUNT,
-            "section_id {section_id} >= V8_MAGIC_SECTION_COUNT ({V8_MAGIC_SECTION_COUNT}); \
-             resize check_state before adding new section ids"
-        );
-        if idx < V8_MAGIC_SECTION_COUNT {
-            match self.check_state[idx].load(Ordering::Acquire) {
-                STATE_OK => {} // already verified
-                STATE_BAD => {
-                    return Err(GraphError::Corrupt {
-                        detail: format!("v8: section {section_id} CRC mismatch (cached)"),
-                    });
-                }
-                _ => {
-                    let computed = crc32fast::hash(bytes);
-                    if computed != entry.crc32 {
-                        self.check_state[idx].store(STATE_BAD, Ordering::Release);
+        // Per-section timing when MUSHROOMDB_TRACE_OPEN is set.
+        let _trace_t = if std::env::var("MUSHROOMDB_TRACE_OPEN").is_ok() {
+            Some((section_id, std::time::Instant::now()))
+        } else {
+            None
+        };
+
+        // Lazy CRC validation — small sections only.
+        //
+        // Large sections (TOPOLOGY, COLUMNS, EDGE_PROPS, HNSW, PROVENANCE,
+        // IVF_STATE) skip the per-touch CRC because a full-section hash at
+        // hundreds of MiB costs 50–200 ms and is not necessary for memory
+        // safety (bounds are validated at open by `validate_section_bounds`;
+        // rkyv access is bounds-checked against the returned slice).
+        // Use `mushroomdb verify` for explicit integrity audits.
+        if !is_large_section(section_id) {
+            let idx = section_id as usize;
+            debug_assert!(
+                idx < V8_MAGIC_SECTION_COUNT,
+                "section_id {section_id} >= V8_MAGIC_SECTION_COUNT ({V8_MAGIC_SECTION_COUNT}); \
+                 resize check_state before adding new section ids"
+            );
+            if idx < V8_MAGIC_SECTION_COUNT {
+                match self.check_state[idx].load(Ordering::Acquire) {
+                    STATE_OK => {} // already verified
+                    STATE_BAD => {
                         return Err(GraphError::Corrupt {
-                            detail: format!(
-                                "v8: section {section_id} CRC mismatch \
-                                 (expected {:08x}, computed {:08x})",
-                                entry.crc32, computed
-                            ),
+                            detail: format!("v8: section {section_id} CRC mismatch (cached)"),
                         });
                     }
-                    self.check_state[idx].store(STATE_OK, Ordering::Release);
+                    _ => {
+                        let computed = crc32fast::hash(bytes);
+                        if computed != entry.crc32 {
+                            self.check_state[idx].store(STATE_BAD, Ordering::Release);
+                            return Err(GraphError::Corrupt {
+                                detail: format!(
+                                    "v8: section {section_id} CRC mismatch \
+                                     (expected {:08x}, computed {:08x})",
+                                    entry.crc32, computed
+                                ),
+                            });
+                        }
+                        self.check_state[idx].store(STATE_OK, Ordering::Release);
+                    }
                 }
             }
+        }
+        if let Some((id, t)) = _trace_t {
+            eprintln!(
+                "[MUSHROOMDB_TRACE_OPEN] section_bytes({id}): {:>9.3?}",
+                t.elapsed()
+            );
         }
         Ok(bytes)
     }
@@ -500,27 +609,40 @@ mod tests {
 
     #[test]
     fn v8_corrupt_section_crc_returns_corrupt_error() {
+        // Corrupt a SMALL section (SECTION_IDS=2) whose CRC is still checked
+        // eagerly on access.  Large sections (e.g. TOPOLOGY=0) skip per-touch
+        // CRC since v0.2.0; use verify_integrity() to audit them instead.
         let mut bytes = encode_tiny();
-        // Section 0 entry: at offset 8 in file.
-        // Entry layout: {id:u8, _pad:3, offset:u32, len:u32, crc32:u32}
-        // offset field is at bytes[8+4..8+8].
-        let entry0_section_offset = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        // Flip a byte inside the section payload (skip the rkyv root pointer
-        // at the end by targeting the start of the payload).
-        if entry0_section_offset < bytes.len() {
-            bytes[entry0_section_offset] ^= 0xff;
+        // Directory starts at file offset 8.
+        // Each entry is 16 bytes: {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}
+        let section_count = u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize;
+        let mut target_entry_base = None;
+        for i in 0..section_count {
+            let base = 8 + i * 16;
+            if bytes[base] == SECTION_IDS {
+                target_entry_base = Some(base);
+                break;
+            }
+        }
+        let entry_base = target_entry_base.expect("SECTION_IDS not found in encode_tiny output");
+        // offset field is at entry_base + 4 .. entry_base + 8.
+        let section_offset =
+            u32::from_le_bytes(bytes[entry_base + 4..entry_base + 8].try_into().unwrap()) as usize;
+        // Flip a byte inside the section payload.
+        if section_offset < bytes.len() {
+            bytes[section_offset] ^= 0xff;
         }
         let path = tmp_path("corrupt");
         std::fs::write(&path, &bytes).unwrap();
         let _cleanup = defer_remove(&path);
         match MappedBase::map(&path) {
             Ok(base) => {
-                // Map succeeded (header ok). Section access must fail.
-                let result = base.topology();
+                // Map succeeded (header ok). ids() must fail CRC.
+                let result = base.ids();
                 match result {
                     Err(GraphError::Corrupt { .. }) => {}
                     Err(e) => panic!("expected Corrupt, got {e:?}"),
-                    Ok(_) => panic!("expected Corrupt error but topology() succeeded"),
+                    Ok(_) => panic!("expected Corrupt error but ids() succeeded"),
                 }
             }
             Err(GraphError::Corrupt { .. }) => {
@@ -528,6 +650,47 @@ mod tests {
             }
             Err(e) => panic!("unexpected error: {e:?}"),
         }
+    }
+
+    #[test]
+    fn v8_verify_integrity_detects_large_section_corruption() {
+        // verify_integrity() must catch corruption in large sections (e.g.
+        // TOPOLOGY=0) even though section_bytes() skips their CRC.
+        let mut bytes = encode_tiny();
+        // Find SECTION_TOPOLOGY entry in directory.
+        let section_count = u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize;
+        let mut target_entry_base = None;
+        for i in 0..section_count {
+            let base = 8 + i * 16;
+            if bytes[base] == SECTION_TOPOLOGY {
+                target_entry_base = Some(base);
+                break;
+            }
+        }
+        let entry_base = target_entry_base.expect("SECTION_TOPOLOGY not found");
+        let section_offset =
+            u32::from_le_bytes(bytes[entry_base + 4..entry_base + 8].try_into().unwrap()) as usize;
+        if section_offset < bytes.len() {
+            bytes[section_offset] ^= 0xff;
+        }
+        let path = tmp_path("corrupt_large");
+        std::fs::write(&path, &bytes).unwrap();
+        let _cleanup = defer_remove(&path);
+        let base = MappedBase::map(&path).expect("map");
+        // topology() should succeed (CRC skipped for large sections).
+        let _ = base
+            .topology()
+            .expect("topology() must not CRC-fail large section");
+        // verify_integrity() must catch it.
+        let results = base.verify_integrity();
+        let topo = results
+            .iter()
+            .find(|(id, _, _, _)| *id == SECTION_TOPOLOGY)
+            .expect("topology entry in verify results");
+        assert!(
+            topo.3.is_err(),
+            "verify_integrity must detect TOPOLOGY corruption; got Ok"
+        );
     }
 
     /// RAII guard that removes the file on drop.

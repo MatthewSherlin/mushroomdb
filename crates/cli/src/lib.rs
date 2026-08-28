@@ -114,6 +114,10 @@ pub enum Command {
     Migrate {
         db_dir: PathBuf,
     },
+    /// Validate CRC32 integrity of every section in the V8 snapshot.
+    Verify {
+        db_dir: PathBuf,
+    },
     Help,
 }
 
@@ -168,6 +172,7 @@ Usage:
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
   mushroomdb snapshot <db-dir> [--keep-wal]
   mushroomdb migrate <db-dir>
+  mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
   mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb algo pagerank <db-dir> [--top N]
   mushroomdb algo wcc <db-dir> [--top N]
@@ -197,6 +202,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "snapshot" => parse_snapshot(&args[1..]),
         "schema" => parse_schema(&args[1..]),
         "migrate" => parse_one_dir("migrate", &args[1..]).map(|db_dir| Command::Migrate { db_dir }),
+        "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -525,6 +531,45 @@ pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
         None => format!("migrated WAL-only -> V{current}\n"),
     };
     Ok(msg)
+}
+
+/// Validate the CRC32 integrity of every section in a V8 snapshot.
+///
+/// Exits with a non-zero code if any section is corrupt.  This is the
+/// explicit integrity audit path; mushroomdb does NOT CRC-check large
+/// sections on the hot query path (see format-stability.md).
+pub fn run_verify(db_dir: &Path) -> Result<String, CliError> {
+    let results = core_api::verify_snapshot(db_dir)
+        .map_err(|e| CliError(format!("verify: cannot open snapshot: {e}")))?;
+    let mut any_fail = false;
+    let mut out = String::new();
+    for (id, section_name, byte_len, result) in &results {
+        match result {
+            Ok(()) => {
+                let _ = writeln!(
+                    out,
+                    "  section {:2} ({:<12}) {:>10} bytes  OK",
+                    id, section_name, byte_len
+                );
+            }
+            Err(msg) => {
+                let _ = writeln!(
+                    out,
+                    "  section {:2} ({:<12}) {:>10} bytes  CORRUPT: {msg}",
+                    id, section_name, byte_len
+                );
+                any_fail = true;
+            }
+        }
+    }
+    if any_fail {
+        Err(CliError(format!("integrity check FAILED:\n{out}")))
+    } else {
+        Ok(format!(
+            "integrity check OK ({} sections):\n{out}",
+            results.len()
+        ))
+    }
 }
 
 /// Open `dir` and write `snapshot.bin`. Default truncates the WAL.
