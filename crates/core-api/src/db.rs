@@ -1120,20 +1120,22 @@ impl<F: Fs> GraphDb<F> {
             v8_sections_mutex: std::sync::Mutex::new(()),
         };
         let _t0 = std::time::Instant::now();
-        let snap_bytes = db.fs.read(FileId::Snapshot)?;
-        // V8 path: keep MappedBase alive for zero-copy topology reads.
-        // Non-V8 paths (fresh / V5-V7) fall through to the legacy decode path.
-        if snap_bytes.len() >= 6
-            && &snap_bytes[0..4] == b"GDB1"
-            && u16::from_le_bytes([snap_bytes[4], snap_bytes[5]])
-                == core_storage::snapshot::VERSION_8
-        {
-            // C2: use file mmap on RealFs (zero-copy, no heap copy); fall back to
-            // from_bytes on SimFs (in-memory, path unavailable).
+        // Peek 6 bytes to determine snapshot version without reading the full
+        // file. For RealFs this is a true partial read (O(1)); for SimFs the
+        // default impl reads all bytes and truncates (still correct).
+        let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
+        let is_v8 = snap_header.len() >= 6
+            && &snap_header[0..4] == b"GDB1"
+            && u16::from_le_bytes([snap_header[4], snap_header[5]])
+                == core_storage::snapshot::VERSION_8;
+        if is_v8 {
+            // V8: map the file zero-copy (RealFs) or read full bytes (SimFs).
+            // No 2.4GB heap Vec is allocated on RealFs.
             let mapped = Arc::new(
                 if let Some(snap_path) = db.fs.snapshot_path() {
                     core_storage::v8::MappedBase::map(&snap_path)
                 } else {
+                    let snap_bytes = db.fs.read(FileId::Snapshot)?;
                     core_storage::v8::MappedBase::from_bytes(snap_bytes)
                 }
                 .map_err(|e| GraphError::Corrupt {
@@ -1144,9 +1146,14 @@ impl<F: Fs> GraphDb<F> {
             trace_open!("restore_v8_base", _t0);
             db.base = Some(mapped);
             trace_open!("base assigned", _t0);
-        } else if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
-            db.restore_snapshot_state(state)?;
+        } else if !snap_header.is_empty() {
+            // Legacy V5-V7: full read required for decode.
+            let snap_bytes = db.fs.read(FileId::Snapshot)?;
+            if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
+                db.restore_snapshot_state(state)?;
+            }
         }
+        // else: snap_header is empty = no snapshot file, fresh store.
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
         if valid_len < bytes.len() {
@@ -1497,12 +1504,42 @@ impl<F: Fs> GraphDb<F> {
         // base reproduces. `keep_wal` and legacy V5/V6 snapshots leave a WAL
         // that reaches further back; for those the historical WAL-only
         // replay applies (`wal_truncated` defaults to false on decode).
-        let snap_bytes = db.fs.read(FileId::Snapshot)?;
-        if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
-            if state.wal_truncated {
-                db.restore_snapshot_state(state)?;
+        // Peek version without a full 2.4GB heap read (same pattern as open_with).
+        let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
+        let is_v8 = snap_header.len() >= 6
+            && &snap_header[0..4] == b"GDB1"
+            && u16::from_le_bytes([snap_header[4], snap_header[5]])
+                == core_storage::snapshot::VERSION_8;
+        if is_v8 {
+            // V8: map the file (RealFs) or read full bytes (SimFs), then do a
+            // full structural decode. open_at needs owned topo/props for WAL
+            // replay mutation so we can't use the zero-copy seam here.
+            let state = if let Some(snap_path) = db.fs.snapshot_path() {
+                let mapped = core_storage::v8::MappedBase::map(&snap_path).map_err(|e| {
+                    GraphError::Corrupt {
+                        detail: format!("v8: open_at mmap: {e:?}"),
+                    }
+                })?;
+                core_storage::snapshot::decode_v8_from_mapped(&mapped)?
+            } else {
+                let snap_bytes = db.fs.read(FileId::Snapshot)?;
+                core_storage::snapshot::decode(&snap_bytes)?
+            };
+            if let Some(state) = state {
+                if state.wal_truncated {
+                    db.restore_snapshot_state(state)?;
+                }
+            }
+        } else if !snap_header.is_empty() {
+            // Legacy V5-V7: full read required for decode.
+            let snap_bytes = db.fs.read(FileId::Snapshot)?;
+            if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
+                if state.wal_truncated {
+                    db.restore_snapshot_state(state)?;
+                }
             }
         }
+        // else: snap_header empty = no snapshot file.
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, _valid_len) = decode_all(&bytes);
         let total = records.len() as u64;

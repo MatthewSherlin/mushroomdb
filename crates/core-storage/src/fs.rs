@@ -39,6 +39,19 @@ pub trait Fs {
     fn snapshot_path(&self) -> Option<std::path::PathBuf> {
         None
     }
+    /// Read at most `n` bytes from the beginning of `file` without loading
+    /// the full contents.
+    ///
+    /// Used by the open path to sniff the 6-byte magic+version header before
+    /// deciding whether to mmap (V8) or full-read (legacy V5-V7).
+    ///
+    /// The default implementation calls `read()` and truncates; override in
+    /// `RealFs` for a true partial read.
+    fn read_prefix(&self, file: FileId, n: usize) -> std::io::Result<Vec<u8>> {
+        let mut bytes = self.read(file)?;
+        bytes.truncate(n);
+        Ok(bytes)
+    }
 }
 
 pub trait FsIntrospect {
@@ -105,6 +118,20 @@ impl Fs for RealFs {
 
     fn snapshot_path(&self) -> Option<std::path::PathBuf> {
         Some(self.path(FileId::Snapshot))
+    }
+
+    fn read_prefix(&self, file: FileId, n: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        match File::open(self.path(file)) {
+            Ok(mut f) => {
+                let mut buf = vec![0u8; n];
+                let read = f.read(&mut buf)?;
+                buf.truncate(read);
+                Ok(buf)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
     }
 }
 
