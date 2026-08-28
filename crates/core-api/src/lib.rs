@@ -3,6 +3,7 @@ mod db;
 pub mod history;
 mod ingest;
 pub mod mask;
+pub mod reader;
 pub mod roles;
 pub mod schema;
 mod shared;
@@ -35,6 +36,7 @@ pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
 pub use mask::NodeMask;
+pub use reader::{CommitDelta, FrozenOverlay, ReaderSnapshot, FOLD_EVERY_K};
 pub use roles::RoleDef;
 pub use schema::{Schema, SchemaDiff};
 pub use shared::SharedDb;

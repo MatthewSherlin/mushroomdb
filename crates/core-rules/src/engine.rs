@@ -61,6 +61,11 @@ pub type SideIvfExport = (Vec<Vec<f64>>, BTreeMap<u32, usize>, u64);
 /// IVF state for both sides (src, dst) of one approximate rule.
 pub type RuleIvfExport = (SideIvfExport, SideIvfExport);
 
+/// Raw (src-graph, dst-graph) HNSW blobs retained from the last snapshot.
+type HnswBlobMap = BTreeMap<String, (Vec<u8>, Vec<u8>)>;
+/// Lazily-decoded HNSW graph pair (src-side, dst-side) keyed by rule name.
+type LazyHnswMap = BTreeMap<String, (Option<HnswIndex>, Option<HnswIndex>)>;
+
 #[derive(Debug, Default)]
 pub struct RuleEngine {
     rules: BTreeMap<String, RuleDef>,
@@ -116,7 +121,7 @@ pub struct RuleEngine {
     /// (`ensure_hnsw_loaded` / the lazy-init guard in the mutation hooks).
     /// Wrapped in Mutex so `ensure_hnsw_loaded` can be called from `&self`
     /// (shared-read ANN path in `find_similar_vector` / `search_hybrid`).
-    retained_hnsw_blobs: Mutex<BTreeMap<String, (Vec<u8>, Vec<u8>)>>,
+    retained_hnsw_blobs: Mutex<HnswBlobMap>,
     /// Persisted IVF cluster state retained from the last snapshot.
     ///
     /// Same lifecycle as `retained_hnsw_blobs` (mutation path only; consumed
@@ -128,7 +133,7 @@ pub struct RuleEngine {
     /// snapshot open with no WAL.  `OnceLock` guarantees exactly-once init
     /// even under concurrent shared-read access.  After the first mutation the
     /// mutation-path HNSW in `indexes` takes over; this field is never cleared.
-    lazy_hnsw: OnceLock<BTreeMap<String, (Option<HnswIndex>, Option<HnswIndex>)>>,
+    lazy_hnsw: OnceLock<LazyHnswMap>,
 }
 
 // ---------------------------------------------------------------------------

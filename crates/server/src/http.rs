@@ -668,7 +668,8 @@ async fn query(
 
     // Role token: writes are denied; reads are auto-masked by the role's
     // visibility mask.  A client-supplied mask can only narrow, never widen.
-    // Single read guard for mask resolution + query (snapshot consistency).
+    // Lock-free epoch snapshot: mask and query execute on the same frozen state
+    // (constraint 2 — RBAC mask coherence), without holding the read lock.
     if let AuthIdentity::Role(ref role_name) = identity {
         let is_write = match is_write_query(&cypher) {
             Ok(b) => b,
@@ -677,19 +678,19 @@ async fn query(
         if is_write {
             return forbidden("role-bound token: writes are not permitted");
         }
-        let db = state.db.read();
-        let role_mask = match db.mask_for_role(role_name) {
+        let snap = state.db.reader();
+        let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
         let effective_mask = if let Some(ref keys) = mask_keys {
             // Client mask intersects role mask — never widens visibility.
-            let client_mask = NodeMask::from_keys(&*db, keys.iter().map(String::as_str));
+            let client_mask = NodeMask::from_ids(keys.iter().filter_map(|k| snap.resolve_key(k)));
             role_mask.intersect(&client_mask)
         } else {
             role_mask
         };
-        return match db.query_masked(&cypher, &params, &effective_mask) {
+        return match snap.query_masked(&cypher, &params, &effective_mask) {
             Ok(rs) => format_query_result(rs, format),
             Err(GraphError::QueryError { detail })
                 if detail.contains("masked queries are read-only") =>
@@ -899,17 +900,21 @@ async fn node_info(
     Path(key): Path<String>,
 ) -> Response {
     if let AuthIdentity::Role(ref role_name) = identity {
-        // Single read guard for mask resolution + node lookup (snapshot consistency).
-        let g = state.db.read();
-        let role_mask = match g.mask_for_role(role_name) {
+        // Lock-free epoch snapshot: mask and node lookup on same frozen state
+        // (constraint 2 — RBAC mask coherence).
+        let snap = state.db.reader();
+        let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
         // Hidden keys respond identically to absent keys — no "restricted" signal in v1.
-        if !role_mask.contains_node(&*g, &key) {
+        if !snap
+            .resolve_key(&key)
+            .is_some_and(|id| role_mask.contains_id(id))
+        {
             return key_not_found(key);
         }
-        return match g.node_info(&key) {
+        return match snap.node_info(&key) {
             Some(info) => json_ok(node_info_json(&info)),
             None => key_not_found(key),
         };
@@ -930,15 +935,20 @@ async fn node_edges(
     Path(key): Path<String>,
 ) -> Response {
     if let AuthIdentity::Role(ref role_name) = identity {
-        let g = state.db.read();
-        let role_mask = match g.mask_for_role(role_name) {
+        // Lock-free epoch snapshot: mask and edge lookup on same frozen state
+        // (constraint 2 — RBAC mask coherence).
+        let snap = state.db.reader();
+        let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
-        if !role_mask.contains_node(&*g, &key) {
+        if !snap
+            .resolve_key(&key)
+            .is_some_and(|id| role_mask.contains_id(id))
+        {
             return key_not_found(key);
         }
-        return match g.node_edges(&key) {
+        return match snap.node_edges(&key) {
             Ok(edges) => {
                 // Filter out edges whose OTHER endpoint is hidden in the role
                 // mask.  A role token must not learn about hidden neighbors via
@@ -951,7 +961,8 @@ async fn node_edges(
                         } else {
                             &e.src_key
                         };
-                        role_mask.contains_node(&*g, other)
+                        snap.resolve_key(other)
+                            .is_some_and(|id| role_mask.contains_id(id))
                     })
                     .collect();
                 json_ok(node_edges_json(&visible))
@@ -1001,18 +1012,23 @@ async fn neighborhood(
         .as_ref()
         .map(|v| v.iter().map(String::as_str).collect());
     if let AuthIdentity::Role(ref role_name) = identity {
-        // Single read guard for mask resolution + neighborhood lookup.
-        let g = state.db.read();
-        let role_mask = match g.mask_for_role(role_name) {
+        // Lock-free epoch snapshot: mask and neighborhood BFS on same frozen state
+        // (constraint 2 — RBAC mask coherence).
+        let snap = state.db.reader();
+        let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
-        if !role_mask.contains_node(&*g, &key) {
+        if !snap
+            .resolve_key(&key)
+            .is_some_and(|id| role_mask.contains_id(id))
+        {
             return key_not_found(key);
         }
         // Use the mask-aware BFS: hidden nodes are excluded from results AND
         // cannot be used as traversal intermediaries (never-leak invariant).
-        let rs = match g.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &role_mask) {
+        let rs = match snap.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &role_mask)
+        {
             Some(rs) => rs,
             None => return key_not_found(key),
         };

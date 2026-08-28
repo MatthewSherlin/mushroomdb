@@ -5,6 +5,7 @@
 //! path — lock-free epoch snapshot readers (Plan 8) replace the `RwLock`
 //! without changing callers.
 
+use crate::reader::ReaderSnapshot;
 use crate::GraphDb;
 use core_storage::RealFs;
 use core_storage::Result;
@@ -66,5 +67,14 @@ impl SharedDb {
         // reopen is the real recovery — this just unblocks the process
         // instead of propagating the poison panic.
         self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Capture a lock-free [`ReaderSnapshot`] of the current db state.
+    ///
+    /// Acquires the read lock only long enough to clone a handful of `Arc`
+    /// handles (the fold overlay and the base mmap). Subsequent reads on the
+    /// returned snapshot are lock-free and do not block writers.
+    pub fn reader(&self) -> ReaderSnapshot {
+        self.read().reader()
     }
 }

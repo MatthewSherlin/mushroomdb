@@ -883,6 +883,15 @@ pub struct GraphDb<F: Fs> {
     /// reads go through a merged `TopologyView`.  `self.props` is always
     /// fully materialized (base + WAL replay) for HNSW/IVF and view compat.
     base: Option<Arc<core_storage::v8::MappedBase>>,
+    // ── MVCC epoch reader state ───────────────────────────────────────────────
+    /// Most-recent full overlay clone.  Initialized at end of `open_with` /
+    /// `open_at_with`; refreshed every `FOLD_EVERY_K` commits.
+    /// `None` only between struct creation and the first fold.
+    fold_overlay: Option<Arc<crate::reader::FrozenOverlay>>,
+    /// Per-commit deltas accumulated since the last fold.
+    delta_tail: Vec<Arc<crate::reader::CommitDelta>>,
+    /// How many commits have occurred since the last fold.
+    commits_since_fold: usize,
 }
 
 /// Options for [`GraphDb::open_with_options`].
@@ -1060,6 +1069,9 @@ impl<F: Fs> GraphDb<F> {
             read_only: false,
             total_wal_commits: 0,
             base: None,
+            fold_overlay: None,
+            delta_tail: Vec::new(),
+            commits_since_fold: 0,
         };
         let snap_bytes = db.fs.read(FileId::Snapshot)?;
         // V8 path: keep MappedBase alive for zero-copy topology reads.
@@ -1144,6 +1156,8 @@ impl<F: Fs> GraphDb<F> {
         // Load roles sidecar. Missing file = no roles (Some(vec![])).
         // Corrupt/unparseable = poisoned (None); mask_for_role will fail-loud.
         db.roles = Self::load_roles_from_fs(&db.fs)?;
+        // Capture the initial MVCC fold so reader() is ready immediately.
+        db.fold_now();
         Ok(db)
     }
 
@@ -1365,6 +1379,9 @@ impl<F: Fs> GraphDb<F> {
             read_only: false, // set to true after replay
             total_wal_commits: 0,
             base: None,
+            fold_overlay: None,
+            delta_tail: Vec::new(),
+            commits_since_fold: 0,
         };
         // Base state: a truncating snapshot compacts all pre-truncation
         // commits, so the on-disk WAL head coincides with the snapshot and
@@ -1421,12 +1438,51 @@ impl<F: Fs> GraphDb<F> {
         db.roles = Self::load_roles_from_fs(&db.fs)?;
         db.read_only = true;
         db.total_wal_commits = total;
+        // Capture initial fold so reader() is immediately usable.
+        db.fold_now();
         Ok(db)
     }
 
     /// Whether this instance is a read-only as-of view.
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    // ── MVCC epoch reader ─────────────────────────────────────────────────────
+
+    /// Clone the current overlay state into a new `FrozenOverlay` and reset
+    /// the delta tail. Called automatically every `FOLD_EVERY_K` commits and at
+    /// the end of `open_with` / `open_at_with` to prime the reader.
+    fn fold_now(&mut self) {
+        let frozen = crate::reader::FrozenOverlay {
+            ids: self.ids.clone(),
+            syms: self.syms.clone(),
+            topo: self.topo.clone(),
+            props: self.props.clone(),
+            labels: self.labels.clone(),
+            edge_props: self.edge_props.clone(),
+            roles: self.roles.clone(),
+            fulltext: self.fulltext.clone(),
+        };
+        self.fold_overlay = Some(Arc::new(frozen));
+        self.delta_tail.clear();
+        self.commits_since_fold = 0;
+    }
+
+    /// Capture a lock-free reader snapshot of the current db state.
+    ///
+    /// The read lock is held only for the duration of this call (to clone a
+    /// handful of `Arc` handles). Subsequent query operations run without any
+    /// lock.
+    pub fn reader(&self) -> crate::reader::ReaderSnapshot {
+        crate::reader::ReaderSnapshot {
+            frozen: self
+                .fold_overlay
+                .clone()
+                .expect("fold_overlay is always Some after open_with; call reader() after open"),
+            base: self.base.clone(),
+            deltas: self.delta_tail.clone(),
+        }
     }
 
     /// Total number of WAL commits at the time [`open_at`] was called.
@@ -2627,6 +2683,33 @@ impl<F: Fs> GraphDb<F> {
         // Drain engine deltas and distribute to subscribers before the existing
         // MutationEvent sink fires — both happen post-fsync, post-apply.
         let engine_deltas = self.engine.drain_deltas();
+
+        // Record MVCC CommitDelta for the epoch reader.  The WAL record is
+        // stored as-is (including any nested Batch / Intern records); the
+        // ReaderSnapshot's apply_one function handles all variants.
+        {
+            let derived_inserts = engine_deltas
+                .iter()
+                .filter(|d| d.fired)
+                .map(|d| (d.etype_sym, d.src_id, d.dst_id))
+                .collect();
+            let derived_deletes = engine_deltas
+                .iter()
+                .filter(|d| !d.fired)
+                .map(|d| (d.etype_sym, d.src_id, d.dst_id))
+                .collect();
+            let delta = Arc::new(crate::reader::CommitDelta {
+                records: vec![rec.clone()],
+                derived_inserts,
+                derived_deletes,
+            });
+            self.delta_tail.push(delta);
+            self.commits_since_fold += 1;
+            if self.commits_since_fold >= crate::reader::FOLD_EVERY_K {
+                self.fold_now();
+            }
+        }
+
         self.distribute_events(&rec, &engine_deltas, seq);
         self.emit_committed(&rec, ingest);
         // Drift is only known after apply, so auto-rebuild cannot join the
@@ -4124,6 +4207,9 @@ impl<F: Fs> GraphDb<F> {
             .write_atomic(FileId::Roles, &bytes)
             .map_err(GraphError::Io)?;
         self.roles = Some(roles);
+        // Refresh the MVCC frozen overlay so that reader() immediately sees the
+        // updated role definitions without waiting for the next K-commit fold.
+        self.fold_now();
         Ok(())
     }
 
@@ -5494,6 +5580,10 @@ impl<F: Fs> GraphDb<F> {
             }
             self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
         }
+        // After snapshot the overlay may have changed (V8 merge path clears
+        // self.topo and self.props). Refresh the MVCC fold so future readers
+        // see the post-snapshot state rather than stale overlay data.
+        self.fold_now();
         Ok(())
     }
 }
