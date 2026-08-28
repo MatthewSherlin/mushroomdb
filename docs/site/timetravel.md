@@ -97,8 +97,79 @@ columns: n
 
 ## HTTP server
 
-Server-side as-of is not yet implemented. Each HTTP request to `/query` reads
-current state. As-of over HTTP is on the roadmap.
+Server-side as-of (`open_at` semantics) over `/query` is not yet implemented.
+
+### History endpoints
+
+Three read-only diagnostic endpoints expose WAL history over HTTP. They scan
+the on-disk WAL and return all events within the current horizon window (since
+the last WAL-truncating snapshot).
+
+**`GET /node/{key}/history`** — per-node change log.
+
+```json
+{
+  "key": "alice",
+  "history": [
+    { "commit": 0, "change": { "type": "NodeInserted", "label": "Person" } },
+    { "commit": 1, "change": { "type": "PropSet", "field": "age", "value": 30 } }
+  ],
+  "total_commits": 2
+}
+```
+
+**`GET /history/edge?a=&b=`** — edge lifecycle between two nodes. Includes
+derived (rule-attributed) edges.
+
+```json
+{
+  "a": "alice", "b": "bob",
+  "events": [
+    { "edge_type": "SIMILAR", "commit": 1, "event": "Added", "rule": "sim_emb" }
+  ],
+  "total_commits": 2
+}
+```
+
+**`GET /history/was_linked?a=&b=&edge_type=&at_commit=`** — point-in-time edge check.
+
+```json
+{ "a": "alice", "b": "bob", "edge_type": "SIMILAR", "at_commit": 1, "linked": true }
+```
+
+Returns `400` (not `500`) when `at_commit` is outside the visible horizon:
+```json
+{ "error": "commit 999 is out of range" }
+```
+
+### Horizon contract
+
+All three endpoints include `total_commits` in their response. This is the
+exclusive upper bound for valid commit indices (`0..total_commits`). When the
+WAL is empty (immediately after a truncating snapshot), `total_commits` is 0
+and the history list is empty. Pre-snapshot commits are not visible.
+
+This field is the **honesty contract**: clients can always determine what
+portion of history is visible and whether their query covers the full timeline.
+
+### Role-token masking
+
+Role tokens may call all three history endpoints (history is a READ operation).
+Masking is applied at the HTTP layer using the same read guard as the history
+call:
+
+- `node_history`: if the target key is outside the role's visibility mask, the
+  response is 404 — identical to querying an absent key (no existence oracle).
+- `edge_history`: BOTH `a` AND `b` must be visible. If either is hidden, 404
+  for that key.
+- `was_linked`: same two-key visibility requirement as `edge_history`.
+
+Write methods (POST/PUT/DELETE) remain 403 for role tokens.
+
+### MCP tools
+
+The same functionality is available as trusted-local MCP tools (no RBAC):
+`node_history`, `edge_history`, and `was_linked`. See the [MCP tools table](api.md#tools).
 
 ## Error reference
 

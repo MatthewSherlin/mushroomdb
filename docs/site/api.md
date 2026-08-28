@@ -294,6 +294,85 @@ ingest or the edges field of `/ingest`.
 
 ---
 
+### GET /node/{key}/history
+
+Return the WAL change history for a node.
+
+Response:
+```json
+{
+  "key": "alice",
+  "history": [
+    { "commit": 0, "change": { "type": "NodeInserted", "label": "Person" } },
+    { "commit": 1, "change": { "type": "PropSet", "field": "age", "value": 30 } },
+    { "commit": 2, "change": { "type": "EdgeAdded", "edge_type": "KNOWS", "other": "bob", "outgoing": true } }
+  ],
+  "total_commits": 3
+}
+```
+
+`total_commits` is the horizon upper bound (exclusive) — the number of WAL frames
+visible in the current window. History before the last WAL-truncating snapshot is not
+visible. See [Horizon contract](#horizon-contract) below.
+
+Role tokens: if the requested key is outside the role's visibility mask, the response
+is identical to querying an absent key (404) — no existence oracle.
+
+---
+
+### GET /history/edge?a=&b=
+
+Return the full add/retract lifecycle for edges between two nodes.
+
+Response:
+```json
+{
+  "a": "alice",
+  "b": "bob",
+  "events": [
+    { "edge_type": "KNOWS", "commit": 2, "event": "Added", "rule": null },
+    { "edge_type": "SIMILAR", "commit": 3, "event": "Added", "rule": "sim_emb" }
+  ],
+  "total_commits": 4
+}
+```
+
+`event` is `"Added"` or `"Retracted"`. `rule` is the rule name for derived edges,
+`null` for manually written edges. `total_commits` is the horizon upper bound.
+
+Role tokens: BOTH `a` AND `b` must be visible in the role mask. If either is hidden,
+the response is 404 for that key (no existence oracle).
+
+---
+
+### GET /history/was_linked?a=&b=&edge_type=&at_commit=
+
+Point-in-time check: was an edge of `edge_type` between `a` and `b` active at WAL
+commit `at_commit` (0-based)?
+
+Response:
+```json
+{ "a": "alice", "b": "bob", "edge_type": "KNOWS", "at_commit": 2, "linked": true }
+```
+
+Returns 400 (not 500) when `at_commit` is outside the visible horizon:
+```json
+{ "error": "commit 999 is out of range" }
+```
+
+Role tokens: BOTH `a` AND `b` must be visible (same-as-absent rule applies).
+
+#### Horizon contract
+
+All three history endpoints include `total_commits` in their response. This is the
+exclusive upper bound for valid commit indices (`0..total_commits`). When the WAL is
+empty (after a truncating snapshot and before any new writes), `total_commits` is 0.
+Pre-snapshot commits are not visible — history restarts from the first WAL frame after
+the snapshot. Use `snapshot_with(SnapshotOptions { keep_wal: true })` to preserve
+deep history across snapshots.
+
+---
+
 ### GET /watch (WebSocket)
 
 Connect with any WebSocket client. After upgrade the first text frame is
@@ -342,7 +421,7 @@ Response:
 
 ### Tools
 
-Twelve tools:
+Fifteen tools:
 
 | Tool | Description |
 |---|---|
@@ -358,6 +437,9 @@ Twelve tools:
 | `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?`; (2) edge traversal — `key`, `edge_type?`, `limit?` |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
+| `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits}` |
+| `edge_history` | Add/retract lifecycle for edges between two nodes; params: `a`, `b`. Returns `{a, b, events, total_commits}` |
+| `was_linked` | Point-in-time edge check; params: `a`, `b`, `edge_type`, `at_commit`. Returns `{linked}` or error when outside horizon |
 
 ---
 

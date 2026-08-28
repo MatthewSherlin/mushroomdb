@@ -150,7 +150,7 @@ fn tools_list_returns_eight_tools_with_schemas() {
         .iter()
         .map(|t| t["name"].as_str().expect("tool name"))
         .collect();
-    // Original eight tools plus three agent-memory tools.
+    // Original eight tools plus agent-memory tools plus history tools.
     for expected in &[
         "query",
         "ingest_json",
@@ -164,10 +164,13 @@ fn tools_list_returns_eight_tools_with_schemas() {
         "find_similar",
         "explain_association",
         "hybrid_search",
+        "node_history",
+        "edge_history",
+        "was_linked",
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 15);
 
     let by_name = |n: &str| {
         tools

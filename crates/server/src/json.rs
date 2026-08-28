@@ -3,7 +3,10 @@
 //! Cells are untagged JSON scalars (the inverse of [`core_api::json_to_value`]),
 //! not `Value`'s internally-tagged serde form.
 
-use core_api::{default_max_edges, json_to_value, EdgeInfo, NodeInfo, ResultSet, RuleDef, Value};
+use core_api::{
+    default_max_edges, json_to_value, EdgeEvent, EdgeHistoryEvent, EdgeInfo, HistoryChange,
+    HistoryEntry, HistoryResult, NodeInfo, ResultSet, RuleDef, Value,
+};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
 
@@ -114,6 +117,87 @@ pub(crate) fn parse_ingest_edges(v: &Js) -> Result<Vec<(String, String, String)>
         out.push((edge_type.to_string(), src.to_string(), dst.to_string()));
     }
     Ok(out)
+}
+
+/// Serialize a [`HistoryChange`] variant to an untagged JSON object.
+///
+/// The `"type"` field names the variant; payload fields follow inline.
+pub(crate) fn history_change_json(change: &HistoryChange) -> Js {
+    match change {
+        HistoryChange::NodeInserted { label } => json!({"type": "NodeInserted", "label": label}),
+        HistoryChange::PropSet { field, value } => json!({
+            "type": "PropSet",
+            "field": field,
+            "value": value_to_json(value),
+        }),
+        HistoryChange::PropRemoved { field } => json!({"type": "PropRemoved", "field": field}),
+        HistoryChange::EdgeAdded {
+            edge_type,
+            other,
+            outgoing,
+        } => json!({
+            "type": "EdgeAdded",
+            "edge_type": edge_type,
+            "other": other,
+            "outgoing": outgoing,
+        }),
+        HistoryChange::EdgeRemoved {
+            edge_type,
+            other,
+            outgoing,
+        } => json!({
+            "type": "EdgeRemoved",
+            "edge_type": edge_type,
+            "other": other,
+            "outgoing": outgoing,
+        }),
+        HistoryChange::NodeDeleted => json!({"type": "NodeDeleted"}),
+    }
+}
+
+pub(crate) fn history_entry_json(entry: &HistoryEntry) -> Js {
+    json!({
+        "commit": entry.commit,
+        "change": history_change_json(&entry.change),
+    })
+}
+
+pub(crate) fn edge_history_result_json(
+    a: &str,
+    b: &str,
+    result: &HistoryResult<EdgeHistoryEvent>,
+) -> Js {
+    let events: Vec<Js> = result
+        .items
+        .iter()
+        .map(|ev| {
+            let event_str = match ev.event {
+                EdgeEvent::Added => "Added",
+                EdgeEvent::Retracted => "Retracted",
+            };
+            json!({
+                "edge_type": ev.edge_type,
+                "commit": ev.commit,
+                "event": event_str,
+                "rule": ev.rule,
+            })
+        })
+        .collect();
+    json!({
+        "a": a,
+        "b": b,
+        "events": events,
+        "total_commits": result.total_commits,
+    })
+}
+
+pub(crate) fn node_history_json(key: &str, entries: &[HistoryEntry], total_commits: u64) -> Js {
+    let history: Vec<Js> = entries.iter().map(history_entry_json).collect();
+    json!({
+        "key": key,
+        "history": history,
+        "total_commits": total_commits,
+    })
 }
 
 /// Deserialize a `RuleDef` from HTTP/MCP JSON. Omitted or null `max_edges`

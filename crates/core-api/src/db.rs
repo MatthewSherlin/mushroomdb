@@ -5598,6 +5598,20 @@ impl<F: Fs> GraphDb<F> {
         self.ids.len()
     }
 
+    /// Return the total number of committed WAL frames visible in the current
+    /// horizon window.
+    ///
+    /// This is the exclusive upper bound for valid `at_commit` indices in
+    /// `was_linked`. Valid indices are `0..wal_total_commits()`.
+    ///
+    /// Returns `0` when the WAL is empty (e.g., immediately after a
+    /// truncating snapshot).
+    pub fn wal_total_commits(&self) -> Result<u64> {
+        let bytes = self.fs.read(FileId::Wal)?;
+        let (frames, _) = decode_all(&bytes);
+        Ok(frames.len() as u64)
+    }
+
     /// Return the per-node change history for `key` by scanning the on-disk WAL.
     ///
     /// ## Horizon
