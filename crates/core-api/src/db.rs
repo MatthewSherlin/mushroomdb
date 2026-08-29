@@ -2794,10 +2794,15 @@ impl<F: Fs> GraphDb<F> {
                     }
                 }
 
-                // (2) Sweep remaining user edges touching n, both directions,
-                // every etype. Collect then remove so neighbor slices stay valid.
-                // Remove from topo first, then call view maintenance so Avg/Min/Max
-                // recompute sees the correct (reduced) neighbor set.
+                // (2) Sweep ALL remaining edges incident to n, both directions,
+                // every etype. This cascade is intentionally mask-independent:
+                // topology integrity requires removing every edge touching the
+                // deleted node regardless of the caller's visibility scope.
+                // (The mask limits which nodes a role's read phase can return;
+                // the WAL delete always executes with full storage authority.)
+                // Collect then remove so neighbor slices stay valid during
+                // iteration. Remove from topo first, then call view maintenance
+                // so Avg/Min/Max recompute sees the correct (reduced) neighbor set.
                 let etypes: Vec<u32> = self.topo.etypes().collect();
                 let mut doomed = Vec::new();
                 for et in &etypes {

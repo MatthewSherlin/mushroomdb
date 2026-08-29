@@ -1651,6 +1651,82 @@ fn limit_param_unknown_is_error() {
     );
 }
 
+// ── LIMIT pushdown behavioral pins ───────────────────────────────────────────
+
+/// Behavioral pin: MATCH (n:Label) RETURN n LIMIT k on a graph of N≫k nodes
+/// returns exactly k rows via the pull-based (pushdown) executor.
+///
+/// N=50, k=5. Guards against regressions where LIMIT fails to short-circuit
+/// the scan; without the bound the scan would produce 10× more rows.
+#[test]
+fn test_limit_pushdown_large_graph_exact_count() {
+    let dir = tmp("limit_pushdown_pin");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        for i in 0..50u32 {
+            batch.insert_node("LP2", &format!("n{i}"), vec![]);
+        }
+        batch.commit().unwrap();
+    }
+    let rs = db
+        .query("MATCH (n:LP2) RETURN n LIMIT 5", &BTreeMap::new())
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        5,
+        "LIMIT 5 on 50-node graph must return exactly 5 rows (pull pushdown)"
+    );
+}
+
+/// Behavioral pin: ORDER BY ... LIMIT returns the correct top-k rows.
+///
+/// ORDER BY disables LIMIT pushdown (row_bound returns None), so the executor
+/// takes the full-scan staged path — materialize all rows, sort, then slice.
+/// 10 nodes with val 0..9; ORDER BY n.val DESC LIMIT 3 must return [9, 8, 7].
+#[test]
+fn test_order_by_limit_correct_top_k() {
+    let dir = tmp("order_by_limit_topk");
+    let mut db = GraphDb::open(&dir).unwrap();
+    {
+        let mut batch = db.batch();
+        for i in 0..10i64 {
+            batch.insert_node(
+                "OBLTK",
+                &format!("n{i}"),
+                vec![("val".into(), Value::Int(i))],
+            );
+        }
+        batch.commit().unwrap();
+    }
+    let rs = db
+        .query(
+            "MATCH (n:OBLTK) RETURN n.val ORDER BY n.val DESC LIMIT 3",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        3,
+        "ORDER BY n.val DESC LIMIT 3 must return exactly 3 rows"
+    );
+    assert_eq!(
+        get_val(&rs, 0, "n.val"),
+        Some(Value::Int(9)),
+        "row 0 must be val=9 (highest)"
+    );
+    assert_eq!(
+        get_val(&rs, 1, "n.val"),
+        Some(Value::Int(8)),
+        "row 1 must be val=8"
+    );
+    assert_eq!(
+        get_val(&rs, 2, "n.val"),
+        Some(Value::Int(7)),
+        "row 2 must be val=7"
+    );
+}
+
 // ── Regression: pipeline GroupAggregate without OPTIONAL MATCH ────────────────
 
 /// Regression pin for the pre-existing pipeline GroupAggregate bug fixed in T3.

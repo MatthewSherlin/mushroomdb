@@ -1314,3 +1314,57 @@ fn test_merge_create_no_mask_widening() {
         "mask refresh must NOT widen to Secret label; hidden_pre must remain invisible"
     );
 }
+
+// ── M2: DETACH DELETE cascade is mask-independent ────────────────────────────
+
+/// Confirm DETACH DELETE cascades ALL incident edges regardless of caller mask,
+/// leaving no orphaned edges to hidden neighbors.
+///
+/// Setup: node A (MyLabel, visible) has KNOWS edges to B (MyLabel, visible) and
+/// C (Secret, hidden). Role DETACH-DELETEs A. After deletion:
+/// - A is gone; B and C survive
+/// - No edges remain incident to A (deleted) in the topology — including the
+///   edge to the hidden neighbor C, which the cascade removes without consulting
+///   the mask (topology integrity requires unconditional removal).
+#[test]
+fn test_detach_delete_cascades_hidden_edges() {
+    let (mut db, _dir) = open_with_writer("detach-delete-cascade");
+    // Admin setup: nodes and edges including one to a hidden neighbor.
+    db.insert_node("MyLabel", "del_a", vec![]).unwrap();
+    db.insert_node("MyLabel", "surv_b", vec![]).unwrap();
+    db.insert_node("Secret", "hidden_c", vec![]).unwrap();
+    db.insert_edge("KNOWS", "del_a", "surv_b").unwrap();
+    db.insert_edge("KNOWS", "del_a", "hidden_c").unwrap();
+
+    // Role-scoped DETACH DELETE: writer has delete_labels=["MyLabel"].
+    db.query_write_authz(
+        "writer",
+        "MATCH (n:MyLabel {id: 'del_a'}) DETACH DELETE n",
+        &no_params(),
+    )
+    .unwrap();
+
+    // del_a is gone.
+    assert!(!db.has_node("del_a"), "del_a must be deleted");
+    // Surviving nodes intact.
+    assert!(db.has_node("surv_b"), "surv_b must survive");
+    assert!(db.has_node("hidden_c"), "hidden_c must survive");
+
+    // No orphan edges: verify from surviving neighbors' perspectives.
+    // surv_b must have no incoming KNOWS from del_a.
+    let b_in = db
+        .neighbors("surv_b", "KNOWS", Direction::In)
+        .unwrap_or_default();
+    assert!(
+        !b_in.contains(&"del_a".to_string()),
+        "edge del_a→surv_b must be cascade-deleted; b_in={b_in:?}"
+    );
+    // hidden_c must have no incoming KNOWS from del_a (mask-independent cascade).
+    let c_in = db
+        .neighbors("hidden_c", "KNOWS", Direction::In)
+        .unwrap_or_default();
+    assert!(
+        !c_in.contains(&"del_a".to_string()),
+        "edge del_a→hidden_c must be cascade-deleted regardless of mask; c_in={c_in:?}"
+    );
+}
