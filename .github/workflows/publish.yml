@@ -93,6 +93,13 @@ jobs:
       # Setup: crates.io → crate settings → Trusted Publishers → Add publisher
       #   repo=MatthewSherlin/mushroomdb workflow=publish.yml
       - uses: rust-lang/crates-io-auth-action@v1
+        id: crates-auth
+
+      # The auth action only OUTPUTS the token — cargo reads CARGO_REGISTRY_TOKEN.
+      # Without this export every publish step fails with "no token found"
+      # (bug found live on the v0.2.0 publish run).
+      - name: export registry token for cargo
+        run: echo "CARGO_REGISTRY_TOKEN=${{ steps.crates-auth.outputs.token }}" >> "$GITHUB_ENV"
 
       - name: publish mushroomdb-storage (leaf)
         run: cargo publish -p mushroomdb-storage
