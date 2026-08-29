@@ -398,6 +398,33 @@ pub struct EdgeInfo {
     pub derived: bool,
 }
 
+/// An edge with mask-aware endpoint visibility.
+///
+/// Returned by [`GraphDb::node_edges_masked`] in [`crate::mask::MaskMode::Stub`]
+/// mode — hidden endpoints carry `*_restricted: true`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskedEdge {
+    pub edge_type: String,
+    pub src_key: String,
+    /// `true` when `src_key` is in the DB but hidden from the mask.
+    pub src_restricted: bool,
+    pub dst_key: String,
+    /// `true` when `dst_key` is in the DB but hidden from the mask.
+    pub dst_restricted: bool,
+    pub derived: bool,
+}
+
+/// Result of a mask-aware node lookup via [`GraphDb::node_info_masked`].
+///
+/// `None` from that method means the key does not exist (→ 404).
+/// `Some(Restricted)` is only produced when `mask.mode() == MaskMode::Stub`.
+#[derive(Debug, PartialEq)]
+pub enum MaskedNodeResult {
+    Visible(NodeInfo),
+    /// Node exists in the DB but is hidden from this mask.
+    Restricted,
+}
+
 /// One rule-owned edge between two nodes, with the rule name, edge type,
 /// direction (src_key → dst_key), and weight if the rule stores one.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -4773,7 +4800,7 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        Ok(crate::mask::NodeMask { visible })
+        Ok(crate::mask::NodeMask::from_ids(visible))
     }
 
     /// Return the current list of role definitions.
@@ -4871,9 +4898,19 @@ impl<F: Fs> GraphDb<F> {
 
     /// BFS neighborhood expansion restricted to visible nodes in `mask`.
     ///
-    /// Hidden nodes are neither returned nor used as traversal intermediaries —
-    /// a visible node reachable only through a hidden node will not appear.
+    /// Hidden nodes are never used as traversal intermediaries in either
+    /// [`MaskMode::Omit`] or [`MaskMode::Stub`] — a visible node reachable
+    /// only through a hidden node will not appear in results.
+    ///
+    /// In [`MaskMode::Stub`] mode, hidden nodes that are direct neighbours of
+    /// a visited visible node are appended to the result as stub rows
+    /// (`label` column is `null`, same key+depth columns as visible rows).
+    /// They are NOT added to the BFS frontier.
+    ///
     /// Returns `None` when `key` does not exist (caller should 404).
+    ///
+    /// **SECURITY**: role-token callers always pass an Omit-mode mask, so
+    /// stub rows are never produced on the role path.
     pub fn neighborhood_masked(
         &self,
         key: &str,
@@ -4882,7 +4919,7 @@ impl<F: Fs> GraphDb<F> {
         dir: Dir,
         mask: &crate::mask::NodeMask,
     ) -> Option<ResultSet> {
-        let id = self.ids.get(key)?;
+        let start_id = self.ids.get(key)?;
         let view = self.view_masked(mask);
         let resolved: Option<Vec<u32>> = edge_types.map(|names| {
             names
@@ -4890,18 +4927,47 @@ impl<F: Fs> GraphDb<F> {
                 .filter_map(|name| view.syms.get(name))
                 .collect()
         });
-        let nb = neighborhood(&view, id, depth, resolved.as_deref(), dir);
+        let nb = neighborhood(&view, start_id, depth, resolved.as_deref(), dir);
         let mut rs = ResultSet::new(vec!["key".into(), "label".into(), "depth".into()]);
-        for (nid, d) in nb.nodes {
-            let key = view.key_of(nid);
+        // Collect visible BFS results (start_id at depth 0, BFS nodes after).
+        let mut visited: Vec<(u32, u32)> = Vec::with_capacity(nb.nodes.len() + 1);
+        visited.push((start_id, 0));
+        for (nid, d) in &nb.nodes {
+            let k = view.key_of(*nid);
             let label = view
-                .label_of(nid)
+                .label_of(*nid)
                 .expect("real nodes always have a label; u32::MAX sentinel cannot occur");
             rs.push_row(vec![
-                Some(Value::Str(key.to_string())),
+                Some(Value::Str(k.to_string())),
                 Some(Value::Str(label.to_string())),
-                Some(Value::Int(d as i64)),
+                Some(Value::Int(*d as i64)),
             ]);
+            visited.push((*nid, *d));
+        }
+        // Stub mode: add hidden direct neighbours of each visited node as stubs.
+        // Hidden nodes are edge-endpoints only — they are not added to the BFS
+        // frontier, so the BFS never expands through them.
+        if mask.mode() == crate::mask::MaskMode::Stub {
+            let raw_view = self.view();
+            let mut seen: std::collections::HashSet<u32> =
+                visited.iter().map(|(id, _)| *id).collect();
+            for (node_id, node_depth) in &visited {
+                if *node_depth >= depth {
+                    continue;
+                }
+                for e in expand(&raw_view, *node_id, resolved.as_deref(), dir) {
+                    let nbr = if e.src == *node_id { e.dst } else { e.src };
+                    if !mask.contains_id(nbr) && seen.insert(nbr) {
+                        if let Some(k) = self.ids.key_of(nbr) {
+                            rs.push_row(vec![
+                                Some(Value::Str(k.to_string())),
+                                None,
+                                Some(Value::Int((*node_depth + 1) as i64)),
+                            ]);
+                        }
+                    }
+                }
+            }
         }
         Some(rs)
     }
@@ -4914,6 +4980,109 @@ impl<F: Fs> GraphDb<F> {
             label: n.label().to_string(),
             props: n.props(),
         })
+    }
+
+    /// Look up a node with mask awareness.
+    ///
+    /// | Key state         | Omit mode       | Stub mode              |
+    /// |-------------------|-----------------|------------------------|
+    /// | does not exist    | `None` (→ 404)  | `None` (→ 404)         |
+    /// | exists, visible   | `Some(Visible)` | `Some(Visible)`        |
+    /// | exists, hidden    | `None` (→ 404)  | `Some(Restricted)`     |
+    ///
+    /// **SECURITY**: only call from client-mask (full-token) paths.
+    /// Role-token paths must use [`node_info`] after an explicit visibility check.
+    pub fn node_info_masked(
+        &self,
+        key: &str,
+        mask: &crate::mask::NodeMask,
+    ) -> Option<MaskedNodeResult> {
+        let id = self.ids.get(key)?;
+        if mask.contains_id(id) {
+            Some(MaskedNodeResult::Visible(self.node_info(key)?))
+        } else {
+            match mask.mode() {
+                crate::mask::MaskMode::Stub => Some(MaskedNodeResult::Restricted),
+                crate::mask::MaskMode::Omit => None,
+            }
+        }
+    }
+
+    /// Get edges for `key` with mask-aware hidden-endpoint handling.
+    ///
+    /// - Omit mode: edges to hidden endpoints are excluded (same as role-path filtering).
+    /// - Stub mode: edges to hidden endpoints are included; `src_restricted`/`dst_restricted`
+    ///   is `true` for each hidden endpoint.
+    ///
+    /// Unknown key → [`GraphError::KeyNotFound`].
+    ///
+    /// **SECURITY**: only call from client-mask (full-token) paths.
+    pub fn node_edges_masked(
+        &self,
+        key: &str,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<MaskedEdge>> {
+        self.ensure_v8_base_sections_loaded();
+        let id = self
+            .ids
+            .get(key)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+        let derived: BTreeSet<(u32, u32, u32)> = self
+            .engine
+            .provenance_touching(id)
+            .map(|(_rule, etype, src, dst)| (etype, src, dst))
+            .collect();
+        let mut edges = Vec::new();
+        let tv = self.topo_view();
+        for etype in tv.etypes() {
+            let edge_type = self
+                .syms
+                .resolve(etype)
+                .expect("topology etype is interned")
+                .to_string();
+            for dir in [Direction::Out, Direction::In] {
+                for &nbr in tv.neighbors(etype, dir, id).as_ref() {
+                    let nbr_restricted = !mask.contains_id(nbr);
+                    if nbr_restricted && mask.mode() == crate::mask::MaskMode::Omit {
+                        continue;
+                    }
+                    let nbr_key = self
+                        .ids
+                        .key_of(nbr)
+                        .ok_or_else(|| GraphError::Corrupt {
+                            detail: format!("topology id {nbr} has no key"),
+                        })?
+                        .to_string();
+                    let (src_id, dst_id, src_key, dst_key, src_restricted, dst_restricted) =
+                        match dir {
+                            Direction::Out => {
+                                (id, nbr, key.to_string(), nbr_key, false, nbr_restricted)
+                            }
+                            Direction::In => {
+                                (nbr, id, nbr_key, key.to_string(), nbr_restricted, false)
+                            }
+                        };
+                    edges.push(MaskedEdge {
+                        edge_type: edge_type.clone(),
+                        src_key,
+                        src_restricted,
+                        dst_key,
+                        dst_restricted,
+                        derived: derived.contains(&(etype, src_id, dst_id)),
+                    });
+                }
+            }
+        }
+        edges.sort_by(|a, b| {
+            a.edge_type
+                .cmp(&b.edge_type)
+                .then(a.src_key.cmp(&b.src_key))
+                .then(a.dst_key.cmp(&b.dst_key))
+        });
+        edges.dedup_by(|a, b| {
+            a.edge_type == b.edge_type && a.src_key == b.src_key && a.dst_key == b.dst_key
+        });
+        Ok(edges)
     }
 
     /// Every directed edge incident on `key`, both directions, every etype.

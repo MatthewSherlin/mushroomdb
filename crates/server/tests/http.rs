@@ -2647,3 +2647,256 @@ async fn node_history_absent_key_is_404_both_identities() {
     let v = parse_json(&body);
     assert_eq!(v, json!({"error": "node key not found: ghost"}));
 }
+
+// ── Restricted-stub mask mode (Task 1: KB-hardening) ─────────────────────────
+
+/// POST /query with a client mask and `stub_hidden: true` must be accepted
+/// and return the same Cypher results as without the flag — hidden nodes are
+/// excluded from query results in both modes (Cypher behaviour is mode-agnostic).
+#[tokio::test]
+async fn client_mask_stub_hidden_query_round_trip() {
+    let (app, db) = open("stub-query-rt");
+    {
+        let mut g = db.write();
+        g.insert_node("P", "alice", vec![]).unwrap();
+        g.insert_node("P", "bob", vec![]).unwrap();
+        g.insert_node("P", "carol", vec![]).unwrap();
+        g.insert_edge("KNOWS", "alice", "bob").unwrap();
+        g.insert_edge("KNOWS", "alice", "carol").unwrap();
+    }
+
+    // With mask=["alice","carol"] and stub_hidden=true, Cypher still sees only
+    // the masked subgraph.  alice→carol is the only visible KNOWS edge.
+    let req = json_req(
+        "POST",
+        "/query?format=json",
+        json!({
+            "cypher": "MATCH (a:P)-[r:KNOWS]->(b:P) RETURN b.id",
+            "mask": ["alice", "carol"],
+            "stub_hidden": true
+        }),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "stub_hidden request must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only alice→carol must be visible: {v}");
+
+    // Same result without stub_hidden (Omit is default).
+    let req2 = json_req(
+        "POST",
+        "/query?format=json",
+        json!({
+            "cypher": "MATCH (a:P)-[r:KNOWS]->(b:P) RETURN b.id",
+            "mask": ["alice", "carol"],
+        }),
+    );
+    let (status2, body2, _) = send(app, req2).await;
+    assert_eq!(status2, StatusCode::OK);
+    let v2 = parse_json(&body2);
+    assert_eq!(
+        v2["rows"].as_array().unwrap().len(),
+        1,
+        "Omit mode must return same row count"
+    );
+}
+
+/// GET /node/{key}?mask=alice,carol&stub_hidden=true on a hidden key must
+/// return `{"key": "<key>", "restricted": true}` — not 404.
+/// Full body must contain ONLY `key` and `restricted` (no label, no props).
+#[tokio::test]
+async fn client_mask_stub_node_info_hidden_key_returns_restricted_stub() {
+    let (app, db) = open("stub-node-info-http");
+    {
+        let mut g = db.write();
+        g.insert_node("P", "alice", vec![("score".into(), Value::Int(99))])
+            .unwrap();
+        g.insert_node("P", "bob", vec![]).unwrap();
+    }
+
+    // GET /node/bob?mask=alice&stub_hidden=true — bob is hidden from the mask.
+    let req = get("/node/bob?mask=alice&stub_hidden=true");
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "hidden key in stub mode must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    // Assert FULL body shape: only key and restricted, nothing else.
+    let obj = v.as_object().expect("response must be a JSON object");
+    assert_eq!(
+        obj.len(),
+        2,
+        "stub JSON must contain exactly 2 fields (key, restricted): {v}"
+    );
+    assert_eq!(v["key"], json!("bob"), "stub key must be the requested key");
+    assert_eq!(v["restricted"], json!(true), "restricted must be true");
+    assert!(v.get("label").is_none(), "stub must not leak label");
+    assert!(v.get("props").is_none(), "stub must not leak props");
+
+    // GET /node/alice?mask=alice — visible key returns normal info.
+    let req2 = get("/node/alice?mask=alice&stub_hidden=true");
+    let (status2, body2, _) = send(app.clone(), req2).await;
+    assert_eq!(status2, StatusCode::OK);
+    let v2 = parse_json(&body2);
+    assert_eq!(v2["key"], json!("alice"));
+    assert!(v2.get("label").is_some(), "visible node must have label");
+
+    // GET /node/ghost?mask=alice&stub_hidden=true — absent key must be 404.
+    let req3 = get("/node/ghost?mask=alice&stub_hidden=true");
+    let (status3, _, _) = send(app, req3).await;
+    assert_eq!(
+        status3,
+        StatusCode::NOT_FOUND,
+        "absent key must still be 404 even in stub mode"
+    );
+}
+
+/// GET /node/{key}/edges?mask=alice,carol&stub_hidden=true must include edges
+/// to hidden neighbors rendered as `{"key": "<key>", "restricted": true}`.
+#[tokio::test]
+async fn client_mask_stub_node_edges_includes_restricted_endpoint() {
+    let (app, db) = open("stub-node-edges-http");
+    {
+        let mut g = db.write();
+        g.insert_node("P", "alice", vec![]).unwrap();
+        g.insert_node("P", "bob", vec![]).unwrap(); // will be hidden
+        g.insert_node("P", "carol", vec![]).unwrap();
+        g.insert_edge("KNOWS", "alice", "bob").unwrap();
+        g.insert_edge("KNOWS", "alice", "carol").unwrap();
+    }
+
+    // mask=alice,carol → bob is hidden; stub_hidden=true → bob appears as stub endpoint.
+    let req = get("/node/alice/edges?mask=alice,carol&stub_hidden=true");
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "node edges stub request must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    let edges = v["edges"]
+        .as_array()
+        .expect("response must have edges array");
+    assert_eq!(edges.len(), 2, "both edges must appear in stub mode: {v}");
+
+    // Find the edge where bob appears as dst_key restricted stub.
+    let bob_edge = edges.iter().find(|e| {
+        e["dst_key"].is_object()
+            && e["dst_key"]["key"] == json!("bob")
+            && e["dst_key"]["restricted"] == json!(true)
+    });
+    assert!(
+        bob_edge.is_some(),
+        "bob must appear as restricted stub dst_key: {v}"
+    );
+
+    // Carol edge must have dst_key as plain string.
+    let carol_edge = edges.iter().find(|e| e["dst_key"] == json!("carol"));
+    assert!(
+        carol_edge.is_some(),
+        "carol must appear as plain string: {v}"
+    );
+}
+
+/// A role-token request with `stub_hidden: true` in the body must NOT produce
+/// stubs — the role path is hard-coded to Omit mode and the flag is ignored.
+///
+/// The test inserts a visible (Pub) and a hidden (Secret) node, issues the
+/// query from a role token that only sees Pub nodes, and verifies that Secret
+/// never appears in any form (no key, no restricted field).
+#[tokio::test]
+async fn role_token_stub_hidden_flag_is_ignored() {
+    let (app, db) = open_rbac(
+        "stub-role-ignored",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    // Role token with stub_hidden: true.  sec1 must NOT appear.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({
+            "cypher": "MATCH (n) RETURN n.id",
+            "stub_hidden": true,
+        }),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "role token stub_hidden request must be 200"
+    );
+    let v = parse_json(&body);
+    let body_str = v.to_string();
+    assert!(
+        !body_str.contains("sec1"),
+        "sec1 must not appear in any form in role-token response: {v}"
+    );
+    assert!(
+        !body_str.contains("restricted"),
+        "restricted field must not appear in role-token response: {v}"
+    );
+
+    // Verify pub1 is present.
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "role token must see exactly 1 node (pub1): {v}"
+    );
+}
+
+/// `stub_hidden: true` on the role-token path also must not produce stubs
+/// when a client-supplied mask is present (role mask + client mask intersection
+/// stays Omit).
+#[tokio::test]
+async fn role_token_with_client_mask_and_stub_hidden_gets_no_stubs() {
+    let (app, db) = open_rbac(
+        "stub-role-client-mask",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    db.write().insert_node("Pub", "pub1", vec![]).unwrap();
+    db.write().insert_node("Pub", "pub2", vec![]).unwrap();
+    db.write().insert_node("Secret", "sec1", vec![]).unwrap();
+
+    // Role token with a client mask that includes pub1 only + stub_hidden: true.
+    // sec1 is outside both the role mask and the client mask — no stub must appear.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({
+            "cypher": "MATCH (n) RETURN n.id",
+            "mask": ["pub1", "sec1"],
+            "stub_hidden": true,
+        }),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    let body_str = v.to_string();
+    assert!(
+        !body_str.contains("sec1"),
+        "sec1 must not appear even with stub_hidden on role path: {v}"
+    );
+    assert!(
+        !body_str.contains("restricted"),
+        "restricted field must not appear on role path: {v}"
+    );
+}

@@ -370,7 +370,7 @@ fn mask_for_role_from(state: &FrozenOverlay, role: &str) -> Result<NodeMask> {
             }
         }
     }
-    Ok(NodeMask { visible })
+    Ok(NodeMask::from_ids(visible))
 }
 
 impl ReaderSnapshot {

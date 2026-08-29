@@ -5,7 +5,7 @@
 
 use core_api::{
     default_max_edges, json_to_value, EdgeEvent, EdgeHistoryEvent, EdgeInfo, HistoryChange,
-    HistoryEntry, HistoryResult, NodeInfo, ResultSet, RuleDef, Value,
+    HistoryEntry, HistoryResult, MaskedEdge, NodeInfo, ResultSet, RuleDef, Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -51,6 +51,41 @@ pub(crate) fn node_edges_json(edges: &[EdgeInfo]) -> Js {
             "derived": e.derived,
         })).collect::<Vec<_>>()
     })
+}
+
+/// Stub JSON for a node that exists but is hidden from a mask.
+/// Shape: `{"key": "<key>", "restricted": true}` — no other fields.
+pub(crate) fn stub_node_json(key: &str) -> Js {
+    json!({"key": key, "restricted": true})
+}
+
+/// Render a [`MaskedEdge`] list to the `node_edges` wire shape.
+///
+/// Hidden endpoints are rendered as `{"key": "<key>", "restricted": true}`;
+/// visible endpoints are rendered as plain key strings.
+pub(crate) fn masked_edges_json(edges: &[MaskedEdge]) -> Js {
+    let items: Vec<Js> = edges
+        .iter()
+        .map(|e| {
+            let src = if e.src_restricted {
+                json!({"key": e.src_key, "restricted": true})
+            } else {
+                json!(e.src_key)
+            };
+            let dst = if e.dst_restricted {
+                json!({"key": e.dst_key, "restricted": true})
+            } else {
+                json!(e.dst_key)
+            };
+            json!({
+                "edge_type": e.edge_type,
+                "src_key": src,
+                "dst_key": dst,
+                "derived": e.derived,
+            })
+        })
+        .collect();
+    json!({"edges": items})
 }
 
 pub(crate) fn result_set_json(rs: &ResultSet) -> Js {

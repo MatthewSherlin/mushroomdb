@@ -24,8 +24,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use core_api::{
     is_write_query, json_to_rows, json_to_value, AutoFk, BatchOp, DegreeConfig, Dir, GraphError,
-    IngestOptions, NodeMask, PageRankConfig, ResultSet, SharedDb, SuggestConfig, Value, WccConfig,
-    SUGGEST_DEFAULT_SEED,
+    IngestOptions, MaskMode, NodeMask, PageRankConfig, ResultSet, SharedDb, SuggestConfig, Value,
+    WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -728,9 +728,24 @@ async fn query(
     // When a client-supplied mask is present, route to query_masked (read-only).
     // Hold a single read guard for both from_keys and query_masked so the mask
     // and the query execute on the same database snapshot.
+    //
+    // `stub_hidden: true` opts into MaskMode::Stub for the mask; Cypher query
+    // behaviour is identical in both modes (hidden nodes are excluded from
+    // query results regardless of mode).
     if let Some(ref keys) = mask_keys {
+        let stub_hidden = body
+            .get("stub_hidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let db = state.db.read();
-        let mask = NodeMask::from_keys(&*db, keys.iter().map(String::as_str));
+        let mask = {
+            let m = NodeMask::from_keys(&*db, keys.iter().map(String::as_str));
+            if stub_hidden {
+                m.with_mode(MaskMode::Stub)
+            } else {
+                m
+            }
+        };
         return match db.query_masked(&cypher, &params, &mask) {
             Ok(rs) => format_query_result(rs, format),
             Err(GraphError::QueryError { detail })
@@ -920,16 +935,17 @@ async fn node_info(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
     Path(key): Path<String>,
+    Query(qs): Query<BTreeMap<String, String>>,
 ) -> Response {
     if let AuthIdentity::Role(ref role_name) = identity {
-        // Lock-free epoch snapshot: mask and node lookup on same frozen state
-        // (constraint 2 — RBAC mask coherence).
+        // Role-token path: hard-coded Omit mode; hidden keys are indistinguishable
+        // from absent keys.  `stub_hidden` query param is silently ignored here —
+        // role paths must NEVER produce stubs (RBAC invariant).
         let snap = state.db.reader();
         let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
-        // Hidden keys respond identically to absent keys — no "restricted" signal in v1.
         if !snap
             .resolve_key(&key)
             .is_some_and(|id| role_mask.contains_id(id))
@@ -941,6 +957,38 @@ async fn node_info(
             None => key_not_found(key),
         };
     }
+
+    // Full-token path: optional client mask + stub_hidden via query params.
+    // `mask=key1,key2` — comma-separated visible keys (empty string = no mask).
+    // `stub_hidden=true` — opt into MaskMode::Stub for this request.
+    let mask_param = qs.get("mask").map(String::as_str).unwrap_or("").trim();
+    if !mask_param.is_empty() {
+        let stub_hidden = qs
+            .get("stub_hidden")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let g = state.db.read();
+        let mask = {
+            let keys = mask_param
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let m = NodeMask::from_keys(&*g, keys);
+            if stub_hidden {
+                m.with_mode(MaskMode::Stub)
+            } else {
+                m
+            }
+        };
+        return match g.node_info_masked(&key, &mask) {
+            Some(core_api::MaskedNodeResult::Visible(info)) => json_ok(node_info_json(&info)),
+            Some(core_api::MaskedNodeResult::Restricted) => {
+                json_ok(crate::json::stub_node_json(&key))
+            }
+            None => key_not_found(key),
+        };
+    }
+
     let info = {
         let g = state.db.read();
         g.node_info(&key)
@@ -955,10 +1003,11 @@ async fn node_edges(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
     Path(key): Path<String>,
+    Query(qs): Query<BTreeMap<String, String>>,
 ) -> Response {
     if let AuthIdentity::Role(ref role_name) = identity {
-        // Lock-free epoch snapshot: mask and edge lookup on same frozen state
-        // (constraint 2 — RBAC mask coherence).
+        // Role-token path: hard-coded Omit mode.  `stub_hidden` query param is
+        // silently ignored — role paths must NEVER produce stubs (RBAC invariant).
         let snap = state.db.reader();
         let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
@@ -993,6 +1042,34 @@ async fn node_edges(
             Err(e) => graph_err(e),
         };
     }
+
+    // Full-token path: optional client mask + stub_hidden via query params.
+    let mask_param = qs.get("mask").map(String::as_str).unwrap_or("").trim();
+    if !mask_param.is_empty() {
+        let stub_hidden = qs
+            .get("stub_hidden")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let g = state.db.read();
+        let mask = {
+            let keys = mask_param
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let m = NodeMask::from_keys(&*g, keys);
+            if stub_hidden {
+                m.with_mode(MaskMode::Stub)
+            } else {
+                m
+            }
+        };
+        return match g.node_edges_masked(&key, &mask) {
+            Ok(edges) => json_ok(crate::json::masked_edges_json(&edges)),
+            Err(GraphError::KeyNotFound { key }) => key_not_found(key),
+            Err(e) => graph_err(e),
+        };
+    }
+
     let out = {
         let g = state.db.read();
         g.node_edges(&key)

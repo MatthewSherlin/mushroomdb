@@ -44,7 +44,8 @@ use crate::json::{
     parse_ingest_edges, result_set_json, rule_def_from_json,
 };
 use core_api::{
-    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, NodeMask, SharedDb, Value,
+    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, MaskMode, NodeMask,
+    SharedDb, Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -202,8 +203,19 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
             }
             None => return CallOutcome::ToolErr("mask must be an array of strings".into()),
         };
+        let stub_hidden = args
+            .get("stub_hidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let g = db.read();
-        let mask = NodeMask::from_keys(&*g, keys.iter().map(String::as_str));
+        let mask = {
+            let m = NodeMask::from_keys(&*g, keys.iter().map(String::as_str));
+            if stub_hidden {
+                m.with_mode(MaskMode::Stub)
+            } else {
+                m
+            }
+        };
         return match g.query_masked(cypher, &params, &mask) {
             Ok(rs) => CallOutcome::ToolOk(result_set_json(&rs)),
             Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
