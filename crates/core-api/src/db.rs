@@ -446,7 +446,15 @@ pub struct BackupReport {
     pub files: Vec<String>,
     /// Total bytes written across all copied files.
     pub bytes: u64,
-    /// `true` when the destination opened cleanly and passed CRC section verification.
+    /// `true` when the destination opened cleanly and passed post-copy checks.
+    ///
+    /// For stores that have a `snapshot.bin` this means: all V8 section CRCs
+    /// matched **and** the destination opened without error.
+    ///
+    /// For WAL-only stores (no `snapshot.bin`) there is no snapshot to
+    /// CRC-check; `verified` is `true` when the destination opened and
+    /// replayed the WAL without error (record-level checksums in the WAL
+    /// provide the integrity signal, not section CRCs).
     pub verified: bool,
 }
 
@@ -5374,9 +5382,24 @@ impl<F: Fs> GraphDb<F> {
     /// Copies every durable file in the database directory — `snapshot.bin`,
     /// `wal.bin`, all `wal.<N>.archive` files, `wal.floor`, `wal.genesis`, and
     /// `roles.json` — into a freshly created `dest` directory using OS-level
-    /// `copy` calls (no large in-process buffers).  Consistency is guaranteed by
-    /// construction: the caller holds `&self`, which excludes any concurrent
-    /// writer holding `&mut self`.
+    /// `copy` calls (no large in-process buffers).
+    ///
+    /// # Consistency guarantee
+    ///
+    /// The guarantee is **process-local**: the caller holds `&self`, which
+    /// prevents any concurrent writer in the **same process** from modifying
+    /// the files during the copy.  Running `mushroomdb backup` against a
+    /// directory that is **concurrently being written by another process** (e.g.
+    /// `mushroomdb serve`) is **unsafe** — the copy can be torn.  The post-copy
+    /// `verified: true` result reduces but does not eliminate the risk of a
+    /// silent corrupt backup (CRC catches many bit-flips; it cannot catch a
+    /// consistent mid-write snapshot).
+    ///
+    /// **The safe path for a live-served store is `POST /backup` on the HTTP
+    /// server.** That handler acquires the read lock on the shared database
+    /// before calling this method, which is the correct cross-process
+    /// synchronisation point because the server is the single process writing
+    /// the files.
     ///
     /// After copying, opens the destination read-only and runs the CRC section
     /// verifier (`verify_snapshot`) to confirm byte-for-byte integrity.

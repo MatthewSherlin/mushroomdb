@@ -2,10 +2,20 @@
 //!
 //! Supports two formats:
 //!   - `jsonl`: nodes.jsonl, edges.jsonl, rules.jsonl (always deterministic)
-//!   - `parquet`: nodes.parquet, edges.parquet, rules.parquet
+//!   - `parquet`: nodes.parquet, edges.parquet, rules.parquet (byte-identical
+//!     output is NOT guaranteed across parquet-rs versions; use JSONL when
+//!     byte-stable reproducibility is required)
 //!
 //! Two runs on the same store state produce byte-identical JSONL output (sorted
 //! by key / (edge_type, src, dst) / name — callers must pre-sort the slices).
+//!
+//! # Float precision loss
+//!
+//! `Value::Float` values that are NaN or ±Inf are not representable in JSON.
+//! They are serialised as JSON `null` rather than causing the export to fail.
+//! This is a lossy mapping; the original value is irrecoverable from the
+//! export.  Stores that need exact float fidelity should use the binary backup
+//! command instead of export.
 
 use core_api::{ExportEdge, NodeInfo, RuleDef, Value};
 use std::io::Write as _;
@@ -42,10 +52,16 @@ impl ExportFormat {
 }
 
 /// Serialize a `Value` to serde_json `Value`.
+///
+/// NaN and ±Inf floats are not representable in JSON and are mapped to `null`
+/// (see module-level docs for the loss semantics).
 fn value_to_json(v: &Value) -> serde_json::Value {
     match v {
         Value::Int(i) => serde_json::Value::Number((*i).into()),
-        Value::Float(f) => serde_json::json!(*f),
+        // serde_json::Number::from_f64 returns None for NaN/±Inf; map those to null.
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Value::Str(s) => serde_json::Value::String(s.clone()),
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::List(xs) => serde_json::Value::Array(xs.iter().map(value_to_json).collect()),
@@ -126,6 +142,11 @@ pub fn write_jsonl(
 /// - rules.parquet: name (Utf8), definition (Utf8, JSON)
 ///
 /// `nodes` must be sorted by key, `edges` by (edge_type, src, dst), `rules` by name.
+///
+/// Compression: Snappy (parquet-rs default).  This is a format detail, not a
+/// stability contract — the column encoding and page layout may differ across
+/// parquet-rs versions.  Use JSONL export when byte-stable reproducibility is
+/// required.
 pub fn write_parquet(
     nodes: &[NodeInfo],
     edges: &[ExportEdge],

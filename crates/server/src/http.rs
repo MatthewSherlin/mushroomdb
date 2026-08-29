@@ -23,9 +23,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use core_api::{
-    is_write_query, json_to_rows, json_to_value, AutoFk, BatchOp, DegreeConfig, Dir, GraphError,
-    IngestOptions, MaskMode, NodeMask, PageRankConfig, ResultSet, SharedDb, SuggestConfig, Value,
-    WccConfig, SUGGEST_DEFAULT_SEED,
+    is_write_query, json_to_rows, json_to_value, AutoFk, BackupReport, BatchOp, DegreeConfig, Dir,
+    GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig, ResultSet, SharedDb,
+    SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -338,6 +338,7 @@ fn build_app(
         .route("/algo/pagerank", post(algo_pagerank))
         .route("/algo/wcc", post(algo_wcc))
         .route("/algo/degree", post(algo_degree))
+        .route("/backup", post(backup))
         .route("/watch", get(crate::ws::watch))
         .route("/subscribe", get(crate::subscribe::subscribe))
         .with_state(state.clone());
@@ -1705,6 +1706,78 @@ async fn remove_node_prop(
     match blocking_write(move || db.submit_batch(vec![BatchOp::RemoveProp { key, field }])).await {
         Ok(_) => json_ok(json!({"ok": true})),
         Err(resp) => resp,
+    }
+}
+
+/// `POST /backup` — take a consistent backup of the database to `dest`.
+///
+/// The read guard is held for the duration of the file copies, which is the
+/// correct cross-process synchronisation point: the server is the single
+/// process touching the files, so holding the read lock excludes concurrent
+/// in-process writers.  This is the safe alternative to running the
+/// `mushroomdb backup` CLI against a live-served store.
+///
+/// Request body: `{"dest": "/absolute/path/to/backup-dir"}`
+///
+/// Responses:
+/// - `200 OK` — backup completed; body is a `BackupReport` JSON object.
+/// - `500 Internal Server Error` — backup succeeded but verification failed;
+///   body is the `BackupReport` JSON object (examine `files` and `bytes`).
+/// - `400 Bad Request` — missing or invalid `dest`.
+/// - `403 Forbidden` — role-bound token; this endpoint requires a full-access token.
+async fn backup(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: /backup requires a full-access token");
+    }
+    let dest = match body.get("dest").and_then(Js::as_str) {
+        Some(s) if !s.is_empty() => std::path::PathBuf::from(s),
+        _ => return err_response("missing or empty \"dest\" field"),
+    };
+    let db = state.db.clone();
+    let report: BackupReport = match tokio::task::spawn_blocking(move || {
+        // The read guard is held inside spawn_blocking so file copies happen
+        // with the write lock excluded.  The guard drops at end of closure.
+        let g = db.read();
+        g.backup_to(&dest)
+    })
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return graph_err(e),
+        Err(_) => return err_response("backup task panicked"),
+    };
+
+    let body = match serde_json::to_value(BackupReportJson::from(&report)) {
+        Ok(v) => v,
+        Err(e) => return err_response(e.to_string()),
+    };
+
+    if report.verified {
+        json_ok(body)
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+    }
+}
+
+/// JSON-serialisable projection of [`BackupReport`].
+#[derive(serde::Serialize)]
+struct BackupReportJson<'a> {
+    files: &'a [String],
+    bytes: u64,
+    verified: bool,
+}
+
+impl<'a> From<&'a BackupReport> for BackupReportJson<'a> {
+    fn from(r: &'a BackupReport) -> Self {
+        Self {
+            files: &r.files,
+            bytes: r.bytes,
+            verified: r.verified,
+        }
     }
 }
 

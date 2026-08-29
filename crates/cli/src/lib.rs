@@ -192,7 +192,9 @@ Usage:
   mushroomdb snapshot <db-dir> [--keep-wal]
   mushroomdb migrate <db-dir>
   mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
-  mushroomdb backup <db-dir> <dest>   consistent copy of the database to <dest>
+  mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
+                                      WARNING: unsafe against a concurrently running serve process;
+                                      use POST /backup on the HTTP server for live-serve backups
   mushroomdb export <db-dir> <dest> --format jsonl|parquet   export all data
   mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb algo pagerank <db-dir> [--top N]
@@ -784,16 +786,10 @@ pub fn run_backup(db_dir: &Path, dest: &Path) -> Result<BackupReport, CliError> 
 /// Format a [`BackupReport`] for display.
 pub fn format_backup(dest: &Path, report: &BackupReport) -> String {
     let mut out = String::new();
-    let _ = std::fmt::write(
-        &mut out,
-        format_args!(
-            "backup to: {}\n  files: {}\n  bytes: {}\n  verified: {}\n",
-            dest.display(),
-            report.files.join(", "),
-            report.bytes,
-            report.verified
-        ),
-    );
+    writeln!(out, "backup to: {}", dest.display()).unwrap();
+    writeln!(out, "  files: {}", report.files.join(", ")).unwrap();
+    writeln!(out, "  bytes: {}", report.bytes).unwrap();
+    writeln!(out, "  verified: {}", report.verified).unwrap();
     out
 }
 
@@ -2407,6 +2403,64 @@ mod tests {
             let meta = std::fs::metadata(dst.join(f)).expect("metadata");
             assert!(meta.len() > 0, "{f} must be non-empty");
         }
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// I1: exporting a store containing NaN/Inf floats must succeed, not panic.
+    /// The NaN field must be serialised as JSON null (lossy but safe).
+    #[test]
+    fn run_export_jsonl_nan_float_becomes_null() {
+        use core_api::{GraphDb, Value};
+        let src = tmp("cli-export-nan-src");
+        let dst = tmp("cli-export-nan-dst");
+
+        // Insert a node with NaN, +Inf, and -Inf properties via the public API.
+        {
+            let mut db = GraphDb::open(&src).unwrap();
+            db.insert_node(
+                "Sensor",
+                "s1",
+                vec![
+                    ("nan_val".into(), Value::Float(f64::NAN)),
+                    ("pos_inf".into(), Value::Float(f64::INFINITY)),
+                    ("neg_inf".into(), Value::Float(f64::NEG_INFINITY)),
+                    ("normal".into(), Value::Float(1.5)),
+                ],
+            )
+            .unwrap();
+        }
+
+        // Export must succeed.
+        run_export(&src, &dst, &ExportFormat::Jsonl).expect("export with NaN must succeed");
+
+        // nodes.jsonl must exist and the NaN fields must be null.
+        let content =
+            std::fs::read_to_string(dst.join("nodes.jsonl")).expect("nodes.jsonl missing");
+        let row: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).expect("valid json line");
+        assert_eq!(
+            row["nan_val"],
+            serde_json::Value::Null,
+            "NaN must export as null"
+        );
+        assert_eq!(
+            row["pos_inf"],
+            serde_json::Value::Null,
+            "+Inf must export as null"
+        );
+        assert_eq!(
+            row["neg_inf"],
+            serde_json::Value::Null,
+            "-Inf must export as null"
+        );
+        // Normal float must survive.
+        assert_eq!(
+            row["normal"],
+            serde_json::json!(1.5),
+            "normal float roundtrips"
+        );
+
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);
     }

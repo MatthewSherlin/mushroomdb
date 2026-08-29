@@ -3098,3 +3098,95 @@ async fn http_upsert_edge_idempotent_when_edge_exists() {
         "edge already existed — edge_inserted must be false"
     );
 }
+
+// ── POST /backup ──────────────────────────────────────────────────────────────
+
+/// C1b: POST /backup with a full-access token and a concurrent writer thread
+/// must produce a clean, openable backup whose node set matches the source.
+#[tokio::test]
+async fn http_backup_live_serve_dest_opens_clean() {
+    use std::sync::{Arc, Barrier};
+
+    let src_dir = tmp("http-backup-src");
+    let dst_dir = tmp("http-backup-dst");
+
+    let db = SharedDb::open(&src_dir).unwrap();
+    // Seed initial data.
+    {
+        let mut w = db.write();
+        w.insert_node("Person", "alice", vec![]).unwrap();
+        w.insert_node("Person", "bob", vec![]).unwrap();
+    }
+
+    let app = router_with_auth(db.clone(), Some("admin".into()));
+
+    // Spawn a concurrent writer thread that races with the backup.
+    let barrier = Arc::new(Barrier::new(2));
+    let db_writer = db.clone();
+    let barrier_clone = barrier.clone();
+    let writer = std::thread::spawn(move || {
+        barrier_clone.wait(); // release once main thread is about to send backup
+        for i in 0..20u32 {
+            let key = format!("concurrent-{i}");
+            let _ = db_writer.write().insert_node("Person", &key, vec![]);
+        }
+    });
+
+    barrier.wait(); // let writer start racing
+
+    let req = authed_json_req(
+        "POST",
+        "/backup",
+        "admin",
+        json!({"dest": dst_dir.to_str().unwrap()}),
+    );
+    let (status, body, _) = send(app, req).await;
+    writer.join().unwrap();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "POST /backup must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert_eq!(v["verified"], json!(true), "backup must be verified");
+    assert!(
+        v["bytes"].as_u64().unwrap_or(0) > 0,
+        "backup bytes must be > 0"
+    );
+
+    // The destination must open cleanly and contain at least the seeded nodes.
+    let backup_db = SharedDb::open(&dst_dir).expect("backup dest must open");
+    assert!(
+        backup_db.read().has_node("alice"),
+        "alice must be in backup"
+    );
+    assert!(backup_db.read().has_node("bob"), "bob must be in backup");
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&dst_dir);
+}
+
+/// C1b: POST /backup with a role-bound token must return 403.
+#[tokio::test]
+async fn http_backup_role_token_is_forbidden() {
+    let (app, _db) = open_rbac(
+        "http-backup-role-403",
+        &[("analyst", &["Person"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/backup",
+        "role-tok",
+        json!({"dest": "/tmp/should-not-exist"}),
+    );
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "role token must be 403 on POST /backup"
+    );
+}

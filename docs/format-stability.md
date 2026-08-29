@@ -242,13 +242,32 @@ current `wal.bin`.
 
 ### 1 — Take a consistent backup
 
+**If the store is idle** (no concurrent writer process):
+
 ```sh
 # Archive the WAL before backup so the archive lands in the backup too.
 mushroomdb snapshot <db-dir> --archive-wal
 
-# Now copy the full directory (snapshot + archives + genesis marker) atomically.
+# Copy the full directory (snapshot + archives + genesis marker).
 mushroomdb backup <db-dir> <backup-dir>
 ```
+
+**If the store is live-served** (a `mushroomdb serve` process is running), use
+the HTTP endpoint — the server holds the read lock during the copy, which is
+the correct cross-process synchronisation point:
+
+```sh
+curl -X POST http://localhost:8080/backup \
+  -H "Authorization: Bearer <full-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"dest": "/path/to/backup-dir"}'
+```
+
+> **WARNING:** Running `mushroomdb backup` against a directory that a separate
+> `mushroomdb serve` process is writing to is **unsafe**.  The file copies are
+> not atomic across processes and can produce a torn backup that only fails at
+> restore time.  The `verified: true` result reduces but does not eliminate
+> this risk.
 
 `backup` copies `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
 `wal.floor`, `wal.genesis`, and `roles.json` into the destination directory.
