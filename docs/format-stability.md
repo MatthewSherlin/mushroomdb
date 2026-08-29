@@ -92,7 +92,7 @@ the snapshot file, or periodically as a sanity check on storage hardware.
 
 ### WAL (`wal.bin`)
 
-WAL record discriminants 0–17 are append-only: once assigned, a discriminant
+WAL record discriminants 0–20 are append-only: once assigned, a discriminant
 is never reused for a different record shape. New record types receive the next
 available discriminant.
 

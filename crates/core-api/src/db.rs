@@ -4687,10 +4687,11 @@ impl<F: Fs> GraphDb<F> {
     /// results are ranked by the text list alone through the same RRF path
     /// (each text result scores `1/(60 + rank)` from that single list).
     ///
-    /// When `label` is `None` and no HNSW rule covers `vector_field`, the
-    /// brute-force scan cannot enumerate a node universe; `find_similar_vector`
-    /// returns an empty result and the fused ranking is text-only.  Document
-    /// this in your application layer if you rely on it.
+    /// When `label` is `None`, the vector leg **always** returns empty results.
+    /// Internally `label` is mapped to `""`, which does not match any rule-created
+    /// HNSW index (all such indexes are keyed to a specific non-empty label), and
+    /// the brute-force fallback finds no nodes with an empty label.  The fused
+    /// ranking is therefore text-only in this case.
     pub fn search_hybrid(
         &self,
         text_field: &str,
@@ -5034,18 +5035,24 @@ impl<F: Fs> GraphDb<F> {
     /// Parse `roles.json` bytes from `fs`.
     ///
     /// Return values:
-    ///   `Ok(Some(roles))` — file present and valid (roles may be an empty vec)
-    ///   `Ok(Some(vec![]))` — file absent (fs returns empty bytes) → no roles defined
+    ///   `Ok(Some(roles))` — file absent (returns `vec![]`) **or** file present
+    ///                       and valid; in both cases `mask_for_role` uses the
+    ///                       list normally (an absent file means no roles defined).
     ///   `Ok(None)`        — file present but corrupt or unrecognised version
-    ///                       → poisoned state; `mask_for_role` will return `Err` for any role token
+    ///                       → poisoned state; `mask_for_role` returns `Err` for
+    ///                       any role name until the file is fixed and the DB
+    ///                       re-opened (or `apply_schema` is called to repair it).
     ///
-    /// Note: absent and healthy-but-empty both produce `Some`; `None` means
-    /// corrupt — the opposite of what an optional "file missing" convention would
-    /// suggest.  The open path stores this result on `db.roles` directly.
+    /// Note: `None` signals corruption, not absence — the opposite of what an
+    /// optional "file missing" convention would suggest.  The open path stores
+    /// this result on `db.roles` directly.
     fn load_roles_from_fs(fs: &F) -> Result<Option<Vec<RoleDef>>> {
         let bytes = fs.read(FileId::Roles).map_err(GraphError::Io)?;
         if bytes.is_empty() {
-            // Missing file: no roles defined.
+            // Empty bytes means either the file is absent or zero-byte — both
+            // are treated identically as "no roles defined".  A zero-byte
+            // roles.json does NOT widen access: an absent file and a zero-byte
+            // file both resolve to an empty role list (sees nothing by default).
             return Ok(Some(vec![]));
         }
         match serde_json::from_slice::<RolesFile>(&bytes) {

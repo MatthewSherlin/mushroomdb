@@ -26,8 +26,9 @@
 //!
 //! # v1 scope
 //!
-//! Rule-edge events and write-mutation events only. Incremental query
-//! subscriptions (differential dataflow) are roadmap (Plan-15 T3+).
+//! Rule-edge events and write-mutation events only. Query subscriptions
+//! ([`GraphDb::subscribe_query`]) perform a full re-run per commit; differential
+//! evaluation is v0.3 wait-list.
 
 use core_storage::Value;
 use serde::Serialize;

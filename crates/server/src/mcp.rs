@@ -935,7 +935,7 @@ fn tools_list() -> Js {
                             "description": "Query embedding vector. Omit for text-only ranking."
                         },
                         "vector_field": { "type": "string", "description": "Property field holding embedding vectors (default: embedding)." },
-                        "label": { "type": "string", "description": "Restrict vector search to nodes with this label. Required when relying on brute-force (no HNSW rule covers the field)." },
+                        "label": { "type": "string", "description": "Restrict vector search to nodes with this label. Required when relying on brute-force (no HNSW rule covers the field). If omitted, the vector leg always returns empty results (no rule-created HNSW index covers the unlabeled path); ranking is text-only in that case." },
                         "k": { "type": "integer", "description": "Maximum results to return (default: 10)." }
                     },
                     "required": ["query_text", "text_field"]
