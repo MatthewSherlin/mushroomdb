@@ -1148,7 +1148,7 @@ mod tests {
     // --- existing tools ---
 
     #[test]
-    fn test_tools_list_includes_all_fifteen() {
+    fn test_tools_list_includes_all_expected() {
         let db = demo_db();
         let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().expect("tools array");

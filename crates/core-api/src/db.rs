@@ -3477,6 +3477,25 @@ impl<F: Fs> GraphDb<F> {
 
     /// Distribute post-commit events to all live subscribers.
     ///
+    /// Build a row-key → row-data map from a [`ResultSet`].
+    ///
+    /// Each row is serialized to JSON to form its key; a debug fallback is used
+    /// if serialization fails. Used by both the initial-seed path in
+    /// [`Self::subscribe_query`] and the per-commit diff path in
+    /// [`Self::distribute_events`] to keep the two in sync.
+    fn result_to_row_map(
+        result: &core_query::ResultSet,
+    ) -> std::collections::HashMap<String, Vec<Option<Value>>> {
+        (0..result.len())
+            .map(|i| {
+                let row = result.row(i).to_vec();
+                let key =
+                    serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
+                (key, row)
+            })
+            .collect()
+    }
+
     /// Called from `log_then_apply_with` after apply + fsync, before the
     /// legacy MutationEvent sink. Prunes dead `Weak` entries in-place.
     ///
@@ -3566,18 +3585,16 @@ impl<F: Fs> GraphDb<F> {
                 };
                 let result = match execute(&self.view(), &entry.ops, &Params(&empty_params)) {
                     Ok(r) => r,
-                    Err(_) => return true, // keep entry; skip diff on transient error
+                    Err(e) => {
+                        // Keep the subscription alive; skip the diff for this commit.
+                        // Re-run errors are transient (e.g., planner change) and
+                        // self-heal when the next commit succeeds.
+                        eprintln!("[mushroomdb] subscribe_query re-run failed: {e}");
+                        return true;
+                    }
                 };
                 // Build new row map: serialized-key → row data.
-                let new_row_map: std::collections::HashMap<String, Vec<Option<Value>>> = (0
-                    ..result.len())
-                    .map(|i| {
-                        let row = result.row(i).to_vec();
-                        let key =
-                            serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
-                        (key, row)
-                    })
-                    .collect();
+                let new_row_map = Self::result_to_row_map(&result);
                 // Removed rows: in prev but not in new.
                 for (key, row) in &entry.prev_row_map {
                     if !new_row_map.contains_key(key) {
@@ -3836,14 +3853,7 @@ impl<F: Fs> GraphDb<F> {
             }
         })?;
         let columns = initial.columns().to_vec();
-        let prev_row_map: std::collections::HashMap<String, Vec<Option<Value>>> = (0..initial
-            .len())
-            .map(|i| {
-                let row = initial.row(i).to_vec();
-                let key = serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
-                (key, row)
-            })
-            .collect();
+        let prev_row_map = Self::result_to_row_map(&initial);
         let inner = SubInner::new(self.sub_capacity());
         self.query_subscriptions.push(QuerySubEntry {
             ops,
@@ -4745,7 +4755,7 @@ impl<F: Fs> GraphDb<F> {
     /// `scratch_search(field, q)` at every quiescent state.
     #[doc(hidden)]
     pub fn scratch_search(&self, field: &str, query: &str) -> Vec<(String, f64)> {
-        use core_storage::fulltext::{parse_query, tokenize_stemmed_with_positions};
+        use core_storage::fulltext::{parse_query, value_tokens_stemmed_with_positions};
         use std::collections::BTreeMap;
 
         let groups = parse_query(query);
@@ -4782,22 +4792,11 @@ impl<F: Fs> GraphDb<F> {
             let Some(value) = self.props_view().get(id, field).map(|vr| vr.into_value()) else {
                 continue;
             };
+            // Use value_tokens_stemmed_with_positions so list elements are
+            // separated by POSITION_GAP — identical to the index path, which
+            // prevents phrase queries from matching across element boundaries.
             let stemmed_with_pos = match &value {
-                Value::Str(s) => tokenize_stemmed_with_positions(s),
-                Value::List(items) => {
-                    let combined: String = items
-                        .iter()
-                        .filter_map(|v| {
-                            if let Value::Str(s) = v {
-                                Some(s.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    tokenize_stemmed_with_positions(&combined)
-                }
+                Value::Str(_) | Value::List(_) => value_tokens_stemmed_with_positions(&value),
                 _ => continue,
             };
             let dl = stemmed_with_pos.len() as u32;

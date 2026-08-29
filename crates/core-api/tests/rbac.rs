@@ -449,3 +449,53 @@ fn roles_survive_reopen() {
     // (No nodes in this db, so mask resolves to empty — that's correct)
     assert!(mask.is_ok(), "mask_for_role must work after re-open");
 }
+
+// ---------------------------------------------------------------------------
+// Item 21: Repair path — apply_schema over a corrupt sidecar heals the state
+// ---------------------------------------------------------------------------
+
+/// When roles.json is corrupt at open (poisoning the state so mask_for_role
+/// returns Err), calling apply_schema with a valid schema must repair the
+/// sidecar and restore mask_for_role to Ok.
+#[test]
+fn apply_schema_over_corrupt_sidecar_repairs_roles() {
+    let dir = tmp("roles-repair");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Initial good state.
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        let schema = Schema {
+            fulltext: vec![],
+            rules: vec![],
+            views: vec![],
+            roles: vec![analyst_role()],
+        };
+        db.apply_schema(&schema).unwrap();
+    }
+
+    // Corrupt roles.json.
+    std::fs::write(dir.join("roles.json"), b"not valid json").unwrap();
+
+    // Re-open: succeeds but mask_for_role is poisoned.
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert!(
+        db.mask_for_role("analyst").is_err(),
+        "mask_for_role must fail with corrupt roles.json"
+    );
+
+    // Repair: apply schema with valid roles — writes a fresh roles.json.
+    let repair_schema = Schema {
+        fulltext: vec![],
+        rules: vec![],
+        views: vec![],
+        roles: vec![analyst_role()],
+    };
+    db.apply_schema(&repair_schema).expect("apply_schema over corrupt sidecar must succeed");
+
+    // State is now repaired — mask_for_role must return Ok.
+    assert!(
+        db.mask_for_role("analyst").is_ok(),
+        "mask_for_role must succeed after repair via apply_schema"
+    );
+}

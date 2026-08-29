@@ -135,9 +135,9 @@ fn handshake_initialize_then_initialized_is_silent() {
     );
 }
 
-/// Binding: tools/list returns exactly the sixteen tools with the specified schemas.
+/// Binding: tools/list returns all expected tools with the specified schemas.
 #[test]
-fn tools_list_returns_fifteen_tools_with_schemas() {
+fn tools_list_returns_all_tools_with_schemas() {
     let stdin = req(json!(1), "tools/list", None);
     let (res, out) = exchange(open("list"), &stdin);
     assert!(res.is_ok(), "{res:?}");
