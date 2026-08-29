@@ -157,11 +157,26 @@ jobs:
         with:
           toolchain: "1.92.0"
 
+      # macOS runners don't ship every CPython we target — install them so
+      # maturin's -i list resolves (Linux builds get them from the manylinux
+      # container's /opt/python instead).
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: startsWith(matrix.os, 'macos')
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.12
+            3.13
+
       # Build manylinux wheel on Linux, native wheel on macOS.
+      # The explicit -i interpreter list is load-bearing: without it the
+      # aarch64 container build died with "Couldn't find any python
+      # interpreters from 'python3'" (v0.2.0 publish, run 33262876469).
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: build
-          args: --release --out dist
+          args: --release --out dist -i 3.10 3.11 3.12 3.13
           working-directory: bindings/python
           target: ${{ matrix.maturin-target }}
           # Use manylinux container on Linux for broad compatibility.
@@ -217,19 +232,33 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
+      # Only rewrite the version when the ref IS a version tag; a
+      # workflow_dispatch from main gets "main" here, which npm rejects
+      # (v0.2.0 publish failure) — the committed package.json version is
+      # already correct in that case.
       - name: set version from tag
         working-directory: packaging/npm
         run: |
-          VER="${GITHUB_REF_NAME#v}"
-          npm version "$VER" --no-git-tag-version --allow-same-version
+          if [[ "$GITHUB_REF_NAME" == v* ]]; then
+            npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+          else
+            echo "ref '$GITHUB_REF_NAME' is not a version tag — keeping package.json version"
+          fi
 
       # --provenance attaches a Sigstore attestation (requires id-token: write).
       # NODE_AUTH_TOKEN is the npm granular token from the NPM_TOKEN secret.
+      # Skip if this exact version is already on the registry (idempotent re-runs).
       - name: npm publish mushroomdb
         working-directory: packaging/npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+        run: |
+          VER=$(node -p "require('./package.json').version")
+          if npm view "mushroomdb@$VER" version >/dev/null 2>&1; then
+            echo "mushroomdb@$VER already published — skipping"
+          else
+            npm publish --provenance --access public
+          fi
 
   publish-npm-client:
     name: npm (mushroomdb-client)
@@ -254,14 +283,24 @@ jobs:
           npm ci
           npm run build
 
+      # Same tag-guard + idempotency as the launcher job above.
       - name: set version from tag
         working-directory: clients/typescript
         run: |
-          VER="${GITHUB_REF_NAME#v}"
-          npm version "$VER" --no-git-tag-version --allow-same-version
+          if [[ "$GITHUB_REF_NAME" == v* ]]; then
+            npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+          else
+            echo "ref '$GITHUB_REF_NAME' is not a version tag — keeping package.json version"
+          fi
 
       - name: npm publish mushroomdb-client
         working-directory: clients/typescript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+        run: |
+          VER=$(node -p "require('./package.json').version")
+          if npm view "mushroomdb-client@$VER" version >/dev/null 2>&1; then
+            echo "mushroomdb-client@$VER already published — skipping"
+          else
+            npm publish --provenance --access public
+          fi
