@@ -1120,3 +1120,135 @@ fn reopen_rebuild_identity_v2() {
     assert!(!rebuilt_keys.is_empty(), "d0 must be found after reopen");
     assert_eq!(rebuilt_keys[0], "d0");
 }
+
+// ---------------------------------------------------------------------------
+// v2: Pinned edge-case behaviors
+// ---------------------------------------------------------------------------
+
+/// Pin: a pure negation query ("-term" with no positive atom) returns empty.
+///
+/// The candidates may be non-empty (all nodes without "embedded"), but no
+/// positive scoring happens so every group_score stays 0.0, which the
+/// `if group_score > 0.0` guard suppresses.
+#[test]
+fn all_negation_query_returns_empty() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "body").unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("graph database embedded".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("graph database".into()))],
+    )
+    .unwrap();
+
+    let r = db.search("body", "-embedded");
+    assert!(r.is_empty(), "pure negation query must return empty");
+}
+
+/// Pin: "graph OR -embedded" returns the same key ordering as "graph".
+///
+/// The negation-only OR group contributes group_score = 0.0, which the scoring
+/// guard suppresses.  The effective query is therefore just "graph".
+#[test]
+fn negation_only_or_group_same_as_plain_query() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "body").unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("graph database".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("rust embedded".into()))],
+    )
+    .unwrap();
+
+    let keys_plain: Vec<String> = db
+        .search("body", "graph")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let keys_or_neg: Vec<String> = db
+        .search("body", "graph OR -embedded")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        keys_plain, keys_or_neg,
+        "negation-only OR group must not change result ordering"
+    );
+}
+
+/// Phrase queries do NOT match across Value::List element boundaries.
+///
+/// The index inserts a position gap (> 1) between list elements.  Adjacent
+/// positions require delta == 1, so cross-boundary adjacency is impossible.
+#[test]
+fn list_phrase_does_not_match_across_element_boundary() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "body").unwrap();
+    // body = ["graph", "database"] — two separate list elements; phrase must NOT match.
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![(
+            "body".into(),
+            Value::List(vec![
+                Value::Str("graph".into()),
+                Value::Str("database".into()),
+            ]),
+        )],
+    )
+    .unwrap();
+    // body = "graph database" — single string; phrase MUST match.
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("graph database".into()))],
+    )
+    .unwrap();
+
+    let r = db.search("body", "\"graph database\"");
+    assert_eq!(
+        r.len(),
+        1,
+        "phrase must not match across list element boundary"
+    );
+    assert_eq!(r[0].0, "d1", "only the single-string doc must match");
+}
+
+/// Phrase within a single list element still matches.
+///
+/// Tokens within one list element have consecutive positions, so a phrase that
+/// fits entirely inside one element is found as expected.
+#[test]
+fn list_phrase_matches_within_single_element() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "body").unwrap();
+    // body = ["graph database", "other"]; "graph database" is adjacent within elem 0.
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![(
+            "body".into(),
+            Value::List(vec![
+                Value::Str("graph database".into()),
+                Value::Str("other".into()),
+            ]),
+        )],
+    )
+    .unwrap();
+
+    let r = db.search("body", "\"graph database\"");
+    assert_eq!(r.len(), 1, "phrase within a single list element must match");
+    assert_eq!(r[0].0, "d0");
+}

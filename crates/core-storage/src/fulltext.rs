@@ -95,26 +95,32 @@ pub fn tokenize_stemmed_with_positions(s: &str) -> Vec<(String, u32)> {
 }
 
 /// Tokenize a `Value`, applying stemming and returning `(stemmed_token, position)`.
-/// `Value::List` of `Str` elements is treated as a concatenated string field;
-/// positions are global across all list elements.
+///
+/// `Value::List` of `Str` elements: each element is tokenized independently.
+/// A `POSITION_GAP` (> 1) is inserted between elements so that phrase queries
+/// cannot match across list element boundaries — adjacency requires consecutive
+/// positions (differing by exactly 1), and the gap guarantees they never are.
 pub fn value_tokens_stemmed_with_positions(v: &Value) -> Vec<(String, u32)> {
     match v {
         Value::Str(s) => tokenize_stemmed_with_positions(s),
         Value::List(items) => {
-            // Concatenate all Str elements with a virtual separator that
-            // does not produce a token (space).  Positions are sequential.
-            let combined: String = items
-                .iter()
-                .filter_map(|item| {
-                    if let Value::Str(s) = item {
-                        Some(s.as_str())
-                    } else {
-                        None
+            // Gap between list elements: any value > 1 breaks cross-boundary adjacency.
+            const POSITION_GAP: u32 = 2;
+            let mut result: Vec<(String, u32)> = Vec::new();
+            let mut pos_offset: u32 = 0;
+            for item in items {
+                if let Value::Str(s) = item {
+                    let toks = tokenize_stemmed_with_positions(s);
+                    for (tok, local_pos) in &toks {
+                        result.push((tok.clone(), pos_offset + local_pos));
                     }
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            tokenize_stemmed_with_positions(&combined)
+                    if !toks.is_empty() {
+                        // Advance past this element's tokens plus the gap.
+                        pos_offset += toks.len() as u32 + POSITION_GAP;
+                    }
+                }
+            }
+            result
         }
         _ => vec![],
     }
@@ -656,6 +662,11 @@ impl FulltextIndex {
                     }
                 }
 
+                // Negation-only groups produce group_score = 0.0 (no positive atom
+                // contributes) and are suppressed here.  This is deliberate: "-term"
+                // alone does not rank surviving docs — it only reduces the candidate
+                // set in group_candidates.  "graph OR -embedded" therefore behaves
+                // identically to "graph": the negation group is silently dropped.
                 if group_score > 0.0 {
                     *scores.entry(node_id).or_insert(0.0) += group_score;
                 }
@@ -1240,5 +1251,162 @@ mod tests {
         idx.add_tokens(0, "f", &Value::Str("rust embedded".into()));
         assert_eq!(idx.search("f", "ru*", 0).len(), 1);
         assert_eq!(idx.search("f", "rust", 0).len(), 1);
+    }
+
+    /// Pin: a pure negation query (no positive atom) always returns empty.
+    ///
+    /// When a group has no positive atoms, `group_candidates` starts with ALL
+    /// nodes in the field and removes matching ones.  However, the scoring loop
+    /// produces `group_score = 0.0` (no positive atom contributes), and the
+    /// `if group_score > 0.0` guard then suppresses every candidate.  The result
+    /// is deliberately empty — negation alone does not rank surviving docs.
+    #[test]
+    fn all_negation_query_returns_empty() {
+        let mut idx = FulltextIndex::new();
+        idx.enable("Doc", "body");
+        idx.add_tokens(0, "body", &Value::Str("graph database embedded".into()));
+        idx.add_tokens(1, "body", &Value::Str("graph database".into()));
+
+        let r = idx.search("body", "-embedded", 0);
+        assert!(r.is_empty(), "pure negation query must return empty");
+    }
+
+    /// Pin: "graph OR -embedded" behaves identically to "graph".
+    ///
+    /// The negation-only OR group ("-embedded") produces `group_score = 0.0` in
+    /// the scoring loop (no positive atom) and is suppressed by the guard, so it
+    /// adds nothing to document scores.  The result key ordering is the same as
+    /// the plain "graph" query.
+    #[test]
+    fn negation_only_or_group_contributes_nothing() {
+        let mut idx = FulltextIndex::new();
+        idx.enable("Doc", "body");
+        idx.add_tokens(0, "body", &Value::Str("graph database".into()));
+        idx.add_tokens(1, "body", &Value::Str("rust embedded".into()));
+
+        let keys_plain: Vec<u32> = idx
+            .search("body", "graph", 0)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let keys_or_neg: Vec<u32> = idx
+            .search("body", "graph OR -embedded", 0)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            keys_plain, keys_or_neg,
+            "negation-only OR group must not change result ordering"
+        );
+    }
+
+    /// Deterministic phrase-adjacency invariant: engine results agree with an
+    /// independent in-test naive adjacency checker (no shared code with the index).
+    ///
+    /// Corpus:
+    ///   doc 0: "graph database embedded" — "graph"/"databas" adjacent at pos 0,1
+    ///   doc 1: "graph embedded database" — scattered (gap between graph and databas)
+    ///   doc 2: "the graph database system" — "graph"/"databas" adjacent at pos 1,2
+    ///
+    /// Phrase query: "graph database" (stems to ["graph","databas"])
+    /// Expected: docs 0 and 2 match; doc 1 does not.
+    #[test]
+    fn phrase_adjacency_engine_matches_naive_checker() {
+        use std::collections::BTreeMap;
+
+        let mut idx = FulltextIndex::new();
+        idx.enable("Doc", "body");
+        idx.add_tokens(0, "body", &Value::Str("graph database embedded".into()));
+        idx.add_tokens(1, "body", &Value::Str("graph embedded database".into()));
+        idx.add_tokens(2, "body", &Value::Str("the graph database system".into()));
+
+        let phrase_stems: Vec<String> = vec![stem("graph"), stem("database")];
+
+        // Naive independent adjacency checker: tokenize doc text from scratch,
+        // build a pos_map, then look for the exact consecutive-position alignment.
+        let naive_check = |doc_text: &str| -> bool {
+            let toks = tokenize_stemmed_with_positions(doc_text);
+            let mut pos_map: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+            for (tok, pos) in toks {
+                pos_map.entry(tok).or_default().push(pos);
+            }
+            let Some(starts) = pos_map.get(&phrase_stems[0]) else {
+                return false;
+            };
+            'start: for &start in starts {
+                let mut cur = start;
+                for tok in &phrase_stems[1..] {
+                    cur += 1;
+                    match pos_map.get(tok) {
+                        Some(positions) if positions.binary_search(&cur).is_ok() => {}
+                        _ => continue 'start,
+                    }
+                }
+                return true;
+            }
+            false
+        };
+
+        let docs = [
+            (0u32, "graph database embedded"),
+            (1u32, "graph embedded database"),
+            (2u32, "the graph database system"),
+        ];
+
+        let engine_ids: BTreeSet<u32> = idx
+            .search("body", "\"graph database\"", 0)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let naive_ids: BTreeSet<u32> = docs
+            .iter()
+            .filter(|(_, text)| naive_check(text))
+            .map(|(id, _)| *id)
+            .collect();
+
+        assert_eq!(
+            engine_ids, naive_ids,
+            "engine phrase results must agree with naive adjacency checker"
+        );
+        assert!(engine_ids.contains(&0), "doc 0 (adjacent) must match");
+        assert!(!engine_ids.contains(&1), "doc 1 (scattered) must not match");
+        assert!(engine_ids.contains(&2), "doc 2 (preceded) must match");
+    }
+
+    /// Pin: phrase queries do NOT match across Value::List element boundaries.
+    ///
+    /// `value_tokens_stemmed_with_positions` inserts a POSITION_GAP (> 1) between
+    /// list elements.  Phrases require consecutive positions (delta == 1), so the
+    /// gap breaks cross-boundary adjacency.
+    ///
+    /// Corpus:
+    ///   doc 0: List ["graph", "database"] — last token of elem 0 is pos 0,
+    ///          first token of elem 1 is pos 0+1+GAP = 3.  Delta = 3, not 1.
+    ///   doc 1: Str "graph database"       — tokens at pos 0, 1.  Delta = 1.
+    ///
+    /// Expected: only doc 1 matches the phrase "graph database".
+    #[test]
+    fn phrase_does_not_match_across_list_boundary() {
+        let mut idx = FulltextIndex::new();
+        idx.enable("Doc", "body");
+        // Two separate list elements — phrase must NOT span them.
+        idx.add_tokens(
+            0,
+            "body",
+            &Value::List(vec![
+                Value::Str("graph".into()),
+                Value::Str("database".into()),
+            ]),
+        );
+        // Single string — tokens are consecutive.
+        idx.add_tokens(1, "body", &Value::Str("graph database".into()));
+
+        let r = idx.search("body", "\"graph database\"", 0);
+        assert_eq!(
+            r.len(),
+            1,
+            "phrase must not match across list element boundary"
+        );
+        assert_eq!(r[0].0, 1, "only single-string doc must match");
     }
 }

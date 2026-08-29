@@ -1,6 +1,6 @@
 use core_api::{Direction, Value};
 use core_rules::{evaluate, NodeView, RuleDef, ViewDef};
-use core_storage::fulltext::{parse_query, tokenize, tokenize_stemmed_with_positions};
+use core_storage::fulltext::{parse_query, value_tokens_stemmed_with_positions};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Obviously-correct reference. No ids, no interning, no persistence.
@@ -470,7 +470,6 @@ impl Oracle {
     /// This is the DST oracle: the KEY ORDERING of its result must match
     /// `db.search(field, query)` at every quiescent point.
     pub fn scratch_search(&self, field: &str, query: &str) -> Vec<(String, f64)> {
-        let _ = tokenize; // keep import used
         let groups = parse_query(query);
         if groups.is_empty() {
             return vec![];
@@ -505,21 +504,11 @@ impl Oracle {
                 Some(p) => p,
                 None => continue,
             };
+            // Use value_tokens_stemmed_with_positions so that List values get
+            // the same POSITION_GAP between elements as the engine index.
             let stemmed_with_pos: Vec<(String, u32)> = match props.get(field) {
-                Some(Value::Str(s)) => tokenize_stemmed_with_positions(s),
-                Some(Value::List(items)) => {
-                    let combined: String = items
-                        .iter()
-                        .filter_map(|v| {
-                            if let Value::Str(s) = v {
-                                Some(s.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    tokenize_stemmed_with_positions(&combined)
+                Some(v @ Value::Str(_)) | Some(v @ Value::List(_)) => {
+                    value_tokens_stemmed_with_positions(v)
                 }
                 _ => continue,
             };
@@ -607,6 +596,9 @@ impl Oracle {
                     }
                 }
 
+                // Negation-only groups produce group_score = 0.0 and are suppressed
+                // here — same deliberate semantics as the engine: "graph OR -embedded"
+                // behaves identically to "graph".
                 if group_score > 0.0 {
                     total_score += group_score;
                 }
