@@ -491,7 +491,8 @@ fn apply_schema_over_corrupt_sidecar_repairs_roles() {
         views: vec![],
         roles: vec![analyst_role()],
     };
-    db.apply_schema(&repair_schema).expect("apply_schema over corrupt sidecar must succeed");
+    db.apply_schema(&repair_schema)
+        .expect("apply_schema over corrupt sidecar must succeed");
 
     // State is now repaired — mask_for_role must return Ok.
     assert!(

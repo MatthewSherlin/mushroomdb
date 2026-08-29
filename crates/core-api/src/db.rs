@@ -3489,8 +3489,7 @@ impl<F: Fs> GraphDb<F> {
         (0..result.len())
             .map(|i| {
                 let row = result.row(i).to_vec();
-                let key =
-                    serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
+                let key = serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
                 (key, row)
             })
             .collect()

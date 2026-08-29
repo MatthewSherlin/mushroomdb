@@ -1293,7 +1293,14 @@ fn scratch_search_oracle_matches_index_for_list_field() {
     .unwrap();
 
     // Both docs have "database" somewhere in their list; confirm oracle agrees.
-    for q in &["database", "graph", "storage", "search", "\"graph database\"", "graph OR search"] {
+    for q in &[
+        "database",
+        "graph",
+        "storage",
+        "search",
+        "\"graph database\"",
+        "graph OR search",
+    ] {
         let idx_keys: Vec<String> = db.search("tags", q).into_iter().map(|(k, _)| k).collect();
         let scratch_keys: Vec<String> = db
             .scratch_search("tags", q)

@@ -1016,10 +1016,30 @@ fn via_hop_via_dir_in() {
     let dir = tmp("via-hop-dir-in");
     let mut db = GraphDb::open(&dir).unwrap();
 
-    db.insert_node("Project", "proj_x", vec![("industry".into(), Value::Str("tech".into()))]).unwrap();
-    db.insert_node("Org", "org_x", vec![("industry".into(), Value::Str("tech".into()))]).unwrap();
-    db.insert_node("Person", "dev_alice", vec![("industry".into(), Value::Str("tech".into()))]).unwrap();
-    db.insert_node("Person", "dev_bob", vec![("industry".into(), Value::Str("law".into()))]).unwrap();
+    db.insert_node(
+        "Project",
+        "proj_x",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Org",
+        "org_x",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Person",
+        "dev_alice",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Person",
+        "dev_bob",
+        vec![("industry".into(), Value::Str("law".into()))],
+    )
+    .unwrap();
 
     // Edge goes org_x → proj_x; via_dir=In means from proj_x follow In-direction
     // of MEMBER_OF to find org_x.
@@ -1029,7 +1049,9 @@ fn via_hop_via_dir_in() {
         name: "project_person_fit".into(),
         src_label: "Project".into(),
         dst_label: "Person".into(),
-        predicate: Predicate::FieldEqual { field: "industry".into() },
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
         edge_type: "FIT".into(),
         weight_prop: None,
         max_edges: None,
@@ -1042,7 +1064,11 @@ fn via_hop_via_dir_in() {
 
     // proj_x hops In over MEMBER_OF → org_x (industry=tech) → matches dev_alice (tech).
     let fit = db.neighbors("proj_x", "FIT", Direction::Out).unwrap();
-    assert_eq!(fit, vec!["dev_alice"], "via_dir=In rule fires for matching industry");
+    assert_eq!(
+        fit,
+        vec!["dev_alice"],
+        "via_dir=In rule fires for matching industry"
+    );
 
     // dev_bob (law) must not be linked.
     let bob_fit = db.neighbors("dev_bob", "FIT", Direction::In).unwrap();
@@ -1060,16 +1086,28 @@ fn via_hop_survives_snapshot_and_wal_replay() {
     let dir = tmp("via-hop-snapshot");
     {
         let mut db = GraphDb::open(&dir).unwrap();
-        db.insert_node("Org", "org1", vec![("industry".into(), Value::Str("tech".into()))]).unwrap();
+        db.insert_node(
+            "Org",
+            "org1",
+            vec![("industry".into(), Value::Str("tech".into()))],
+        )
+        .unwrap();
         db.insert_node("Person", "alice", vec![]).unwrap();
-        db.insert_node("Project", "proj_a", vec![("industry".into(), Value::Str("tech".into()))]).unwrap();
+        db.insert_node(
+            "Project",
+            "proj_a",
+            vec![("industry".into(), Value::Str("tech".into()))],
+        )
+        .unwrap();
         db.insert_edge("WORKS_AT", "alice", "org1").unwrap();
 
         let rule = RuleDef {
             name: "fit".into(),
             src_label: "Person".into(),
             dst_label: "Project".into(),
-            predicate: Predicate::FieldEqual { field: "industry".into() },
+            predicate: Predicate::FieldEqual {
+                field: "industry".into(),
+            },
             edge_type: "FIT".into(),
             weight_prop: None,
             max_edges: None,
@@ -1128,14 +1166,26 @@ fn via_hop_new_via_node_insert_after_rule_creation() {
 
     // Insert src and dst; no via-label node yet.
     db.insert_node("Person", "alice", vec![]).unwrap();
-    db.insert_node("Project", "proj_a", vec![("industry".into(), Value::Str("bio".into()))]).unwrap();
-    db.insert_node("Project", "proj_b", vec![("industry".into(), Value::Str("tech".into()))]).unwrap();
+    db.insert_node(
+        "Project",
+        "proj_a",
+        vec![("industry".into(), Value::Str("bio".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Project",
+        "proj_b",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
 
     let rule = RuleDef {
         name: "fit".into(),
         src_label: "Person".into(),
         dst_label: "Project".into(),
-        predicate: Predicate::FieldEqual { field: "industry".into() },
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
         edge_type: "FIT".into(),
         weight_prop: None,
         max_edges: None,
@@ -1148,26 +1198,41 @@ fn via_hop_new_via_node_insert_after_rule_creation() {
 
     // No Org node yet → backfill finds nothing.
     assert!(
-        db.neighbors("alice", "FIT", Direction::Out).unwrap().is_empty(),
+        db.neighbors("alice", "FIT", Direction::Out)
+            .unwrap()
+            .is_empty(),
         "no FIT before any Org inserted"
     );
 
     // Now insert a new Org node (via-label) after rule creation.
-    db.insert_node("Org", "biotech_inc", vec![("industry".into(), Value::Str("bio".into()))]).unwrap();
+    db.insert_node(
+        "Org",
+        "biotech_inc",
+        vec![("industry".into(), Value::Str("bio".into()))],
+    )
+    .unwrap();
     // No WORKS_AT edge yet → as_via fires for biotech_inc but finds no alice-edge.
     assert!(
-        db.neighbors("alice", "FIT", Direction::Out).unwrap().is_empty(),
+        db.neighbors("alice", "FIT", Direction::Out)
+            .unwrap()
+            .is_empty(),
         "no FIT after Org insert without WORKS_AT edge"
     );
 
     // Insert the via edge → rule fires (as_src for alice).
     db.insert_edge("WORKS_AT", "alice", "biotech_inc").unwrap();
     let fit = db.neighbors("alice", "FIT", Direction::Out).unwrap();
-    assert_eq!(fit, vec!["proj_a"], "FIT fires after WORKS_AT to newly inserted Org");
+    assert_eq!(
+        fit,
+        vec!["proj_a"],
+        "FIT fires after WORKS_AT to newly inserted Org"
+    );
 
     // Confirm proj_b (tech) is not linked — no Org with tech industry.
     assert!(
-        db.neighbors("proj_b", "FIT", Direction::In).unwrap().is_empty(),
+        db.neighbors("proj_b", "FIT", Direction::In)
+            .unwrap()
+            .is_empty(),
         "proj_b (tech) gets no FIT"
     );
 }
