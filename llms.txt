@@ -121,6 +121,31 @@ MCP is a trusted-local stdio interface — no bearer-token or role enforcement.
 `stub_hidden` on the `query` tool applies to client-masked paths only; Cypher rows
 are always omit-only.
 
+## Role-bound write scopes (v0.3)
+
+Role tokens may now carry write scopes. A role without a write scope is read-only
+(v1 behavior). A role with a write scope may mutate nodes and edges within its
+declared scope, subject to the never-widen invariant: only nodes in the role's
+current read mask are mutable, and no write may expose hidden-node existence.
+
+Write scope fields (all default to empty = read-only):
+- `create_labels` — CREATE nodes under these labels
+- `update_labels` — SET properties on or MERGE-match visible nodes of these labels
+- `delete_labels` — DELETE or DETACH DELETE visible nodes of these labels
+- `create_edge_types` — INSERT EDGE between two visible endpoints
+- `delete_edge_types` — DELETE user-owned edges of these types
+
+All label fields must be subsets of the role's read `labels`; `apply_schema`
+rejects disjoint write and read scopes.
+
+Endpoints that remain 403 for all role tokens regardless of write scope:
+`POST /rules`, `GET /stats`, `GET /explain`, `GET /suggest`, `GET /algo/*`,
+`GET /subscribe`, `GET /watch`, `POST /nodes/{key}/rename`, `POST /backup`.
+
+Error bodies for write denials follow §4.3 — see `docs/site/api.md` for the
+full list. Hidden nodes are indistinguishable from absent nodes in all write
+responses.
+
 Claude Desktop config:
 ```json
 {
