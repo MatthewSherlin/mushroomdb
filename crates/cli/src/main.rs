@@ -1,9 +1,9 @@
 //! `mushroomdb` — thin dispatcher over [`cli`] lib functions.
 
 use cli::{
-    format_demo, format_stats, format_suggest, maybe_run_demo_if_empty, parse_args, read_stats,
-    run_algo, run_asof, run_demo, run_migrate, run_query, run_schema_apply, run_snapshot,
-    run_suggest, run_verify, usage, Command, ServeUi,
+    format_backup, format_demo, format_stats, format_suggest, maybe_run_demo_if_empty, parse_args,
+    read_stats, run_algo, run_asof, run_backup, run_demo, run_export, run_migrate, run_query,
+    run_schema_apply, run_snapshot, run_suggest, run_verify, usage, Command, ServeUi,
 };
 use core_api::SharedDb;
 use std::collections::HashMap;
@@ -172,6 +172,28 @@ fn main() -> ExitCode {
                 eprintln!("error: {}", e);
                 ExitCode::from(1)
             }
+        },
+        Ok(Command::Backup { db_dir, dest }) => match run_backup(&db_dir, &dest) {
+            Ok(report) => {
+                print!("{}", format_backup(&dest, &report));
+                if !report.verified {
+                    eprintln!("warning: backup verification failed");
+                    return ExitCode::from(1);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
+        Ok(Command::Export {
+            db_dir,
+            dest,
+            format,
+        }) => match run_export(&db_dir, &dest, &format) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
         },
         Err(e) => {
             let _ = writeln!(io::stderr(), "{e}");

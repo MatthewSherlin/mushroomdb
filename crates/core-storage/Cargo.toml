@@ -20,6 +20,7 @@ zstd = { workspace = true }
 libc = "0.2"
 rkyv = { workspace = true }
 memmap2 = { workspace = true }
+rust-stemmers = "1"
 
 [dev-dependencies]
 proptest = { workspace = true }

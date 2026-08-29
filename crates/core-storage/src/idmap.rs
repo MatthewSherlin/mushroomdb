@@ -58,6 +58,24 @@ impl IdMap {
         self.to_key.get(id as usize).map(|s| s.as_str())
     }
 
+    /// Rename a live key, keeping its dense id stable.
+    ///
+    /// Returns `Err(KeyNotFound)` if `old` is unknown or tombstoned.
+    /// Returns `Err(DuplicateKey)` if `new` is already a live key.
+    /// On success returns the stable id shared by both names.
+    pub fn rename(&mut self, old: &str, new: &str) -> Result<u32> {
+        if self.to_id.contains_key(new) {
+            return Err(GraphError::DuplicateKey { key: new.into() });
+        }
+        let id = self
+            .to_id
+            .remove(old)
+            .ok_or_else(|| GraphError::KeyNotFound { key: old.into() })?;
+        self.to_id.insert(new.to_string(), id);
+        self.to_key[id as usize] = new.to_string();
+        Ok(id)
+    }
+
     /// Remove `key` from the live map, permanently tombstone its dense id, and
     /// return that id. Returns `None` if the key is not present.
     pub fn delete(&mut self, key: &str) -> Option<u32> {

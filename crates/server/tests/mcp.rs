@@ -135,7 +135,7 @@ fn handshake_initialize_then_initialized_is_silent() {
     );
 }
 
-/// Binding: tools/list returns exactly the fifteen tools with the specified schemas.
+/// Binding: tools/list returns exactly the sixteen tools with the specified schemas.
 #[test]
 fn tools_list_returns_fifteen_tools_with_schemas() {
     let stdin = req(json!(1), "tools/list", None);
@@ -167,10 +167,11 @@ fn tools_list_returns_fifteen_tools_with_schemas() {
         "node_history",
         "edge_history",
         "was_linked",
+        "rename_node",
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 15);
+    assert_eq!(tools.len(), 16);
 
     let by_name = |n: &str| {
         tools

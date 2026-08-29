@@ -23,9 +23,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use core_api::{
-    is_write_query, json_to_rows, json_to_value, AutoFk, BatchOp, DegreeConfig, Dir, GraphError,
-    IngestOptions, NodeMask, PageRankConfig, ResultSet, SharedDb, SuggestConfig, Value, WccConfig,
-    SUGGEST_DEFAULT_SEED,
+    is_write_query, json_to_rows, json_to_value, AutoFk, BackupReport, BatchOp, DegreeConfig, Dir,
+    GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig, ResultSet, SharedDb,
+    SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -328,7 +328,9 @@ fn build_app(
         // queue (submit_batch) so concurrent node/edge CRUD does not hold
         // the write lock during fsync.
         .route("/nodes", post(create_node))
+        .route("/nodes/{key}/rename", post(rename_node))
         .route("/edges", post(create_edge))
+        .route("/edges/upsert", post(upsert_edge))
         .route(
             "/edges/{etype}/{src}/{dst}",
             axum::routing::delete(delete_edge),
@@ -336,6 +338,7 @@ fn build_app(
         .route("/algo/pagerank", post(algo_pagerank))
         .route("/algo/wcc", post(algo_wcc))
         .route("/algo/degree", post(algo_degree))
+        .route("/backup", post(backup))
         .route("/watch", get(crate::ws::watch))
         .route("/subscribe", get(crate::subscribe::subscribe))
         .with_state(state.clone());
@@ -600,6 +603,14 @@ fn key_not_found(key: String) -> Response {
         .into_response()
 }
 
+fn conflict_response(key: String) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"error": GraphError::DuplicateKey { key }.to_string()})),
+    )
+        .into_response()
+}
+
 fn json_ok(value: Js) -> Response {
     (StatusCode::OK, Json(value)).into_response()
 }
@@ -728,9 +739,24 @@ async fn query(
     // When a client-supplied mask is present, route to query_masked (read-only).
     // Hold a single read guard for both from_keys and query_masked so the mask
     // and the query execute on the same database snapshot.
+    //
+    // `stub_hidden: true` opts into MaskMode::Stub for the mask; Cypher query
+    // behaviour is identical in both modes (hidden nodes are excluded from
+    // query results regardless of mode).
     if let Some(ref keys) = mask_keys {
+        let stub_hidden = body
+            .get("stub_hidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let db = state.db.read();
-        let mask = NodeMask::from_keys(&*db, keys.iter().map(String::as_str));
+        let mask = {
+            let m = NodeMask::from_keys(&*db, keys.iter().map(String::as_str));
+            if stub_hidden {
+                m.with_mode(MaskMode::Stub)
+            } else {
+                m
+            }
+        };
         return match db.query_masked(&cypher, &params, &mask) {
             Ok(rs) => format_query_result(rs, format),
             Err(GraphError::QueryError { detail })
@@ -920,16 +946,17 @@ async fn node_info(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
     Path(key): Path<String>,
+    Query(qs): Query<BTreeMap<String, String>>,
 ) -> Response {
     if let AuthIdentity::Role(ref role_name) = identity {
-        // Lock-free epoch snapshot: mask and node lookup on same frozen state
-        // (constraint 2 — RBAC mask coherence).
+        // Role-token path: hard-coded Omit mode; hidden keys are indistinguishable
+        // from absent keys.  `stub_hidden` query param is silently ignored here —
+        // role paths must NEVER produce stubs (RBAC invariant).
         let snap = state.db.reader();
         let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
-        // Hidden keys respond identically to absent keys — no "restricted" signal in v1.
         if !snap
             .resolve_key(&key)
             .is_some_and(|id| role_mask.contains_id(id))
@@ -941,6 +968,38 @@ async fn node_info(
             None => key_not_found(key),
         };
     }
+
+    // Full-token path: optional client mask + stub_hidden via query params.
+    // `mask=key1,key2` — comma-separated visible keys (empty string = no mask).
+    // `stub_hidden=true` — opt into MaskMode::Stub for this request.
+    let mask_param = qs.get("mask").map(String::as_str).unwrap_or("").trim();
+    if !mask_param.is_empty() {
+        let stub_hidden = qs
+            .get("stub_hidden")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let g = state.db.read();
+        let mask = {
+            let keys = mask_param
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let m = NodeMask::from_keys(&*g, keys);
+            if stub_hidden {
+                m.with_mode(MaskMode::Stub)
+            } else {
+                m
+            }
+        };
+        return match g.node_info_masked(&key, &mask) {
+            Some(core_api::MaskedNodeResult::Visible(info)) => json_ok(node_info_json(&info)),
+            Some(core_api::MaskedNodeResult::Restricted) => {
+                json_ok(crate::json::stub_node_json(&key))
+            }
+            None => key_not_found(key),
+        };
+    }
+
     let info = {
         let g = state.db.read();
         g.node_info(&key)
@@ -955,10 +1014,11 @@ async fn node_edges(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
     Path(key): Path<String>,
+    Query(qs): Query<BTreeMap<String, String>>,
 ) -> Response {
     if let AuthIdentity::Role(ref role_name) = identity {
-        // Lock-free epoch snapshot: mask and edge lookup on same frozen state
-        // (constraint 2 — RBAC mask coherence).
+        // Role-token path: hard-coded Omit mode.  `stub_hidden` query param is
+        // silently ignored — role paths must NEVER produce stubs (RBAC invariant).
         let snap = state.db.reader();
         let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
@@ -993,6 +1053,34 @@ async fn node_edges(
             Err(e) => graph_err(e),
         };
     }
+
+    // Full-token path: optional client mask + stub_hidden via query params.
+    let mask_param = qs.get("mask").map(String::as_str).unwrap_or("").trim();
+    if !mask_param.is_empty() {
+        let stub_hidden = qs
+            .get("stub_hidden")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let g = state.db.read();
+        let mask = {
+            let keys = mask_param
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let m = NodeMask::from_keys(&*g, keys);
+            if stub_hidden {
+                m.with_mode(MaskMode::Stub)
+            } else {
+                m
+            }
+        };
+        return match g.node_edges_masked(&key, &mask) {
+            Ok(edges) => json_ok(crate::json::masked_edges_json(&edges)),
+            Err(GraphError::KeyNotFound { key }) => key_not_found(key),
+            Err(e) => graph_err(e),
+        };
+    }
+
     let out = {
         let g = state.db.read();
         g.node_edges(&key)
@@ -1056,6 +1144,37 @@ async fn neighborhood(
         };
         return json_ok(result_set_json(&rs));
     }
+    // Full-token path: optional client mask + stub_hidden via query params.
+    // `mask=key1,key2` — comma-separated visible keys.
+    // `stub_hidden=true` — opt into MaskMode::Stub; hidden direct neighbours
+    // appear as stub rows (label: null) in the result; BFS does not expand
+    // through them in either mode.
+    let mask_param = qs.get("mask").map(String::as_str).unwrap_or("").trim();
+    if !mask_param.is_empty() {
+        let stub_hidden = qs
+            .get("stub_hidden")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let g = state.db.read();
+        let mask = {
+            let keys = mask_param
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let m = NodeMask::from_keys(&*g, keys);
+            if stub_hidden {
+                m.with_mode(MaskMode::Stub)
+            } else {
+                m
+            }
+        };
+        return match g.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &mask) {
+            Some(rs) => json_ok(result_set_json(&rs)),
+            None => graph_err(GraphError::KeyNotFound { key: key.clone() }),
+        };
+    }
+
+    // Unmasked full-token path (no mask param).
     let rs = {
         let g = state.db.read();
         match g.node_ref(&key) {
@@ -1277,6 +1396,87 @@ async fn delete_edge(
     .await
     {
         Ok(_) => json_ok(json!({"ok": true})),
+        Err(resp) => resp,
+    }
+}
+
+/// `POST /nodes/{key}/rename` — rename a node's key via the group-commit queue.
+///
+/// Body: `{"new_key": "alice2"}`
+/// Returns 404 on KeyNotFound, 409 on DuplicateKey, 200 on success.
+async fn rename_node(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(key): Path<String>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
+    let new_key = match body.get("new_key").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing new_key"),
+    };
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || {
+        db.submit_batch(vec![BatchOp::RenameNode {
+            old_key: key,
+            new_key,
+        }])
+    })
+    .await
+    {
+        Ok(Ok(_)) => json_ok(json!({"ok": true})),
+        Ok(Err(GraphError::KeyNotFound { key })) => key_not_found(key),
+        Ok(Err(GraphError::DuplicateKey { key })) => conflict_response(key),
+        Ok(Err(e)) => graph_err(e),
+        Err(_) => err_response("write task panicked"),
+    }
+}
+
+/// `POST /edges/upsert` — insert an edge, auto-creating missing endpoints.
+///
+/// Body: `{"edge_type":"KNOWS","src_key":"alice","dst_key":"bob","placeholder_label":"Person"}`
+/// Returns `{"nodes_created": N, "edge_inserted": bool}`.
+async fn upsert_edge(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
+    let edge_type = match body.get("edge_type").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing edge_type"),
+    };
+    let src_key = match body.get("src_key").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing src_key"),
+    };
+    let dst_key = match body.get("dst_key").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing dst_key"),
+    };
+    let placeholder_label = match body.get("placeholder_label").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing placeholder_label"),
+    };
+    let db = state.db.clone();
+    match blocking_write(move || {
+        db.submit_batch(vec![BatchOp::InsertEdgeUpsert {
+            edge_type,
+            src_key,
+            dst_key,
+            placeholder_label,
+        }])
+    })
+    .await
+    {
+        Ok((nodes, edges)) => json_ok(json!({
+            "nodes_created": nodes,
+            "edge_inserted": edges > 0,
+        })),
         Err(resp) => resp,
     }
 }
@@ -1506,6 +1706,78 @@ async fn remove_node_prop(
     match blocking_write(move || db.submit_batch(vec![BatchOp::RemoveProp { key, field }])).await {
         Ok(_) => json_ok(json!({"ok": true})),
         Err(resp) => resp,
+    }
+}
+
+/// `POST /backup` — take a consistent backup of the database to `dest`.
+///
+/// The read guard is held for the duration of the file copies, which is the
+/// correct cross-process synchronisation point: the server is the single
+/// process touching the files, so holding the read lock excludes concurrent
+/// in-process writers.  This is the safe alternative to running the
+/// `mushroomdb backup` CLI against a live-served store.
+///
+/// Request body: `{"dest": "/absolute/path/to/backup-dir"}`
+///
+/// Responses:
+/// - `200 OK` — backup completed; body is a `BackupReport` JSON object.
+/// - `500 Internal Server Error` — backup succeeded but verification failed;
+///   body is the `BackupReport` JSON object (examine `files` and `bytes`).
+/// - `400 Bad Request` — missing or invalid `dest`.
+/// - `403 Forbidden` — role-bound token; this endpoint requires a full-access token.
+async fn backup(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: /backup requires a full-access token");
+    }
+    let dest = match body.get("dest").and_then(Js::as_str) {
+        Some(s) if !s.is_empty() => std::path::PathBuf::from(s),
+        _ => return err_response("missing or empty \"dest\" field"),
+    };
+    let db = state.db.clone();
+    let report: BackupReport = match tokio::task::spawn_blocking(move || {
+        // The read guard is held inside spawn_blocking so file copies happen
+        // with the write lock excluded.  The guard drops at end of closure.
+        let g = db.read();
+        g.backup_to(&dest)
+    })
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return graph_err(e),
+        Err(_) => return err_response("backup task panicked"),
+    };
+
+    let body = match serde_json::to_value(BackupReportJson::from(&report)) {
+        Ok(v) => v,
+        Err(e) => return err_response(e.to_string()),
+    };
+
+    if report.verified {
+        json_ok(body)
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+    }
+}
+
+/// JSON-serialisable projection of [`BackupReport`].
+#[derive(serde::Serialize)]
+struct BackupReportJson<'a> {
+    files: &'a [String],
+    bytes: u64,
+    verified: bool,
+}
+
+impl<'a> From<&'a BackupReport> for BackupReportJson<'a> {
+    fn from(r: &'a BackupReport) -> Self {
+        Self {
+            files: &r.files,
+            bytes: r.bytes,
+            verified: r.verified,
+        }
     }
 }
 

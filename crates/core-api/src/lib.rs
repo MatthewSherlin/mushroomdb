@@ -21,9 +21,10 @@ pub use core_rules::{
 };
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{
-    snapshot_version_at, write_snapshot_bak, BatchBuilder, BatchOp, DeleteReport, EdgeInfo,
-    Explanation, FsyncPolicy, GraphDb, MutationEvent, NodeInfo, NodeRef, OpenOptions, Precondition,
-    PredicateSummary, RuleStats, SnapshotOptions, Stats,
+    snapshot_version_at, write_snapshot_bak, BackupReport, BatchBuilder, BatchOp, DeleteReport,
+    EdgeInfo, Explanation, ExportEdge, FsyncPolicy, GraphDb, MaskedEdge, MaskedNodeResult,
+    MutationEvent, NodeInfo, NodeRef, OpenOptions, Precondition, PredicateSummary, RuleStats,
+    SnapshotOptions, Stats,
 };
 
 /// Current on-disk snapshot format version written by this build.
@@ -35,7 +36,7 @@ pub use history::{EdgeEvent, EdgeHistoryEvent, HistoryChange, HistoryEntry, Hist
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
-pub use mask::NodeMask;
+pub use mask::{MaskMode, NodeMask};
 pub use reader::{CommitDelta, FrozenOverlay, ReaderSnapshot, FOLD_EVERY_K};
 pub use roles::RoleDef;
 pub use schema::{Schema, SchemaDiff};

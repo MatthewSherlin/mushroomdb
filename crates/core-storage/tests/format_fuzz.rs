@@ -2,7 +2,7 @@
 //! never panic, and mutated valid WAL streams decode as a prefix of the
 //! pristine record list.
 //!
-//! Four generators, 256 cases each (1024 total):
+//! Five generators, 256 cases each (1280 total):
 //!   (a) arbitrary byte vectors (len 0..4096) → `wal::decode_all`
 //!   (b) arbitrary byte vectors (len 0..4096) → `snapshot::decode`
 //!   (c) bit-flip / truncate / splice mutations of a valid WAL stream
@@ -11,8 +11,17 @@
 //!   (d) mutate the raw v3 snapshot *payload*, then reattach a fresh valid
 //!       header (magic + version + CRC of the mutated payload) so
 //!       `bincode::deserialize` is actually reached
+//!   (e) V8 section-directory mutations: set a section `len` to u32::MAX
+//!       (out-of-bounds), 1 (below rkyv root minimum), or an arbitrary u32,
+//!       then recompute the header CRC so `parse_header` succeeds and
+//!       `validate_section_bounds` is actually exercised.  Both
+//!       `MappedBase::validate_section_bounds` and `snapshot::decode` are
+//!       called; neither may panic.  Random seed (proptest default);
+//!       deterministic hardcoded mutations (u32::MAX / 1 / arbitrary) provide
+//!       the coverage floor regardless of seed.
 
 use core_storage::snapshot::{self, SnapshotState};
+use core_storage::v8::MappedBase;
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 use proptest::prelude::*;
@@ -348,5 +357,83 @@ proptest! {
         let mutated = mutate(&snap[10..], kind, &entropy);
         let framed = wrap_snapshot_payload(&mutated);
         check_snap_decode(&framed)?;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block (e) helpers
+// ---------------------------------------------------------------------------
+
+/// Return a copy of `v8` with section `section_idx`'s `len` field replaced by
+/// `new_len` and the header CRC recomputed so `parse_header` passes and
+/// `validate_section_bounds` is actually exercised.
+///
+/// V8 directory layout: `[8 + i*16 + 8 .. 8 + i*16 + 12]` = len (u32 LE).
+/// Header CRC covers `[0 .. 8 + section_count * 16]`.
+///
+/// Returns `None` when the bytes are too short to contain the requested entry.
+fn corrupt_v8_section_len(v8: &[u8], section_idx: usize, new_len: u32) -> Option<Vec<u8>> {
+    if v8.len() < 12 {
+        return None;
+    }
+    let section_count = u16::from_le_bytes([v8[6], v8[7]]) as usize;
+    if section_idx >= section_count {
+        return None;
+    }
+    let dir_end = 8 + section_count * 16;
+    if dir_end + 4 > v8.len() {
+        return None;
+    }
+    let len_offset = 8 + section_idx * 16 + 8;
+    if len_offset + 4 > dir_end {
+        return None;
+    }
+    let mut out = v8.to_vec();
+    out[len_offset..len_offset + 4].copy_from_slice(&new_len.to_le_bytes());
+    let crc = crc32fast::hash(&out[0..dir_end]);
+    out[dir_end..dir_end + 4].copy_from_slice(&crc.to_le_bytes());
+    Some(out)
+}
+
+// Block (e): V8 section-directory corruption — validate_section_bounds never panics.
+//
+// Mutates individual section `len` fields in a valid V8 snapshot, recomputes
+// the header CRC so `parse_header` passes, then verifies that both
+// `MappedBase::validate_section_bounds` and `snapshot::decode` return
+// `Err(Corrupt)` rather than panicking.  Random seed (proptest default);
+// deterministic hardcoded mutations (u32::MAX / 1 / arbitrary u32) provide
+// the coverage floor regardless of seed.  256 cases.
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+    #[test]
+    fn v8_section_directory_corruption_never_panics(
+        section_idx in 0usize..12usize,
+        mutation in 0u8..3u8,
+        len_val in any::<u32>(),
+    ) {
+        let v8 = valid_snapshot_bytes();
+        let new_len = match mutation % 3 {
+            0 => u32::MAX,  // section extends past any plausible file
+            1 => 1,         // below rkyv root minimum for large sections
+            _ => len_val,   // arbitrary value
+        };
+        if let Some(bytes) = corrupt_v8_section_len(&v8, section_idx, new_len) {
+            // Path 1: validate_section_bounds directly — must not panic.
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                if let Ok(base) = MappedBase::from_bytes(bytes.clone()) {
+                    let _ = base.validate_section_bounds();
+                }
+            }));
+            prop_assert!(
+                outcome.is_ok(),
+                "validate_section_bounds panicked on section_idx={section_idx} new_len={new_len}"
+            );
+            // Path 2: full snapshot::decode — must also not panic.
+            check_snap_decode(&bytes)?;
+        }
     }
 }

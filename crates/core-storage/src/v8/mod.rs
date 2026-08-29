@@ -172,11 +172,22 @@ impl MappedBase {
     }
 
     /// Check that every section listed in the directory fits within the backing
-    /// buffer.  Pure pointer arithmetic — no bytes are read, no CRCs are
-    /// computed, and no page faults are triggered.
+    /// buffer, and that the four large rkyv sections carry enough bytes for
+    /// their rkyv root struct.  Pure pointer arithmetic — no bytes are read,
+    /// no CRCs are computed, and no page faults are triggered.
     ///
-    /// Used by `restore_v8_base` to detect truncated snapshots eagerly at
-    /// open time before the expensive section content reads are deferred.
+    /// Used by `restore_v8_base` to detect truncated or corrupt snapshots
+    /// eagerly at open time before the expensive section content reads are
+    /// deferred.
+    ///
+    /// The minimum-size check closes the gap between `validate_section_bounds`
+    /// (which only verifies `(offset, len)` fit in the file) and the
+    /// individual accessor checks in `topology()` / `columns()` /
+    /// `edge_props_section()` / `hnsw_section()`.  Without this check a
+    /// crafted snapshot with `len = 1` for the TOPOLOGY section would pass
+    /// bounds validation and then panic inside `topology().expect(...)` on the
+    /// first query.  After this check all "bounds validated at open" expects
+    /// become true post-validation invariants.
     pub fn validate_section_bounds(&self) -> Result<()> {
         for entry in &self.dir {
             let start = entry.offset as usize;
@@ -198,6 +209,22 @@ impl MappedBase {
                         self.backing.len()
                     ),
                 })?;
+            // Minimum rkyv root size check for the four large sections.
+            // The individual accessors (topology(), columns(), etc.) already
+            // guard on this, but only AFTER validate_section_bounds has
+            // returned Ok.  Checking here prevents the expect()-on-Err panic
+            // that would otherwise fire on the first query after open.
+            if let Some(min) = min_rkyv_root_size(entry.id) {
+                if (entry.len as usize) < min {
+                    return Err(GraphError::Corrupt {
+                        detail: format!(
+                            "v8: section {} payload too small for rkyv root \
+                             (len={}, minimum={})",
+                            entry.id, entry.len, min
+                        ),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -528,6 +555,27 @@ impl MappedBase {
     }
 }
 
+/// Minimum payload size for the four large rkyv-archived sections.
+///
+/// The rkyv root of an archived type must fit within the section payload;
+/// `rkyv::access_unchecked` reads the root pointer at `bytes.len() -
+/// size_of::<T::Archived>()`.  A section shorter than the root struct would
+/// cause the accessor to attempt an out-of-bounds read.  We catch this at
+/// open time in `validate_section_bounds` so the hot-path `expect()` calls
+/// never fire on corrupt data.
+fn min_rkyv_root_size(section_id: u8) -> Option<usize> {
+    use crate::v8::layout::{
+        ArchivedColumnsData, ArchivedCsrData, ArchivedEdgePropsData, ArchivedHnswSectionData,
+    };
+    match section_id {
+        SECTION_TOPOLOGY => Some(std::mem::size_of::<ArchivedCsrData>()),
+        SECTION_COLUMNS => Some(std::mem::size_of::<ArchivedColumnsData>()),
+        SECTION_EDGE_PROPS => Some(std::mem::size_of::<ArchivedEdgePropsData>()),
+        SECTION_HNSW => Some(std::mem::size_of::<ArchivedHnswSectionData>()),
+        _ => None,
+    }
+}
+
 /// Parse and validate the V8 header page.
 ///
 /// Validates magic, version, directory bounds, and the whole-header CRC32.
@@ -755,6 +803,51 @@ mod tests {
             topo.3.is_err(),
             "verify_integrity must detect TOPOLOGY corruption; got Ok"
         );
+    }
+
+    /// A corrupt snapshot where the TOPOLOGY directory entry's `len` is set to 1
+    /// (below the rkyv root minimum) must be rejected by `validate_section_bounds`.
+    ///
+    /// This is the targeted repro for the minimum-size validation gap: before the
+    /// fix, `validate_section_bounds` only checked `(offset, len)` fits in the
+    /// file, so a `len=1` for the TOPOLOGY section passed — then the first call to
+    /// `topology().expect("bounds validated at open")` panicked because
+    /// `topology()` returned `Err(Corrupt{too short for rkyv root})`.
+    #[test]
+    fn validate_section_bounds_rejects_tiny_section_len() {
+        let mut bytes = encode_tiny();
+        // Locate the SECTION_TOPOLOGY directory entry.
+        let section_count = u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize;
+        let mut topo_entry_base = None;
+        for i in 0..section_count {
+            let base = 8 + i * 16;
+            if bytes[base] == SECTION_TOPOLOGY {
+                topo_entry_base = Some(base);
+                break;
+            }
+        }
+        let entry_base = topo_entry_base.expect("SECTION_TOPOLOGY in directory");
+        // Overwrite len (entry_base+8..entry_base+12) with 1.
+        let tiny_len: u32 = 1;
+        bytes[entry_base + 8..entry_base + 12].copy_from_slice(&tiny_len.to_le_bytes());
+        // Recompute the whole-header CRC so parse_header accepts it.
+        let dir_end = 8 + section_count * 16;
+        let new_crc = crc32fast::hash(&bytes[0..dir_end]);
+        bytes[dir_end..dir_end + 4].copy_from_slice(&new_crc.to_le_bytes());
+        // from_bytes validates only the header; validate_section_bounds (called
+        // by restore_v8_base) is the step that catches the tiny payload.
+        let base = MappedBase::from_bytes(bytes).expect("header CRC is correct after recompute");
+        let result = base.validate_section_bounds();
+        match result {
+            Err(GraphError::Corrupt { detail }) => {
+                assert!(
+                    detail.contains("too small for rkyv root") || detail.contains("section"),
+                    "error should mention tiny section; got: {detail}"
+                );
+            }
+            Err(other) => panic!("expected Corrupt, got {other:?}"),
+            Ok(_) => panic!("expected Err(Corrupt) for tiny section len, got Ok"),
+        }
     }
 
     /// RAII guard that removes the file on drop.

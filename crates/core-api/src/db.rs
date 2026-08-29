@@ -216,7 +216,9 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         // History markers are no-ops for mutation events — they carry no new
         // state and rules re-derive deterministically on replay.
         | WalRecord::DerivedEdgeAdded { .. }
-        | WalRecord::DerivedEdgeRetracted { .. } => None,
+        | WalRecord::DerivedEdgeRetracted { .. }
+        // RenameNode carries no node/edge count change; no special event.
+        | WalRecord::RenameNode { .. } => None,
     }
 }
 
@@ -398,6 +400,33 @@ pub struct EdgeInfo {
     pub derived: bool,
 }
 
+/// An edge with mask-aware endpoint visibility.
+///
+/// Returned by [`GraphDb::node_edges_masked`] in [`crate::mask::MaskMode::Stub`]
+/// mode — hidden endpoints carry `*_restricted: true`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskedEdge {
+    pub edge_type: String,
+    pub src_key: String,
+    /// `true` when `src_key` is in the DB but hidden from the mask.
+    pub src_restricted: bool,
+    pub dst_key: String,
+    /// `true` when `dst_key` is in the DB but hidden from the mask.
+    pub dst_restricted: bool,
+    pub derived: bool,
+}
+
+/// Result of a mask-aware node lookup via [`GraphDb::node_info_masked`].
+///
+/// `None` from that method means the key does not exist (→ 404).
+/// `Some(Restricted)` is only produced when `mask.mode() == MaskMode::Stub`.
+#[derive(Debug, PartialEq)]
+pub enum MaskedNodeResult {
+    Visible(NodeInfo),
+    /// Node exists in the DB but is hidden from this mask.
+    Restricted,
+}
+
 /// One rule-owned edge between two nodes, with the rule name, edge type,
 /// direction (src_key → dst_key), and weight if the rule stores one.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -408,6 +437,38 @@ pub struct Explanation {
     pub dst_key: String,
     pub weight: Option<f64>,
     pub predicate: PredicateSummary,
+}
+
+/// Report returned by [`GraphDb::backup_to`].
+#[derive(Debug, Clone)]
+pub struct BackupReport {
+    /// Filenames copied into the destination directory (sorted ascending).
+    pub files: Vec<String>,
+    /// Total bytes written across all copied files.
+    pub bytes: u64,
+    /// `true` when the destination opened cleanly and passed post-copy checks.
+    ///
+    /// For stores that have a `snapshot.bin` this means: all V8 section CRCs
+    /// matched **and** the destination opened without error.
+    ///
+    /// For WAL-only stores (no `snapshot.bin`) there is no snapshot to
+    /// CRC-check; `verified` is `true` when the destination opened and
+    /// replayed the WAL without error (record-level checksums in the WAL
+    /// provide the integrity signal, not section CRCs).
+    pub verified: bool,
+}
+
+/// One directed edge in export form, with optional rule attribution for derived edges.
+///
+/// Returned by [`GraphDb::all_edges_for_export`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExportEdge {
+    pub edge_type: String,
+    pub src: String,
+    pub dst: String,
+    pub derived: bool,
+    /// Rule name that created this edge, if derived. `None` for manual edges.
+    pub rule: Option<String>,
 }
 
 /// Construct the standard write-query result set (columns: created, properties_set, deleted).
@@ -1387,6 +1448,44 @@ impl<F: Fs> GraphDb<F> {
         self.props = state.props;
         self.labels = state.labels;
         self.edge_props = state.edge_props;
+        // Cross-section label integrity for V5/V7 snapshots: same invariants as
+        // restore_v8_base.  A crafted bincode snapshot with a short `labels` vec,
+        // out-of-range sym ids, or a sentinel label on a live node would otherwise
+        // open successfully and panic later in `NodeRef::label()` or
+        // `neighborhood_masked()`.  Catching it here turns those into typed
+        // `GraphError::Corrupt` at open time.
+        {
+            let ids_len = self.ids.len();
+            if self.labels.len() != ids_len {
+                return Err(GraphError::Corrupt {
+                    detail: format!(
+                        "snapshot: labels vec has {} entries but id table has {} total slots",
+                        self.labels.len(),
+                        ids_len,
+                    ),
+                });
+            }
+            let syms_len = self.syms.len() as u32;
+            for (i, &sym) in self.labels.iter().enumerate() {
+                let is_tombstoned = self.ids.is_tombstoned(i as u32);
+                if sym == u32::MAX {
+                    if !is_tombstoned {
+                        return Err(GraphError::Corrupt {
+                            detail: format!(
+                                "snapshot: live node at id slot {i} has sentinel label (u32::MAX)"
+                            ),
+                        });
+                    }
+                } else if sym >= syms_len {
+                    return Err(GraphError::Corrupt {
+                        detail: format!(
+                            "snapshot: label at id slot {i} references sym {sym} \
+                             which is out of interner range ({syms_len})"
+                        ),
+                    });
+                }
+            }
+        }
         let defs: Vec<RuleDef> = state
             .rule_defs
             .iter()
@@ -1458,6 +1557,48 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("v8: meta decode: {e:?}"),
         })?;
         self.labels = meta.labels;
+        // Cross-section label integrity: labels must cover every id slot (live
+        // and tombstoned), every non-sentinel sym must be within the interner's
+        // bound, and no live (non-tombstoned) node may carry the u32::MAX
+        // sentinel label.  Without this check, a crafted snapshot where the META
+        // section (small, CRC-validated) holds a short `labels` vec, out-of-range
+        // sym ids, or a sentinel label on a live node, would open successfully
+        // and then panic in `NodeRef::label()`, `neighborhood_masked()`, and
+        // related read paths.  Catching the inconsistency here converts those
+        // panics into typed `GraphError::Corrupt` at open time.
+        {
+            let ids_len = self.ids.len();
+            if self.labels.len() != ids_len {
+                return Err(GraphError::Corrupt {
+                    detail: format!(
+                        "v8: labels section has {} entries but id table has {} total slots",
+                        self.labels.len(),
+                        ids_len,
+                    ),
+                });
+            }
+            let syms_len = self.syms.len() as u32;
+            for (i, &sym) in self.labels.iter().enumerate() {
+                let is_tombstoned = self.ids.is_tombstoned(i as u32);
+                if sym == u32::MAX {
+                    // Sentinel is only valid for tombstoned slots.
+                    if !is_tombstoned {
+                        return Err(GraphError::Corrupt {
+                            detail: format!(
+                                "v8: live node at id slot {i} has sentinel label (u32::MAX)"
+                            ),
+                        });
+                    }
+                } else if sym >= syms_len {
+                    return Err(GraphError::Corrupt {
+                        detail: format!(
+                            "v8: label at id slot {i} references sym {sym} \
+                             which is out of interner range ({syms_len})"
+                        ),
+                    });
+                }
+            }
+        }
         // C3: self.edge_props stays as an empty overlay.  Reads go through
         // edge_props_view() which consults the mmap'd base section zero-copy
         // via EdgePropsView::with_base.  No heap decode at open time.
@@ -2809,6 +2950,22 @@ impl<F: Fs> GraphDb<F> {
             // History markers carry no replay state — rules re-derive edges
             // deterministically on open/replay. Skip unconditionally.
             WalRecord::DerivedEdgeAdded { .. } | WalRecord::DerivedEdgeRetracted { .. } => {}
+            // ── rename_node ──────────────────────────────────────────────────
+            WalRecord::RenameNode { old_key, new_key } => {
+                // Recovery-safe: if old_key is already gone (key was renamed
+                // by a snapshot or a prior replay frame), skip cleanly.
+                if self.ids.get(old_key).is_none() {
+                    return Ok(());
+                }
+                // The rename only updates the key-table; the dense id, all
+                // topo edges, props, labels, and rule state are id-indexed and
+                // require no change.
+                self.ids
+                    .rename(old_key, new_key)
+                    .map_err(|e| GraphError::Corrupt {
+                        detail: format!("wal replay RenameNode {old_key}→{new_key}: {e}"),
+                    })?;
+            }
         }
         Ok(())
     }
@@ -2919,6 +3076,23 @@ impl<F: Fs> GraphDb<F> {
                         }
                     })?;
                     out.push(WalRecord::InsertEdgeId { etype, src, dst });
+                }
+                WalRecord::RenameNode {
+                    ref old_key,
+                    ref new_key,
+                } => {
+                    // Track the rename in `pending` so subsequent InsertEdge /
+                    // SetProp records in this batch can resolve the new key.
+                    let id = lookup(&self.ids, &pending, old_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!(
+                                "dense WAL rewrite: RenameNode old key {old_key} not found"
+                            ),
+                        }
+                    })?;
+                    pending.remove(old_key.as_str());
+                    pending.insert(new_key.clone(), id);
+                    out.push(rec);
                 }
                 other => out.push(other),
             }
@@ -3534,7 +3708,8 @@ impl<F: Fs> GraphDb<F> {
             // History markers produce no DbEvent — the engine delta already
             // fired the EdgeFired/EdgeRetracted subscription events.
             | WalRecord::DerivedEdgeAdded { .. }
-            | WalRecord::DerivedEdgeRetracted { .. } => vec![],
+            | WalRecord::DerivedEdgeRetracted { .. }
+            | WalRecord::RenameNode { .. } => vec![],
         }
     }
 
@@ -3902,6 +4077,39 @@ impl<F: Fs> GraphDb<F> {
                         preview.note_delete_rule(&name);
                         recs.push(WalRecord::DeleteRule { name });
                     }
+                    BatchOp::RenameNode { old_key, new_key } => {
+                        preview.check_rename_node(&old_key, &new_key)?;
+                        preview.note_rename_node(&old_key, &new_key);
+                        recs.push(WalRecord::RenameNode { old_key, new_key });
+                    }
+                    BatchOp::InsertEdgeUpsert {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                        placeholder_label,
+                    } => {
+                        // Auto-create any missing endpoints as plain InsertNode ops.
+                        // Rules fire and last-change is updated for each created node.
+                        for key in [&src_key, &dst_key] {
+                            if !preview.has_key(key) {
+                                preview.check_insert_node(key)?;
+                                preview.note_insert_node(key, &[]);
+                                recs.push(WalRecord::InsertNode {
+                                    label: placeholder_label.clone(),
+                                    key: key.clone(),
+                                    props: vec![],
+                                });
+                            }
+                        }
+                        if preview.prepare_insert_edge(&edge_type, &src_key, &dst_key)? {
+                            preview.note_insert_edge(&edge_type, &src_key, &dst_key);
+                            recs.push(WalRecord::InsertEdge {
+                                edge_type,
+                                src_key,
+                                dst_key,
+                            });
+                        }
+                    }
                 }
             }
             recs
@@ -4153,6 +4361,22 @@ impl<F: Fs> GraphDb<F> {
         Ok(DeleteReport {
             manual_edges,
             derived_edges,
+        })
+    }
+
+    /// Rename a live node's key.  The dense id (and therefore all edges,
+    /// props, history, and last-change tracking) is unaffected.
+    ///
+    /// Returns `Err(KeyNotFound)` if `old` is not a live key.
+    /// Returns `Err(DuplicateKey)` if `new` is already live.
+    pub fn rename_node(&mut self, old: &str, new: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        MutPreview::new(self).check_rename_node(old, new)?;
+        self.log_then_apply(WalRecord::RenameNode {
+            old_key: old.into(),
+            new_key: new.into(),
         })
     }
 
@@ -4421,18 +4645,26 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// **Memory / performance:** O(postings) lookup; no scan.  The index is
     /// in-memory and proportional to total indexed text across all enabled fields.
-    pub fn search(&self, field: &str, query: &str) -> Vec<(String, usize)> {
+    ///
+    /// **v2 grammar:** supports `"phrase"`, `-negation`, `prefix*`, `OR`, `AND`.
+    /// Results are BM25-scored (k1=1.2, b=0.75) and sorted by score descending,
+    /// key ascending for deterministic tiebreaking.
+    pub fn search(&self, field: &str, query: &str) -> Vec<(String, f64)> {
         // Resolve node_ids to keys (excluding tombstones) then re-sort by
-        // (match_count DESC, key ASC) to give a deterministic, key-lexicographic
-        // tiebreak.  FulltextIndex::search sorts by (count DESC, node_id ASC)
+        // (score DESC, key ASC) to give a deterministic, key-lexicographic
+        // tiebreak.  FulltextIndex::search sorts by (score DESC, node_id ASC)
         // which diverges from key order when nodes were not inserted in key-lex order.
-        let mut results: Vec<(String, usize)> = self
+        let mut results: Vec<(String, f64)> = self
             .fulltext
-            .search(field, query)
+            .search(field, query, 0)
             .into_iter()
-            .filter_map(|(id, count)| self.ids.key_of(id).map(|key| (key.to_string(), count)))
+            .filter_map(|(id, score)| self.ids.key_of(id).map(|key| (key.to_string(), score)))
             .collect();
-        results.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
         results
     }
 
@@ -4504,17 +4736,31 @@ impl<F: Fs> GraphDb<F> {
         ranked
     }
 
-    /// For DST/testing: scratch full-text search over live nodes without using
-    /// the index.  Walks every live node, tokenizes the field value, and returns
-    /// nodes matching the query.  Results are sorted match_count desc, key asc.
+    /// For DST/testing: scratch BM25 search over live nodes without the index.
+    /// Walks every live node, re-stems field tokens, computes corpus stats, and
+    /// returns BM25-ranked results.
     ///
-    /// The oracle: `search(field, q)` must equal `scratch_search(field, q)`.
+    /// The oracle: the ordered key list of `search(field, q)` must equal that of
+    /// `scratch_search(field, q)` at every quiescent state.
     #[doc(hidden)]
-    pub fn scratch_search(&self, field: &str, query: &str) -> Vec<(String, usize)> {
-        use core_storage::fulltext::{parse_query, tokenize};
-        use std::collections::BTreeSet;
+    pub fn scratch_search(&self, field: &str, query: &str) -> Vec<(String, f64)> {
+        use core_storage::fulltext::{parse_query, tokenize_stemmed_with_positions};
+        use std::collections::BTreeMap;
+
         let groups = parse_query(query);
-        let mut results: Vec<(String, usize)> = Vec::new();
+        if groups.is_empty() {
+            return vec![];
+        }
+
+        // --- Pass 1: collect all live indexed nodes with stemmed token data ---
+        struct NodeData {
+            key: String,
+            /// stemmed_token → positions (sorted)
+            tokens: BTreeMap<String, Vec<u32>>,
+            dl: u32,
+        }
+
+        let mut nodes: Vec<NodeData> = Vec::new();
         for id in 0..self.ids.len() as u32 {
             let Some(key) = self.ids.key_of(id) else {
                 continue;
@@ -4525,7 +4771,6 @@ impl<F: Fs> GraphDb<F> {
             if sym == u32::MAX {
                 continue;
             }
-            // Only scan nodes whose label has this field indexed.
             let label = match self.syms.resolve(sym) {
                 Some(l) => l,
                 None => continue,
@@ -4536,44 +4781,124 @@ impl<F: Fs> GraphDb<F> {
             let Some(value) = self.props_view().get(id, field).map(|vr| vr.into_value()) else {
                 continue;
             };
-            let node_tokens: BTreeSet<String> = match &value {
-                Value::Str(s) => tokenize(s).into_iter().collect(),
-                Value::List(items) => items
-                    .iter()
-                    .flat_map(|v| {
-                        if let Value::Str(s) = v {
-                            tokenize(s)
-                        } else {
-                            vec![]
-                        }
-                    })
-                    .collect(),
-                _ => BTreeSet::new(),
+            let stemmed_with_pos = match &value {
+                Value::Str(s) => tokenize_stemmed_with_positions(s),
+                Value::List(items) => {
+                    let combined: String = items
+                        .iter()
+                        .filter_map(|v| {
+                            if let Value::Str(s) = v {
+                                Some(s.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    tokenize_stemmed_with_positions(&combined)
+                }
+                _ => continue,
             };
-            // Count OR-group matches.
-            let mut count = 0usize;
-            for group in &groups {
-                let mut group_match = true;
-                for term in group {
-                    let matched = if term.prefix {
-                        node_tokens.iter().any(|t| t.starts_with(&term.token))
-                    } else {
-                        node_tokens.contains(&term.token)
-                    };
-                    if !matched {
-                        group_match = false;
-                        break;
-                    }
-                }
-                if group_match {
-                    count += 1;
-                }
+            let dl = stemmed_with_pos.len() as u32;
+            let mut tok_map: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+            for (tok, pos) in stemmed_with_pos {
+                tok_map.entry(tok).or_default().push(pos);
             }
-            if count > 0 {
-                results.push((key.to_string(), count));
+            nodes.push(NodeData {
+                key: key.to_string(),
+                tokens: tok_map,
+                dl,
+            });
+        }
+
+        if nodes.is_empty() {
+            return vec![];
+        }
+
+        // --- BM25 corpus stats ---
+        let n = nodes.len() as f64;
+        let avg_dl: f64 = nodes.iter().map(|nd| nd.dl as f64).sum::<f64>() / n;
+        // df per stemmed token across all live indexed nodes.
+        let mut df_map: BTreeMap<&str, f64> = BTreeMap::new();
+        for nd in &nodes {
+            for tok in nd.tokens.keys() {
+                *df_map.entry(tok.as_str()).or_insert(0.0) += 1.0;
             }
         }
-        results.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        const K1: f64 = 1.2;
+        const B: f64 = 0.75;
+
+        // --- Pass 2: score each node against each OR-group ---
+        let mut results: Vec<(String, f64)> = Vec::new();
+        for nd in &nodes {
+            let dl = nd.dl as f64;
+            let mut total_score = 0.0f64;
+
+            'group: for group in &groups {
+                let mut group_score = 0.0f64;
+
+                for term in group {
+                    if term.negated {
+                        // Negated: if doc has this stemmed token → group fails.
+                        let present = if term.prefix {
+                            nd.tokens.keys().any(|t| t.starts_with(term.token.as_str()))
+                        } else {
+                            nd.tokens.contains_key(term.token.as_str())
+                        };
+                        if present {
+                            continue 'group;
+                        }
+                        continue;
+                    }
+                    if term.prefix {
+                        // Prefix: sum BM25 for all matching stemmed tokens.
+                        let mut prefix_matched = false;
+                        for (tok, positions) in &nd.tokens {
+                            if tok.starts_with(term.token.as_str()) {
+                                let tf = positions.len() as f64;
+                                let df = df_map.get(tok.as_str()).copied().unwrap_or(1.0);
+                                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                                let tf_norm =
+                                    tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avg_dl));
+                                group_score += idf * tf_norm;
+                                prefix_matched = true;
+                            }
+                        }
+                        if !prefix_matched {
+                            continue 'group;
+                        }
+                    } else {
+                        // term.token is already stemmed by parse_query; use directly.
+                        match nd.tokens.get(term.token.as_str()) {
+                            None => continue 'group,
+                            Some(positions) => {
+                                let tf = positions.len() as f64;
+                                let df = df_map.get(term.token.as_str()).copied().unwrap_or(1.0);
+                                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                                let tf_norm =
+                                    tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avg_dl));
+                                group_score += idf * tf_norm;
+                            }
+                        }
+                    }
+                }
+
+                if group_score > 0.0 {
+                    total_score += group_score;
+                }
+            }
+
+            if total_score > 0.0 {
+                results.push((nd.key.clone(), total_score));
+            }
+        }
+
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
         results
     }
 
@@ -4773,7 +5098,7 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        Ok(crate::mask::NodeMask { visible })
+        Ok(crate::mask::NodeMask::from_ids(visible))
     }
 
     /// Return the current list of role definitions.
@@ -4871,9 +5196,19 @@ impl<F: Fs> GraphDb<F> {
 
     /// BFS neighborhood expansion restricted to visible nodes in `mask`.
     ///
-    /// Hidden nodes are neither returned nor used as traversal intermediaries —
-    /// a visible node reachable only through a hidden node will not appear.
+    /// Hidden nodes are never used as traversal intermediaries in either
+    /// [`MaskMode::Omit`] or [`MaskMode::Stub`] — a visible node reachable
+    /// only through a hidden node will not appear in results.
+    ///
+    /// In [`MaskMode::Stub`] mode, hidden nodes that are direct neighbours of
+    /// a visited visible node are appended to the result as stub rows
+    /// (`label` column is `null`, same key+depth columns as visible rows).
+    /// They are NOT added to the BFS frontier.
+    ///
     /// Returns `None` when `key` does not exist (caller should 404).
+    ///
+    /// **SECURITY**: role-token callers always pass an Omit-mode mask, so
+    /// stub rows are never produced on the role path.
     pub fn neighborhood_masked(
         &self,
         key: &str,
@@ -4882,7 +5217,7 @@ impl<F: Fs> GraphDb<F> {
         dir: Dir,
         mask: &crate::mask::NodeMask,
     ) -> Option<ResultSet> {
-        let id = self.ids.get(key)?;
+        let start_id = self.ids.get(key)?;
         let view = self.view_masked(mask);
         let resolved: Option<Vec<u32>> = edge_types.map(|names| {
             names
@@ -4890,18 +5225,47 @@ impl<F: Fs> GraphDb<F> {
                 .filter_map(|name| view.syms.get(name))
                 .collect()
         });
-        let nb = neighborhood(&view, id, depth, resolved.as_deref(), dir);
+        let nb = neighborhood(&view, start_id, depth, resolved.as_deref(), dir);
         let mut rs = ResultSet::new(vec!["key".into(), "label".into(), "depth".into()]);
-        for (nid, d) in nb.nodes {
-            let key = view.key_of(nid);
+        // Collect visible BFS results (start_id at depth 0, BFS nodes after).
+        let mut visited: Vec<(u32, u32)> = Vec::with_capacity(nb.nodes.len() + 1);
+        visited.push((start_id, 0));
+        for (nid, d) in &nb.nodes {
+            let k = view.key_of(*nid);
             let label = view
-                .label_of(nid)
+                .label_of(*nid)
                 .expect("real nodes always have a label; u32::MAX sentinel cannot occur");
             rs.push_row(vec![
-                Some(Value::Str(key.to_string())),
+                Some(Value::Str(k.to_string())),
                 Some(Value::Str(label.to_string())),
-                Some(Value::Int(d as i64)),
+                Some(Value::Int(*d as i64)),
             ]);
+            visited.push((*nid, *d));
+        }
+        // Stub mode: add hidden direct neighbours of each visited node as stubs.
+        // Hidden nodes are edge-endpoints only — they are not added to the BFS
+        // frontier, so the BFS never expands through them.
+        if mask.mode() == crate::mask::MaskMode::Stub {
+            let raw_view = self.view();
+            let mut seen: std::collections::HashSet<u32> =
+                visited.iter().map(|(id, _)| *id).collect();
+            for (node_id, node_depth) in &visited {
+                if *node_depth >= depth {
+                    continue;
+                }
+                for e in expand(&raw_view, *node_id, resolved.as_deref(), dir) {
+                    let nbr = if e.src == *node_id { e.dst } else { e.src };
+                    if !mask.contains_id(nbr) && seen.insert(nbr) {
+                        if let Some(k) = self.ids.key_of(nbr) {
+                            rs.push_row(vec![
+                                Some(Value::Str(k.to_string())),
+                                None,
+                                Some(Value::Int((*node_depth + 1) as i64)),
+                            ]);
+                        }
+                    }
+                }
+            }
         }
         Some(rs)
     }
@@ -4914,6 +5278,114 @@ impl<F: Fs> GraphDb<F> {
             label: n.label().to_string(),
             props: n.props(),
         })
+    }
+
+    /// Look up a node with mask awareness.
+    ///
+    /// | Key state         | Omit mode       | Stub mode              |
+    /// |-------------------|-----------------|------------------------|
+    /// | does not exist    | `None` (→ 404)  | `None` (→ 404)         |
+    /// | exists, visible   | `Some(Visible)` | `Some(Visible)`        |
+    /// | exists, hidden    | `None` (→ 404)  | `Some(Restricted)`     |
+    ///
+    /// **SECURITY**: only call from client-mask (full-token) paths.
+    /// Role-token paths must use [`node_info`] after an explicit visibility check.
+    pub fn node_info_masked(
+        &self,
+        key: &str,
+        mask: &crate::mask::NodeMask,
+    ) -> Option<MaskedNodeResult> {
+        let id = self.ids.get(key)?;
+        if mask.contains_id(id) {
+            Some(MaskedNodeResult::Visible(self.node_info(key)?))
+        } else {
+            match mask.mode() {
+                crate::mask::MaskMode::Stub => Some(MaskedNodeResult::Restricted),
+                crate::mask::MaskMode::Omit => None,
+            }
+        }
+    }
+
+    /// Get edges for `key` with mask-aware hidden-endpoint handling.
+    ///
+    /// - Omit mode: edges to hidden endpoints are excluded (same as role-path filtering).
+    /// - Stub mode: edges to hidden endpoints are included; `src_restricted`/`dst_restricted`
+    ///   is `true` for each hidden endpoint.
+    ///
+    /// Unknown key → [`GraphError::KeyNotFound`].
+    ///
+    /// **SECURITY**: only call from client-mask (full-token) paths.
+    pub fn node_edges_masked(
+        &self,
+        key: &str,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<MaskedEdge>> {
+        self.ensure_v8_base_sections_loaded();
+        let id = self
+            .ids
+            .get(key)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+        let derived: BTreeSet<(u32, u32, u32)> = self
+            .engine
+            .provenance_touching(id)
+            .map(|(_rule, etype, src, dst)| (etype, src, dst))
+            .collect();
+        let mut edges = Vec::new();
+        let tv = self.topo_view();
+        for etype in tv.etypes() {
+            // etype comes from the archived CSR (access_unchecked, no eager CRC).
+            // A bit-flip in the large TOPOLOGY section can produce an etype id
+            // that is not in the interner.  Return Corrupt rather than panic.
+            let edge_type = self
+                .syms
+                .resolve(etype)
+                .ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: topology etype {etype} not in interner"),
+                })?
+                .to_string();
+            for dir in [Direction::Out, Direction::In] {
+                for &nbr in tv.neighbors(etype, dir, id).as_ref() {
+                    let nbr_restricted = !mask.contains_id(nbr);
+                    if nbr_restricted && mask.mode() == crate::mask::MaskMode::Omit {
+                        continue;
+                    }
+                    let nbr_key = self
+                        .ids
+                        .key_of(nbr)
+                        .ok_or_else(|| GraphError::Corrupt {
+                            detail: format!("topology id {nbr} has no key"),
+                        })?
+                        .to_string();
+                    let (src_id, dst_id, src_key, dst_key, src_restricted, dst_restricted) =
+                        match dir {
+                            Direction::Out => {
+                                (id, nbr, key.to_string(), nbr_key, false, nbr_restricted)
+                            }
+                            Direction::In => {
+                                (nbr, id, nbr_key, key.to_string(), nbr_restricted, false)
+                            }
+                        };
+                    edges.push(MaskedEdge {
+                        edge_type: edge_type.clone(),
+                        src_key,
+                        src_restricted,
+                        dst_key,
+                        dst_restricted,
+                        derived: derived.contains(&(etype, src_id, dst_id)),
+                    });
+                }
+            }
+        }
+        edges.sort_by(|a, b| {
+            a.edge_type
+                .cmp(&b.edge_type)
+                .then(a.src_key.cmp(&b.src_key))
+                .then(a.dst_key.cmp(&b.dst_key))
+        });
+        edges.dedup_by(|a, b| {
+            a.edge_type == b.edge_type && a.src_key == b.src_key && a.dst_key == b.dst_key
+        });
+        Ok(edges)
     }
 
     /// Every directed edge incident on `key`, both directions, every etype.
@@ -4936,10 +5408,13 @@ impl<F: Fs> GraphDb<F> {
         let mut edges = Vec::new();
         let tv = self.topo_view();
         for etype in tv.etypes() {
+            // Same guard as node_edges_masked: etype from unchecked-CRC CSR.
             let edge_type = self
                 .syms
                 .resolve(etype)
-                .expect("topology etype is interned")
+                .ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: topology etype {etype} not in interner"),
+                })?
                 .to_string();
             for dir in [Direction::Out, Direction::In] {
                 for &nbr in tv.neighbors(etype, dir, id).as_ref() {
@@ -4986,6 +5461,208 @@ impl<F: Fs> GraphDb<F> {
         // (sort key matches PartialEq for this case) so one pass drops the dup.
         edges.dedup();
         Ok(edges)
+    }
+
+    // ── Backup ────────────────────────────────────────────────────────────────
+
+    /// Copy this store to `dest` as a consistent, verified snapshot.
+    ///
+    /// Copies every durable file in the database directory — `snapshot.bin`,
+    /// `wal.bin`, all `wal.<N>.archive` files, `wal.floor`, `wal.genesis`, and
+    /// `roles.json` — into a freshly created `dest` directory using OS-level
+    /// `copy` calls (no large in-process buffers).
+    ///
+    /// # Consistency guarantee
+    ///
+    /// The guarantee is **process-local**: the caller holds `&self`, which
+    /// prevents any concurrent writer in the **same process** from modifying
+    /// the files during the copy.  Running `mushroomdb backup` against a
+    /// directory that is **concurrently being written by another process** (e.g.
+    /// `mushroomdb serve`) is **unsafe** — the copy can be torn.  The post-copy
+    /// `verified: true` result reduces but does not eliminate the risk of a
+    /// silent corrupt backup (CRC catches many bit-flips; it cannot catch a
+    /// consistent mid-write snapshot).
+    ///
+    /// **The safe path for a live-served store is `POST /backup` on the HTTP
+    /// server.** That handler acquires the read lock on the shared database
+    /// before calling this method, which is the correct cross-process
+    /// synchronisation point because the server is the single process writing
+    /// the files.
+    ///
+    /// After copying, opens the destination read-only and runs the CRC section
+    /// verifier (`verify_snapshot`) to confirm byte-for-byte integrity.
+    /// `BackupReport::verified` reflects whether both checks passed.
+    ///
+    /// Returns `Err` when `self` is not backed by a `RealFs` (e.g. `SimFs`).
+    pub fn backup_to(&self, dest: &std::path::Path) -> Result<BackupReport> {
+        // Derive source directory from snapshot_path (RealFs only).
+        let src_dir = match self.fs.snapshot_path() {
+            Some(p) => p.parent().map(|d| d.to_path_buf()).ok_or_else(|| {
+                GraphError::Io(std::io::Error::other("snapshot has no parent dir"))
+            })?,
+            None => {
+                return Err(GraphError::Io(std::io::Error::other(
+                    "backup_to requires a real filesystem (RealFs)",
+                )))
+            }
+        };
+
+        std::fs::create_dir_all(dest)?;
+
+        let mut files: Vec<String> = Vec::new();
+        let mut bytes: u64 = 0;
+
+        // Helper: copy src_dir/name → dest/name if the file exists.
+        let mut try_copy = |name: &str| -> std::io::Result<()> {
+            let src_path = src_dir.join(name);
+            if src_path.exists() {
+                let n = std::fs::copy(&src_path, dest.join(name))?;
+                bytes += n;
+                files.push(name.to_string());
+            }
+            Ok(())
+        };
+
+        try_copy("snapshot.bin")?;
+        try_copy("snapshot.bin.bak")?;
+        try_copy("wal.bin")?;
+        try_copy("wal.floor")?;
+        try_copy("wal.genesis")?;
+        try_copy("roles.json")?;
+
+        // Copy WAL archives.
+        let archives = self.fs.list_archives()?;
+        for n in &archives {
+            let name = format!("wal.{n}.archive");
+            let n_bytes = std::fs::copy(src_dir.join(&name), dest.join(&name))?;
+            bytes += n_bytes;
+            files.push(name);
+        }
+
+        files.sort();
+
+        // Post-copy verification: open dest and run CRC checks.
+        let snap_in_dest = dest.join("snapshot.bin").exists();
+        let crc_ok = if snap_in_dest {
+            crate::verify_snapshot(dest)
+                .map(|results| results.iter().all(|(_, _, _, r)| r.is_ok()))
+                .unwrap_or(false)
+        } else {
+            true // WAL-only store: nothing to CRC-check in snapshot
+        };
+        let opens_ok = GraphDb::<core_storage::fs::RealFs>::open(dest).is_ok();
+        let verified = crc_ok && opens_ok;
+
+        Ok(BackupReport {
+            files,
+            bytes,
+            verified,
+        })
+    }
+
+    // ── Export helpers ────────────────────────────────────────────────────────
+
+    /// All live nodes, sorted by key (deterministic).
+    ///
+    /// Reads base + WAL overlay. Tombstoned nodes are excluded.
+    pub fn all_nodes_for_export(&self) -> Vec<NodeInfo> {
+        self.ensure_v8_base_sections_loaded();
+        let pv = self.props_view();
+        let mut nodes = Vec::new();
+        for id in 0..self.ids.len() as u32 {
+            let Some(key) = self.ids.key_of(id) else {
+                continue;
+            };
+            let Some(&sym) = self.labels.get(id as usize) else {
+                continue;
+            };
+            if sym == u32::MAX {
+                continue; // tombstoned
+            }
+            let Some(label) = self.syms.resolve(sym) else {
+                continue;
+            };
+            let mut props = BTreeMap::new();
+            for field in pv.field_names() {
+                if let Some(vr) = pv.get(id, &field) {
+                    props.insert(field, vr.into_value());
+                }
+            }
+            nodes.push(NodeInfo {
+                key: key.to_string(),
+                label: label.to_string(),
+                props,
+            });
+        }
+        nodes.sort_by(|a, b| a.key.cmp(&b.key));
+        nodes
+    }
+
+    /// All directed edges, sorted by `(edge_type, src, dst)`. Each edge appears once.
+    ///
+    /// Derived edges carry `derived: true` and the creating rule's name in `rule`.
+    /// Manual edges carry `derived: false` and `rule: None`.
+    /// Deterministic across runs on the same store state.
+    pub fn all_edges_for_export(&self) -> Vec<ExportEdge> {
+        self.ensure_v8_base_sections_loaded();
+
+        // Build (etype_sym, src_id, dst_id) → rule_name for O(1) derivation lookup.
+        let mut prov: HashMap<(u32, u32, u32), String> = HashMap::new();
+        for (rule_name, triples) in self.engine.provenance() {
+            for &(etype, src, dst) in triples {
+                prov.insert((etype, src, dst), rule_name.clone());
+            }
+        }
+
+        let tv = self.topo_view();
+        let mut edges = Vec::new();
+
+        for id in 0..self.ids.len() as u32 {
+            let Some(key) = self.ids.key_of(id) else {
+                continue;
+            };
+            let Some(&lsym) = self.labels.get(id as usize) else {
+                continue;
+            };
+            if lsym == u32::MAX {
+                continue; // tombstoned
+            }
+
+            for etype_sym in tv.etypes() {
+                // etype from archived CSR (access_unchecked, no eager CRC).
+                // Skip edges whose etype is not in the interner; this can only
+                // occur with a corrupt large TOPOLOGY section (bit-flip on an
+                // etype field in the archived data).  The function returns Vec,
+                // not Result, so we continue rather than propagate.
+                let Some(edge_type) = self.syms.resolve(etype_sym) else {
+                    continue;
+                };
+                let edge_type = edge_type.to_string();
+                for &nbr in tv.neighbors(etype_sym, Direction::Out, id).as_ref() {
+                    let Some(dst_key) = self.ids.key_of(nbr) else {
+                        continue; // skip corrupt entries
+                    };
+                    let prov_key = (etype_sym, id, nbr);
+                    let rule = prov.get(&prov_key).cloned();
+                    let derived = rule.is_some();
+                    edges.push(ExportEdge {
+                        edge_type: edge_type.clone(),
+                        src: key.to_string(),
+                        dst: dst_key.to_string(),
+                        derived,
+                        rule,
+                    });
+                }
+            }
+        }
+
+        edges.sort_by(|a, b| {
+            a.edge_type
+                .cmp(&b.edge_type)
+                .then(a.src.cmp(&b.src))
+                .then(a.dst.cmp(&b.dst))
+        });
+        edges
     }
 
     pub fn nodes_with_label(&self, label: &str) -> Vec<NodeRef<'_, F>> {
@@ -5722,15 +6399,22 @@ impl<F: Fs> GraphDb<F> {
                 Some(s) => s.to_string(),
                 None => continue,
             };
+            // Provenance (src, dst) ids come from the archived PROVENANCE section
+            // (large, no eager CRC).  A corrupt section can produce ids that are
+            // out of range; return Corrupt rather than panic.
             let src_key = self
                 .ids
                 .key_of(src)
-                .expect("provenance ids always resolvable")
+                .ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: provenance src id {src} not in id table"),
+                })?
                 .to_string();
             let dst_key = self
                 .ids
                 .key_of(dst)
-                .expect("provenance ids always resolvable")
+                .ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: provenance dst id {dst} not in id table"),
+                })?
                 .to_string();
             let weight = rule_def.weight_prop.as_deref().and_then(|prop| {
                 self.edge_props_view()
@@ -5921,6 +6605,13 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::DeleteView { .. }
             | WalRecord::EnableFulltext { .. }
             | WalRecord::DisableFulltext { .. } => {}
+            // RenameNode: node id is stable; update last_change via the new key.
+            // Called after apply(), so ids already reflects new_key.
+            WalRecord::RenameNode { new_key, .. } => {
+                if let Some(id) = self.ids.get(new_key) {
+                    self.last_change.insert(id, seq);
+                }
+            }
             WalRecord::Batch(inner) => {
                 for inner_rec in inner {
                     self.update_last_change_from_rec(inner_rec, seq);
@@ -6043,11 +6734,106 @@ impl<F: Fs> GraphDb<F> {
     /// Edge entries from dense-id WAL records (`InsertEdgeId`) are omitted when the partner
     /// endpoint's dense id is tombstoned. As a result, a live node's history can contain an
     /// `EdgeRemoved` (string-keyed, always resolves) without a corresponding `EdgeAdded`.
+    /// Build commit-bounded alias intervals for `queried_key`.
+    ///
+    /// Returns a list of `(key, valid_from_inclusive, valid_until_exclusive)` tuples.
+    /// A record written under `key` at commit `c` matches the queried identity iff
+    /// `c >= valid_from && (valid_until.is_none() || c < valid_until)`.
+    ///
+    /// Each alias entry carries both a lower and an upper bound so that key-reuse
+    /// after a rename is handled correctly: if "a" is renamed to "b" at commit 5,
+    /// then a NEW node is created as "a" at commit 7 and renamed to "c" at commit 10,
+    /// querying "c" must NOT surface identity-1's events (commits 0–4 under "a");
+    /// only identity-2's events (commits 7–9 under "a") are in scope.
+    ///
+    /// Only **forward aliasing**: querying the *new* key surfaces events written
+    /// under the *old* key.  The reverse direction is not supported.
+    fn build_key_alias_intervals(
+        &self,
+        frames: &[core_storage::wal::WalRecord],
+        queried_key: &str,
+    ) -> Vec<(String, u64, Option<u64>)> {
+        use core_storage::wal::WalRecord;
+
+        // Pre-pass: build reverse_rename and key_starts maps.
+        let mut reverse_rename: HashMap<String, (String, u64)> = HashMap::new();
+        let mut key_starts: HashMap<String, Vec<u64>> = HashMap::new();
+
+        for (local_i, frame) in frames.iter().enumerate() {
+            let commit = self.wal_horizon_floor + local_i as u64;
+            let records: &[WalRecord] = match frame {
+                WalRecord::Batch(inner) => inner.as_slice(),
+                single => std::slice::from_ref(single),
+            };
+            for rec in records {
+                match rec {
+                    WalRecord::InsertNode { key, .. } | WalRecord::InsertNodeId { key, .. } => {
+                        key_starts.entry(key.clone()).or_default().push(commit);
+                    }
+                    WalRecord::RenameNode { old_key, new_key } => {
+                        // new_key came into existence at this commit.
+                        key_starts.entry(new_key.clone()).or_default().push(commit);
+                        // Record the reverse rename: new_key was introduced by renaming old_key.
+                        reverse_rename.insert(new_key.clone(), (old_key.clone(), commit));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Build alias intervals by following the reverse rename chain.
+        let mut result: Vec<(String, u64, Option<u64>)> = Vec::new();
+        let mut current_key = queried_key.to_string();
+        let mut current_valid_until: Option<u64> = None;
+
+        loop {
+            // valid_from: the most recent commit where current_key was assigned to this
+            // identity.  For aliases (valid_until = Some(vu)), find the last start event
+            // for the key strictly before vu — this is where the alias's occupancy by
+            // this identity began, correctly excluding prior identities that reused the key.
+            let valid_from = if let Some(vu) = current_valid_until {
+                key_starts
+                    .get(&current_key)
+                    .and_then(|starts| starts.iter().rev().find(|&&s| s < vu).copied())
+                    .unwrap_or(self.wal_horizon_floor)
+            } else {
+                // Queried key — no upper bound; may have been introduced at any commit.
+                self.wal_horizon_floor
+            };
+
+            result.push((current_key.clone(), valid_from, current_valid_until));
+
+            match reverse_rename.get(&current_key) {
+                Some((old_key, rename_commit)) => {
+                    current_valid_until = Some(*rename_commit);
+                    current_key = old_key.clone();
+                }
+                None => break,
+            }
+        }
+
+        result
+    }
+
+    /// Returns true if `record_key` matches any alias interval that covers `commit`.
+    fn aliases_match(
+        intervals: &[(String, u64, Option<u64>)],
+        record_key: &str,
+        commit: u64,
+    ) -> bool {
+        intervals
+            .iter()
+            .any(|(k, vf, vu)| k == record_key && commit >= *vf && vu.is_none_or(|u| commit < u))
+    }
+
     pub fn node_history(&self, key: &str) -> Result<Vec<crate::history::HistoryEntry>> {
         use crate::history::{HistoryChange, HistoryEntry};
         use core_storage::wal::WalRecord;
 
         let (frames, _) = self.all_frames()?;
+
+        // Resolve commit-bounded alias intervals for `key` (handles renames in the WAL).
+        let alias_intervals = self.build_key_alias_intervals(&frames, key);
 
         let mut out: Vec<HistoryEntry> = Vec::new();
 
@@ -6061,12 +6847,16 @@ impl<F: Fs> GraphDb<F> {
 
             for rec in records {
                 let change = match rec {
-                    WalRecord::InsertNode { label, key: k, .. } if k == key => {
+                    WalRecord::InsertNode { label, key: k, .. }
+                        if Self::aliases_match(&alias_intervals, k, commit) =>
+                    {
                         Some(HistoryChange::NodeInserted {
                             label: label.clone(),
                         })
                     }
-                    WalRecord::InsertNodeId { label, key: k, .. } if k == key => {
+                    WalRecord::InsertNodeId { label, key: k, .. }
+                        if Self::aliases_match(&alias_intervals, k, commit) =>
+                    {
                         let label_str = match self.syms.resolve(*label) {
                             Some(s) => s.to_string(),
                             None => continue,
@@ -6077,11 +6867,14 @@ impl<F: Fs> GraphDb<F> {
                         key: k,
                         field,
                         value,
-                    } if k == key => Some(HistoryChange::PropSet {
-                        field: field.clone(),
-                        value: value.clone(),
-                    }),
+                    } if Self::aliases_match(&alias_intervals, k, commit) => {
+                        Some(HistoryChange::PropSet {
+                            field: field.clone(),
+                            value: value.clone(),
+                        })
+                    }
                     WalRecord::SetPropId { id, field, value } => match self.ids.key_of(*id) {
+                        // key_of returns the current (post-rename) key; compare to queried key.
                         Some(resolved) if resolved == key => {
                             let field_str = match self.syms.resolve(*field) {
                                 Some(s) => s.to_string(),
@@ -6094,7 +6887,9 @@ impl<F: Fs> GraphDb<F> {
                         }
                         _ => None,
                     },
-                    WalRecord::RemoveProp { key: k, field } if k == key => {
+                    WalRecord::RemoveProp { key: k, field }
+                        if Self::aliases_match(&alias_intervals, k, commit) =>
+                    {
                         Some(HistoryChange::PropRemoved {
                             field: field.clone(),
                         })
@@ -6104,13 +6899,13 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        if src_key == key {
+                        if Self::aliases_match(&alias_intervals, src_key, commit) {
                             Some(HistoryChange::EdgeAdded {
                                 edge_type: edge_type.clone(),
                                 other: dst_key.clone(),
                                 outgoing: true,
                             })
-                        } else if dst_key == key {
+                        } else if Self::aliases_match(&alias_intervals, dst_key, commit) {
                             Some(HistoryChange::EdgeAdded {
                                 edge_type: edge_type.clone(),
                                 other: src_key.clone(),
@@ -6156,13 +6951,13 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        if src_key == key {
+                        if Self::aliases_match(&alias_intervals, src_key, commit) {
                             Some(HistoryChange::EdgeRemoved {
                                 edge_type: edge_type.clone(),
                                 other: dst_key.clone(),
                                 outgoing: true,
                             })
-                        } else if dst_key == key {
+                        } else if Self::aliases_match(&alias_intervals, dst_key, commit) {
                             Some(HistoryChange::EdgeRemoved {
                                 edge_type: edge_type.clone(),
                                 other: src_key.clone(),
@@ -6172,7 +6967,9 @@ impl<F: Fs> GraphDb<F> {
                             None
                         }
                     }
-                    WalRecord::DeleteNode { key: k } if k == key => {
+                    WalRecord::DeleteNode { key: k }
+                        if Self::aliases_match(&alias_intervals, k, commit) =>
+                    {
                         Some(HistoryChange::NodeDeleted)
                     }
                     // Skip: rule/view/fulltext/intern metadata; Batch wrapper handled above.
@@ -6231,6 +7028,11 @@ impl<F: Fs> GraphDb<F> {
         let (frames, _) = self.all_frames()?;
         let total_commits = self.wal_horizon_floor + frames.len() as u64;
 
+        // Resolve all historical names for a and b (handles RenameNode in the WAL).
+        // Intervals are commit-bounded so recycled keys don't contaminate histories.
+        let alias_a = self.build_key_alias_intervals(&frames, a);
+        let alias_b = self.build_key_alias_intervals(&frames, b);
+
         // Active edges between a and b tracked as (edge_type, src_key, dst_key, is_derived).
         // The is_derived flag is used by the DeleteNode sweep: manual edges are
         // swept with a synthetic Retracted(rule:None); derived edges are skipped
@@ -6253,8 +7055,10 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = Self::aliases_match(&alias_a, src_key, commit)
+                            && Self::aliases_match(&alias_b, dst_key, commit);
+                        let is_ba = Self::aliases_match(&alias_b, src_key, commit)
+                            && Self::aliases_match(&alias_a, dst_key, commit);
                         if is_ab || is_ba {
                             active.push((
                                 edge_type.clone(),
@@ -6298,8 +7102,10 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = Self::aliases_match(&alias_a, src_key, commit)
+                            && Self::aliases_match(&alias_b, dst_key, commit);
+                        let is_ba = Self::aliases_match(&alias_b, src_key, commit)
+                            && Self::aliases_match(&alias_a, dst_key, commit);
                         if is_ab || is_ba {
                             // Remove the first matching active entry (flag ignored).
                             if let Some(pos) = active.iter().position(|(et, s, d, _)| {
@@ -6315,7 +7121,10 @@ impl<F: Fs> GraphDb<F> {
                             });
                         }
                     }
-                    WalRecord::DeleteNode { key: k } if k == a || k == b => {
+                    WalRecord::DeleteNode { key: k }
+                        if Self::aliases_match(&alias_a, k, commit)
+                            || Self::aliases_match(&alias_b, k, commit) =>
+                    {
                         // Sweep: implicitly retract only MANUAL active edges.
                         // Derived active edges are skipped here because the rule
                         // engine appends a DerivedEdgeRetracted marker immediately
@@ -6341,8 +7150,10 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = Self::aliases_match(&alias_a, src_key, commit)
+                            && Self::aliases_match(&alias_b, dst_key, commit);
+                        let is_ba = Self::aliases_match(&alias_b, src_key, commit)
+                            && Self::aliases_match(&alias_a, dst_key, commit);
                         if is_ab || is_ba {
                             active.push((et.clone(), src_key.clone(), dst_key.clone(), true));
                             out.push(EdgeHistoryEvent {
@@ -6359,8 +7170,10 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = Self::aliases_match(&alias_a, src_key, commit)
+                            && Self::aliases_match(&alias_b, dst_key, commit);
+                        let is_ba = Self::aliases_match(&alias_b, src_key, commit)
+                            && Self::aliases_match(&alias_a, dst_key, commit);
                         if is_ab || is_ba {
                             // Push unconditionally: a derived edge whose Added marker
                             // predates the history horizon has no `active` entry, but
@@ -6425,13 +7238,19 @@ impl<F: Fs> GraphDb<F> {
             });
         }
 
+        // Resolve all historical names for a and b (handles RenameNode in the WAL).
+        // Intervals are commit-bounded so recycled keys don't contaminate point-in-time reads.
+        let alias_a = self.build_key_alias_intervals(&frames, a);
+        let alias_b = self.build_key_alias_intervals(&frames, b);
+
         // Local index into surviving frames (0 = first frame of oldest archive).
         let local_commit = at_commit - self.wal_horizon_floor;
 
         // Replay local frames 0..=local_commit, tracking active edges.
         let mut active: BTreeSet<(String, String, String)> = BTreeSet::new();
 
-        for (_local_i, frame) in frames.iter().enumerate().take((local_commit + 1) as usize) {
+        for (local_i, frame) in frames.iter().enumerate().take((local_commit + 1) as usize) {
+            let commit = self.wal_horizon_floor + local_i as u64;
             let records: &[WalRecord] = match frame {
                 WalRecord::Batch(inner) => inner.as_slice(),
                 single => std::slice::from_ref(single),
@@ -6444,8 +7263,10 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = Self::aliases_match(&alias_a, src_key, commit)
+                            && Self::aliases_match(&alias_b, dst_key, commit);
+                        let is_ba = Self::aliases_match(&alias_b, src_key, commit)
+                            && Self::aliases_match(&alias_a, dst_key, commit);
                         if is_ab || is_ba {
                             active.insert((et.clone(), src_key.clone(), dst_key.clone()));
                         }
@@ -6473,13 +7294,18 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = Self::aliases_match(&alias_a, src_key, commit)
+                            && Self::aliases_match(&alias_b, dst_key, commit);
+                        let is_ba = Self::aliases_match(&alias_b, src_key, commit)
+                            && Self::aliases_match(&alias_a, dst_key, commit);
                         if is_ab || is_ba {
                             active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
                         }
                     }
-                    WalRecord::DeleteNode { key: k } if k == a || k == b => {
+                    WalRecord::DeleteNode { key: k }
+                        if Self::aliases_match(&alias_a, k, commit)
+                            || Self::aliases_match(&alias_b, k, commit) =>
+                    {
                         // All edges touching the deleted node are gone.
                         active.retain(|(_, s, d)| s != k && d != k);
                     }
@@ -6489,8 +7315,10 @@ impl<F: Fs> GraphDb<F> {
                         dst_key,
                         ..
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = Self::aliases_match(&alias_a, src_key, commit)
+                            && Self::aliases_match(&alias_b, dst_key, commit);
+                        let is_ba = Self::aliases_match(&alias_b, src_key, commit)
+                            && Self::aliases_match(&alias_a, dst_key, commit);
                         if is_ab || is_ba {
                             active.insert((et.clone(), src_key.clone(), dst_key.clone()));
                         }
@@ -6501,8 +7329,10 @@ impl<F: Fs> GraphDb<F> {
                         dst_key,
                         ..
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = Self::aliases_match(&alias_a, src_key, commit)
+                            && Self::aliases_match(&alias_b, dst_key, commit);
+                        let is_ba = Self::aliases_match(&alias_b, src_key, commit)
+                            && Self::aliases_match(&alias_a, dst_key, commit);
                         if is_ab || is_ba {
                             active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
                         }
@@ -7005,6 +7835,20 @@ pub enum BatchOp {
     DeleteRule {
         name: String,
     },
+    /// Rename a node's key. Validated: old must exist, new must not.
+    RenameNode {
+        old_key: String,
+        new_key: String,
+    },
+    /// Insert an edge, auto-creating any missing endpoint as a plain node with
+    /// `placeholder_label` and no props. Rules fire and last-change is updated
+    /// for each created endpoint (normal InsertNode semantics in the batch frame).
+    InsertEdgeUpsert {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+        placeholder_label: String,
+    },
 }
 
 /// Overlay of ops already accepted earlier in the same batch. Never written
@@ -7363,6 +8207,54 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.overlay.extra_rules.insert(name.to_string());
     }
 
+    fn check_rename_node(&self, old: &str, new: &str) -> Result<()> {
+        if !self.has_key(old) {
+            return Err(GraphError::KeyNotFound { key: old.into() });
+        }
+        if self.has_key(new) {
+            return Err(GraphError::DuplicateKey { key: new.into() });
+        }
+        Ok(())
+    }
+
+    fn note_rename_node(&mut self, old: &str, new: &str) {
+        // Mark old as deleted so subsequent batch ops cannot reference it.
+        self.overlay.extra_keys.remove(old);
+        self.overlay.deleted_keys.insert(old.to_string());
+        // Mark new as extra so subsequent batch ops can reference it.
+        self.overlay.deleted_keys.remove(new);
+        self.overlay.extra_keys.insert(new.to_string());
+        // Migrate any overlay props from old key to new key.
+        let new_str = new.to_string();
+        let transferred: Vec<((String, String), Value)> = self
+            .overlay
+            .extra_props
+            .iter()
+            .filter(|((k, _), _)| k.as_str() == old)
+            .map(|((_, f), v)| ((new_str.clone(), f.clone()), v.clone()))
+            .collect();
+        self.overlay
+            .extra_props
+            .retain(|(k, _), _| k.as_str() != old);
+        for (k, v) in transferred {
+            self.overlay.extra_props.insert(k, v);
+        }
+        // Migrate removed_props.
+        let transferred_removed: Vec<(String, String)> = self
+            .overlay
+            .removed_props
+            .iter()
+            .filter(|(k, _)| k.as_str() == old)
+            .map(|(_, f)| (new_str.clone(), f.clone()))
+            .collect();
+        self.overlay
+            .removed_props
+            .retain(|(k, _)| k.as_str() != old);
+        for k in transferred_removed {
+            self.overlay.removed_props.insert(k);
+        }
+    }
+
     fn note_delete_rule(&mut self, name: &str) {
         self.overlay.extra_rules.remove(name);
         self.overlay.deleted_rules.insert(name.to_string());
@@ -7459,6 +8351,38 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
 
     pub fn delete_rule(&mut self, name: &str) -> &mut Self {
         self.ops.push(BatchOp::DeleteRule { name: name.into() });
+        self
+    }
+
+    /// Queue a node-rename in this batch.
+    ///
+    /// Validation (old exists, new not taken) runs at commit time.
+    pub fn rename_node(&mut self, old_key: &str, new_key: &str) -> &mut Self {
+        self.ops.push(BatchOp::RenameNode {
+            old_key: old_key.into(),
+            new_key: new_key.into(),
+        });
+        self
+    }
+
+    /// Queue an edge insert with endpoint auto-creation.
+    ///
+    /// Any missing endpoint is created as a plain node `{key, label:
+    /// placeholder_label, no props}` inside this batch frame. Rules fire and
+    /// last-change is updated for each auto-created node.
+    pub fn insert_edge_upsert(
+        &mut self,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+        placeholder_label: &str,
+    ) -> &mut Self {
+        self.ops.push(BatchOp::InsertEdgeUpsert {
+            edge_type: edge_type.into(),
+            src_key: src_key.into(),
+            dst_key: dst_key.into(),
+            placeholder_label: placeholder_label.into(),
+        });
         self
     }
 
@@ -7568,11 +8492,12 @@ impl<'a, F: Fs> NodeRef<'a, F> {
         let view = self.db.view();
         let mut groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for e in expand(&view, self.id, None, Dir::Both) {
-            let etype = view
-                .syms
-                .resolve(e.etype)
-                .expect("topology etype is interned")
-                .to_string();
+            // Skip edges with unknown etypes (only possible from corrupt large
+            // TOPOLOGY section; function returns BTreeMap not Result).
+            let Some(etype) = view.syms.resolve(e.etype) else {
+                continue;
+            };
+            let etype = etype.to_string();
             let nbr = if e.src == self.id { e.dst } else { e.src };
             groups
                 .entry(etype)

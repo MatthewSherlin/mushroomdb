@@ -386,3 +386,84 @@ def test_snapshot_and_reopen(tmp_path):
     # Reopen after snapshot should be sub-second for 1k nodes.
     assert elapsed < 5.0, f"snapshot reopen took {elapsed:.2f}s — unexpectedly slow"
     db2.close()
+
+
+# ── Task 2: query() params — dict form, tuple-list form, injection inertness ──
+
+def test_query_params_dict_form(tmp_path):
+    """query(cypher, params={...}) passes bound params to the engine."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Org", "org-01", {"founded_year": 2010})
+    db.insert_node("Org", "org-02", {"founded_year": 2020})
+    rows = db.query(
+        "MATCH (n:Org) WHERE n.founded_year = $yr RETURN n",
+        params={"yr": 2010},
+    )
+    assert len(rows) == 1
+    assert rows[0]["n"] == "org-01"
+    db.close()
+
+
+def test_query_params_tuple_list_form(tmp_path):
+    """query(cypher, params=[("name", value)]) tuple-list also works."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Org", "org-01", {"founded_year": 2010})
+    db.insert_node("Org", "org-02", {"founded_year": 2020})
+    rows = db.query(
+        "MATCH (n:Org) WHERE n.founded_year = $yr RETURN n",
+        params=[("yr", 2020)],
+    )
+    assert len(rows) == 1
+    assert rows[0]["n"] == "org-02"
+    db.close()
+
+
+def test_query_no_params_unchanged(tmp_path):
+    """query(cypher) with no params still works (backward compat)."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Org", "org-01", {"founded_year": 2010})
+    rows = db.query("MATCH (n:Org) RETURN n")
+    assert len(rows) == 1
+    db.close()
+
+
+def test_query_params_injection_string_inert(tmp_path):
+    """An injection string passed as a param value is treated as a literal string value."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Org", "legit", {"name": "legit"})
+    # This is the injection motivating test: the value looks like Cypher but is
+    # just a string.  The query should return no rows (the name doesn't match).
+    rows = db.query(
+        "MATCH (n:Org) WHERE n.name = $name RETURN n",
+        params={"name": "legit RETURN n //"},
+    )
+    assert len(rows) == 0, "injection string must be treated as literal, not executed"
+    db.close()
+
+
+# ── Task 2: rename_node ────────────────────────────────────────────────────────
+
+def test_rename_node_python(tmp_path):
+    """rename_node: old key gone, new key live, props preserved."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Person", "alice", {"age": 30})
+    db.rename_node("alice", "alice2")
+    assert db.node_info("alice") is None
+    info = db.node_info("alice2")
+    assert info is not None
+    assert info["props"]["age"] == 30
+    db.close()
+
+
+# ── Task 2: insert_edge_upsert (Python) ───────────────────────────────────────
+
+def test_insert_edge_upsert_python(tmp_path):
+    """insert_edge_upsert: missing endpoints created as placeholder nodes."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    result = db.insert_edge_upsert("KNOWS", "alice", "bob", "Person")
+    assert result["nodes_created"] == 2
+    assert result["edge_inserted"] is True
+    assert db.node_info("alice")["label"] == "Person"
+    assert db.node_info("bob")["label"] == "Person"
+    assert "bob" in db.neighbors("alice", "KNOWS", "out")
+    db.close()

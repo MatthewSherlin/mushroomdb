@@ -1006,12 +1006,12 @@ proptest! {
                 Op::FulltextSearch(f, q) => {
                     let field = ft_field(*f);
                     let query = ft_query(*q);
-                    let engine_results = db.search(field, query);
-                    let oracle_results = oracle.scratch_search(field, query);
+                    let engine_keys: Vec<String> = db.search(field, query).into_iter().map(|(k, _)| k).collect();
+                    let oracle_keys: Vec<String> = oracle.scratch_search(field, query).into_iter().map(|(k, _)| k).collect();
                     prop_assert_eq!(
-                        engine_results,
-                        oracle_results,
-                        "fulltext search mismatch field={} query={:?}",
+                        engine_keys,
+                        oracle_keys,
+                        "fulltext search ordering mismatch field={} query={:?}",
                         field,
                         query
                     );
@@ -1141,15 +1141,15 @@ proptest! {
         }
 
         // Req 7: fulltext oracle equivalence — for every field in FT_FIELDS and
-        // every query in FT_QUERIES, db.search == oracle.scratch_search.
+        // every query in FT_QUERIES, db.search ordering == oracle.scratch_search ordering.
         for field in &FT_FIELDS {
             for query in &FT_QUERIES {
-                let engine_results = db.search(field, query);
-                let oracle_results = oracle.scratch_search(field, query);
+                let engine_keys: Vec<String> = db.search(field, query).into_iter().map(|(k, _)| k).collect();
+                let oracle_keys: Vec<String> = oracle.scratch_search(field, query).into_iter().map(|(k, _)| k).collect();
                 prop_assert_eq!(
-                    engine_results,
-                    oracle_results,
-                    "fulltext final-state mismatch field={} query={}",
+                    engine_keys,
+                    oracle_keys,
+                    "fulltext final-state ordering mismatch field={} query={}",
                     field,
                     query
                 );

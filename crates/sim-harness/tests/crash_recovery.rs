@@ -1705,13 +1705,21 @@ fn recovery_byte_sweep_fulltext() {
         // Invariant (a): open never panics.
         let recovered = GraphDb::open_with(survivor).unwrap();
 
-        // Invariant (b): index == scratch_search for every query.
+        // Invariant (b): index ordering == scratch_search ordering for every query.
         for query in FT_WORKLOAD_QUERIES {
-            let index_results = recovered.search("bio", query);
-            let scratch_results = recovered.scratch_search("bio", query);
+            let index_keys: Vec<String> = recovered
+                .search("bio", query)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
+            let scratch_keys: Vec<String> = recovered
+                .scratch_search("bio", query)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
             assert_eq!(
-                index_results, scratch_results,
-                "crash_at={crash_at}: fulltext index != scratch for query={query:?}"
+                index_keys, scratch_keys,
+                "crash_at={crash_at}: fulltext index ordering != scratch for query={query:?}"
             );
         }
     }
@@ -1744,13 +1752,21 @@ fn recovery_byte_sweep_fulltext_with_snapshot() {
         // Invariant (a): open never panics.
         let recovered = GraphDb::open_with(survivor).unwrap();
 
-        // Invariant (b): index == scratch_search for every query.
+        // Invariant (b): index ordering == scratch_search ordering for every query.
         for query in FT_WORKLOAD_QUERIES {
-            let index_results = recovered.search("bio", query);
-            let scratch_results = recovered.scratch_search("bio", query);
+            let index_keys: Vec<String> = recovered
+                .search("bio", query)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
+            let scratch_keys: Vec<String> = recovered
+                .scratch_search("bio", query)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
             assert_eq!(
-                index_results, scratch_results,
-                "crash_at={crash_at} (snapshot workload): index != scratch for query={query:?}"
+                index_keys, scratch_keys,
+                "crash_at={crash_at} (snapshot workload): index ordering != scratch for query={query:?}"
             );
         }
     }

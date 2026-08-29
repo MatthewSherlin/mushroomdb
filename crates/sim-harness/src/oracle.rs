@@ -1,6 +1,6 @@
 use core_api::{Direction, Value};
 use core_rules::{evaluate, NodeView, RuleDef, ViewDef};
-use core_storage::fulltext::{parse_query, tokenize};
+use core_storage::fulltext::{parse_query, value_tokens_stemmed_with_positions};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Obviously-correct reference. No ids, no interning, no persistence.
@@ -460,15 +460,16 @@ impl Oracle {
         self.fulltext_enabled.remove(&(label.into(), field.into()))
     }
 
-    /// Brute-force full-text search equivalent to `GraphDb::search`.
+    /// Brute-force BM25 search equivalent to `GraphDb::search`.
     ///
     /// Walks all live nodes whose label has `(label, field)` enabled,
-    /// tokenizes their `field` value, and counts OR-group matches.
-    /// Returns `(key, match_count)` sorted by match_count DESC, key ASC.
+    /// re-tokenizes and stems field values, computes BM25 corpus stats, and
+    /// returns scored results.  Returns `(key, bm25_score)` sorted by score DESC,
+    /// key ASC for deterministic tiebreaking.
     ///
-    /// This is the DST oracle: its result must match `db.search(field, query)`
-    /// at every quiescent point.
-    pub fn scratch_search(&self, field: &str, query: &str) -> Vec<(String, usize)> {
+    /// This is the DST oracle: the KEY ORDERING of its result must match
+    /// `db.search(field, query)` at every quiescent point.
+    pub fn scratch_search(&self, field: &str, query: &str) -> Vec<(String, f64)> {
         let groups = parse_query(query);
         if groups.is_empty() {
             return vec![];
@@ -486,54 +487,133 @@ impl Oracle {
             return vec![];
         }
 
-        let mut results: Vec<(String, usize)> = Vec::new();
-        for (key, props) in &self.nodes {
+        // --- Pass 1: collect all candidate nodes with stemmed token maps ---
+        // Iterate in insertion order for deterministic results.
+        struct DocInfo {
+            key: String,
+            tokens: HashMap<String, Vec<u32>>,
+            dl: u32,
+        }
+        let mut docs: Vec<DocInfo> = Vec::new();
+        for key in &self.node_order {
             let label = self.labels.get(key).map_or("", |l| l.as_str());
             if !indexed_labels.contains(label) {
                 continue;
             }
-            // Mirror fulltext.rs value_tokens: tokenize Str, flatten List<Str>,
-            // skip everything else.  Both db.search() and oracle.scratch_search
-            // must agree on which values produce tokens.
-            let doc_tokens: BTreeSet<String> = match props.get(field) {
-                Some(Value::Str(s)) => tokenize(s).into_iter().collect(),
-                Some(Value::List(items)) => items
-                    .iter()
-                    .flat_map(|v| {
-                        if let Value::Str(s) = v {
-                            tokenize(s)
-                        } else {
-                            vec![]
-                        }
-                    })
-                    .collect(),
+            let props = match self.nodes.get(key) {
+                Some(p) => p,
+                None => continue,
+            };
+            // Use value_tokens_stemmed_with_positions so that List values get
+            // the same POSITION_GAP between elements as the engine index.
+            let stemmed_with_pos: Vec<(String, u32)> = match props.get(field) {
+                Some(v @ Value::Str(_)) | Some(v @ Value::List(_)) => {
+                    value_tokens_stemmed_with_positions(v)
+                }
                 _ => continue,
             };
-
-            // Count how many OR-groups match (mirrors FulltextIndex::search).
-            let mut match_count = 0usize;
-            for group in &groups {
-                let group_matched = group.iter().all(|term| {
-                    if term.prefix {
-                        doc_tokens
-                            .iter()
-                            .any(|t| t.starts_with(term.token.as_str()))
-                    } else {
-                        doc_tokens.contains(&term.token)
-                    }
-                });
-                if group_matched {
-                    match_count += 1;
-                }
+            let dl = stemmed_with_pos.len() as u32;
+            let mut tok_map: HashMap<String, Vec<u32>> = HashMap::new();
+            for (tok, pos) in stemmed_with_pos {
+                tok_map.entry(tok).or_default().push(pos);
             }
+            docs.push(DocInfo {
+                key: key.clone(),
+                tokens: tok_map,
+                dl,
+            });
+        }
 
-            if match_count > 0 {
-                results.push((key.clone(), match_count));
+        if docs.is_empty() {
+            return vec![];
+        }
+
+        // --- BM25 corpus stats ---
+        let n = docs.len() as f64;
+        let avg_dl: f64 = docs.iter().map(|d| d.dl as f64).sum::<f64>() / n;
+        let mut df_map: HashMap<&str, f64> = HashMap::new();
+        for doc in &docs {
+            for tok in doc.tokens.keys() {
+                *df_map.entry(tok.as_str()).or_insert(0.0) += 1.0;
             }
         }
 
-        // Sort by match_count DESC, then key ASC (deterministic tiebreak).
-        results.sort_by(|(ka, ca), (kb, cb)| cb.cmp(ca).then_with(|| ka.cmp(kb)));
+        const K1: f64 = 1.2;
+        const B: f64 = 0.75;
+
+        // --- Pass 2: score each doc ---
+        let mut results: Vec<(String, f64)> = Vec::new();
+        for doc in &docs {
+            let dl = doc.dl as f64;
+            let mut total_score = 0.0f64;
+
+            'group: for group in &groups {
+                let mut group_score = 0.0f64;
+
+                for term in group {
+                    if term.negated {
+                        let present = if term.prefix {
+                            doc.tokens
+                                .keys()
+                                .any(|t| t.starts_with(term.token.as_str()))
+                        } else {
+                            doc.tokens.contains_key(term.token.as_str())
+                        };
+                        if present {
+                            continue 'group;
+                        }
+                        continue;
+                    }
+                    if term.prefix {
+                        let mut prefix_matched = false;
+                        for (tok, positions) in &doc.tokens {
+                            if tok.starts_with(term.token.as_str()) {
+                                let tf = positions.len() as f64;
+                                let df = df_map.get(tok.as_str()).copied().unwrap_or(1.0);
+                                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                                let tf_norm =
+                                    tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avg_dl));
+                                group_score += idf * tf_norm;
+                                prefix_matched = true;
+                            }
+                        }
+                        if !prefix_matched {
+                            continue 'group;
+                        }
+                    } else {
+                        // term.token is already stemmed by parse_query; use directly.
+                        match doc.tokens.get(term.token.as_str()) {
+                            None => continue 'group,
+                            Some(positions) => {
+                                let tf = positions.len() as f64;
+                                let df = df_map.get(term.token.as_str()).copied().unwrap_or(1.0);
+                                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                                let tf_norm =
+                                    tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avg_dl));
+                                group_score += idf * tf_norm;
+                            }
+                        }
+                    }
+                }
+
+                // Negation-only groups produce group_score = 0.0 and are suppressed
+                // here — same deliberate semantics as the engine: "graph OR -embedded"
+                // behaves identically to "graph".
+                if group_score > 0.0 {
+                    total_score += group_score;
+                }
+            }
+
+            if total_score > 0.0 {
+                results.push((doc.key.clone(), total_score));
+            }
+        }
+
+        results.sort_by(|(ka, sa), (kb, sb)| {
+            sb.partial_cmp(sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| ka.cmp(kb))
+        });
         results
     }
 
@@ -774,5 +854,44 @@ mod tests {
         let edges = o.all_edges();
         assert!(edges.contains(&("VEC".into(), "a".into(), "b".into())));
         assert!(!edges.contains(&("VEC".into(), "a".into(), "c".into())));
+    }
+
+    /// Oracle direct pin: scratch_search("x OR -y") returns the same key ordering
+    /// as scratch_search("x").
+    ///
+    /// The negation-only OR group ("-y") produces group_score = 0.0 in the scoring
+    /// loop (no positive atom contributes) and is suppressed by the guard, so it
+    /// adds nothing to document scores.  This pin mirrors the engine-side test.
+    #[test]
+    fn oracle_negation_only_or_group_same_as_plain_query() {
+        let mut o = Oracle::new();
+        o.enable_fulltext("Doc", "body");
+        o.insert_node(
+            "Doc",
+            "alpha",
+            &[("body".into(), Value::Str("graph node".into()))],
+        );
+        o.insert_node(
+            "Doc",
+            "beta",
+            &[("body".into(), Value::Str("disk wal commit".into()))],
+        );
+
+        let keys_plain: Vec<String> = o
+            .scratch_search("body", "graph")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let keys_or_neg: Vec<String> = o
+            .scratch_search("body", "graph OR -disk")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+
+        assert_eq!(
+            keys_plain, keys_or_neg,
+            "oracle: negation-only OR group must not change result ordering"
+        );
+        assert_eq!(keys_plain, vec!["alpha"], "only 'alpha' has 'graph'");
     }
 }

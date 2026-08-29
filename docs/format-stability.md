@@ -225,6 +225,100 @@ bytes that the exact-consumption check rejects.
 
 ---
 
+## Point-in-time recovery (PITR)
+
+mushroomdb supports point-in-time recovery by combining the `backup` command
+with a WAL archive chain.  This section explains how to set up and use the
+full recovery workflow.
+
+### How PITR works
+
+Every WAL-archiving snapshot (`snapshot --archive-wal`) renames the current
+`wal.bin` to `wal.<commit>.archive` and writes a fresh snapshot.  A continuous
+sequence of archives, together with `wal.genesis` (marks an unbroken chain from
+the store's first commit) and `wal.floor` (the lowest reachable commit index),
+lets `open_at` replay any commit in the archive chain — not just commits in the
+current `wal.bin`.
+
+### 1 — Take a consistent backup
+
+**If the store is idle** (no concurrent writer process):
+
+```sh
+# Archive the WAL before backup so the archive lands in the backup too.
+mushroomdb snapshot <db-dir> --archive-wal
+
+# Copy the full directory (snapshot + archives + genesis marker).
+mushroomdb backup <db-dir> <backup-dir>
+```
+
+**If the store is live-served** (a `mushroomdb serve` process is running), use
+the HTTP endpoint — the server holds the read lock during the copy, which is
+the correct cross-process synchronisation point:
+
+```sh
+curl -X POST http://localhost:8080/backup \
+  -H "Authorization: Bearer <full-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"dest": "/path/to/backup-dir"}'
+```
+
+> **WARNING:** Running `mushroomdb backup` against a directory that a separate
+> `mushroomdb serve` process is writing to is **unsafe**.  The file copies are
+> not atomic across processes and can produce a torn backup that only fails at
+> restore time.  The `verified: true` result reduces but does not eliminate
+> this risk.
+
+`backup` copies `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
+`wal.floor`, `wal.genesis`, and `roles.json` into the destination directory.
+It then opens the backup read-only and runs the CRC verifier; the reported
+`verified: true` confirms byte-for-byte integrity before the command returns.
+
+### 2 — Keep WAL archives (retention policy)
+
+```sh
+# Unlimited retention (default) — keep every archive ever taken.
+mushroomdb snapshot <db-dir> --archive-wal
+
+# Bounded retention — keep only the newest 7 archives; older ones are pruned.
+mushroomdb snapshot <db-dir> --archive-wal --retention 7
+```
+
+Pruning updates `wal.floor` so `open_at` can refuse commits that are no longer
+reachable.  The `wal.genesis` marker is removed whenever the chain is broken
+(e.g. when a WAL-truncating snapshot is taken after archives exist, or when
+the floor advances past zero).
+
+### 3 — Recover to a specific commit
+
+```sh
+# List how many commits exist in the WAL.
+mushroomdb asof <backup-dir> --commit 0   # shows total commit count
+
+# Open the backup at commit 42 and run a read query against that state.
+mushroomdb asof <backup-dir> --commit 42 --query "MATCH (n) RETURN n LIMIT 5"
+```
+
+`open_at` rehydrates the graph up to (and including) commit `N` by replaying:
+1. `snapshot.bin` (the base), then
+2. the ordered archive chain (`wal.<N>.archive` files, oldest first), then
+3. the current `wal.bin` tail.
+
+This is only permitted when `wal.genesis` is present and `wal.floor == 0`
+(full unbroken chain from genesis), or when the requested commit lies within
+the current `wal.bin` range.
+
+### Recovery contract
+
+| Scenario | PITR capability |
+|----------|-----------------|
+| No archives, no genesis | Recover only within current `wal.bin` |
+| Archives + genesis + floor = 0 | Recover any commit from genesis to HEAD |
+| Archives pruned (floor > 0) | Recover commits from `wal.floor` to HEAD |
+| WAL-truncating snapshot after archives | Genesis marker removed; chain broken |
+
+---
+
 ## Honesty
 
 Performance claims in README and docs cite measured numbers with date and
@@ -233,3 +327,12 @@ golden-fixture pin tests in `crates/core-api/tests/snapshot.rs` and
 `crates/core-api/tests/migrate.rs`: if a code change silently alters the
 on-disk byte layout the pin tests fail rather than silently corrupting existing
 databases.
+
+---
+
+## Panic policy
+
+Corrupt, truncated, or adversarial on-disk bytes always produce a typed
+`GraphError::Corrupt` — never a panic. The complete policy, including which
+`.expect()` calls are retained as post-validation invariants and why, is in
+[docs/site/panic-policy.md](site/panic-policy.md).
