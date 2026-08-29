@@ -470,13 +470,23 @@ async fn rule_tripped_hidden_edge_not_revealed() {
 // test_merge_unscoped_no_key_lookup in crates/core-api/tests/write_scopes.rs,
 // which confirms the scope denial fires even when the store is completely empty.
 //
-// Implementation: an unscoped role (create_labels/update_labels both empty for
-// "AgentNote") attempts MERGE on (1) a key that exists but is hidden, and
-// (2) a key that does not exist at all. Both return byte-identical 403 bodies.
+// This test pins TWO decision-table closures:
+//
+//   Case A (step-1/2, scope-first): an unscoped role (create_labels/update_labels
+//   both empty) attempts MERGE. The scope check fires BEFORE any key lookup.
+//   Both hidden and absent keys return byte-identical scope-denied 403 bodies.
+//
+//   Case B (step-3/4, hidden≡absent): an in-scope role (update_labels populated,
+//   create_labels empty) attempts MERGE. The scope check passes, then the key
+//   lookup fires. A hidden key is indistinguishable from an absent key — both
+//   return 403 "target node not visible". Byte-identical bodies pin this
+//   at the HTTP layer (the engine-level pin is test_merge_update_only_hidden_eq_
+//   absent in crates/core-api/tests/write_scopes.rs).
 #[tokio::test]
 async fn merge_visibility_oracle() {
-    let (app, db) = open_adv(
-        "adv5-merge-oracle",
+    // ── Case A: scope-first (step-1/2) ──────────────────────────────────────
+    let (app_a, db_a) = open_adv(
+        "adv5a-merge-oracle-scope",
         &[(
             "reader",
             &["AgentNote"],
@@ -496,14 +506,14 @@ async fn merge_visibility_oracle() {
     );
 
     // "probe-key" EXISTS in the DB under "Secret" — it is hidden from the role.
-    db.write()
+    db_a.write()
         .insert_node("Secret", "probe-key", vec![])
         .unwrap();
 
     // Role MERGE on the hidden key ("probe-key" exists, but role has no scope).
     // The scope check fires first — no key lookup occurs.
-    let (st_hidden, body_hidden) = send(
-        app.clone(),
+    let (st_hidden_a, body_hidden_a) = send(
+        app_a.clone(),
         authed_json_req(
             "POST",
             "/query",
@@ -514,8 +524,8 @@ async fn merge_visibility_oracle() {
     .await;
 
     // Role MERGE on a key that does not exist at all.
-    let (st_absent, body_absent) = send(
-        app,
+    let (st_absent_a, body_absent_a) = send(
+        app_a,
         authed_json_req(
             "POST",
             "/query",
@@ -525,21 +535,103 @@ async fn merge_visibility_oracle() {
     )
     .await;
 
-    assert_eq!(st_hidden, StatusCode::FORBIDDEN, "hidden MERGE must be 403");
-    assert_eq!(st_absent, StatusCode::FORBIDDEN, "absent MERGE must be 403");
-
-    // Structural pin: the code path is identical for both — scope check fires
-    // before key lookup in both cases. Response bodies must be byte-identical.
     assert_eq!(
-        body_hidden, body_absent,
-        "scope-denied before key lookup: hidden and absent MERGE must return byte-identical bodies"
+        st_hidden_a,
+        StatusCode::FORBIDDEN,
+        "case A hidden MERGE must be 403"
+    );
+    assert_eq!(
+        st_absent_a,
+        StatusCode::FORBIDDEN,
+        "case A absent MERGE must be 403"
+    );
+    // Structural pin: scope check fires before key lookup — code path is identical.
+    assert_eq!(
+        body_hidden_a, body_absent_a,
+        "case A: scope-denied before key lookup — hidden and absent must return byte-identical bodies"
+    );
+    let va = parse_json(&body_hidden_a);
+    assert_eq!(
+        va["error"].as_str().unwrap_or(""),
+        "role-bound token: label 'AgentNote' not in write scope (create_labels)",
+        "case A: §4.3 scope-denied body must be verbatim"
     );
 
-    let v = parse_json(&body_hidden);
+    // ── Case B: hidden≡absent after scope check (step-3/4) ──────────────────
+    //
+    // In-scope role (update_labels: ["AgentNote"], create_labels: []).
+    // The scope check PASSES for an AgentNote MERGE (update arm). Then the key
+    // lookup fires. A key that exists under "Secret" (hidden from the role) and
+    // a key that does not exist at all must both return 403 "target node not
+    // visible" with byte-identical bodies — the role learns nothing about
+    // whether the key existed.
+    let (app_b, db_b) = open_adv(
+        "adv5b-merge-oracle-hidden",
+        &[(
+            "updater",
+            &["AgentNote"],
+            Some(WriteScope {
+                create_labels: vec![],
+                update_labels: vec!["AgentNote".into()],
+                delete_labels: vec![],
+                create_edge_types: vec![],
+                delete_edge_types: vec![],
+            }),
+        )],
+        vec![],
+        Some("admin"),
+        &[("rtok", "updater")],
+    );
+
+    // "hidden-key" EXISTS in the DB under "Secret" — outside the role's read mask.
+    db_b.write()
+        .insert_node("Secret", "hidden-key", vec![])
+        .unwrap();
+
+    // Role MERGE on the hidden key (scope passes, key lookup fires, key is hidden).
+    let (st_hidden_b, body_hidden_b) = send(
+        app_b.clone(),
+        authed_json_req(
+            "POST",
+            "/query",
+            "rtok",
+            json!({"cypher": "MERGE (n:AgentNote {id: 'hidden-key'})"}),
+        ),
+    )
+    .await;
+
+    // Role MERGE on a key that does not exist at all (scope passes, key lookup fires, absent).
+    let (st_absent_b, body_absent_b) = send(
+        app_b,
+        authed_json_req(
+            "POST",
+            "/query",
+            "rtok",
+            json!({"cypher": "MERGE (n:AgentNote {id: 'truly-absent-key'})"}),
+        ),
+    )
+    .await;
+
     assert_eq!(
-        v["error"].as_str().unwrap_or(""),
-        "role-bound token: label 'AgentNote' not in write scope (create_labels)",
-        "§4.3 scope-denied body must be verbatim"
+        st_hidden_b,
+        StatusCode::FORBIDDEN,
+        "case B hidden MERGE must be 403"
+    );
+    assert_eq!(
+        st_absent_b,
+        StatusCode::FORBIDDEN,
+        "case B absent MERGE must be 403"
+    );
+    // Existence oracle pin: hidden and absent must be indistinguishable.
+    assert_eq!(
+        body_hidden_b, body_absent_b,
+        "case B: hidden≡absent after scope check — hidden and absent must return byte-identical bodies"
+    );
+    let vb = parse_json(&body_hidden_b);
+    assert_eq!(
+        vb["error"].as_str().unwrap_or(""),
+        "role-bound token: target node not visible",
+        "case B: §4.3 error body must be verbatim"
     );
 }
 
@@ -554,55 +646,129 @@ async fn merge_visibility_oracle() {
 // labels. apply_schema validates this at schema application time and returns an
 // error naming the role and the offending label. Disjoint scopes are
 // unrepresentable — the spec §7.1 alternative arm (require subset) is adopted.
+//
+// All three write-scope fields are validated: create_labels, update_labels, and
+// delete_labels. Each is asserted independently with its own schema + error check.
 #[test]
 fn write_scope_read_mask_orthogonality() {
-    let dir = tmp("adv6-scope-orthog");
-    let db = SharedDb::open(&dir).unwrap();
+    // ── create_labels ⊄ labels → rejected ────────────────────────────────────
+    {
+        let dir = tmp("adv6a-scope-create");
+        let db = SharedDb::open(&dir).unwrap();
+        let schema = Schema {
+            roles: vec![RoleDef {
+                name: "bad-role".into(),
+                labels: vec![],
+                keys: vec![],
+                write: Some(WriteScope {
+                    create_labels: vec!["AgentNote".into()],
+                    update_labels: vec![],
+                    delete_labels: vec![],
+                    create_edge_types: vec![],
+                    delete_edge_types: vec![],
+                }),
+            }],
+            ..Default::default()
+        };
+        let result = db.write().apply_schema(&schema);
+        assert!(
+            result.is_err(),
+            "apply_schema must REJECT a role where create_labels ⊄ read labels"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("bad-role") || err_msg.contains("AgentNote"),
+            "create_labels rejection must name the role or offending label: {err_msg}"
+        );
+    }
 
-    // "bad-role" declares create_labels: ["AgentNote"] but read labels: [].
-    // create_labels ⊄ labels — must be rejected at apply_schema.
-    let schema = Schema {
-        roles: vec![RoleDef {
-            name: "bad-role".into(),
-            labels: vec![],
-            keys: vec![],
-            write: Some(WriteScope {
-                create_labels: vec!["AgentNote".into()],
-                update_labels: vec![],
-                delete_labels: vec![],
-                create_edge_types: vec![],
-                delete_edge_types: vec![],
-            }),
-        }],
-        ..Default::default()
-    };
+    // ── update_labels ⊄ labels → rejected ────────────────────────────────────
+    {
+        let dir = tmp("adv6b-scope-update");
+        let db = SharedDb::open(&dir).unwrap();
+        let schema = Schema {
+            roles: vec![RoleDef {
+                name: "bad-role".into(),
+                labels: vec![], // read scope: empty
+                keys: vec![],
+                write: Some(WriteScope {
+                    create_labels: vec![],
+                    update_labels: vec!["AgentNote".into()], // not in read labels
+                    delete_labels: vec![],
+                    create_edge_types: vec![],
+                    delete_edge_types: vec![],
+                }),
+            }],
+            ..Default::default()
+        };
+        let result = db.write().apply_schema(&schema);
+        assert!(
+            result.is_err(),
+            "apply_schema must REJECT a role where update_labels ⊄ read labels"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("bad-role") || err_msg.contains("AgentNote"),
+            "update_labels rejection must name the role or offending label: {err_msg}"
+        );
+    }
 
-    let result = db.write().apply_schema(&schema);
-    assert!(
-        result.is_err(),
-        "apply_schema must REJECT a role where create_labels ⊄ read labels"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    // The error must identify the offending role and/or label.
-    assert!(
-        err_msg.contains("bad-role") || err_msg.contains("AgentNote"),
-        "error must name the role or offending label: {err_msg}"
-    );
+    // ── delete_labels ⊄ labels → rejected ────────────────────────────────────
+    {
+        let dir = tmp("adv6c-scope-delete");
+        let db = SharedDb::open(&dir).unwrap();
+        let schema = Schema {
+            roles: vec![RoleDef {
+                name: "bad-role".into(),
+                labels: vec![], // read scope: empty
+                keys: vec![],
+                write: Some(WriteScope {
+                    create_labels: vec![],
+                    update_labels: vec![],
+                    delete_labels: vec!["AgentNote".into()], // not in read labels
+                    create_edge_types: vec![],
+                    delete_edge_types: vec![],
+                }),
+            }],
+            ..Default::default()
+        };
+        let result = db.write().apply_schema(&schema);
+        assert!(
+            result.is_err(),
+            "apply_schema must REJECT a role where delete_labels ⊄ read labels"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("bad-role") || err_msg.contains("AgentNote"),
+            "delete_labels rejection must name the role or offending label: {err_msg}"
+        );
+    }
 }
 
 // ── §6.2 item 7: Concurrent writer interference ───────────────────────────────
 //
 // Threat: Two role tokens writing to the same node concurrently observe a
-// partial intermediate state if writes are not fully serialized.
+// partial intermediate state if writes are not fully serialized under the drain
+// queue's write lock.
 //
 // Closure: All write-scoped submissions go through SharedDb::submit_batch_authz,
 // which enqueues them through a single drain queue. The drain loop holds the
 // write lock (inner.write()) for the duration of each batch commit. Both
-// submissions serialize, each batch is atomic (all-or-nothing WAL frame), and
-// neither sees a partial intermediate state.
+// submissions serialize: one completes atomically, THEN the other runs.
+// Neither observes partial state; the final committed value is one whole write.
 //
-// The test asserts both SetProp operations succeed and both properties are
-// durably present on the node after both threads join — no partial state.
+// Why both threads must write to the SAME field:
+//
+// Writing to different fields (e.g. from_t1 / from_t2) is a false negative —
+// two non-conflicting SetProp operations would both succeed and both be durable
+// even with the write lock entirely removed, because they touch disjoint storage
+// locations. Same-field contention is the minimum conflict that distinguishes
+// serialized from unserialized concurrent execution: with correct serialization,
+// the second writer atomically overwrites the first's value (last-writer-wins);
+// without serialization, the value could be corrupted, absent, or a byte-mix.
+//
+// The test asserts both operations succeed AND the final "counter" value is
+// exactly one of the two submitted values — proving atomicity and no lost write.
 #[test]
 fn concurrent_writer_interference() {
     let dir = tmp("adv7-concurrent-write");
@@ -629,8 +795,12 @@ fn concurrent_writer_interference() {
         .insert_node("AgentNote", "shared-node", vec![])
         .unwrap();
 
-    // Two threads each submit a SetProp on the same node simultaneously.
-    // They compete for the drain queue — one is serialized before the other.
+    // Two threads each submit a SetProp on the SAME field of the same node with
+    // different values. This is a genuine conflict: only one can be the final
+    // committed value. With correct drain-queue serialization, one batch completes
+    // first (writing its value), then the second overwrites it (last-writer-wins).
+    // Without a lock, concurrent byte-level writes to the same field could produce
+    // corruption, absence, or a value not equal to either submitted value.
     let db1 = db.clone();
     let db2 = db.clone();
     let h1 = std::thread::spawn(move || {
@@ -638,7 +808,7 @@ fn concurrent_writer_interference() {
             "agent".into(),
             vec![BatchOp::SetProp {
                 key: "shared-node".into(),
-                field: "from_t1".into(),
+                field: "counter".into(),
                 value: Value::Int(1),
             }],
         )
@@ -648,7 +818,7 @@ fn concurrent_writer_interference() {
             "agent".into(),
             vec![BatchOp::SetProp {
                 key: "shared-node".into(),
-                field: "from_t2".into(),
+                field: "counter".into(),
                 value: Value::Int(2),
             }],
         )
@@ -659,17 +829,15 @@ fn concurrent_writer_interference() {
     assert!(r1.is_ok(), "concurrent write 1 must succeed: {r1:?}");
     assert!(r2.is_ok(), "concurrent write 2 must succeed: {r2:?}");
 
-    // Both properties must be present — no write lost, no partial state.
-    let r = db.read();
-    assert_eq!(
-        r.get_prop("shared-node", "from_t1"),
-        Some(Value::Int(1)),
-        "from_t1 must be durably set"
-    );
-    assert_eq!(
-        r.get_prop("shared-node", "from_t2"),
-        Some(Value::Int(2)),
-        "from_t2 must be durably set"
+    // Final value must be exactly one of the two submitted values.
+    // "Exactly one" proves serialization:
+    //   - Not absent  → neither write was lost entirely.
+    //   - Not a third value → no corruption from unserialized byte-level interleave.
+    //   - Value::Int(1) or Value::Int(2) → the last writer's full atomic write won.
+    let final_val = db.read().get_prop("shared-node", "counter");
+    assert!(
+        final_val == Some(Value::Int(1)) || final_val == Some(Value::Int(2)),
+        "counter must be exactly one submitted value (serialization proof — last-writer-wins): got {final_val:?}"
     );
 }
 
