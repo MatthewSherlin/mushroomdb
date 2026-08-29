@@ -16,11 +16,19 @@ intersects it with any client mask — it can never widen the intersection.
 - Hidden nodes return 404 on node-info/edges/neighborhood endpoints (existence is
   not disclosed).
 - Cypher rows referencing hidden nodes are filtered out entirely.
-- Write and analytics endpoints return 403.
+- Roles without a declared write scope get 403 on all write and analytics endpoints.
+- Roles with a write scope may write within their declared scope — but only to nodes
+  currently in their read mask. See [api.md](api.md#write-scopes-for-role-bound-tokens)
+  for the full write-scope surface, error body shapes, and the threat model.
 - An unknown token or a role name not present in `roles.json` returns 401.
 
-**Never-widen invariant:** a client-supplied mask is always intersected with the role
-mask. A caller with a role token cannot supply a mask that expands their view.
+**Never-widen invariant (read):** a client-supplied mask is always intersected with
+the role mask. A caller with a role token cannot supply a mask that expands their view.
+
+**Never-widen invariant (write):** no write a role performs may make data visible to
+itself or any other party that was not already visible before the write. A role token
+may only mutate nodes that are currently in its read mask. Hidden nodes are treated
+as non-existent in all write responses — no existence oracle.
 
 ---
 

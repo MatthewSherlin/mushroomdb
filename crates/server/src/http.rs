@@ -598,11 +598,15 @@ fn err_response(detail: impl Into<String>) -> Response {
 }
 
 fn graph_err(e: GraphError) -> Response {
-    let detail = match e {
-        GraphError::QueryError { detail } | GraphError::IngestError { detail } => detail,
-        other => other.to_string(),
-    };
-    err_response(detail)
+    match e {
+        // §4.3: role-scoped write denials map to 403 with the verbatim reason
+        // string (Display delegates to reason, so .to_string() == reason).
+        GraphError::RoleWriteDenied { reason } => forbidden(&reason),
+        GraphError::QueryError { detail } | GraphError::IngestError { detail } => {
+            err_response(detail)
+        }
+        other => err_response(other.to_string()),
+    }
 }
 
 fn key_not_found(key: String) -> Response {
@@ -709,17 +713,27 @@ async fn query(
         Some(_) => return err_response("mask must be an array of strings"),
     };
 
-    // Role token: writes are denied; reads are auto-masked by the role's
-    // visibility mask.  A client-supplied mask can only narrow, never widen.
-    // Lock-free epoch snapshot: mask and query execute on the same frozen state
-    // (constraint 2 — RBAC mask coherence), without holding the read lock.
+    // Role token: write Cypher routes to query_write_authz (scope + mask
+    // resolved under the write lock, §5 discipline).  Read Cypher uses the
+    // lock-free epoch snapshot path unchanged.
     if let AuthIdentity::Role(ref role_name) = identity {
         let is_write = match is_write_query(&cypher) {
             Ok(b) => b,
             Err(e) => return err_response(e),
         };
         if is_write {
-            return forbidden("role-bound token: writes are not permitted");
+            let role = role_name.clone();
+            let cypher_c = cypher.clone();
+            let params_c = params.clone();
+            let db = state.db.clone();
+            return match blocking_write(move || {
+                db.write().query_write_authz(&role, &cypher_c, &params_c)
+            })
+            .await
+            {
+                Ok(rs) => format_query_result(rs, format),
+                Err(resp) => resp,
+            };
         }
         let snap = state.db.reader();
         let role_mask = match snap.mask_for_role(role_name) {
@@ -826,9 +840,6 @@ async fn ingest(
     Extension(identity): Extension<AuthIdentity>,
     Json(body): Json<Js>,
 ) -> Response {
-    if let AuthIdentity::Role(_) = identity {
-        return forbidden("role-bound token: writes are not permitted");
-    }
     let label = match body.get("label").and_then(Js::as_str) {
         Some(s) => s.to_string(),
         None => return err_response("missing label"),
@@ -854,6 +865,29 @@ async fn ingest(
         },
     };
     let db = state.db.clone();
+
+    // Role token: route to ingest_with_edges_authz (scope + mask resolved under
+    // the write lock, §5 discipline; §7.3 — create_labels required, enforced by
+    // the engine's per-op authz check inside commit_logged_batch).
+    if let AuthIdentity::Role(role_name) = &identity {
+        let role = role_name.clone();
+        return match blocking_write(move || {
+            db.write()
+                .ingest_with_edges_authz(&role, &label, taken, &opts, &edges)
+        })
+        .await
+        {
+            Ok(r) => {
+                let report = converted.into_report(r);
+                match serde_json::to_value(&report) {
+                    Ok(v) => json_ok(v),
+                    Err(e) => err_response(e.to_string()),
+                }
+            }
+            Err(resp) => resp,
+        };
+    }
+
     let report =
         match blocking_write(move || db.write().ingest_with_edges(&label, taken, &opts, &edges))
             .await
@@ -1305,9 +1339,6 @@ async fn create_node(
     Extension(identity): Extension<AuthIdentity>,
     Json(body): Json<Js>,
 ) -> Response {
-    if let AuthIdentity::Role(_) = identity {
-        return forbidden("role-bound token: writes are not permitted");
-    }
     let label = match body.get("label").and_then(Js::as_str) {
         Some(s) => s.to_string(),
         None => return err_response("missing label"),
@@ -1324,6 +1355,17 @@ async fn create_node(
         },
     };
     let db = state.db.clone();
+    if let AuthIdentity::Role(role_name) = &identity {
+        let role = role_name.clone();
+        return match blocking_write(move || {
+            db.submit_batch_authz(role, vec![BatchOp::InsertNode { label, key, props }])
+        })
+        .await
+        {
+            Ok((nodes, edges)) => json_ok(json!({"ok": true, "nodes": nodes, "edges": edges})),
+            Err(resp) => resp,
+        };
+    }
     match blocking_write(move || db.submit_batch(vec![BatchOp::InsertNode { label, key, props }]))
         .await
     {
@@ -1338,10 +1380,18 @@ async fn delete_node(
     Extension(identity): Extension<AuthIdentity>,
     Path(key): Path<String>,
 ) -> Response {
-    if let AuthIdentity::Role(_) = identity {
-        return forbidden("role-bound token: writes are not permitted");
-    }
     let db = state.db.clone();
+    if let AuthIdentity::Role(role_name) = &identity {
+        let role = role_name.clone();
+        return match blocking_write(move || {
+            db.submit_batch_authz(role, vec![BatchOp::DeleteNode { key }])
+        })
+        .await
+        {
+            Ok(_) => json_ok(json!({"ok": true})),
+            Err(resp) => resp,
+        };
+    }
     match blocking_write(move || db.submit_batch(vec![BatchOp::DeleteNode { key }])).await {
         Ok(_) => json_ok(json!({"ok": true})),
         Err(resp) => resp,
@@ -1356,9 +1406,6 @@ async fn create_edge(
     Extension(identity): Extension<AuthIdentity>,
     Json(body): Json<Js>,
 ) -> Response {
-    if let AuthIdentity::Role(_) = identity {
-        return forbidden("role-bound token: writes are not permitted");
-    }
     let edge_type = match body.get("type").and_then(Js::as_str) {
         Some(s) => s.to_string(),
         None => return err_response("missing type"),
@@ -1372,6 +1419,24 @@ async fn create_edge(
         None => return err_response("missing dst"),
     };
     let db = state.db.clone();
+    if let AuthIdentity::Role(role_name) = &identity {
+        let role = role_name.clone();
+        return match blocking_write(move || {
+            db.submit_batch_authz(
+                role,
+                vec![BatchOp::InsertEdge {
+                    edge_type,
+                    src_key: src,
+                    dst_key: dst,
+                }],
+            )
+        })
+        .await
+        {
+            Ok(_) => json_ok(json!({"ok": true})),
+            Err(resp) => resp,
+        };
+    }
     match blocking_write(move || {
         db.submit_batch(vec![BatchOp::InsertEdge {
             edge_type,
@@ -1392,10 +1457,25 @@ async fn delete_edge(
     Extension(identity): Extension<AuthIdentity>,
     Path((etype, src, dst)): Path<(String, String, String)>,
 ) -> Response {
-    if let AuthIdentity::Role(_) = identity {
-        return forbidden("role-bound token: writes are not permitted");
-    }
     let db = state.db.clone();
+    if let AuthIdentity::Role(role_name) = &identity {
+        let role = role_name.clone();
+        return match blocking_write(move || {
+            db.submit_batch_authz(
+                role,
+                vec![BatchOp::DeleteEdge {
+                    edge_type: etype,
+                    src_key: src,
+                    dst_key: dst,
+                }],
+            )
+        })
+        .await
+        {
+            Ok(_) => json_ok(json!({"ok": true})),
+            Err(resp) => resp,
+        };
+    }
     match blocking_write(move || {
         db.submit_batch(vec![BatchOp::DeleteEdge {
             edge_type: etype,
@@ -1453,9 +1533,6 @@ async fn upsert_edge(
     Extension(identity): Extension<AuthIdentity>,
     Json(body): Json<Js>,
 ) -> Response {
-    if let AuthIdentity::Role(_) = identity {
-        return forbidden("role-bound token: writes are not permitted");
-    }
     let edge_type = match body.get("edge_type").and_then(Js::as_str) {
         Some(s) => s.to_string(),
         None => return err_response("missing edge_type"),
@@ -1473,6 +1550,28 @@ async fn upsert_edge(
         None => return err_response("missing placeholder_label"),
     };
     let db = state.db.clone();
+    if let AuthIdentity::Role(role_name) = &identity {
+        let role = role_name.clone();
+        return match blocking_write(move || {
+            db.submit_batch_authz(
+                role,
+                vec![BatchOp::InsertEdgeUpsert {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                    placeholder_label,
+                }],
+            )
+        })
+        .await
+        {
+            Ok((nodes, edges)) => json_ok(json!({
+                "nodes_created": nodes,
+                "edge_inserted": edges > 0,
+            })),
+            Err(resp) => resp,
+        };
+    }
     match blocking_write(move || {
         db.submit_batch(vec![BatchOp::InsertEdgeUpsert {
             edge_type,
@@ -1500,14 +1599,22 @@ async fn set_node_prop(
     Path((key, field)): Path<(String, String)>,
     Json(body): Json<Js>,
 ) -> Response {
-    if let AuthIdentity::Role(_) = identity {
-        return forbidden("role-bound token: writes are not permitted");
-    }
     let value = match body.get("value").and_then(|v| json_to_value(v.clone())) {
         Some(v) => v,
         None => return err_response("missing or null value"),
     };
     let db = state.db.clone();
+    if let AuthIdentity::Role(role_name) = &identity {
+        let role = role_name.clone();
+        return match blocking_write(move || {
+            db.submit_batch_authz(role, vec![BatchOp::SetProp { key, field, value }])
+        })
+        .await
+        {
+            Ok(_) => json_ok(json!({"ok": true})),
+            Err(resp) => resp,
+        };
+    }
     match blocking_write(move || db.submit_batch(vec![BatchOp::SetProp { key, field, value }]))
         .await
     {
@@ -1709,10 +1816,18 @@ async fn remove_node_prop(
     Extension(identity): Extension<AuthIdentity>,
     Path((key, field)): Path<(String, String)>,
 ) -> Response {
-    if let AuthIdentity::Role(_) = identity {
-        return forbidden("role-bound token: writes are not permitted");
-    }
     let db = state.db.clone();
+    if let AuthIdentity::Role(role_name) = &identity {
+        let role = role_name.clone();
+        return match blocking_write(move || {
+            db.submit_batch_authz(role, vec![BatchOp::RemoveProp { key, field }])
+        })
+        .await
+        {
+            Ok(_) => json_ok(json!({"ok": true})),
+            Err(resp) => resp,
+        };
+    }
     match blocking_write(move || db.submit_batch(vec![BatchOp::RemoveProp { key, field }])).await {
         Ok(_) => json_ok(json!({"ok": true})),
         Err(resp) => resp,

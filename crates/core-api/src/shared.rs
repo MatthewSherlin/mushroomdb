@@ -86,7 +86,7 @@
 //! `Arc<Inner>` is held by every clone); no submission enqueued before the
 //! last clone is dropped can be silently lost.
 
-use crate::db::{BatchOp, FsyncPolicy, Precondition};
+use crate::db::{BatchOp, FsyncPolicy, Precondition, WriteAuthz};
 use crate::reader::ReaderSnapshot;
 use crate::GraphDb;
 use core_storage::sync_wal_at;
@@ -123,6 +123,11 @@ struct Submission {
     /// non-empty for `submit_batch_cas` calls.  The drain thread checks these
     /// under the same write guard as the batch apply (no TOCTOU).
     preconds: Vec<Precondition>,
+    /// Role name for role-scoped write authz.  `Some` only for
+    /// `submit_batch_authz` calls; `None` for full-authority submissions.
+    /// The drain thread resolves mask + scope under `inner.write()` (§5 lock
+    /// discipline: authz check and mutation share one guard lifetime).
+    authz_role: Option<String>,
     done: std::sync::mpsc::SyncSender<Result<(usize, usize)>>,
 }
 
@@ -437,6 +442,7 @@ impl SharedDb {
         self.queue.enqueue(Submission {
             ops,
             preconds: Vec::new(),
+            authz_role: None,
             done: tx,
         });
         rx.recv().unwrap_or_else(|_| {
@@ -466,6 +472,38 @@ impl SharedDb {
         self.queue.enqueue(Submission {
             ops,
             preconds,
+            authz_role: None,
+            done: tx,
+        });
+        rx.recv().unwrap_or_else(|_| {
+            Err(GraphError::Io(std::io::Error::other(
+                "group-commit drain thread terminated unexpectedly",
+            )))
+        })
+    }
+
+    /// Like [`submit_batch`] but with role-scoped write authorization.
+    ///
+    /// The drain thread resolves `mask_for_role` + scope under the same write
+    /// guard as the mutation (§5 lock discipline: authz BEFORE any CAS
+    /// preconditions, BEFORE the WAL write).
+    ///
+    /// - Role with `write: None` → `GraphError::RoleWriteDenied` (endpoint not
+    ///   permitted) — maps to HTTP 403.
+    /// - Scope / visibility violations inside the batch → `GraphError::RoleWriteDenied`
+    ///   with the appropriate §4.3 reason string.
+    ///
+    /// All-or-nothing semantics: a single denied op rejects the entire batch
+    /// with no WAL frame written.
+    pub fn submit_batch_authz(&self, role: String, ops: Vec<BatchOp>) -> Result<(usize, usize)> {
+        if let Some(msg) = self.queue.degraded_message() {
+            return Err(GraphError::Io(std::io::Error::other(msg)));
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.queue.enqueue(Submission {
+            ops,
+            preconds: Vec::new(),
+            authz_role: Some(role),
             done: tx,
         });
         rx.recv().unwrap_or_else(|_| {
@@ -492,10 +530,17 @@ fn drain_loop(
             return; // shutdown + nothing pending
         }
 
-        // Extract ops and preconditions together; keep alignment with group index.
-        let submissions: Vec<(Vec<Precondition>, Vec<BatchOp>)> = group
+        // Extract ops, preconditions, and authz_role together; keep alignment
+        // with group index.
+        let submissions: Vec<(Vec<Precondition>, Vec<BatchOp>, Option<String>)> = group
             .iter_mut()
-            .map(|s| (std::mem::take(&mut s.preconds), std::mem::take(&mut s.ops)))
+            .map(|s| {
+                (
+                    std::mem::take(&mut s.preconds),
+                    std::mem::take(&mut s.ops),
+                    s.authz_role.take(),
+                )
+            })
             .collect();
 
         // ── Step 1: Acquire WAL mutex BEFORE the write lock ─────────────────
@@ -539,8 +584,41 @@ fn drain_loop(
             let mut r: Vec<Result<(usize, usize)>> = Vec::with_capacity(submissions.len());
             let mut pending_non_cas: Vec<Vec<BatchOp>> = Vec::new();
 
-            for (preconds, ops) in submissions {
-                if preconds.is_empty() {
+            for (preconds, ops, authz_role) in submissions {
+                if let Some(role) = authz_role {
+                    // Authz submission: process individually (breaks coalescing).
+                    // Flush accumulated non-CAS batch first so authz evaluation
+                    // sees their writes already applied.
+                    if !pending_non_cas.is_empty() {
+                        let batch = std::mem::take(&mut pending_non_cas);
+                        r.extend(db.commit_group_nosync(batch));
+                    }
+                    // Resolve WriteAuthz under the write guard (§5 lock discipline:
+                    // scope + mask resolved in the same guard as the mutation;
+                    // authz check fires BEFORE any WAL write).
+                    let result = (|| -> Result<(usize, usize)> {
+                        let scope = {
+                            // Temporary scope so the borrow on db.roles ends
+                            // before write_batch_authz_nosync borrows db mutably.
+                            let roles_vec = db.roles();
+                            let def = roles_vec
+                                .iter()
+                                .find(|r| r.name == role)
+                                .ok_or_else(|| GraphError::KeyNotFound {
+                                    key: format!("role:{role}"),
+                                })?
+                                .clone();
+                            // write:None → byte-identical v1 blanket-403 body.
+                            def.write.ok_or_else(|| GraphError::RoleWriteDenied {
+                                reason: "role-bound token: writes are not permitted".into(),
+                            })?
+                        };
+                        let mask = db.mask_for_role(&role)?;
+                        let authz = WriteAuthz { role, scope, mask };
+                        db.write_batch_authz_nosync(Some(&authz), ops)
+                    })();
+                    r.push(result);
+                } else if preconds.is_empty() {
                     // Non-CAS: accumulate for a batched commit_group_nosync call.
                     pending_non_cas.push(ops);
                 } else {

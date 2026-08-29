@@ -1,5 +1,5 @@
 use crate::ingest::{IngestOptions, IngestReport};
-use crate::roles::{RoleDef, RolesFile};
+use crate::roles::{RoleDef, RolesFile, WriteScope};
 use crate::subscription::{
     event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
 };
@@ -1071,6 +1071,10 @@ pub struct GraphDb<F: Fs> {
     ///
     /// Persisted via the `wal.genesis` marker file; loaded from it at open.
     archive_genesis_chain: bool,
+    /// Transient write-authz context set by `write_batch_authz` /
+    /// `query_write_authz` for the duration of ONE mutation call.
+    /// Always `None` at rest.  Never serialized, never WAL-replayed.
+    pending_write_authz: Option<WriteAuthz>,
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -1099,6 +1103,24 @@ impl Default for OpenOptions {
     fn default() -> Self {
         Self { auto_migrate: true }
     }
+}
+
+/// Authorization context carried by `write_batch_authz` / `query_write_authz`.
+///
+/// `None` at the call site = full authority (today's zero-cost behavior).
+/// `Some(WriteAuthz)` = role-scoped: the decision table (plan §"authz decision
+/// table") is evaluated per-op inside `commit_logged_batch` BEFORE any WAL
+/// record is built.  A denial returns an error with no WAL frame written.
+///
+/// The mask is ALWAYS `Omit`-mode: role-token paths must never acknowledge
+/// hidden-node existence to callers.
+#[derive(Clone, Debug)]
+pub struct WriteAuthz {
+    pub role: String,
+    pub scope: WriteScope,
+    /// Resolved by `mask_for_role` under the same write guard as the mutation.
+    /// Always `Omit`-mode — never `Stub`.
+    pub mask: crate::mask::NodeMask,
 }
 
 /// Write `bytes` to `snapshot.bin.bak` atomically with full fsync.
@@ -1289,6 +1311,7 @@ impl<F: Fs> GraphDb<F> {
             wal_archive_retention: None,
             wal_horizon_floor: 0,
             archive_genesis_chain: false,
+            pending_write_authz: None,
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
@@ -1801,6 +1824,7 @@ impl<F: Fs> GraphDb<F> {
             wal_archive_retention: None,
             wal_horizon_floor: 0,
             archive_genesis_chain: false,
+            pending_write_authz: None,
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
@@ -4011,6 +4035,10 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         ops: Vec<BatchOp>,
         ingest: Option<(String, usize)>,
+        // Two-source rule: write_batch_authz threads authz here directly (never
+        // touches pending_write_authz); query_write_authz sets the field instead
+        // and passes None.  Only one source is non-None per call.
+        param_authz: Option<WriteAuthz>,
     ) -> Result<(usize, usize)> {
         // Read-only guard: catches empty-batch calls before the early-return
         // that skips log_then_apply_with, ensuring all mutation entry points fail.
@@ -4020,6 +4048,67 @@ impl<F: Fs> GraphDb<F> {
         // Ensure provenance is decoded before MutPreview accesses it
         // (note_delete_rule / is_rule_owned may call engine.provenance()).
         self.engine.ensure_provenance_loaded_mut();
+
+        // ── Authz pre-check ──────────────────────────────────────────────────
+        // Evaluate the decision table per-op BEFORE MutPreview so that a denial
+        // produces no WAL frame (all-or-nothing at the authz boundary extends
+        // the existing validate-then-apply contract to role-scope checks).
+        //
+        // `batch_created` tracks key→label for nodes created by earlier ops in
+        // THIS batch, so InsertEdgeUpsert can count same-batch placeholder nodes
+        // as visible without needing to call `self.ids.get` on not-yet-committed
+        // keys (they won't be there yet).
+        //
+        // Two-source rule: param_authz (write_batch_authz path) takes precedence;
+        // fall back to self.pending_write_authz (query_write_authz/Cypher path).
+        // Cloning the field copy avoids a simultaneous borrow of self.ids below.
+        let authz_opt = param_authz.or_else(|| self.pending_write_authz.clone());
+        if let Some(ref authz) = authz_opt {
+            let mut batch_created: BTreeMap<String, String> = BTreeMap::new();
+            for op in &ops {
+                self.check_single_op_authz(authz, op, &batch_created)?;
+                // Update batch_created after a passing authz check so that
+                // subsequent ops in this batch see the nodes as "about to exist".
+                match op {
+                    BatchOp::InsertNode { label, key, .. } => {
+                        // Only track genuinely new nodes (absent from the
+                        // snapshot at authz-check time). A pre-existing visible
+                        // key would be a DuplicateKey — not a real creation —
+                        // so MutPreview handles it. Letting it into batch_created
+                        // would allow a later SetProp to bypass update_labels
+                        // via the "batch-created → always updatable" ruling
+                        // (delete+recreate exploit, fix for I1 review round 2).
+                        //
+                        // Accepted edge: for a delete+recreate-with-different-
+                        // label batch, node_status resolves the pre-delete
+                        // (store) label for any subsequent update checks. This
+                        // grants no net-new capability — a role that can delete+
+                        // create can already place arbitrary props via
+                        // InsertNode's own props field.
+                        if self.ids.get(key.as_str()).is_none() {
+                            batch_created.insert(key.clone(), label.clone());
+                        }
+                    }
+                    BatchOp::InsertEdgeUpsert {
+                        placeholder_label,
+                        src_key,
+                        dst_key,
+                        ..
+                    } => {
+                        // Both endpoints will be created if not already in store.
+                        for ep_key in [src_key, dst_key] {
+                            if self.ids.get(ep_key.as_str()).is_none()
+                                && !batch_created.contains_key(ep_key.as_str())
+                            {
+                                batch_created.insert(ep_key.clone(), placeholder_label.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let recs = {
             let mut preview = MutPreview::new(self);
             let mut recs = Vec::with_capacity(ops.len());
@@ -4150,7 +4239,7 @@ impl<F: Fs> GraphDb<F> {
     }
 
     fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<(usize, usize)> {
-        self.commit_logged_batch(ops, None)
+        self.commit_logged_batch(ops, None, None)
     }
 
     /// Commit one submission WITHOUT an fsync — for use inside `commit_group`
@@ -4174,7 +4263,7 @@ impl<F: Fs> GraphDb<F> {
         // SAFETY: raw pointer into self; guard dropped within this frame.
         let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
         self.fsync = FsyncPolicy::Relaxed;
-        self.commit_logged_batch(ops, None)
+        self.commit_logged_batch(ops, None, None)
     }
 
     /// Commit multiple op-batches as a **group**: each submission gets its own
@@ -5055,8 +5144,8 @@ impl<F: Fs> GraphDb<F> {
             return Ok(Some(vec![]));
         }
         match serde_json::from_slice::<RolesFile>(&bytes) {
-            Ok(f) if f.version == 1 => Ok(Some(f.roles)),
-            // Corrupt or unrecognised version: poison the roles state.
+            Ok(f) if f.version == 1 || f.version == 2 => Ok(Some(f.roles)),
+            // Corrupt or unrecognised version (>2): poison the roles state.
             _ => Ok(None),
         }
     }
@@ -5116,12 +5205,477 @@ impl<F: Fs> GraphDb<F> {
         self.roles.as_deref().unwrap_or(&[]).to_vec()
     }
 
+    // ── Role-scoped write authz ───────────────────────────────────────────────
+
+    /// Execute `ops` with optional role-scoped write authorization.
+    ///
+    /// - `None` → full authority, identical to [`write_batch`](Self::write_batch)
+    ///   (zero-cost bypass of all authz checks).
+    /// - `Some(authz)` → the decision table is evaluated per-op BEFORE any WAL
+    ///   record is built.  A denial returns an error with no WAL frame written
+    ///   (all-or-nothing at the authz boundary, then at the MutPreview boundary).
+    ///
+    /// See the plan's "authz decision table" section for the full semantics.
+    pub fn write_batch_authz(
+        &mut self,
+        authz: Option<&WriteAuthz>,
+        ops: Vec<BatchOp>,
+    ) -> Result<(usize, usize)> {
+        // Thread authz as a direct parameter — never touches pending_write_authz.
+        self.commit_logged_batch(ops, None, authz.cloned())
+    }
+
+    /// Execute a Cypher write statement with role-scoped write authorization.
+    ///
+    /// Resolves scope + mask from `self.roles` inside the call (same write-guard
+    /// lifetime as execution, satisfying §5 lock discipline).  The resolved
+    /// `WriteAuthz` is stored as `pending_write_authz` for the duration of the
+    /// call so that all inner `batch.commit()` calls are authz-checked.
+    ///
+    /// MERGE is handled specially: the MERGE scope precondition (§3.3) is
+    /// checked in `exec_merge` BEFORE `has_node` to close the §6.2
+    /// timing-oracle item (hidden ≡ absent for unscoped roles).
+    ///
+    /// Roles with `write: None` (v1 behavior) → `RoleWriteDenied` with
+    /// "this endpoint is not permitted".
+    pub fn query_write_authz(
+        &mut self,
+        role: &str,
+        cypher: &str,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        // Resolve scope (fails fast if role has no write scope).
+        // write:None → byte-identical v1 blanket-403 body (plan §v1-sidecar mandate).
+        let scope =
+            {
+                let roles = self.roles.as_deref().ok_or_else(|| GraphError::Corrupt {
+                    detail: "roles.json was corrupt at open; re-open to restore role access".into(),
+                })?;
+                let def = roles.iter().find(|r| r.name == role).ok_or_else(|| {
+                    GraphError::KeyNotFound {
+                        key: format!("role:{role}"),
+                    }
+                })?;
+                def.write
+                    .clone()
+                    .ok_or_else(|| GraphError::RoleWriteDenied {
+                        reason: "role-bound token: writes are not permitted".into(),
+                    })?
+            };
+        // Resolve mask inside the call (same guard, §5 coherence).
+        let mask = self.mask_for_role(role)?;
+        self.pending_write_authz = Some(WriteAuthz {
+            role: role.into(),
+            scope,
+            mask,
+        });
+        // RAII guard: always clears pending_write_authz on scope exit, including
+        // on panic or early-return, mirroring the RestoreEmitDeltas precedent.
+        struct ClearPendingAuthzOnDrop(*mut Option<WriteAuthz>);
+        impl Drop for ClearPendingAuthzOnDrop {
+            fn drop(&mut self) {
+                // SAFETY: pointer into the owning GraphDb; guard is dropped
+                // within this function's frame before it returns.
+                unsafe { *self.0 = None };
+            }
+        }
+        // SAFETY: raw pointer into self; guard dropped before this fn returns.
+        let _authz_guard = ClearPendingAuthzOnDrop(&mut self.pending_write_authz as *mut _);
+        let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
+            detail: format!("lex: {e}"),
+        })?;
+        let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
+            detail: format!("parse: {e}"),
+        })?;
+        self.exec_write_stmt(stmt, params)
+    }
+
+    /// Execute `ops` with optional role-scoped write authorization, suppressing
+    /// fsync (for use inside the group-commit drain thread, which performs one
+    /// group fsync after releasing the write lock).
+    ///
+    /// Identical to [`write_batch_authz`] except the fsync policy is temporarily
+    /// forced to `Relaxed` for the duration of the call, matching the drain-thread
+    /// contract established by [`commit_batch_nosync`].
+    pub(crate) fn write_batch_authz_nosync(
+        &mut self,
+        authz: Option<&WriteAuthz>,
+        ops: Vec<BatchOp>,
+    ) -> Result<(usize, usize)> {
+        let saved = self.fsync;
+        struct RestoreFsync(*mut FsyncPolicy, FsyncPolicy);
+        impl Drop for RestoreFsync {
+            fn drop(&mut self) {
+                // SAFETY: pointer into the owning GraphDb; guard is dropped
+                // within the enclosing function's frame before it returns.
+                unsafe { *self.0 = self.1 };
+            }
+        }
+        // SAFETY: raw pointer into self; guard dropped before this fn returns.
+        let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
+        self.fsync = FsyncPolicy::Relaxed;
+        self.commit_logged_batch(ops, None, authz.cloned())
+    }
+
+    /// Execute a `/ingest` request with role-scoped write authorization.
+    ///
+    /// Resolves the role's `WriteScope` and `NodeMask` inside this call (same
+    /// write-guard lifetime as the mutation, satisfying §5 lock discipline).
+    /// Sets `pending_write_authz` for the duration of the call so that the
+    /// `commit_ingest` → `commit_logged_batch` path picks up the authz context
+    /// and evaluates the decision table per-op before any WAL write.
+    ///
+    /// §7.3: roles with empty `create_labels` will see every `InsertNode` op
+    /// denied by the decision table with the appropriate §4.3 scope reason;
+    /// no special HTTP-layer check is needed.
+    ///
+    /// Roles with `write: None` return `RoleWriteDenied` with
+    /// "writes are not permitted" (byte-identical to v1 blanket 403).
+    pub fn ingest_with_edges_authz(
+        &mut self,
+        role: &str,
+        label: &str,
+        rows: Vec<std::collections::BTreeMap<String, Value>>,
+        opts: &crate::ingest::IngestOptions,
+        edges: &[(String, String, String)],
+    ) -> Result<crate::ingest::IngestReport> {
+        // Resolve scope (fails fast if role has no write scope).
+        // write:None → byte-identical v1 blanket-403 body (plan §v1-sidecar mandate).
+        let scope =
+            {
+                let roles = self.roles.as_deref().ok_or_else(|| GraphError::Corrupt {
+                    detail: "roles.json was corrupt at open; re-open to restore role access".into(),
+                })?;
+                let def = roles.iter().find(|r| r.name == role).ok_or_else(|| {
+                    GraphError::KeyNotFound {
+                        key: format!("role:{role}"),
+                    }
+                })?;
+                def.write
+                    .clone()
+                    .ok_or_else(|| GraphError::RoleWriteDenied {
+                        reason: "role-bound token: writes are not permitted".into(),
+                    })?
+            };
+        let mask = self.mask_for_role(role)?;
+        self.pending_write_authz = Some(WriteAuthz {
+            role: role.into(),
+            scope,
+            mask,
+        });
+        // RAII guard: always clears pending_write_authz on scope exit, including
+        // on panic or early-return, mirroring the RestoreEmitDeltas precedent.
+        struct ClearPendingAuthzOnDrop(*mut Option<WriteAuthz>);
+        impl Drop for ClearPendingAuthzOnDrop {
+            fn drop(&mut self) {
+                // SAFETY: pointer into the owning GraphDb; guard is dropped
+                // within this function's frame before it returns.
+                unsafe { *self.0 = None };
+            }
+        }
+        // SAFETY: raw pointer into self; guard dropped before this fn returns.
+        let _authz_guard = ClearPendingAuthzOnDrop(&mut self.pending_write_authz as *mut _);
+        self.ingest_with_edges(label, rows, opts, edges)
+    }
+
+    /// Evaluate the write-authz decision table for one `BatchOp`.
+    ///
+    /// Called by `commit_logged_batch` for each op when `pending_write_authz`
+    /// is `Some`, BEFORE MutPreview.  A denial returns an error immediately;
+    /// the remaining ops are not evaluated and no WAL frame is written.
+    ///
+    /// `batch_created` carries the key→label pairs of nodes that earlier ops in
+    /// THIS batch will create.  Used by `InsertEdgeUpsert` to count same-batch
+    /// placeholder nodes as visible (spec: "a placeholder endpoint the SAME
+    /// batch creates counts as visible if its label passed the create-class gate").
+    fn check_single_op_authz(
+        &self,
+        authz: &WriteAuthz,
+        op: &BatchOp,
+        batch_created: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        // Helper: 3-way node status under the authz mask.
+        //
+        // Batch-created nodes (from earlier InsertNode in THIS batch) are treated
+        // as Visible with their recorded label — their create gate already passed
+        // and they are not yet in self.ids (not committed).  This fixes the
+        // MERGE+ON CREATE SET case where InsertNode + SetProp arrive together:
+        // the SetProp must not see the node as Absent.
+        let node_status = |key: &str| -> NodeAuthzStatus {
+            if let Some(label) = batch_created.get(key) {
+                return NodeAuthzStatus::Visible(label.clone());
+            }
+            match self.ids.get(key) {
+                None => NodeAuthzStatus::Absent,
+                Some(id) if !authz.mask.contains_id(id) => NodeAuthzStatus::Hidden,
+                Some(id) => {
+                    let label = self
+                        .labels
+                        .get(id as usize)
+                        .and_then(|&sym| {
+                            if sym == u32::MAX {
+                                None
+                            } else {
+                                self.syms.resolve(sym).map(str::to_string)
+                            }
+                        })
+                        .unwrap_or_default();
+                    NodeAuthzStatus::Visible(label)
+                }
+            }
+        };
+
+        // Helper: is an InsertEdgeUpsert endpoint visible?
+        // A same-batch placeholder counts as visible if its label passed
+        // the create-class gate (spec "upsert placeholder-counts-as-visible").
+        let upsert_ep_visible = |ep_key: &str, placeholder_label: &str| -> bool {
+            // In store and visible?
+            if let Some(id) = self.ids.get(ep_key) {
+                return authz.mask.contains_id(id);
+            }
+            // Created by an earlier op in this batch?
+            if let Some(created_label) = batch_created.get(ep_key) {
+                return authz.scope.create_labels.contains(created_label);
+            }
+            // Will be created by THIS InsertEdgeUpsert: placeholder_label
+            // must pass the create-class gate.
+            authz
+                .scope
+                .create_labels
+                .contains(&placeholder_label.to_string())
+        };
+
+        match op {
+            // RenameNode / CreateRule / DeleteRule: defense-in-depth gate.
+            // These ops are never routed to role-scoped paths by the HTTP layer,
+            // but we 403 them here to close any future bypass route.
+            BatchOp::RenameNode { .. } | BatchOp::CreateRule(_) | BatchOp::DeleteRule { .. } => {
+                return Err(GraphError::RoleWriteDenied {
+                    reason: "role-bound token: this endpoint is not permitted".into(),
+                });
+            }
+
+            // ── CREATE-class: InsertNode ─────────────────────────────────────
+            //
+            // Decision table row 1 (scope-before-lookup): check label in
+            // create_labels BEFORE any key lookup.  This is the structural
+            // closure of the §6.2 timing-oracle item — the denial fires even
+            // when the store is EMPTY (see test_create_scope_denied_empty_store).
+            BatchOp::InsertNode { label, key, .. } => {
+                if !authz.scope.create_labels.contains(label) {
+                    return Err(GraphError::RoleWriteDenied {
+                        reason: format!(
+                            "role-bound token: label '{}' not in write scope (create_labels)",
+                            label
+                        ),
+                    });
+                }
+                // Row 2/3: key lookup.
+                match self.ids.get(key.as_str()) {
+                    Some(id) if authz.mask.contains_id(id) => {
+                        // Visible: DuplicateKey — let MutPreview handle this.
+                    }
+                    Some(_) => {
+                        // Hidden: indistinguishable from absent to the role.
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: "role-bound token: target node not visible".into(),
+                        });
+                    }
+                    None => {
+                        // Absent: proceed (create).
+                    }
+                }
+            }
+
+            // ── UPDATE-class: SetProp, RemoveProp ────────────────────────────
+            BatchOp::SetProp { key, .. } | BatchOp::RemoveProp { key, .. } => {
+                if batch_created.contains_key(key.as_str()) {
+                    // Batch-created node: create gate already passed this batch.
+                    // Updating it in the same batch is always allowed, regardless
+                    // of update_labels (ruling §3.5: "writer just created it").
+                } else {
+                    let label = match node_status(key) {
+                        NodeAuthzStatus::Visible(lbl) => lbl,
+                        _ => {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: "role-bound token: target node not visible".into(),
+                            });
+                        }
+                    };
+                    if !authz.scope.update_labels.contains(&label) {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: label '{}' not in write scope (update_labels)",
+                                label
+                            ),
+                        });
+                    }
+                }
+            }
+
+            // ── DELETE-class: DeleteNode ─────────────────────────────────────
+            BatchOp::DeleteNode { key } => {
+                let label = match node_status(key) {
+                    NodeAuthzStatus::Visible(lbl) => lbl,
+                    _ => {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: "role-bound token: target node not visible".into(),
+                        });
+                    }
+                };
+                if !authz.scope.delete_labels.contains(&label) {
+                    return Err(GraphError::RoleWriteDenied {
+                        reason: format!(
+                            "role-bound token: label '{}' not in write scope (delete_labels)",
+                            label
+                        ),
+                    });
+                }
+            }
+
+            // ── DELETE-class: DeleteEdge ─────────────────────────────────────
+            //
+            // Derived-edge rejection runs BEFORE the delete_edge_types scope
+            // check (spec §3.5: "existing derived-edge rejection precedes
+            // delete_edge_types check").
+            BatchOp::DeleteEdge {
+                edge_type,
+                src_key,
+                dst_key,
+            } => {
+                // Check provenance ownership BEFORE scope (spec §3.5 ordering).
+                if let (Some(src_id), Some(dst_id), Some(et_sym)) = (
+                    self.ids.get(src_key.as_str()),
+                    self.ids.get(dst_key.as_str()),
+                    self.syms.get(edge_type.as_str()),
+                ) {
+                    if self.engine.is_owned(et_sym, src_id, dst_id) {
+                        return Err(GraphError::RuleOwned {
+                            detail: format!(
+                                "edge {edge_type} {src_key}→{dst_key} is rule-owned; \
+                                 delete or change the owning rule"
+                            ),
+                        });
+                    }
+                    // Also check would_derive via MutPreview (empty overlay, pre-batch).
+                    let preview = MutPreview::new(self);
+                    if preview.would_derive(edge_type, src_key, dst_key) {
+                        return Err(GraphError::RuleOwned {
+                            detail: format!(
+                                "edge {edge_type} {src_key}→{dst_key} is rule-owned; \
+                                 delete or change the owning rule, or a live rule would \
+                                 re-derive it"
+                            ),
+                        });
+                    }
+                }
+                // Scope check (AFTER derived-edge check, BEFORE endpoint visibility).
+                if !authz.scope.delete_edge_types.contains(edge_type) {
+                    return Err(GraphError::RoleWriteDenied {
+                        reason: format!(
+                            "role-bound token: edge type '{}' not in write scope (delete_edge_types)",
+                            edge_type
+                        ),
+                    });
+                }
+                // Both endpoints must be visible.
+                for ep_key in [src_key.as_str(), dst_key.as_str()] {
+                    match self.ids.get(ep_key) {
+                        None => {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: "role-bound token: edge endpoint not visible".into(),
+                            });
+                        }
+                        Some(id) if !authz.mask.contains_id(id) => {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: "role-bound token: edge endpoint not visible".into(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // ── EDGE-CREATE: InsertEdge ──────────────────────────────────────
+            //
+            // Scope check BEFORE endpoint lookup (preserves timing symmetry).
+            BatchOp::InsertEdge {
+                edge_type,
+                src_key,
+                dst_key,
+            } => {
+                if !authz.scope.create_edge_types.contains(edge_type) {
+                    return Err(GraphError::RoleWriteDenied {
+                        reason: format!(
+                            "role-bound token: edge type '{}' not in write scope (create_edge_types)",
+                            edge_type
+                        ),
+                    });
+                }
+                // Both endpoints must be visible. A node created by an earlier
+                // InsertNode in the same batch (tracked in batch_created) counts
+                // as visible if its label passed the create-class gate.
+                for ep_key in [src_key.as_str(), dst_key.as_str()] {
+                    if batch_created.contains_key(ep_key) {
+                        // Created earlier this batch — already scope-checked.
+                        continue;
+                    }
+                    match self.ids.get(ep_key) {
+                        None => {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: "role-bound token: edge endpoint not visible".into(),
+                            });
+                        }
+                        Some(id) if !authz.mask.contains_id(id) => {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: "role-bound token: edge endpoint not visible".into(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // ── EDGE-CREATE: InsertEdgeUpsert ────────────────────────────────
+            //
+            // Scope check first; then endpoint visibility using same-batch
+            // placeholder awareness (spec: "a placeholder endpoint the SAME
+            // batch creates counts as visible if its label passed the
+            // create-class gate").
+            BatchOp::InsertEdgeUpsert {
+                edge_type,
+                src_key,
+                dst_key,
+                placeholder_label,
+            } => {
+                if !authz.scope.create_edge_types.contains(edge_type) {
+                    return Err(GraphError::RoleWriteDenied {
+                        reason: format!(
+                            "role-bound token: edge type '{}' not in write scope (create_edge_types)",
+                            edge_type
+                        ),
+                    });
+                }
+                // Check placeholder label against create_labels (create-class gate).
+                // This ensures the auto-created endpoints are scope-allowed.
+                for ep_key in [src_key.as_str(), dst_key.as_str()] {
+                    if !upsert_ep_visible(ep_key, placeholder_label) {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: "role-bound token: edge endpoint not visible".into(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Write `roles` to `roles.json` atomically and update the in-memory list.
     ///
     /// Called by `apply_schema` when roles change. Never called on unchanged
     /// re-apply — this preserves byte-identical idempotency.
     pub(crate) fn commit_roles(&mut self, roles: Vec<RoleDef>) -> Result<()> {
-        let file = RolesFile::v1(roles.clone());
+        let file = RolesFile::new_versioned(roles.clone());
         let bytes = serde_json::to_vec(&file).map_err(|e| GraphError::Corrupt {
             detail: format!("roles serialization: {e}"),
         })?;
@@ -6155,10 +6709,22 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("plan: {e}"),
         })?;
         // MATCH phase is read-only; borrow ends before batch opens.
-        let match_rs =
-            execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            })?;
+        //
+        // When a role-scoped write is in flight, run the MATCH read through
+        // view_masked so hidden nodes are invisible → hidden ≡ absent ≡
+        // zero-rows (no SetProp ops generated, no existence-oracle 403).
+        // Full-authority writes (pending_write_authz=None) keep view().
+        let match_rs = {
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            }
+        }
+        .map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })?;
 
         // Collect (key, field, value) for each matched row × each SET clause.
         let mut set_ops: Vec<(String, String, Value)> = Vec::new();
@@ -6252,10 +6818,19 @@ impl<F: Fs> GraphDb<F> {
         let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
             detail: format!("plan: {e}"),
         })?;
-        let match_rs =
-            execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            })?;
+        // Role-scoped writes: mask the MATCH read phase so hidden nodes are
+        // invisible → hidden ≡ absent ≡ zero-rows (spec §3.1, hidden ≡ absent).
+        let match_rs = {
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            }
+        }
+        .map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })?;
 
         // Collect (etype, src_key, dst_key) for each row × each delete target.
         let mut del_ops: Vec<(String, String, String)> = Vec::new();
@@ -6346,10 +6921,19 @@ impl<F: Fs> GraphDb<F> {
         let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
             detail: format!("plan: {e}"),
         })?;
-        let match_rs =
-            execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            })?;
+        // Role-scoped writes: mask the MATCH read phase so hidden nodes are
+        // invisible → hidden ≡ absent ≡ zero-rows (spec §3.1, hidden ≡ absent).
+        let match_rs = {
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            }
+        }
+        .map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })?;
 
         // Collect unique node keys to delete (deduplicate across rows × vars).
         let mut keys: Vec<String> = Vec::new();
@@ -6440,7 +7024,73 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        let existed = self.has_node(&key);
+        // ── MERGE authz pre-check (when role-scoped) ─────────────────────────
+        //
+        // MERGE scope precondition: check create OR update scope for the
+        // declared label BEFORE calling `has_node` (timing-oracle closure,
+        // spec §6.2 "MERGE visibility oracle" item: hidden ≡ absent for
+        // unscoped roles — the scope denial fires without touching the key store).
+        //
+        // Clone to avoid holding a borrow on `self.pending_write_authz` while
+        // also calling `self.ids.get(key)`.
+        let merge_existed: bool = if let Some(authz) = self.pending_write_authz.clone() {
+            let has_create = authz.scope.create_labels.contains(&stmt.label);
+            let has_update = authz.scope.update_labels.contains(&stmt.label);
+            if !has_create && !has_update {
+                // Scope-before-lookup: 403 without has_node call (timing oracle
+                // closure — see test_merge_unscoped_no_key_lookup).
+                return Err(GraphError::RoleWriteDenied {
+                    reason: format!(
+                        "role-bound token: label '{}' not in write scope (create_labels)",
+                        stmt.label
+                    ),
+                });
+            }
+            // Key lookup under mask.
+            match self.ids.get(key.as_str()) {
+                Some(id) if authz.mask.contains_id(id) => {
+                    // Visible: must have update scope to proceed to match arm.
+                    if !has_update {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: label '{}' not in write scope (update_labels)",
+                                stmt.label
+                            ),
+                        });
+                    }
+                    true // existed = true → match arm
+                }
+                Some(_) => {
+                    // Hidden: same error as absent to the role (spec §3.1/§3.3).
+                    return Err(GraphError::RoleWriteDenied {
+                        reason: "role-bound token: target node not visible".into(),
+                    });
+                }
+                None => {
+                    // Absent: must have create scope to proceed to the create arm.
+                    //
+                    // Update-only roles (create_labels empty, update_labels set):
+                    // return the SAME "not visible" error as the hidden-key branch
+                    // so hidden ≡ absent — no distinguishing oracle (spec §6.1
+                    // "confirm existence of hidden nodes: No").
+                    //
+                    // Create-scoped roles (has_create=true): absent → create arm
+                    // as before.  The accepted structural key-existence disclosure
+                    // (§THREAT-MODEL) applies only when the role holds create scope.
+                    if !has_create {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: "role-bound token: target node not visible".into(),
+                        });
+                    }
+                    false // existed = false → create arm
+                }
+            }
+        } else {
+            // Full authority: use the existing non-masked has_node check.
+            self.has_node(&key)
+        };
+
+        let existed = merge_existed;
         let mut created = 0i64;
         if !existed || !stmt.on_match.is_empty() {
             let mut batch = self.batch();
@@ -6488,10 +7138,16 @@ impl<F: Fs> GraphDb<F> {
             let ops = plan(&q).map_err(|e| GraphError::QueryError {
                 detail: format!("plan: {e}"),
             })?;
-            return execute(&self.view(), &ops, &Params(params)).map_err(|e| {
-                GraphError::QueryError {
-                    detail: format!("execute: {e}"),
-                }
+            // Use view_masked when a role-scoped write is in flight so the
+            // post-merge projection is consistent with the masked read phase.
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            return (if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            })
+            .map_err(|e| GraphError::QueryError {
+                detail: format!("execute: {e}"),
             });
         }
 
@@ -6684,7 +7340,7 @@ impl<F: Fs> GraphDb<F> {
         ops: Vec<BatchOp>,
     ) -> Result<(usize, usize)> {
         self.check_preconditions(&preconds)?;
-        self.commit_logged_batch(ops, None)
+        self.commit_logged_batch(ops, None, None)
     }
 
     /// Update the per-node last-change map for a WAL record at commit `seq`.
@@ -7993,6 +8649,16 @@ pub enum BatchOp {
     },
 }
 
+/// Three-way node visibility status used by `check_single_op_authz`.
+enum NodeAuthzStatus {
+    /// Node exists in the store and is in the role's read mask.
+    Visible(String), // carries the node's label
+    /// Node exists in the store but is NOT in the role's read mask.
+    Hidden,
+    /// Node does not exist in the store.
+    Absent,
+}
+
 /// Overlay of ops already accepted earlier in the same batch. Never written
 /// back to the database — validation only.
 #[derive(Default)]
@@ -8557,7 +9223,7 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
     pub(crate) fn commit_ingest(&mut self, label: &str, inserted: usize) -> Result<(usize, usize)> {
         let ops = std::mem::take(&mut self.ops);
         self.db
-            .commit_logged_batch(ops, Some((label.to_string(), inserted)))
+            .commit_logged_batch(ops, Some((label.to_string(), inserted)), None)
     }
 }
 

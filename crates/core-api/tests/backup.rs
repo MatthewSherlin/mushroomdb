@@ -83,6 +83,7 @@ fn build_store_with_archives(dir: &std::path::Path) -> usize {
             name: "reader".into(),
             keys: vec![],
             labels: vec!["Person".into()],
+            write: None,
         }],
     };
     db.apply_schema(&schema).unwrap();

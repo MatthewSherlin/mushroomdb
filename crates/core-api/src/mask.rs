@@ -38,6 +38,7 @@ pub enum MaskMode {
 ///
 /// Unknown keys in `from_keys` are silently ignored (they resolve to no id).
 /// An empty mask hides every node.
+#[derive(Clone, Debug)]
 pub struct NodeMask {
     pub(crate) visible: HashSet<u32>,
     mode: MaskMode,

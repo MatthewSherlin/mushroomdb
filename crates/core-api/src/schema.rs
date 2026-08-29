@@ -157,7 +157,9 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        // Validate roles: non-empty names, unique names within the schema.
+        // Validate roles: non-empty names, unique names within the schema,
+        // and write-scope subset rule (§7.1 ruling: create/update/delete_labels
+        // must each be a subset of the role's read labels).
         {
             let mut seen = std::collections::HashSet::new();
             for role_def in &schema.roles {
@@ -170,6 +172,31 @@ impl<F: Fs> GraphDb<F> {
                     return Err(GraphError::RuleInvalid {
                         detail: format!("duplicate role name: {}", role_def.name),
                     });
+                }
+                if let Some(write) = &role_def.write {
+                    let read_labels: std::collections::HashSet<&str> =
+                        role_def.labels.iter().map(String::as_str).collect();
+                    // Check create_labels, update_labels, delete_labels — each must
+                    // be a subset of the role's read labels (§7.1 subset ruling).
+                    // create_edge_types and delete_edge_types are exempt (no read-scope
+                    // analog for edge types).
+                    for (field, labels) in [
+                        ("create_labels", &write.create_labels),
+                        ("update_labels", &write.update_labels),
+                        ("delete_labels", &write.delete_labels),
+                    ] {
+                        for label in labels {
+                            if !read_labels.contains(label.as_str()) {
+                                return Err(GraphError::RuleInvalid {
+                                    detail: format!(
+                                        "role '{}': write scope {field} contains label '{}' \
+                                         that is not in the role's read labels (subset rule)",
+                                        role_def.name, label
+                                    ),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
