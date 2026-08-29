@@ -2213,23 +2213,131 @@ Role-token behavior per endpoint:
 |---|---|
 | `GET /health` | 200 (unauthenticated — no identity needed) |
 | `POST /query` (read) | 200 — rows filtered to visible nodes; client `mask` intersects role mask (never widens) |
-| `POST /query` (write: `CREATE`/`SET`/`DELETE`/`MERGE`) | 403 |
+| `POST /query` (write: `CREATE`/`SET`/`DELETE`/`MERGE`) | 200 if in write scope + target visible; 403 with reason otherwise |
+| `POST /nodes` | 200 if `label` in `create_labels`; 403 with scope reason otherwise |
+| `DELETE /node/{key}` | 200 if node visible and `label` in `delete_labels`; 403 otherwise |
+| `POST /edges` | 200 if type in `create_edge_types` and both endpoints visible; 403 otherwise |
+| `DELETE /edges/{t}/{s}/{d}` | 200 if type in `delete_edge_types` and both endpoints visible; 403 otherwise |
+| `POST /edges/upsert` | 200 if type in `create_edge_types` and both endpoints visible; 403 otherwise |
+| `PUT /node/{key}/prop/{f}` | 200 if node visible and `label` in `update_labels`; 403 otherwise |
+| `DELETE /node/{key}/prop/{f}` | 200 if node visible and `label` in `update_labels`; 403 otherwise |
+| `POST /ingest` | 200 if `label` in `create_labels`; 403 otherwise (all-or-nothing) |
 | `GET /node/{key}` | 200 if visible; 404 if hidden or absent (indistinguishable) |
 | `GET /node/{key}/edges` | 200 if visible; 404 if hidden or absent |
 | `GET /node/{key}/neighborhood` | 200 if visible; 404 if hidden or absent |
-| `GET /stats` | 403 (counts leak graph size) |
-| `POST /ingest` | 403 |
-| `POST /rules` | 403 |
-| `GET /explain` | 403 |
-| `GET /suggest` | 403 |
-| `GET /algo/*` | 403 |
-| `GET /subscribe` | 403 |
-| `GET /watch` | 403 |
+| `GET /stats` | 403 (counts leak graph size beyond the role's subgraph) |
+| `POST /rules` | 403 (administrative — all role tokens, including write-scoped) |
+| `GET /explain` | 403 (rule explanation reveals hidden-node linkage) |
+| `GET /suggest` | 403 (scans full graph) |
+| `GET /algo/*` | 403 (full-graph algorithms) |
+| `GET /subscribe` | 403 (unfiltered mutation stream) |
+| `GET /watch` | 403 (unfiltered mutation stream) |
+| `POST /nodes/{key}/rename` | 403 (admin-only identity change) |
+| `POST /backup` | 403 |
+
+Roles without a `write` scope (or roles defined in a v1 sidecar) receive 403 on all
+write endpoints — exactly the v1 read-only behavior.
 
 **Never-widen invariant:** unknown token → 401; token bound to a role name not
-present in `roles.json` at request time → 401; corrupt `roles.json` → 500 for
+present in `roles.json` at open time → 401; corrupt `roles.json` → 500 for
 role tokens (full-access token unaffected); empty role → sees zero nodes.
-Role sidecar is stored in `/roles.json`.
+Role sidecar is stored in `/roles.json` (v1 for read-only roles, v2 when
+any role carries a write scope).
+
+---
+
+### Write scopes for role-bound tokens
+
+v0.3 lifts the write ban for roles that explicitly declare write scopes in
+`schema.json`. Roles without a write scope remain read-only.
+
+#### WriteScope schema
+
+```rust
+pub struct WriteScope {
+    pub create_labels: Vec,      // CREATE nodes under these labels
+    pub update_labels: Vec,      // SET props / MERGE-match on visible nodes
+    pub delete_labels: Vec,      // DELETE / DETACH DELETE visible nodes
+    pub create_edge_types: Vec,  // INSERT EDGE between two visible endpoints
+    pub delete_edge_types: Vec,  // DELETE user-owned edges (not derived)
+}
+```
+
+All fields default to empty (read-only). Each label field must be a subset of the
+role's read `labels` — `apply_schema` rejects disjoint write and read scopes with
+an error naming the role and offending label.
+
+Example `schema.json` role definition:
+
+```json
+{
+  "name": "agent-memory",
+  "labels": ["AgentNote", "AgentContext"],
+  "write": {
+    "create_labels": ["AgentNote", "AgentContext"],
+    "update_labels": ["AgentNote", "AgentContext"],
+    "delete_labels": ["AgentNote"],
+    "create_edge_types": ["RECALLS", "DERIVED_FROM"],
+    "delete_edge_types": ["RECALLS"]
+  }
+}
+```
+
+#### Never-widen for writes
+
+No write a role performs may make data visible to itself or any other party that
+was not already visible before the write. Concretely:
+
+- A role may only update or delete nodes currently in its read mask.
+- MERGE on a hidden key returns 403 "target node not visible" — indistinguishable
+  from a non-existent key (no existence oracle).
+- Edge creation requires both endpoints to be in the role's read mask.
+- When a role's CREATE triggers a derivation rule that links to a hidden neighbor,
+  the derived edge is created (rule engine runs with DB authority) but is filtered
+  from all role-scoped read responses. The role cannot observe the derived edge.
+- `/rules`, `/stats`, `/explain`, `/subscribe`, and `/watch` remain 403 for all role
+  tokens regardless of write scope.
+
+#### §4.3 Error body shapes
+
+All write denials return 403 with a structured JSON body:
+
+```json
+{"error": "role-bound token: label 'Secret' not in write scope (create_labels)"}
+{"error": "role-bound token: target node not visible"}
+{"error": "role-bound token: edge endpoint not visible"}
+{"error": "role-bound token: edge type 'LINKS' not in write scope (create_edge_types)"}
+{"error": "role-bound token: this endpoint is not permitted"}
+```
+
+The "target node not visible" response is identical for hidden nodes and
+non-existent nodes — the role cannot distinguish the two cases.
+
+#### Threat model
+
+| Capability | v1 (read-only) | v0.3 (with write scope) |
+|---|---|---|
+| Read nodes outside role mask | No | No |
+| Confirm existence of hidden nodes | No | No (hidden ≡ absent in all responses) |
+| Create nodes under allowed labels | No | Yes (in `create_labels`) |
+| Overwrite properties of visible nodes | No | Yes (if label in `update_labels`) |
+| Delete visible nodes | No | Yes (if label in `delete_labels`) |
+| Create edges between visible nodes | No | Yes (if type in `create_edge_types`) |
+| Trigger rule engine to link hidden neighbors | Indirectly | Yes via CREATE; result edges to hidden nodes are not visible to role |
+| Observe rule trip counts | No | No (`/stats` remains 403) |
+| Expand write scope at runtime | No | No (`roles.json` requires full-access token) |
+| Declare new linking rules | No | No (`/rules` remains 403) |
+| Subscribe to mutation streams | No | No (`/subscribe` and `/watch` remain 403) |
+
+**Accepted structural disclosure:** a role holding `create_labels` for some label
+can learn whether a given key exists in the global key namespace by attempting a
+CREATE — if the key is hidden (exists under a different label) the response is
+"target node not visible" rather than the success response for a truly absent key.
+This key-existence signal is structural and predates write scopes (a full-token
+INSERT does the same via DuplicateKey). The disclosure is confined to roles holding
+create scope, reveals existence only (never label, properties, or adjacency), and
+is stated plainly in the threat model. Roles that do not hold create scope cannot
+drive this oracle.
 
 **MCP trust boundary:** The MCP interface (`mushroomdb mcp`) is a stdio
 JSON-RPC server intended for local agent use; it operates without bearer-token
