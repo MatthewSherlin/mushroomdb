@@ -855,4 +855,43 @@ mod tests {
         assert!(edges.contains(&("VEC".into(), "a".into(), "b".into())));
         assert!(!edges.contains(&("VEC".into(), "a".into(), "c".into())));
     }
+
+    /// Oracle direct pin: scratch_search("x OR -y") returns the same key ordering
+    /// as scratch_search("x").
+    ///
+    /// The negation-only OR group ("-y") produces group_score = 0.0 in the scoring
+    /// loop (no positive atom contributes) and is suppressed by the guard, so it
+    /// adds nothing to document scores.  This pin mirrors the engine-side test.
+    #[test]
+    fn oracle_negation_only_or_group_same_as_plain_query() {
+        let mut o = Oracle::new();
+        o.enable_fulltext("Doc", "body");
+        o.insert_node(
+            "Doc",
+            "alpha",
+            &[("body".into(), Value::Str("graph node".into()))],
+        );
+        o.insert_node(
+            "Doc",
+            "beta",
+            &[("body".into(), Value::Str("disk wal commit".into()))],
+        );
+
+        let keys_plain: Vec<String> = o
+            .scratch_search("body", "graph")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let keys_or_neg: Vec<String> = o
+            .scratch_search("body", "graph OR -disk")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+
+        assert_eq!(
+            keys_plain, keys_or_neg,
+            "oracle: negation-only OR group must not change result ordering"
+        );
+        assert_eq!(keys_plain, vec!["alpha"], "only 'alpha' has 'graph'");
+    }
 }

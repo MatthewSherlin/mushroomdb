@@ -1300,61 +1300,81 @@ mod tests {
         );
     }
 
-    /// Deterministic phrase-adjacency invariant: engine results agree with an
-    /// independent in-test naive adjacency checker (no shared code with the index).
+    /// Deterministic phrase-adjacency invariant: engine results agree with a
+    /// fully independent in-test adjacency checker.
+    ///
+    /// The checker is truly independent: it inlines its own tokenizer (split on
+    /// non-alphanumeric, lowercase) and does NOT call `tokenize_stemmed_with_positions`
+    /// or any other core-storage function.  To sidestep reimplementing Snowball,
+    /// the corpus is constrained to stem-stable words (stem(w) == w), which are
+    /// verified by assertions at test setup.  For stable words the engine's stemmed
+    /// tokens equal the raw lowercase tokens, so the checker's array-index walk
+    /// and the engine's position-map path must agree on the match set — any
+    /// position-assignment bug would cause a disagreement.
+    ///
+    /// Stem-stable corpus words: "graph", "node", "disk", "wal", "commit"
     ///
     /// Corpus:
-    ///   doc 0: "graph database embedded" — "graph"/"databas" adjacent at pos 0,1
-    ///   doc 1: "graph embedded database" — scattered (gap between graph and databas)
-    ///   doc 2: "the graph database system" — "graph"/"databas" adjacent at pos 1,2
+    ///   doc 0: "graph node disk"        — phrase "graph node" adjacent at idx 0,1
+    ///   doc 1: "graph disk node"        — scattered  (gap: graph idx 0, node idx 2)
+    ///   doc 2: "commit graph node wal"  — phrase "graph node" adjacent at idx 1,2
     ///
-    /// Phrase query: "graph database" (stems to ["graph","databas"])
     /// Expected: docs 0 and 2 match; doc 1 does not.
     #[test]
     fn phrase_adjacency_engine_matches_naive_checker() {
-        use std::collections::BTreeMap;
+        // Verify stem-stability so the independent checker (no stemming) is valid.
+        for w in &["graph", "node", "disk", "wal", "commit"] {
+            assert_eq!(stem(w), *w, "word '{w}' must be its own Snowball stem");
+        }
 
         let mut idx = FulltextIndex::new();
         idx.enable("Doc", "body");
-        idx.add_tokens(0, "body", &Value::Str("graph database embedded".into()));
-        idx.add_tokens(1, "body", &Value::Str("graph embedded database".into()));
-        idx.add_tokens(2, "body", &Value::Str("the graph database system".into()));
+        idx.add_tokens(0, "body", &Value::Str("graph node disk".into()));
+        idx.add_tokens(1, "body", &Value::Str("graph disk node".into()));
+        idx.add_tokens(2, "body", &Value::Str("commit graph node wal".into()));
 
-        let phrase_stems: Vec<String> = vec![stem("graph"), stem("database")];
-
-        // Naive independent adjacency checker: tokenize doc text from scratch,
-        // build a pos_map, then look for the exact consecutive-position alignment.
+        // Naive checker: inline tokenizer + array-index walk.
+        // Zero core-storage imports — no shared position-assignment code.
+        let phrase_words: &[&str] = &["graph", "node"];
         let naive_check = |doc_text: &str| -> bool {
-            let toks = tokenize_stemmed_with_positions(doc_text);
-            let mut pos_map: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-            for (tok, pos) in toks {
-                pos_map.entry(tok).or_default().push(pos);
-            }
-            let Some(starts) = pos_map.get(&phrase_stems[0]) else {
-                return false;
-            };
-            'start: for &start in starts {
-                let mut cur = start;
-                for tok in &phrase_stems[1..] {
-                    cur += 1;
-                    match pos_map.get(tok) {
-                        Some(positions) if positions.binary_search(&cur).is_ok() => {}
-                        _ => continue 'start,
+            // Inline tokenizer: split on non-alphanumeric, lowercase.
+            let mut toks: Vec<String> = Vec::new();
+            let mut cur = String::new();
+            for ch in doc_text.chars() {
+                if ch.is_alphanumeric() {
+                    for lc in ch.to_lowercase() {
+                        cur.push(lc);
                     }
+                } else if !cur.is_empty() {
+                    toks.push(std::mem::take(&mut cur));
                 }
-                return true;
+            }
+            if !cur.is_empty() {
+                toks.push(cur);
+            }
+            // Adjacency walk: phrase must appear as a contiguous sub-sequence.
+            for i in 0..toks.len() {
+                if toks[i] == phrase_words[0]
+                    && i + phrase_words.len() <= toks.len()
+                    && phrase_words
+                        .iter()
+                        .enumerate()
+                        .all(|(j, w)| toks[i + j] == *w)
+                {
+                    return true;
+                }
             }
             false
         };
 
         let docs = [
-            (0u32, "graph database embedded"),
-            (1u32, "graph embedded database"),
-            (2u32, "the graph database system"),
+            (0u32, "graph node disk"),
+            (1u32, "graph disk node"),
+            (2u32, "commit graph node wal"),
         ];
 
         let engine_ids: BTreeSet<u32> = idx
-            .search("body", "\"graph database\"", 0)
+            .search("body", "\"graph node\"", 0)
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -1366,7 +1386,7 @@ mod tests {
 
         assert_eq!(
             engine_ids, naive_ids,
-            "engine phrase results must agree with naive adjacency checker"
+            "engine phrase results must agree with independent naive adjacency checker"
         );
         assert!(engine_ids.contains(&0), "doc 0 (adjacent) must match");
         assert!(!engine_ids.contains(&1), "doc 1 (scattered) must not match");
