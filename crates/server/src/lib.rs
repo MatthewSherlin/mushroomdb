@@ -37,6 +37,7 @@ struct AppState {
     addr: std::net::SocketAddr,
 }
 
+#[allow(deprecated)]
 pub use http::{
     router, router_with_auth, router_with_role_tokens, router_with_ui, serve,
     serve_with_role_tokens, serve_with_ui, serve_with_ui_and_role_tokens,

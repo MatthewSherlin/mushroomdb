@@ -11,6 +11,7 @@
 //! OS buffer sizes.  We test the Lagged serialization in subscribe.rs unit
 //! tests and the Lagged queue logic in core-api events tests.  The integration
 //! test here verifies the subscribe-message + event-payload wire format.
+#![allow(deprecated)] // serve() used for test convenience; production code uses serve_with_role_tokens
 
 use core_api::{Predicate, RuleDef, SharedDb, Value};
 use futures_util::{SinkExt, StreamExt};

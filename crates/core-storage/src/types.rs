@@ -90,6 +90,12 @@ pub enum GraphError {
         expected: u64,
         actual: u64,
     },
+    /// Write statement submitted to a read-only masked query path.
+    ///
+    /// Returned by [`GraphDb::query_masked`] when the Cypher input is a write
+    /// statement (CREATE / MERGE / MATCH…SET / DELETE). The HTTP layer maps
+    /// this to 400 Bad Request with body `{"error":"masked queries are read-only"}`.
+    MaskedReadOnly,
 }
 
 impl std::fmt::Display for GraphError {
@@ -122,6 +128,7 @@ impl std::fmt::Display for GraphError {
                 f,
                 "CAS conflict on key {key:?}: expected commit {expected}, actual {actual}"
             ),
+            GraphError::MaskedReadOnly => write!(f, "masked queries are read-only"),
         }
     }
 }

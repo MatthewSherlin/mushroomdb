@@ -4,6 +4,7 @@
 //! axum/tower `oneshot` cannot complete a WebSocket upgrade, so a live
 //! server is required. The first frame after upgrade is `{"subscribed":true}`
 //! (receiver already exists). Tests wait for that ack before writing.
+#![allow(deprecated)] // serve() used for test convenience; production code uses serve_with_role_tokens
 
 use core_api::{MutationEvent, SharedDb, Value};
 use futures_util::StreamExt;

@@ -1,3 +1,4 @@
+#![allow(deprecated)] // serve() used for test convenience; production code uses serve_with_role_tokens
 use arrow_array::{Array, StringArray};
 use arrow_ipc::reader::StreamReader;
 use axum::body::{to_bytes, Body};

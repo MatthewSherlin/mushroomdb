@@ -4704,7 +4704,7 @@ impl<F: Fs> GraphDb<F> {
         use std::collections::HashMap;
 
         const RRF_K: f64 = 60.0;
-        let pool = 4 * k.max(1);
+        let pool = 4 * k;
 
         // Accumulate per-node RRF scores.
         let mut scores: HashMap<String, f64> = HashMap::new();
@@ -5179,9 +5179,7 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("lex: {e}"),
         })?;
         if is_write_tokens(&tokens) {
-            return Err(GraphError::QueryError {
-                detail: "masked queries are read-only".into(),
-            });
+            return Err(GraphError::MaskedReadOnly);
         }
         let ast = parse(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),

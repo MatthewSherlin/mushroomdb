@@ -18,6 +18,7 @@
 //! bridge-thread wakeup + tokio mpsc + socket round-trip on loopback.
 //!
 //! Clock: std::time::Instant (monotonic, ~ns resolution on Apple Silicon).
+#![allow(deprecated)] // serve() used for test convenience; production code uses serve_with_role_tokens
 
 use core_api::{DbEvent, SharedDb};
 use futures_util::{SinkExt, StreamExt};

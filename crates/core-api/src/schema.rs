@@ -113,6 +113,26 @@ impl<F: Fs> GraphDb<F> {
         let live_views = self.views();
         let live_rules = self.rules();
 
+        // Reject duplicate names within the submitted schema before any mutation.
+        {
+            let mut seen_rules = std::collections::HashSet::new();
+            for rule_def in &schema.rules {
+                if !seen_rules.insert(rule_def.name.as_str()) {
+                    return Err(GraphError::RuleInvalid {
+                        detail: format!("duplicate rule name in schema: {}", rule_def.name),
+                    });
+                }
+            }
+            let mut seen_views = std::collections::HashSet::new();
+            for view_def in &schema.views {
+                if !seen_views.insert(view_def.name.as_str()) {
+                    return Err(GraphError::RuleInvalid {
+                        detail: format!("duplicate view name in schema: {}", view_def.name),
+                    });
+                }
+            }
+        }
+
         for view_def in &schema.views {
             let would_mutate = live_views
                 .iter()

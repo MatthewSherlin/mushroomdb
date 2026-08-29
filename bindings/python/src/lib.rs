@@ -506,7 +506,7 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::Map(map));
     }
     Err(PyTypeError::new_err(format!(
-        "cannot convert {} to Value (need str, int, float, bool, or list)",
+        "cannot convert {} to Value (need str, int, float, bool, list, or dict)",
         obj.get_type().name()?
     )))
 }

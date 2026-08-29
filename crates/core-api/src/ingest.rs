@@ -112,21 +112,11 @@ fn number_to_value(n: &serde_json::Number) -> Option<Value> {
     }
 }
 
-fn field_shape_error(_field: &str, _v: &serde_json::Value) -> Option<String> {
-    // All JSON shapes are now accepted: scalars, arrays (via List), and objects
-    // (via Map). `json_to_value` handles conversion recursively. `null` fields
-    // are silently dropped by the caller rather than reported as an error.
-    None
-}
-
 fn object_to_row(
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> std::result::Result<BTreeMap<String, Value>, String> {
     let mut row = BTreeMap::new();
     for (k, v) in obj {
-        if let Some(err) = field_shape_error(k, v) {
-            return Err(err);
-        }
         if let Some(val) = json_to_value(v.clone()) {
             row.insert(k.clone(), val);
         }

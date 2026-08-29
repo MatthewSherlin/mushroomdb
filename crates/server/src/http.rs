@@ -173,6 +173,11 @@ fn embedded_ctype(path: &str) -> &'static str {
 ///
 /// Role enforcement is not active on this entry point; use
 /// [`serve_with_role_tokens`] when role-bound tokens are required.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use `serve_with_role_tokens` instead; this variant silently ignores role-token configuration."
+)]
+#[doc(hidden)]
 pub async fn serve(
     db: SharedDb,
     addr: SocketAddr,
@@ -200,6 +205,11 @@ pub async fn serve_with_role_tokens(
 ///
 /// Role enforcement is not active on this entry point; use
 /// [`serve_with_ui_and_role_tokens`] when role-bound tokens are required.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use `serve_with_ui_and_role_tokens` instead; this variant silently ignores role-token configuration."
+)]
+#[doc(hidden)]
 pub async fn serve_with_ui(
     db: SharedDb,
     addr: SocketAddr,
@@ -725,11 +735,11 @@ async fn query(
         };
         return match snap.query_masked(&cypher, &params, &effective_mask) {
             Ok(rs) => format_query_result(rs, format),
-            Err(GraphError::QueryError { detail })
-                if detail.contains("masked queries are read-only") =>
-            {
-                (StatusCode::BAD_REQUEST, Json(json!({"error": detail}))).into_response()
-            }
+            Err(GraphError::MaskedReadOnly) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "masked queries are read-only"})),
+            )
+                .into_response(),
             Err(e) => graph_err(e),
         };
     }
@@ -759,11 +769,11 @@ async fn query(
         };
         return match db.query_masked(&cypher, &params, &mask) {
             Ok(rs) => format_query_result(rs, format),
-            Err(GraphError::QueryError { detail })
-                if detail.contains("masked queries are read-only") =>
-            {
-                (StatusCode::BAD_REQUEST, Json(json!({"error": detail}))).into_response()
-            }
+            Err(GraphError::MaskedReadOnly) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "masked queries are read-only"})),
+            )
+                .into_response(),
             Err(e) => graph_err(e),
         };
     }
