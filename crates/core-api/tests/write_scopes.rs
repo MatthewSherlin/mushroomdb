@@ -546,11 +546,10 @@ fn test_merge_unscoped_no_key_lookup() {
         is_role_write_denied(&err),
         "expected RoleWriteDenied for unscoped MERGE, got {err:?}"
     );
-    assert!(
-        denied_reason(&err).contains("create_labels")
-            || denied_reason(&err).contains("write scope"),
-        "reason should indicate scope issue: {}",
-        denied_reason(&err)
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: label 'Secret' not in write scope (create_labels)",
+        "unscoped MERGE must return exact §4.3 reason string"
     );
     // Key "x" must not exist (no key lookup before scope denial).
     assert!(
@@ -617,6 +616,68 @@ fn test_merge_hidden_key() {
     assert_eq!(
         denied_reason(&err),
         "role-bound token: target node not visible"
+    );
+}
+
+/// MERGE ON CREATE SET under a scoped role: InsertNode + SetProp arrive in the
+/// same batch.  The SetProp must see the batch-created node as Visible and must
+/// succeed without checking update_labels (ruling §3.5: batch-created nodes are
+/// updatable by the same batch that created them).
+#[test]
+fn test_merge_on_create_set_with_role_authz() {
+    // Writer role: create_labels=["MyLabel"], update_labels=["MyLabel","Visible"].
+    // Confirm ON CREATE SET succeeds (create + update in scope).
+    let (mut db, _dir) = open_with_writer("merge-on-create-set");
+    db.query_write_authz(
+        "writer",
+        "MERGE (n:MyLabel {id: 'new_mc'}) ON CREATE SET n.created = 1",
+        &no_params(),
+    )
+    .unwrap();
+    assert!(
+        db.has_node("new_mc"),
+        "MERGE ON CREATE SET must create the node"
+    );
+    assert_eq!(
+        db.get_prop("new_mc", "created"),
+        Some(Value::Int(1)),
+        "ON CREATE SET property must be applied"
+    );
+
+    // Create-only role: create_labels=["MyLabel"], update_labels=[].
+    // ON CREATE SET on the batch-created node must STILL succeed (ruling §3.5).
+    let dir2 = tmp("merge-on-create-set-create-only");
+    let mut db2 = GraphDb::open(&dir2).unwrap();
+    let schema = core_api::schema::Schema {
+        fulltext: vec![],
+        rules: vec![],
+        views: vec![],
+        roles: vec![RoleDef {
+            name: "creator".into(),
+            keys: vec![],
+            labels: vec!["MyLabel".into()],
+            write: Some(WriteScope {
+                create_labels: vec!["MyLabel".into()],
+                update_labels: vec![], // empty — no update scope
+                delete_labels: vec![],
+                create_edge_types: vec![],
+                delete_edge_types: vec![],
+            }),
+        }],
+    };
+    db2.apply_schema(&schema).unwrap();
+    // ON CREATE SET on a batch-created node bypasses update_labels (ruling).
+    db2.query_write_authz(
+        "creator",
+        "MERGE (n:MyLabel {id: 'creator_node'}) ON CREATE SET n.x = 42",
+        &no_params(),
+    )
+    .unwrap();
+    assert!(db2.has_node("creator_node"));
+    assert_eq!(
+        db2.get_prop("creator_node", "x"),
+        Some(Value::Int(42)),
+        "batch-created node updatable by same batch regardless of update_labels"
     );
 }
 

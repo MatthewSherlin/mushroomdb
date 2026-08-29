@@ -4035,6 +4035,10 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         ops: Vec<BatchOp>,
         ingest: Option<(String, usize)>,
+        // Two-source rule: write_batch_authz threads authz here directly (never
+        // touches pending_write_authz); query_write_authz sets the field instead
+        // and passes None.  Only one source is non-None per call.
+        param_authz: Option<WriteAuthz>,
     ) -> Result<(usize, usize)> {
         // Read-only guard: catches empty-batch calls before the early-return
         // that skips log_then_apply_with, ensuring all mutation entry points fail.
@@ -4055,9 +4059,10 @@ impl<F: Fs> GraphDb<F> {
         // as visible without needing to call `self.ids.get` on not-yet-committed
         // keys (they won't be there yet).
         //
-        // Clone to avoid borrowing `self.pending_write_authz` and `self.ids`
-        // simultaneously (both are fields of `self`).
-        let authz_opt = self.pending_write_authz.clone();
+        // Two-source rule: param_authz (write_batch_authz path) takes precedence;
+        // fall back to self.pending_write_authz (query_write_authz/Cypher path).
+        // Cloning the field copy avoids a simultaneous borrow of self.ids below.
+        let authz_opt = param_authz.or_else(|| self.pending_write_authz.clone());
         if let Some(ref authz) = authz_opt {
             let mut batch_created: BTreeMap<String, String> = BTreeMap::new();
             for op in &ops {
@@ -4218,7 +4223,7 @@ impl<F: Fs> GraphDb<F> {
     }
 
     fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<(usize, usize)> {
-        self.commit_logged_batch(ops, None)
+        self.commit_logged_batch(ops, None, None)
     }
 
     /// Commit one submission WITHOUT an fsync — for use inside `commit_group`
@@ -4242,7 +4247,7 @@ impl<F: Fs> GraphDb<F> {
         // SAFETY: raw pointer into self; guard dropped within this frame.
         let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
         self.fsync = FsyncPolicy::Relaxed;
-        self.commit_logged_batch(ops, None)
+        self.commit_logged_batch(ops, None, None)
     }
 
     /// Commit multiple op-batches as a **group**: each submission gets its own
@@ -5201,12 +5206,8 @@ impl<F: Fs> GraphDb<F> {
         authz: Option<&WriteAuthz>,
         ops: Vec<BatchOp>,
     ) -> Result<(usize, usize)> {
-        if let Some(a) = authz {
-            self.pending_write_authz = Some(a.clone());
-        }
-        let result = self.commit_logged_batch(ops, None);
-        self.pending_write_authz = None;
-        result
+        // Thread authz as a direct parameter — never touches pending_write_authz.
+        self.commit_logged_batch(ops, None, authz.cloned())
     }
 
     /// Execute a Cypher write statement with role-scoped write authorization.
@@ -5252,15 +5253,25 @@ impl<F: Fs> GraphDb<F> {
             scope,
             mask,
         });
+        // RAII guard: always clears pending_write_authz on scope exit, including
+        // on panic or early-return, mirroring the RestoreEmitDeltas precedent.
+        struct ClearPendingAuthzOnDrop(*mut Option<WriteAuthz>);
+        impl Drop for ClearPendingAuthzOnDrop {
+            fn drop(&mut self) {
+                // SAFETY: pointer into the owning GraphDb; guard is dropped
+                // within this function's frame before it returns.
+                unsafe { *self.0 = None };
+            }
+        }
+        // SAFETY: raw pointer into self; guard dropped before this fn returns.
+        let _authz_guard = ClearPendingAuthzOnDrop(&mut self.pending_write_authz as *mut _);
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
         let stmt = parse_write(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
-        let result = self.exec_write_stmt(stmt, params);
-        self.pending_write_authz = None;
-        result
+        self.exec_write_stmt(stmt, params)
     }
 
     /// Evaluate the write-authz decision table for one `BatchOp`.
@@ -5280,7 +5291,16 @@ impl<F: Fs> GraphDb<F> {
         batch_created: &BTreeMap<String, String>,
     ) -> Result<()> {
         // Helper: 3-way node status under the authz mask.
+        //
+        // Batch-created nodes (from earlier InsertNode in THIS batch) are treated
+        // as Visible with their recorded label — their create gate already passed
+        // and they are not yet in self.ids (not committed).  This fixes the
+        // MERGE+ON CREATE SET case where InsertNode + SetProp arrive together:
+        // the SetProp must not see the node as Absent.
         let node_status = |key: &str| -> NodeAuthzStatus {
+            if let Some(label) = batch_created.get(key) {
+                return NodeAuthzStatus::Visible(label.clone());
+            }
             match self.ids.get(key) {
                 None => NodeAuthzStatus::Absent,
                 Some(id) if !authz.mask.contains_id(id) => NodeAuthzStatus::Hidden,
@@ -5365,21 +5385,27 @@ impl<F: Fs> GraphDb<F> {
 
             // ── UPDATE-class: SetProp, RemoveProp ────────────────────────────
             BatchOp::SetProp { key, .. } | BatchOp::RemoveProp { key, .. } => {
-                let label = match node_status(key) {
-                    NodeAuthzStatus::Visible(lbl) => lbl,
-                    _ => {
+                if batch_created.contains_key(key.as_str()) {
+                    // Batch-created node: create gate already passed this batch.
+                    // Updating it in the same batch is always allowed, regardless
+                    // of update_labels (ruling §3.5: "writer just created it").
+                } else {
+                    let label = match node_status(key) {
+                        NodeAuthzStatus::Visible(lbl) => lbl,
+                        _ => {
+                            return Err(GraphError::RoleWriteDenied {
+                                reason: "role-bound token: target node not visible".into(),
+                            });
+                        }
+                    };
+                    if !authz.scope.update_labels.contains(&label) {
                         return Err(GraphError::RoleWriteDenied {
-                            reason: "role-bound token: target node not visible".into(),
+                            reason: format!(
+                                "role-bound token: label '{}' not in write scope (update_labels)",
+                                label
+                            ),
                         });
                     }
-                };
-                if !authz.scope.update_labels.contains(&label) {
-                    return Err(GraphError::RoleWriteDenied {
-                        reason: format!(
-                            "role-bound token: label '{}' not in write scope (update_labels)",
-                            label
-                        ),
-                    });
                 }
             }
 
@@ -7030,7 +7056,7 @@ impl<F: Fs> GraphDb<F> {
         ops: Vec<BatchOp>,
     ) -> Result<(usize, usize)> {
         self.check_preconditions(&preconds)?;
-        self.commit_logged_batch(ops, None)
+        self.commit_logged_batch(ops, None, None)
     }
 
     /// Update the per-node last-change map for a WAL record at commit `seq`.
@@ -8913,7 +8939,7 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
     pub(crate) fn commit_ingest(&mut self, label: &str, inserted: usize) -> Result<(usize, usize)> {
         let ops = std::mem::take(&mut self.ops);
         self.db
-            .commit_logged_batch(ops, Some((label.to_string(), inserted)))
+            .commit_logged_batch(ops, Some((label.to_string(), inserted)), None)
     }
 }
 
