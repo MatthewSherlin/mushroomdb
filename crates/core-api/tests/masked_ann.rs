@@ -245,10 +245,8 @@ fn adversarial_hidden_node_never_leaks() {
         .unwrap();
     }
 
-    let visible: Vec<&str> = (0..5u32)
-        .map(|i| Box::leak(format!("ok{i}").into_boxed_str()) as &str)
-        .collect();
-    let mask = NodeMask::from_keys(&db, visible.iter().copied());
+    let visible: Vec<String> = (0..5u32).map(|i| format!("ok{i}")).collect();
+    let mask = NodeMask::from_keys(&db, visible.iter().map(String::as_str));
 
     // Brute-force path.
     let hits = db.find_similar_vector_masked("emb", Some("T"), &[1.0_f64, 0.0], 10, 0.0, &mask);
@@ -265,4 +263,50 @@ fn adversarial_hidden_node_never_leaks() {
         max_score < 1.0 - 1e-9,
         "no result should have the poison node's score of 1.0; got {max_score}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Adversarial: HNSW path — hidden top-scorer never leaks key or score
+// ---------------------------------------------------------------------------
+
+#[test]
+fn adversarial_hnsw_hidden_node_never_leaks() {
+    let dir = tmp("adversarial-hnsw");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // "poison" has the perfect query alignment; it must never appear after masking.
+    db.insert_node("V", "poison", vec![("emb".into(), emb(&[1.0, 0.0]))])
+        .unwrap();
+    for i in 0..6u32 {
+        let x = 0.5 + i as f64 * 0.05;
+        db.insert_node(
+            "V",
+            &format!("ok{i}"),
+            vec![("emb".into(), emb(&[x, 1.0 - x]))],
+        )
+        .unwrap();
+    }
+
+    // Register an approximate rule so the HNSW index is populated.
+    db.create_rule(approx_rule("V", "V", "emb", "SIM")).unwrap();
+    assert!(db.has_vector_rule("emb"), "HNSW rule must be present");
+
+    let visible: Vec<String> = (0..6u32).map(|i| format!("ok{i}")).collect();
+    let mask = NodeMask::from_keys(&db, visible.iter().map(String::as_str));
+
+    let hits = db.find_similar_vector_masked("emb", Some("V"), &[1.0_f64, 0.0], 10, 0.0, &mask);
+
+    for (key, _score) in &hits {
+        assert_ne!(key, "poison", "poison key must never appear via HNSW path");
+    }
+    let max_score = hits
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(f64::NEG_INFINITY, f64::max);
+    // All visible nodes have x ∈ [0.5, 0.75], so their cosine with [1,0] < 1.0.
+    assert!(
+        max_score < 1.0 - 1e-9,
+        "poison score of 1.0 must not appear in HNSW-masked results; got {max_score}"
+    );
+    assert!(!hits.is_empty(), "visible nodes must still be returned");
 }

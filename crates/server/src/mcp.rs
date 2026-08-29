@@ -518,6 +518,28 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
 /// is empty — no live cosine computation is performed here.
 /// Returns up to `limit` (default 10) neighbor entries.
 fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
+    // Parse the optional mask once — it applies to both vector and edge paths.
+    // An invalid mask value (non-array or non-string element) fails closed.
+    let mask_keys: Option<Vec<String>> = if let Some(mask_val) = args.get("mask") {
+        match mask_val.as_array() {
+            Some(arr) => {
+                let mut ks: Vec<String> = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v.as_str() {
+                        Some(s) => ks.push(s.to_string()),
+                        None => {
+                            return CallOutcome::ToolErr("mask must be an array of strings".into())
+                        }
+                    }
+                }
+                Some(ks)
+            }
+            None => return CallOutcome::ToolErr("mask must be an array of strings".into()),
+        }
+    } else {
+        None
+    };
+
     // When a `vector` array is provided, use the HNSW / brute-force vector
     // similarity path instead of looking up pre-derived edges.
     if let Some(vec_js) = args.get("vector").and_then(Js::as_array) {
@@ -542,34 +564,11 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
             .unwrap_or(10);
         let min = args.get("min").and_then(Js::as_f64).unwrap_or(0.8);
 
-        // Optional mask: when present restrict results to listed node keys.
-        let mask_keys: Option<Vec<String>> = if let Some(mask_val) = args.get("mask") {
-            match mask_val.as_array() {
-                Some(arr) => {
-                    let mut ks: Vec<String> = Vec::with_capacity(arr.len());
-                    for v in arr {
-                        match v.as_str() {
-                            Some(s) => ks.push(s.to_string()),
-                            None => {
-                                return CallOutcome::ToolErr(
-                                    "mask must be an array of strings".into(),
-                                )
-                            }
-                        }
-                    }
-                    Some(ks)
-                }
-                None => return CallOutcome::ToolErr("mask must be an array of strings".into()),
-            }
-        } else {
-            None
-        };
-
         let hits = {
             let g = db.read();
-            if let Some(keys) = mask_keys {
-                let mask = NodeMask::from_keys(&*g, keys.iter().map(String::as_str));
-                g.find_similar_vector_masked(field, label, &q, k, min, &mask)
+            if let Some(ref keys) = mask_keys {
+                let node_mask = NodeMask::from_keys(&*g, keys.iter().map(String::as_str));
+                g.find_similar_vector_masked(field, label, &q, k, min, &node_mask)
             } else {
                 g.find_similar_vector(field, label, &q, k, min)
             }
@@ -601,6 +600,59 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
         .and_then(Js::as_u64)
         .map(|n| n as usize)
         .unwrap_or(10);
+
+    // When a mask is present, a hidden query key behaves identically to a
+    // nonexistent key — we do not confirm its existence.
+    if let Some(ref mask) = mask_keys {
+        let mask_set: std::collections::HashSet<&str> = mask.iter().map(String::as_str).collect();
+        if !mask_set.contains(key) {
+            return CallOutcome::ToolErr(graph_err_msg(GraphError::KeyNotFound {
+                key: key.into(),
+            }));
+        }
+        let out = {
+            let g = db.read();
+            g.node_edges(key)
+        };
+        return match out {
+            Ok(edges) => {
+                let similar: Vec<Js> = edges
+                    .iter()
+                    .filter(|e| e.edge_type == edge_type)
+                    .filter(|e| {
+                        // Keep only edges where the neighbor is also visible.
+                        let neighbor_key = if e.src_key == key {
+                            &e.dst_key
+                        } else {
+                            &e.src_key
+                        };
+                        mask_set.contains(neighbor_key.as_str())
+                    })
+                    .take(limit)
+                    .map(|e| {
+                        let neighbor_key = if e.src_key == key {
+                            &e.dst_key
+                        } else {
+                            &e.src_key
+                        };
+                        let direction = if e.src_key == key { "out" } else { "in" };
+                        json!({
+                            "neighbor_key": neighbor_key,
+                            "direction": direction,
+                            "edge_type": e.edge_type,
+                            "derived": e.derived,
+                        })
+                    })
+                    .collect();
+                CallOutcome::ToolOk(json!({
+                    "key": key,
+                    "edge_type": edge_type,
+                    "similar": similar
+                }))
+            }
+            Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+        };
+    }
 
     let out = {
         let g = db.read();
@@ -923,7 +975,7 @@ fn tools_list() -> Js {
             },
             {
                 "name": "find_similar",
-                "description": "Two modes: (1) Vector search — provide `vector` (and optionally `field`, `label`, `k`, `min`, `mask`) to find the k most similar nodes by cosine similarity using the HNSW index when available, brute-force otherwise. Hidden nodes (those not in `mask`) never appear in results; the mask is applied before k-truncation. (2) Edge traversal — provide `key` (and optionally `edge_type`, `limit`) to return neighbors previously connected by a derived rule edge. Results from mode 2 come only from edges already derived by a VectorSimilar rule.",
+                "description": "Two modes: (1) Vector search — provide `vector` (and optionally `field`, `label`, `k`, `min`) to find the k most similar nodes by cosine similarity using the HNSW index when available, brute-force otherwise. (2) Edge traversal — provide `key` (and optionally `edge_type`, `limit`) to return neighbors previously connected by a derived rule edge. Results from mode 2 come only from edges already derived by a VectorSimilar rule. In both modes, the optional `mask` array limits visibility: hidden nodes never appear in results, and a hidden query key in edge mode behaves identically to a nonexistent key.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1181,6 +1233,13 @@ mod tests {
 
     fn is_error(resp: &Js) -> bool {
         resp["result"]["isError"].as_bool().unwrap_or(false)
+    }
+
+    fn tool_err_text(resp: &Js) -> String {
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
     }
 
     // --- existing tools ---
@@ -1612,6 +1671,83 @@ mod tests {
         assert!(
             is_error(&resp),
             "non-string mask element must produce a tool error"
+        );
+    }
+
+    /// Edge-traversal mode with `mask` must exclude hidden neighbors.
+    #[test]
+    fn test_find_similar_edge_mask_excludes_hidden_neighbor() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            g.insert_node("P", "alice", vec![]).unwrap();
+            g.insert_node("P", "bob", vec![]).unwrap(); // visible
+            g.insert_node("P", "carol", vec![]).unwrap(); // hidden
+            g.insert_edge("KNOWS", "alice", "bob").unwrap();
+            g.insert_edge("KNOWS", "alice", "carol").unwrap();
+        }
+        // Mask: alice and bob visible; carol hidden.
+        let resp = tool_call(
+            &db,
+            1,
+            "find_similar",
+            json!({
+                "key": "alice",
+                "edge_type": "KNOWS",
+                "mask": ["alice", "bob"]
+            }),
+        );
+        assert!(!is_error(&resp), "masked edge search must not error");
+        let result = tool_text(&resp);
+        let similar = result["similar"].as_array().expect("similar array");
+        let neighbors: Vec<&str> = similar
+            .iter()
+            .filter_map(|e| e["neighbor_key"].as_str())
+            .collect();
+        assert!(neighbors.contains(&"bob"), "bob (visible) must appear");
+        assert!(
+            !neighbors.contains(&"carol"),
+            "carol (hidden) must be excluded"
+        );
+    }
+
+    /// Edge-traversal mode with `mask`: a hidden query key must not reveal
+    /// its existence — response must be a tool error identical to a nonexistent key.
+    #[test]
+    fn test_find_similar_edge_mask_hidden_key_is_not_found() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            g.insert_node("P", "alice", vec![]).unwrap();
+            g.insert_node("P", "bob", vec![]).unwrap();
+        }
+        // alice exists but is not in the mask — must look like not-found.
+        let resp_masked = tool_call(
+            &db,
+            1,
+            "find_similar",
+            json!({ "key": "alice", "edge_type": "KNOWS", "mask": ["bob"] }),
+        );
+        // ghost never exists — use as the reference for "not found".
+        let resp_ghost = tool_call(
+            &db,
+            2,
+            "find_similar",
+            json!({ "key": "ghost", "edge_type": "KNOWS" }),
+        );
+        assert!(
+            is_error(&resp_masked),
+            "hidden query key must produce a tool error"
+        );
+        assert!(
+            is_error(&resp_ghost),
+            "nonexistent key must produce a tool error"
+        );
+        // Both errors must carry the same shape (both are key-not-found).
+        assert_eq!(
+            tool_err_text(&resp_masked).contains("alice"),
+            tool_err_text(&resp_ghost).contains("ghost"),
+            "error messages should follow same not-found template"
         );
     }
 
