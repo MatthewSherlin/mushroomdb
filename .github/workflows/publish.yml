@@ -169,14 +169,15 @@ jobs:
             3.12
             3.13
 
-      # Build manylinux wheel on Linux, native wheel on macOS.
-      # The explicit -i interpreter list is load-bearing: without it the
-      # aarch64 container build died with "Couldn't find any python
-      # interpreters from 'python3'" (v0.2.0 publish, run 33262876469).
+      # Build one abi3 wheel per platform (pyo3 abi3-py310 → a single wheel
+      # covers CPython ≥3.10). This sidesteps the aarch64 manylinux failure
+      # where a per-version interpreter list ("-i 3.10 3.11 …") couldn't be
+      # resolved inside the container (v0.2.0 publish, run 33262876469):
+      # abi3 needs only ONE interpreter, which every container ships.
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: build
-          args: --release --out dist -i 3.10 3.11 3.12 3.13
+          args: --release --out dist -i 3.10
           working-directory: bindings/python
           target: ${{ matrix.maturin-target }}
           # Use manylinux container on Linux for broad compatibility.
