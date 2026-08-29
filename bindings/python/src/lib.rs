@@ -1,5 +1,5 @@
 use core_api::{
-    default_max_edges, Direction, Explanation, GraphDb as CoreDb, GraphError, NodeInfo,
+    default_max_edges, Direction, Explanation, GraphDb as CoreDb, GraphError, NodeInfo, NodeMask,
     PredicateSummary, ResultSet, RuleDef, Value,
 };
 use core_storage::fs::RealFs;
@@ -205,15 +205,21 @@ impl GraphDb {
     /// (check with `has_vector_rule`); falls back to O(n) brute-force scan
     /// when no such rule exists.
     ///
+    /// When `mask` is a list of node keys, only those nodes are eligible for
+    /// results (hidden nodes are excluded before k-truncation).  `None` keeps
+    /// the existing unmasked behaviour.
+    ///
     /// Returns a list of `(node_key, similarity_score)` tuples sorted by
     /// score descending, filtered to `score >= min`.
     ///
     /// ```python
     /// hits = db.find_similar("embedding", query_vec, k=10, min=0.7)
-    /// # or restrict to a label:
+    /// # restrict to a label:
     /// hits = db.find_similar("embedding", query_vec, label="Document", k=10)
+    /// # restrict to visible nodes:
+    /// hits = db.find_similar("embedding", query_vec, mask=["alice", "bob"])
     /// ```
-    #[pyo3(signature = (field, vector, label = None, k = 10, min = 0.0))]
+    #[pyo3(signature = (field, vector, label = None, k = 10, min = 0.0, mask = None))]
     fn find_similar(
         &self,
         _py: Python<'_>,
@@ -222,9 +228,26 @@ impl GraphDb {
         label: Option<&str>,
         k: usize,
         min: f64,
+        mask: Option<Bound<'_, PyList>>,
     ) -> PyResult<Vec<(String, f64)>> {
         let q = pylist_to_f64_vec(&vector)?;
-        self.with_ref(|db| Ok(db.find_similar_vector(field, label, &q, k, min)))
+        if let Some(mask_list) = mask {
+            // Parse the mask key list (must be strings).
+            let mut keys: Vec<String> = Vec::with_capacity(mask_list.len());
+            for item in mask_list.iter() {
+                if let Ok(s) = item.downcast::<PyString>() {
+                    keys.push(s.to_string());
+                } else {
+                    return Err(PyTypeError::new_err("mask must be a list of strings"));
+                }
+            }
+            self.with_ref(|db| {
+                let node_mask = NodeMask::from_keys(db, keys.iter().map(String::as_str));
+                Ok(db.find_similar_vector_masked(field, label, &q, k, min, &node_mask))
+            })
+        } else {
+            self.with_ref(|db| Ok(db.find_similar_vector(field, label, &q, k, min)))
+        }
     }
 
     /// Hybrid RRF search combining fulltext and vector similarity.

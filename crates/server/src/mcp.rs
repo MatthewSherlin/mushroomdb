@@ -542,9 +542,37 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
             .unwrap_or(10);
         let min = args.get("min").and_then(Js::as_f64).unwrap_or(0.8);
 
+        // Optional mask: when present restrict results to listed node keys.
+        let mask_keys: Option<Vec<String>> = if let Some(mask_val) = args.get("mask") {
+            match mask_val.as_array() {
+                Some(arr) => {
+                    let mut ks: Vec<String> = Vec::with_capacity(arr.len());
+                    for v in arr {
+                        match v.as_str() {
+                            Some(s) => ks.push(s.to_string()),
+                            None => {
+                                return CallOutcome::ToolErr(
+                                    "mask must be an array of strings".into(),
+                                )
+                            }
+                        }
+                    }
+                    Some(ks)
+                }
+                None => return CallOutcome::ToolErr("mask must be an array of strings".into()),
+            }
+        } else {
+            None
+        };
+
         let hits = {
             let g = db.read();
-            g.find_similar_vector(field, label, &q, k, min)
+            if let Some(keys) = mask_keys {
+                let mask = NodeMask::from_keys(&*g, keys.iter().map(String::as_str));
+                g.find_similar_vector_masked(field, label, &q, k, min, &mask)
+            } else {
+                g.find_similar_vector(field, label, &q, k, min)
+            }
         };
         let results: Vec<Js> = hits
             .into_iter()
@@ -895,7 +923,7 @@ fn tools_list() -> Js {
             },
             {
                 "name": "find_similar",
-                "description": "Two modes: (1) Vector search — provide `vector` (and optionally `field`, `label`, `k`, `min`) to find the k most similar nodes by cosine similarity using the HNSW index when available, brute-force otherwise. (2) Edge traversal — provide `key` (and optionally `edge_type`, `limit`) to return neighbors previously connected by a derived rule edge. Results from mode 2 come only from edges already derived by a VectorSimilar rule.",
+                "description": "Two modes: (1) Vector search — provide `vector` (and optionally `field`, `label`, `k`, `min`, `mask`) to find the k most similar nodes by cosine similarity using the HNSW index when available, brute-force otherwise. Hidden nodes (those not in `mask`) never appear in results; the mask is applied before k-truncation. (2) Edge traversal — provide `key` (and optionally `edge_type`, `limit`) to return neighbors previously connected by a derived rule edge. Results from mode 2 come only from edges already derived by a VectorSimilar rule.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -908,6 +936,11 @@ fn tools_list() -> Js {
                         "label": { "type": "string", "description": "Restrict search to nodes with this label. Empty string means all labels. Used in vector-search mode." },
                         "k": { "type": "integer", "description": "Maximum results to return in vector-search mode (default: 10)." },
                         "min": { "type": "number", "description": "Minimum cosine similarity threshold in vector-search mode (default: 0.8)." },
+                        "mask": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional node key allow-list for vector-search mode. When present, only nodes whose key appears in this list are eligible for results. Hidden nodes are excluded before k-truncation so callers still receive up to k visible hits. Unknown keys are silently ignored."
+                        },
                         "key": { "type": "string", "description": "Source node key for edge-traversal mode." },
                         "edge_type": { "type": "string", "description": "Edge type to filter by in edge-traversal mode (default: SIMILAR)." },
                         "limit": { "type": "integer", "description": "Maximum neighbors to return in edge-traversal mode (default: 10)." }
@@ -1502,6 +1535,83 @@ mod tests {
         assert!(
             !keys.contains(&"far"),
             "far node (sim=0.0) must be excluded by default min=0.8"
+        );
+    }
+
+    /// `find_similar` with `mask` must exclude hidden node keys from results.
+    #[test]
+    fn test_find_similar_vector_mask_excludes_hidden() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            // visible: [1,0] — should appear in results.
+            g.insert_node(
+                "Item",
+                "visible",
+                vec![(
+                    "emb".into(),
+                    Value::List(vec![Value::Float(1.0), Value::Float(0.0)]),
+                )],
+            )
+            .unwrap();
+            // hidden: [1,0] — same direction as query but must not appear.
+            g.insert_node(
+                "Item",
+                "hidden",
+                vec![(
+                    "emb".into(),
+                    Value::List(vec![Value::Float(1.0), Value::Float(0.0)]),
+                )],
+            )
+            .unwrap();
+        }
+
+        let resp = tool_call(
+            &db,
+            1,
+            "find_similar",
+            json!({
+                "vector": [1.0, 0.0],
+                "field": "emb",
+                "label": "Item",
+                "k": 10,
+                "min": 0.0,
+                "mask": ["visible"]
+            }),
+        );
+        assert!(!is_error(&resp), "masked vector search must not error");
+        let result = tool_text(&resp);
+        let results = result["results"].as_array().expect("results array");
+
+        let keys: Vec<&str> = results.iter().filter_map(|r| r["key"].as_str()).collect();
+        assert!(
+            keys.contains(&"visible"),
+            "visible node must appear in masked results"
+        );
+        assert!(
+            !keys.contains(&"hidden"),
+            "hidden node must be excluded by mask"
+        );
+    }
+
+    /// `find_similar` with `mask` — bad mask value returns a tool error.
+    #[test]
+    fn test_find_similar_vector_mask_bad_type_is_error() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let resp = tool_call(
+            &db,
+            1,
+            "find_similar",
+            json!({
+                "vector": [1.0, 0.0],
+                "field": "emb",
+                "k": 5,
+                "mask": [42]
+            }),
+        );
+        assert!(
+            is_error(&resp),
+            "non-string mask element must produce a tool error"
         );
     }
 

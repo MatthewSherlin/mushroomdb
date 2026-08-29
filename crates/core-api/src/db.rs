@@ -5780,6 +5780,101 @@ impl<F: Fs> GraphDb<F> {
         scored
     }
 
+    /// Like [`find_similar_vector`] but restricts results to nodes visible in
+    /// `mask`. Hidden nodes never appear in results; the mask is applied
+    /// **before** k-truncation so a caller still receives up to `k` visible
+    /// hits.
+    ///
+    /// # HNSW path (over-fetch policy)
+    ///
+    /// When an HNSW index covers the request, this function fetches `4 * k`
+    /// candidates from the index and discards hidden nodes in the post-filter
+    /// step.  If fewer than `k` visible nodes remain after filtering the caller
+    /// receives whatever is available — we do not re-query the index.  The 4×
+    /// multiplier is a heuristic suited for sparsely masked graphs; callers
+    /// operating under a very selective mask should register a VectorSimilar
+    /// rule with a non-approximate index, or use the brute-force path (no HNSW
+    /// rule) which exhaustively filters through the masked [`GraphView`].
+    ///
+    /// # Brute-force path
+    ///
+    /// When no HNSW index covers the request the function builds a masked
+    /// [`GraphView`] so that `nodes_all` / `nodes_with_label` return only
+    /// visible nodes, guaranteeing exact `k` results (or all visible nodes if
+    /// fewer than `k` exist).
+    pub fn find_similar_vector_masked(
+        &self,
+        field: &str,
+        label: Option<&str>,
+        q: &[f64],
+        k: usize,
+        min: f64,
+        mask: &crate::mask::NodeMask,
+    ) -> Vec<(String, f64)> {
+        self.engine.ensure_hnsw_loaded();
+        let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm == 0.0 {
+            return vec![];
+        }
+        let q_unit: Vec<f64> = q.iter().map(|x| x / norm).collect();
+
+        // HNSW fast path — over-fetch 4×k so post-masking still yields up to k
+        // visible hits.  See doc comment above for the policy rationale.
+        let over_k = k.saturating_mul(4).max(k + 1);
+        let hnsw_hits = match label {
+            Some(lbl) => self.engine.hnsw_search_dst(field, lbl, &q_unit, over_k),
+            None => self.engine.hnsw_search_any_dst(field, &q_unit, over_k),
+        };
+        if let Some(hits) = hnsw_hits {
+            let mut out: Vec<(String, f64)> = hits
+                .into_iter()
+                .filter(|&(id, sim)| sim >= min && mask.visible.contains(&id))
+                .filter_map(|(id, sim)| self.ids.key_of(id).map(|key| (key.to_string(), sim)))
+                .collect();
+            out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            out.truncate(k);
+            return out;
+        }
+
+        // Brute-force fallback — masked view ensures only visible nodes are
+        // enumerated by nodes_all(); nodes_with_label() does not filter by
+        // mask so we apply view.visible() explicitly for the labeled case.
+        let view = self.view_masked(mask);
+        let candidate_ids: Vec<u32> = match label {
+            Some(lbl) => view
+                .nodes_with_label(lbl)
+                .into_iter()
+                .filter(|&id| view.visible(id))
+                .collect(),
+            None => view.nodes_all(),
+        };
+        let mut scored: Vec<(String, f64)> = candidate_ids
+            .into_iter()
+            .filter_map(|id| {
+                let v = view.prop(id, field)?;
+                let v_owned = v.into_value();
+                let xs = value_as_float_list(&v_owned)?;
+                let v_norm: f64 = xs.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if v_norm == 0.0 {
+                    return None;
+                }
+                let dot: f64 = q_unit
+                    .iter()
+                    .zip(xs.iter())
+                    .map(|(a, b)| a * (b / v_norm))
+                    .sum();
+                if dot < min {
+                    return None;
+                }
+                let key = self.ids.key_of(id)?.to_string();
+                Some((key, dot))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
+    }
+
     /// Read a single property from an edge.
     ///
     /// Returns `None` when the edge does not exist, the field is absent, or any

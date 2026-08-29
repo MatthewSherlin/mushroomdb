@@ -591,3 +591,50 @@ def test_find_similar_rejects_bool_vector(tmp_path):
     with pytest.raises(TypeError, match="bool"):
         db.find_similar("vec", [True, False], k=5)
     db.close()
+
+
+# ── Mask-aware ANN ──────────────────────────────────────────────────────────
+
+def test_find_similar_mask_excludes_hidden(tmp_path):
+    """find_similar with mask= excludes hidden nodes from results."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "visible", {"vec": [1.0, 0.0]})
+    db.insert_node("Item", "hidden", {"vec": [1.0, 0.0]})  # same direction, masked out
+
+    hits = db.find_similar("vec", [1.0, 0.0], label="Item", k=10, min=0.0, mask=["visible"])
+    keys = [h[0] for h in hits]
+    assert "visible" in keys, "visible node must appear"
+    assert "hidden" not in keys, "hidden node must be excluded by mask"
+    db.close()
+
+
+def test_find_similar_mask_none_is_unmasked(tmp_path):
+    """find_similar with mask=None (default) behaves identically to omitting mask."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "a", {"vec": [1.0, 0.0]})
+    db.insert_node("Item", "b", {"vec": [0.8, 0.2]})
+
+    hits_no_mask = db.find_similar("vec", [1.0, 0.0], label="Item", k=5, min=0.0)
+    hits_none = db.find_similar("vec", [1.0, 0.0], label="Item", k=5, min=0.0, mask=None)
+
+    assert [h[0] for h in hits_no_mask] == [h[0] for h in hits_none]
+    db.close()
+
+
+def test_find_similar_mask_empty_returns_empty(tmp_path):
+    """find_similar with an empty mask returns no results (all nodes hidden)."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "a", {"vec": [1.0, 0.0]})
+
+    hits = db.find_similar("vec", [1.0, 0.0], label="Item", k=5, min=0.0, mask=[])
+    assert hits == [], "empty mask must yield no results"
+    db.close()
+
+
+def test_find_similar_mask_bad_type_raises(tmp_path):
+    """find_similar raises TypeError when mask contains non-string elements."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "a", {"vec": [1.0, 0.0]})
+    with pytest.raises(TypeError):
+        db.find_similar("vec", [1.0, 0.0], label="Item", k=5, mask=[42])
+    db.close()
