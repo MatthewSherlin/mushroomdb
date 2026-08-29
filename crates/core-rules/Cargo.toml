@@ -14,7 +14,7 @@ name = "core_rules"
 
 [dependencies]
 bincode = { workspace = true }
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.1.2" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.2.0" }
 serde = { workspace = true }
 
 [dev-dependencies]

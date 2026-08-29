@@ -1,5 +1,91 @@
 # Changelog
 
+## v0.2.0 — 2026-08-29
+
+The association-engine release: trust, physics, and agent-default memory.
+
+### Storage physics (V8 mapped snapshots + MVCC)
+
+- New V8 snapshot format: rkyv-archived, memory-mapped, 12 sections with
+  per-section CRCs. Open-to-first-query on a 2.2 GiB / 100k-node store:
+  **0.02 s, 31–41 MiB RSS** (was 17.6 s / 12 GiB on v0.1). Measured
+  2026-08-28, warm-file/cold-process; methodology in
+  `dogfood/results/scale-100k.md`.
+- MVCC epoch readers: concurrent readers proceed during writes
+  (reader-burst p95 45 µs under write load).
+- Group-commit write queue: 8 concurrent writers at Strict fsync reach
+  4.17× serialized throughput (measured; SimFs amortization proof 7.98×).
+- `mushroomdb verify` command for offline CRC checking.
+
+### Trust: migration + format promise
+
+- V5–V7 stores migrate on open (opt-out) or via `mushroomdb migrate`
+  (crash-safe, `.bak` retained). Format promise in
+  `docs/format-stability.md`: append-only evolution within a minor series,
+  migrators across majors, v0.2 reads V5+.
+- Benchmarks run in CI and gate merges against pinned baselines.
+- Panic policy (`docs/site/panic-policy.md`): all disk-reachable decode
+  paths return typed `Corrupt` errors (15 sites hardened this release,
+  fuzz-covered); remaining panics are internal invariants.
+
+### Temporal memory (time travel for agents)
+
+- `edge_history(a, b)` and `was_linked(a, b, type, at_commit)` — full edge
+  lifecycle over the WAL, including rule-derived edges with rule
+  attribution (history markers written at true firing time).
+- Compare-and-set writes: `write_batch_cas` with per-node last-change
+  preconditions and a typed `CasConflict` error; last-change map persists
+  across snapshots (V8 LAST_CHANGE section).
+- History-preserving snapshots: `archive_wal` keeps WAL segments as
+  `wal.<n>.archive` with retention — unbounded time travel for
+  `node_history` / `edge_history` / `open_at`, honest genesis-chain
+  contract for pre-archive commits.
+- All history APIs over HTTP and MCP; horizons reported in every response.
+
+### RBAC over masks
+
+- Named roles in schema-as-code (`roles.json` sidecar), server tokens
+  bound to a role, automatic mask resolution on query paths. Role tokens
+  are read-only in v0.2; never-widen is the standing invariant.
+- Restricted-stub mask mode (opt-in): hidden nodes surface as
+  `{key, restricted: true}` stubs on read surfaces instead of being
+  omitted — per-mask choice, never available to role tokens.
+
+### Fulltext v2
+
+- BM25 ranking (k1=1.2, b=0.75), Snowball English stemming at index and
+  query time, `"phrase"` adjacency matching, `-term` negation, `prefix*`
+  — in `search`, `search_hybrid` (RRF text leg upgrades automatically),
+  and Cypher `textMatches`.
+
+### Operations: backup + export
+
+- `mushroomdb backup <dir> <dest>` and `GraphDb::backup_to`: consistent
+  verified copies (CRC + reopen check). `POST /backup` for live served
+  stores. PITR recipe in `docs/format-stability.md`.
+- `mushroomdb export <dir> <dest> --format jsonl|parquet`: full
+  deterministic dumps (nodes/edges/rules; derived edges flagged with rule
+  attribution). Your data is never locked in.
+
+### Quality of life
+
+- `rename_node(old, new)` — key changes, identity and history follow.
+- Edge upsert with placeholder endpoints (`POST /edges/upsert`).
+- Python `query(cypher, params=...)` — parameterized queries (dict or
+  tuple list); no more string interpolation.
+- `Value::Map`, hybrid RRF search, `apply_schema`, `node_history` (0.1.2
+  interim releases, first tagged here).
+- Integrations: `llama-index-graph-stores-mushroomdb` and LangChain
+  `MushroomdbGraphStore` packages; MCP server listed on the official
+  registry (16 tools).
+
+### Breaking
+
+- `search()` returns BM25 scores (`f64`) instead of match counts.
+- `serve`/`serve_with_ui` library functions deprecated (use
+  `serve_with_role_tokens` / `serve_with_ui_and_role_tokens`).
+- Snapshot format V8 (auto-migration from V5+ on open).
+
 ## v0.1.1 — 2026-08-24
 
 ### MCP agent-memory tools

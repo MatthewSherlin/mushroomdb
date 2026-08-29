@@ -1,6 +1,6 @@
 {
   "name": "mushroomdb",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Launcher for the mushroomdb native binary (downloaded from GitHub Releases).",
   "license": "(MIT OR Apache-2.0)",
   "repository": {
