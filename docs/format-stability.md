@@ -327,3 +327,12 @@ golden-fixture pin tests in `crates/core-api/tests/snapshot.rs` and
 `crates/core-api/tests/migrate.rs`: if a code change silently alters the
 on-disk byte layout the pin tests fail rather than silently corrupting existing
 databases.
+
+---
+
+## Panic policy
+
+Corrupt, truncated, or adversarial on-disk bytes always produce a typed
+`GraphError::Corrupt` — never a panic. The complete policy, including which
+`.expect()` calls are retained as post-validation invariants and why, is in
+[docs/site/panic-policy.md](site/panic-policy.md).

@@ -1448,6 +1448,44 @@ impl<F: Fs> GraphDb<F> {
         self.props = state.props;
         self.labels = state.labels;
         self.edge_props = state.edge_props;
+        // Cross-section label integrity for V5/V7 snapshots: same invariants as
+        // restore_v8_base.  A crafted bincode snapshot with a short `labels` vec,
+        // out-of-range sym ids, or a sentinel label on a live node would otherwise
+        // open successfully and panic later in `NodeRef::label()` or
+        // `neighborhood_masked()`.  Catching it here turns those into typed
+        // `GraphError::Corrupt` at open time.
+        {
+            let ids_len = self.ids.len();
+            if self.labels.len() != ids_len {
+                return Err(GraphError::Corrupt {
+                    detail: format!(
+                        "snapshot: labels vec has {} entries but id table has {} total slots",
+                        self.labels.len(),
+                        ids_len,
+                    ),
+                });
+            }
+            let syms_len = self.syms.len() as u32;
+            for (i, &sym) in self.labels.iter().enumerate() {
+                let is_tombstoned = self.ids.is_tombstoned(i as u32);
+                if sym == u32::MAX {
+                    if !is_tombstoned {
+                        return Err(GraphError::Corrupt {
+                            detail: format!(
+                                "snapshot: live node at id slot {i} has sentinel label (u32::MAX)"
+                            ),
+                        });
+                    }
+                } else if sym >= syms_len {
+                    return Err(GraphError::Corrupt {
+                        detail: format!(
+                            "snapshot: label at id slot {i} references sym {sym} \
+                             which is out of interner range ({syms_len})"
+                        ),
+                    });
+                }
+            }
+        }
         let defs: Vec<RuleDef> = state
             .rule_defs
             .iter()
@@ -1519,6 +1557,48 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("v8: meta decode: {e:?}"),
         })?;
         self.labels = meta.labels;
+        // Cross-section label integrity: labels must cover every id slot (live
+        // and tombstoned), every non-sentinel sym must be within the interner's
+        // bound, and no live (non-tombstoned) node may carry the u32::MAX
+        // sentinel label.  Without this check, a crafted snapshot where the META
+        // section (small, CRC-validated) holds a short `labels` vec, out-of-range
+        // sym ids, or a sentinel label on a live node, would open successfully
+        // and then panic in `NodeRef::label()`, `neighborhood_masked()`, and
+        // related read paths.  Catching the inconsistency here converts those
+        // panics into typed `GraphError::Corrupt` at open time.
+        {
+            let ids_len = self.ids.len();
+            if self.labels.len() != ids_len {
+                return Err(GraphError::Corrupt {
+                    detail: format!(
+                        "v8: labels section has {} entries but id table has {} total slots",
+                        self.labels.len(),
+                        ids_len,
+                    ),
+                });
+            }
+            let syms_len = self.syms.len() as u32;
+            for (i, &sym) in self.labels.iter().enumerate() {
+                let is_tombstoned = self.ids.is_tombstoned(i as u32);
+                if sym == u32::MAX {
+                    // Sentinel is only valid for tombstoned slots.
+                    if !is_tombstoned {
+                        return Err(GraphError::Corrupt {
+                            detail: format!(
+                                "v8: live node at id slot {i} has sentinel label (u32::MAX)"
+                            ),
+                        });
+                    }
+                } else if sym >= syms_len {
+                    return Err(GraphError::Corrupt {
+                        detail: format!(
+                            "v8: label at id slot {i} references sym {sym} \
+                             which is out of interner range ({syms_len})"
+                        ),
+                    });
+                }
+            }
+        }
         // C3: self.edge_props stays as an empty overlay.  Reads go through
         // edge_props_view() which consults the mmap'd base section zero-copy
         // via EdgePropsView::with_base.  No heap decode at open time.
@@ -5253,10 +5333,15 @@ impl<F: Fs> GraphDb<F> {
         let mut edges = Vec::new();
         let tv = self.topo_view();
         for etype in tv.etypes() {
+            // etype comes from the archived CSR (access_unchecked, no eager CRC).
+            // A bit-flip in the large TOPOLOGY section can produce an etype id
+            // that is not in the interner.  Return Corrupt rather than panic.
             let edge_type = self
                 .syms
                 .resolve(etype)
-                .expect("topology etype is interned")
+                .ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: topology etype {etype} not in interner"),
+                })?
                 .to_string();
             for dir in [Direction::Out, Direction::In] {
                 for &nbr in tv.neighbors(etype, dir, id).as_ref() {
@@ -5323,10 +5408,13 @@ impl<F: Fs> GraphDb<F> {
         let mut edges = Vec::new();
         let tv = self.topo_view();
         for etype in tv.etypes() {
+            // Same guard as node_edges_masked: etype from unchecked-CRC CSR.
             let edge_type = self
                 .syms
                 .resolve(etype)
-                .expect("topology etype is interned")
+                .ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: topology etype {etype} not in interner"),
+                })?
                 .to_string();
             for dir in [Direction::Out, Direction::In] {
                 for &nbr in tv.neighbors(etype, dir, id).as_ref() {
@@ -5541,11 +5629,15 @@ impl<F: Fs> GraphDb<F> {
             }
 
             for etype_sym in tv.etypes() {
-                let edge_type = self
-                    .syms
-                    .resolve(etype_sym)
-                    .expect("topology etype is interned")
-                    .to_string();
+                // etype from archived CSR (access_unchecked, no eager CRC).
+                // Skip edges whose etype is not in the interner; this can only
+                // occur with a corrupt large TOPOLOGY section (bit-flip on an
+                // etype field in the archived data).  The function returns Vec,
+                // not Result, so we continue rather than propagate.
+                let Some(edge_type) = self.syms.resolve(etype_sym) else {
+                    continue;
+                };
+                let edge_type = edge_type.to_string();
                 for &nbr in tv.neighbors(etype_sym, Direction::Out, id).as_ref() {
                     let Some(dst_key) = self.ids.key_of(nbr) else {
                         continue; // skip corrupt entries
@@ -6307,15 +6399,22 @@ impl<F: Fs> GraphDb<F> {
                 Some(s) => s.to_string(),
                 None => continue,
             };
+            // Provenance (src, dst) ids come from the archived PROVENANCE section
+            // (large, no eager CRC).  A corrupt section can produce ids that are
+            // out of range; return Corrupt rather than panic.
             let src_key = self
                 .ids
                 .key_of(src)
-                .expect("provenance ids always resolvable")
+                .ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: provenance src id {src} not in id table"),
+                })?
                 .to_string();
             let dst_key = self
                 .ids
                 .key_of(dst)
-                .expect("provenance ids always resolvable")
+                .ok_or_else(|| GraphError::Corrupt {
+                    detail: format!("v8: provenance dst id {dst} not in id table"),
+                })?
                 .to_string();
             let weight = rule_def.weight_prop.as_deref().and_then(|prop| {
                 self.edge_props_view()
@@ -8393,11 +8492,12 @@ impl<'a, F: Fs> NodeRef<'a, F> {
         let view = self.db.view();
         let mut groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for e in expand(&view, self.id, None, Dir::Both) {
-            let etype = view
-                .syms
-                .resolve(e.etype)
-                .expect("topology etype is interned")
-                .to_string();
+            // Skip edges with unknown etypes (only possible from corrupt large
+            // TOPOLOGY section; function returns BTreeMap not Result).
+            let Some(etype) = view.syms.resolve(e.etype) else {
+                continue;
+            };
+            let etype = etype.to_string();
             let nbr = if e.src == self.id { e.dst } else { e.src };
             groups
                 .entry(etype)
