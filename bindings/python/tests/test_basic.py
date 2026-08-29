@@ -581,3 +581,13 @@ def test_get_edge_prop_missing_returns_none(tmp_path):
     assert db.get_edge_prop("LINK", "y", "x", "weight") is None
     assert db.get_edge_prop("GHOST", "x", "y", "weight") is None
     db.close()
+
+
+def test_find_similar_rejects_bool_vector(tmp_path):
+    """find_similar raises TypeError when the query vector contains booleans."""
+    import pytest
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "a", {"vec": [1.0, 0.0]})
+    with pytest.raises(TypeError, match="bool"):
+        db.find_similar("vec", [True, False], k=5)
+    db.close()

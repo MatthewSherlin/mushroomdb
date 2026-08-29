@@ -570,9 +570,12 @@ fn pylist_to_f64_vec(list: &Bound<'_, PyList>) -> PyResult<Vec<f64>> {
     for item in list.iter() {
         // PyBool must be checked before PyInt: Python bool is a subclass of
         // int, so is_instance_of::<PyInt>() returns true for True/False too.
+        // Booleans are explicitly rejected — a True/False in a query vector
+        // is almost certainly a caller bug, not intentional numeric embedding.
         if item.is_instance_of::<PyBool>() {
-            let b: bool = item.extract()?;
-            out.push(if b { 1.0 } else { 0.0 });
+            return Err(PyTypeError::new_err(
+                "vector elements must be numbers (int or float), not bool",
+            ));
         } else if item.is_instance_of::<PyInt>() {
             let i: i64 = item.extract()?;
             out.push(i as f64);

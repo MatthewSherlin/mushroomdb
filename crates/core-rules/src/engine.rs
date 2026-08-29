@@ -1941,12 +1941,12 @@ impl RuleEngine {
         None
     }
 
-    /// Returns `true` if any approximate (HNSW) VectorSimilar rule covers `field`.
+    /// Returns `true` if any approximate VectorSimilar rule covers `field`.
     ///
     /// Use as a capability probe before calling `hnsw_search_dst` or
-    /// `hnsw_search_any_dst` — presence of the rule guarantees that the native
-    /// ANN path is available (even if the index is currently empty because no
-    /// nodes have been inserted yet).
+    /// `hnsw_search_any_dst` — presence of the rule guarantees the native Rust
+    /// path will be used (HNSW when the index is populated, Rust brute-force
+    /// otherwise); it does NOT guarantee a populated HNSW index.
     pub fn hnsw_has_rule(&self, field: &str) -> bool {
         self.rules
             .values()
