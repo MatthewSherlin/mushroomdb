@@ -2794,10 +2794,15 @@ impl<F: Fs> GraphDb<F> {
                     }
                 }
 
-                // (2) Sweep remaining user edges touching n, both directions,
-                // every etype. Collect then remove so neighbor slices stay valid.
-                // Remove from topo first, then call view maintenance so Avg/Min/Max
-                // recompute sees the correct (reduced) neighbor set.
+                // (2) Sweep ALL remaining edges incident to n, both directions,
+                // every etype. This cascade is intentionally mask-independent:
+                // topology integrity requires removing every edge touching the
+                // deleted node regardless of the caller's visibility scope.
+                // (The mask limits which nodes a role's read phase can return;
+                // the WAL delete always executes with full storage authority.)
+                // Collect then remove so neighbor slices stay valid during
+                // iteration. Remove from topo first, then call view maintenance
+                // so Avg/Min/Max recompute sees the correct (reduced) neighbor set.
                 let etypes: Vec<u32> = self.topo.etypes().collect();
                 let mut doomed = Vec::new();
                 for et in &etypes {
@@ -7109,6 +7114,19 @@ impl<F: Fs> GraphDb<F> {
                 }
             }
             batch.commit()?;
+        }
+
+        // Refresh the role mask so the just-created node is visible to this
+        // statement's RETURN (read-after-write). Safe: create_labels ⊆ read labels
+        // (apply_schema subset rule), so the new node's label is already in the
+        // role's read scope — this never widens beyond the role's declared labels.
+        if !existed {
+            if let Some(role) = self.pending_write_authz.as_ref().map(|a| a.role.clone()) {
+                let new_mask = self.mask_for_role(&role)?;
+                if let Some(a) = self.pending_write_authz.as_mut() {
+                    a.mask = new_mask;
+                }
+            }
         }
 
         // Optional RETURN clause: project the node (created or matched) as a read result.

@@ -1213,3 +1213,164 @@ fn test_delete_recreate_setprop_respects_update_labels() {
         denied_reason(&err)
     );
 }
+
+// ── MERGE RETURN: read-after-write (M1 fix verification) ─────────────────────
+
+/// MERGE create arm with RETURN yields the created node (read-after-write fix).
+///
+/// Before the fix, the mask was resolved before the node existed, so the RETURN
+/// clause returned 0 rows. After the fix (mask re-resolved after batch.commit()),
+/// the created node is visible and RETURN yields exactly 1 row.
+#[test]
+fn test_merge_create_return_yields_node() {
+    let (mut db, _dir) = open_with_writer("merge-create-return");
+    let rs = db
+        .query_write_authz(
+            "writer",
+            "MERGE (n:MyLabel {id: 'new_m1'}) ON CREATE SET n.x = 1 RETURN n",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "MERGE create arm RETURN must yield exactly 1 row (read-after-write)"
+    );
+    assert_eq!(
+        rs.get(0, "n"),
+        Some(&Value::Str("new_m1".into())),
+        "RETURN n must project the created node key"
+    );
+    assert_eq!(
+        db.get_prop("new_m1", "x"),
+        Some(Value::Int(1)),
+        "ON CREATE SET must be applied"
+    );
+}
+
+/// MERGE match arm with RETURN is unaffected by the M1 mask refresh.
+///
+/// The refresh fires only in the !existed (CREATE) branch. MATCH arm RETURN
+/// must still project the matched node correctly (no regression).
+#[test]
+fn test_merge_match_return_unaffected() {
+    let (mut db, _dir) = open_with_writer("merge-match-return");
+    db.insert_node("MyLabel", "existing_m1", vec![]).unwrap();
+    let rs = db
+        .query_write_authz(
+            "writer",
+            "MERGE (n:MyLabel {id: 'existing_m1'}) RETURN n",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "MERGE match arm RETURN must yield exactly 1 row"
+    );
+    assert_eq!(
+        rs.get(0, "n"),
+        Some(&Value::Str("existing_m1".into())),
+        "RETURN n must project the matched node key"
+    );
+}
+
+/// No-widening invariant: after MERGE-create, the mask refresh does NOT let the
+/// role see nodes outside its declared read labels.
+///
+/// Security proof: create_labels ⊆ labels (enforced at apply_schema), so
+/// mask_for_role resolves only over the role's declared labels. A "Secret" node
+/// never enters the mask regardless of how many MERGE-creates occur.
+#[test]
+fn test_merge_create_no_mask_widening() {
+    let (mut db, _dir) = open_with_writer("merge-no-widen");
+    // Admin inserts a node with label "Secret" (not in writer's read labels).
+    db.insert_node("Secret", "hidden_pre", vec![]).unwrap();
+
+    // Writer MERGE-creates a new MyLabel node with RETURN (exercises the refresh path).
+    let rs = db
+        .query_write_authz(
+            "writer",
+            "MERGE (n:MyLabel {id: 'new_no_widen'}) RETURN n",
+            &no_params(),
+        )
+        .unwrap();
+    // M1 fix: create arm RETURN yields exactly the created node (via the refreshed
+    // internal mask), not the hidden node or an empty result.
+    assert_eq!(rs.len(), 1, "create arm RETURN must yield 1 row");
+    assert_eq!(
+        rs.get(0, "n"),
+        Some(&Value::Str("new_no_widen".into())),
+        "RETURN must project the created node key, not hidden_pre or nothing"
+    );
+
+    // No-widening: the role's mask must still exclude "Secret"-labeled nodes.
+    // Obtain a fresh mask and run a masked read for the hidden node.
+    let mask = db.mask_for_role("writer").unwrap();
+    let hidden_rs = db
+        .query_masked(
+            "MATCH (n:Secret {id: 'hidden_pre'}) RETURN n",
+            &no_params(),
+            &mask,
+        )
+        .unwrap();
+    assert_eq!(
+        hidden_rs.len(),
+        0,
+        "mask refresh must NOT widen to Secret label; hidden_pre must remain invisible"
+    );
+}
+
+// ── M2: DETACH DELETE cascade is mask-independent ────────────────────────────
+
+/// Confirm DETACH DELETE cascades ALL incident edges regardless of caller mask,
+/// leaving no orphaned edges to hidden neighbors.
+///
+/// Setup: node A (MyLabel, visible) has KNOWS edges to B (MyLabel, visible) and
+/// C (Secret, hidden). Role DETACH-DELETEs A. After deletion:
+/// - A is gone; B and C survive
+/// - No edges remain incident to A (deleted) in the topology — including the
+///   edge to the hidden neighbor C, which the cascade removes without consulting
+///   the mask (topology integrity requires unconditional removal).
+#[test]
+fn test_detach_delete_cascades_hidden_edges() {
+    let (mut db, _dir) = open_with_writer("detach-delete-cascade");
+    // Admin setup: nodes and edges including one to a hidden neighbor.
+    db.insert_node("MyLabel", "del_a", vec![]).unwrap();
+    db.insert_node("MyLabel", "surv_b", vec![]).unwrap();
+    db.insert_node("Secret", "hidden_c", vec![]).unwrap();
+    db.insert_edge("KNOWS", "del_a", "surv_b").unwrap();
+    db.insert_edge("KNOWS", "del_a", "hidden_c").unwrap();
+
+    // Role-scoped DETACH DELETE: writer has delete_labels=["MyLabel"].
+    db.query_write_authz(
+        "writer",
+        "MATCH (n:MyLabel {id: 'del_a'}) DETACH DELETE n",
+        &no_params(),
+    )
+    .unwrap();
+
+    // del_a is gone.
+    assert!(!db.has_node("del_a"), "del_a must be deleted");
+    // Surviving nodes intact.
+    assert!(db.has_node("surv_b"), "surv_b must survive");
+    assert!(db.has_node("hidden_c"), "hidden_c must survive");
+
+    // No orphan edges: verify from surviving neighbors' perspectives.
+    // surv_b must have no incoming KNOWS from del_a.
+    let b_in = db
+        .neighbors("surv_b", "KNOWS", Direction::In)
+        .unwrap_or_default();
+    assert!(
+        !b_in.contains(&"del_a".to_string()),
+        "edge del_a→surv_b must be cascade-deleted; b_in={b_in:?}"
+    );
+    // hidden_c must have no incoming KNOWS from del_a (mask-independent cascade).
+    let c_in = db
+        .neighbors("hidden_c", "KNOWS", Direction::In)
+        .unwrap_or_default();
+    assert!(
+        !c_in.contains(&"del_a".to_string()),
+        "edge del_a→hidden_c must be cascade-deleted regardless of mask; c_in={c_in:?}"
+    );
+}
