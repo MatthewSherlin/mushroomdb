@@ -59,7 +59,7 @@ fn masked_write_is_rejected() {
     let err = db
         .query_masked("CREATE (n:P {id: 'new'})", &p, &mask)
         .unwrap_err();
-    let msg = format!("{err:?}");
+    let msg = format!("{err}");
     assert!(
         msg.contains("masked queries are read-only"),
         "error should mention read-only: {msg}"
