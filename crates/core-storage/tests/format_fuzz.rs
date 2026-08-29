@@ -424,11 +424,8 @@ proptest! {
         if let Some(bytes) = corrupt_v8_section_len(&v8, section_idx, new_len) {
             // Path 1: validate_section_bounds directly — must not panic.
             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                match MappedBase::from_bytes(bytes.clone()) {
-                    Ok(base) => {
-                        let _ = base.validate_section_bounds();
-                    }
-                    Err(_) => {}
+                if let Ok(base) = MappedBase::from_bytes(bytes.clone()) {
+                    let _ = base.validate_section_bounds();
                 }
             }));
             prop_assert!(
