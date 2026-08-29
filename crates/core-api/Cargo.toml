@@ -23,5 +23,7 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.2.0" }
-sim-harness = { path = "../sim-harness", version = "0.2.0" }
+# Path-only (no version): sim-harness is publish=false; a version key makes
+# `cargo publish -p mushroomdb` try to resolve it on the index and fail.
+sim-harness = { path = "../sim-harness" }
 serde_json = { workspace = true }

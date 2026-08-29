@@ -101,44 +101,28 @@ jobs:
       - name: export registry token for cargo
         run: echo "CARGO_REGISTRY_TOKEN=${{ steps.crates-auth.outputs.token }}" >> "$GITHUB_ENV"
 
-      - name: publish mushroomdb-storage (leaf)
-        run: cargo publish -p mushroomdb-storage
-
-      - name: wait for index propagation
-        run: sleep 30
-
-      - name: publish mushroomdb-rules
-        run: cargo publish -p mushroomdb-rules
-
-      - name: wait for index propagation
-        run: sleep 30
-
-      - name: publish mushroomdb-query
-        run: cargo publish -p mushroomdb-query
-
-      - name: wait for index propagation
-        run: sleep 30
-
-      - name: publish mushroomdb (core-api, user-facing crate)
-        run: cargo publish -p mushroomdb
-
-      - name: wait for index propagation
-        run: sleep 30
-
-      - name: publish mushroomdb-arrow
-        run: cargo publish -p mushroomdb-arrow
-
-      - name: wait for index propagation
-        run: sleep 30
-
-      - name: publish mushroomdb-server
-        run: cargo publish -p mushroomdb-server
-
-      - name: wait for index propagation
-        run: sleep 30
-
-      - name: publish mushroomdb-cli
-        run: cargo publish -p mushroomdb-cli
+      # Idempotent ordered publish: a re-run after a partial failure skips
+      # crates already on the index instead of dying on "already exists"
+      # (lesson from the v0.2.0 release: run 33262706595 published 3 of 7,
+      # then failed; a naive re-run would have died on crate 1).
+      - name: publish crates in dependency order (idempotent)
+        run: |
+          set -u
+          for c in mushroomdb-storage mushroomdb-rules mushroomdb-query \
+                   mushroomdb mushroomdb-arrow mushroomdb-server mushroomdb-cli; do
+            echo "── publishing $c ──"
+            if out=$(cargo publish -p "$c" 2>&1); then
+              echo "$out" | tail -3
+            else
+              echo "$out"
+              if echo "$out" | grep -q "already exists\|already uploaded"; then
+                echo "$c: this version is already on the index — skipping"
+              else
+                exit 1
+              fi
+            fi
+            sleep 30
+          done
 
   # ── PyPI ───────────────────────────────────────────────────────────────────
   # Builds wheels for four targets, then uploads via OIDC trusted publishing.
