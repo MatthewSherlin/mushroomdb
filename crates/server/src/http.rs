@@ -328,7 +328,9 @@ fn build_app(
         // queue (submit_batch) so concurrent node/edge CRUD does not hold
         // the write lock during fsync.
         .route("/nodes", post(create_node))
+        .route("/nodes/{key}/rename", post(rename_node))
         .route("/edges", post(create_edge))
+        .route("/edges/upsert", post(upsert_edge))
         .route(
             "/edges/{etype}/{src}/{dst}",
             axum::routing::delete(delete_edge),
@@ -1385,6 +1387,84 @@ async fn delete_edge(
     .await
     {
         Ok(_) => json_ok(json!({"ok": true})),
+        Err(resp) => resp,
+    }
+}
+
+/// `POST /nodes/{key}/rename` — rename a node's key via the group-commit queue.
+///
+/// Body: `{"new_key": "alice2"}`
+/// Returns 404 on KeyNotFound, 409 on DuplicateKey, 200 on success.
+async fn rename_node(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(key): Path<String>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
+    let new_key = match body.get("new_key").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing new_key"),
+    };
+    let db = state.db.clone();
+    match blocking_write(move || {
+        db.submit_batch(vec![BatchOp::RenameNode {
+            old_key: key,
+            new_key,
+        }])
+    })
+    .await
+    {
+        Ok(_) => json_ok(json!({"ok": true})),
+        Err(resp) => resp,
+    }
+}
+
+/// `POST /edges/upsert` — insert an edge, auto-creating missing endpoints.
+///
+/// Body: `{"edge_type":"KNOWS","src_key":"alice","dst_key":"bob","placeholder_label":"Person"}`
+/// Returns `{"nodes_created": N, "edge_inserted": bool}`.
+async fn upsert_edge(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: writes are not permitted");
+    }
+    let edge_type = match body.get("edge_type").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing edge_type"),
+    };
+    let src_key = match body.get("src_key").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing src_key"),
+    };
+    let dst_key = match body.get("dst_key").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing dst_key"),
+    };
+    let placeholder_label = match body.get("placeholder_label").and_then(Js::as_str) {
+        Some(s) => s.to_string(),
+        None => return err_response("missing placeholder_label"),
+    };
+    let db = state.db.clone();
+    match blocking_write(move || {
+        db.submit_batch(vec![BatchOp::InsertEdgeUpsert {
+            edge_type,
+            src_key,
+            dst_key,
+            placeholder_label,
+        }])
+    })
+    .await
+    {
+        Ok((nodes, edges)) => json_ok(json!({
+            "nodes_created": nodes,
+            "edge_inserted": edges > 0,
+        })),
         Err(resp) => resp,
     }
 }

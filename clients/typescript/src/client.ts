@@ -273,6 +273,54 @@ export class MushroomClient {
   }
 
   /**
+   * Rename a node's key.
+   *
+   * Wraps `POST /nodes/{key}/rename`. The dense id and all edges remain stable.
+   *
+   * @param oldKey The current key.
+   * @param newKey The desired new key.
+   * @throws {@link MushroomError} on `KeyNotFound` (old key) or `DuplicateKey` (new key taken).
+   */
+  async renameNode(oldKey: string, newKey: string): Promise<void> {
+    await this.fetchJson(`/nodes/${encodeURIComponent(oldKey)}/rename`, {
+      method: "POST",
+      body: JSON.stringify({ new_key: newKey }),
+    });
+  }
+
+  /**
+   * Insert an edge, auto-creating any missing endpoint as a placeholder node.
+   *
+   * Wraps `POST /edges/upsert`. Each missing endpoint is created with
+   * `placeholderLabel` and no properties.
+   *
+   * @param edgeType The edge type string.
+   * @param src Source node key.
+   * @param dst Destination node key.
+   * @param placeholderLabel Label applied to any auto-created endpoint node.
+   * @returns A report with `nodes_created` and `edge_inserted`.
+   */
+  async upsertEdge(
+    edgeType: string,
+    src: string,
+    dst: string,
+    placeholderLabel: string,
+  ): Promise<{ nodes_created: number; edge_inserted: boolean }> {
+    return this.fetchJson<{ nodes_created: number; edge_inserted: boolean }>(
+      "/edges/upsert",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          edge_type: edgeType,
+          src_key: src,
+          dst_key: dst,
+          placeholder_label: placeholderLabel,
+        }),
+      },
+    );
+  }
+
+  /**
    * Fetch a node by key.
    *
    * Wraps `GET /node/{key}`. Returns `null` when the server answers 404

@@ -405,3 +405,64 @@ describe.skipIf(NO_SERVER)("explain / node / neighborhood / createRule", () => {
 
 // Prevent unused variable warning for wsBase — used via inject() in beforeAll.
 void (wsBase!);
+
+// ---------------------------------------------------------------------------
+// renameNode / upsertEdge (mock-based: shape + routing)
+// ---------------------------------------------------------------------------
+
+describe("renameNode request", () => {
+  it("POSTs /nodes/{old}/rename with new_key body", async () => {
+    const orig = globalThis.fetch;
+    const seen: { url: string; init?: RequestInit }[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push({ url: String(input), init });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      const c = new MushroomClient("http://example.test");
+      await c.renameNode("alice", "alice2");
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.url).toBe("http://example.test/nodes/alice/rename");
+      expect(seen[0]!.init?.method).toBe("POST");
+      const body = JSON.parse(seen[0]!.init?.body as string);
+      expect(body).toEqual({ new_key: "alice2" });
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+});
+
+describe("upsertEdge request", () => {
+  it("POSTs /edges/upsert with correct fields", async () => {
+    const orig = globalThis.fetch;
+    const seen: { url: string; init?: RequestInit }[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push({ url: String(input), init });
+      return new Response(
+        JSON.stringify({ nodes_created: 2, edge_inserted: true }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof fetch;
+    try {
+      const c = new MushroomClient("http://example.test");
+      const result = await c.upsertEdge("KNOWS", "alice", "bob", "Person");
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.url).toBe("http://example.test/edges/upsert");
+      expect(seen[0]!.init?.method).toBe("POST");
+      const body = JSON.parse(seen[0]!.init?.body as string);
+      expect(body).toEqual({
+        edge_type: "KNOWS",
+        src_key: "alice",
+        dst_key: "bob",
+        placeholder_label: "Person",
+      });
+      expect(result.nodes_created).toBe(2);
+      expect(result.edge_inserted).toBe(true);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+});

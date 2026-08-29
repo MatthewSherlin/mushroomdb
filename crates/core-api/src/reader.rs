@@ -339,6 +339,16 @@ fn apply_one(
         // serve edge_history / was_linked WAL scans.
         | WalRecord::DerivedEdgeAdded { .. }
         | WalRecord::DerivedEdgeRetracted { .. } => {}
+
+        WalRecord::RenameNode { old_key, new_key } => {
+            // Recovery-safe: if old_key is already gone (frozen overlay or a
+            // prior delta already applied the rename), skip cleanly.
+            if ids.get(old_key).is_some() {
+                ids.rename(old_key, new_key).map_err(|_| GraphError::Corrupt {
+                    detail: format!("mvcc delta RenameNode {old_key}→{new_key} failed"),
+                })?;
+            }
+        }
     }
     Ok(())
 }

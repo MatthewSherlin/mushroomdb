@@ -50,12 +50,28 @@ impl GraphDb {
         self.with_mut(|db| db.set_prop(key, field, v))
     }
 
-    fn query(&self, py: Python<'_>, cypher: &str) -> PyResult<Vec<Py<PyDict>>> {
-        let rs = self.with_ref(|db| db.query(cypher, &BTreeMap::new()))?;
+    /// Execute a read query, optionally with named parameters.
+    ///
+    /// `params` may be:
+    /// - omitted (no parameters)
+    /// - a `dict` mapping name→value (ergonomic form)
+    /// - a list of `(name, value)` tuples (back-compat with `query_with_params`)
+    ///
+    /// Values must be `int`, `float`, `str`, `bool`, `list`, or `dict`.
+    #[pyo3(signature = (cypher, params = None))]
+    fn query(
+        &self,
+        py: Python<'_>,
+        cypher: &str,
+        params: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        let map = params_to_map(params)?;
+        let rs = self.with_ref(|db| db.query(cypher, &map))?;
         result_set_to_rows(py, &rs)
     }
 
-    /// Execute a read query with named parameters.
+    /// Execute a read query with named parameters (back-compat alias for
+    /// `query(cypher, params=[...])` with a tuple-list).
     ///
     /// ```python
     /// rows = db.query_with_params(
@@ -90,6 +106,40 @@ impl GraphDb {
         }
         let rs = self.with_ref(|db| db.query(cypher, &map))?;
         result_set_to_rows(py, &rs)
+    }
+
+    /// Rename a node's key.  The dense id (edges, history, last-change) is
+    /// unchanged.
+    ///
+    /// Raises `RuntimeError` with `KeyNotFound` if `old` is unknown, or
+    /// `DuplicateKey` if `new` is already live.
+    fn rename_node(&self, old: &str, new: &str) -> PyResult<()> {
+        self.with_mut(|db| db.rename_node(old, new))
+    }
+
+    /// Insert an edge, auto-creating any missing endpoint.
+    ///
+    /// Each missing endpoint is created as a plain node with label
+    /// `placeholder_label` and no properties.  Rules fire and last-change is
+    /// updated for each auto-created node.  Returns a dict with keys
+    /// `nodes_created` and `edge_inserted`.
+    fn insert_edge_upsert(
+        &self,
+        py: Python<'_>,
+        edge_type: &str,
+        src: &str,
+        dst: &str,
+        placeholder_label: &str,
+    ) -> PyResult<Py<PyDict>> {
+        let (nodes, edges) = self.with_mut(|db| {
+            db.batch()
+                .insert_edge_upsert(edge_type, src, dst, placeholder_label)
+                .commit()
+        })?;
+        let d = PyDict::new(py);
+        d.set_item("nodes_created", nodes)?;
+        d.set_item("edge_inserted", edges > 0)?;
+        Ok(d.unbind())
     }
 
     /// Execute a Cypher write statement (CREATE / MATCH…SET / MATCH…DELETE /
@@ -482,6 +532,50 @@ fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
             Ok(dict.into_any())
         }
     }
+}
+
+/// Convert an optional Python params argument to a `BTreeMap`.
+///
+/// Accepts `None` (empty map), a `dict` (name→value), or a list of
+/// `(name, value)` tuples.
+fn params_to_map(params: Option<Bound<'_, PyAny>>) -> PyResult<BTreeMap<String, Value>> {
+    let Some(obj) = params else {
+        return Ok(BTreeMap::new());
+    };
+    // Dict form: {"key": value, ...}
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut map = BTreeMap::new();
+        for (k, v) in dict.iter() {
+            let name: String = k.extract().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err("params dict keys must be str")
+            })?;
+            map.insert(name, py_to_value(&v)?);
+        }
+        return Ok(map);
+    }
+    // Tuple-list form: [("key", value), ...]
+    if let Ok(list) = obj.downcast::<PyList>() {
+        let mut map = BTreeMap::new();
+        for item in list.iter() {
+            let tuple = item.downcast::<pyo3::types::PyTuple>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "params must be a dict or a list of (name, value) tuples",
+                )
+            })?;
+            if tuple.len() != 2 {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "each param tuple must have exactly 2 elements",
+                ));
+            }
+            let name: String = tuple.get_item(0)?.extract()?;
+            let val = py_to_value(&tuple.get_item(1)?)?;
+            map.insert(name, val);
+        }
+        return Ok(map);
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "params must be a dict or a list of (name, value) tuples",
+    ))
 }
 
 fn dict_to_props(props: &Bound<'_, PyDict>) -> PyResult<Vec<(String, Value)>> {

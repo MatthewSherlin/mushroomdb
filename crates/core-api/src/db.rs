@@ -216,7 +216,9 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         // History markers are no-ops for mutation events — they carry no new
         // state and rules re-derive deterministically on replay.
         | WalRecord::DerivedEdgeAdded { .. }
-        | WalRecord::DerivedEdgeRetracted { .. } => None,
+        | WalRecord::DerivedEdgeRetracted { .. }
+        // RenameNode carries no node/edge count change; no special event.
+        | WalRecord::RenameNode { .. } => None,
     }
 }
 
@@ -2836,6 +2838,22 @@ impl<F: Fs> GraphDb<F> {
             // History markers carry no replay state — rules re-derive edges
             // deterministically on open/replay. Skip unconditionally.
             WalRecord::DerivedEdgeAdded { .. } | WalRecord::DerivedEdgeRetracted { .. } => {}
+            // ── rename_node ──────────────────────────────────────────────────
+            WalRecord::RenameNode { old_key, new_key } => {
+                // Recovery-safe: if old_key is already gone (key was renamed
+                // by a snapshot or a prior replay frame), skip cleanly.
+                if self.ids.get(old_key).is_none() {
+                    return Ok(());
+                }
+                // The rename only updates the key-table; the dense id, all
+                // topo edges, props, labels, and rule state are id-indexed and
+                // require no change.
+                self.ids
+                    .rename(old_key, new_key)
+                    .map_err(|e| GraphError::Corrupt {
+                        detail: format!("wal replay RenameNode {old_key}→{new_key}: {e}"),
+                    })?;
+            }
         }
         Ok(())
     }
@@ -2946,6 +2964,23 @@ impl<F: Fs> GraphDb<F> {
                         }
                     })?;
                     out.push(WalRecord::InsertEdgeId { etype, src, dst });
+                }
+                WalRecord::RenameNode {
+                    ref old_key,
+                    ref new_key,
+                } => {
+                    // Track the rename in `pending` so subsequent InsertEdge /
+                    // SetProp records in this batch can resolve the new key.
+                    let id = lookup(&self.ids, &pending, old_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!(
+                                "dense WAL rewrite: RenameNode old key {old_key} not found"
+                            ),
+                        }
+                    })?;
+                    pending.remove(old_key.as_str());
+                    pending.insert(new_key.clone(), id);
+                    out.push(rec);
                 }
                 other => out.push(other),
             }
@@ -3561,7 +3596,8 @@ impl<F: Fs> GraphDb<F> {
             // History markers produce no DbEvent — the engine delta already
             // fired the EdgeFired/EdgeRetracted subscription events.
             | WalRecord::DerivedEdgeAdded { .. }
-            | WalRecord::DerivedEdgeRetracted { .. } => vec![],
+            | WalRecord::DerivedEdgeRetracted { .. }
+            | WalRecord::RenameNode { .. } => vec![],
         }
     }
 
@@ -3929,6 +3965,39 @@ impl<F: Fs> GraphDb<F> {
                         preview.note_delete_rule(&name);
                         recs.push(WalRecord::DeleteRule { name });
                     }
+                    BatchOp::RenameNode { old_key, new_key } => {
+                        preview.check_rename_node(&old_key, &new_key)?;
+                        preview.note_rename_node(&old_key, &new_key);
+                        recs.push(WalRecord::RenameNode { old_key, new_key });
+                    }
+                    BatchOp::InsertEdgeUpsert {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                        placeholder_label,
+                    } => {
+                        // Auto-create any missing endpoints as plain InsertNode ops.
+                        // Rules fire and last-change is updated for each created node.
+                        for key in [&src_key, &dst_key] {
+                            if !preview.has_key(key) {
+                                preview.check_insert_node(key)?;
+                                preview.note_insert_node(key, &[]);
+                                recs.push(WalRecord::InsertNode {
+                                    label: placeholder_label.clone(),
+                                    key: key.clone(),
+                                    props: vec![],
+                                });
+                            }
+                        }
+                        if preview.prepare_insert_edge(&edge_type, &src_key, &dst_key)? {
+                            preview.note_insert_edge(&edge_type, &src_key, &dst_key);
+                            recs.push(WalRecord::InsertEdge {
+                                edge_type,
+                                src_key,
+                                dst_key,
+                            });
+                        }
+                    }
                 }
             }
             recs
@@ -4180,6 +4249,22 @@ impl<F: Fs> GraphDb<F> {
         Ok(DeleteReport {
             manual_edges,
             derived_edges,
+        })
+    }
+
+    /// Rename a live node's key.  The dense id (and therefore all edges,
+    /// props, history, and last-change tracking) is unaffected.
+    ///
+    /// Returns `Err(KeyNotFound)` if `old` is not a live key.
+    /// Returns `Err(DuplicateKey)` if `new` is already live.
+    pub fn rename_node(&mut self, old: &str, new: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        MutPreview::new(self).check_rename_node(old, new)?;
+        self.log_then_apply(WalRecord::RenameNode {
+            old_key: old.into(),
+            new_key: new.into(),
         })
     }
 
@@ -6090,6 +6175,13 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::DeleteView { .. }
             | WalRecord::EnableFulltext { .. }
             | WalRecord::DisableFulltext { .. } => {}
+            // RenameNode: node id is stable; update last_change via the new key.
+            // Called after apply(), so ids already reflects new_key.
+            WalRecord::RenameNode { new_key, .. } => {
+                if let Some(id) = self.ids.get(new_key) {
+                    self.last_change.insert(id, seq);
+                }
+            }
             WalRecord::Batch(inner) => {
                 for inner_rec in inner {
                     self.update_last_change_from_rec(inner_rec, seq);
@@ -7174,6 +7266,20 @@ pub enum BatchOp {
     DeleteRule {
         name: String,
     },
+    /// Rename a node's key. Validated: old must exist, new must not.
+    RenameNode {
+        old_key: String,
+        new_key: String,
+    },
+    /// Insert an edge, auto-creating any missing endpoint as a plain node with
+    /// `placeholder_label` and no props. Rules fire and last-change is updated
+    /// for each created endpoint (normal InsertNode semantics in the batch frame).
+    InsertEdgeUpsert {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+        placeholder_label: String,
+    },
 }
 
 /// Overlay of ops already accepted earlier in the same batch. Never written
@@ -7532,6 +7638,54 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.overlay.extra_rules.insert(name.to_string());
     }
 
+    fn check_rename_node(&self, old: &str, new: &str) -> Result<()> {
+        if !self.has_key(old) {
+            return Err(GraphError::KeyNotFound { key: old.into() });
+        }
+        if self.has_key(new) {
+            return Err(GraphError::DuplicateKey { key: new.into() });
+        }
+        Ok(())
+    }
+
+    fn note_rename_node(&mut self, old: &str, new: &str) {
+        // Mark old as deleted so subsequent batch ops cannot reference it.
+        self.overlay.extra_keys.remove(old);
+        self.overlay.deleted_keys.insert(old.to_string());
+        // Mark new as extra so subsequent batch ops can reference it.
+        self.overlay.deleted_keys.remove(new);
+        self.overlay.extra_keys.insert(new.to_string());
+        // Migrate any overlay props from old key to new key.
+        let new_str = new.to_string();
+        let transferred: Vec<((String, String), Value)> = self
+            .overlay
+            .extra_props
+            .iter()
+            .filter(|((k, _), _)| k.as_str() == old)
+            .map(|((_, f), v)| ((new_str.clone(), f.clone()), v.clone()))
+            .collect();
+        self.overlay
+            .extra_props
+            .retain(|(k, _), _| k.as_str() != old);
+        for (k, v) in transferred {
+            self.overlay.extra_props.insert(k, v);
+        }
+        // Migrate removed_props.
+        let transferred_removed: Vec<(String, String)> = self
+            .overlay
+            .removed_props
+            .iter()
+            .filter(|(k, _)| k.as_str() == old)
+            .map(|(_, f)| (new_str.clone(), f.clone()))
+            .collect();
+        self.overlay
+            .removed_props
+            .retain(|(k, _)| k.as_str() != old);
+        for k in transferred_removed {
+            self.overlay.removed_props.insert(k);
+        }
+    }
+
     fn note_delete_rule(&mut self, name: &str) {
         self.overlay.extra_rules.remove(name);
         self.overlay.deleted_rules.insert(name.to_string());
@@ -7628,6 +7782,38 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
 
     pub fn delete_rule(&mut self, name: &str) -> &mut Self {
         self.ops.push(BatchOp::DeleteRule { name: name.into() });
+        self
+    }
+
+    /// Queue a node-rename in this batch.
+    ///
+    /// Validation (old exists, new not taken) runs at commit time.
+    pub fn rename_node(&mut self, old_key: &str, new_key: &str) -> &mut Self {
+        self.ops.push(BatchOp::RenameNode {
+            old_key: old_key.into(),
+            new_key: new_key.into(),
+        });
+        self
+    }
+
+    /// Queue an edge insert with endpoint auto-creation.
+    ///
+    /// Any missing endpoint is created as a plain node `{key, label:
+    /// placeholder_label, no props}` inside this batch frame. Rules fire and
+    /// last-change is updated for each auto-created node.
+    pub fn insert_edge_upsert(
+        &mut self,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+        placeholder_label: &str,
+    ) -> &mut Self {
+        self.ops.push(BatchOp::InsertEdgeUpsert {
+            edge_type: edge_type.into(),
+            src_key: src_key.into(),
+            dst_key: dst_key.into(),
+            placeholder_label: placeholder_label.into(),
+        });
         self
     }
 

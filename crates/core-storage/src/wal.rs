@@ -128,6 +128,16 @@ pub enum WalRecord {
         src_key: String,
         dst_key: String,
     },
+    // ── Key-mutation variants (appended after history markers; discriminant 20) ──
+    //
+    // RenameNode updates the key-table entry for an existing node without
+    // changing its dense id.  All edges, properties, rules, and history remain
+    // valid — only the string key resolves differently after replay.
+    /// Rename a node's key.  Dense id is unchanged.  Discriminant 20.
+    RenameNode {
+        old_key: String,
+        new_key: String,
+    },
 }
 
 /// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.
@@ -701,6 +711,36 @@ mod tests {
                 edge_type: "T".into(),
                 src_key: "a".into(),
                 dst_key: "b".into(),
+            }
+        );
+    }
+
+    /// Pin discriminant 20 (RenameNode).
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    #[test]
+    fn rename_node_discriminant_pinned() {
+        let r = WalRecord::RenameNode {
+            old_key: "a".into(),
+            new_key: "b".into(),
+        };
+        let payload = bincode::serialize(&r).unwrap();
+        assert_eq!(
+            &payload[0..4],
+            &[20, 0, 0, 0],
+            "RenameNode discriminant changed — a variant was inserted before position 20"
+        );
+        // Roundtrip through encode_record / decode_all.
+        let bytes = encode_record(&r);
+        let (recs, consumed) = decode_all(&bytes);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0],
+            WalRecord::RenameNode {
+                old_key: "a".into(),
+                new_key: "b".into(),
             }
         );
     }
