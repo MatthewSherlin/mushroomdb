@@ -7111,6 +7111,19 @@ impl<F: Fs> GraphDb<F> {
             batch.commit()?;
         }
 
+        // Refresh the role mask so the just-created node is visible to this
+        // statement's RETURN (read-after-write). Safe: create_labels ⊆ read labels
+        // (apply_schema subset rule), so the new node's label is already in the
+        // role's read scope — this never widens beyond the role's declared labels.
+        if !existed {
+            if let Some(role) = self.pending_write_authz.as_ref().map(|a| a.role.clone()) {
+                let new_mask = self.mask_for_role(&role)?;
+                if let Some(a) = self.pending_write_authz.as_mut() {
+                    a.mask = new_mask;
+                }
+            }
+        }
+
         // Optional RETURN clause: project the node (created or matched) as a read result.
         if let Some(returns) = stmt.returns {
             let var = stmt.var.as_deref().unwrap_or("_mn0");

@@ -1213,3 +1213,104 @@ fn test_delete_recreate_setprop_respects_update_labels() {
         denied_reason(&err)
     );
 }
+
+// ── MERGE RETURN: read-after-write (M1 fix verification) ─────────────────────
+
+/// MERGE create arm with RETURN yields the created node (read-after-write fix).
+///
+/// Before the fix, the mask was resolved before the node existed, so the RETURN
+/// clause returned 0 rows. After the fix (mask re-resolved after batch.commit()),
+/// the created node is visible and RETURN yields exactly 1 row.
+#[test]
+fn test_merge_create_return_yields_node() {
+    let (mut db, _dir) = open_with_writer("merge-create-return");
+    let rs = db
+        .query_write_authz(
+            "writer",
+            "MERGE (n:MyLabel {id: 'new_m1'}) ON CREATE SET n.x = 1 RETURN n",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "MERGE create arm RETURN must yield exactly 1 row (read-after-write)"
+    );
+    assert_eq!(
+        rs.get(0, "n"),
+        Some(&Value::Str("new_m1".into())),
+        "RETURN n must project the created node key"
+    );
+    assert_eq!(
+        db.get_prop("new_m1", "x"),
+        Some(Value::Int(1)),
+        "ON CREATE SET must be applied"
+    );
+}
+
+/// MERGE match arm with RETURN is unaffected by the M1 mask refresh.
+///
+/// The refresh fires only in the !existed (CREATE) branch. MATCH arm RETURN
+/// must still project the matched node correctly (no regression).
+#[test]
+fn test_merge_match_return_unaffected() {
+    let (mut db, _dir) = open_with_writer("merge-match-return");
+    db.insert_node("MyLabel", "existing_m1", vec![]).unwrap();
+    let rs = db
+        .query_write_authz(
+            "writer",
+            "MERGE (n:MyLabel {id: 'existing_m1'}) RETURN n",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        rs.len(),
+        1,
+        "MERGE match arm RETURN must yield exactly 1 row"
+    );
+    assert_eq!(
+        rs.get(0, "n"),
+        Some(&Value::Str("existing_m1".into())),
+        "RETURN n must project the matched node key"
+    );
+}
+
+/// No-widening invariant: after MERGE-create, the mask refresh does NOT let the
+/// role see nodes outside its declared read labels.
+///
+/// Security proof: create_labels ⊆ labels (enforced at apply_schema), so
+/// mask_for_role resolves only over the role's declared labels. A "Secret" node
+/// never enters the mask regardless of how many MERGE-creates occur.
+#[test]
+fn test_merge_create_no_mask_widening() {
+    let (mut db, _dir) = open_with_writer("merge-no-widen");
+    // Admin inserts a node with label "Secret" (not in writer's read labels).
+    db.insert_node("Secret", "hidden_pre", vec![]).unwrap();
+
+    // Writer MERGE-creates a new MyLabel node with RETURN (exercises the refresh path).
+    let rs = db
+        .query_write_authz(
+            "writer",
+            "MERGE (n:MyLabel {id: 'new_no_widen'}) RETURN n",
+            &no_params(),
+        )
+        .unwrap();
+    // M1 fix: create arm RETURN yields the node.
+    assert_eq!(rs.len(), 1, "create arm RETURN must yield 1 row");
+
+    // No-widening: the role's mask must still exclude "Secret"-labeled nodes.
+    // Obtain a fresh mask and run a masked read for the hidden node.
+    let mask = db.mask_for_role("writer").unwrap();
+    let hidden_rs = db
+        .query_masked(
+            "MATCH (n:Secret {id: 'hidden_pre'}) RETURN n",
+            &no_params(),
+            &mask,
+        )
+        .unwrap();
+    assert_eq!(
+        hidden_rs.len(),
+        0,
+        "mask refresh must NOT widen to Secret label; hidden_pre must remain invisible"
+    );
+}
