@@ -552,7 +552,7 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
-**Agent memory quickstart** (all fifteen MCP tools):
+**Agent memory quickstart** (all sixteen MCP tools):
 
 | Tool | Purpose |
 |---|---|
@@ -571,6 +571,7 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
 | `node_history` | WAL change history for a node (since last truncating snapshot) |
 | `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
 | `was_linked` | Point-in-time edge check: was an edge active at a given commit? |
+| `rename_node` | Rename a node's key; old_key, new_key |
 
 Full walkthrough, tool reference, and Claude Desktop setup:
 [`docs/site/mcp.md`](docs/site/mcp.md).

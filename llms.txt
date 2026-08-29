@@ -96,7 +96,7 @@ let mask = NodeMask::from_keys(&db, ["alice", "bob"]);
 let rows = db.query_masked("MATCH (p:Person) RETURN p", &Default::default(), &mask)?;
 ```
 
-## MCP tools (17 total)
+## MCP tools (16 total)
 
 | Tool | Description |
 |---|---|
@@ -116,7 +116,6 @@ let rows = db.query_masked("MATCH (p:Person) RETURN p", &Default::default(), &ma
 | `edge_history` | Add/retract lifecycle for edges between two nodes with rule attribution; returns {a, b, events, total_commits} |
 | `was_linked` | Point-in-time edge check; returns {linked} or error when outside horizon |
 | `rename_node` | Rename a node's key; params: old_key, new_key; errors on absent old or duplicate new |
-| `upsert_edge` | Insert edge with auto-create for missing endpoints; returns {nodes_created, edge_inserted} |
 
 MCP is a trusted-local stdio interface — no bearer-token or role enforcement.
 `stub_hidden` on the `query` tool applies to client-masked paths only; Cypher rows

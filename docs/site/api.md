@@ -623,7 +623,7 @@ Response:
 
 ### Tools
 
-Seventeen tools:
+Sixteen tools:
 
 | Tool | Description |
 |---|---|
@@ -643,7 +643,6 @@ Seventeen tools:
 | `edge_history` | Add/retract lifecycle for edges between two nodes; params: `a`, `b`. Returns `{a, b, events, total_commits}` |
 | `was_linked` | Point-in-time edge check; params: `a`, `b`, `edge_type`, `at_commit`. Returns `{linked}` or error when outside horizon |
 | `rename_node` | Rename a node's key; params: `old_key`, `new_key`. Errors if old key absent or new key already exists. |
-| `upsert_edge` | Insert an edge, auto-creating missing endpoint nodes; params: `edge_type`, `src_key`, `dst_key`, `placeholder_label`. Returns `{nodes_created, edge_inserted}`. |
 
 **`stub_hidden` on the `query` tool:** when `true` and a `mask` is supplied,
 hidden nodes in the mask appear as `{"key":"…","restricted":true}` in node-info and
