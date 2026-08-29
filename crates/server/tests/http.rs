@@ -6,7 +6,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use core_api::{
     json_to_value, schema::Schema, Explanation, FkSkip, IngestReport, Predicate, PredicateSummary,
-    RoleDef, RuleDef, RuleStats, SharedDb, Stats, Value,
+    RoleDef, RuleDef, RuleStats, SharedDb, Stats, Value, WriteScope,
 };
 use serde_json::{json, Value as Json};
 #[cfg(feature = "embed-ui")]
@@ -3220,4 +3220,1022 @@ async fn http_backup_role_token_is_forbidden() {
         StatusCode::FORBIDDEN,
         "role token must be 403 on POST /backup"
     );
+}
+
+// ── T3: Scoped role writes over HTTP ─────────────────────────────────────────
+//
+// Decision table (plan §3): CREATE-class, UPDATE/DELETE-class, EDGE-CREATE.
+// §4.3 error bodies are asserted verbatim throughout.
+//
+// Endpoint × outcome matrix:
+//
+//  Endpoint          | allow | scope-deny | vis-deny | write:None
+//  ------------------+-------+------------+----------+-----------
+//  POST /nodes       |  yes  |    yes     |   yes    |   yes
+//  DELETE /node      |  yes  |    yes     |   yes    |   yes
+//  POST /edges       |  yes  |    yes     |   yes    |   yes
+//  DELETE /edges     |  yes  |    yes     |   n/a    |   yes
+//  POST /edges/upsert|  yes  |    yes     |   yes    |   yes
+//  PUT  /node/prop   |  yes  |    yes     |   yes    |   yes
+//  DELETE /node/prop |  yes  |    n/a     |   yes    |   yes
+//  POST /query write |  yes  |    yes     |   yes    |   yes
+//  POST /ingest      |  yes  |    yes     |   n/a    |   yes
+//
+// Cross-cutting:
+//  - rename/backup/stats/subscribe stay 403 for write-scoped roles
+//  - concurrent role writers FIFO-serialize
+//  - ingest all-or-nothing (edge failure rolls back entire request)
+//  - ingest without create_labels → 403 naming missing scope (§7.3)
+
+/// Helper: open a DB with write-scoped roles.
+///
+/// `roles` entries: (role_name, visible_labels, write_scope or None).
+fn open_rbac_write(
+    name: &str,
+    roles: &[(&str, &[&str], Option<WriteScope>)],
+    full_token: Option<&str>,
+    role_token_map: &[(&str, &str)],
+) -> (Router, SharedDb) {
+    let db = SharedDb::open(&tmp(name)).unwrap();
+    let schema = Schema {
+        roles: roles
+            .iter()
+            .map(|(rname, labels, write)| RoleDef {
+                name: rname.to_string(),
+                labels: labels.iter().map(|s| s.to_string()).collect(),
+                keys: vec![],
+                write: write.clone(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    db.write().apply_schema(&schema).unwrap();
+    let rtoks: std::collections::HashMap<String, String> = role_token_map
+        .iter()
+        .map(|(tok, role)| (tok.to_string(), role.to_string()))
+        .collect();
+    let app = router_with_role_tokens(db.clone(), full_token.map(str::to_string), rtoks);
+    (app, db)
+}
+
+/// Helper: agent role that can create/update/delete AgentNote nodes and RECALLS edges.
+fn agent_write_scope() -> WriteScope {
+    WriteScope {
+        create_labels: vec!["AgentNote".into()],
+        update_labels: vec!["AgentNote".into()],
+        delete_labels: vec!["AgentNote".into()],
+        create_edge_types: vec!["RECALLS".into()],
+        delete_edge_types: vec!["RECALLS".into()],
+    }
+}
+
+/// Authenticated DELETE with optional JSON body (for prop endpoints) or no body.
+fn authed_delete(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Authenticated PUT with JSON body.
+fn authed_put_json(uri: &str, token: &str, body: Json) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+// ── POST /nodes — create_node ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn scoped_create_node_allowed() {
+    let (app, db) = open_rbac_write(
+        "t3-cn-allow",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/nodes",
+        "role-tok",
+        json!({"label": "AgentNote", "key": "note1", "props": {}}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "scoped create must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    // Effect is visible to the role's own read view.
+    assert!(db.read().has_node("note1"), "note1 must exist after create");
+}
+
+#[tokio::test]
+async fn scoped_create_node_scope_denied() {
+    let (app, _db) = open_rbac_write(
+        "t3-cn-scope",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    // "Secret" is not in create_labels — must get §4.3 scope-denied body.
+    let req = authed_json_req(
+        "POST",
+        "/nodes",
+        "role-tok",
+        json!({"label": "Secret", "key": "evil", "props": {}}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: label 'Secret' not in write scope (create_labels)"),
+        "scope-denied body must match §4.3: {v}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_create_node_vis_denied() {
+    let (app, db) = open_rbac_write(
+        "t3-cn-vis",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    // Seed a hidden node (label "Secret" is outside the role's read mask).
+    db.write()
+        .insert_node("Secret", "hidden-key", vec![])
+        .unwrap();
+    // Role tries to create AgentNote with the same key — hidden collision → not-visible.
+    let req = authed_json_req(
+        "POST",
+        "/nodes",
+        "role-tok",
+        json!({"label": "AgentNote", "key": "hidden-key", "props": {}}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: target node not visible"),
+        "hidden-collision body must match §4.3: {v}"
+    );
+}
+
+#[tokio::test]
+async fn write_none_create_node_endpoint_not_permitted() {
+    // write:None role → §4.3 "this endpoint is not permitted".
+    let (app, _db) = open_rbac_write(
+        "t3-cn-none",
+        &[("analyst", &["AgentNote"], None)],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/nodes",
+        "role-tok",
+        json!({"label": "AgentNote", "key": "x", "props": {}}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: this endpoint is not permitted"),
+        "write:None must get endpoint-not-permitted: {v}"
+    );
+}
+
+// ── DELETE /node/{key} — delete_node ─────────────────────────────────────────
+
+#[tokio::test]
+async fn scoped_delete_node_allowed() {
+    let (app, db) = open_rbac_write(
+        "t3-dn-allow",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write()
+        .insert_node("AgentNote", "del-me", vec![])
+        .unwrap();
+    let (status, _, _) = send(app, authed_delete("/node/del-me", "role-tok")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!db.read().has_node("del-me"), "node must be deleted");
+}
+
+#[tokio::test]
+async fn scoped_delete_node_scope_denied() {
+    // Role has AgentNote in labels (visible) but NOT in delete_labels.
+    let (app, db) = open_rbac_write(
+        "t3-dn-scope",
+        &[(
+            "agent",
+            &["AgentNote"],
+            Some(WriteScope {
+                create_labels: vec!["AgentNote".into()],
+                update_labels: vec!["AgentNote".into()],
+                delete_labels: vec![], // no delete scope
+                create_edge_types: vec![],
+                delete_edge_types: vec![],
+            }),
+        )],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "nd1", vec![]).unwrap();
+    let (status, body, _) = send(app, authed_delete("/node/nd1", "role-tok")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: label 'AgentNote' not in write scope (delete_labels)"),
+        "delete scope-denied body must match §4.3: {v}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_delete_node_vis_denied() {
+    let (app, db) = open_rbac_write(
+        "t3-dn-vis",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("Secret", "hidden", vec![]).unwrap();
+    let (status, body, _) = send(app, authed_delete("/node/hidden", "role-tok")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: target node not visible"),
+        "vis-denied body must match §4.3: {v}"
+    );
+}
+
+// ── POST /edges — create_edge ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn scoped_create_edge_allowed() {
+    let (app, db) = open_rbac_write(
+        "t3-ce-allow",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "a", vec![]).unwrap();
+    db.write().insert_node("AgentNote", "b", vec![]).unwrap();
+    let req = authed_json_req(
+        "POST",
+        "/edges",
+        "role-tok",
+        json!({"type": "RECALLS", "src": "a", "dst": "b"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "scoped edge create must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn scoped_create_edge_type_denied() {
+    let (app, db) = open_rbac_write(
+        "t3-ce-type",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "a", vec![]).unwrap();
+    db.write().insert_node("AgentNote", "b", vec![]).unwrap();
+    let req = authed_json_req(
+        "POST",
+        "/edges",
+        "role-tok",
+        json!({"type": "UNKNOWN_TYPE", "src": "a", "dst": "b"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: edge type 'UNKNOWN_TYPE' not in write scope (create_edge_types)"),
+        "edge type-denied body must match §4.3: {v}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_create_edge_endpoint_hidden() {
+    let (app, db) = open_rbac_write(
+        "t3-ce-vis",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "src", vec![]).unwrap();
+    db.write()
+        .insert_node("Secret", "hidden-dst", vec![])
+        .unwrap();
+    let req = authed_json_req(
+        "POST",
+        "/edges",
+        "role-tok",
+        json!({"type": "RECALLS", "src": "src", "dst": "hidden-dst"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: edge endpoint not visible"),
+        "edge endpoint vis-denied body must match §4.3: {v}"
+    );
+}
+
+// ── DELETE /edges/{etype}/{src}/{dst} — delete_edge ──────────────────────────
+
+#[tokio::test]
+async fn scoped_delete_edge_allowed() {
+    let (app, db) = open_rbac_write(
+        "t3-de-allow",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "x", vec![]).unwrap();
+    db.write().insert_node("AgentNote", "y", vec![]).unwrap();
+    db.write().insert_edge("RECALLS", "x", "y").unwrap();
+    let (status, body, _) = send(app, authed_delete("/edges/RECALLS/x/y", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "scoped delete edge must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn scoped_delete_edge_type_denied() {
+    let (app, db) = open_rbac_write(
+        "t3-de-type",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "x", vec![]).unwrap();
+    db.write().insert_node("AgentNote", "y", vec![]).unwrap();
+    db.write().insert_edge("OTHER_TYPE", "x", "y").unwrap();
+    let (status, body, _) = send(app, authed_delete("/edges/OTHER_TYPE/x/y", "role-tok")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: edge type 'OTHER_TYPE' not in write scope (delete_edge_types)"),
+        "delete edge type-denied body must match §4.3: {v}"
+    );
+}
+
+// ── POST /edges/upsert — upsert_edge ─────────────────────────────────────────
+
+#[tokio::test]
+async fn scoped_upsert_edge_allowed() {
+    let (app, db) = open_rbac_write(
+        "t3-ue-allow",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "src", vec![]).unwrap();
+    db.write().insert_node("AgentNote", "dst", vec![]).unwrap();
+    let req = authed_json_req(
+        "POST",
+        "/edges/upsert",
+        "role-tok",
+        json!({"edge_type": "RECALLS", "src_key": "src", "dst_key": "dst",
+               "placeholder_label": "AgentNote"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "scoped upsert edge must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn scoped_upsert_edge_type_denied() {
+    let (app, db) = open_rbac_write(
+        "t3-ue-type",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "src", vec![]).unwrap();
+    db.write().insert_node("AgentNote", "dst", vec![]).unwrap();
+    let req = authed_json_req(
+        "POST",
+        "/edges/upsert",
+        "role-tok",
+        json!({"edge_type": "FORBIDDEN_TYPE", "src_key": "src", "dst_key": "dst",
+               "placeholder_label": "AgentNote"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!(
+            "role-bound token: edge type 'FORBIDDEN_TYPE' not in write scope (create_edge_types)"
+        ),
+        "upsert edge type-denied body must match §4.3: {v}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_upsert_edge_hidden_endpoint() {
+    let (app, db) = open_rbac_write(
+        "t3-ue-vis",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "src", vec![]).unwrap();
+    // dst exists but is a "Secret" node — hidden from role
+    db.write()
+        .insert_node("Secret", "hidden-dst", vec![])
+        .unwrap();
+    let req = authed_json_req(
+        "POST",
+        "/edges/upsert",
+        "role-tok",
+        json!({"edge_type": "RECALLS", "src_key": "src", "dst_key": "hidden-dst",
+               "placeholder_label": "AgentNote"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: edge endpoint not visible"),
+        "upsert endpoint vis-denied body must match §4.3: {v}"
+    );
+}
+
+// ── PUT /node/{key}/prop/{field} — set_node_prop ─────────────────────────────
+
+#[tokio::test]
+async fn scoped_set_prop_allowed() {
+    let (app, db) = open_rbac_write(
+        "t3-sp-allow",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "n1", vec![]).unwrap();
+    let req = authed_put_json("/node/n1/prop/score", "role-tok", json!({"value": 42}));
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "scoped set prop must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn scoped_set_prop_scope_denied() {
+    // update_labels is empty — cannot SET any property.
+    let (app, db) = open_rbac_write(
+        "t3-sp-scope",
+        &[(
+            "agent",
+            &["AgentNote"],
+            Some(WriteScope {
+                create_labels: vec!["AgentNote".into()],
+                update_labels: vec![], // no update scope
+                delete_labels: vec![],
+                create_edge_types: vec![],
+                delete_edge_types: vec![],
+            }),
+        )],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "n1", vec![]).unwrap();
+    let req = authed_put_json("/node/n1/prop/score", "role-tok", json!({"value": 1}));
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: label 'AgentNote' not in write scope (update_labels)"),
+        "set prop scope-denied body must match §4.3: {v}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_set_prop_vis_denied() {
+    let (app, db) = open_rbac_write(
+        "t3-sp-vis",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("Secret", "hid", vec![]).unwrap();
+    let req = authed_put_json("/node/hid/prop/x", "role-tok", json!({"value": 1}));
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: target node not visible"),
+        "set prop vis-denied body must match §4.3: {v}"
+    );
+}
+
+// ── DELETE /node/{key}/prop/{field} — remove_node_prop ───────────────────────
+
+#[tokio::test]
+async fn scoped_remove_prop_allowed() {
+    let (app, db) = open_rbac_write(
+        "t3-rp-allow",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write()
+        .insert_node("AgentNote", "n1", vec![("score".into(), Value::Int(5))])
+        .unwrap();
+    let (status, body, _) = send(app, authed_delete("/node/n1/prop/score", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "scoped remove prop must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn scoped_remove_prop_vis_denied() {
+    let (app, db) = open_rbac_write(
+        "t3-rp-vis",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write()
+        .insert_node("Secret", "hid", vec![("x".into(), Value::Int(1))])
+        .unwrap();
+    let (status, body, _) = send(app, authed_delete("/node/hid/prop/x", "role-tok")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: target node not visible"),
+        "remove prop vis-denied body must match §4.3: {v}"
+    );
+}
+
+// ── POST /query (write Cypher) ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn scoped_query_create_allowed() {
+    let (app, db) = open_rbac_write(
+        "t3-qc-allow",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({"cypher": "CREATE (n:AgentNote {id: 'q-create-1'})"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "scoped query CREATE must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(db.read().has_node("q-create-1"), "node must be created");
+}
+
+#[tokio::test]
+async fn scoped_query_create_scope_denied() {
+    let (app, _db) = open_rbac_write(
+        "t3-qc-scope",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({"cypher": "CREATE (n:AdminLabel {id: 'evil'})"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: label 'AdminLabel' not in write scope (create_labels)"),
+        "query create scope-denied body must match §4.3: {v}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_query_set_allowed() {
+    let (app, db) = open_rbac_write(
+        "t3-qs-allow",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "n1", vec![]).unwrap();
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({"cypher": "MATCH (n {id: 'n1'}) SET n.x = 1"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "scoped query SET must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn scoped_query_set_vis_denied() {
+    let (app, db) = open_rbac_write(
+        "t3-qs-vis",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("Secret", "hid", vec![]).unwrap();
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({"cypher": "MATCH (n {id: 'hid'}) SET n.x = 1"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    // MATCH in the write context sees all nodes (the read phase is unmasked in
+    // exec_write_stmt); the matched SetProp op then hits the authz check in
+    // commit_logged_batch → "target node not visible" → 403.
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "query SET on hidden node must be 403: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: target node not visible"),
+        "SET vis-denied body must match §4.3: {v}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_query_write_none_endpoint_not_permitted() {
+    // write:None role trying a write Cypher query → §4.3 "this endpoint is not permitted".
+    let (app, _db) = open_rbac_write(
+        "t3-qw-none",
+        &[("analyst", &["AgentNote"], None)],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "role-tok",
+        json!({"cypher": "CREATE (n:AgentNote {id: 'x'})"}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: this endpoint is not permitted"),
+        "write:None query must get endpoint-not-permitted: {v}"
+    );
+}
+
+// ── POST /ingest ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn scoped_ingest_allowed() {
+    let (app, db) = open_rbac_write(
+        "t3-ing-allow",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/ingest",
+        "role-tok",
+        json!({"label": "AgentNote", "rows": [{"id": "note-a"}, {"id": "note-b"}]}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "scoped ingest must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(db.read().has_node("note-a"), "note-a must be ingested");
+    assert!(db.read().has_node("note-b"), "note-b must be ingested");
+}
+
+#[tokio::test]
+async fn scoped_ingest_label_not_in_scope_403() {
+    // §7.3: /ingest requires create_labels to include the label.
+    // "AdminLabel" is not in create_labels → §4.3 scope-denied.
+    let (app, _db) = open_rbac_write(
+        "t3-ing-scope",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/ingest",
+        "role-tok",
+        json!({"label": "AdminLabel", "rows": [{"id": "x"}]}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "ingest with unlisted label must be 403: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    // §7.3 ruling: the 403 names the missing scope (create_labels).
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: label 'AdminLabel' not in write scope (create_labels)"),
+        "ingest scope-denied body must name the missing create_labels scope: {v}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_ingest_no_create_labels_403() {
+    // §7.3: role with empty create_labels cannot use /ingest at all.
+    let (app, _db) = open_rbac_write(
+        "t3-ing-nolabels",
+        &[(
+            "edge-only",
+            &["AgentNote"],
+            Some(WriteScope {
+                create_labels: vec![], // no create scope
+                update_labels: vec![],
+                delete_labels: vec![],
+                create_edge_types: vec!["RECALLS".into()],
+                delete_edge_types: vec![],
+            }),
+        )],
+        Some("admin"),
+        &[("role-tok", "edge-only")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/ingest",
+        "role-tok",
+        json!({"label": "AgentNote", "rows": [{"id": "x"}]}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "ingest with empty create_labels must be 403: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    // "AgentNote" not in empty create_labels → scope-denied naming the label.
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: label 'AgentNote' not in write scope (create_labels)"),
+        "ingest no-create-labels body must name missing scope: {v}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_ingest_with_write_none_role_403() {
+    // write:None role → §4.3 "this endpoint is not permitted".
+    let (app, _db) = open_rbac_write(
+        "t3-ing-none",
+        &[("analyst", &["AgentNote"], None)],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/ingest",
+        "role-tok",
+        json!({"label": "AgentNote", "rows": [{"id": "x"}]}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: this endpoint is not permitted"),
+        "write:None ingest must get endpoint-not-permitted: {v}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_ingest_edges_all_or_nothing() {
+    // §7.2: all-or-nothing semantics — if one edge fails, nothing is applied.
+    // The node rows succeed but the second edge has a type not in scope.
+    let (app, db) = open_rbac_write(
+        "t3-ing-aon",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write()
+        .insert_node("AgentNote", "existing-a", vec![])
+        .unwrap();
+    db.write()
+        .insert_node("AgentNote", "existing-b", vec![])
+        .unwrap();
+    // Ingest with two edges: first valid, second invalid type.
+    // Note: ingest edge format is {edge_type, src, dst}.
+    let req = authed_json_req(
+        "POST",
+        "/ingest",
+        "role-tok",
+        json!({
+            "label": "AgentNote",
+            "rows": [{"id": "new-node"}],
+            "edges": [
+                {"edge_type": "RECALLS", "src": "existing-a", "dst": "existing-b"},
+                {"edge_type": "FORBIDDEN_EDGE", "src": "existing-a", "dst": "existing-b"}
+            ]
+        }),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "ingest all-or-nothing: forbidden edge must reject entire request: {}",
+        String::from_utf8_lossy(&body)
+    );
+    // new-node must NOT have been created (all-or-nothing).
+    assert!(
+        !db.read().has_node("new-node"),
+        "new-node must NOT exist after rejected ingest"
+    );
+}
+
+// ── Endpoints that STAY 403 for write-scoped roles ────────────────────────────
+
+#[tokio::test]
+async fn write_scoped_rename_stays_403() {
+    let (app, db) = open_rbac_write(
+        "t3-rename-403",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "old", vec![]).unwrap();
+    let req = authed_json_req(
+        "POST",
+        "/nodes/old/rename",
+        "role-tok",
+        json!({"new_key": "new"}),
+    );
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "rename must stay 403 for write-scoped role"
+    );
+}
+
+#[tokio::test]
+async fn write_scoped_backup_stays_403() {
+    let (app, _db) = open_rbac_write(
+        "t3-backup-403",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    let req = authed_json_req(
+        "POST",
+        "/backup",
+        "role-tok",
+        json!({"dest": "/tmp/must-not-exist"}),
+    );
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "backup must stay 403 for write-scoped role"
+    );
+}
+
+#[tokio::test]
+async fn write_scoped_stats_stays_403() {
+    let (app, _db) = open_rbac_write(
+        "t3-stats-403",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    let (status, _, _) = send(app, authed_get("/stats", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "stats must stay 403 for write-scoped role"
+    );
+}
+
+#[tokio::test]
+async fn write_scoped_subscribe_stays_403() {
+    let (app, _db) = open_rbac_write(
+        "t3-sub-403",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    let req = authed_ws_upgrade("/subscribe", "role-tok");
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "subscribe must stay 403 for write-scoped role"
+    );
+}
+
+// ── Concurrent role writers FIFO-serialize ─────────────────────────────────────
+
+#[tokio::test]
+async fn concurrent_role_writers_fifo_serialize() {
+    // Two concurrent role-token submissions for different keys must both succeed
+    // and FIFO-serialize through the drain queue (no lost writes).
+    let db = SharedDb::open(&tmp("t3-conc-fifo")).unwrap();
+    let schema = Schema {
+        roles: vec![RoleDef {
+            name: "agent".into(),
+            labels: vec!["AgentNote".into()],
+            keys: vec![],
+            write: Some(agent_write_scope()),
+        }],
+        ..Default::default()
+    };
+    db.write().apply_schema(&schema).unwrap();
+
+    // Submit two creates concurrently through the queue.
+    let db1 = db.clone();
+    let db2 = db.clone();
+    let h1 = std::thread::spawn(move || {
+        db1.submit_batch_authz(
+            "agent".into(),
+            vec![core_api::BatchOp::InsertNode {
+                label: "AgentNote".into(),
+                key: "conc-1".into(),
+                props: vec![],
+            }],
+        )
+    });
+    let h2 = std::thread::spawn(move || {
+        db2.submit_batch_authz(
+            "agent".into(),
+            vec![core_api::BatchOp::InsertNode {
+                label: "AgentNote".into(),
+                key: "conc-2".into(),
+                props: vec![],
+            }],
+        )
+    });
+    let r1 = h1.join().unwrap();
+    let r2 = h2.join().unwrap();
+    assert!(r1.is_ok(), "concurrent write 1 must succeed: {r1:?}");
+    assert!(r2.is_ok(), "concurrent write 2 must succeed: {r2:?}");
+    assert!(db.read().has_node("conc-1"), "conc-1 must exist");
+    assert!(db.read().has_node("conc-2"), "conc-2 must exist");
 }

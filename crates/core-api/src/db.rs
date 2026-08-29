@@ -5290,6 +5290,93 @@ impl<F: Fs> GraphDb<F> {
         self.exec_write_stmt(stmt, params)
     }
 
+    /// Execute `ops` with optional role-scoped write authorization, suppressing
+    /// fsync (for use inside the group-commit drain thread, which performs one
+    /// group fsync after releasing the write lock).
+    ///
+    /// Identical to [`write_batch_authz`] except the fsync policy is temporarily
+    /// forced to `Relaxed` for the duration of the call, matching the drain-thread
+    /// contract established by [`commit_batch_nosync`].
+    pub(crate) fn write_batch_authz_nosync(
+        &mut self,
+        authz: Option<&WriteAuthz>,
+        ops: Vec<BatchOp>,
+    ) -> Result<(usize, usize)> {
+        let saved = self.fsync;
+        struct RestoreFsync(*mut FsyncPolicy, FsyncPolicy);
+        impl Drop for RestoreFsync {
+            fn drop(&mut self) {
+                // SAFETY: pointer into the owning GraphDb; guard is dropped
+                // within the enclosing function's frame before it returns.
+                unsafe { *self.0 = self.1 };
+            }
+        }
+        // SAFETY: raw pointer into self; guard dropped before this fn returns.
+        let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
+        self.fsync = FsyncPolicy::Relaxed;
+        self.commit_logged_batch(ops, None, authz.cloned())
+    }
+
+    /// Execute a `/ingest` request with role-scoped write authorization.
+    ///
+    /// Resolves the role's `WriteScope` and `NodeMask` inside this call (same
+    /// write-guard lifetime as the mutation, satisfying §5 lock discipline).
+    /// Sets `pending_write_authz` for the duration of the call so that the
+    /// `commit_ingest` → `commit_logged_batch` path picks up the authz context
+    /// and evaluates the decision table per-op before any WAL write.
+    ///
+    /// §7.3: roles with empty `create_labels` will see every `InsertNode` op
+    /// denied by the decision table with the appropriate §4.3 scope reason;
+    /// no special HTTP-layer check is needed.
+    ///
+    /// Roles with `write: None` return `RoleWriteDenied` with
+    /// "this endpoint is not permitted" (byte-identical to v1 blanket 403).
+    pub fn ingest_with_edges_authz(
+        &mut self,
+        role: &str,
+        label: &str,
+        rows: Vec<std::collections::BTreeMap<String, Value>>,
+        opts: &crate::ingest::IngestOptions,
+        edges: &[(String, String, String)],
+    ) -> Result<crate::ingest::IngestReport> {
+        // Resolve scope (fails fast if role has no write scope).
+        let scope =
+            {
+                let roles = self.roles.as_deref().ok_or_else(|| GraphError::Corrupt {
+                    detail: "roles.json was corrupt at open; re-open to restore role access".into(),
+                })?;
+                let def = roles.iter().find(|r| r.name == role).ok_or_else(|| {
+                    GraphError::KeyNotFound {
+                        key: format!("role:{role}"),
+                    }
+                })?;
+                def.write
+                    .clone()
+                    .ok_or_else(|| GraphError::RoleWriteDenied {
+                        reason: "role-bound token: this endpoint is not permitted".into(),
+                    })?
+            };
+        let mask = self.mask_for_role(role)?;
+        self.pending_write_authz = Some(WriteAuthz {
+            role: role.into(),
+            scope,
+            mask,
+        });
+        // RAII guard: always clears pending_write_authz on scope exit, including
+        // on panic or early-return, mirroring the RestoreEmitDeltas precedent.
+        struct ClearPendingAuthzOnDrop(*mut Option<WriteAuthz>);
+        impl Drop for ClearPendingAuthzOnDrop {
+            fn drop(&mut self) {
+                // SAFETY: pointer into the owning GraphDb; guard is dropped
+                // within this function's frame before it returns.
+                unsafe { *self.0 = None };
+            }
+        }
+        // SAFETY: raw pointer into self; guard dropped before this fn returns.
+        let _authz_guard = ClearPendingAuthzOnDrop(&mut self.pending_write_authz as *mut _);
+        self.ingest_with_edges(label, rows, opts, edges)
+    }
+
     /// Evaluate the write-authz decision table for one `BatchOp`.
     ///
     /// Called by `commit_logged_batch` for each op when `pending_write_authz`
