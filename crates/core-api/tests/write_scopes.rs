@@ -1295,8 +1295,14 @@ fn test_merge_create_no_mask_widening() {
             &no_params(),
         )
         .unwrap();
-    // M1 fix: create arm RETURN yields the node.
+    // M1 fix: create arm RETURN yields exactly the created node (via the refreshed
+    // internal mask), not the hidden node or an empty result.
     assert_eq!(rs.len(), 1, "create arm RETURN must yield 1 row");
+    assert_eq!(
+        rs.get(0, "n"),
+        Some(&Value::Str("new_no_widen".into())),
+        "RETURN must project the created node key, not hidden_pre or nothing"
+    );
 
     // No-widening: the role's mask must still exclude "Secret"-labeled nodes.
     // Obtain a fresh mask and run a masked read for the hidden node.
