@@ -1014,3 +1014,71 @@ fn test_rules_fire_but_hidden_edges_masked() {
         "hidden neighbor must not appear in masked edge list; edges: {masked_edges:?}"
     );
 }
+
+/// Regression: delete+recreate of the same key in one batch must NOT let a
+/// following SetProp bypass update_labels via the batch_created fast-path.
+///
+/// The batch_created guard only admits genuinely new keys (absent from the
+/// snapshot at authz-check time).  A pre-existing visible key is a potential
+/// DuplicateKey, not a real creation, so it must NOT enter batch_created.
+#[test]
+fn test_delete_recreate_setprop_respects_update_labels() {
+    // Role: can delete+create "MyLabel" but has EMPTY update_labels.
+    let dir = tmp("delete-recreate-setprop");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let schema = core_api::schema::Schema {
+        fulltext: vec![],
+        rules: vec![],
+        views: vec![],
+        roles: vec![RoleDef {
+            name: "delcreate".into(),
+            keys: vec![],
+            labels: vec!["MyLabel".into()],
+            write: Some(WriteScope {
+                create_labels: vec!["MyLabel".into()],
+                update_labels: vec![], // intentionally empty
+                delete_labels: vec!["MyLabel".into()],
+                create_edge_types: vec![],
+                delete_edge_types: vec![],
+            }),
+        }],
+    };
+    db.apply_schema(&schema).unwrap();
+    db.insert_node("MyLabel", "existing", vec![]).unwrap();
+
+    let roles = db.roles();
+    let def = roles.iter().find(|r| r.name == "delcreate").unwrap();
+    let authz = core_api::WriteAuthz {
+        role: "delcreate".into(),
+        scope: def.write.clone().unwrap(),
+        mask: db.mask_for_role("delcreate").unwrap(),
+    };
+
+    // [DeleteNode, InsertNode, SetProp] — SetProp must be denied because
+    // "existing" was pre-existing at authz-check time (update_labels is empty).
+    let ops = vec![
+        BatchOp::DeleteNode {
+            key: "existing".into(),
+        },
+        BatchOp::InsertNode {
+            label: "MyLabel".into(),
+            key: "existing".into(),
+            props: vec![],
+        },
+        BatchOp::SetProp {
+            key: "existing".into(),
+            field: "x".into(),
+            value: Value::Int(1),
+        },
+    ];
+    let err = db.write_batch_authz(Some(&authz), ops).unwrap_err();
+    assert!(
+        is_role_write_denied(&err),
+        "SetProp after delete+recreate must be denied when update_labels is empty; got {err:?}"
+    );
+    assert!(
+        denied_reason(&err).contains("update_labels"),
+        "reason must name update_labels: {}",
+        denied_reason(&err)
+    );
+}

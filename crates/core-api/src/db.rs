@@ -4071,7 +4071,23 @@ impl<F: Fs> GraphDb<F> {
                 // subsequent ops in this batch see the nodes as "about to exist".
                 match op {
                     BatchOp::InsertNode { label, key, .. } => {
-                        batch_created.insert(key.clone(), label.clone());
+                        // Only track genuinely new nodes (absent from the
+                        // snapshot at authz-check time). A pre-existing visible
+                        // key would be a DuplicateKey — not a real creation —
+                        // so MutPreview handles it. Letting it into batch_created
+                        // would allow a later SetProp to bypass update_labels
+                        // via the "batch-created → always updatable" ruling
+                        // (delete+recreate exploit, fix for I1 review round 2).
+                        //
+                        // Accepted edge: for a delete+recreate-with-different-
+                        // label batch, node_status resolves the pre-delete
+                        // (store) label for any subsequent update checks. This
+                        // grants no net-new capability — a role that can delete+
+                        // create can already place arbitrary props via
+                        // InsertNode's own props field.
+                        if self.ids.get(key.as_str()).is_none() {
+                            batch_created.insert(key.clone(), label.clone());
+                        }
                     }
                     BatchOp::InsertEdgeUpsert {
                         placeholder_label,
