@@ -189,8 +189,8 @@ fn mask_for_role_keys_and_labels_union() {
             name: "viewer".into(),
             keys: vec!["alice".into()],
             labels: vec!["Public".into()],
-                write: None,
-}],
+            write: None,
+        }],
     };
     db.apply_schema(&schema).unwrap();
 
@@ -239,8 +239,8 @@ fn mask_for_role_label_resolves_live() {
             name: "viewer".into(),
             keys: vec![],
             labels: vec!["Public".into()],
-                write: None,
-}],
+            write: None,
+        }],
     };
     db.apply_schema(&schema).unwrap();
 
@@ -298,8 +298,8 @@ fn empty_role_yields_empty_visibility() {
             name: "nothing".into(),
             keys: vec![],
             labels: vec![],
-                write: None,
-}],
+            write: None,
+        }],
     };
     db.apply_schema(&schema).unwrap();
 
@@ -369,8 +369,8 @@ fn apply_schema_rejects_empty_role_name() {
             name: "".into(),
             keys: vec![],
             labels: vec![],
-                write: None,
-}],
+            write: None,
+        }],
     };
     assert!(
         db.apply_schema(&schema).is_err(),
@@ -393,14 +393,14 @@ fn apply_schema_rejects_duplicate_role_names() {
                 name: "viewer".into(),
                 keys: vec![],
                 labels: vec![],
-                        write: None,
-},
+                write: None,
+            },
             RoleDef {
                 name: "viewer".into(),
                 keys: vec!["alice".into()],
                 labels: vec![],
-                        write: None,
-},
+                write: None,
+            },
         ],
     };
     assert!(
@@ -899,4 +899,168 @@ fn zero_byte_roles_json_is_healthy_empty() {
         !msg.contains("corrupt"),
         "zero-byte file must not produce a corruption error; got: {msg}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// W3c: write: Some(WriteScope::default()) — all vecs empty — still lifts to v2
+// and round-trips back as Some(empty), not None.
+// ---------------------------------------------------------------------------
+#[test]
+fn empty_write_scope_still_writes_v2_and_round_trips_as_some() {
+    let dir = tmp("v2-empty-write-scope");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    let role = RoleDef {
+        name: "noop-writer".into(),
+        keys: vec![],
+        labels: vec!["Doc".into()],
+        write: Some(WriteScope::default()), // all vecs empty, but Some(...)
+    };
+    let schema = Schema {
+        fulltext: vec![],
+        rules: vec![],
+        views: vec![],
+        roles: vec![role],
+    };
+    db.apply_schema(&schema).unwrap();
+    drop(db);
+
+    // Version in file must be 2 — write is Some, even if all fields are empty.
+    let bytes = std::fs::read(dir.join("roles.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        parsed["version"].as_u64().unwrap(),
+        2,
+        "Some(WriteScope::default()) must produce version 2, not 1"
+    );
+
+    // On reload, write must come back as Some with all-empty vecs, not None.
+    let db = GraphDb::open(&dir).unwrap();
+    let roles = db.roles();
+    assert_eq!(roles.len(), 1);
+    let ws = roles[0]
+        .write
+        .as_ref()
+        .expect("write must round-trip as Some, not coerce to None");
+    assert!(ws.create_labels.is_empty());
+    assert!(ws.update_labels.is_empty());
+    assert!(ws.delete_labels.is_empty());
+    assert!(ws.create_edge_types.is_empty());
+    assert!(ws.delete_edge_types.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// W2b: multi-role v1→v2 transition — two roles, apply_schema adds write to
+// only one; file lifts from v1 to v2; writeless role round-trips unchanged.
+// ---------------------------------------------------------------------------
+#[test]
+fn multi_role_v1_to_v2_transition_writeless_role_unchanged() {
+    let dir = tmp("multi-role-v1-to-v2");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // First apply: two read-only roles (v1).
+    let schema_v1 = Schema {
+        fulltext: vec![],
+        rules: vec![],
+        views: vec![],
+        roles: vec![
+            RoleDef {
+                name: "reader".into(),
+                keys: vec!["key1".into()],
+                labels: vec!["Public".into()],
+                write: None,
+            },
+            RoleDef {
+                name: "admin".into(),
+                keys: vec!["key2".into()],
+                labels: vec!["Admin".into()],
+                write: None,
+            },
+        ],
+    };
+    db.apply_schema(&schema_v1).unwrap();
+    drop(db);
+
+    let bytes_v1 = std::fs::read(dir.join("roles.json")).unwrap();
+    let parsed_v1: serde_json::Value = serde_json::from_slice(&bytes_v1).unwrap();
+    assert_eq!(
+        parsed_v1["version"].as_u64().unwrap(),
+        1,
+        "initial apply with no write scopes must write version 1"
+    );
+
+    // Second apply: give admin a write scope; reader stays read-only.
+    let mut db = GraphDb::open(&dir).unwrap();
+    let schema_v2 = Schema {
+        fulltext: vec![],
+        rules: vec![],
+        views: vec![],
+        roles: vec![
+            RoleDef {
+                name: "reader".into(),
+                keys: vec!["key1".into()],
+                labels: vec!["Public".into()],
+                write: None, // unchanged
+            },
+            RoleDef {
+                name: "admin".into(),
+                keys: vec!["key2".into()],
+                labels: vec!["Admin".into()],
+                write: Some(WriteScope {
+                    create_labels: vec!["Admin".into()],
+                    update_labels: vec![],
+                    delete_labels: vec![],
+                    create_edge_types: vec![],
+                    delete_edge_types: vec![],
+                }),
+            },
+        ],
+    };
+    let diff = db.apply_schema(&schema_v2).unwrap();
+    assert!(
+        diff.updated.contains(&"role:admin".to_string()),
+        "admin must be updated; diff: {diff:?}"
+    );
+    assert!(
+        diff.unchanged.contains(&"role:reader".to_string()),
+        "reader must be unchanged; diff: {diff:?}"
+    );
+    drop(db);
+
+    // File must now be version 2.
+    let bytes_v2 = std::fs::read(dir.join("roles.json")).unwrap();
+    let parsed_v2: serde_json::Value = serde_json::from_slice(&bytes_v2).unwrap();
+    assert_eq!(
+        parsed_v2["version"].as_u64().unwrap(),
+        2,
+        "file must lift to version 2 after adding write scope to one role"
+    );
+
+    // Re-open: reader must still have write: None, keys and labels intact.
+    let db = GraphDb::open(&dir).unwrap();
+    let roles = db.roles();
+    let reader = roles
+        .iter()
+        .find(|r| r.name == "reader")
+        .expect("reader must survive");
+    assert!(reader.write.is_none(), "reader.write must remain None");
+    assert_eq!(reader.keys, vec!["key1"], "reader.keys must be intact");
+    assert_eq!(
+        reader.labels,
+        vec!["Public"],
+        "reader.labels must be intact"
+    );
+
+    // admin must have the write scope preserved.
+    let admin = roles
+        .iter()
+        .find(|r| r.name == "admin")
+        .expect("admin must survive");
+    let ws = admin
+        .write
+        .as_ref()
+        .expect("admin.write must be Some after v2 reload");
+    assert_eq!(ws.create_labels, vec!["Admin"]);
 }
