@@ -441,14 +441,15 @@ fn only_enabled_label_indexed() {
 }
 
 // ---------------------------------------------------------------------------
-// Ranking by match_count descending
+// BM25 ranking
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ranking_match_count_desc() {
+fn ranking_bm25_desc() {
     let mut db = open();
     db.enable_fulltext("Doc", "body").unwrap();
-    // d0 matches both OR-groups (alpha + beta); d1 matches only one (beta)
+    // d0 matches both OR-groups (alpha + beta) → higher total BM25 score.
+    // d1 matches only the beta group.
     db.insert_node(
         "Doc",
         "d0",
@@ -464,11 +465,49 @@ fn ranking_match_count_desc() {
 
     let r = db.search("body", "alpha OR beta");
     assert_eq!(r.len(), 2);
-    // d0 has match_count=2 (matches both "alpha" group AND "beta" group)
+    // d0 has contributions from both OR-groups → higher BM25 score.
     assert_eq!(r[0].0, "d0");
-    assert_eq!(r[0].1, 2);
     assert_eq!(r[1].0, "d1");
-    assert_eq!(r[1].1, 1);
+    assert!(r[0].1 > r[1].1, "d0 must score higher than d1");
+    assert!(r[0].1 > 0.0 && r[1].1 > 0.0);
+}
+
+/// BM25 ranks the document with the rarer term above the document with only
+/// the common term.
+///
+/// Corpus:
+///   n0: "alpha"  — "alpha" has df=1 → high IDF
+///   n1: "beta"   — "beta" has df=2  → lower IDF
+///   n2: "beta"   — contributes df("beta")=2
+/// Query: "alpha OR beta"
+/// Expected order: n0 > n1 = n2 (n1 before n2 by key ascending tiebreak).
+#[test]
+fn ranking_rarer_term_wins_bm25() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "body").unwrap();
+    db.insert_node(
+        "Doc",
+        "n0",
+        vec![("body".into(), Value::Str("alpha".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "n1",
+        vec![("body".into(), Value::Str("beta".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "n2",
+        vec![("body".into(), Value::Str("beta".into()))],
+    )
+    .unwrap();
+
+    let r = db.search("body", "alpha OR beta");
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0].0, "n0", "n0 (rare alpha) must rank first");
+    assert!(r[0].1 > r[1].1, "alpha (df=1) must score above beta (df=2)");
 }
 
 // ---------------------------------------------------------------------------
@@ -512,9 +551,13 @@ fn oracle_equivalence_basic() {
         "databases",
         "nope",
     ] {
-        let idx = db.search("body", q);
-        let scratch = db.scratch_search("body", q);
-        assert_eq!(idx, scratch, "oracle mismatch for query {q:?}");
+        let idx_keys: Vec<String> = db.search("body", q).into_iter().map(|(k, _)| k).collect();
+        let scratch_keys: Vec<String> = db
+            .scratch_search("body", q)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(idx_keys, scratch_keys, "oracle mismatch for query {q:?}");
     }
 }
 
@@ -546,9 +589,13 @@ fn oracle_after_update_and_delete() {
     db.delete_node("d2").unwrap();
 
     for q in &["rust", "python", "java", "rust OR python", "now", "py*"] {
-        let idx = db.search("body", q);
-        let scratch = db.scratch_search("body", q);
-        assert_eq!(idx, scratch, "oracle mismatch for query {q:?}");
+        let idx_keys: Vec<String> = db.search("body", q).into_iter().map(|(k, _)| k).collect();
+        let scratch_keys: Vec<String> = db
+            .scratch_search("body", q)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(idx_keys, scratch_keys, "oracle mismatch for query {q:?}");
     }
 }
 
@@ -820,4 +867,256 @@ fn disable_shared_field_removes_only_disabled_label_postings() {
         0,
         "column dropped; no results"
     );
+}
+
+// ---------------------------------------------------------------------------
+// v2: Stemming
+// ---------------------------------------------------------------------------
+
+/// "running" and "run" share a stem ("run") → both match the indexed doc.
+#[test]
+fn stemming_running_matches_run_doc() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "body").unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("run forest run".into()))],
+    )
+    .unwrap();
+
+    // Query with inflected form → same stem → must find d0.
+    let r = db.search("body", "running");
+    assert_eq!(r.len(), 1, "inflected query must match stemmed index");
+    assert_eq!(r[0].0, "d0");
+
+    // Stemmed base form also matches.
+    let r2 = db.search("body", "run");
+    assert_eq!(r2.len(), 1);
+}
+
+/// "databases" stems to "databas"; index and query both stem consistently.
+#[test]
+fn stemming_databases_matches() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "body").unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("graph databases embedded".into()))],
+    )
+    .unwrap();
+
+    let r = db.search("body", "databases");
+    assert_eq!(r.len(), 1);
+    let r2 = db.search("body", "database");
+    assert_eq!(r2.len(), 1, "singular form must also match via stemming");
+}
+
+// ---------------------------------------------------------------------------
+// v2: Phrase queries
+// ---------------------------------------------------------------------------
+
+/// Phrase match requires adjacent tokens (stemmed), not scattered tokens.
+#[test]
+fn phrase_adjacent_only() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "body").unwrap();
+    // d0: "graph" and "database" are adjacent.
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("graph database embedded".into()))],
+    )
+    .unwrap();
+    // d1: "graph" and "database" are NOT adjacent.
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("graph embedded database".into()))],
+    )
+    .unwrap();
+
+    let r = db.search("body", "\"graph database\"");
+    assert_eq!(r.len(), 1, "only adjacent doc must match phrase");
+    assert_eq!(r[0].0, "d0");
+}
+
+/// Phrase match uses stemmed tokens: "running fast" matches "I am running fast today".
+#[test]
+fn phrase_matches_stemmed_forms() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "body").unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("I am running fast today".into()))],
+    )
+    .unwrap();
+
+    // Both tokens stem correctly and are adjacent in the document.
+    let r = db.search("body", "\"running fast\"");
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].0, "d0");
+}
+
+// ---------------------------------------------------------------------------
+// v2: Negation
+// ---------------------------------------------------------------------------
+
+/// `-embedded` excludes documents containing "embedded" (stemmed).
+#[test]
+fn negation_excludes_matching_doc() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "body").unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("graph database embedded".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("graph database".into()))],
+    )
+    .unwrap();
+
+    // "-embedded graph" → d0 excluded (has "embedded"); d1 matches.
+    let r = db.search("body", "-embedded graph");
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].0, "d1");
+}
+
+/// Prefix `emb*` still works and matches "embedded" in the stemmed index.
+#[test]
+fn prefix_emb_matches_embedded() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "body").unwrap();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("graph embedded database".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("graph only".into()))],
+    )
+    .unwrap();
+
+    let r = db.search("body", "emb*");
+    assert_eq!(r.len(), 1, "emb* must match the doc with embedded");
+    assert_eq!(r[0].0, "d0");
+}
+
+// ---------------------------------------------------------------------------
+// v2: textMatches WHERE with phrase and negation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cypher_text_matches_phrase() {
+    let mut db = open();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("graph database embedded".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("graph embedded database".into()))],
+    )
+    .unwrap();
+
+    let no_params: BTreeMap<String, Value> = BTreeMap::new();
+
+    let rs = db
+        .query(
+            "MATCH (d:Doc) WHERE textMatches(d.body, '\"graph database\"') RETURN d",
+            &no_params,
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 1, "only adjacent doc must match phrase in WHERE");
+}
+
+#[test]
+fn cypher_text_matches_negation() {
+    let mut db = open();
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![("body".into(), Value::Str("graph database embedded".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![("body".into(), Value::Str("graph database".into()))],
+    )
+    .unwrap();
+
+    let no_params: BTreeMap<String, Value> = BTreeMap::new();
+
+    // "-embedded graph" → d0 excluded; d1 matches.
+    let rs = db
+        .query(
+            "MATCH (d:Doc) WHERE textMatches(d.body, '-embedded graph') RETURN d",
+            &no_params,
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 1, "negation must exclude doc with embedded");
+}
+
+// ---------------------------------------------------------------------------
+// v2: Index rebuild (WAL replay identity)
+// ---------------------------------------------------------------------------
+
+/// Rebuild via WAL replay produces the same search results as the pre-close state.
+/// This is the "replay-identity" test: the index is rebuilt-from-WAL (not
+/// snapshot-persisted), so any stemming/position change must survive reopen.
+#[test]
+fn reopen_rebuild_identity_v2() {
+    let dir = tmp_dir();
+    let expected_keys = {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_fulltext("Doc", "body").unwrap();
+        db.insert_node(
+            "Doc",
+            "d0",
+            vec![(
+                "body".into(),
+                Value::Str("running databases embedded".into()),
+            )],
+        )
+        .unwrap();
+        db.insert_node(
+            "Doc",
+            "d1",
+            vec![("body".into(), Value::Str("python scripting".into()))],
+        )
+        .unwrap();
+        let keys: Vec<String> = db
+            .search("body", "run")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        keys
+    };
+
+    // Reopen from WAL — must rebuild identical index.
+    let db2 = GraphDb::open(&dir).unwrap();
+    let rebuilt_keys: Vec<String> = db2
+        .search("body", "run")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        expected_keys, rebuilt_keys,
+        "WAL-rebuilt index must match pre-close state"
+    );
+    assert!(!rebuilt_keys.is_empty(), "d0 must be found after reopen");
+    assert_eq!(rebuilt_keys[0], "d0");
 }

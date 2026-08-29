@@ -1439,31 +1439,14 @@ fn eval_func(
             match (field_val, query_val) {
                 (None, _) | (_, None) => Ok(None),
                 (Some(Value::Str(s)), Some(Value::Str(q))) => {
-                    use std::collections::BTreeSet;
-                    let node_tokens: BTreeSet<String> =
-                        core_storage::fulltext::tokenize(&s).into_iter().collect();
-                    Ok(Some(Value::Bool(core_storage::fulltext::eval_query(
-                        &node_tokens,
-                        &q,
+                    // v2 grammar: phrase adjacency, negation, prefix, stemming.
+                    Ok(Some(Value::Bool(core_storage::fulltext::eval_query_str(
+                        &s, &q,
                     ))))
                 }
-                (Some(Value::List(items)), Some(Value::Str(q))) => {
-                    use std::collections::BTreeSet;
-                    let node_tokens: BTreeSet<String> = items
-                        .iter()
-                        .flat_map(|v| {
-                            if let Value::Str(s) = v {
-                                core_storage::fulltext::tokenize(s)
-                            } else {
-                                vec![]
-                            }
-                        })
-                        .collect();
-                    Ok(Some(Value::Bool(core_storage::fulltext::eval_query(
-                        &node_tokens,
-                        &q,
-                    ))))
-                }
+                (Some(Value::List(items)), Some(Value::Str(q))) => Ok(Some(Value::Bool(
+                    core_storage::fulltext::eval_query_str_list(&items, &q),
+                ))),
                 _ => Ok(Some(Value::Bool(false))), // non-string field → no match
             }
         }

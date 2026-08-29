@@ -4533,18 +4533,26 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// **Memory / performance:** O(postings) lookup; no scan.  The index is
     /// in-memory and proportional to total indexed text across all enabled fields.
-    pub fn search(&self, field: &str, query: &str) -> Vec<(String, usize)> {
+    ///
+    /// **v2 grammar:** supports `"phrase"`, `-negation`, `prefix*`, `OR`, `AND`.
+    /// Results are BM25-scored (k1=1.2, b=0.75) and sorted by score descending,
+    /// key ascending for deterministic tiebreaking.
+    pub fn search(&self, field: &str, query: &str) -> Vec<(String, f64)> {
         // Resolve node_ids to keys (excluding tombstones) then re-sort by
-        // (match_count DESC, key ASC) to give a deterministic, key-lexicographic
-        // tiebreak.  FulltextIndex::search sorts by (count DESC, node_id ASC)
+        // (score DESC, key ASC) to give a deterministic, key-lexicographic
+        // tiebreak.  FulltextIndex::search sorts by (score DESC, node_id ASC)
         // which diverges from key order when nodes were not inserted in key-lex order.
-        let mut results: Vec<(String, usize)> = self
+        let mut results: Vec<(String, f64)> = self
             .fulltext
-            .search(field, query)
+            .search(field, query, 0)
             .into_iter()
-            .filter_map(|(id, count)| self.ids.key_of(id).map(|key| (key.to_string(), count)))
+            .filter_map(|(id, score)| self.ids.key_of(id).map(|key| (key.to_string(), score)))
             .collect();
-        results.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
         results
     }
 
@@ -4616,17 +4624,31 @@ impl<F: Fs> GraphDb<F> {
         ranked
     }
 
-    /// For DST/testing: scratch full-text search over live nodes without using
-    /// the index.  Walks every live node, tokenizes the field value, and returns
-    /// nodes matching the query.  Results are sorted match_count desc, key asc.
+    /// For DST/testing: scratch BM25 search over live nodes without the index.
+    /// Walks every live node, re-stems field tokens, computes corpus stats, and
+    /// returns BM25-ranked results.
     ///
-    /// The oracle: `search(field, q)` must equal `scratch_search(field, q)`.
+    /// The oracle: the ordered key list of `search(field, q)` must equal that of
+    /// `scratch_search(field, q)` at every quiescent state.
     #[doc(hidden)]
-    pub fn scratch_search(&self, field: &str, query: &str) -> Vec<(String, usize)> {
-        use core_storage::fulltext::{parse_query, tokenize};
-        use std::collections::BTreeSet;
+    pub fn scratch_search(&self, field: &str, query: &str) -> Vec<(String, f64)> {
+        use core_storage::fulltext::{parse_query, tokenize_stemmed_with_positions};
+        use std::collections::BTreeMap;
+
         let groups = parse_query(query);
-        let mut results: Vec<(String, usize)> = Vec::new();
+        if groups.is_empty() {
+            return vec![];
+        }
+
+        // --- Pass 1: collect all live indexed nodes with stemmed token data ---
+        struct NodeData {
+            key: String,
+            /// stemmed_token → positions (sorted)
+            tokens: BTreeMap<String, Vec<u32>>,
+            dl: u32,
+        }
+
+        let mut nodes: Vec<NodeData> = Vec::new();
         for id in 0..self.ids.len() as u32 {
             let Some(key) = self.ids.key_of(id) else {
                 continue;
@@ -4637,7 +4659,6 @@ impl<F: Fs> GraphDb<F> {
             if sym == u32::MAX {
                 continue;
             }
-            // Only scan nodes whose label has this field indexed.
             let label = match self.syms.resolve(sym) {
                 Some(l) => l,
                 None => continue,
@@ -4648,44 +4669,124 @@ impl<F: Fs> GraphDb<F> {
             let Some(value) = self.props_view().get(id, field).map(|vr| vr.into_value()) else {
                 continue;
             };
-            let node_tokens: BTreeSet<String> = match &value {
-                Value::Str(s) => tokenize(s).into_iter().collect(),
-                Value::List(items) => items
-                    .iter()
-                    .flat_map(|v| {
-                        if let Value::Str(s) = v {
-                            tokenize(s)
-                        } else {
-                            vec![]
-                        }
-                    })
-                    .collect(),
-                _ => BTreeSet::new(),
+            let stemmed_with_pos = match &value {
+                Value::Str(s) => tokenize_stemmed_with_positions(s),
+                Value::List(items) => {
+                    let combined: String = items
+                        .iter()
+                        .filter_map(|v| {
+                            if let Value::Str(s) = v {
+                                Some(s.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    tokenize_stemmed_with_positions(&combined)
+                }
+                _ => continue,
             };
-            // Count OR-group matches.
-            let mut count = 0usize;
-            for group in &groups {
-                let mut group_match = true;
-                for term in group {
-                    let matched = if term.prefix {
-                        node_tokens.iter().any(|t| t.starts_with(&term.token))
-                    } else {
-                        node_tokens.contains(&term.token)
-                    };
-                    if !matched {
-                        group_match = false;
-                        break;
-                    }
-                }
-                if group_match {
-                    count += 1;
-                }
+            let dl = stemmed_with_pos.len() as u32;
+            let mut tok_map: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+            for (tok, pos) in stemmed_with_pos {
+                tok_map.entry(tok).or_default().push(pos);
             }
-            if count > 0 {
-                results.push((key.to_string(), count));
+            nodes.push(NodeData {
+                key: key.to_string(),
+                tokens: tok_map,
+                dl,
+            });
+        }
+
+        if nodes.is_empty() {
+            return vec![];
+        }
+
+        // --- BM25 corpus stats ---
+        let n = nodes.len() as f64;
+        let avg_dl: f64 = nodes.iter().map(|nd| nd.dl as f64).sum::<f64>() / n;
+        // df per stemmed token across all live indexed nodes.
+        let mut df_map: BTreeMap<&str, f64> = BTreeMap::new();
+        for nd in &nodes {
+            for tok in nd.tokens.keys() {
+                *df_map.entry(tok.as_str()).or_insert(0.0) += 1.0;
             }
         }
-        results.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        const K1: f64 = 1.2;
+        const B: f64 = 0.75;
+
+        // --- Pass 2: score each node against each OR-group ---
+        let mut results: Vec<(String, f64)> = Vec::new();
+        for nd in &nodes {
+            let dl = nd.dl as f64;
+            let mut total_score = 0.0f64;
+
+            'group: for group in &groups {
+                let mut group_score = 0.0f64;
+
+                for term in group {
+                    if term.negated {
+                        // Negated: if doc has this stemmed token → group fails.
+                        let present = if term.prefix {
+                            nd.tokens.keys().any(|t| t.starts_with(term.token.as_str()))
+                        } else {
+                            nd.tokens.contains_key(term.token.as_str())
+                        };
+                        if present {
+                            continue 'group;
+                        }
+                        continue;
+                    }
+                    if term.prefix {
+                        // Prefix: sum BM25 for all matching stemmed tokens.
+                        let mut prefix_matched = false;
+                        for (tok, positions) in &nd.tokens {
+                            if tok.starts_with(term.token.as_str()) {
+                                let tf = positions.len() as f64;
+                                let df = df_map.get(tok.as_str()).copied().unwrap_or(1.0);
+                                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                                let tf_norm =
+                                    tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avg_dl));
+                                group_score += idf * tf_norm;
+                                prefix_matched = true;
+                            }
+                        }
+                        if !prefix_matched {
+                            continue 'group;
+                        }
+                    } else {
+                        // term.token is already stemmed by parse_query; use directly.
+                        match nd.tokens.get(term.token.as_str()) {
+                            None => continue 'group,
+                            Some(positions) => {
+                                let tf = positions.len() as f64;
+                                let df = df_map.get(term.token.as_str()).copied().unwrap_or(1.0);
+                                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                                let tf_norm =
+                                    tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avg_dl));
+                                group_score += idf * tf_norm;
+                            }
+                        }
+                    }
+                }
+
+                if group_score > 0.0 {
+                    total_score += group_score;
+                }
+            }
+
+            if total_score > 0.0 {
+                results.push((nd.key.clone(), total_score));
+            }
+        }
+
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
         results
     }
 
