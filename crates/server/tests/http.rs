@@ -2968,3 +2968,133 @@ async fn client_mask_stub_neighborhood_shows_hidden_direct_neighbor() {
         "omit mode: neighborhood must be empty when hidden node blocks all paths: {v2}"
     );
 }
+
+// ── HTTP: POST /nodes/{key}/rename ────────────────────────────────────────────
+
+#[tokio::test]
+async fn http_rename_node_success() {
+    let (app, db) = open("http-rename-ok");
+    seed_person(&db, "alice");
+
+    let req = json_req("POST", "/nodes/alice/rename", json!({"new_key": "alice2"}));
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rename must return 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert_eq!(v["ok"], json!(true));
+
+    // Old key must be gone; new key must exist.
+    let (s2, _b2, _) = send(app.clone(), get("/node/alice")).await;
+    assert_eq!(s2, StatusCode::NOT_FOUND, "alice must be gone after rename");
+
+    let (s3, b3, _) = send(app, get("/node/alice2")).await;
+    assert_eq!(
+        s3,
+        StatusCode::OK,
+        "alice2 must exist after rename: {}",
+        String::from_utf8_lossy(&b3)
+    );
+}
+
+#[tokio::test]
+async fn http_rename_node_404_when_not_found() {
+    let (app, _db) = open("http-rename-404");
+
+    let req = json_req("POST", "/nodes/ghost/rename", json!({"new_key": "ghost2"}));
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "rename of non-existent key must be 404: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn http_rename_node_409_when_target_exists() {
+    let (app, db) = open("http-rename-409");
+    seed_person(&db, "alice");
+    seed_person(&db, "alice2");
+
+    let req = json_req("POST", "/nodes/alice/rename", json!({"new_key": "alice2"}));
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "rename to existing key must be 409: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+// ── HTTP: POST /edges/upsert ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn http_upsert_edge_creates_missing_endpoints_and_edge() {
+    let (app, _db) = open("http-upsert-ok");
+
+    let req = json_req(
+        "POST",
+        "/edges/upsert",
+        json!({
+            "edge_type": "KNOWS",
+            "src_key": "p1",
+            "dst_key": "p2",
+            "placeholder_label": "Person"
+        }),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "upsert must succeed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    assert_eq!(
+        v["nodes_created"],
+        json!(2),
+        "both endpoints must be created"
+    );
+    assert_eq!(v["edge_inserted"], json!(true));
+
+    // Both nodes must now exist.
+    let (s1, _, _) = send(app.clone(), get("/node/p1")).await;
+    assert_eq!(s1, StatusCode::OK, "p1 must exist");
+    let (s2, _, _) = send(app, get("/node/p2")).await;
+    assert_eq!(s2, StatusCode::OK, "p2 must exist");
+}
+
+#[tokio::test]
+async fn http_upsert_edge_idempotent_when_edge_exists() {
+    let (app, db) = open("http-upsert-idem");
+    {
+        let mut w = db.write();
+        w.insert_node("Person", "a", vec![]).unwrap();
+        w.insert_node("Person", "b", vec![]).unwrap();
+        w.insert_edge("KNOWS", "a", "b").unwrap();
+    }
+
+    let req = json_req(
+        "POST",
+        "/edges/upsert",
+        json!({
+            "edge_type": "KNOWS",
+            "src_key": "a",
+            "dst_key": "b",
+            "placeholder_label": "Person"
+        }),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK, "idempotent upsert must be 200");
+    let v = parse_json(&body);
+    assert_eq!(v["nodes_created"], json!(0), "no new nodes when both exist");
+    assert_eq!(
+        v["edge_inserted"],
+        json!(false),
+        "edge already existed — edge_inserted must be false"
+    );
+}

@@ -602,6 +602,14 @@ fn key_not_found(key: String) -> Response {
         .into_response()
 }
 
+fn conflict_response(key: String) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"error": GraphError::DuplicateKey { key }.to_string()})),
+    )
+        .into_response()
+}
+
 fn json_ok(value: Js) -> Response {
     (StatusCode::OK, Json(value)).into_response()
 }
@@ -1409,7 +1417,7 @@ async fn rename_node(
         None => return err_response("missing new_key"),
     };
     let db = state.db.clone();
-    match blocking_write(move || {
+    match tokio::task::spawn_blocking(move || {
         db.submit_batch(vec![BatchOp::RenameNode {
             old_key: key,
             new_key,
@@ -1417,8 +1425,11 @@ async fn rename_node(
     })
     .await
     {
-        Ok(_) => json_ok(json!({"ok": true})),
-        Err(resp) => resp,
+        Ok(Ok(_)) => json_ok(json!({"ok": true})),
+        Ok(Err(GraphError::KeyNotFound { key })) => key_not_found(key),
+        Ok(Err(GraphError::DuplicateKey { key })) => conflict_response(key),
+        Ok(Err(e)) => graph_err(e),
+        Err(_) => err_response("write task panicked"),
     }
 }
 

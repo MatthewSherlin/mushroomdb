@@ -6304,11 +6304,53 @@ impl<F: Fs> GraphDb<F> {
     /// Edge entries from dense-id WAL records (`InsertEdgeId`) are omitted when the partner
     /// endpoint's dense id is tombstoned. As a result, a live node's history can contain an
     /// `EdgeRemoved` (string-keyed, always resolves) without a corresponding `EdgeAdded`.
+    /// Build the set of all historical key-names that refer to the same node as
+    /// `queried_key` in the given WAL frames.
+    ///
+    /// When `RenameNode { old_key, new_key }` records are present in the WAL, a node
+    /// may have been known under different keys at different points in time.  This helper
+    /// follows the reverse-rename chain from `queried_key` and collects every historical
+    /// alias so that history scanners can match records written under any past name.
+    ///
+    /// Only **forward aliasing** is built: querying for the *new* key surfaces history
+    /// written under the *old* key.  The reverse direction (new events visible from old
+    /// key) is intentionally not supported.
+    fn build_key_alias_set(
+        frames: &[core_storage::wal::WalRecord],
+        queried_key: &str,
+    ) -> BTreeSet<String> {
+        use core_storage::wal::WalRecord;
+        // Map new_key → old_key for every RenameNode in the WAL.
+        let mut reverse_rename: HashMap<String, String> = HashMap::new();
+        for frame in frames {
+            let records: &[WalRecord] = match frame {
+                WalRecord::Batch(inner) => inner.as_slice(),
+                single => std::slice::from_ref(single),
+            };
+            for rec in records {
+                if let WalRecord::RenameNode { old_key, new_key } = rec {
+                    reverse_rename.insert(new_key.clone(), old_key.clone());
+                }
+            }
+        }
+        // Follow the reverse chain from queried_key.
+        let mut alias_set: BTreeSet<String> = BTreeSet::from([queried_key.to_string()]);
+        let mut current = queried_key.to_string();
+        while let Some(older) = reverse_rename.get(&current) {
+            alias_set.insert(older.clone());
+            current = older.clone();
+        }
+        alias_set
+    }
+
     pub fn node_history(&self, key: &str) -> Result<Vec<crate::history::HistoryEntry>> {
         use crate::history::{HistoryChange, HistoryEntry};
         use core_storage::wal::WalRecord;
 
         let (frames, _) = self.all_frames()?;
+
+        // Resolve all historical names for `key` (handles renames in the WAL).
+        let alias_set = Self::build_key_alias_set(&frames, key);
 
         let mut out: Vec<HistoryEntry> = Vec::new();
 
@@ -6322,12 +6364,16 @@ impl<F: Fs> GraphDb<F> {
 
             for rec in records {
                 let change = match rec {
-                    WalRecord::InsertNode { label, key: k, .. } if k == key => {
+                    WalRecord::InsertNode { label, key: k, .. }
+                        if alias_set.contains(k.as_str()) =>
+                    {
                         Some(HistoryChange::NodeInserted {
                             label: label.clone(),
                         })
                     }
-                    WalRecord::InsertNodeId { label, key: k, .. } if k == key => {
+                    WalRecord::InsertNodeId { label, key: k, .. }
+                        if alias_set.contains(k.as_str()) =>
+                    {
                         let label_str = match self.syms.resolve(*label) {
                             Some(s) => s.to_string(),
                             None => continue,
@@ -6338,11 +6384,12 @@ impl<F: Fs> GraphDb<F> {
                         key: k,
                         field,
                         value,
-                    } if k == key => Some(HistoryChange::PropSet {
+                    } if alias_set.contains(k.as_str()) => Some(HistoryChange::PropSet {
                         field: field.clone(),
                         value: value.clone(),
                     }),
                     WalRecord::SetPropId { id, field, value } => match self.ids.key_of(*id) {
+                        // key_of returns the current (post-rename) key; compare to queried key.
                         Some(resolved) if resolved == key => {
                             let field_str = match self.syms.resolve(*field) {
                                 Some(s) => s.to_string(),
@@ -6355,7 +6402,7 @@ impl<F: Fs> GraphDb<F> {
                         }
                         _ => None,
                     },
-                    WalRecord::RemoveProp { key: k, field } if k == key => {
+                    WalRecord::RemoveProp { key: k, field } if alias_set.contains(k.as_str()) => {
                         Some(HistoryChange::PropRemoved {
                             field: field.clone(),
                         })
@@ -6365,13 +6412,13 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        if src_key == key {
+                        if alias_set.contains(src_key.as_str()) {
                             Some(HistoryChange::EdgeAdded {
                                 edge_type: edge_type.clone(),
                                 other: dst_key.clone(),
                                 outgoing: true,
                             })
-                        } else if dst_key == key {
+                        } else if alias_set.contains(dst_key.as_str()) {
                             Some(HistoryChange::EdgeAdded {
                                 edge_type: edge_type.clone(),
                                 other: src_key.clone(),
@@ -6417,13 +6464,13 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        if src_key == key {
+                        if alias_set.contains(src_key.as_str()) {
                             Some(HistoryChange::EdgeRemoved {
                                 edge_type: edge_type.clone(),
                                 other: dst_key.clone(),
                                 outgoing: true,
                             })
-                        } else if dst_key == key {
+                        } else if alias_set.contains(dst_key.as_str()) {
                             Some(HistoryChange::EdgeRemoved {
                                 edge_type: edge_type.clone(),
                                 other: src_key.clone(),
@@ -6433,7 +6480,7 @@ impl<F: Fs> GraphDb<F> {
                             None
                         }
                     }
-                    WalRecord::DeleteNode { key: k } if k == key => {
+                    WalRecord::DeleteNode { key: k } if alias_set.contains(k.as_str()) => {
                         Some(HistoryChange::NodeDeleted)
                     }
                     // Skip: rule/view/fulltext/intern metadata; Batch wrapper handled above.
@@ -6492,6 +6539,10 @@ impl<F: Fs> GraphDb<F> {
         let (frames, _) = self.all_frames()?;
         let total_commits = self.wal_horizon_floor + frames.len() as u64;
 
+        // Resolve all historical names for a and b (handles RenameNode in the WAL).
+        let alias_a = Self::build_key_alias_set(&frames, a);
+        let alias_b = Self::build_key_alias_set(&frames, b);
+
         // Active edges between a and b tracked as (edge_type, src_key, dst_key, is_derived).
         // The is_derived flag is used by the DeleteNode sweep: manual edges are
         // swept with a synthetic Retracted(rule:None); derived edges are skipped
@@ -6514,8 +6565,10 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = alias_a.contains(src_key.as_str())
+                            && alias_b.contains(dst_key.as_str());
+                        let is_ba = alias_b.contains(src_key.as_str())
+                            && alias_a.contains(dst_key.as_str());
                         if is_ab || is_ba {
                             active.push((
                                 edge_type.clone(),
@@ -6559,8 +6612,10 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = alias_a.contains(src_key.as_str())
+                            && alias_b.contains(dst_key.as_str());
+                        let is_ba = alias_b.contains(src_key.as_str())
+                            && alias_a.contains(dst_key.as_str());
                         if is_ab || is_ba {
                             // Remove the first matching active entry (flag ignored).
                             if let Some(pos) = active.iter().position(|(et, s, d, _)| {
@@ -6576,7 +6631,9 @@ impl<F: Fs> GraphDb<F> {
                             });
                         }
                     }
-                    WalRecord::DeleteNode { key: k } if k == a || k == b => {
+                    WalRecord::DeleteNode { key: k }
+                        if alias_a.contains(k.as_str()) || alias_b.contains(k.as_str()) =>
+                    {
                         // Sweep: implicitly retract only MANUAL active edges.
                         // Derived active edges are skipped here because the rule
                         // engine appends a DerivedEdgeRetracted marker immediately
@@ -6602,8 +6659,10 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = alias_a.contains(src_key.as_str())
+                            && alias_b.contains(dst_key.as_str());
+                        let is_ba = alias_b.contains(src_key.as_str())
+                            && alias_a.contains(dst_key.as_str());
                         if is_ab || is_ba {
                             active.push((et.clone(), src_key.clone(), dst_key.clone(), true));
                             out.push(EdgeHistoryEvent {
@@ -6620,8 +6679,10 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = alias_a.contains(src_key.as_str())
+                            && alias_b.contains(dst_key.as_str());
+                        let is_ba = alias_b.contains(src_key.as_str())
+                            && alias_a.contains(dst_key.as_str());
                         if is_ab || is_ba {
                             // Push unconditionally: a derived edge whose Added marker
                             // predates the history horizon has no `active` entry, but
@@ -6686,6 +6747,10 @@ impl<F: Fs> GraphDb<F> {
             });
         }
 
+        // Resolve all historical names for a and b (handles RenameNode in the WAL).
+        let alias_a = Self::build_key_alias_set(&frames, a);
+        let alias_b = Self::build_key_alias_set(&frames, b);
+
         // Local index into surviving frames (0 = first frame of oldest archive).
         let local_commit = at_commit - self.wal_horizon_floor;
 
@@ -6705,8 +6770,10 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = alias_a.contains(src_key.as_str())
+                            && alias_b.contains(dst_key.as_str());
+                        let is_ba = alias_b.contains(src_key.as_str())
+                            && alias_a.contains(dst_key.as_str());
                         if is_ab || is_ba {
                             active.insert((et.clone(), src_key.clone(), dst_key.clone()));
                         }
@@ -6734,13 +6801,17 @@ impl<F: Fs> GraphDb<F> {
                         src_key,
                         dst_key,
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = alias_a.contains(src_key.as_str())
+                            && alias_b.contains(dst_key.as_str());
+                        let is_ba = alias_b.contains(src_key.as_str())
+                            && alias_a.contains(dst_key.as_str());
                         if is_ab || is_ba {
                             active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
                         }
                     }
-                    WalRecord::DeleteNode { key: k } if k == a || k == b => {
+                    WalRecord::DeleteNode { key: k }
+                        if alias_a.contains(k.as_str()) || alias_b.contains(k.as_str()) =>
+                    {
                         // All edges touching the deleted node are gone.
                         active.retain(|(_, s, d)| s != k && d != k);
                     }
@@ -6750,8 +6821,10 @@ impl<F: Fs> GraphDb<F> {
                         dst_key,
                         ..
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = alias_a.contains(src_key.as_str())
+                            && alias_b.contains(dst_key.as_str());
+                        let is_ba = alias_b.contains(src_key.as_str())
+                            && alias_a.contains(dst_key.as_str());
                         if is_ab || is_ba {
                             active.insert((et.clone(), src_key.clone(), dst_key.clone()));
                         }
@@ -6762,8 +6835,10 @@ impl<F: Fs> GraphDb<F> {
                         dst_key,
                         ..
                     } => {
-                        let is_ab = src_key == a && dst_key == b;
-                        let is_ba = src_key == b && dst_key == a;
+                        let is_ab = alias_a.contains(src_key.as_str())
+                            && alias_b.contains(dst_key.as_str());
+                        let is_ba = alias_b.contains(src_key.as_str())
+                            && alias_a.contains(dst_key.as_str());
                         if is_ab || is_ba {
                             active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
                         }

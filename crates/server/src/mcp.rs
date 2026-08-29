@@ -166,6 +166,7 @@ fn dispatch_call(db: &SharedDb, params: Option<&Js>) -> CallOutcome {
         "node_history" => tool_node_history(db, args),
         "edge_history" => tool_edge_history(db, args),
         "was_linked" => tool_was_linked(db, args),
+        "rename_node" => tool_rename_node(db, args),
         _ => protocol_invalid(),
     }
 }
@@ -715,6 +716,24 @@ fn tool_was_linked(db: &SharedDb, args: &Js) -> CallOutcome {
     }
 }
 
+fn tool_rename_node(db: &SharedDb, args: &Js) -> CallOutcome {
+    let Some(old_key) = args.get("old_key").and_then(Js::as_str) else {
+        return CallOutcome::ToolErr("missing old_key".into());
+    };
+    let Some(new_key) = args.get("new_key").and_then(Js::as_str) else {
+        return CallOutcome::ToolErr("missing new_key".into());
+    };
+    let mut g = db.write();
+    match g.rename_node(old_key, new_key) {
+        Ok(()) => CallOutcome::ToolOk(json!({
+            "ok": true,
+            "old_key": old_key,
+            "new_key": new_key,
+        })),
+        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+    }
+}
+
 fn graph_err_msg(e: GraphError) -> String {
     match e {
         GraphError::QueryError { detail } | GraphError::IngestError { detail } => detail,
@@ -958,6 +977,18 @@ fn tools_list() -> Js {
                     },
                     "required": ["a", "b", "edge_type", "at_commit"]
                 }
+            },
+            {
+                "name": "rename_node",
+                "description": "Rename a node's key. The dense id and all edges/properties remain stable. Returns 404 if `old_key` does not exist, 409 if `new_key` is already taken.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "old_key": { "type": "string", "minLength": 1, "description": "Current node key." },
+                        "new_key": { "type": "string", "minLength": 1, "description": "Desired new node key." }
+                    },
+                    "required": ["old_key", "new_key"]
+                }
             }
         ]
     })
@@ -1141,13 +1172,14 @@ mod tests {
             "node_history",
             "edge_history",
             "was_linked",
+            "rename_node",
         ] {
             assert!(names.contains(expected), "missing tool: {expected}");
         }
         assert_eq!(
             names.len(),
-            15,
-            "expected exactly 15 tools, got {}",
+            16,
+            "expected exactly 16 tools, got {}",
             names.len()
         );
     }

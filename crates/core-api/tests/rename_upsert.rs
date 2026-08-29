@@ -1,6 +1,8 @@
 /// Tests for rename_node, InsertEdgeUpsert, and reader.rs MVCC coherence for
 /// RenameNode — see Task 2 brief.
-use core_api::{Direction, GraphDb, GraphError, SharedDb, Value};
+use core_api::{
+    Direction, EdgeEvent, GraphDb, GraphError, HistoryChange, Predicate, RuleDef, SharedDb, Value,
+};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -360,5 +362,105 @@ fn insert_edge_upsert_placeholder_last_change_touched() {
     assert!(
         db.last_changed("bob").is_some(),
         "last_changed must be set for newly created bob"
+    );
+}
+
+// ── history alias chain: rename visibility ────────────────────────────────────
+
+/// node_history on the NEW key must include the NodeInserted record written
+/// under the OLD key before the rename.
+#[test]
+fn node_history_shows_insert_through_rename() {
+    let dir = tmp("nh-insert");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.rename_node("alice", "alice2").unwrap();
+
+    let history = db.node_history("alice2").expect("history must succeed");
+    let has_inserted = history
+        .iter()
+        .any(|e| matches!(&e.change, HistoryChange::NodeInserted { label } if label == "Person"));
+    assert!(
+        has_inserted,
+        "node_history(alice2) must include the NodeInserted written under 'alice': {history:?}"
+    );
+}
+
+/// edge_history on the NEW key pair (after rename) must surface DerivedEdgeAdded
+/// markers that were written under the OLD key.
+#[test]
+fn edge_history_sees_derived_events_after_rename() {
+    let dir = tmp("eh-derived");
+    let mut db = GraphDb::open(&dir).unwrap();
+    // Create two nodes, wire a rule, then rename one.
+    db.insert_node("Item", "x", vec![("kind".into(), Value::Str("w".into()))])
+        .unwrap();
+    db.insert_node("Item", "y", vec![("kind".into(), Value::Str("w".into()))])
+        .unwrap();
+    db.create_rule(RuleDef {
+        name: "ehr-rule".into(),
+        src_label: "Item".into(),
+        dst_label: "Item".into(),
+        predicate: Predicate::FieldEqual {
+            field: "kind".into(),
+        },
+        edge_type: "RELATED".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    // Rule fires: DerivedEdgeAdded written with src="x", dst="y"
+    db.rename_node("x", "x2").unwrap();
+
+    // edge_history on the new key pair must surface the Added event.
+    let hr = db
+        .edge_history("x2", "y")
+        .expect("edge_history must succeed");
+    let has_added = hr.items.iter().any(|e| e.event == EdgeEvent::Added);
+    assert!(
+        has_added,
+        "edge_history(x2, y) must include DerivedEdgeAdded written under old key 'x': {:?}",
+        hr.items
+    );
+}
+
+/// was_linked on the NEW key pair must see the derived edge added before the rename.
+#[test]
+fn was_linked_resolves_through_rename() {
+    let dir = tmp("wl-rename");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Item", "a", vec![("k".into(), Value::Str("v".into()))])
+        .unwrap();
+    db.insert_node("Item", "b", vec![("k".into(), Value::Str("v".into()))])
+        .unwrap();
+    db.create_rule(RuleDef {
+        name: "wlr-rule".into(),
+        src_label: "Item".into(),
+        dst_label: "Item".into(),
+        predicate: Predicate::FieldEqual { field: "k".into() },
+        edge_type: "LINKED".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    // Rule fires at commit N. Rename happens at commit N+1.
+    let total_before_rename = db.wal_total_commits().unwrap();
+    db.rename_node("a", "a2").unwrap();
+
+    // was_linked at the commit when the rule fired, querying with the NEW key.
+    let linked = db
+        .was_linked("a2", "b", "LINKED", total_before_rename - 1)
+        .expect("was_linked must succeed");
+    assert!(
+        linked,
+        "was_linked(a2, b, LINKED, commit-before-rename) must be true"
     );
 }
