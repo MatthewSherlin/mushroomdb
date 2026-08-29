@@ -24,7 +24,7 @@ pub use db::{
     snapshot_version_at, write_snapshot_bak, BackupReport, BatchBuilder, BatchOp, DeleteReport,
     EdgeInfo, Explanation, ExportEdge, FsyncPolicy, GraphDb, MaskedEdge, MaskedNodeResult,
     MutationEvent, NodeInfo, NodeRef, OpenOptions, Precondition, PredicateSummary, RuleStats,
-    SnapshotOptions, Stats,
+    SnapshotOptions, Stats, WriteAuthz,
 };
 
 /// Current on-disk snapshot format version written by this build.

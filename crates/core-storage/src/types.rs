@@ -96,6 +96,19 @@ pub enum GraphError {
     /// statement (CREATE / MERGE / MATCH…SET / DELETE). The HTTP layer maps
     /// this to 400 Bad Request with body `{"error":"masked queries are read-only"}`.
     MaskedReadOnly,
+    /// A role-scoped write was denied by the authz decision table (§3, §4.3).
+    ///
+    /// `reason` carries the verbatim §4.3 error body text (without the JSON
+    /// envelope).  The HTTP layer maps this to 403 with body
+    /// `{"error": "<reason>"}`.  Five reason patterns are defined by the spec:
+    /// - `"role-bound token: label '<L>' not in write scope (<scope_field>)"`
+    /// - `"role-bound token: target node not visible"` (hidden ≡ absent)
+    /// - `"role-bound token: edge endpoint not visible"`
+    /// - `"role-bound token: edge type '<T>' not in write scope (<scope_field>)"`
+    /// - `"role-bound token: this endpoint is not permitted"`
+    RoleWriteDenied {
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for GraphError {
@@ -129,6 +142,7 @@ impl std::fmt::Display for GraphError {
                 "CAS conflict on key {key:?}: expected commit {expected}, actual {actual}"
             ),
             GraphError::MaskedReadOnly => write!(f, "masked queries are read-only"),
+            GraphError::RoleWriteDenied { reason } => write!(f, "{reason}"),
         }
     }
 }
