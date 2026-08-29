@@ -2900,3 +2900,71 @@ async fn role_token_with_client_mask_and_stub_hidden_gets_no_stubs() {
         "restricted field must not appear on role path: {v}"
     );
 }
+
+/// Full-token GET /neighborhood/{key}?mask=...&stub_hidden=true must return
+/// hidden direct neighbours as stub rows (key present, label null).
+/// The same request without stub_hidden must omit the hidden neighbours entirely.
+///
+/// Graph: alice -KNOWS-> bob (hidden from mask) -KNOWS-> carol (visible)
+/// Mask: {alice, carol}
+///
+/// stub_hidden=true  → alice's neighborhood at depth=1 includes bob as stub row
+/// stub_hidden absent → alice's neighborhood at depth=1 is empty (bob hidden)
+///
+/// In both cases carol must NOT appear (BFS doesn't expand through hidden bob).
+#[tokio::test]
+async fn client_mask_stub_neighborhood_shows_hidden_direct_neighbor() {
+    let (app, db) = open("stub-nb-http");
+    {
+        let mut g = db.write();
+        g.insert_node("P", "alice", vec![]).unwrap();
+        g.insert_node("P", "bob", vec![]).unwrap(); // hidden from mask
+        g.insert_node("P", "carol", vec![]).unwrap();
+        g.insert_edge("KNOWS", "alice", "bob").unwrap();
+        g.insert_edge("KNOWS", "bob", "carol").unwrap();
+    }
+
+    // Stub mode: bob appears as a stub row (label absent/null); carol does not.
+    let req = get("/node/alice/neighborhood?mask=alice,carol&stub_hidden=true&depth=2&dir=out");
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "stub neighborhood must be 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    let rows = v["rows"].as_array().expect("must have rows");
+
+    let bob_stub_row = rows.iter().find(|r| {
+        let row = r.as_array().unwrap();
+        row.first() == Some(&json!("bob")) && row.get(1) == Some(&json!(null))
+    });
+    assert!(
+        bob_stub_row.is_some(),
+        "stub mode: bob must appear as stub row (key=bob, label=null): {v}"
+    );
+
+    let carol_row = rows.iter().find(|r| {
+        r.as_array()
+            .and_then(|row| row.first())
+            .map(|k| k == &json!("carol"))
+            .unwrap_or(false)
+    });
+    assert!(
+        carol_row.is_none(),
+        "carol must NOT appear — BFS must not expand through hidden bob: {v}"
+    );
+
+    // Omit mode (no stub_hidden): bob is invisible, neighborhood is empty.
+    let req2 = get("/node/alice/neighborhood?mask=alice,carol&depth=2&dir=out");
+    let (status2, body2, _) = send(app, req2).await;
+    assert_eq!(status2, StatusCode::OK);
+    let v2 = parse_json(&body2);
+    let rows2 = v2["rows"].as_array().expect("must have rows");
+    assert_eq!(
+        rows2.len(),
+        0,
+        "omit mode: neighborhood must be empty when hidden node blocks all paths: {v2}"
+    );
+}

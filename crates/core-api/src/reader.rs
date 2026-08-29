@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use core_query::cypher::{execute, is_write_tokens, lex, parse, plan, Params};
-use core_query::{neighborhood, Dir, GraphView, ResultSet};
+use core_query::{expand, neighborhood, Dir, GraphView, ResultSet};
 use core_storage::fulltext::FulltextIndex;
 use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::v8::MappedBase;
@@ -647,7 +647,7 @@ fn neighborhood_masked_from(
     dir: Dir,
     mask: &NodeMask,
 ) -> Option<ResultSet> {
-    let id = state.ids.get(key)?;
+    let start_id = state.ids.get(key)?;
     let view = make_view(state, base, Some(&mask.visible));
     let resolved: Option<Vec<u32>> = edge_types.map(|names| {
         names
@@ -655,18 +655,50 @@ fn neighborhood_masked_from(
             .filter_map(|name| view.syms.get(name))
             .collect()
     });
-    let nb = neighborhood(&view, id, depth, resolved.as_deref(), dir);
+    let nb = neighborhood(&view, start_id, depth, resolved.as_deref(), dir);
     let mut rs = ResultSet::new(vec!["key".into(), "label".into(), "depth".into()]);
-    for (nid, d) in nb.nodes {
-        let k = view.key_of(nid);
+    // Collect visible BFS results (start_id at depth 0, BFS nodes after).
+    let mut visited: Vec<(u32, u32)> = Vec::with_capacity(nb.nodes.len() + 1);
+    visited.push((start_id, 0));
+    for (nid, d) in &nb.nodes {
+        let k = view.key_of(*nid);
         let lbl = view
-            .label_of(nid)
+            .label_of(*nid)
             .expect("real nodes always have a label; u32::MAX sentinel cannot occur");
         rs.push_row(vec![
             Some(Value::Str(k.to_string())),
             Some(Value::Str(lbl.to_string())),
-            Some(Value::Int(d as i64)),
+            Some(Value::Int(*d as i64)),
         ]);
+        visited.push((*nid, *d));
+    }
+    // Stub mode: add hidden direct neighbours of each visited node as stubs.
+    // Hidden nodes are edge-endpoints only — they are not added to the BFS
+    // frontier, so the BFS never expands through them in either mode.
+    //
+    // Role-token callers always pass an Omit-mode mask (mask_for_role uses
+    // NodeMask::from_ids which defaults to Omit; intersect() hard-returns Omit),
+    // so this branch is unreachable on the role path — security is unaffected.
+    if mask.mode() == crate::mask::MaskMode::Stub {
+        let raw_view = make_view(state, base, None);
+        let mut seen: HashSet<u32> = visited.iter().map(|(id, _)| *id).collect();
+        for (node_id, node_depth) in &visited {
+            if *node_depth >= depth {
+                continue;
+            }
+            for e in expand(&raw_view, *node_id, resolved.as_deref(), dir) {
+                let nbr = if e.src == *node_id { e.dst } else { e.src };
+                if !mask.contains_id(nbr) && seen.insert(nbr) {
+                    if let Some(k) = state.ids.key_of(nbr) {
+                        rs.push_row(vec![
+                            Some(Value::Str(k.to_string())),
+                            None,
+                            Some(Value::Int((*node_depth + 1) as i64)),
+                        ]);
+                    }
+                }
+            }
+        }
     }
     Some(rs)
 }

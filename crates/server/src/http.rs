@@ -1133,6 +1133,37 @@ async fn neighborhood(
         };
         return json_ok(result_set_json(&rs));
     }
+    // Full-token path: optional client mask + stub_hidden via query params.
+    // `mask=key1,key2` — comma-separated visible keys.
+    // `stub_hidden=true` — opt into MaskMode::Stub; hidden direct neighbours
+    // appear as stub rows (label: null) in the result; BFS does not expand
+    // through them in either mode.
+    let mask_param = qs.get("mask").map(String::as_str).unwrap_or("").trim();
+    if !mask_param.is_empty() {
+        let stub_hidden = qs
+            .get("stub_hidden")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let g = state.db.read();
+        let mask = {
+            let keys = mask_param
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let m = NodeMask::from_keys(&*g, keys);
+            if stub_hidden {
+                m.with_mode(MaskMode::Stub)
+            } else {
+                m
+            }
+        };
+        return match g.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &mask) {
+            Some(rs) => json_ok(result_set_json(&rs)),
+            None => graph_err(GraphError::KeyNotFound { key: key.clone() }),
+        };
+    }
+
+    // Unmasked full-token path (no mask param).
     let rs = {
         let g = state.db.read();
         match g.node_ref(&key) {
