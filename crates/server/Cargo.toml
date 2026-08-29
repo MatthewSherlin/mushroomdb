@@ -17,8 +17,8 @@ default = []
 embed-ui = ["dep:include_dir"]
 
 [dependencies]
-core-api = { package = "mushroomdb", path = "../core-api", version = "0.2.0" }
-arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.2.0" }
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.3.0" }
+arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.3.0" }
 # ws enabled now so Task 5 can add GET /watch without a dep bump.
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }

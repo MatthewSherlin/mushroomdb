@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.3.0 — 2026-08-30
+
+Role-scoped writes and mask-aware vector search. Additive over v0.2.0 — no
+breaking changes; existing role tokens and stores behave exactly as before.
+
+### RBAC write scopes (role-bounded mutations)
+
+v0.2 shipped role tokens as read-only. v0.3 lets a role declare **write
+scopes** and perform the mutations they allow, under a never-widen rule: no
+write a role performs can reveal or touch data outside its visibility.
+
+- `WriteScope` on `RoleDef` (`roles.json` v2): `create_labels`,
+  `update_labels`, `delete_labels`, `create_edge_types`, `delete_edge_types`.
+  A role with no `write` field stays read-only (v1 sidecars load unchanged,
+  byte-identical behavior).
+- Scoped writes over HTTP: `POST /query` (CREATE/SET/DELETE/MERGE),
+  `/ingest`, `/nodes`, `/edges`, `/edges/upsert`, and prop endpoints flip
+  from blanket-403 to scoped-allow for roles that declare the scope.
+- Every escalation path from the threat model is closed and tested: hidden
+  nodes are indistinguishable from absent ones (byte-equal errors) on
+  update/delete/MERGE; edge creation requires both endpoints visible;
+  the Cypher `MATCH` phase of a role-scoped write reads through the role's
+  mask; a role can read back a node it just created via `MERGE … RETURN`.
+- `create/update/delete_labels ⊆` the role's read labels, validated at
+  `apply_schema` — a role can never touch state it cannot observe.
+- `/rules`, `/subscribe`, `/watch`, `/stats`, `/suggest`, `/explain`,
+  `/algo/*`, `/backup`, and node rename remain admin-only for all role
+  tokens. The full §6.2 adversarial checklist ships as executable tests.
+
+### Mask-aware vector search
+
+- ANN / vector search and edge-traversal reads now respect node masks: a
+  masked reader never sees hidden nodes in similarity results or neighbor
+  expansions. HNSW adversarial coverage added.
+- Python binding gains native ANN and edge-property reads (parity with the
+  core API and TypeScript client).
+
+### Fixes
+
+- `MERGE … RETURN` under a role token now returns the just-created node
+  instead of empty rows (the authz mask is re-resolved after the create).
+
 ## v0.2.0 — 2026-08-29
 
 The association-engine release: trust, physics, and agent-default memory.
