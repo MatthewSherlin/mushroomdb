@@ -603,7 +603,9 @@ fn node_edges_from(
         let edge_type = state
             .syms
             .resolve(etype)
-            .expect("topology etype must be interned")
+            .ok_or_else(|| GraphError::Corrupt {
+                detail: format!("reader: topology etype {etype} not in interner"),
+            })?
             .to_string();
         for dir in [Direction::Out, Direction::In] {
             for &nbr in tv.neighbors(etype, dir, id).as_ref() {

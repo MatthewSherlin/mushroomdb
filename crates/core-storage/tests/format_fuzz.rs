@@ -16,7 +16,9 @@
 //!       then recompute the header CRC so `parse_header` succeeds and
 //!       `validate_section_bounds` is actually exercised.  Both
 //!       `MappedBase::validate_section_bounds` and `snapshot::decode` are
-//!       called; neither may panic.  Fixed seed, 256 cases.
+//!       called; neither may panic.  Random seed (proptest default);
+//!       deterministic hardcoded mutations (u32::MAX / 1 / arbitrary) provide
+//!       the coverage floor regardless of seed.
 
 use core_storage::snapshot::{self, SnapshotState};
 use core_storage::v8::MappedBase;
@@ -398,7 +400,9 @@ fn corrupt_v8_section_len(v8: &[u8], section_idx: usize, new_len: u32) -> Option
 // Mutates individual section `len` fields in a valid V8 snapshot, recomputes
 // the header CRC so `parse_header` passes, then verifies that both
 // `MappedBase::validate_section_bounds` and `snapshot::decode` return
-// `Err(Corrupt)` rather than panicking.  Fixed 256-case corpus.
+// `Err(Corrupt)` rather than panicking.  Random seed (proptest default);
+// deterministic hardcoded mutations (u32::MAX / 1 / arbitrary u32) provide
+// the coverage floor regardless of seed.  256 cases.
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 256,
