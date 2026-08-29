@@ -3393,7 +3393,7 @@ async fn scoped_create_node_vis_denied() {
 
 #[tokio::test]
 async fn write_none_create_node_endpoint_not_permitted() {
-    // write:None role → §4.3 "this endpoint is not permitted".
+    // write:None role → v1 byte-identical body "writes are not permitted".
     let (app, _db) = open_rbac_write(
         "t3-cn-none",
         &[("analyst", &["AgentNote"], None)],
@@ -3411,8 +3411,8 @@ async fn write_none_create_node_endpoint_not_permitted() {
     let v = parse_json(&body);
     assert_eq!(
         v["error"],
-        json!("role-bound token: this endpoint is not permitted"),
-        "write:None must get endpoint-not-permitted: {v}"
+        json!("role-bound token: writes are not permitted"),
+        "write:None must get v1 blanket-403 body: {v}"
     );
 }
 
@@ -3604,6 +3604,37 @@ async fn scoped_delete_edge_type_denied() {
         v["error"],
         json!("role-bound token: edge type 'OTHER_TYPE' not in write scope (delete_edge_types)"),
         "delete edge type-denied body must match §4.3: {v}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_delete_edge_hidden_endpoint() {
+    // DELETE /edges with one hidden endpoint → "edge endpoint not visible".
+    let (app, db) = open_rbac_write(
+        "t3-de-vis",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write().insert_node("AgentNote", "src", vec![]).unwrap();
+    // dst is a "Secret" node — hidden from role's mask.
+    db.write()
+        .insert_node("Secret", "hidden-dst", vec![])
+        .unwrap();
+    db.write()
+        .insert_edge("RECALLS", "src", "hidden-dst")
+        .unwrap();
+    let (status, body, _) = send(
+        app,
+        authed_delete("/edges/RECALLS/src/hidden-dst", "role-tok"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: edge endpoint not visible"),
+        "delete edge with hidden endpoint must match §4.3: {v}"
     );
 }
 
@@ -3809,6 +3840,39 @@ async fn scoped_remove_prop_vis_denied() {
     );
 }
 
+#[tokio::test]
+async fn scoped_remove_prop_scope_denied() {
+    // DELETE /node/{key}/prop/{field} on a visible node whose label is NOT in
+    // update_labels → §4.3 scope-denied body.
+    let (app, db) = open_rbac_write(
+        "t3-rp-scope",
+        &[(
+            "agent",
+            &["AgentNote"],
+            Some(WriteScope {
+                create_labels: vec!["AgentNote".into()],
+                update_labels: vec![], // no update scope
+                delete_labels: vec!["AgentNote".into()],
+                create_edge_types: vec!["RECALLS".into()],
+                delete_edge_types: vec!["RECALLS".into()],
+            }),
+        )],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write()
+        .insert_node("AgentNote", "n1", vec![("x".into(), Value::Int(1))])
+        .unwrap();
+    let (status, body, _) = send(app, authed_delete("/node/n1/prop/x", "role-tok")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["error"],
+        json!("role-bound token: label 'AgentNote' not in write scope (update_labels)"),
+        "remove prop scope-denied body must match §4.3: {v}"
+    );
+}
+
 // ── POST /query (write Cypher) ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -3885,13 +3949,18 @@ async fn scoped_query_set_allowed() {
 
 #[tokio::test]
 async fn scoped_query_set_vis_denied() {
+    // The MATCH read phase is masked for role-scoped writes: a hidden node is
+    // invisible to MATCH → zero rows → no SetProp op → 200 zero-rows.
+    // This closes the existence oracle: hidden ≡ absent (spec §3.1).
     let (app, db) = open_rbac_write(
         "t3-qs-vis",
         &[("agent", &["AgentNote"], Some(agent_write_scope()))],
         Some("admin"),
         &[("role-tok", "agent")],
     );
-    db.write().insert_node("Secret", "hid", vec![]).unwrap();
+    db.write()
+        .insert_node("Secret", "hid", vec![("x".into(), Value::Int(0))])
+        .unwrap();
     let req = authed_json_req(
         "POST",
         "/query?format=json",
@@ -3899,26 +3968,24 @@ async fn scoped_query_set_vis_denied() {
         json!({"cypher": "MATCH (n {id: 'hid'}) SET n.x = 1"}),
     );
     let (status, body, _) = send(app, req).await;
-    // MATCH in the write context sees all nodes (the read phase is unmasked in
-    // exec_write_stmt); the matched SetProp op then hits the authz check in
-    // commit_logged_batch → "target node not visible" → 403.
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "query SET on hidden node must be 403: {}",
+        StatusCode::OK,
+        "query SET on hidden node must be 200 zero-rows (hidden ≡ absent): {}",
         String::from_utf8_lossy(&body)
     );
-    let v = parse_json(&body);
+    // Verify the hidden node is untouched (full-token read).
+    let val = db.read().get_prop("hid", "x");
     assert_eq!(
-        v["error"],
-        json!("role-bound token: target node not visible"),
-        "SET vis-denied body must match §4.3: {v}"
+        val,
+        Some(Value::Int(0)),
+        "hidden node prop must be unchanged after masked MATCH SET"
     );
 }
 
 #[tokio::test]
 async fn scoped_query_write_none_endpoint_not_permitted() {
-    // write:None role trying a write Cypher query → §4.3 "this endpoint is not permitted".
+    // write:None role trying a write Cypher query → v1 byte-identical body.
     let (app, _db) = open_rbac_write(
         "t3-qw-none",
         &[("analyst", &["AgentNote"], None)],
@@ -3936,8 +4003,8 @@ async fn scoped_query_write_none_endpoint_not_permitted() {
     let v = parse_json(&body);
     assert_eq!(
         v["error"],
-        json!("role-bound token: this endpoint is not permitted"),
-        "write:None query must get endpoint-not-permitted: {v}"
+        json!("role-bound token: writes are not permitted"),
+        "write:None query must get v1 blanket-403 body: {v}"
     );
 }
 
@@ -4043,7 +4110,7 @@ async fn scoped_ingest_no_create_labels_403() {
 
 #[tokio::test]
 async fn scoped_ingest_with_write_none_role_403() {
-    // write:None role → §4.3 "this endpoint is not permitted".
+    // write:None role → v1 byte-identical body "writes are not permitted".
     let (app, _db) = open_rbac_write(
         "t3-ing-none",
         &[("analyst", &["AgentNote"], None)],
@@ -4061,8 +4128,8 @@ async fn scoped_ingest_with_write_none_role_403() {
     let v = parse_json(&body);
     assert_eq!(
         v["error"],
-        json!("role-bound token: this endpoint is not permitted"),
-        "write:None ingest must get endpoint-not-permitted: {v}"
+        json!("role-bound token: writes are not permitted"),
+        "write:None ingest must get v1 blanket-403 body: {v}"
     );
 }
 

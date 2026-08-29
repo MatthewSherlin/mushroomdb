@@ -5246,6 +5246,7 @@ impl<F: Fs> GraphDb<F> {
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
         // Resolve scope (fails fast if role has no write scope).
+        // write:None → byte-identical v1 blanket-403 body (plan §v1-sidecar mandate).
         let scope =
             {
                 let roles = self.roles.as_deref().ok_or_else(|| GraphError::Corrupt {
@@ -5259,7 +5260,7 @@ impl<F: Fs> GraphDb<F> {
                 def.write
                     .clone()
                     .ok_or_else(|| GraphError::RoleWriteDenied {
-                        reason: "role-bound token: this endpoint is not permitted".into(),
+                        reason: "role-bound token: writes are not permitted".into(),
                     })?
             };
         // Resolve mask inside the call (same guard, §5 coherence).
@@ -5330,7 +5331,7 @@ impl<F: Fs> GraphDb<F> {
     /// no special HTTP-layer check is needed.
     ///
     /// Roles with `write: None` return `RoleWriteDenied` with
-    /// "this endpoint is not permitted" (byte-identical to v1 blanket 403).
+    /// "writes are not permitted" (byte-identical to v1 blanket 403).
     pub fn ingest_with_edges_authz(
         &mut self,
         role: &str,
@@ -5340,6 +5341,7 @@ impl<F: Fs> GraphDb<F> {
         edges: &[(String, String, String)],
     ) -> Result<crate::ingest::IngestReport> {
         // Resolve scope (fails fast if role has no write scope).
+        // write:None → byte-identical v1 blanket-403 body (plan §v1-sidecar mandate).
         let scope =
             {
                 let roles = self.roles.as_deref().ok_or_else(|| GraphError::Corrupt {
@@ -5353,7 +5355,7 @@ impl<F: Fs> GraphDb<F> {
                 def.write
                     .clone()
                     .ok_or_else(|| GraphError::RoleWriteDenied {
-                        reason: "role-bound token: this endpoint is not permitted".into(),
+                        reason: "role-bound token: writes are not permitted".into(),
                     })?
             };
         let mask = self.mask_for_role(role)?;
@@ -6570,10 +6572,22 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("plan: {e}"),
         })?;
         // MATCH phase is read-only; borrow ends before batch opens.
-        let match_rs =
-            execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            })?;
+        //
+        // When a role-scoped write is in flight, run the MATCH read through
+        // view_masked so hidden nodes are invisible → hidden ≡ absent ≡
+        // zero-rows (no SetProp ops generated, no existence-oracle 403).
+        // Full-authority writes (pending_write_authz=None) keep view().
+        let match_rs = {
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            }
+        }
+        .map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })?;
 
         // Collect (key, field, value) for each matched row × each SET clause.
         let mut set_ops: Vec<(String, String, Value)> = Vec::new();
@@ -6667,10 +6681,19 @@ impl<F: Fs> GraphDb<F> {
         let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
             detail: format!("plan: {e}"),
         })?;
-        let match_rs =
-            execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            })?;
+        // Role-scoped writes: mask the MATCH read phase so hidden nodes are
+        // invisible → hidden ≡ absent ≡ zero-rows (spec §3.1, hidden ≡ absent).
+        let match_rs = {
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            }
+        }
+        .map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })?;
 
         // Collect (etype, src_key, dst_key) for each row × each delete target.
         let mut del_ops: Vec<(String, String, String)> = Vec::new();
@@ -6761,10 +6784,19 @@ impl<F: Fs> GraphDb<F> {
         let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
             detail: format!("plan: {e}"),
         })?;
-        let match_rs =
-            execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-                detail: format!("execute: {e}"),
-            })?;
+        // Role-scoped writes: mask the MATCH read phase so hidden nodes are
+        // invisible → hidden ≡ absent ≡ zero-rows (spec §3.1, hidden ≡ absent).
+        let match_rs = {
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            }
+        }
+        .map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })?;
 
         // Collect unique node keys to delete (deduplicate across rows × vars).
         let mut keys: Vec<String> = Vec::new();
@@ -6963,10 +6995,16 @@ impl<F: Fs> GraphDb<F> {
             let ops = plan(&q).map_err(|e| GraphError::QueryError {
                 detail: format!("plan: {e}"),
             })?;
-            return execute(&self.view(), &ops, &Params(params)).map_err(|e| {
-                GraphError::QueryError {
-                    detail: format!("execute: {e}"),
-                }
+            // Use view_masked when a role-scoped write is in flight so the
+            // post-merge projection is consistent with the masked read phase.
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            return (if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            })
+            .map_err(|e| GraphError::QueryError {
+                detail: format!("execute: {e}"),
             });
         }
 

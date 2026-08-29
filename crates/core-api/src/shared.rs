@@ -608,8 +608,9 @@ fn drain_loop(
                                     key: format!("role:{role}"),
                                 })?
                                 .clone();
+                            // write:None → byte-identical v1 blanket-403 body.
                             def.write.ok_or_else(|| GraphError::RoleWriteDenied {
-                                reason: "role-bound token: this endpoint is not permitted".into(),
+                                reason: "role-bound token: writes are not permitted".into(),
                             })?
                         };
                         let mask = db.mask_for_role(&role)?;
