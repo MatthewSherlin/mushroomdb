@@ -439,6 +439,30 @@ pub struct Explanation {
     pub predicate: PredicateSummary,
 }
 
+/// Report returned by [`GraphDb::backup_to`].
+#[derive(Debug, Clone)]
+pub struct BackupReport {
+    /// Filenames copied into the destination directory (sorted ascending).
+    pub files: Vec<String>,
+    /// Total bytes written across all copied files.
+    pub bytes: u64,
+    /// `true` when the destination opened cleanly and passed CRC section verification.
+    pub verified: bool,
+}
+
+/// One directed edge in export form, with optional rule attribution for derived edges.
+///
+/// Returned by [`GraphDb::all_edges_for_export`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExportEdge {
+    pub edge_type: String,
+    pub src: String,
+    pub dst: String,
+    pub derived: bool,
+    /// Rule name that created this edge, if derived. `None` for manual edges.
+    pub rule: Option<String>,
+}
+
 /// Construct the standard write-query result set (columns: created, properties_set, deleted).
 fn write_result_set() -> ResultSet {
     ResultSet::new(vec![
@@ -5341,6 +5365,189 @@ impl<F: Fs> GraphDb<F> {
         // (sort key matches PartialEq for this case) so one pass drops the dup.
         edges.dedup();
         Ok(edges)
+    }
+
+    // ── Backup ────────────────────────────────────────────────────────────────
+
+    /// Copy this store to `dest` as a consistent, verified snapshot.
+    ///
+    /// Copies every durable file in the database directory — `snapshot.bin`,
+    /// `wal.bin`, all `wal.<N>.archive` files, `wal.floor`, `wal.genesis`, and
+    /// `roles.json` — into a freshly created `dest` directory using OS-level
+    /// `copy` calls (no large in-process buffers).  Consistency is guaranteed by
+    /// construction: the caller holds `&self`, which excludes any concurrent
+    /// writer holding `&mut self`.
+    ///
+    /// After copying, opens the destination read-only and runs the CRC section
+    /// verifier (`verify_snapshot`) to confirm byte-for-byte integrity.
+    /// `BackupReport::verified` reflects whether both checks passed.
+    ///
+    /// Returns `Err` when `self` is not backed by a `RealFs` (e.g. `SimFs`).
+    pub fn backup_to(&self, dest: &std::path::Path) -> Result<BackupReport> {
+        // Derive source directory from snapshot_path (RealFs only).
+        let src_dir = match self.fs.snapshot_path() {
+            Some(p) => p.parent().map(|d| d.to_path_buf()).ok_or_else(|| {
+                GraphError::Io(std::io::Error::other("snapshot has no parent dir"))
+            })?,
+            None => {
+                return Err(GraphError::Io(std::io::Error::other(
+                    "backup_to requires a real filesystem (RealFs)",
+                )))
+            }
+        };
+
+        std::fs::create_dir_all(dest)?;
+
+        let mut files: Vec<String> = Vec::new();
+        let mut bytes: u64 = 0;
+
+        // Helper: copy src_dir/name → dest/name if the file exists.
+        let mut try_copy = |name: &str| -> std::io::Result<()> {
+            let src_path = src_dir.join(name);
+            if src_path.exists() {
+                let n = std::fs::copy(&src_path, dest.join(name))?;
+                bytes += n;
+                files.push(name.to_string());
+            }
+            Ok(())
+        };
+
+        try_copy("snapshot.bin")?;
+        try_copy("snapshot.bin.bak")?;
+        try_copy("wal.bin")?;
+        try_copy("wal.floor")?;
+        try_copy("wal.genesis")?;
+        try_copy("roles.json")?;
+
+        // Copy WAL archives.
+        let archives = self.fs.list_archives()?;
+        for n in &archives {
+            let name = format!("wal.{n}.archive");
+            let n_bytes = std::fs::copy(src_dir.join(&name), dest.join(&name))?;
+            bytes += n_bytes;
+            files.push(name);
+        }
+
+        files.sort();
+
+        // Post-copy verification: open dest and run CRC checks.
+        let snap_in_dest = dest.join("snapshot.bin").exists();
+        let crc_ok = if snap_in_dest {
+            crate::verify_snapshot(dest)
+                .map(|results| results.iter().all(|(_, _, _, r)| r.is_ok()))
+                .unwrap_or(false)
+        } else {
+            true // WAL-only store: nothing to CRC-check in snapshot
+        };
+        let opens_ok = GraphDb::<core_storage::fs::RealFs>::open(dest).is_ok();
+        let verified = crc_ok && opens_ok;
+
+        Ok(BackupReport {
+            files,
+            bytes,
+            verified,
+        })
+    }
+
+    // ── Export helpers ────────────────────────────────────────────────────────
+
+    /// All live nodes, sorted by key (deterministic).
+    ///
+    /// Reads base + WAL overlay. Tombstoned nodes are excluded.
+    pub fn all_nodes_for_export(&self) -> Vec<NodeInfo> {
+        self.ensure_v8_base_sections_loaded();
+        let pv = self.props_view();
+        let mut nodes = Vec::new();
+        for id in 0..self.ids.len() as u32 {
+            let Some(key) = self.ids.key_of(id) else {
+                continue;
+            };
+            let Some(&sym) = self.labels.get(id as usize) else {
+                continue;
+            };
+            if sym == u32::MAX {
+                continue; // tombstoned
+            }
+            let Some(label) = self.syms.resolve(sym) else {
+                continue;
+            };
+            let mut props = BTreeMap::new();
+            for field in pv.field_names() {
+                if let Some(vr) = pv.get(id, &field) {
+                    props.insert(field, vr.into_value());
+                }
+            }
+            nodes.push(NodeInfo {
+                key: key.to_string(),
+                label: label.to_string(),
+                props,
+            });
+        }
+        nodes.sort_by(|a, b| a.key.cmp(&b.key));
+        nodes
+    }
+
+    /// All directed edges, sorted by `(edge_type, src, dst)`. Each edge appears once.
+    ///
+    /// Derived edges carry `derived: true` and the creating rule's name in `rule`.
+    /// Manual edges carry `derived: false` and `rule: None`.
+    /// Deterministic across runs on the same store state.
+    pub fn all_edges_for_export(&self) -> Vec<ExportEdge> {
+        self.ensure_v8_base_sections_loaded();
+
+        // Build (etype_sym, src_id, dst_id) → rule_name for O(1) derivation lookup.
+        let mut prov: HashMap<(u32, u32, u32), String> = HashMap::new();
+        for (rule_name, triples) in self.engine.provenance() {
+            for &(etype, src, dst) in triples {
+                prov.insert((etype, src, dst), rule_name.clone());
+            }
+        }
+
+        let tv = self.topo_view();
+        let mut edges = Vec::new();
+
+        for id in 0..self.ids.len() as u32 {
+            let Some(key) = self.ids.key_of(id) else {
+                continue;
+            };
+            let Some(&lsym) = self.labels.get(id as usize) else {
+                continue;
+            };
+            if lsym == u32::MAX {
+                continue; // tombstoned
+            }
+
+            for etype_sym in tv.etypes() {
+                let edge_type = self
+                    .syms
+                    .resolve(etype_sym)
+                    .expect("topology etype is interned")
+                    .to_string();
+                for &nbr in tv.neighbors(etype_sym, Direction::Out, id).as_ref() {
+                    let Some(dst_key) = self.ids.key_of(nbr) else {
+                        continue; // skip corrupt entries
+                    };
+                    let prov_key = (etype_sym, id, nbr);
+                    let rule = prov.get(&prov_key).cloned();
+                    let derived = rule.is_some();
+                    edges.push(ExportEdge {
+                        edge_type: edge_type.clone(),
+                        src: key.to_string(),
+                        dst: dst_key.to_string(),
+                        derived,
+                        rule,
+                    });
+                }
+            }
+        }
+
+        edges.sort_by(|a, b| {
+            a.edge_type
+                .cmp(&b.edge_type)
+                .then(a.src.cmp(&b.src))
+                .then(a.dst.cmp(&b.dst))
+        });
+        edges
     }
 
     pub fn nodes_with_label(&self, label: &str) -> Vec<NodeRef<'_, F>> {

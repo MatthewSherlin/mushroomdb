@@ -3,12 +3,15 @@
 //! The binary in `main.rs` stays thin — it dispatches on [`parse_args`] and
 //! prints what the lib functions return.
 
+pub mod export;
+
 use core_api::schema::Schema;
 use core_api::{
-    default_max_edges, is_write_query, wal_commit_count_at, AlgoDir, DegreeConfig, Explanation,
-    GraphDb, IngestOptions, PageRankConfig, Predicate, ResultSet, RuleDef, RuleSuggestion,
-    SharedDb, SnapshotOptions, Stats, Value, WccConfig,
+    default_max_edges, is_write_query, wal_commit_count_at, AlgoDir, BackupReport, DegreeConfig,
+    Explanation, GraphDb, IngestOptions, PageRankConfig, Predicate, ResultSet, RuleDef,
+    RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
 };
+use export::ExportFormat;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -123,6 +126,17 @@ pub enum Command {
     Verify {
         db_dir: PathBuf,
     },
+    /// Create a consistent, verified copy of the database directory.
+    Backup {
+        db_dir: PathBuf,
+        dest: PathBuf,
+    },
+    /// Export all nodes, edges, and rules to a destination directory.
+    Export {
+        db_dir: PathBuf,
+        dest: PathBuf,
+        format: ExportFormat,
+    },
     Help,
 }
 
@@ -178,6 +192,8 @@ Usage:
   mushroomdb snapshot <db-dir> [--keep-wal]
   mushroomdb migrate <db-dir>
   mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
+  mushroomdb backup <db-dir> <dest>   consistent copy of the database to <dest>
+  mushroomdb export <db-dir> <dest> --format jsonl|parquet   export all data
   mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb algo pagerank <db-dir> [--top N]
   mushroomdb algo wcc <db-dir> [--top N]
@@ -208,6 +224,8 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "schema" => parse_schema(&args[1..]),
         "migrate" => parse_one_dir("migrate", &args[1..]).map(|db_dir| Command::Migrate { db_dir }),
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
+        "backup" => parse_backup(&args[1..]),
+        "export" => parse_export(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -695,6 +713,112 @@ pub fn run_schema_apply(db_dir: &Path, schema_file: &Path) -> Result<String, Cli
         let _ = writeln!(out, "schema applied: nothing to do (empty schema)");
     }
     Ok(out)
+}
+
+fn parse_backup(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir = None;
+    let mut dest = None;
+    for a in args {
+        if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        }
+        if db_dir.is_none() {
+            db_dir = Some(PathBuf::from(*a));
+        } else if dest.is_none() {
+            dest = Some(PathBuf::from(*a));
+        } else {
+            return Err(format!("unexpected extra argument: {a}"));
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| "backup requires <db-dir>".to_string())?;
+    let dest = dest.ok_or_else(|| "backup requires <dest>".to_string())?;
+    Ok(Command::Backup { db_dir, dest })
+}
+
+fn parse_export(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir = None;
+    let mut dest = None;
+    let mut format = ExportFormat::Jsonl;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--format" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --format".to_string())?;
+            format = ExportFormat::parse(val)
+                .ok_or_else(|| format!("unknown format '{val}'; expected jsonl or parquet"))?;
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--format=") {
+            format = ExportFormat::parse(val)
+                .ok_or_else(|| format!("unknown format '{val}'; expected jsonl or parquet"))?;
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_none() {
+            db_dir = Some(PathBuf::from(a));
+            i += 1;
+        } else if dest.is_none() {
+            dest = Some(PathBuf::from(a));
+            i += 1;
+        } else {
+            return Err(format!("unexpected extra argument: {a}"));
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| "export requires <db-dir>".to_string())?;
+    let dest = dest.ok_or_else(|| "export requires <dest>".to_string())?;
+    Ok(Command::Export {
+        db_dir,
+        dest,
+        format,
+    })
+}
+
+/// Create a consistent, verified backup of `db_dir` to `dest`.
+pub fn run_backup(db_dir: &Path, dest: &Path) -> Result<BackupReport, CliError> {
+    let db = GraphDb::open(db_dir)?;
+    Ok(db.backup_to(dest)?)
+}
+
+/// Format a [`BackupReport`] for display.
+pub fn format_backup(dest: &Path, report: &BackupReport) -> String {
+    let mut out = String::new();
+    let _ = std::fmt::write(
+        &mut out,
+        format_args!(
+            "backup to: {}\n  files: {}\n  bytes: {}\n  verified: {}\n",
+            dest.display(),
+            report.files.join(", "),
+            report.bytes,
+            report.verified
+        ),
+    );
+    out
+}
+
+/// Export all data from `db_dir` to `dest` in `format`.
+pub fn run_export(db_dir: &Path, dest: &Path, format: &ExportFormat) -> Result<String, CliError> {
+    let db = GraphDb::open(db_dir)?;
+    let nodes = db.all_nodes_for_export();
+    let edges = db.all_edges_for_export();
+    let mut rules = db.rules();
+    rules.sort_by(|a, b| a.name.cmp(&b.name));
+    let node_count = nodes.len();
+    let edge_count = edges.len();
+    let rule_count = rules.len();
+    match format {
+        ExportFormat::Jsonl => export::write_jsonl(&nodes, &edges, &rules, dest)?,
+        ExportFormat::Parquet => export::write_parquet(&nodes, &edges, &rules, dest)?,
+    }
+    Ok(format!(
+        "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
+        dest.display(),
+        format.name(),
+        node_count,
+        edge_count,
+        rule_count
+    ))
 }
 
 fn format_result_set(rs: &ResultSet) -> String {
@@ -2112,5 +2236,178 @@ mod tests {
             "stats output should mention edges, got:\n{text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── backup CLI tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_backup_round_trip() {
+        let r = parse_args(&["backup", "/db/dir", "/backup/dest"]);
+        match r {
+            Ok(Command::Backup { db_dir, dest }) => {
+                assert_eq!(db_dir, PathBuf::from("/db/dir"));
+                assert_eq!(dest, PathBuf::from("/backup/dest"));
+            }
+            other => panic!("backup parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_backup_missing_dest_errors() {
+        let r = parse_args(&["backup", "/db/dir"]);
+        assert!(r.is_err(), "backup without <dest> should error");
+        let e = r.unwrap_err();
+        assert!(
+            e.to_lowercase().contains("dest"),
+            "error should mention dest, got: {e}"
+        );
+    }
+
+    #[test]
+    fn parse_export_defaults_to_jsonl() {
+        let r = parse_args(&["export", "/db/dir", "/export/dest"]);
+        match r {
+            Ok(Command::Export { format, .. }) => {
+                assert_eq!(format, ExportFormat::Jsonl);
+            }
+            other => panic!("export parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_export_parquet_flag() {
+        let r = parse_args(&["export", "/db/dir", "/export/dest", "--format", "parquet"]);
+        match r {
+            Ok(Command::Export { format, .. }) => {
+                assert_eq!(format, ExportFormat::Parquet);
+            }
+            other => panic!("export --format parquet parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_export_parquet_flag_eq() {
+        let r = parse_args(&["export", "/db/dir", "/dest", "--format=parquet"]);
+        match r {
+            Ok(Command::Export { format, .. }) => {
+                assert_eq!(format, ExportFormat::Parquet);
+            }
+            other => panic!("export --format=parquet parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_backup_cli_produces_verified_report() {
+        let src = tmp("cli-backup-src");
+        let dst = tmp("cli-backup-dst");
+        let _ = run_demo(&src).expect("demo");
+        let report = run_backup(&src, &dst).expect("run_backup");
+        assert!(report.verified, "backup must be verified");
+        assert!(!report.files.is_empty());
+        assert!(report.bytes > 0);
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn run_export_jsonl_two_runs_byte_identical() {
+        let src = tmp("cli-export-src");
+        let dst1 = tmp("cli-export-dst1");
+        let dst2 = tmp("cli-export-dst2");
+        let _ = run_demo(&src).expect("demo");
+
+        run_export(&src, &dst1, &ExportFormat::Jsonl).expect("first export");
+        run_export(&src, &dst2, &ExportFormat::Jsonl).expect("second export");
+
+        for filename in &["nodes.jsonl", "edges.jsonl", "rules.jsonl"] {
+            let f1 = std::fs::read(dst1.join(filename)).expect("read first");
+            let f2 = std::fs::read(dst2.join(filename)).expect("read second");
+            assert_eq!(
+                f1, f2,
+                "{filename} must be byte-identical across two export runs"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst1);
+        let _ = std::fs::remove_dir_all(&dst2);
+    }
+
+    #[test]
+    fn run_export_jsonl_nodes_are_sorted() {
+        let src = tmp("cli-export-sorted");
+        let dst = tmp("cli-export-sorted-dst");
+        let _ = run_demo(&src).expect("demo");
+        run_export(&src, &dst, &ExportFormat::Jsonl).expect("export");
+
+        let content = std::fs::read_to_string(dst.join("nodes.jsonl")).expect("read nodes");
+        let keys: Vec<String> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).expect("parse line");
+                v["key"].as_str().unwrap_or("").to_string()
+            })
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "nodes.jsonl must be sorted by key");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn run_export_jsonl_derived_edges_have_rule() {
+        let src = tmp("cli-export-derived");
+        let dst = tmp("cli-export-derived-dst");
+        let _ = run_demo(&src).expect("demo");
+        run_export(&src, &dst, &ExportFormat::Jsonl).expect("export");
+
+        let content = std::fs::read_to_string(dst.join("edges.jsonl")).expect("read edges");
+        let derived_lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).expect("parse line"))
+            .filter(|v: &serde_json::Value| v["derived"].as_bool().unwrap_or(false))
+            .collect();
+        assert!(
+            !derived_lines.is_empty(),
+            "demo store should have derived edges"
+        );
+        for edge in &derived_lines {
+            assert!(
+                !edge["rule"].is_null(),
+                "derived edge must have non-null rule: {edge}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn run_export_parquet_produces_files() {
+        let src = tmp("cli-export-parq-src");
+        let dst = tmp("cli-export-parq-dst");
+        let _ = run_demo(&src).expect("demo");
+        run_export(&src, &dst, &ExportFormat::Parquet).expect("parquet export");
+
+        assert!(
+            dst.join("nodes.parquet").exists(),
+            "nodes.parquet must exist"
+        );
+        assert!(
+            dst.join("edges.parquet").exists(),
+            "edges.parquet must exist"
+        );
+        assert!(
+            dst.join("rules.parquet").exists(),
+            "rules.parquet must exist"
+        );
+        // All files must be non-empty.
+        for f in &["nodes.parquet", "edges.parquet", "rules.parquet"] {
+            let meta = std::fs::metadata(dst.join(f)).expect("metadata");
+            assert!(meta.len() > 0, "{f} must be non-empty");
+        }
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
     }
 }

@@ -26,3 +26,6 @@ core-api = { package = "mushroomdb", path = "../core-api", version = "0.1.2" }
 server = { package = "mushroomdb-server", path = "../server", version = "0.1.2" }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+parquet = { version = "59", default-features = false, features = ["arrow"] }
+arrow-array = { version = "59", default-features = false }
+arrow-schema = { version = "59", default-features = false }
