@@ -464,3 +464,86 @@ fn was_linked_resolves_through_rename() {
         "was_linked(a2, b, LINKED, commit-before-rename) must be true"
     );
 }
+
+// ── N1: temporal alias bounds — recycled-key exclusion ───────────────────────
+
+/// Rename "a" → "b" at commit N, then insert a brand new node also called "a"
+/// at commit N+2. node_history("b") must NOT include events from the new "a".
+#[test]
+fn node_history_alias_excludes_recycled_key_events() {
+    let dir = tmp("alias-recycle");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // commit 0: insert original "a"
+    db.insert_node("T", "a", vec![]).unwrap();
+    // commit 1: rename "a" → "b"  (retires key "a" for this identity)
+    db.rename_node("a", "b").unwrap();
+    // commit 2: insert a completely new node called "a" (different identity)
+    db.insert_node("T", "a", vec![("recycled".into(), Value::Bool(true))])
+        .unwrap();
+    // commit 3: set a prop on the new "a" — must NOT appear in history("b")
+    db.set_prop("a", "extra", Value::Int(99)).unwrap();
+
+    let hist = db.node_history("b").unwrap();
+    // history("b") must NOT contain the new "a"'s extra prop
+    let has_recycled_set_prop = hist
+        .iter()
+        .any(|e| matches!(&e.change, HistoryChange::PropSet { field, .. } if field == "extra"));
+    assert!(
+        !has_recycled_set_prop,
+        "node_history('b') must not include events from the recycled 'a' node"
+    );
+
+    // Sanity: history("a") must include the recycled node's prop
+    let hist_a = db.node_history("a").unwrap();
+    let has_new_a_prop = hist_a
+        .iter()
+        .any(|e| matches!(&e.change, HistoryChange::PropSet { field, .. } if field == "extra"));
+    assert!(
+        has_new_a_prop,
+        "node_history('a') must include the recycled node's own events"
+    );
+}
+
+/// Multi-hop reuse: a→b at N1, new "a" at N2, a→c at N3.
+/// node_history("c") must see only the SECOND identity of "a" (commits N2..N3),
+/// not the original identity (commits 0..N1).
+#[test]
+fn node_history_alias_multi_hop_reuse() {
+    let dir = tmp("alias-multihop");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // First identity of "a"
+    db.insert_node("T", "a", vec![]).unwrap();
+    db.set_prop("a", "phase", Value::Int(1)).unwrap();
+    // Rename: "a" → "b"
+    db.rename_node("a", "b").unwrap();
+
+    // Second identity of "a"
+    db.insert_node("T", "a", vec![]).unwrap();
+    db.set_prop("a", "phase", Value::Int(2)).unwrap();
+    // Rename: "a" → "c"
+    db.rename_node("a", "c").unwrap();
+
+    let hist = db.node_history("c").unwrap();
+
+    // Must see phase=2 (second identity)
+    let has_phase2 = hist.iter().any(|e| {
+        matches!(&e.change, HistoryChange::PropSet { field, value }
+            if field == "phase" && *value == Value::Int(2))
+    });
+    assert!(
+        has_phase2,
+        "node_history('c') must see the second identity's phase=2 event"
+    );
+
+    // Must NOT see phase=1 (first identity, pre-first-rename)
+    let has_phase1 = hist.iter().any(|e| {
+        matches!(&e.change, HistoryChange::PropSet { field, value }
+            if field == "phase" && *value == Value::Int(1))
+    });
+    assert!(
+        !has_phase1,
+        "node_history('c') must not see the first identity's phase=1 event"
+    );
+}
