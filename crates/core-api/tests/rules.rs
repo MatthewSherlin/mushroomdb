@@ -971,3 +971,268 @@ fn via_hop_incremental_via_prop_change() {
         "proj_a FIT retracted after org industry changed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Item 4: via_dir = Some(In) path
+// ---------------------------------------------------------------------------
+
+/// Verify that via_dir=In reverses the traversal direction: the edge goes
+/// via-label → src-label, i.e. src is found by following In-neighbors from
+/// the via-label over the via-edge type.
+///
+/// Setup: Org -[SPONSOR]-> Project (reversed; via_dir=In means "project points to org").
+/// Rule: Project src → Org dst, via Org-via via SPONSOR dir=In → FIT.
+///
+/// Actually a clearer model: Person nodes that are *pointed to* by a Org via
+/// EMPLOYS edge.  via_dir=In means Org -[EMPLOYS]-> Person, so Person is found
+/// as the In-neighbor of Org.
+///
+/// Person (src_label) -?-> Project (dst_label), via Org (via_label),
+/// via_edge EMPLOYS, via_dir=In means:
+///   traverse Person <-[EMPLOYS]- Org   (Org employs Person, so edge Org→Person in In from Person's POV)
+///
+/// Let's use: the edge Org -[MEMBER_OF]-> Person, via_dir=In.
+/// src=Project, dst=Person, via=Org, via_edge=MEMBER_OF, via_dir=In.
+/// This means src hops via: find Orgs that have an In-neighbor src (Project ←[MEMBER_OF]− Org).
+/// Then match those Orgs' fields against dst's (Person) fields.
+///
+/// Concrete:
+///   Project "proj_x" and Org "org_x" share industry="tech".
+///   Person "dev_alice" and Org "org_x" share industry="tech".
+///   Edge: Org "org_x" -[MEMBER_OF]-> Project "proj_x" (so proj_x is In-neighbor of org_x w.r.t. MEMBER_OF In).
+///   via_dir=In: from src=Project, find orgs via: orgs that have MEMBER_OF Out-neighbors matching src
+///              → org_x Out-neighbor includes proj_x → org_x is the via-node.
+///   Wait, via_dir=In means the edge direction FROM src TO via is "In", i.e., the edge goes via→src.
+///   So the edge is org_x -[MEMBER_OF]-> proj_x, and via_dir=In means "go In to find via from src"
+///   meaning follow MEMBER_OF edges that POINT TO proj_x, finding org_x.
+///
+/// Summary of setup:
+///   src_label=Project, dst_label=Person, via_label=Org, via_edge=MEMBER_OF, via_dir=In
+///   Edge: org_x -[MEMBER_OF]-> proj_x  (project is In-neighbor of org)
+///   Shared field: industry="tech" on Org and Person
+///   Expected: proj_x -[FIT]-> dev_alice (project hops in to org_x, matches alice's industry)
+#[test]
+fn via_hop_via_dir_in() {
+    let dir = tmp("via-hop-dir-in");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node(
+        "Project",
+        "proj_x",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Org",
+        "org_x",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Person",
+        "dev_alice",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Person",
+        "dev_bob",
+        vec![("industry".into(), Value::Str("law".into()))],
+    )
+    .unwrap();
+
+    // Edge goes org_x → proj_x; via_dir=In means from proj_x follow In-direction
+    // of MEMBER_OF to find org_x.
+    db.insert_edge("MEMBER_OF", "org_x", "proj_x").unwrap();
+
+    let rule = RuleDef {
+        name: "project_person_fit".into(),
+        src_label: "Project".into(),
+        dst_label: "Person".into(),
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
+        edge_type: "FIT".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("Org".into()),
+        via_edge: Some("MEMBER_OF".into()),
+        via_dir: Some(core_storage::Direction::In),
+    };
+    db.create_rule(rule).unwrap();
+
+    // proj_x hops In over MEMBER_OF → org_x (industry=tech) → matches dev_alice (tech).
+    let fit = db.neighbors("proj_x", "FIT", Direction::Out).unwrap();
+    assert_eq!(
+        fit,
+        vec!["dev_alice"],
+        "via_dir=In rule fires for matching industry"
+    );
+
+    // dev_bob (law) must not be linked.
+    let bob_fit = db.neighbors("dev_bob", "FIT", Direction::In).unwrap();
+    assert!(bob_fit.is_empty(), "dev_bob (law) gets no FIT via proj_x");
+}
+
+// ---------------------------------------------------------------------------
+// Item 5: Snapshot/WAL-replay roundtrip with a via-hop rule
+// ---------------------------------------------------------------------------
+
+/// Derived edges from a via-hop rule must survive both WAL replay and a
+/// snapshot+reopen cycle.
+#[test]
+fn via_hop_survives_snapshot_and_wal_replay() {
+    let dir = tmp("via-hop-snapshot");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node(
+            "Org",
+            "org1",
+            vec![("industry".into(), Value::Str("tech".into()))],
+        )
+        .unwrap();
+        db.insert_node("Person", "alice", vec![]).unwrap();
+        db.insert_node(
+            "Project",
+            "proj_a",
+            vec![("industry".into(), Value::Str("tech".into()))],
+        )
+        .unwrap();
+        db.insert_edge("WORKS_AT", "alice", "org1").unwrap();
+
+        let rule = RuleDef {
+            name: "fit".into(),
+            src_label: "Person".into(),
+            dst_label: "Project".into(),
+            predicate: Predicate::FieldEqual {
+                field: "industry".into(),
+            },
+            edge_type: "FIT".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: Some("Org".into()),
+            via_edge: Some("WORKS_AT".into()),
+            via_dir: None,
+        };
+        db.create_rule(rule).unwrap();
+
+        assert_eq!(
+            db.neighbors("alice", "FIT", Direction::Out).unwrap(),
+            vec!["proj_a"],
+            "FIT edge present before snapshot"
+        );
+
+        // Take a snapshot.
+        db.snapshot().unwrap();
+    }
+
+    // Reopen from snapshot — derived edges must be re-derived.
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.neighbors("alice", "FIT", Direction::Out).unwrap(),
+        vec!["proj_a"],
+        "FIT edge survives snapshot+reopen"
+    );
+    assert_eq!(db.rules().len(), 1, "rule survives snapshot+reopen");
+
+    // Also drop the in-memory db and replay from WAL only.
+    drop(db);
+    let db2 = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db2.neighbors("alice", "FIT", Direction::Out).unwrap(),
+        vec!["proj_a"],
+        "FIT edge survives WAL replay"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Item 6: New via-label node insert (after rule creation) triggers the as_via branch
+// ---------------------------------------------------------------------------
+
+/// When a new node with the via-label is inserted AFTER rule creation, the
+/// rule must correctly evaluate it.  This exercises the `on_node_changed_via`
+/// code path for a freshly inserted via-label node.
+///
+/// Because edges must point to existing nodes, the via-edge from the src to
+/// the new via-node is inserted immediately after the via-node, exercising
+/// the full as_via → as_src incremental chain starting from a post-creation
+/// via-node insert.
+#[test]
+fn via_hop_new_via_node_insert_after_rule_creation() {
+    let dir = tmp("via-hop-new-via");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Insert src and dst; no via-label node yet.
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node(
+        "Project",
+        "proj_a",
+        vec![("industry".into(), Value::Str("bio".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Project",
+        "proj_b",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+
+    let rule = RuleDef {
+        name: "fit".into(),
+        src_label: "Person".into(),
+        dst_label: "Project".into(),
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
+        edge_type: "FIT".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("Org".into()),
+        via_edge: Some("WORKS_AT".into()),
+        via_dir: None,
+    };
+    db.create_rule(rule).unwrap();
+
+    // No Org node yet → backfill finds nothing.
+    assert!(
+        db.neighbors("alice", "FIT", Direction::Out)
+            .unwrap()
+            .is_empty(),
+        "no FIT before any Org inserted"
+    );
+
+    // Now insert a new Org node (via-label) after rule creation.
+    db.insert_node(
+        "Org",
+        "biotech_inc",
+        vec![("industry".into(), Value::Str("bio".into()))],
+    )
+    .unwrap();
+    // No WORKS_AT edge yet → as_via fires for biotech_inc but finds no alice-edge.
+    assert!(
+        db.neighbors("alice", "FIT", Direction::Out)
+            .unwrap()
+            .is_empty(),
+        "no FIT after Org insert without WORKS_AT edge"
+    );
+
+    // Insert the via edge → rule fires (as_src for alice).
+    db.insert_edge("WORKS_AT", "alice", "biotech_inc").unwrap();
+    let fit = db.neighbors("alice", "FIT", Direction::Out).unwrap();
+    assert_eq!(
+        fit,
+        vec!["proj_a"],
+        "FIT fires after WORKS_AT to newly inserted Org"
+    );
+
+    // Confirm proj_b (tech) is not linked — no Org with tech industry.
+    assert!(
+        db.neighbors("proj_b", "FIT", Direction::In)
+            .unwrap()
+            .is_empty(),
+        "proj_b (tech) gets no FIT"
+    );
+}

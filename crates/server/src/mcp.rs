@@ -935,7 +935,7 @@ fn tools_list() -> Js {
                             "description": "Query embedding vector. Omit for text-only ranking."
                         },
                         "vector_field": { "type": "string", "description": "Property field holding embedding vectors (default: embedding)." },
-                        "label": { "type": "string", "description": "Restrict vector search to nodes with this label. Required when relying on brute-force (no HNSW rule covers the field)." },
+                        "label": { "type": "string", "description": "Restrict vector search to nodes with this label. Required when relying on brute-force (no HNSW rule covers the field). If omitted, the vector leg always returns empty results (no rule-created HNSW index covers the unlabeled path); ranking is text-only in that case." },
                         "k": { "type": "integer", "description": "Maximum results to return (default: 10)." }
                     },
                     "required": ["query_text", "text_field"]
@@ -1148,7 +1148,7 @@ mod tests {
     // --- existing tools ---
 
     #[test]
-    fn test_tools_list_includes_all_fifteen() {
+    fn test_tools_list_includes_all_expected() {
         let db = demo_db();
         let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let tools = resp["result"]["tools"].as_array().expect("tools array");

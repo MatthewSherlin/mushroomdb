@@ -3477,6 +3477,26 @@ impl<F: Fs> GraphDb<F> {
 
     /// Distribute post-commit events to all live subscribers.
     ///
+    /// Build a row-key → row-data map from a [`ResultSet`].
+    ///
+    /// Each row is serialized to JSON to form its key; a debug fallback is used
+    /// if serialization fails. Used by both the initial-seed path in
+    /// [`Self::subscribe_query`] and the per-commit diff path in
+    /// [`Self::distribute_events`] to keep the two in sync.
+    fn result_to_row_map(
+        result: &core_query::ResultSet,
+    ) -> std::collections::HashMap<String, Vec<Option<Value>>> {
+        (0..result.len())
+            .map(|i| {
+                let row = result.row(i).to_vec();
+                let key = serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
+                (key, row)
+            })
+            .collect()
+    }
+
+    /// Distribute post-commit events to all live subscribers.
+    ///
     /// Called from `log_then_apply_with` after apply + fsync, before the
     /// legacy MutationEvent sink. Prunes dead `Weak` entries in-place.
     ///
@@ -3566,18 +3586,16 @@ impl<F: Fs> GraphDb<F> {
                 };
                 let result = match execute(&self.view(), &entry.ops, &Params(&empty_params)) {
                     Ok(r) => r,
-                    Err(_) => return true, // keep entry; skip diff on transient error
+                    Err(e) => {
+                        // Keep the subscription alive; skip the diff for this commit.
+                        // Re-run errors are transient (e.g., planner change) and
+                        // self-heal when the next commit succeeds.
+                        eprintln!("[mushroomdb] subscribe_query re-run failed: {e}");
+                        return true;
+                    }
                 };
                 // Build new row map: serialized-key → row data.
-                let new_row_map: std::collections::HashMap<String, Vec<Option<Value>>> = (0
-                    ..result.len())
-                    .map(|i| {
-                        let row = result.row(i).to_vec();
-                        let key =
-                            serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
-                        (key, row)
-                    })
-                    .collect();
+                let new_row_map = Self::result_to_row_map(&result);
                 // Removed rows: in prev but not in new.
                 for (key, row) in &entry.prev_row_map {
                     if !new_row_map.contains_key(key) {
@@ -3836,14 +3854,7 @@ impl<F: Fs> GraphDb<F> {
             }
         })?;
         let columns = initial.columns().to_vec();
-        let prev_row_map: std::collections::HashMap<String, Vec<Option<Value>>> = (0..initial
-            .len())
-            .map(|i| {
-                let row = initial.row(i).to_vec();
-                let key = serde_json::to_string(&row).unwrap_or_else(|_| format!("{row:?}"));
-                (key, row)
-            })
-            .collect();
+        let prev_row_map = Self::result_to_row_map(&initial);
         let inner = SubInner::new(self.sub_capacity());
         self.query_subscriptions.push(QuerySubEntry {
             ops,
@@ -4687,10 +4698,11 @@ impl<F: Fs> GraphDb<F> {
     /// results are ranked by the text list alone through the same RRF path
     /// (each text result scores `1/(60 + rank)` from that single list).
     ///
-    /// When `label` is `None` and no HNSW rule covers `vector_field`, the
-    /// brute-force scan cannot enumerate a node universe; `find_similar_vector`
-    /// returns an empty result and the fused ranking is text-only.  Document
-    /// this in your application layer if you rely on it.
+    /// When `label` is `None`, the vector leg **always** returns empty results.
+    /// Internally `label` is mapped to `""`, which does not match any rule-created
+    /// HNSW index (all such indexes are keyed to a specific non-empty label), and
+    /// the brute-force fallback finds no nodes with an empty label.  The fused
+    /// ranking is therefore text-only in this case.
     pub fn search_hybrid(
         &self,
         text_field: &str,
@@ -4703,7 +4715,7 @@ impl<F: Fs> GraphDb<F> {
         use std::collections::HashMap;
 
         const RRF_K: f64 = 60.0;
-        let pool = 4 * k.max(1);
+        let pool = 4 * k;
 
         // Accumulate per-node RRF scores.
         let mut scores: HashMap<String, f64> = HashMap::new();
@@ -4744,7 +4756,7 @@ impl<F: Fs> GraphDb<F> {
     /// `scratch_search(field, q)` at every quiescent state.
     #[doc(hidden)]
     pub fn scratch_search(&self, field: &str, query: &str) -> Vec<(String, f64)> {
-        use core_storage::fulltext::{parse_query, tokenize_stemmed_with_positions};
+        use core_storage::fulltext::{parse_query, value_tokens_stemmed_with_positions};
         use std::collections::BTreeMap;
 
         let groups = parse_query(query);
@@ -4781,22 +4793,11 @@ impl<F: Fs> GraphDb<F> {
             let Some(value) = self.props_view().get(id, field).map(|vr| vr.into_value()) else {
                 continue;
             };
+            // Use value_tokens_stemmed_with_positions so list elements are
+            // separated by POSITION_GAP — identical to the index path, which
+            // prevents phrase queries from matching across element boundaries.
             let stemmed_with_pos = match &value {
-                Value::Str(s) => tokenize_stemmed_with_positions(s),
-                Value::List(items) => {
-                    let combined: String = items
-                        .iter()
-                        .filter_map(|v| {
-                            if let Value::Str(s) = v {
-                                Some(s.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    tokenize_stemmed_with_positions(&combined)
-                }
+                Value::Str(_) | Value::List(_) => value_tokens_stemmed_with_positions(&value),
                 _ => continue,
             };
             let dl = stemmed_with_pos.len() as u32;
@@ -5034,18 +5035,24 @@ impl<F: Fs> GraphDb<F> {
     /// Parse `roles.json` bytes from `fs`.
     ///
     /// Return values:
-    ///   `Ok(Some(roles))` — file present and valid (roles may be an empty vec)
-    ///   `Ok(Some(vec![]))` — file absent (fs returns empty bytes) → no roles defined
+    ///   `Ok(Some(roles))` — file absent (returns `vec![]`) **or** file present
+    ///                       and valid; in both cases `mask_for_role` uses the
+    ///                       list normally (an absent file means no roles defined).
     ///   `Ok(None)`        — file present but corrupt or unrecognised version
-    ///                       → poisoned state; `mask_for_role` will return `Err` for any role token
+    ///                       → poisoned state; `mask_for_role` returns `Err` for
+    ///                       any role name until the file is fixed and the DB
+    ///                       re-opened (or `apply_schema` is called to repair it).
     ///
-    /// Note: absent and healthy-but-empty both produce `Some`; `None` means
-    /// corrupt — the opposite of what an optional "file missing" convention would
-    /// suggest.  The open path stores this result on `db.roles` directly.
+    /// Note: `None` signals corruption, not absence — the opposite of what an
+    /// optional "file missing" convention would suggest.  The open path stores
+    /// this result on `db.roles` directly.
     fn load_roles_from_fs(fs: &F) -> Result<Option<Vec<RoleDef>>> {
         let bytes = fs.read(FileId::Roles).map_err(GraphError::Io)?;
         if bytes.is_empty() {
-            // Missing file: no roles defined.
+            // Empty bytes means either the file is absent or zero-byte — both
+            // are treated identically as "no roles defined".  A zero-byte
+            // roles.json does NOT widen access: an absent file and a zero-byte
+            // file both resolve to an empty role list (sees nothing by default).
             return Ok(Some(vec![]));
         }
         match serde_json::from_slice::<RolesFile>(&bytes) {
@@ -5172,9 +5179,7 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("lex: {e}"),
         })?;
         if is_write_tokens(&tokens) {
-            return Err(GraphError::QueryError {
-                detail: "masked queries are read-only".into(),
-            });
+            return Err(GraphError::MaskedReadOnly);
         }
         let ast = parse(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),

@@ -409,6 +409,12 @@ impl HnswIndex {
 
         // Defensively scan all remaining nodes for any back-references to `id`
         // (asymmetric pruning can leave links not recorded in `node.layers`).
+        //
+        // Known cost: O(N·M) where N = live nodes and M = max neighbors per
+        // layer. For typical graphs this is fast, but it becomes a bottleneck
+        // when removing many nodes from a large index. The fix (v0.3 candidate)
+        // is a reverse-adjacency map (node → set of nodes that list it as a
+        // neighbor), reducing removal to O(in-degree).
         for other_node in self.nodes.values_mut() {
             for layer in other_node.layers.iter_mut() {
                 layer.retain(|&x| x != id);

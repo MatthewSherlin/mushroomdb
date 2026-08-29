@@ -349,3 +349,46 @@ fn schema_json_round_trips() {
     assert_eq!(back.rules.len(), 1);
     assert_eq!(back.views.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Item 16: duplicate names within one schema are rejected pre-validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn apply_schema_rejects_duplicate_rule_names() {
+    let dir = tmp("schema-dup-rules");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    let schema = Schema {
+        fulltext: vec![],
+        rules: vec![sample_rule("my_rule"), sample_rule("my_rule")],
+        views: vec![],
+        roles: vec![],
+    };
+    let result = db.apply_schema(&schema);
+    assert!(
+        result.is_err(),
+        "duplicate rule names within one schema must be rejected"
+    );
+    // Database must not have been mutated (no rule created).
+    assert!(db.rules().is_empty(), "no rule created on error");
+}
+
+#[test]
+fn apply_schema_rejects_duplicate_view_names() {
+    let dir = tmp("schema-dup-views");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    let schema = Schema {
+        fulltext: vec![],
+        rules: vec![],
+        views: vec![sample_view("my_view"), sample_view("my_view")],
+        roles: vec![],
+    };
+    let result = db.apply_schema(&schema);
+    assert!(
+        result.is_err(),
+        "duplicate view names within one schema must be rejected"
+    );
+    assert!(db.views().is_empty(), "no view created on error");
+}

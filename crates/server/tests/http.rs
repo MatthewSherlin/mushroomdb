@@ -1,3 +1,4 @@
+#![allow(deprecated)] // serve() used for test convenience; production code uses serve_with_role_tokens
 use arrow_array::{Array, StringArray};
 use arrow_ipc::reader::StreamReader;
 use axum::body::{to_bytes, Body};
@@ -2337,6 +2338,35 @@ async fn query_mask_filters_nodes() {
     assert_eq!(status, StatusCode::OK);
     let v = parse_json(&body);
     assert_eq!(v["rows"].as_array().unwrap().len(), 3);
+}
+
+/// POST /query with a client mask and a write Cypher must return exactly
+/// 400 Bad Request with body `{"error":"masked queries are read-only"}`.
+/// Pins the MaskedReadOnly → HTTP mapping so the arm cannot be silently removed.
+#[tokio::test]
+async fn masked_write_returns_400_with_exact_body() {
+    let (app, db) = open("masked-write-pin");
+    db.write().insert_node("P", "alice", vec![]).unwrap();
+
+    let req = json_req(
+        "POST",
+        "/query?format=json",
+        json!({"cypher": "CREATE (n:P {id: 'evil'})", "mask": ["alice"]}),
+    );
+    let (status, body, _) = send(app, req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "masked write must be 400; body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("body must be valid JSON");
+    assert_eq!(
+        v,
+        json!({"error": "masked queries are read-only"}),
+        "response body must be exactly {{\"error\":\"masked queries are read-only\"}}"
+    );
 }
 
 // ── History endpoints ─────────────────────────────────────────────────────────

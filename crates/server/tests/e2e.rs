@@ -6,6 +6,7 @@
 //! `project_json` / `person_json` / `skill_fit`) — keep this copy in lockstep
 //! or the row pins below will drift. `cli → server` already exists; a
 //! `server` dev-dep on `cli` would be a crate cycle. Nothing is moved.
+#![allow(deprecated)] // serve() used for test convenience; production code uses serve_with_role_tokens
 
 use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow_ipc::reader::StreamReader;

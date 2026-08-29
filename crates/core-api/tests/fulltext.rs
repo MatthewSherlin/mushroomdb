@@ -1252,3 +1252,90 @@ fn list_phrase_matches_within_single_element() {
     assert_eq!(r.len(), 1, "phrase within a single list element must match");
     assert_eq!(r[0].0, "d0");
 }
+
+// ---------------------------------------------------------------------------
+// Item 24: scratch_search oracle matches index for list-field values
+// ---------------------------------------------------------------------------
+
+/// After fixing scratch_search to use value_tokens_stemmed_with_positions
+/// (with POSITION_GAP between list elements), the oracle must agree with the
+/// indexed search for list-valued fields.  This test is the list-boundary
+/// oracle case called for in item 24.
+#[test]
+fn scratch_search_oracle_matches_index_for_list_field() {
+    let mut db = open();
+    db.enable_fulltext("Doc", "tags").unwrap();
+
+    // Two docs with list-valued tags fields.
+    db.insert_node(
+        "Doc",
+        "d0",
+        vec![(
+            "tags".into(),
+            Value::List(vec![
+                Value::Str("graph database".into()),
+                Value::Str("storage".into()),
+            ]),
+        )],
+    )
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![(
+            "tags".into(),
+            Value::List(vec![
+                Value::Str("search engine".into()),
+                Value::Str("database".into()),
+            ]),
+        )],
+    )
+    .unwrap();
+
+    // Both docs have "database" somewhere in their list; confirm oracle agrees.
+    for q in &[
+        "database",
+        "graph",
+        "storage",
+        "search",
+        "\"graph database\"",
+        "graph OR search",
+    ] {
+        let idx_keys: Vec<String> = db.search("tags", q).into_iter().map(|(k, _)| k).collect();
+        let scratch_keys: Vec<String> = db
+            .scratch_search("tags", q)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            idx_keys, scratch_keys,
+            "oracle mismatch for query {:?}: index={:?} scratch={:?}",
+            q, idx_keys, scratch_keys
+        );
+    }
+
+    // Phrase "graph database" must NOT match d1 (cross-element boundary):
+    // d0 has "graph database" as a single list element → should match.
+    // d1 has "search engine" and "database" in separate elements → "graph database" must not match.
+    let phrase_hits: Vec<String> = db
+        .search("tags", "\"graph database\"")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        phrase_hits,
+        vec!["d0".to_string()],
+        "phrase should only match within single element, not across list boundary"
+    );
+
+    // Confirm scratch_search also correctly does not cross boundaries.
+    let scratch_phrase: Vec<String> = db
+        .scratch_search("tags", "\"graph database\"")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        scratch_phrase, phrase_hits,
+        "scratch_search and index must agree on list-boundary phrase behavior"
+    );
+}
