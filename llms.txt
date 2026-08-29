@@ -96,11 +96,11 @@ let mask = NodeMask::from_keys(&db, ["alice", "bob"]);
 let rows = db.query_masked("MATCH (p:Person) RETURN p", &Default::default(), &mask)?;
 ```
 
-## MCP tools (15 total)
+## MCP tools (17 total)
 
 | Tool | Description |
 |---|---|
-| `query` | Cypher query; `mask` param for ACL-scoped read |
+| `query` | Cypher query; `mask` param for ACL-scoped read; `stub_hidden` bool for existence disclosure |
 | `ingest_json` | Batch ingest nodes from JSON array |
 | `create_rule` | Declare a derivation rule |
 | `explain` | Explain rule-derived edges between two nodes |
@@ -115,6 +115,12 @@ let rows = db.query_masked("MATCH (p:Person) RETURN p", &Default::default(), &ma
 | `node_history` | WAL change history for a node; returns {key, history, total_commits} |
 | `edge_history` | Add/retract lifecycle for edges between two nodes with rule attribution; returns {a, b, events, total_commits} |
 | `was_linked` | Point-in-time edge check; returns {linked} or error when outside horizon |
+| `rename_node` | Rename a node's key; params: old_key, new_key; errors on absent old or duplicate new |
+| `upsert_edge` | Insert edge with auto-create for missing endpoints; returns {nodes_created, edge_inserted} |
+
+MCP is a trusted-local stdio interface — no bearer-token or role enforcement.
+`stub_hidden` on the `query` tool applies to client-masked paths only; Cypher rows
+are always omit-only.
 
 Claude Desktop config:
 ```json
@@ -178,6 +184,59 @@ This creates edges in both directions (a→b and b→a). An undirected Cypher pa
 `MATCH (a)-[:SIMILAR]-(b)` double-counts rows. Use directed patterns `MATCH (a)-[:SIMILAR]->(b)`
 or `RETURN DISTINCT a, b` to avoid duplicates.
 
+## Node masks and restricted-stub mode
+
+`NodeMask` restricts which nodes are visible to a query. Default behavior (omit mode):
+hidden nodes are removed from results entirely — no existence disclosure.
+
+Stub mode (`stub_hidden: true` in HTTP or MCP): hidden nodes appear as
+`{"key": "…", "restricted": true}`. Labels, properties, and neighbors are not
+disclosed. Use only when your application explicitly needs to indicate a node exists
+but is restricted.
+
+- Role tokens **always** use omit mode — `stub_hidden` is silently ignored.
+- Cypher result rows are **always omit-only** in both modes.
+- Edges to restricted endpoints: in stub mode, the edge object is included with the
+  restricted endpoint rendered as `{"key":…,"restricted":true}`; `edge_type` and
+  `derived` are present.
+
+HTTP query params: `stub_hidden=true` on `GET /node/{key}`, `GET /node/{key}/edges`,
+`GET /node/{key}/neighborhood`. POST /query body field: `"stub_hidden": true`.
+
+## Backup and export
+
+### Backup
+
+- **CLI** (idle store only): `mushroomdb backup <db-dir> <backup-dir>`
+- **HTTP** (live-served store): `POST /backup` with body `{"dest": "/path"}`;
+  full-token only; read lock held for file copies AND post-copy CRC verification.
+  Response: `{"files":[…],"bytes":N,"verified":true}`.
+- `backup_to(dest)` Rust API: process-local guarantee only.
+
+### Export
+
+- `mushroomdb export <db-dir> <dest> [--format jsonl|parquet]`
+- JSONL: stable, deterministic, byte-identical between runs.
+- Parquet: Snappy compression; NOT byte-identical across parquet-rs versions.
+- NaN/±Inf `Value::Float` → null in both formats.
+- Derived edges include rule attribution (`"rule": "name"`); manual edges: `"rule": null`.
+
+## Full-text search v2 (2026-08-29)
+
+BM25 ranking (k1=1.2, b=0.75) with Snowball English stemming. Query syntax:
+
+| Form | Meaning |
+|------|---------|
+| `word` | stemmed term |
+| `"a b"` | phrase (stemmed adjacency) |
+| `-word` | negation (exclude) |
+| `word*` | unstemmed prefix |
+| `a OR b` | OR groups |
+
+Negation-only queries return empty. Negation-only OR groups contribute nothing to
+score. Phrases never match across list-element boundaries. Both index and query paths
+use the same stemmer — do not re-stem query tokens.
+
 ## Python API notes
 
 `GraphDb.open(path)` creates the database directory if it does not already exist — no
@@ -187,6 +246,16 @@ manual mkdir required.
 default (32 for scored predicates, 1 for KeyMatch). This is the same as HTTP null.
 Neither Python nor HTTP can express the Rust `max_edges: None` global-budget hatch
 (1,000,000 per source); use the Rust API directly for that.
+
+`query(cypher, params=None)` — `params` accepts a dict or a list of (name, value)
+tuples. Values are parameterized, never interpolated — injection-safe regardless of
+content. `query_with_params(cypher, params)` is a retained alias.
+
+`rename_node(old_key, new_key)` — rename a node; raises on absent old or duplicate new.
+
+`insert_edge_upsert(edge_type, src_key, dst_key, placeholder_label)` — insert an edge,
+auto-creating missing endpoints with `placeholder_label`. Returns
+`{"nodes_created": N, "edge_inserted": bool}`.
 
 `query()` result rows are dicts; keys are the RETURN aliases from the Cypher query.
 

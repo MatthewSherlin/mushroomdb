@@ -72,6 +72,9 @@ authentication and is not subject to role enforcement.
 | `GET` | `/node/{key}` | Node info and properties |
 | `GET` | `/node/{key}/edges` | Incident edges (typed, with derived flag) |
 | `GET` | `/node/{key}/neighborhood` | Typed neighborhood expansion |
+| `POST` | `/nodes/{key}/rename` | Rename a node's key (full-token only) |
+| `POST` | `/edges/upsert` | Insert an edge, auto-creating missing endpoints (full-token only) |
+| `POST` | `/backup` | Consistent backup of the database to an admin-supplied path (full-token only) |
 | `GET` | `/watch` | WebSocket — live mutation events |
 | `GET` | `/subscribe` | WebSocket — rule and write events |
 
@@ -84,9 +87,19 @@ Request body:
 ```json
 {
   "cypher": "MATCH (p:Person)-[r:FIT]->(o:Org) WHERE r.score >= $min RETURN p, o, r.score AS score ORDER BY score DESC",
-  "params": { "min": 0.5 }
+  "params": { "min": 0.5 },
+  "stub_hidden": false
 }
 ```
+
+`stub_hidden` (optional, default `false`): when `true`, hidden nodes in the client
+mask appear as `{"key": "…", "restricted": true}` rather than being omitted. See
+[masks.md](masks.md) for the full policy. Note: Cypher result rows are **always
+omit-only** — `stub_hidden` has no effect on which rows the query returns; it only
+affects the node-info, edges, and neighborhood endpoints.
+
+Role tokens: `stub_hidden` is silently ignored. Hidden nodes are always fully omitted
+for role-token requests.
 
 Default response: Arrow IPC stream (`application/vnd.apache.arrow.stream`).
 
@@ -263,6 +276,8 @@ Response: array of explanation objects:
 
 ### GET /node/{key}
 
+Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
+
 ```json
 {
   "key": "person-01",
@@ -276,9 +291,16 @@ Response: array of explanation objects:
 
 Returns 404 with `{"error": "key not found: person-01"}` for unknown keys.
 
+With `stub_hidden=true` and a client mask, a key that exists but is outside the mask
+returns `{"key": "person-01", "restricted": true}` rather than 404. A key that does
+not exist at all still returns 404. Role tokens: `stub_hidden` is ignored; hidden keys
+return 404 as if absent.
+
 ---
 
 ### GET /node/{key}/edges
+
+Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
 
 ```json
 {
@@ -289,15 +311,188 @@ Returns 404 with `{"error": "key not found: person-01"}` for unknown keys.
 }
 ```
 
-Sorted by `(edge_type, src_key, dst_key)`. `derived: true` means the edge
-was created by a rule; `derived: false` means it was written directly via
-ingest or the edges field of `/ingest`.
+Sorted by `(edge_type, src_key, dst_key)`. `derived: true` means the edge was created
+by a rule; `derived: false` means it was written directly.
+
+With `stub_hidden=true` and a client mask, edges to restricted endpoints are included
+in the list; the restricted endpoint is rendered as `{"key": "…", "restricted": true}`.
+The `edge_type` and `derived` fields are always present in the edge object. Without
+`stub_hidden`, edges to hidden endpoints are omitted entirely.
 
 ---
 
 ### GET /node/{key}/neighborhood?depth=&dir=
 
 `depth` defaults to 1. `dir` is `out`, `in`, or `both` (default `both`).
+
+Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
+
+With `stub_hidden=true` and a client mask, hidden **direct** neighbors of visited nodes
+appear as stub rows (`label: null`). The BFS frontier is not expanded through hidden
+nodes — stub rows are terminal.
+
+---
+
+### POST /nodes/{key}/rename
+
+Rename a node's key. `{key}` is the current (old) key. Full-token only; role tokens
+return 403.
+
+Request body:
+
+```json
+{"new_key": "alice2"}
+```
+
+Responses:
+
+- `200 OK` — `{"ok": true}` — rename succeeded.
+- `404 Not Found` — old key does not exist.
+- `409 Conflict` — new key already exists.
+
+The rename is WAL-logged as a single `RenameNode` record. All edges referencing the
+node continue to work under the new key. Node history and time-travel (`open_at`)
+correctly scope events to the identity that held the key at each commit — recycling
+a key for a different node does not contaminate the previous identity's history.
+
+---
+
+### POST /edges/upsert
+
+Insert an edge, auto-creating any missing endpoint nodes. Full-token only; role tokens
+return 403.
+
+Request body:
+
+```json
+{
+  "edge_type": "KNOWS",
+  "src_key": "alice",
+  "dst_key": "bob",
+  "placeholder_label": "Person"
+}
+```
+
+`placeholder_label` is the label used when a missing endpoint node is created. If both
+endpoints already exist the body still requires this field.
+
+Response:
+
+```json
+{"nodes_created": 1, "edge_inserted": true}
+```
+
+`nodes_created` is 0, 1, or 2. `edge_inserted` is `false` when the edge already
+existed (idempotent on re-submission). Linking rules fire on any newly created
+placeholder nodes within the same batch frame.
+
+---
+
+### POST /backup
+
+Take a consistent backup of the database. Full-token only; role tokens return 403.
+
+Request body:
+
+```json
+{"dest": "/absolute/path/to/backup-dir"}
+```
+
+`dest` is an arbitrary admin-supplied path; the server must have write permission to
+it. The endpoint accepts any absolute path without validation — restrict access to
+this endpoint accordingly.
+
+The server holds the read lock for the **full duration** of the operation: file copies
+plus post-copy CRC verification. Writers are blocked for that entire window. For
+stores with large snapshots this may be tens of seconds.
+
+The server copies: `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
+`wal.floor`, `wal.genesis`, and `roles.json`. After the copies complete it opens the
+backup read-only and runs the CRC verifier.
+
+Responses:
+
+- `200 OK` — backup completed and verified. Body:
+
+  ```json
+  {
+    "files": ["snapshot.bin", "wal.bin", "wal.genesis"],
+    "bytes": 1887436800,
+    "verified": true
+  }
+  ```
+
+- `500 Internal Server Error` — backup succeeded but verification failed
+  (`verified: false` in body). Treat as a failure; do not use the backup.
+
+**This is the correct path for live-served stores.** Running `mushroomdb backup` CLI
+against a directory that a `serve` process is writing to is unsafe — the CLI copies
+are not atomic across processes. Use `POST /backup` when the server is running.
+
+See [format-stability.md](../format-stability.md) for the PITR (point-in-time
+recovery) workflow using backup together with WAL archives.
+
+---
+
+## Backup and export (Rust API and CLI)
+
+### Backup (Rust API)
+
+```rust
+let report = db.backup_to(Path::new("/backup/dir"))?;
+// report.files: Vec<String>  — files copied, sorted
+// report.bytes: u64          — total bytes copied
+// report.verified: bool      — true when post-copy CRC check passed
+```
+
+`backup_to` copies the store files and verifies the copy by opening it read-only.
+The `&self` borrow excludes concurrent writers within the same process, but it
+provides **no cross-process guarantee**. Do not call `backup_to` via the Rust API
+against a directory that a separate `mushroomdb serve` process is writing to. Use
+`POST /backup` instead.
+
+### Backup (CLI)
+
+```sh
+mushroomdb backup <db-dir> <backup-dir>
+```
+
+WARNING: unsafe against a concurrently running `mushroomdb serve` process. For
+live-served stores use `POST /backup`.
+
+### Export (Rust API)
+
+```rust
+let nodes: Vec<NodeInfo>     = db.all_nodes_for_export();
+let edges: Vec<ExportEdge>   = db.all_edges_for_export();
+// ExportEdge { edge_type, src, dst, derived: bool, rule: Option<String> }
+```
+
+Nodes are sorted by key. Edges are sorted by `(edge_type, src, dst)`. Derived
+edges include the rule name in `rule`; manually-written edges have `rule: None`.
+
+### Export (CLI)
+
+```sh
+mushroomdb export <db-dir> <dest-dir> [--format jsonl|parquet]
+```
+
+Default format: `jsonl`.
+
+**JSONL format** (default): writes `nodes.jsonl`, `edges.jsonl`, and `rules.jsonl`
+to `<dest-dir>`. Each line is a JSON object. JSONL output is stable, deterministic,
+and byte-identical between two runs on the same store.
+
+**Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
+and `rules.parquet` with Snappy compression (parquet-rs default). Parquet output
+is **not** byte-identical between parquet-rs library versions — use JSONL if you
+need a stable byte checksum.
+
+**Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as JSON
+`null` / Parquet null. Normal finite floats round-trip correctly.
+
+**Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is
+the rule name (present for derived edges, null for manual edges).
 
 ---
 
@@ -428,11 +623,11 @@ Response:
 
 ### Tools
 
-Fifteen tools:
+Seventeen tools:
 
 | Tool | Description |
 |---|---|
-| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set) |
+| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `stub_hidden?` (bool; see below) |
 | `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?` |
 | `create_rule` | Declare a linking rule; params: `RuleDef` fields |
 | `explain` | Explain edges; params: `a`, `b` |
@@ -447,6 +642,18 @@ Fifteen tools:
 | `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits}` |
 | `edge_history` | Add/retract lifecycle for edges between two nodes; params: `a`, `b`. Returns `{a, b, events, total_commits}` |
 | `was_linked` | Point-in-time edge check; params: `a`, `b`, `edge_type`, `at_commit`. Returns `{linked}` or error when outside horizon |
+| `rename_node` | Rename a node's key; params: `old_key`, `new_key`. Errors if old key absent or new key already exists. |
+| `upsert_edge` | Insert an edge, auto-creating missing endpoint nodes; params: `edge_type`, `src_key`, `dst_key`, `placeholder_label`. Returns `{nodes_created, edge_inserted}`. |
+
+**`stub_hidden` on the `query` tool:** when `true` and a `mask` is supplied,
+hidden nodes in the mask appear as `{"key":"…","restricted":true}` in node-info and
+neighborhood results. Cypher result rows are always omit-only — `stub_hidden` does not
+change which Cypher rows are returned.
+
+**MCP trust boundary:** the MCP server is a stdio JSON-RPC interface for local trusted
+use. It operates without bearer-token authentication and is not subject to role
+enforcement. All tools have full-access semantics regardless of any role configuration
+on the HTTP server.
 
 ---
 
@@ -520,14 +727,31 @@ because both `a→b` and `b→a` edges exist. Use directed patterns
 ### Query
 
 ```python
+# params as a dict
 result = db.query(
-    "MATCH (p:Person)-[r:FIT]->(o:Org) RETURN p, o, r.score AS score",
-    {}
+    "MATCH (p:Person)-[r:FIT]->(o:Org) WHERE r.score >= $min RETURN p, o, r.score AS score",
+    params={"min": 0.5}
 )
-# result is a list of dicts; dict keys are the RETURN aliases
+
+# params as a list of (name, value) tuples (back-compat form)
+result = db.query(
+    "MATCH (p:Person) WHERE p.age > $age RETURN p",
+    params=[("age", 30)]
+)
+
+# no params
+result = db.query("MATCH (p:Person) RETURN p")
+
 for row in result:
-    print(row["p"], row["o"], row["score"])
+    print(row["p"], row["score"])
 ```
+
+`params` accepts a `dict`, a list of `(str, value)` tuples, or `None`. Values
+are passed as Cypher parameters — they are never interpolated into the Cypher
+string, so string values are safe against injection regardless of content.
+
+`query_with_params(cypher, params)` is a retained back-compat alias for
+`query(cypher, params=params)`.
 
 The dict keys in each row are the **RETURN aliases** from the query — `p`, `o`,
 and `score` in the example above. Bare `RETURN n` yields `{"n": ...}`; `RETURN
@@ -540,6 +764,25 @@ edges = db.node_edges("alice")   # list of EdgeInfo dicts
 info  = db.node_info("alice")    # {key, label, props}
 neighbors = db.neighbors("alice", depth=1, direction="out")
 ```
+
+### Rename a node
+
+```python
+db.rename_node("alice", "alice2")
+```
+
+Raises `KeyNotFoundError` if the old key does not exist, `DuplicateKeyError` if the
+new key is already taken.
+
+### Insert edge with auto-create
+
+```python
+result = db.insert_edge_upsert("KNOWS", "alice", "bob", "Person")
+# result is a dict: {"nodes_created": 1, "edge_inserted": True}
+```
+
+Missing endpoint nodes are created with the given `placeholder_label`. If the edge
+already exists, `edge_inserted` is `False` (idempotent).
 
 ### Explain
 
@@ -678,8 +921,9 @@ async interface. See [timetravel.md](timetravel.md) for the full semantics.
 ### Exposed surface
 
 The bindings expose: `insert_node`, `ingest_batch`, `batch_edges`,
-`create_rule`, `set_prop`, `query`, `explain`, `neighbors`, `node_edges`,
-`node_info`, `stats`, `snapshot`.
+`create_rule`, `set_prop`, `query` (with `params`), `query_with_params` (alias),
+`explain`, `neighbors`, `node_edges`, `node_info`, `stats`, `snapshot`,
+`rename_node`, `insert_edge_upsert`.
 
 `write_batch` is not directly exposed in the Python bindings because Rust
 closures capturing `&mut BatchBuilder` do not map naturally to the Python
