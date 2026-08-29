@@ -5056,8 +5056,8 @@ impl<F: Fs> GraphDb<F> {
             return Ok(Some(vec![]));
         }
         match serde_json::from_slice::<RolesFile>(&bytes) {
-            Ok(f) if f.version == 1 => Ok(Some(f.roles)),
-            // Corrupt or unrecognised version: poison the roles state.
+            Ok(f) if f.version == 1 || f.version == 2 => Ok(Some(f.roles)),
+            // Corrupt or unrecognised version (>2): poison the roles state.
             _ => Ok(None),
         }
     }
@@ -5122,7 +5122,7 @@ impl<F: Fs> GraphDb<F> {
     /// Called by `apply_schema` when roles change. Never called on unchanged
     /// re-apply — this preserves byte-identical idempotency.
     pub(crate) fn commit_roles(&mut self, roles: Vec<RoleDef>) -> Result<()> {
-        let file = RolesFile::v1(roles.clone());
+        let file = RolesFile::new_versioned(roles.clone());
         let bytes = serde_json::to_vec(&file).map_err(|e| GraphError::Corrupt {
             detail: format!("roles serialization: {e}"),
         })?;

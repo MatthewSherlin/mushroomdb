@@ -38,7 +38,7 @@ pub use ingest::{
 };
 pub use mask::{MaskMode, NodeMask};
 pub use reader::{CommitDelta, FrozenOverlay, ReaderSnapshot, FOLD_EVERY_K};
-pub use roles::RoleDef;
+pub use roles::{RoleDef, WriteScope};
 pub use schema::{Schema, SchemaDiff};
 pub use shared::SharedDb;
 pub use subscription::{DbEvent, Subscription, DEFAULT_SUB_CAPACITY};

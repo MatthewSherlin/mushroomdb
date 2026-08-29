@@ -1451,6 +1451,7 @@ fn open_rbac(
                 name: rname.to_string(),
                 labels: labels.iter().map(|s| s.to_string()).collect(),
                 keys: keys.iter().map(|s| s.to_string()).collect(),
+                write: None,
             })
             .collect(),
         ..Default::default()
