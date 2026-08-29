@@ -179,6 +179,110 @@ impl GraphDb {
         result_set_to_rows(py, &rs)
     }
 
+    /// Returns `True` if any approximate (HNSW) VectorSimilar rule covers
+    /// `field`.
+    ///
+    /// Use as a capability probe before calling `find_similar`: when `True`,
+    /// the native ANN index is active and `find_similar` will use it;
+    /// when `False`, no HNSW rule covers `field` and `find_similar` falls back
+    /// to an O(n) brute-force scan.
+    ///
+    /// ```python
+    /// if db.has_vector_rule("embedding"):
+    ///     hits = db.find_similar("embedding", query_vec, k=10)
+    /// ```
+    fn has_vector_rule(&self, field: &str) -> PyResult<bool> {
+        self.with_ref(|db| Ok(db.has_vector_rule(field)))
+    }
+
+    /// Find the `k` most similar nodes to `vector` by cosine similarity on
+    /// `field`.
+    ///
+    /// When `label` is `None` (the default) the search spans nodes of every
+    /// label; when `label` is a string it restricts to nodes with that label.
+    ///
+    /// Uses the HNSW index when a VectorSimilar rule covers `field`
+    /// (check with `has_vector_rule`); falls back to O(n) brute-force scan
+    /// when no such rule exists.
+    ///
+    /// Returns a list of `(node_key, similarity_score)` tuples sorted by
+    /// score descending, filtered to `score >= min`.
+    ///
+    /// ```python
+    /// hits = db.find_similar("embedding", query_vec, k=10, min=0.7)
+    /// # or restrict to a label:
+    /// hits = db.find_similar("embedding", query_vec, label="Document", k=10)
+    /// ```
+    #[pyo3(signature = (field, vector, label = None, k = 10, min = 0.0))]
+    fn find_similar(
+        &self,
+        _py: Python<'_>,
+        field: &str,
+        vector: Bound<'_, PyList>,
+        label: Option<&str>,
+        k: usize,
+        min: f64,
+    ) -> PyResult<Vec<(String, f64)>> {
+        let q = pylist_to_f64_vec(&vector)?;
+        self.with_ref(|db| Ok(db.find_similar_vector(field, label, &q, k, min)))
+    }
+
+    /// Hybrid RRF search combining fulltext and vector similarity.
+    ///
+    /// Fuses up to `4*k` fulltext hits on `text_field` for `query_text` with
+    /// up to `4*k` vector hits on `vector_field` for `vector` using Reciprocal
+    /// Rank Fusion (constant 60).  When `vector` is empty the vector leg is
+    /// skipped and results come from the text leg alone.
+    ///
+    /// Returns `[(node_key, fused_score)]` sorted score-descending, ties by key.
+    ///
+    /// ```python
+    /// hits = db.search_hybrid(
+    ///     "bio", "machine learning",
+    ///     "embedding", query_vec,
+    ///     label="Person", k=5,
+    /// )
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (text_field, query_text, vector_field, vector, label = None, k = 10))]
+    fn search_hybrid(
+        &self,
+        _py: Python<'_>,
+        text_field: &str,
+        query_text: &str,
+        vector_field: &str,
+        vector: Bound<'_, PyList>,
+        label: Option<&str>,
+        k: usize,
+    ) -> PyResult<Vec<(String, f64)>> {
+        let q = pylist_to_f64_vec(&vector)?;
+        self.with_ref(|db| Ok(db.search_hybrid(text_field, query_text, vector_field, &q, label, k)))
+    }
+
+    /// Read a single property from an edge.
+    ///
+    /// Returns the value if the edge has this property set (e.g. a `score`
+    /// weight written by a rule), or `None` if the edge does not exist, the
+    /// field is absent, or any key cannot be resolved.
+    ///
+    /// ```python
+    /// score = db.get_edge_prop("SIMILAR", "alice", "bob", "score")
+    /// ```
+    fn get_edge_prop(
+        &self,
+        py: Python<'_>,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+        field: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let val = self.with_ref(|db| Ok(db.get_edge_prop(edge_type, src_key, dst_key, field)))?;
+        match val {
+            Some(v) => value_to_py(py, &v).map(|b| b.unbind()),
+            None => Ok(py.None()),
+        }
+    }
+
     fn create_rule(&self, py: Python<'_>, rule: Bound<'_, PyAny>) -> PyResult<()> {
         let def = rule_from_py(py, &rule)?;
         self.with_mut(|db| db.create_rule(def))
@@ -238,6 +342,7 @@ impl GraphDb {
     /// A single call with 100 000+ nodes serialises one giant WAL frame whose
     /// fsync cost dominates and negates the batching benefit.  Chunk at the
     /// call site (e.g. `for chunk in batched(nodes, 10_000)`).
+    #[allow(clippy::type_complexity)]
     #[pyo3(signature = (nodes, edges=None))]
     fn ingest_batch(
         &self,
@@ -263,9 +368,9 @@ impl GraphDb {
             let props_obj = d
                 .get_item("props")?
                 .ok_or_else(|| PyValueError::new_err("node dict missing 'props'"))?;
-            let props_dict = props_obj.downcast::<PyDict>().map_err(|_| {
-                PyTypeError::new_err("node 'props' must be a dict")
-            })?;
+            let props_dict = props_obj
+                .downcast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("node 'props' must be a dict"))?;
             let props = dict_to_props(props_dict)?;
             node_ops.push((label, key, props));
         }
@@ -355,8 +460,16 @@ impl GraphDb {
             }
             Ok(ops)
         }
-        let insert_ops = inserts.as_ref().map(parse_edges).transpose()?.unwrap_or_default();
-        let delete_ops = deletes.as_ref().map(parse_edges).transpose()?.unwrap_or_default();
+        let insert_ops = inserts
+            .as_ref()
+            .map(parse_edges)
+            .transpose()?
+            .unwrap_or_default();
+        let delete_ops = deletes
+            .as_ref()
+            .map(parse_edges)
+            .transpose()?
+            .unwrap_or_default();
         let n_insert = insert_ops.len();
         let n_delete = delete_ops.len();
         self.with_mut(|db| {
@@ -450,6 +563,29 @@ impl GraphDb {
             .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
         f(db).map_err(graph_err)
     }
+}
+
+fn pylist_to_f64_vec(list: &Bound<'_, PyList>) -> PyResult<Vec<f64>> {
+    let mut out = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        // PyBool must be checked before PyInt: Python bool is a subclass of
+        // int, so is_instance_of::<PyInt>() returns true for True/False too.
+        // Booleans are explicitly rejected — a True/False in a query vector
+        // is almost certainly a caller bug, not intentional numeric embedding.
+        if item.is_instance_of::<PyBool>() {
+            return Err(PyTypeError::new_err(
+                "vector elements must be numbers (int or float), not bool",
+            ));
+        } else if item.is_instance_of::<PyInt>() {
+            let i: i64 = item.extract()?;
+            out.push(i as f64);
+        } else if item.is_instance_of::<PyFloat>() {
+            out.push(item.extract()?);
+        } else {
+            return Err(PyTypeError::new_err("vector elements must be int or float"));
+        }
+    }
+    Ok(out)
 }
 
 fn lock<T>(m: &Mutex<T>) -> PyResult<std::sync::MutexGuard<'_, T>> {

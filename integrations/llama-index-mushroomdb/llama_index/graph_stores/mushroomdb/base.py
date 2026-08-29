@@ -3,8 +3,6 @@
 Built against llama-index-core 0.14.24.
 
 Binding surface gaps worked around in this file:
-- No native vector similarity (find_similar missing): cosine similarity is
-  computed in Python over embeddings stored as list-valued node properties.
 - No MERGE Cypher keyword: upsert is implemented as insert_node + set_prop
   fallback when the key already exists.
 - No label-rename primitive: when upsert_nodes is called for a key that
@@ -15,6 +13,13 @@ Binding surface gaps worked around in this file:
   engine automatically).
 - 'id' is a reserved Cypher parameter name: query parameters use 'k', 'v',
   'p0'..'pN' as parameter names instead.
+
+Resolved in binding >= 0.2:
+- Native vector similarity (find_similar): vector_query now calls
+  db.find_similar when the binding exposes it; the O(n) Python fallback is
+  retained for stores built against binding < 0.2.
+- 'id' is now a legal Cypher parameter name (was reserved in < 0.2).
+- Double-quoted string literals are now accepted by the parser.
 
 Reserved sentinel properties
 -----------------------------
@@ -489,11 +494,19 @@ class MushroomDBPropertyGraphStore(PropertyGraphStore):
     ) -> Tuple[List[LabelledNode], List[float]]:
         """Cosine similarity search over stored embeddings.
 
-        mushroomdb does not expose a native find_similar / ANN API in the
-        Python binding (as of 0.1.2). Embeddings are stored as list-valued
-        node properties and the top-k ranking is computed in Python. For
-        datasets of reasonable knowledge-graph size this is acceptable; a
-        native binding method would replace this loop.
+        **Native HNSW path** (binding >= 0.2, VectorSimilar rule required):
+        When ``db.has_vector_rule(_PROP_EMBEDDING)`` returns ``True`` a
+        VectorSimilar rule is active for the embedding field and the native
+        ``find_similar`` call goes directly to the HNSW index.  The result is
+        returned as-is — a legitimate empty list when no neighbors exceed the
+        similarity threshold is returned unchanged; the Python fallback is NOT
+        invoked (it would compute different semantics).
+
+        **O(n) Python fallback** (binding < 0.2 *or* no VectorSimilar rule):
+        Scans all nodes that have ``_PROP_EMBEDDING`` set and ranks by cosine
+        similarity.  Suitable for knowledge-graph sizes (thousands of nodes);
+        not for million-scale vector workloads.  To use HNSW, upgrade to
+        binding >= 0.2 and configure a VectorSimilar rule on ``_PROP_EMBEDDING``.
         """
         q_emb = query.query_embedding
         if not q_emb:
@@ -501,7 +514,26 @@ class MushroomDBPropertyGraphStore(PropertyGraphStore):
 
         k = max(1, query.similarity_top_k or 1)
 
-        # Fetch all nodes that have an embedding stored
+        # --- native path: HNSW via VectorSimilar rule -----------------------
+        # The capability probe is has_vector_rule — NOT result emptiness.
+        # A legitimate "no near neighbors" result must be returned as [],
+        # not silently replaced by an O(n) scan with different semantics.
+        if hasattr(self._db, "has_vector_rule") and self._db.has_vector_rule(
+            _PROP_EMBEDDING
+        ):
+            hits: List[Tuple[str, float]] = self._db.find_similar(
+                _PROP_EMBEDDING, q_emb, k=k, min=0.0  # label omitted → all labels
+            )
+            native_nodes: List[LabelledNode] = []
+            native_scores: List[float] = []
+            for nid, score in hits:
+                info = self._db.node_info(nid)
+                if info:
+                    native_nodes.append(self._info_to_node(info))
+                    native_scores.append(score)
+            return native_nodes, native_scores
+
+        # --- O(n) Python fallback (no HNSW rule, or binding < 0.2) ----------
         col = f"n.{_PROP_ID}"
         rows = self._db.query(
             f"MATCH (n) WHERE n.{_PROP_EMBEDDING} IS NOT NULL RETURN {col} LIMIT 10000"
@@ -522,9 +554,9 @@ class MushroomDBPropertyGraphStore(PropertyGraphStore):
 
         candidates.sort(key=lambda x: x[0], reverse=True)
         top = candidates[:k]
-        nodes = [self._info_to_node(info) for _, info in top]
-        scores = [score for score, _ in top]
-        return nodes, scores
+        fallback_nodes = [self._info_to_node(info) for _, info in top]
+        fallback_scores = [score for score, _ in top]
+        return fallback_nodes, fallback_scores
 
     def persist(
         self,

@@ -60,6 +60,24 @@ impl<'a> GraphView<'a> {
             .collect()
     }
 
+    /// All non-tombstoned node ids regardless of label.
+    ///
+    /// Respects the query-scoped mask: when a mask is active only ids present
+    /// in the mask are returned, consistent with every other node accessor.
+    pub fn nodes_all(&self) -> Vec<u32> {
+        self.labels
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &s)| {
+                if s != u32::MAX && self.visible(i as u32) {
+                    Some(i as u32)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Look up the property `field` for node `id`.
     ///
     /// Returns `ValueRef::Borrowed` for overlay hits (zero allocation) and
@@ -186,5 +204,37 @@ mod tests {
         assert_eq!(v.nodes_with_label("Person"), vec![bob, ada]);
         assert_eq!(v.nodes_with_label("Person"), vec![0, 1]);
         assert!(v.nodes_with_label("Nope").is_empty());
+    }
+
+    #[test]
+    fn nodes_all_respects_mask() {
+        use std::collections::HashSet;
+        let mut fx = Fx::new();
+        let alice = fx.add("Person", "alice", vec![]);
+        let bob = fx.add("Person", "bob", vec![]);
+        let carol = fx.add("Person", "carol", vec![]);
+
+        // Unmask: all three visible.
+        let v_full = fx.view();
+        let all = v_full.nodes_all();
+        assert!(all.contains(&alice));
+        assert!(all.contains(&bob));
+        assert!(all.contains(&carol));
+
+        // Masked: only alice and carol visible.
+        let visible: HashSet<u32> = [alice, carol].into_iter().collect();
+        let v_masked = GraphView {
+            ids: &fx.ids,
+            syms: &fx.syms,
+            labels: &fx.labels,
+            props: ColumnsView::owned(&fx.props),
+            topo: TopologyView::owned(&fx.topo),
+            edge_props: EdgePropsView::owned(&fx.eprops),
+            mask: Some(&visible),
+        };
+        let masked = v_masked.nodes_all();
+        assert!(masked.contains(&alice));
+        assert!(!masked.contains(&bob), "masked node must be excluded");
+        assert!(masked.contains(&carol));
     }
 }

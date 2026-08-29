@@ -467,3 +467,127 @@ def test_insert_edge_upsert_python(tmp_path):
     assert db.node_info("bob")["label"] == "Person"
     assert "bob" in db.neighbors("alice", "KNOWS", "out")
     db.close()
+
+
+# ── ANN binding: find_similar, search_hybrid, has_vector_rule, get_edge_prop ──
+
+def test_find_similar_returns_list(tmp_path):
+    """find_similar returns a list of (key, score) pairs."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "a", {"vec": [1.0, 0.0]})
+    db.insert_node("Item", "b", {"vec": [0.9, 0.1]})
+    db.insert_node("Item", "c", {"vec": [-1.0, 0.0]})
+
+    hits = db.find_similar("vec", [1.0, 0.0], label="Item", k=3, min=0.0)
+    assert isinstance(hits, list)
+    assert len(hits) >= 2
+    keys = [h[0] for h in hits]
+    assert "a" in keys
+    assert "b" in keys
+    assert hits[0][1] >= hits[1][1]
+    db.close()
+
+
+def test_find_similar_min_threshold(tmp_path):
+    """min threshold filters out low-similarity results."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "a", {"vec": [1.0, 0.0]})
+    db.insert_node("Item", "b", {"vec": [-1.0, 0.0]})
+
+    hits = db.find_similar("vec", [1.0, 0.0], label="Item", k=10, min=0.5)
+    keys = [h[0] for h in hits]
+    assert "a" in keys
+    assert "b" not in keys
+    db.close()
+
+
+def test_find_similar_empty_vector(tmp_path):
+    """Zero-length query vector returns no results (cannot normalise)."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "a", {"vec": [1.0, 0.0]})
+    hits = db.find_similar("vec", [0.0, 0.0], label="Item", k=5, min=0.0)
+    assert hits == []
+    db.close()
+
+
+def test_search_hybrid_returns_list(tmp_path):
+    """search_hybrid returns a list of (key, score) pairs."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Doc", "d1", {"text": "machine learning algorithms"})
+    db.insert_node("Doc", "d2", {"text": "graph database query"})
+
+    hits = db.search_hybrid("text", "machine", "vec", [], label="Doc", k=5)
+    assert isinstance(hits, list)
+    db.close()
+
+
+def test_has_vector_rule_without_rule(tmp_path):
+    """has_vector_rule returns False when no VectorSimilar rule is registered."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    assert db.has_vector_rule("embedding") is False
+    db.close()
+
+
+def test_has_vector_rule_with_rule(tmp_path):
+    """has_vector_rule returns True once a VectorSimilar rule is created."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "x", {"embedding": [1.0, 0.0]})
+    db.create_rule({
+        "name": "ann_rule",
+        "src_label": "Item",
+        "dst_label": "Item",
+        "predicate": {"VectorSimilar": {"field": "embedding", "min": 0.5}},
+        "edge_type": "SIMILAR",
+        "weight_prop": None,
+        "max_edges": None,
+        "approximate": True,
+    })
+    assert db.has_vector_rule("embedding") is True
+    assert db.has_vector_rule("other_field") is False
+    db.close()
+
+
+def test_get_edge_prop_rule_weight(tmp_path):
+    """get_edge_prop reads rule-written weight fields."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Thing", "a", {"score": 10.0})
+    db.insert_node("Thing", "b", {"score": 9.0})
+    db.create_rule({
+        "name": "similar_score",
+        "src_label": "Thing",
+        "dst_label": "Thing",
+        "predicate": {"NumericWithin": {"field": "score", "tolerance": 5.0}},
+        "edge_type": "SIMILAR",
+        "weight_prop": "score",
+        "max_edges": None,
+    })
+
+    assert "b" in db.neighbors("a", "SIMILAR", "out")
+
+    val = db.get_edge_prop("SIMILAR", "a", "b", "score")
+    assert val is not None
+    assert isinstance(val, float)
+    db.close()
+
+
+def test_get_edge_prop_missing_returns_none(tmp_path):
+    """get_edge_prop returns None for non-existent edges or missing fields."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("N", "x", {})
+    db.insert_node("N", "y", {})
+    db.insert_edge("LINK", "x", "y")
+
+    assert db.get_edge_prop("LINK", "x", "y", "weight") is None
+    assert db.get_edge_prop("LINK", "y", "x", "weight") is None
+    assert db.get_edge_prop("GHOST", "x", "y", "weight") is None
+    db.close()
+
+
+def test_find_similar_rejects_bool_vector(tmp_path):
+    """find_similar raises TypeError when the query vector contains booleans."""
+    import pytest
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "a", {"vec": [1.0, 0.0]})
+    with pytest.raises(TypeError, match="bool"):
+        db.find_similar("vec", [True, False], k=5)
+    db.close()

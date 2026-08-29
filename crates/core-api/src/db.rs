@@ -4729,8 +4729,7 @@ impl<F: Fs> GraphDb<F> {
 
         // Vector leg (skipped when query_vec is empty).
         if !query_vec.is_empty() {
-            let lbl = label.unwrap_or("");
-            let vec_hits = self.find_similar_vector(vector_field, lbl, query_vec, pool, 0.0);
+            let vec_hits = self.find_similar_vector(vector_field, label, query_vec, pool, 0.0);
             for (rank0, (key, _sim)) in vec_hits.into_iter().enumerate() {
                 let rank = (rank0 + 1) as f64;
                 *scores.entry(key).or_insert(0.0) += 1.0 / (RRF_K + rank);
@@ -5691,16 +5690,28 @@ impl<F: Fs> GraphDb<F> {
             .collect()
     }
 
-    /// Find nodes with the given `label` whose `field` vector is most similar
-    /// to `q` (cosine similarity), returning up to `k` results with similarity
-    /// ≥ `min`, sorted descending.
+    /// Returns `true` if any approximate (HNSW) VectorSimilar rule covers
+    /// `field`.  Use as a capability probe: when `true`, `find_similar_vector`
+    /// with `label = None` will use the native ANN path rather than the O(n)
+    /// brute-force scan.
+    pub fn has_vector_rule(&self, field: &str) -> bool {
+        self.engine.hnsw_has_rule(field)
+    }
+
+    /// Find nodes whose `field` vector is most similar to `q` (cosine
+    /// similarity), returning up to `k` results with similarity ≥ `min`,
+    /// sorted descending.
+    ///
+    /// When `label` is `None` the search spans all labels (via
+    /// `hnsw_search_any_dst` or a full brute-force scan); when `label` is
+    /// `Some(lbl)` it restricts to nodes with that label.
     ///
     /// Uses the HNSW index when one is available (fast path); otherwise falls
-    /// back to an O(n) brute-force scan over all nodes with that label (exact).
+    /// back to an O(n) brute-force scan.
     pub fn find_similar_vector(
         &self,
         field: &str,
-        label: &str,
+        label: Option<&str>,
         q: &[f64],
         k: usize,
         min: f64,
@@ -5716,7 +5727,15 @@ impl<F: Fs> GraphDb<F> {
         let q_unit: Vec<f64> = q.iter().map(|x| x / norm).collect();
 
         // Try HNSW fast path.
-        if let Some(hits) = self.engine.hnsw_search_dst(field, label, &q_unit, k) {
+        // `None` label searches across all VectorSimilar rules covering `field`
+        // (merging their results); `Some(lbl)` restricts to rules whose
+        // dst_label matches.  Returns `None` when no populated HNSW index
+        // covers the request — the O(n) brute-force fallback handles that case.
+        let hnsw_hits = match label {
+            Some(lbl) => self.engine.hnsw_search_dst(field, lbl, &q_unit, k),
+            None => self.engine.hnsw_search_any_dst(field, &q_unit, k),
+        };
+        if let Some(hits) = hnsw_hits {
             let mut out: Vec<(String, f64)> = hits
                 .into_iter()
                 .filter(|&(_, sim)| sim >= min)
@@ -5727,10 +5746,14 @@ impl<F: Fs> GraphDb<F> {
             return out;
         }
 
-        // Brute-force fallback: O(n) scan.
+        // Brute-force fallback: O(n) scan (only reached when no HNSW index
+        // covers the request).
         let view = self.view();
-        let mut scored: Vec<(String, f64)> = view
-            .nodes_with_label(label)
+        let candidate_ids: Vec<u32> = match label {
+            Some(lbl) => view.nodes_with_label(lbl),
+            None => view.nodes_all(),
+        };
+        let mut scored: Vec<(String, f64)> = candidate_ids
             .into_iter()
             .filter_map(|id| {
                 let v = view.prop(id, field)?;
@@ -5755,6 +5778,25 @@ impl<F: Fs> GraphDb<F> {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
         scored
+    }
+
+    /// Read a single property from an edge.
+    ///
+    /// Returns `None` when the edge does not exist, the field is absent, or any
+    /// of the string keys cannot be resolved to interned ids.  Only edge props
+    /// written by rules (weight fields) are accessible without a `set_edge_prop`
+    /// binding; topology-only edges (no props set) return `None` for every field.
+    pub fn get_edge_prop(
+        &self,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+        field: &str,
+    ) -> Option<Value> {
+        let etype = self.syms.get(edge_type)?;
+        let src = self.ids.get(src_key)?;
+        let dst = self.ids.get(dst_key)?;
+        self.edge_props_view().get(etype, src, dst, field)
     }
 
     /// Lex → parse → plan → execute `cypher` over a read-only view.
