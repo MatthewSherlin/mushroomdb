@@ -3495,6 +3495,8 @@ impl<F: Fs> GraphDb<F> {
             .collect()
     }
 
+    /// Distribute post-commit events to all live subscribers.
+    ///
     /// Called from `log_then_apply_with` after apply + fsync, before the
     /// legacy MutationEvent sink. Prunes dead `Weak` entries in-place.
     ///
