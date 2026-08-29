@@ -6930,13 +6930,19 @@ impl<F: Fs> GraphDb<F> {
                     });
                 }
                 None => {
-                    // Absent: must have create scope.
+                    // Absent: must have create scope to proceed to the create arm.
+                    //
+                    // Update-only roles (create_labels empty, update_labels set):
+                    // return the SAME "not visible" error as the hidden-key branch
+                    // so hidden ≡ absent — no distinguishing oracle (spec §6.1
+                    // "confirm existence of hidden nodes: No").
+                    //
+                    // Create-scoped roles (has_create=true): absent → create arm
+                    // as before.  The accepted structural key-existence disclosure
+                    // (§THREAT-MODEL) applies only when the role holds create scope.
                     if !has_create {
                         return Err(GraphError::RoleWriteDenied {
-                            reason: format!(
-                                "role-bound token: label '{}' not in write scope (create_labels)",
-                                stmt.label
-                            ),
+                            reason: "role-bound token: target node not visible".into(),
                         });
                     }
                     false // existed = false → create arm

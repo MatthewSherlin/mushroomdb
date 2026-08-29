@@ -44,6 +44,10 @@
 //!     test_merge_match_arm
 //!   Key hidden → not-visible:
 //!     test_merge_hidden_key
+//!   Update-only role: hidden ≡ absent (byte-equal "not visible", §6.1 oracle):
+//!     test_merge_update_only_hidden_eq_absent
+//!   Create-only role: hidden→not-visible, absent→create (accepted disclosure):
+//!     test_merge_create_only_disclosure_pinned
 //!
 //! EDGE-CREATE:
 //!   Both endpoints visible, type in create_edge_types → allowed:
@@ -616,6 +620,133 @@ fn test_merge_hidden_key() {
     assert_eq!(
         denied_reason(&err),
         "role-bound token: target node not visible"
+    );
+}
+
+/// Update-only role (create_labels empty, update_labels=["MyLabel"]):
+/// MERGE on a hidden key → "target node not visible".
+/// MERGE on an absent key → "target node not visible".
+/// The two bodies must be BYTE-EQUAL (spec §6.1 "confirm existence of hidden
+/// nodes: No"; closes the update-only MERGE existence oracle).
+#[test]
+fn test_merge_update_only_hidden_eq_absent() {
+    let dir = tmp("merge-update-only");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let schema = Schema {
+        fulltext: vec![],
+        rules: vec![],
+        views: vec![],
+        roles: vec![RoleDef {
+            name: "updater".into(),
+            keys: vec![],
+            labels: vec!["MyLabel".into()],
+            write: Some(WriteScope {
+                create_labels: vec![], // no create scope
+                update_labels: vec!["MyLabel".into()],
+                delete_labels: vec![],
+                create_edge_types: vec![],
+                delete_edge_types: vec![],
+            }),
+        }],
+    };
+    db.apply_schema(&schema).unwrap();
+
+    // Insert a node hidden from the updater role.
+    db.insert_node("Secret", "hidden_node", vec![]).unwrap();
+
+    // MERGE on hidden key.
+    let err_hidden = db
+        .query_write_authz(
+            "updater",
+            "MERGE (n:MyLabel {id: 'hidden_node'})",
+            &no_params(),
+        )
+        .unwrap_err();
+    // MERGE on absent key (store has no "absent_node").
+    let err_absent = db
+        .query_write_authz(
+            "updater",
+            "MERGE (n:MyLabel {id: 'absent_node'})",
+            &no_params(),
+        )
+        .unwrap_err();
+
+    // Both must be RoleWriteDenied.
+    assert!(is_role_write_denied(&err_hidden), "hidden: {err_hidden:?}");
+    assert!(is_role_write_denied(&err_absent), "absent: {err_absent:?}");
+
+    // Bodies must be byte-identical (no oracle).
+    assert_eq!(
+        denied_reason(&err_hidden),
+        denied_reason(&err_absent),
+        "update-only role: hidden and absent MERGE bodies must be equal"
+    );
+    assert_eq!(
+        denied_reason(&err_hidden),
+        "role-bound token: target node not visible"
+    );
+
+    // Confirm neither node was created.
+    assert!(
+        !db.has_node("absent_node"),
+        "absent node must not be created by update-only MERGE"
+    );
+}
+
+/// Create+update role: absent key → create arm (unchanged; pin against over-correction).
+/// This is the accepted structural key-existence disclosure (§THREAT-MODEL):
+/// hidden→not-visible, absent→create arm with create scope.
+#[test]
+fn test_merge_create_only_disclosure_pinned() {
+    // create-only role: create_labels=["MyLabel"], update_labels=[].
+    // hidden → not-visible; absent → create arm (accepted disclosure).
+    let dir = tmp("merge-create-only-disclosure");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let schema = Schema {
+        fulltext: vec![],
+        rules: vec![],
+        views: vec![],
+        roles: vec![RoleDef {
+            name: "creator".into(),
+            keys: vec![],
+            labels: vec!["MyLabel".into()],
+            write: Some(WriteScope {
+                create_labels: vec!["MyLabel".into()],
+                update_labels: vec![],
+                delete_labels: vec![],
+                create_edge_types: vec![],
+                delete_edge_types: vec![],
+            }),
+        }],
+    };
+    db.apply_schema(&schema).unwrap();
+
+    // Hidden key → not-visible (not a new DuplicateKey disclosure).
+    db.insert_node("Secret", "hidden_key", vec![]).unwrap();
+    let err_hidden = db
+        .query_write_authz(
+            "creator",
+            "MERGE (n:MyLabel {id: 'hidden_key'})",
+            &no_params(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        denied_reason(&err_hidden),
+        "role-bound token: target node not visible",
+        "create-only: hidden key must be not-visible"
+    );
+
+    // Absent key → create arm proceeds (the structural disclosure: key-existence
+    // via collision, accepted in the threat model).
+    db.query_write_authz(
+        "creator",
+        "MERGE (n:MyLabel {id: 'new_node'})",
+        &no_params(),
+    )
+    .unwrap();
+    assert!(
+        db.has_node("new_node"),
+        "create-only role: absent key must create the node"
     );
 }
 
