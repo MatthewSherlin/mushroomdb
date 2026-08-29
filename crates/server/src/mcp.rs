@@ -529,7 +529,12 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
             .get("field")
             .and_then(Js::as_str)
             .unwrap_or("embedding");
-        let label = args.get("label").and_then(Js::as_str).unwrap_or("");
+        let label_str = args.get("label").and_then(Js::as_str).unwrap_or("");
+        let label = if label_str.is_empty() {
+            None
+        } else {
+            Some(label_str)
+        };
         let k = args
             .get("k")
             .and_then(Js::as_u64)

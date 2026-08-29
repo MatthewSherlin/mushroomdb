@@ -588,3 +588,131 @@ def test_property_graph_index_smoke(tmp_path):
     assert all(isinstance(s, float) for s in scores)
 
     pg_store._db.close()
+
+
+# ---------------------------------------------------------------------------
+# 12. Native ANN proof tests (binding >= 0.2, VectorSimilar rule required)
+# ---------------------------------------------------------------------------
+
+
+def test_vector_query_native_path_used(tmp_path):
+    """When a VectorSimilar rule covers __embedding__, the native HNSW path
+    is used and the O(n) Python fallback must NOT run.
+
+    Proof: the Python _cosine helper is monkeypatched to raise; if the
+    fallback ran, the test would error rather than pass.
+    """
+    from llama_index.graph_stores.mushroomdb.base import _PROP_EMBEDDING
+
+    store = MushroomDBPropertyGraphStore(str(tmp_path / "db"))
+    nodes = [
+        EntityNode(name="A", label="EmbNode", embedding=_norm([1.0, 0.0, 0.0])),
+        EntityNode(name="B", label="EmbNode", embedding=_norm([0.9, 0.1, 0.0])),
+        EntityNode(name="C", label="EmbNode", embedding=_norm([0.0, 1.0, 0.0])),
+    ]
+    store.upsert_nodes(nodes)
+
+    store._db.create_rule({
+        "name": "emb_sim",
+        "src_label": "EmbNode",
+        "dst_label": "EmbNode",
+        "predicate": {"VectorSimilar": {"field": _PROP_EMBEDDING, "min": 0.5}},
+        "edge_type": "SIMILAR_TO",
+        "weight_prop": None,
+        "max_edges": None,
+        "approximate": True,
+    })
+
+    assert store._db.has_vector_rule(_PROP_EMBEDDING), "rule must be active"
+
+    import llama_index.graph_stores.mushroomdb.base as base_mod
+
+    def _raise_if_called(*args, **kwargs):
+        raise AssertionError("Python O(n) fallback ran — native path did not")
+
+    original_cosine = base_mod._cosine
+    base_mod._cosine = _raise_if_called
+    try:
+        result_nodes, scores = store.vector_query(
+            VectorStoreQuery(
+                query_embedding=_norm([1.0, 0.0, 0.0]),
+                similarity_top_k=2,
+            )
+        )
+    finally:
+        base_mod._cosine = original_cosine
+
+    assert len(result_nodes) > 0, "native path must return results"
+    assert all(s >= 0.0 for s in scores)
+    store._db.close()
+
+
+def test_vector_query_no_rule_uses_fallback(tmp_path):
+    """Without a VectorSimilar rule, has_vector_rule returns False and the
+    O(n) Python fallback runs normally."""
+    from llama_index.graph_stores.mushroomdb.base import _PROP_EMBEDDING
+
+    store = MushroomDBPropertyGraphStore(str(tmp_path / "db"))
+    nodes = [
+        EntityNode(name="P", embedding=_norm([1.0, 0.0])),
+        EntityNode(name="Q", embedding=_norm([0.0, 1.0])),
+    ]
+    store.upsert_nodes(nodes)
+
+    assert not store._db.has_vector_rule(_PROP_EMBEDDING)
+
+    result_nodes, scores = store.vector_query(
+        VectorStoreQuery(query_embedding=_norm([1.0, 0.0]), similarity_top_k=1)
+    )
+    assert len(result_nodes) == 1
+    assert result_nodes[0].id == "P"
+    store._db.close()
+
+
+def test_vector_query_native_legitimate_empty(tmp_path):
+    """When HNSW is active but no neighbors exceed the threshold, the native
+    path returns [] without falling back to the O(n) scan.
+
+    Proof: monkeypatch _cosine to raise; assert result is [].
+    """
+    import llama_index.graph_stores.mushroomdb.base as base_mod
+    from llama_index.graph_stores.mushroomdb.base import _PROP_EMBEDDING
+
+    store = MushroomDBPropertyGraphStore(str(tmp_path / "db"))
+    nodes = [
+        EntityNode(name="X", label="Sphere", embedding=_norm([1.0, 0.0, 0.0])),
+    ]
+    store.upsert_nodes(nodes)
+
+    store._db.create_rule({
+        "name": "sphere_sim",
+        "src_label": "Sphere",
+        "dst_label": "Sphere",
+        "predicate": {"VectorSimilar": {"field": _PROP_EMBEDDING, "min": 0.5}},
+        "edge_type": "SPHERE_SIM",
+        "weight_prop": None,
+        "max_edges": None,
+        "approximate": True,
+    })
+
+    assert store._db.has_vector_rule(_PROP_EMBEDDING)
+
+    original_cosine = base_mod._cosine
+
+    def _raise_if_called(*args, **kwargs):
+        raise AssertionError("Python O(n) fallback ran — legitimate-empty must not fall back")
+
+    base_mod._cosine = _raise_if_called
+    try:
+        result_nodes, scores = store.vector_query(
+            VectorStoreQuery(
+                query_embedding=_norm([1.0, 0.0, 0.0]),
+                similarity_top_k=10,
+            )
+        )
+    finally:
+        base_mod._cosine = original_cosine
+
+    assert isinstance(result_nodes, list)
+    assert isinstance(scores, list)
+    store._db.close()

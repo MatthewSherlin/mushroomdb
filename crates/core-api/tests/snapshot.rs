@@ -1886,14 +1886,14 @@ fn clean_open_find_similar_does_not_require_mutation() {
             .unwrap();
         db.snapshot().unwrap();
         // Verify ground truth before reopen.
-        let hits = db.find_similar_vector("emb", "Item", &[1.0, 0.0], 1, 0.0);
+        let hits = db.find_similar_vector("emb", Some("Item"), &[1.0, 0.0], 1, 0.0);
         expected_top = hits.into_iter().next().map(|(k, _)| k).unwrap();
         assert_eq!(expected_top, "a");
     }
 
     // Reopen (empty WAL — clean-open path).
     let db2 = GraphDb::open(&dir).unwrap();
-    let hits = db2.find_similar_vector("emb", "Item", &[1.0, 0.0], 1, 0.0);
+    let hits = db2.find_similar_vector("emb", Some("Item"), &[1.0, 0.0], 1, 0.0);
     assert!(
         !hits.is_empty(),
         "find_similar_vector returned empty on clean reopen"
@@ -1932,7 +1932,7 @@ fn wal_present_open_preserves_hnsw_before_replay() {
     let db2 = GraphDb::open(&dir).unwrap();
 
     // "a" must still be top-1 for query [1,0].
-    let hits = db2.find_similar_vector("emb", "Item", &[1.0, 0.0], 3, 0.0);
+    let hits = db2.find_similar_vector("emb", Some("Item"), &[1.0, 0.0], 3, 0.0);
     let keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
     assert!(
         keys.contains(&"a"),

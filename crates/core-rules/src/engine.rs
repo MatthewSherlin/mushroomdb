@@ -1941,6 +1941,87 @@ impl RuleEngine {
         None
     }
 
+    /// Returns `true` if any approximate (HNSW) VectorSimilar rule covers `field`.
+    ///
+    /// Use as a capability probe before calling `hnsw_search_dst` or
+    /// `hnsw_search_any_dst` — presence of the rule guarantees that the native
+    /// ANN path is available (even if the index is currently empty because no
+    /// nodes have been inserted yet).
+    pub fn hnsw_has_rule(&self, field: &str) -> bool {
+        self.rules
+            .values()
+            .any(|def| def.approximate && predicate_covers_field(&def.predicate, field))
+    }
+
+    /// Like `hnsw_search_dst` but searches across **all** dst_labels that have
+    /// an approximate VectorSimilar rule covering `field`.
+    ///
+    /// Results from multiple rules are merged by node id (keeping the maximum
+    /// score for any id that appears in more than one rule's index), then
+    /// sorted descending and truncated to `k`.
+    ///
+    /// Returns `None` when no applicable rule has a populated HNSW index
+    /// (same sentinel convention as `hnsw_search_dst`).
+    pub fn hnsw_search_any_dst(&self, field: &str, q: &[f64], k: usize) -> Option<Vec<(u32, f64)>> {
+        let mut merged: std::collections::BTreeMap<u32, f64> = std::collections::BTreeMap::new();
+        let mut found_index = false;
+
+        for (name, def) in &self.rules {
+            if !def.approximate {
+                continue;
+            }
+            if !predicate_covers_field(&def.predicate, field) {
+                continue;
+            }
+            let hits: Option<Vec<(u32, f64)>> = if let Some(idx) = self.indexes.get(name) {
+                if let Some(h) = idx.dst_side.hnsw_ref() {
+                    if !h.is_empty() {
+                        found_index = true;
+                        Some(h.search(q, k))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else if let Some(lazy) = self.lazy_hnsw.get() {
+                if let Some((_, Some(h))) = lazy.get(name) {
+                    if !h.is_empty() {
+                        found_index = true;
+                        Some(h.search(q, k))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(hits) = hits {
+                for (id, score) in hits {
+                    merged
+                        .entry(id)
+                        .and_modify(|s| {
+                            if score > *s {
+                                *s = score;
+                            }
+                        })
+                        .or_insert(score);
+                }
+            }
+        }
+
+        if !found_index {
+            return None;
+        }
+        let mut result: Vec<(u32, f64)> = merged.into_iter().collect();
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        result.truncate(k);
+        Some(result)
+    }
+
     /// Register a rule and backfill existing nodes.
     /// Returns Err on failed validate() or duplicate name.
     pub fn create_rule(&mut self, def: RuleDef, g: &mut GraphMut<'_>) -> Result<(), String> {

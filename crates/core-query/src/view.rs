@@ -60,6 +60,15 @@ impl<'a> GraphView<'a> {
             .collect()
     }
 
+    /// All non-tombstoned node ids regardless of label.
+    pub fn nodes_all(&self) -> Vec<u32> {
+        self.labels
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &s)| if s != u32::MAX { Some(i as u32) } else { None })
+            .collect()
+    }
+
     /// Look up the property `field` for node `id`.
     ///
     /// Returns `ValueRef::Borrowed` for overlay hits (zero allocation) and

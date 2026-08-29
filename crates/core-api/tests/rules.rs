@@ -721,7 +721,7 @@ fn find_similar_vector_without_edges() {
     let query = vec![1.0_f64, 0.0];
 
     // k=2, min=0.5: should return "a" and "b" only (c is orthogonal).
-    let hits = db.find_similar_vector("emb", "Item", &query, 2, 0.5);
+    let hits = db.find_similar_vector("emb", Some("Item"), &query, 2, 0.5);
     let keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(keys, vec!["a", "b"], "top-2 with min=0.5");
 
@@ -730,13 +730,13 @@ fn find_similar_vector_without_edges() {
     assert!((hits[0].1 - 1.0).abs() < 1e-9, "a is perfectly aligned");
 
     // k=3, min=0.0: all three nodes; c appears last with near-zero score.
-    let all = db.find_similar_vector("emb", "Item", &query, 3, 0.0);
+    let all = db.find_similar_vector("emb", Some("Item"), &query, 3, 0.0);
     assert_eq!(all.len(), 3);
     assert_eq!(all[2].0, "c");
     assert!(all[2].1.abs() < 1e-9, "c is orthogonal");
 
     // Label filter: only Items (no false positives from other labels).
-    let filtered = db.find_similar_vector("emb", "Other", &query, 10, 0.0);
+    let filtered = db.find_similar_vector("emb", Some("Other"), &query, 10, 0.0);
     assert!(filtered.is_empty(), "no Other-label nodes exist");
 }
 
