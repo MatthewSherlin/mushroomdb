@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Cypher fluency
+
+- `collect(x)` aggregation (grouped and ungrouped), skipping nulls.
+- `UNION` / `UNION ALL` combine two or more read queries (matching column names;
+  `UNION` dedups, `UNION ALL` keeps duplicates; masks apply uniformly).
+- `CASE WHEN <cond> THEN <value> … [ELSE <value>] END` expressions in
+  RETURN/WITH/WHERE/SET.
+- Multi-relationship-type patterns: `(a)-[:A|:B]->(b)` matches an edge of any
+  listed type.
+- New scalar functions: `contains`, `startsWith`, `endsWith`, `toInteger`,
+  `toFloat`, `toString`.
+
+Known follow-ons: bare `RETURN r` for a relationship variable still requires
+`r.field` (no relationship value type yet); `MATCH (a) MATCH (b) CREATE (a)-[:E]->(b)`
+between separately matched nodes does not yet create the edge.
+
 ### Property (equality) indexes
 
 - Opt-in equality index over scalar node properties: `MATCH (n:L {field: value})`
