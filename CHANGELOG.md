@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Property (equality) indexes
+
+- Opt-in equality index over scalar node properties: `MATCH (n:L {field: value})`
+  becomes an O(matches) indexed lookup instead of an O(N_label) scan. Declare via
+  a schema `indexes: [["Label","field"]]` list or `db.enable_index(label, field)`.
+  Maintained incrementally, persisted via the WAL + snapshot baseline, and rebuilt
+  on open (no format migration). Declaring an index never changes results, only
+  speed. See `docs/site/indexes.md`.
+
+### Fixes
+
+- Graph algorithms (PageRank, WCC, degree centrality) now read the unified
+  topology view, so they see rule-derived edges after a snapshot + reopen instead
+  of reporting zero for every node. Affected HTTP and CLI equally.
+- Cypher accepts list literals in `CREATE`/`SET` property values
+  (`CREATE (n {tags: ['a','b']})`).
+- `POST /backup` confines its `dest` to a backup root (`MUSHROOMDB_BACKUP_DIR`,
+  else the working directory); constant-time token comparison; 64 MiB request
+  body cap; bounded neighborhood BFS depth.
+- CLI `algo degree`/`pagerank` gain `--dir out|in|both`.
+
 ## v0.3.0 — 2026-08-30
 
 Role-scoped writes and mask-aware vector search. Additive over v0.2.0 — no
