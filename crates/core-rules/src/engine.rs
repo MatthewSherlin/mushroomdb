@@ -5029,4 +5029,62 @@ mod tests {
             "backfill must not materialize the full cross-product; peak was {peak}"
         );
     }
+
+    /// Regression guard for the `max_edges = None` (global-budget) backfill path.
+    ///
+    /// With `max_edges = None`, `create_rule` routes to `apply_streaming_create`
+    /// (engine.rs:~1075), which calls `compute_desired` once per source node and
+    /// applies edges immediately under a `prov.len() >= budget` latch
+    /// (budget = DEFAULT_MAX_EDGES = 1_000_000).  For 400 Person × 400 Org nodes
+    /// the cross-product is 160_000 — well below the budget — so ALL pairs are
+    /// applied.  Crucially, no global desired-map is ever materialised: the
+    /// per-source map is computed, iterated, and dropped before the next source
+    /// is processed.
+    ///
+    /// The budget latch itself (edges capped at DEFAULT_MAX_EDGES when the
+    /// cross-product exceeds it) is covered by the existing `#[ignore]`d
+    /// `streaming_peak_transient_bound` test (~line 4436); this test guards
+    /// peak desired-pair memory only.
+    #[test]
+    fn global_budget_backfill_stays_per_source_bounded() {
+        use std::sync::atomic::Ordering;
+        // Same 400 Person × 400 Org shared-value fixture as the Task 1 test,
+        // but rule has max_edges = None (global-budget path).
+        let mut fx = Fx::new();
+        for i in 0..400u32 {
+            fx.add("Person", &format!("p{i}"), vec![("city", Value::Str("austin".into()))]);
+        }
+        for i in 0..400u32 {
+            fx.add("Org", &format!("o{i}"), vec![("city", Value::Str("austin".into()))]);
+        }
+
+        let mut eng = RuleEngine::new();
+        PEAK_DESIRED_PAIRS.store(0, Ordering::Relaxed);
+        {
+            let mut g = fx.g();
+            eng.create_rule(
+                field_equal_rule("Person", "Org", "city", "IN_CITY", None),
+                &mut g,
+            )
+            .unwrap();
+        }
+
+        // All 160_000 pairs are below DEFAULT_MAX_EDGES (1_000_000), so every
+        // pair is applied — edge count equals the full cross-product.
+        let edges = fx.topo.edge_count();
+        assert_eq!(
+            edges,
+            400 * 400,
+            "none-path must apply all pairs when under budget; got {edges}"
+        );
+
+        // Peak simultaneous pairs must be bounded per-source (≤400 candidates),
+        // NOT the full 160_000 cross-product.  Any reversion to global desired-map
+        // accumulation would observe peak = 160_000 and trip this guard.
+        let peak = PEAK_DESIRED_PAIRS.load(Ordering::Relaxed);
+        assert!(
+            peak <= 400 * 4, // one per-src map of ≤400 candidates, with headroom
+            "none-path backfill must not accumulate a global desired-map; peak was {peak}"
+        );
+    }
 }
