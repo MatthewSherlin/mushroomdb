@@ -5,7 +5,8 @@
 //! `cypher_scan_filter_project`, `cypher_two_hop_join`,
 //! `rule_incremental_fire`, `rule_backfill_10k`, `explain_pair`,
 //! `explain_pair_dense`, `vector_rule_update`, `read_contention_1r0w`,
-//! `read_contention_4r1w`, `read_contention_16r1w`.
+//! `read_contention_4r1w`, `read_contention_16r1w`,
+//! `backfill_field_equal_5k`.
 
 use core_api::{AutoFk, Dir, GraphDb, IngestOptions, Predicate, RuleDef, SharedDb, Value};
 use core_storage::RealFs;
@@ -273,6 +274,76 @@ fn empty_params() -> BTreeMap<String, Value> {
     BTreeMap::new()
 }
 
+fn rule_field_equal_scale() -> RuleDef {
+    RuleDef {
+        name: "shared_group".into(),
+        src_label: "Src".into(),
+        dst_label: "Dst".into(),
+        predicate: Predicate::FieldEqual {
+            field: "group".into(),
+        },
+        edge_type: "GROUPED".into(),
+        weight_prop: None,
+        // Hard cap per source — exercises the streaming per-source budget path,
+        // not the cross-product materialisation path.
+        max_edges: Some(5),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    }
+}
+
+/// 5k × 5k FieldEqual backfill scale probe.
+///
+/// Ingests 5 000 "Src" nodes and 5 000 "Dst" nodes that all share the same
+/// `group = "shared"` value, creating a 25 M-pair cross-product scenario.
+/// `max_edges = Some(5)` caps each source at 5 edges, so the streaming
+/// `apply_streaming_create_top_k` path terminates after emitting at most
+/// 5 edges per source rather than materialising all 25 M pairs.  The bench
+/// pins the wall time of that streaming path so CI catches future regressions
+/// that would reintroduce cross-product materialisation.
+fn field_equal_scale_backfill(c: &mut Criterion) {
+    const SCALE: usize = 5_000;
+    let opts = ingest_opts();
+
+    let src_rows: Vec<PropRow> = (0..SCALE)
+        .map(|i| {
+            row(vec![
+                ("id", Value::Str(format!("src-{i:05}"))),
+                ("group", Value::Str("shared".into())),
+            ])
+        })
+        .collect();
+    let dst_rows: Vec<PropRow> = (0..SCALE)
+        .map(|i| {
+            row(vec![
+                ("id", Value::Str(format!("dst-{i:05}"))),
+                ("group", Value::Str("shared".into())),
+            ])
+        })
+        .collect();
+
+    c.bench_function("backfill_field_equal_5k", |b| {
+        b.iter_batched(
+            || {
+                let mut db = GraphDb::open(&tmp_dir()).expect("open");
+                db.ingest("Src", src_rows.clone(), &opts)
+                    .expect("ingest src");
+                db.ingest("Dst", dst_rows.clone(), &opts)
+                    .expect("ingest dst");
+                db
+            },
+            |mut db| {
+                db.create_rule(rule_field_equal_scale())
+                    .expect("backfill field_equal");
+                black_box(db.edge_count());
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
 fn engine_benches(c: &mut Criterion) {
     ingest_10k_nodes(c);
     neighborhood(c);
@@ -281,6 +352,7 @@ fn engine_benches(c: &mut Criterion) {
     explain_pair(c);
     vector_rule_update(c);
     vector_semantic_backfill(c);
+    field_equal_scale_backfill(c);
     contention(c);
 }
 
