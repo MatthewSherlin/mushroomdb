@@ -1126,6 +1126,24 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Ok(Value::Str(s))
             }
+            // List literal: `[]`, `[v1, v2, …]`, nesting allowed. Elements are
+            // themselves literal values (recursion), matching the UNWIND list
+            // form and downstream `Value::List` support in the store.
+            Some(Tok::LBracket) => {
+                self.pos += 1; // consume '['
+                let mut items = Vec::new();
+                if !self.eat(&Tok::RBracket) {
+                    loop {
+                        items.push(self.literal_value(what)?);
+                        if self.eat(&Tok::Comma) {
+                            continue;
+                        }
+                        self.expect(&Tok::RBracket, "expected ']' to close list literal")?;
+                        break;
+                    }
+                }
+                Ok(Value::List(items))
+            }
             Some(Tok::Param(_)) => Err(self.err(&format!(
                 "parameter references are not supported in {what} (v1 limitation: use literals only)"
             ))),
@@ -1358,6 +1376,9 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            // List-literal RHS: `SET n.tags = ['a', 'b']`. Lists are pure
+            // literals (no arithmetic), so parse directly into `Operand::Lit`.
+            Some(Tok::LBracket) => Operand::Lit(self.literal_value("SET value")?),
             _ => {
                 return Err(
                     self.err("expected literal, $parameter, or arithmetic expression as SET value")
@@ -2479,6 +2500,76 @@ LIMIT 10";
         assert_hop_err(
             "MATCH (a)-[r:T*0..3]->(b) RETURN a",
             "zero-length variable-length paths are not supported",
+        );
+    }
+
+    #[test]
+    fn create_accepts_list_literal_property() {
+        use super::parse_write;
+        use crate::cypher::ast::WriteStatement;
+        let src = "CREATE (n:Person {id: 'p1', tags: ['a', 'b']})";
+        let stmt = parse_write(&lex(src).unwrap())
+            .expect("CREATE with a list-literal property must parse");
+        let WriteStatement::Create(c) = stmt else {
+            panic!("expected a Create statement");
+        };
+        let tags = &c.nodes[0]
+            .props
+            .iter()
+            .find(|(k, _)| k == "tags")
+            .expect("tags property present")
+            .1;
+        assert_eq!(
+            *tags,
+            Value::List(vec![Value::Str("a".into()), Value::Str("b".into())])
+        );
+    }
+
+    #[test]
+    fn create_accepts_empty_and_nested_list_literals() {
+        use super::parse_write;
+        use crate::cypher::ast::WriteStatement;
+        let src = "CREATE (n:L {id: 'p1', empty: [], nested: [[1, 2], [3]]})";
+        let stmt = parse_write(&lex(src).unwrap()).expect("empty and nested lists must parse");
+        let WriteStatement::Create(c) = stmt else {
+            panic!("expected a Create statement");
+        };
+        let get = |k: &str| {
+            c.nodes[0]
+                .props
+                .iter()
+                .find(|(name, _)| name == k)
+                .expect("property present")
+                .1
+                .clone()
+        };
+        assert_eq!(get("empty"), Value::List(vec![]));
+        assert_eq!(
+            get("nested"),
+            Value::List(vec![
+                Value::List(vec![Value::Int(1), Value::Int(2)]),
+                Value::List(vec![Value::Int(3)]),
+            ])
+        );
+    }
+
+    #[test]
+    fn set_accepts_list_literal_rhs() {
+        use super::parse_write;
+        use crate::cypher::ast::{Operand, WriteStatement};
+        let src = "MATCH (n:Person {id: 'p1'}) SET n.tags = ['x', 'y']";
+        let stmt = parse_write(&lex(src).unwrap()).expect("SET with a list-literal RHS must parse");
+        let WriteStatement::MatchSet(m) = stmt else {
+            panic!("expected a MatchSet statement");
+        };
+        let set = &m.sets[0];
+        assert_eq!(set.field, "tags");
+        assert_eq!(
+            set.value,
+            Operand::Lit(Value::List(vec![
+                Value::Str("x".into()),
+                Value::Str("y".into())
+            ]))
         );
     }
 }
