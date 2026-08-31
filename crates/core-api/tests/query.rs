@@ -242,16 +242,17 @@ fn query_stage_prefixes_lex_plan_and_execute() {
         }
         other => panic!("expected QueryError, got {other:?}"),
     }
-    // Lexes and parses; planning rejects the unbound RETURN variable.
+    // Lexes and parses; planning (now folded into execute_union so UNION parts
+    // plan independently) rejects the unbound RETURN variable.
     match db.query("MATCH (a) RETURN b", &BTreeMap::new()) {
         Err(GraphError::QueryError { detail }) => {
             assert!(
-                detail.starts_with("plan:"),
-                "plan errors must be prefixed plan:, got: {detail}"
+                detail.starts_with("execute:"),
+                "planning errors now surface via execute:, got: {detail}"
             );
             assert!(
                 detail.contains("b") && (detail.contains("unbound") || detail.contains("Unbound")),
-                "plan error must name the unbound variable, got: {detail}"
+                "error must name the unbound variable, got: {detail}"
             );
         }
         other => panic!("expected QueryError, got {other:?}"),
@@ -2112,24 +2113,40 @@ fn return_distinct_cities() {
 }
 
 #[test]
-fn union_is_a_named_error() {
-    let db = open_fixture("named-err-union");
-    for (cypher, needle) in [(
-        "MATCH (n:Person) RETURN n UNION MATCH (m:Person) RETURN m",
-        "UNION",
-    )] {
-        let err = db.query(cypher, &BTreeMap::new()).expect_err(cypher);
-        let detail = match err {
-            GraphError::QueryError { detail } => detail,
-            other => panic!("{cypher}: expected QueryError, got {other:?}"),
-        };
-        assert!(
-            detail
-                .to_ascii_lowercase()
-                .contains(&needle.to_ascii_lowercase()),
-            "{cypher}: error must name {needle}, got: {detail}"
-        );
+fn union_distinct_and_union_all() {
+    let dir = tmp("union");
+    let mut db = GraphDb::open(&dir).unwrap();
+    // Keys are globally unique; the shared `id` value 'x' is what UNION dedups on.
+    for (label, key, id) in [("A", "ax", "x"), ("A", "ay", "y"), ("B", "bx", "x")] {
+        db.insert_node(label, key, vec![("id".into(), Value::Str(id.into()))])
+            .unwrap();
     }
+    // UNION dedups: A ids {x,y} ∪ B ids {x} = {x, y} → 2 rows.
+    let rs = db
+        .query(
+            "MATCH (n:A) RETURN n.id AS id UNION MATCH (m:B) RETURN m.id AS id",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 2, "UNION dedups the duplicate 'x'");
+
+    // UNION ALL keeps duplicates → 3 rows.
+    let rs = db
+        .query(
+            "MATCH (n:A) RETURN n.id AS id UNION ALL MATCH (m:B) RETURN m.id AS id",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 3, "UNION ALL keeps the duplicate 'x'");
+
+    // Mismatched column names → error.
+    let err = db.query(
+        "MATCH (n:A) RETURN n.id AS a UNION MATCH (m:B) RETURN m.id AS b",
+        &BTreeMap::new(),
+    );
+    assert!(err.is_err(), "UNION with mismatched columns must error");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Composite pin: float BinArith null propagation (Minor-3).

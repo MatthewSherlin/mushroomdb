@@ -10,7 +10,7 @@ pub use ast::{
     Query, RelDir, RelPat, RetItem, RetVal, SetClause, UnwindClause, UnwindExpr, WithStage,
     WriteStatement,
 };
-pub use exec::{execute, Params};
+pub use exec::{execute, execute_union, Params};
 pub use lexer::{lex, Tok};
-pub use parser::{is_write_tokens, parse, parse_write};
+pub use parser::{is_write_tokens, parse, parse_read, parse_write, UnionQuery};
 pub use plan::{is_subscribable, plan, PlanOp};

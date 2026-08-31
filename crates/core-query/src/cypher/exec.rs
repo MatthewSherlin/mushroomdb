@@ -231,6 +231,62 @@ pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<Res
     execute_inner(view, plan, params, row_bound(plan))
 }
 
+/// Execute a read query that may be a `UNION` / `UNION ALL` chain. Each part is
+/// planned and executed against the same `view` (so masking applies uniformly),
+/// then combined left-to-right: `UNION` dedups the accumulated rows, `UNION ALL`
+/// concatenates. All parts must project the same column names.
+pub fn execute_union(
+    view: &GraphView,
+    union: &crate::cypher::parser::UnionQuery,
+    params: &Params,
+) -> Result<ResultSet, String> {
+    let mut acc: Option<ResultSet> = None;
+    for (i, part) in union.parts.iter().enumerate() {
+        let ops = crate::cypher::plan::plan(part)?;
+        let rs = execute(view, &ops, params)?;
+        acc = Some(match acc {
+            None => rs,
+            Some(prev) => {
+                if prev.columns() != rs.columns() {
+                    return Err(format!(
+                        "UNION requires matching column names across all parts; \
+                         got {:?} then {:?}",
+                        prev.columns(),
+                        rs.columns()
+                    ));
+                }
+                // all_flags has one entry per boundary; index i-1 for part i.
+                let all = union.all_flags.get(i - 1).copied().unwrap_or(false);
+                combine_result_sets(prev, rs, all)
+            }
+        });
+    }
+    // `parse_read` guarantees at least one part.
+    Ok(acc.expect("UNION query has at least one part"))
+}
+
+fn combine_result_sets(mut acc: ResultSet, other: ResultSet, all: bool) -> ResultSet {
+    for i in 0..other.len() {
+        acc.push_row(other.row(i).to_vec());
+    }
+    if !all {
+        // UNION (distinct): keep first occurrence of each row.
+        let mut seen: Vec<Vec<Option<Value>>> = Vec::new();
+        for i in 0..acc.len() {
+            let r = acc.row(i).to_vec();
+            if !seen.contains(&r) {
+                seen.push(r);
+            }
+        }
+        let mut deduped = ResultSet::new(acc.columns().to_vec());
+        for r in seen {
+            deduped.push_row(r);
+        }
+        return deduped;
+    }
+    acc
+}
+
 /// Like `execute` but always disables LIMIT push-down (row_bound = None).
 ///
 /// Used in tests as the reference implementation: the result must equal that of

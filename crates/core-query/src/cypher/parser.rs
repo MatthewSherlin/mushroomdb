@@ -20,7 +20,46 @@ pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
         toks: tokens,
         pos: 0,
     };
-    p.query()
+    let q = p.query()?;
+    if p.pos < p.toks.len() {
+        // A single-query parse: a trailing `UNION` (or anything else) is an
+        // error here. Use `parse_read` to accept a `UNION` chain.
+        return Err(p.unsupported_or_unexpected("unexpected tokens after query"));
+    }
+    Ok(q)
+}
+
+/// A read query that may be a single query or a `UNION` / `UNION ALL` chain.
+/// `all_flags[i]` is `true` when the boundary before `parts[i + 1]` was
+/// `UNION ALL` (bag union); `false` for `UNION` (distinct). Length is
+/// `parts.len() - 1`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionQuery {
+    pub parts: Vec<Query>,
+    pub all_flags: Vec<bool>,
+}
+
+/// Parse a read query, accepting a `UNION` / `UNION ALL` chain.
+pub fn parse_read(tokens: &[Tok]) -> Result<UnionQuery, String> {
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+    };
+    let mut parts = vec![p.query()?];
+    let mut all_flags = Vec::new();
+    while p.peek_is_union() {
+        p.pos += 1; // consume UNION
+        let all = matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("all"));
+        if all {
+            p.pos += 1; // consume ALL
+        }
+        all_flags.push(all);
+        parts.push(p.query()?);
+    }
+    if p.pos < p.toks.len() {
+        return Err(p.err("unexpected tokens after UNION query"));
+    }
+    Ok(UnionQuery { parts, all_flags })
 }
 
 /// Parse a tokenized write statement (CREATE / MATCH…SET / MATCH…DELETE / MERGE).
@@ -156,9 +195,8 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        if self.pos < self.toks.len() {
-            return Err(self.unsupported_or_unexpected("unexpected tokens after query"));
-        }
+        // NOTE: the leftover-token check lives in `parse` / `parse_read`, not
+        // here, so `query()` can stop cleanly at a `UNION` boundary.
         Ok(Query {
             matches,
             optional_clauses,
@@ -172,6 +210,11 @@ impl<'a> Parser<'a> {
             skip,
             limit,
         })
+    }
+
+    /// True if the next token is the `UNION` keyword (an ordinary identifier).
+    fn peek_is_union(&self) -> bool {
+        matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("union"))
     }
 
     /// Named errors for still-unsupported Cypher forms (`UNION`, `CASE`).
@@ -2190,12 +2233,16 @@ LIMIT 10";
     }
 
     #[test]
-    fn union_is_a_named_error() {
-        let err = parse_src("MATCH (n) RETURN n UNION MATCH (m) RETURN m").unwrap_err();
-        assert!(
-            err.contains("UNION"),
-            "UNION must be a named error, got: {err}"
-        );
+    fn union_query_parses_into_parts() {
+        use super::parse_read;
+        let u = parse_read(&lex("MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m").unwrap())
+            .expect("UNION parses");
+        assert_eq!(u.parts.len(), 2);
+        assert_eq!(u.all_flags, vec![true]);
+        // A single query yields one part, no boundaries.
+        let single = parse_read(&lex("MATCH (n) RETURN n").unwrap()).unwrap();
+        assert_eq!(single.parts.len(), 1);
+        assert!(single.all_flags.is_empty());
     }
 
     #[test]
