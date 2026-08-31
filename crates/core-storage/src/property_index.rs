@@ -12,7 +12,10 @@
 //! update or delete removes the stale entry in `O(log n)` without knowing the
 //! previous value.
 
+use crate::idmap::IdMap;
+use crate::interner::Interner;
 use crate::types::{Value, ValueKey};
+use crate::v8::seam::ColumnsView;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Equality index over declared `(label, field)` pairs.
@@ -90,6 +93,20 @@ impl PropertyIndex {
         }
     }
 
+    /// Remove every entry for node `id` across all declared pairs. Used when a
+    /// node is deleted (mirrors [`crate::fulltext::FulltextIndex::remove_node`]).
+    pub fn remove_node_all(&mut self, id: u32) {
+        let pairs: Vec<(String, String)> = self
+            .reverse
+            .keys()
+            .filter(|(_, _, i)| *i == id)
+            .map(|(l, f, _)| (l.clone(), f.clone()))
+            .collect();
+        for (l, f) in pairs {
+            self.remove_node(&l, &f, id);
+        }
+    }
+
     /// Remove node `id`'s entry for `(label, field)` if present.
     pub fn remove_node(&mut self, label: &str, field: &str, id: u32) {
         let rkey = (label.to_string(), field.to_string(), id);
@@ -117,6 +134,47 @@ impl PropertyIndex {
             .and_then(|by_value| by_value.get(&vk))
             .map(|ids| ids.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Rebuild all postings for the declared pairs from live column data.
+    /// Called at open end to correct any drift from per-record replay; a no-op
+    /// when nothing is declared. Mirrors [`crate::fulltext::FulltextIndex::rebuild_all`].
+    pub fn rebuild_all(
+        &mut self,
+        ids: &IdMap,
+        labels: &[u32],
+        syms: &Interner,
+        props: ColumnsView<'_>,
+    ) {
+        if self.enabled.is_empty() {
+            return;
+        }
+        let enabled_vec: Vec<(String, String)> = self.enabled.iter().cloned().collect();
+        for pair in &enabled_vec {
+            self.forward.remove(pair);
+        }
+        self.reverse
+            .retain(|(l, f, _), _| !enabled_vec.iter().any(|(el, ef)| el == l && ef == f));
+        let n = ids.len() as u32;
+        for id in 0..n {
+            let Some(&sym) = labels.get(id as usize) else {
+                continue;
+            };
+            if sym == u32::MAX {
+                continue;
+            }
+            let Some(label) = syms.resolve(sym) else {
+                continue;
+            };
+            for (lbl, field) in &enabled_vec {
+                if lbl == label {
+                    if let Some(vr) = props.get(id, field) {
+                        let value = vr.into_value();
+                        self.set(lbl, field, id, &value);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -194,6 +252,19 @@ mod tests {
         ix.set("N", "active", 1, &Value::Bool(true));
         assert_eq!(ix.lookup("N", "age", &Value::Int(30)), vec![1, 2]);
         assert_eq!(ix.lookup("N", "active", &Value::Bool(true)), vec![1]);
+    }
+
+    #[test]
+    fn remove_node_all_drops_every_field_for_id() {
+        let mut ix = PropertyIndex::new();
+        ix.enable("Person", "city");
+        ix.enable("Person", "team");
+        ix.set("Person", "city", 1, &s("austin"));
+        ix.set("Person", "team", 1, &s("blue"));
+        ix.set("Person", "city", 2, &s("austin"));
+        ix.remove_node_all(1);
+        assert_eq!(ix.lookup("Person", "city", &s("austin")), vec![2]);
+        assert_eq!(ix.lookup("Person", "team", &s("blue")), Vec::<u32>::new());
     }
 
     #[test]

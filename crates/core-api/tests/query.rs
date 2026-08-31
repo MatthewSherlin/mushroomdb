@@ -2171,3 +2171,106 @@ fn abs_float_binarith_null_propagation() {
         "abs(null - 1.5) must propagate null, not error"
     );
 }
+
+// ── Property (equality) index ─────────────────────────────────────────────
+
+/// End-to-end: an equality index accelerates `MATCH (n:L {field: value})`,
+/// its declaration and postings survive a snapshot + reopen, and it is
+/// maintained on subsequent writes.
+#[test]
+fn property_index_end_to_end_and_survives_snapshot() {
+    let dir = tmp("prop-index-e2e");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_index("Person", "city").unwrap();
+        for (k, city) in [("a", "austin"), ("b", "boston"), ("c", "austin")] {
+            db.insert_node("Person", k, vec![("city".into(), Value::Str(city.into()))])
+                .unwrap();
+        }
+        let rs = db
+            .query(
+                "MATCH (n:Person {city: 'austin'}) RETURN n",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(rs.len(), 2, "two austin nodes before snapshot");
+        db.snapshot().unwrap();
+    }
+
+    // Reopen: declaration persisted via WAL baseline, postings rebuilt from base.
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert!(
+        db.is_index_enabled("Person", "city"),
+        "index declaration must survive snapshot + reopen"
+    );
+    let rs = db
+        .query(
+            "MATCH (n:Person {city: 'austin'}) RETURN n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 2, "indexed query correct after reopen");
+
+    // Maintained on new writes.
+    db.insert_node(
+        "Person",
+        "d",
+        vec![("city".into(), Value::Str("austin".into()))],
+    )
+    .unwrap();
+    let rs = db
+        .query(
+            "MATCH (n:Person {city: 'austin'}) RETURN n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 3, "new austin node reflected via index");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The indexed result must equal the unindexed scan result for the same query
+/// (correctness of the IndexScan fast path vs the scan+filter fallback).
+#[test]
+fn property_index_matches_unindexed_scan() {
+    let indexed = {
+        let dir = tmp("prop-index-parity-on");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_index("Person", "city").unwrap();
+        for (k, city) in [("a", "austin"), ("b", "boston"), ("c", "austin")] {
+            db.insert_node("Person", k, vec![("city".into(), Value::Str(city.into()))])
+                .unwrap();
+        }
+        let rs = db
+            .query(
+                "MATCH (n:Person {city: 'austin'}) RETURN n",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let n = rs.len();
+        let _ = std::fs::remove_dir_all(&dir);
+        n
+    };
+    let unindexed = {
+        let dir = tmp("prop-index-parity-off");
+        let mut db = GraphDb::open(&dir).unwrap();
+        for (k, city) in [("a", "austin"), ("b", "boston"), ("c", "austin")] {
+            db.insert_node("Person", k, vec![("city".into(), Value::Str(city.into()))])
+                .unwrap();
+        }
+        let rs = db
+            .query(
+                "MATCH (n:Person {city: 'austin'}) RETURN n",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let n = rs.len();
+        let _ = std::fs::remove_dir_all(&dir);
+        n
+    };
+    assert_eq!(
+        indexed, unindexed,
+        "indexed and unindexed results must match"
+    );
+    assert_eq!(indexed, 2);
+}

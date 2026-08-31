@@ -137,6 +137,9 @@ fn make_view<'a>(
         topo: build_tv(&state.topo, base),
         edge_props: build_epv(&state.edge_props, base),
         mask,
+        // MVCC reader snapshots don't carry the equality index; IndexScan
+        // falls back to a correct scan+filter on this path.
+        prop_index: None,
     }
 }
 
@@ -334,6 +337,11 @@ fn apply_one(
         | WalRecord::RebuildRule { .. }
         | WalRecord::CreateView { .. }
         | WalRecord::DeleteView { .. }
+        // Property-index declarations are no-ops in the read path: MVCC reader
+        // snapshots do not carry the equality index, so `IndexScan` falls back
+        // to a correct scan+filter for reader queries.
+        | WalRecord::EnableIndex { .. }
+        | WalRecord::DisableIndex { .. }
         // History markers are no-ops in the read path. Rules re-derive their
         // edges when the ReaderSnapshot queries the live engine; markers only
         // serve edge_history / was_linked WAL scans.

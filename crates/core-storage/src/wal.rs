@@ -138,6 +138,22 @@ pub enum WalRecord {
         old_key: String,
         new_key: String,
     },
+    // ── Property-index variants (appended after rename; discriminants 21, 22) ──
+    //
+    // Like the full-text variants, these persist only the *declaration* of an
+    // equality index on `(label, field)`; the postings are rebuilt from live
+    // data on open.  Zero replay state beyond the enabled set.
+    /// Enable an equality index on `(label, field)`.  Discriminant 21.
+    EnableIndex {
+        label: String,
+        field: String,
+    },
+    /// Disable the equality index on `(label, field)` and drop its postings.
+    /// Discriminant 22.
+    DisableIndex {
+        label: String,
+        field: String,
+    },
 }
 
 /// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.
@@ -619,6 +635,41 @@ mod tests {
                 field: "b".into()
             }
         );
+    }
+
+    /// Pin discriminants 21 (EnableIndex) and 22 (DisableIndex).
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    #[test]
+    fn golden_bytes_pin_property_index_wire_format() {
+        let enable = WalRecord::EnableIndex {
+            label: "A".into(),
+            field: "b".into(),
+        };
+        let ep = bincode::serialize(&enable).unwrap();
+        assert_eq!(
+            &ep[0..4],
+            &[21, 0, 0, 0],
+            "EnableIndex discriminant changed — a variant was inserted before position 21"
+        );
+
+        let disable = WalRecord::DisableIndex {
+            label: "A".into(),
+            field: "b".into(),
+        };
+        let dp = bincode::serialize(&disable).unwrap();
+        assert_eq!(
+            &dp[0..4],
+            &[22, 0, 0, 0],
+            "DisableIndex discriminant changed — a variant was inserted before position 22"
+        );
+
+        let mut buf = encode_record(&enable);
+        buf.extend(encode_record(&disable));
+        let (recs, consumed) = decode_all(&buf);
+        assert_eq!(consumed, buf.len());
+        assert_eq!(recs, vec![enable, disable]);
     }
 
     #[test]

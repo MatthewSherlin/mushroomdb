@@ -77,6 +77,7 @@ fn build_store_with_archives(dir: &std::path::Path) -> usize {
     // Apply schema with a role so roles.json is written.
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {

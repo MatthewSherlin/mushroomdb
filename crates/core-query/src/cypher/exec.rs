@@ -25,6 +25,12 @@ static FUSED_SCAN_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 #[cfg(test)]
 static SCAN_KEY_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only counter incremented each time an `IndexScan` takes the *indexed*
+/// path (not the scan fallback). Lets tests assert the equality index is used.
+#[cfg(test)]
+pub static INDEX_SCAN_FIRES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Query parameters. Missing names anywhere in the plan are an error at
 /// execution start (the plan is walked before any rows are produced).
 pub struct Params<'a>(pub &'a BTreeMap<String, Value>);
@@ -321,6 +327,23 @@ fn execute_inner(
             }
             PlanOp::ScanKey { var, key, label } => {
                 rows = scan_key(view, &vars, &rows, var, key, label.as_deref(), params)?;
+            }
+            PlanOp::IndexScan {
+                var,
+                label,
+                field,
+                value,
+            } => {
+                rows = scan_index(
+                    view,
+                    &vars,
+                    &rows,
+                    var,
+                    label.as_deref(),
+                    field,
+                    value,
+                    params,
+                )?;
             }
             PlanOp::LookupProps { var, props } => {
                 rows = retain_node(view, &vars, &rows, var, None, props, params)?;
@@ -1249,6 +1272,77 @@ fn scan_label(
         .ok_or_else(|| format!("unbound variable `{var}`"))?;
     let cap = max_intermediate_rows();
     let mut out = Vec::with_capacity(rows.len().saturating_mul(ids.len()).min(cap));
+    for row in rows {
+        for &id in &ids {
+            if out.len() >= cap {
+                return Err(row_cap_err(cap));
+            }
+            let mut next = row.clone();
+            next[slot] = Some(Cell::Node(id));
+            out.push(next);
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve the matching node ids for an `IndexScan` of `label`/`field`/`value`.
+///
+/// Indexed path (`(label, field)` declared, concrete label, scalar value): the
+/// property index answers directly. Otherwise a full label scan filtered by the
+/// same `node_matches` equality the `LookupProps` plan uses — so the id set is
+/// identical to `ScanLabel` + `LookupProps` regardless of whether an index
+/// exists. `row` supplies `$param` bindings (the value is row-independent).
+#[allow(clippy::too_many_arguments)]
+fn index_scan_ids(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    label: Option<&str>,
+    field: &str,
+    value: &Operand,
+    params: &Params,
+) -> Result<Vec<u32>, String> {
+    let resolved = resolve_operand(view, vars, row, value, params)?;
+    if let (Some(label_str), Some(val)) = (label, resolved.as_ref()) {
+        if let Some(ids) = view.nodes_with_prop(label_str, field, val) {
+            #[cfg(test)]
+            INDEX_SCAN_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(ids);
+        }
+    }
+    // Fallback: full label scan + single-equality retain.
+    let props = [(field.to_string(), value.clone())];
+    let mut out = Vec::new();
+    for id in scan_ids(view, label) {
+        if node_matches(view, vars, row, id, None, &props, params)? {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Execute an `IndexScan`: seed rows from nodes of `label` whose scalar
+/// `field` equals `value` (see [`index_scan_ids`]).
+#[allow(clippy::too_many_arguments)]
+fn scan_index(
+    view: &GraphView,
+    vars: &VarTable,
+    rows: &[Row],
+    var: &str,
+    label: Option<&str>,
+    field: &str,
+    value: &Operand,
+    params: &Params,
+) -> Result<Vec<Row>, String> {
+    let Some(first) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let ids = index_scan_ids(view, vars, first, label, field, value, params)?;
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    let cap = max_intermediate_rows();
+    let mut out = Vec::new();
     for row in rows {
         for &id in &ids {
             if out.len() >= cap {
@@ -2255,6 +2349,31 @@ fn agg_stream(
                 agg_stream(ctx, rest, &next, acc)?;
             }
         }
+        PlanOp::IndexScan {
+            var,
+            label,
+            field,
+            value,
+        } => {
+            let ids = index_scan_ids(
+                ctx.view,
+                ctx.vars,
+                row,
+                label.as_deref(),
+                field,
+                value,
+                ctx.params,
+            )?;
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for &id in &ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                agg_stream(ctx, rest, &next, acc)?;
+            }
+        }
         PlanOp::Expand {
             from,
             rel_var,
@@ -2712,6 +2831,31 @@ fn group_stream(
                 group_stream(ctx, rest, &next, groups, key_order)?;
             }
         }
+        PlanOp::IndexScan {
+            var,
+            label,
+            field,
+            value,
+        } => {
+            let ids = index_scan_ids(
+                ctx.view,
+                ctx.vars,
+                row,
+                label.as_deref(),
+                field,
+                value,
+                ctx.params,
+            )?;
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for &id in &ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                group_stream(ctx, rest, &next, groups, key_order)?;
+            }
+        }
         PlanOp::Expand {
             from,
             rel_var,
@@ -3050,6 +3194,35 @@ fn pull_rows(
                 pull_rows(ctx, rest, row, result)?;
                 row[slot] = prev;
             }
+        }
+        PlanOp::IndexScan {
+            var,
+            label,
+            field,
+            value,
+        } => {
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            let ids = index_scan_ids(
+                ctx.view,
+                ctx.vars,
+                row,
+                label.as_deref(),
+                field,
+                value,
+                ctx.params,
+            )?;
+            let prev = row[slot].clone();
+            for id in ids {
+                if result.len() >= ctx.bound {
+                    break;
+                }
+                row[slot] = Some(Cell::Node(id));
+                pull_rows(ctx, rest, row, result)?;
+            }
+            row[slot] = prev;
         }
         PlanOp::Expand {
             from,
@@ -3578,6 +3751,17 @@ mod tests {
                 topo: TopologyView::owned(&self.topo),
                 edge_props: EdgePropsView::owned(&self.eprops),
                 mask: None,
+                prop_index: None,
+            }
+        }
+
+        fn view_indexed<'a>(
+            &'a self,
+            index: &'a core_storage::property_index::PropertyIndex,
+        ) -> GraphView<'a> {
+            GraphView {
+                prop_index: Some(index),
+                ..self.view()
             }
         }
     }
@@ -6487,6 +6671,44 @@ LIMIT 10";
     }
 
     /// Arithmetic in a WHERE comparison: `n.age + 1 > 5` filters correctly.
+    #[test]
+    fn index_scan_uses_index_and_matches_fallback() {
+        use core_storage::property_index::PropertyIndex;
+        use std::sync::atomic::Ordering;
+
+        let mut fx = Fx::new();
+        let a = fx.add("Person", "a", vec![("city", s("austin"))]);
+        let _b = fx.add("Person", "b", vec![("city", s("boston"))]);
+        let c = fx.add("Person", "c", vec![("city", s("austin"))]);
+
+        let mut pi = PropertyIndex::new();
+        pi.enable("Person", "city");
+        pi.set("Person", "city", a, &s("austin"));
+        pi.set("Person", "city", 1, &s("boston"));
+        pi.set("Person", "city", c, &s("austin"));
+
+        let q = "MATCH (n:Person {city: 'austin'}) RETURN n";
+
+        // Indexed view: the IndexScan fast path must fire and return both nodes.
+        let before = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        let indexed = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
+        let after = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        assert!(after > before, "IndexScan must take the indexed path");
+        assert_eq!(indexed.len(), 2);
+
+        // Unindexed view (prop_index None): same result via scan+filter fallback,
+        // and the counter must NOT advance.
+        let before2 = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        let fallback = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        let after2 = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        assert_eq!(after2, before2, "fallback must not touch the index counter");
+        assert_eq!(
+            fallback.len(),
+            indexed.len(),
+            "fallback matches indexed result"
+        );
+    }
+
     #[test]
     fn arithmetic_in_where_comparison() {
         let mut fx = Fx::new();

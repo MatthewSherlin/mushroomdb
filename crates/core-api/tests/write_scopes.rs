@@ -133,6 +133,7 @@ fn open_with_writer(name: &str) -> (GraphDb<core_storage::fs::RealFs>, std::path
     let mut db = GraphDb::open(&dir).unwrap();
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![writer_role()],
@@ -284,6 +285,7 @@ fn test_update_scope_denied() {
     let mut db = GraphDb::open(&dir).unwrap();
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {
@@ -429,6 +431,7 @@ fn test_delete_edge_derived_before_scope() {
     let mut db = GraphDb::open(&dir).unwrap();
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![derived_rule()],
         views: vec![],
         roles: vec![writer_role()],
@@ -634,6 +637,7 @@ fn test_merge_update_only_hidden_eq_absent() {
     let mut db = GraphDb::open(&dir).unwrap();
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {
@@ -704,6 +708,7 @@ fn test_merge_create_only_disclosure_pinned() {
     let mut db = GraphDb::open(&dir).unwrap();
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {
@@ -781,6 +786,7 @@ fn test_merge_on_create_set_with_role_authz() {
     let mut db2 = GraphDb::open(&dir2).unwrap();
     let schema = core_api::schema::Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {
@@ -1111,6 +1117,7 @@ fn test_rules_fire_but_hidden_edges_masked() {
     // Rule: SIMILAR edges between MyLabel nodes sharing a tag.
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![derived_rule()],
         views: vec![],
         roles: vec![writer_role()],
@@ -1159,6 +1166,7 @@ fn test_delete_recreate_setprop_respects_update_labels() {
     let mut db = GraphDb::open(&dir).unwrap();
     let schema = core_api::schema::Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {
