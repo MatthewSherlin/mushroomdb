@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Temporal / moat
+
+- Time-travel reads: `GraphDb::query_at(commit, cypher)`, `POST /query
+  {"as_of": N}`, and Python `query_at` run a read-only query against the graph
+  as it existed at a past WAL commit — the agent-replay primitive. The live
+  store is unaffected; writes and (for now) role/masked temporal queries are
+  rejected.
+- `docs/site/roadmap-moat.md` specifies the two remaining category-defining
+  features — rule chaining (with a cycle-safe, replay-deterministic design) and
+  memory-native decay/consolidation/namespaces — ready to build with sign-off.
+
 ### Trust & hardening
 
 - `mushroomdb verify` now runs a structural (rkyv `bytecheck`) pass over the
