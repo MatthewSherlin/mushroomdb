@@ -150,7 +150,9 @@ pub enum RelDir {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelPat {
     pub var: Option<String>,
-    pub etype: Option<String>,
+    /// Relationship-type alternatives. Empty = any type; one = single type;
+    /// many = `[:A|:B]` alternation (match an edge of any listed type).
+    pub etypes: Vec<String>,
     pub dir: RelDir,
     /// `None` = single-hop (normal `Expand`).  `Some(r)` = variable-length
     /// (`VarExpand`) with the given min/max hop bounds.

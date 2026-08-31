@@ -422,20 +422,20 @@ impl<'a> Parser<'a> {
                 &Tok::Dash,
                 "expected '-' after '<' in a left-directed relationship",
             )?;
-            let (var, etype, hops) = self.rel_body()?;
+            let (var, etypes, hops) = self.rel_body()?;
             self.expect(
                 &Tok::Dash,
                 "expected '-' to close a left-directed relationship",
             )?;
             return Ok(RelPat {
                 var,
-                etype,
+                etypes,
                 dir: RelDir::Left,
                 hops,
             });
         }
         self.expect(&Tok::Dash, "expected '-' to start a relationship")?;
-        let (var, etype, hops) = self.rel_body()?;
+        let (var, etypes, hops) = self.rel_body()?;
         self.expect(&Tok::Dash, "expected '-' after ']'")?;
         let dir = if self.eat(&Tok::Gt) {
             RelDir::Right
@@ -444,14 +444,14 @@ impl<'a> Parser<'a> {
         };
         Ok(RelPat {
             var,
-            etype,
+            etypes,
             dir,
             hops,
         })
     }
 
     #[allow(clippy::type_complexity)]
-    fn rel_body(&mut self) -> Result<(Option<String>, Option<String>, Option<HopRange>), String> {
+    fn rel_body(&mut self) -> Result<(Option<String>, Vec<String>, Option<HopRange>), String> {
         self.expect(&Tok::LBracket, "expected '[' in a relationship pattern")?;
         let var = match self.peek() {
             Some(Tok::Ident(s)) => {
@@ -461,11 +461,16 @@ impl<'a> Parser<'a> {
             }
             _ => None,
         };
-        let etype = if self.eat(&Tok::Colon) {
-            Some(self.ident("expected relationship type identifier after ':'")?)
-        } else {
-            None
-        };
+        // `:A`, or `:A|:B|:C` alternation. Empty = any type.
+        let mut etypes = Vec::new();
+        if self.eat(&Tok::Colon) {
+            etypes.push(self.ident("expected relationship type identifier after ':'")?);
+            while self.eat(&Tok::Pipe) {
+                // Both `|:B` (openCypher) and the lenient `|B` are accepted.
+                self.eat(&Tok::Colon);
+                etypes.push(self.ident("expected relationship type identifier after '|'")?);
+            }
+        }
         let hops = if self.eat(&Tok::Star) {
             Some(self.parse_hop_range()?)
         } else {
@@ -475,7 +480,7 @@ impl<'a> Parser<'a> {
             &Tok::RBracket,
             "expected ']' to close a relationship pattern",
         )?;
-        Ok((var, etype, hops))
+        Ok((var, etypes, hops))
     }
 
     /// Parse the hop-count range that follows `*` inside a relationship bracket.
@@ -1403,12 +1408,18 @@ impl<'a> Parser<'a> {
             for (rel, dest) in &pat.chain {
                 let to_var = dest.var.as_deref().unwrap_or("_unknown");
                 if rel.var.as_deref() == Some(var) {
-                    let etype = match &rel.etype {
-                        Some(t) => t.clone(),
-                        None => {
+                    let etype = match rel.etypes.as_slice() {
+                        [t] => t.clone(),
+                        [] => {
                             return Err(format!(
                                 "DELETE `{var}`: relationship has no type; \
                                  DELETE requires an explicit edge type (e.g., [r:TYPE])"
+                            ))
+                        }
+                        _ => {
+                            return Err(format!(
+                                "DELETE `{var}`: relationship has multiple types; \
+                                 DELETE requires a single explicit edge type (e.g., [r:TYPE])"
                             ))
                         }
                     };
@@ -1581,7 +1592,7 @@ SKIP 1 LIMIT 5";
                     (
                         RelPat {
                             var: Some("r".into()),
-                            etype: Some("KNOWS".into()),
+                            etypes: vec!["KNOWS".into()],
                             dir: RelDir::Right,
                             hops: None,
                         },
@@ -1590,7 +1601,7 @@ SKIP 1 LIMIT 5";
                     (
                         RelPat {
                             var: Some("u".into()),
-                            etype: Some("TEAM".into()),
+                            etypes: vec!["TEAM".into()],
                             dir: RelDir::Undirected,
                             hops: None,
                         },
@@ -1599,7 +1610,7 @@ SKIP 1 LIMIT 5";
                     (
                         RelPat {
                             var: Some("s".into()),
-                            etype: Some("LIKES".into()),
+                            etypes: vec!["LIKES".into()],
                             dir: RelDir::Left,
                             hops: None,
                         },
@@ -1676,7 +1687,7 @@ SKIP 1 LIMIT 5";
         let q = parse_src("MATCH (a)-[r:T]->(b) RETURN a").unwrap();
         assert_eq!(q.matches[0].chain[0].0.dir, RelDir::Right);
         assert_eq!(q.matches[0].chain[0].0.var.as_deref(), Some("r"));
-        assert_eq!(q.matches[0].chain[0].0.etype.as_deref(), Some("T"));
+        assert_eq!(q.matches[0].chain[0].0.etypes, vec!["T".to_string()]);
     }
 
     #[test]
@@ -1813,7 +1824,7 @@ LIMIT 10";
                     chain: vec![(
                         RelPat {
                             var: Some("i".into()),
-                            etype: Some("INDUSTRY_ALIGNMENT".into()),
+                            etypes: vec!["INDUSTRY_ALIGNMENT".into()],
                             dir: RelDir::Right,
                             hops: None,
                         },
@@ -1826,7 +1837,7 @@ LIMIT 10";
                     chain: vec![(
                         RelPat {
                             var: Some("s".into()),
-                            etype: Some("SPECIALTY_MATCH".into()),
+                            etypes: vec!["SPECIALTY_MATCH".into()],
                             dir: RelDir::Right,
                             hops: None,
                         },
@@ -2481,7 +2492,7 @@ LIMIT 10";
         assert!(q.matches[2].shortest, "third match must be shortest=true");
         let (rel, _) = &q.matches[2].chain[0];
         assert_eq!(rel.hops, Some(HopRange { min: 1, max: 5 }));
-        assert_eq!(rel.etype.as_deref(), Some("T"));
+        assert_eq!(rel.etypes, vec!["T".to_string()]);
     }
 
     #[test]
@@ -2496,7 +2507,7 @@ LIMIT 10";
         let q = parse_src("MATCH (a)-[r:T*2..4]->(b) RETURN a").unwrap();
         let (rel, dest) = &q.matches[0].chain[0];
         assert_eq!(rel.var.as_deref(), Some("r"));
-        assert_eq!(rel.etype.as_deref(), Some("T"));
+        assert_eq!(rel.etypes, vec!["T".to_string()]);
         assert_eq!(rel.dir, RelDir::Right);
         assert_eq!(rel.hops, Some(HopRange { min: 2, max: 4 }));
         assert_eq!(dest.var.as_deref(), Some("b"));

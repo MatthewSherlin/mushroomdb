@@ -357,26 +357,26 @@ fn execute_inner(
             PlanOp::VarExpand {
                 from,
                 rel_var,
-                etype,
+                etypes,
                 dir,
                 to,
                 min,
                 max,
             } => {
                 rows = exec_var_expand(
-                    view, &vars, &rows, from, rel_var, etype, *dir, to, *min, *max,
+                    view, &vars, &rows, from, rel_var, etypes, *dir, to, *min, *max,
                 )?;
             }
             PlanOp::ShortestPath {
                 from,
                 rel_var,
-                etype,
+                etypes,
                 dir,
                 to,
                 max_hops,
             } => {
                 rows = exec_shortest_path(
-                    view, &vars, &rows, from, rel_var, etype, *dir, to, *max_hops,
+                    view, &vars, &rows, from, rel_var, etypes, *dir, to, *max_hops,
                 )?;
             }
             PlanOp::Filter { expr } => {
@@ -1837,8 +1837,14 @@ fn row_has_edge(row: &Row, e: &EdgeRef) -> bool {
         .any(|c| matches!(c, Some(Cell::Rel(existing)) if existing == e))
 }
 
-fn resolve_etypes(view: &GraphView, etype: Option<&str>) -> Option<Vec<u32>> {
-    etype.map(|name| view.syms.get(name).into_iter().collect())
+fn resolve_etypes(view: &GraphView, etypes: &[String]) -> Option<Vec<u32>> {
+    if etypes.is_empty() {
+        None // no type constraint → all edge types
+    } else {
+        // Resolve each named type to its symbol, skipping any not interned
+        // (a named type with no edges contributes nothing).
+        Some(etypes.iter().filter_map(|n| view.syms.get(n)).collect())
+    }
 }
 
 fn exec_expand(
@@ -1851,7 +1857,7 @@ fn exec_expand(
     let PlanOp::Expand {
         from,
         rel_var,
-        etype,
+        etypes,
         dir,
         to,
         to_label,
@@ -1860,7 +1866,7 @@ fn exec_expand(
     else {
         return Err("internal: expected Expand".into());
     };
-    let etypes = resolve_etypes(view, etype.as_deref());
+    let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(*dir);
     let to_slot = vars
         .slot(to)
@@ -1924,13 +1930,13 @@ fn exec_var_expand(
     rows: &[Row],
     from: &str,
     rel_var: &Option<String>,
-    etype: &Option<String>,
+    etypes: &[String],
     dir: RelDir,
     to: &str,
     min: u8,
     max: u8,
 ) -> Result<Vec<Row>, String> {
-    let etypes = resolve_etypes(view, etype.as_deref());
+    let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(dir);
     let to_slot = vars
         .slot(to)
@@ -2038,12 +2044,12 @@ fn exec_shortest_path(
     rows: &[Row],
     from: &str,
     rel_var: &Option<String>,
-    etype: &Option<String>,
+    etypes: &[String],
     dir: RelDir,
     to: &str,
     max_hops: u8,
 ) -> Result<Vec<Row>, String> {
-    let etypes = resolve_etypes(view, etype.as_deref());
+    let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(dir);
     let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
     let mut out: Vec<Row> = Vec::new();
@@ -2506,13 +2512,13 @@ fn agg_stream(
         PlanOp::Expand {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             to_label,
             to_props,
         } => {
-            let etypes = resolve_etypes(ctx.view, etype.as_deref());
+            let etypes = resolve_etypes(ctx.view, etypes);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -2589,7 +2595,7 @@ fn agg_stream(
         PlanOp::VarExpand {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             min,
@@ -2601,7 +2607,7 @@ fn agg_stream(
                 std::slice::from_ref(row),
                 from,
                 rel_var,
-                etype,
+                etypes,
                 *dir,
                 to,
                 *min,
@@ -2614,7 +2620,7 @@ fn agg_stream(
         PlanOp::ShortestPath {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             max_hops,
@@ -2625,7 +2631,7 @@ fn agg_stream(
                 std::slice::from_ref(row),
                 from,
                 rel_var,
-                etype,
+                etypes,
                 *dir,
                 to,
                 *max_hops,
@@ -2988,13 +2994,13 @@ fn group_stream(
         PlanOp::Expand {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             to_label,
             to_props,
         } => {
-            let etypes = resolve_etypes(ctx.view, etype.as_deref());
+            let etypes = resolve_etypes(ctx.view, etypes);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -3071,7 +3077,7 @@ fn group_stream(
         PlanOp::VarExpand {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             min,
@@ -3083,7 +3089,7 @@ fn group_stream(
                 std::slice::from_ref(row),
                 from,
                 rel_var,
-                etype,
+                etypes,
                 *dir,
                 to,
                 *min,
@@ -3096,7 +3102,7 @@ fn group_stream(
         PlanOp::ShortestPath {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             max_hops,
@@ -3107,7 +3113,7 @@ fn group_stream(
                 std::slice::from_ref(row),
                 from,
                 rel_var,
-                etype,
+                etypes,
                 *dir,
                 to,
                 *max_hops,
@@ -3356,13 +3362,13 @@ fn pull_rows(
         PlanOp::Expand {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             to_label,
             to_props,
         } => {
-            let etypes = resolve_etypes(ctx.view, etype.as_deref());
+            let etypes = resolve_etypes(ctx.view, etypes);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -4409,7 +4415,7 @@ LIMIT 10";
             PlanOp::Expand {
                 from: "zzz".into(),
                 rel_var: Some("r".into()),
-                etype: None,
+                etypes: vec![],
                 dir: RelDir::Right,
                 to: "b".into(),
                 to_label: None,
@@ -6067,7 +6073,7 @@ LIMIT 10";
         let ops = vec![PlanOp::VarExpand {
             from: "a".into(),
             rel_var: None,
-            etype: None,
+            etypes: vec![],
             dir: crate::cypher::RelDir::Right,
             to: "b".into(),
             min: 1,
@@ -6103,7 +6109,7 @@ LIMIT 10";
         let ops = vec![PlanOp::ShortestPath {
             from: "a".into(),
             rel_var: None,
-            etype: None,
+            etypes: vec![],
             dir: crate::cypher::RelDir::Right,
             to: "b".into(),
             max_hops: 5,
@@ -6801,6 +6807,27 @@ LIMIT 10";
     }
 
     /// Arithmetic in a WHERE comparison: `n.age + 1 > 5` filters correctly.
+    #[test]
+    fn multi_relationship_type_pattern_matches_either() {
+        let mut fx = Fx::new();
+        let a = fx.add("N", "a", vec![("id", s("a"))]);
+        let b = fx.add("N", "b", vec![("id", s("b"))]);
+        let c = fx.add("N", "c", vec![("id", s("c"))]);
+        let d = fx.add("N", "d", vec![("id", s("d"))]);
+        fx.edge("KNOWS", a, b, vec![]);
+        fx.edge("LIKES", a, c, vec![]);
+        fx.edge("HATES", a, d, vec![]);
+        let v = fx.view();
+        // a -[:KNOWS|:LIKES]-> should reach b and c, not d.
+        let rs = run(
+            &v,
+            "MATCH (a:N {id: 'a'})-[r:KNOWS|:LIKES]->(x) RETURN x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 2, "KNOWS|LIKES reaches exactly b and c");
+    }
+
     #[test]
     fn collect_grouped_gathers_values_per_group() {
         let mut fx = Fx::new();

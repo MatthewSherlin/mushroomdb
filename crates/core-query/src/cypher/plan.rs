@@ -52,7 +52,7 @@ pub enum PlanOp {
     Expand {
         from: String,
         rel_var: Option<String>,
-        etype: Option<String>,
+        etypes: Vec<String>,
         dir: RelDir,
         to: String,
         to_label: Option<String>,
@@ -128,7 +128,7 @@ pub enum PlanOp {
     VarExpand {
         from: String,
         rel_var: Option<String>,
-        etype: Option<String>,
+        etypes: Vec<String>,
         dir: RelDir,
         to: String,
         min: u8,
@@ -148,7 +148,7 @@ pub enum PlanOp {
     ShortestPath {
         from: String,
         rel_var: Option<String>,
-        etype: Option<String>,
+        etypes: Vec<String>,
         dir: RelDir,
         to: String,
         max_hops: u8,
@@ -777,7 +777,7 @@ fn compile_pattern(
         ops.push(PlanOp::Expand {
             from: dest_name,
             rel_var: Some(rel_name),
-            etype: rel.etype.clone(),
+            etypes: rel.etypes.clone(),
             dir: invert_dir(rel.dir),
             to: start.clone(),
             to_label: pat.start.label.clone(),
@@ -844,7 +844,7 @@ fn compile_pattern(
                 ops.push(PlanOp::ShortestPath {
                     from: from.clone(),
                     rel_var: Some(rel_name),
-                    etype: rel.etype.clone(),
+                    etypes: rel.etypes.clone(),
                     dir: rel.dir,
                     to: to.clone(),
                     max_hops: hops.max,
@@ -853,7 +853,7 @@ fn compile_pattern(
                 ops.push(PlanOp::VarExpand {
                     from: from.clone(),
                     rel_var: Some(rel_name),
-                    etype: rel.etype.clone(),
+                    etypes: rel.etypes.clone(),
                     dir: rel.dir,
                     to: to.clone(),
                     min: hops.min,
@@ -865,7 +865,7 @@ fn compile_pattern(
             ops.push(PlanOp::Expand {
                 from: from.clone(),
                 rel_var: Some(rel_name),
-                etype: rel.etype.clone(),
+                etypes: rel.etypes.clone(),
                 dir: rel.dir,
                 to: to.clone(),
                 to_label: dest.label.clone(),
@@ -1248,7 +1248,7 @@ LIMIT 10";
             PlanOp::Expand {
                 from: "t".into(),
                 rel_var: Some("i".into()),
-                etype: Some("INDUSTRY_ALIGNMENT".into()),
+                etypes: vec!["INDUSTRY_ALIGNMENT".into()],
                 dir: RelDir::Left,
                 to: "c".into(),
                 to_label: Some("Company".into()),
@@ -1262,7 +1262,7 @@ LIMIT 10";
             PlanOp::Expand {
                 from: "c".into(),
                 rel_var: Some("s".into()),
-                etype: Some("SPECIALTY_MATCH".into()),
+                etypes: vec!["SPECIALTY_MATCH".into()],
                 dir: RelDir::Right,
                 to: "t".into(),
                 to_label: None,
@@ -1344,7 +1344,7 @@ LIMIT 10";
                 PlanOp::Expand {
                     from: "_n0".into(),
                     rel_var: Some("_r0".into()),
-                    etype: None,
+                    etypes: vec![],
                     dir: RelDir::Right,
                     to: "a".into(),
                     to_label: None,
@@ -1353,7 +1353,7 @@ LIMIT 10";
                 PlanOp::Expand {
                     from: "a".into(),
                     rel_var: Some("_r1".into()),
-                    etype: None,
+                    etypes: vec![],
                     dir: RelDir::Left,
                     to: "_n1".into(),
                     to_label: None,
@@ -1606,7 +1606,7 @@ LIMIT 10";
                 PlanOp::Expand {
                     from: "a".into(),
                     rel_var: Some("r".into()),
-                    etype: Some("T".into()),
+                    etypes: vec!["T".into()],
                     dir: RelDir::Right,
                     to: "b".into(),
                     to_label: None,
@@ -1646,7 +1646,7 @@ LIMIT 10";
                 PlanOp::Expand {
                     from: "t".into(),
                     rel_var: Some("r".into()),
-                    etype: None,
+                    etypes: vec![],
                     dir: RelDir::Left,
                     to: "c".into(),
                     to_label: None,

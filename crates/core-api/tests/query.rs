@@ -2112,7 +2112,7 @@ fn return_distinct_cities() {
 }
 
 #[test]
-fn union_case_collect_are_named_errors() {
+fn union_case_are_named_errors() {
     let db = open_fixture("named-err-union");
     for (cypher, needle) in [
         (
@@ -2123,7 +2123,6 @@ fn union_case_collect_are_named_errors() {
             "MATCH (n:Person) RETURN CASE WHEN n.id = 't1' THEN 1 ELSE 0 END",
             "CASE",
         ),
-        ("MATCH (n:Person) RETURN collect(n)", "collect"),
     ] {
         let err = db.query(cypher, &BTreeMap::new()).expect_err(cypher);
         let detail = match err {
