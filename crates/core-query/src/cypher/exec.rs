@@ -1065,6 +1065,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                                         Operand::Param(p) => format!("${p}"),
                                         Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                                         Operand::BinArith { .. } => "<arith>".to_string(),
+                                        Operand::Case { .. } => "<case>".to_string(),
                                     })
                                     .collect();
                                 let col = format!("{name}({})", arg_strs.join(", "));
@@ -1155,6 +1156,15 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
         Operand::FuncCall { args, .. } => {
             for arg in args {
                 intern_operand(vars, arg);
+            }
+        }
+        Operand::Case { branches, default } => {
+            for (cond, value) in branches {
+                intern_expr(vars, cond);
+                intern_operand(vars, value);
+            }
+            if let Some(d) = default {
+                intern_operand(vars, d);
             }
         }
     }
@@ -1682,6 +1692,17 @@ fn resolve_operand(
             }
         }
         Operand::FuncCall { name, args } => eval_func(name, args, view, vars, row, params),
+        Operand::Case { branches, default } => {
+            for (cond, value) in branches {
+                if eval_expr(view, vars, row, cond, params, 0)? {
+                    return resolve_operand(view, vars, row, value, params);
+                }
+            }
+            match default {
+                Some(d) => resolve_operand(view, vars, row, d, params),
+                None => Ok(None),
+            }
+        }
         Operand::BinArith { op, left, right } => {
             use super::ast::ArithOp;
             let lv = resolve_operand(view, vars, row, left, params)?;
@@ -3682,6 +3703,7 @@ fn column_name(item: &RetItem) -> String {
                     Operand::Param(p) => format!("${p}"),
                     Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                     Operand::BinArith { .. } => "<arith>".to_string(),
+                    Operand::Case { .. } => "<case>".to_string(),
                 })
                 .collect();
             format!("{name}({})", arg_strs.join(", "))
@@ -6807,6 +6829,42 @@ LIMIT 10";
     }
 
     /// Arithmetic in a WHERE comparison: `n.age + 1 > 5` filters correctly.
+    #[test]
+    fn case_when_expression_in_return() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("id", s("a")), ("age", i(20))]);
+        fx.add("N", "b", vec![("id", s("b")), ("age", i(65))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:N) RETURN n.id AS id, \
+             CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let band_of = |who: &str| {
+            (0..rs.len())
+                .find(|&i| rs.get(i, "id") == Some(&s(who)))
+                .and_then(|i| rs.get(i, "band").cloned())
+        };
+        assert_eq!(band_of("a"), Some(s("other")));
+        assert_eq!(band_of("b"), Some(s("senior")));
+    }
+
+    #[test]
+    fn case_when_no_else_yields_null() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("age", i(20))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:N) RETURN CASE WHEN n.age >= 65 THEN 'senior' END AS band",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "band"), None);
+    }
+
     #[test]
     fn multi_relationship_type_pattern_matches_either() {
         let mut fx = Fx::new();

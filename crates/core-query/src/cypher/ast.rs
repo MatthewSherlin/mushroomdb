@@ -212,6 +212,13 @@ pub enum Operand {
         left: Box<Operand>,
         right: Box<Operand>,
     },
+    /// Generic `CASE WHEN <cond> THEN <value> [WHEN …] [ELSE <value>] END`.
+    /// Evaluates each branch's condition in order, returning the first matching
+    /// value; the `default` (ELSE) or null if none match.
+    Case {
+        branches: Vec<(Expr, Operand)>,
+        default: Option<Box<Operand>>,
+    },
 }
 
 /// Arithmetic operators for `Operand::BinArith`.

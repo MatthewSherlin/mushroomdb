@@ -2112,18 +2112,12 @@ fn return_distinct_cities() {
 }
 
 #[test]
-fn union_case_are_named_errors() {
+fn union_is_a_named_error() {
     let db = open_fixture("named-err-union");
-    for (cypher, needle) in [
-        (
-            "MATCH (n:Person) RETURN n UNION MATCH (m:Person) RETURN m",
-            "UNION",
-        ),
-        (
-            "MATCH (n:Person) RETURN CASE WHEN n.id = 't1' THEN 1 ELSE 0 END",
-            "CASE",
-        ),
-    ] {
+    for (cypher, needle) in [(
+        "MATCH (n:Person) RETURN n UNION MATCH (m:Person) RETURN m",
+        "UNION",
+    )] {
         let err = db.query(cypher, &BTreeMap::new()).expect_err(cypher);
         let detail = match err {
             GraphError::QueryError { detail } => detail,

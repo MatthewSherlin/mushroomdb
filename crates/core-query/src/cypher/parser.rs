@@ -809,7 +809,7 @@ impl<'a> Parser<'a> {
             Some(Tok::Ident(_)) => {
                 let name = self.ident("expected identifier")?;
                 if name.eq_ignore_ascii_case("case") {
-                    return Err("CASE is not supported".to_string());
+                    return self.parse_case();
                 }
                 if name.eq_ignore_ascii_case("collect") && self.peek() == Some(&Tok::LParen) {
                     // collect() is a top-level RETURN/WITH aggregate (handled in
@@ -842,6 +842,38 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.err("expected operand (property, literal, or parameter)")),
         }
+    }
+
+    /// Parse a generic `CASE WHEN <cond> THEN <value> … [ELSE <value>] END`.
+    /// The `CASE` keyword has already been consumed. `WHEN`/`THEN`/`ELSE`/`END`
+    /// are ordinary identifiers to the lexer, matched case-insensitively.
+    fn parse_case(&mut self) -> Result<Operand, String> {
+        let is_kw = |tok: Option<&Tok>, kw: &str| matches!(tok, Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw));
+        let mut branches = Vec::new();
+        while is_kw(self.peek(), "when") {
+            self.pos += 1; // consume WHEN
+            let cond = self.expr(0)?;
+            if !is_kw(self.peek(), "then") {
+                return Err(self.err("expected THEN in a CASE branch"));
+            }
+            self.pos += 1; // consume THEN
+            let value = self.arith_expr()?;
+            branches.push((cond, value));
+        }
+        if branches.is_empty() {
+            return Err(self.err("CASE requires at least one WHEN ... THEN branch"));
+        }
+        let default = if is_kw(self.peek(), "else") {
+            self.pos += 1; // consume ELSE
+            Some(Box::new(self.arith_expr()?))
+        } else {
+            None
+        };
+        if !is_kw(self.peek(), "end") {
+            return Err(self.err("expected END to close CASE"));
+        }
+        self.pos += 1; // consume END
+        Ok(Operand::Case { branches, default })
     }
 
     /// Parse a full arithmetic expression (additive + multiplicative + unary +
@@ -1378,7 +1410,8 @@ impl<'a> Parser<'a> {
                     Operand::Lit(_)
                     | Operand::Param(_)
                     | Operand::BinArith { .. }
-                    | Operand::FuncCall { .. } => op,
+                    | Operand::FuncCall { .. }
+                    | Operand::Case { .. } => op,
                     Operand::Prop { .. } | Operand::Var(_) => {
                         return Err(self.err(
                             "SET RHS: bare property/variable reference is not supported; \
@@ -2157,17 +2190,22 @@ LIMIT 10";
     }
 
     #[test]
-    fn union_case_are_named_errors() {
+    fn union_is_a_named_error() {
         let err = parse_src("MATCH (n) RETURN n UNION MATCH (m) RETURN m").unwrap_err();
         assert!(
             err.contains("UNION"),
             "UNION must be a named error, got: {err}"
         );
-        let err = parse_src("MATCH (n) RETURN CASE WHEN n.x = 1 THEN 2 ELSE 3 END").unwrap_err();
-        assert!(
-            err.contains("CASE"),
-            "CASE must be a named error, got: {err}"
-        );
+    }
+
+    #[test]
+    fn case_when_expression_parses() {
+        let q = parse_src("MATCH (n) RETURN CASE WHEN n.x = 1 THEN 2 ELSE 3 END AS c")
+            .expect("CASE parses");
+        assert!(matches!(
+            q.returns[0].value,
+            RetVal::ScalarExpr(Operand::Case { .. })
+        ));
     }
 
     #[test]

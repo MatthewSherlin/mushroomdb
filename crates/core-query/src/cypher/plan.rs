@@ -1008,6 +1008,16 @@ fn check_operand_bound(
             }
             Ok(())
         }
+        Operand::Case { branches, default } => {
+            for (cond, value) in branches {
+                check_expr_bound(cond, bound)?;
+                check_operand_bound(value, bound, clause)?;
+            }
+            if let Some(d) = default {
+                check_operand_bound(d, bound, clause)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1117,6 +1127,7 @@ fn column_name(item: &RetItem) -> String {
                     Operand::Param(p) => format!("${p}"),
                     Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                     Operand::BinArith { .. } => "<arith>".to_string(),
+                    Operand::Case { .. } => "<case>".to_string(),
                 })
                 .collect();
             format!("{name}({})", arg_strs.join(", "))

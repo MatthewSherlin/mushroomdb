@@ -514,6 +514,17 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
             operand_node_vars(left, out);
             operand_node_vars(right, out);
         }
+        Operand::Case { branches, default } => {
+            // Branch conditions reference vars already bound (and mask-filtered)
+            // by the MATCH phase, so collecting from the value operands + ELSE
+            // is sufficient for RETURN-projection var discovery.
+            for (_, value) in branches {
+                operand_node_vars(value, out);
+            }
+            if let Some(d) = default {
+                operand_node_vars(d, out);
+            }
+        }
         Operand::Lit(_) | Operand::Param(_) => {}
     }
 }
@@ -595,6 +606,7 @@ fn ret_column_name(item: &RetItem) -> String {
                     Operand::Param(p) => format!("${p}"),
                     Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                     Operand::BinArith { .. } => "<arith>".to_string(),
+                    Operand::Case { .. } => "<case>".to_string(),
                 })
                 .collect();
             format!("{name}({})", arg_strs.join(", "))
@@ -640,6 +652,13 @@ fn eval_set_return_operand<F: Fs>(
             let rv = eval_set_return_operand(db, match_rs, row, rel_vars, right, params)?;
             eval_set_return_arith(op, lv, rv)
         }
+        // CASE is supported in read-query RETURN; in a write-statement RETURN
+        // projection (CREATE/MERGE/SET … RETURN) it is not yet wired.
+        Operand::Case { .. } => Err(GraphError::QueryError {
+            detail: "CASE is not supported in a write-statement RETURN projection; \
+                     use a read query"
+                .into(),
+        }),
     }
 }
 
