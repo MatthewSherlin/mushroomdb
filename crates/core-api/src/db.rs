@@ -5038,7 +5038,8 @@ impl<F: Fs> GraphDb<F> {
     /// `config.converged` is `true` only when the power iteration converged
     /// within `config.max_iters` and within any time budget.
     pub fn pagerank(&self, config: &crate::algo::PageRankConfig) -> crate::algo::PageRankReport {
-        crate::algo::pagerank(&self.topo, &self.ids, &self.syms, &self.labels, config)
+        let topo = build_topo_view(&self.topo, &self.base);
+        crate::algo::pagerank(&topo, &self.ids, &self.syms, &self.labels, config)
     }
 
     /// Weakly-connected components over the unified topology (treated as
@@ -5047,7 +5048,8 @@ impl<F: Fs> GraphDb<F> {
     /// Component IDs are the key of the smallest member in the component
     /// (deterministic).  Result sorted by (component_id, key).
     pub fn connected_components(&self, config: &crate::algo::WccConfig) -> crate::algo::WccReport {
-        crate::algo::wcc(&self.topo, &self.ids, &self.syms, &self.labels, config)
+        let topo = build_topo_view(&self.topo, &self.base);
+        crate::algo::wcc(&topo, &self.ids, &self.syms, &self.labels, config)
     }
 
     /// Degree centrality for every live node.
@@ -5061,7 +5063,8 @@ impl<F: Fs> GraphDb<F> {
         &self,
         config: &crate::algo::DegreeConfig,
     ) -> crate::algo::DegreeReport {
-        crate::algo::degree_centrality(&self.topo, &self.ids, &self.syms, &self.labels, config)
+        let topo = build_topo_view(&self.topo, &self.base);
+        crate::algo::degree_centrality(&topo, &self.ids, &self.syms, &self.labels, config)
     }
 
     /// Write a vector of `(node_key, score)` pairs as `prop_name` on each node,

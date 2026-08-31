@@ -192,6 +192,65 @@ fn pagerank_over_derived_edges() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Regression: after a V8 snapshot + reopen, derived edges live in the mmap
+/// base, not the in-memory overlay `Topology`. The graph algorithms must read
+/// the unified topology *view* (overlay + base), otherwise they report zero
+/// degree/rank for every node even though edge traversal, stats, and Cypher
+/// all still see the derived edges.
+#[test]
+fn algos_see_derived_edges_after_snapshot_reopen() {
+    let dir = tmp("algo-derived-snapshot");
+    {
+        let mut db = open(&dir);
+        db.insert_node("T", "x", vec![("tag".into(), Value::Str("same".into()))])
+            .unwrap();
+        db.insert_node("T", "y", vec![("tag".into(), Value::Str("same".into()))])
+            .unwrap();
+        db.create_rule(RuleDef {
+            name: "link".into(),
+            src_label: "T".into(),
+            dst_label: "T".into(),
+            predicate: Predicate::FieldEqual {
+                field: "tag".into(),
+            },
+            edge_type: "LINKED".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })
+        .unwrap();
+        // Persist a V8 snapshot; derived edges move into the mmap base and the
+        // in-memory overlay is empty after reopen.
+        db.snapshot().unwrap();
+    }
+
+    let db = open(&dir);
+
+    // Degree: x↔y symmetric derived edges → each has total degree 2 (1 out, 1 in).
+    let deg = db.degree_centrality(&DegreeConfig::default());
+    let total: u64 = deg.scores.iter().map(|(_, d)| *d).sum();
+    assert!(
+        total > 0,
+        "degree_centrality must see snapshot-restored derived edges, got {:?}",
+        deg.scores
+    );
+
+    // WCC: the two nodes must land in a single component via the derived edges.
+    let wcc = db.connected_components(&core_api::WccConfig::default());
+    let distinct_components: BTreeSet<_> = wcc.components.iter().map(|(_, c)| c.clone()).collect();
+    assert_eq!(
+        distinct_components.len(),
+        1,
+        "wcc must connect x and y through derived edges after reopen, got {:?}",
+        wcc.components
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `converged: false` is reported honestly when max_iters is 0.
 #[test]
 fn pagerank_reports_not_converged_when_zero_iters() {
