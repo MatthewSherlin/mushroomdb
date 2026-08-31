@@ -59,7 +59,15 @@ pub type SectionVerifyResult = (u8, &'static str, usize, std::result::Result<(),
 pub fn verify_snapshot(dir: &std::path::Path) -> crate::Result<Vec<SectionVerifyResult>> {
     let snap_path = dir.join("snapshot.bin");
     let mapped = core_storage::v8::MappedBase::map(&snap_path)?;
-    Ok(mapped.verify_integrity())
+    // Bounds first, then per-section CRC32, then a structural (rkyv bytecheck)
+    // pass over the sections the hot path reads unchecked. The structural pass
+    // rejects a maliciously crafted snapshot whose relative pointers would
+    // otherwise trigger UB on open — a threat CRC32 alone can't catch (an
+    // attacker can recompute the CRC). Fail loud on structural corruption.
+    mapped.validate_section_bounds()?;
+    let results = mapped.verify_integrity();
+    mapped.validate_hot_sections()?;
+    Ok(results)
 }
 
 /// Return `true` if `cypher` is a write statement (CREATE / MERGE / MATCH…SET /

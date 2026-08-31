@@ -2432,3 +2432,49 @@ fn clean_open_snapshot_preserves_approx_rule_ivf_hnsw() {
         "provenance must be intact after clean-open snapshot; got 0 in stats"
     );
 }
+
+/// `verify_snapshot` now runs a structural (rkyv bytecheck) pass over the
+/// hot-path sections in addition to CRC32. A healthy snapshot passes; a
+/// byte-corrupted snapshot is rejected loudly (Err, not UB/panic).
+#[test]
+fn verify_snapshot_structural_pass_and_corruption_detection() {
+    let dir = tmp("verify-structural");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![("v".into(), Value::Str("hello".into()))])
+            .unwrap();
+        db.insert_node("N", "b", vec![("v".into(), Value::Str("world".into()))])
+            .unwrap();
+        db.insert_edge("E", "a", "b").unwrap();
+        db.snapshot().unwrap();
+    }
+
+    // Healthy snapshot: verify (bounds + CRC + structural) succeeds.
+    let results = core_api::verify_snapshot(&dir).expect("healthy snapshot must verify");
+    assert!(
+        results.iter().all(|(_, _, _, r)| r.is_ok()),
+        "every section CRC must be OK on a healthy snapshot"
+    );
+
+    // Corrupt the header/section-table region (bytes 64..128), which is
+    // integrity-protected; verify must reject it rather than open into UB.
+    let path = dir.join("snapshot.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    for b in bytes.iter_mut().take(128).skip(64) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    // Corruption must be detected by *some* layer — a bounds/structural failure
+    // (outer Err) or a per-section CRC mismatch (Err entry) — never a silent
+    // pass into UB.
+    let detected = match core_api::verify_snapshot(&dir) {
+        Err(_) => true,
+        Ok(results) => results.iter().any(|(_, _, _, r)| r.is_err()),
+    };
+    assert!(
+        detected,
+        "a corrupted snapshot must fail verification, not open into UB"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
