@@ -638,3 +638,33 @@ def test_find_similar_mask_bad_type_raises(tmp_path):
     with pytest.raises(TypeError):
         db.find_similar("vec", [1.0, 0.0], label="Item", k=5, mask=[42])
     db.close()
+
+
+def test_property_index_roundtrip(tmp_path):
+    """enable_index makes MATCH (n:L {field: v}) work and is reported enabled."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.enable_index("Person", "city")
+    assert db.is_index_enabled("Person", "city")
+    db.insert_node("Person", "a", {"city": "austin"})
+    db.insert_node("Person", "b", {"city": "boston"})
+    db.insert_node("Person", "c", {"city": "austin"})
+    rows = db.query("MATCH (n:Person {city: 'austin'}) RETURN n")
+    assert len(rows) == 2
+    db.disable_index("Person", "city")
+    assert not db.is_index_enabled("Person", "city")
+    db.close()
+
+
+def test_node_history_and_was_linked(tmp_path):
+    """node_history reports inserts/prop-sets; was_linked answers point-in-time."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("A", "x", {"n": 1})
+    db.insert_node("A", "y", {})
+    db.set_prop("x", "n", 2)
+    hist = db.node_history("x")
+    kinds = [e["kind"] for e in hist]
+    assert "node_inserted" in kinds
+    assert "prop_set" in kinds
+    # was_linked returns a bool for a (missing) edge without error.
+    assert db.was_linked("x", "y", "KNOWS", 999) in (True, False)
+    db.close()

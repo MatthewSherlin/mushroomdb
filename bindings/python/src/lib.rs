@@ -1,6 +1,6 @@
 use core_api::{
-    default_max_edges, Direction, Explanation, GraphDb as CoreDb, GraphError, NodeInfo, NodeMask,
-    PredicateSummary, ResultSet, RuleDef, Value,
+    default_max_edges, Direction, Explanation, GraphDb as CoreDb, GraphError, HistoryChange,
+    HistoryEntry, NodeInfo, NodeMask, PredicateSummary, ResultSet, RuleDef, Value,
 };
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -350,6 +350,38 @@ impl GraphDb {
             .collect()
     }
 
+    /// Enable an equality index on `(label, field)` so `MATCH (n:label {field: v})`
+    /// becomes an indexed lookup instead of a scan.
+    fn enable_index(&self, label: &str, field: &str) -> PyResult<()> {
+        self.with_mut(|db| db.enable_index(label, field))
+    }
+
+    /// Disable the equality index on `(label, field)`.
+    fn disable_index(&self, label: &str, field: &str) -> PyResult<()> {
+        self.with_mut(|db| db.disable_index(label, field))
+    }
+
+    /// Whether `(label, field)` currently has an equality index.
+    fn is_index_enabled(&self, label: &str, field: &str) -> PyResult<bool> {
+        self.with_ref(|db| Ok(db.is_index_enabled(label, field)))
+    }
+
+    /// Whether `a` and `b` were linked by `edge_type` at or before `at_commit`.
+    fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> PyResult<bool> {
+        self.with_ref(|db| db.was_linked(a, b, edge_type, at_commit))
+    }
+
+    /// Per-node change history since the last truncating snapshot. Returns a
+    /// list of `{commit, kind, ...}` dicts (kind is one of node_inserted,
+    /// prop_set, prop_removed, edge_added, edge_removed, node_deleted).
+    fn node_history(&self, py: Python<'_>, key: &str) -> PyResult<Vec<Py<PyDict>>> {
+        let entries = self.with_ref(|db| db.node_history(key))?;
+        entries
+            .iter()
+            .map(|e| history_entry_to_dict(py, e))
+            .collect()
+    }
+
     /// Atomically ingest `nodes` (each `{key, label, props}`) and optional
     /// `edges` (each `{edge_type, src, dst}`) in a single WAL commit.
     ///
@@ -586,6 +618,51 @@ impl GraphDb {
             .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
         f(db).map_err(graph_err)
     }
+}
+
+/// Convert a [`HistoryEntry`] into a Python dict tagged by `kind`.
+fn history_entry_to_dict(py: Python<'_>, e: &HistoryEntry) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("commit", e.commit)?;
+    match &e.change {
+        HistoryChange::NodeInserted { label } => {
+            d.set_item("kind", "node_inserted")?;
+            d.set_item("label", label)?;
+        }
+        HistoryChange::PropSet { field, value } => {
+            d.set_item("kind", "prop_set")?;
+            d.set_item("field", field)?;
+            d.set_item("value", value_to_py(py, value)?)?;
+        }
+        HistoryChange::PropRemoved { field } => {
+            d.set_item("kind", "prop_removed")?;
+            d.set_item("field", field)?;
+        }
+        HistoryChange::EdgeAdded {
+            edge_type,
+            other,
+            outgoing,
+        } => {
+            d.set_item("kind", "edge_added")?;
+            d.set_item("edge_type", edge_type)?;
+            d.set_item("other", other)?;
+            d.set_item("outgoing", *outgoing)?;
+        }
+        HistoryChange::EdgeRemoved {
+            edge_type,
+            other,
+            outgoing,
+        } => {
+            d.set_item("kind", "edge_removed")?;
+            d.set_item("edge_type", edge_type)?;
+            d.set_item("other", other)?;
+            d.set_item("outgoing", *outgoing)?;
+        }
+        HistoryChange::NodeDeleted => {
+            d.set_item("kind", "node_deleted")?;
+        }
+    }
+    Ok(d.unbind())
 }
 
 fn pylist_to_f64_vec(list: &Bound<'_, PyList>) -> PyResult<Vec<f64>> {
