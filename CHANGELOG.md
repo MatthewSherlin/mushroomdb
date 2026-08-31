@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Trust & hardening
+
+- `mushroomdb verify` now runs a structural (rkyv `bytecheck`) pass over the
+  hot-path sections in addition to CRC32, so it rejects a maliciously crafted
+  snapshot whose relative pointers would trigger UB on open. Run it before
+  restoring an untrusted snapshot. Zero cost on the query path.
+- Concurrency torture tests: overlapping-key races land exactly once, and
+  concurrent writers that trigger rule-fires keep derived edges and the property
+  index consistent.
+- Python bindings gain `enable_index`/`disable_index`/`is_index_enabled`,
+  `node_history`, and `was_linked`.
+- New `docs/site/durability.md` documents the crash-recovery model. Deferred:
+  making rule-derived edges first-class replayable WAL records (the snapshot
+  path already gives fast recovery; `--snapshot-every` bounds the worst case).
+
 ### Cypher fluency
 
 - `collect(x)` aggregation (grouped and ungrouped), skipping nulls.

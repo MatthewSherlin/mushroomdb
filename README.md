@@ -706,6 +706,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 - Materialized views: [`docs/site/views.md`](docs/site/views.md)
 - Full-text search v2 (BM25, Snowball EN stemming, phrase/negation/prefix): [`docs/site/fulltext.md`](docs/site/fulltext.md)
 - Property (equality) indexes for `MATCH (n:L {field: value})` lookups: [`docs/site/indexes.md`](docs/site/indexes.md)
+- Durability, crash recovery, and snapshot/integrity guidance: [`docs/site/durability.md`](docs/site/durability.md)
 - Node masks and access control (role tokens, restricted-stub mode): [`docs/site/masks.md`](docs/site/masks.md)
 - Rule suggestions: [`docs/site/suggest.md`](docs/site/suggest.md)
 - Graph algorithms (PageRank, WCC, degree centrality): [`docs/site/algorithms.md`](docs/site/algorithms.md)
