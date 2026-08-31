@@ -101,6 +101,9 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// `collect(x)` — gather each row's value of `x` into a list, skipping
+    /// nulls. Per group when grouping keys are present.
+    Collect,
 }
 
 /// Argument to an aggregate function.

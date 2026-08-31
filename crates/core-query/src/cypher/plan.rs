@@ -1144,6 +1144,7 @@ fn func_name(func: &AggFunc) -> &'static str {
         AggFunc::Avg => "AVG",
         AggFunc::Min => "MIN",
         AggFunc::Max => "MAX",
+        AggFunc::Collect => "COLLECT",
     }
 }
 

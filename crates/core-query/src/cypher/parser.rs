@@ -807,7 +807,12 @@ impl<'a> Parser<'a> {
                     return Err("CASE is not supported".to_string());
                 }
                 if name.eq_ignore_ascii_case("collect") && self.peek() == Some(&Tok::LParen) {
-                    return Err("collect() is not supported".to_string());
+                    // collect() is a top-level RETURN/WITH aggregate (handled in
+                    // ret_item); it is not valid inside a larger expression.
+                    return Err(
+                        "collect() is only supported as a top-level RETURN/WITH aggregate"
+                            .to_string(),
+                    );
                 }
                 if self.peek() == Some(&Tok::LParen) {
                     // Scalar function call: name(arg, ...)
@@ -877,6 +882,7 @@ impl<'a> Parser<'a> {
                 "avg" => Some(AggFunc::Avg),
                 "min" => Some(AggFunc::Min),
                 "max" => Some(AggFunc::Max),
+                "collect" => Some(AggFunc::Collect),
                 _ => None,
             };
             if let Some(func) = func {
@@ -1522,8 +1528,8 @@ enum DeleteTargetResult {
 mod tests {
     use super::parse;
     use crate::cypher::ast::{
-        Expr, HopRange, LimitSkip, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query,
-        RelDir, RelPat, RetItem, RetVal,
+        AggFunc, Expr, HopRange, LimitSkip, NodePat, Operand, OrderItem, OrderTarget, Pattern,
+        Query, RelDir, RelPat, RetItem, RetVal,
     };
     use crate::cypher::{lex, Tok};
     use crate::filter::CmpOp;
@@ -2140,7 +2146,7 @@ LIMIT 10";
     }
 
     #[test]
-    fn union_case_collect_are_named_errors() {
+    fn union_case_are_named_errors() {
         let err = parse_src("MATCH (n) RETURN n UNION MATCH (m) RETURN m").unwrap_err();
         assert!(
             err.contains("UNION"),
@@ -2151,11 +2157,18 @@ LIMIT 10";
             err.contains("CASE"),
             "CASE must be a named error, got: {err}"
         );
-        let err = parse_src("MATCH (n) RETURN collect(n)").unwrap_err();
-        assert!(
-            err.contains("collect"),
-            "collect() must be a named error, got: {err}"
-        );
+    }
+
+    #[test]
+    fn collect_is_a_supported_aggregate() {
+        let q = parse_src("MATCH (n) RETURN collect(n.name) AS names").expect("collect parses");
+        assert!(matches!(
+            q.returns[0].value,
+            RetVal::Agg {
+                func: AggFunc::Collect,
+                ..
+            }
+        ));
     }
 
     #[test]

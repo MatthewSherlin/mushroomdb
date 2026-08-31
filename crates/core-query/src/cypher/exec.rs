@@ -1384,7 +1384,39 @@ const SCALAR_FUNCS: &[&str] = &[
     "abs",
     "round",
     "textMatches",
+    "contains",
+    "startsWith",
+    "endsWith",
+    "toInteger",
+    "toFloat",
+    "toString",
 ];
+
+/// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
+/// `endsWith`). Null in either argument → null; non-string args → null.
+fn eval_string_predicate(
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+    f: impl Fn(&str, &str) -> bool,
+) -> Result<Option<Value>, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "{name}() requires exactly 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let a = resolve_operand(view, vars, row, &args[0], params)?;
+    let b = resolve_operand(view, vars, row, &args[1], params)?;
+    match (a, b) {
+        (Some(Value::Str(s)), Some(Value::Str(sub))) => Ok(Some(Value::Bool(f(&s, &sub)))),
+        (None, _) | (_, None) => Ok(None),
+        _ => Ok(None),
+    }
+}
 
 /// Evaluate one of the supported scalar functions.  Unknown function names
 /// produce a named error listing the supported set.  Null propagation:
@@ -1543,6 +1575,73 @@ fn eval_func(
                 ))),
                 _ => Ok(Some(Value::Bool(false))), // non-string field → no match
             }
+        }
+        "contains" => eval_string_predicate("contains", args, view, vars, row, params, |s, sub| {
+            s.contains(sub)
+        }),
+        "startswith" => {
+            eval_string_predicate("startsWith", args, view, vars, row, params, |s, p| {
+                s.starts_with(p)
+            })
+        }
+        "endswith" => eval_string_predicate("endsWith", args, view, vars, row, params, |s, p| {
+            s.ends_with(p)
+        }),
+        "tointeger" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "toInteger() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
+            }
+            let v = resolve_operand(view, vars, row, &args[0], params)?;
+            Ok(match v {
+                None => None,
+                Some(Value::Int(n)) => Some(Value::Int(n)),
+                Some(Value::Float(f)) => Some(Value::Int(f.trunc() as i64)),
+                // Cypher parses an integer literal; a float-looking string
+                // truncates via the float parse. Unparseable → null.
+                Some(Value::Str(s)) => s
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .or_else(|| s.trim().parse::<f64>().ok().map(|f| f.trunc() as i64))
+                    .map(Value::Int),
+                Some(_) => None,
+            })
+        }
+        "tofloat" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "toFloat() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
+            }
+            let v = resolve_operand(view, vars, row, &args[0], params)?;
+            Ok(match v {
+                None => None,
+                Some(Value::Float(f)) => Some(Value::Float(f)),
+                Some(Value::Int(n)) => Some(Value::Float(n as f64)),
+                Some(Value::Str(s)) => s.trim().parse::<f64>().ok().map(Value::Float),
+                Some(_) => None,
+            })
+        }
+        "tostring" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "toString() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
+            }
+            let v = resolve_operand(view, vars, row, &args[0], params)?;
+            Ok(match v {
+                None => None,
+                Some(Value::Str(s)) => Some(Value::Str(s)),
+                Some(Value::Int(n)) => Some(Value::Str(n.to_string())),
+                Some(Value::Float(f)) => Some(Value::Str(f.to_string())),
+                Some(Value::Bool(b)) => Some(Value::Str(b.to_string())),
+                Some(_) => None, // list/map have no scalar string form
+            })
         }
         _ => Err(format!(
             "unknown function `{name}`; supported: {}",
@@ -2099,6 +2198,7 @@ enum AggAcc {
     Avg { sum: f64, n: u64 },
     Min(Option<Value>),
     Max(Option<Value>),
+    Collect(Vec<Value>),
 }
 
 impl AggAcc {
@@ -2112,6 +2212,7 @@ impl AggAcc {
             AggFunc::Avg => AggAcc::Avg { sum: 0.0, n: 0 },
             AggFunc::Min => AggAcc::Min(None),
             AggFunc::Max => AggAcc::Max(None),
+            AggFunc::Collect => AggAcc::Collect(Vec::new()),
         }
     }
 
@@ -2138,6 +2239,8 @@ impl AggAcc {
             }
             AggAcc::Min(v) => v,
             AggAcc::Max(v) => v,
+            // Empty collect() yields an empty list (never null), matching openCypher.
+            AggAcc::Collect(items) => Some(Value::List(items)),
         }
     }
 }
@@ -2296,6 +2399,32 @@ fn update_acc(
                             }
                         });
                     }
+                }
+            }
+        }
+        (AggFunc::Collect, AggArg::Var(v)) => {
+            // Gather each row's value of `v` — node → key, scalar alias → value,
+            // path → hop count. Nulls (unbound / relationship) are skipped.
+            let val = vars
+                .slot(v)
+                .and_then(|s| row.get(s))
+                .and_then(|c| c.as_ref())
+                .and_then(|cell| match cell {
+                    Cell::Scalar(x) => Some(x.clone()),
+                    Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                    Cell::Path(h) => Some(Value::Int(*h as i64)),
+                    Cell::Rel(_) => None,
+                });
+            if let Some(val) = val {
+                if let AggAcc::Collect(items) = acc {
+                    items.push(val);
+                }
+            }
+        }
+        (AggFunc::Collect, AggArg::Prop { var, field }) => {
+            if let Some(val) = resolve_prop(view, vars, row, var, field)? {
+                if let AggAcc::Collect(items) = acc {
+                    items.push(val);
                 }
             }
         }
@@ -3528,6 +3657,7 @@ fn column_name(item: &RetItem) -> String {
                 AggFunc::Avg => "AVG",
                 AggFunc::Min => "MIN",
                 AggFunc::Max => "MAX",
+                AggFunc::Collect => "COLLECT",
             };
             let a = match arg {
                 AggArg::Star => "*".to_string(),
@@ -6671,6 +6801,118 @@ LIMIT 10";
     }
 
     /// Arithmetic in a WHERE comparison: `n.age + 1 > 5` filters correctly.
+    #[test]
+    fn collect_grouped_gathers_values_per_group() {
+        let mut fx = Fx::new();
+        fx.add("P", "a", vec![("city", s("austin")), ("name", s("Ann"))]);
+        fx.add("P", "b", vec![("city", s("austin")), ("name", s("Bob"))]);
+        fx.add("P", "c", vec![("city", s("boston")), ("name", s("Cy"))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN n.city AS city, collect(n.name) AS names",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 2, "two city groups");
+        // Locate the austin row and check its collected names.
+        let austin = (0..rs.len())
+            .find(|&i| rs.get(i, "city") == Some(&s("austin")))
+            .expect("austin group present");
+        assert_eq!(
+            rs.get(austin, "names"),
+            Some(&Value::List(vec![s("Ann"), s("Bob")]))
+        );
+    }
+
+    #[test]
+    fn collect_ungrouped_gathers_all_into_one_list() {
+        let mut fx = Fx::new();
+        fx.add("P", "a", vec![("name", s("Ann"))]);
+        fx.add("P", "b", vec![("name", s("Bob"))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN collect(n.name) AS names",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(
+            rs.get(0, "names"),
+            Some(&Value::List(vec![s("Ann"), s("Bob")]))
+        );
+    }
+
+    #[test]
+    fn string_predicate_functions_in_where() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("email", s("alice@acme.com"))]);
+        fx.add("N", "b", vec![("email", s("bob@other.org"))]);
+        let v = fx.view();
+        let p = BTreeMap::new();
+        assert_eq!(
+            run(
+                &v,
+                "MATCH (n:N) WHERE endsWith(n.email, '.com') RETURN n",
+                &p
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            run(
+                &v,
+                "MATCH (n:N) WHERE startsWith(n.email, 'bob') RETURN n",
+                &p
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            run(
+                &v,
+                "MATCH (n:N) WHERE contains(n.email, 'acme') RETURN n",
+                &p
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn coercion_functions_in_return() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("s", s("42")), ("n", i(7)), ("g", f(3.9))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:N) RETURN toInteger(n.s) AS ti, toFloat(n.n) AS tf, toString(n.g) AS ts",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "ti"), Some(&Value::Int(42)));
+        assert_eq!(rs.get(0, "tf"), Some(&Value::Float(7.0)));
+        assert_eq!(rs.get(0, "ts"), Some(&Value::Str("3.9".into())));
+    }
+
+    #[test]
+    fn to_integer_unparseable_string_is_null() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("s", s("not-a-number"))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:N) RETURN toInteger(n.s) AS ti",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "ti"), None);
+    }
+
     #[test]
     fn index_scan_uses_index_and_matches_fallback() {
         use core_storage::property_index::PropertyIndex;
