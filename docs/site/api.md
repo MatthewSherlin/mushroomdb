@@ -53,7 +53,7 @@ Role-token behavior per endpoint:
 | `POST /rules` | 403 (administrative — all role tokens, including write-scoped) |
 | `GET /explain` | 403 (rule explanation reveals hidden-node linkage) |
 | `GET /suggest` | 403 (scans full graph) |
-| `GET /algo/*` | 403 (full-graph algorithms) |
+| `POST /algo/*` | 403 (full-graph algorithms) |
 | `GET /subscribe` | 403 (unfiltered mutation stream) |
 | `GET /watch` | 403 (unfiltered mutation stream) |
 | `POST /nodes/{key}/rename` | 403 (admin-only identity change) |
@@ -273,7 +273,7 @@ without `LIMIT` still error at 1,000,000 intermediate rows.
   "nodes_tombstoned": 0,
   "edges": 334,
   "rules": [
-    {"name": "skill_fit", "edge_count": 90, "tripped": false},
+    {"name": "skill_fit", "edges": 90, "tripped": false, "fires": 90, "approximate": false},
     ...
   ]
 }

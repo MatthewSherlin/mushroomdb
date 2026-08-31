@@ -96,6 +96,9 @@ pub enum Command {
         subcmd: AlgoSubcmd,
         /// Print only the top N results (0 = all).
         top: usize,
+        /// Edge direction for degree/pagerank (`out` / `in` / `both`).
+        /// Ignored by `wcc`, which is always undirected.
+        dir: AlgoDir,
     },
     /// Run a Cypher query (read or write).
     Query {
@@ -197,9 +200,9 @@ Usage:
                                       use POST /backup on the HTTP server for live-serve backups
   mushroomdb export <db-dir> <dest> --format jsonl|parquet   export all data
   mushroomdb schema apply <db-dir> <schema.json>
-  mushroomdb algo pagerank <db-dir> [--top N]
+  mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
   mushroomdb algo wcc <db-dir> [--top N]
-  mushroomdb algo degree <db-dir> [--top N]
+  mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
   mushroomdb --help
 
 Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
@@ -591,6 +594,15 @@ pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
 /// explicit integrity audit path; mushroomdb does NOT CRC-check large
 /// sections on the hot query path (see format-stability.md).
 pub fn run_verify(db_dir: &Path) -> Result<String, CliError> {
+    // A store that has only ever been written via the WAL has no snapshot yet;
+    // give an actionable message instead of a raw "No such file" io error.
+    if !db_dir.join("snapshot.bin").exists() {
+        return Err(CliError(format!(
+            "verify: no snapshot found in {} — take one first with `mushroomdb snapshot {}`",
+            db_dir.display(),
+            db_dir.display()
+        )));
+    }
     let results = core_api::verify_snapshot(db_dir)
         .map_err(|e| CliError(format!("verify: cannot open snapshot: {e}")))?;
     let mut any_fail = false;
@@ -848,6 +860,7 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
     let rest = &args[1..];
     let mut db_dir = None;
     let mut top: usize = 20;
+    let mut dir = AlgoDir::Both;
     let mut i = 0;
     while i < rest.len() {
         let a = rest[i];
@@ -865,6 +878,16 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
                 .parse()
                 .map_err(|_| format!("--top must be a non-negative integer, got {val}"))?;
             i += 1;
+        } else if a == "--dir" {
+            let val = rest
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --dir".to_string())?;
+            dir = parse_algo_dir(val)?;
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--dir=") {
+            dir = parse_algo_dir(val)?;
+            i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -879,15 +902,37 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
         db_dir,
         subcmd,
         top,
+        dir,
     })
 }
 
+/// Parse the `--dir` value for `algo` into an [`AlgoDir`].
+fn parse_algo_dir(val: &str) -> Result<AlgoDir, String> {
+    match val.to_ascii_lowercase().as_str() {
+        "out" => Ok(AlgoDir::Out),
+        "in" => Ok(AlgoDir::In),
+        "both" => Ok(AlgoDir::Both),
+        other => Err(format!("--dir must be one of out | in | both, got {other}")),
+    }
+}
+
 /// Run a graph algorithm and return a formatted string.
-pub fn run_algo(db_dir: &Path, subcmd: &AlgoSubcmd, top: usize) -> Result<String, CliError> {
+///
+/// `dir` selects the edge direction for `degree` and `pagerank`; `wcc` is
+/// always undirected and ignores it.
+pub fn run_algo(
+    db_dir: &Path,
+    subcmd: &AlgoSubcmd,
+    top: usize,
+    dir: AlgoDir,
+) -> Result<String, CliError> {
     let db = GraphDb::open(db_dir)?;
     match subcmd {
         AlgoSubcmd::Pagerank => {
-            let config = PageRankConfig::default();
+            let config = PageRankConfig {
+                direction: dir,
+                ..PageRankConfig::default()
+            };
             let report = db.pagerank(&config);
             Ok(format_pagerank(&report, top))
         }
@@ -898,7 +943,7 @@ pub fn run_algo(db_dir: &Path, subcmd: &AlgoSubcmd, top: usize) -> Result<String
         }
         AlgoSubcmd::Degree => {
             let config = DegreeConfig {
-                direction: AlgoDir::Both,
+                direction: dir,
                 ..DegreeConfig::default()
             };
             let report = db.degree_centrality(&config);
@@ -2405,6 +2450,41 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn parse_algo_degree_defaults_dir_both() {
+        let cmd = parse_args(&["algo", "degree", "/db"]).unwrap();
+        match cmd {
+            Command::Algo { dir, .. } => assert_eq!(dir, AlgoDir::Both),
+            other => panic!("expected Algo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_algo_degree_with_dir_flag() {
+        for (arg, want) in [
+            ("out", AlgoDir::Out),
+            ("in", AlgoDir::In),
+            ("both", AlgoDir::Both),
+        ] {
+            let cmd = parse_args(&["algo", "degree", "/db", "--dir", arg]).unwrap();
+            match cmd {
+                Command::Algo { dir, .. } => assert_eq!(dir, want, "--dir {arg}"),
+                other => panic!("expected Algo, got {other:?}"),
+            }
+        }
+        // `--dir=out` form too.
+        let cmd = parse_args(&["algo", "degree", "/db", "--dir=in"]).unwrap();
+        match cmd {
+            Command::Algo { dir, .. } => assert_eq!(dir, AlgoDir::In),
+            other => panic!("expected Algo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_algo_rejects_unknown_dir() {
+        assert!(parse_args(&["algo", "degree", "/db", "--dir", "sideways"]).is_err());
     }
 
     /// I1: exporting a store containing NaN/Inf floats must succeed, not panic.

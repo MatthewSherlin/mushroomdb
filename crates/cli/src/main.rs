@@ -120,7 +120,8 @@ fn main() -> ExitCode {
             db_dir,
             subcmd,
             top,
-        }) => match run_algo(&db_dir, &subcmd, top) {
+            dir,
+        }) => match run_algo(&db_dir, &subcmd, top, dir) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS

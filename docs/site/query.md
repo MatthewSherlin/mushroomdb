@@ -138,10 +138,14 @@ No other fields on `r` are available for variable-length relationships.
 nodes:
 
 ```cypher
-MATCH (a:N {id: 'alice'}), (b:N {id: 'bob'})
+MATCH (a:N {id: 'alice'}) MATCH (b:N {id: 'bob'})
 MATCH shortestPath((a)-[r:T*..5]->(b))
 RETURN r.length
 ```
+
+Bind the two endpoints with **separate** `MATCH` clauses. Comma-separated
+patterns in a single `MATCH` (`MATCH (a), (b)`) are not supported and fail to
+parse.
 
 - Both endpoints must be bound before the `shortestPath` clause.  Unbound
   forms are rejected at planning time.
