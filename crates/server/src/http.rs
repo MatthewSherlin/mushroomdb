@@ -709,6 +709,16 @@ async fn query(
     };
     let format = qs.get("format").map(String::as_str).unwrap_or("");
 
+    // Optional time-travel: `as_of` is a 0-based WAL commit index. The query
+    // runs against the graph as it existed at that commit (read-only).
+    let as_of = match body.get("as_of") {
+        None | Some(Js::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) => Some(n),
+            None => return err_response("as_of must be a non-negative integer commit index"),
+        },
+    };
+
     // Parse client-supplied mask (optional array of node keys).
     let mask_keys: Option<Vec<String>> = match body.get("mask") {
         None | Some(Js::Null) => None,
@@ -724,6 +734,14 @@ async fn query(
         }
         Some(_) => return err_response("mask must be an array of strings"),
     };
+
+    // Time-travel is currently supported only on the full-token, unmasked read
+    // path (temporal + RBAC-mask composition is a follow-on).
+    if as_of.is_some() && (matches!(identity, AuthIdentity::Role(_)) || mask_keys.is_some()) {
+        return err_response(
+            "as_of (time-travel) is not yet supported with role tokens or a client mask",
+        );
+    }
 
     // Role token: write Cypher routes to query_write_authz (scope + mask
     // resolved under the write lock, §5 discipline).  Read Cypher uses the
@@ -813,11 +831,20 @@ async fn query(
         Err(e) => return err_response(e),
     };
 
+    if as_of.is_some() && is_write {
+        return err_response("as_of (time-travel) queries are read-only");
+    }
+
     let rs = if is_write {
         let db = state.db.clone();
         match blocking_write(move || db.write().query_write(&cypher, &params)).await {
             Ok(rs) => rs,
             Err(resp) => return resp,
+        }
+    } else if let Some(commit) = as_of {
+        match state.db.read().query_at(commit, &cypher, &params) {
+            Ok(rs) => rs,
+            Err(e) => return graph_err(e),
         }
     } else {
         match state.db.read().query(&cypher, &params) {

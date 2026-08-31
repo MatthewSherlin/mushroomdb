@@ -1301,6 +1301,38 @@ impl GraphDb<RealFs> {
     pub fn open_at(dir: &std::path::Path, commit: u64) -> Result<Self> {
         Self::open_at_with(RealFs::new(dir)?, commit)
     }
+
+    /// Run a **read-only** Cypher query against the graph as it existed at
+    /// `commit` — the "time-travel" / agent-replay query. Opens a temporal view
+    /// of this store's directory at that commit and executes the read there.
+    ///
+    /// The current instance is unaffected. Write statements are rejected (the
+    /// temporal view is read-only). `commit` is a 0-based WAL commit index;
+    /// `commit == wal_commit_count` (or `open_at`'s range) yields the newest
+    /// state. Prefer this over holding many historical instances open.
+    ///
+    /// # Errors
+    /// - [`GraphError::CommitOutOfRange`] if `commit` is past the WAL horizon.
+    /// - A query error for a malformed or write query.
+    pub fn query_at(
+        &self,
+        commit: u64,
+        cypher: &str,
+        params: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let dir = self.fs.dir().to_path_buf();
+        let temporal = Self::open_at(&dir, commit)?;
+        if is_write_tokens(&lex(cypher).map_err(|e| GraphError::QueryError {
+            detail: format!("lex: {e}"),
+        })?) {
+            return Err(GraphError::QueryError {
+                detail: "query_at is read-only: write statements are not permitted in a \
+                         time-travel query"
+                    .into(),
+            });
+        }
+        temporal.query(cypher, params)
+    }
 }
 
 impl<F: Fs> GraphDb<F> {

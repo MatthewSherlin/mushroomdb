@@ -2284,3 +2284,37 @@ fn property_index_matches_unindexed_scan() {
     );
     assert_eq!(indexed, 2);
 }
+
+/// Time-travel query: query_at runs a read against the graph as it existed at
+/// a past commit, without disturbing the live instance.
+#[test]
+fn query_at_time_travel() {
+    let dir = tmp("query-at");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "a", vec![]).unwrap(); // commit 0
+    db.insert_node("N", "b", vec![]).unwrap(); // commit 1
+    db.insert_node("N", "c", vec![]).unwrap(); // commit 2
+
+    let at0 = db
+        .query_at(0, "MATCH (n:N) RETURN n", &BTreeMap::new())
+        .unwrap();
+    assert_eq!(at0.len(), 1, "after commit 0 only 'a' exists");
+
+    let at2 = db
+        .query_at(2, "MATCH (n:N) RETURN n", &BTreeMap::new())
+        .unwrap();
+    assert_eq!(at2.len(), 3, "after commit 2 all three exist");
+
+    // The live instance is unchanged and still current.
+    let now = db.query("MATCH (n:N) RETURN n", &BTreeMap::new()).unwrap();
+    assert_eq!(now.len(), 3);
+
+    // Write statements are rejected in a time-travel query.
+    assert!(
+        db.query_at(0, "CREATE (x:N {id: 'z'})", &BTreeMap::new())
+            .is_err(),
+        "query_at must reject writes"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

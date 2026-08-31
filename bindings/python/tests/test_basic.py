@@ -668,3 +668,15 @@ def test_node_history_and_was_linked(tmp_path):
     # was_linked returns a bool for a (missing) edge without error.
     assert db.was_linked("x", "y", "KNOWS", 999) in (True, False)
     db.close()
+
+
+def test_query_at_time_travel(tmp_path):
+    """query_at reads the graph as it existed at a past commit."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("N", "a", {})  # commit 0
+    db.insert_node("N", "b", {})  # commit 1
+    db.insert_node("N", "c", {})  # commit 2
+    assert len(db.query_at(0, "MATCH (n:N) RETURN n")) == 1
+    assert len(db.query_at(2, "MATCH (n:N) RETURN n")) == 3
+    assert len(db.query("MATCH (n:N) RETURN n")) == 3  # live unaffected
+    db.close()

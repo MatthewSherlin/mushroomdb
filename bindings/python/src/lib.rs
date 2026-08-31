@@ -371,6 +371,22 @@ impl GraphDb {
         self.with_ref(|db| db.was_linked(a, b, edge_type, at_commit))
     }
 
+    /// Time-travel read: run `cypher` against the graph as it existed at
+    /// `commit` (a 0-based WAL commit index). Read-only; the live store is
+    /// unaffected. Returns a list of row dicts, like `query`.
+    #[pyo3(signature = (commit, cypher, params=None))]
+    fn query_at(
+        &self,
+        py: Python<'_>,
+        commit: u64,
+        cypher: &str,
+        params: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        let map = params_to_map(params)?;
+        let rs = self.with_ref(|db| db.query_at(commit, cypher, &map))?;
+        result_set_to_rows(py, &rs)
+    }
+
     /// Per-node change history since the last truncating snapshot. Returns a
     /// list of `{commit, kind, ...}` dicts (kind is one of node_inserted,
     /// prop_set, prop_removed, edge_added, edge_removed, node_deleted).
