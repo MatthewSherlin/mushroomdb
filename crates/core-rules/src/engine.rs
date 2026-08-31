@@ -55,6 +55,24 @@ pub struct EngineEdgeDelta {
 #[cfg(test)]
 pub use crate::index::{with_ivf_drift_rebuild, with_vector_dim_reject, with_vector_early_exit};
 
+/// Test-only: the largest number of desired (src,dst) pairs held in memory at
+/// once during a backfill sweep. Lets scale tests assert bounded materialization.
+#[cfg(test)]
+pub(crate) static PEAK_DESIRED_PAIRS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn record_desired_len(n: usize) {
+    use std::sync::atomic::Ordering;
+    let mut cur = PEAK_DESIRED_PAIRS.load(Ordering::Relaxed);
+    while n > cur {
+        match PEAK_DESIRED_PAIRS.compare_exchange_weak(cur, n, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 /// Borrowed mutable view of graph state the engine writes derived edges into.
 pub struct GraphMut<'a> {
     pub ids: &'a IdMap,
@@ -434,6 +452,8 @@ fn compute_desired(
             out.insert((s_id, d_id), score);
         }
     }
+    #[cfg(test)]
+    record_desired_len(out.len());
     out
 }
 
@@ -956,6 +976,8 @@ fn compute_full_desired(
         };
         if src_sym == Some(label_sym) {
             desired.extend(compute_desired(def, index, id, true, g));
+            #[cfg(test)]
+            record_desired_len(desired.len());
         }
     }
     desired
@@ -4904,6 +4926,107 @@ mod tests {
         assert_eq!(
             edges_on, oracle,
             "razor dim=1536: early-exit ON vs brute-force oracle must be identical"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Scale test: backfill must not materialise the full cross-product
+    // -----------------------------------------------------------------------
+    //
+    // Step-1 analysis (flow read per brief):
+    //
+    // compute_desired (~246): returns a BTreeMap<(u32,u32),f64> for ONE source
+    //   node against all matching candidates from the dst-side index.  For a
+    //   FieldEqual rule with 400 Org dsts all sharing city="austin", each call
+    //   returns at most 400 pairs.  The per-source map is dropped after
+    //   filter_src_top_k consumes it.
+    //
+    // compute_desired_via (~452): similar per-anchor scope; not exercised here.
+    //
+    // compute_full_desired (~945): TEST-ONLY reference implementation.  Iterates
+    //   every src node and calls compute_desired, extending a GLOBAL BTreeMap.
+    //   For 400 Person × 400 Org this accumulates 160 000 pairs — the full
+    //   cross-product — before returning.  This is the memory wall the streaming
+    //   rewrite was designed to eliminate.
+    //
+    // apply_streaming_create_top_k (~1106): the production path for
+    //   max_edges=Some(k).  Calls compute_desired per src (≤400 pairs), passes
+    //   ownership to filter_src_top_k (truncates to k=5), then drops the map.
+    //   The largest map alive at any instant is one per-src BTreeMap of ≤400
+    //   entries — never the 160 000-pair global map.
+    //
+    // filter_src_top_k (~626): runs BEFORE compute_full_desired is ever called
+    //   (compute_full_desired is dead code in the production path).  It truncates
+    //   the per-source map to k entries BEFORE apply_per_src_top_k sees it.
+    //   Conclusion: filter_src_top_k IS applied per-source before any global map
+    //   extension; compute_full_desired does NOT participate in create_rule.
+    //
+    // Expected test behaviour:
+    //   The production path (apply_streaming_create_top_k) yields peak ≈ 400
+    //   (one per-src BTreeMap).  The assertion bound is 400*5*4 = 8 000 — well
+    //   below the 160 000 cross-product.  The test therefore PASSES with the
+    //   current streaming code, confirming the fix is in place.
+    //
+    //   If someone reverts the streaming path and re-introduces a global
+    //   compute_full_desired call inside create_rule, peak would reach 160 000
+    //   and the assertion would FAIL — which is the regression this test guards.
+
+    /// Helper: FieldEqual rule between two distinct labels with top-k cap.
+    fn field_equal_rule(
+        src_label: &str,
+        dst_label: &str,
+        field: &str,
+        edge_type: &str,
+        max_edges: Option<u64>,
+    ) -> RuleDef {
+        RuleDef {
+            name: format!("{src_label}_{dst_label}_{field}"),
+            src_label: src_label.into(),
+            dst_label: dst_label.into(),
+            predicate: Predicate::FieldEqual { field: field.into() },
+            edge_type: edge_type.into(),
+            weight_prop: None,
+            max_edges,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        }
+    }
+
+    #[test]
+    fn backfill_does_not_materialize_the_cross_product() {
+        use std::sync::atomic::Ordering;
+        // 400 Person + 400 Org, all city="austin"; rule FieldEqual{city},
+        // max_edges=Some(5).  Correct behaviour: 400 × 5 = 2000 derived edges,
+        // and peak simultaneous pairs ≤ 400*5*4 (generous headroom), NOT the
+        // 160 000 cross-product.
+        let mut fx = Fx::new();
+        for i in 0..400u32 {
+            fx.add("Person", &format!("p{i}"), vec![("city", Value::Str("austin".into()))]);
+        }
+        for i in 0..400u32 {
+            fx.add("Org", &format!("o{i}"), vec![("city", Value::Str("austin".into()))]);
+        }
+
+        let mut eng = RuleEngine::new();
+        PEAK_DESIRED_PAIRS.store(0, Ordering::Relaxed);
+        {
+            let mut g = fx.g();
+            eng.create_rule(
+                field_equal_rule("Person", "Org", "city", "IN_CITY", Some(5)),
+                &mut g,
+            )
+            .unwrap();
+        }
+
+        let edges = fx.topo.edge_count();
+        assert_eq!(edges, 400 * 5, "per-source top-k must yield exactly k per source");
+
+        let peak = PEAK_DESIRED_PAIRS.load(Ordering::Relaxed);
+        assert!(
+            peak <= 400 * 5 * 4, // generous headroom; NOT the 160_000 cross product
+            "backfill must not materialize the full cross-product; peak was {peak}"
         );
     }
 }
