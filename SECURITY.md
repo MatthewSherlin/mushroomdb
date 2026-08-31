@@ -34,8 +34,12 @@ days of confirmation.
 
 - Memory safety issues in the Rust core (storage, rule engine, server)
 - WAL or snapshot parsing that could cause data corruption on malformed input
-- Path traversal or unintended file writes via the `--ui` or `--db` arguments
-- Denial of service via crafted Cypher queries or ingest payloads
+- Path traversal or unintended file writes via the `--ui` or `--db` arguments,
+  or the `POST /backup` `dest` field (confined to `MUSHROOMDB_BACKUP_DIR`, else
+  the server's working directory; `..` and out-of-root paths are rejected)
+- Denial of service via crafted Cypher queries or ingest payloads (request
+  bodies are capped at 64 MiB and the `/node/{key}/neighborhood` BFS `depth`
+  is bounded)
 
 Out of scope: issues that require local write access to the database
 directory (the threat model assumes the OS user has that access), or

@@ -3139,7 +3139,13 @@ async fn http_backup_live_serve_dest_opens_clean() {
     use std::sync::{Arc, Barrier};
 
     let src_dir = tmp("http-backup-src");
-    let dst_dir = tmp("http-backup-dst");
+    // The backup dest is confined to the backup root (CWD by default), so place
+    // it under the crate's `target/` dir rather than the system temp dir.
+    let dst_dir = std::env::current_dir().unwrap().join(format!(
+        "target/graphdb-http-backup-dst-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dst_dir);
 
     let db = SharedDb::open(&src_dir).unwrap();
     // Seed initial data.
