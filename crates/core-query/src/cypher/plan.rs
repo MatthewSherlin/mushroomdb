@@ -27,6 +27,17 @@ pub enum PlanOp {
         key: Operand,
         label: Option<String>,
     },
+    /// Indexed equality lookup: seed rows from nodes of `label` whose scalar
+    /// `field` equals `value`. Emitted when a MATCH node property map is exactly
+    /// one equality on a non-`id` field. The executor uses the property index
+    /// when `(label, field)` is declared, else falls back to a scan+filter, so
+    /// this op is always correct regardless of whether the index exists.
+    IndexScan {
+        var: String,
+        label: Option<String>,
+        field: String,
+        value: Operand,
+    },
     /// Retain rows whose `var` node matches the pattern-map props.
     LookupProps {
         var: String,
@@ -41,7 +52,7 @@ pub enum PlanOp {
     Expand {
         from: String,
         rel_var: Option<String>,
-        etype: Option<String>,
+        etypes: Vec<String>,
         dir: RelDir,
         to: String,
         to_label: Option<String>,
@@ -117,7 +128,7 @@ pub enum PlanOp {
     VarExpand {
         from: String,
         rel_var: Option<String>,
-        etype: Option<String>,
+        etypes: Vec<String>,
         dir: RelDir,
         to: String,
         min: u8,
@@ -137,7 +148,7 @@ pub enum PlanOp {
     ShortestPath {
         from: String,
         rel_var: Option<String>,
-        etype: Option<String>,
+        etypes: Vec<String>,
         dir: RelDir,
         to: String,
         max_hops: u8,
@@ -301,6 +312,7 @@ pub fn is_subscribable(ops: &[PlanOp]) -> bool {
             op,
             PlanOp::ScanLabel { .. }
                 | PlanOp::ScanKey { .. }
+                | PlanOp::IndexScan { .. }
                 | PlanOp::LookupProps { .. }
                 | PlanOp::Expand { .. }
                 | PlanOp::Filter { .. }
@@ -309,9 +321,12 @@ pub fn is_subscribable(ops: &[PlanOp]) -> bool {
         )
     })
     // At least one scan.
-    && ops
-        .iter()
-        .any(|op| matches!(op, PlanOp::ScanLabel { .. } | PlanOp::ScanKey { .. }))
+    && ops.iter().any(|op| {
+        matches!(
+            op,
+            PlanOp::ScanLabel { .. } | PlanOp::ScanKey { .. } | PlanOp::IndexScan { .. }
+        )
+    })
     // Exactly one Project (ensures it is a RETURN query).
     && ops.iter().any(|op| matches!(op, PlanOp::Project { .. }))
     // At most one Expand: multi-hop chains are outside the documented subset.
@@ -686,6 +701,19 @@ fn id_lookup(props: &[(String, Operand)]) -> Option<&Operand> {
     }
 }
 
+/// A single equality on a non-`id` field with a literal or `$param` value —
+/// the shape eligible for an `IndexScan`. Returns `(field, value)`.
+fn index_lookup(props: &[(String, Operand)]) -> Option<(&str, &Operand)> {
+    if props.len() == 1
+        && props[0].0 != "id"
+        && matches!(props[0].1, Operand::Lit(_) | Operand::Param(_))
+    {
+        Some((props[0].0.as_str(), &props[0].1))
+    } else {
+        None
+    }
+}
+
 fn invert_dir(d: RelDir) -> RelDir {
     match d {
         RelDir::Right => RelDir::Left,
@@ -749,7 +777,7 @@ fn compile_pattern(
         ops.push(PlanOp::Expand {
             from: dest_name,
             rel_var: Some(rel_name),
-            etype: rel.etype.clone(),
+            etypes: rel.etypes.clone(),
             dir: invert_dir(rel.dir),
             to: start.clone(),
             to_label: pat.start.label.clone(),
@@ -762,6 +790,14 @@ fn compile_pattern(
             var: start.clone(),
             key: key.clone(),
             label: pat.start.label.clone(),
+        });
+        bound.insert(start.clone());
+    } else if let Some((field, value)) = index_lookup(&pat.start.props) {
+        ops.push(PlanOp::IndexScan {
+            var: start.clone(),
+            label: pat.start.label.clone(),
+            field: field.to_string(),
+            value: value.clone(),
         });
         bound.insert(start.clone());
     } else {
@@ -808,7 +844,7 @@ fn compile_pattern(
                 ops.push(PlanOp::ShortestPath {
                     from: from.clone(),
                     rel_var: Some(rel_name),
-                    etype: rel.etype.clone(),
+                    etypes: rel.etypes.clone(),
                     dir: rel.dir,
                     to: to.clone(),
                     max_hops: hops.max,
@@ -817,7 +853,7 @@ fn compile_pattern(
                 ops.push(PlanOp::VarExpand {
                     from: from.clone(),
                     rel_var: Some(rel_name),
-                    etype: rel.etype.clone(),
+                    etypes: rel.etypes.clone(),
                     dir: rel.dir,
                     to: to.clone(),
                     min: hops.min,
@@ -829,7 +865,7 @@ fn compile_pattern(
             ops.push(PlanOp::Expand {
                 from: from.clone(),
                 rel_var: Some(rel_name),
-                etype: rel.etype.clone(),
+                etypes: rel.etypes.clone(),
                 dir: rel.dir,
                 to: to.clone(),
                 to_label: dest.label.clone(),
@@ -972,6 +1008,16 @@ fn check_operand_bound(
             }
             Ok(())
         }
+        Operand::Case { branches, default } => {
+            for (cond, value) in branches {
+                check_expr_bound(cond, bound)?;
+                check_operand_bound(value, bound, clause)?;
+            }
+            if let Some(d) = default {
+                check_operand_bound(d, bound, clause)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1081,6 +1127,7 @@ fn column_name(item: &RetItem) -> String {
                     Operand::Param(p) => format!("${p}"),
                     Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                     Operand::BinArith { .. } => "<arith>".to_string(),
+                    Operand::Case { .. } => "<case>".to_string(),
                 })
                 .collect();
             format!("{name}({})", arg_strs.join(", "))
@@ -1108,6 +1155,7 @@ fn func_name(func: &AggFunc) -> &'static str {
         AggFunc::Avg => "AVG",
         AggFunc::Min => "MIN",
         AggFunc::Max => "MAX",
+        AggFunc::Collect => "COLLECT",
     }
 }
 
@@ -1211,7 +1259,7 @@ LIMIT 10";
             PlanOp::Expand {
                 from: "t".into(),
                 rel_var: Some("i".into()),
-                etype: Some("INDUSTRY_ALIGNMENT".into()),
+                etypes: vec!["INDUSTRY_ALIGNMENT".into()],
                 dir: RelDir::Left,
                 to: "c".into(),
                 to_label: Some("Company".into()),
@@ -1225,7 +1273,7 @@ LIMIT 10";
             PlanOp::Expand {
                 from: "c".into(),
                 rel_var: Some("s".into()),
-                etype: Some("SPECIALTY_MATCH".into()),
+                etypes: vec!["SPECIALTY_MATCH".into()],
                 dir: RelDir::Right,
                 to: "t".into(),
                 to_label: None,
@@ -1307,7 +1355,7 @@ LIMIT 10";
                 PlanOp::Expand {
                     from: "_n0".into(),
                     rel_var: Some("_r0".into()),
-                    etype: None,
+                    etypes: vec![],
                     dir: RelDir::Right,
                     to: "a".into(),
                     to_label: None,
@@ -1316,7 +1364,7 @@ LIMIT 10";
                 PlanOp::Expand {
                     from: "a".into(),
                     rel_var: Some("_r1".into()),
-                    etype: None,
+                    etypes: vec![],
                     dir: RelDir::Left,
                     to: "_n1".into(),
                     to_label: None,
@@ -1569,7 +1617,7 @@ LIMIT 10";
                 PlanOp::Expand {
                     from: "a".into(),
                     rel_var: Some("r".into()),
-                    etype: Some("T".into()),
+                    etypes: vec!["T".into()],
                     dir: RelDir::Right,
                     to: "b".into(),
                     to_label: None,
@@ -1609,7 +1657,7 @@ LIMIT 10";
                 PlanOp::Expand {
                     from: "t".into(),
                     rel_var: Some("r".into()),
-                    etype: None,
+                    etypes: vec![],
                     dir: RelDir::Left,
                     to: "c".into(),
                     to_label: None,

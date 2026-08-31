@@ -39,6 +39,8 @@ pub enum Tok {
     LBrace,
     RBrace,
     Colon,
+    /// `|` — relationship-type alternation in a pattern (`[:A|:B]`).
+    Pipe,
     Comma,
     Dot,
     Eq,
@@ -71,6 +73,7 @@ pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
             '{' => toks.push(Tok::LBrace),
             '}' => toks.push(Tok::RBrace),
             ':' => toks.push(Tok::Colon),
+            '|' => toks.push(Tok::Pipe),
             ',' => toks.push(Tok::Comma),
             '.' => toks.push(Tok::Dot),
             '=' => toks.push(Tok::Eq),

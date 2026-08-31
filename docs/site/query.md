@@ -138,10 +138,14 @@ No other fields on `r` are available for variable-length relationships.
 nodes:
 
 ```cypher
-MATCH (a:N {id: 'alice'}), (b:N {id: 'bob'})
+MATCH (a:N {id: 'alice'}) MATCH (b:N {id: 'bob'})
 MATCH shortestPath((a)-[r:T*..5]->(b))
 RETURN r.length
 ```
+
+Bind the two endpoints with **separate** `MATCH` clauses. Comma-separated
+patterns in a single `MATCH` (`MATCH (a), (b)`) are not supported and fail to
+parse.
 
 - Both endpoints must be bound before the `shortestPath` clause.  Unbound
   forms are rejected at planning time.
@@ -486,11 +490,25 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `abs(n)` | `Int` or `Float` | same type | absolute value |
 | `round(f)` | `Float` | `Float` | rounds to nearest integer as Float |
 | `textMatches(s, q)` | `String`/`List`, `String` | `Bool` | per-row scratch full-text; see [`fulltext.md`](fulltext.md) |
+| `contains(s, sub)` | `String`, `String` | `Bool` | substring test |
+| `startsWith(s, p)` | `String`, `String` | `Bool` | prefix test |
+| `endsWith(s, p)` | `String`, `String` | `Bool` | suffix test |
+| `toInteger(x)` | `Int`/`Float`/`String` | `Int` | parse/truncate; unparseable → null |
+| `toFloat(x)` | `Int`/`Float`/`String` | `Float` | parse; unparseable → null |
+| `toString(x)` | scalar | `String` | scalar to text |
+
+Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
+row's value into a list, per group when grouping keys are present).
+
+`CASE WHEN <cond> THEN <value> … [ELSE <value>] END` is supported anywhere a
+scalar expression is (RETURN/WITH/WHERE/SET). `UNION` and `UNION ALL` combine
+read queries with matching column names. Relationship patterns accept
+type alternation: `(a)-[:A|:B]->(b)`.
 
 Calling an unknown function name returns:
 
 ```
-unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches
+unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString
 ```
 
 ### Examples
@@ -559,7 +577,11 @@ clear, actionable message; **Absent** = not implemented (not tested here).
 | `CREATE … RETURN …` | `CREATE (n:Person {id: 'alice'}) RETURN n.id AS id` — single-statement create + projection |
 | `WHERE … IS NULL / IS NOT NULL` | `WHERE n.score IS NULL`, `WHERE b IS NOT NULL` — null-check predicate; composes with AND/OR |
 | Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error |
-| `toLower`, `toUpper`, `size`, `coalesce`, `type`, `abs`, `round` | `RETURN abs(n.score), round(n.weight)` |
+| Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, …) | `RETURN abs(n.score), toString(n.weight)` |
+| `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |
+| `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` |
+| `UNION` / `UNION ALL` | `MATCH (a:A) RETURN a.id AS id UNION MATCH (b:B) RETURN b.id AS id` |
+| Multi-relationship-type `[:A\|:B]` | `MATCH (a)-[:KNOWS\|:LIKES]->(b) RETURN b` |
 | View-maintained properties queryable like any property | `MATCH (c:City) WHERE c.pop > 1000 RETURN c.name` — `pop` is a degree view maintained incrementally; reads like a stored prop |
 | `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
 
@@ -569,9 +591,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 
 | Form | Error message (excerpt) |
 |---|---|
-| `UNION` | `UNION is not supported` |
-| `CASE WHEN … THEN … ELSE … END` | `CASE is not supported` |
-| `collect()` | `collect() is not supported` |
+| Bare `RETURN r` for a relationship variable | `cannot return relationship variable '…' bare; return its properties (….field) instead` |
 | `MERGE (n:L {id: 'x', extra: 2})` (multi-property) | `MERGE supports exactly one key property (got 2)` |
 | `DELETE n` when node has incident edges | `Cannot delete node … because it still has incident edges. Use DETACH DELETE…` |
 | `DELETE r` on derived (rule-owned) edge | `cannot delete derived edge; retract via the rule or change the property` |
@@ -583,7 +603,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH (found …)` |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
 | `shortestPath` with endpoints bound via comma-sep `MATCH (a), (b)` | `parse error: unexpected tokens after CREATE pattern (found Comma)` — comma-separated MATCH is not supported; use sequential `MATCH (a) MATCH (b)` forms |
-| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches` |
+| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString` |
 | `$param` referenced but not supplied | `execute: missing parameter …` |
 | `SET n.prop = n.other` (bare property-to-property copy) | `SET RHS: bare property/variable reference is not supported; use a literal, $parameter, or arithmetic expression` |
 | Integer division by zero | `execute: division by zero` |

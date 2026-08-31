@@ -359,7 +359,16 @@ fn build_app(
         UiFallback::Embedded => app.fallback(embedded_fallback),
     };
     app.layer(middleware::from_fn_with_state(state, auth_middleware))
+        // Cap request bodies (default axum limit is only 2 MiB; we allow larger
+        // ingest batches but reject multi-GB bodies that would OOM the collector
+        // before any handler runs).
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
 }
+
+/// Maximum accepted HTTP request body size (64 MiB). Large enough for batched
+/// `/ingest` payloads, small enough to prevent a single request from
+/// exhausting memory. Clients with larger imports should chunk.
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 async fn health(State(state): State<AppState>) -> Response {
     let (nodes, edges) = {
@@ -408,7 +417,10 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
 
     // Check full-access token first.
     if let Some(ref full_tok) = state.token.clone().filter(|s| !s.is_empty()) {
-        if presented.as_deref() == Some(full_tok.as_str()) {
+        if presented
+            .as_deref()
+            .is_some_and(|p| constant_time_eq(p.as_bytes(), full_tok.as_bytes()))
+        {
             let set_cookie = presented_bearer_or_query(&req).as_deref() == Some(full_tok.as_str());
             req.extensions_mut().insert(AuthIdentity::Full);
             let mut res = next.run(req).await;
@@ -697,6 +709,16 @@ async fn query(
     };
     let format = qs.get("format").map(String::as_str).unwrap_or("");
 
+    // Optional time-travel: `as_of` is a 0-based WAL commit index. The query
+    // runs against the graph as it existed at that commit (read-only).
+    let as_of = match body.get("as_of") {
+        None | Some(Js::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) => Some(n),
+            None => return err_response("as_of must be a non-negative integer commit index"),
+        },
+    };
+
     // Parse client-supplied mask (optional array of node keys).
     let mask_keys: Option<Vec<String>> = match body.get("mask") {
         None | Some(Js::Null) => None,
@@ -712,6 +734,14 @@ async fn query(
         }
         Some(_) => return err_response("mask must be an array of strings"),
     };
+
+    // Time-travel is currently supported only on the full-token, unmasked read
+    // path (temporal + RBAC-mask composition is a follow-on).
+    if as_of.is_some() && (matches!(identity, AuthIdentity::Role(_)) || mask_keys.is_some()) {
+        return err_response(
+            "as_of (time-travel) is not yet supported with role tokens or a client mask",
+        );
+    }
 
     // Role token: write Cypher routes to query_write_authz (scope + mask
     // resolved under the write lock, §5 discipline).  Read Cypher uses the
@@ -801,11 +831,20 @@ async fn query(
         Err(e) => return err_response(e),
     };
 
+    if as_of.is_some() && is_write {
+        return err_response("as_of (time-travel) queries are read-only");
+    }
+
     let rs = if is_write {
         let db = state.db.clone();
         match blocking_write(move || db.write().query_write(&cypher, &params)).await {
             Ok(rs) => rs,
             Err(resp) => return resp,
+        }
+    } else if let Some(commit) = as_of {
+        match state.db.read().query_at(commit, &cypher, &params) {
+            Ok(rs) => rs,
+            Err(e) => return graph_err(e),
         }
     } else {
         match state.db.read().query(&cypher, &params) {
@@ -1142,12 +1181,9 @@ async fn neighborhood(
     Path(key): Path<String>,
     Query(qs): Query<BTreeMap<String, String>>,
 ) -> Response {
-    let depth = match qs.get("depth") {
-        None => 1u32,
-        Some(s) => match s.parse() {
-            Ok(d) => d,
-            Err(_) => return err_response("depth must be an integer"),
-        },
+    let depth = match resolve_neighborhood_depth(qs.get("depth").map(String::as_str)) {
+        Ok(d) => d,
+        Err(e) => return err_response(e),
     };
     let dir = match qs.get("dir").map(String::as_str).unwrap_or("both") {
         s if s.eq_ignore_ascii_case("out") => Dir::Out,
@@ -1601,7 +1637,12 @@ async fn set_node_prop(
 ) -> Response {
     let value = match body.get("value").and_then(|v| json_to_value(v.clone())) {
         Some(v) => v,
-        None => return err_response("missing or null value"),
+        None => {
+            return err_response(
+                "request body must be a JSON object with a \"value\" field, \
+                 e.g. {\"value\": \"SanFrancisco\"} or {\"value\": [\"a\", \"b\"]}",
+            )
+        }
     };
     let db = state.db.clone();
     if let AuthIdentity::Role(role_name) = &identity {
@@ -1834,6 +1875,85 @@ async fn remove_node_prop(
     }
 }
 
+/// Constant-time byte-string equality, used for secret (token) comparison so
+/// the match does not short-circuit on the first differing byte and leak the
+/// token through response-timing. Length is compared up front (token length is
+/// not treated as a secret); the byte loop is branch-free over equal lengths.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Maximum `depth` accepted by the neighborhood endpoint. Bounds the read-lock
+/// hold time of a single BFS request on a dense graph (a hostile
+/// `depth=4294967295` would otherwise traverse the whole graph under the read
+/// guard, starving writers).
+const MAX_NEIGHBORHOOD_DEPTH: u32 = 64;
+
+/// Parse and bound the neighborhood `depth` query parameter.
+fn resolve_neighborhood_depth(raw: Option<&str>) -> Result<u32, String> {
+    match raw {
+        None => Ok(1),
+        Some(s) => {
+            let d: u32 = s
+                .parse()
+                .map_err(|_| "depth must be an integer".to_string())?;
+            if d > MAX_NEIGHBORHOOD_DEPTH {
+                return Err(format!("depth must be ≤ {MAX_NEIGHBORHOOD_DEPTH}"));
+            }
+            Ok(d)
+        }
+    }
+}
+
+/// Confine a client-supplied backup `dest` to `root`, closing the arbitrary
+/// filesystem-write vector (a full-access token could otherwise direct the
+/// backup writer at `/etc/...`, `/root/.ssh/...`, etc.).
+///
+/// Rules: reject empty; reject any `..` segment; relative paths resolve under
+/// `root`; absolute paths must already fall within `root`. The check is lexical
+/// (no filesystem access) and safe because `..` is rejected before joining.
+fn confine_backup_dest(dest: &str, root: &std::path::Path) -> Result<PathBuf, String> {
+    if dest.is_empty() {
+        return Err("missing or empty \"dest\" field".into());
+    }
+    let dest_path = std::path::Path::new(dest);
+    if dest_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("backup \"dest\" may not contain \"..\" path segments".into());
+    }
+    let joined = if dest_path.is_absolute() {
+        dest_path.to_path_buf()
+    } else {
+        root.join(dest_path)
+    };
+    if !joined.starts_with(root) {
+        return Err(format!(
+            "backup \"dest\" must be within the backup root ({}); \
+             set MUSHROOMDB_BACKUP_DIR to change it",
+            root.display()
+        ));
+    }
+    Ok(joined)
+}
+
+/// Directory backups are confined to: `MUSHROOMDB_BACKUP_DIR` if set, else the
+/// server's current working directory.
+fn backup_root() -> PathBuf {
+    std::env::var_os("MUSHROOMDB_BACKUP_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// `POST /backup` — take a consistent backup of the database to `dest`.
 ///
 /// The read guard is held for the duration of the file copies, which is the
@@ -1842,7 +1962,11 @@ async fn remove_node_prop(
 /// in-process writers.  This is the safe alternative to running the
 /// `mushroomdb backup` CLI against a live-served store.
 ///
-/// Request body: `{"dest": "/absolute/path/to/backup-dir"}`
+/// Request body: `{"dest": "backup-dir"}`. `dest` is confined to the backup
+/// root (`MUSHROOMDB_BACKUP_DIR`, else the server's working directory):
+/// relative paths resolve under it, absolute paths must fall within it, and
+/// `..` segments are rejected. This prevents a full-access token from writing
+/// to arbitrary filesystem paths.
 ///
 /// Responses:
 /// - `200 OK` — backup completed; body is a `BackupReport` JSON object.
@@ -1858,9 +1982,13 @@ async fn backup(
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /backup requires a full-access token");
     }
+    let root = backup_root();
     let dest = match body.get("dest").and_then(Js::as_str) {
-        Some(s) if !s.is_empty() => std::path::PathBuf::from(s),
-        _ => return err_response("missing or empty \"dest\" field"),
+        Some(s) => match confine_backup_dest(s, &root) {
+            Ok(p) => p,
+            Err(e) => return err_response(e),
+        },
+        None => return err_response("missing or empty \"dest\" field"),
     };
     let db = state.db.clone();
     let report: BackupReport = match tokio::task::spawn_blocking(move || {
@@ -1949,5 +2077,81 @@ mod tests {
         let default = DegreeConfig::default();
         assert_eq!(config.budget_ms, default.budget_ms);
         assert_eq!(config.edge_type, default.edge_type);
+    }
+
+    #[test]
+    fn backup_dest_rejects_empty() {
+        assert!(confine_backup_dest("", std::path::Path::new("/srv/backups")).is_err());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_equality() {
+        assert!(constant_time_eq(b"secret-token", b"secret-token"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"secret-token", b"secret-toke")); // shorter
+        assert!(!constant_time_eq(b"secret-token", b"secret-tokex")); // last byte differs
+        assert!(!constant_time_eq(b"secret-token", b"Xecret-token")); // first byte differs
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn depth_defaults_to_one_when_absent() {
+        assert_eq!(resolve_neighborhood_depth(None).unwrap(), 1);
+    }
+
+    #[test]
+    fn depth_within_cap_is_accepted() {
+        assert_eq!(resolve_neighborhood_depth(Some("10")).unwrap(), 10);
+        assert_eq!(
+            resolve_neighborhood_depth(Some(&MAX_NEIGHBORHOOD_DEPTH.to_string())).unwrap(),
+            MAX_NEIGHBORHOOD_DEPTH
+        );
+    }
+
+    #[test]
+    fn depth_over_cap_is_rejected() {
+        assert!(resolve_neighborhood_depth(Some("65")).is_err());
+        assert!(resolve_neighborhood_depth(Some("4294967295")).is_err());
+    }
+
+    #[test]
+    fn depth_non_integer_is_rejected() {
+        assert!(resolve_neighborhood_depth(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn backup_dest_rejects_parent_traversal() {
+        let root = std::path::Path::new("/srv/backups");
+        assert!(confine_backup_dest("../../etc/cron.d", root).is_err());
+        assert!(confine_backup_dest("ok/../../../etc", root).is_err());
+    }
+
+    #[test]
+    fn backup_dest_rejects_absolute_outside_root() {
+        let root = std::path::Path::new("/srv/backups");
+        assert!(confine_backup_dest("/etc/cron.d", root).is_err());
+        assert!(confine_backup_dest("/root/.ssh/authorized_keys", root).is_err());
+    }
+
+    #[test]
+    fn backup_dest_allows_relative_within_root() {
+        let root = std::path::Path::new("/srv/backups");
+        assert_eq!(
+            confine_backup_dest("nightly", root).unwrap(),
+            PathBuf::from("/srv/backups/nightly")
+        );
+        assert_eq!(
+            confine_backup_dest("2026/aug", root).unwrap(),
+            PathBuf::from("/srv/backups/2026/aug")
+        );
+    }
+
+    #[test]
+    fn backup_dest_allows_absolute_within_root() {
+        let root = std::path::Path::new("/srv/backups");
+        assert_eq!(
+            confine_backup_dest("/srv/backups/x", root).unwrap(),
+            PathBuf::from("/srv/backups/x")
+        );
     }
 }

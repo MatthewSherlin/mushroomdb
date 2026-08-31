@@ -101,6 +101,9 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// `collect(x)` — gather each row's value of `x` into a list, skipping
+    /// nulls. Per group when grouping keys are present.
+    Collect,
 }
 
 /// Argument to an aggregate function.
@@ -147,7 +150,9 @@ pub enum RelDir {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelPat {
     pub var: Option<String>,
-    pub etype: Option<String>,
+    /// Relationship-type alternatives. Empty = any type; one = single type;
+    /// many = `[:A|:B]` alternation (match an edge of any listed type).
+    pub etypes: Vec<String>,
     pub dir: RelDir,
     /// `None` = single-hop (normal `Expand`).  `Some(r)` = variable-length
     /// (`VarExpand`) with the given min/max hop bounds.
@@ -206,6 +211,13 @@ pub enum Operand {
         op: ArithOp,
         left: Box<Operand>,
         right: Box<Operand>,
+    },
+    /// Generic `CASE WHEN <cond> THEN <value> [WHEN …] [ELSE <value>] END`.
+    /// Evaluates each branch's condition in order, returning the first matching
+    /// value; the `default` (ELSE) or null if none match.
+    Case {
+        branches: Vec<(Expr, Operand)>,
+        default: Option<Box<Operand>>,
     },
 }
 

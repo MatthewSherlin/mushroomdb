@@ -5,8 +5,9 @@ use crate::subscription::{
 };
 use core_query::cypher::ast::ArithOp;
 use core_query::cypher::{
-    execute, is_subscribable, is_write_tokens, lex, parse, parse_write, plan, MatchDeleteNodeStmt,
-    NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem, RetVal, WriteStatement,
+    execute, execute_union, is_subscribable, is_write_tokens, lex, parse, parse_read, parse_write,
+    plan, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem, RetVal,
+    WriteStatement,
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
@@ -15,6 +16,7 @@ use core_rules::{
 };
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
+use core_storage::property_index::PropertyIndex;
 use core_storage::v8::encode::{
     archived_hnsw_to_owned, archived_rules_meta_to_owned, archived_to_idmap, archived_to_interner,
     archived_views_to_owned, decode_last_change_bytes, decode_meta, encode_v8, V8Meta,
@@ -212,6 +214,8 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         | WalRecord::DeleteView { .. }
         | WalRecord::EnableFulltext { .. }
         | WalRecord::DisableFulltext { .. }
+        | WalRecord::EnableIndex { .. }
+        | WalRecord::DisableIndex { .. }
         | WalRecord::Intern { .. }
         // History markers are no-ops for mutation events — they carry no new
         // state and rules re-derive deterministically on replay.
@@ -511,6 +515,17 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
             operand_node_vars(left, out);
             operand_node_vars(right, out);
         }
+        Operand::Case { branches, default } => {
+            // Branch conditions reference vars already bound (and mask-filtered)
+            // by the MATCH phase, so collecting from the value operands + ELSE
+            // is sufficient for RETURN-projection var discovery.
+            for (_, value) in branches {
+                operand_node_vars(value, out);
+            }
+            if let Some(d) = default {
+                operand_node_vars(d, out);
+            }
+        }
         Operand::Lit(_) | Operand::Param(_) => {}
     }
 }
@@ -592,6 +607,7 @@ fn ret_column_name(item: &RetItem) -> String {
                     Operand::Param(p) => format!("${p}"),
                     Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                     Operand::BinArith { .. } => "<arith>".to_string(),
+                    Operand::Case { .. } => "<case>".to_string(),
                 })
                 .collect();
             format!("{name}({})", arg_strs.join(", "))
@@ -637,6 +653,13 @@ fn eval_set_return_operand<F: Fs>(
             let rv = eval_set_return_operand(db, match_rs, row, rel_vars, right, params)?;
             eval_set_return_arith(op, lv, rv)
         }
+        // CASE is supported in read-query RETURN; in a write-statement RETURN
+        // projection (CREATE/MERGE/SET … RETURN) it is not yet wired.
+        Operand::Case { .. } => Err(GraphError::QueryError {
+            detail: "CASE is not supported in a write-statement RETURN projection; \
+                     use a read query"
+                .into(),
+        }),
     }
 }
 
@@ -981,6 +1004,10 @@ pub struct GraphDb<F: Fs> {
     /// Incremental inverted index for full-text-lite search.
     /// Rebuild-on-open: populated from WAL replay + rebuild_all at open end.
     fulltext: FulltextIndex,
+    /// Opt-in equality index over scalar node properties.
+    /// Rebuild-on-open: declarations replay from the WAL, postings rebuild at
+    /// open end (mirrors `fulltext`).
+    prop_index: PropertyIndex,
     event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
     /// WAL fsync cadence. Default [`FsyncPolicy::Strict`].
     fsync: FsyncPolicy,
@@ -1274,6 +1301,38 @@ impl GraphDb<RealFs> {
     pub fn open_at(dir: &std::path::Path, commit: u64) -> Result<Self> {
         Self::open_at_with(RealFs::new(dir)?, commit)
     }
+
+    /// Run a **read-only** Cypher query against the graph as it existed at
+    /// `commit` — the "time-travel" / agent-replay query. Opens a temporal view
+    /// of this store's directory at that commit and executes the read there.
+    ///
+    /// The current instance is unaffected. Write statements are rejected (the
+    /// temporal view is read-only). `commit` is a 0-based WAL commit index;
+    /// `commit == wal_commit_count` (or `open_at`'s range) yields the newest
+    /// state. Prefer this over holding many historical instances open.
+    ///
+    /// # Errors
+    /// - [`GraphError::CommitOutOfRange`] if `commit` is past the WAL horizon.
+    /// - A query error for a malformed or write query.
+    pub fn query_at(
+        &self,
+        commit: u64,
+        cypher: &str,
+        params: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let dir = self.fs.dir().to_path_buf();
+        let temporal = Self::open_at(&dir, commit)?;
+        if is_write_tokens(&lex(cypher).map_err(|e| GraphError::QueryError {
+            detail: format!("lex: {e}"),
+        })?) {
+            return Err(GraphError::QueryError {
+                detail: "query_at is read-only: write statements are not permitted in a \
+                         time-travel query"
+                    .into(),
+            });
+        }
+        temporal.query(cypher, params)
+    }
 }
 
 impl<F: Fs> GraphDb<F> {
@@ -1289,6 +1348,7 @@ impl<F: Fs> GraphDb<F> {
             engine: RuleEngine::new(),
             view_store: ViewStore::new(),
             fulltext: FulltextIndex::new(),
+            prop_index: PropertyIndex::new(),
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
@@ -1441,6 +1501,12 @@ impl<F: Fs> GraphDb<F> {
         // Rebuild full-text index after WAL replay.  Corrects drift from
         // per-record incremental apply during replay.
         db.fulltext.rebuild_all(
+            &db.ids,
+            &db.labels,
+            &db.syms,
+            build_props_view(&db.props, &db.base),
+        );
+        db.prop_index.rebuild_all(
             &db.ids,
             &db.labels,
             &db.syms,
@@ -1802,6 +1868,7 @@ impl<F: Fs> GraphDb<F> {
             engine: RuleEngine::new(),
             view_store: ViewStore::new(),
             fulltext: FulltextIndex::new(),
+            prop_index: PropertyIndex::new(),
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
@@ -1951,6 +2018,12 @@ impl<F: Fs> GraphDb<F> {
             &db.syms,
             build_props_view(&db.props, &db.base),
         );
+        db.prop_index.rebuild_all(
+            &db.ids,
+            &db.labels,
+            &db.syms,
+            build_props_view(&db.props, &db.base),
+        );
         // Load roles sidecar (current roles, not point-in-time).
         db.roles = Self::load_roles_from_fs(&db.fs)?;
         db.read_only = true;
@@ -2071,6 +2144,12 @@ impl<F: Fs> GraphDb<F> {
                         if self.fulltext.is_enabled(label, field) {
                             self.fulltext.add_tokens(id, field, value);
                         }
+                    }
+                }
+                // Property (equality) index maintenance.
+                if self.prop_index.has_label(label) {
+                    for (field, value) in props {
+                        self.prop_index.set(label, field, id, value);
                     }
                 }
             }
@@ -2227,6 +2306,19 @@ impl<F: Fs> GraphDb<F> {
                         }
                     }
                 }
+                // Property (equality) index maintenance: re-key this node's value.
+                if self.prop_index.field_indexed(field) {
+                    let label_opt = self.labels.get(id as usize).and_then(|&sym| {
+                        if sym == u32::MAX {
+                            None
+                        } else {
+                            self.syms.resolve(sym)
+                        }
+                    });
+                    if let Some(label) = label_opt {
+                        self.prop_index.set(label, field, id, value);
+                    }
+                }
             }
             WalRecord::Intern { id, text } => {
                 if let Some(existing) = self.syms.get(text) {
@@ -2318,6 +2410,14 @@ impl<F: Fs> GraphDb<F> {
                         if self.fulltext.is_enabled(&label_str, field) {
                             self.fulltext.add_tokens(id, field, value);
                         }
+                    }
+                }
+                if self.prop_index.has_label(&label_str) {
+                    for (field_sym, value) in props {
+                        let Some(field) = self.syms.resolve(*field_sym) else {
+                            continue;
+                        };
+                        self.prop_index.set(&label_str, field, id, value);
                     }
                 }
             }
@@ -2475,6 +2575,18 @@ impl<F: Fs> GraphDb<F> {
                             self.fulltext.remove_node_field(*id, &field_str);
                             self.fulltext.add_tokens(*id, &field_str, value);
                         }
+                    }
+                }
+                if self.prop_index.field_indexed(&field_str) {
+                    let label_opt = self.labels.get(*id as usize).and_then(|&sym| {
+                        if sym == u32::MAX {
+                            None
+                        } else {
+                            self.syms.resolve(sym)
+                        }
+                    });
+                    if let Some(label) = label_opt {
+                        self.prop_index.set(label, &field_str, *id, value);
                     }
                 }
             }
@@ -2658,6 +2770,14 @@ impl<F: Fs> GraphDb<F> {
                 if self.fulltext.field_indexed(field) {
                     self.fulltext.remove_node_field(id, field);
                 }
+                // Property (equality) index maintenance: drop this node's entry.
+                if self.prop_index.field_indexed(field) {
+                    if let Some(label) = self.labels.get(id as usize).and_then(|&sym| {
+                        (sym != u32::MAX).then(|| self.syms.resolve(sym)).flatten()
+                    }) {
+                        self.prop_index.remove_node(label, field, id);
+                    }
+                }
             }
             WalRecord::DeleteEdge {
                 edge_type,
@@ -2839,6 +2959,8 @@ impl<F: Fs> GraphDb<F> {
                 self.props.remove_all(n);
                 // Full-text index maintenance: remove all tokens for this node.
                 self.fulltext.remove_node(n);
+                // Property (equality) index maintenance: drop all entries for n.
+                self.prop_index.remove_node_all(n);
 
                 // (4) Retire the dense id and stamp the label sentinel.
                 self.ids.delete(key);
@@ -2975,6 +3097,38 @@ impl<F: Fs> GraphDb<F> {
                     }
                 }
                 self.fulltext.disable(label, field);
+            }
+            WalRecord::EnableIndex { label, field } => {
+                // Replay-over-snapshot idempotency: already enabled → skip.
+                if self.prop_index.is_enabled(label, field) {
+                    return Ok(());
+                }
+                self.prop_index.enable(label, field);
+                // Backfill: index all live nodes of this label that have the field.
+                let n = self.ids.len() as u32;
+                for id in 0..n {
+                    let Some(&sym) = self.labels.get(id as usize) else {
+                        continue;
+                    };
+                    if sym == u32::MAX {
+                        continue; // tombstoned
+                    }
+                    let Some(lbl) = self.syms.resolve(sym) else {
+                        continue;
+                    };
+                    if lbl != label {
+                        continue;
+                    }
+                    if let Some(value) = build_props_view(&self.props, &self.base)
+                        .get(id, field)
+                        .map(|vr| vr.into_value())
+                    {
+                        self.prop_index.set(label, field, id, &value);
+                    }
+                }
+            }
+            WalRecord::DisableIndex { label, field } => {
+                self.prop_index.disable(label, field);
             }
             // History markers carry no replay state — rules re-derive edges
             // deterministically on open/replay. Skip unconditionally.
@@ -3751,6 +3905,8 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::DeleteView { .. }
             | WalRecord::EnableFulltext { .. }
             | WalRecord::DisableFulltext { .. }
+            | WalRecord::EnableIndex { .. }
+            | WalRecord::DisableIndex { .. }
             | WalRecord::Intern { .. }
             // History markers produce no DbEvent — the engine delta already
             // fired the EdgeFired/EdgeRetracted subscription events.
@@ -4733,6 +4889,54 @@ impl<F: Fs> GraphDb<F> {
         self.fulltext.is_enabled(label, field)
     }
 
+    /// Enable an equality index for all nodes of `label` on scalar property
+    /// `field`. Subsequent `WHERE n.field = value` lookups become O(matches)
+    /// instead of an O(N_label) scan. Existing nodes are backfilled; the
+    /// declaration persists via WAL and the postings rebuild on re-open.
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::RuleInvalid`]: `(label, field)` is already indexed.
+    pub fn enable_index(&mut self, label: &str, field: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if self.prop_index.is_enabled(label, field) {
+            return Err(GraphError::RuleInvalid {
+                detail: format!("property index for ({label:?}, {field:?}) already enabled"),
+            });
+        }
+        self.log_then_apply(WalRecord::EnableIndex {
+            label: label.into(),
+            field: field.into(),
+        })
+    }
+
+    /// Disable the equality index for `(label, field)` and drop its postings.
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::RuleNotFound`]: `(label, field)` is not currently indexed.
+    pub fn disable_index(&mut self, label: &str, field: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if !self.prop_index.is_enabled(label, field) {
+            return Err(GraphError::RuleNotFound {
+                name: format!("index({label},{field})"),
+            });
+        }
+        self.log_then_apply(WalRecord::DisableIndex {
+            label: label.into(),
+            field: field.into(),
+        })
+    }
+
+    /// Whether `(label, field)` currently has an equality index.
+    pub fn is_index_enabled(&self, label: &str, field: &str) -> bool {
+        self.prop_index.is_enabled(label, field)
+    }
+
     /// Search a full-text-indexed field.
     ///
     /// Returns `(node_key, match_count)` pairs sorted by match_count descending,
@@ -5038,7 +5242,8 @@ impl<F: Fs> GraphDb<F> {
     /// `config.converged` is `true` only when the power iteration converged
     /// within `config.max_iters` and within any time budget.
     pub fn pagerank(&self, config: &crate::algo::PageRankConfig) -> crate::algo::PageRankReport {
-        crate::algo::pagerank(&self.topo, &self.ids, &self.syms, &self.labels, config)
+        let topo = build_topo_view(&self.topo, &self.base);
+        crate::algo::pagerank(&topo, &self.ids, &self.syms, &self.labels, config)
     }
 
     /// Weakly-connected components over the unified topology (treated as
@@ -5047,7 +5252,8 @@ impl<F: Fs> GraphDb<F> {
     /// Component IDs are the key of the smallest member in the component
     /// (deterministic).  Result sorted by (component_id, key).
     pub fn connected_components(&self, config: &crate::algo::WccConfig) -> crate::algo::WccReport {
-        crate::algo::wcc(&self.topo, &self.ids, &self.syms, &self.labels, config)
+        let topo = build_topo_view(&self.topo, &self.base);
+        crate::algo::wcc(&topo, &self.ids, &self.syms, &self.labels, config)
     }
 
     /// Degree centrality for every live node.
@@ -5061,7 +5267,8 @@ impl<F: Fs> GraphDb<F> {
         &self,
         config: &crate::algo::DegreeConfig,
     ) -> crate::algo::DegreeReport {
-        crate::algo::degree_centrality(&self.topo, &self.ids, &self.syms, &self.labels, config)
+        let topo = build_topo_view(&self.topo, &self.base);
+        crate::algo::degree_centrality(&topo, &self.ids, &self.syms, &self.labels, config)
     }
 
     /// Write a vector of `(node_key, score)` pairs as `prop_name` on each node,
@@ -5703,6 +5910,7 @@ impl<F: Fs> GraphDb<F> {
             topo: self.topo_view(),
             edge_props: self.edge_props_view(),
             mask: None,
+            prop_index: Some(&self.prop_index),
         }
     }
 
@@ -5715,6 +5923,7 @@ impl<F: Fs> GraphDb<F> {
             topo: self.topo_view(),
             edge_props: self.edge_props_view(),
             mask: Some(&mask.visible),
+            prop_index: Some(&self.prop_index),
         }
     }
 
@@ -5739,13 +5948,12 @@ impl<F: Fs> GraphDb<F> {
         if is_write_tokens(&tokens) {
             return Err(GraphError::MaskedReadOnly);
         }
-        let ast = parse(&tokens).map_err(|e| GraphError::QueryError {
+        let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
-        let ops = plan(&ast).map_err(|e| GraphError::QueryError {
-            detail: format!("plan: {e}"),
-        })?;
-        execute(&self.view_masked(mask), &ops, &Params(params)).map_err(|e| {
+        // Each UNION part executes against the same masked view, so the mask
+        // applies uniformly across the chain.
+        execute_union(&self.view_masked(mask), &union, &Params(params)).map_err(|e| {
             GraphError::QueryError {
                 detail: format!("execute: {e}"),
             }
@@ -6460,13 +6668,10 @@ impl<F: Fs> GraphDb<F> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
-        let ast = parse(&tokens).map_err(|e| GraphError::QueryError {
+        let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
-        let ops = plan(&ast).map_err(|e| GraphError::QueryError {
-            detail: format!("plan: {e}"),
-        })?;
-        execute(&self.view(), &ops, &Params(params)).map_err(|e| GraphError::QueryError {
+        execute_union(&self.view(), &union, &Params(params)).map_err(|e| GraphError::QueryError {
             detail: format!("execute: {e}"),
         })
     }
@@ -7420,7 +7625,9 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::CreateView { .. }
             | WalRecord::DeleteView { .. }
             | WalRecord::EnableFulltext { .. }
-            | WalRecord::DisableFulltext { .. } => {}
+            | WalRecord::DisableFulltext { .. }
+            | WalRecord::EnableIndex { .. }
+            | WalRecord::DisableIndex { .. } => {}
             // RenameNode: node id is stable; update last_change via the new key.
             // Called after apply(), so ids already reflects new_key.
             WalRecord::RenameNode { new_key, .. } => {
@@ -8568,6 +8775,13 @@ impl<F: Fs> GraphDb<F> {
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
+            for (label, field) in self.prop_index.enabled_pairs() {
+                let rec = WalRecord::EnableIndex {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
             self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
         } else if opts.keep_wal {
             // keep_wal=true: WAL is left untouched.  The existing WAL already
@@ -8599,6 +8813,13 @@ impl<F: Fs> GraphDb<F> {
             let mut baseline_wal: Vec<u8> = Vec::new();
             for (label, field) in self.fulltext.enabled_pairs() {
                 let rec = WalRecord::EnableFulltext {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            for (label, field) in self.prop_index.enabled_pairs() {
+                let rec = WalRecord::EnableIndex {
                     label: label.clone(),
                     field: field.clone(),
                 };

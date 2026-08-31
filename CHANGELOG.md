@@ -1,5 +1,70 @@
 # Changelog
 
+## Unreleased
+
+### Temporal / moat
+
+- Time-travel reads: `GraphDb::query_at(commit, cypher)`, `POST /query
+  {"as_of": N}`, and Python `query_at` run a read-only query against the graph
+  as it existed at a past WAL commit — the agent-replay primitive. The live
+  store is unaffected; writes and (for now) role/masked temporal queries are
+  rejected.
+- `docs/site/roadmap-moat.md` specifies the two remaining category-defining
+  features — rule chaining (with a cycle-safe, replay-deterministic design) and
+  memory-native decay/consolidation/namespaces — ready to build with sign-off.
+
+### Trust & hardening
+
+- `mushroomdb verify` now runs a structural (rkyv `bytecheck`) pass over the
+  hot-path sections in addition to CRC32, so it rejects a maliciously crafted
+  snapshot whose relative pointers would trigger UB on open. Run it before
+  restoring an untrusted snapshot. Zero cost on the query path.
+- Concurrency torture tests: overlapping-key races land exactly once, and
+  concurrent writers that trigger rule-fires keep derived edges and the property
+  index consistent.
+- Python bindings gain `enable_index`/`disable_index`/`is_index_enabled`,
+  `node_history`, and `was_linked`.
+- New `docs/site/durability.md` documents the crash-recovery model. Deferred:
+  making rule-derived edges first-class replayable WAL records (the snapshot
+  path already gives fast recovery; `--snapshot-every` bounds the worst case).
+
+### Cypher fluency
+
+- `collect(x)` aggregation (grouped and ungrouped), skipping nulls.
+- `UNION` / `UNION ALL` combine two or more read queries (matching column names;
+  `UNION` dedups, `UNION ALL` keeps duplicates; masks apply uniformly).
+- `CASE WHEN <cond> THEN <value> … [ELSE <value>] END` expressions in
+  RETURN/WITH/WHERE/SET.
+- Multi-relationship-type patterns: `(a)-[:A|:B]->(b)` matches an edge of any
+  listed type.
+- New scalar functions: `contains`, `startsWith`, `endsWith`, `toInteger`,
+  `toFloat`, `toString`.
+
+Known follow-ons: bare `RETURN r` for a relationship variable still requires
+`r.field` (no relationship value type yet); `MATCH (a) MATCH (b) CREATE (a)-[:E]->(b)`
+between separately matched nodes does not yet create the edge.
+
+### Property (equality) indexes
+
+- Opt-in equality index over scalar node properties: `MATCH (n:L {field: value})`
+  becomes an O(matches) indexed lookup instead of an O(N_label) scan. Declare via
+  a schema `indexes: [["Label","field"]]` list or `db.enable_index(label, field)`.
+  Maintained incrementally, persisted via the WAL + snapshot baseline, and rebuilt
+  on open (no format migration). Declaring an index never changes results, only
+  speed. See `docs/site/indexes.md`.
+
+### Fixes
+
+- Graph algorithms (PageRank, WCC, degree centrality) now read the unified
+  topology view, so they see rule-derived edges after a snapshot + reopen instead
+  of reporting zero for every node. Affected HTTP and CLI equally.
+- Cypher accepts list literals in `CREATE`/`SET` property values
+  (`CREATE (n {tags: ['a','b']})`).
+- `POST /backup` confines its `dest` to a backup root (`MUSHROOMDB_BACKUP_DIR`,
+  else the working directory); constant-time token comparison; 64 MiB request
+  body cap; bounded neighborhood BFS depth.
+- CLI `algo degree`/`pagerank` gain `--dir out|in|both`.
+
 ## v0.3.0 — 2026-08-30
 
 Role-scoped writes and mask-aware vector search. Additive over v0.2.0 — no

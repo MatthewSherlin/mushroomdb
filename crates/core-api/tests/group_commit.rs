@@ -1001,3 +1001,142 @@ fn write_batch_strict_always_fsyncs() {
     );
     assert_eq!(db.node_count(), 10);
 }
+
+// ── Concurrency torture: overlapping keys and rule/index consistency ─────────
+
+/// Many threads race to insert the *same* key. Regardless of interleaving, the
+/// store must end with exactly one such node and no corruption — duplicate
+/// submissions are rejected, not double-applied.
+#[test]
+fn concurrent_overlapping_key_inserts_land_exactly_once() {
+    let dir = tmp("conc-overlap");
+    let db = SharedDb::open(&dir).unwrap();
+    const WRITERS: usize = 16;
+
+    let start = Arc::new(Barrier::new(WRITERS));
+    let ok_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|_| {
+            let db = db.clone();
+            let start = Arc::clone(&start);
+            let ok_count = Arc::clone(&ok_count);
+            thread::spawn(move || {
+                start.wait();
+                let r = db.submit_batch(vec![BatchOp::InsertNode {
+                    label: "N".into(),
+                    key: "shared".into(),
+                    props: vec![],
+                }]);
+                if r.is_ok() {
+                    ok_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("writer thread panicked");
+    }
+
+    assert_eq!(
+        ok_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "exactly one insert of the shared key may succeed"
+    );
+    assert!(db.read().has_node("shared"), "the node must exist");
+    assert_eq!(db.read().node_count(), 1, "exactly one node total");
+}
+
+/// Concurrent writers that trigger rule-fires must leave the derived edges,
+/// the fulltext-style property index, and node state mutually consistent — no
+/// lost edges, no stale index entries, no panics.
+#[test]
+fn concurrent_writes_keep_rules_and_index_consistent() {
+    use core_api::{Predicate, RuleDef};
+    use std::collections::BTreeMap;
+
+    let dir = tmp("conc-rules-index");
+    let db = SharedDb::open(&dir).unwrap();
+
+    // Rule: Talent.city == Company.city → IN_CITY. Plus an equality index on
+    // Talent.city so the index-maintenance path runs under concurrency too.
+    db.write()
+        .create_rule(RuleDef {
+            name: "same_city".into(),
+            src_label: "Talent".into(),
+            dst_label: "Company".into(),
+            predicate: Predicate::FieldEqual {
+                field: "city".into(),
+            },
+            edge_type: "IN_CITY".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })
+        .unwrap();
+    db.write().enable_index("Talent", "city").unwrap();
+
+    const N_TALENT: usize = 30;
+    const N_COMPANY: usize = 10;
+
+    let start = Arc::new(Barrier::new(2));
+    let db_t = db.clone();
+    let start_t = Arc::clone(&start);
+    let t_thread = thread::spawn(move || {
+        start_t.wait();
+        for i in 0..N_TALENT {
+            db_t.submit_batch(vec![BatchOp::InsertNode {
+                label: "Talent".into(),
+                key: format!("t{i}"),
+                props: vec![("city".into(), core_api::Value::Str("austin".into()))],
+            }])
+            .unwrap();
+        }
+    });
+    let db_c = db.clone();
+    let start_c = Arc::clone(&start);
+    let c_thread = thread::spawn(move || {
+        start_c.wait();
+        for i in 0..N_COMPANY {
+            db_c.submit_batch(vec![BatchOp::InsertNode {
+                label: "Company".into(),
+                key: format!("c{i}"),
+                props: vec![("city".into(), core_api::Value::Str("austin".into()))],
+            }])
+            .unwrap();
+        }
+    });
+    t_thread.join().unwrap();
+    c_thread.join().unwrap();
+
+    // Every Talent×Company austin pair must have an IN_CITY edge.
+    let edges = db
+        .read()
+        .query(
+            "MATCH (t:Talent)-[r:IN_CITY]->(c:Company) RETURN t",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        edges.len(),
+        N_TALENT * N_COMPANY,
+        "all derived edges must be present after concurrent rule-fires"
+    );
+
+    // The property index must see every austin Talent.
+    let indexed = db
+        .read()
+        .query(
+            "MATCH (t:Talent {city: 'austin'}) RETURN t",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        indexed.len(),
+        N_TALENT,
+        "the equality index must be consistent under concurrent writes"
+    );
+    assert_eq!(db.read().node_count(), N_TALENT + N_COMPANY);
+}

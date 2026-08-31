@@ -25,6 +25,12 @@ static FUSED_SCAN_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 #[cfg(test)]
 static SCAN_KEY_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only counter incremented each time an `IndexScan` takes the *indexed*
+/// path (not the scan fallback). Lets tests assert the equality index is used.
+#[cfg(test)]
+pub static INDEX_SCAN_FIRES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Query parameters. Missing names anywhere in the plan are an error at
 /// execution start (the plan is walked before any rows are produced).
 pub struct Params<'a>(pub &'a BTreeMap<String, Value>);
@@ -225,6 +231,62 @@ pub fn execute(view: &GraphView, plan: &[PlanOp], params: &Params) -> Result<Res
     execute_inner(view, plan, params, row_bound(plan))
 }
 
+/// Execute a read query that may be a `UNION` / `UNION ALL` chain. Each part is
+/// planned and executed against the same `view` (so masking applies uniformly),
+/// then combined left-to-right: `UNION` dedups the accumulated rows, `UNION ALL`
+/// concatenates. All parts must project the same column names.
+pub fn execute_union(
+    view: &GraphView,
+    union: &crate::cypher::parser::UnionQuery,
+    params: &Params,
+) -> Result<ResultSet, String> {
+    let mut acc: Option<ResultSet> = None;
+    for (i, part) in union.parts.iter().enumerate() {
+        let ops = crate::cypher::plan::plan(part)?;
+        let rs = execute(view, &ops, params)?;
+        acc = Some(match acc {
+            None => rs,
+            Some(prev) => {
+                if prev.columns() != rs.columns() {
+                    return Err(format!(
+                        "UNION requires matching column names across all parts; \
+                         got {:?} then {:?}",
+                        prev.columns(),
+                        rs.columns()
+                    ));
+                }
+                // all_flags has one entry per boundary; index i-1 for part i.
+                let all = union.all_flags.get(i - 1).copied().unwrap_or(false);
+                combine_result_sets(prev, rs, all)
+            }
+        });
+    }
+    // `parse_read` guarantees at least one part.
+    Ok(acc.expect("UNION query has at least one part"))
+}
+
+fn combine_result_sets(mut acc: ResultSet, other: ResultSet, all: bool) -> ResultSet {
+    for i in 0..other.len() {
+        acc.push_row(other.row(i).to_vec());
+    }
+    if !all {
+        // UNION (distinct): keep first occurrence of each row.
+        let mut seen: Vec<Vec<Option<Value>>> = Vec::new();
+        for i in 0..acc.len() {
+            let r = acc.row(i).to_vec();
+            if !seen.contains(&r) {
+                seen.push(r);
+            }
+        }
+        let mut deduped = ResultSet::new(acc.columns().to_vec());
+        for r in seen {
+            deduped.push_row(r);
+        }
+        return deduped;
+    }
+    acc
+}
+
 /// Like `execute` but always disables LIMIT push-down (row_bound = None).
 ///
 /// Used in tests as the reference implementation: the result must equal that of
@@ -322,6 +384,23 @@ fn execute_inner(
             PlanOp::ScanKey { var, key, label } => {
                 rows = scan_key(view, &vars, &rows, var, key, label.as_deref(), params)?;
             }
+            PlanOp::IndexScan {
+                var,
+                label,
+                field,
+                value,
+            } => {
+                rows = scan_index(
+                    view,
+                    &vars,
+                    &rows,
+                    var,
+                    label.as_deref(),
+                    field,
+                    value,
+                    params,
+                )?;
+            }
             PlanOp::LookupProps { var, props } => {
                 rows = retain_node(view, &vars, &rows, var, None, props, params)?;
             }
@@ -334,26 +413,26 @@ fn execute_inner(
             PlanOp::VarExpand {
                 from,
                 rel_var,
-                etype,
+                etypes,
                 dir,
                 to,
                 min,
                 max,
             } => {
                 rows = exec_var_expand(
-                    view, &vars, &rows, from, rel_var, etype, *dir, to, *min, *max,
+                    view, &vars, &rows, from, rel_var, etypes, *dir, to, *min, *max,
                 )?;
             }
             PlanOp::ShortestPath {
                 from,
                 rel_var,
-                etype,
+                etypes,
                 dir,
                 to,
                 max_hops,
             } => {
                 rows = exec_shortest_path(
-                    view, &vars, &rows, from, rel_var, etype, *dir, to, *max_hops,
+                    view, &vars, &rows, from, rel_var, etypes, *dir, to, *max_hops,
                 )?;
             }
             PlanOp::Filter { expr } => {
@@ -1042,6 +1121,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                                         Operand::Param(p) => format!("${p}"),
                                         Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                                         Operand::BinArith { .. } => "<arith>".to_string(),
+                                        Operand::Case { .. } => "<case>".to_string(),
                                     })
                                     .collect();
                                 let col = format!("{name}({})", arg_strs.join(", "));
@@ -1132,6 +1212,15 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
         Operand::FuncCall { args, .. } => {
             for arg in args {
                 intern_operand(vars, arg);
+            }
+        }
+        Operand::Case { branches, default } => {
+            for (cond, value) in branches {
+                intern_expr(vars, cond);
+                intern_operand(vars, value);
+            }
+            if let Some(d) = default {
+                intern_operand(vars, d);
             }
         }
     }
@@ -1262,6 +1351,77 @@ fn scan_label(
     Ok(out)
 }
 
+/// Resolve the matching node ids for an `IndexScan` of `label`/`field`/`value`.
+///
+/// Indexed path (`(label, field)` declared, concrete label, scalar value): the
+/// property index answers directly. Otherwise a full label scan filtered by the
+/// same `node_matches` equality the `LookupProps` plan uses — so the id set is
+/// identical to `ScanLabel` + `LookupProps` regardless of whether an index
+/// exists. `row` supplies `$param` bindings (the value is row-independent).
+#[allow(clippy::too_many_arguments)]
+fn index_scan_ids(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    label: Option<&str>,
+    field: &str,
+    value: &Operand,
+    params: &Params,
+) -> Result<Vec<u32>, String> {
+    let resolved = resolve_operand(view, vars, row, value, params)?;
+    if let (Some(label_str), Some(val)) = (label, resolved.as_ref()) {
+        if let Some(ids) = view.nodes_with_prop(label_str, field, val) {
+            #[cfg(test)]
+            INDEX_SCAN_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(ids);
+        }
+    }
+    // Fallback: full label scan + single-equality retain.
+    let props = [(field.to_string(), value.clone())];
+    let mut out = Vec::new();
+    for id in scan_ids(view, label) {
+        if node_matches(view, vars, row, id, None, &props, params)? {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Execute an `IndexScan`: seed rows from nodes of `label` whose scalar
+/// `field` equals `value` (see [`index_scan_ids`]).
+#[allow(clippy::too_many_arguments)]
+fn scan_index(
+    view: &GraphView,
+    vars: &VarTable,
+    rows: &[Row],
+    var: &str,
+    label: Option<&str>,
+    field: &str,
+    value: &Operand,
+    params: &Params,
+) -> Result<Vec<Row>, String> {
+    let Some(first) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let ids = index_scan_ids(view, vars, first, label, field, value, params)?;
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    let cap = max_intermediate_rows();
+    let mut out = Vec::new();
+    for row in rows {
+        for &id in &ids {
+            if out.len() >= cap {
+                return Err(row_cap_err(cap));
+            }
+            let mut next = row.clone();
+            next[slot] = Some(Cell::Node(id));
+            out.push(next);
+        }
+    }
+    Ok(out)
+}
+
 fn require_cell<'a>(row: &'a Row, vars: &VarTable, var: &str) -> Result<&'a Cell, String> {
     let slot = vars
         .slot(var)
@@ -1290,7 +1450,39 @@ const SCALAR_FUNCS: &[&str] = &[
     "abs",
     "round",
     "textMatches",
+    "contains",
+    "startsWith",
+    "endsWith",
+    "toInteger",
+    "toFloat",
+    "toString",
 ];
+
+/// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
+/// `endsWith`). Null in either argument → null; non-string args → null.
+fn eval_string_predicate(
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+    f: impl Fn(&str, &str) -> bool,
+) -> Result<Option<Value>, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "{name}() requires exactly 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let a = resolve_operand(view, vars, row, &args[0], params)?;
+    let b = resolve_operand(view, vars, row, &args[1], params)?;
+    match (a, b) {
+        (Some(Value::Str(s)), Some(Value::Str(sub))) => Ok(Some(Value::Bool(f(&s, &sub)))),
+        (None, _) | (_, None) => Ok(None),
+        _ => Ok(None),
+    }
+}
 
 /// Evaluate one of the supported scalar functions.  Unknown function names
 /// produce a named error listing the supported set.  Null propagation:
@@ -1450,6 +1642,73 @@ fn eval_func(
                 _ => Ok(Some(Value::Bool(false))), // non-string field → no match
             }
         }
+        "contains" => eval_string_predicate("contains", args, view, vars, row, params, |s, sub| {
+            s.contains(sub)
+        }),
+        "startswith" => {
+            eval_string_predicate("startsWith", args, view, vars, row, params, |s, p| {
+                s.starts_with(p)
+            })
+        }
+        "endswith" => eval_string_predicate("endsWith", args, view, vars, row, params, |s, p| {
+            s.ends_with(p)
+        }),
+        "tointeger" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "toInteger() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
+            }
+            let v = resolve_operand(view, vars, row, &args[0], params)?;
+            Ok(match v {
+                None => None,
+                Some(Value::Int(n)) => Some(Value::Int(n)),
+                Some(Value::Float(f)) => Some(Value::Int(f.trunc() as i64)),
+                // Cypher parses an integer literal; a float-looking string
+                // truncates via the float parse. Unparseable → null.
+                Some(Value::Str(s)) => s
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .or_else(|| s.trim().parse::<f64>().ok().map(|f| f.trunc() as i64))
+                    .map(Value::Int),
+                Some(_) => None,
+            })
+        }
+        "tofloat" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "toFloat() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
+            }
+            let v = resolve_operand(view, vars, row, &args[0], params)?;
+            Ok(match v {
+                None => None,
+                Some(Value::Float(f)) => Some(Value::Float(f)),
+                Some(Value::Int(n)) => Some(Value::Float(n as f64)),
+                Some(Value::Str(s)) => s.trim().parse::<f64>().ok().map(Value::Float),
+                Some(_) => None,
+            })
+        }
+        "tostring" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "toString() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
+            }
+            let v = resolve_operand(view, vars, row, &args[0], params)?;
+            Ok(match v {
+                None => None,
+                Some(Value::Str(s)) => Some(Value::Str(s)),
+                Some(Value::Int(n)) => Some(Value::Str(n.to_string())),
+                Some(Value::Float(f)) => Some(Value::Str(f.to_string())),
+                Some(Value::Bool(b)) => Some(Value::Str(b.to_string())),
+                Some(_) => None, // list/map have no scalar string form
+            })
+        }
         _ => Err(format!(
             "unknown function `{name}`; supported: {}",
             SCALAR_FUNCS.join(", ")
@@ -1489,6 +1748,17 @@ fn resolve_operand(
             }
         }
         Operand::FuncCall { name, args } => eval_func(name, args, view, vars, row, params),
+        Operand::Case { branches, default } => {
+            for (cond, value) in branches {
+                if eval_expr(view, vars, row, cond, params, 0)? {
+                    return resolve_operand(view, vars, row, value, params);
+                }
+            }
+            match default {
+                Some(d) => resolve_operand(view, vars, row, d, params),
+                None => Ok(None),
+            }
+        }
         Operand::BinArith { op, left, right } => {
             use super::ast::ArithOp;
             let lv = resolve_operand(view, vars, row, left, params)?;
@@ -1644,8 +1914,14 @@ fn row_has_edge(row: &Row, e: &EdgeRef) -> bool {
         .any(|c| matches!(c, Some(Cell::Rel(existing)) if existing == e))
 }
 
-fn resolve_etypes(view: &GraphView, etype: Option<&str>) -> Option<Vec<u32>> {
-    etype.map(|name| view.syms.get(name).into_iter().collect())
+fn resolve_etypes(view: &GraphView, etypes: &[String]) -> Option<Vec<u32>> {
+    if etypes.is_empty() {
+        None // no type constraint → all edge types
+    } else {
+        // Resolve each named type to its symbol, skipping any not interned
+        // (a named type with no edges contributes nothing).
+        Some(etypes.iter().filter_map(|n| view.syms.get(n)).collect())
+    }
 }
 
 fn exec_expand(
@@ -1658,7 +1934,7 @@ fn exec_expand(
     let PlanOp::Expand {
         from,
         rel_var,
-        etype,
+        etypes,
         dir,
         to,
         to_label,
@@ -1667,7 +1943,7 @@ fn exec_expand(
     else {
         return Err("internal: expected Expand".into());
     };
-    let etypes = resolve_etypes(view, etype.as_deref());
+    let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(*dir);
     let to_slot = vars
         .slot(to)
@@ -1731,13 +2007,13 @@ fn exec_var_expand(
     rows: &[Row],
     from: &str,
     rel_var: &Option<String>,
-    etype: &Option<String>,
+    etypes: &[String],
     dir: RelDir,
     to: &str,
     min: u8,
     max: u8,
 ) -> Result<Vec<Row>, String> {
-    let etypes = resolve_etypes(view, etype.as_deref());
+    let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(dir);
     let to_slot = vars
         .slot(to)
@@ -1845,12 +2121,12 @@ fn exec_shortest_path(
     rows: &[Row],
     from: &str,
     rel_var: &Option<String>,
-    etype: &Option<String>,
+    etypes: &[String],
     dir: RelDir,
     to: &str,
     max_hops: u8,
 ) -> Result<Vec<Row>, String> {
-    let etypes = resolve_etypes(view, etype.as_deref());
+    let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(dir);
     let rel_slot = rel_var.as_ref().and_then(|rv| vars.slot(rv));
     let mut out: Vec<Row> = Vec::new();
@@ -2005,6 +2281,7 @@ enum AggAcc {
     Avg { sum: f64, n: u64 },
     Min(Option<Value>),
     Max(Option<Value>),
+    Collect(Vec<Value>),
 }
 
 impl AggAcc {
@@ -2018,6 +2295,7 @@ impl AggAcc {
             AggFunc::Avg => AggAcc::Avg { sum: 0.0, n: 0 },
             AggFunc::Min => AggAcc::Min(None),
             AggFunc::Max => AggAcc::Max(None),
+            AggFunc::Collect => AggAcc::Collect(Vec::new()),
         }
     }
 
@@ -2044,6 +2322,8 @@ impl AggAcc {
             }
             AggAcc::Min(v) => v,
             AggAcc::Max(v) => v,
+            // Empty collect() yields an empty list (never null), matching openCypher.
+            AggAcc::Collect(items) => Some(Value::List(items)),
         }
     }
 }
@@ -2205,6 +2485,32 @@ fn update_acc(
                 }
             }
         }
+        (AggFunc::Collect, AggArg::Var(v)) => {
+            // Gather each row's value of `v` — node → key, scalar alias → value,
+            // path → hop count. Nulls (unbound / relationship) are skipped.
+            let val = vars
+                .slot(v)
+                .and_then(|s| row.get(s))
+                .and_then(|c| c.as_ref())
+                .and_then(|cell| match cell {
+                    Cell::Scalar(x) => Some(x.clone()),
+                    Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                    Cell::Path(h) => Some(Value::Int(*h as i64)),
+                    Cell::Rel(_) => None,
+                });
+            if let Some(val) = val {
+                if let AggAcc::Collect(items) = acc {
+                    items.push(val);
+                }
+            }
+        }
+        (AggFunc::Collect, AggArg::Prop { var, field }) => {
+            if let Some(val) = resolve_prop(view, vars, row, var, field)? {
+                if let AggAcc::Collect(items) = acc {
+                    items.push(val);
+                }
+            }
+        }
         // Remaining combinations are rejected by the planner (e.g., SUM(*))
         // but handle defensively without panic.
         _ => {}
@@ -2255,16 +2561,41 @@ fn agg_stream(
                 agg_stream(ctx, rest, &next, acc)?;
             }
         }
+        PlanOp::IndexScan {
+            var,
+            label,
+            field,
+            value,
+        } => {
+            let ids = index_scan_ids(
+                ctx.view,
+                ctx.vars,
+                row,
+                label.as_deref(),
+                field,
+                value,
+                ctx.params,
+            )?;
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for &id in &ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                agg_stream(ctx, rest, &next, acc)?;
+            }
+        }
         PlanOp::Expand {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             to_label,
             to_props,
         } => {
-            let etypes = resolve_etypes(ctx.view, etype.as_deref());
+            let etypes = resolve_etypes(ctx.view, etypes);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -2341,7 +2672,7 @@ fn agg_stream(
         PlanOp::VarExpand {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             min,
@@ -2353,7 +2684,7 @@ fn agg_stream(
                 std::slice::from_ref(row),
                 from,
                 rel_var,
-                etype,
+                etypes,
                 *dir,
                 to,
                 *min,
@@ -2366,7 +2697,7 @@ fn agg_stream(
         PlanOp::ShortestPath {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             max_hops,
@@ -2377,7 +2708,7 @@ fn agg_stream(
                 std::slice::from_ref(row),
                 from,
                 rel_var,
-                etype,
+                etypes,
                 *dir,
                 to,
                 *max_hops,
@@ -2712,16 +3043,41 @@ fn group_stream(
                 group_stream(ctx, rest, &next, groups, key_order)?;
             }
         }
+        PlanOp::IndexScan {
+            var,
+            label,
+            field,
+            value,
+        } => {
+            let ids = index_scan_ids(
+                ctx.view,
+                ctx.vars,
+                row,
+                label.as_deref(),
+                field,
+                value,
+                ctx.params,
+            )?;
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for &id in &ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                group_stream(ctx, rest, &next, groups, key_order)?;
+            }
+        }
         PlanOp::Expand {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             to_label,
             to_props,
         } => {
-            let etypes = resolve_etypes(ctx.view, etype.as_deref());
+            let etypes = resolve_etypes(ctx.view, etypes);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -2798,7 +3154,7 @@ fn group_stream(
         PlanOp::VarExpand {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             min,
@@ -2810,7 +3166,7 @@ fn group_stream(
                 std::slice::from_ref(row),
                 from,
                 rel_var,
-                etype,
+                etypes,
                 *dir,
                 to,
                 *min,
@@ -2823,7 +3179,7 @@ fn group_stream(
         PlanOp::ShortestPath {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             max_hops,
@@ -2834,7 +3190,7 @@ fn group_stream(
                 std::slice::from_ref(row),
                 from,
                 rel_var,
-                etype,
+                etypes,
                 *dir,
                 to,
                 *max_hops,
@@ -3051,16 +3407,45 @@ fn pull_rows(
                 row[slot] = prev;
             }
         }
+        PlanOp::IndexScan {
+            var,
+            label,
+            field,
+            value,
+        } => {
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            let ids = index_scan_ids(
+                ctx.view,
+                ctx.vars,
+                row,
+                label.as_deref(),
+                field,
+                value,
+                ctx.params,
+            )?;
+            let prev = row[slot].clone();
+            for id in ids {
+                if result.len() >= ctx.bound {
+                    break;
+                }
+                row[slot] = Some(Cell::Node(id));
+                pull_rows(ctx, rest, row, result)?;
+            }
+            row[slot] = prev;
+        }
         PlanOp::Expand {
             from,
             rel_var,
-            etype,
+            etypes,
             dir,
             to,
             to_label,
             to_props,
         } => {
-            let etypes = resolve_etypes(ctx.view, etype.as_deref());
+            let etypes = resolve_etypes(ctx.view, etypes);
             let exp_dir = map_dir(*dir);
             let to_slot = ctx
                 .vars
@@ -3355,6 +3740,7 @@ fn column_name(item: &RetItem) -> String {
                 AggFunc::Avg => "AVG",
                 AggFunc::Min => "MIN",
                 AggFunc::Max => "MAX",
+                AggFunc::Collect => "COLLECT",
             };
             let a = match arg {
                 AggArg::Star => "*".to_string(),
@@ -3373,6 +3759,7 @@ fn column_name(item: &RetItem) -> String {
                     Operand::Param(p) => format!("${p}"),
                     Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                     Operand::BinArith { .. } => "<arith>".to_string(),
+                    Operand::Case { .. } => "<case>".to_string(),
                 })
                 .collect();
             format!("{name}({})", arg_strs.join(", "))
@@ -3578,6 +3965,17 @@ mod tests {
                 topo: TopologyView::owned(&self.topo),
                 edge_props: EdgePropsView::owned(&self.eprops),
                 mask: None,
+                prop_index: None,
+            }
+        }
+
+        fn view_indexed<'a>(
+            &'a self,
+            index: &'a core_storage::property_index::PropertyIndex,
+        ) -> GraphView<'a> {
+            GraphView {
+                prop_index: Some(index),
+                ..self.view()
             }
         }
     }
@@ -4095,7 +4493,7 @@ LIMIT 10";
             PlanOp::Expand {
                 from: "zzz".into(),
                 rel_var: Some("r".into()),
-                etype: None,
+                etypes: vec![],
                 dir: RelDir::Right,
                 to: "b".into(),
                 to_label: None,
@@ -5753,7 +6151,7 @@ LIMIT 10";
         let ops = vec![PlanOp::VarExpand {
             from: "a".into(),
             rel_var: None,
-            etype: None,
+            etypes: vec![],
             dir: crate::cypher::RelDir::Right,
             to: "b".into(),
             min: 1,
@@ -5789,7 +6187,7 @@ LIMIT 10";
         let ops = vec![PlanOp::ShortestPath {
             from: "a".into(),
             rel_var: None,
-            etype: None,
+            etypes: vec![],
             dir: crate::cypher::RelDir::Right,
             to: "b".into(),
             max_hops: 5,
@@ -6487,6 +6885,213 @@ LIMIT 10";
     }
 
     /// Arithmetic in a WHERE comparison: `n.age + 1 > 5` filters correctly.
+    #[test]
+    fn case_when_expression_in_return() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("id", s("a")), ("age", i(20))]);
+        fx.add("N", "b", vec![("id", s("b")), ("age", i(65))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:N) RETURN n.id AS id, \
+             CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let band_of = |who: &str| {
+            (0..rs.len())
+                .find(|&i| rs.get(i, "id") == Some(&s(who)))
+                .and_then(|i| rs.get(i, "band").cloned())
+        };
+        assert_eq!(band_of("a"), Some(s("other")));
+        assert_eq!(band_of("b"), Some(s("senior")));
+    }
+
+    #[test]
+    fn case_when_no_else_yields_null() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("age", i(20))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:N) RETURN CASE WHEN n.age >= 65 THEN 'senior' END AS band",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "band"), None);
+    }
+
+    #[test]
+    fn multi_relationship_type_pattern_matches_either() {
+        let mut fx = Fx::new();
+        let a = fx.add("N", "a", vec![("id", s("a"))]);
+        let b = fx.add("N", "b", vec![("id", s("b"))]);
+        let c = fx.add("N", "c", vec![("id", s("c"))]);
+        let d = fx.add("N", "d", vec![("id", s("d"))]);
+        fx.edge("KNOWS", a, b, vec![]);
+        fx.edge("LIKES", a, c, vec![]);
+        fx.edge("HATES", a, d, vec![]);
+        let v = fx.view();
+        // a -[:KNOWS|:LIKES]-> should reach b and c, not d.
+        let rs = run(
+            &v,
+            "MATCH (a:N {id: 'a'})-[r:KNOWS|:LIKES]->(x) RETURN x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 2, "KNOWS|LIKES reaches exactly b and c");
+    }
+
+    #[test]
+    fn collect_grouped_gathers_values_per_group() {
+        let mut fx = Fx::new();
+        fx.add("P", "a", vec![("city", s("austin")), ("name", s("Ann"))]);
+        fx.add("P", "b", vec![("city", s("austin")), ("name", s("Bob"))]);
+        fx.add("P", "c", vec![("city", s("boston")), ("name", s("Cy"))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN n.city AS city, collect(n.name) AS names",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 2, "two city groups");
+        // Locate the austin row and check its collected names.
+        let austin = (0..rs.len())
+            .find(|&i| rs.get(i, "city") == Some(&s("austin")))
+            .expect("austin group present");
+        assert_eq!(
+            rs.get(austin, "names"),
+            Some(&Value::List(vec![s("Ann"), s("Bob")]))
+        );
+    }
+
+    #[test]
+    fn collect_ungrouped_gathers_all_into_one_list() {
+        let mut fx = Fx::new();
+        fx.add("P", "a", vec![("name", s("Ann"))]);
+        fx.add("P", "b", vec![("name", s("Bob"))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN collect(n.name) AS names",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(
+            rs.get(0, "names"),
+            Some(&Value::List(vec![s("Ann"), s("Bob")]))
+        );
+    }
+
+    #[test]
+    fn string_predicate_functions_in_where() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("email", s("alice@acme.com"))]);
+        fx.add("N", "b", vec![("email", s("bob@other.org"))]);
+        let v = fx.view();
+        let p = BTreeMap::new();
+        assert_eq!(
+            run(
+                &v,
+                "MATCH (n:N) WHERE endsWith(n.email, '.com') RETURN n",
+                &p
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            run(
+                &v,
+                "MATCH (n:N) WHERE startsWith(n.email, 'bob') RETURN n",
+                &p
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            run(
+                &v,
+                "MATCH (n:N) WHERE contains(n.email, 'acme') RETURN n",
+                &p
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn coercion_functions_in_return() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("s", s("42")), ("n", i(7)), ("g", f(3.9))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:N) RETURN toInteger(n.s) AS ti, toFloat(n.n) AS tf, toString(n.g) AS ts",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "ti"), Some(&Value::Int(42)));
+        assert_eq!(rs.get(0, "tf"), Some(&Value::Float(7.0)));
+        assert_eq!(rs.get(0, "ts"), Some(&Value::Str("3.9".into())));
+    }
+
+    #[test]
+    fn to_integer_unparseable_string_is_null() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("s", s("not-a-number"))]);
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:N) RETURN toInteger(n.s) AS ti",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "ti"), None);
+    }
+
+    #[test]
+    fn index_scan_uses_index_and_matches_fallback() {
+        use core_storage::property_index::PropertyIndex;
+        use std::sync::atomic::Ordering;
+
+        let mut fx = Fx::new();
+        let a = fx.add("Person", "a", vec![("city", s("austin"))]);
+        let _b = fx.add("Person", "b", vec![("city", s("boston"))]);
+        let c = fx.add("Person", "c", vec![("city", s("austin"))]);
+
+        let mut pi = PropertyIndex::new();
+        pi.enable("Person", "city");
+        pi.set("Person", "city", a, &s("austin"));
+        pi.set("Person", "city", 1, &s("boston"));
+        pi.set("Person", "city", c, &s("austin"));
+
+        let q = "MATCH (n:Person {city: 'austin'}) RETURN n";
+
+        // Indexed view: the IndexScan fast path must fire and return both nodes.
+        let before = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        let indexed = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
+        let after = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        assert!(after > before, "IndexScan must take the indexed path");
+        assert_eq!(indexed.len(), 2);
+
+        // Unindexed view (prop_index None): same result via scan+filter fallback,
+        // and the counter must NOT advance.
+        let before2 = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        let fallback = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        let after2 = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        assert_eq!(after2, before2, "fallback must not touch the index counter");
+        assert_eq!(
+            fallback.len(),
+            indexed.len(),
+            "fallback matches indexed result"
+        );
+    }
+
     #[test]
     fn arithmetic_in_where_comparison() {
         let mut fx = Fx::new();

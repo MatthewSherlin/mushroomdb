@@ -3139,7 +3139,13 @@ async fn http_backup_live_serve_dest_opens_clean() {
     use std::sync::{Arc, Barrier};
 
     let src_dir = tmp("http-backup-src");
-    let dst_dir = tmp("http-backup-dst");
+    // The backup dest is confined to the backup root (CWD by default), so place
+    // it under the crate's `target/` dir rather than the system temp dir.
+    let dst_dir = std::env::current_dir().unwrap().join(format!(
+        "target/graphdb-http-backup-dst-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dst_dir);
 
     let db = SharedDb::open(&src_dir).unwrap();
     // Seed initial data.
@@ -4305,4 +4311,69 @@ async fn concurrent_role_writers_fifo_serialize() {
     assert!(r2.is_ok(), "concurrent write 2 must succeed: {r2:?}");
     assert!(db.read().has_node("conc-1"), "conc-1 must exist");
     assert!(db.read().has_node("conc-2"), "conc-2 must exist");
+}
+
+/// POST /query with `as_of` runs a time-travel read; the current state is
+/// unaffected and a write + as_of is rejected.
+#[tokio::test]
+async fn http_query_as_of_time_travel() {
+    let db = SharedDb::open(&tmp("query-as-of")).unwrap();
+    let app = router_with_auth(db.clone(), Some("adm".into()));
+
+    // Three separate write commits.
+    for id in ["a", "b", "c"] {
+        let req = authed_json_req(
+            "POST",
+            "/query",
+            "adm",
+            json!({"cypher": format!("CREATE (n:N {{id: '{id}'}})")}),
+        );
+        let (status, _, _) = send(app.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // as_of commit 0 → only 'a' existed.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "adm",
+        json!({"cypher": "MATCH (n:N) RETURN n", "as_of": 0}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["rows"].as_array().unwrap().len(),
+        1,
+        "as_of 0 sees one node"
+    );
+
+    // No as_of → current state, three nodes.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "adm",
+        json!({"cypher": "MATCH (n:N) RETURN n"}),
+    );
+    let (_, body, _) = send(app.clone(), req).await;
+    let v = parse_json(&body);
+    assert_eq!(
+        v["rows"].as_array().unwrap().len(),
+        3,
+        "current sees three nodes"
+    );
+
+    // as_of + write is rejected.
+    let req = authed_json_req(
+        "POST",
+        "/query",
+        "adm",
+        json!({"cypher": "CREATE (x:N {id: 'z'})", "as_of": 0}),
+    );
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "as_of write must be rejected"
+    );
 }

@@ -59,6 +59,7 @@ fn apply_schema_roles_creates_diff_entry() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![analyst_role()],
@@ -84,6 +85,7 @@ fn apply_schema_roles_idempotent_and_byte_identical() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![analyst_role()],
@@ -129,6 +131,7 @@ fn apply_schema_role_change_triggers_update() {
 
     let schema_v1 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![analyst_role()],
@@ -140,6 +143,7 @@ fn apply_schema_role_change_triggers_update() {
 
     let schema_v2 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![changed],
@@ -183,6 +187,7 @@ fn mask_for_role_keys_and_labels_union() {
     // Union: alice (key) + alice,bob (label) = alice + bob
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {
@@ -233,6 +238,7 @@ fn mask_for_role_label_resolves_live() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {
@@ -292,6 +298,7 @@ fn empty_role_yields_empty_visibility() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {
@@ -324,6 +331,7 @@ fn corrupt_roles_json_open_succeeds_mask_for_role_errs() {
     let mut db = GraphDb::open(&dir).unwrap();
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![analyst_role()],
@@ -363,6 +371,7 @@ fn apply_schema_rejects_empty_role_name() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {
@@ -386,6 +395,7 @@ fn apply_schema_rejects_duplicate_role_names() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![
@@ -422,6 +432,7 @@ fn roles_accessor_returns_defined_roles() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![analyst_role()],
@@ -445,6 +456,7 @@ fn roles_survive_reopen() {
         let mut db = GraphDb::open(&dir).unwrap();
         let schema = Schema {
             fulltext: vec![],
+            indexes: vec![],
             rules: vec![],
             views: vec![],
             roles: vec![analyst_role()],
@@ -483,6 +495,7 @@ fn apply_schema_over_corrupt_sidecar_repairs_roles() {
         let mut db = GraphDb::open(&dir).unwrap();
         let schema = Schema {
             fulltext: vec![],
+            indexes: vec![],
             rules: vec![],
             views: vec![],
             roles: vec![analyst_role()],
@@ -503,6 +516,7 @@ fn apply_schema_over_corrupt_sidecar_repairs_roles() {
     // Repair: apply schema with valid roles — writes a fresh roles.json.
     let repair_schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![analyst_role()],
@@ -564,6 +578,7 @@ fn v2_write_scope_round_trips() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![role.clone()],
@@ -611,6 +626,7 @@ fn version_written_is_v2_when_write_present() {
     };
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![role],
@@ -638,6 +654,7 @@ fn version_written_is_v1_when_no_write() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![analyst_role()], // write: None
@@ -678,6 +695,7 @@ fn subset_violation_create_labels_not_in_read_labels_rejected() {
     };
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![role],
@@ -715,6 +733,7 @@ fn subset_violation_update_labels_not_in_read_labels_rejected() {
     };
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![role],
@@ -752,6 +771,7 @@ fn subset_violation_delete_labels_not_in_read_labels_rejected() {
     };
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![role],
@@ -790,6 +810,7 @@ fn edge_types_not_subset_validated() {
     };
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![role],
@@ -811,6 +832,7 @@ fn write_scope_only_change_produces_updated_diff() {
     // First apply: read-only role.
     let schema_v1 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {
@@ -826,6 +848,7 @@ fn write_scope_only_change_produces_updated_diff() {
     // Second apply: add write scope (same read scope).
     let schema_v2 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![RoleDef {
@@ -919,6 +942,7 @@ fn empty_write_scope_still_writes_v2_and_round_trips_as_some() {
     };
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![role],
@@ -963,6 +987,7 @@ fn multi_role_v1_to_v2_transition_writeless_role_unchanged() {
     // First apply: two read-only roles (v1).
     let schema_v1 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![
@@ -995,6 +1020,7 @@ fn multi_role_v1_to_v2_transition_writeless_role_unchanged() {
     let mut db = GraphDb::open(&dir).unwrap();
     let schema_v2 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![

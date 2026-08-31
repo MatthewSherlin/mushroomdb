@@ -168,6 +168,11 @@ impl RealFs {
         })
     }
 
+    /// The database directory this filesystem is rooted at.
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     fn path(&self, file: FileId) -> PathBuf {
         self.dir.join(file.name())
     }

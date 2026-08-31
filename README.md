@@ -484,7 +484,7 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit |
 | `mushroomdb algo pagerank <dir> --top 20` | Run PageRank over the unified topology (manual + derived edges) |
 | `mushroomdb algo wcc <dir> --top 50` | Find weakly-connected components |
-| `mushroomdb algo degree <dir> --top 20` | Degree centrality (out / in / both) |
+| `mushroomdb algo degree <dir> --top 20 [--dir out\|in\|both]` | Degree centrality; `--dir` selects out / in / both (default both) |
 | `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch (large sections skip CRC on the normal query path; this command reads them all) |
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff of created/updated/unchanged items |
 | `mushroomdb backup <dir> <dest>` | Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a concurrently running `serve` process — use `POST /backup` for live-served stores |
@@ -705,6 +705,9 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 - Time travel (as-of queries): [`docs/site/timetravel.md`](docs/site/timetravel.md)
 - Materialized views: [`docs/site/views.md`](docs/site/views.md)
 - Full-text search v2 (BM25, Snowball EN stemming, phrase/negation/prefix): [`docs/site/fulltext.md`](docs/site/fulltext.md)
+- Property (equality) indexes for `MATCH (n:L {field: value})` lookups: [`docs/site/indexes.md`](docs/site/indexes.md)
+- Durability, crash recovery, and snapshot/integrity guidance: [`docs/site/durability.md`](docs/site/durability.md)
+- Moat roadmap (temporal queries, rule chaining, memory-native): [`docs/site/roadmap-moat.md`](docs/site/roadmap-moat.md)
 - Node masks and access control (role tokens, restricted-stub mode): [`docs/site/masks.md`](docs/site/masks.md)
 - Rule suggestions: [`docs/site/suggest.md`](docs/site/suggest.md)
 - Graph algorithms (PageRank, WCC, degree centrality): [`docs/site/algorithms.md`](docs/site/algorithms.md)

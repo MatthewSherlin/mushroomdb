@@ -60,6 +60,7 @@ fn apply_schema_is_idempotent_and_diffs() {
     // Schema: 1 fulltext pair, 1 rule, 1 view.
     let schema = Schema {
         fulltext: vec![("A".into(), "body".into())],
+        indexes: vec![],
         rules: vec![sample_rule("rel_rule")],
         views: vec![sample_view("deg_view")],
         roles: vec![],
@@ -124,6 +125,7 @@ fn apply_schema_update_replaces_changed_rule() {
 
     let schema_v1 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![sample_rule("link")],
         views: vec![sample_view("outdeg")],
         roles: vec![],
@@ -137,6 +139,7 @@ fn apply_schema_update_replaces_changed_rule() {
 
     let schema_v2 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![changed_rule],
         views: vec![sample_view("outdeg")], // view unchanged
         roles: vec![],
@@ -172,6 +175,7 @@ fn apply_schema_no_pruning() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![],
         roles: vec![],
@@ -196,6 +200,7 @@ fn apply_schema_view_update() {
 
     let schema_v1 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![sample_view("degview")],
         roles: vec![],
@@ -214,6 +219,7 @@ fn apply_schema_view_update() {
     };
     let schema_v2 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![changed_view],
         roles: vec![],
@@ -235,6 +241,7 @@ fn apply_schema_invalid_rule_update_is_rejected_before_mutation() {
     // Seed with a valid rule.
     let schema_v1 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![sample_rule("link")],
         views: vec![],
         roles: vec![],
@@ -251,6 +258,7 @@ fn apply_schema_invalid_rule_update_is_rejected_before_mutation() {
 
     let schema_bad = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![bad_rule],
         views: vec![],
         roles: vec![],
@@ -288,6 +296,7 @@ fn apply_schema_invalid_view_update_is_rejected_before_mutation() {
     // Seed with a valid view.
     let schema_v1 = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![sample_view("degview")],
         roles: vec![],
@@ -310,6 +319,7 @@ fn apply_schema_invalid_view_update_is_rejected_before_mutation() {
     };
     let schema_bad = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![bad_view],
         roles: vec![],
@@ -339,6 +349,7 @@ fn schema_json_round_trips() {
     // Schema is serde-JSON round-trippable.
     let schema = Schema {
         fulltext: vec![("Label".into(), "field".into())],
+        indexes: vec![],
         rules: vec![sample_rule("r")],
         views: vec![sample_view("v")],
         roles: vec![],
@@ -361,6 +372,7 @@ fn apply_schema_rejects_duplicate_rule_names() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![sample_rule("my_rule"), sample_rule("my_rule")],
         views: vec![],
         roles: vec![],
@@ -381,6 +393,7 @@ fn apply_schema_rejects_duplicate_view_names() {
 
     let schema = Schema {
         fulltext: vec![],
+        indexes: vec![],
         rules: vec![],
         views: vec![sample_view("my_view"), sample_view("my_view")],
         roles: vec![],

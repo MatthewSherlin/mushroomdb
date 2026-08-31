@@ -20,7 +20,46 @@ pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
         toks: tokens,
         pos: 0,
     };
-    p.query()
+    let q = p.query()?;
+    if p.pos < p.toks.len() {
+        // A single-query parse: a trailing `UNION` (or anything else) is an
+        // error here. Use `parse_read` to accept a `UNION` chain.
+        return Err(p.unsupported_or_unexpected("unexpected tokens after query"));
+    }
+    Ok(q)
+}
+
+/// A read query that may be a single query or a `UNION` / `UNION ALL` chain.
+/// `all_flags[i]` is `true` when the boundary before `parts[i + 1]` was
+/// `UNION ALL` (bag union); `false` for `UNION` (distinct). Length is
+/// `parts.len() - 1`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionQuery {
+    pub parts: Vec<Query>,
+    pub all_flags: Vec<bool>,
+}
+
+/// Parse a read query, accepting a `UNION` / `UNION ALL` chain.
+pub fn parse_read(tokens: &[Tok]) -> Result<UnionQuery, String> {
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+    };
+    let mut parts = vec![p.query()?];
+    let mut all_flags = Vec::new();
+    while p.peek_is_union() {
+        p.pos += 1; // consume UNION
+        let all = matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("all"));
+        if all {
+            p.pos += 1; // consume ALL
+        }
+        all_flags.push(all);
+        parts.push(p.query()?);
+    }
+    if p.pos < p.toks.len() {
+        return Err(p.err("unexpected tokens after UNION query"));
+    }
+    Ok(UnionQuery { parts, all_flags })
 }
 
 /// Parse a tokenized write statement (CREATE / MATCH…SET / MATCH…DELETE / MERGE).
@@ -156,9 +195,8 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        if self.pos < self.toks.len() {
-            return Err(self.unsupported_or_unexpected("unexpected tokens after query"));
-        }
+        // NOTE: the leftover-token check lives in `parse` / `parse_read`, not
+        // here, so `query()` can stop cleanly at a `UNION` boundary.
         Ok(Query {
             matches,
             optional_clauses,
@@ -172,6 +210,11 @@ impl<'a> Parser<'a> {
             skip,
             limit,
         })
+    }
+
+    /// True if the next token is the `UNION` keyword (an ordinary identifier).
+    fn peek_is_union(&self) -> bool {
+        matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("union"))
     }
 
     /// Named errors for still-unsupported Cypher forms (`UNION`, `CASE`).
@@ -422,20 +465,20 @@ impl<'a> Parser<'a> {
                 &Tok::Dash,
                 "expected '-' after '<' in a left-directed relationship",
             )?;
-            let (var, etype, hops) = self.rel_body()?;
+            let (var, etypes, hops) = self.rel_body()?;
             self.expect(
                 &Tok::Dash,
                 "expected '-' to close a left-directed relationship",
             )?;
             return Ok(RelPat {
                 var,
-                etype,
+                etypes,
                 dir: RelDir::Left,
                 hops,
             });
         }
         self.expect(&Tok::Dash, "expected '-' to start a relationship")?;
-        let (var, etype, hops) = self.rel_body()?;
+        let (var, etypes, hops) = self.rel_body()?;
         self.expect(&Tok::Dash, "expected '-' after ']'")?;
         let dir = if self.eat(&Tok::Gt) {
             RelDir::Right
@@ -444,14 +487,14 @@ impl<'a> Parser<'a> {
         };
         Ok(RelPat {
             var,
-            etype,
+            etypes,
             dir,
             hops,
         })
     }
 
     #[allow(clippy::type_complexity)]
-    fn rel_body(&mut self) -> Result<(Option<String>, Option<String>, Option<HopRange>), String> {
+    fn rel_body(&mut self) -> Result<(Option<String>, Vec<String>, Option<HopRange>), String> {
         self.expect(&Tok::LBracket, "expected '[' in a relationship pattern")?;
         let var = match self.peek() {
             Some(Tok::Ident(s)) => {
@@ -461,11 +504,16 @@ impl<'a> Parser<'a> {
             }
             _ => None,
         };
-        let etype = if self.eat(&Tok::Colon) {
-            Some(self.ident("expected relationship type identifier after ':'")?)
-        } else {
-            None
-        };
+        // `:A`, or `:A|:B|:C` alternation. Empty = any type.
+        let mut etypes = Vec::new();
+        if self.eat(&Tok::Colon) {
+            etypes.push(self.ident("expected relationship type identifier after ':'")?);
+            while self.eat(&Tok::Pipe) {
+                // Both `|:B` (openCypher) and the lenient `|B` are accepted.
+                self.eat(&Tok::Colon);
+                etypes.push(self.ident("expected relationship type identifier after '|'")?);
+            }
+        }
         let hops = if self.eat(&Tok::Star) {
             Some(self.parse_hop_range()?)
         } else {
@@ -475,7 +523,7 @@ impl<'a> Parser<'a> {
             &Tok::RBracket,
             "expected ']' to close a relationship pattern",
         )?;
-        Ok((var, etype, hops))
+        Ok((var, etypes, hops))
     }
 
     /// Parse the hop-count range that follows `*` inside a relationship bracket.
@@ -804,10 +852,15 @@ impl<'a> Parser<'a> {
             Some(Tok::Ident(_)) => {
                 let name = self.ident("expected identifier")?;
                 if name.eq_ignore_ascii_case("case") {
-                    return Err("CASE is not supported".to_string());
+                    return self.parse_case();
                 }
                 if name.eq_ignore_ascii_case("collect") && self.peek() == Some(&Tok::LParen) {
-                    return Err("collect() is not supported".to_string());
+                    // collect() is a top-level RETURN/WITH aggregate (handled in
+                    // ret_item); it is not valid inside a larger expression.
+                    return Err(
+                        "collect() is only supported as a top-level RETURN/WITH aggregate"
+                            .to_string(),
+                    );
                 }
                 if self.peek() == Some(&Tok::LParen) {
                     // Scalar function call: name(arg, ...)
@@ -832,6 +885,38 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.err("expected operand (property, literal, or parameter)")),
         }
+    }
+
+    /// Parse a generic `CASE WHEN <cond> THEN <value> … [ELSE <value>] END`.
+    /// The `CASE` keyword has already been consumed. `WHEN`/`THEN`/`ELSE`/`END`
+    /// are ordinary identifiers to the lexer, matched case-insensitively.
+    fn parse_case(&mut self) -> Result<Operand, String> {
+        let is_kw = |tok: Option<&Tok>, kw: &str| matches!(tok, Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw));
+        let mut branches = Vec::new();
+        while is_kw(self.peek(), "when") {
+            self.pos += 1; // consume WHEN
+            let cond = self.expr(0)?;
+            if !is_kw(self.peek(), "then") {
+                return Err(self.err("expected THEN in a CASE branch"));
+            }
+            self.pos += 1; // consume THEN
+            let value = self.arith_expr()?;
+            branches.push((cond, value));
+        }
+        if branches.is_empty() {
+            return Err(self.err("CASE requires at least one WHEN ... THEN branch"));
+        }
+        let default = if is_kw(self.peek(), "else") {
+            self.pos += 1; // consume ELSE
+            Some(Box::new(self.arith_expr()?))
+        } else {
+            None
+        };
+        if !is_kw(self.peek(), "end") {
+            return Err(self.err("expected END to close CASE"));
+        }
+        self.pos += 1; // consume END
+        Ok(Operand::Case { branches, default })
     }
 
     /// Parse a full arithmetic expression (additive + multiplicative + unary +
@@ -877,6 +962,7 @@ impl<'a> Parser<'a> {
                 "avg" => Some(AggFunc::Avg),
                 "min" => Some(AggFunc::Min),
                 "max" => Some(AggFunc::Max),
+                "collect" => Some(AggFunc::Collect),
                 _ => None,
             };
             if let Some(func) = func {
@@ -1126,6 +1212,24 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Ok(Value::Str(s))
             }
+            // List literal: `[]`, `[v1, v2, …]`, nesting allowed. Elements are
+            // themselves literal values (recursion), matching the UNWIND list
+            // form and downstream `Value::List` support in the store.
+            Some(Tok::LBracket) => {
+                self.pos += 1; // consume '['
+                let mut items = Vec::new();
+                if !self.eat(&Tok::RBracket) {
+                    loop {
+                        items.push(self.literal_value(what)?);
+                        if self.eat(&Tok::Comma) {
+                            continue;
+                        }
+                        self.expect(&Tok::RBracket, "expected ']' to close list literal")?;
+                        break;
+                    }
+                }
+                Ok(Value::List(items))
+            }
             Some(Tok::Param(_)) => Err(self.err(&format!(
                 "parameter references are not supported in {what} (v1 limitation: use literals only)"
             ))),
@@ -1349,7 +1453,8 @@ impl<'a> Parser<'a> {
                     Operand::Lit(_)
                     | Operand::Param(_)
                     | Operand::BinArith { .. }
-                    | Operand::FuncCall { .. } => op,
+                    | Operand::FuncCall { .. }
+                    | Operand::Case { .. } => op,
                     Operand::Prop { .. } | Operand::Var(_) => {
                         return Err(self.err(
                             "SET RHS: bare property/variable reference is not supported; \
@@ -1358,6 +1463,9 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            // List-literal RHS: `SET n.tags = ['a', 'b']`. Lists are pure
+            // literals (no arithmetic), so parse directly into `Operand::Lit`.
+            Some(Tok::LBracket) => Operand::Lit(self.literal_value("SET value")?),
             _ => {
                 return Err(
                     self.err("expected literal, $parameter, or arithmetic expression as SET value")
@@ -1376,12 +1484,18 @@ impl<'a> Parser<'a> {
             for (rel, dest) in &pat.chain {
                 let to_var = dest.var.as_deref().unwrap_or("_unknown");
                 if rel.var.as_deref() == Some(var) {
-                    let etype = match &rel.etype {
-                        Some(t) => t.clone(),
-                        None => {
+                    let etype = match rel.etypes.as_slice() {
+                        [t] => t.clone(),
+                        [] => {
                             return Err(format!(
                                 "DELETE `{var}`: relationship has no type; \
                                  DELETE requires an explicit edge type (e.g., [r:TYPE])"
+                            ))
+                        }
+                        _ => {
+                            return Err(format!(
+                                "DELETE `{var}`: relationship has multiple types; \
+                                 DELETE requires a single explicit edge type (e.g., [r:TYPE])"
                             ))
                         }
                     };
@@ -1501,8 +1615,8 @@ enum DeleteTargetResult {
 mod tests {
     use super::parse;
     use crate::cypher::ast::{
-        Expr, HopRange, LimitSkip, NodePat, Operand, OrderItem, OrderTarget, Pattern, Query,
-        RelDir, RelPat, RetItem, RetVal,
+        AggFunc, Expr, HopRange, LimitSkip, NodePat, Operand, OrderItem, OrderTarget, Pattern,
+        Query, RelDir, RelPat, RetItem, RetVal,
     };
     use crate::cypher::{lex, Tok};
     use crate::filter::CmpOp;
@@ -1554,7 +1668,7 @@ SKIP 1 LIMIT 5";
                     (
                         RelPat {
                             var: Some("r".into()),
-                            etype: Some("KNOWS".into()),
+                            etypes: vec!["KNOWS".into()],
                             dir: RelDir::Right,
                             hops: None,
                         },
@@ -1563,7 +1677,7 @@ SKIP 1 LIMIT 5";
                     (
                         RelPat {
                             var: Some("u".into()),
-                            etype: Some("TEAM".into()),
+                            etypes: vec!["TEAM".into()],
                             dir: RelDir::Undirected,
                             hops: None,
                         },
@@ -1572,7 +1686,7 @@ SKIP 1 LIMIT 5";
                     (
                         RelPat {
                             var: Some("s".into()),
-                            etype: Some("LIKES".into()),
+                            etypes: vec!["LIKES".into()],
                             dir: RelDir::Left,
                             hops: None,
                         },
@@ -1649,7 +1763,7 @@ SKIP 1 LIMIT 5";
         let q = parse_src("MATCH (a)-[r:T]->(b) RETURN a").unwrap();
         assert_eq!(q.matches[0].chain[0].0.dir, RelDir::Right);
         assert_eq!(q.matches[0].chain[0].0.var.as_deref(), Some("r"));
-        assert_eq!(q.matches[0].chain[0].0.etype.as_deref(), Some("T"));
+        assert_eq!(q.matches[0].chain[0].0.etypes, vec!["T".to_string()]);
     }
 
     #[test]
@@ -1786,7 +1900,7 @@ LIMIT 10";
                     chain: vec![(
                         RelPat {
                             var: Some("i".into()),
-                            etype: Some("INDUSTRY_ALIGNMENT".into()),
+                            etypes: vec!["INDUSTRY_ALIGNMENT".into()],
                             dir: RelDir::Right,
                             hops: None,
                         },
@@ -1799,7 +1913,7 @@ LIMIT 10";
                     chain: vec![(
                         RelPat {
                             var: Some("s".into()),
-                            etype: Some("SPECIALTY_MATCH".into()),
+                            etypes: vec!["SPECIALTY_MATCH".into()],
                             dir: RelDir::Right,
                             hops: None,
                         },
@@ -2119,22 +2233,38 @@ LIMIT 10";
     }
 
     #[test]
-    fn union_case_collect_are_named_errors() {
-        let err = parse_src("MATCH (n) RETURN n UNION MATCH (m) RETURN m").unwrap_err();
-        assert!(
-            err.contains("UNION"),
-            "UNION must be a named error, got: {err}"
-        );
-        let err = parse_src("MATCH (n) RETURN CASE WHEN n.x = 1 THEN 2 ELSE 3 END").unwrap_err();
-        assert!(
-            err.contains("CASE"),
-            "CASE must be a named error, got: {err}"
-        );
-        let err = parse_src("MATCH (n) RETURN collect(n)").unwrap_err();
-        assert!(
-            err.contains("collect"),
-            "collect() must be a named error, got: {err}"
-        );
+    fn union_query_parses_into_parts() {
+        use super::parse_read;
+        let u = parse_read(&lex("MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m").unwrap())
+            .expect("UNION parses");
+        assert_eq!(u.parts.len(), 2);
+        assert_eq!(u.all_flags, vec![true]);
+        // A single query yields one part, no boundaries.
+        let single = parse_read(&lex("MATCH (n) RETURN n").unwrap()).unwrap();
+        assert_eq!(single.parts.len(), 1);
+        assert!(single.all_flags.is_empty());
+    }
+
+    #[test]
+    fn case_when_expression_parses() {
+        let q = parse_src("MATCH (n) RETURN CASE WHEN n.x = 1 THEN 2 ELSE 3 END AS c")
+            .expect("CASE parses");
+        assert!(matches!(
+            q.returns[0].value,
+            RetVal::ScalarExpr(Operand::Case { .. })
+        ));
+    }
+
+    #[test]
+    fn collect_is_a_supported_aggregate() {
+        let q = parse_src("MATCH (n) RETURN collect(n.name) AS names").expect("collect parses");
+        assert!(matches!(
+            q.returns[0].value,
+            RetVal::Agg {
+                func: AggFunc::Collect,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2447,7 +2577,7 @@ LIMIT 10";
         assert!(q.matches[2].shortest, "third match must be shortest=true");
         let (rel, _) = &q.matches[2].chain[0];
         assert_eq!(rel.hops, Some(HopRange { min: 1, max: 5 }));
-        assert_eq!(rel.etype.as_deref(), Some("T"));
+        assert_eq!(rel.etypes, vec!["T".to_string()]);
     }
 
     #[test]
@@ -2462,7 +2592,7 @@ LIMIT 10";
         let q = parse_src("MATCH (a)-[r:T*2..4]->(b) RETURN a").unwrap();
         let (rel, dest) = &q.matches[0].chain[0];
         assert_eq!(rel.var.as_deref(), Some("r"));
-        assert_eq!(rel.etype.as_deref(), Some("T"));
+        assert_eq!(rel.etypes, vec!["T".to_string()]);
         assert_eq!(rel.dir, RelDir::Right);
         assert_eq!(rel.hops, Some(HopRange { min: 2, max: 4 }));
         assert_eq!(dest.var.as_deref(), Some("b"));
@@ -2479,6 +2609,76 @@ LIMIT 10";
         assert_hop_err(
             "MATCH (a)-[r:T*0..3]->(b) RETURN a",
             "zero-length variable-length paths are not supported",
+        );
+    }
+
+    #[test]
+    fn create_accepts_list_literal_property() {
+        use super::parse_write;
+        use crate::cypher::ast::WriteStatement;
+        let src = "CREATE (n:Person {id: 'p1', tags: ['a', 'b']})";
+        let stmt = parse_write(&lex(src).unwrap())
+            .expect("CREATE with a list-literal property must parse");
+        let WriteStatement::Create(c) = stmt else {
+            panic!("expected a Create statement");
+        };
+        let tags = &c.nodes[0]
+            .props
+            .iter()
+            .find(|(k, _)| k == "tags")
+            .expect("tags property present")
+            .1;
+        assert_eq!(
+            *tags,
+            Value::List(vec![Value::Str("a".into()), Value::Str("b".into())])
+        );
+    }
+
+    #[test]
+    fn create_accepts_empty_and_nested_list_literals() {
+        use super::parse_write;
+        use crate::cypher::ast::WriteStatement;
+        let src = "CREATE (n:L {id: 'p1', empty: [], nested: [[1, 2], [3]]})";
+        let stmt = parse_write(&lex(src).unwrap()).expect("empty and nested lists must parse");
+        let WriteStatement::Create(c) = stmt else {
+            panic!("expected a Create statement");
+        };
+        let get = |k: &str| {
+            c.nodes[0]
+                .props
+                .iter()
+                .find(|(name, _)| name == k)
+                .expect("property present")
+                .1
+                .clone()
+        };
+        assert_eq!(get("empty"), Value::List(vec![]));
+        assert_eq!(
+            get("nested"),
+            Value::List(vec![
+                Value::List(vec![Value::Int(1), Value::Int(2)]),
+                Value::List(vec![Value::Int(3)]),
+            ])
+        );
+    }
+
+    #[test]
+    fn set_accepts_list_literal_rhs() {
+        use super::parse_write;
+        use crate::cypher::ast::{Operand, WriteStatement};
+        let src = "MATCH (n:Person {id: 'p1'}) SET n.tags = ['x', 'y']";
+        let stmt = parse_write(&lex(src).unwrap()).expect("SET with a list-literal RHS must parse");
+        let WriteStatement::MatchSet(m) = stmt else {
+            panic!("expected a MatchSet statement");
+        };
+        let set = &m.sets[0];
+        assert_eq!(set.field, "tags");
+        assert_eq!(
+            set.value,
+            Operand::Lit(Value::List(vec![
+                Value::Str("x".into()),
+                Value::Str("y".into())
+            ]))
         );
     }
 }

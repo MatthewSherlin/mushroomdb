@@ -52,6 +52,10 @@ pub struct Schema {
     /// Fulltext index declarations as `(label, field)` pairs.
     #[serde(default)]
     pub fulltext: Vec<(String, String)>,
+    /// Equality-index declarations as `(label, field)` pairs. Each enables an
+    /// exact-match index so `WHERE n.field = value` becomes an indexed lookup.
+    #[serde(default)]
+    pub indexes: Vec<(String, String)>,
     /// Linking rule definitions.
     #[serde(default)]
     pub rules: Vec<RuleDef>,
@@ -213,6 +217,17 @@ impl<F: Fs> GraphDb<F> {
                 unchanged.push(key);
             } else {
                 self.enable_fulltext(label, field)?;
+                created.push(key);
+            }
+        }
+
+        // 1b. Equality (property) indexes.
+        for (label, field) in &schema.indexes {
+            let key = format!("index:{label}.{field}");
+            if self.is_index_enabled(label, field) {
+                unchanged.push(key);
+            } else {
+                self.enable_index(label, field)?;
                 created.push(key);
             }
         }

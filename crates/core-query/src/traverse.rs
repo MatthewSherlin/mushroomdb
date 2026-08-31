@@ -162,6 +162,7 @@ mod tests {
                 topo: TopologyView::owned(&self.topo),
                 edge_props: EdgePropsView::owned(&self.eprops),
                 mask: None,
+                prop_index: None,
             }
         }
     }

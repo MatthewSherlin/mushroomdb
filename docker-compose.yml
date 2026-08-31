@@ -7,8 +7,12 @@ services:
     volumes:
       - mushroomdb-data:/data
     # Image CMD binds 0.0.0.0:8080; non-loopback serve requires a token.
+    # REQUIRED: set MUSHROOMDB_TOKEN to a strong secret before deploying. The
+    # server refuses a non-loopback bind without a token, so this must be set.
+    # Prefer supplying it from the environment or a secrets file rather than
+    # committing a literal value:  MUSHROOMDB_TOKEN: ${MUSHROOMDB_TOKEN:?set a strong token}
     environment:
-      MUSHROOMDB_TOKEN: changeme
+      MUSHROOMDB_TOKEN: ${MUSHROOMDB_TOKEN:?set MUSHROOMDB_TOKEN to a strong secret before running}
 
 volumes:
   mushroomdb-data:

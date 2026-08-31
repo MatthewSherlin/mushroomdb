@@ -1,5 +1,6 @@
+use core_storage::property_index::PropertyIndex;
 use core_storage::v8::seam::{ColumnsView, EdgePropsView, TopologyView, ValueRef};
-use core_storage::{IdMap, Interner};
+use core_storage::{IdMap, Interner, Value};
 use std::collections::HashSet;
 
 /// Read-only twin of `GraphMut`. Holds only borrowed graph state.
@@ -23,6 +24,10 @@ pub struct GraphView<'a> {
     /// Optional query-scoped node visibility set. `None` = all nodes visible.
     /// When `Some(set)`, only dense ids present in `set` are accessible.
     pub mask: Option<&'a HashSet<u32>>,
+    /// Optional equality index over scalar properties. `Some` on the primary
+    /// locked read path; `None` for MVCC reader snapshots (which fall back to a
+    /// scan). `IndexScan` consults it only when the `(label, field)` is declared.
+    pub prop_index: Option<&'a PropertyIndex>,
 }
 
 impl<'a> GraphView<'a> {
@@ -47,6 +52,23 @@ impl<'a> GraphView<'a> {
             return None;
         }
         self.syms.resolve(sym)
+    }
+
+    /// Indexed lookup of node ids of `label` whose scalar `field` equals
+    /// `value`, filtered by the active mask. Returns `None` when no equality
+    /// index covers `(label, field)` (the caller should fall back to a scan);
+    /// `Some(ids)` — possibly empty — when the index answers the query.
+    pub fn nodes_with_prop(&self, label: &str, field: &str, value: &Value) -> Option<Vec<u32>> {
+        let index = self.prop_index?;
+        if !index.is_enabled(label, field) {
+            return None;
+        }
+        let ids = index
+            .lookup(label, field, value)
+            .into_iter()
+            .filter(|&id| self.visible(id))
+            .collect();
+        Some(ids)
     }
 
     pub fn nodes_with_label(&self, label: &str) -> Vec<u32> {
@@ -136,6 +158,7 @@ mod tests {
                 topo: TopologyView::owned(&self.topo),
                 edge_props: EdgePropsView::owned(&self.eprops),
                 mask: None,
+                prop_index: None,
             }
         }
     }
@@ -231,6 +254,7 @@ mod tests {
             topo: TopologyView::owned(&fx.topo),
             edge_props: EdgePropsView::owned(&fx.eprops),
             mask: Some(&visible),
+            prop_index: None,
         };
         let masked = v_masked.nodes_all();
         assert!(masked.contains(&alice));

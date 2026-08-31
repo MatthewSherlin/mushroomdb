@@ -242,16 +242,17 @@ fn query_stage_prefixes_lex_plan_and_execute() {
         }
         other => panic!("expected QueryError, got {other:?}"),
     }
-    // Lexes and parses; planning rejects the unbound RETURN variable.
+    // Lexes and parses; planning (now folded into execute_union so UNION parts
+    // plan independently) rejects the unbound RETURN variable.
     match db.query("MATCH (a) RETURN b", &BTreeMap::new()) {
         Err(GraphError::QueryError { detail }) => {
             assert!(
-                detail.starts_with("plan:"),
-                "plan errors must be prefixed plan:, got: {detail}"
+                detail.starts_with("execute:"),
+                "planning errors now surface via execute:, got: {detail}"
             );
             assert!(
                 detail.contains("b") && (detail.contains("unbound") || detail.contains("Unbound")),
-                "plan error must name the unbound variable, got: {detail}"
+                "error must name the unbound variable, got: {detail}"
             );
         }
         other => panic!("expected QueryError, got {other:?}"),
@@ -2112,31 +2113,40 @@ fn return_distinct_cities() {
 }
 
 #[test]
-fn union_case_collect_are_named_errors() {
-    let db = open_fixture("named-err-union");
-    for (cypher, needle) in [
-        (
-            "MATCH (n:Person) RETURN n UNION MATCH (m:Person) RETURN m",
-            "UNION",
-        ),
-        (
-            "MATCH (n:Person) RETURN CASE WHEN n.id = 't1' THEN 1 ELSE 0 END",
-            "CASE",
-        ),
-        ("MATCH (n:Person) RETURN collect(n)", "collect"),
-    ] {
-        let err = db.query(cypher, &BTreeMap::new()).expect_err(cypher);
-        let detail = match err {
-            GraphError::QueryError { detail } => detail,
-            other => panic!("{cypher}: expected QueryError, got {other:?}"),
-        };
-        assert!(
-            detail
-                .to_ascii_lowercase()
-                .contains(&needle.to_ascii_lowercase()),
-            "{cypher}: error must name {needle}, got: {detail}"
-        );
+fn union_distinct_and_union_all() {
+    let dir = tmp("union");
+    let mut db = GraphDb::open(&dir).unwrap();
+    // Keys are globally unique; the shared `id` value 'x' is what UNION dedups on.
+    for (label, key, id) in [("A", "ax", "x"), ("A", "ay", "y"), ("B", "bx", "x")] {
+        db.insert_node(label, key, vec![("id".into(), Value::Str(id.into()))])
+            .unwrap();
     }
+    // UNION dedups: A ids {x,y} ∪ B ids {x} = {x, y} → 2 rows.
+    let rs = db
+        .query(
+            "MATCH (n:A) RETURN n.id AS id UNION MATCH (m:B) RETURN m.id AS id",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 2, "UNION dedups the duplicate 'x'");
+
+    // UNION ALL keeps duplicates → 3 rows.
+    let rs = db
+        .query(
+            "MATCH (n:A) RETURN n.id AS id UNION ALL MATCH (m:B) RETURN m.id AS id",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 3, "UNION ALL keeps the duplicate 'x'");
+
+    // Mismatched column names → error.
+    let err = db.query(
+        "MATCH (n:A) RETURN n.id AS a UNION MATCH (m:B) RETURN m.id AS b",
+        &BTreeMap::new(),
+    );
+    assert!(err.is_err(), "UNION with mismatched columns must error");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Composite pin: float BinArith null propagation (Minor-3).
@@ -2170,4 +2180,141 @@ fn abs_float_binarith_null_propagation() {
         None,
         "abs(null - 1.5) must propagate null, not error"
     );
+}
+
+// ── Property (equality) index ─────────────────────────────────────────────
+
+/// End-to-end: an equality index accelerates `MATCH (n:L {field: value})`,
+/// its declaration and postings survive a snapshot + reopen, and it is
+/// maintained on subsequent writes.
+#[test]
+fn property_index_end_to_end_and_survives_snapshot() {
+    let dir = tmp("prop-index-e2e");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_index("Person", "city").unwrap();
+        for (k, city) in [("a", "austin"), ("b", "boston"), ("c", "austin")] {
+            db.insert_node("Person", k, vec![("city".into(), Value::Str(city.into()))])
+                .unwrap();
+        }
+        let rs = db
+            .query(
+                "MATCH (n:Person {city: 'austin'}) RETURN n",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(rs.len(), 2, "two austin nodes before snapshot");
+        db.snapshot().unwrap();
+    }
+
+    // Reopen: declaration persisted via WAL baseline, postings rebuilt from base.
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert!(
+        db.is_index_enabled("Person", "city"),
+        "index declaration must survive snapshot + reopen"
+    );
+    let rs = db
+        .query(
+            "MATCH (n:Person {city: 'austin'}) RETURN n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 2, "indexed query correct after reopen");
+
+    // Maintained on new writes.
+    db.insert_node(
+        "Person",
+        "d",
+        vec![("city".into(), Value::Str("austin".into()))],
+    )
+    .unwrap();
+    let rs = db
+        .query(
+            "MATCH (n:Person {city: 'austin'}) RETURN n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 3, "new austin node reflected via index");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The indexed result must equal the unindexed scan result for the same query
+/// (correctness of the IndexScan fast path vs the scan+filter fallback).
+#[test]
+fn property_index_matches_unindexed_scan() {
+    let indexed = {
+        let dir = tmp("prop-index-parity-on");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_index("Person", "city").unwrap();
+        for (k, city) in [("a", "austin"), ("b", "boston"), ("c", "austin")] {
+            db.insert_node("Person", k, vec![("city".into(), Value::Str(city.into()))])
+                .unwrap();
+        }
+        let rs = db
+            .query(
+                "MATCH (n:Person {city: 'austin'}) RETURN n",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let n = rs.len();
+        let _ = std::fs::remove_dir_all(&dir);
+        n
+    };
+    let unindexed = {
+        let dir = tmp("prop-index-parity-off");
+        let mut db = GraphDb::open(&dir).unwrap();
+        for (k, city) in [("a", "austin"), ("b", "boston"), ("c", "austin")] {
+            db.insert_node("Person", k, vec![("city".into(), Value::Str(city.into()))])
+                .unwrap();
+        }
+        let rs = db
+            .query(
+                "MATCH (n:Person {city: 'austin'}) RETURN n",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let n = rs.len();
+        let _ = std::fs::remove_dir_all(&dir);
+        n
+    };
+    assert_eq!(
+        indexed, unindexed,
+        "indexed and unindexed results must match"
+    );
+    assert_eq!(indexed, 2);
+}
+
+/// Time-travel query: query_at runs a read against the graph as it existed at
+/// a past commit, without disturbing the live instance.
+#[test]
+fn query_at_time_travel() {
+    let dir = tmp("query-at");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "a", vec![]).unwrap(); // commit 0
+    db.insert_node("N", "b", vec![]).unwrap(); // commit 1
+    db.insert_node("N", "c", vec![]).unwrap(); // commit 2
+
+    let at0 = db
+        .query_at(0, "MATCH (n:N) RETURN n", &BTreeMap::new())
+        .unwrap();
+    assert_eq!(at0.len(), 1, "after commit 0 only 'a' exists");
+
+    let at2 = db
+        .query_at(2, "MATCH (n:N) RETURN n", &BTreeMap::new())
+        .unwrap();
+    assert_eq!(at2.len(), 3, "after commit 2 all three exist");
+
+    // The live instance is unchanged and still current.
+    let now = db.query("MATCH (n:N) RETURN n", &BTreeMap::new()).unwrap();
+    assert_eq!(now.len(), 3);
+
+    // Write statements are rejected in a time-travel query.
+    assert!(
+        db.query_at(0, "CREATE (x:N {id: 'z'})", &BTreeMap::new())
+            .is_err(),
+        "query_at must reject writes"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

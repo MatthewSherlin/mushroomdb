@@ -3,12 +3,14 @@
 //! ## Dependency rule note
 //!
 //! This module lives in `core-api` (not `core-query`) because it must read the
-//! *unified topology* — manual edges from `Topology` plus derived edges written
-//! there by the rule engine via `GraphMut`. `core-query` has no dependency on
-//! `core-rules` and therefore cannot see derived provenance.  `GraphDb` fields
-//! are private; the algorithms are pure functions called from `GraphDb` methods
-//! that pass in the already-unified `&Topology` (which already contains both
-//! manual and rule-derived edges).
+//! *unified topology* — manual edges plus derived edges written by the rule
+//! engine via `GraphMut`. `core-query` has no dependency on `core-rules` and
+//! therefore cannot see derived provenance.  `GraphDb` fields are private; the
+//! algorithms are pure functions called from `GraphDb` methods that pass in a
+//! [`TopologyView`] over the in-memory overlay **and** the mmap V8 base. Reading
+//! the view (not the bare overlay `Topology`) is required: after a snapshot
+//! reopen the derived edges live in the base, and using the overlay alone would
+//! report zero degree/rank for every node.
 //!
 //! ## When to use views vs `degree_centrality`
 //!
@@ -28,7 +30,8 @@
 //! create a Degree view.
 
 use core_query::Dir;
-use core_storage::{Direction, IdMap, Interner, Topology};
+use core_storage::v8::seam::TopologyView;
+use core_storage::{Direction, IdMap, Interner};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -77,7 +80,7 @@ fn resolve_etype(syms: &Interner, edge_type: Option<&str>) -> Option<Option<u32>
 }
 
 /// Iterate over etypes in the topology, optionally filtered to a single etype.
-fn etypes_filtered(topo: &Topology, filter: Option<u32>) -> Vec<u32> {
+fn etypes_filtered(topo: &TopologyView, filter: Option<u32>) -> Vec<u32> {
     match filter {
         Some(sym) => {
             // Only include if the etype actually exists.
@@ -169,7 +172,7 @@ impl From<Dir> for AlgoDir {
 ///
 /// Returns a [`PageRankReport`] with scores sorted descending (ties: key asc).
 pub(crate) fn pagerank(
-    topo: &Topology,
+    topo: &TopologyView,
     idmap: &IdMap,
     syms: &Interner,
     labels: &[u32],
@@ -407,7 +410,7 @@ impl UnionFind {
 ///
 /// Component ID is the smallest member key in each component (deterministic).
 pub(crate) fn wcc(
-    topo: &Topology,
+    topo: &TopologyView,
     idmap: &IdMap,
     syms: &Interner,
     labels: &[u32],
@@ -546,7 +549,7 @@ pub struct DegreeReport {
 
 /// Compute degree centrality for all live nodes.
 pub(crate) fn degree_centrality(
-    topo: &Topology,
+    topo: &TopologyView,
     idmap: &IdMap,
     syms: &Interner,
     labels: &[u32],

@@ -498,6 +498,49 @@ impl MappedBase {
         Ok(unsafe { rkyv::access_unchecked::<crate::v8::layout::ArchivedHnswSectionData>(bytes) })
     }
 
+    /// Structurally validate the four sections that the hot path reads via
+    /// `access_unchecked` (topology, columns, edge_props, hnsw), using rkyv's
+    /// checked access (`bytecheck`). This walks every relative pointer and
+    /// rejects out-of-bounds / malformed archives — the defense the hot path
+    /// deliberately skips for speed.
+    ///
+    /// Unlike CRC32 (which an attacker who controls the bytes can recompute),
+    /// this catches a *maliciously* crafted snapshot whose pointers would
+    /// otherwise trigger UB in `access_unchecked`. It is O(section size) and
+    /// touches every page, so it is intended for a pre-flight check
+    /// (`mushroomdb verify`), not the per-query read path. Returns the first
+    /// section that fails to validate.
+    pub fn validate_hot_sections(&self) -> Result<()> {
+        use crate::v8::layout::{
+            ArchivedColumnsData, ArchivedCsrData, ArchivedEdgePropsData, ArchivedHnswSectionData,
+        };
+        let check = |bytes: &[u8], name: &str| -> Result<()> {
+            match name {
+                "topology" => {
+                    rkyv::access::<ArchivedCsrData, rkyv::rancor::Error>(bytes).map(|_| ())
+                }
+                "columns" => {
+                    rkyv::access::<ArchivedColumnsData, rkyv::rancor::Error>(bytes).map(|_| ())
+                }
+                "edge_props" => {
+                    rkyv::access::<ArchivedEdgePropsData, rkyv::rancor::Error>(bytes).map(|_| ())
+                }
+                "hnsw" => {
+                    rkyv::access::<ArchivedHnswSectionData, rkyv::rancor::Error>(bytes).map(|_| ())
+                }
+                _ => Ok(()),
+            }
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: {name} section failed structural validation: {e}"),
+            })
+        };
+        check(self.section_bytes(SECTION_TOPOLOGY)?, "topology")?;
+        check(self.section_bytes(SECTION_COLUMNS)?, "columns")?;
+        check(self.section_bytes(SECTION_EDGE_PROPS)?, "edge_props")?;
+        check(self.section_bytes(SECTION_HNSW)?, "hnsw")?;
+        Ok(())
+    }
+
     /// Zero-copy access to the archived rules meta (section 8).
     pub fn rules_meta_section(&self) -> Result<&ArchivedRulesMeta> {
         let bytes = self.section_bytes(SECTION_RULES_META)?;

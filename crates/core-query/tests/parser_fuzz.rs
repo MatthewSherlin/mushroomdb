@@ -80,6 +80,7 @@ fn render_tok(t: &Tok) -> String {
         Tok::LBrace => "{".into(),
         Tok::RBrace => "}".into(),
         Tok::Colon => ":".into(),
+        Tok::Pipe => "|".into(),
         Tok::Comma => ",".into(),
         Tok::Dot => ".".into(),
         Tok::Eq => "=".into(),
