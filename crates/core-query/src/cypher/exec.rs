@@ -7147,9 +7147,13 @@ LIMIT 10";
         assert!(after > before, "WHERE equality fold must take the indexed path");
         assert_eq!(indexed.len(), 2);
 
-        // Fallback (no index) returns the same number of rows.
+        // Fallback (no index) must return byte-identical rows in the same order.
         let fallback = run(&fx.view(), q, &BTreeMap::new()).unwrap();
-        assert_eq!(fallback.len(), indexed.len(), "fallback must return same count as indexed");
+        assert_eq!(
+            rows_of(&fallback),
+            rows_of(&indexed),
+            "fallback must return identical rows, not just the same count"
+        );
     }
 
     /// Folded WHERE equality that matches no nodes returns empty result.

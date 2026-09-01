@@ -758,6 +758,14 @@ pub(super) fn join_and(mut exprs: Vec<Expr>) -> Option<Expr> {
 /// Folding is always correct regardless of whether the field is indexed:
 /// the `IndexScan` executor arm (exec.rs:1379-1386) falls back to a full scan
 /// + single-equality retain when `nodes_with_prop` returns `None`.
+///
+/// **Semantic note:** folding changes the set of *candidate* nodes that reach
+/// residual predicates — only nodes matching the equality are visited, not every
+/// node in the label. For valid data this produces identical result rows.
+/// However, if a node's residual property would cause a type error (e.g. calling
+/// a string function on an Int) that node must also match the folded equality to
+/// trigger the error; nodes eliminated by the `IndexScan` will not surface it.
+/// This is consistent with predicate pushdown in all standard query engines.
 pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
     // Find the first ScanLabel.
     let Some(scan_pos) = ops.iter().position(|op| matches!(op, PlanOp::ScanLabel { .. })) else {
@@ -2148,6 +2156,10 @@ LIMIT 10";
             matches!(&ops[0], PlanOp::IndexScan { field, .. } if field == "team"),
             "inline prop must stay as IndexScan on 'team', got {:?}",
             ops[0]
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, PlanOp::Filter { .. })),
+            "WHERE n.city = 'austin' must remain as Filter (T2 handles compound fold)"
         );
     }
 }
