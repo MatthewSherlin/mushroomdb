@@ -1,7 +1,9 @@
 use core_api::{
     Direction, GraphDb, GraphError, Predicate, RuleDef, SnapshotOptions, Value, ViewDef, ViewSource,
 };
+use core_storage::snapshot::{decode, encode_v6, encode_v7, SnapshotState, VERSION_7};
 use core_storage::wal::decode_all;
+use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -2477,4 +2479,178 @@ fn verify_snapshot_structural_pass_and_corruption_detection() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// V6/V7 richer-content round-trips (format-compat)
+// ---------------------------------------------------------------------------
+
+/// Build a SnapshotState richer than the golden fixtures' 2-node shape:
+///   - 3 live nodes across 2 labels (alice/bob = Person, acme = Company)
+///   - 1 tombstoned node in IdMap (ghost, id 3) — IdMap.tombstones is serialised
+///   - 2 edges of distinct types (KNOWS: alice→bob, WORKS_AT: alice→acme)
+///   - string, int, and float node properties
+///   - one edge property (KNOWS(alice,bob).weight = 0.9)
+///
+/// Fields that DO NOT exist in SnapshotState and therefore cannot be covered:
+///   - Topology.out_tombstones / in_tombstones: not serialised; eliminated at
+///     snapshot-merge time, so they never appear in a SnapshotState on disk
+///   - EdgeProps.tombstones: #[serde(skip)]; ephemeral in-memory overlay only
+fn rich_state(wal_truncated: bool) -> SnapshotState {
+    let mut ids = IdMap::new();
+    let alice_id = ids.get_or_insert("alice"); // 0
+    let bob_id = ids.get_or_insert("bob"); // 1
+    let acme_id = ids.get_or_insert("acme"); // 2
+    ids.get_or_insert("ghost"); // 3 — allocated, then tombstoned below
+    ids.delete("ghost");
+
+    let mut syms = Interner::new();
+    let sym_person = syms.intern("Person"); // 0
+    let sym_company = syms.intern("Company"); // 1
+    let sym_knows = syms.intern("KNOWS"); // 2
+    let sym_works = syms.intern("WORKS_AT"); // 3
+
+    let mut topo = Topology::new();
+    topo.add_edge(sym_knows, alice_id, bob_id);
+    topo.add_edge(sym_works, alice_id, acme_id);
+
+    let mut props = ColumnStore::new();
+    props.set(alice_id, "name", Value::Str("Alice Smith".into()));
+    props.set(alice_id, "score", Value::Float(0.95));
+    props.set(bob_id, "age", Value::Int(25));
+
+    let mut edge_props = EdgeProps::new();
+    edge_props.set(sym_knows, alice_id, bob_id, "weight", Value::Float(0.9));
+
+    // One label entry per allocated node slot (4 slots: alice, bob, acme, ghost).
+    let labels = vec![sym_person, sym_person, sym_company, sym_person];
+
+    SnapshotState {
+        ids,
+        syms,
+        topo,
+        props,
+        labels,
+        edge_props,
+        rule_defs: vec![],
+        provenance: BTreeMap::new(),
+        rule_tripped: BTreeMap::new(),
+        rule_fires: BTreeMap::new(),
+        ivf_state: BTreeMap::new(),
+        view_defs: vec![],
+        wal_truncated,
+        hnsw_state: BTreeMap::new(),
+    }
+}
+
+/// Assert that a decoded SnapshotState preserves all observable fields written
+/// by `rich_state`. Checks are structural (ids, syms, topo, props, edge_props,
+/// IdMap tombstone) rather than byte-identical so the helper is version-agnostic.
+fn assert_rich_state_eq(decoded: &SnapshotState) {
+    let alice_id = decoded.ids.get("alice").expect("alice must be present");
+    let bob_id = decoded.ids.get("bob").expect("bob must be present");
+    let acme_id = decoded.ids.get("acme").expect("acme must be present");
+    // ghost was tombstoned — lookup returns None
+    assert_eq!(
+        decoded.ids.get("ghost"),
+        None,
+        "tombstoned node 'ghost' must not appear as live"
+    );
+    assert!(
+        decoded.ids.is_tombstoned(3),
+        "IdMap tombstone for dense id 3 must survive round-trip"
+    );
+
+    let sym_knows = decoded.syms.get("KNOWS").expect("KNOWS sym must survive");
+    let sym_works = decoded.syms.get("WORKS_AT").expect("WORKS_AT sym must survive");
+    assert!(decoded.syms.get("Person").is_some(), "Person sym must survive");
+    assert!(decoded.syms.get("Company").is_some(), "Company sym must survive");
+
+    assert_eq!(
+        decoded.topo.edge_count(),
+        2,
+        "2 edges must survive round-trip"
+    );
+    assert!(
+        decoded
+            .topo
+            .neighbors(sym_knows, Direction::Out, alice_id)
+            .contains(&bob_id),
+        "KNOWS alice→bob must survive"
+    );
+    assert!(
+        decoded
+            .topo
+            .neighbors(sym_works, Direction::Out, alice_id)
+            .contains(&acme_id),
+        "WORKS_AT alice→acme must survive"
+    );
+
+    assert_eq!(
+        decoded.props.get(alice_id, "name"),
+        Some(&Value::Str("Alice Smith".into())),
+        "alice.name (String) must survive"
+    );
+    assert_eq!(
+        decoded.props.get(alice_id, "score"),
+        Some(&Value::Float(0.95)),
+        "alice.score (Float) must survive"
+    );
+    assert_eq!(
+        decoded.props.get(bob_id, "age"),
+        Some(&Value::Int(25)),
+        "bob.age (Int) must survive"
+    );
+
+    assert_eq!(
+        decoded.edge_props.get(sym_knows, alice_id, bob_id, "weight"),
+        Some(&Value::Float(0.9)),
+        "KNOWS(alice,bob).weight edge prop must survive"
+    );
+}
+
+/// encode_v7 must stamp a V7 header (not V8) and round-trip richer content.
+///
+/// TDD red step: before the encode_v7 bug fix this test fails on the header
+/// assertion (reads 8, expects 7). The fix changes wrap_zstd(VERSION, …) →
+/// wrap_zstd(VERSION_7, …) in encode_v7.
+#[test]
+fn encode_v7_roundtrips_through_open() {
+    let state = rich_state(true);
+    let bytes = encode_v7(&state).unwrap();
+    assert_eq!(
+        u16::from_le_bytes([bytes[4], bytes[5]]),
+        VERSION_7,
+        "encode_v7 header must say V7 (was erroneously writing V8)"
+    );
+    let decoded = decode(&bytes).unwrap().unwrap();
+    // V7 preserves wal_truncated in V7Meta.
+    assert!(decoded.wal_truncated, "V7 must round-trip wal_truncated=true");
+    assert_rich_state_eq(&decoded);
+}
+
+/// encode_v6 produces a correct V6 container and round-trips richer content.
+///
+/// This locks in richer V6 coverage beyond the 2-node golden fixture.
+/// V6 does not preserve wal_truncated (#[serde(skip)]) — it always decodes false.
+#[test]
+fn encode_v6_richer_roundtrip() {
+    let state = rich_state(false);
+    let bytes = encode_v6(&state);
+    assert_eq!(
+        &bytes[0..4],
+        b"GDB1",
+        "encode_v6 must start with GDB1 magic"
+    );
+    assert_eq!(
+        u16::from_le_bytes([bytes[4], bytes[5]]),
+        6,
+        "encode_v6 header must say V6"
+    );
+    let decoded = decode(&bytes).unwrap().unwrap();
+    assert!(
+        !decoded.wal_truncated,
+        "V6 payload never carried wal_truncated; decode must default false"
+    );
+    assert_rich_state_eq(&decoded);
 }
