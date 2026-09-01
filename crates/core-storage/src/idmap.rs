@@ -21,6 +21,10 @@ impl IdMap {
         Self::default()
     }
 
+    /// Convenience wrapper around [`Self::try_insert`] for call-sites that do not
+    /// return `Result`.  Panics only when the u32 id space is exhausted (> 4 billion
+    /// distinct node keys inserted without restart).  Converting this to return
+    /// `Result<u32>` requires a public API change — tracked as a TODO-0.4.2 task.
     pub fn get_or_insert(&mut self, key: &str) -> u32 {
         self.try_insert(key).expect("id space exhausted")
     }

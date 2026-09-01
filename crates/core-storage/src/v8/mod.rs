@@ -637,6 +637,7 @@ fn parse_header(mmap: &[u8]) -> Result<Vec<SectionEntry>> {
             detail: "v8: bad magic (expected GDB1)".into(),
         });
     }
+    // Infallible: `mmap.len() >= HEADER_SIZE` checked above; slices are exactly 2 bytes each.
     let version = u16::from_le_bytes(mmap[4..6].try_into().unwrap());
     if version != 8 {
         return Err(GraphError::Corrupt {
@@ -657,6 +658,7 @@ fn parse_header(mmap: &[u8]) -> Result<Vec<SectionEntry>> {
         });
     }
     // Whole-header CRC32 covers bytes [0..dir_end].
+    // Infallible: `dir_end + 4 <= HEADER_SIZE` verified above; slice is exactly 4 bytes.
     let stored_crc = u32::from_le_bytes(mmap[dir_end..dir_end + 4].try_into().unwrap());
     let computed_crc = crc32fast::hash(&mmap[0..dir_end]);
     if stored_crc != computed_crc {
@@ -668,6 +670,8 @@ fn parse_header(mmap: &[u8]) -> Result<Vec<SectionEntry>> {
         });
     }
     // Parse directory entries: {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}.
+    // Infallible: each `base + 16 <= dir_end <= HEADER_SIZE <= mmap.len()`, so every
+    // 4-byte subslice is within bounds; `try_into` on an exact-size slice cannot fail.
     let mut dir = Vec::with_capacity(section_count);
     for i in 0..section_count {
         let base = 8 + i * 16;

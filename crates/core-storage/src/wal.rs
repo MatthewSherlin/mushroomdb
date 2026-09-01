@@ -206,6 +206,8 @@ pub fn decode_all(bytes: &[u8]) -> (Vec<WalRecord>, usize) {
         if bytes.len() < pos + 8 {
             return (recs, pos);
         }
+        // Infallible: the `bytes.len() >= pos + 8` guard above ensures both
+        // 4-byte slices are exactly 4 bytes wide; `try_into` cannot fail.
         let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
         let start = pos + 8;

@@ -60,13 +60,13 @@ pub fn read_exact<'a>(src: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u
 }
 
 pub fn read_u32(src: &[u8], pos: &mut usize) -> Result<u32> {
-    let s = read_exact(src, pos, 4)?;
-    Ok(u32::from_le_bytes(s.try_into().unwrap()))
+    let s = read_exact(src, pos, 4)?; // returns exactly 4 bytes
+    Ok(u32::from_le_bytes(s.try_into().unwrap())) // infallible: slice is exactly 4 bytes
 }
 
 pub fn read_u64(src: &[u8], pos: &mut usize) -> Result<u64> {
-    let s = read_exact(src, pos, 8)?;
-    Ok(u64::from_le_bytes(s.try_into().unwrap()))
+    let s = read_exact(src, pos, 8)?; // returns exactly 8 bytes
+    Ok(u64::from_le_bytes(s.try_into().unwrap())) // infallible: slice is exactly 8 bytes
 }
 
 pub fn read_u32s(src: &[u8], pos: &mut usize) -> Result<Vec<u32>> {
@@ -74,7 +74,7 @@ pub fn read_u32s(src: &[u8], pos: &mut usize) -> Result<Vec<u32>> {
     let bytes = read_exact(src, pos, n.saturating_mul(4))?;
     let mut out = Vec::with_capacity(n);
     for chunk in bytes.chunks_exact(4) {
-        out.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        out.push(u32::from_le_bytes(chunk.try_into().unwrap())); // infallible: chunks_exact(4) yields 4-byte slices
     }
     Ok(out)
 }
@@ -84,7 +84,7 @@ pub fn read_i64s(src: &[u8], pos: &mut usize) -> Result<Vec<i64>> {
     let bytes = read_exact(src, pos, n.saturating_mul(8))?;
     let mut out = Vec::with_capacity(n);
     for chunk in bytes.chunks_exact(8) {
-        out.push(i64::from_le_bytes(chunk.try_into().unwrap()));
+        out.push(i64::from_le_bytes(chunk.try_into().unwrap())); // infallible: chunks_exact(8) yields 8-byte slices
     }
     Ok(out)
 }
@@ -94,7 +94,7 @@ pub fn read_f64s(src: &[u8], pos: &mut usize) -> Result<Vec<f64>> {
     let bytes = read_exact(src, pos, n.saturating_mul(8))?;
     let mut out = Vec::with_capacity(n);
     for chunk in bytes.chunks_exact(8) {
-        out.push(f64::from_le_bytes(chunk.try_into().unwrap()));
+        out.push(f64::from_le_bytes(chunk.try_into().unwrap())); // infallible: chunks_exact(8) yields 8-byte slices
     }
     Ok(out)
 }
