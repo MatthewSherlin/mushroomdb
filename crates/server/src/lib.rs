@@ -35,6 +35,10 @@ struct AppState {
     role_tokens: std::collections::HashMap<String, String>,
     /// Bind address advertised in `GET /health`.
     addr: std::net::SocketAddr,
+    /// True when the server is serving over TLS (via the `tls` feature).
+    /// Consumed by Task 3 to set the `Secure` cookie flag. Default false.
+    #[allow(dead_code)]
+    tls_active: bool,
 }
 
 #[allow(deprecated)]
@@ -44,3 +48,5 @@ pub use http::{
 };
 #[cfg(feature = "embed-ui")]
 pub use http::{router_with_embedded_ui, serve_with_embedded_ui};
+#[cfg(feature = "tls")]
+pub use http::serve_tls;

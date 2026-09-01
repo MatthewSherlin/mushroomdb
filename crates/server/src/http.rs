@@ -68,6 +68,7 @@ pub fn router_with_auth(db: SharedDb, token: Option<String>) -> Router {
         HashMap::new(),
         UiFallback::None,
         default_advertise_addr(),
+        false,
     )
 }
 
@@ -87,6 +88,7 @@ pub fn router_with_role_tokens(
         role_tokens,
         UiFallback::None,
         default_advertise_addr(),
+        false,
     )
 }
 
@@ -105,6 +107,7 @@ pub fn router_with_ui(
         HashMap::new(),
         UiFallback::Dir(ui_dir.as_ref().to_path_buf()),
         default_advertise_addr(),
+        false,
     )
 }
 
@@ -121,6 +124,7 @@ pub fn router_with_embedded_ui(db: SharedDb) -> Router {
         HashMap::new(),
         UiFallback::Embedded,
         default_advertise_addr(),
+        false,
     )
 }
 
@@ -276,8 +280,41 @@ async fn serve_inner(
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    let app = build_app(db, token, role_tokens, ui, local);
+    let app = build_app(db, token, role_tokens, ui, local, false);
     axum::serve(listener, app).await
+}
+
+/// Serve over TLS (requires the `tls` cargo feature).
+///
+/// Accepts a path to a PEM certificate and a PEM private key. Uses rustls
+/// via `axum-server`. The `ready` sender fires with the bound local address
+/// once the listener is accepting, mirroring the contract of [`serve_inner`].
+///
+/// Pass `token` / `role_tokens` the same way you would for [`serve_with_role_tokens`].
+#[cfg(feature = "tls")]
+pub async fn serve_tls(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+) -> std::io::Result<()> {
+    let config =
+        axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    let local = listener.local_addr()?;
+    if ready.send(local).is_err() {
+        eprintln!("serve_tls: readiness receiver dropped before bind notify");
+    }
+    let app = build_app(db, token, role_tokens, UiFallback::None, local, true);
+    axum_server::from_tcp_rustls(listener, config)?
+        .serve(app.into_make_service())
+        .await
 }
 
 fn default_advertise_addr() -> SocketAddr {
@@ -290,6 +327,7 @@ fn build_app(
     role_tokens: HashMap<String, String>,
     ui: UiFallback,
     addr: SocketAddr,
+    tls_active: bool,
 ) -> Router {
     debug_assert!(
         !db.read().has_event_sink(),
@@ -310,6 +348,7 @@ fn build_app(
         token,
         role_tokens,
         addr,
+        tls_active,
     };
     let app = Router::new()
         .route("/health", get(health))
