@@ -66,7 +66,8 @@ pub(crate) fn record_desired_len(n: usize) {
     use std::sync::atomic::Ordering;
     let mut cur = PEAK_DESIRED_PAIRS.load(Ordering::Relaxed);
     while n > cur {
-        match PEAK_DESIRED_PAIRS.compare_exchange_weak(cur, n, Ordering::Relaxed, Ordering::Relaxed) {
+        match PEAK_DESIRED_PAIRS.compare_exchange_weak(cur, n, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => break,
             Err(actual) => cur = actual,
         }
@@ -4983,7 +4984,9 @@ mod tests {
             name: format!("{src_label}_{dst_label}_{field}"),
             src_label: src_label.into(),
             dst_label: dst_label.into(),
-            predicate: Predicate::FieldEqual { field: field.into() },
+            predicate: Predicate::FieldEqual {
+                field: field.into(),
+            },
             edge_type: edge_type.into(),
             weight_prop: None,
             max_edges,
@@ -5003,10 +5006,18 @@ mod tests {
         // 160 000 cross-product.
         let mut fx = Fx::new();
         for i in 0..400u32 {
-            fx.add("Person", &format!("p{i}"), vec![("city", Value::Str("austin".into()))]);
+            fx.add(
+                "Person",
+                &format!("p{i}"),
+                vec![("city", Value::Str("austin".into()))],
+            );
         }
         for i in 0..400u32 {
-            fx.add("Org", &format!("o{i}"), vec![("city", Value::Str("austin".into()))]);
+            fx.add(
+                "Org",
+                &format!("o{i}"),
+                vec![("city", Value::Str("austin".into()))],
+            );
         }
 
         let mut eng = RuleEngine::new();
@@ -5021,7 +5032,11 @@ mod tests {
         }
 
         let edges = fx.topo.edge_count();
-        assert_eq!(edges, 400 * 5, "per-source top-k must yield exactly k per source");
+        assert_eq!(
+            edges,
+            400 * 5,
+            "per-source top-k must yield exactly k per source"
+        );
 
         let peak = PEAK_DESIRED_PAIRS.load(Ordering::Relaxed);
         assert!(
@@ -5052,10 +5067,18 @@ mod tests {
         // but rule has max_edges = None (global-budget path).
         let mut fx = Fx::new();
         for i in 0..400u32 {
-            fx.add("Person", &format!("p{i}"), vec![("city", Value::Str("austin".into()))]);
+            fx.add(
+                "Person",
+                &format!("p{i}"),
+                vec![("city", Value::Str("austin".into()))],
+            );
         }
         for i in 0..400u32 {
-            fx.add("Org", &format!("o{i}"), vec![("city", Value::Str("austin".into()))]);
+            fx.add(
+                "Org",
+                &format!("o{i}"),
+                vec![("city", Value::Str("austin".into()))],
+            );
         }
 
         let mut eng = RuleEngine::new();

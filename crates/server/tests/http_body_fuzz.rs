@@ -32,8 +32,7 @@ use tower::ServiceExt;
 // ── infrastructure ────────────────────────────────────────────────────────────
 
 fn fuzz_dir(tag: &str) -> PathBuf {
-    std::env::temp_dir()
-        .join(format!("graphdb-http-fuzz-{}-{}", tag, std::process::id()))
+    std::env::temp_dir().join(format!("graphdb-http-fuzz-{}-{}", tag, std::process::id()))
 }
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -79,8 +78,7 @@ fn json_value() -> BoxedStrategy<serde_json::Value> {
     json_leaf()
         .prop_recursive(3, 16, 4, |inner| {
             prop_oneof![
-                proptest::collection::vec(inner.clone(), 0..4)
-                    .prop_map(serde_json::Value::Array),
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(serde_json::Value::Array),
                 proptest::collection::vec(
                     (
                         proptest::collection::vec(any::<u8>(), 0..16)

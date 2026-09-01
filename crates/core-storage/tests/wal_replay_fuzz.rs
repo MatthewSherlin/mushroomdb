@@ -226,7 +226,11 @@ fn valid_wal_fixture_roundtrip() {
     let bytes = encode_wal(&recs);
     let (decoded, consumed) = decode_all(&bytes);
     assert_eq!(decoded, recs, "round-trip must be lossless");
-    assert_eq!(consumed, bytes.len(), "all bytes must be consumed on valid input");
+    assert_eq!(
+        consumed,
+        bytes.len(),
+        "all bytes must be consumed on valid input"
+    );
 }
 
 // ── Block (a): arbitrary bytes → decode_all never panics ─────────────────────
