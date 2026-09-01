@@ -40,6 +40,8 @@ struct AppState {
     tls_active: bool,
 }
 
+#[cfg(feature = "tls")]
+pub use http::serve_tls;
 #[allow(deprecated)]
 pub use http::{
     router, router_with_auth, router_with_role_tokens, router_with_ui, router_with_ui_tls, serve,
@@ -47,5 +49,3 @@ pub use http::{
 };
 #[cfg(feature = "embed-ui")]
 pub use http::{router_with_embedded_ui, serve_with_embedded_ui};
-#[cfg(feature = "tls")]
-pub use http::serve_tls;

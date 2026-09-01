@@ -11,7 +11,9 @@ use core_api::{
 use serde_json::{json, Value as Json};
 #[cfg(feature = "embed-ui")]
 use server::router_with_embedded_ui;
-use server::{router, router_with_auth, router_with_role_tokens, router_with_ui, router_with_ui_tls, serve};
+use server::{
+    router, router_with_auth, router_with_role_tokens, router_with_ui, router_with_ui_tls, serve,
+};
 use std::io::Cursor;
 use std::path::PathBuf;
 use tower::ServiceExt;

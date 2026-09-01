@@ -220,6 +220,7 @@ fn fail(msg: &str) -> ExitCode {
     ExitCode::from(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_serve(
     db_dir: PathBuf,
     addr: SocketAddr,

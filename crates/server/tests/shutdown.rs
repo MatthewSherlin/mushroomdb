@@ -10,11 +10,8 @@ use core_api::SharedDb;
 use std::path::PathBuf;
 
 fn tmp_shutdown(index: usize) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "graphdb-shutdown-{}-{}",
-        std::process::id(),
-        index,
-    ));
+    let d =
+        std::env::temp_dir().join(format!("graphdb-shutdown-{}-{}", std::process::id(), index,));
     let _ = std::fs::remove_dir_all(&d);
     d
 }

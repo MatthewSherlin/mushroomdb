@@ -319,10 +319,9 @@ pub async fn serve_tls(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
 ) -> std::io::Result<()> {
-    let config =
-        axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let listener = std::net::TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;

@@ -2562,9 +2562,18 @@ fn assert_rich_state_eq(decoded: &SnapshotState) {
     );
 
     let sym_knows = decoded.syms.get("KNOWS").expect("KNOWS sym must survive");
-    let sym_works = decoded.syms.get("WORKS_AT").expect("WORKS_AT sym must survive");
-    assert!(decoded.syms.get("Person").is_some(), "Person sym must survive");
-    assert!(decoded.syms.get("Company").is_some(), "Company sym must survive");
+    let sym_works = decoded
+        .syms
+        .get("WORKS_AT")
+        .expect("WORKS_AT sym must survive");
+    assert!(
+        decoded.syms.get("Person").is_some(),
+        "Person sym must survive"
+    );
+    assert!(
+        decoded.syms.get("Company").is_some(),
+        "Company sym must survive"
+    );
 
     assert_eq!(
         decoded.topo.edge_count(),
@@ -2603,7 +2612,9 @@ fn assert_rich_state_eq(decoded: &SnapshotState) {
     );
 
     assert_eq!(
-        decoded.edge_props.get(sym_knows, alice_id, bob_id, "weight"),
+        decoded
+            .edge_props
+            .get(sym_knows, alice_id, bob_id, "weight"),
         Some(&Value::Float(0.9)),
         "KNOWS(alice,bob).weight edge prop must survive"
     );
@@ -2625,7 +2636,10 @@ fn encode_v7_roundtrips_through_open() {
     );
     let decoded = decode(&bytes).unwrap().unwrap();
     // V7 preserves wal_truncated in V7Meta.
-    assert!(decoded.wal_truncated, "V7 must round-trip wal_truncated=true");
+    assert!(
+        decoded.wal_truncated,
+        "V7 must round-trip wal_truncated=true"
+    );
     assert_rich_state_eq(&decoded);
 }
 

@@ -1,5 +1,71 @@
 # Changelog
 
+## v0.4.2 — 2026-09-01
+
+### Hardening patch (format-stable)
+
+No format change — upgrade in place from any 0.4.x store. The WAL discriminants,
+snapshot section IDs, and `VERSION` constant remain at V8. (The `encode_v7` header
+fix in this release touches a test-only encoder for the historical V7 format; the
+current-format code path is unchanged.)
+
+- **Shutdown missed-wakeup fix (macOS hang).** `WriteQueue::signal_shutdown` now holds
+  the queue mutex while setting the shutdown flag and calling `notify_all`. Without the
+  lock the drain thread could observe the flag, release the mutex, and enter
+  `Condvar::wait` after the notify fired — a missed wakeup that left `DrainHandle::drop`
+  blocked forever. macOS thread-startup timing entered this window reliably; Ubuntu
+  rarely did. Fixed by taking the lock before the store+notify so the wakeup cannot be
+  lost. A 200-iteration stress test (`shared_db_drop_never_hangs`) guards against
+  regression on any platform.
+
+- **Optional TLS (`--features tls`) + deployment docs.** The axum server now supports
+  native TLS via a `tls` cargo feature backed by `axum-server`/rustls. Pass
+  `--tls-cert cert.pem --tls-key key.pem` to `mushroomdb serve`; without the flags,
+  behavior is byte-identical to 0.4.1. Without the feature flag the binary prints a
+  clear error directing users to the new `docs/site/deployment.md` (reverse-proxy
+  termination, native TLS, and loopback-first posture). `SECURITY.md` cross-references
+  the deployment doc.
+
+- **Cookie `Secure` flag conditional on TLS.** `Set-Cookie` now includes the `Secure`
+  attribute only when the server is running with TLS active. Plain-HTTP deployments are
+  unchanged (the 0.4.0-era UI-breakage concern applied to unconditional `Secure`).
+
+- **Named `format-compat` CI gate + `encode_v7` header fix.** The V5–V8 golden-fixture
+  pins and migration tests are now promoted to a dedicated CI job (`format-compat`) so a
+  failure names itself rather than hiding in the general test run. Additionally, the
+  test-only `encode_v7` encoder had a latent bug: it stamped a V8 header on V7-shaped
+  content, making V7 round-trips unreachable in tests. Fixed to emit a V7 header.
+  Richer-content round-trips (multi-label, multi-type edges, scalar+float+tombstone
+  props) added for V6 and V7. The golden pins themselves are unchanged.
+  `docs/site/durability.md` gains a format-compatibility matrix (V5→0.1.0 through
+  V8→0.2.0+) with the patch-stability promise documented.
+
+- **HNSW recall fix — layer-0 link budget and candidate floor (behavior change,
+  disclosed).** The v0.4.1 changelog noted "IVF-Flat recall ≈0.55 at 5k×1536-D" as a
+  known issue. That was a misdiagnosis: the actual recall path is HNSW, not IVF. IVF
+  probe/cluster knobs had zero effect because `VectorSimilar approximate: true` routes
+  through `CandidateSpec::Hnsw` (not `VectorClusters`). The root cause: with M₀=64
+  (layer-0 max connections), nodes beyond the 64th in each cluster became inbound-only
+  leaves invisible to beam search, capping recall at 0.68 regardless of ef or k
+  escalation. Fix: M₀ 64→128 in `crates/core-rules/src/hnsw.rs`; approximate candidate
+  floor 64→128 in `engine.rs` so the expanded neighborhood is not truncated before edge
+  derivation. Measured recall at the dense 5k×1536-D fixture: 0.5467 → 1.0000 (the old
+  code silently missed ~45% of true nearest-neighbor edges). The `approximate_recall_5k_timing`
+  test is now gated in CI (previously excluded with a stale "IVF recall gap" note).
+  Costs disclosed: layer-0 index memory doubles (~256 B → ~512 B/node; ~256 MB at the
+  500k-node ceiling); approximate-rule backfill on dense fixtures is ~5× slower (44.8 s
+  → 227.6 s at 5k — the price of correct results). Known limitation: the density ceiling
+  moved to ~128-node clusters; the structural fix (HNSW §3.5 diverse-neighbor selection)
+  is tracked for 0.4.3+. **Behavior change:** derived edges from ANN-based association
+  rules may differ after a store rebuild — they are now more complete. Stores opened
+  without a rebuild continue to serve queries normally; the change takes effect when the
+  rule engine re-derives edges (on rebuild or new writes that trigger the rule).
+
+- **Docs cleanup.** `benchmarks/README.md` updated to describe the enforcing
+  re-pin flow (the gate has been enforcing since before v0.4.1; the bootstrap-mode
+  description was stale). `CHANGELOG.md` v0.4.1 case-count corrected ("1280 cases
+  total: 768 WAL-replay + 512 HTTP-body").
+
 ## v0.4.1 — 2026-09-01
 
 ### Foundations (format-stable patch)

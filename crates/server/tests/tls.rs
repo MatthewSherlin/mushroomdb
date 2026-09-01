@@ -50,7 +50,10 @@ async fn tls_serves_https_and_rejects_plain_http() {
     assert!(plain.is_err() || !plain.unwrap().status().is_success());
 
     // /health is unauthenticated and returns JSON — no Set-Cookie header.
-    assert!(res.headers().get("set-cookie").is_none(), "health must not set cookies");
+    assert!(
+        res.headers().get("set-cookie").is_none(),
+        "health must not set cookies"
+    );
 
     handle.abort();
 }

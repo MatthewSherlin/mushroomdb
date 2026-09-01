@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "core-bench"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "criterion",
  "mushroomdb",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bincode",
  "mushroomdb-query",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-arrow"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-query"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "mushroomdb-storage",
  "proptest",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-rules"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bincode",
  "mushroomdb-storage",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-server"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-storage"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "sim-harness"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "mushroomdb",
  "mushroomdb-rules",
