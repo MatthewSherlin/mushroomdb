@@ -286,6 +286,38 @@ pub struct RuleStats {
     pub approximate: bool,
 }
 
+/// One entry in the slow-query ring buffer.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlowQueryEntry {
+    /// Execution time in whole milliseconds.
+    pub ms: u64,
+    /// The Cypher query string that was slow.
+    pub query: String,
+    /// The commit sequence number at the time the query ran.
+    pub at_commit: u64,
+}
+
+/// Snapshot of the slow-query log returned by [`GraphDb::slow_query_snapshot`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SlowQuerySnapshot {
+    /// Current threshold in milliseconds (0 = disabled).
+    pub threshold_ms: u64,
+    /// Total number of slow queries ever recorded (not capped by ring size).
+    pub count: u64,
+    /// Most-recent slow queries (up to 16), oldest first.
+    pub last: Vec<SlowQueryEntry>,
+}
+
+/// Internal ring-buffer state protected by a `Mutex` so `query(&self)` can
+/// write to it without a mutable borrow.
+struct SlowQueryLog {
+    entries: std::collections::VecDeque<SlowQueryEntry>,
+    total: u64,
+}
+
+/// Maximum number of entries kept in the slow-query ring buffer.
+const SLOW_QUERY_RING_CAP: usize = 16;
+
 /// Wire summary of a [`Predicate`]. JSON only — `Explanation` is never
 /// bincode-persisted (WAL/snapshots store `RuleDef` bytes, not this type).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1136,6 +1168,16 @@ pub struct GraphDb<F: Fs> {
     /// `query_write_authz` for the duration of ONE mutation call.
     /// Always `None` at rest.  Never serialized, never WAL-replayed.
     pending_write_authz: Option<WriteAuthz>,
+    /// Slow-query threshold in milliseconds.  0 = disabled.
+    /// Seeded from `MUSHROOMDB_SLOW_QUERY_MS` at open; override via
+    /// [`GraphDb::set_slow_query_threshold_ms`] (tests must use the setter
+    /// — env vars are process-global and race parallel test threads).
+    slow_query_threshold_ms: u64,
+    /// Ring buffer of recent slow queries (interior-mutable so `query(&self)`
+    /// can record entries without requiring `&mut self`).
+    slow_queries: std::sync::Mutex<SlowQueryLog>,
+    /// Instant at which the database was opened (used by `/metrics` uptime).
+    started_at: std::time::Instant,
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -1258,9 +1300,15 @@ fn extract_scan_label(ops: &[PlanOp], syms: &mut Interner) -> Option<u32> {
     }
     for op in ops {
         match op {
-            PlanOp::ScanLabel { label: Some(label), .. } => return Some(syms.intern(label)),
-            PlanOp::IndexScan { label: Some(label), .. } => return Some(syms.intern(label)),
-            PlanOp::IndexIntersect { label: Some(label), .. } => return Some(syms.intern(label)),
+            PlanOp::ScanLabel {
+                label: Some(label), ..
+            } => return Some(syms.intern(label)),
+            PlanOp::IndexScan {
+                label: Some(label), ..
+            } => return Some(syms.intern(label)),
+            PlanOp::IndexIntersect {
+                label: Some(label), ..
+            } => return Some(syms.intern(label)),
             _ => {}
         }
     }
@@ -1435,6 +1483,15 @@ impl<F: Fs> GraphDb<F> {
             wal_horizon_floor: 0,
             archive_genesis_chain: false,
             pending_write_authz: None,
+            slow_query_threshold_ms: std::env::var("MUSHROOMDB_SLOW_QUERY_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
+            slow_queries: std::sync::Mutex::new(SlowQueryLog {
+                entries: std::collections::VecDeque::new(),
+                total: 0,
+            }),
+            started_at: std::time::Instant::now(),
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
@@ -1955,6 +2012,15 @@ impl<F: Fs> GraphDb<F> {
             wal_horizon_floor: 0,
             archive_genesis_chain: false,
             pending_write_authz: None,
+            slow_query_threshold_ms: std::env::var("MUSHROOMDB_SLOW_QUERY_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
+            slow_queries: std::sync::Mutex::new(SlowQueryLog {
+                entries: std::collections::VecDeque::new(),
+                total: 0,
+            }),
+            started_at: std::time::Instant::now(),
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
@@ -3937,12 +4003,8 @@ impl<F: Fs> GraphDb<F> {
                 // edge deltas fired), the result set cannot have changed — skip.
                 if let Some(scan_sym) = entry.scan_label {
                     if engine_deltas.is_empty() {
-                        let touched = Self::commit_touched_labels(
-                            rec,
-                            &self.syms,
-                            &self.ids,
-                            &self.labels,
-                        );
+                        let touched =
+                            Self::commit_touched_labels(rec, &self.syms, &self.ids, &self.labels);
                         if touched.map(|t| !t.contains(&scan_sym)).unwrap_or(false) {
                             return true; // safe to skip — result set unchanged
                         }
@@ -6857,9 +6919,30 @@ impl<F: Fs> GraphDb<F> {
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
-        execute_union(&self.view(), &union, &Params(params)).map_err(|e| GraphError::QueryError {
-            detail: format!("execute: {e}"),
-        })
+        let t0 = std::time::Instant::now();
+        let result = execute_union(&self.view(), &union, &Params(params)).map_err(|e| {
+            GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            }
+        });
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        let threshold = self.slow_query_threshold_ms;
+        if threshold > 0 && elapsed_ms >= threshold {
+            eprintln!("[mushroomdb] slow query ({elapsed_ms}ms): {cypher}");
+            let entry = SlowQueryEntry {
+                ms: elapsed_ms,
+                query: cypher.to_string(),
+                at_commit: self.commit_seq,
+            };
+            if let Ok(mut log) = self.slow_queries.lock() {
+                if log.entries.len() == SLOW_QUERY_RING_CAP {
+                    log.entries.pop_front();
+                }
+                log.entries.push_back(entry);
+                log.total += 1;
+            }
+        }
+        result
     }
 
     /// Convenience entry-point that accepts a slice of `(name, value)` pairs
@@ -8584,6 +8667,46 @@ impl<F: Fs> GraphDb<F> {
             edges: self.topo_view().edge_count(),
             rules,
         }
+    }
+
+    /// On-disk size of the WAL file in bytes.
+    ///
+    /// Reads file metadata without loading WAL contents.  Returns `Err` for
+    /// in-memory (`SimFs`) databases where no WAL file exists on disk.
+    pub fn wal_size_bytes(&self) -> std::io::Result<u64> {
+        let path = self.fs.wal_path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "wal_path not available for this Fs implementation",
+            )
+        })?;
+        Ok(std::fs::metadata(path)?.len())
+    }
+
+    /// Set the slow-query threshold.  Queries whose execution time equals or
+    /// exceeds `ms` milliseconds are logged.  Pass `0` to disable.
+    ///
+    /// Use this setter in tests — the environment variable
+    /// `MUSHROOMDB_SLOW_QUERY_MS` is process-global and races parallel test
+    /// threads.
+    pub fn set_slow_query_threshold_ms(&mut self, ms: u64) {
+        self.slow_query_threshold_ms = ms;
+    }
+
+    /// Snapshot of the slow-query ring buffer and lifetime counter.
+    pub fn slow_query_snapshot(&self) -> SlowQuerySnapshot {
+        let log = self.slow_queries.lock().unwrap_or_else(|e| e.into_inner());
+        SlowQuerySnapshot {
+            threshold_ms: self.slow_query_threshold_ms,
+            count: log.total,
+            last: log.entries.iter().cloned().collect(),
+        }
+    }
+
+    /// Instant the database was opened.  Used by consumers (e.g. `/metrics`)
+    /// to compute uptime.
+    pub fn started_at(&self) -> std::time::Instant {
+        self.started_at
     }
 
     /// On-disk snapshot format version this binary writes and reads.

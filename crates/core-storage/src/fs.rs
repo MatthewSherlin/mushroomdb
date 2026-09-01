@@ -39,6 +39,14 @@ pub trait Fs {
     fn snapshot_path(&self) -> Option<std::path::PathBuf> {
         None
     }
+
+    /// Return the on-disk path of the WAL file, if any.
+    ///
+    /// `Some` for `RealFs`. `None` for in-memory implementations.
+    /// Used by [`GraphDb::wal_size_bytes`] to read WAL file metadata.
+    fn wal_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
     /// Read at most `n` bytes from the beginning of `file` without loading
     /// the full contents.
     ///
@@ -217,6 +225,10 @@ impl Fs for RealFs {
 
     fn snapshot_path(&self) -> Option<std::path::PathBuf> {
         Some(self.path(FileId::Snapshot))
+    }
+
+    fn wal_path(&self) -> Option<std::path::PathBuf> {
+        Some(self.path(FileId::Wal))
     }
 
     fn read_prefix(&self, file: FileId, n: usize) -> std::io::Result<Vec<u8>> {

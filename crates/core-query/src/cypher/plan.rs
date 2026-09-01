@@ -744,9 +744,10 @@ fn multi_index_lookup(props: &[(String, Operand)]) -> Option<Vec<(String, Operan
     if props.len() < 2 {
         return None;
     }
-    if props.iter().any(|(f, v)| {
-        f == "id" || !matches!(v, Operand::Lit(_) | Operand::Param(_))
-    }) {
+    if props
+        .iter()
+        .any(|(f, v)| f == "id" || !matches!(v, Operand::Lit(_) | Operand::Param(_)))
+    {
         return None;
     }
     Some(props.to_vec())
@@ -804,9 +805,10 @@ pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
     // Locate the anchoring scan op: ScanLabel (most common), or IndexScan produced
     // by the inline-prop path (merge with WHERE equalities → IndexIntersect).
     // IndexIntersect anchors are not re-folded here; T2's exec handles them.
-    let Some(scan_pos) = ops.iter().position(|op| {
-        matches!(op, PlanOp::ScanLabel { .. } | PlanOp::IndexScan { .. })
-    }) else {
+    let Some(scan_pos) = ops
+        .iter()
+        .position(|op| matches!(op, PlanOp::ScanLabel { .. } | PlanOp::IndexScan { .. }))
+    else {
         return ops;
     };
 
@@ -814,9 +816,16 @@ pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
     // inline-prop IndexScan (used when merging inline+WHERE into IndexIntersect).
     let (scan_var, scan_label, existing_eq) = match &ops[scan_pos] {
         PlanOp::ScanLabel { var, label } => (var.clone(), label.clone(), None),
-        PlanOp::IndexScan { var, label, field, value } => {
-            (var.clone(), label.clone(), Some((field.clone(), value.clone())))
-        }
+        PlanOp::IndexScan {
+            var,
+            label,
+            field,
+            value,
+        } => (
+            var.clone(),
+            label.clone(),
+            Some((field.clone(), value.clone())),
+        ),
         _ => unreachable!(),
     };
 
@@ -2191,9 +2200,8 @@ LIMIT 10";
 
     #[test]
     fn where_and_keeps_residual_filter() {
-        let ops =
-            plan_src("MATCH (n:Person) WHERE n.city = 'austin' AND n.age > 30 RETURN n.key")
-                .unwrap();
+        let ops = plan_src("MATCH (n:Person) WHERE n.city = 'austin' AND n.age > 30 RETURN n.key")
+            .unwrap();
         assert!(
             matches!(&ops[0], PlanOp::IndexScan { field, .. } if field == "city"),
             "equality must fold to IndexScan, got {:?}",
@@ -2207,10 +2215,9 @@ LIMIT 10";
 
     #[test]
     fn where_on_expanded_var_does_not_fold() {
-        let ops = plan_src(
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.city = 'austin' RETURN a.key",
-        )
-        .unwrap();
+        let ops =
+            plan_src("MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.city = 'austin' RETURN a.key")
+                .unwrap();
         assert!(
             matches!(&ops[0], PlanOp::ScanLabel { .. } | PlanOp::IndexScan { .. }),
             "first op must be a scan, got {:?}",
@@ -2253,8 +2260,7 @@ LIMIT 10";
 
     #[test]
     fn compound_inline_props_emit_index_intersect() {
-        let ops =
-            plan_src("MATCH (n:Doc {namespace: 'a', status: 'live'}) RETURN n.key").unwrap();
+        let ops = plan_src("MATCH (n:Doc {namespace: 'a', status: 'live'}) RETURN n.key").unwrap();
         assert!(
             matches!(&ops[0], PlanOp::IndexIntersect { equalities, .. } if equalities.len() == 2),
             "two inline props must emit IndexIntersect(2), got {:?}",
@@ -2264,10 +2270,8 @@ LIMIT 10";
 
     #[test]
     fn where_two_equalities_emit_index_intersect() {
-        let ops = plan_src(
-            "MATCH (n:Doc) WHERE n.namespace = 'a' AND n.status = $s RETURN n.key",
-        )
-        .unwrap();
+        let ops = plan_src("MATCH (n:Doc) WHERE n.namespace = 'a' AND n.status = $s RETURN n.key")
+            .unwrap();
         assert!(
             matches!(&ops[0], PlanOp::IndexIntersect { equalities, .. } if equalities.len() == 2),
             "two WHERE equalities must emit IndexIntersect(2), got {:?}",
@@ -2281,9 +2285,8 @@ LIMIT 10";
 
     #[test]
     fn mixed_inline_and_where_equalities_merge() {
-        let ops =
-            plan_src("MATCH (n:Doc {namespace: 'a'}) WHERE n.status = 'live' RETURN n.key")
-                .unwrap();
+        let ops = plan_src("MATCH (n:Doc {namespace: 'a'}) WHERE n.status = 'live' RETURN n.key")
+            .unwrap();
         assert!(
             matches!(&ops[0], PlanOp::IndexIntersect { equalities, .. } if equalities.len() == 2),
             "inline+WHERE equalities must merge to IndexIntersect(2), got {:?}",

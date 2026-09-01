@@ -997,7 +997,9 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                 vars.intern(var);
                 intern_operand(&mut vars, value);
             }
-            PlanOp::IndexIntersect { var, equalities, .. } => {
+            PlanOp::IndexIntersect {
+                var, equalities, ..
+            } => {
                 vars.intern(var);
                 for (_, operand) in equalities {
                     intern_operand(&mut vars, operand);
@@ -1209,7 +1211,9 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                             vars.intern(var);
                             intern_operand(&mut vars, value);
                         }
-                        PlanOp::IndexIntersect { var, equalities, .. } => {
+                        PlanOp::IndexIntersect {
+                            var, equalities, ..
+                        } => {
                             vars.intern(var);
                             for (_, operand) in equalities {
                                 intern_operand(&mut vars, operand);
@@ -7373,7 +7377,10 @@ LIMIT 10";
         let before = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
         let indexed = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
         let after = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
-        assert!(after > before, "WHERE equality fold must take the indexed path");
+        assert!(
+            after > before,
+            "WHERE equality fold must take the indexed path"
+        );
         assert_eq!(indexed.len(), 2);
 
         // Fallback (no index) must return byte-identical rows in the same order.
@@ -7425,9 +7432,21 @@ LIMIT 10";
     #[test]
     fn where_fold_residual_filter_applied() {
         let mut fx = Fx::new();
-        fx.add("Person", "young-austin", vec![("city", s("austin")), ("age", Value::Int(20))]);
-        fx.add("Person", "old-austin", vec![("city", s("austin")), ("age", Value::Int(40))]);
-        fx.add("Person", "boston", vec![("city", s("boston")), ("age", Value::Int(20))]);
+        fx.add(
+            "Person",
+            "young-austin",
+            vec![("city", s("austin")), ("age", Value::Int(20))],
+        );
+        fx.add(
+            "Person",
+            "old-austin",
+            vec![("city", s("austin")), ("age", Value::Int(40))],
+        );
+        fx.add(
+            "Person",
+            "boston",
+            vec![("city", s("boston")), ("age", Value::Int(20))],
+        );
 
         let q = "MATCH (n:Person) WHERE n.city = 'austin' AND n.age > 30 RETURN n";
         let rs = run(&fx.view(), q, &BTreeMap::new()).unwrap();
@@ -7465,11 +7484,23 @@ LIMIT 10";
 
         let mut fx = Fx::new();
         // alice: city=austin, age=30 — both match
-        let a = fx.add("Person", "alice", vec![("city", s("austin")), ("age", Value::Int(30))]);
+        let a = fx.add(
+            "Person",
+            "alice",
+            vec![("city", s("austin")), ("age", Value::Int(30))],
+        );
         // bob: city=austin, age=25 — city matches, age misses
-        let b = fx.add("Person", "bob", vec![("city", s("austin")), ("age", Value::Int(25))]);
+        let b = fx.add(
+            "Person",
+            "bob",
+            vec![("city", s("austin")), ("age", Value::Int(25))],
+        );
         // carol: city=boston, age=30 — age matches, city misses
-        let c = fx.add("Person", "carol", vec![("city", s("boston")), ("age", Value::Int(30))]);
+        let c = fx.add(
+            "Person",
+            "carol",
+            vec![("city", s("boston")), ("age", Value::Int(30))],
+        );
 
         let mut pi = PropertyIndex::new();
         pi.enable("Person", "city");
@@ -7486,7 +7517,10 @@ LIMIT 10";
         let before = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
         let indexed = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
         let after = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
-        assert!(after > before, "IndexIntersect must advance counter on indexed path");
+        assert!(
+            after > before,
+            "IndexIntersect must advance counter on indexed path"
+        );
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed.get(0, "n"), Some(&s("alice")));
 
@@ -7506,9 +7540,21 @@ LIMIT 10";
         use std::sync::atomic::Ordering;
 
         let mut fx = Fx::new();
-        let a = fx.add("Person", "alice", vec![("city", s("austin")), ("role", s("eng"))]);
-        let b = fx.add("Person", "bob", vec![("city", s("austin")), ("role", s("mgr"))]);
-        let _c = fx.add("Person", "carol", vec![("city", s("boston")), ("role", s("eng"))]);
+        let a = fx.add(
+            "Person",
+            "alice",
+            vec![("city", s("austin")), ("role", s("eng"))],
+        );
+        let b = fx.add(
+            "Person",
+            "bob",
+            vec![("city", s("austin")), ("role", s("mgr"))],
+        );
+        let _c = fx.add(
+            "Person",
+            "carol",
+            vec![("city", s("boston")), ("role", s("eng"))],
+        );
 
         // Only city is indexed; role is not.
         let mut pi = PropertyIndex::new();
@@ -7521,7 +7567,10 @@ LIMIT 10";
         let before = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
         let indexed = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
         let after = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
-        assert!(after > before, "IndexIntersect must fire when at least one field is indexed");
+        assert!(
+            after > before,
+            "IndexIntersect must fire when at least one field is indexed"
+        );
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed.get(0, "n"), Some(&s("alice")));
 
@@ -7556,8 +7605,16 @@ LIMIT 10";
         use core_storage::property_index::PropertyIndex;
 
         let mut fx = Fx::new();
-        let a = fx.add("Person", "alice", vec![("city", s("austin")), ("age", Value::Int(30))]);
-        let b = fx.add("Person", "bob", vec![("city", s("boston")), ("age", Value::Int(25))]);
+        let a = fx.add(
+            "Person",
+            "alice",
+            vec![("city", s("austin")), ("age", Value::Int(30))],
+        );
+        let b = fx.add(
+            "Person",
+            "bob",
+            vec![("city", s("boston")), ("age", Value::Int(25))],
+        );
 
         let mut pi = PropertyIndex::new();
         pi.enable("Person", "city");
@@ -7580,8 +7637,16 @@ LIMIT 10";
         use std::sync::atomic::Ordering;
 
         let mut fx = Fx::new();
-        let a = fx.add("Person", "alice", vec![("city", s("austin")), ("age", Value::Int(30))]);
-        let b = fx.add("Person", "bob", vec![("city", s("boston")), ("age", Value::Int(30))]);
+        let a = fx.add(
+            "Person",
+            "alice",
+            vec![("city", s("austin")), ("age", Value::Int(30))],
+        );
+        let b = fx.add(
+            "Person",
+            "bob",
+            vec![("city", s("boston")), ("age", Value::Int(30))],
+        );
 
         let mut pi = PropertyIndex::new();
         pi.enable("Person", "city");
@@ -7618,17 +7683,25 @@ LIMIT 10";
 
         let mut fx = Fx::new();
         // alice: all three match
-        let a = fx.add("Person", "alice", vec![
-            ("city", s("austin")),
-            ("age", Value::Int(30)),
-            ("role", s("eng")),
-        ]);
+        let a = fx.add(
+            "Person",
+            "alice",
+            vec![
+                ("city", s("austin")),
+                ("age", Value::Int(30)),
+                ("role", s("eng")),
+            ],
+        );
         // bob: city+age match, role misses
-        let b = fx.add("Person", "bob", vec![
-            ("city", s("austin")),
-            ("age", Value::Int(30)),
-            ("role", s("mgr")),
-        ]);
+        let b = fx.add(
+            "Person",
+            "bob",
+            vec![
+                ("city", s("austin")),
+                ("age", Value::Int(30)),
+                ("role", s("mgr")),
+            ],
+        );
 
         let mut pi = PropertyIndex::new();
         pi.enable("Person", "city");
@@ -7639,7 +7712,8 @@ LIMIT 10";
         pi.set("Person", "age", a, &Value::Int(30));
         pi.set("Person", "age", b, &Value::Int(30));
 
-        let q = "MATCH (n:Person) WHERE n.city = 'austin' AND n.age = 30 AND n.role = 'eng' RETURN n";
+        let q =
+            "MATCH (n:Person) WHERE n.city = 'austin' AND n.age = 30 AND n.role = 'eng' RETURN n";
         let indexed = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed.get(0, "n"), Some(&s("alice")));

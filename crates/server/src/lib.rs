@@ -38,6 +38,8 @@ struct AppState {
     /// True when the server is serving over TLS (via the `tls` feature).
     /// When true, the auth cookie gains the `Secure` attribute.
     tls_active: bool,
+    /// Instant the router was first built; used by `GET /metrics` uptime_s.
+    started_at: std::time::Instant,
 }
 
 #[cfg(feature = "tls")]

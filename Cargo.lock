@@ -1310,6 +1310,7 @@ dependencies = [
  "axum-server",
  "futures-util",
  "include_dir",
+ "libc",
  "mushroomdb",
  "mushroomdb-arrow",
  "proptest",
