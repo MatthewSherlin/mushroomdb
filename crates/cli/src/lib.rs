@@ -2589,4 +2589,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);
     }
+
+    #[test]
+    fn serve_tls_flags_parse_both_forms() {
+        // --tls-cert VALUE --tls-key VALUE (space form)
+        match parse_args(&[
+            "serve", "/tmp/db", "--tls-cert", "/a/cert.pem", "--tls-key", "/a/key.pem",
+        ])
+        .unwrap()
+        {
+            Command::Serve { tls_cert, tls_key, .. } => {
+                assert_eq!(tls_cert, Some(PathBuf::from("/a/cert.pem")));
+                assert_eq!(tls_key, Some(PathBuf::from("/a/key.pem")));
+            }
+            other => panic!("{other:?}"),
+        }
+        // --tls-cert=VALUE --tls-key=VALUE (equals form)
+        match parse_args(&[
+            "serve",
+            "/tmp/db",
+            "--tls-cert=/b/cert.pem",
+            "--tls-key=/b/key.pem",
+        ])
+        .unwrap()
+        {
+            Command::Serve { tls_cert, tls_key, .. } => {
+                assert_eq!(tls_cert, Some(PathBuf::from("/b/cert.pem")));
+                assert_eq!(tls_key, Some(PathBuf::from("/b/key.pem")));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Neither → both None.
+        match parse_args(&["serve", "/tmp/db"]).unwrap() {
+            Command::Serve { tls_cert, tls_key, .. } => {
+                assert_eq!(tls_cert, None);
+                assert_eq!(tls_key, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_tls_flags_require_both() {
+        // --tls-cert alone → error
+        let err =
+            parse_args(&["serve", "/tmp/db", "--tls-cert", "/a/cert.pem"]).unwrap_err();
+        assert!(
+            err.contains("tls-key"),
+            "--tls-cert alone must mention --tls-key in error, got {err}"
+        );
+        // --tls-key alone → error
+        let err =
+            parse_args(&["serve", "/tmp/db", "--tls-key", "/a/key.pem"]).unwrap_err();
+        assert!(
+            err.contains("tls-cert"),
+            "--tls-key alone must mention --tls-cert in error, got {err}"
+        );
+    }
 }

@@ -36,14 +36,13 @@ struct AppState {
     /// Bind address advertised in `GET /health`.
     addr: std::net::SocketAddr,
     /// True when the server is serving over TLS (via the `tls` feature).
-    /// Consumed by Task 3 to set the `Secure` cookie flag. Default false.
-    #[allow(dead_code)]
+    /// When true, the auth cookie gains the `Secure` attribute.
     tls_active: bool,
 }
 
 #[allow(deprecated)]
 pub use http::{
-    router, router_with_auth, router_with_role_tokens, router_with_ui, serve,
+    router, router_with_auth, router_with_role_tokens, router_with_ui, router_with_ui_tls, serve,
     serve_with_role_tokens, serve_with_ui, serve_with_ui_and_role_tokens,
 };
 #[cfg(feature = "embed-ui")]

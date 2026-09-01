@@ -111,6 +111,24 @@ pub fn router_with_ui(
     )
 }
 
+/// Like [`router_with_ui`] but marks the connection as TLS-active so the auth
+/// cookie carries the `Secure` attribute. Use when the binary is serving
+/// directly over HTTPS (i.e. via `serve_tls`) rather than behind a proxy.
+pub fn router_with_ui_tls(
+    db: SharedDb,
+    ui_dir: impl AsRef<std::path::Path>,
+    token: Option<String>,
+) -> Router {
+    build_app(
+        db,
+        token,
+        HashMap::new(),
+        UiFallback::Dir(ui_dir.as_ref().to_path_buf()),
+        default_advertise_addr(),
+        true,
+    )
+}
+
 #[cfg(feature = "embed-ui")]
 static EMBEDDED_UI: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../ui/dist");
@@ -464,7 +482,7 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
             req.extensions_mut().insert(AuthIdentity::Full);
             let mut res = next.run(req).await;
             if set_cookie && is_html_response(&res) {
-                attach_token_cookie(&mut res, full_tok);
+                attach_token_cookie(&mut res, full_tok, state.tls_active);
             }
             return res;
         }
@@ -540,8 +558,9 @@ fn is_html_response(res: &Response) -> bool {
         })
 }
 
-fn attach_token_cookie(res: &mut Response, token: &str) {
-    let value = format!("{TOKEN_COOKIE}={token}; Path=/; SameSite=Lax; HttpOnly");
+fn attach_token_cookie(res: &mut Response, token: &str, secure: bool) {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    let value = format!("{TOKEN_COOKIE}={token}; Path=/; SameSite=Lax; HttpOnly{secure_attr}");
     if let Ok(hv) = HeaderValue::from_str(&value) {
         res.headers_mut().insert(header::SET_COOKIE, hv);
     }
