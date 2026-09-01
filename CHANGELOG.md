@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.4.1 — 2026-09-01
+
+### Foundations (format-stable patch)
+
+No format change — upgrade in place from any 0.4.0 store.
+
+- **Backfill scale regression guards.** The streaming backfill introduced in
+  v0.4.0 (which fixed the cross-product wall) is now locked in by peak-memory
+  regression tests covering both the top-k and global-budget paths, plus a
+  5000×5000 criterion bench with a CI-pinned baseline enforced on every merge.
+- **CI recall gates.** HNSW + approximate-recall floor tests (previously
+  `#[ignore]`d) now run in a dedicated CI job on every merge.
+- **Known issue:** `approximate_recall_5k_timing` reveals IVF-Flat recall
+  ≈0.55 at 5k×1536-D vs the 0.90 floor — a pre-existing gap discovered by
+  this release's gating work. The test is excluded from the CI gate until
+  fixed; tracked for a 0.4.x follow-up.
+- **Benchmark baselines re-pinned.** Baselines regenerated from a canonical
+  ubuntu-latest run on the current architecture; the bench regression gate
+  enforces them on every merge.
+- **Unwrap audit.** All 31 production-path `unwrap`/`expect` sites in
+  `storage` and `server` verified infallible and annotated. `idmap` u32-capacity
+  growth panic documented as TODO-0.4.2 (requires an API change).
+- **Fuzz targets.** WAL-replay and HTTP-body never-panic proptests (1280
+  cases each).
+
 ## v0.4.0 — 2026-08-31
 
 ### Temporal / moat

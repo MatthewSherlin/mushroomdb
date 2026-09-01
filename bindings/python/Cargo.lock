@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bincode",
  "mushroomdb-query",
@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-python"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "mushroomdb",
  "mushroomdb-storage",
@@ -258,14 +258,14 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-query"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "mushroomdb-storage",
 ]
 
 [[package]]
 name = "mushroomdb-rules"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bincode",
  "mushroomdb-storage",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-storage"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bincode",
  "crc32fast",
