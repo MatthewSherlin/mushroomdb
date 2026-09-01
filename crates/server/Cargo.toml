@@ -35,3 +35,4 @@ arrow-array = { version = "59", default-features = false }
 # WS integration: axum oneshot cannot complete an upgrade; real TCP + this client.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+proptest = { workspace = true }

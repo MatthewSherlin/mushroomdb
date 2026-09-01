@@ -1011,6 +1011,7 @@ dependencies = [
  "include_dir",
  "mushroomdb",
  "mushroomdb-arrow",
+ "proptest",
  "serde",
  "serde_json",
  "tokio",
