@@ -38,11 +38,12 @@ jobs:
         with: { toolchain: "1.92.0" }
       # hnsw_5k_1536_recall: 5k vectors × 1536-D HNSW; asserts min recall@10 ≥ 0.90, mean ≥ 0.95.
       - run: cargo test --release -p mushroomdb-rules -- hnsw_5k_1536_recall --ignored --nocapture
-      # approximate_recall_above_floor_1536dim_1k: 1024-node IVF-Flat × 1536-D; asserts recall ≥ 0.90.
+      # approximate_recall_above_floor_1536dim_1k: 1024-node HNSW × 1536-D; asserts recall ≥ 0.90.
       - run: cargo test --release -p sim-harness -- approximate_recall_above_floor_1536dim_1k --ignored --nocapture
-      # NOTE: approximate_recall_5k_timing is excluded — IVF-Flat currently achieves recall ~0.55
-      # at 5k/1536-D, below the 0.90 floor. Gating a failing test breaks every build; this is a
-      # known IVF recall gap at 5k scale that requires a code fix before it can be gated here.
+      # approximate_recall_5k_timing: 5k-node HNSW × 1536-D; asserts recall ≥ 0.90 at M₀=128.
+      # Measured: recall 1.0000 (approx=495000 exact=495000) at M₀=128/k=128/ef=400.
+      # Note: this test takes ~4.5 min (HNSW backfill 227 s + exact O(n²) ground truth ~43 s).
+      - run: cargo test --release -p sim-harness -- approximate_recall_5k_timing --ignored --nocapture
 
   # Every historical snapshot format (V5..V8) must open, migrate, and preserve
   # data, forever. Naming this job separately means a regression says
