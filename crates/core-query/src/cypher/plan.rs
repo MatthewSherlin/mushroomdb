@@ -2290,4 +2290,21 @@ LIMIT 10";
             ops[0]
         );
     }
+
+    #[test]
+    fn where_three_equalities_emit_index_intersect() {
+        let ops = plan_src(
+            "MATCH (n:Doc) WHERE n.namespace = 'a' AND n.status = 'live' AND n.kind = $k RETURN n",
+        )
+        .unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::IndexIntersect { equalities, .. } if equalities.len() == 3),
+            "three WHERE equalities must emit IndexIntersect(3), got {:?}",
+            ops[0]
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, PlanOp::Filter { .. })),
+            "all three equalities fully consumed; no residual Filter expected"
+        );
+    }
 }

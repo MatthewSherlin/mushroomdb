@@ -1536,12 +1536,17 @@ fn index_intersect_ids(
         result = merged;
     }
 
-    // Apply unindexed fields as post-filter.
+    // Apply unindexed fields as post-filter. Use a manual loop (not retain) so
+    // that node_matches errors are propagated rather than silently dropped —
+    // matching the all-unindexed fallback path which surfaces errors via `?`.
     if !unindexed_props.is_empty() {
-        result.retain(|&id| {
-            node_matches(view, vars, row, id, None, &unindexed_props, params)
-                .unwrap_or(false)
-        });
+        let mut filtered = Vec::with_capacity(result.len());
+        for id in result {
+            if node_matches(view, vars, row, id, None, &unindexed_props, params)? {
+                filtered.push(id);
+            }
+        }
+        result = filtered;
     }
 
     Ok(result)
@@ -7514,11 +7519,18 @@ LIMIT 10";
         let q = "MATCH (n:Person) WHERE n.city = 'austin' AND n.role = 'eng' RETURN n";
 
         let before = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
-        let rs = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
+        let indexed = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
         let after = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
         assert!(after > before, "IndexIntersect must fire when at least one field is indexed");
-        assert_eq!(rs.len(), 1);
-        assert_eq!(rs.get(0, "n"), Some(&s("alice")));
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed.get(0, "n"), Some(&s("alice")));
+
+        let fallback = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        assert_eq!(
+            rows_of(&fallback),
+            rows_of(&indexed),
+            "fallback must return identical rows"
+        );
     }
 
     /// No indexed fields: full scan fallback returns the correct node.
@@ -7585,11 +7597,18 @@ LIMIT 10";
         params.insert("a".to_string(), Value::Int(30));
 
         let before = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
-        let rs = run(&fx.view_indexed(&pi), q, &params).unwrap();
+        let indexed = run(&fx.view_indexed(&pi), q, &params).unwrap();
         let after = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
         assert!(after > before, "$param intersect must fire indexed path");
-        assert_eq!(rs.len(), 1);
-        assert_eq!(rs.get(0, "n"), Some(&s("alice")));
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed.get(0, "n"), Some(&s("alice")));
+
+        let fallback = run(&fx.view(), q, &params).unwrap();
+        assert_eq!(
+            rows_of(&fallback),
+            rows_of(&indexed),
+            "fallback must return identical rows"
+        );
     }
 
     /// Three-field intersect with two indexed fields returns the one node matching all three.
@@ -7621,8 +7640,15 @@ LIMIT 10";
         pi.set("Person", "age", b, &Value::Int(30));
 
         let q = "MATCH (n:Person) WHERE n.city = 'austin' AND n.age = 30 AND n.role = 'eng' RETURN n";
-        let rs = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
-        assert_eq!(rs.len(), 1);
-        assert_eq!(rs.get(0, "n"), Some(&s("alice")));
+        let indexed = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed.get(0, "n"), Some(&s("alice")));
+
+        let fallback = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        assert_eq!(
+            rows_of(&fallback),
+            rows_of(&indexed),
+            "fallback must return identical rows"
+        );
     }
 }
