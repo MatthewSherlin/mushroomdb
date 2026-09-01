@@ -67,6 +67,31 @@ thread_local! {
     static DELTA_COPY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Per-thread count of query-subscription `execute` calls in `distribute_events`.
+///
+/// Incremented each time a query subscription actually runs its plan (i.e.,
+/// the label-skip fast-path did not fire). Because `distribute_events` is
+/// called synchronously on the writer thread, this thread-local correctly
+/// isolates each test thread's count even when integration tests run in
+/// parallel. Read via [`query_sub_exec_count`].
+thread_local! {
+    static QUERY_SUB_EXECS_TL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Return the number of query-subscription re-executions logged on this
+/// thread since the process started (or since last reset via
+/// [`reset_query_sub_exec_count`]).
+///
+/// Primarily for integration tests that verify the label-skip fast-path.
+pub fn query_sub_exec_count() -> usize {
+    QUERY_SUB_EXECS_TL.with(|c| c.get())
+}
+
+/// Reset the per-thread query-subscription execution counter to zero.
+pub fn reset_query_sub_exec_count() {
+    QUERY_SUB_EXECS_TL.with(|c| c.set(0));
+}
+
 /// Internal state for a single `subscribe_query` subscription.
 ///
 /// On every commit, `distribute_events` re-executes `ops` against the current
@@ -85,6 +110,15 @@ pub(crate) struct QuerySubEntry {
     prev_row_map: std::collections::HashMap<String, Vec<Option<Value>>>,
     /// Weak pointer to the subscriber queue; dead Weak → subscription dropped.
     inner: std::sync::Weak<SubInner>,
+    /// Interned label sym captured at subscribe time from the plan's leading scan
+    /// (`ScanLabel`, `IndexScan`, or `IndexIntersect` with a concrete label).
+    ///
+    /// `None` means the plan has an `Expand` op (or no recognizable leading scan
+    /// with a concrete label), and this subscription must re-execute on every
+    /// commit without skipping. This is the conservative v0.4.3 boundary: Expand
+    /// queries are never skipped because edges can alter join results regardless
+    /// of which node labels were written.
+    scan_label: Option<u32>,
 }
 
 /// A post-commit mutation notification.
@@ -1202,6 +1236,35 @@ pub struct SnapshotOptions {
     /// [`GraphDb::open_at`], extending the reachable history horizon across
     /// snapshot boundaries.
     pub archive_wal: bool,
+}
+
+/// Derive the scan-label sym for the commit-skip fast-path.
+///
+/// Walks `ops` to find the plan's leading scan op (`ScanLabel`, `IndexScan`,
+/// or `IndexIntersect`) with a concrete label string, then interns it.
+///
+/// Returns `None` in all cases where skipping is unsafe:
+/// - Any `Expand` op is present (edge traversal; edges change results regardless
+///   of node labels).
+/// - The leading scan has no label (`ScanLabel { label: None }` — full scan).
+/// - No recognizable leading scan op is found.
+///
+/// This is the conservative v0.4.3 boundary. The caller stores the result in
+/// [`QuerySubEntry::scan_label`] at subscribe time; `None` means always execute.
+fn extract_scan_label(ops: &[PlanOp], syms: &mut Interner) -> Option<u32> {
+    // Any Expand → must always re-execute (edges can change join results).
+    if ops.iter().any(|op| matches!(op, PlanOp::Expand { .. })) {
+        return None;
+    }
+    for op in ops {
+        match op {
+            PlanOp::ScanLabel { label: Some(label), .. } => return Some(syms.intern(label)),
+            PlanOp::IndexScan { label: Some(label), .. } => return Some(syms.intern(label)),
+            PlanOp::IndexIntersect { label: Some(label), .. } => return Some(syms.intern(label)),
+            _ => {}
+        }
+    }
+    None
 }
 
 impl GraphDb<RealFs> {
@@ -3678,6 +3741,108 @@ impl<F: Fs> GraphDb<F> {
             .collect()
     }
 
+    /// Collect the set of label syms touched by a WAL record.
+    ///
+    /// Returns `Some(set)` when every record in this commit can be attributed to
+    /// a known label sym. Returns `None` when the commit must not be skipped:
+    /// edge records, unresolvable key→label lookups, or any record type not in
+    /// the explicit handled set.
+    ///
+    /// Handled record types and their actions:
+    /// - `InsertNode`   → look up label in interner (fails → None)
+    /// - `InsertNodeId` → label sym is carried directly
+    /// - `SetProp`      → resolve key→id→label (fails → None)
+    /// - `DeleteNode`   → resolve key→id→label (fails → None)
+    /// - `Batch`        → recurse into every inner record
+    /// - `InsertEdge`, `DeleteEdge`, `InsertEdgeId` → always None (edge records)
+    /// - everything else → None (conservative)
+    fn commit_touched_labels(
+        rec: &WalRecord,
+        syms: &Interner,
+        ids: &IdMap,
+        labels: &[u32],
+    ) -> Option<BTreeSet<u32>> {
+        let mut out = BTreeSet::new();
+        if Self::collect_touched_labels(rec, syms, ids, labels, &mut out) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    fn collect_touched_labels(
+        rec: &WalRecord,
+        syms: &Interner,
+        ids: &IdMap,
+        labels: &[u32],
+        out: &mut BTreeSet<u32>,
+    ) -> bool {
+        match rec {
+            // String-key insert: the dense rewrite converts this to
+            // [Intern, InsertNodeId], so this arm fires only for legacy WAL
+            // records written before the dense path was added.
+            WalRecord::InsertNode { label, .. } => {
+                if let Some(sym) = syms.get(label) {
+                    out.insert(sym);
+                    true
+                } else {
+                    false
+                }
+            }
+            // Dense-id insert (produced by rewrite_wal_dense for every
+            // insert_node call in the current codebase).
+            WalRecord::InsertNodeId { label, .. } => {
+                out.insert(*label);
+                true
+            }
+            // String-key prop set: dense path converts to [Intern, SetPropId].
+            WalRecord::SetProp { key, .. } => {
+                if let Some(sym) = Self::resolve_key_label_sym(key, ids, labels) {
+                    out.insert(sym);
+                    true
+                } else {
+                    false
+                }
+            }
+            // Dense-id prop set (produced by rewrite_wal_dense for set_prop).
+            WalRecord::SetPropId { id, .. } => {
+                if let Some(sym) = labels.get(*id as usize).copied().filter(|&s| s != u32::MAX) {
+                    out.insert(sym);
+                    true
+                } else {
+                    false
+                }
+            }
+            WalRecord::DeleteNode { key } => {
+                if let Some(sym) = Self::resolve_key_label_sym(key, ids, labels) {
+                    out.insert(sym);
+                    true
+                } else {
+                    false
+                }
+            }
+            WalRecord::Batch(inner) => inner
+                .iter()
+                .all(|r| Self::collect_touched_labels(r, syms, ids, labels, out)),
+            // Intern is a pure metadata record — it does not touch any node's
+            // label and is safe to skip for the label-skip predicate.
+            WalRecord::Intern { .. } => true,
+            // Edge records: always re-execute (edges can change join results).
+            WalRecord::InsertEdge { .. }
+            | WalRecord::DeleteEdge { .. }
+            | WalRecord::InsertEdgeId { .. } => false,
+            _ => false,
+        }
+    }
+
+    /// Resolve a node key to its label sym via the dense id table.
+    /// Returns `None` if the key is unknown or the label is a tombstone sentinel.
+    fn resolve_key_label_sym(key: &str, ids: &IdMap, labels: &[u32]) -> Option<u32> {
+        let id = ids.get(key)?;
+        let sym = labels.get(id as usize).copied()?;
+        (sym != u32::MAX).then_some(sym)
+    }
+
     /// Distribute post-commit events to all live subscribers.
     ///
     /// Called from `log_then_apply_with` after apply + fsync, before the
@@ -3767,6 +3932,23 @@ impl<F: Fs> GraphDb<F> {
                 let Some(inner) = entry.inner.upgrade() else {
                     return false; // subscriber dropped — prune
                 };
+                // Label-skip: if the plan has a known scan label and this commit
+                // can be proven to touch only different labels (and no rule-derived
+                // edge deltas fired), the result set cannot have changed — skip.
+                if let Some(scan_sym) = entry.scan_label {
+                    if engine_deltas.is_empty() {
+                        let touched = Self::commit_touched_labels(
+                            rec,
+                            &self.syms,
+                            &self.ids,
+                            &self.labels,
+                        );
+                        if touched.map(|t| !t.contains(&scan_sym)).unwrap_or(false) {
+                            return true; // safe to skip — result set unchanged
+                        }
+                    }
+                }
+                QUERY_SUB_EXECS_TL.with(|c| c.set(c.get() + 1));
                 let result = match execute(&self.view(), &entry.ops, &Params(&empty_params)) {
                     Ok(r) => r,
                     Err(e) => {
@@ -4041,11 +4223,15 @@ impl<F: Fs> GraphDb<F> {
         let columns = initial.columns().to_vec();
         let prev_row_map = Self::result_to_row_map(&initial);
         let inner = SubInner::new(self.sub_capacity());
+        // Derive the scan-label sym for the commit-skip fast-path.  Any Expand op
+        // or unrecognized leading scan → None (always re-execute).
+        let scan_label = extract_scan_label(&ops, &mut self.syms);
         self.query_subscriptions.push(QuerySubEntry {
             ops,
             columns,
             prev_row_map,
             inner: std::sync::Arc::downgrade(&inner),
+            scan_label,
         });
         Ok(Subscription(inner))
     }

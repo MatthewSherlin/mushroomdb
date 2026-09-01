@@ -26,6 +26,7 @@ pub use db::{
     MutationEvent, NodeInfo, NodeRef, OpenOptions, Precondition, PredicateSummary, RuleStats,
     SnapshotOptions, Stats, WriteAuthz,
 };
+pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
 
 /// Current on-disk snapshot format version written by this build.
 ///
