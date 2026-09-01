@@ -225,6 +225,7 @@ pub fn peek_version(bytes: &[u8]) -> Result<Option<u16>> {
             detail: "snapshot: bad magic or truncated header".into(),
         });
     }
+    // Infallible: `bytes.len() >= 6` checked above; `bytes[4..6]` is exactly 2 bytes.
     Ok(Some(u16::from_le_bytes(bytes[4..6].try_into().unwrap())))
 }
 
@@ -237,6 +238,7 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
             detail: "snapshot: bad magic".into(),
         });
     }
+    // Infallible: `bytes.len() >= 6` checked above; `bytes[4..6]` is exactly 2 bytes.
     let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
     match version {
         VERSION_5 => decode_v5(&bytes[6..]),
@@ -443,6 +445,7 @@ fn strip_crc(body: &[u8]) -> Result<&[u8]> {
             detail: "snapshot: truncated CRC header".into(),
         });
     }
+    // Infallible: `body.len() >= 4` checked above; `body[0..4]` is exactly 4 bytes.
     let crc = u32::from_le_bytes(body[0..4].try_into().unwrap());
     let payload = &body[4..];
     if crc32fast::hash(payload) != crc {

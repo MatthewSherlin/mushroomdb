@@ -665,8 +665,10 @@ def test_node_history_and_was_linked(tmp_path):
     kinds = [e["kind"] for e in hist]
     assert "node_inserted" in kinds
     assert "prop_set" in kinds
-    # was_linked returns a bool for a (missing) edge without error.
-    assert db.was_linked("x", "y", "KNOWS", 999) in (True, False)
+    # was_linked raises RuntimeError when the commit is outside the valid horizon
+    # (documented behaviour — binding does not clamp out-of-range commits to False).
+    with pytest.raises(RuntimeError, match="out of range"):
+        db.was_linked("x", "y", "KNOWS", 999)
     db.close()
 
 

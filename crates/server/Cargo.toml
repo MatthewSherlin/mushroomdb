@@ -17,8 +17,8 @@ default = []
 embed-ui = ["dep:include_dir"]
 
 [dependencies]
-core-api = { package = "mushroomdb", path = "../core-api", version = "0.4.0" }
-arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.4.0" }
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.4.1" }
+arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.4.1" }
 # ws enabled now so Task 5 can add GET /watch without a dep bump.
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
@@ -35,3 +35,4 @@ arrow-array = { version = "59", default-features = false }
 # WS integration: axum oneshot cannot complete an upgrade; real TCP + this client.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+proptest = { workspace = true }

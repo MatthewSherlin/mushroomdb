@@ -3,5 +3,6 @@
   "rule_backfill_wall_s": 13.767794,
   "snapshot_write_s": 0.728758,
   "snapshot_open_s": 0.002227,
-  "query_p50_ms": 0.012519
+  "query_p50_ms": 0.012519,
+  "backfill_field_equal_5k_wall_s": 8.982503
 }

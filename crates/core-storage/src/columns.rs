@@ -76,7 +76,7 @@ impl Bitmap {
         let bytes = read_exact(src, pos, n.saturating_mul(8))?;
         let mut bits = Vec::with_capacity(n);
         for chunk in bytes.chunks_exact(8) {
-            bits.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+            bits.push(u64::from_le_bytes(chunk.try_into().unwrap())); // infallible: chunks_exact(8) yields 8-byte slices
         }
         Ok(Self { bits })
     }
@@ -419,6 +419,7 @@ impl Column {
     }
 
     fn unpack(src: &[u8], pos: &mut usize) -> StoreResult<Self> {
+        // Infallible: `read_exact(src, pos, 1)` returns a 1-byte slice; `first()` cannot return None.
         let tag = *read_exact(src, pos, 1)?.first().unwrap();
         match tag {
             0 => {

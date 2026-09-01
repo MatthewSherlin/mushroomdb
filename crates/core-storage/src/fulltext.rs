@@ -198,6 +198,7 @@ fn parse_query_v2(query: &str) -> Groups {
                 i += 1; // consume closing '"'
             }
             if !phrase_tokens.is_empty() {
+                // Infallible: `groups` is initialised as `vec![vec![]]` and OR never removes groups.
                 groups
                     .last_mut()
                     .unwrap()
@@ -250,6 +251,7 @@ fn parse_query_v2(query: &str) -> Groups {
             // Non-prefix tokens are stemmed.
             let final_token = if prefix { token } else { stem(&token) };
 
+            // Infallible: `groups` is initialised as `vec![vec![]]` and OR never removes groups.
             groups.last_mut().unwrap().push(QueryAtom::Term(Term {
                 token: final_token,
                 prefix,

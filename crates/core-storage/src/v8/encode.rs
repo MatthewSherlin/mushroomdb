@@ -747,7 +747,7 @@ fn unpack_bitmap(buf: &[u8], pos: &mut usize) -> Option<Vec<u64>> {
     Some(
         bytes
             .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap())) // infallible: chunks_exact(8) yields 8-byte slices
             .collect(),
     )
 }
