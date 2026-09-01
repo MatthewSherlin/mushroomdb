@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc c23ba10848b070056272c2dc4ad66d376e319e98f2d2e62d532c324815abe090 # shrinks to n_nodes = 0, prop_mask = 0, float_mask = 0, threshold = 0, op_idx = 0, skip = 0, limit = 1
+cc 5cb66e3eb5c9a44b8359ca07423ce4377ef228b63248c9fbabd781fdd77b1fbd # shrinks to n_nodes = 1, prop_mask = 0, float_mask = 0, threshold = 0, op_idx = 0, skip = 0, limit = 1

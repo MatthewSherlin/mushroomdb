@@ -971,6 +971,10 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                 vars.intern(var);
                 intern_operand(&mut vars, key);
             }
+            PlanOp::IndexScan { var, value, .. } => {
+                vars.intern(var);
+                intern_operand(&mut vars, value);
+            }
             PlanOp::LookupProps { var, props } | PlanOp::JoinBound { var, props, .. } => {
                 vars.intern(var);
                 for (_, operand) in props {
@@ -1172,6 +1176,10 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                         PlanOp::ScanKey { var, key, .. } => {
                             vars.intern(var);
                             intern_operand(&mut vars, key);
+                        }
+                        PlanOp::IndexScan { var, value, .. } => {
+                            vars.intern(var);
+                            intern_operand(&mut vars, value);
                         }
                         PlanOp::Expand {
                             from, rel_var, to, ..
@@ -4887,7 +4895,10 @@ LIMIT 10";
             // assert the fused arm actually executed (counter advanced).
             // Guard: with 0 nodes the label symbol is never interned, so pull_rows
             // exits before the fused detection — nothing to assert in that case.
-            if n_nodes > 0 {
+            // Guard: op_idx==0 (Eq) is folded to IndexScan by the WHERE equality
+            // fold pass — the fused ScanLabel+Filter shape is not produced, so the
+            // FUSED counter does not advance; correctness is still verified below.
+            if n_nodes > 0 && op_idx != 0 {
                 prop_assert!(
                     fires_after > fires_before,
                     "fused arm did NOT fire for op={} threshold={} n_nodes={}: \
@@ -7106,5 +7117,108 @@ LIMIT 10";
         .unwrap();
         assert_eq!(rs.len(), 1);
         assert_eq!(rs.get(0, "n"), Some(&s("alice")));
+    }
+
+    // --- WHERE equality fold executor equivalence tests (T1) ---
+
+    /// Folded WHERE equality uses index when available; fallback returns same count.
+    #[test]
+    fn where_fold_indexed_matches_fallback() {
+        use core_storage::property_index::PropertyIndex;
+        use std::sync::atomic::Ordering;
+
+        let mut fx = Fx::new();
+        let a = fx.add("Person", "alice", vec![("city", s("austin"))]);
+        let b = fx.add("Person", "bob", vec![("city", s("boston"))]);
+        let c = fx.add("Person", "carol", vec![("city", s("austin"))]);
+
+        let mut pi = PropertyIndex::new();
+        pi.enable("Person", "city");
+        pi.set("Person", "city", a, &s("austin"));
+        pi.set("Person", "city", b, &s("boston"));
+        pi.set("Person", "city", c, &s("austin"));
+
+        let q = "MATCH (n:Person) WHERE n.city = 'austin' RETURN n";
+
+        // Indexed path must fire and return both austin nodes.
+        let before = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        let indexed = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
+        let after = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        assert!(after > before, "WHERE equality fold must take the indexed path");
+        assert_eq!(indexed.len(), 2);
+
+        // Fallback (no index) returns the same number of rows.
+        let fallback = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        assert_eq!(fallback.len(), indexed.len(), "fallback must return same count as indexed");
+    }
+
+    /// Folded WHERE equality that matches no nodes returns empty result.
+    #[test]
+    fn where_fold_miss_returns_empty() {
+        let mut fx = Fx::new();
+        fx.add("Person", "alice", vec![("city", s("austin"))]);
+        let q = "MATCH (n:Person) WHERE n.city = 'berlin' RETURN n";
+        let rs = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        assert_eq!(rs.len(), 0);
+    }
+
+    /// WHERE equality with a $param folds to IndexScan and uses the index.
+    #[test]
+    fn where_fold_param_uses_index() {
+        use core_storage::property_index::PropertyIndex;
+        use std::sync::atomic::Ordering;
+
+        let mut fx = Fx::new();
+        let a = fx.add("Person", "alice", vec![("city", s("austin"))]);
+        let b = fx.add("Person", "bob", vec![("city", s("boston"))]);
+
+        let mut pi = PropertyIndex::new();
+        pi.enable("Person", "city");
+        pi.set("Person", "city", a, &s("austin"));
+        pi.set("Person", "city", b, &s("boston"));
+
+        let q = "MATCH (n:Person) WHERE n.city = $c RETURN n";
+        let mut params = BTreeMap::new();
+        params.insert("c".to_string(), s("austin"));
+
+        let before = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        let rs = run(&fx.view_indexed(&pi), q, &params).unwrap();
+        let after = super::INDEX_SCAN_FIRES.load(Ordering::Relaxed);
+        assert!(after > before, "$param WHERE equality must use index");
+        assert_eq!(rs.len(), 1);
+    }
+
+    /// Residual AND predicate is applied after the IndexScan fold.
+    #[test]
+    fn where_fold_residual_filter_applied() {
+        let mut fx = Fx::new();
+        fx.add("Person", "young-austin", vec![("city", s("austin")), ("age", Value::Int(20))]);
+        fx.add("Person", "old-austin", vec![("city", s("austin")), ("age", Value::Int(40))]);
+        fx.add("Person", "boston", vec![("city", s("boston")), ("age", Value::Int(20))]);
+
+        let q = "MATCH (n:Person) WHERE n.city = 'austin' AND n.age > 30 RETURN n";
+        let rs = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        assert_eq!(rs.len(), 1, "only old-austin should match city+age filter");
+        assert_eq!(rs.get(0, "n"), Some(&s("old-austin")));
+    }
+
+    /// IndexScan for an unindexed field falls back to scan+filter; result is correct.
+    /// Counter correctness for the fallback path is already covered by the
+    /// canonical `index_scan_uses_index_and_matches_fallback` test; this test
+    /// focuses on result equivalence when WHERE folds to IndexScan on a field
+    /// that has no declared index.
+    #[test]
+    fn where_fold_unindexed_field_fallback() {
+        let mut fx = Fx::new();
+        fx.add("Person", "a", vec![("notindexed", s("x"))]);
+        fx.add("Person", "b", vec![("notindexed", s("y"))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:Person) WHERE n.notindexed = 'x' RETURN n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.get(0, "n"), Some(&s("a")));
     }
 }

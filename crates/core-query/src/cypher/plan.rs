@@ -8,6 +8,7 @@ use super::ast::{
     AggArg, AggFunc, Expr, LimitSkip, NodePat, Operand, OptionalClause, OrderItem, OrderTarget,
     Pattern, Query, RelDir, RelPat, RetItem, RetVal, UnwindExpr, WithStage,
 };
+use crate::filter::CmpOp;
 use std::collections::BTreeSet;
 
 /// One operator in the logical plan. Patterns compile left-to-right into
@@ -382,6 +383,9 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         check_expr_bound(expr, &bound)?;
         ops.push(PlanOp::Filter { expr: expr.clone() });
     }
+    // Fold WHERE single-equality predicates into IndexScan ops before any
+    // aggregate or project ops are appended.
+    ops = fold_where_equalities(ops);
 
     // Post-UNWIND WHERE: filter expanded rows using UNWIND alias bindings.
     if let Some(expr) = &q.post_unwind_where {
@@ -712,6 +716,121 @@ fn index_lookup(props: &[(String, Operand)]) -> Option<(&str, &Operand)> {
     } else {
         None
     }
+}
+
+/// Split an `Expr::And` chain into a flat list of sub-expressions. Used by the
+/// WHERE-equality fold pass (T1) and compound-equality folding (T2).
+pub(super) fn split_and(expr: Expr) -> Vec<Expr> {
+    match expr {
+        Expr::And(l, r) => {
+            let mut v = split_and(*l);
+            v.extend(split_and(*r));
+            v
+        }
+        other => vec![other],
+    }
+}
+
+/// Reassemble a flat list of expressions into an `Expr::And` chain.
+/// Returns `None` when the list is empty (the caller must drop the Filter op).
+pub(super) fn join_and(mut exprs: Vec<Expr>) -> Option<Expr> {
+    if exprs.is_empty() {
+        return None;
+    }
+    let mut result = exprs.remove(0);
+    for e in exprs {
+        result = Expr::And(Box::new(result), Box::new(e));
+    }
+    Some(result)
+}
+
+/// Post-pass: fold WHERE-clause single-equality predicates into `IndexScan` ops.
+///
+/// Eligibility (conservative):
+/// - The anchoring scan must be `ScanLabel` — `ScanKey` is already O(1);
+///   `IndexScan` already holds one equality (T2 handles compound).
+/// - No `Expand` op may appear between the `ScanLabel` and the `Filter` being
+///   folded: the conservative rule avoids cross-expand pushdown for now.
+/// - The Filter must contain at least one `Cmp{Prop{var==scan_var,field}, Eq,
+///   Lit|Param}` term. Only the first such term is taken; the rest stay as a
+///   residual `Filter` for T2 / the executor to handle.
+///
+/// Folding is always correct regardless of whether the field is indexed:
+/// the `IndexScan` executor arm (exec.rs:1379-1386) falls back to a full scan
+/// + single-equality retain when `nodes_with_prop` returns `None`.
+pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
+    // Find the first ScanLabel.
+    let Some(scan_pos) = ops.iter().position(|op| matches!(op, PlanOp::ScanLabel { .. })) else {
+        return ops;
+    };
+    let (scan_var, scan_label) = match &ops[scan_pos] {
+        PlanOp::ScanLabel { var, label } => (var.clone(), label.clone()),
+        _ => unreachable!(),
+    };
+
+    // Find the first Filter after the ScanLabel.
+    let Some(rel_pos) = ops[scan_pos + 1..]
+        .iter()
+        .position(|op| matches!(op, PlanOp::Filter { .. }))
+    else {
+        return ops;
+    };
+    let filter_pos = scan_pos + 1 + rel_pos;
+
+    // Conservative: do not fold if any Expand lies between ScanLabel and Filter.
+    if ops[scan_pos + 1..filter_pos]
+        .iter()
+        .any(|op| matches!(op, PlanOp::Expand { .. }))
+    {
+        return ops;
+    }
+
+    let filter_expr = match &ops[filter_pos] {
+        PlanOp::Filter { expr } => expr.clone(),
+        _ => unreachable!(),
+    };
+
+    // Flatten the AND chain and find the first eligible equality on the scan var.
+    let mut terms = split_and(filter_expr);
+    let Some(eq_idx) = terms.iter().position(|t| {
+        matches!(
+            t,
+            Expr::Cmp {
+                lhs: Operand::Prop { var, .. },
+                op: CmpOp::Eq,
+                rhs: Operand::Lit(_) | Operand::Param(_),
+            } if var == &scan_var
+        )
+    }) else {
+        return ops;
+    };
+
+    let (field, value) = match terms.remove(eq_idx) {
+        Expr::Cmp {
+            lhs: Operand::Prop { field, .. },
+            rhs,
+            ..
+        } => (field, rhs),
+        _ => unreachable!(),
+    };
+
+    // Promote ScanLabel → IndexScan.
+    ops[scan_pos] = PlanOp::IndexScan {
+        var: scan_var,
+        label: scan_label,
+        field,
+        value,
+    };
+
+    // Drop or narrow the Filter.
+    match join_and(terms) {
+        Some(residual) => ops[filter_pos] = PlanOp::Filter { expr: residual },
+        None => {
+            ops.remove(filter_pos);
+        }
+    }
+
+    ops
 }
 
 fn invert_dir(d: RelDir) -> RelDir {
@@ -1960,5 +2079,75 @@ LIMIT 10";
         assert!(!subscribable(
             "MATCH (a:Person)-[r:KNOWS*1..3]->(b) RETURN b"
         ));
+    }
+
+    // --- WHERE equality fold tests (T1) ---
+
+    #[test]
+    fn where_equality_folds_to_index_scan() {
+        let ops = plan_src("MATCH (n:Person) WHERE n.city = 'austin' RETURN n.key").unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::IndexScan { field, .. } if field == "city"),
+            "WHERE single equality must fold to IndexScan, got {:?}",
+            ops[0]
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, PlanOp::Filter { .. })),
+            "consumed predicate must not remain as Filter"
+        );
+    }
+
+    #[test]
+    fn where_equality_param_folds_to_index_scan() {
+        let ops = plan_src("MATCH (n:Person) WHERE n.city = $c RETURN n.key").unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::IndexScan { .. }),
+            "param WHERE equality must fold to IndexScan, got {:?}",
+            ops[0]
+        );
+    }
+
+    #[test]
+    fn where_and_keeps_residual_filter() {
+        let ops =
+            plan_src("MATCH (n:Person) WHERE n.city = 'austin' AND n.age > 30 RETURN n.key")
+                .unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::IndexScan { field, .. } if field == "city"),
+            "equality must fold to IndexScan, got {:?}",
+            ops[0]
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, PlanOp::Filter { .. })),
+            "n.age > 30 must remain as residual Filter"
+        );
+    }
+
+    #[test]
+    fn where_on_expanded_var_does_not_fold() {
+        let ops = plan_src(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.city = 'austin' RETURN a.key",
+        )
+        .unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::ScanLabel { .. } | PlanOp::IndexScan { .. }),
+            "first op must be a scan, got {:?}",
+            ops[0]
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, PlanOp::Filter { .. })),
+            "b.city filter must remain"
+        );
+    }
+
+    #[test]
+    fn where_inline_prop_and_where_equality_both_usable() {
+        let ops = plan_src("MATCH (n:Person {team: 'core'}) WHERE n.city = 'austin' RETURN n.key")
+            .unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::IndexScan { field, .. } if field == "team"),
+            "inline prop must stay as IndexScan on 'team', got {:?}",
+            ops[0]
+        );
     }
 }
