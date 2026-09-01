@@ -39,6 +39,21 @@ pub enum PlanOp {
         field: String,
         value: Operand,
     },
+    /// Compound indexed equality lookup: seed rows from nodes whose scalar
+    /// properties all satisfy two or more equalities. Emitted when a MATCH node
+    /// has ≥2 non-`id` scalar equalities (inline map, WHERE fold, or a mix).
+    ///
+    /// The executor resolves each `(field, value)` via `nodes_with_prop`:
+    /// indexed fields contribute a candidate list; unindexed fields become
+    /// per-node post-filters (`node_matches`). When ALL fields are unindexed it
+    /// falls back to a full label scan + filter — identical semantics to
+    /// `ScanLabel + LookupProps` but expressed as a single op for later passes.
+    /// `INDEX_INTERSECT_FIRES` advances only when at least one field is indexed.
+    IndexIntersect {
+        var: String,
+        label: Option<String>,
+        equalities: Vec<(String, Operand)>,
+    },
     /// Retain rows whose `var` node matches the pattern-map props.
     LookupProps {
         var: String,
@@ -314,6 +329,7 @@ pub fn is_subscribable(ops: &[PlanOp]) -> bool {
             PlanOp::ScanLabel { .. }
                 | PlanOp::ScanKey { .. }
                 | PlanOp::IndexScan { .. }
+                | PlanOp::IndexIntersect { .. }
                 | PlanOp::LookupProps { .. }
                 | PlanOp::Expand { .. }
                 | PlanOp::Filter { .. }
@@ -325,7 +341,10 @@ pub fn is_subscribable(ops: &[PlanOp]) -> bool {
     && ops.iter().any(|op| {
         matches!(
             op,
-            PlanOp::ScanLabel { .. } | PlanOp::ScanKey { .. } | PlanOp::IndexScan { .. }
+            PlanOp::ScanLabel { .. }
+                | PlanOp::ScanKey { .. }
+                | PlanOp::IndexScan { .. }
+                | PlanOp::IndexIntersect { .. }
         )
     })
     // Exactly one Project (ensures it is a RETURN query).
@@ -718,6 +737,21 @@ fn index_lookup(props: &[(String, Operand)]) -> Option<(&str, &Operand)> {
     }
 }
 
+/// Two or more non-`id` equalities all with literal or `$param` values —
+/// the shape eligible for `IndexIntersect`. Returns the full equality list
+/// when ALL props qualify (no `id` field, all Lit|Param operands, len ≥ 2).
+fn multi_index_lookup(props: &[(String, Operand)]) -> Option<Vec<(String, Operand)>> {
+    if props.len() < 2 {
+        return None;
+    }
+    if props.iter().any(|(f, v)| {
+        f == "id" || !matches!(v, Operand::Lit(_) | Operand::Param(_))
+    }) {
+        return None;
+    }
+    Some(props.to_vec())
+}
+
 /// Split an `Expr::And` chain into a flat list of sub-expressions. Used by the
 /// WHERE-equality fold pass (T1) and compound-equality folding (T2).
 pub(super) fn split_and(expr: Expr) -> Vec<Expr> {
@@ -767,16 +801,26 @@ pub(super) fn join_and(mut exprs: Vec<Expr>) -> Option<Expr> {
 /// trigger the error; nodes eliminated by the `IndexScan` will not surface it.
 /// This is consistent with predicate pushdown in all standard query engines.
 pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
-    // Find the first ScanLabel.
-    let Some(scan_pos) = ops.iter().position(|op| matches!(op, PlanOp::ScanLabel { .. })) else {
+    // Locate the anchoring scan op: ScanLabel (most common), or IndexScan produced
+    // by the inline-prop path (merge with WHERE equalities → IndexIntersect).
+    // IndexIntersect anchors are not re-folded here; T2's exec handles them.
+    let Some(scan_pos) = ops.iter().position(|op| {
+        matches!(op, PlanOp::ScanLabel { .. } | PlanOp::IndexScan { .. })
+    }) else {
         return ops;
     };
-    let (scan_var, scan_label) = match &ops[scan_pos] {
-        PlanOp::ScanLabel { var, label } => (var.clone(), label.clone()),
+
+    // Extract the scan variable, label, and any equality already committed by an
+    // inline-prop IndexScan (used when merging inline+WHERE into IndexIntersect).
+    let (scan_var, scan_label, existing_eq) = match &ops[scan_pos] {
+        PlanOp::ScanLabel { var, label } => (var.clone(), label.clone(), None),
+        PlanOp::IndexScan { var, label, field, value } => {
+            (var.clone(), label.clone(), Some((field.clone(), value.clone())))
+        }
         _ => unreachable!(),
     };
 
-    // Find the first Filter after the ScanLabel.
+    // Find the first Filter after the anchoring scan op.
     let Some(rel_pos) = ops[scan_pos + 1..]
         .iter()
         .position(|op| matches!(op, PlanOp::Filter { .. }))
@@ -785,7 +829,7 @@ pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
     };
     let filter_pos = scan_pos + 1 + rel_pos;
 
-    // Conservative: do not fold if any Expand lies between ScanLabel and Filter.
+    // Conservative: do not fold if any Expand lies between the anchor and the Filter.
     if ops[scan_pos + 1..filter_pos]
         .iter()
         .any(|op| matches!(op, PlanOp::Expand { .. }))
@@ -798,36 +842,59 @@ pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
         _ => unreachable!(),
     };
 
-    // Flatten the AND chain and find the first eligible equality on the scan var.
+    // Flatten the AND chain and collect ALL eligible equalities on the scan var.
     let mut terms = split_and(filter_expr);
-    let Some(eq_idx) = terms.iter().position(|t| {
-        matches!(
-            t,
+    let mut extracted: Vec<(String, Operand)> = Vec::new();
+    let mut i = 0;
+    while i < terms.len() {
+        if matches!(
+            &terms[i],
             Expr::Cmp {
                 lhs: Operand::Prop { var, .. },
                 op: CmpOp::Eq,
                 rhs: Operand::Lit(_) | Operand::Param(_),
             } if var == &scan_var
-        )
-    }) else {
+        ) {
+            let term = terms.remove(i);
+            match term {
+                Expr::Cmp {
+                    lhs: Operand::Prop { field, .. },
+                    rhs,
+                    ..
+                } => extracted.push((field, rhs)),
+                _ => unreachable!(),
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    if extracted.is_empty() {
         return ops;
-    };
+    }
 
-    let (field, value) = match terms.remove(eq_idx) {
-        Expr::Cmp {
-            lhs: Operand::Prop { field, .. },
-            rhs,
-            ..
-        } => (field, rhs),
-        _ => unreachable!(),
-    };
+    // Merge any pre-existing inline equality (from IndexScan) with the WHERE equalities.
+    let mut all_equalities: Vec<(String, Operand)> = Vec::new();
+    if let Some(eq) = existing_eq {
+        all_equalities.push(eq);
+    }
+    all_equalities.extend(extracted);
 
-    // Promote ScanLabel → IndexScan.
-    ops[scan_pos] = PlanOp::IndexScan {
-        var: scan_var,
-        label: scan_label,
-        field,
-        value,
+    // Promote the anchor op.
+    ops[scan_pos] = if all_equalities.len() == 1 {
+        let (field, value) = all_equalities.remove(0);
+        PlanOp::IndexScan {
+            var: scan_var,
+            label: scan_label,
+            field,
+            value,
+        }
+    } else {
+        PlanOp::IndexIntersect {
+            var: scan_var,
+            label: scan_label,
+            equalities: all_equalities,
+        }
     };
 
     // Drop or narrow the Filter.
@@ -925,6 +992,13 @@ fn compile_pattern(
             label: pat.start.label.clone(),
             field: field.to_string(),
             value: value.clone(),
+        });
+        bound.insert(start.clone());
+    } else if let Some(equalities) = multi_index_lookup(&pat.start.props) {
+        ops.push(PlanOp::IndexIntersect {
+            var: start.clone(),
+            label: pat.start.label.clone(),
+            equalities,
         });
         bound.insert(start.clone());
     } else {
@@ -2150,16 +2224,70 @@ LIMIT 10";
 
     #[test]
     fn where_inline_prop_and_where_equality_both_usable() {
+        // T2: inline prop + WHERE equality on same var → IndexIntersect with both.
         let ops = plan_src("MATCH (n:Person {team: 'core'}) WHERE n.city = 'austin' RETURN n.key")
             .unwrap();
         assert!(
-            matches!(&ops[0], PlanOp::IndexScan { field, .. } if field == "team"),
-            "inline prop must stay as IndexScan on 'team', got {:?}",
+            matches!(&ops[0], PlanOp::IndexIntersect { equalities, .. } if equalities.len() == 2),
+            "inline+WHERE equalities must merge to IndexIntersect(2), got {:?}",
             ops[0]
         );
         assert!(
-            ops.iter().any(|op| matches!(op, PlanOp::Filter { .. })),
-            "WHERE n.city = 'austin' must remain as Filter (T2 handles compound fold)"
+            !ops.iter().any(|op| matches!(op, PlanOp::Filter { .. })),
+            "both equalities fully folded; no residual Filter expected"
+        );
+    }
+
+    // --- IndexIntersect tests (T2) ---
+
+    #[test]
+    fn single_equality_inline_stays_index_scan() {
+        // Regression: single inline prop must stay IndexScan, not IndexIntersect.
+        let ops = plan_src("MATCH (n:Person {city: 'austin'}) RETURN n").unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::IndexScan { field, .. } if field == "city"),
+            "single-equality inline prop must emit IndexScan, got {:?}",
+            ops[0]
+        );
+    }
+
+    #[test]
+    fn compound_inline_props_emit_index_intersect() {
+        let ops =
+            plan_src("MATCH (n:Doc {namespace: 'a', status: 'live'}) RETURN n.key").unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::IndexIntersect { equalities, .. } if equalities.len() == 2),
+            "two inline props must emit IndexIntersect(2), got {:?}",
+            ops[0]
+        );
+    }
+
+    #[test]
+    fn where_two_equalities_emit_index_intersect() {
+        let ops = plan_src(
+            "MATCH (n:Doc) WHERE n.namespace = 'a' AND n.status = $s RETURN n.key",
+        )
+        .unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::IndexIntersect { equalities, .. } if equalities.len() == 2),
+            "two WHERE equalities must emit IndexIntersect(2), got {:?}",
+            ops[0]
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, PlanOp::Filter { .. })),
+            "both equalities fully consumed; no residual Filter expected"
+        );
+    }
+
+    #[test]
+    fn mixed_inline_and_where_equalities_merge() {
+        let ops =
+            plan_src("MATCH (n:Doc {namespace: 'a'}) WHERE n.status = 'live' RETURN n.key")
+                .unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::IndexIntersect { equalities, .. } if equalities.len() == 2),
+            "inline+WHERE equalities must merge to IndexIntersect(2), got {:?}",
+            ops[0]
         );
     }
 }

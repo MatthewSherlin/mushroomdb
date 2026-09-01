@@ -31,6 +31,13 @@ static SCAN_KEY_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 pub static INDEX_SCAN_FIRES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only counter incremented each time an `IndexIntersect` takes the
+/// indexed path (at least one field resolved via `nodes_with_prop`). Does not
+/// advance on the all-unindexed full-scan fallback.
+#[cfg(test)]
+pub static INDEX_INTERSECT_FIRES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Query parameters. Missing names anywhere in the plan are an error at
 /// execution start (the plan is walked before any rows are produced).
 pub struct Params<'a>(pub &'a BTreeMap<String, Value>);
@@ -398,6 +405,21 @@ fn execute_inner(
                     label.as_deref(),
                     field,
                     value,
+                    params,
+                )?;
+            }
+            PlanOp::IndexIntersect {
+                var,
+                label,
+                equalities,
+            } => {
+                rows = scan_intersect(
+                    view,
+                    &vars,
+                    &rows,
+                    var,
+                    label.as_deref(),
+                    equalities,
                     params,
                 )?;
             }
@@ -975,6 +997,12 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                 vars.intern(var);
                 intern_operand(&mut vars, value);
             }
+            PlanOp::IndexIntersect { var, equalities, .. } => {
+                vars.intern(var);
+                for (_, operand) in equalities {
+                    intern_operand(&mut vars, operand);
+                }
+            }
             PlanOp::LookupProps { var, props } | PlanOp::JoinBound { var, props, .. } => {
                 vars.intern(var);
                 for (_, operand) in props {
@@ -1180,6 +1208,12 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                         PlanOp::IndexScan { var, value, .. } => {
                             vars.intern(var);
                             intern_operand(&mut vars, value);
+                        }
+                        PlanOp::IndexIntersect { var, equalities, .. } => {
+                            vars.intern(var);
+                            for (_, operand) in equalities {
+                                intern_operand(&mut vars, operand);
+                            }
                         }
                         PlanOp::Expand {
                             from, rel_var, to, ..
@@ -1412,6 +1446,123 @@ fn scan_index(
         return Ok(Vec::new());
     };
     let ids = index_scan_ids(view, vars, first, label, field, value, params)?;
+    let slot = vars
+        .slot(var)
+        .ok_or_else(|| format!("unbound variable `{var}`"))?;
+    let cap = max_intermediate_rows();
+    let mut out = Vec::new();
+    for row in rows {
+        for &id in &ids {
+            if out.len() >= cap {
+                return Err(row_cap_err(cap));
+            }
+            let mut next = row.clone();
+            next[slot] = Some(Cell::Node(id));
+            out.push(next);
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve candidate node ids for an `IndexIntersect` op.
+///
+/// Partitions `equalities` into indexed (label+field in `prop_index`) and
+/// unindexed fields. If ALL fields are unindexed → full label scan filtered by
+/// all equalities (`INDEX_INTERSECT_FIRES` does NOT advance). Otherwise:
+/// intersects the sorted id-lists from indexed fields (smallest set first,
+/// two-pointer merge), then applies unindexed fields as per-node post-filters
+/// via `node_matches` (`INDEX_INTERSECT_FIRES` advances once).
+#[allow(clippy::too_many_arguments)]
+fn index_intersect_ids(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    label: Option<&str>,
+    equalities: &[(String, Operand)],
+    params: &Params,
+) -> Result<Vec<u32>, String> {
+    // Resolve all operands to concrete Values (needed for both paths).
+    let mut resolved: Vec<(String, Option<Value>)> = Vec::with_capacity(equalities.len());
+    for (field, operand) in equalities {
+        let val = resolve_operand(view, vars, row, operand, params)?;
+        resolved.push((field.clone(), val));
+    }
+
+    // Partition into indexed and unindexed fields.
+    let mut indexed_lists: Vec<Vec<u32>> = Vec::new();
+    let mut unindexed_props: Vec<(String, Operand)> = Vec::new();
+
+    for ((field, val_opt), (_, operand)) in resolved.iter().zip(equalities.iter()) {
+        if let (Some(label_str), Some(val)) = (label, val_opt.as_ref()) {
+            if let Some(ids) = view.nodes_with_prop(label_str, field, val) {
+                indexed_lists.push(ids);
+                continue;
+            }
+        }
+        unindexed_props.push((field.clone(), operand.clone()));
+    }
+
+    if indexed_lists.is_empty() {
+        // All-unindexed fallback: full label scan + filter. Counter does NOT advance.
+        let mut out = Vec::new();
+        for id in scan_ids(view, label) {
+            if node_matches(view, vars, row, id, None, equalities, params)? {
+                out.push(id);
+            }
+        }
+        return Ok(out);
+    }
+
+    #[cfg(test)]
+    INDEX_INTERSECT_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Two-pointer intersection of sorted id lists — smallest list first.
+    indexed_lists.sort_unstable_by_key(|v| v.len());
+    let mut result = indexed_lists.remove(0);
+    for other in indexed_lists {
+        let mut merged = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        while i < result.len() && j < other.len() {
+            match result[i].cmp(&other[j]) {
+                std::cmp::Ordering::Equal => {
+                    merged.push(result[i]);
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+            }
+        }
+        result = merged;
+    }
+
+    // Apply unindexed fields as post-filter.
+    if !unindexed_props.is_empty() {
+        result.retain(|&id| {
+            node_matches(view, vars, row, id, None, &unindexed_props, params)
+                .unwrap_or(false)
+        });
+    }
+
+    Ok(result)
+}
+
+/// Execute an `IndexIntersect`: seed rows from nodes satisfying all equalities
+/// (see [`index_intersect_ids`]).
+#[allow(clippy::too_many_arguments)]
+fn scan_intersect(
+    view: &GraphView,
+    vars: &VarTable,
+    rows: &[Row],
+    var: &str,
+    label: Option<&str>,
+    equalities: &[(String, Operand)],
+    params: &Params,
+) -> Result<Vec<Row>, String> {
+    let Some(first) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let ids = index_intersect_ids(view, vars, first, label, equalities, params)?;
     let slot = vars
         .slot(var)
         .ok_or_else(|| format!("unbound variable `{var}`"))?;
@@ -2594,6 +2745,29 @@ fn agg_stream(
                 agg_stream(ctx, rest, &next, acc)?;
             }
         }
+        PlanOp::IndexIntersect {
+            var,
+            label,
+            equalities,
+        } => {
+            let ids = index_intersect_ids(
+                ctx.view,
+                ctx.vars,
+                row,
+                label.as_deref(),
+                equalities,
+                ctx.params,
+            )?;
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for id in ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                agg_stream(ctx, rest, &next, acc)?;
+            }
+        }
         PlanOp::Expand {
             from,
             rel_var,
@@ -3076,6 +3250,29 @@ fn group_stream(
                 group_stream(ctx, rest, &next, groups, key_order)?;
             }
         }
+        PlanOp::IndexIntersect {
+            var,
+            label,
+            equalities,
+        } => {
+            let ids = index_intersect_ids(
+                ctx.view,
+                ctx.vars,
+                row,
+                label.as_deref(),
+                equalities,
+                ctx.params,
+            )?;
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            for id in ids {
+                let mut next = row.clone();
+                next[slot] = Some(Cell::Node(id));
+                group_stream(ctx, rest, &next, groups, key_order)?;
+            }
+        }
         PlanOp::Expand {
             from,
             rel_var,
@@ -3432,6 +3629,33 @@ fn pull_rows(
                 label.as_deref(),
                 field,
                 value,
+                ctx.params,
+            )?;
+            let prev = row[slot].clone();
+            for id in ids {
+                if result.len() >= ctx.bound {
+                    break;
+                }
+                row[slot] = Some(Cell::Node(id));
+                pull_rows(ctx, rest, row, result)?;
+            }
+            row[slot] = prev;
+        }
+        PlanOp::IndexIntersect {
+            var,
+            label,
+            equalities,
+        } => {
+            let slot = ctx
+                .vars
+                .slot(var)
+                .ok_or_else(|| format!("unbound variable `{var}`"))?;
+            let ids = index_intersect_ids(
+                ctx.view,
+                ctx.vars,
+                row,
+                label.as_deref(),
+                equalities,
                 ctx.params,
             )?;
             let prev = row[slot].clone();
@@ -7224,5 +7448,181 @@ LIMIT 10";
         .unwrap();
         assert_eq!(rs.len(), 1);
         assert_eq!(rs.get(0, "n"), Some(&s("a")));
+    }
+
+    // --- IndexIntersect executor equivalence tests (T2) ---
+
+    /// Both fields indexed: IndexIntersect fires and returns only the node matching both.
+    #[test]
+    fn index_intersect_both_indexed_fires() {
+        use core_storage::property_index::PropertyIndex;
+        use std::sync::atomic::Ordering;
+
+        let mut fx = Fx::new();
+        // alice: city=austin, age=30 — both match
+        let a = fx.add("Person", "alice", vec![("city", s("austin")), ("age", Value::Int(30))]);
+        // bob: city=austin, age=25 — city matches, age misses
+        let b = fx.add("Person", "bob", vec![("city", s("austin")), ("age", Value::Int(25))]);
+        // carol: city=boston, age=30 — age matches, city misses
+        let c = fx.add("Person", "carol", vec![("city", s("boston")), ("age", Value::Int(30))]);
+
+        let mut pi = PropertyIndex::new();
+        pi.enable("Person", "city");
+        pi.enable("Person", "age");
+        pi.set("Person", "city", a, &s("austin"));
+        pi.set("Person", "city", b, &s("austin"));
+        pi.set("Person", "city", c, &s("boston"));
+        pi.set("Person", "age", a, &Value::Int(30));
+        pi.set("Person", "age", b, &Value::Int(25));
+        pi.set("Person", "age", c, &Value::Int(30));
+
+        let q = "MATCH (n:Person) WHERE n.city = 'austin' AND n.age = 30 RETURN n";
+
+        let before = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
+        let indexed = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
+        let after = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
+        assert!(after > before, "IndexIntersect must advance counter on indexed path");
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed.get(0, "n"), Some(&s("alice")));
+
+        // Fallback (no index) returns the same row.
+        let fallback = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        assert_eq!(
+            rows_of(&fallback),
+            rows_of(&indexed),
+            "fallback must return identical rows"
+        );
+    }
+
+    /// One indexed field + one unindexed: indexed path fires; unindexed field is post-filtered.
+    #[test]
+    fn index_intersect_one_indexed_one_not() {
+        use core_storage::property_index::PropertyIndex;
+        use std::sync::atomic::Ordering;
+
+        let mut fx = Fx::new();
+        let a = fx.add("Person", "alice", vec![("city", s("austin")), ("role", s("eng"))]);
+        let b = fx.add("Person", "bob", vec![("city", s("austin")), ("role", s("mgr"))]);
+        let _c = fx.add("Person", "carol", vec![("city", s("boston")), ("role", s("eng"))]);
+
+        // Only city is indexed; role is not.
+        let mut pi = PropertyIndex::new();
+        pi.enable("Person", "city");
+        pi.set("Person", "city", a, &s("austin"));
+        pi.set("Person", "city", b, &s("austin"));
+
+        let q = "MATCH (n:Person) WHERE n.city = 'austin' AND n.role = 'eng' RETURN n";
+
+        let before = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
+        let rs = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
+        let after = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
+        assert!(after > before, "IndexIntersect must fire when at least one field is indexed");
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.get(0, "n"), Some(&s("alice")));
+    }
+
+    /// No indexed fields: full scan fallback returns the correct node.
+    /// Counter isolation is not asserted here because parallel tests share the
+    /// global INDEX_INTERSECT_FIRES atomic; the fires-on-indexed path is already
+    /// covered by `index_intersect_both_indexed_fires`.
+    #[test]
+    fn index_intersect_no_indexed_fallback() {
+        let mut fx = Fx::new();
+        fx.add("Person", "alice", vec![("x", s("1")), ("y", s("a"))]);
+        fx.add("Person", "bob", vec![("x", s("1")), ("y", s("b"))]);
+        fx.add("Person", "carol", vec![("x", s("2")), ("y", s("a"))]);
+
+        let q = "MATCH (n:Person) WHERE n.x = '1' AND n.y = 'a' RETURN n";
+        let rs = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.get(0, "n"), Some(&s("alice")));
+    }
+
+    /// Two-field intersect with no nodes matching both returns empty.
+    #[test]
+    fn index_intersect_empty_intersection() {
+        use core_storage::property_index::PropertyIndex;
+
+        let mut fx = Fx::new();
+        let a = fx.add("Person", "alice", vec![("city", s("austin")), ("age", Value::Int(30))]);
+        let b = fx.add("Person", "bob", vec![("city", s("boston")), ("age", Value::Int(25))]);
+
+        let mut pi = PropertyIndex::new();
+        pi.enable("Person", "city");
+        pi.enable("Person", "age");
+        pi.set("Person", "city", a, &s("austin"));
+        pi.set("Person", "city", b, &s("boston"));
+        pi.set("Person", "age", a, &Value::Int(30));
+        pi.set("Person", "age", b, &Value::Int(25));
+
+        // Requesting city=boston AND age=30 — no node has both.
+        let q = "MATCH (n:Person) WHERE n.city = 'boston' AND n.age = 30 RETURN n";
+        let rs = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
+        assert_eq!(rs.len(), 0);
+    }
+
+    /// IndexIntersect equality using $params resolves at runtime and fires correctly.
+    #[test]
+    fn index_intersect_with_params() {
+        use core_storage::property_index::PropertyIndex;
+        use std::sync::atomic::Ordering;
+
+        let mut fx = Fx::new();
+        let a = fx.add("Person", "alice", vec![("city", s("austin")), ("age", Value::Int(30))]);
+        let b = fx.add("Person", "bob", vec![("city", s("boston")), ("age", Value::Int(30))]);
+
+        let mut pi = PropertyIndex::new();
+        pi.enable("Person", "city");
+        pi.enable("Person", "age");
+        pi.set("Person", "city", a, &s("austin"));
+        pi.set("Person", "city", b, &s("boston"));
+        pi.set("Person", "age", a, &Value::Int(30));
+        pi.set("Person", "age", b, &Value::Int(30));
+
+        let q = "MATCH (n:Person) WHERE n.city = $c AND n.age = $a RETURN n";
+        let mut params = BTreeMap::new();
+        params.insert("c".to_string(), s("austin"));
+        params.insert("a".to_string(), Value::Int(30));
+
+        let before = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
+        let rs = run(&fx.view_indexed(&pi), q, &params).unwrap();
+        let after = super::INDEX_INTERSECT_FIRES.load(Ordering::Relaxed);
+        assert!(after > before, "$param intersect must fire indexed path");
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.get(0, "n"), Some(&s("alice")));
+    }
+
+    /// Three-field intersect with two indexed fields returns the one node matching all three.
+    #[test]
+    fn index_intersect_three_fields() {
+        use core_storage::property_index::PropertyIndex;
+
+        let mut fx = Fx::new();
+        // alice: all three match
+        let a = fx.add("Person", "alice", vec![
+            ("city", s("austin")),
+            ("age", Value::Int(30)),
+            ("role", s("eng")),
+        ]);
+        // bob: city+age match, role misses
+        let b = fx.add("Person", "bob", vec![
+            ("city", s("austin")),
+            ("age", Value::Int(30)),
+            ("role", s("mgr")),
+        ]);
+
+        let mut pi = PropertyIndex::new();
+        pi.enable("Person", "city");
+        pi.enable("Person", "age");
+        // role intentionally not indexed
+        pi.set("Person", "city", a, &s("austin"));
+        pi.set("Person", "city", b, &s("austin"));
+        pi.set("Person", "age", a, &Value::Int(30));
+        pi.set("Person", "age", b, &Value::Int(30));
+
+        let q = "MATCH (n:Person) WHERE n.city = 'austin' AND n.age = 30 AND n.role = 'eng' RETURN n";
+        let rs = run(&fx.view_indexed(&pi), q, &BTreeMap::new()).unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.get(0, "n"), Some(&s("alice")));
     }
 }
