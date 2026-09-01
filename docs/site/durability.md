@@ -42,6 +42,39 @@ otherwise reads unchecked. Run it before restoring a snapshot from an untrusted
 source — CRC32 alone cannot detect a maliciously crafted image (an attacker can
 recompute the checksum), but the structural pass rejects out-of-bounds pointers.
 
+## Format compatibility matrix
+
+Every historical snapshot format is permanently readable.  A format version is
+stamped in the 6-byte header (magic `GDB1` + 2-byte little-endian version).
+
+| Version | Introduced in | Status | Notes |
+|---------|--------------|--------|-------|
+| V5 | 0.1.0 | readable | uncompressed bincode + CRC32 header; **no encoder** — only the golden fixture pin covers this format |
+| V6 | 0.1.1 | readable | zstd-compressed V5 payload in a container |
+| V7 | pre-0.2.0 (interim) | readable | zstd(CRC + packed CSR + packed columns + bincode meta) |
+| V8 | 0.2.0+ | default | 4 KB header page + rkyv sections; mmap-able, zero-copy open |
+
+**Patch-stability promise:** a snapshot written by any 0.4.x release opens
+correctly on any other 0.4.x binary without migration.  Format version is only
+bumped on minor or major releases.
+
+**What the golden pins prove:** `crates/core-api/tests/fixtures/` contains a
+committed binary fixture for each version (golden_v5.bin … golden_v8.bin).  The
+`golden_v{5..8}_pin` tests in the `snapshot` integration-test suite load each
+fixture into a real `GraphDb::open()` call and assert node count, edge count, and
+specific property values.  A change to any decoder that silently corrupts data
+will fail its pin, not just the new-data tests.
+
+**V5 limitation:** the V5 encoder was removed when V6 shipped.  The V5 golden
+pin contains 2 nodes and 1 edge (the minimal shape that exercises the decoder);
+richer content coverage is not possible without a V5 encoder.
+
+**format-compat CI job:** the `format-compat` job runs
+`cargo test -p mushroomdb --test snapshot --test migrate`, which exercises every
+version pin and every migration path on every CI run.  A failure in that job
+names the format-compat category explicitly rather than surfacing as a generic
+test failure.
+
 ## Roadmap
 
 A future optimization can make rule-derived edges first-class replayable WAL

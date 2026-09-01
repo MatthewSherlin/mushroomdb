@@ -28,6 +28,8 @@ fn main() -> ExitCode {
             token,
             role_tokens,
             snapshot_every,
+            tls_cert,
+            tls_key,
         }) => {
             let token = token.filter(|s| !s.is_empty()).or_else(|| {
                 std::env::var("MUSHROOMDB_TOKEN")
@@ -81,6 +83,8 @@ fn main() -> ExitCode {
                 token,
                 all_role_tokens,
                 snapshot_every,
+                tls_cert,
+                tls_key,
             ))
         }
         Ok(Command::Mcp { db_dir }) => exit(run_mcp(db_dir)),
@@ -216,6 +220,7 @@ fn fail(msg: &str) -> ExitCode {
     ExitCode::from(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_serve(
     db_dir: PathBuf,
     addr: SocketAddr,
@@ -223,6 +228,8 @@ fn run_serve(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
     snapshot_every: Option<Duration>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async {
@@ -247,6 +254,24 @@ fn run_serve(
         }
         let db_serve = db.clone();
         let mut serve = tokio::spawn(async move {
+            // TLS path: both --tls-cert and --tls-key were supplied.
+            if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+                #[cfg(feature = "tls")]
+                {
+                    return server::serve_tls(db_serve, addr, tx, cert, key, token, role_tokens)
+                        .await;
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    let _ = (cert, key, db_serve, addr, tx, token, role_tokens);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "this binary was built without TLS support; \
+                         rebuild with --features tls or terminate TLS at a \
+                         reverse proxy (see docs/site/deployment.md)",
+                    ));
+                }
+            }
             match ui {
                 ServeUi::Filesystem(dir) => {
                     server::serve_with_ui_and_role_tokens(

@@ -14,6 +14,10 @@ configured, every HTTP request except `GET /health` must present
 and WebSockets; HTML responses set the cookie so `/assets/*` load. The
 process refuses to start if `--addr` is not loopback and no token is set.
 
+For TLS options — terminating at a reverse proxy (recommended) or using the
+native `--features tls` rustls path — see
+[docs/site/deployment.md](docs/site/deployment.md).
+
 The `mushroomdb mcp` mode reads and writes to a local database via stdio
 only. It opens no sockets.
 

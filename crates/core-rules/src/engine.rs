@@ -215,9 +215,10 @@ pub struct RuleEngine {
 /// `VectorClusters` for `approximate=true` (VectorSimilar-rooted predicates).
 fn candidate_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
     if def.approximate {
-        // k = max(max_edges, 64): return at least 64 candidates so evaluation
-        // has a meaningful pool; bounded by max_edges when set by the caller.
-        let k = def.max_edges.map(|me| me.max(64)).unwrap_or(64) as usize;
+        // k = max(max_edges, 128): return at least 128 candidates so the HNSW
+        // beam's expanded reach (M₀=128 layer-0 edges) is not truncated before
+        // evaluation; bounded by max_edges when set by the caller.
+        let k = def.max_edges.map(|me| me.max(128)).unwrap_or(128) as usize;
         candidate_spec_approx_with_k(&def.predicate, k)
     } else {
         candidate_spec(&def.predicate)

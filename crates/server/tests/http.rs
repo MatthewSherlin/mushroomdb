@@ -11,7 +11,9 @@ use core_api::{
 use serde_json::{json, Value as Json};
 #[cfg(feature = "embed-ui")]
 use server::router_with_embedded_ui;
-use server::{router, router_with_auth, router_with_role_tokens, router_with_ui, serve};
+use server::{
+    router, router_with_auth, router_with_role_tokens, router_with_ui, router_with_ui_tls, serve,
+};
 use std::io::Cursor;
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -275,6 +277,43 @@ async fn html_query_token_sets_auth_cookie() {
     assert!(
         cookie.contains("SameSite=Lax"),
         "Set-Cookie SameSite=Lax, got {cookie:?}"
+    );
+    assert!(
+        cookie.contains("HttpOnly"),
+        "Set-Cookie HttpOnly, got {cookie:?}"
+    );
+    assert!(
+        !cookie.contains("Secure"),
+        "plain-HTTP router must not set Secure on cookie, got {cookie:?}"
+    );
+}
+
+/// Cookie carries `; Secure` when the router is flagged as TLS-active,
+/// even in an in-process test (no real TLS needed — the flag drives the attribute).
+#[tokio::test]
+async fn auth_cookie_is_secure_when_tls_active() {
+    let ui = tmp("ui-cookie-tls");
+    std::fs::create_dir_all(&ui).unwrap();
+    std::fs::write(
+        ui.join("index.html"),
+        "<!doctype html><title>graph-db</title>",
+    )
+    .unwrap();
+    let db = SharedDb::open(&tmp("ui-cookie-tls-db")).unwrap();
+    let app = router_with_ui_tls(db, &ui, Some("t".into()));
+    let (status, _, headers) = send_headers(app, get("/?token=t")).await;
+    assert_eq!(status, StatusCode::OK);
+    let cookie = headers
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        cookie.contains("mushroomdb_token=t"),
+        "Set-Cookie must include mushroomdb_token=, got {cookie:?}"
+    );
+    assert!(
+        cookie.contains("; Secure"),
+        "TLS-active router must include Secure attribute, got {cookie:?}"
     );
     assert!(
         cookie.contains("HttpOnly"),

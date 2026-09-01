@@ -162,6 +162,10 @@ impl WriteQueue {
     }
 
     fn signal_shutdown(&self) {
+        // Hold the queue mutex while flagging + notifying: the drain thread
+        // checks `shutdown` only under this mutex, so the notify can no longer
+        // fire between its predicate check and Condvar::wait (missed wakeup).
+        let _lock = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         self.shutdown.store(true, Ordering::Release);
         self.notify.notify_all();
     }

@@ -160,6 +160,13 @@ rules: 7
 
 ---
 
+## Deployment and TLS
+
+To serve over HTTPS — via a reverse proxy (nginx, Caddy) or the built-in
+`--features tls` rustls path — see [deployment.md](deployment.md).
+
+---
+
 ## Known first-run issues
 
 - `demo` refuses a non-empty directory, including hidden files (`.DS_Store`

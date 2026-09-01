@@ -172,7 +172,6 @@ pub fn encode_v6(state: &SnapshotState) -> Vec<u8> {
     wrap_zstd(VERSION_6, crc_inner(&payload))
 }
 
-#[allow(dead_code)]
 fn section_len(name: &str, len: usize) -> Result<u32> {
     u32::try_from(len).map_err(|_| GraphError::Corrupt {
         detail: format!(
@@ -181,8 +180,7 @@ fn section_len(name: &str, len: usize) -> Result<u32> {
     })
 }
 
-#[allow(dead_code)]
-fn encode_v7(state: &SnapshotState) -> Result<Vec<u8>> {
+pub fn encode_v7(state: &SnapshotState) -> Result<Vec<u8>> {
     let mut topo = Vec::new();
     state.topo.pack(&mut topo);
     let mut props = Vec::new();
@@ -208,7 +206,7 @@ fn encode_v7(state: &SnapshotState) -> Result<Vec<u8>> {
     push_u32(&mut payload, section_len("columns", props.len())?);
     payload.extend_from_slice(&props);
     payload.extend_from_slice(&meta_bytes);
-    Ok(wrap_zstd(VERSION, crc_inner(&payload)))
+    Ok(wrap_zstd(VERSION_7, crc_inner(&payload)))
 }
 
 /// Peek at the on-disk snapshot format version without a full decode.

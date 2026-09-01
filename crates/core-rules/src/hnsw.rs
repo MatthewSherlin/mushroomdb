@@ -28,7 +28,16 @@ const MAX_LEVEL: usize = 16;
 /// `M` — max connections per layer (except layer 0).
 pub const M: usize = 32;
 /// `M₀` — max connections at layer 0.
-pub const M0: usize = 64;
+///
+/// Raised from 64 → 128 (v0.4.2) to support clustered-density graphs where
+/// natural clusters exceed 64 nodes. At M₀=64, nodes beyond the 64th in a
+/// cluster become inbound-only leaves invisible to beam search, capping recall
+/// at ~64/cluster_size. M₀=128 raises the density ceiling to ~128-node
+/// clusters; it does NOT remove the structural pathology — the HNSW §3.5
+/// diverse-neighbour heuristic is the true fix, ledgered for v0.4.3+.
+/// Memory cost: layer-0 adjacency roughly doubles (~256 B → ~512 B/node;
+/// ~256 MB at the 500k-node ceiling). Disclosed in CHANGELOG.
+pub const M0: usize = 128;
 /// Beam width for insertion.
 pub const EF_CONSTRUCTION: usize = 400;
 /// Beam width for search.

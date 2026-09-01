@@ -1341,7 +1341,7 @@ fn delete_edge_of_user_first_derived_pair_is_rule_owned() {
 }
 
 // ---------------------------------------------------------------------------
-// Approximate-rule tests (IVF-Flat)
+// Approximate-rule tests (HNSW)
 // ---------------------------------------------------------------------------
 
 // Recall floors imported from sim_harness (canonical location: crates/sim-harness/src/lib.rs).
@@ -1814,10 +1814,10 @@ fn approximate_recall_above_floor_1536dim_1k() {
     );
 }
 
-/// 5k-node IVF-Flat wall-clock probe with recall vs exact ground truth.
+/// 5k-node HNSW wall-clock probe with recall vs exact ground truth.
 ///
 /// Shape: 5000 nodes × 1536-D, min_sim=0.85, approximate=true.
-/// Records: IVF backfill wall-clock, recall vs brute-force exact.
+/// Records: HNSW backfill wall-clock, recall vs brute-force exact.
 /// `#[ignore]` — exact O(n²) ground truth is expensive; run explicitly with
 /// `cargo test --release -- --ignored approximate_recall_5k_timing --nocapture`.
 #[test]
@@ -1852,7 +1852,7 @@ fn approximate_recall_5k_timing() {
             .unwrap();
     }
 
-    // Time the IVF-Flat backfill (k-means fit + candidate probing + edge derivation).
+    // Time the HNSW backfill (index construction + candidate probing + edge derivation).
     let t0 = Instant::now();
     db.create_rule(RuleDef {
         name: "approx_sim5k".into(),
@@ -1871,7 +1871,7 @@ fn approximate_recall_5k_timing() {
         via_dir: None,
     })
     .unwrap();
-    let ivf_ms = t0.elapsed().as_millis();
+    let hnsw_ms = t0.elapsed().as_millis();
 
     // Collect approximate edges.
     let approx_edges: BTreeSet<(String, String, String)> = {
@@ -1909,7 +1909,7 @@ fn approximate_recall_5k_timing() {
 
     let r = recall(&approx_edges, &exact_edges);
     eprintln!(
-        "5k probe: IVF backfill {ivf_ms}ms | exact ground truth {exact_ms}ms | \
+        "5k probe: HNSW backfill {hnsw_ms}ms | exact ground truth {exact_ms}ms | \
          recall {r:.4} (approx={} exact={})",
         approx_edges.len(),
         exact_edges.len()

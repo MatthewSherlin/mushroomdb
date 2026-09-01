@@ -15,12 +15,14 @@ name = "server"
 [features]
 default = []
 embed-ui = ["dep:include_dir"]
+tls = ["dep:axum-server"]
 
 [dependencies]
-core-api = { package = "mushroomdb", path = "../core-api", version = "0.4.1" }
-arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.4.1" }
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.4.2" }
+arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.4.2" }
 # ws enabled now so Task 5 can add GET /watch without a dep bump.
 axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -36,3 +38,9 @@ arrow-array = { version = "59", default-features = false }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 proptest = { workspace = true }
+# TLS integration tests.
+tempfile = "3"
+rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+# Install an explicit crypto provider when both ring and aws-lc-rs are compiled in.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

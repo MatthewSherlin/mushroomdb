@@ -22,6 +22,8 @@ listener is accepting. Non-loopback `--addr` requires `--token` or
 
 ### Authentication
 
+For TLS configuration options, see [deployment.md](deployment.md).
+
 **Full-access token** (`--token` / `MUSHROOMDB_TOKEN`): bearer or `?token=`
 query param. Grants access to all endpoints.
 

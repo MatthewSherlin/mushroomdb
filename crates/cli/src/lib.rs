@@ -68,6 +68,10 @@ pub enum Command {
         role_tokens: Vec<(String, String)>,
         /// Periodic snapshot cadence. `None` = off (default).
         snapshot_every: Option<Duration>,
+        /// Path to PEM certificate for native TLS (`--tls-cert`). Requires `--tls-key`.
+        tls_cert: Option<PathBuf>,
+        /// Path to PEM private key for native TLS (`--tls-key`). Requires `--tls-cert`.
+        tls_key: Option<PathBuf>,
     },
     Mcp {
         db_dir: PathBuf,
@@ -249,6 +253,8 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut token = None;
     let mut role_tokens: Vec<(String, String)> = Vec::new();
     let mut snapshot_every = None;
+    let mut tls_cert: Option<PathBuf> = None;
+    let mut tls_key: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -313,6 +319,26 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--snapshot-every=") {
             snapshot_every = Some(parse_snapshot_every(val)?);
             i += 1;
+        } else if a == "--tls-cert" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --tls-cert".to_string())?;
+            tls_cert = Some(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--tls-cert=") {
+            tls_cert = Some(PathBuf::from(val));
+            i += 1;
+        } else if a == "--tls-key" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --tls-key".to_string())?;
+            tls_key = Some(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--tls-key=") {
+            tls_key = Some(PathBuf::from(val));
+            i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -325,6 +351,11 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     if saw_ui && saw_no_ui {
         return Err("cannot combine --ui and --no-ui".to_string());
     }
+    match (&tls_cert, &tls_key) {
+        (Some(_), None) => return Err("--tls-cert requires --tls-key".to_string()),
+        (None, Some(_)) => return Err("--tls-key requires --tls-cert".to_string()),
+        _ => {}
+    }
     let db_dir = db_dir.ok_or_else(|| "serve requires <db-dir>".to_string())?;
     Ok(Command::Serve {
         db_dir,
@@ -334,6 +365,8 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         token,
         role_tokens,
         snapshot_every,
+        tls_cert,
+        tls_key,
     })
 }
 
@@ -1571,6 +1604,8 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        tls_cert,
+                        tls_key,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(addr, default_bind());
@@ -1579,6 +1614,8 @@ mod tests {
                         assert_eq!(token, None);
                         assert!(role_tokens.is_empty());
                         assert_eq!(snapshot_every, None);
+                        assert_eq!(tls_cert, None);
+                        assert_eq!(tls_key, None);
                     }
                     other => panic!("serve <dir> → Serve default addr, got {other:?}"),
                 },
@@ -1594,6 +1631,8 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        tls_cert,
+                        tls_key,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(
@@ -1605,6 +1644,8 @@ mod tests {
                         assert_eq!(token, None);
                         assert!(role_tokens.is_empty());
                         assert_eq!(snapshot_every, None);
+                        assert_eq!(tls_cert, None);
+                        assert_eq!(tls_key, None);
                     }
                     other => panic!("serve --addr after dir, got {other:?}"),
                 },
@@ -1620,6 +1661,8 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        tls_cert,
+                        tls_key,
                     }) => {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                         assert_eq!(
@@ -1631,6 +1674,8 @@ mod tests {
                         assert_eq!(token, None);
                         let _ = role_tokens; // empty, not asserted
                         assert_eq!(snapshot_every, None);
+                        assert_eq!(tls_cert, None);
+                        assert_eq!(tls_key, None);
                     }
                     other => panic!("serve --addr=VALUE, got {other:?}"),
                 },
@@ -2543,5 +2588,71 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn serve_tls_flags_parse_both_forms() {
+        // --tls-cert VALUE --tls-key VALUE (space form)
+        match parse_args(&[
+            "serve",
+            "/tmp/db",
+            "--tls-cert",
+            "/a/cert.pem",
+            "--tls-key",
+            "/a/key.pem",
+        ])
+        .unwrap()
+        {
+            Command::Serve {
+                tls_cert, tls_key, ..
+            } => {
+                assert_eq!(tls_cert, Some(PathBuf::from("/a/cert.pem")));
+                assert_eq!(tls_key, Some(PathBuf::from("/a/key.pem")));
+            }
+            other => panic!("{other:?}"),
+        }
+        // --tls-cert=VALUE --tls-key=VALUE (equals form)
+        match parse_args(&[
+            "serve",
+            "/tmp/db",
+            "--tls-cert=/b/cert.pem",
+            "--tls-key=/b/key.pem",
+        ])
+        .unwrap()
+        {
+            Command::Serve {
+                tls_cert, tls_key, ..
+            } => {
+                assert_eq!(tls_cert, Some(PathBuf::from("/b/cert.pem")));
+                assert_eq!(tls_key, Some(PathBuf::from("/b/key.pem")));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Neither → both None.
+        match parse_args(&["serve", "/tmp/db"]).unwrap() {
+            Command::Serve {
+                tls_cert, tls_key, ..
+            } => {
+                assert_eq!(tls_cert, None);
+                assert_eq!(tls_key, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_tls_flags_require_both() {
+        // --tls-cert alone → error
+        let err = parse_args(&["serve", "/tmp/db", "--tls-cert", "/a/cert.pem"]).unwrap_err();
+        assert!(
+            err.contains("tls-key"),
+            "--tls-cert alone must mention --tls-key in error, got {err}"
+        );
+        // --tls-key alone → error
+        let err = parse_args(&["serve", "/tmp/db", "--tls-key", "/a/key.pem"]).unwrap_err();
+        assert!(
+            err.contains("tls-cert"),
+            "--tls-key alone must mention --tls-cert in error, got {err}"
+        );
     }
 }
