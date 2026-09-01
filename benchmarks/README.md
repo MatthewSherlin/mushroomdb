@@ -157,10 +157,10 @@ benchmarks/
     *.md                — other runs (gitignored)
   ci/
     run.sh              — CI bench harness (builds + runs ci_bench example)
-    compare.py          — regression gate (15% threshold, --bootstrap mode)
+    compare.py          — regression gate (15% threshold; exits 1 on regression or missing key)
     test_compare.py     — pytest: 3 comparator unit tests
   baselines/
-    ci.json             — NOT YET COMMITTED; written after first post-merge CI run (see "How to flip to enforcing mode")
+    ci.json             — committed CI baseline (ubuntu-latest runner; re-pin when intentionally changing perf)
 ```
 
 ---
@@ -206,29 +206,30 @@ the baseline on the new class before merging.
 Baselines live in `benchmarks/baselines/ci.json`.  They are committed by a
 human after a deliberate capture run, not written automatically on every push.
 
-The workflow currently runs in **bootstrap mode** (`--bootstrap`), which writes
-the baseline artifact and exits 0.  This is intentional: the baseline cannot
-exist before the CI runner has produced one.
+The workflow runs in **enforcing mode**: `compare.py` exits 1 if any metric
+exceeds the 15% threshold or if a key present in the baseline is missing from
+the current run.  The baseline in `benchmarks/baselines/ci.json` was captured
+on an ubuntu-latest runner and committed deliberately; it is not rewritten
+automatically.
 
-### How to flip to enforcing mode
+### Re-pinning the baseline after an intentional performance change
 
-1. Merge this branch.  The first CI run writes `bench-results` (a GitHub
-   Actions artifact); download `results.json` from that run.
-2. Run a second workflow dispatch to warm any runner caches; download that
-   `results.json` (run 2 is the canonical baseline per the task brief).
-3. Copy it to `benchmarks/baselines/ci.json` and commit:
+When a commit intentionally changes benchmark numbers (e.g. a new algorithm,
+a changed workload, a runner-class migration), re-pin the baseline:
+
+1. Push the branch.  CI runs the bench job and uploads a `bench-results`
+   artifact containing `results.json`.
+2. Download the artifact:
+   ```bash
+   gh run download --name bench-results --dir /tmp/bench-results
    ```
-   cp /path/to/downloaded/results.json benchmarks/baselines/ci.json
+3. Copy it to the committed baseline and commit:
+   ```bash
+   cp /tmp/bench-results/results.json benchmarks/baselines/ci.json
    git add benchmarks/baselines/ci.json
-   git commit -m "chore: commit CI bench baseline (ubuntu-latest runner)"
+   git commit -m "chore: re-pin CI bench baseline (ubuntu-latest runner)"
    ```
-4. In `.github/workflows/ci.yml`, remove `--bootstrap` from the compare step
-   so it reads:
-   ```yaml
-   python3 benchmarks/ci/compare.py results.json benchmarks/baselines/ci.json \
-     --threshold 0.15
-   ```
-5. Push and confirm two consecutive main runs are green.
+4. Push and confirm the next CI run is green.
 
 ### Verifying a regression
 

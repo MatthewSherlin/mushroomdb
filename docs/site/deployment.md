@@ -16,6 +16,9 @@ server {
 
     ssl_certificate     /etc/letsencrypt/live/db.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/db.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
 
     location / {
         proxy_pass http://127.0.0.1:8080;

@@ -23,7 +23,7 @@ No format change — upgrade in place from any 0.4.0 store.
   `storage` and `server` verified infallible and annotated. `idmap` u32-capacity
   growth panic documented as TODO-0.4.2 (requires an API change).
 - **Fuzz targets.** WAL-replay and HTTP-body never-panic proptests (1280
-  cases each).
+  cases total: 768 WAL-replay + 512 HTTP-body).
 
 ## v0.4.0 — 2026-08-31
 
