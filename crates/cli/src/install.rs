@@ -9,24 +9,24 @@
 //! - Manifest-driven uninstall: tracks every file written; removes exactly
 //!   what install created.
 //!
-//! # User-scope MCP config location (verified 2026-09-02)
+//! # User-scope MCP config location (verified 2026-09-02 by live inspection)
 //!
-//! Claude Code (the CLI) reads user-level MCP servers from
-//! `~/.claude/settings.json` under the `"mcpServers"` key — the same
-//! structure as project-level `.mcp.json`. This is verified against the
-//! `claude mcp add --help` output which prints:
-//!   "Adds an MCP server to your user settings (~/.claude/settings.json)"
-//! Cursor uses `~/.cursor/mcp.json` for user-scope MCP servers (same format).
+//! Claude Code user-level MCP servers live in `~/.claude.json` under the
+//! top-level `"mcpServers"` key. This was verified empirically on a live
+//! Claude Code install: `~/.claude/settings.json` holds env/permissions/hooks
+//! but NO mcpServers key. Cursor uses `~/.cursor/mcp.json` (same format as
+//! project-level `.cursor/mcp.json`).
 
 use crate::CliError;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// Template files embedded at compile time.
+// Template files embedded at compile time. Files live inside the crates/cli
+// package so `cargo package` includes them in the published tarball.
 // Path is relative to this source file (crates/cli/src/install.rs).
-const SKILL_TEMPLATE: &str = include_str!("../../../skills/mushroom/SKILL.md");
-const CURSOR_RULES_TEMPLATE: &str = include_str!("../../../skills/mushroom/cursor-rules.mdc");
+const SKILL_TEMPLATE: &str = include_str!("../skills/mushroom/SKILL.md");
+const CURSOR_RULES_TEMPLATE: &str = include_str!("../skills/mushroom/cursor-rules.mdc");
 
 /// Placeholder string replaced with the real db path in embedded templates.
 const DB_PATH_PLACEHOLDER: &str = "{{DB_PATH}}";
@@ -137,9 +137,15 @@ pub fn run_install(
         )?;
     }
 
-    // Write manifest last (after all files are in place).
     let manifest_path = manifest_path(project_root, home, opts.project, &platforms);
-    write_manifest(&manifest_path, &manifest)?;
+
+    // Only write the manifest when something was actually written this run.
+    // Skipping on a fully-idempotent re-install preserves the existing manifest
+    // (which uninstall needs) rather than replacing it with an empty one.
+    let anything_written = !manifest.files.is_empty() || !manifest.mcp_keys.is_empty();
+    if anything_written {
+        write_manifest(&manifest_path, &manifest)?;
+    }
 
     let mut out = format!("mushroomdb installed ({} platform(s))\n", platforms.len());
     for f in &manifest.files {
@@ -152,7 +158,11 @@ pub fn run_install(
             k.file.display()
         ));
     }
-    out.push_str(&format!("  manifest  {}\n", manifest_path.display()));
+    if anything_written {
+        out.push_str(&format!("  manifest  {}\n", manifest_path.display()));
+    } else {
+        out.push_str("  (already installed — no changes)\n");
+    }
     Ok(out)
 }
 
@@ -267,7 +277,10 @@ fn preflight_check(
             let mcp_file = if project_scope {
                 project_root.join(".mcp.json")
             } else {
-                home.join(".claude").join("settings.json")
+                // User-scope: verified empirically on a live Claude Code install.
+                // ~/.claude.json holds top-level mcpServers; ~/.claude/settings.json
+                // holds env/permissions/hooks but no mcpServers key.
+                home.join(".claude.json")
             };
             check_mcp_conflict(&mcp_file, db_str)?;
         }
@@ -369,11 +382,12 @@ fn install_claude_code(
         manifest.files.push(skill_file);
     }
 
-    // MCP JSON.
+    // MCP JSON. User-scope writes to ~/.claude.json (top-level mcpServers),
+    // not ~/.claude/settings.json (which holds env/hooks, not mcpServers).
     let mcp_file = if project_scope {
         project_root.join(".mcp.json")
     } else {
-        home.join(".claude").join("settings.json")
+        home.join(".claude.json")
     };
     merge_mcp_entry(&mcp_file, db_str, manifest)?;
 

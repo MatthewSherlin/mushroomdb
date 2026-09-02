@@ -139,6 +139,36 @@ fn install_is_idempotent() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: install → install → uninstall removes everything (manifest survives
+//       a no-op second install and uninstall still cleans up)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn double_install_then_uninstall_cleans_up() {
+    let root = temp_dir("double-uninstall");
+    let home = temp_dir("double-uninstall-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    run_install(&root, &home, &opts).expect("first install");
+    run_install(&root, &home, &opts).expect("second install (no-op)");
+    run_uninstall(&root, &home, &opts).expect("uninstall after double-install");
+
+    // Skill file must be gone.
+    assert_absent(&root, ".claude/skills/mushroom/SKILL.md");
+    // Manifest must be gone.
+    assert_absent(&root, ".claude/skills/mushroom/.install-manifest.json");
+    // MCP entry must be gone.
+    if root.join(".mcp.json").exists() {
+        let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+        assert!(
+            mcp["mcpServers"]["mushroomdb"].is_null(),
+            "mushroomdb key still in .mcp.json after double-install → uninstall"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test: conflicting existing .mcp.json entry → non-zero error, no changes
 // ---------------------------------------------------------------------------
 

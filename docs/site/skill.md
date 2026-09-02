@@ -45,11 +45,12 @@ Same as above but paths are:
 | File | Location |
 |------|---------|
 | Skill | `~/.claude/skills/mushroom/SKILL.md` |
-| MCP config | `~/.claude/settings.json` (`mcpServers` key — same format as project `.mcp.json`) |
+| MCP config | `~/.claude.json` (top-level `mcpServers` key — same structure as project `.mcp.json`) |
 | Manifest | `~/.mushroomdb/install-manifest.json` |
 
-**Verified 2026-09-02:** `claude mcp add --help` confirms user-level MCP
-servers are stored in `~/.claude/settings.json` under `mcpServers`.
+**Verified 2026-09-02 by live inspection:** `~/.claude.json` holds the
+top-level `mcpServers` key for Claude Code user-level MCP servers.
+`~/.claude/settings.json` holds env/permissions/hooks but no `mcpServers`.
 
 ### Cursor — project scope (`--project`)
 
