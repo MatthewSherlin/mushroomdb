@@ -17,7 +17,7 @@ The graph stays true as your data changes: when you SET a property, rules retrac
 
 **First time — `{{DB_PATH}}` does not exist yet:**
 
-Run this in a terminal to seed an instant graph you can explore:
+Run this in a terminal to seed an instant graph you can explore (if `mushroomdb` is not on PATH, install it first with `cargo install mushroomdb-cli` or run it via `npx mushroomdb`):
 
 ```
 mushroomdb demo {{DB_PATH}}
@@ -190,4 +190,4 @@ At commit 10 (before the SET), the edge existed. The store keeps the full versio
 
 ---
 
-For more: `mushroomdb --help` · [docs](https://mushroomdb.dev/docs)
+For more: `mushroomdb --help` · [docs](https://github.com/MatthewSherlin/mushroomdb/tree/main/docs/site)
