@@ -2,11 +2,12 @@
   "name": "mushroomdb",
   "description": "Embedded graph database with incremental association rules and a built-in MCP stdio server for AI agents.",
   "repository": "https://github.com/MatthewSherlin/mushroomdb",
-  "version": "0.1.2",
+  "version": "0.4.3",
   "transport": "stdio",
   "tools": [
     "query", "ingest_json", "create_rule", "explain", "explain_association",
     "upsert_entity", "find_similar", "hybrid_search", "neighborhood",
-    "node_info", "node_edges", "stats"
+    "node_info", "node_edges", "stats",
+    "node_history", "edge_history", "was_linked", "rename_node"
   ]
 }

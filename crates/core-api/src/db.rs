@@ -83,11 +83,13 @@ thread_local! {
 /// [`reset_query_sub_exec_count`]).
 ///
 /// Primarily for integration tests that verify the label-skip fast-path.
+#[doc(hidden)]
 pub fn query_sub_exec_count() -> usize {
     QUERY_SUB_EXECS_TL.with(|c| c.get())
 }
 
 /// Reset the per-thread query-subscription execution counter to zero.
+#[doc(hidden)]
 pub fn reset_query_sub_exec_count() {
     QUERY_SUB_EXECS_TL.with(|c| c.set(0));
 }
