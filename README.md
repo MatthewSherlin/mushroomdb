@@ -5,15 +5,35 @@
 </td>
 <td>
 <h1>mushroomdb</h1>
-<p><strong>The association engine for apps and AI agents.</strong>
-An embedded Rust graph database where edges are declared, not inserted:
-you write rules, the db creates, maintains, and retracts edges automatically
-and can explain() why any edge exists. SQLite for relationships.
-Built-in MCP server, explainable links, per-node history — a natural fit for
-agent memory and small internal apps where matching and relationships are the product.</p>
+<p><strong>The graph that stays true — and knows who's allowed to see it.</strong>
+An embedded Rust graph database: declare a rule once, and every write creates, maintains,
+and retracts the matching edges automatically. Set a property and stale edges vanish; new ones appear.
+Explain any link with one call. SQLite for relationships. Built-in 16-tool MCP server for agent memory.
+<em>Pre-1.0 alpha — APIs and formats may change between minor versions.</em></p>
 </td>
 </tr>
 </table>
+
+---
+
+## Agent memory in 30 seconds
+
+![A SET retriggers a rule: a derived edge is retracted, another fires, and explain shows the arithmetic](docs/assets/rule-fire-explain.gif)
+
+**Install:**
+
+```sh
+npx mushroomdb install
+```
+
+Open **Claude Code** and type `/mushroom`, or open **Cursor** (rules apply automatically).
+
+- **Instant demo store:** no store yet? The skill runs `mushroomdb demo` and seeds 10 Orgs, 20 Projects, 30 People, and 334 edges in seconds — ready to query.
+- **Memory-first behavior:** before answering questions about entities or relationships, the assistant queries the graph. State a durable fact and it's persisted. Set a property and the graph reacts — rules retract stale edges and fire new ones automatically.
+- **Explain on demand:** ask "why are X and Y related" and the assistant calls `explain` and surfaces the rule name and score, not just a summary.
+
+Access is enforced per query via node masks — same graph, different views for different callers.
+`mushroomdb install` writes a skill file + MCP config entry. `mushroomdb uninstall` removes exactly what install wrote.
 
 ---
 
@@ -213,7 +233,91 @@ same suggestions. No rule is ever applied automatically. See
 
 ---
 
-## Quickstart
+## Agent Memory
+
+mushroomdb is a natural fit for AI agent memory. Graph structure captures the
+semantic shape of real knowledge — entities, associations, similarity, and
+lineage — and rule-derived edges keep those associations fresh automatically as
+new facts arrive.
+
+**How it works:**
+
+- Entities map to nodes (`Person`, `Document`, `Project`, `Concept`, …).
+- Associations are edges derived from data: cosine similarity on embeddings,
+  shared field values, FK relationships, geographic proximity, and more.
+  Declare a rule once; every write maintains the matching edges without any
+  agent-side bookkeeping.
+- Recall has three modes: `find_similar` by query vector (HNSW index when
+  available, brute-force otherwise); `find_similar` by key (returns neighbors
+  from a rule-derived edge type); `query` runs Cypher for structured recall.
+- Hybrid search: `hybrid_search` fuses fulltext + vector results via Reciprocal
+  Rank Fusion (RRF) — provide `query_text` + `text_field` for text-only, add
+  `vector` for a combined ranking.
+- Explanations are built in: `explain_association` shows which rules and scores
+  produced each link — an agent can cite evidence, not just conclusions.
+- Temporal history: `node_history(key)`, `edge_history(a, b)`, and
+  `was_linked(a, b, edge_type, at_commit)` return per-node and per-edge WAL
+  history with rule attribution — which rule created each derived link, at
+  which commit, and when it was retracted. Available over Rust API, MCP tools
+  (3 tools), and HTTP (`GET /node/{key}/history`, `GET /history/edge`,
+  `GET /history/was_linked`). Useful for audit, provenance, agent replay, and
+  change-triggered workflows.
+- Query subscriptions: `subscribe_query` (Rust API + WebSocket `/subscribe`)
+  delivers incremental Cypher result sets after each commit (supported
+  subset; full re-run per commit; use `LIMIT`).
+- Node masks (ACL primitive): pass `mask: [key1, key2, …]` to `query` to restrict
+  the visible node set; write statements are rejected on masked queries.
+- Schema-as-code: `apply_schema` (Rust) / `mushroomdb schema apply` (CLI)
+  idempotently applies a JSON schema file (rules, views, fulltext indexes) — no
+  WAL writes for items that already match; prints a created/updated/unchanged diff.
+
+**Claude Desktop config** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "mushroomdb": {
+      "command": "mushroomdb",
+      "args": ["mcp", "/path/to/your/db"]
+    }
+  }
+}
+```
+
+**Minimal workflow** (four tool calls):
+
+```
+upsert_entity  →  create_rule  →  find_similar  →  explain_association
+  (store)           (link)           (recall)          (explain)
+```
+
+**Agent memory quickstart** (all sixteen MCP tools):
+
+| Tool | Purpose |
+|---|---|
+| `upsert_entity` | Insert or update a node by key (no existence check needed) |
+| `ingest_json` | Batch-ingest nodes of one label from a JSON array |
+| `create_rule` | Declare a derivation rule; backfills existing nodes immediately |
+| `find_similar` | Find similar nodes by query vector (HNSW) or by derived edge traversal |
+| `hybrid_search` | RRF over fulltext + vector results |
+| `explain_association` | Show rules and scores that link two nodes |
+| `explain` | Alias for `explain_association` |
+| `query` | Cypher query (read or write); pass `mask` for ACL-scoped read |
+| `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter |
+| `node_info` | Return a node's key, label, and properties |
+| `node_edges` | Return all edges incident on a node |
+| `stats` | Live node, edge, and rule counts |
+| `node_history` | WAL change history for a node (since last truncating snapshot) |
+| `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
+| `was_linked` | Point-in-time edge check: was an edge active at a given commit? |
+| `rename_node` | Rename a node's key; old_key, new_key |
+
+Full walkthrough, tool reference, and Claude Desktop setup:
+[`docs/site/mcp.md`](docs/site/mcp.md).
+
+---
+
+## Install options
 
 The two-command flow uses the release binary with the UI embedded:
 
@@ -335,81 +439,6 @@ Full predicate reference and examples: [`docs/site/rules.md`](docs/site/rules.md
 
 ---
 
-## Benchmarks
-
-10,000-node graph (Apple M4 Pro, macOS 15.7.3, arm64). Full methodology
-and honesty notes: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md).
-Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
-
-| Workload | mushroomdb | Neo4j | KùzuDB | Memgraph |
-|---|---|---|---|---|
-| Bulk ingest | 784 ms | 13.2 s | 1.21 min | 12.5 s |
-| Neighborhood depth-1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
-| Neighborhood depth-1 (p95) | 2.2 µs | 1.46 ms | 519 µs | 2.14 ms |
-| Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
-| Cypher scan-filter-project (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
-| Cypher two-hop join (200 rows) | **261.6 µs** ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
-| Cold-start: V8 snapshot open | **0.02 s** ▽ | — | — | — |
-| Cold-start: WAL-only open | 8.16 min ▽ | — | — | — |
-| Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
-
-*(v0.1.1 mushroomdb, 2026-08-24, release build; competitor numbers = v2.2 corrected; two-hop row = corrected four-engine benchmark)*
-
-**Honesty notes:**
-
-- mushroomdb numbers are **embedded** (no network RTT, no serialization
-  overhead). KùzuDB is also embedded — its numbers are directly comparable
-  to mushroomdb's. Neo4j and Memgraph numbers go over bolt/localhost
-  (~0.1–1 ms round-trip per query).
-- ★ Two-hop join — same dataset, same warmup policy (v2.2 corrected benchmark): all four engines use
-  **5,810,000 INDUSTRY_ALIGNMENT edges** (FieldEqual on `industry`; per-source top-k,
-  effectively uncapped at 10k scale). Policy: fresh process/container → ingest + preload
-  → 3 warmup executions (discarded) → **median of 10 measured runs**. mushroomdb derives
-  edges automatically via `create_rule`; competitors pre-loaded via UNWIND MERGE (neo4j,
-  memgraph) or COPY FROM CSV (kuzu). All engines return 200 rows.
-  Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`.
-- v2.1 consolidated-pass two-hop values (2.88 ms neo4j / 2.22 ms kuzu / 2.57 ms memgraph)
-  **retracted**: cross-engine contamination confirmed — memgraph cell was neo4j on a warm
-  container; see `benchmarks/results/head-to-head-10k-v2.md` contamination section.
-  v2 mushroomdb 307 µs **retired**: measured on the old 1M-edge global-budget graph
-  (current uncapped graph has 5.81M edges; see dataset growth note in methodology).
-
-Rule derivation (mushroomdb-only, excluded from cross-engine table):
-two-rule backfill on 10k nodes: v2.4 baseline 928 ms + 2.221 s = 3.149 s (+8.8% vs pre-eventing v2.3 baseline of 2.894 s). **v0.1.0 measured: 3.49–3.51 s** (two runs, 0.6% intrarun variance; +11% from v2.4). **v0.1.1 re-measured: 2.929 s** (single-pass 2026-08-24; N=5 criterion median 2.878 s — no residual regression vs 2.894 s pre-eventing baseline). A two-stage fix (is\_empty guard + emit\_deltas engine gate, commit d4d312c) recovered the original subscription overhead. Competitors have no auto-derivation equivalent.
-
-▽ 100k cold-start (100k-node representative matching workload, 9 backfill rules,
-~10M derived edges in snapshot; warm file cache, cold process; measured
-2026-08-28 with `/usr/bin/time -l`, release build, Apple M4 Pro):
-**V8 snapshot open:** **0.02 s** (runs 2–3; 0.25 s on first-ever dyld-cold run),
-**31–41 MiB RSS** depending on query type — V8 mmap format (v0.2,
-`feat/v0.2-phase-b-physics` @ `b0798a1`). Cold-cache not measured (requires
-`sudo purge`). **V7 snapshot open:** ~11 s (measured 2026-08-26, three runs
-10.7–11.1 s; V7 decompresses packed snapshot on open; no rule re-fire).
-**WAL-only open:** 8.16 min (measured 2026-08-24) — CreateRule WAL records trigger
-full rule re-derivation; ANN index re-fitting dominates. **V8 snapshot size:**
-1.8 GiB (18% smaller than V5's 2.2 GiB; V5 stored IVF state as uncompressed
-inline bincode in its meta blob — V8 moves it to a dedicated compact section).
-**V8 snapshot write:** ~35 s. **Backfill (9 rules, max_edges=1M each):** 20.343 s.
-`mushroomdb verify <db-dir>` audits all 12 sections with full CRC32 and exits 2
-on any mismatch (0.26 s on the 1.8 GiB store; large sections skip CRC on the
-normal query path — see `docs/format-stability.md` for the trust model).
-Full trajectory and methodology:
-[`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
-
-Rule engine vs hand-rolled maintenance (three-way, measured 2026-08-21): on 10k nodes with
-1,000 specialty updates, all three strategies produce identical edge sets (drift = 0).
-**(a) per-op (expert-written)** (individual `delete_edge`/`insert_edge`, one WAL fsync each): **64.93 min**.
-**(b) batched (expert-written)** (uses `batch_edges` — a mushroomdb-only API, one WAL frame per update): **24.98 s**.
-**(c) Rule engine** (`create_rule` + `set_prop`, fully automatic): **17.58 s** (1.42× faster than batched).
-Add-only pattern (NOT benchmarked — omits retraction; stale edges accumulate on every update).
-Disclosures: (1) `batch_edges` was introduced alongside this benchmark to make the comparison fair; it
-is not available on any competitor engine. (2) Both hand-rolled variants were written by the engine team
-with full knowledge of retraction semantics; drift=0 is a property of expert implementation, not of the
-hand-rolled approach in general — real application code typically misses at least one retraction path.
-See [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-vs-rules.md).
-
----
-
 ## Architecture
 
 ```
@@ -489,92 +518,85 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff of created/updated/unchanged items |
 | `mushroomdb backup <dir> <dest>` | Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a concurrently running `serve` process — use `POST /backup` for live-served stores |
 | `mushroomdb export <dir> <dest> [--format jsonl\|parquet]` | Export nodes, edges, and rules to JSONL (stable, byte-identical) or Parquet (Snappy, not byte-identical across library versions). NaN/Inf floats export as null |
+| `mushroomdb install [--platform claude-code\|cursor\|all] [--project] [--db <path>]` | Write the `/mushroom` skill + MCP server entry for Claude Code or Cursor. Auto-detects platform. See [`docs/site/skill.md`](docs/site/skill.md) |
+| `mushroomdb uninstall [--platform claude-code\|cursor\|all] [--project] [--db <path>]` | Remove exactly what `install` wrote (manifest-driven; leaves user files) |
 
 Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 
 ---
 
-## Agent Memory
+## Benchmarks
 
-mushroomdb is a natural fit for AI agent memory. Graph structure captures the
-semantic shape of real knowledge — entities, associations, similarity, and
-lineage — and rule-derived edges keep those associations fresh automatically as
-new facts arrive.
+10,000-node graph (Apple M4 Pro, macOS 15.7.3, arm64). Full methodology
+and honesty notes: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md).
+Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
 
-**How it works:**
+| Workload | mushroomdb | Neo4j | KùzuDB | Memgraph |
+|---|---|---|---|---|
+| Bulk ingest | 784 ms | 13.2 s | 1.21 min | 12.5 s |
+| Neighborhood depth-1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
+| Neighborhood depth-1 (p95) | 2.2 µs | 1.46 ms | 519 µs | 2.14 ms |
+| Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
+| Cypher scan-filter-project (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
+| Cypher two-hop join (200 rows) | **261.6 µs** ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
+| Cold-start: V8 snapshot open | **0.02 s** ▽ | — | — | — |
+| Cold-start: WAL-only open | 8.16 min ▽ | — | — | — |
+| Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
-- Entities map to nodes (`Person`, `Document`, `Project`, `Concept`, …).
-- Associations are edges derived from data: cosine similarity on embeddings,
-  shared field values, FK relationships, geographic proximity, and more.
-  Declare a rule once; every write maintains the matching edges without any
-  agent-side bookkeeping.
-- Recall has three modes: `find_similar` by query vector (HNSW index when
-  available, brute-force otherwise); `find_similar` by key (returns neighbors
-  from a rule-derived edge type); `query` runs Cypher for structured recall.
-- Hybrid search: `hybrid_search` fuses fulltext + vector results via Reciprocal
-  Rank Fusion (RRF) — provide `query_text` + `text_field` for text-only, add
-  `vector` for a combined ranking.
-- Explanations are built in: `explain_association` shows which rules and scores
-  produced each link — an agent can cite evidence, not just conclusions.
-- Temporal history: `node_history(key)`, `edge_history(a, b)`, and
-  `was_linked(a, b, edge_type, at_commit)` return per-node and per-edge WAL
-  history with rule attribution — which rule created each derived link, at
-  which commit, and when it was retracted. Available over Rust API, MCP tools
-  (3 tools), and HTTP (`GET /node/{key}/history`, `GET /history/edge`,
-  `GET /history/was_linked`). Useful for audit, provenance, agent replay, and
-  change-triggered workflows.
-- Query subscriptions: `subscribe_query` (Rust API + WebSocket `/subscribe`)
-  delivers incremental Cypher result sets after each commit (supported
-  subset; full re-run per commit; use `LIMIT`).
-- Node masks (ACL primitive): pass `mask: [key1, key2, …]` to `query` to restrict
-  the visible node set; write statements are rejected on masked queries.
-- Schema-as-code: `apply_schema` (Rust) / `mushroomdb schema apply` (CLI)
-  idempotently applies a JSON schema file (rules, views, fulltext indexes) — no
-  WAL writes for items that already match; prints a created/updated/unchanged diff.
+*(v0.1.1 mushroomdb, 2026-08-24, release build; competitor numbers = v2.2 corrected; two-hop row = corrected four-engine benchmark)*
 
-**Claude Desktop config** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+**Honesty notes:**
 
-```json
-{
-  "mcpServers": {
-    "mushroomdb": {
-      "command": "mushroomdb",
-      "args": ["mcp", "/path/to/your/db"]
-    }
-  }
-}
-```
+- mushroomdb numbers are **embedded** (no network RTT, no serialization
+  overhead). KùzuDB is also embedded — its numbers are directly comparable
+  to mushroomdb's. Neo4j and Memgraph numbers go over bolt/localhost
+  (~0.1–1 ms round-trip per query).
+- ★ Two-hop join — same dataset, same warmup policy (v2.2 corrected benchmark): all four engines use
+  **5,810,000 INDUSTRY_ALIGNMENT edges** (FieldEqual on `industry`; per-source top-k,
+  effectively uncapped at 10k scale). Policy: fresh process/container → ingest + preload
+  → 3 warmup executions (discarded) → **median of 10 measured runs**. mushroomdb derives
+  edges automatically via `create_rule`; competitors pre-loaded via UNWIND MERGE (neo4j,
+  memgraph) or COPY FROM CSV (kuzu). All engines return 200 rows.
+  Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`.
+- v2.1 consolidated-pass two-hop values (2.88 ms neo4j / 2.22 ms kuzu / 2.57 ms memgraph)
+  **retracted**: cross-engine contamination confirmed — memgraph cell was neo4j on a warm
+  container; see `benchmarks/results/head-to-head-10k-v2.md` contamination section.
+  v2 mushroomdb 307 µs **retired**: measured on the old 1M-edge global-budget graph
+  (current uncapped graph has 5.81M edges; see dataset growth note in methodology).
 
-**Minimal workflow** (four tool calls):
+Rule derivation (mushroomdb-only, excluded from cross-engine table):
+two-rule backfill on 10k nodes: v2.4 baseline 928 ms + 2.221 s = 3.149 s (+8.8% vs pre-eventing v2.3 baseline of 2.894 s). **v0.1.0 measured: 3.49–3.51 s** (two runs, 0.6% intrarun variance; +11% from v2.4). **v0.1.1 re-measured: 2.929 s** (single-pass 2026-08-24; N=5 criterion median 2.878 s — no residual regression vs 2.894 s pre-eventing baseline). A two-stage fix (is\_empty guard + emit\_deltas engine gate, commit d4d312c) recovered the original subscription overhead. Competitors have no auto-derivation equivalent.
 
-```
-upsert_entity  →  create_rule  →  find_similar  →  explain_association
-  (store)           (link)           (recall)          (explain)
-```
+▽ 100k cold-start (100k-node representative matching workload, 9 backfill rules,
+~10M derived edges in snapshot; warm file cache, cold process; measured
+2026-08-28 with `/usr/bin/time -l`, release build, Apple M4 Pro):
+**V8 snapshot open:** **0.02 s** (runs 2–3; 0.25 s on first-ever dyld-cold run),
+**31–41 MiB RSS** depending on query type — V8 mmap format (v0.2,
+`feat/v0.2-phase-b-physics` @ `b0798a1`). Cold-cache not measured (requires
+`sudo purge`). **V7 snapshot open:** ~11 s (measured 2026-08-26, three runs
+10.7–11.1 s; V7 decompresses packed snapshot on open; no rule re-fire).
+**WAL-only open:** 8.16 min (measured 2026-08-24) — CreateRule WAL records trigger
+full rule re-derivation; ANN index re-fitting dominates. **V8 snapshot size:**
+1.8 GiB (18% smaller than V5's 2.2 GiB; V5 stored IVF state as uncompressed
+inline bincode in its meta blob — V8 moves it to a dedicated compact section).
+**V8 snapshot write:** ~35 s. **Backfill (9 rules, max_edges=1M each):** 20.343 s.
+`mushroomdb verify <db-dir>` audits all 12 sections with full CRC32 and exits 2
+on any mismatch (0.26 s on the 1.8 GiB store; large sections skip CRC on the
+normal query path — see `docs/format-stability.md` for the trust model).
+Full trajectory and methodology:
+[`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
 
-**Agent memory quickstart** (all sixteen MCP tools):
-
-| Tool | Purpose |
-|---|---|
-| `upsert_entity` | Insert or update a node by key (no existence check needed) |
-| `ingest_json` | Batch-ingest nodes of one label from a JSON array |
-| `create_rule` | Declare a derivation rule; backfills existing nodes immediately |
-| `find_similar` | Find similar nodes by query vector (HNSW) or by derived edge traversal |
-| `hybrid_search` | RRF over fulltext + vector results |
-| `explain_association` | Show rules and scores that link two nodes |
-| `explain` | Alias for `explain_association` |
-| `query` | Cypher query (read or write); pass `mask` for ACL-scoped read |
-| `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter |
-| `node_info` | Return a node's key, label, and properties |
-| `node_edges` | Return all edges incident on a node |
-| `stats` | Live node, edge, and rule counts |
-| `node_history` | WAL change history for a node (since last truncating snapshot) |
-| `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
-| `was_linked` | Point-in-time edge check: was an edge active at a given commit? |
-| `rename_node` | Rename a node's key; old_key, new_key |
-
-Full walkthrough, tool reference, and Claude Desktop setup:
-[`docs/site/mcp.md`](docs/site/mcp.md).
+Rule engine vs hand-rolled maintenance (three-way, measured 2026-08-21): on 10k nodes with
+1,000 specialty updates, all three strategies produce identical edge sets (drift = 0).
+**(a) per-op (expert-written)** (individual `delete_edge`/`insert_edge`, one WAL fsync each): **64.93 min**.
+**(b) batched (expert-written)** (uses `batch_edges` — a mushroomdb-only API, one WAL frame per update): **24.98 s**.
+**(c) Rule engine** (`create_rule` + `set_prop`, fully automatic): **17.58 s** (1.42× faster than batched).
+Add-only pattern (NOT benchmarked — omits retraction; stale edges accumulate on every update).
+Disclosures: (1) `batch_edges` was introduced alongside this benchmark to make the comparison fair; it
+is not available on any competitor engine. (2) Both hand-rolled variants were written by the engine team
+with full knowledge of retraction semantics; drift=0 is a property of expert implementation, not of the
+hand-rolled approach in general — real application code typically misses at least one retraction path.
+See [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-vs-rules.md).
 
 ---
 
@@ -594,7 +616,7 @@ Phases 1–4 and Plan 18 all landed. What remains:
 ## Distribution
 
 Pre-1.0 alpha quality software — APIs and formats may change between minor
-versions. Tags `v0.4.1`, `v0.4.2`, and `v0.4.3` are published; `npx mushroomdb`,
+versions. Tags `v0.4.1`, `v0.4.2`, `v0.4.3`, and `v0.4.4` are published; `npx mushroomdb`,
 the `curl install.sh`, and `ghcr.io/matthewsherlin/mushroomdb` are all live today.
 
 ### Docker (after the first v* tag)
@@ -724,5 +746,6 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 Copyright 2026 Matthew Sherlin.
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

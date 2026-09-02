@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.4.4 — 2026-09-02
+
+### The front door (format-stable)
+
+No format change — upgrade in place from any 0.4.x store. The WAL discriminants,
+snapshot section IDs, and `VERSION` constant remain at V8.
+
+- **`mushroomdb install` / `mushroomdb uninstall` subcommands.** One-command setup
+  for Claude Code and Cursor: `npx mushroomdb install` writes the MCP config entry
+  and drops the `/mushroom` skill into the project's `.claude/` directory.
+  `mushroomdb uninstall` reverses the operation cleanly. No manual JSON editing
+  required.
+
+- **`/mushroom` skill for Claude Code.** An assistant-facing skill that provides
+  memory-first behavior: before answering questions about entities or relationships
+  the assistant queries the graph, persists durable facts, and calls `explain` to
+  surface rule names and scores on demand. Includes a demo-store bootstrap
+  (`mushroomdb demo`) that seeds 10 Orgs, 20 Projects, 30 People, and 334 edges.
+
+- **Cursor rules integration.** `mushroomdb install` also writes a `.cursor/rules`
+  file so the same memory-first behavior applies automatically in Cursor without
+  any additional configuration.
+
+- **README front-door restructure.** "Agent memory in 30 seconds" is now the
+  opening screen with the rule-fire + explain GIF inline. The install flow leads
+  with `npx mushroomdb install` and the `/mushroom` skill entry point.
+
+- **Reproducible rule-fire + explain GIF.** A VHS tape at `scripts/rule-fire-explain.tape`
+  reproduces the animated demo in the README header. Run `vhs scripts/rule-fire-explain.tape`
+  to regenerate.
+
+- **No engine or on-disk format changes.** All existing 0.4.x stores open without
+  migration. This release is purely additive (CLI subcommands, skill content,
+  documentation).
+
 ## v0.4.3 — 2026-09-02
 
 ### Query completeness + observability (format-stable, final 0.4.x patch)

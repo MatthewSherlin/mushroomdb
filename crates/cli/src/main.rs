@@ -1,9 +1,9 @@
 //! `mushroomdb` — thin dispatcher over [`cli`] lib functions.
 
 use cli::{
-    format_backup, format_demo, format_stats, format_suggest, maybe_run_demo_if_empty, parse_args,
-    read_stats, run_algo, run_asof, run_backup, run_demo, run_export, run_migrate, run_query,
-    run_schema_apply, run_snapshot, run_suggest, run_verify, usage, Command, ServeUi,
+    format_backup, format_demo, format_stats, format_suggest, install, maybe_run_demo_if_empty,
+    parse_args, read_stats, run_algo, run_asof, run_backup, run_demo, run_export, run_migrate,
+    run_query, run_schema_apply, run_snapshot, run_suggest, run_verify, usage, Command, ServeUi,
 };
 use core_api::SharedDb;
 use std::collections::HashMap;
@@ -200,6 +200,28 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
+        Ok(Command::Install(opts)) => {
+            let home = home_dir();
+            let cwd = std::env::current_dir().unwrap_or_default();
+            match install::run_install(&cwd, &home, &opts) {
+                Ok(out) => {
+                    print!("{out}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+        Ok(Command::Uninstall(opts)) => {
+            let home = home_dir();
+            let cwd = std::env::current_dir().unwrap_or_default();
+            match install::run_uninstall(&cwd, &home, &opts) {
+                Ok(out) => {
+                    print!("{out}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
         Err(e) => {
             let _ = writeln!(io::stderr(), "{e}");
             eprint!("{}", usage());
@@ -355,4 +377,11 @@ fn run_mcp(db_dir: PathBuf) -> Result<(), String> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     server::run_mcp_stdio(db, stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
+}
+
+fn home_dir() -> PathBuf {
+    // Prefer HOME env var; fall back to /tmp for safety (never panic).
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
