@@ -20,13 +20,11 @@ Explain any link with one call. SQLite for relationships. Built-in 16-tool MCP s
 
 ![A SET retriggers a rule: a derived edge is retracted, another fires, and explain shows the arithmetic](docs/assets/rule-fire-explain.gif)
 
-**Install (v0.4.4+):**
+**Install:**
 
 ```sh
 npx mushroomdb install
 ```
-
-*On v0.4.3 today: `cargo install mushroomdb-cli`, then add the MCP config entry manually — see the [Agent Memory](#agent-memory) section for the config snippet.*
 
 Open **Claude Code** and type `/mushroom`, or open **Cursor** (rules apply automatically).
 
@@ -618,7 +616,7 @@ Phases 1–4 and Plan 18 all landed. What remains:
 ## Distribution
 
 Pre-1.0 alpha quality software — APIs and formats may change between minor
-versions. Tags `v0.4.1`, `v0.4.2`, and `v0.4.3` are published; `npx mushroomdb`,
+versions. Tags `v0.4.1`, `v0.4.2`, `v0.4.3`, and `v0.4.4` are published; `npx mushroomdb`,
 the `curl install.sh`, and `ghcr.io/matthewsherlin/mushroomdb` are all live today.
 
 ### Docker (after the first v* tag)
