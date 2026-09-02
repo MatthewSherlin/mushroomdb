@@ -23,7 +23,7 @@ Run this in a terminal to seed an instant graph you can explore:
 mushroomdb demo {{DB_PATH}}
 ```
 
-This seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, and ~334 edges. It takes a few seconds.
+This seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, and 334 edges. It takes a few seconds.
 
 **`{{DB_PATH}}` already exists:** the MCP server connected automatically when Claude Code started. Skip ahead to querying.
 
@@ -106,21 +106,30 @@ mushroomdb demo {{DB_PATH}}
 ```
 == demo ==
 ingested 10 Orgs, 20 Projects, 30 People
-skill_fit edges=90, similar_interests edges=114, total 334 edges
+overlap rule: skill_fit (Person.skills ∩ Project.skills, min 0.5)
+numeric rule: founded_within (Org.founded_year, tolerance 2)
+geo rule: nearby_office (Org.office [lat,lon], 50 km)
+vector rule: similar_interests (Person.embedding dim 8, min 0.8)
+
+== auto-FK rules ==
+  auto_fk_person_org_id
+  auto_fk_person_project_id
+  auto_fk_project_org_id
 ```
 
-### Step 2 — Query the current skill-fit edges for person-01 (`query`)
+### Step 2 — Query the current FIT edges for person-01 (`query`)
 
 ```cypher
-MATCH (p:Person {id: 'person-01'})-[r:skill_fit]->(proj:Project)
+MATCH (p:Person {id: 'person-01'})-[r:FIT]->(proj:Project)
 RETURN p.id, proj.id, r.score
 ORDER BY r.score DESC LIMIT 3
 ```
 
 ```
-p.id=person-01  proj.id=proj-01  r.score=1.0
-p.id=person-01  proj.id=proj-02  r.score=0.5
-p.id=person-01  proj.id=proj-20  r.score=0.5
+columns: p.id, proj.id, r.score
+  p.id=person-01  proj.id=proj-01  r.score=1.0
+  p.id=person-01  proj.id=proj-02  r.score=0.5
+  p.id=person-01  proj.id=proj-20  r.score=0.5
 ```
 
 ### Step 3 — Change a property; the rule retracts and refires (`query` with SET)
@@ -132,23 +141,25 @@ RETURN p.id, p.skills
 ```
 
 ```
-p.id=person-01  p.skills=[s05, s06, s07]
+columns: p.id, p.skills
+  p.id=person-01  p.skills=[s05, s06, s07]
 ```
 
-The rule engine ran immediately: stale `skill_fit` edges from the old skill set were retracted; new ones were computed.
+The rule engine ran immediately: stale `FIT` edges from the old skill set were retracted; new ones were computed by the `skill_fit` rule.
 
 ### Step 4 — Same query; different projects fit now (`query`)
 
 ```cypher
-MATCH (p:Person {id: 'person-01'})-[r:skill_fit]->(proj:Project)
+MATCH (p:Person {id: 'person-01'})-[r:FIT]->(proj:Project)
 RETURN p.id, proj.id, r.score
 ORDER BY r.score DESC LIMIT 3
 ```
 
 ```
-p.id=person-01  proj.id=proj-05  r.score=1.0
-p.id=person-01  proj.id=proj-04  r.score=0.5
-p.id=person-01  proj.id=proj-06  r.score=0.5
+columns: p.id, proj.id, r.score
+  p.id=person-01  proj.id=proj-05  r.score=1.0
+  p.id=person-01  proj.id=proj-04  r.score=0.5
+  p.id=person-01  proj.id=proj-06  r.score=0.5
 ```
 
 `proj-01` is gone from the list. The rule retracted that edge because the skill overlap changed.
@@ -163,16 +174,16 @@ p.id=person-01  proj.id=proj-06  r.score=0.5
 rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=none
 ```
 
-The `skill_fit` row is absent — retracted when skills changed. The FK rule (person-01's id is a prefix of proj-01) is structural and stays regardless of skill overlap.
+The `FIT` row is absent — the `skill_fit` rule retracted that edge when skills changed. The FK rule (person-01's id is a prefix of proj-01) is structural and stays regardless of skill overlap.
 
-### Step 6 — Check that the old skill_fit edge existed before the SET (`was_linked`)
+### Step 6 — Check that the old FIT edge existed before the SET (`was_linked`)
 
 ```json
-{ "a": "person-01", "b": "proj-01", "edge_type": "skill_fit", "at_commit": 10 }
+{ "a": "person-01", "b": "proj-01", "edge_type": "FIT", "at_commit": 10 }
 ```
 
 ```json
-{ "a": "person-01", "b": "proj-01", "edge_type": "skill_fit", "at_commit": 10, "linked": true }
+{ "a": "person-01", "b": "proj-01", "edge_type": "FIT", "at_commit": 10, "linked": true }
 ```
 
 At commit 10 (before the SET), the edge existed. The store keeps the full version history — nothing is lost when an edge is retracted.
