@@ -35,7 +35,7 @@ Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If it already ex
 - Call `upsert_entity` to persist it. Do not skip this.
 
 **When asked "why are X and Y related":**
-- Call `explain_association` with both keys and surface the scores.
+- Call `explain` or its alias `explain_association` (both dispatch to the same implementation) with both keys and surface the scores.
 - Never describe a relationship without running the tool.
 
 **When a recurring relationship pattern appears:**
@@ -64,7 +64,8 @@ Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If it already ex
 
 Key signatures:
 - `query`: `cypher`, optional `params`, optional `mask` (array of node keys to hide)
-- `explain` / `explain_association`: `a`, `b`
+- `explain` / `explain_association`: `a`, `b` (aliases — same implementation)
+- `hybrid_search`: `query_text`, `text_field`; optional `vector` (bring-your-own embedding), `vector_field`, `label`, `k`
 - `neighborhood`: `key`, optional `depth`, `direction`, `edge_types`
 - `upsert_entity`: `key`, `props`, optional `label`
 - `was_linked`: `a`, `b`, `edge_type`, `at_commit`

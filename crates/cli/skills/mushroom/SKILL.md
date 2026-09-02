@@ -43,7 +43,7 @@ When a question names a specific entity, run `node_info` for its properties and 
 When the user states a durable fact about a person, project, org, or concept — call `upsert_entity` to persist it. Never silently skip this step.
 
 **4. Explain before asserting relationships.**
-When asked "why are X and Y related," always call `explain_association` with the two keys and surface the scores. Never describe a relationship without running the tool.
+When asked "why are X and Y related," always call `explain` (or its alias `explain_association` — both names dispatch to the same implementation) with the two keys and surface the scores. Never describe a relationship without running the tool.
 
 **5. Propose rules — never create silently.**
 When a recurring relationship pattern appears, propose `create_rule`. Always confirm with the user first (show the predicate and what edges it would derive). Never create a rule without explicit approval.
@@ -77,15 +77,15 @@ All 16 tools. Use these names exactly.
 | `query` | Cypher read or write — the primary tool | `cypher`; optional: `params`, `mask` (array of node keys) |
 | `ingest_json` | Bulk-load a JSON array as nodes | `label`, `rows_json`; optional: `key_field`, `auto_fk_suffix` |
 | `create_rule` | Define a derived-edge rule | `name`, `src_label`, `dst_label`, `predicate`, `edge_type`; optional: `weight_prop` |
-| `explain` | Show rule-edges between two specific nodes | `a`, `b` |
-| `explain_association` | Full association breakdown across all path types | `a`, `b` |
+| `explain` | Rule-edge and association breakdown between two nodes (alias: `explain_association`) | `a`, `b` |
+| `explain_association` | Alias for `explain` — dispatches to the same implementation | `a`, `b` |
 | `stats` | Node and edge counts for the whole store | — |
 | `neighborhood` | Subgraph radiating from a node | `key`; optional: `depth`, `direction`, `edge_types` |
 | `node_info` | Properties of one node | `key` |
 | `node_edges` | All edges on a node | `key` |
 | `upsert_entity` | Create or update a node | `key`, `props`; optional: `label` |
 | `find_similar` | Nearest-neighbor by edge type or by vector | by edge: `key`, `edge_type?`; by vector: `vector`, `field?`, `label?`, `k?`, `min?` |
-| `hybrid_search` | Text + vector search | `query_text`, `text_field`; optional: `vector_field`, `label`, `k` |
+| `hybrid_search` | RRF over fulltext + vector results | `query_text`, `text_field`; optional: `vector` (bring-your-own embedding), `vector_field`, `label`, `k` |
 | `node_history` | Full property-change log for a node | `key` |
 | `edge_history` | Full edge-change log between two nodes | `a`, `b` |
 | `was_linked` | Point-in-time edge check at a specific commit | `a`, `b`, `edge_type`, `at_commit` |
