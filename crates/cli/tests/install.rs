@@ -728,3 +728,54 @@ fn on_path_install_uses_bare_name_everywhere() {
     assert!(!rules.contains("{{BIN}}"));
     assert_absent(&home, ".mushroomdb/bin/mushroomdb");
 }
+
+// ---------------------------------------------------------------------------
+// Test: the rendered skill states mask semantics correctly (allow-list) and
+//       documents the arguments the MCP server actually accepts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn skill_text_is_truthful_about_masks_and_tool_args() {
+    let root = temp_dir("skill-truth");
+    let home = temp_dir("skill-truth-home");
+    let db = root.join("mushroom-memory");
+    let opts = all_project_opts(&db);
+    install_on_path(&root, &home, &opts).expect("install");
+
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    let rules = read(&root, ".cursor/rules/mushroom.mdc");
+    for (name, text) in [("SKILL.md", &skill), ("mushroom.mdc", &rules)] {
+        assert!(
+            text.contains("allow-list"),
+            "{name}: mask must be described as an allow-list"
+        );
+        assert!(
+            !text.contains("must not see"),
+            "{name}: inverted mask text still present"
+        );
+        assert!(
+            !text.contains("keys to exclude"),
+            "{name}: inverted mask text still present"
+        );
+        assert!(
+            !text.contains("keys to hide"),
+            "{name}: inverted mask text still present"
+        );
+        assert!(
+            text.contains("max_edges"),
+            "{name}: create_rule max_edges undocumented"
+        );
+        assert!(
+            text.contains("no auth"),
+            "{name}: MCP trust model undocumented"
+        );
+    }
+    assert!(
+        skill.contains("`edges`"),
+        "SKILL.md: ingest_json edges arg undocumented"
+    );
+    assert!(
+        skill.contains("ambiguous target labels"),
+        "SKILL.md: polymorphic FK pattern undocumented"
+    );
+}

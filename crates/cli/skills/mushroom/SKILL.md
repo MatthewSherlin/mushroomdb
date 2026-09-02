@@ -49,7 +49,7 @@ When asked "why are X and Y related," always call `explain` (or its alias `expla
 When a recurring relationship pattern appears, propose `create_rule`. Always confirm with the user first (show the predicate and what edges it would derive). Never create a rule without explicit approval.
 
 **6. Enforce access with mask.**
-When acting for a restricted audience, pass `mask` on `query`. The mask is a list of node keys the caller must not see. The masked nodes are excluded from results.
+When acting for a restricted audience, pass `mask` on `query` (and on `find_similar`). The mask is an **allow-list**: only the listed node keys are visible; every other node is omitted from results, and write statements are rejected while a mask is set. Compute the allowed key set for the caller first (for example, every node the caller's role may see), then pass it. `explain`, `neighborhood`, `node_info`, `node_edges` and `hybrid_search` take no mask — do not use them on behalf of a restricted caller.
 
 **7. Answer history questions with history tools.**
 For "when did..." / "has X ever been linked to Y?" — use `node_history` and `edge_history` for full audit trails; use `was_linked` for point-in-time edge checks at a specific commit.
@@ -65,6 +65,7 @@ When asked about the overall state of the graph, run `stats` before drilling int
 - **Surface errors verbatim.** If a tool call fails, show the error message — do not guess what the graph contains.
 - **This store is local and alpha.** No cloud sync. If durability matters, the user should snapshot: `{{BIN}} snapshot {{DB_PATH}} <output-file>`.
 - **Attribute derived edges.** When showing rule-fired edges, always note which rule produced them. Use `explain` or `explain_association` to get the rule name. Never assert a rule name from memory.
+- **This MCP server has no auth.** `mushroomdb mcp` is a local stdio process; masks here are cooperative (the caller supplies them). Real access control is the HTTP server's role tokens (`mushroomdb serve --role-token`). Never present an MCP mask as a security boundary.
 
 ---
 
@@ -74,9 +75,9 @@ All 16 tools. Use these names exactly.
 
 | Tool | Use for | Required args |
 |---|---|---|
-| `query` | Cypher read or write — the primary tool | `cypher`; optional: `params`, `mask` (array of node keys) |
-| `ingest_json` | Bulk-load a JSON array as nodes | `label`, `rows_json`; optional: `key_field`, `auto_fk_suffix` |
-| `create_rule` | Define a derived-edge rule | `name`, `src_label`, `dst_label`, `predicate`, `edge_type`; optional: `weight_prop` |
+| `query` | Cypher read or write — the primary tool | `cypher`; optional: `params`, `mask` (allow-list of node keys) |
+| `ingest_json` | Bulk-load a JSON array as nodes | `label`, `rows_json`; optional: `key_field` (default `id`), `auto_fk_suffix` (default `_id`), `edges` (array of `{edge_type, src, dst}` user edges). Auto-FK skips a field whose values point at two labels with reason `ambiguous target labels`; for such polymorphic references declare two `create_rule` KeyMatch rules (one per target label) instead. |
+| `create_rule` | Define a derived-edge rule | `name`, `src_label`, `dst_label`, `predicate`, `edge_type`; optional: `weight_prop` (default `weight`), `max_edges` (top-k per source) |
 | `explain` | Rule-edge and association breakdown between two nodes (alias: `explain_association`) | `a`, `b` |
 | `explain_association` | Alias for `explain` — dispatches to the same implementation | `a`, `b` |
 | `stats` | Node and edge counts for the whole store | — |
@@ -84,8 +85,8 @@ All 16 tools. Use these names exactly.
 | `node_info` | Properties of one node | `key` |
 | `node_edges` | All edges on a node | `key` |
 | `upsert_entity` | Create or update a node | `key`, `props`; optional: `label` |
-| `find_similar` | Nearest-neighbor by edge type or by vector | by edge: `key`, `edge_type?`; by vector: `vector`, `field?`, `label?`, `k?`, `min?` |
-| `hybrid_search` | RRF over fulltext + vector results | `query_text`, `text_field`; optional: `vector` (bring-your-own embedding), `vector_field`, `label`, `k` |
+| `find_similar` | Neighbors by edge or by vector | by edge: `key`, optional `edge_type`, `limit`; by vector: `vector`, optional `field`, `label`, `k`, `min`; optional `mask` (allow-list) in both modes |
+| `hybrid_search` | Text + vector fused ranking | `query_text`, `text_field`; optional: `vector`, `vector_field`, `label`, `k`. Pass `label` whenever you pass `vector` — without it the vector leg returns nothing and ranking is text-only. |
 | `node_history` | Full property-change log for a node | `key` |
 | `edge_history` | Full edge-change log between two nodes | `a`, `b` |
 | `was_linked` | Point-in-time edge check at a specific commit | `a`, `b`, `edge_type`, `at_commit` |

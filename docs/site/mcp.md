@@ -195,6 +195,12 @@ are 96% similar and they share the role `"engineer"`.
 
 ---
 
+## Trust model
+
+`mushroomdb mcp` is a local stdio process with no auth. Masks passed via `mask` are cooperative — the caller supplies them, and nothing on the MCP path enforces them. Real access control is the HTTP server's role tokens (`mushroomdb serve --role-token`); never present an MCP mask as a security boundary.
+
+---
+
 ## Why this works for agent memory
 
 Graph databases are a natural fit for long-term agent memory:
