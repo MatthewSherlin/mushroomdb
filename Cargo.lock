@@ -1277,6 +1277,7 @@ dependencies = [
  "mushroomdb",
  "mushroomdb-server",
  "parquet",
+ "serde",
  "serde_json",
  "tokio",
 ]

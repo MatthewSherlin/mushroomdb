@@ -1,0 +1,17 @@
+---
+alwaysApply: true
+description: Live graph memory for Cursor — query/create entities, derive relationships by rule, explain associations, time-travel, and enforce who-can-see-what.
+---
+
+<!-- PLACEHOLDER: Task 2 fills in the real cursor rules content. -->
+<!-- This file is embedded via include_str! in crates/cli/src/install.rs -->
+<!-- and installed to .cursor/rules/mushroom.mdc by `mushroomdb install`. -->
+<!-- DB_PATH below is substituted at install time with the actual db path. -->
+
+# mushroomdb memory rules
+
+> **Alpha.** Local only. No data leaves your machine.
+
+These rules wire Cursor to a live mushroomdb graph at `{{DB_PATH}}`.
+Task 2 will replace this block with full behavior rules, the memory-first
+protocol, worked examples, and the 60-second demo script.

@@ -489,6 +489,8 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff of created/updated/unchanged items |
 | `mushroomdb backup <dir> <dest>` | Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a concurrently running `serve` process — use `POST /backup` for live-served stores |
 | `mushroomdb export <dir> <dest> [--format jsonl\|parquet]` | Export nodes, edges, and rules to JSONL (stable, byte-identical) or Parquet (Snappy, not byte-identical across library versions). NaN/Inf floats export as null |
+| `mushroomdb install [--platform claude-code\|cursor\|all] [--project] [--db <path>]` | Write the `/mushroom` skill + MCP server entry for Claude Code or Cursor. Auto-detects platform. See [`docs/site/skill.md`](docs/site/skill.md) |
+| `mushroomdb uninstall [--platform claude-code\|cursor\|all] [--project] [--db <path>]` | Remove exactly what `install` wrote (manifest-driven; leaves user files) |
 
 Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 

@@ -4,6 +4,7 @@
 //! prints what the lib functions return.
 
 pub mod export;
+pub mod install;
 
 use core_api::schema::Schema;
 use core_api::{
@@ -144,6 +145,10 @@ pub enum Command {
         dest: PathBuf,
         format: ExportFormat,
     },
+    /// Wire the /mushroom skill and MCP server into Claude Code / Cursor.
+    Install(install::InstallOpts),
+    /// Undo what `install` wrote (manifest-driven).
+    Uninstall(install::InstallOpts),
     Help,
 }
 
@@ -189,6 +194,8 @@ pub fn usage() -> &'static str {
 mushroomdb — embedded graph database
 
 Usage:
+  mushroomdb install [--platform claude-code|cursor|all] [--project] [--db <path>]
+  mushroomdb uninstall [--platform claude-code|cursor|all] [--project] [--db <path>]
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
   mushroomdb mcp <db-dir>
   mushroomdb stats <db-dir>
@@ -210,7 +217,51 @@ Usage:
   mushroomdb --help
 
 Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
+install defaults: --platform auto-detect, user scope (omit --project for ~/.mushroomdb/memory).
 "
+}
+
+fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
+    let mut platform: Option<install::Platform> = None;
+    let mut project = false;
+    let mut db: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--platform" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --platform".to_string())?;
+            platform = Some(install::Platform::parse(val)?);
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--platform=") {
+            platform = Some(install::Platform::parse(val)?);
+            i += 1;
+        } else if a == "--project" {
+            project = true;
+            i += 1;
+        } else if a == "--db" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --db".to_string())?;
+            db = Some(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--db=") {
+            db = Some(PathBuf::from(val));
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else {
+            return Err(format!("unexpected argument: {a}"));
+        }
+    }
+    Ok(install::InstallOpts {
+        platform,
+        project,
+        db,
+    })
 }
 
 /// Parse argv after the binary name. Hand-rolled — no clap.
@@ -235,6 +286,8 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
         "backup" => parse_backup(&args[1..]),
         "export" => parse_export(&args[1..]),
+        "install" => parse_install_cmd(&args[1..]).map(Command::Install),
+        "uninstall" => parse_install_cmd(&args[1..]).map(Command::Uninstall),
         other => Err(format!("unknown command: {other}")),
     }
 }
