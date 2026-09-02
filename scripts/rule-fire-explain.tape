@@ -9,8 +9,9 @@ Set TypingSpeed 20ms
 Set Padding 20
 
 # ── hidden setup: add binary to PATH, seed fresh demo store ──
+# Run from the worktree root: vhs scripts/rule-fire-explain.tape
 Hide
-Type "export PATH=/Users/nilrehsttam/Repos/graph-db/.claude/worktrees/product-sprint/target/release:$PATH"
+Type "export PATH=./target/release:$PATH"
 Enter
 Type "export STORE=/tmp/mshroom-gif-demo"
 Enter
@@ -43,7 +44,7 @@ Enter
 Sleep 1.5s
 Show
 
-# ── 4. explain: skill_fit edge retracted, FK structural rule survives ──
-Type `curl -s 'http://127.0.0.1:19333/explain?a=person-01&b=proj-01' | jq -r '.[] | "rule=" + .rule + "  type=" + .edge_type'`
+# ── 4. explain surviving FIT edge: overlap arithmetic visible ──
+Type `curl -s 'http://127.0.0.1:19333/explain?a=person-01&b=proj-05' | jq -r '.[] | "rule=\(.rule)  kind=\(.predicate.kind)  field=\(.predicate.fields[0])  min=\(.predicate.min)  weight=\(.weight)"'`
 Enter
 Sleep 3s
