@@ -28,6 +28,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tower-http = { version = "0.6", default-features = false, features = ["fs"] }
 include_dir = { version = "0.7", optional = true }
+# RSS memory metric — already in the transitive tree at 0.2.189; direct dep
+# so the cfg(target_os) blocks compile without an indirect version pin.
+libc = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 # oneshot ServiceExt — axum re-exports tower types but not the util trait.

@@ -593,8 +593,9 @@ Phases 1–4 and Plan 18 all landed. What remains:
 
 ## Distribution
 
-Pre-alpha. No tag has been pushed. The one-liners below are the intended
-front door **after the first `v*` tag**; they are not available until then.
+Pre-1.0 alpha quality software — APIs and formats may change between minor
+versions. Tags `v0.4.1`, `v0.4.2`, and `v0.4.3` are published; `npx mushroomdb`,
+the `curl install.sh`, and `ghcr.io/matthewsherlin/mushroomdb` are all live today.
 
 ### Docker (after the first v* tag)
 

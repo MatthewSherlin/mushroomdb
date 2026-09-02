@@ -3,7 +3,7 @@
 //! Implements the Malkov & Yashunin (2018) Hierarchical Navigable Small World
 //! algorithm with:
 //!   - M = 32 (max connections per layer above layer 0)
-//!   - M₀ = 64 (max connections at layer 0)
+//!   - M₀ = 128 (max connections at layer 0)
 //!   - ef_construction = 400 (beam width during insertion)
 //!   - ef_search = 400 (beam width during query)
 //!

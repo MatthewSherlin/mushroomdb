@@ -366,11 +366,13 @@ fn build_app(
         role_tokens,
         addr,
         tls_active,
+        started_at: std::time::Instant::now(),
     };
     let app = Router::new()
         .route("/health", get(health))
         .route("/query", post(query))
         .route("/stats", get(stats))
+        .route("/metrics", get(metrics))
         .route("/ingest", post(ingest))
         .route("/rules", post(create_rule))
         .route("/suggest", get(suggest))
@@ -929,6 +931,122 @@ async fn stats(
         Ok(v) => json_ok(v),
         Err(e) => err_response(e.to_string()),
     }
+}
+
+async fn metrics(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    // Mirror /stats auth: deny role tokens — counters leak graph size.
+    if let AuthIdentity::Role(_) = identity {
+        return forbidden("role-bound token: /metrics requires a full-access token");
+    }
+    let (s, commit_seq, wal_size_bytes, slow_snap) = {
+        let g = state.db.read();
+        let s = g.stats();
+        let commit_seq = g.commit_seq();
+        let wal_size_bytes = g.wal_size_bytes().ok();
+        let slow_snap = g.slow_query_snapshot();
+        (s, commit_seq, wal_size_bytes, slow_snap)
+    };
+    let uptime_s = state.started_at.elapsed().as_secs();
+    let slow_entries: Vec<Js> = slow_snap
+        .last
+        .iter()
+        .map(|e| {
+            json!({
+                "ms": e.ms,
+                "query": e.query,
+                "at_commit": e.at_commit,
+            })
+        })
+        .collect();
+    json_ok(json!({
+        "nodes_live": s.nodes_live,
+        "nodes_tombstoned": s.nodes_tombstoned,
+        "edges": s.edges,
+        "commit_seq": commit_seq,
+        "wal_size_bytes": wal_size_bytes,
+        "rss_bytes": rss_bytes(),
+        "uptime_s": uptime_s,
+        "slow_queries": {
+            "threshold_ms": slow_snap.threshold_ms,
+            "count": slow_snap.count,
+            "last": slow_entries,
+        },
+    }))
+}
+
+/// Resident set size of the current process in bytes.
+///
+/// macOS: mach task_info (MACH_TASK_BASIC_INFO).
+/// Linux: /proc/self/statm RSS pages × page size.
+/// Other: always returns None.
+///
+/// Never panics; returns None on any failure.
+fn rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        // MACH_TASK_BASIC_INFO flavor = 20.
+        // struct mach_task_basic_info { u64 virtual, u64 resident,
+        //   u64 resident_max, [u32;2] user_time, [u32;2] sys_time,
+        //   i32 policy, i32 suspend_count } = 48 bytes = 12 natural_t(u32)s.
+        const MACH_TASK_BASIC_INFO: u32 = 20;
+        const MACH_TASK_BASIC_INFO_COUNT: u32 = 12;
+
+        #[repr(C)]
+        struct MachTaskBasicInfo {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time: [u32; 2],
+            system_time: [u32; 2],
+            policy: i32,
+            suspend_count: i32,
+        }
+
+        extern "C" {
+            fn mach_task_self() -> u32;
+            fn task_info(
+                target_task: u32,
+                flavor: u32,
+                task_info_out: *mut std::ffi::c_void,
+                task_info_cnt: *mut u32,
+            ) -> i32;
+        }
+
+        let mut info: MachTaskBasicInfo = unsafe { std::mem::zeroed() };
+        let mut count = MACH_TASK_BASIC_INFO_COUNT;
+        let ret = unsafe {
+            task_info(
+                mach_task_self(),
+                MACH_TASK_BASIC_INFO,
+                &mut info as *mut _ as *mut _,
+                &mut count,
+            )
+        };
+        if ret != 0 {
+            return None; // KERN_SUCCESS = 0
+        }
+        return Some(info.resident_size);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/self/statm: "vsize rss ..." in pages.
+        let content = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let mut parts = content.split_whitespace();
+        let _vsize = parts.next()?;
+        let rss_pages: u64 = parts.next()?.parse().ok()?;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return None;
+        }
+        return Some(rss_pages * page_size as u64);
+    }
+
+    #[allow(unreachable_code)]
+    None
 }
 
 async fn ingest(

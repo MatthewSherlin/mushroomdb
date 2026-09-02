@@ -764,3 +764,151 @@ fn subscribe_query_no_overhead_after_drop() {
     // No panic; the commit path must handle the dead Weak gracefully.
     db.insert_node("Person", "bob", vec![]).unwrap();
 }
+
+// ── label-skip tests ──────────────────────────────────────────────────────────
+
+/// Binding: committing a node with a different label than the subscribed scan
+/// must NOT re-execute the query (counter stays flat, no events).
+#[test]
+fn query_sub_skips_unrelated_label_commit() {
+    let dir = tmp("sq-skip-unrelated");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    let sub = db
+        .subscribe_query("MATCH (n:Person) RETURN n")
+        .expect("subscribe_query must succeed");
+
+    let before = core_api::query_sub_exec_count();
+
+    // Org insert — no overlap with Person scan.
+    db.insert_node("Org", "acme", vec![]).unwrap();
+
+    let after = core_api::query_sub_exec_count();
+    assert_eq!(
+        after - before,
+        0,
+        "re-execution counter must not advance for unrelated-label commit"
+    );
+    assert!(
+        sub.recv_timeout(Duration::from_millis(50)).is_none(),
+        "no events expected when commit cannot affect Person result set"
+    );
+}
+
+/// Binding: committing a node whose label matches the subscribed scan must
+/// trigger re-execution (counter advances, QueryRowAdded arrives).
+#[test]
+fn query_sub_still_fires_on_matching_label() {
+    let dir = tmp("sq-fires-matching");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    let sub = db
+        .subscribe_query("MATCH (n:Person) RETURN n")
+        .expect("subscribe_query must succeed");
+
+    let before = core_api::query_sub_exec_count();
+
+    db.insert_node("Person", "bob", vec![]).unwrap();
+
+    let after = core_api::query_sub_exec_count();
+    assert_eq!(
+        after - before,
+        1,
+        "re-execution counter must advance for matching-label commit"
+    );
+    assert!(
+        matches!(
+            sub.recv_timeout(Duration::from_secs(1)),
+            Some(DbEvent::QueryRowAdded { .. })
+        ),
+        "QueryRowAdded must arrive for Person insert"
+    );
+}
+
+/// Binding: an edge-record commit must NOT be skipped, even when only
+/// node-label scans appear in the plan (edges can change join results).
+#[test]
+fn query_sub_does_not_skip_on_edge_commit() {
+    let dir = tmp("sq-no-skip-edge");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Seed nodes so the edge insert is valid.
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node("Org", "acme", vec![]).unwrap();
+
+    let _sub = db
+        .subscribe_query("MATCH (n:Person) RETURN n")
+        .expect("subscribe_query must succeed");
+
+    let before = core_api::query_sub_exec_count();
+
+    db.insert_edge("WORKS_AT", "alice", "acme").unwrap();
+
+    let after = core_api::query_sub_exec_count();
+    assert_eq!(
+        after - before,
+        1,
+        "edge commit must trigger re-execution (never skip on edge records)"
+    );
+}
+
+/// Binding: when a rule fires and produces engine deltas, re-execution must
+/// not be skipped even if the node commit itself is for an unrelated label.
+#[test]
+fn query_sub_does_not_skip_on_rule_delta() {
+    let dir = tmp("sq-no-skip-rule-delta");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.create_rule(overlap_rule("rel", "REL")).unwrap();
+    db.insert_node("A", "n1", vec![("tags".into(), tags(&["x", "y"]))])
+        .unwrap();
+    db.insert_node("A", "n2", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+
+    // Subscribe to Person (different label from the A-node rule).
+    let sub = db
+        .subscribe_query("MATCH (n:Person) RETURN n")
+        .expect("subscribe_query must succeed");
+
+    let before = core_api::query_sub_exec_count();
+
+    // Insert another A node — the overlap rule fires → engine_deltas non-empty.
+    db.insert_node("A", "n3", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+
+    let after = core_api::query_sub_exec_count();
+    assert_eq!(
+        after - before,
+        1,
+        "rule delta must force re-execution even when the node label doesn't match"
+    );
+    // No Person events (result set didn't change).
+    let _ = sub;
+}
+
+/// Binding: a subscription whose plan contains an Expand op must never be
+/// skipped (conservative v0.4.3 boundary), even when the commit label is
+/// unrelated to both endpoints of the Expand pattern.
+#[test]
+fn query_sub_does_not_skip_with_expand() {
+    let dir = tmp("sq-no-skip-expand");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // Single-hop Expand is an allowed subscribe_query shape.
+    let sub = db
+        .subscribe_query("MATCH (a:Person)-[r:KNOWS]->(b:Org) RETURN a")
+        .expect("single-hop Expand must be accepted");
+
+    let before = core_api::query_sub_exec_count();
+
+    // Insert a Thing node — touches neither Person nor Org.
+    db.insert_node("Thing", "gadget", vec![]).unwrap();
+
+    let after = core_api::query_sub_exec_count();
+    assert_eq!(
+        after - before,
+        1,
+        "Expand queries must always re-execute (v0.4.3 conservative boundary)"
+    );
+    let _ = sub;
+}

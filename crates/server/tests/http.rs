@@ -4416,3 +4416,70 @@ async fn http_query_as_of_time_travel() {
         "as_of write must be rejected"
     );
 }
+
+/// /metrics returns expected JSON shape after inserts.
+#[tokio::test]
+async fn metrics_endpoint_returns_counters() {
+    let (app, db) = open("metrics-counters");
+
+    // Insert 2 nodes + 1 edge so the counters are non-trivial.
+    seed_person(&db, "alice");
+    seed_person(&db, "bob");
+    db.write().insert_edge("KNOWS", "alice", "bob").unwrap();
+
+    let (status, body, _) = send(app, get("/metrics")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200, body={}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let v = parse_json(&body);
+    assert_eq!(v["nodes_live"], json!(2), "nodes_live");
+    assert_eq!(v["nodes_tombstoned"], json!(0), "nodes_tombstoned");
+    assert_eq!(v["edges"], json!(1), "edges");
+    assert!(
+        v["commit_seq"].as_u64().unwrap_or(0) >= 2,
+        "commit_seq must be >= 2 after two node inserts, got {}",
+        v["commit_seq"]
+    );
+    assert!(
+        v["wal_size_bytes"].as_u64().unwrap_or(0) > 0,
+        "wal_size_bytes must be > 0, got {}",
+        v["wal_size_bytes"]
+    );
+    assert!(v["uptime_s"].is_number(), "uptime_s must be a number");
+    // rss_bytes may be null on unsupported platforms but must be present.
+    assert!(
+        v.get("rss_bytes").is_some(),
+        "rss_bytes key must be present in response"
+    );
+    let sq = &v["slow_queries"];
+    assert!(sq["threshold_ms"].is_number(), "slow_queries.threshold_ms");
+    assert!(sq["count"].is_number(), "slow_queries.count");
+    assert!(sq["last"].is_array(), "slow_queries.last");
+}
+
+/// Role-bound token receives 403 on /metrics (same as /stats).
+#[tokio::test]
+async fn metrics_role_token_is_forbidden() {
+    let db = SharedDb::open(&tmp("metrics-role-403")).unwrap();
+    let app = router_with_role_tokens(
+        db,
+        Some("adm".into()),
+        std::collections::HashMap::from([("viewer".to_string(), "reader".to_string())]),
+    );
+    let req = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .header(axum::http::header::AUTHORIZATION, "Bearer viewer")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "role token must be 403 on /metrics"
+    );
+}

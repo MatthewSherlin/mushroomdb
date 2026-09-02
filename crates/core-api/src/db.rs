@@ -67,6 +67,33 @@ thread_local! {
     static DELTA_COPY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Per-thread count of query-subscription `execute` calls in `distribute_events`.
+//
+// Incremented each time a query subscription actually runs its plan (i.e.,
+// the label-skip fast-path did not fire). Because `distribute_events` is
+// called synchronously on the writer thread, this thread-local correctly
+// isolates each test thread's count even when integration tests run in
+// parallel. Read via [`query_sub_exec_count`].
+thread_local! {
+    static QUERY_SUB_EXECS_TL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Return the number of query-subscription re-executions logged on this
+/// thread since the process started (or since last reset via
+/// [`reset_query_sub_exec_count`]).
+///
+/// Primarily for integration tests that verify the label-skip fast-path.
+#[doc(hidden)]
+pub fn query_sub_exec_count() -> usize {
+    QUERY_SUB_EXECS_TL.with(|c| c.get())
+}
+
+/// Reset the per-thread query-subscription execution counter to zero.
+#[doc(hidden)]
+pub fn reset_query_sub_exec_count() {
+    QUERY_SUB_EXECS_TL.with(|c| c.set(0));
+}
+
 /// Internal state for a single `subscribe_query` subscription.
 ///
 /// On every commit, `distribute_events` re-executes `ops` against the current
@@ -85,6 +112,15 @@ pub(crate) struct QuerySubEntry {
     prev_row_map: std::collections::HashMap<String, Vec<Option<Value>>>,
     /// Weak pointer to the subscriber queue; dead Weak → subscription dropped.
     inner: std::sync::Weak<SubInner>,
+    /// Interned label sym captured at subscribe time from the plan's leading scan
+    /// (`ScanLabel`, `IndexScan`, or `IndexIntersect` with a concrete label).
+    ///
+    /// `None` means the plan has an `Expand` op (or no recognizable leading scan
+    /// with a concrete label), and this subscription must re-execute on every
+    /// commit without skipping. This is the conservative v0.4.3 boundary: Expand
+    /// queries are never skipped because edges can alter join results regardless
+    /// of which node labels were written.
+    scan_label: Option<u32>,
 }
 
 /// A post-commit mutation notification.
@@ -251,6 +287,38 @@ pub struct RuleStats {
     /// Whether this rule uses the approximate IVF-Flat candidate path.
     pub approximate: bool,
 }
+
+/// One entry in the slow-query ring buffer.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlowQueryEntry {
+    /// Execution time in whole milliseconds.
+    pub ms: u64,
+    /// The Cypher query string that was slow.
+    pub query: String,
+    /// The commit sequence number at the time the query ran.
+    pub at_commit: u64,
+}
+
+/// Snapshot of the slow-query log returned by [`GraphDb::slow_query_snapshot`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SlowQuerySnapshot {
+    /// Current threshold in milliseconds (0 = disabled).
+    pub threshold_ms: u64,
+    /// Total number of slow queries ever recorded (not capped by ring size).
+    pub count: u64,
+    /// Most-recent slow queries (up to 16), oldest first.
+    pub last: Vec<SlowQueryEntry>,
+}
+
+/// Internal ring-buffer state protected by a `Mutex` so `query(&self)` can
+/// write to it without a mutable borrow.
+struct SlowQueryLog {
+    entries: std::collections::VecDeque<SlowQueryEntry>,
+    total: u64,
+}
+
+/// Maximum number of entries kept in the slow-query ring buffer.
+const SLOW_QUERY_RING_CAP: usize = 16;
 
 /// Wire summary of a [`Predicate`]. JSON only — `Explanation` is never
 /// bincode-persisted (WAL/snapshots store `RuleDef` bytes, not this type).
@@ -1102,6 +1170,16 @@ pub struct GraphDb<F: Fs> {
     /// `query_write_authz` for the duration of ONE mutation call.
     /// Always `None` at rest.  Never serialized, never WAL-replayed.
     pending_write_authz: Option<WriteAuthz>,
+    /// Slow-query threshold in milliseconds.  0 = disabled.
+    /// Seeded from `MUSHROOMDB_SLOW_QUERY_MS` at open; override via
+    /// [`GraphDb::set_slow_query_threshold_ms`] (tests must use the setter
+    /// — env vars are process-global and race parallel test threads).
+    slow_query_threshold_ms: u64,
+    /// Ring buffer of recent slow queries (interior-mutable so `query(&self)`
+    /// can record entries without requiring `&mut self`).
+    slow_queries: std::sync::Mutex<SlowQueryLog>,
+    /// Instant at which the database was opened (used by `/metrics` uptime).
+    started_at: std::time::Instant,
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -1202,6 +1280,41 @@ pub struct SnapshotOptions {
     /// [`GraphDb::open_at`], extending the reachable history horizon across
     /// snapshot boundaries.
     pub archive_wal: bool,
+}
+
+/// Derive the scan-label sym for the commit-skip fast-path.
+///
+/// Walks `ops` to find the plan's leading scan op (`ScanLabel`, `IndexScan`,
+/// or `IndexIntersect`) with a concrete label string, then interns it.
+///
+/// Returns `None` in all cases where skipping is unsafe:
+/// - Any `Expand` op is present (edge traversal; edges change results regardless
+///   of node labels).
+/// - The leading scan has no label (`ScanLabel { label: None }` — full scan).
+/// - No recognizable leading scan op is found.
+///
+/// This is the conservative v0.4.3 boundary. The caller stores the result in
+/// [`QuerySubEntry::scan_label`] at subscribe time; `None` means always execute.
+fn extract_scan_label(ops: &[PlanOp], syms: &mut Interner) -> Option<u32> {
+    // Any Expand → must always re-execute (edges can change join results).
+    if ops.iter().any(|op| matches!(op, PlanOp::Expand { .. })) {
+        return None;
+    }
+    for op in ops {
+        match op {
+            PlanOp::ScanLabel {
+                label: Some(label), ..
+            } => return Some(syms.intern(label)),
+            PlanOp::IndexScan {
+                label: Some(label), ..
+            } => return Some(syms.intern(label)),
+            PlanOp::IndexIntersect {
+                label: Some(label), ..
+            } => return Some(syms.intern(label)),
+            _ => {}
+        }
+    }
+    None
 }
 
 impl GraphDb<RealFs> {
@@ -1372,6 +1485,15 @@ impl<F: Fs> GraphDb<F> {
             wal_horizon_floor: 0,
             archive_genesis_chain: false,
             pending_write_authz: None,
+            slow_query_threshold_ms: std::env::var("MUSHROOMDB_SLOW_QUERY_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
+            slow_queries: std::sync::Mutex::new(SlowQueryLog {
+                entries: std::collections::VecDeque::new(),
+                total: 0,
+            }),
+            started_at: std::time::Instant::now(),
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
@@ -1892,6 +2014,15 @@ impl<F: Fs> GraphDb<F> {
             wal_horizon_floor: 0,
             archive_genesis_chain: false,
             pending_write_authz: None,
+            slow_query_threshold_ms: std::env::var("MUSHROOMDB_SLOW_QUERY_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
+            slow_queries: std::sync::Mutex::new(SlowQueryLog {
+                entries: std::collections::VecDeque::new(),
+                total: 0,
+            }),
+            started_at: std::time::Instant::now(),
         };
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
@@ -3678,6 +3809,108 @@ impl<F: Fs> GraphDb<F> {
             .collect()
     }
 
+    /// Collect the set of label syms touched by a WAL record.
+    ///
+    /// Returns `Some(set)` when every record in this commit can be attributed to
+    /// a known label sym. Returns `None` when the commit must not be skipped:
+    /// edge records, unresolvable key→label lookups, or any record type not in
+    /// the explicit handled set.
+    ///
+    /// Handled record types and their actions:
+    /// - `InsertNode`   → look up label in interner (fails → None)
+    /// - `InsertNodeId` → label sym is carried directly
+    /// - `SetProp`      → resolve key→id→label (fails → None)
+    /// - `DeleteNode`   → resolve key→id→label (fails → None)
+    /// - `Batch`        → recurse into every inner record
+    /// - `InsertEdge`, `DeleteEdge`, `InsertEdgeId` → always None (edge records)
+    /// - everything else → None (conservative)
+    fn commit_touched_labels(
+        rec: &WalRecord,
+        syms: &Interner,
+        ids: &IdMap,
+        labels: &[u32],
+    ) -> Option<BTreeSet<u32>> {
+        let mut out = BTreeSet::new();
+        if Self::collect_touched_labels(rec, syms, ids, labels, &mut out) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    fn collect_touched_labels(
+        rec: &WalRecord,
+        syms: &Interner,
+        ids: &IdMap,
+        labels: &[u32],
+        out: &mut BTreeSet<u32>,
+    ) -> bool {
+        match rec {
+            // String-key insert: the dense rewrite converts this to
+            // [Intern, InsertNodeId], so this arm fires only for legacy WAL
+            // records written before the dense path was added.
+            WalRecord::InsertNode { label, .. } => {
+                if let Some(sym) = syms.get(label) {
+                    out.insert(sym);
+                    true
+                } else {
+                    false
+                }
+            }
+            // Dense-id insert (produced by rewrite_wal_dense for every
+            // insert_node call in the current codebase).
+            WalRecord::InsertNodeId { label, .. } => {
+                out.insert(*label);
+                true
+            }
+            // String-key prop set: dense path converts to [Intern, SetPropId].
+            WalRecord::SetProp { key, .. } => {
+                if let Some(sym) = Self::resolve_key_label_sym(key, ids, labels) {
+                    out.insert(sym);
+                    true
+                } else {
+                    false
+                }
+            }
+            // Dense-id prop set (produced by rewrite_wal_dense for set_prop).
+            WalRecord::SetPropId { id, .. } => {
+                if let Some(sym) = labels.get(*id as usize).copied().filter(|&s| s != u32::MAX) {
+                    out.insert(sym);
+                    true
+                } else {
+                    false
+                }
+            }
+            WalRecord::DeleteNode { key } => {
+                if let Some(sym) = Self::resolve_key_label_sym(key, ids, labels) {
+                    out.insert(sym);
+                    true
+                } else {
+                    false
+                }
+            }
+            WalRecord::Batch(inner) => inner
+                .iter()
+                .all(|r| Self::collect_touched_labels(r, syms, ids, labels, out)),
+            // Intern is a pure metadata record — it does not touch any node's
+            // label and is safe to skip for the label-skip predicate.
+            WalRecord::Intern { .. } => true,
+            // Edge records: always re-execute (edges can change join results).
+            WalRecord::InsertEdge { .. }
+            | WalRecord::DeleteEdge { .. }
+            | WalRecord::InsertEdgeId { .. } => false,
+            _ => false,
+        }
+    }
+
+    /// Resolve a node key to its label sym via the dense id table.
+    /// Returns `None` if the key is unknown or the label is a tombstone sentinel.
+    fn resolve_key_label_sym(key: &str, ids: &IdMap, labels: &[u32]) -> Option<u32> {
+        let id = ids.get(key)?;
+        let sym = labels.get(id as usize).copied()?;
+        (sym != u32::MAX).then_some(sym)
+    }
+
     /// Distribute post-commit events to all live subscribers.
     ///
     /// Called from `log_then_apply_with` after apply + fsync, before the
@@ -3767,6 +4000,19 @@ impl<F: Fs> GraphDb<F> {
                 let Some(inner) = entry.inner.upgrade() else {
                     return false; // subscriber dropped — prune
                 };
+                // Label-skip: if the plan has a known scan label and this commit
+                // can be proven to touch only different labels (and no rule-derived
+                // edge deltas fired), the result set cannot have changed — skip.
+                if let Some(scan_sym) = entry.scan_label {
+                    if engine_deltas.is_empty() {
+                        let touched =
+                            Self::commit_touched_labels(rec, &self.syms, &self.ids, &self.labels);
+                        if touched.map(|t| !t.contains(&scan_sym)).unwrap_or(false) {
+                            return true; // safe to skip — result set unchanged
+                        }
+                    }
+                }
+                QUERY_SUB_EXECS_TL.with(|c| c.set(c.get() + 1));
                 let result = match execute(&self.view(), &entry.ops, &Params(&empty_params)) {
                     Ok(r) => r,
                     Err(e) => {
@@ -4041,11 +4287,15 @@ impl<F: Fs> GraphDb<F> {
         let columns = initial.columns().to_vec();
         let prev_row_map = Self::result_to_row_map(&initial);
         let inner = SubInner::new(self.sub_capacity());
+        // Derive the scan-label sym for the commit-skip fast-path.  Any Expand op
+        // or unrecognized leading scan → None (always re-execute).
+        let scan_label = extract_scan_label(&ops, &mut self.syms);
         self.query_subscriptions.push(QuerySubEntry {
             ops,
             columns,
             prev_row_map,
             inner: std::sync::Arc::downgrade(&inner),
+            scan_label,
         });
         Ok(Subscription(inner))
     }
@@ -6671,9 +6921,30 @@ impl<F: Fs> GraphDb<F> {
         let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
-        execute_union(&self.view(), &union, &Params(params)).map_err(|e| GraphError::QueryError {
-            detail: format!("execute: {e}"),
-        })
+        let t0 = std::time::Instant::now();
+        let result = execute_union(&self.view(), &union, &Params(params)).map_err(|e| {
+            GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            }
+        });
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        let threshold = self.slow_query_threshold_ms;
+        if threshold > 0 && elapsed_ms >= threshold {
+            eprintln!("[mushroomdb] slow query ({elapsed_ms}ms): {cypher}");
+            let entry = SlowQueryEntry {
+                ms: elapsed_ms,
+                query: cypher.to_string(),
+                at_commit: self.commit_seq,
+            };
+            if let Ok(mut log) = self.slow_queries.lock() {
+                if log.entries.len() == SLOW_QUERY_RING_CAP {
+                    log.entries.pop_front();
+                }
+                log.entries.push_back(entry);
+                log.total += 1;
+            }
+        }
+        result
     }
 
     /// Convenience entry-point that accepts a slice of `(name, value)` pairs
@@ -8398,6 +8669,46 @@ impl<F: Fs> GraphDb<F> {
             edges: self.topo_view().edge_count(),
             rules,
         }
+    }
+
+    /// On-disk size of the WAL file in bytes.
+    ///
+    /// Reads file metadata without loading WAL contents.  Returns `Err` for
+    /// in-memory (`SimFs`) databases where no WAL file exists on disk.
+    pub fn wal_size_bytes(&self) -> std::io::Result<u64> {
+        let path = self.fs.wal_path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "wal_path not available for this Fs implementation",
+            )
+        })?;
+        Ok(std::fs::metadata(path)?.len())
+    }
+
+    /// Set the slow-query threshold.  Queries whose execution time equals or
+    /// exceeds `ms` milliseconds are logged.  Pass `0` to disable.
+    ///
+    /// Use this setter in tests — the environment variable
+    /// `MUSHROOMDB_SLOW_QUERY_MS` is process-global and races parallel test
+    /// threads.
+    pub fn set_slow_query_threshold_ms(&mut self, ms: u64) {
+        self.slow_query_threshold_ms = ms;
+    }
+
+    /// Snapshot of the slow-query ring buffer and lifetime counter.
+    pub fn slow_query_snapshot(&self) -> SlowQuerySnapshot {
+        let log = self.slow_queries.lock().unwrap_or_else(|e| e.into_inner());
+        SlowQuerySnapshot {
+            threshold_ms: self.slow_query_threshold_ms,
+            count: log.total,
+            last: log.entries.iter().cloned().collect(),
+        }
+    }
+
+    /// Instant the database was opened.  Used by consumers (e.g. `/metrics`)
+    /// to compute uptime.
+    pub fn started_at(&self) -> std::time::Instant {
+        self.started_at
     }
 
     /// On-disk snapshot format version this binary writes and reads.

@@ -103,6 +103,28 @@ The server disconnects only on a write error; slow consumers receive `{"type":"l
 
 **Multi-subscription idle latency:** when a single WS connection subscribes to multiple rules, the server bridge thread blocks on the first subscription when idle. Events arriving on secondary subscriptions while the first is quiet may experience up to ~100 ms of additional latency before being forwarded.
 
+## Query subscription skip optimization (v0.4.3)
+
+`subscribe_query` re-executes the plan on every commit. v0.4.3 adds a label-skip fast-path: if the commit can be proven to touch only nodes with a label that does not match the subscription's leading scan, re-execution is skipped entirely — the result set cannot have changed.
+
+### When a subscription is skipped
+
+A subscription for `MATCH (n:Person) …` is skipped when ALL of the following hold:
+
+- The commit contains only node records (`InsertNode`, `InsertNodeId`, `SetProp`, `DeleteNode`) whose resolved labels are all ≠ `Person`.
+- The commit contains no edge records (`InsertEdge`, `DeleteEdge`, or their dense-id variants).
+- No rule engine produced derived-edge deltas for this commit.
+
+Any record type not in the above set (e.g., unknown future variants) causes re-execution rather than a skip.
+
+### Expand limitation
+
+Subscriptions whose plan contains an `Expand` op (i.e., one-hop MATCH patterns like `MATCH (a:Person)-[r:KNOWS]->(b:Org) RETURN a`) are **never skipped**. Edges can join two label sets together, so a commit touching any label can potentially change the result. This is the conservative v0.4.3 boundary; differential evaluation that handles Expand correctly is roadmap / Phase 5.
+
+### No-scan or unlabeled scan
+
+`MATCH (n) RETURN n` (no label filter) and any subscription whose plan has no recognizable leading scan are also never skipped.
+
 ## Invariants
 
 1. **Post-fsync ordering.** Events are distributed inside `log_then_apply_with` after WAL fsync and in-memory apply both complete. A subscriber querying immediately on receipt sees consistent state.
@@ -110,3 +132,4 @@ The server disconnects only on a write error; slow consumers receive `{"type":"l
 3. **Clean unregister on drop.** Dropping `Subscription` releases the `Arc`; the next commit's distribution loop prunes the dead `Weak`.
 4. **Replay silence.** `open()` / WAL recovery applies records via `apply`, not `log_then_apply_with`. Pending engine deltas accumulated during replay are drained and discarded before `open_with` returns. Subscriptions installed after open receive only live commits.
 5. **commit_seq cohesion.** All events from one `write_batch` share the same `commit_seq` and arrive in a contiguous run.
+6. **Skip soundness.** A skipped commit is guaranteed to produce the same result set as the previous execution. Any skip requires: (a) no engine deltas, (b) every record resolves to a label ≠ the scan label, (c) no edge records. Any resolution failure is treated as "must execute."

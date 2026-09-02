@@ -43,10 +43,26 @@ way you declare rules or fulltext fields.
   MATCH property map to an indexed lookup. If the field is not indexed the query
   still runs, just as a scan — declaring an index never changes results, only
   speed.
-- **Which query shapes.** Today the fast path covers exactly one equality in the
-  inline property map, e.g. `MATCH (n:Person {city: 'austin'})` or with a
-  parameter `MATCH (n:Person {city: $c})`. Compound filters and `WHERE`-clause
-  equality fall back to a scan.
+- **Which query shapes.** The fast path covers:
+  - A single non-`id` equality in the inline property map:
+    `MATCH (n:Person {city: 'austin'})` or `MATCH (n:Person {city: $c})`.
+  - A `WHERE`-clause single equality on the scan variable:
+    `MATCH (n:Person) WHERE n.city = 'austin'` or `WHERE n.city = $c`.
+    The equality is folded into an `IndexScan` at plan time.
+  - **Compound equalities** (two or more equalities on the same scan variable):
+    `MATCH (n:Person) WHERE n.city = 'austin' AND n.age = 30` or equivalently
+    as an inline map `MATCH (n:Person {city: 'austin', age: 30})`. The planner
+    emits an `IndexIntersect` op; the executor resolves each field against the
+    property index, two-pointer-intersects the resulting sorted node-ID lists,
+    then post-filters any fields that have no declared index. If no fields are
+    indexed the query falls back to a full label scan — results are always
+    correct; only the speed benefit depends on indexes being declared. Compound
+    `WHERE` predicates with non-equality residuals (`AND n.score > 10`) fold
+    the equality terms and leave the rest as a trailing filter.
+  - Eligibility rules: the fold applies when the scan node has no prior
+    `Expand` binding it (conservative — cross-expand pushdown is not yet
+    supported). The `id` pseudo-property is always resolved via the identity
+    map and is excluded from index intersection.
 
 ## Relationship to fulltext
 

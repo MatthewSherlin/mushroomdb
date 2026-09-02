@@ -1,5 +1,72 @@
 # Changelog
 
+## v0.4.3 — 2026-09-02
+
+### Query completeness + observability (format-stable, final 0.4.x patch)
+
+No format change — upgrade in place from any 0.4.x store. The WAL discriminants,
+snapshot section IDs, and `VERSION` constant remain at V8. T1–T4 are
+planner/executor/runtime changes only; all query results are byte-identical to
+unindexed execution (equivalence-tested in every task).
+
+- **WHERE-clause equality pushdown into the property index (T1).** Queries of the
+  form `MATCH (n:Label) WHERE n.field = value` now use the property index instead
+  of a full label scan. Previously, only the first inline property pattern
+  (`{field: value}`) was indexed; a `WHERE` equality on the same variable was
+  re-executed as a post-scan filter over all nodes in the label. A new planner
+  post-pass `fold_where_equalities` folds a single-var equality in the `WHERE`
+  clause into an `IndexScan`, dropping the consumed predicate from the `Filter` (or
+  removing the `Filter` entirely when no residual remains). Eligibility is
+  conservative: only the scan variable, only before an `Expand`, only literal and
+  `$param` operands. Unindexed fields fold gracefully (the `IndexScan` executor arm
+  falls back to a scan when `nodes_with_prop` returns `None`). Results are
+  byte-identical to the unoptimized path in all cases, including the fallback.
+
+- **Compound AND-of-equalities via index intersection (T2).** Queries with two or
+  more equality predicates on the same scanned variable — whether from inline
+  patterns (`MATCH (n:Doc {namespace: 'a', status: 'live'})`) or `WHERE` clauses
+  (`WHERE n.namespace = $ns AND n.status = 'live'`) — now emit a new
+  `IndexIntersect` plan operator. The executor resolves each `(field, operand)` pair
+  via `nodes_with_prop`, two-pointer-intersects the resulting sorted id-lists
+  (smallest first for efficiency), then applies any unindexed fields as per-node
+  post-filters. If all fields are unindexed the executor falls back to a full scan
+  plus filter; ascending id order is preserved in every code path. The motivating
+  example from the v0.5 roadmap (`MATCH (d:Doc {namespace: $ns}) WHERE d.status =
+  'live'`) now hits the index directly.
+
+- **Subscription label-skip (T3).** Query subscriptions (`subscribe_query`) no
+  longer re-execute on every commit regardless of content. A captured `scan_label`
+  per subscription (the interned symbol of the leading `ScanLabel` / `IndexScan` /
+  `IndexIntersect` label) gates re-execution: if the commit contains only node
+  records for labels other than the scan label, no edge records, no `SetProp` /
+  `DeleteNode` for nodes whose label cannot be resolved at skip-time, and no
+  rule-engine deltas, the subscription is skipped entirely. The predicate is
+  conservative (default-deny): any unrecognized record type, any edge operation, and
+  any plan that includes `Expand` (edge traversal) clears the skip flag and always
+  re-executes. A skipped re-execution is provably unable to change the result set.
+  Subscriptions over traversal queries (`MATCH (a)-[:E]->(b) ...`) retain
+  `scan_label = None` and never skip — the honest v0.4.3 boundary, documented.
+
+- **`GET /metrics` endpoint + slow-query log (T4).** A new `GET /metrics` route
+  (same auth middleware as `GET /stats`) returns a JSON object with:
+  `nodes_live`, `nodes_tombstoned`, `edges`, `commit_seq`, `wal_size_bytes`,
+  `rss_bytes` (null where unsupported), `uptime_s`, and a `slow_queries` block
+  containing the threshold in ms, a lifetime count, and a ring of the last ≤16
+  slow query records (`ms`, `query`, `at_commit`). Slow-query logging is controlled
+  by `MUSHROOMDB_SLOW_QUERY_MS` (default 100 ms; 0 disables); the threshold is also
+  settable at runtime via `GraphDb::set_slow_query_threshold_ms`. RSS is read via
+  the platform memory API (macOS `proc_pidinfo` / Linux `/proc/self/statm`) and
+  returns `null` on any failure without panicking.
+
+- **New direct dependency: `libc`.** Added as a direct dep to `mushroomdb-server`
+  for the macOS RSS helper (`proc_pidinfo`). `libc` was already a transitive
+  dependency of the workspace; this makes the dependency explicit.
+
+- **`#[doc(hidden)]` on test-instrumentation helpers.** `query_sub_exec_count()`
+  and `reset_query_sub_exec_count()` in `mushroomdb` (core-api) are now tagged
+  `#[doc(hidden)]` — no behavior change; the functions remain `pub` for integration
+  tests.
+
 ## v0.4.2 — 2026-09-01
 
 ### Hardening patch (format-stable)
