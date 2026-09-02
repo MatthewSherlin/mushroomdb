@@ -283,6 +283,57 @@ without `LIMIT` still error at 1,000,000 intermediate rows.
 
 ---
 
+### GET /metrics
+
+Returns runtime counters and the slow-query log. Requires a full-access token
+(role-bound tokens receive 403, same as `/stats`).
+
+```json
+{
+  "nodes_live": 60,
+  "nodes_tombstoned": 0,
+  "edges": 334,
+  "commit_seq": 42,
+  "wal_size_bytes": 8192,
+  "rss_bytes": 20971520,
+  "uptime_s": 3600,
+  "slow_queries": {
+    "threshold_ms": 100,
+    "count": 3,
+    "last": [
+      {"ms": 142, "query": "MATCH (n:Person) RETURN n", "at_commit": 40}
+    ]
+  }
+}
+```
+
+**Fields:**
+
+| Field | Type | Notes |
+|---|---|---|
+| `nodes_live` | integer | Live (non-tombstoned) node count |
+| `nodes_tombstoned` | integer | Soft-deleted node count |
+| `edges` | integer | Total edge count |
+| `commit_seq` | integer | WAL commit sequence number (monotonically increasing) |
+| `wal_size_bytes` | integer | On-disk WAL file size in bytes |
+| `rss_bytes` | integer or null | Resident set size of the server process; null on unsupported platforms |
+| `uptime_s` | integer | Seconds since the HTTP server started |
+| `slow_queries.threshold_ms` | integer | Current slow-query threshold (0 = disabled) |
+| `slow_queries.count` | integer | Lifetime count of slow queries recorded |
+| `slow_queries.last` | array | Up to 16 most recent slow-query entries, oldest first |
+
+**Slow-query threshold:** set via the `MUSHROOMDB_SLOW_QUERY_MS` environment
+variable at server start (default 100 ms; 0 disables the log). Any read query
+whose execution time meets or exceeds the threshold is logged to `stderr` and
+appended to the in-memory ring buffer (capped at 16 entries).
+
+**RSS caveats:** `rss_bytes` is read from `mach_task_basic_info` on macOS and
+`/proc/self/statm` on Linux. On other platforms it is always `null`. The value
+includes shared library mappings and may not match tools like `top` exactly. It
+never causes a panic or blocking I/O.
+
+---
+
 ### POST /ingest
 
 ```json

@@ -67,13 +67,13 @@ thread_local! {
     static DELTA_COPY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Per-thread count of query-subscription `execute` calls in `distribute_events`.
-///
-/// Incremented each time a query subscription actually runs its plan (i.e.,
-/// the label-skip fast-path did not fire). Because `distribute_events` is
-/// called synchronously on the writer thread, this thread-local correctly
-/// isolates each test thread's count even when integration tests run in
-/// parallel. Read via [`query_sub_exec_count`].
+// Per-thread count of query-subscription `execute` calls in `distribute_events`.
+//
+// Incremented each time a query subscription actually runs its plan (i.e.,
+// the label-skip fast-path did not fire). Because `distribute_events` is
+// called synchronously on the writer thread, this thread-local correctly
+// isolates each test thread's count even when integration tests run in
+// parallel. Read via [`query_sub_exec_count`].
 thread_local! {
     static QUERY_SUB_EXECS_TL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
