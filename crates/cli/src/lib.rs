@@ -36,6 +36,9 @@ ORDER BY score DESC, proj";
 const SAMPLE_EXPLAIN_A: &str = "person-01";
 const SAMPLE_EXPLAIN_B: &str = "proj-01";
 
+/// Build version, printed by `mushroomdb --version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// How `serve` should mount a UI. Precedence: `--ui dir` > embedded > `--no-ui`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeUi {
@@ -149,6 +152,7 @@ pub enum Command {
     Install(install::InstallOpts),
     /// Undo what `install` wrote (manifest-driven).
     Uninstall(install::InstallOpts),
+    Version,
     Help,
 }
 
@@ -214,6 +218,7 @@ Usage:
   mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
   mushroomdb algo wcc <db-dir> [--top N]
   mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
+  mushroomdb --version
   mushroomdb --help
 
 Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
@@ -272,6 +277,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
     }
     match args[0] {
         "--help" | "-h" | "help" => Ok(Command::Help),
+        "--version" | "-V" | "version" => Ok(Command::Version),
         "serve" => parse_serve(&args[1..]),
         "mcp" => parse_one_dir("mcp", &args[1..]).map(|db_dir| Command::Mcp { db_dir }),
         "stats" => parse_one_dir("stats", &args[1..]).map(|db_dir| Command::Stats { db_dir }),
@@ -2707,5 +2713,18 @@ mod tests {
             err.contains("tls-cert"),
             "--tls-key alone must mention --tls-cert in error, got {err}"
         );
+    }
+
+    #[test]
+    fn version_flag_parses() {
+        assert_eq!(parse_args(&["--version"]).unwrap(), Command::Version);
+        assert_eq!(parse_args(&["-V"]).unwrap(), Command::Version);
+        assert_eq!(parse_args(&["version"]).unwrap(), Command::Version);
+    }
+
+    #[test]
+    fn version_constant_matches_cargo() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(usage().contains("--version"));
     }
 }

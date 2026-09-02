@@ -20,6 +20,10 @@ fn main() -> ExitCode {
             print!("{}", usage());
             ExitCode::SUCCESS
         }
+        Ok(Command::Version) => {
+            println!("mushroomdb {}", cli::VERSION);
+            ExitCode::SUCCESS
+        }
         Ok(Command::Serve {
             db_dir,
             addr,
