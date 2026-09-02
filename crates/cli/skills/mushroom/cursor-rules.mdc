@@ -3,15 +3,69 @@ alwaysApply: true
 description: Live graph memory for Cursor — query/create entities, derive relationships by rule, explain associations, time-travel, and enforce who-can-see-what.
 ---
 
-<!-- PLACEHOLDER: Task 2 fills in the real cursor rules content. -->
-<!-- This file is embedded via include_str! in crates/cli/src/install.rs -->
-<!-- and installed to .cursor/rules/mushroom.mdc by `mushroomdb install`. -->
-<!-- DB_PATH below is substituted at install time with the actual db path. -->
-
 # mushroomdb memory rules
 
 > **Alpha.** Local only. No data leaves your machine.
 
-These rules wire Cursor to a live mushroomdb graph at `{{DB_PATH}}`.
-Task 2 will replace this block with full behavior rules, the memory-first
-protocol, worked examples, and the 60-second demo script.
+These rules connect Cursor to a live mushroomdb graph at `{{DB_PATH}}`.
+
+The graph stays true as data changes: when a property is SET, rules retract stale derived edges and fire new ones in the same transaction. Access is enforced per query via the `mask` argument. Every write is versioned so you can inspect any prior state.
+
+## Bootstrap
+
+If `{{DB_PATH}}` does not exist, seed it first:
+
+```
+mushroomdb demo {{DB_PATH}}
+```
+
+Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If it already exists, the MCP server is connected and ready.
+
+## Memory-first behavior
+
+**Before answering questions about entities, relationships, or stored facts:**
+- Run `query` (Cypher) or `hybrid_search` (text + vector) against the store first.
+- Do not improvise from conversation context when a live record exists.
+- If the query returns empty, say so explicitly.
+
+**For questions about a specific node:**
+- Run `node_info` for its properties and `neighborhood` for its graph context before answering.
+
+**When the user states a durable fact:**
+- Call `upsert_entity` to persist it. Do not skip this.
+
+**When asked "why are X and Y related":**
+- Call `explain_association` with both keys and surface the scores.
+- Never describe a relationship without running the tool.
+
+**When a recurring relationship pattern appears:**
+- Propose `create_rule` and confirm with the user before creating. Show the predicate and what edges it would derive. Never create rules silently.
+
+**When acting for a restricted audience:**
+- Pass `mask` on `query` with the list of node keys to exclude.
+
+**For history questions ("when did...", "was X ever linked to Y"):**
+- Use `node_history` and `edge_history` for full audit trails.
+- Use `was_linked` with `at_commit` for point-in-time edge checks.
+
+**To orient on overall graph state:**
+- Run `stats` first, then drill in.
+
+## Honesty rules
+
+- Never invent graph contents. If a tool returns empty, say so.
+- Surface tool errors verbatim — do not guess.
+- This store is local and alpha. Durability requires manual snapshots: `mushroomdb snapshot {{DB_PATH}} <output-file>`.
+- When showing derived edges, always report which rule produced them — use `explain` or `explain_association` to get the rule name, never assert it from memory.
+
+## Tools (use these names exactly)
+
+`query` · `ingest_json` · `create_rule` · `explain` · `explain_association` · `stats` · `neighborhood` · `node_info` · `node_edges` · `upsert_entity` · `find_similar` · `hybrid_search` · `node_history` · `edge_history` · `was_linked` · `rename_node`
+
+Key signatures:
+- `query`: `cypher`, optional `params`, optional `mask` (array of node keys to hide)
+- `explain` / `explain_association`: `a`, `b`
+- `neighborhood`: `key`, optional `depth`, `direction`, `edge_types`
+- `upsert_entity`: `key`, `props`, optional `label`
+- `was_linked`: `a`, `b`, `edge_type`, `at_commit`
+- `rename_node`: `old_key`, `new_key`
