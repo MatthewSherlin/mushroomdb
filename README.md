@@ -26,7 +26,7 @@ Explain any link with one call. SQLite for relationships. Built-in 16-tool MCP s
 npx mushroomdb install
 ```
 
-*Can't wait for v0.4.4? `cargo install mushroomdb-cli && mushroomdb install` works today.*
+*On v0.4.3 today: `cargo install mushroomdb-cli`, then add the MCP config entry manually — see the [Agent Memory](#agent-memory) section for the config snippet.*
 
 Open **Claude Code** and type `/mushroom`, or open **Cursor** (rules apply automatically).
 
@@ -747,5 +747,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 ---
 
 ## License
+
+Copyright 2026 Matthew Sherlin.
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
