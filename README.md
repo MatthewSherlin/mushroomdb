@@ -18,7 +18,7 @@ Explain any link with one call. SQLite for relationships. Built-in 16-tool MCP s
 
 ## Agent memory in 30 seconds
 
-<!-- T4: rule-fire + explain gif -->
+![A SET retriggers a rule: a derived edge is retracted, another fires, and explain shows the arithmetic](docs/assets/rule-fire-explain.gif)
 
 **Install (v0.4.4+):**
 
