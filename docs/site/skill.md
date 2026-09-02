@@ -28,15 +28,34 @@ Then open Claude Code in the same directory and type `/mushroom`.
 
 ---
 
+## How the MCP server is invoked
+
+Your assistant spawns the MCP server by the `command` in the config entry, so
+that command must resolve from the assistant's process, not just your shell.
+`install` picks the form that will actually work:
+
+| Situation | `command` written | Why |
+|-----------|-------------------|-----|
+| `mushroomdb` is on `PATH` (`cargo install`, Homebrew, `npm i -g`) | `mushroomdb` | Bare name follows upgrades automatically. |
+| Not on `PATH` (`npx mushroomdb install`, a local `target/release` build, a one-off download) | `~/.mushroomdb/bin/mushroomdb` (absolute) | `install` copies the running binary there first, so the path always exists. |
+
+The same command is substituted into the skill's bootstrap lines
+(`demo`, `snapshot`, `--help`), so the assistant can seed the store without
+a `PATH` lookup either. The copy is tracked in the manifest and removed by
+`uninstall`. Re-running `install` from a newer binary refreshes the copy.
+
+---
+
 ## What gets written
 
 ### Claude Code — project scope (`--project`)
 
 | File | Purpose |
 |------|---------|
-| `.claude/skills/mushroom/SKILL.md` | The `/mushroom` skill, with `{{DB_PATH}}` substituted for your db path. |
-| `.mcp.json` | `mcpServers.mushroomdb` entry: `{"command":"mushroomdb","args":["mcp","<db>"]}`. Created if absent; merged if present. |
+| `.claude/skills/mushroom/SKILL.md` | The `/mushroom` skill, with `{{DB_PATH}}` and `{{BIN}}` substituted for your db path and the resolved command. |
+| `.mcp.json` | `mcpServers.mushroomdb` entry: `{"command":"<see above>","args":["mcp","<db>"]}`. Created if absent; merged if present. |
 | `.claude/skills/mushroom/.install-manifest.json` | Manifest of everything written — consumed by `uninstall`. |
+| `~/.mushroomdb/bin/mushroomdb` | Only when the binary is not on `PATH`: a copy of the running binary. |
 
 ### Claude Code — user scope (no `--project`)
 
@@ -94,6 +113,11 @@ If `.mcp.json` (or `~/.claude.json`) already has a `mushroomdb`
 entry pointing to a **different** database path, `install` exits non-zero,
 prints manual-merge instructions, and makes **no changes**.
 
+An entry for the **same** database path with a different `command` is not a
+conflict: `install` rewrites the command in place. This repairs an entry whose
+bare `mushroomdb` never resolved, and refreshes a stale absolute path after an
+upgrade.
+
 ---
 
 ## Uninstall
@@ -119,6 +143,9 @@ the old entry, then `install` again with the new path.
 **Skill not showing in Claude Code** — restart Claude Code after install, or
 run `claude skills reload` (Claude Code ≥ 1.5).
 
-**MCP server not connecting** — verify `mushroomdb` is on your `PATH`:
-`which mushroomdb`. If installed via npm: `npx mushroomdb mcp <db>` works
-too; edit `.mcp.json` to use `"command":"npx","args":["mushroomdb","mcp","<db>"]`.
+**MCP server not connecting** — check the `command` in the config entry
+resolves: run `<command> --help` in a terminal. If the entry still says bare
+`mushroomdb` and `which mushroomdb` finds nothing, you installed with a build
+older than 0.4.5; re-run `install` and it will copy the binary to
+`~/.mushroomdb/bin/` and rewrite the entry. Restart the assistant afterwards —
+MCP servers are only spawned at startup.

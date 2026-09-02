@@ -16,7 +16,7 @@ The graph stays true as data changes: when a property is SET, rules retract stal
 If `{{DB_PATH}}` does not exist, seed it first:
 
 ```
-mushroomdb demo {{DB_PATH}}
+{{BIN}} demo {{DB_PATH}}
 ```
 
 Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If it already exists, the MCP server is connected and ready.
@@ -55,7 +55,7 @@ Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If it already ex
 
 - Never invent graph contents. If a tool returns empty, say so.
 - Surface tool errors verbatim — do not guess.
-- This store is local and alpha. Durability requires manual snapshots: `mushroomdb snapshot {{DB_PATH}} <output-file>`.
+- This store is local and alpha. Durability requires manual snapshots: `{{BIN}} snapshot {{DB_PATH}} <output-file>`.
 - When showing derived edges, always report which rule produced them — use `explain` or `explain_association` to get the rule name, never assert it from memory.
 
 ## Tools (use these names exactly)

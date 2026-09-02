@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.4.5 — 2026-09-03
+
+### `install` writes an MCP command that actually resolves (format-stable)
+
+No format change — upgrade in place from any 0.4.x store. Patch release for
+the `mushroomdb install` front door; no engine or storage changes.
+
+- **Fix: `mushroomdb install` produced a server that never connected when the
+  binary was not on `PATH`.** The MCP entry always said `"command": "mushroomdb"`,
+  which the assistant host could not spawn after `npx mushroomdb install` or an
+  install run from a local build (`ENOENT`), and the skill's `mushroomdb demo`
+  bootstrap failed the same way. `install` now checks `PATH` first: if the bare
+  name resolves it is kept (upgrade-safe); otherwise the running binary is copied
+  to `~/.mushroomdb/bin/mushroomdb` and that absolute path is written. The same
+  command is substituted into the skill templates via a new `{{BIN}}` placeholder.
+  The copy is tracked in the manifest (removed by `uninstall`) and refreshed when
+  `install` is re-run from a newer binary.
+
+- **Re-install repairs an entry for the same db instead of refusing.** Only a
+  different db path is a conflict now; a stale or unresolvable `command` for the
+  same path is rewritten in place. `install` also prints the resolved command and
+  a reminder to restart the assistant.
+
 ## v0.4.4 — 2026-09-02
 
 ### The front door (format-stable)

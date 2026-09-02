@@ -31,8 +31,59 @@ const CURSOR_RULES_TEMPLATE: &str = include_str!("../skills/mushroom/cursor-rule
 /// Placeholder string replaced with the real db path in embedded templates.
 const DB_PATH_PLACEHOLDER: &str = "{{DB_PATH}}";
 
+/// Placeholder string replaced with the command that invokes mushroomdb —
+/// the bare name when it is on PATH, else the absolute path of the stable copy.
+const BIN_PLACEHOLDER: &str = "{{BIN}}";
+
 /// The MCP server name we write. Must not be changed without a migration.
 const SERVER_NAME: &str = "mushroomdb";
+
+/// The binary name looked up on PATH and used as the bare MCP command.
+const BIN_NAME: &str = "mushroomdb";
+
+/// How the MCP server entry (and the skill's bootstrap commands) invoke
+/// mushroomdb.
+///
+/// The assistant host spawns the MCP server by `command`; a bare name only
+/// works if it resolves on the host's PATH. `npx mushroomdb install` and a
+/// local `target/release` build both run install from a binary that is NOT
+/// on PATH, so writing the bare name silently produces a server that never
+/// connects. In that case we copy the running executable to a stable,
+/// install-owned location and write its absolute path instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BinaryLocation {
+    /// `mushroomdb` resolves on PATH: write the bare name (upgrade-safe).
+    OnPath,
+    /// Not on PATH: copy this executable to `<home>/.mushroomdb/bin/mushroomdb`
+    /// and write that absolute path.
+    CopyFrom(PathBuf),
+}
+
+/// Decide how the MCP entry should invoke mushroomdb, from the real
+/// environment: PATH lookup first, else the current executable.
+pub fn detect_binary_location() -> BinaryLocation {
+    if bin_on_path() {
+        return BinaryLocation::OnPath;
+    }
+    match std::env::current_exe() {
+        Ok(exe) => BinaryLocation::CopyFrom(exe),
+        // Cannot locate ourselves — fall back to the bare name rather than fail.
+        Err(_) => BinaryLocation::OnPath,
+    }
+}
+
+fn bin_on_path() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(BIN_NAME).is_file())
+}
+
+/// Stable, install-owned location for the copied binary (user-level, so a
+/// project-scope install still yields a command that works from any cwd).
+fn stable_bin_path(home: &Path) -> PathBuf {
+    home.join(".mushroomdb").join("bin").join(BIN_NAME)
+}
 
 /// Which assistant platform(s) to wire up.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +161,18 @@ pub fn run_install(
     home: &Path,
     opts: &InstallOpts,
 ) -> Result<String, CliError> {
+    run_install_with(project_root, home, opts, &detect_binary_location())
+}
+
+/// Like [`run_install`], but with the binary location supplied by the caller
+/// instead of detected from PATH / `current_exe`. Tests use this to stay
+/// deterministic; `run_install` is the real-environment wrapper.
+pub fn run_install_with(
+    project_root: &Path,
+    home: &Path,
+    opts: &InstallOpts,
+    bin: &BinaryLocation,
+) -> Result<String, CliError> {
     let db = opts
         .db
         .clone()
@@ -134,15 +197,38 @@ pub fn run_install(
 
     let mut manifest = Manifest::default();
 
+    // Resolve the command the MCP entry and skill templates will use. For the
+    // off-PATH case this copies the binary first so the path it names exists.
+    let bin_cmd = match bin {
+        BinaryLocation::OnPath => BIN_NAME.to_string(),
+        BinaryLocation::CopyFrom(src) => {
+            let dest = stable_bin_path(home);
+            copy_binary(src, &dest, &mut manifest)?;
+            dest.to_string_lossy().into_owned()
+        }
+    };
+
     for plat in &platforms {
-        install_platform(
+        let step = install_platform(
             project_root,
             home,
             plat,
             opts.project,
             &db_str,
+            &bin_cmd,
             &mut manifest,
-        )?;
+        );
+        if let Err(e) = step {
+            // Persist whatever was already written (binary copy, earlier
+            // platform's files) so uninstall can still clean up after a
+            // partial failure. Best effort: the original error wins.
+            let anything_written = !manifest.files.is_empty() || !manifest.mcp_keys.is_empty();
+            if anything_written {
+                let merged = union_manifests(load_manifest(&manifest_path), &manifest);
+                let _ = write_manifest(&manifest_path, &merged);
+            }
+            return Err(e);
+        }
     }
 
     let anything_written = !manifest.files.is_empty() || !manifest.mcp_keys.is_empty();
@@ -166,10 +252,48 @@ pub fn run_install(
     }
     if anything_written {
         out.push_str(&format!("  manifest  {}\n", manifest_path.display()));
+        out.push_str(&format!(
+            "  mcp command  {bin_cmd}\n  restart your assistant to connect the MCP server\n"
+        ));
     } else {
         out.push_str("  (already installed — no changes)\n");
     }
     Ok(out)
+}
+
+/// Copy the running binary to its stable location. No-op if the bytes at
+/// `dest` already match `src` (idempotent re-install); overwrites when they
+/// differ (upgrade). Records `dest` in the manifest so uninstall removes it.
+fn copy_binary(src: &Path, dest: &Path, manifest: &mut Manifest) -> Result<(), CliError> {
+    let bytes = fs::read(src)
+        .map_err(|e| CliError(format!("cannot read binary {}: {e}", src.display())))?;
+    if fs::read(dest).map(|cur| cur == bytes).unwrap_or(false) {
+        return Ok(());
+    }
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|e| CliError(format!("cannot create {}: {e}", parent.display())))?;
+    // Write to a temp name and rename so a running MCP server holding the old
+    // inode keeps working and the swap is atomic.
+    let tmp = parent.join(format!(".{BIN_NAME}.tmp-{}", std::process::id()));
+    fs::write(&tmp, &bytes)
+        .map_err(|e| CliError(format!("cannot write {}: {e}", tmp.display())))?;
+    let finish = || -> Result<(), CliError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+                .map_err(|e| CliError(format!("cannot chmod {}: {e}", tmp.display())))?;
+        }
+        fs::rename(&tmp, dest)
+            .map_err(|e| CliError(format!("cannot move binary into {}: {e}", dest.display())))
+    };
+    if let Err(e) = finish() {
+        let _ = fs::remove_file(&tmp); // never leave an untracked temp file behind
+        return Err(e);
+    }
+    manifest.files.push(dest.to_path_buf());
+    Ok(())
 }
 
 /// Uninstall: remove exactly what install wrote. Reads the manifest.
@@ -306,7 +430,10 @@ fn preflight_check(
 /// Check if a MCP JSON file has a conflicting `mushroomdb` entry.
 ///
 /// A conflict is: the file exists, has `mcpServers.mushroomdb`, and its
-/// `args[1]` (the db path) differs from what we'd write.
+/// `args[1]` (the db path) differs from what we'd write. An entry for the
+/// SAME db with a different `command` is ours to repair (e.g. a bare name
+/// that never resolved, or a stale absolute path after an upgrade), so it is
+/// not a conflict.
 fn check_mcp_conflict(mcp_file: &Path, db_str: &str) -> Result<(), CliError> {
     if !mcp_file.exists() {
         return Ok(());
@@ -321,15 +448,13 @@ fn check_mcp_conflict(mcp_file: &Path, db_str: &str) -> Result<(), CliError> {
         return Ok(()); // Key absent — no conflict.
     }
 
-    // Key present — check if it matches what we'd write.
-    let existing_cmd = existing["command"].as_str().unwrap_or("");
     let existing_db = existing["args"]
         .get(1)
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    if existing_cmd == "mushroomdb" && existing_db == db_str {
-        return Ok(()); // Exact match — idempotent, no conflict.
+    if existing_db == db_str {
+        return Ok(()); // Same db — idempotent or repairable, no conflict.
     }
 
     Err(CliError(format!(
@@ -352,15 +477,25 @@ fn install_platform(
     platform: &Platform,
     project_scope: bool,
     db_str: &str,
+    bin_cmd: &str,
     manifest: &mut Manifest,
 ) -> Result<(), CliError> {
     match platform {
         Platform::ClaudeCode => {
-            install_claude_code(project_root, home, project_scope, db_str, manifest)
+            install_claude_code(project_root, home, project_scope, db_str, bin_cmd, manifest)
         }
-        Platform::Cursor => install_cursor(project_root, home, project_scope, db_str, manifest),
+        Platform::Cursor => {
+            install_cursor(project_root, home, project_scope, db_str, bin_cmd, manifest)
+        }
         Platform::All => unreachable!("expand_platform never produces All"),
     }
+}
+
+/// Substitute both template placeholders.
+fn render_template(template: &str, db_str: &str, bin_cmd: &str) -> String {
+    template
+        .replace(DB_PATH_PLACEHOLDER, db_str)
+        .replace(BIN_PLACEHOLDER, bin_cmd)
 }
 
 fn install_claude_code(
@@ -368,9 +503,10 @@ fn install_claude_code(
     home: &Path,
     project_scope: bool,
     db_str: &str,
+    bin_cmd: &str,
     manifest: &mut Manifest,
 ) -> Result<(), CliError> {
-    let skill_content = SKILL_TEMPLATE.replace(DB_PATH_PLACEHOLDER, db_str);
+    let skill_content = render_template(SKILL_TEMPLATE, db_str, bin_cmd);
 
     let skill_dir = if project_scope {
         project_root.join(".claude").join("skills").join("mushroom")
@@ -395,7 +531,7 @@ fn install_claude_code(
     } else {
         home.join(".claude.json")
     };
-    merge_mcp_entry(&mcp_file, db_str, manifest)?;
+    merge_mcp_entry(&mcp_file, db_str, bin_cmd, manifest)?;
 
     Ok(())
 }
@@ -405,9 +541,10 @@ fn install_cursor(
     home: &Path,
     project_scope: bool,
     db_str: &str,
+    bin_cmd: &str,
     manifest: &mut Manifest,
 ) -> Result<(), CliError> {
-    let rules_content = CURSOR_RULES_TEMPLATE.replace(DB_PATH_PLACEHOLDER, db_str);
+    let rules_content = render_template(CURSOR_RULES_TEMPLATE, db_str, bin_cmd);
 
     let rules_dir = if project_scope {
         project_root.join(".cursor").join("rules")
@@ -430,7 +567,7 @@ fn install_cursor(
     } else {
         home.join(".cursor").join("mcp.json")
     };
-    merge_mcp_entry(&mcp_file, db_str, manifest)?;
+    merge_mcp_entry(&mcp_file, db_str, bin_cmd, manifest)?;
 
     Ok(())
 }
@@ -441,7 +578,12 @@ fn install_cursor(
 
 /// Add `mcpServers.mushroomdb` to a JSON config file. Creates the file if
 /// absent. No-op if the entry already matches (idempotent).
-fn merge_mcp_entry(mcp_file: &Path, db_str: &str, manifest: &mut Manifest) -> Result<(), CliError> {
+fn merge_mcp_entry(
+    mcp_file: &Path,
+    db_str: &str,
+    bin_cmd: &str,
+    manifest: &mut Manifest,
+) -> Result<(), CliError> {
     let mut root: serde_json::Value = if mcp_file.exists() {
         let raw = fs::read_to_string(mcp_file)
             .map_err(|e| CliError(format!("cannot read {}: {e}", mcp_file.display())))?;
@@ -456,7 +598,7 @@ fn merge_mcp_entry(mcp_file: &Path, db_str: &str, manifest: &mut Manifest) -> Re
         root["mcpServers"] = serde_json::json!({});
     }
 
-    let desired = mcp_server_entry(db_str);
+    let desired = mcp_server_entry(db_str, bin_cmd);
     let existing = &root["mcpServers"][SERVER_NAME];
 
     if existing == &desired {
@@ -506,9 +648,9 @@ fn remove_mcp_key(mcp_file: &Path, server: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn mcp_server_entry(db_str: &str) -> serde_json::Value {
+fn mcp_server_entry(db_str: &str, bin_cmd: &str) -> serde_json::Value {
     serde_json::json!({
-        "command": "mushroomdb",
+        "command": bin_cmd,
         "args": ["mcp", db_str]
     })
 }
