@@ -124,6 +124,14 @@ pub fn run_install(
         preflight_check(project_root, home, plat, opts.project, &db_str)?;
     }
 
+    let manifest_path = manifest_path(project_root, home, opts.project, &platforms);
+
+    // Load the existing manifest so we can union it with what this run writes.
+    // This covers partial-drift re-installs: if SKILL.md was edited but the MCP
+    // entry is still intact, only the file is re-written this run; unioning
+    // preserves the MCP key in the saved manifest so uninstall cleans it up too.
+    let existing = load_manifest(&manifest_path);
+
     let mut manifest = Manifest::default();
 
     for plat in &platforms {
@@ -137,14 +145,12 @@ pub fn run_install(
         )?;
     }
 
-    let manifest_path = manifest_path(project_root, home, opts.project, &platforms);
-
-    // Only write the manifest when something was actually written this run.
-    // Skipping on a fully-idempotent re-install preserves the existing manifest
-    // (which uninstall needs) rather than replacing it with an empty one.
     let anything_written = !manifest.files.is_empty() || !manifest.mcp_keys.is_empty();
+
     if anything_written {
-        write_manifest(&manifest_path, &manifest)?;
+        // Union this-run entries with the existing manifest (dedup by path/key).
+        let merged = union_manifests(existing, &manifest);
+        write_manifest(&manifest_path, &merged)?;
     }
 
     let mut out = format!("mushroomdb installed ({} platform(s))\n", platforms.len());
@@ -530,6 +536,36 @@ fn manifest_path(
     } else {
         project_root.join(".cursor").join(".install-manifest.json")
     }
+}
+
+/// Load an existing manifest from `path`. Returns an empty manifest if absent or unparseable.
+fn load_manifest(path: &Path) -> Manifest {
+    let raw = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Manifest::default(),
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Union `existing` with `this_run`, deduplicating by path (files) and by
+/// (file, server) pair (mcp_keys). Entries from `this_run` win on collision
+/// so the manifest always reflects the latest state.
+fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
+    for f in &this_run.files {
+        if !existing.files.contains(f) {
+            existing.files.push(f.clone());
+        }
+    }
+    for k in &this_run.mcp_keys {
+        let already = existing
+            .mcp_keys
+            .iter()
+            .any(|e| e.file == k.file && e.server == k.server);
+        if !already {
+            existing.mcp_keys.push(k.clone());
+        }
+    }
+    existing
 }
 
 fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), CliError> {

@@ -90,7 +90,7 @@ location → run `uninstall` first, then re-install.
 
 ## Conflict handling
 
-If `.mcp.json` (or `~/.claude/settings.json`) already has a `mushroomdb`
+If `.mcp.json` (or `~/.claude.json`) already has a `mushroomdb`
 entry pointing to a **different** database path, `install` exits non-zero,
 prints manual-merge instructions, and makes **no changes**.
 

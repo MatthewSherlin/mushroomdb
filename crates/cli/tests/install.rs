@@ -169,6 +169,54 @@ fn double_install_then_uninstall_cleans_up() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: install → edit SKILL.md → install (repairs it) → uninstall cleans all
+//       (covers manifest-union: MCP entry must stay in manifest after partial re-install)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn partial_drift_reinstall_then_uninstall_cleans_all() {
+    let root = temp_dir("partial-drift");
+    let home = temp_dir("partial-drift-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    // First install — writes SKILL.md + .mcp.json + manifest.
+    run_install(&root, &home, &opts).expect("first install");
+
+    // Simulate user editing SKILL.md (drift).
+    let skill_path = root.join(".claude/skills/mushroom/SKILL.md");
+    fs::write(&skill_path, "user edited this").unwrap();
+
+    // Second install — detects drift, rewrites SKILL.md; MCP entry is intact so
+    // nothing is added to manifest.mcp_keys this run. The manifest must be
+    // union-merged so the MCP key is NOT dropped from the saved manifest.
+    run_install(&root, &home, &opts).expect("re-install after drift");
+    assert!(
+        skill_path.exists(),
+        "SKILL.md should be restored after re-install"
+    );
+    let skill_content = fs::read_to_string(&skill_path).unwrap();
+    assert!(
+        skill_content.contains(db.to_str().unwrap()),
+        "restored SKILL.md should contain the db path"
+    );
+
+    // Uninstall must remove SKILL.md, manifest, AND the MCP key (which was in
+    // the union-merged manifest, not just the partial this-run manifest).
+    run_uninstall(&root, &home, &opts).expect("uninstall after partial drift");
+
+    assert_absent(&root, ".claude/skills/mushroom/SKILL.md");
+    assert_absent(&root, ".claude/skills/mushroom/.install-manifest.json");
+    if root.join(".mcp.json").exists() {
+        let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+        assert!(
+            mcp["mcpServers"]["mushroomdb"].is_null(),
+            "mushroomdb mcp key orphaned after partial-drift uninstall"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test: conflicting existing .mcp.json entry → non-zero error, no changes
 // ---------------------------------------------------------------------------
 
