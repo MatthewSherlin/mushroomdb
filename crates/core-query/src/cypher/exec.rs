@@ -1625,6 +1625,7 @@ const SCALAR_FUNCS: &[&str] = &[
     "toFloat",
     "toString",
     "decay",
+    "key",
 ];
 
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
@@ -1744,6 +1745,32 @@ fn eval_func(
                 Some(Cell::Scalar(_) | Cell::Path(_)) => Err(format!(
                     "type() argument `{var_name}` is not a relationship"
                 )),
+                None => Ok(None), // null binding → null (optional match scenario)
+            }
+        }
+        "key" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "key() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
+            }
+            // Argument must be a node variable (Cell::Node) — the node's key
+            // string is not a property, so `n.key` cannot express it.
+            let Operand::Var(var_name) = &args[0] else {
+                return Err("key() argument must be a node variable (e.g. key(n))".to_string());
+            };
+            let slot = vars
+                .slot(var_name)
+                .ok_or_else(|| format!("unbound variable `{var_name}` in key()"))?;
+            match row.get(slot).and_then(|c| c.as_ref()) {
+                Some(Cell::Node(id)) => Ok(Some(Value::Str(view.key_of(*id).to_owned()))),
+                Some(Cell::Rel(_)) => Err(format!(
+                    "key() argument `{var_name}` is a relationship, not a node"
+                )),
+                Some(Cell::Scalar(_) | Cell::Path(_)) => {
+                    Err(format!("key() argument `{var_name}` is not a node"))
+                }
                 None => Ok(None), // null binding → null (optional match scenario)
             }
         }

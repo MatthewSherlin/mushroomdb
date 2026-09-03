@@ -46,7 +46,7 @@ full design spec is at [docs/design.md](../design.md).
 Pre-1.0 alpha — APIs and formats may change between minor versions. Single
 writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
 
-v0.5.1 is the current release. Install it with `npx mushroomdb install`, which
+v0.5.2 is the current release. Install it with `npx mushroomdb install`, which
 writes the `/mushroom` skill, the MCP server entry, and the recall hook for
 Claude Code or Cursor. The crates.io (`cargo install mushroomdb-cli`,
 `cargo add mushroomdb`) and PyPI (`pip install mushroomdb`) packages are live at

@@ -7,7 +7,7 @@
 //! # Methods
 //!
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
-//!   `serverInfo.name` `"mushroomdb"`
+//!   `serverInfo.name` `"mushroomdb"`, `serverInfo.version` (crate version)
 //! - `notifications/initialized` — ignored
 //! - `tools/list` — the twelve tools below, each with a JSON Schema
 //! - `tools/call` — dispatch; success is
@@ -830,7 +830,7 @@ fn initialize_result() -> Js {
     json!({
         "protocolVersion": "2024-11-05",
         "capabilities": { "tools": {} },
-        "serverInfo": { "name": "mushroomdb" }
+        "serverInfo": { "name": "mushroomdb", "version": env!("CARGO_PKG_VERSION") }
     })
 }
 

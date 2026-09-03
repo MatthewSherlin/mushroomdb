@@ -497,6 +497,7 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `toFloat(x)` | `Int`/`Float`/`String` | `Float` | parse; unparseable → null |
 | `toString(x)` | scalar | `String` | scalar to text |
 | `decay(base, age, halflife)` | `Int`/`Float` ×3 | `Float` | `base * 0.5^(age / halflife)`; error if `halflife <= 0` |
+| `key(n)` | node variable | `String` | the node's key; `n.key` is not a property so this is the only way to project it. Non-node argument is a named error |
 
 Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
 row's value into a list, per group when grouping keys are present).
@@ -509,7 +510,7 @@ type alternation: `(a)-[:A|:B]->(b)`.
 Calling an unknown function name returns:
 
 ```
-unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay
+unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key
 ```
 
 ### Examples
@@ -521,6 +522,7 @@ MATCH (n:Person) RETURN coalesce(n.nickname, n.name)
 MATCH (a:Person)-[r]->(b:Person) RETURN type(r)
 MATCH (n:Person) RETURN abs(n.score)
 MATCH (n:Measurement) RETURN round(n.value)
+MATCH (n:Person) RETURN key(n) AS id
 ```
 
 ---
@@ -578,7 +580,7 @@ clear, actionable message; **Absent** = not implemented (not tested here).
 | `CREATE … RETURN …` | `CREATE (n:Person {id: 'alice'}) RETURN n.id AS id` — single-statement create + projection |
 | `WHERE … IS NULL / IS NOT NULL` | `WHERE n.score IS NULL`, `WHERE b IS NOT NULL` — null-check predicate; composes with AND/OR |
 | Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error |
-| Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, …) | `RETURN abs(n.score), toString(n.weight)` |
+| Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, `key`, …) | `RETURN abs(n.score), toString(n.weight)` |
 | `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |
 | `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` |
 | `UNION` / `UNION ALL` | `MATCH (a:A) RETURN a.id AS id UNION MATCH (b:B) RETURN b.id AS id` |
@@ -604,7 +606,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH (found …)` |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
 | `shortestPath` with endpoints bound via comma-sep `MATCH (a), (b)` | `parse error: unexpected tokens after CREATE pattern (found Comma)` — comma-separated MATCH is not supported; use sequential `MATCH (a) MATCH (b)` forms |
-| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay` |
+| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key` |
 | `$param` referenced but not supplied | `execute: missing parameter …` |
 | `SET n.prop = n.other` (bare property-to-property copy) | `SET RHS: bare property/variable reference is not supported; use a literal, $parameter, or arithmetic expression` |
 | Integer division by zero | `execute: division by zero` |

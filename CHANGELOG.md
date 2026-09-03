@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.5.2 — 2026-09-03
+
+### Python binding parity (format-stable)
+
+No format change — snapshot VERSION stays V8 and WAL discriminants are untouched; every item
+below is binding surface, one new read-only Cypher scalar, and docs. Upgrade in place from any
+0.4.x or 0.5.x store.
+
+The gaps a real integrator hit using the Python binding, closed:
+
+- **`delete_node(key)`** on the binding, returning the `DeleteReport` as a dict
+  (`{"manual_edges", "derived_edges"}`). Deleting a node retracts the edges its properties
+  derived; an unknown key raises `KeyNotFound` as it does in Rust.
+- **`key(n)` Cypher scalar.** A node's key is not a property, so `n.key` never resolved and there
+  was no way to project or filter on the key from Cypher. `key(n)` is now in both scalar registries
+  — read queries and the `MATCH … SET … RETURN` mirror — and returns the key string. A non-node
+  argument (property expression, relationship variable, wrong arity) is a named error, not a silent
+  null. `node_info` already carried `"key"`; the binding README and `docs/site/query.md` now say so.
+- **`upsert_node(label, key, props)`** returning `"inserted"` or `"updated"`. Writes only the
+  provided fields whose value differs from the stored one, so omitted fields are untouched and
+  unchanged fields produce no WAL record and no rule re-fire. An existing key under a different
+  label raises `ValueError` rather than silently relabelling.
+- **`remove_prop(key, field)`** on the binding, and `set_prop(key, field, None)` now removes the
+  field instead of raising `TypeError`. Python has no null property and the store has no null
+  `Value`, so `None` means absent. Removing a watched field retracts the edges it derived.
+- **Predicate shapes round-trip.** `create_rule` now accepts the snake_case shape that `explain`
+  emits (`{"kind": "field_equal", "fields": ["team"]}`) alongside the Rust-native externally-tagged
+  form (`{"FieldEqual": {"field": "team"}}`), for every predicate kind including nested `all`/`any`.
+  An explanation's `predicate` dict can be dropped straight into a new rule. `explain` output is
+  unchanged; the snake_case form is documented as canonical.
+- **`create_rule(rule, if_not_exists=False)`** returns `True` when it created the rule. With
+  `if_not_exists=True` a duplicate name returns `False` instead of raising.
+- **`query_write` accepts a params dict** like `query` does, keeping the list-of-tuples form for
+  compatibility. The `query` docstring no longer describes the tuple list as the only shape.
+- **Type stubs and docstrings.** `bindings/python/mushroomdb.pyi` ships in the wheel as
+  `__init__.pyi` with a `py.typed` marker, so mypy and Pyright resolve signatures with no
+  configuration. Every `#[pymethods]` function now carries a doc comment and a `text_signature`,
+  so `help(mushroomdb.GraphDb)` is useful at the REPL.
+- **Concurrency documented (docs only; no lock in this release).** One writer process per store;
+  a handle sees only the commits made through it; there is no cross-process lock yet, and no
+  `reopen()` — close and `open` again to pick up another process's writes.
+- **Fix: MCP `initialize` now returns `serverInfo.version`.** Claude Code rejected the handshake
+  without it, so the server never connected in Claude Code before this release.
+
 ## v0.5.1 — 2026-09-03
 
 - **Fix: `npx mushroomdb install` wrote a bare `mushroomdb` command** because npm's shim on PATH

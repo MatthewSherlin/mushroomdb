@@ -21,7 +21,12 @@ struct GraphDb {
 
 #[pymethods]
 impl GraphDb {
+    /// Open (creating if needed) the database rooted at `path`.
+    ///
+    /// One writer process per store — see the Concurrency section of the
+    /// binding README.
     #[staticmethod]
+    #[pyo3(text_signature = "(path)")]
     fn open(path: PathBuf) -> PyResult<Self> {
         let db = CoreDb::open(&path).map_err(graph_err)?;
         Ok(GraphDb {
@@ -29,11 +34,56 @@ impl GraphDb {
         })
     }
 
+    /// Insert a new node.  Raises `RuntimeError` (`DuplicateKey`) if `key` is
+    /// already live; use `upsert_node` for insert-or-update semantics.
+    #[pyo3(text_signature = "($self, label, key, props)")]
     fn insert_node(&self, label: &str, key: &str, props: Bound<'_, PyDict>) -> PyResult<()> {
         let mapped = dict_to_props(&props)?;
         self.with_mut(|db| db.insert_node(label, key, mapped))
     }
 
+    /// Insert `key` if absent, otherwise update it in place.
+    ///
+    /// Returns `"inserted"` or `"updated"`.  On update, only the fields
+    /// present in `props` whose value differs from the stored one are written
+    /// — fields you do not pass are left untouched, and unchanged fields
+    /// produce no WAL record (so rules do not re-fire needlessly).
+    ///
+    /// Raises `ValueError` if `key` already exists under a different label:
+    /// relabelling a node is not an upsert, and silently ignoring the
+    /// mismatch would hide a caller bug.
+    ///
+    /// ```python
+    /// db.upsert_node("Person", "alice", {"team": "red"})   # "inserted"
+    /// db.upsert_node("Person", "alice", {"team": "blue"})  # "updated"
+    /// ```
+    #[pyo3(text_signature = "($self, label, key, props)")]
+    fn upsert_node(&self, label: &str, key: &str, props: Bound<'_, PyDict>) -> PyResult<String> {
+        let mapped = dict_to_props(&props)?;
+        let existing = self.with_ref(|db| Ok(db.node_info(key)))?;
+        let Some(info) = existing else {
+            self.with_mut(|db| db.insert_node(label, key, mapped))?;
+            return Ok("inserted".to_string());
+        };
+        if info.label != label {
+            return Err(PyValueError::new_err(format!(
+                "upsert_node: node '{key}' already exists with label '{}', not '{label}'; \
+                 delete and re-insert to change a node's label",
+                info.label
+            )));
+        }
+        for (field, value) in mapped {
+            if info.props.get(&field) == Some(&value) {
+                continue; // unchanged: no WAL record, no rule re-fire
+            }
+            self.with_mut(|db| db.set_prop(key, &field, value.clone()))?;
+        }
+        Ok("updated".to_string())
+    }
+
+    /// Insert a user-owned edge.  Returns `True` if it was newly written,
+    /// `False` if it already existed.
+    #[pyo3(text_signature = "($self, edge_type, src, dst)")]
     fn insert_edge(&self, edge_type: &str, src: &str, dst: &str) -> PyResult<bool> {
         self.with_mut(|db| db.insert_edge(edge_type, src, dst))
     }
@@ -41,24 +91,75 @@ impl GraphDb {
     /// Delete a user-owned edge.  Returns `True` if the edge existed and was
     /// removed, `False` if it was not present.  Raises `RuntimeError` if the
     /// edge is rule-derived (must retract by changing properties instead).
+    #[pyo3(text_signature = "($self, edge_type, src, dst)")]
     fn delete_edge(&self, edge_type: &str, src: &str, dst: &str) -> PyResult<bool> {
         self.with_mut(|db| db.delete_edge(edge_type, src, dst))
     }
 
+    /// Delete a live node and every edge incident on it.
+    ///
+    /// Returns a `DeleteReport` dict `{"manual_edges": N, "derived_edges": M}`
+    /// counting the user-inserted and rule-derived edges removed.  Raises
+    /// `RuntimeError` (`KeyNotFound`) for an unknown or already-deleted key.
+    ///
+    /// ```python
+    /// report = db.delete_node("alice")
+    /// # {"manual_edges": 1, "derived_edges": 3}
+    /// ```
+    #[pyo3(text_signature = "($self, key)")]
+    fn delete_node(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyDict>> {
+        let report = self.with_mut(|db| db.delete_node(key))?;
+        let d = PyDict::new(py);
+        d.set_item("manual_edges", report.manual_edges)?;
+        d.set_item("derived_edges", report.derived_edges)?;
+        Ok(d.unbind())
+    }
+
+    /// Set or overwrite a single property.
+    ///
+    /// `value=None` removes the field (equivalent to `remove_prop`) — Python
+    /// has no distinct "null property" and the store has no null `Value`, so
+    /// `None` means absent.
+    #[pyo3(text_signature = "($self, key, field, value)")]
     fn set_prop(&self, key: &str, field: &str, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.with_mut(|db| db.remove_prop(key, field))?;
+            return Ok(());
+        }
         let v = py_to_value(&value)?;
         self.with_mut(|db| db.set_prop(key, field, v))
+    }
+
+    /// Remove a property.  Returns `True` if the field was present and
+    /// removed, `False` if it was already absent.  Raises `RuntimeError`
+    /// (`KeyNotFound`) for an unknown or deleted key.
+    ///
+    /// Removing a field a rule watches retracts the edges that field derived.
+    #[pyo3(text_signature = "($self, key, field)")]
+    fn remove_prop(&self, key: &str, field: &str) -> PyResult<bool> {
+        self.with_mut(|db| db.remove_prop(key, field))
     }
 
     /// Execute a read query, optionally with named parameters.
     ///
     /// `params` may be:
-    /// - omitted (no parameters)
+    /// - omitted or `None` (no parameters)
     /// - a `dict` mapping name→value (ergonomic form)
     /// - a list of `(name, value)` tuples (back-compat with `query_with_params`)
     ///
     /// Values must be `int`, `float`, `str`, `bool`, `list`, or `dict`.
-    #[pyo3(signature = (cypher, params = None))]
+    /// Parameters are bound, never interpolated, so string values are safe
+    /// against injection.
+    ///
+    /// Returns one dict per row, keyed by RETURN alias.
+    ///
+    /// ```python
+    /// rows = db.query(
+    ///     "MATCH (n:Person) WHERE n.age > $min RETURN key(n) AS id",
+    ///     {"min": 18},
+    /// )
+    /// ```
+    #[pyo3(signature = (cypher, params = None), text_signature = "($self, cypher, params=None)")]
     fn query(
         &self,
         py: Python<'_>,
@@ -75,13 +176,14 @@ impl GraphDb {
     ///
     /// ```python
     /// rows = db.query_with_params(
-    ///     "MATCH (n:Person) WHERE n.age > $min RETURN n.key",
+    ///     "MATCH (n:Person) WHERE n.age > $min RETURN key(n)",
     ///     [("min", 18)],
     /// )
     /// ```
     ///
     /// Each element of `params` is a `(name, value)` tuple.  Values must be
     /// `int`, `float`, `str`, `bool`, or a `list` of those.
+    #[pyo3(text_signature = "($self, cypher, params)")]
     fn query_with_params(
         &self,
         py: Python<'_>,
@@ -113,6 +215,7 @@ impl GraphDb {
     ///
     /// Raises `RuntimeError` with `KeyNotFound` if `old` is unknown, or
     /// `DuplicateKey` if `new` is already live.
+    #[pyo3(text_signature = "($self, old, new)")]
     fn rename_node(&self, old: &str, new: &str) -> PyResult<()> {
         self.with_mut(|db| db.rename_node(old, new))
     }
@@ -123,6 +226,7 @@ impl GraphDb {
     /// `placeholder_label` and no properties.  Rules fire and last-change is
     /// updated for each auto-created node.  Returns a dict with keys
     /// `nodes_created` and `edge_inserted`.
+    #[pyo3(text_signature = "($self, edge_type, src, dst, placeholder_label)")]
     fn insert_edge_upsert(
         &self,
         py: Python<'_>,
@@ -146,35 +250,25 @@ impl GraphDb {
     /// MATCH…DETACH DELETE / MERGE).
     ///
     /// Returns a one-row result dict with keys `created`, `properties_set`,
-    /// and `deleted`.
+    /// and `deleted`, unless the statement has its own `RETURN` projection.
     ///
-    /// Params follow the same `[(name, value)]` convention as
-    /// `query_with_params`.
-    #[pyo3(signature = (cypher, params = None))]
+    /// `params` takes the same shapes as `query`: `None`, a `dict`, or a list
+    /// of `(name, value)` tuples.
+    ///
+    /// ```python
+    /// db.query_write(
+    ///     "MATCH (n:Person) WHERE key(n) = $k SET n.age = 31 RETURN key(n)",
+    ///     {"k": "alice"},
+    /// )
+    /// ```
+    #[pyo3(signature = (cypher, params = None), text_signature = "($self, cypher, params=None)")]
     fn query_write(
         &self,
         py: Python<'_>,
         cypher: &str,
-        params: Option<Bound<'_, PyList>>,
+        params: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Py<PyDict>>> {
-        let mut map = BTreeMap::new();
-        if let Some(pl) = params {
-            for item in pl.iter() {
-                let tuple = item.downcast::<pyo3::types::PyTuple>().map_err(|_| {
-                    pyo3::exceptions::PyTypeError::new_err(
-                        "params must be a list of (name, value) tuples",
-                    )
-                })?;
-                if tuple.len() != 2 {
-                    return Err(pyo3::exceptions::PyTypeError::new_err(
-                        "each param must be a (name, value) tuple",
-                    ));
-                }
-                let name: String = tuple.get_item(0)?.extract()?;
-                let val = py_to_value(&tuple.get_item(1)?)?;
-                map.insert(name, val);
-            }
-        }
+        let map = params_to_map(params)?;
         let rs = self.with_mut(|db| db.query_write(cypher, &map))?;
         result_set_to_rows(py, &rs)
     }
@@ -191,6 +285,7 @@ impl GraphDb {
     /// if db.has_vector_rule("embedding"):
     ///     hits = db.find_similar("embedding", query_vec, k=10)
     /// ```
+    #[pyo3(text_signature = "($self, field)")]
     fn has_vector_rule(&self, field: &str) -> PyResult<bool> {
         self.with_ref(|db| Ok(db.has_vector_rule(field)))
     }
@@ -219,7 +314,11 @@ impl GraphDb {
     /// # restrict to visible nodes:
     /// hits = db.find_similar("embedding", query_vec, mask=["alice", "bob"])
     /// ```
-    #[pyo3(signature = (field, vector, label = None, k = 10, min = 0.0, mask = None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (field, vector, label = None, k = 10, min = 0.0, mask = None),
+        text_signature = "($self, field, vector, label=None, k=10, min=0.0, mask=None)"
+    )]
     fn find_similar(
         &self,
         _py: Python<'_>,
@@ -267,7 +366,10 @@ impl GraphDb {
     /// )
     /// ```
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (text_field, query_text, vector_field, vector, label = None, k = 10))]
+    #[pyo3(
+        signature = (text_field, query_text, vector_field, vector, label = None, k = 10),
+        text_signature = "($self, text_field, query_text, vector_field, vector, label=None, k=10)"
+    )]
     fn search_hybrid(
         &self,
         _py: Python<'_>,
@@ -291,6 +393,7 @@ impl GraphDb {
     /// ```python
     /// score = db.get_edge_prop("SIMILAR", "alice", "bob", "score")
     /// ```
+    #[pyo3(text_signature = "($self, edge_type, src_key, dst_key, field)")]
     fn get_edge_prop(
         &self,
         py: Python<'_>,
@@ -306,16 +409,64 @@ impl GraphDb {
         }
     }
 
-    fn create_rule(&self, py: Python<'_>, rule: Bound<'_, PyAny>) -> PyResult<()> {
+    /// Register a linking rule.  Returns `True` when the rule was created.
+    ///
+    /// `rule` is a dict with `name`, `src_label`, `dst_label`, `predicate`,
+    /// `edge_type`, and optionally `weight_prop`, `max_edges`, `approximate`,
+    /// `via_label`, `via_edge`, `via_dir`.
+    ///
+    /// The `predicate` accepts two shapes.  The canonical one is the
+    /// snake_case form that `explain` emits, so an explanation round-trips
+    /// straight back into a new rule:
+    ///
+    /// ```python
+    /// {"kind": "field_equal", "fields": ["team"]}
+    /// {"kind": "overlap", "fields": ["skills"], "min": 0.5}
+    /// {"kind": "all", "parts": [ …nested predicates… ]}
+    /// ```
+    ///
+    /// The Rust-native externally-tagged form is also accepted:
+    /// `{"FieldEqual": {"field": "team"}}`, `{"Overlap": {"field": "skills",
+    /// "min": 0.5}}`, `{"All": [ … ]}`.
+    ///
+    /// With `if_not_exists=True`, a rule whose `name` is already registered
+    /// returns `False` instead of raising.
+    #[pyo3(
+        signature = (rule, if_not_exists = false),
+        text_signature = "($self, rule, if_not_exists=False)"
+    )]
+    fn create_rule(
+        &self,
+        py: Python<'_>,
+        rule: Bound<'_, PyAny>,
+        if_not_exists: bool,
+    ) -> PyResult<bool> {
         let def = rule_from_py(py, &rule)?;
-        self.with_mut(|db| db.create_rule(def))
+        if if_not_exists {
+            let name = def.name.clone();
+            let exists = self.with_ref(|db| Ok(db.rules().iter().any(|r| r.name == name)))?;
+            if exists {
+                return Ok(false);
+            }
+        }
+        self.with_mut(|db| db.create_rule(def))?;
+        Ok(true)
     }
 
+    /// Why are `a` and `b` linked?  Returns one dict per derived edge between
+    /// them: `rule`, `edge_type`, `src_key`, `dst_key`, `weight`, `predicate`.
+    ///
+    /// `predicate` is the snake_case summary shape, which `create_rule`
+    /// accepts verbatim.
+    #[pyo3(text_signature = "($self, a, b)")]
     fn explain(&self, py: Python<'_>, a: &str, b: &str) -> PyResult<Vec<Py<PyDict>>> {
         let rows = self.with_ref(|db| db.explain(a, b))?;
         rows.iter().map(|e| explanation_to_py(py, e)).collect()
     }
 
+    /// One-hop neighbour keys along `edge_type`.  `direction` is `"out"` or
+    /// `"in"`.
+    #[pyo3(text_signature = "($self, key, edge_type, direction)")]
     fn neighbors(&self, key: &str, edge_type: &str, direction: &str) -> PyResult<Vec<String>> {
         let dir = parse_dir(direction)?;
         self.with_ref(|db| db.neighbors(key, edge_type, dir))
@@ -324,6 +475,9 @@ impl GraphDb {
     /// Unknown key: `None`, matching Rust `GraphDb::node_info` → `Option`.
     /// Contrast `node_edges`, which raises `RuntimeError` for the same miss
     /// because Rust returns `Result` (`GraphError::KeyNotFound`). Deliberate.
+    ///
+    /// Returns `{"key", "label", "props"}`.
+    #[pyo3(text_signature = "($self, key)")]
     fn node_info(&self, py: Python<'_>, key: &str) -> PyResult<Option<Py<PyDict>>> {
         let info = self.with_ref(|db| Ok(db.node_info(key)))?;
         match info {
@@ -335,6 +489,9 @@ impl GraphDb {
     /// Unknown key: `RuntimeError` (`node key not found: …`), matching Rust
     /// `GraphDb::node_edges` → `Result`. `node_info` stays `None` on the same
     /// miss (`Option`). The asymmetry is the core API, not a Python invention.
+    ///
+    /// Each dict is `{"edge_type", "src_key", "dst_key", "derived"}`.
+    #[pyo3(text_signature = "($self, key)")]
     fn node_edges(&self, py: Python<'_>, key: &str) -> PyResult<Vec<Py<PyDict>>> {
         let edges = self.with_ref(|db| db.node_edges(key))?;
         edges
@@ -352,21 +509,25 @@ impl GraphDb {
 
     /// Enable an equality index on `(label, field)` so `MATCH (n:label {field: v})`
     /// becomes an indexed lookup instead of a scan.
+    #[pyo3(text_signature = "($self, label, field)")]
     fn enable_index(&self, label: &str, field: &str) -> PyResult<()> {
         self.with_mut(|db| db.enable_index(label, field))
     }
 
     /// Disable the equality index on `(label, field)`.
+    #[pyo3(text_signature = "($self, label, field)")]
     fn disable_index(&self, label: &str, field: &str) -> PyResult<()> {
         self.with_mut(|db| db.disable_index(label, field))
     }
 
     /// Whether `(label, field)` currently has an equality index.
+    #[pyo3(text_signature = "($self, label, field)")]
     fn is_index_enabled(&self, label: &str, field: &str) -> PyResult<bool> {
         self.with_ref(|db| Ok(db.is_index_enabled(label, field)))
     }
 
     /// Whether `a` and `b` were linked by `edge_type` at or before `at_commit`.
+    #[pyo3(text_signature = "($self, a, b, edge_type, at_commit)")]
     fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> PyResult<bool> {
         self.with_ref(|db| db.was_linked(a, b, edge_type, at_commit))
     }
@@ -374,7 +535,10 @@ impl GraphDb {
     /// Time-travel read: run `cypher` against the graph as it existed at
     /// `commit` (a 0-based WAL commit index). Read-only; the live store is
     /// unaffected. Returns a list of row dicts, like `query`.
-    #[pyo3(signature = (commit, cypher, params=None))]
+    #[pyo3(
+        signature = (commit, cypher, params=None),
+        text_signature = "($self, commit, cypher, params=None)"
+    )]
     fn query_at(
         &self,
         py: Python<'_>,
@@ -390,6 +554,7 @@ impl GraphDb {
     /// Per-node change history since the last truncating snapshot. Returns a
     /// list of `{commit, kind, ...}` dicts (kind is one of node_inserted,
     /// prop_set, prop_removed, edge_added, edge_removed, node_deleted).
+    #[pyo3(text_signature = "($self, key)")]
     fn node_history(&self, py: Python<'_>, key: &str) -> PyResult<Vec<Py<PyDict>>> {
         let entries = self.with_ref(|db| db.node_history(key))?;
         entries
@@ -414,7 +579,7 @@ impl GraphDb {
     /// fsync cost dominates and negates the batching benefit.  Chunk at the
     /// call site (e.g. `for chunk in batched(nodes, 10_000)`).
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (nodes, edges=None))]
+    #[pyo3(signature = (nodes, edges=None), text_signature = "($self, nodes, edges=None)")]
     fn ingest_batch(
         &self,
         py: Python<'_>,
@@ -502,7 +667,10 @@ impl GraphDb {
     /// `delete_edge` calls would serialize one WAL fsync per call.
     ///
     /// Returns `{"edges_inserted": N, "edges_deleted": M}`.
-    #[pyo3(signature = (inserts=None, deletes=None))]
+    #[pyo3(
+        signature = (inserts=None, deletes=None),
+        text_signature = "($self, inserts=None, deletes=None)"
+    )]
     fn batch_edges(
         &self,
         py: Python<'_>,
@@ -562,6 +730,7 @@ impl GraphDb {
     /// Return database statistics: node/edge counts plus per-rule provenance
     /// size, trip latch, and fire counter.  Shape matches the HTTP `/stats`
     /// JSON response.
+    #[pyo3(text_signature = "($self)")]
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let s = self.with_ref(|db| Ok(db.stats()))?;
         let d = PyDict::new(py);
@@ -587,10 +756,15 @@ impl GraphDb {
     /// After `snapshot()`, the next `GraphDb.open()` on the same path loads
     /// the snapshot directly and skips WAL replay, making reopen significantly
     /// faster for large databases.
+    #[pyo3(text_signature = "($self)")]
     fn snapshot(&self) -> PyResult<()> {
         self.with_mut(|db| db.snapshot())
     }
 
+    /// Close the handle and release the store.  Further calls raise
+    /// `RuntimeError`.  `GraphDb` is also a context manager, so
+    /// `with GraphDb.open(path) as db:` closes on exit.
+    #[pyo3(text_signature = "($self)")]
     fn close(&self) -> PyResult<()> {
         let mut guard = lock(&self.inner.0)?;
         *guard = None;
@@ -846,13 +1020,95 @@ fn rule_from_py(py: Python<'_>, rule: &Bound<'_, PyAny>) -> PyResult<RuleDef> {
     };
     let json = py.import("json")?;
     let s: String = json.call_method1("dumps", (rule,))?.extract()?;
-    let mut def: RuleDef = serde_json::from_str(&s).map_err(|e| {
+    let mut raw: serde_json::Value = serde_json::from_str(&s)
+        .map_err(|e| PyValueError::new_err(format!("create_rule rule is not JSON-able: {e}")))?;
+    if let Some(pred) = raw.get_mut("predicate") {
+        *pred = normalize_predicate(pred).map_err(PyValueError::new_err)?;
+    }
+    let mut def: RuleDef = serde_json::from_value(raw).map_err(|e| {
         PyValueError::new_err(format!("create_rule JSON does not match RuleDef: {e}"))
     })?;
     if missing_max_edges {
         def.max_edges = Some(default_max_edges(&def.predicate));
     }
     Ok(def)
+}
+
+/// Rewrite the snake_case `PredicateSummary` shape that `explain` emits into
+/// the externally-tagged shape `Predicate` deserializes from.
+///
+/// A predicate dict carrying a `"kind"` string is treated as the summary
+/// shape; anything else is passed through untouched so the Rust-native form
+/// (`{"FieldEqual": {"field": …}}`) keeps working.  This is what makes an
+/// explanation round-trip straight back into `create_rule`.
+fn normalize_predicate(v: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::{json, Value as J};
+
+    let Some(obj) = v.as_object() else {
+        return Ok(v.clone());
+    };
+    let Some(J::String(kind)) = obj.get("kind") else {
+        return Ok(v.clone());
+    };
+
+    // `fields` is the summary shape; `field` is tolerated for hand-written dicts.
+    let field = || -> Result<String, String> {
+        if let Some(J::String(f)) = obj.get("field") {
+            return Ok(f.clone());
+        }
+        match obj
+            .get("fields")
+            .and_then(J::as_array)
+            .and_then(|a| a.first())
+        {
+            Some(J::String(f)) => Ok(f.clone()),
+            _ => Err(format!(
+                "predicate kind `{kind}` requires a non-empty `fields` list (or a `field` string)"
+            )),
+        }
+    };
+    let number = |name: &str| -> Result<f64, String> {
+        obj.get(name).and_then(J::as_f64).ok_or_else(|| {
+            format!(
+                "predicate kind `{kind}` requires a numeric `{name}` (got {:?})",
+                obj.get(name)
+            )
+        })
+    };
+    let parts = || -> Result<Vec<J>, String> {
+        let Some(J::Array(items)) = obj.get("parts") else {
+            return Err(format!(
+                "predicate kind `{kind}` requires a non-empty `parts` list"
+            ));
+        };
+        if items.is_empty() {
+            return Err(format!(
+                "predicate kind `{kind}` requires a non-empty `parts` list"
+            ));
+        }
+        items.iter().map(normalize_predicate).collect()
+    };
+
+    Ok(match kind.as_str() {
+        "key_match" => json!({ "KeyMatch": { "field": field()? } }),
+        "field_equal" => json!({ "FieldEqual": { "field": field()? } }),
+        "overlap" => json!({ "Overlap": { "field": field()?, "min": number("min")? } }),
+        "numeric_within" => {
+            json!({ "NumericWithin": { "field": field()?, "tolerance": number("tolerance")? } })
+        }
+        "geo_radius" => json!({ "GeoRadius": { "field": field()?, "km": number("km")? } }),
+        "vector_similar" => {
+            json!({ "VectorSimilar": { "field": field()?, "min": number("min")? } })
+        }
+        "all" => json!({ "All": parts()? }),
+        "any" => json!({ "Any": parts()? }),
+        other => {
+            return Err(format!(
+                "unknown predicate kind `{other}`; expected one of key_match, field_equal, \
+                 overlap, numeric_within, geo_radius, vector_similar, all, any"
+            ))
+        }
+    })
 }
 
 fn result_set_to_rows(py: Python<'_>, rs: &ResultSet) -> PyResult<Vec<Py<PyDict>>> {

@@ -130,7 +130,7 @@ fn handshake_initialize_then_initialized_is_silent() {
         json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "mushroomdb"}
+            "serverInfo": {"name": "mushroomdb", "version": env!("CARGO_PKG_VERSION")}
         })
     );
 }
@@ -502,6 +502,10 @@ fn agent_memory_loop() {
     );
 
     assert_eq!(replies[0]["result"]["serverInfo"]["name"], "mushroomdb");
+    assert_eq!(
+        replies[0]["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
 
     let org = content_json(&replies[1]);
     assert_eq!(org["inserted"], json!(1));
