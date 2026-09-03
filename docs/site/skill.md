@@ -75,7 +75,18 @@ Same as above but paths are:
 **Verified 2026-09-02 by live inspection:** `~/.claude.json` holds the
 top-level `mcpServers` key for Claude Code user-level MCP servers.
 `~/.claude/settings.json` holds env/permissions/hooks — `install` merges a
-`hooks.UserPromptSubmit` entry into it without disturbing anything else there.
+`hooks.UserPromptSubmit` entry into it. Every other key and value is preserved,
+but the file is re-serialized: `serde_json` is built without `preserve_order`,
+so keys come back alphabetized and indented two spaces. Content is kept,
+layout is not. `uninstall` skips the write entirely when there is nothing of
+ours to remove, so a file we never touched stays byte-identical.
+
+The hook runs `<bin> recall <db>`, which opens the store without migration or
+WAL repair (`auto_migrate: false`, `repair_wal: false`) — it fires on every
+prompt and must not write to the store. Its digest opens with a line marking
+the content as untrusted graph data, and control characters are stripped from
+every rendered value: node keys and names are ingested content, and for an
+`ingest-git` store any contributor to the repository controls them.
 
 Cursor gets no hook: its hook contract is undocumented, so the always-apply
 rules file remains the only injection mechanism there.
