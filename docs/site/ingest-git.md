@@ -62,7 +62,9 @@ author. From an author, the hop expands incoming `TOP_AUTHOR` edges to the
 files they own, evaluates the overlap between each owned file and every other
 file, and links the author to what co-changes with their code. So an author
 `KNOWS` files they may never have committed to, as long as those files move
-with files they own.
+with files they own. `TOP_AUTHOR` is itself rule-derived, and rules chain, so
+reassigning a file's `top_author_id` moves both edges in one write: the FK rule
+rewrites `TOP_AUTHOR` and `knows` refires off it before the commit closes.
 
 Both rules are declared once, on the first run, after the nodes exist — so each
 backfills exactly once. `File.path`, `Commit.message`, and `Author.name` are

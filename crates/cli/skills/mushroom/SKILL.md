@@ -263,7 +263,7 @@ columns: f.id, a.id
   f.id=benchmarks/adapters/kuzu.py  a.id=71659168+MatthewSherlin@users.noreply.github.com
 ```
 
-### Step 5 — `KNOWS` hasn't moved yet (`was_linked`)
+### Step 5 — `KNOWS` moved with it, in the same write (`was_linked`)
 
 ```json
 { "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 14 }
@@ -273,23 +273,28 @@ columns: f.id, a.id
 { "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 14, "linked": false }
 ```
 
-`KNOWS` is a two-hop rule (`Author` →`TOP_AUTHOR`→ `File` →overlap→ `File`) — it does not chain off the `TOP_AUTHOR` edge that another rule just wrote in the same transaction. It re-derives the next time a write touches the file directly, which in normal use is the next `ingest-git` sync that records a new commit against it.
-
-### Step 6 — After the next touch, `KNOWS` catches up (`was_linked`)
-
-A real `ingest-git` sync makes this write for you the moment a new commit touches the file. To see it now:
-
-```cypher
-MATCH (f:File {id:'benchmarks/adapters/kuzu.py'})
-SET f.commits = ['c7121a713915489bd214e3dba60cf0c51cb595fb', '44c9987dbbede3d99621ffceb3ec25d1450613d3', '5b1b03c16e4e5b3de4a350fe4d7cbebca0669d0c']
-RETURN f.id
+```json
+{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 15 }
 ```
 
 ```json
-{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 17, "linked": true }
+{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 15, "linked": true }
 ```
 
-`node_edges` on that author now lists `benchmarks/adapters/kuzu.py` among the files they `KNOWS`.
+`KNOWS` is a two-hop rule (`Author` →`TOP_AUTHOR`→ `File` →overlap→ `File`), and rules chain: the `TOP_AUTHOR` edge the FK rule wrote in Step 4 immediately fed `knows`, with no second write. Commit 14 is the `SET` itself; every derived-edge change it caused is recorded one marker commit later, which is why 15 is the first sequence that shows the new link. `TOP_AUTHOR` reads the same way — `false` at 14, `true` at 15.
+
+### Step 6 — Ask which hop earned the link (`explain`)
+
+```json
+{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py" }
+```
+
+```json
+[{"rule": "auto_fk_file_top_author_id", "edge_type": "TOP_AUTHOR", "weight": 1.0, "via_edge": null},
+ {"rule": "knows", "edge_type": "KNOWS", "weight": 1.0, "via_edge": "TOP_AUTHOR"}]
+```
+
+Both edges, abridged to the fields that matter here. The `knows` row names `TOP_AUTHOR` as its `via_edge` — the hop it chained off — so the whole path from a one-line `SET` to a new `KNOWS` edge is on the record. `node_edges` on that author now lists `benchmarks/adapters/kuzu.py` among the files they `KNOWS`.
 
 ---
 

@@ -280,6 +280,58 @@ Response:
 The UI why panel renders this as human-readable arithmetic for each
 predicate kind.
 
+Each entry also carries `via_edge`: the edge type a via-hop rule hops over,
+or `null` for a plain two-node rule.
+
+---
+
+## Chaining
+
+A via-hop rule reads edges. Those edges can themselves be rule-derived, so
+one write cascades: setting `File.top_author_id` refires the FK rule that
+owns `TOP_AUTHOR`, and the new `TOP_AUTHOR` edge immediately refires every
+via-hop rule that hops over `TOP_AUTHOR` — `KNOWS`, say. All of it lands in
+the same commit. Retraction chains the same way: an edge that disappears
+takes the edges derived from it with it.
+
+The rules of the cascade:
+
+- **Depth 4.** A write chains at most four levels past the rule that fired
+  first. A longer chain stops there, leaving the levels beyond it at their
+  previous values until the next write touches them. The cap is
+  `MAX_CHAIN_DEPTH`, exported from the crate root.
+- **Once per rule and source.** Within one write, each `(rule, source node)`
+  pair is recomputed at most once. The recompute is a full re-evaluation of
+  that source's desired edge set against the finished topology, so a second
+  pass would only repeat work — except in a diamond, where two chains of
+  different lengths reach the same rule; there the shorter one wins and the
+  longer one is skipped. Prefer rule sets that fan out over ones that
+  reconverge.
+- **Deterministic.** Derived edges are consumed in the order they were
+  written and rules are visited in name order, so a chain produces the same
+  result every time. WAL replay runs the identical hooks, so a reopened store
+  reproduces the identical chained edges.
+- **No cycles.** See below.
+
+### Cycles are rejected at rule creation
+
+A rule set where `A` hops over an edge `B` writes, and `B` hops over an edge
+`A` writes, would refire itself forever; the depth cap would silently cut it
+short at an arbitrary point. So `create_rule` rejects it outright:
+
+```text
+RuleInvalid: rule chain cycle: KNOWS -> TOP_AUTHOR -> KNOWS
+```
+
+The path names the edge types around the loop. A rule whose `via_edge`
+equals its own `edge_type` is rejected the same way. The check runs against
+the rules already in the store; rules created earlier in the same batch are
+not visible to it, matching the batch rule window that `is_rule_owned` uses.
+
+Views are not part of this. A rule cannot read a view, so a view computed
+from derived edges never feeds another rule and cannot close a cycle.
+View-fed rules remain designed, not shipped.
+
 ---
 
 ## Backfill and max_edges

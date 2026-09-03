@@ -17,15 +17,19 @@ syntax (parser clause → routes to `query_at`); temporal + RBAC-mask compositio
 (currently rejected); a `commit_at(timestamp)` helper so callers can time-travel
 by wall-clock, not just commit index.
 
-## 2. Rule chaining — designed
+## 2. Rule chaining — shipped in v0.5 for derived edges; view-fed rules remain designed
 
-**Today:** rules fire on property changes (`insert_node` / `set_prop`). A
-rule-derived *edge* does not itself trigger other rules, so association logic is
-one level deep.
+**Today:** a rule-derived edge feeds every via-hop rule that hops over its edge
+type, in the same commit, bounded at four levels with each `(rule, source)`
+recomputed once per write and every via-edge dependency cycle rejected at
+`create_rule`. See [Chaining](rules.md#chaining). What is *not* shipped is the
+view half below: a rule cannot read a view, so view values still do not feed
+rules, and there is no cycle damping — v0.5 rejects every cycle rather than
+looking for a fixpoint.
 
-**Goal:** let a derived edge (and the view values it updates) feed dependent
-rules, so `A → B` associations can cascade into `B → C` — a declarative graph
-computation model no competitor has.
+**Goal:** let the view values a derived edge updates also feed dependent rules,
+so `A → B` associations can cascade into `B → C` through aggregates — a
+declarative graph computation model no competitor has.
 
 **The hard part — cycles.** Rule R1 updates a neighbor-aggregate view that R2
 matches on; R2 creates an edge that changes a view R1 matches on → infinite
