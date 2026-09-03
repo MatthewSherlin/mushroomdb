@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "mushroomdb"
-version = "0.5.0"
+version = "0.5.1"
 requires-python = ">=3.10"
 description = "Embedded mushroomdb graph database — Python bindings via PyO3"
 license = { text = "MIT OR Apache-2.0" }

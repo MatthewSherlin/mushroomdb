@@ -39,8 +39,14 @@ that command must resolve from the assistant's process, not just your shell.
 
 | Situation | `command` written | Why |
 |-----------|-------------------|-----|
-| `mushroomdb` is on `PATH` (`cargo install`, Homebrew, `npm i -g`) | `mushroomdb` | Bare name follows upgrades automatically. |
-| Not on `PATH` (`npx mushroomdb install`, a local `target/release` build, a one-off download) | `~/.mushroomdb/bin/mushroomdb` (absolute) | `install` copies the running binary there first, so the path always exists. |
+| The `mushroomdb` on `PATH` is this binary (`cargo install`, Homebrew — a symlink to it counts) | `mushroomdb` | Bare name follows upgrades automatically. |
+| `npx mushroomdb install` or `npm i -g mushroomdb` | `~/.mushroomdb/bin/mushroomdb` (absolute) | npm's entry point is a Node shim named `mushroomdb`, not this binary; the bare name resolves only inside the shell npm spawned. |
+| Nothing named `mushroomdb` on `PATH` (a local `target/release` build, a one-off download) | `~/.mushroomdb/bin/mushroomdb` (absolute) | `install` copies the running binary there first, so the path always exists. |
+
+The test is identity, not name: `install` canonicalizes the `mushroomdb` that
+`PATH` resolves to and the executable it is running, and writes the bare name
+only when they are the same file. Anything else — npm's shim, a different
+build, no hit at all — gets the absolute path of the copy.
 
 The same command is substituted into the skill's bootstrap lines
 (`demo`, `snapshot`, `--help`), so the assistant can seed the store without

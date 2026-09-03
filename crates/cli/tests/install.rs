@@ -1072,3 +1072,119 @@ fn uninstall_does_not_reformat_settings_it_removes_nothing_from() {
         "nothing of ours was in the file, so it must be byte-identical"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test: PATH classification — a file named `mushroomdb` on PATH only means
+//       "on PATH" when it IS this executable. npm/npx put a Node shim of the
+//       same name on PATH; treating it as ours wrote a bare command that only
+//       resolves inside the npx shell (v0.5.0 bug).
+// ---------------------------------------------------------------------------
+
+/// Build a PATH-style OsString out of directories.
+fn path_var(dirs: &[&Path]) -> std::ffi::OsString {
+    std::env::join_paths(dirs.iter().map(|d| d.as_os_str())).unwrap()
+}
+
+/// Write a file literally named `mushroomdb` into `dir` with the given bytes.
+fn named_bin(dir: &Path, bytes: &[u8]) -> PathBuf {
+    let p = dir.join("mushroomdb");
+    fs::write(&p, bytes).unwrap();
+    p
+}
+
+#[test]
+fn npm_shim_on_path_is_not_our_binary_so_we_copy() {
+    let shim_dir = temp_dir("classify-shim");
+    let exe_dir = temp_dir("classify-shim-exe");
+
+    // What `npx mushroomdb` prepends to PATH: a Node shim, same name, ours in
+    // no other sense.
+    named_bin(
+        &shim_dir,
+        b"#!/usr/bin/env node\nrequire('../lib/cli.js')\n",
+    );
+    let current_exe = fake_exe(&exe_dir, b"\x7fELF fake native binary\n");
+
+    assert_eq!(
+        cli::install::classify_binary_location(
+            Some(path_var(&[&shim_dir]).as_os_str()),
+            &current_exe
+        ),
+        BinaryLocation::CopyFrom(current_exe.clone()),
+        "a Node shim named mushroomdb must not count as our binary"
+    );
+}
+
+#[test]
+fn symlink_on_path_pointing_at_current_exe_counts_as_on_path() {
+    let link_dir = temp_dir("classify-link");
+    let exe_dir = temp_dir("classify-link-exe");
+    let current_exe = fake_exe(&exe_dir, b"\x7fELF fake native binary\n");
+
+    // cargo install / brew put a symlink to the real binary on PATH.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&current_exe, link_dir.join("mushroomdb")).unwrap();
+    #[cfg(windows)]
+    fs::copy(&current_exe, link_dir.join("mushroomdb")).unwrap();
+
+    assert_eq!(
+        cli::install::classify_binary_location(
+            Some(path_var(&[&link_dir]).as_os_str()),
+            &current_exe
+        ),
+        BinaryLocation::OnPath,
+        "a symlink to this executable is this executable"
+    );
+}
+
+#[test]
+fn current_exe_itself_on_path_counts_as_on_path() {
+    let dir = temp_dir("classify-self");
+    let current_exe = named_bin(&dir, b"\x7fELF fake native binary\n");
+
+    assert_eq!(
+        cli::install::classify_binary_location(Some(path_var(&[&dir]).as_os_str()), &current_exe),
+        BinaryLocation::OnPath
+    );
+}
+
+#[test]
+fn no_path_hit_copies_the_current_exe() {
+    let empty_dir = temp_dir("classify-empty");
+    let exe_dir = temp_dir("classify-empty-exe");
+    let current_exe = fake_exe(&exe_dir, b"\x7fELF fake native binary\n");
+
+    // PATH set but holding no mushroomdb.
+    assert_eq!(
+        cli::install::classify_binary_location(
+            Some(path_var(&[&empty_dir]).as_os_str()),
+            &current_exe
+        ),
+        BinaryLocation::CopyFrom(current_exe.clone())
+    );
+
+    // PATH unset entirely.
+    assert_eq!(
+        cli::install::classify_binary_location(None, &current_exe),
+        BinaryLocation::CopyFrom(current_exe)
+    );
+}
+
+#[test]
+fn a_different_native_binary_first_on_path_shadows_us_so_we_copy() {
+    let other_dir = temp_dir("classify-other");
+    let exe_dir = temp_dir("classify-other-exe");
+
+    // Some other mushroomdb (an older global install) wins PATH resolution.
+    named_bin(&other_dir, b"\x7fELF a different build\n");
+    let current_exe = fake_exe(&exe_dir, b"\x7fELF fake native binary\n");
+
+    assert_eq!(
+        cli::install::classify_binary_location(
+            Some(path_var(&[&other_dir]).as_os_str()),
+            &current_exe
+        ),
+        BinaryLocation::CopyFrom(current_exe.clone()),
+        "PATH resolves to a binary that is not us, so name the copy explicitly"
+    );
+}
