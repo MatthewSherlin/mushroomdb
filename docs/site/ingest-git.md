@@ -89,8 +89,14 @@ for `<sha>..HEAD`, then applies the changes in order:
   Its commits stay in the graph; only the file node goes.
 - **Renamed** (git's `-M` detection) — the node is renamed, keeping its history,
   props, and edges, and its `id` prop follows the key. Chained renames inside
-  one window collapse to a single move.
+  one window collapse to a single move, and a file moved away and back again is
+  no move at all.
 - **Copied** — treated as a new file with no prior history.
+
+Only the path a file ends the window on decides its fate. A file renamed and
+then deleted in the same window is deleted, not moved onto a dead path; a rename
+onto a path another file just vacated replaces that file's node. Either way one
+`File` node exists per live path, and its `id` always equals its key.
 
 A run with no new commits writes nothing at all: `commit_seq` does not move.
 Merge commits appear as `Commit` nodes with no `TOUCHED` edges, since

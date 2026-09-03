@@ -419,8 +419,10 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     report.rules_created.extend(a.rules_created);
     report.authors = walk.authors.len();
 
-    // 2. Deletes free any path a rename is about to claim, then renames carry
-    //    each node (and its history) to its new path.
+    // 2. Deletes run first so a rename can claim a path freed in this same
+    //    window, then renames carry each node (and its history) to its new path.
+    //    `walk.files` is the authority on what is still live: a rename whose
+    //    destination is not in it is a delete, not a move.
     for p in &walk.deleted {
         if w.has_node(p) {
             w.delete_node(p)?;
@@ -428,14 +430,30 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
         }
     }
     for (from, to) in &walk.renamed {
-        if !w.has_node(from) {
+        if !w.has_node(from) || from == to {
+            // Nothing to move, or a rename that swapped back to its own path.
+            continue;
+        }
+        if !walk.files.contains_key(to) {
+            // The destination did not survive the window — it was deleted, or
+            // moved into an excluded path, after this rename. The node goes
+            // with it; renaming into a dead path would strand a phantom node
+            // that no later phase refreshes.
+            w.delete_node(from)?;
+            report.deleted += 1;
             continue;
         }
         if w.has_node(to) {
+            // A pre-existing node already holds the destination path (deleted
+            // earlier in this window, then claimed by this rename).
             w.delete_node(to)?;
             report.deleted += 1;
         }
         w.rename_node(from, to)?;
+        // The key moved, so the `id` prop must move with it. Phase 3 also sets
+        // it for every dirty path; doing it here keeps the invariant local to
+        // the rename and independent of that filter.
+        w.set_prop(to, "id", Value::Str(to.clone()))?;
         report.renamed += 1;
     }
 

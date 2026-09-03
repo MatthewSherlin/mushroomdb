@@ -35,12 +35,9 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(st.success(), "git {args:?} failed");
 }
 
-fn commit(repo: &Path, author: &str, msg: &str, files: &[(&str, &str)]) {
-    for (p, body) in files {
-        let full = repo.join(p);
-        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-        std::fs::write(full, body).unwrap();
-    }
+/// Stage whatever is in the worktree (including `git rm` / `git mv` results)
+/// and commit it.
+fn commit_all(repo: &Path, author: &str, msg: &str) {
     git(repo, &["add", "-A"]);
     git(
         repo,
@@ -55,6 +52,23 @@ fn commit(repo: &Path, author: &str, msg: &str, files: &[(&str, &str)]) {
             msg,
         ],
     );
+}
+
+fn commit(repo: &Path, author: &str, msg: &str, files: &[(&str, &str)]) {
+    for (p, body) in files {
+        let full = repo.join(p);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+    commit_all(repo, author, msg);
+}
+
+/// `git mv`, creating the destination directory first — git will not.
+fn mv(repo: &Path, from: &str, to: &str) {
+    if let Some(parent) = Path::new(to).parent() {
+        std::fs::create_dir_all(repo.join(parent)).unwrap();
+    }
+    git(repo, &["mv", from, to]);
 }
 
 fn seed_repo() -> PathBuf {
@@ -135,20 +149,7 @@ fn rerun_is_incremental_and_delete_retracts_edges() {
     run_ingest_git(&db_dir, &opts(&repo)).unwrap();
     // delete model.rs in a new commit
     std::fs::remove_file(repo.join("src/model.rs")).unwrap();
-    git(&repo, &["add", "-A"]);
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=alice",
-            "-c",
-            "user.email=alice@x.test",
-            "commit",
-            "-q",
-            "-m",
-            "drop model",
-        ],
-    );
+    commit_all(&repo, "alice", "drop model");
     let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
     assert!(r.incremental);
     assert_eq!((r.commits, r.deleted), (1, 1));
@@ -180,22 +181,8 @@ fn rename_keeps_history_and_moves_edges() {
     let repo = seed_repo();
     let db_dir = tmp("db");
     run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-    // `git mv` will not create the destination directory itself.
-    std::fs::create_dir_all(repo.join("src/domain")).unwrap();
-    git(&repo, &["mv", "src/model.rs", "src/domain/model.rs"]);
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=alice",
-            "-c",
-            "user.email=alice@x.test",
-            "commit",
-            "-q",
-            "-m",
-            "move model",
-        ],
-    );
+    mv(&repo, "src/model.rs", "src/domain/model.rs");
+    commit_all(&repo, "alice", "move model");
     let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
     assert_eq!(r.renamed, 1);
     let db = GraphDb::open(&db_dir).unwrap();
@@ -247,5 +234,255 @@ fn rerun_without_new_commits_is_a_noop() {
         GraphDb::open(&db_dir).unwrap().commit_seq(),
         before,
         "no writes on a no-op rerun"
+    );
+}
+
+/// A file renamed and then deleted inside one window must leave nothing behind.
+/// Renaming into a path that does not survive the window would strand a node
+/// under the new key with stale props, which the next run would then duplicate
+/// (its `id` prop still names the old path).
+#[test]
+fn rename_then_delete_in_one_window_leaves_no_phantom_node() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    mv(&repo, "src/api.rs", "src/renamed.rs");
+    commit_all(&repo, "alice", "move api");
+    std::fs::remove_file(repo.join("src/renamed.rs")).unwrap();
+    commit_all(&repo, "alice", "drop the moved api");
+
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!((r.commits, r.renamed, r.deleted), (2, 0, 1));
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(!db.has_node("src/api.rs"), "the original path is gone");
+    assert!(
+        !db.has_node("src/renamed.rs"),
+        "the rename destination must not survive its own deletion"
+    );
+    // Nothing still points at either path.
+    assert!(db
+        .neighbors("src/model.rs", "CO_CHANGED", Direction::Out)
+        .unwrap()
+        .is_empty());
+    let touched = db
+        .query(
+            "MATCH (c:Commit)-[:TOUCHED]->(f:File) RETURN f.id AS id",
+            &Default::default(),
+        )
+        .unwrap();
+    for i in 0..touched.len() {
+        let id = touched.get(i, "id").cloned();
+        assert_ne!(id, Some(core_api::Value::Str("src/api.rs".into())));
+        assert_ne!(id, Some(core_api::Value::Str("src/renamed.rs".into())));
+    }
+    // Exactly one File node per live path, and no id/key disagreement.
+    let files = db
+        .query("MATCH (f:File) RETURN f.id AS id", &Default::default())
+        .unwrap();
+    assert_eq!(files.len(), 2, "only model.rs and readme.md remain");
+
+    // A further run must find nothing to do — no resurrected duplicate.
+    let before = db.commit_seq();
+    drop(db);
+    let again = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!(again.commits, 0);
+    assert_eq!(
+        GraphDb::open(&db_dir).unwrap().commit_seq(),
+        before,
+        "the follow-up run writes nothing"
+    );
+}
+
+/// Two renames of the same file in one window collapse to a single move, so the
+/// node lands on the final path with its whole history rather than being
+/// dropped and recreated at the intermediate name.
+#[test]
+fn chained_rename_in_one_window_collapses_to_one_move() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    mv(&repo, "src/model.rs", "src/model2.rs");
+    commit_all(&repo, "alice", "first move");
+    mv(&repo, "src/model2.rs", "src/domain/model.rs");
+    commit_all(&repo, "alice", "second move");
+
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!((r.commits, r.renamed, r.deleted), (2, 1, 0));
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(!db.has_node("src/model.rs"));
+    assert!(
+        !db.has_node("src/model2.rs"),
+        "the intermediate path must not exist"
+    );
+    assert!(db.has_node("src/domain/model.rs"));
+    let n = db.node_ref("src/domain/model.rs").unwrap();
+    assert_eq!(
+        n.prop("n_commits"),
+        Some(core_api::Value::Int(5)),
+        "3 original commits plus both moves"
+    );
+    assert_eq!(
+        n.prop("id"),
+        Some(core_api::Value::Str("src/domain/model.rs".to_string()))
+    );
+    assert_eq!(
+        db.neighbors("src/api.rs", "CO_CHANGED", Direction::Out)
+            .unwrap(),
+        vec!["src/domain/model.rs".to_string()]
+    );
+    // The commit that touched the intermediate name points at the final node.
+    let touched = db
+        .neighbors("src/domain/model.rs", "TOUCHED", Direction::In)
+        .unwrap();
+    assert_eq!(touched.len(), 5, "every touching commit retargeted");
+}
+
+/// A file moved away and moved back inside one window collapses to no move at
+/// all, rather than a rename of the node onto its own key.
+#[test]
+fn rename_that_swaps_back_in_one_window_is_not_a_move() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    mv(&repo, "src/model.rs", "src/model2.rs");
+    commit_all(&repo, "alice", "move away");
+    mv(&repo, "src/model2.rs", "src/model.rs");
+    commit_all(&repo, "alice", "move back");
+
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!((r.commits, r.renamed, r.deleted), (2, 0, 0));
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(db.has_node("src/model.rs"));
+    assert!(!db.has_node("src/model2.rs"));
+    let n = db.node_ref("src/model.rs").unwrap();
+    assert_eq!(
+        n.prop("n_commits"),
+        Some(core_api::Value::Int(5)),
+        "both moves still count as commits touching the file"
+    );
+    assert_eq!(
+        n.prop("id"),
+        Some(core_api::Value::Str("src/model.rs".to_string()))
+    );
+}
+
+/// A rename whose destination is excluded is a delete: the old node goes and no
+/// node appears under the vendored path.
+#[test]
+fn rename_into_excluded_path_deletes_the_node() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    let mut o = opts(&repo);
+    o.exclude = vec!["vendor/".into()];
+    run_ingest_git(&db_dir, &o).unwrap();
+    mv(&repo, "src/model.rs", "vendor/model.rs");
+    commit_all(&repo, "alice", "vendor the model");
+
+    let r = run_ingest_git(&db_dir, &o).unwrap();
+    assert_eq!((r.renamed, r.deleted), (0, 1));
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(!db.has_node("src/model.rs"));
+    assert!(
+        !db.has_node("vendor/model.rs"),
+        "excluded destination gets no node"
+    );
+    assert!(db
+        .neighbors("src/api.rs", "CO_CHANGED", Direction::Out)
+        .unwrap()
+        .is_empty());
+}
+
+/// A path freed by a delete and immediately claimed by a rename: the stale node
+/// under that path is removed so `rename_node` has somewhere to land.
+#[test]
+fn rename_onto_a_just_deleted_path_replaces_the_old_node() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    std::fs::remove_file(repo.join("src/api.rs")).unwrap();
+    commit_all(&repo, "alice", "drop api");
+    mv(&repo, "docs/readme.md", "src/api.rs");
+    commit_all(&repo, "bob", "readme takes the api path");
+
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!((r.commits, r.renamed, r.deleted), (2, 1, 1));
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(!db.has_node("docs/readme.md"));
+    assert!(db.has_node("src/api.rs"), "the moved node holds the path");
+    let n = db.node_ref("src/api.rs").unwrap();
+    assert_eq!(
+        n.prop("n_commits"),
+        Some(core_api::Value::Int(2)),
+        "readme's own commit plus the move, not the old api.rs history"
+    );
+    assert_eq!(
+        n.prop("id"),
+        Some(core_api::Value::Str("src/api.rs".to_string()))
+    );
+    assert_eq!(
+        n.prop("top_author_id"),
+        Some(core_api::Value::Str("bob@x.test".to_string())),
+        "ownership came across with the node, it is not the old api.rs owner"
+    );
+    let files = db
+        .query("MATCH (f:File) RETURN f.id AS id", &Default::default())
+        .unwrap();
+    assert_eq!(files.len(), 2, "no duplicate under the reclaimed path");
+}
+
+/// An initialised repository with no commits reports zeros and writes nothing.
+#[test]
+fn empty_repository_reports_zeros_and_writes_nothing() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let db_dir = tmp("db");
+
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!((r.commits, r.files, r.authors), (0, 0, 0));
+    assert!(!r.incremental);
+    assert!(r.rules_created.is_empty(), "no rules on an empty repo");
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert_eq!(db.commit_seq(), 0, "nothing was written");
+    assert_eq!(db.stats().nodes_live, 0);
+    drop(db);
+
+    // The first real commit still gets a full, non-incremental ingest.
+    commit(&repo, "alice", "first", &[("src/api.rs", "a1")]);
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!((r.commits, r.files, r.authors), (1, 1, 1));
+    assert!(!r.incremental, "the empty run left no sync marker");
+    assert!(r.rules_created.contains(&"co_changed".to_string()));
+}
+
+/// If the recorded sync head is not in the repository the run fails loudly
+/// instead of replaying the whole history on top of what is already stored.
+#[test]
+fn missing_sync_head_errors_without_writing() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let before = GraphDb::open(&db_dir).unwrap().commit_seq();
+
+    // A different repository, whose history does not contain the recorded sha.
+    let other = tmp("other");
+    git(&other, &["init", "-q", "-b", "main"]);
+    commit(&other, "carol", "unrelated work", &[("other.rs", "z")]);
+
+    let err = run_ingest_git(&db_dir, &opts(&other)).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("sync head") && msg.contains("fresh database"),
+        "error should name the problem and the way out, got: {msg}"
+    );
+    assert_eq!(
+        GraphDb::open(&db_dir).unwrap().commit_seq(),
+        before,
+        "a failed run writes nothing"
     );
 }
