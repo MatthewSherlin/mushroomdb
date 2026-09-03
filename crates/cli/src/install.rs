@@ -166,9 +166,18 @@ const HOOK_EVENT: &str = "UserPromptSubmit";
 /// Kept short: the hook must never noticeably slow a prompt.
 const HOOK_TIMEOUT_SECS: u64 = 5;
 
+/// Single-quote `s` for embedding in a POSIX shell command line, escaping
+/// embedded single quotes as `'\''`. Claude Code runs a `type: "command"`
+/// hook through a shell, so an unquoted path containing whitespace or shell
+/// metacharacters is word-split and the hook silently receives the wrong
+/// arguments — quoting both interpolations keeps the command exact.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// The exact command string written into the hook entry.
 fn recall_hook_command(bin_cmd: &str, db_str: &str) -> String {
-    format!("{bin_cmd} recall {db_str}")
+    format!("{} recall {}", sh_quote(bin_cmd), sh_quote(db_str))
 }
 
 /// One `hooks.<event>` array entry in Claude Code's settings.json shape.
@@ -194,6 +203,9 @@ fn settings_has_hook(root: &serde_json::Value, event: &str, command: &str) -> bo
 /// Add the recall hook to `settings_file` (created if absent). Idempotent:
 /// no-op if the command is already present under `HOOK_EVENT`. Every other
 /// key in the file — including other hook events and groups — is preserved.
+/// Errors out (no write) rather than overwriting if `hooks` or
+/// `hooks.<HOOK_EVENT>` already exists with an unexpected JSON type, or if
+/// the file's top level is not a JSON object.
 fn merge_hook_entry(
     settings_file: &Path,
     command: &str,
@@ -208,15 +220,39 @@ fn merge_hook_entry(
         serde_json::json!({})
     };
 
+    if !root.is_object() {
+        return Err(CliError(format!(
+            "{} is not a JSON object at its top level — refusing to add a hook",
+            settings_file.display()
+        )));
+    }
+
     if settings_has_hook(&root, HOOK_EVENT, command) {
         return Ok(());
     }
 
-    if !root["hooks"].is_object() {
-        root["hooks"] = serde_json::json!({});
+    // Validate the shapes we are about to write into before touching
+    // anything: a wrong-shaped `hooks` or `hooks.<event>` value belongs to
+    // the user (or another tool) and must never be silently overwritten.
+    match root.get("hooks") {
+        None => root["hooks"] = serde_json::json!({}),
+        Some(v) if v.is_object() => {}
+        Some(_) => {
+            return Err(CliError(format!(
+                "{}: \"hooks\" is not a JSON object — refusing to overwrite it",
+                settings_file.display()
+            )));
+        }
     }
-    if !root["hooks"][HOOK_EVENT].is_array() {
-        root["hooks"][HOOK_EVENT] = serde_json::json!([]);
+    match root["hooks"].get(HOOK_EVENT) {
+        None => root["hooks"][HOOK_EVENT] = serde_json::json!([]),
+        Some(v) if v.is_array() => {}
+        Some(_) => {
+            return Err(CliError(format!(
+                "{}: \"hooks.{HOOK_EVENT}\" is not a JSON array — refusing to overwrite it",
+                settings_file.display()
+            )));
+        }
     }
     root["hooks"][HOOK_EVENT]
         .as_array_mut()
@@ -240,7 +276,14 @@ fn merge_hook_entry(
 }
 
 /// Remove exactly the hook groups whose only command is `command`; drop the
-/// command from mixed groups; leave everything else byte-for-byte equivalent.
+/// command from mixed groups; leave everything else semantically unchanged
+/// (every key is re-serialized — comments are not supported since
+/// `serde_json` is strict JSON).
+///
+/// Reads `hooks.<event>` through immutable accessors first, so a settings
+/// file where the user removed the `hooks` key (or `<event>`, or shaped
+/// either as something other than an object/array) is left byte-for-byte
+/// untouched rather than having a stray `null` written back in.
 fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result<(), CliError> {
     if !settings_file.exists() {
         return Ok(());
@@ -254,21 +297,33 @@ fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result
         ))
     })?;
 
-    if let Some(groups) = root["hooks"][event].as_array_mut() {
-        for g in groups.iter_mut() {
-            if let Some(hs) = g["hooks"].as_array_mut() {
-                hs.retain(|h| h["command"] != command);
-            }
+    let Some(mut groups) = root
+        .get("hooks")
+        .and_then(|h| h.get(event))
+        .and_then(|g| g.as_array())
+        .cloned()
+    else {
+        // No matching (or well-shaped) event array — nothing of ours to
+        // remove; leave the file exactly as it is, no write at all.
+        return Ok(());
+    };
+
+    for g in groups.iter_mut() {
+        if let Some(hs) = g["hooks"].as_array_mut() {
+            hs.retain(|h| h["command"] != command);
         }
-        groups.retain(|g| {
-            g["hooks"]
-                .as_array()
-                .map(|hs| !hs.is_empty())
-                .unwrap_or(true)
-        });
-        if groups.is_empty() {
-            root["hooks"].as_object_mut().unwrap().remove(event);
-        }
+    }
+    groups.retain(|g| {
+        g["hooks"]
+            .as_array()
+            .map(|hs| !hs.is_empty())
+            .unwrap_or(true)
+    });
+
+    if groups.is_empty() {
+        root["hooks"].as_object_mut().unwrap().remove(event);
+    } else {
+        root["hooks"][event] = serde_json::Value::Array(groups);
     }
 
     let json = serde_json::to_string_pretty(&root)
@@ -854,9 +909,10 @@ fn load_manifest(path: &Path) -> Manifest {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
-/// Union `existing` with `this_run`, deduplicating by path (files) and by
-/// (file, server) pair (mcp_keys). Entries from `this_run` win on collision
-/// so the manifest always reflects the latest state.
+/// Union `existing` with `this_run`, deduplicating by path (files), by
+/// (file, server) pair (mcp_keys), and by full equality (hooks). Entries from
+/// `this_run` win on collision so the manifest always reflects the latest
+/// state.
 fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
     for f in &this_run.files {
         if !existing.files.contains(f) {
