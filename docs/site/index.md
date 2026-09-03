@@ -36,18 +36,22 @@ mushroomdb is embedded-first (same process, no network round-trip), like
 DuckDB or SQLite. The optional `serve` command adds an HTTP API and a
 bundled graph explorer when you want them.
 
-The design spec and roadmap are in `README.md`. The full spec is at
-`docs/design.md`.
+The roadmap and the benchmark numbers are in [README.md](../../README.md). The
+full design spec is at [docs/design.md](../design.md).
 
 ---
 
 ## Status
 
-Pre-alpha. Single-writer, no multi-statement
-transactions. Toolchain pinned to Rust 1.92.0.
+Pre-1.0 alpha — APIs and formats may change between minor versions. Single
+writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
 
-The distribution commands below (Docker, npm, install.sh) are available
-after the first `v*` tag is pushed. The source build path is available now.
+v0.5.1 is the current release. Install it with `npx mushroomdb install`, which
+writes the `/mushroom` skill, the MCP server entry, and the recall hook for
+Claude Code or Cursor. The crates.io (`cargo install mushroomdb-cli`,
+`cargo add mushroomdb`) and PyPI (`pip install mushroomdb`) packages are live at
+the same version. Docker, `install.sh`, and the build-from-source path are in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).
 
 ---
 

@@ -75,17 +75,18 @@ printed does not compile.
 or the missing field) and any other struct-literal snippets in the same file are checked
 the same way.
 
-### 5. Refresh the stale status block in the docs index
+### 5. Support `CASE` in a write-statement `RETURN` projection
 
-**File:** `docs/site/index.md`
+**File:** `crates/core-api/src/db.rs` (`eval_set_return_operand`, around line 736)
 
-The Status section says "Pre-alpha" and "the distribution commands below (Docker, npm,
-install.sh) are available after the first `v*` tag is pushed". Tags through `v0.5.1` are
-published and all three channels are live, so the page contradicts the README.
+`CASE WHEN … THEN … END` works anywhere a scalar expression is allowed in a read query,
+but the write-statement projection path (`CREATE`/`MERGE`/`SET … RETURN`) rejects it with
+"CASE is not supported in a write-statement RETURN projection; use a read query". The read
+path already has the evaluator.
 
-**Acceptance:** the status block matches the README's single alpha line, the "after the
-first v* tag" sentence is gone, and the page's positioning text does not restate anything
-the README says differently.
+**Acceptance:** `MATCH (n:Person) SET n.age = 30 RETURN CASE WHEN n.age >= 65 THEN 'senior'
+ELSE 'other' END` returns a row instead of an error, the read and write paths agree on the
+same inputs, and the coverage table in `docs/site/query.md` is updated.
 
 ---
 

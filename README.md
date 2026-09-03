@@ -346,7 +346,7 @@ Phases 1–4 and Plan 18 all landed. What remains:
 |---|---|
 | Medium | mmap snapshots; lock-free epoch readers |
 | Medium | v1.0 format stability (snapshot + WAL semver guarantee) |
-| Low | `CASE` / subqueries / `UNION`; napi-rs; WASM |
+| Low | `CASE` in a write-statement `RETURN`; subqueries; napi-rs; WASM |
 | Low | Multi-statement `BEGIN/COMMIT` interactive transactions |
 
 ---

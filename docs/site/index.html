@@ -127,14 +127,15 @@
   </section>
 
   <section>
-    <h2>Point it at a repository and watch it stay current.</h2>
+    <h2>One property changes. The graph catches up in the same write.</h2>
     <p>
-      <strong>mushroomdb ingest-git</strong> graphs authors, commits, and files, then derives
-      co-change and ownership edges by rule. Re-run it to sync: only new commits replay, deleted
-      files drop their derived edges, and renamed files carry their history to the new path.
+      A Cypher <strong>SET</strong> in the built-in console changes a single property, the
+      <code>founded_within</code> rule fires, and the new scored edges appear on the canvas.
+      There is no re-index step and no batch job to schedule — the derivation happens inside the
+      write that changed the property.
     </p>
     <figure>
-      <img src="assets/ingest-git-cascade.gif" alt="Ingesting a repository, querying which files co-change, handing one file to a new owner, and watching the KNOWS edges follow in the same write" />
+      <img src="assets/demo-set-derives.gif" alt="A Cypher SET changing one property, the founded_within rule firing, and new scored edges appearing in the explorer" />
     </figure>
   </section>
 
