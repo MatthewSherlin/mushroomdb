@@ -17,7 +17,7 @@ pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;
 pub use core_rules::{
     default_max_edges, is_keymatch_rooted, AggFn, Predicate, RuleDef, RuleSuggestion,
     SuggestConfig, SuggestReport, ViewDef, ViewSource, ViewStore, DEFAULT_KEYMATCH_TOP_K,
-    DEFAULT_SCORED_TOP_K,
+    DEFAULT_SCORED_TOP_K, MAX_CHAIN_DEPTH,
 };
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{query_sub_exec_count, reset_query_sub_exec_count};

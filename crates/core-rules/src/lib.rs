@@ -8,7 +8,9 @@ pub use def::{
     decode_rule_def, default_max_edges, evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef,
     DEFAULT_KEYMATCH_TOP_K, DEFAULT_SCORED_TOP_K,
 };
-pub use engine::{EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport};
+pub use engine::{
+    EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport, MAX_CHAIN_DEPTH,
+};
 pub use hnsw::HnswIndex;
 pub use index::{
     candidate_spec, with_ivf_drift_rebuild, CandidateSpec, RuleIndex, SideIndex, IVF_DRIFT_REBUILD,

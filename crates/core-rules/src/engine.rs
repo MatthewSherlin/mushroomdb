@@ -87,10 +87,32 @@ pub struct GraphMut<'a> {
 /// Used when `RuleDef.max_edges` is `None`.
 pub const DEFAULT_MAX_EDGES: u64 = 1_000_000;
 
+/// How many chained levels a single write may cascade through.
+///
+/// A derived edge written by one rule can feed a via-hop rule, whose derived
+/// edges can feed another, and so on. Chaining stops after this many levels
+/// even if further rules would still fire, so one write is always bounded.
+/// Cycles are rejected at rule-creation time; the cap bounds long acyclic
+/// chains and any chain the creation-time check could not see (a rule created
+/// in an earlier release, or a same-batch rule window).
+pub const MAX_CHAIN_DEPTH: usize = 4;
+
 /// `(etype, src, dst)` as stored in `provenance` / `owned`.
 type Triple = (u32, u32, u32);
 /// Reverse-index entry: `(rule_id, etype, src, dst)`. `rule_id` is interned.
 type Touch = (u32, u32, u32, u32);
+
+/// State captured when a top-level engine hook is entered, so its tail can
+/// chain the derived-edge deltas that hook produced.
+struct ChainScope {
+    /// `pending_deltas.len()` at hook entry.
+    cursor: usize,
+    /// `emit_deltas` at hook entry, restored on exit.
+    prev_emit: bool,
+    /// Whether this hook is the top-level one *and* some rule hops over an
+    /// edge type, i.e. chaining can do anything at all.
+    active: bool,
+}
 
 /// IVF state for one index side, exported for V4 snapshot persistence:
 /// `(centroids, node→cluster assignments, drift_counter)`.
@@ -205,6 +227,15 @@ pub struct RuleEngine {
     /// even under concurrent shared-read access.  After the first mutation the
     /// mutation-path HNSW in `indexes` takes over; this field is never cleared.
     lazy_hnsw: OnceLock<LazyHnswMap>,
+    /// Current chaining level. `0` while a top-level hook runs; `1..=MAX_CHAIN_DEPTH`
+    /// while [`RuleEngine::chain_from`] re-enters `on_edge_changed`. Non-zero
+    /// suppresses re-entrant chaining and enables the fire-once guard.
+    chain_depth: usize,
+    /// `(rule id, rule src)` pairs already recomputed during the current
+    /// top-level write. Cleared at the start of every `chain_from`. Each entry
+    /// is a *full* recompute of that src's desired set, so recomputing it a
+    /// second time within one write can only repeat work.
+    chain_fired: BTreeSet<(u32, u32)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,6 +1347,87 @@ impl RuleEngine {
         Self::default()
     }
 
+    /// True when at least one rule hops over an edge type, so a derived edge
+    /// could feed another rule. Rule counts are small; this is a cheap scan.
+    fn chaining_possible(&self) -> bool {
+        self.rules.values().any(|r| r.via_edge.is_some())
+    }
+
+    /// Open a chaining scope at the entry of a top-level hook.
+    ///
+    /// Chaining reads the deltas the hook appends to `pending_deltas`, and
+    /// those are only recorded while `emit_deltas` is on. Live commits already
+    /// force it on for every apply (db.rs needs the deltas for history
+    /// markers), but WAL replay does not — and replay has to chain identically
+    /// or reopening a store would lose every chained edge. So the scope turns
+    /// emission on for the duration and restores it afterwards; the extra
+    /// deltas are drained and discarded by the replay loop either way.
+    ///
+    /// `active` is decided on entry. A hook that *creates* the first via-hop
+    /// rule therefore does not chain, which is correct: the only rules that
+    /// could consume that rule's fresh edges are themselves via-hop rules, and
+    /// any such rule would already have made `chaining_possible` true.
+    fn begin_chain(&mut self) -> ChainScope {
+        let active = self.chain_depth == 0 && self.chaining_possible();
+        let prev_emit = self.emit_deltas;
+        if active {
+            self.emit_deltas = true;
+        }
+        ChainScope {
+            cursor: self.pending_deltas.len(),
+            prev_emit,
+            active,
+        }
+    }
+
+    /// Close a chaining scope: run the chain, then restore `emit_deltas`.
+    fn end_chain(&mut self, scope: ChainScope, g: &mut GraphMut<'_>) {
+        if scope.active {
+            self.chain_from(scope.cursor, g);
+        }
+        self.emit_deltas = scope.prev_emit;
+    }
+
+    /// Feed derived-edge deltas appended since `cursor` back into via-hop rules.
+    ///
+    /// Runs at most [`MAX_CHAIN_DEPTH`] levels; each `(rule, src)` is recomputed
+    /// at most once per top-level write. Deterministic throughout: deltas are
+    /// consumed in append order, rules iterate in BTree name order, and nothing
+    /// reads a hash-ordered container. Because replay runs the identical hooks,
+    /// it reproduces the identical chain.
+    fn chain_from(&mut self, mut cursor: usize, g: &mut GraphMut<'_>) {
+        debug_assert_eq!(self.chain_depth, 0);
+        self.chain_fired.clear();
+        // Only a delta on an edge type some rule hops over can trigger further
+        // work. Filtering here keeps a large backfill from paying
+        // O(deltas * rules) in the per-rule scan inside on_edge_changed.
+        let via_edges: BTreeSet<String> = self
+            .rules
+            .values()
+            .filter_map(|r| r.via_edge.clone())
+            .collect();
+        for level in 1..=MAX_CHAIN_DEPTH {
+            let end = self.pending_deltas.len();
+            if end == cursor {
+                break;
+            }
+            let batch: Vec<(String, u32, u32)> = self.pending_deltas[cursor..end]
+                .iter()
+                .filter(|d| via_edges.contains(&d.edge_type))
+                .map(|d| (d.edge_type.clone(), d.src_id, d.dst_id))
+                .collect();
+            cursor = end;
+            if batch.is_empty() {
+                break;
+            }
+            self.chain_depth = level;
+            for (etype, src, dst) in batch {
+                self.on_edge_changed_inner(&etype, src, dst, g);
+            }
+            self.chain_depth = 0;
+        }
+    }
+
     pub fn rules(&self) -> impl Iterator<Item = &RuleDef> {
         self.rules.values()
     }
@@ -1501,6 +1613,8 @@ impl RuleEngine {
             retained_provenance_bytes: Mutex::new(None),
             lazy_provenance: OnceLock::new(),
             lazy_hnsw: OnceLock::new(),
+            chain_depth: 0,
+            chain_fired: BTreeSet::new(),
         }
     }
 
@@ -2053,6 +2167,10 @@ impl RuleEngine {
         if self.rules.contains_key(&def.name) {
             return Err(format!("rule {:?} already exists", def.name));
         }
+        // Backfilled edges chain like any other derived edge: creating a rule
+        // whose edge type an existing via-hop rule hops over recomputes that
+        // rule in the same commit.
+        let scope = self.begin_chain();
         let name = def.name.clone();
         self.rules.insert(name.clone(), def);
         self.indexes.insert(name.clone(), RuleIndex::default());
@@ -2159,6 +2277,7 @@ impl RuleEngine {
         // as ready; otherwise a later reindex_all call will set the flag.
         self.indexes_populated = true;
 
+        self.end_chain(scope, g);
         Ok(())
     }
 
@@ -2217,7 +2336,22 @@ impl RuleEngine {
     /// the via-label: finds all srcs that route through n and recomputes their
     /// derived edges. Via-hop rules bypass the candidate index and use
     /// `compute_desired_via` instead.
+    ///
+    /// Derived edges written here are chained into via-hop rules before the
+    /// call returns (see [`RuleEngine::chain_from`]), so one write reaches a
+    /// bounded fixpoint.
     pub fn on_node_changed(
+        &mut self,
+        n: u32,
+        changed: Option<(&str, Option<Value>)>,
+        g: &mut GraphMut<'_>,
+    ) {
+        let scope = self.begin_chain();
+        self.on_node_changed_inner(n, changed, g);
+        self.end_chain(scope, g);
+    }
+
+    fn on_node_changed_inner(
         &mut self,
         n: u32,
         changed: Option<(&str, Option<Value>)>,
@@ -2543,8 +2677,21 @@ impl RuleEngine {
     /// This is the only hook the engine exposes for topology changes. It is
     /// called from `db.rs` on `WalRecord::InsertEdge` and `WalRecord::DeleteEdge`
     /// immediately after the topo is updated (so `g.topo` already reflects the
-    /// new state).
+    /// new state), and re-entrantly by [`RuleEngine::chain_from`] for derived
+    /// edges a rule just wrote.
     pub fn on_edge_changed(
+        &mut self,
+        etype_str: &str,
+        src_id: u32,
+        dst_id: u32,
+        g: &mut GraphMut<'_>,
+    ) {
+        let scope = self.begin_chain();
+        self.on_edge_changed_inner(etype_str, src_id, dst_id, g);
+        self.end_chain(scope, g);
+    }
+
+    fn on_edge_changed_inner(
         &mut self,
         etype_str: &str,
         src_id: u32,
@@ -2574,7 +2721,7 @@ impl RuleEngine {
         }
 
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
-        for rule_name in rule_names {
+        for (rule_idx, rule_name) in rule_names.into_iter().enumerate() {
             let def = self.rules[&rule_name].clone();
             let Some(ref via_edge) = def.via_edge else {
                 continue; // not a via-hop rule
@@ -2605,6 +2752,18 @@ impl RuleEngine {
                 continue;
             }
             if g.labels.get(rule_via as usize).copied() != Some(via_sym) {
+                continue;
+            }
+
+            // Fire-once. While chaining, each (rule, src) is recomputed at most
+            // once per top-level write. That is safe because the work below is a
+            // *full* recompute of this src's desired set against the current
+            // topology, not an incremental patch: by the time the chain runs,
+            // every edge the triggering hook wrote is already in `g.topo`, so
+            // one recompute sees all of them. The key is the rule's ordinal in
+            // the (fixed, BTree-ordered) rule set, so it is stable across levels
+            // and independent of the provenance intern table.
+            if self.chain_depth > 0 && !self.chain_fired.insert((rule_idx as u32, rule_src)) {
                 continue;
             }
 
@@ -2647,7 +2806,16 @@ impl RuleEngine {
     /// tombstone). Rules are walked in BTree name order; touching edges in
     /// BTree triple order. A second call on an already-retracted node is a
     /// no-op (crash-window replay / absent state).
+    ///
+    /// Retractions chain: a retracted derived edge that some via-hop rule hops
+    /// over retracts that rule's edges too, bounded by [`MAX_CHAIN_DEPTH`].
     pub fn on_node_removed(&mut self, n: u32, g: &mut GraphMut<'_>) {
+        let scope = self.begin_chain();
+        self.on_node_removed_inner(n, g);
+        self.end_chain(scope, g);
+    }
+
+    fn on_node_removed_inner(&mut self, n: u32, g: &mut GraphMut<'_>) {
         // Ensure provenance is decoded before diffing against existing edges.
         self.ensure_provenance_loaded_mut();
         // Lazy index build: same guard as on_node_changed.  Top-k backfill

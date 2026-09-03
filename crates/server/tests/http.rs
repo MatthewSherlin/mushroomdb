@@ -1247,6 +1247,7 @@ fn wire_types_serialize() {
         dst_key: "b".into(),
         weight: Some(0.5),
         predicate: PredicateSummary::from(&Predicate::KeyMatch { field: "fk".into() }),
+        via_edge: None,
     })
     .unwrap();
     assert_eq!(expl["predicate"]["kind"], json!("key_match"));

@@ -509,6 +509,12 @@ pub struct Explanation {
     pub dst_key: String,
     pub weight: Option<f64>,
     pub predicate: PredicateSummary,
+    /// For a via-hop rule, the edge type the rule hops over to reach its
+    /// candidates. `None` for a plain two-node rule. A via-hop rule whose
+    /// `via_edge` is itself rule-derived is the chaining case: the hop edge
+    /// was written by another rule in the same commit.
+    #[serde(default)]
+    pub via_edge: Option<String>,
 }
 
 /// Report returned by [`GraphDb::backup_to`].
@@ -7804,6 +7810,7 @@ impl<F: Fs> GraphDb<F> {
                     approximate: rule_def.approximate,
                     ..PredicateSummary::from(&rule_def.predicate)
                 },
+                via_edge: rule_def.via_edge.clone(),
             });
         }
 
@@ -9305,6 +9312,44 @@ struct MutPreview<'a, F: Fs> {
     overlay: Overlay,
 }
 
+/// Shortest path from `start` to `target` following `arcs` (`from → to`), or
+/// `None` if `target` is unreachable.
+///
+/// Used for rule-chain cycle detection, where an arc is "a rule hops over
+/// `from` and writes `to`". Breadth-first over BTree-ordered adjacency, so the
+/// reported path is stable for a given rule set, and iterative so a pathological
+/// rule graph cannot overflow the stack.
+fn find_cycle_through(arcs: &[(String, String)], start: &str, target: &str) -> Option<Vec<String>> {
+    let mut adj: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (from, to) in arcs {
+        adj.entry(from.as_str()).or_default().insert(to.as_str());
+    }
+    let mut parent: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
+    let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+    visited.insert(start);
+    queue.push_back(start);
+    while let Some(node) = queue.pop_front() {
+        if node == target {
+            let mut path = vec![node.to_string()];
+            let mut cur = node;
+            while let Some(&p) = parent.get(cur) {
+                path.push(p.to_string());
+                cur = p;
+            }
+            path.reverse();
+            return Some(path);
+        }
+        for &next in adj.get(node).into_iter().flatten() {
+            if visited.insert(next) {
+                parent.insert(next, node);
+                queue.push_back(next);
+            }
+        }
+    }
+    None
+}
+
 impl<'a, F: Fs> MutPreview<'a, F> {
     fn new(db: &'a GraphDb<F>) -> Self {
         Self {
@@ -9566,6 +9611,36 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             return Err(GraphError::RuleInvalid {
                 detail: format!("rule {:?} already exists", def.name),
             });
+        }
+        // Rule-chain cycle rejection. Derived edges feed via-hop rules, so a
+        // rule set forms a graph whose arcs are "hops over `via_edge`, writes
+        // `edge_type`". A cycle in that graph is a rule set that would re-fire
+        // itself forever; the engine's depth cap would silently truncate it
+        // instead, leaving an arbitrary partial result. Reject it here, the one
+        // place that sees the whole rule set.
+        //
+        // Same-batch CreateRule ops are not considered: the overlay records
+        // only their names, matching the documented rule window in
+        // `is_rule_owned` and `would_derive`.
+        if let Some(via) = def.via_edge.as_deref() {
+            if via == def.edge_type {
+                return Err(GraphError::RuleInvalid {
+                    detail: format!("rule chain cycle: {} -> {}", via, def.edge_type),
+                });
+            }
+            let mut arcs: Vec<(String, String)> = self
+                .db
+                .engine
+                .rules()
+                .filter(|r| !self.overlay.deleted_rules.contains(&r.name))
+                .filter_map(|r| r.via_edge.clone().map(|v| (v, r.edge_type.clone())))
+                .collect();
+            arcs.push((via.to_string(), def.edge_type.clone()));
+            if let Some(path) = find_cycle_through(&arcs, &def.edge_type, via) {
+                return Err(GraphError::RuleInvalid {
+                    detail: format!("rule chain cycle: {} -> {}", via, path.join(" -> ")),
+                });
+            }
         }
         Ok(())
     }
