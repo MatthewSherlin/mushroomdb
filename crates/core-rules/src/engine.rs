@@ -87,10 +87,32 @@ pub struct GraphMut<'a> {
 /// Used when `RuleDef.max_edges` is `None`.
 pub const DEFAULT_MAX_EDGES: u64 = 1_000_000;
 
+/// How many chained levels a single write may cascade through.
+///
+/// A derived edge written by one rule can feed a via-hop rule, whose derived
+/// edges can feed another, and so on. Chaining stops after this many levels
+/// even if further rules would still fire, so one write is always bounded.
+/// Cycles are rejected at rule-creation time; the cap bounds long acyclic
+/// chains and any chain the creation-time check could not see (a rule created
+/// in an earlier release, or a same-batch rule window).
+pub const MAX_CHAIN_DEPTH: usize = 4;
+
 /// `(etype, src, dst)` as stored in `provenance` / `owned`.
 type Triple = (u32, u32, u32);
 /// Reverse-index entry: `(rule_id, etype, src, dst)`. `rule_id` is interned.
 type Touch = (u32, u32, u32, u32);
+
+/// State captured when a top-level engine hook is entered, so its tail can
+/// chain the derived-edge deltas that hook produced.
+struct ChainScope {
+    /// `pending_deltas.len()` at hook entry.
+    cursor: usize,
+    /// `emit_deltas` at hook entry, restored on exit.
+    prev_emit: bool,
+    /// Whether some rule hops over an edge type, i.e. chaining can do anything
+    /// at all.
+    active: bool,
+}
 
 /// IVF state for one index side, exported for V4 snapshot persistence:
 /// `(centroids, node→cluster assignments, drift_counter)`.
@@ -205,6 +227,28 @@ pub struct RuleEngine {
     /// even under concurrent shared-read access.  After the first mutation the
     /// mutation-path HNSW in `indexes` takes over; this field is never cleared.
     lazy_hnsw: OnceLock<LazyHnswMap>,
+    /// Current chaining level. `0` while a top-level hook runs; `1..=MAX_CHAIN_DEPTH`
+    /// while [`RuleEngine::chain_from`] re-enters `on_edge_changed`. Non-zero
+    /// suppresses re-entrant chaining and enables the fire-once guard.
+    chain_depth: usize,
+    /// `(rule ordinal, rule src)` pairs already recomputed during the current
+    /// chain *level*, where the ordinal is the rule's position in the
+    /// BTree-ordered rule set. Cleared at the start of every level: within one
+    /// level a second recompute can only repeat work, but across levels a rule
+    /// may legitimately need to see an edge a later level produced.
+    chain_fired: BTreeSet<(u32, u32)>,
+    /// The node currently being deleted, for the duration of `on_node_removed`.
+    ///
+    /// Chained recomputes run while that node still carries its label and
+    /// props (`db.rs` tombstones it only after the hook returns), and
+    /// `compute_desired_via` enumerates candidates by scanning labels rather
+    /// than the rule index, so without this the chain would happily re-derive
+    /// an edge onto a node that is about to vanish — leaving provenance the
+    /// later topology sweep never cleans up.
+    doomed: Option<u32>,
+    /// How many times a write hit [`MAX_CHAIN_DEPTH`] with work still pending.
+    /// Never persisted; counts from engine construction. Surfaced in `Stats`.
+    chain_truncations: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -471,9 +515,16 @@ fn compute_desired(
 ///   if any via hop to them evaluates with n.
 ///
 /// Always returns `(src, dst)` keyed pairs regardless of anchor.
+///
+/// `doomed` is the node currently being deleted, if any. It is excluded from
+/// every role — source, via hop, and destination — because candidates are
+/// enumerated by scanning `g.labels`, and a node mid-delete still carries its
+/// label and props. Deriving an edge onto it would leave provenance that the
+/// caller's later topology sweep does not clean up.
 fn compute_desired_via(
     def: &RuleDef,
     anchor: ViaAnchor,
+    doomed: Option<u32>,
     g: &GraphMut<'_>,
 ) -> BTreeMap<(u32, u32), f64> {
     let via_label = def.via_label.as_deref().unwrap();
@@ -500,6 +551,9 @@ fn compute_desired_via(
     // Determine which src ids to iterate over.
     let srcs: Vec<u32> = match anchor {
         ViaAnchor::Src(src_id) => {
+            if Some(src_id) == doomed {
+                return BTreeMap::new();
+            }
             if g.labels.get(src_id as usize).copied() == Some(src_sym) {
                 vec![src_id]
             } else {
@@ -510,10 +564,11 @@ fn compute_desired_via(
             // Scan all src-label nodes.
             (0..g.ids.len() as u32)
                 .filter(|&id| {
-                    matches!(
-                        g.labels.get(id as usize).copied(),
-                        Some(s) if s != u32::MAX && s == src_sym
-                    )
+                    Some(id) != doomed
+                        && matches!(
+                            g.labels.get(id as usize).copied(),
+                            Some(s) if s != u32::MAX && s == src_sym
+                        )
                 })
                 .collect()
         }
@@ -522,6 +577,9 @@ fn compute_desired_via(
     // Collect dst candidates: all dst-label nodes (or just the anchored dst).
     let anchored_dst: Option<u32> = match anchor {
         ViaAnchor::Dst(dst_id) => {
+            if Some(dst_id) == doomed {
+                return BTreeMap::new();
+            }
             if g.labels.get(dst_id as usize).copied() == Some(dst_sym) {
                 Some(dst_id)
             } else {
@@ -544,7 +602,7 @@ fn compute_desired_via(
             .neighbors(via_etype, via_dir, src)
             .iter()
             .copied()
-            .filter(|&v| g.labels.get(v as usize).copied() == Some(via_sym))
+            .filter(|&v| Some(v) != doomed && g.labels.get(v as usize).copied() == Some(via_sym))
             .collect();
 
         if via_neighbors.is_empty() {
@@ -558,6 +616,7 @@ fn compute_desired_via(
             (0..g.ids.len() as u32)
                 .filter(|&id| {
                     id != src
+                        && Some(id) != doomed
                         && matches!(
                             g.labels.get(id as usize).copied(),
                             Some(s) if s != u32::MAX && s == dst_sym
@@ -1159,6 +1218,7 @@ fn apply_streaming_rebuild_top_k(
     def: &RuleDef,
     k: u64,
     index: &RuleIndex,
+    doomed: Option<u32>,
     prov: &mut ProvSets<'_>,
     g: &mut GraphMut<'_>,
 ) {
@@ -1186,9 +1246,103 @@ fn apply_streaming_rebuild_top_k(
     }
 
     for src in all_srcs {
-        let desired_src = compute_desired(def, index, src, true, g);
+        // A via-hop rule evaluates its predicate between the *via* node and the
+        // dst, so the candidate index cannot express it; see `apply_via_rebuild`.
+        let desired_src = if def.via_edge.is_some() {
+            compute_desired_via(def, ViaAnchor::Src(src), doomed, g)
+        } else {
+            compute_desired(def, index, src, true, g)
+        };
         let top_k = filter_src_top_k(desired_src, k, g.ids);
         apply_per_src_top_k(def, src, top_k, prov, g);
+    }
+}
+
+/// Full recompute of a via-hop rule's edge set, one source at a time.
+///
+/// Via-hop rules are never rebuilt through the candidate index. `compute_desired`
+/// evaluates the rule's predicate between the source and the destination, but a
+/// via-hop rule evaluates it between the *via* node and the destination — so the
+/// index path returns an empty desired set and silently retracts every edge the
+/// rule legitimately owns. This is the via counterpart of
+/// [`apply_streaming_rebuild`] and keeps its all-or-nothing budget contract:
+/// over budget leaves provenance untouched and the tripped latch set.
+///
+/// Retraction is scoped per source rather than through `by_node`, so the result
+/// does not depend on the order sources are visited even when a rule's
+/// `src_label` and `dst_label` are the same.
+fn apply_via_rebuild(
+    def: &RuleDef,
+    doomed: Option<u32>,
+    prov: &mut ProvSets<'_>,
+    tripped: &mut bool,
+    g: &mut GraphMut<'_>,
+) {
+    let budget = edge_budget(def);
+    let et = g.syms.intern(&def.edge_type);
+
+    // Sources: every node this rule currently derives an edge from (its label
+    // may have changed since), plus every live src-label node. BTree order.
+    let mut sources: BTreeSet<u32> = prov
+        .set
+        .iter()
+        .filter(|(t, _, _)| *t == et)
+        .map(|(_, s, _)| *s)
+        .collect();
+    let src_sym = g.syms.get(&def.src_label);
+    for id in 0..g.ids.len() as u32 {
+        if let Some(s) = g.labels.get(id as usize).copied() {
+            if s != u32::MAX && Some(s) == src_sym {
+                sources.insert(id);
+            }
+        }
+    }
+    let sources: Vec<u32> = sources.into_iter().collect();
+
+    // Pass 1: does the whole desired set fit? Rebuild is the only exit from the
+    // tripped latch, and it is all-or-nothing.
+    let mut total: u64 = 0;
+    for &src in &sources {
+        total += compute_desired_via(def, ViaAnchor::Src(src), doomed, g).len() as u64;
+        if total > budget {
+            *tripped = true;
+            return; // provenance untouched; latch stays set
+        }
+    }
+    *tripped = false;
+
+    // Pass 2: per source, retract what it no longer derives, then add what it
+    // does. Pass 1 proved the total fits, so no trip guard is needed here.
+    for src in sources {
+        let desired = compute_desired_via(def, ViaAnchor::Src(src), doomed, g);
+        let current: Vec<Triple> = prov
+            .set
+            .iter()
+            .filter(|&&(t, s, _)| t == et && s == src)
+            .copied()
+            .collect();
+        for triple in current {
+            let (t, s, d) = triple;
+            if !desired.contains_key(&(s, d)) {
+                g.topo.remove_edge(t, s, d);
+                g.edge_props.remove_edge(t, s, d);
+                prov.remove(&def.name, triple, g.ids, g.syms);
+            }
+        }
+        for ((s, d), score) in desired {
+            let triple = (et, s, d);
+            let already = prov.contains(&triple);
+            if !already && g.topo.add_edge(et, s, d) {
+                prov.insert(&def.name, triple, g.ids, g.syms);
+            }
+            // Only weight edges this rule owns; a pre-existing user edge is not
+            // ours to annotate.
+            if already || prov.contains(&triple) {
+                if let Some(p) = &def.weight_prop {
+                    g.edge_props.set(et, s, d, p, Value::Float(score));
+                }
+            }
+        }
     }
 }
 
@@ -1316,8 +1470,144 @@ impl RuleEngine {
         Self::default()
     }
 
+    /// True when at least one rule hops over an edge type, so a derived edge
+    /// could feed another rule. Rule counts are small; this is a cheap scan.
+    fn chaining_possible(&self) -> bool {
+        self.rules.values().any(|r| r.via_edge.is_some())
+    }
+
+    /// Open a chaining scope at the entry of a top-level hook.
+    ///
+    /// Chaining reads the deltas the hook appends to `pending_deltas`, and
+    /// those are only recorded while `emit_deltas` is on. Live commits already
+    /// force it on for every apply (db.rs needs the deltas for history
+    /// markers), but WAL replay does not — and replay has to chain identically
+    /// or reopening a store would lose every chained edge. So the scope turns
+    /// emission on for the duration and restores it afterwards; the extra
+    /// deltas are drained and discarded by the replay loop either way.
+    ///
+    /// `active` is decided on entry. A hook that *creates* the first via-hop
+    /// rule therefore does not chain, which is correct: the only rules that
+    /// could consume that rule's fresh edges are themselves via-hop rules, and
+    /// any such rule would already have made `chaining_possible` true.
+    ///
+    /// There is no nesting to worry about: every hook that could be reached
+    /// from inside another one is called through its `*_inner` form
+    /// (`delete_rule` → `rebuild_inner`, `chain_from` → `on_edge_changed_inner`),
+    /// so a scope is only ever opened at the outermost frame.
+    fn begin_chain(&mut self) -> ChainScope {
+        let active = self.chain_depth == 0 && self.chaining_possible();
+        let prev_emit = self.emit_deltas;
+        if active {
+            self.emit_deltas = true;
+        }
+        ChainScope {
+            cursor: self.pending_deltas.len(),
+            prev_emit,
+            active,
+        }
+    }
+
+    /// Close a chaining scope: run the chain, then restore what was saved.
+    fn end_chain(&mut self, scope: ChainScope, g: &mut GraphMut<'_>) {
+        if scope.active {
+            self.chain_from(scope.cursor, g);
+        }
+        self.emit_deltas = scope.prev_emit;
+    }
+
+    /// Reset the transient chaining state.
+    ///
+    /// Called by `db.rs` from the same RAII guard that restores `emit_deltas`
+    /// after every apply, so a panic unwinding out of a hook cannot leave
+    /// `chain_depth` non-zero — which would make `begin_chain` compute
+    /// `active = false` and silently disable chaining for the life of the
+    /// engine. On the normal path this state is already clean and the call is
+    /// a no-op.
+    pub fn reset_chain_state(&mut self) {
+        self.chain_depth = 0;
+        self.chain_fired.clear();
+        self.doomed = None;
+    }
+
+    /// Feed derived-edge deltas appended since `cursor` back into via-hop rules.
+    ///
+    /// Runs at most [`MAX_CHAIN_DEPTH`] levels. Deterministic throughout: deltas
+    /// are consumed in append order, rules iterate in BTree name order, and
+    /// nothing reads a hash-ordered container. Because replay runs the identical
+    /// hooks, it reproduces the identical chain.
+    fn chain_from(&mut self, mut cursor: usize, g: &mut GraphMut<'_>) {
+        debug_assert_eq!(self.chain_depth, 0);
+        if self.pending_deltas.len() == cursor {
+            return; // nothing was written; allocate nothing
+        }
+        // Only a delta on an edge type some rule hops over can trigger further
+        // work. Filtering here keeps a large backfill from paying
+        // O(deltas * rules) in the per-rule scan inside on_edge_changed.
+        let via_edges: BTreeSet<String> = self
+            .rules
+            .values()
+            .filter_map(|r| r.via_edge.clone())
+            .collect();
+        let rule_count = self.rules.len();
+        for level in 1..=MAX_CHAIN_DEPTH {
+            let end = self.pending_deltas.len();
+            if end == cursor {
+                return; // reached a fixpoint inside the cap
+            }
+            let batch: Vec<(String, u32, u32)> = self.pending_deltas[cursor..end]
+                .iter()
+                .filter(|d| via_edges.contains(&d.edge_type))
+                .map(|d| (d.edge_type.clone(), d.src_id, d.dst_id))
+                .collect();
+            cursor = end;
+            if batch.is_empty() {
+                return; // nothing left that any rule hops over
+            }
+            // Fire-once is per LEVEL, not per write: a rule that already
+            // recomputed at level N may still need to see an edge another rule
+            // writes at level N+1. Within one level the guard is sound, because
+            // every edge that level consumes was already in `g.topo` before the
+            // level began, and each recompute re-evaluates the whole desired set
+            // for that source.
+            self.chain_fired.clear();
+            self.chain_depth = level;
+            for (etype, src, dst) in batch {
+                self.on_edge_changed_inner(&etype, src, dst, g);
+            }
+            self.chain_depth = 0;
+            // The fire-once key is a rule's position in the BTree-ordered rule
+            // set, which is only stable because nothing a chained recompute does
+            // can create or delete a rule.
+            debug_assert_eq!(
+                self.rules.len(),
+                rule_count,
+                "the rule set must not change during a chain"
+            );
+        }
+        // Fell out of the loop with the cap reached. If the last level wrote
+        // anything a rule hops over, the chain was truncated and the store is
+        // not a fixpoint of its own rule set.
+        let truncated = self.pending_deltas[cursor..]
+            .iter()
+            .any(|d| via_edges.contains(&d.edge_type));
+        if truncated {
+            self.chain_truncations = self.chain_truncations.saturating_add(1);
+        }
+    }
+
     pub fn rules(&self) -> impl Iterator<Item = &RuleDef> {
         self.rules.values()
+    }
+
+    /// How many writes hit [`MAX_CHAIN_DEPTH`] with rule-relevant work still
+    /// pending, since this engine was constructed. A non-zero value means some
+    /// derived edges beyond the cap are stale: the store is not a fixpoint of
+    /// its own rule set, and no single later write will repair it. Not
+    /// persisted; replay re-runs the same hooks, so the value is re-derived
+    /// identically on reopen.
+    pub fn chain_truncations(&self) -> u64 {
+        self.chain_truncations
     }
 
     pub fn is_owned(&self, etype: u32, src: u32, dst: u32) -> bool {
@@ -1501,6 +1791,10 @@ impl RuleEngine {
             retained_provenance_bytes: Mutex::new(None),
             lazy_provenance: OnceLock::new(),
             lazy_hnsw: OnceLock::new(),
+            chain_depth: 0,
+            chain_fired: BTreeSet::new(),
+            doomed: None,
+            chain_truncations: 0,
         }
     }
 
@@ -2053,6 +2347,10 @@ impl RuleEngine {
         if self.rules.contains_key(&def.name) {
             return Err(format!("rule {:?} already exists", def.name));
         }
+        // Backfilled edges chain like any other derived edge: creating a rule
+        // whose edge type an existing via-hop rule hops over recomputes that
+        // rule in the same commit.
+        let scope = self.begin_chain();
         let name = def.name.clone();
         self.rules.insert(name.clone(), def);
         self.indexes.insert(name.clone(), RuleIndex::default());
@@ -2116,7 +2414,7 @@ impl RuleEngine {
                 if src_sym != Some(label_sym) {
                     continue;
                 }
-                let per_src = compute_desired_via(&def, ViaAnchor::Src(id), g);
+                let per_src = compute_desired_via(&def, ViaAnchor::Src(id), self.doomed, g);
                 if let Some(k) = def.max_edges {
                     let top_k = filter_src_top_k(per_src, k, g.ids);
                     apply_per_src_top_k(&def, id, top_k, &mut prov, g);
@@ -2159,6 +2457,7 @@ impl RuleEngine {
         // as ready; otherwise a later reindex_all call will set the flag.
         self.indexes_populated = true;
 
+        self.end_chain(scope, g);
         Ok(())
     }
 
@@ -2167,6 +2466,10 @@ impl RuleEngine {
         if !self.rules.contains_key(name) {
             return Err(format!("rule {:?} not found", name));
         }
+        // Retracting a rule's edges chains: a via-hop rule that hopped over them
+        // loses its own derived edges in the same commit. The scope spans the
+        // survivor rebuilds below too, so the chain runs once at the end.
+        let scope = self.begin_chain();
         let def = self.rules.remove(name).unwrap();
         self.indexes.remove(name);
         self.tripped.remove(name);
@@ -2203,8 +2506,9 @@ impl RuleEngine {
             .collect();
         for survivor in same_etype_survivors {
             // rebuild returns Err only for unknown rules; survivor is live.
-            let _ = self.rebuild(&survivor, g);
+            let _ = self.rebuild_inner(&survivor, g);
         }
+        self.end_chain(scope, g);
         Ok(())
     }
 
@@ -2217,7 +2521,22 @@ impl RuleEngine {
     /// the via-label: finds all srcs that route through n and recomputes their
     /// derived edges. Via-hop rules bypass the candidate index and use
     /// `compute_desired_via` instead.
+    ///
+    /// Derived edges written here are chained into via-hop rules before the
+    /// call returns (see [`RuleEngine::chain_from`]), so one write reaches a
+    /// bounded fixpoint.
     pub fn on_node_changed(
+        &mut self,
+        n: u32,
+        changed: Option<(&str, Option<Value>)>,
+        g: &mut GraphMut<'_>,
+    ) {
+        let scope = self.begin_chain();
+        self.on_node_changed_inner(n, changed, g);
+        self.end_chain(scope, g);
+    }
+
+    fn on_node_changed_inner(
         &mut self,
         n: u32,
         changed: Option<(&str, Option<Value>)>,
@@ -2423,6 +2742,7 @@ impl RuleEngine {
         changed: Option<(&str, Option<Value>)>,
         g: &mut GraphMut<'_>,
     ) {
+        let doomed = self.doomed;
         let src_sym = g.syms.get(&def.src_label);
         let dst_sym = g.syms.get(&def.dst_label);
         let via_sym = def.via_label.as_deref().and_then(|l| g.syms.get(l));
@@ -2469,7 +2789,7 @@ impl RuleEngine {
         }
         if as_dst {
             // Recompute all srcs whose via-hops might produce edges to n.
-            let desired_touching_n = compute_desired_via(def, ViaAnchor::Dst(n), g);
+            let desired_touching_n = compute_desired_via(def, ViaAnchor::Dst(n), doomed, g);
             for (src, _dst) in desired_touching_n.keys() {
                 affected_srcs.insert(*src);
             }
@@ -2501,7 +2821,7 @@ impl RuleEngine {
                 emit: self.emit_deltas,
             };
             for src in affected_srcs {
-                let desired_src = compute_desired_via(def, ViaAnchor::Src(src), g);
+                let desired_src = compute_desired_via(def, ViaAnchor::Src(src), doomed, g);
                 let top_k = filter_src_top_k(desired_src, k, g.ids);
                 apply_per_src_top_k(def, src, top_k, &mut prov, g);
             }
@@ -2511,7 +2831,7 @@ impl RuleEngine {
             // Apply per-src so each affected src retracts its stale edges and
             // adds its new desired edges independently.
             for src in affected_srcs {
-                let desired_src = compute_desired_via(def, ViaAnchor::Src(src), g);
+                let desired_src = compute_desired_via(def, ViaAnchor::Src(src), doomed, g);
                 if !*tripped {
                     let mut prov = ProvSets {
                         set: self.provenance.entry(rule_name.to_string()).or_default(),
@@ -2543,8 +2863,21 @@ impl RuleEngine {
     /// This is the only hook the engine exposes for topology changes. It is
     /// called from `db.rs` on `WalRecord::InsertEdge` and `WalRecord::DeleteEdge`
     /// immediately after the topo is updated (so `g.topo` already reflects the
-    /// new state).
+    /// new state), and re-entrantly by [`RuleEngine::chain_from`] for derived
+    /// edges a rule just wrote.
     pub fn on_edge_changed(
+        &mut self,
+        etype_str: &str,
+        src_id: u32,
+        dst_id: u32,
+        g: &mut GraphMut<'_>,
+    ) {
+        let scope = self.begin_chain();
+        self.on_edge_changed_inner(etype_str, src_id, dst_id, g);
+        self.end_chain(scope, g);
+    }
+
+    fn on_edge_changed_inner(
         &mut self,
         etype_str: &str,
         src_id: u32,
@@ -2574,7 +2907,7 @@ impl RuleEngine {
         }
 
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
-        for rule_name in rule_names {
+        for (rule_idx, rule_name) in rule_names.into_iter().enumerate() {
             let def = self.rules[&rule_name].clone();
             let Some(ref via_edge) = def.via_edge else {
                 continue; // not a via-hop rule
@@ -2608,9 +2941,23 @@ impl RuleEngine {
                 continue;
             }
 
+            // Fire-once, scoped to one chain LEVEL. Every edge a level consumes
+            // was already in `g.topo` before that level began, and the work
+            // below is a *full* recompute of this src's desired set rather than
+            // an incremental patch — so a second recompute at the same level can
+            // only repeat itself. That argument does not extend across levels: a
+            // rule that recomputed at level N may still need to see an edge
+            // another rule writes at level N+1, which is why `chain_fired` is
+            // cleared per level rather than per write. The key is the rule's
+            // ordinal in the BTree-ordered rule set, stable because nothing a
+            // chained recompute does can add or remove a rule.
+            if self.chain_depth > 0 && !self.chain_fired.insert((rule_idx as u32, rule_src)) {
+                continue;
+            }
+
             // Recompute derived edges for rule_src — its via-hop set just changed.
             *self.fires.entry(rule_name.clone()).or_default() += 1;
-            let desired_src = compute_desired_via(&def, ViaAnchor::Src(rule_src), g);
+            let desired_src = compute_desired_via(&def, ViaAnchor::Src(rule_src), self.doomed, g);
 
             if let Some(k) = def.max_edges {
                 let mut prov = ProvSets {
@@ -2647,7 +2994,25 @@ impl RuleEngine {
     /// tombstone). Rules are walked in BTree name order; touching edges in
     /// BTree triple order. A second call on an already-retracted node is a
     /// no-op (crash-window replay / absent state).
+    ///
+    /// Retractions chain: a retracted derived edge that some via-hop rule hops
+    /// over retracts that rule's edges too, bounded by [`MAX_CHAIN_DEPTH`].
     pub fn on_node_removed(&mut self, n: u32, g: &mut GraphMut<'_>) {
+        // `n` is still fully alive here — `db.rs` strips its edges and stamps
+        // the label sentinel only after this returns — so mark it doomed for
+        // the whole hook, chain included. Without this, a chained via-hop
+        // recompute would scan labels, find `n` still matching, and re-derive
+        // an edge onto it; the caller's topology sweep would then remove that
+        // edge without removing its provenance.
+        let prev_doomed = self.doomed;
+        self.doomed = Some(n);
+        let scope = self.begin_chain();
+        self.on_node_removed_inner(n, g);
+        self.end_chain(scope, g);
+        self.doomed = prev_doomed;
+    }
+
+    fn on_node_removed_inner(&mut self, n: u32, g: &mut GraphMut<'_>) {
         // Ensure provenance is decoded before diffing against existing edges.
         self.ensure_provenance_loaded_mut();
         // Lazy index build: same guard as on_node_changed.  Top-k backfill
@@ -2748,7 +3113,14 @@ impl RuleEngine {
         for (rule_name, src) in topk_backfill {
             let def = self.rules[&rule_name].clone();
             let k = def.max_edges.unwrap(); // guarded by filter above
-            let desired_src = compute_desired(&def, &self.indexes[&rule_name], src, true, g);
+                                            // Via-hop rules cannot be evaluated through the candidate index; the
+                                            // index path would return nothing and retract this source's whole
+                                            // set. `self.doomed` keeps the node being deleted out of the result.
+            let desired_src = if def.via_edge.is_some() {
+                compute_desired_via(&def, ViaAnchor::Src(src), self.doomed, g)
+            } else {
+                compute_desired(&def, &self.indexes[&rule_name], src, true, g)
+            };
             let top_k = filter_src_top_k(desired_src, k, g.ids);
             let mut prov = ProvSets {
                 set: self.provenance.entry(rule_name.clone()).or_default(),
@@ -2770,7 +3142,22 @@ impl RuleEngine {
     /// provenance is left completely untouched and `tripped` stays true
     /// (rebuild-is-noop for at/over-cap rules). Always counts as a fire
     /// evaluation per participating node. Returns Err if unknown.
+    ///
+    /// A via-hop rule is never rebuilt through the candidate index — its
+    /// predicate holds between the via node and the destination, which the
+    /// index cannot express — so it goes through [`apply_via_rebuild`] or the
+    /// via arm of [`apply_streaming_rebuild_top_k`] instead.
     pub fn rebuild(&mut self, name: &str, g: &mut GraphMut<'_>) -> Result<(), String> {
+        let scope = self.begin_chain();
+        let out = self.rebuild_inner(name, g);
+        self.end_chain(scope, g);
+        out
+    }
+
+    /// `rebuild` without the chaining scope, for callers that already hold one
+    /// (`delete_rule` rebuilds every same-etype survivor and must chain once,
+    /// at its own exit, not once per survivor).
+    fn rebuild_inner(&mut self, name: &str, g: &mut GraphMut<'_>) -> Result<(), String> {
         if !self.rules.contains_key(name) {
             return Err(format!("rule {:?} not found", name));
         }
@@ -2808,6 +3195,10 @@ impl RuleEngine {
         // Streaming rebuild: branches on max_edges semantics.
         //   None    → global-budget path (may no-op if still over budget)
         //   Some(k) → per-source top-k rebuild (always converges; no tripped latch)
+        // Via-hop rules take the via path in both arms: their predicate is
+        // evaluated between the via node and the dst, which the candidate index
+        // cannot express.
+        let doomed = self.doomed;
         let mut prov = ProvSets {
             set: self.provenance.get_mut(name).unwrap(),
             owned: &mut self.owned,
@@ -2818,10 +3209,14 @@ impl RuleEngine {
             emit: self.emit_deltas,
         };
         if let Some(k) = def.max_edges {
-            apply_streaming_rebuild_top_k(&def, k, &self.indexes[name], &mut prov, g);
+            apply_streaming_rebuild_top_k(&def, k, &self.indexes[name], doomed, &mut prov, g);
         } else {
             let tripped = self.tripped.get_mut(name).unwrap();
-            apply_streaming_rebuild(&def, &self.indexes[name], &mut prov, tripped, g);
+            if def.via_edge.is_some() {
+                apply_via_rebuild(&def, doomed, &mut prov, tripped, g);
+            } else {
+                apply_streaming_rebuild(&def, &self.indexes[name], &mut prov, tripped, g);
+            }
         }
         let fires = self.fires.entry(name.to_string()).or_default();
         bump_fires_for_participants(&def, g, fires);

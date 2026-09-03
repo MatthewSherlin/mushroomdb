@@ -14,15 +14,33 @@
 
 
 mushroomdb
-The association engine for apps and AI agents.
-An embedded Rust graph database where edges are declared, not inserted:
-you write rules, the db creates, maintains, and retracts edges automatically
-and can explain() why any edge exists. SQLite for relationships.
-Built-in MCP server, explainable links, per-node history — a natural fit for
-agent memory and small internal apps where matching and relationships are the product.
+The graph that stays true — and knows who's allowed to see it.
+An embedded Rust graph database: declare a rule once, and every write creates, maintains,
+and retracts the matching edges automatically. Set a property and stale edges vanish; new ones appear.
+Explain any link with one call. SQLite for relationships. Built-in 16-tool MCP server for agent memory.
+Pre-1.0 alpha — APIs and formats may change between minor versions.
 
 
 
+
+---
+
+## A graph of your repo that stays true — in 30 seconds
+
+![Ingest this repository, query which files co-change, hand one file to a new owner, and watch the KNOWS edges follow in the same write](docs/assets/ingest-git-cascade.gif)
+
+```sh
+npx mushroomdb install                        # /mushroom skill + MCP server + recall hook
+mushroomdb ingest-git ~/.mushroomdb/memory .  # Author, Commit, File nodes; CO_CHANGED + KNOWS by rule
+```
+
+- **Live, not a snapshot.** One `SET f.top_author_id = …` moves the `TOP_AUTHOR` edge *and* re-derives that author's `KNOWS` edges before the write closes — the `SET` in the GIF above is that one write.
+- **Retracts instead of going stale.** Re-run `ingest-git` to sync: only new commits replay, deleted files drop their derived edges, and renamed files carry their history to the new path.
+- **Knows who's allowed to see it.** Pass a `mask` with a query and the same graph answers differently per caller; write statements are rejected on masked queries.
+- **Answers what it said last week.** `mushroomdb asof ./db --commit 5 --query "…"` replays the WAL to a past commit, derived edges included.
+- **Explains any link.** `explain` names the rule and the score behind an edge, so *"which files change together with `src/api.rs`, and why?"* has an answer your assistant can quote instead of a guess.
+
+Local, single binary, nothing to run alongside it. Pre-1.0 alpha — APIs and formats may change between minor versions.
 
 ---
 
@@ -222,287 +240,6 @@ same suggestions. No rule is ever applied automatically. See
 
 ---
 
-## Quickstart
-
-The two-command flow uses the release binary with the UI embedded:
-
-```text
-mushroomdb demo ./db
-mushroomdb serve ./db
-```
-
-Install from crates.io:
-
-```text
-cargo install mushroomdb-cli      # `mushroomdb` binary (no embedded UI)
-cargo add mushroomdb              # embedded Rust library
-```
-
-Or build the embedded-UI binary from source:
-
-```text
-cd ui && npm ci && npm run build && cd ..
-cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
-cp target/release/mushroomdb ~/.local/bin/  # or any directory on PATH
-```
-
-Or run directly from the source tree (no copy needed):
-
-```text
-./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db
-```
-
-Open `http://127.0.0.1:8080/`. When a token is configured, open
-`http://host:8080/?token=…`. The demo graph has 10 Orgs, 20 Projects,
-30 People, and 334 edges — 304 of them derived by seven rule sets.
-
-**Role-bound tokens** limit a caller to a named subset of nodes. Define
-roles in `schema.json` under the `roles` key (each role has a `label`
-selector list), then pass `--role-token TOKEN:ROLE` (repeatable) when
-starting the server, or set `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`.
-A role token receives only the nodes matching its label selectors — read
-endpoints return rows filtered to the visible set; write, subscription, and
-analytics endpoints return 403. Unknown token or unknown role name: 401.
-Corrupt `roles.json`: 500 for role tokens (full-access token unaffected).
-The never-widen invariant is enforced in the server: a client-supplied mask
-is always intersected with the role mask, never bypassing it. The MCP
-interface (`mushroomdb mcp`) is a stdio JSON-RPC server for local agent use
-and is not subject to bearer-token or role enforcement.
-
-`mushroomdb demo ./db` output:
-
-```text
-== demo ==
-ingested 10 Orgs, 20 Projects, 30 People
-overlap rule: skill_fit (Person.skills ∩ Project.skills, min 0.5)
-numeric rule: founded_within (Org.founded_year, tolerance 2)
-geo rule: nearby_office (Org.office [lat,lon], 50 km)
-vector rule: similar_interests (Person.embedding dim 8, min 0.8)
-
-== auto-FK rules ==
-  auto_fk_person_org_id
-  auto_fk_person_project_id
-  auto_fk_project_org_id
-
-== query ==
-MATCH (p:Person {id: 'person-01'})-[r:FIT]->(proj:Project)
-RETURN p, proj, r.score AS score
-ORDER BY score DESC, proj
-
-columns: p, proj, score
-  p=person-01  proj=proj-01  score=1.0
-  p=person-01  proj=proj-02  score=0.5
-  p=person-01  proj=proj-20  score=0.5
-
-== explain (person-01, proj-01) ==
-  rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=none
-  rule=skill_fit  type=FIT  person-01→proj-01  weight=1.0
-
-== serve ==
-  mushroomdb serve ./db
-```
-
-`mushroomdb serve ./db` output:
-
-```text
-listening on http://127.0.0.1:8080
-```
-
-Without the embedded binary (cargo only, debug build):
-
-```text
-cargo run -p mushroomdb-cli --bin mushroomdb -- demo ./demo-db
-cargo run -p mushroomdb-cli --bin mushroomdb -- serve ./demo-db
-```
-
----
-
-## Rules tour
-
-Six predicate kinds ship today. Predicates compose via `All(...)` (AND, score = min) and `Any(...)` (OR, score = max). Nesting is allowed up to depth 4.
-
-| Predicate | What it tests |
-|---|---|
-| `KeyMatch` | FK equality — source field matches destination key |
-| `FieldEqual` | Exact match on a named scalar field (string, int, float, bool) |
-| `Overlap` | Jaccard on list-valued fields, min threshold |
-| `NumericWithin` | Absolute numeric difference within a tolerance; score = `1 - |Δ|/tolerance` |
-| `GeoRadius` | Haversine distance on `[lat, lon]` fields within km; score = `1 - dist/radius` |
-| `VectorSimilar` | Cosine similarity on float arrays, min threshold |
-
-Auto-FK: fields ending in `_id` whose values match existing node keys get
-`KeyMatch` rules created automatically at ingest time.
-
-Approximate mode: `VectorSimilar` accepts `approximate: true`, which
-switches the candidate path to in-tree HNSW. Per-query recall: min 0.90,
-mean 0.998 at 5k nodes / dim 1536 (fixed-seed probe). Exact backfill at
-that scale takes ~12 min; approximate is substantially faster. Use it when
-backfill latency matters more than perfect recall; document the recall
-trade-off for your workload.
-
-Full predicate reference and examples: [`docs/site/rules.md`](docs/site/rules.md).
-
----
-
-## Benchmarks
-
-10,000-node graph (Apple M4 Pro, macOS 15.7.3, arm64). Full methodology
-and honesty notes: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md).
-Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
-
-| Workload | mushroomdb | Neo4j | KùzuDB | Memgraph |
-|---|---|---|---|---|
-| Bulk ingest | 784 ms | 13.2 s | 1.21 min | 12.5 s |
-| Neighborhood depth-1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
-| Neighborhood depth-1 (p95) | 2.2 µs | 1.46 ms | 519 µs | 2.14 ms |
-| Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
-| Cypher scan-filter-project (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
-| Cypher two-hop join (200 rows) | **261.6 µs** ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
-| Cold-start: V8 snapshot open | **0.02 s** ▽ | — | — | — |
-| Cold-start: WAL-only open | 8.16 min ▽ | — | — | — |
-| Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
-
-*(v0.1.1 mushroomdb, 2026-08-24, release build; competitor numbers = v2.2 corrected; two-hop row = corrected four-engine benchmark)*
-
-**Honesty notes:**
-
-- mushroomdb numbers are **embedded** (no network RTT, no serialization
-  overhead). KùzuDB is also embedded — its numbers are directly comparable
-  to mushroomdb's. Neo4j and Memgraph numbers go over bolt/localhost
-  (~0.1–1 ms round-trip per query).
-- ★ Two-hop join — same dataset, same warmup policy (v2.2 corrected benchmark): all four engines use
-  **5,810,000 INDUSTRY_ALIGNMENT edges** (FieldEqual on `industry`; per-source top-k,
-  effectively uncapped at 10k scale). Policy: fresh process/container → ingest + preload
-  → 3 warmup executions (discarded) → **median of 10 measured runs**. mushroomdb derives
-  edges automatically via `create_rule`; competitors pre-loaded via UNWIND MERGE (neo4j,
-  memgraph) or COPY FROM CSV (kuzu). All engines return 200 rows.
-  Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`.
-- v2.1 consolidated-pass two-hop values (2.88 ms neo4j / 2.22 ms kuzu / 2.57 ms memgraph)
-  **retracted**: cross-engine contamination confirmed — memgraph cell was neo4j on a warm
-  container; see `benchmarks/results/head-to-head-10k-v2.md` contamination section.
-  v2 mushroomdb 307 µs **retired**: measured on the old 1M-edge global-budget graph
-  (current uncapped graph has 5.81M edges; see dataset growth note in methodology).
-
-Rule derivation (mushroomdb-only, excluded from cross-engine table):
-two-rule backfill on 10k nodes: v2.4 baseline 928 ms + 2.221 s = 3.149 s (+8.8% vs pre-eventing v2.3 baseline of 2.894 s). **v0.1.0 measured: 3.49–3.51 s** (two runs, 0.6% intrarun variance; +11% from v2.4). **v0.1.1 re-measured: 2.929 s** (single-pass 2026-08-24; N=5 criterion median 2.878 s — no residual regression vs 2.894 s pre-eventing baseline). A two-stage fix (is\_empty guard + emit\_deltas engine gate, commit d4d312c) recovered the original subscription overhead. Competitors have no auto-derivation equivalent.
-
-▽ 100k cold-start (100k-node representative matching workload, 9 backfill rules,
-~10M derived edges in snapshot; warm file cache, cold process; measured
-2026-08-28 with `/usr/bin/time -l`, release build, Apple M4 Pro):
-**V8 snapshot open:** **0.02 s** (runs 2–3; 0.25 s on first-ever dyld-cold run),
-**31–41 MiB RSS** depending on query type — V8 mmap format (v0.2,
-`feat/v0.2-phase-b-physics` @ `b0798a1`). Cold-cache not measured (requires
-`sudo purge`). **V7 snapshot open:** ~11 s (measured 2026-08-26, three runs
-10.7–11.1 s; V7 decompresses packed snapshot on open; no rule re-fire).
-**WAL-only open:** 8.16 min (measured 2026-08-24) — CreateRule WAL records trigger
-full rule re-derivation; ANN index re-fitting dominates. **V8 snapshot size:**
-1.8 GiB (18% smaller than V5's 2.2 GiB; V5 stored IVF state as uncompressed
-inline bincode in its meta blob — V8 moves it to a dedicated compact section).
-**V8 snapshot write:** ~35 s. **Backfill (9 rules, max_edges=1M each):** 20.343 s.
-`mushroomdb verify ` audits all 12 sections with full CRC32 and exits 2
-on any mismatch (0.26 s on the 1.8 GiB store; large sections skip CRC on the
-normal query path — see `docs/format-stability.md` for the trust model).
-Full trajectory and methodology:
-[`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
-
-Rule engine vs hand-rolled maintenance (three-way, measured 2026-08-21): on 10k nodes with
-1,000 specialty updates, all three strategies produce identical edge sets (drift = 0).
-**(a) per-op (expert-written)** (individual `delete_edge`/`insert_edge`, one WAL fsync each): **64.93 min**.
-**(b) batched (expert-written)** (uses `batch_edges` — a mushroomdb-only API, one WAL frame per update): **24.98 s**.
-**(c) Rule engine** (`create_rule` + `set_prop`, fully automatic): **17.58 s** (1.42× faster than batched).
-Add-only pattern (NOT benchmarked — omits retraction; stale edges accumulate on every update).
-Disclosures: (1) `batch_edges` was introduced alongside this benchmark to make the comparison fair; it
-is not available on any competitor engine. (2) Both hand-rolled variants were written by the engine team
-with full knowledge of retraction semantics; drift=0 is a property of expert implementation, not of the
-hand-rolled approach in general — real application code typically misses at least one retraction path.
-See [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-vs-rules.md).
-
----
-
-## Architecture
-
-```
-graph-db/
-├── crates/
-│   ├── core-storage      # Packed adjacency topology + columnar property store + WAL + snapshots
-│   ├── core-rules        # linking rules, per-rule indexes, incremental maintenance
-│   ├── core-query        # pull-based interpreter; traversal ops + Cypher subset
-│   ├── core-api          # the one public Rust interface; typed error enums
-│   ├── arrow-bridge      # results ↔ Arrow buffers
-│   ├── server            # axum HTTP + WebSocket; serves UI
-│   ├── cli               # mushroomdb binary
-│   └── sim-harness       # DST: virtual clock, fault-injecting IO, seeded runner
-├── ui/                   # TypeScript + Vite graph explorer
-├── bindings/python/      # PyO3 / maturin
-└── clients/typescript/   # HTTP + WebSocket client
-```
-
-Dependency rule (inward only):
-`bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
-
-Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy`),
-plus mmap-able V8 rkyv snapshots (12 sections: CSR topology, columnar properties,
-HNSW blobs, provenance, IVF state, per-node last-change index, and more — zero-copy,
-no heap allocation on open).
-V5/V6/V7 stores are auto-migrated to V8 on `GraphDb::open`. Open = mmap header +
-lazy section reads; derived edges and ANN state load from snapshot without rule re-fire.
-Derived edges are not WAL-logged; they are restored directly from the mmap'd sections.
-See [`docs/format-stability.md`](docs/format-stability.md) for the format evolution
-contract (append-only WAL discriminants, migrate-on-open, V5+ support, verify command).
-
-Concurrency: single writer, many readers via `RwLock`-backed `SharedDb`.
-Lock-free epoch snapshot readers are on the roadmap.
-
-HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
-(pandas/polars zero-copy is not wired yet). JSON is available via
-`?format=json`.
-
----
-
-## Known limitations
-
-| Limitation | Detail |
-|---|---|
-| Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
-| Cold start without a snapshot re-fires all rules | Snapshots (V8 mmap, v0.2+) persist derived edges, ANN state, and view definitions — opening from a snapshot skips re-derivation. Measured at 100k nodes / ~10M derived edges (2026-08-28, warm file cache, cold process): **0.02 s, 31–41 MiB RSS** (V8 mmap). WAL-only open: **8.16 min** (ANN re-fit dominates). Snapshot write cost: ~35 s (1.8 GiB on disk). Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
-| Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection (in-tree, no external dependency). Per-query recall: min 0.90, mean 0.998 at 5k/dim 1536 (fixed-seed probe). Review the recall trade-off before using it in completeness-critical workloads. |
-| Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`. |
-| Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
-| Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE (manual edges only), MATCH…DETACH DELETE (node deletes), MATCH…DELETE (isolated-node or edge deletes), and MERGE (single-key match-or-create, including `ON CREATE SET` / `ON MATCH SET`) are supported. SET RHS accepts a literal, `$param`, or arithmetic (`n.x + 1`). Combined MATCH…SET…RETURN commits the write then projects from post-write state. Multi-statement transactions are not supported. Each write statement produces one WAL Batch frame (one fsync). See [`docs/site/query.md`](docs/site/query.md) coverage table. |
-| Crash-atomic write batches; no interactive transactions or isolation | `db.write_batch(\|b\| { b.insert_node(...); b.set_prop(...); b.delete_node(...); })` commits all ops in one `WalRecord::Batch` frame (one fsync). On crash replay the frame is all-or-nothing: a torn frame replays as none-applied. Rules fire per op in order — semantically identical to sequential singles. Error semantics: validate-then-apply — if op N fails validation (duplicate key, unknown key, rule-owned edge) the entire batch is rejected and nothing is written or applied. **Not isolated:** readers may observe intermediate states while a committed batch is being applied in memory. Per-query Cypher writes (`query_write`) also produce one Batch frame per statement. Multi-statement BEGIN/COMMIT interactive transactions are not supported in v1. |
-| Cypher aggregations | `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` are supported both as single aggregates and as grouped aggregates (`RETURN a, COUNT(*)`). Multiple group keys and multiple aggregates per query are allowed. Group count is capped at 1,000,000 distinct keys. |
-| Variable-length paths: max hops capped at 10 | `-[r:TYPE*min..max]->` and `shortestPath` are supported. Max hops is hard-capped at 10; unbounded forms (`*min..`) are rejected at parse time. Intermediate results are capped at 1,000,000 rows. See [`docs/site/query.md`](docs/site/query.md). |
-| WITH pipeline and UNWIND | `WITH` pipeline stages (projection, aliasing, HAVING-style WHERE, ORDER BY, LIMIT, re-entry MATCH) and `UNWIND` list expansion are fully supported. Intermediate rows count against the 1,000,000-row budget. See [`docs/site/query.md`](docs/site/query.md). |
-| OPTIONAL MATCH | Left-outer-join semantics: rows failing the optional pattern survive with optional bindings null. Composes with WITH, grouped aggregation (`MATCH (a) OPTIONAL MATCH (a)-[:R]->(b) RETURN a, COUNT(b)` → 0 for edgeless nodes), and WHERE inside the optional scope. Multiple chained OPTIONAL MATCHes on the same anchor are supported. |
-| Query parameters | `$name` placeholders are replaced with values supplied at query time. Use `db.query_with_params(cypher, &[("name", value)])` in Rust or `{"params": {...}}` in the HTTP API. Unknown parameters return a named error. Parameters are safe — values are never interpreted as Cypher. |
-| Scalar functions | `toLower`, `toUpper`, `size` (strings + lists), `coalesce`, `type(r)`, `abs`, `round` in WHERE and RETURN/WITH. Binary arithmetic (`-`, `*`) is supported inside function arguments (e.g. `abs(n.age - 27)`). Null propagates through all functions except `coalesce`. Unknown function names return a named error listing the supported set. |
-
----
-
-## What the server and CLI expose
-
-| Command | What it does |
-|---|---|
-| `mushroomdb demo ` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
-| `mushroomdb serve ` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE` for role-bound tokens) |
-| `mushroomdb query  ` | Run a Cypher read or write (`--query` also accepted) |
-| `mushroomdb snapshot  [--keep-wal]` | Write `snapshot.bin` (truncates WAL unless `--keep-wal`) |
-| `mushroomdb mcp ` | Start a stdio MCP JSON-RPC server for agent tools |
-| `mushroomdb stats ` | Print node/edge/rule counts |
-| `mushroomdb suggest ` | Rank candidate linking rules (scored top-k 32, KeyMatch 1) |
-| `mushroomdb asof  --commit N` | Read-only view at a WAL commit |
-| `mushroomdb algo pagerank  --top 20` | Run PageRank over the unified topology (manual + derived edges) |
-| `mushroomdb algo wcc  --top 50` | Find weakly-connected components |
-| `mushroomdb algo degree  --top 20` | Degree centrality (out / in / both) |
-| `mushroomdb verify ` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch (large sections skip CRC on the normal query path; this command reads them all) |
-| `mushroomdb schema apply  ` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff of created/updated/unchanged items |
-| `mushroomdb backup  ` | Copy store files to `` and CRC-verify the copy. WARNING: unsafe against a concurrently running `serve` process — use `POST /backup` for live-served stores |
-| `mushroomdb export   [--format jsonl\|parquet]` | Export nodes, edges, and rules to JSONL (stable, byte-identical) or Parquet (Snappy, not byte-identical across library versions). NaN/Inf floats export as null |
-
-Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
-
----
-
 ## Agent Memory
 
 mushroomdb is a natural fit for AI agent memory. Graph structure captures the
@@ -587,6 +324,304 @@ Full walkthrough, tool reference, and Claude Desktop setup:
 
 ---
 
+## Install options
+
+The two-command flow uses the release binary with the UI embedded:
+
+```text
+mushroomdb demo ./db
+mushroomdb serve ./db
+```
+
+Install from crates.io:
+
+```text
+cargo install mushroomdb-cli      # `mushroomdb` binary (no embedded UI)
+cargo add mushroomdb              # embedded Rust library
+```
+
+Or build the embedded-UI binary from source:
+
+```text
+cd ui && npm ci && npm run build && cd ..
+cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
+cp target/release/mushroomdb ~/.local/bin/  # or any directory on PATH
+```
+
+Or run directly from the source tree (no copy needed):
+
+```text
+./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db
+```
+
+Open `http://127.0.0.1:8080/`. When a token is configured, open
+`http://host:8080/?token=…`. The demo graph has 10 Orgs, 20 Projects,
+30 People, and 334 edges — 304 of them derived by seven rule sets.
+
+**Role-bound tokens** limit a caller to a named subset of nodes. Define
+roles in `schema.json` under the `roles` key (each role has a `label`
+selector list), then pass `--role-token TOKEN:ROLE` (repeatable) when
+starting the server, or set `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`.
+A role token receives only the nodes matching its label selectors — read
+endpoints return rows filtered to the visible set; write, subscription, and
+analytics endpoints return 403. Unknown token or unknown role name: 401.
+Corrupt `roles.json`: 500 for role tokens (full-access token unaffected).
+The never-widen invariant is enforced in the server: a client-supplied mask
+is always intersected with the role mask, never bypassing it. The MCP
+interface (`mushroomdb mcp`) is a stdio JSON-RPC server for local agent use
+and is not subject to bearer-token or role enforcement.
+
+`mushroomdb demo ./db` output:
+
+```text
+== demo ==
+ingested 10 Orgs, 20 Projects, 30 People
+overlap rule: skill_fit (Person.skills ∩ Project.skills, min 0.5)
+numeric rule: founded_within (Org.founded_year, tolerance 2)
+geo rule: nearby_office (Org.office [lat,lon], 50 km)
+vector rule: similar_interests (Person.embedding dim 8, min 0.8)
+
+== auto-FK rules ==
+  auto_fk_person_org_id
+  auto_fk_person_project_id
+  auto_fk_project_org_id
+
+== query ==
+MATCH (p:Person {id: 'person-01'})-[r:FIT]->(proj:Project)
+RETURN p, proj, r.score AS score
+ORDER BY score DESC, proj
+
+columns: p, proj, score
+  p=person-01  proj=proj-01  score=1.0
+  p=person-01  proj=proj-02  score=0.5
+  p=person-01  proj=proj-20  score=0.5
+
+== explain (person-01, proj-01) ==
+  rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=1.0
+  rule=skill_fit  type=FIT  person-01→proj-01  weight=1.0
+
+== serve ==
+  mushroomdb serve ./db
+```
+
+`mushroomdb serve ./db` output:
+
+```text
+listening on http://127.0.0.1:8080
+```
+
+Without the embedded binary (cargo only, debug build):
+
+```text
+cargo run -p mushroomdb-cli --bin mushroomdb -- demo ./demo-db
+cargo run -p mushroomdb-cli --bin mushroomdb -- serve ./demo-db
+```
+
+---
+
+## Rules tour
+
+Six predicate kinds ship today. Predicates compose via `All(...)` (AND, score = min) and `Any(...)` (OR, score = max). Nesting is allowed up to depth 4.
+
+| Predicate | What it tests |
+|---|---|
+| `KeyMatch` | FK equality — source field matches destination key |
+| `FieldEqual` | Exact match on a named scalar field (string, int, float, bool) |
+| `Overlap` | Jaccard on list-valued fields, min threshold |
+| `NumericWithin` | Absolute numeric difference within a tolerance; score = `1 - |Δ|/tolerance` |
+| `GeoRadius` | Haversine distance on `[lat, lon]` fields within km; score = `1 - dist/radius` |
+| `VectorSimilar` | Cosine similarity on float arrays, min threshold |
+
+Auto-FK: fields ending in `_id` whose values match existing node keys get
+`KeyMatch` rules created automatically at ingest time.
+
+Approximate mode: `VectorSimilar` accepts `approximate: true`, which
+switches the candidate path to in-tree HNSW. Per-query recall: min 0.90,
+mean 0.998 at 5k nodes / dim 1536 (fixed-seed probe). Exact backfill at
+that scale takes ~12 min; approximate is substantially faster. Use it when
+backfill latency matters more than perfect recall; document the recall
+trade-off for your workload.
+
+Full predicate reference and examples: [`docs/site/rules.md`](docs/site/rules.md).
+
+---
+
+## Architecture
+
+```
+graph-db/
+├── crates/
+│   ├── core-storage      # Packed adjacency topology + columnar property store + WAL + snapshots
+│   ├── core-rules        # linking rules, per-rule indexes, incremental maintenance
+│   ├── core-query        # pull-based interpreter; traversal ops + Cypher subset
+│   ├── core-api          # the one public Rust interface; typed error enums
+│   ├── arrow-bridge      # results ↔ Arrow buffers
+│   ├── server            # axum HTTP + WebSocket; serves UI
+│   ├── cli               # mushroomdb binary
+│   └── sim-harness       # DST: virtual clock, fault-injecting IO, seeded runner
+├── ui/                   # TypeScript + Vite graph explorer
+├── bindings/python/      # PyO3 / maturin
+└── clients/typescript/   # HTTP + WebSocket client
+```
+
+Dependency rule (inward only):
+`bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
+
+Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy`),
+plus mmap-able V8 rkyv snapshots (12 sections: CSR topology, columnar properties,
+HNSW blobs, provenance, IVF state, per-node last-change index, and more — zero-copy,
+no heap allocation on open).
+V5/V6/V7 stores are auto-migrated to V8 on `GraphDb::open`. Open = mmap header +
+lazy section reads; derived edges and ANN state load from snapshot without rule re-fire.
+Derived edges are not WAL-logged; they are restored directly from the mmap'd sections.
+See [`docs/format-stability.md`](docs/format-stability.md) for the format evolution
+contract (append-only WAL discriminants, migrate-on-open, V5+ support, verify command).
+
+Concurrency: single writer, many readers via `RwLock`-backed `SharedDb`.
+Lock-free epoch snapshot readers are on the roadmap.
+
+HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
+(pandas/polars zero-copy is not wired yet). JSON is available via
+`?format=json`.
+
+---
+
+## Known limitations
+
+| Limitation | Detail |
+|---|---|
+| Two-hop Cypher joins at scale | Dense patterns that produce >1,000,000 intermediate rows still error without `LIMIT`. Add `LIMIT n` to any such query — the pull-based executor stops early and never materializes the full binding table. |
+| Cold start without a snapshot re-fires all rules | Snapshots (V8 mmap, v0.2+) persist derived edges, ANN state, and view definitions — opening from a snapshot skips re-derivation. Measured at 100k nodes / ~10M derived edges (2026-08-28, warm file cache, cold process): **0.02 s, 31–41 MiB RSS** (V8 mmap). WAL-only open: **8.16 min** (ANN re-fit dominates). Snapshot write cost: ~35 s (1.8 GiB on disk). Call `snapshot()` before close; a WAL-only open re-derives everything. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
+| Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection (in-tree, no external dependency). Per-query recall: min 0.90, mean 0.998 at 5k/dim 1536 (fixed-seed probe). Review the recall trade-off before using it in completeness-critical workloads. |
+| Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is deferred; see `docs/superpowers/specs/2026-08-25-best-graph-db.md`. |
+| Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
+| Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE (manual edges only), MATCH…DETACH DELETE (node deletes), MATCH…DELETE (isolated-node or edge deletes), and MERGE (single-key match-or-create, including `ON CREATE SET` / `ON MATCH SET`) are supported. SET RHS accepts a literal, `$param`, or arithmetic (`n.x + 1`). Combined MATCH…SET…RETURN commits the write then projects from post-write state. Multi-statement transactions are not supported. Each write statement produces one WAL Batch frame (one fsync). See [`docs/site/query.md`](docs/site/query.md) coverage table. |
+| Crash-atomic write batches; no interactive transactions or isolation | `db.write_batch(\|b\| { b.insert_node(...); b.set_prop(...); b.delete_node(...); })` commits all ops in one `WalRecord::Batch` frame (one fsync). On crash replay the frame is all-or-nothing: a torn frame replays as none-applied. Rules fire per op in order — semantically identical to sequential singles. Error semantics: validate-then-apply — if op N fails validation (duplicate key, unknown key, rule-owned edge) the entire batch is rejected and nothing is written or applied. **Not isolated:** readers may observe intermediate states while a committed batch is being applied in memory. Per-query Cypher writes (`query_write`) also produce one Batch frame per statement. Multi-statement BEGIN/COMMIT interactive transactions are not supported in v1. |
+| Cypher aggregations | `COUNT(*)`, `COUNT(n)`, `SUM`, `AVG`, `MIN`, `MAX` are supported both as single aggregates and as grouped aggregates (`RETURN a, COUNT(*)`). Multiple group keys and multiple aggregates per query are allowed. Group count is capped at 1,000,000 distinct keys. |
+| Variable-length paths: max hops capped at 10 | `-[r:TYPE*min..max]->` and `shortestPath` are supported. Max hops is hard-capped at 10; unbounded forms (`*min..`) are rejected at parse time. Intermediate results are capped at 1,000,000 rows. See [`docs/site/query.md`](docs/site/query.md). |
+| WITH pipeline and UNWIND | `WITH` pipeline stages (projection, aliasing, HAVING-style WHERE, ORDER BY, LIMIT, re-entry MATCH) and `UNWIND` list expansion are fully supported. Intermediate rows count against the 1,000,000-row budget. See [`docs/site/query.md`](docs/site/query.md). |
+| OPTIONAL MATCH | Left-outer-join semantics: rows failing the optional pattern survive with optional bindings null. Composes with WITH, grouped aggregation (`MATCH (a) OPTIONAL MATCH (a)-[:R]->(b) RETURN a, COUNT(b)` → 0 for edgeless nodes), and WHERE inside the optional scope. Multiple chained OPTIONAL MATCHes on the same anchor are supported. |
+| Query parameters | `$name` placeholders are replaced with values supplied at query time. Use `db.query_with_params(cypher, &[("name", value)])` in Rust or `{"params": {...}}` in the HTTP API. Unknown parameters return a named error. Parameters are safe — values are never interpreted as Cypher. |
+| Scalar functions | `toLower`, `toUpper`, `size` (strings + lists), `coalesce`, `type(r)`, `abs`, `round`, `textMatches`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay` in WHERE and RETURN/WITH. Binary arithmetic (`-`, `*`) is supported inside function arguments (e.g. `abs(n.age - 27)`). Null propagates through all functions except `coalesce`. Unknown function names return a named error listing the supported set. |
+
+---
+
+## What the server and CLI expose
+
+| Command | What it does |
+|---|---|
+| `mushroomdb demo ` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
+| `mushroomdb serve ` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE` for role-bound tokens) |
+| `mushroomdb query  ` | Run a Cypher read or write (`--query` also accepted) |
+| `mushroomdb snapshot  [--keep-wal]` | Write `snapshot.bin` (truncates WAL unless `--keep-wal`) |
+| `mushroomdb mcp ` | Start a stdio MCP JSON-RPC server for agent tools |
+| `mushroomdb stats ` | Print node/edge/rule counts |
+| `mushroomdb suggest ` | Rank candidate linking rules (scored top-k 32, KeyMatch 1) |
+| `mushroomdb recall ` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin, prints related graph facts. Wired automatically by `mushroomdb install`; see [`docs/site/skill.md`](docs/site/skill.md) |
+| `mushroomdb asof  --commit N` | Read-only view at a WAL commit |
+| `mushroomdb algo pagerank  --top 20` | Run PageRank over the unified topology (manual + derived edges) |
+| `mushroomdb algo wcc  --top 50` | Find weakly-connected components |
+| `mushroomdb algo degree  --top 20 [--dir out\|in\|both]` | Degree centrality; `--dir` selects out / in / both (default both) |
+| `mushroomdb verify ` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch (large sections skip CRC on the normal query path; this command reads them all) |
+| `mushroomdb schema apply  ` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff of created/updated/unchanged items |
+| `mushroomdb backup  ` | Copy store files to `` and CRC-verify the copy. WARNING: unsafe against a concurrently running `serve` process — use `POST /backup` for live-served stores |
+| `mushroomdb export   [--format jsonl\|parquet]` | Export nodes, edges, and rules to JSONL (stable, byte-identical) or Parquet (Snappy, not byte-identical across library versions). NaN/Inf floats export as null |
+| `mushroomdb ingest-git   [--exclude ]...` | Graph a git repository: `Author`, `Commit`, and `File` nodes plus `CO_CHANGED` and `KNOWS` rules. Re-run to sync — later runs replay only new commits, so deletes and renames retract or move derived edges. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
+| `mushroomdb install [--platform claude-code\|cursor\|all] [--project] [--db ]` | Write the `/mushroom` skill + MCP server entry for Claude Code or Cursor. Auto-detects platform. See [`docs/site/skill.md`](docs/site/skill.md) |
+| `mushroomdb uninstall [--platform claude-code\|cursor\|all] [--project] [--db ]` | Remove exactly what `install` wrote (manifest-driven; leaves user files) |
+| `mushroomdb --version` | Print the CLI's version and exit |
+
+**Concurrency:** `ingest-git` and other CLI write commands (`query` writes,
+`schema apply`, etc.) open the database directory directly and have no
+coordination with a running `mushroomdb serve` process's locking. Do not run
+them against a store a live `serve` process holds — write through the HTTP
+API instead. This is the same hazard the `backup` row above warns about.
+
+The `recall` hook `install` writes is the same hazard unattended: the hook
+opens the store on every prompt. It opens without migration or WAL repair
+(`auto_migrate: false`, `repair_wal: false`) so it writes nothing, but it has
+no coordination with a live `serve` either. Do not point the hook at a store a
+live `serve` process holds.
+
+Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
+
+---
+
+## Benchmarks
+
+10,000-node graph (Apple M4 Pro, macOS 15.7.3, arm64). Full methodology
+and honesty notes: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md).
+Regression results (v2.1 + v2.3, 2026-08-21) are appended to that document.
+
+| Workload | mushroomdb | Neo4j | KùzuDB | Memgraph |
+|---|---|---|---|---|
+| Bulk ingest | 784 ms | 13.2 s | 1.21 min | 12.5 s |
+| Neighborhood depth-1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
+| Neighborhood depth-1 (p95) | 2.2 µs | 1.46 ms | 519 µs | 2.14 ms |
+| Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
+| Cypher scan-filter-project (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
+| Cypher two-hop join (200 rows) | **261.6 µs** ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
+| Cold-start: V8 snapshot open | **0.02 s** ▽ | — | — | — |
+| Cold-start: WAL-only open | 8.16 min ▽ | — | — | — |
+| Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
+
+*(v0.1.1 mushroomdb, 2026-08-24, release build; competitor numbers = v2.2 corrected; two-hop row = corrected four-engine benchmark)*
+
+**Honesty notes:**
+
+- mushroomdb numbers are **embedded** (no network RTT, no serialization
+  overhead). KùzuDB is also embedded — its numbers are directly comparable
+  to mushroomdb's. Neo4j and Memgraph numbers go over bolt/localhost
+  (~0.1–1 ms round-trip per query).
+- ★ Two-hop join — same dataset, same warmup policy (v2.2 corrected benchmark): all four engines use
+  **5,810,000 INDUSTRY_ALIGNMENT edges** (FieldEqual on `industry`; per-source top-k,
+  effectively uncapped at 10k scale). Policy: fresh process/container → ingest + preload
+  → 3 warmup executions (discarded) → **median of 10 measured runs**. mushroomdb derives
+  edges automatically via `create_rule`; competitors pre-loaded via UNWIND MERGE (neo4j,
+  memgraph) or COPY FROM CSV (kuzu). All engines return 200 rows.
+  Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`.
+- v2.1 consolidated-pass two-hop values (2.88 ms neo4j / 2.22 ms kuzu / 2.57 ms memgraph)
+  **retracted**: cross-engine contamination confirmed — memgraph cell was neo4j on a warm
+  container; see `benchmarks/results/head-to-head-10k-v2.md` contamination section.
+  v2 mushroomdb 307 µs **retired**: measured on the old 1M-edge global-budget graph
+  (current uncapped graph has 5.81M edges; see dataset growth note in methodology).
+
+Rule derivation (mushroomdb-only, excluded from cross-engine table):
+two-rule backfill on 10k nodes: v2.4 baseline 928 ms + 2.221 s = 3.149 s (+8.8% vs pre-eventing v2.3 baseline of 2.894 s). **v0.1.0 measured: 3.49–3.51 s** (two runs, 0.6% intrarun variance; +11% from v2.4). **v0.1.1 re-measured: 2.929 s** (single-pass 2026-08-24; N=5 criterion median 2.878 s — no residual regression vs 2.894 s pre-eventing baseline). A two-stage fix (is\_empty guard + emit\_deltas engine gate, commit d4d312c) recovered the original subscription overhead. Competitors have no auto-derivation equivalent.
+
+▽ 100k cold-start (100k-node representative matching workload, 9 backfill rules,
+~10M derived edges in snapshot; warm file cache, cold process; measured
+2026-08-28 with `/usr/bin/time -l`, release build, Apple M4 Pro):
+**V8 snapshot open:** **0.02 s** (runs 2–3; 0.25 s on first-ever dyld-cold run),
+**31–41 MiB RSS** depending on query type — V8 mmap format (v0.2,
+`feat/v0.2-phase-b-physics` @ `b0798a1`). Cold-cache not measured (requires
+`sudo purge`). **V7 snapshot open:** ~11 s (measured 2026-08-26, three runs
+10.7–11.1 s; V7 decompresses packed snapshot on open; no rule re-fire).
+**WAL-only open:** 8.16 min (measured 2026-08-24) — CreateRule WAL records trigger
+full rule re-derivation; ANN index re-fitting dominates. **V8 snapshot size:**
+1.8 GiB (18% smaller than V5's 2.2 GiB; V5 stored IVF state as uncompressed
+inline bincode in its meta blob — V8 moves it to a dedicated compact section).
+**V8 snapshot write:** ~35 s. **Backfill (9 rules, max_edges=1M each):** 20.343 s.
+`mushroomdb verify ` audits all 12 sections with full CRC32 and exits 2
+on any mismatch (0.26 s on the 1.8 GiB store; large sections skip CRC on the
+normal query path — see `docs/format-stability.md` for the trust model).
+Full trajectory and methodology:
+[`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
+
+Rule engine vs hand-rolled maintenance (three-way, measured 2026-08-21): on 10k nodes with
+1,000 specialty updates, all three strategies produce identical edge sets (drift = 0).
+**(a) per-op (expert-written)** (individual `delete_edge`/`insert_edge`, one WAL fsync each): **64.93 min**.
+**(b) batched (expert-written)** (uses `batch_edges` — a mushroomdb-only API, one WAL frame per update): **24.98 s**.
+**(c) Rule engine** (`create_rule` + `set_prop`, fully automatic): **17.58 s** (1.42× faster than batched).
+Add-only pattern (NOT benchmarked — omits retraction; stale edges accumulate on every update).
+Disclosures: (1) `batch_edges` was introduced alongside this benchmark to make the comparison fair; it
+is not available on any competitor engine. (2) Both hand-rolled variants were written by the engine team
+with full knowledge of retraction semantics; drift=0 is a property of expert implementation, not of the
+hand-rolled approach in general — real application code typically misses at least one retraction path.
+See [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-vs-rules.md).
+
+---
+
 ## Roadmap
 
 Phases 1–4 and Plan 18 all landed. What remains:
@@ -602,8 +637,9 @@ Phases 1–4 and Plan 18 all landed. What remains:
 
 ## Distribution
 
-Pre-alpha. No tag has been pushed. The one-liners below are the intended
-front door **after the first `v*` tag**; they are not available until then.
+Pre-1.0 alpha quality software — APIs and formats may change between minor
+versions. Tags `v0.4.1`, `v0.4.2`, `v0.4.3`, `v0.4.4`, `v0.4.5`, and `v0.5.0` are published; `npx mushroomdb`,
+the `curl install.sh`, and `ghcr.io/matthewsherlin/mushroomdb` are all live today.
 
 ### Docker (after the first v* tag)
 
@@ -714,6 +750,9 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 - Time travel (as-of queries): [`docs/site/timetravel.md`](docs/site/timetravel.md)
 - Materialized views: [`docs/site/views.md`](docs/site/views.md)
 - Full-text search v2 (BM25, Snowball EN stemming, phrase/negation/prefix): [`docs/site/fulltext.md`](docs/site/fulltext.md)
+- Property (equality) indexes for `MATCH (n:L {field: value})` lookups: [`docs/site/indexes.md`](docs/site/indexes.md)
+- Durability, crash recovery, and snapshot/integrity guidance: [`docs/site/durability.md`](docs/site/durability.md)
+- Moat roadmap (temporal queries, rule chaining, memory-native): [`docs/site/roadmap-moat.md`](docs/site/roadmap-moat.md)
 - Node masks and access control (role tokens, restricted-stub mode): [`docs/site/masks.md`](docs/site/masks.md)
 - Rule suggestions: [`docs/site/suggest.md`](docs/site/suggest.md)
 - Graph algorithms (PageRank, WCC, degree centrality): [`docs/site/algorithms.md`](docs/site/algorithms.md)
@@ -729,8 +768,9 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full testing philosophy.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 Copyright 2026 Matthew Sherlin.
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 
 ---
 
@@ -794,6 +834,7 @@ after the first `v*` tag is pushed. The source build path is available now.
 - [Quickstart](quickstart.md) — two commands to a running graph explorer
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
+- [Codebase graph](ingest-git.md) — `ingest-git`, its co-change and ownership rules, incremental sync
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
 - [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error
 
@@ -867,7 +908,7 @@ columns: p, proj, score
   p=person-01  proj=proj-20  score=0.5
 
 == explain (person-01, proj-01) ==
-  rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=none
+  rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=1.0
   rule=skill_fit  type=FIT  person-01→proj-01  weight=1.0
 
 == serve ==
@@ -963,6 +1004,13 @@ rules: 7
 
 ---
 
+## Deployment and TLS
+
+To serve over HTTPS — via a reverse proxy (nginx, Caddy) or the built-in
+`--features tls` rustls path — see [deployment.md](deployment.md).
+
+---
+
 ## Known first-run issues
 
 - `demo` refuses a non-empty directory, including hidden files (`.DS_Store`
@@ -986,6 +1034,12 @@ an edge between two nodes. Once declared, the rule fires automatically on every
 Derived edges carry rule provenance (visible via `explain` and the UI why
 panel) and are retracted automatically when the properties that matched them
 change.
+
+![Rule fire, retraction, and explain arithmetic on the demo store](../assets/rule-fire-explain.gif)
+
+Reproduce the GIF above with `vhs scripts/rule-fire-explain.tape` — it shows
+the FIT edges before and after a `SET` that retracts one and fires another,
+then calls `explain` on the edge that survives.
 
 ---
 
@@ -1029,7 +1083,7 @@ Predicate::KeyMatch { field: "org_id".into() }
 field matches an Org's key gets a `ORG` edge to that Org. After the demo,
 30 such edges exist (one per Person).
 
-**Score:** none (the `weight_prop` field is ignored; explain shows `weight=none`).
+**Score:** 1.0 when the field matches the destination key.
 
 ---
 
@@ -1044,6 +1098,18 @@ Predicate::FieldEqual { field: "industry".into() }
 ```
 
 **Score:** 1.0 when the fields match; the edge is not written when they differ.
+
+Scores are stored on the edge under `weight_prop` (MCP default `weight`);
+`explain` reports the score even for rules that store none. Via-hop rules are
+the exception: they score over the via set, so `explain` reports their stored
+score only.
+
+For a rule declared with no `weight_prop` at all (only reachable via the Rust
+API — the MCP `create_rule` tool always defaults it to `"weight"`), `explain`
+still reports the recomputed score (1.0 for `KeyMatch`/`FieldEqual`), but the
+`EdgeFired` subscription event's `weight` field (`Option`) is absent
+(omitted) from the JSON payload — because it only looks up the stored prop,
+not the predicate.
 
 **Example:** two Talent nodes both with `industry = "architecture"` get a
 `INDUSTRY_ALIGNMENT` edge between them (score 1.0).
@@ -1245,7 +1311,7 @@ Response:
 ```json
 [
   {"rule": "auto_fk_person_project_id", "edge_type": "PROJECT",
-   "src": "person-01", "dst": "proj-01", "weight": null},
+   "src": "person-01", "dst": "proj-01", "weight": 1.0},
   {"rule": "skill_fit", "edge_type": "FIT",
    "src": "person-01", "dst": "proj-01", "weight": 1.0}
 ]
@@ -1253,6 +1319,71 @@ Response:
 
 The UI why panel renders this as human-readable arithmetic for each
 predicate kind.
+
+Each entry also carries `via_edge`: the edge type a via-hop rule hops over,
+or `null` for a plain two-node rule.
+
+---
+
+## Chaining
+
+A via-hop rule reads edges. Those edges can themselves be rule-derived, so
+one write cascades: setting `File.top_author_id` refires the FK rule that
+owns `TOP_AUTHOR`, and the new `TOP_AUTHOR` edge immediately refires every
+via-hop rule that hops over `TOP_AUTHOR` — `KNOWS`, say. All of it lands in
+the same commit. Retraction chains the same way: an edge that disappears
+takes the edges derived from it with it — including when the edge disappears
+because you deleted the rule that owned it, or removed one of its endpoints.
+
+The rules of the cascade:
+
+- **Depth 4.** A write chains at most four levels past the rule that fired
+  first. A longer chain stops there, leaving the levels beyond it at their
+  previous values, and no later write repairs them — a write that touches the
+  root chains four levels again and never reaches the fifth. The cap is
+  `MAX_CHAIN_DEPTH`, exported from the crate root. When a write hits it with
+  work still pending, `stats().chain_truncations` goes up; a non-zero value
+  there means some derived edges are stale and the rule chain needs
+  shortening or splitting. The counter is not persisted, so it starts at zero
+  on every open and is re-accumulated by replay.
+- **Once per rule and source, per level.** Within one chain level each
+  `(rule, source node)` pair is recomputed at most once. Every edge a level
+  consumes was already written before that level began, and a recompute is a
+  full re-evaluation of the source's desired edge set rather than a patch, so
+  a second pass at the same level could only repeat itself. Across levels the
+  guard is released: a rule that ran at one level still refires at the next if
+  another rule wrote an edge it hops over. Each such chained recompute of a
+  via-hop rule increments that rule's `stats().rules[].fires` counter the same
+  as a top-level fire, so a rule that sits deep in a chain reports more fires
+  than the number of writes that triggered it.
+- **Deterministic.** Derived edges are consumed in the order they were
+  written and rules are visited in name order, so a chain produces the same
+  result every time. WAL replay runs the identical hooks, so a reopened store
+  reproduces the identical chained edges — and the identical truncations.
+- **Nothing derives onto a node being deleted.** A delete retracts that
+  node's derived edges and chains those retractions, but the node is excluded
+  from every role a rule could put it in while the delete is in flight, so the
+  chain cannot hand it a new edge on the way out.
+- **No cycles.** See below.
+
+### Cycles are rejected at rule creation
+
+A rule set where `A` hops over an edge `B` writes, and `B` hops over an edge
+`A` writes, would refire itself forever; the depth cap would silently cut it
+short at an arbitrary point. So `create_rule` rejects it outright:
+
+```text
+RuleInvalid: rule chain cycle: KNOWS -> TOP_AUTHOR -> KNOWS
+```
+
+The path names the edge types around the loop. A rule whose `via_edge`
+equals its own `edge_type` is rejected the same way. Rules created earlier in
+the same batch count too, so a batch cannot assemble a cycle one rule at a
+time and have both halves accepted.
+
+Views are not part of this. A rule cannot read a view, so a view computed
+from derived edges never feeds another rule and cannot close a cycle.
+View-fed rules remain designed, not shipped.
 
 ---
 
@@ -1495,7 +1626,7 @@ Example response:
     "edge_type": "SAME_ROLE",
     "src_key": "alice",
     "dst_key": "bob",
-    "weight": null,
+    "weight": 1.0,
     "predicate": { "kind": "FieldEqual", "field": "role" }
   }
 ]
@@ -1517,11 +1648,17 @@ are 96% similar and they share the role `"engineer"`.
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain_association` | Show which rules and scores produced edges between two nodes. |
 | `explain` | Alias for `explain_association`. |
-| `query` | Run a Cypher query (read or write). Pass `mask` (array of node keys) for an ACL-scoped read — writes are rejected when `mask` is set. |
+| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read. See [Trust model](#trust-model) below. |
 | `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter. |
 | `node_info` | Return a node's key, label, and all properties. |
 | `node_edges` | Return all edges incident on a node. |
 | `stats` | Return live node, edge, and rule counts. |
+
+---
+
+## Trust model
+
+`mushroomdb mcp` is a local stdio process with no auth. Masks passed via `mask` are cooperative — the caller supplies them, and nothing on the MCP path enforces them. Real access control is the HTTP server's role tokens (`mushroomdb serve --role-token`); never present an MCP mask as a security boundary.
 
 ---
 
@@ -1686,10 +1823,14 @@ No other fields on `r` are available for variable-length relationships.
 nodes:
 
 ```cypher
-MATCH (a:N {id: 'alice'}), (b:N {id: 'bob'})
+MATCH (a:N {id: 'alice'}) MATCH (b:N {id: 'bob'})
 MATCH shortestPath((a)-[r:T*..5]->(b))
 RETURN r.length
 ```
+
+Bind the two endpoints with **separate** `MATCH` clauses. Comma-separated
+patterns in a single `MATCH` (`MATCH (a), (b)`) are not supported and fail to
+parse.
 
 - Both endpoints must be bound before the `shortestPath` clause.  Unbound
   forms are rejected at planning time.
@@ -2034,11 +2175,26 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `abs(n)` | `Int` or `Float` | same type | absolute value |
 | `round(f)` | `Float` | `Float` | rounds to nearest integer as Float |
 | `textMatches(s, q)` | `String`/`List`, `String` | `Bool` | per-row scratch full-text; see [`fulltext.md`](fulltext.md) |
+| `contains(s, sub)` | `String`, `String` | `Bool` | substring test |
+| `startsWith(s, p)` | `String`, `String` | `Bool` | prefix test |
+| `endsWith(s, p)` | `String`, `String` | `Bool` | suffix test |
+| `toInteger(x)` | `Int`/`Float`/`String` | `Int` | parse/truncate; unparseable → null |
+| `toFloat(x)` | `Int`/`Float`/`String` | `Float` | parse; unparseable → null |
+| `toString(x)` | scalar | `String` | scalar to text |
+| `decay(base, age, halflife)` | `Int`/`Float` ×3 | `Float` | `base * 0.5^(age / halflife)`; error if `halflife <= 0` |
+
+Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
+row's value into a list, per group when grouping keys are present).
+
+`CASE WHEN  THEN  … [ELSE ] END` is supported anywhere a
+scalar expression is (RETURN/WITH/WHERE/SET). `UNION` and `UNION ALL` combine
+read queries with matching column names. Relationship patterns accept
+type alternation: `(a)-[:A|:B]->(b)`.
 
 Calling an unknown function name returns:
 
 ```
-unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches
+unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay
 ```
 
 ### Examples
@@ -2107,7 +2263,11 @@ clear, actionable message; **Absent** = not implemented (not tested here).
 | `CREATE … RETURN …` | `CREATE (n:Person {id: 'alice'}) RETURN n.id AS id` — single-statement create + projection |
 | `WHERE … IS NULL / IS NOT NULL` | `WHERE n.score IS NULL`, `WHERE b IS NOT NULL` — null-check predicate; composes with AND/OR |
 | Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error |
-| `toLower`, `toUpper`, `size`, `coalesce`, `type`, `abs`, `round` | `RETURN abs(n.score), round(n.weight)` |
+| Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, …) | `RETURN abs(n.score), toString(n.weight)` |
+| `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |
+| `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` |
+| `UNION` / `UNION ALL` | `MATCH (a:A) RETURN a.id AS id UNION MATCH (b:B) RETURN b.id AS id` |
+| Multi-relationship-type `[:A\|:B]` | `MATCH (a)-[:KNOWS\|:LIKES]->(b) RETURN b` |
 | View-maintained properties queryable like any property | `MATCH (c:City) WHERE c.pop > 1000 RETURN c.name` — `pop` is a degree view maintained incrementally; reads like a stored prop |
 | `textMatches(n.field, "query")` in WHERE (per-row scratch scan) | `MATCH (a:Article) WHERE textMatches(a.bio, 'rust embedded') RETURN a.key` — correct for any graph size; O(scan) per row. Prefer `db.search()` for large indexed fields. |
 
@@ -2117,9 +2277,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 
 | Form | Error message (excerpt) |
 |---|---|
-| `UNION` | `UNION is not supported` |
-| `CASE WHEN … THEN … ELSE … END` | `CASE is not supported` |
-| `collect()` | `collect() is not supported` |
+| Bare `RETURN r` for a relationship variable | `cannot return relationship variable '…' bare; return its properties (….field) instead` |
 | `MERGE (n:L {id: 'x', extra: 2})` (multi-property) | `MERGE supports exactly one key property (got 2)` |
 | `DELETE n` when node has incident edges | `Cannot delete node … because it still has incident edges. Use DETACH DELETE…` |
 | `DELETE r` on derived (rule-owned) edge | `cannot delete derived edge; retract via the rule or change the property` |
@@ -2131,7 +2289,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH (found …)` |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
 | `shortestPath` with endpoints bound via comma-sep `MATCH (a), (b)` | `parse error: unexpected tokens after CREATE pattern (found Comma)` — comma-separated MATCH is not supported; use sequential `MATCH (a) MATCH (b)` forms |
-| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches` |
+| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay` |
 | `$param` referenced but not supplied | `execute: missing parameter …` |
 | `SET n.prop = n.other` (bare property-to-property copy) | `SET RHS: bare property/variable reference is not supported; use a literal, $parameter, or arithmetic expression` |
 | Integer division by zero | `execute: division by zero` |
@@ -2198,6 +2356,8 @@ listener is accepting. Non-loopback `--addr` requires `--token` or
 
 ### Authentication
 
+For TLS configuration options, see [deployment.md](deployment.md).
+
 **Full-access token** (`--token` / `MUSHROOMDB_TOKEN`): bearer or `?token=`
 query param. Grants access to all endpoints.
 
@@ -2229,7 +2389,7 @@ Role-token behavior per endpoint:
 | `POST /rules` | 403 (administrative — all role tokens, including write-scoped) |
 | `GET /explain` | 403 (rule explanation reveals hidden-node linkage) |
 | `GET /suggest` | 403 (scans full graph) |
-| `GET /algo/*` | 403 (full-graph algorithms) |
+| `POST /algo/*` | 403 (full-graph algorithms) |
 | `GET /subscribe` | 403 (unfiltered mutation stream) |
 | `GET /watch` | 403 (unfiltered mutation stream) |
 | `POST /nodes/{key}/rename` | 403 (admin-only identity change) |
@@ -2449,11 +2609,62 @@ without `LIMIT` still error at 1,000,000 intermediate rows.
   "nodes_tombstoned": 0,
   "edges": 334,
   "rules": [
-    {"name": "skill_fit", "edge_count": 90, "tripped": false},
+    {"name": "skill_fit", "edges": 90, "tripped": false, "fires": 90, "approximate": false},
     ...
   ]
 }
 ```
+
+---
+
+### GET /metrics
+
+Returns runtime counters and the slow-query log. Requires a full-access token
+(role-bound tokens receive 403, same as `/stats`).
+
+```json
+{
+  "nodes_live": 60,
+  "nodes_tombstoned": 0,
+  "edges": 334,
+  "commit_seq": 42,
+  "wal_size_bytes": 8192,
+  "rss_bytes": 20971520,
+  "uptime_s": 3600,
+  "slow_queries": {
+    "threshold_ms": 100,
+    "count": 3,
+    "last": [
+      {"ms": 142, "query": "MATCH (n:Person) RETURN n", "at_commit": 40}
+    ]
+  }
+}
+```
+
+**Fields:**
+
+| Field | Type | Notes |
+|---|---|---|
+| `nodes_live` | integer | Live (non-tombstoned) node count |
+| `nodes_tombstoned` | integer | Soft-deleted node count |
+| `edges` | integer | Total edge count |
+| `commit_seq` | integer | WAL commit sequence number (monotonically increasing) |
+| `wal_size_bytes` | integer | On-disk WAL file size in bytes |
+| `rss_bytes` | integer or null | Resident set size of the server process; null on unsupported platforms |
+| `uptime_s` | integer | Seconds since the HTTP server started |
+| `slow_queries.threshold_ms` | integer | Current slow-query threshold (0 = disabled) |
+| `slow_queries.count` | integer | Lifetime count of slow queries recorded |
+| `slow_queries.last` | array | Up to 16 most recent slow-query entries, oldest first |
+
+**Slow-query threshold:** set via the `MUSHROOMDB_SLOW_QUERY_MS` environment
+variable at server start (default 100 ms; 0 disables the log). Any read query
+whose execution time meets or exceeds the threshold is logged to `stderr` and
+appended to the in-memory ring buffer (capped at 16 entries).
+
+**RSS caveats:** `rss_bytes` is read from `mach_task_basic_info` on macOS and
+`/proc/self/statm` on Linux. On other platforms it is always `null`. The value
+includes shared library mappings and may not match tools like `top` exactly. It
+never causes a panic or blocking I/O.
 
 ---
 
@@ -2542,7 +2753,7 @@ Response: array of explanation objects:
     "edge_type": "PROJECT",
     "src": "person-01",
     "dst": "proj-01",
-    "weight": null,
+    "weight": 1.0,
     "approximate": false
   },
   {
@@ -3326,6 +3537,28 @@ The server disconnects only on a write error; slow consumers receive `{"type":"l
 
 **Multi-subscription idle latency:** when a single WS connection subscribes to multiple rules, the server bridge thread blocks on the first subscription when idle. Events arriving on secondary subscriptions while the first is quiet may experience up to ~100 ms of additional latency before being forwarded.
 
+## Query subscription skip optimization (v0.4.3)
+
+`subscribe_query` re-executes the plan on every commit. v0.4.3 adds a label-skip fast-path: if the commit can be proven to touch only nodes with a label that does not match the subscription's leading scan, re-execution is skipped entirely — the result set cannot have changed.
+
+### When a subscription is skipped
+
+A subscription for `MATCH (n:Person) …` is skipped when ALL of the following hold:
+
+- The commit contains only node records (`InsertNode`, `InsertNodeId`, `SetProp`, `DeleteNode`) whose resolved labels are all ≠ `Person`.
+- The commit contains no edge records (`InsertEdge`, `DeleteEdge`, or their dense-id variants).
+- No rule engine produced derived-edge deltas for this commit.
+
+Any record type not in the above set (e.g., unknown future variants) causes re-execution rather than a skip.
+
+### Expand limitation
+
+Subscriptions whose plan contains an `Expand` op (i.e., one-hop MATCH patterns like `MATCH (a:Person)-[r:KNOWS]->(b:Org) RETURN a`) are **never skipped**. Edges can join two label sets together, so a commit touching any label can potentially change the result. This is the conservative v0.4.3 boundary; differential evaluation that handles Expand correctly is roadmap / Phase 5.
+
+### No-scan or unlabeled scan
+
+`MATCH (n) RETURN n` (no label filter) and any subscription whose plan has no recognizable leading scan are also never skipped.
+
 ## Invariants
 
 1. **Post-fsync ordering.** Events are distributed inside `log_then_apply_with` after WAL fsync and in-memory apply both complete. A subscriber querying immediately on receipt sees consistent state.
@@ -3333,6 +3566,7 @@ The server disconnects only on a write error; slow consumers receive `{"type":"l
 3. **Clean unregister on drop.** Dropping `Subscription` releases the `Arc`; the next commit's distribution loop prunes the dead `Weak`.
 4. **Replay silence.** `open()` / WAL recovery applies records via `apply`, not `log_then_apply_with`. Pending engine deltas accumulated during replay are drained and discarded before `open_with` returns. Subscriptions installed after open receive only live commits.
 5. **commit_seq cohesion.** All events from one `write_batch` share the same `commit_seq` and arrive in a contiguous run.
+6. **Skip soundness.** A skipped commit is guaranteed to produce the same result set as the previous execution. Any skip requires: (a) no engine deltas, (b) every record resolves to a label ≠ the scan label, (c) no edge records. Any resolution failure is treated as "must execute."
 
 ---
 

@@ -8,6 +8,12 @@ Derived edges carry rule provenance (visible via `explain` and the UI why
 panel) and are retracted automatically when the properties that matched them
 change.
 
+![Rule fire, retraction, and explain arithmetic on the demo store](../assets/rule-fire-explain.gif)
+
+Reproduce the GIF above with `vhs scripts/rule-fire-explain.tape` — it shows
+the FIT edges before and after a `SET` that retracts one and fires another,
+then calls `explain` on the edge that survives.
+
 ---
 
 ## Declaring a rule
@@ -50,7 +56,7 @@ Predicate::KeyMatch { field: "org_id".into() }
 field matches an Org's key gets a `ORG` edge to that Org. After the demo,
 30 such edges exist (one per Person).
 
-**Score:** none (the `weight_prop` field is ignored; explain shows `weight=none`).
+**Score:** 1.0 when the field matches the destination key.
 
 ---
 
@@ -65,6 +71,18 @@ Predicate::FieldEqual { field: "industry".into() }
 ```
 
 **Score:** 1.0 when the fields match; the edge is not written when they differ.
+
+Scores are stored on the edge under `weight_prop` (MCP default `weight`);
+`explain` reports the score even for rules that store none. Via-hop rules are
+the exception: they score over the via set, so `explain` reports their stored
+score only.
+
+For a rule declared with no `weight_prop` at all (only reachable via the Rust
+API — the MCP `create_rule` tool always defaults it to `"weight"`), `explain`
+still reports the recomputed score (1.0 for `KeyMatch`/`FieldEqual`), but the
+`EdgeFired` subscription event's `weight` field (`Option<f64>`) is absent
+(omitted) from the JSON payload — because it only looks up the stored prop,
+not the predicate.
 
 **Example:** two Talent nodes both with `industry = "architecture"` get a
 `INDUSTRY_ALIGNMENT` edge between them (score 1.0).
@@ -266,7 +284,7 @@ Response:
 ```json
 [
   {"rule": "auto_fk_person_project_id", "edge_type": "PROJECT",
-   "src": "person-01", "dst": "proj-01", "weight": null},
+   "src": "person-01", "dst": "proj-01", "weight": 1.0},
   {"rule": "skill_fit", "edge_type": "FIT",
    "src": "person-01", "dst": "proj-01", "weight": 1.0}
 ]
@@ -274,6 +292,71 @@ Response:
 
 The UI why panel renders this as human-readable arithmetic for each
 predicate kind.
+
+Each entry also carries `via_edge`: the edge type a via-hop rule hops over,
+or `null` for a plain two-node rule.
+
+---
+
+## Chaining
+
+A via-hop rule reads edges. Those edges can themselves be rule-derived, so
+one write cascades: setting `File.top_author_id` refires the FK rule that
+owns `TOP_AUTHOR`, and the new `TOP_AUTHOR` edge immediately refires every
+via-hop rule that hops over `TOP_AUTHOR` — `KNOWS`, say. All of it lands in
+the same commit. Retraction chains the same way: an edge that disappears
+takes the edges derived from it with it — including when the edge disappears
+because you deleted the rule that owned it, or removed one of its endpoints.
+
+The rules of the cascade:
+
+- **Depth 4.** A write chains at most four levels past the rule that fired
+  first. A longer chain stops there, leaving the levels beyond it at their
+  previous values, and no later write repairs them — a write that touches the
+  root chains four levels again and never reaches the fifth. The cap is
+  `MAX_CHAIN_DEPTH`, exported from the crate root. When a write hits it with
+  work still pending, `stats().chain_truncations` goes up; a non-zero value
+  there means some derived edges are stale and the rule chain needs
+  shortening or splitting. The counter is not persisted, so it starts at zero
+  on every open and is re-accumulated by replay.
+- **Once per rule and source, per level.** Within one chain level each
+  `(rule, source node)` pair is recomputed at most once. Every edge a level
+  consumes was already written before that level began, and a recompute is a
+  full re-evaluation of the source's desired edge set rather than a patch, so
+  a second pass at the same level could only repeat itself. Across levels the
+  guard is released: a rule that ran at one level still refires at the next if
+  another rule wrote an edge it hops over. Each such chained recompute of a
+  via-hop rule increments that rule's `stats().rules[].fires` counter the same
+  as a top-level fire, so a rule that sits deep in a chain reports more fires
+  than the number of writes that triggered it.
+- **Deterministic.** Derived edges are consumed in the order they were
+  written and rules are visited in name order, so a chain produces the same
+  result every time. WAL replay runs the identical hooks, so a reopened store
+  reproduces the identical chained edges — and the identical truncations.
+- **Nothing derives onto a node being deleted.** A delete retracts that
+  node's derived edges and chains those retractions, but the node is excluded
+  from every role a rule could put it in while the delete is in flight, so the
+  chain cannot hand it a new edge on the way out.
+- **No cycles.** See below.
+
+### Cycles are rejected at rule creation
+
+A rule set where `A` hops over an edge `B` writes, and `B` hops over an edge
+`A` writes, would refire itself forever; the depth cap would silently cut it
+short at an arbitrary point. So `create_rule` rejects it outright:
+
+```text
+RuleInvalid: rule chain cycle: KNOWS -> TOP_AUTHOR -> KNOWS
+```
+
+The path names the edge types around the loop. A rule whose `via_edge`
+equals its own `edge_type` is rejected the same way. Rules created earlier in
+the same batch count too, so a batch cannot assemble a cycle one rule at a
+time and have both halves accepted.
+
+Views are not part of this. A rule cannot read a view, so a view computed
+from derived edges never feeds another rule and cannot close a cycle.
+View-fed rules remain designed, not shipped.
 
 ---
 

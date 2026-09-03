@@ -529,7 +529,7 @@ fn off_path_install_copies_binary_and_writes_absolute_command() {
     // SKILL.md bootstrap uses the same absolute path so `demo` works too.
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
     assert!(
-        skill.contains(&format!("{} demo {}", copied.display(), db.display())),
+        skill.contains(&format!("'{}' demo '{}'", copied.display(), db.display())),
         "SKILL.md bootstrap does not use the copied binary path"
     );
     assert!(
@@ -601,7 +601,7 @@ fn reinstall_repairs_stale_command_for_same_db() {
     assert_eq!(mcp["mcpServers"]["other"]["command"], "other-tool");
     // Skill bootstrap uses the repaired command too.
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
-    assert!(skill.contains(&format!("{} demo {}", copied.display(), db.display())));
+    assert!(skill.contains(&format!("'{}' demo '{}'", copied.display(), db.display())));
 }
 
 // ---------------------------------------------------------------------------
@@ -721,10 +721,354 @@ fn on_path_install_uses_bare_name_everywhere() {
     install_on_path(&root, &home, &opts).expect("install");
 
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
-    assert!(skill.contains(&format!("mushroomdb demo {}", db.display())));
+    assert!(skill.contains(&format!("'mushroomdb' demo '{}'", db.display())));
     assert!(!skill.contains("{{BIN}}"));
     let rules = read(&root, ".cursor/rules/mushroom.mdc");
-    assert!(rules.contains(&format!("mushroomdb demo {}", db.display())));
+    assert!(rules.contains(&format!("'mushroomdb' demo '{}'", db.display())));
     assert!(!rules.contains("{{BIN}}"));
     assert_absent(&home, ".mushroomdb/bin/mushroomdb");
+}
+
+// ---------------------------------------------------------------------------
+// Test: Claude Code install adds a UserPromptSubmit recall hook, merges with
+//       existing hooks, is idempotent, and uninstall removes exactly it
+// ---------------------------------------------------------------------------
+
+#[test]
+fn install_adds_recall_hook_and_uninstall_removes_only_it() {
+    let root = temp_dir("hook");
+    let home = temp_dir("hook-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    // Pre-existing user hook that must survive.
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    fs::write(
+        root.join(".claude/settings.json"),
+        r#"{"permissions":{"allow":["Bash"]},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}}"#,
+    )
+    .unwrap();
+
+    install_on_path(&root, &home, &opts).expect("install");
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    let ups = s["hooks"]["UserPromptSubmit"]
+        .as_array()
+        .expect("UserPromptSubmit array");
+    assert_eq!(ups.len(), 1);
+    let cmd = ups[0]["hooks"][0]["command"].as_str().unwrap();
+    assert_eq!(cmd, format!("'mushroomdb' recall '{}'", db.display()));
+    assert_eq!(ups[0]["hooks"][0]["timeout"], 5);
+    // user's things untouched
+    assert_eq!(s["permissions"]["allow"][0], "Bash");
+    assert_eq!(
+        s["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        "echo hi"
+    );
+
+    // idempotent
+    let out = install_on_path(&root, &home, &opts).expect("second install");
+    assert!(out.contains("already installed"), "{out}");
+    let s2: serde_json::Value =
+        serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(s2["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
+
+    // manifest tracks it
+    let m: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(m["hooks"][0]["event"], "UserPromptSubmit");
+
+    run_uninstall(&root, &home, &opts).expect("uninstall");
+    let s3: serde_json::Value =
+        serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        s3["hooks"]["UserPromptSubmit"].is_null()
+            || s3["hooks"]["UserPromptSubmit"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+    );
+    assert_eq!(
+        s3["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        "echo hi"
+    );
+    assert_eq!(s3["permissions"]["allow"][0], "Bash");
+}
+
+#[test]
+fn user_scope_hook_goes_to_home_settings_and_uses_absolute_bin() {
+    let root = temp_dir("hook-user");
+    let home = temp_dir("hook-user-home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        project: false,
+        db: None,
+    };
+    let src = fake_exe(&root, b"v1");
+    run_install_with(&root, &home, &opts, &BinaryLocation::CopyFrom(src)).expect("install");
+    let s: serde_json::Value = serde_json::from_str(&read(&home, ".claude/settings.json")).unwrap();
+    let cmd = s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(
+        cmd.starts_with(&format!(
+            "'{}",
+            home.join(".mushroomdb/bin/mushroomdb").display()
+        )),
+        "{cmd}"
+    );
+    assert!(
+        cmd.ends_with(&format!(
+            "recall '{}'",
+            home.join(".mushroomdb/memory").display()
+        )),
+        "{cmd}"
+    );
+    assert_absent(&root, ".claude/settings.json");
+}
+
+#[test]
+fn old_manifest_without_hooks_field_still_uninstalls() {
+    let root = temp_dir("old-manifest");
+    let home = temp_dir("old-manifest-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+    install_on_path(&root, &home, &opts).expect("install");
+    // Strip the hooks field to simulate a 0.4.x manifest.
+    let p = root.join(".claude/skills/mushroom/.install-manifest.json");
+    let mut m: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+    m.as_object_mut().unwrap().remove("hooks");
+    fs::write(&p, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+    run_uninstall(&root, &home, &opts).expect("uninstall with old manifest");
+}
+
+// ---------------------------------------------------------------------------
+// Test: the hook command is shell-quoted — a project or db path containing a
+//       space must not be word-split by the shell that runs the hook
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hook_command_is_shell_quoted_for_paths_with_spaces() {
+    let root = temp_dir("hook-space");
+    let home = temp_dir("hook-space-home");
+    let db = root.join("mushroom memory"); // deliberately contains a space
+    let opts = claude_project_opts(&db);
+
+    install_on_path(&root, &home, &opts).expect("install");
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    let cmd = s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert_eq!(cmd, format!("'mushroomdb' recall '{}'", db.display()));
+}
+
+// ---------------------------------------------------------------------------
+// Test: uninstall after the user hand-deletes the whole `hooks` key must
+//       leave settings.json exactly as-is — no `hooks: {event: null}` clobber
+// ---------------------------------------------------------------------------
+
+#[test]
+fn uninstall_after_hand_deleting_hooks_key_leaves_settings_unchanged() {
+    let root = temp_dir("hooks-key-deleted");
+    let home = temp_dir("hooks-key-deleted-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    install_on_path(&root, &home, &opts).expect("install");
+
+    let settings_path = root.join(".claude/settings.json");
+    let mut s: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    s.as_object_mut().unwrap().remove("hooks");
+    let stripped = serde_json::to_string_pretty(&s).unwrap();
+    fs::write(&settings_path, &stripped).unwrap();
+
+    run_uninstall(&root, &home, &opts).expect("uninstall despite missing hooks key");
+
+    assert_eq!(read(&root, ".claude/settings.json"), stripped);
+}
+
+// ---------------------------------------------------------------------------
+// Test: install refuses (does not clobber) a `hooks` value that is not a
+//       JSON object
+// ---------------------------------------------------------------------------
+
+#[test]
+fn install_refuses_when_hooks_key_is_not_an_object() {
+    let root = temp_dir("hooks-not-object");
+    let home = temp_dir("hooks-not-object-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    let original = r#"{"hooks":[]}"#;
+    fs::write(root.join(".claude/settings.json"), original).unwrap();
+
+    let result = install_on_path(&root, &home, &opts);
+    assert!(
+        result.is_err(),
+        "expected error when hooks is not an object"
+    );
+    assert_eq!(read(&root, ".claude/settings.json"), original);
+}
+
+// ---------------------------------------------------------------------------
+// Test: install refuses (does not panic) when the settings.json top level is
+//       not a JSON object
+// ---------------------------------------------------------------------------
+
+#[test]
+fn install_refuses_when_settings_root_is_not_an_object() {
+    let root = temp_dir("settings-root-not-object");
+    let home = temp_dir("settings-root-not-object-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    let original = "[]";
+    fs::write(root.join(".claude/settings.json"), original).unwrap();
+
+    let result = install_on_path(&root, &home, &opts);
+    assert!(
+        result.is_err(),
+        "expected a clean error, not a panic, for a non-object settings root"
+    );
+    assert_eq!(read(&root, ".claude/settings.json"), original);
+}
+
+// ---------------------------------------------------------------------------
+// Test: uninstall on a group that mixes a user hook with ours removes only
+//       ours and leaves the user's hook in place
+// ---------------------------------------------------------------------------
+
+#[test]
+fn uninstall_leaves_mixed_hook_group_with_user_hook_intact() {
+    let root = temp_dir("mixed-group");
+    let home = temp_dir("mixed-group-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    install_on_path(&root, &home, &opts).expect("install");
+
+    // Hand-edit settings.json so our entry shares a group with a user hook,
+    // as if the user had merged the two by hand.
+    let settings_path = root.join(".claude/settings.json");
+    let our_cmd = format!("'mushroomdb' recall '{}'", db.display());
+    let mixed = serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": "echo hi"},
+                        {"type": "command", "command": our_cmd, "timeout": 5}
+                    ]
+                }
+            ]
+        }
+    });
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&mixed).unwrap(),
+    )
+    .unwrap();
+
+    run_uninstall(&root, &home, &opts).expect("uninstall");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    let group_hooks = s["hooks"]["UserPromptSubmit"][0]["hooks"]
+        .as_array()
+        .expect("group must survive with the user's hook");
+    assert_eq!(
+        group_hooks.len(),
+        1,
+        "expected only the user's hook to remain: {group_hooks:?}"
+    );
+    assert_eq!(group_hooks[0]["command"], "echo hi");
+}
+
+// ---------------------------------------------------------------------------
+// Test: the rendered skill states mask semantics correctly (allow-list) and
+//       documents the arguments the MCP server actually accepts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn skill_text_is_truthful_about_masks_and_tool_args() {
+    let root = temp_dir("skill-truth");
+    let home = temp_dir("skill-truth-home");
+    let db = root.join("mushroom-memory");
+    let opts = all_project_opts(&db);
+    install_on_path(&root, &home, &opts).expect("install");
+
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    let rules = read(&root, ".cursor/rules/mushroom.mdc");
+    for (name, text) in [("SKILL.md", &skill), ("mushroom.mdc", &rules)] {
+        assert!(
+            text.contains("allow-list"),
+            "{name}: mask must be described as an allow-list"
+        );
+        assert!(
+            !text.contains("must not see"),
+            "{name}: inverted mask text still present"
+        );
+        assert!(
+            !text.contains("keys to exclude"),
+            "{name}: inverted mask text still present"
+        );
+        assert!(
+            !text.contains("keys to hide"),
+            "{name}: inverted mask text still present"
+        );
+        assert!(
+            text.contains("max_edges"),
+            "{name}: create_rule max_edges undocumented"
+        );
+        assert!(
+            text.contains("no auth"),
+            "{name}: MCP trust model undocumented"
+        );
+        assert!(
+            text.contains("ingest-git"),
+            "{name}: ingest-git bootstrap undocumented"
+        );
+    }
+    assert!(
+        skill.contains("`edges`"),
+        "SKILL.md: ingest_json edges arg undocumented"
+    );
+    assert!(
+        skill.contains("ambiguous target labels"),
+        "SKILL.md: polymorphic FK pattern undocumented"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: uninstall against a settings.json whose UserPromptSubmit holds only a
+//       user's own hook has nothing to remove, so it must not rewrite the file
+// ---------------------------------------------------------------------------
+
+#[test]
+fn uninstall_does_not_reformat_settings_it_removes_nothing_from() {
+    let root = temp_dir("no-op-uninstall");
+    let home = temp_dir("no-op-uninstall-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    install_on_path(&root, &home, &opts).expect("install");
+
+    // Hand-edit: our entry is gone, the user's own hook remains, and the file
+    // is laid out the way a person maintains it (4-space indent, own key order).
+    let settings_path = root.join(".claude/settings.json");
+    let user_owned = "{\n    \"hooks\": {\n        \"UserPromptSubmit\": [\n            {\n                \"hooks\": [\n                    {\"type\": \"command\", \"command\": \"echo hi\"}\n                ]\n            }\n        ]\n    },\n    \"env\": {\"FOO\": \"bar\"}\n}\n";
+    fs::write(&settings_path, user_owned).unwrap();
+
+    run_uninstall(&root, &home, &opts).expect("uninstall");
+
+    assert_eq!(
+        read(&root, ".claude/settings.json"),
+        user_owned,
+        "nothing of ours was in the file, so it must be byte-identical"
+    );
 }

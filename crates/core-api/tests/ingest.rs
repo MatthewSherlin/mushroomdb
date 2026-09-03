@@ -99,7 +99,8 @@ fn org_id_auto_links_and_later_insert_fires_rule() {
     assert_eq!(ex[0].edge_type, "ORG");
     assert_eq!(ex[0].src_key, "p1");
     assert_eq!(ex[0].dst_key, "acme");
-    assert_eq!(ex[0].weight, None);
+    // auto-FK stores no weight prop; explain recomputes the KeyMatch score.
+    assert_eq!(ex[0].weight, Some(1.0));
 
     db.insert_node(
         "Person",

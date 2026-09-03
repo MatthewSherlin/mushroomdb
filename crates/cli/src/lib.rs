@@ -4,7 +4,9 @@
 //! prints what the lib functions return.
 
 pub mod export;
+pub mod ingest_git;
 pub mod install;
+pub mod recall;
 
 use core_api::schema::Schema;
 use core_api::{
@@ -35,6 +37,9 @@ ORDER BY score DESC, proj";
 
 const SAMPLE_EXPLAIN_A: &str = "person-01";
 const SAMPLE_EXPLAIN_B: &str = "proj-01";
+
+/// Build version, printed by `mushroomdb --version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How `serve` should mount a UI. Precedence: `--ui dir` > embedded > `--no-ui`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,10 +150,21 @@ pub enum Command {
         dest: PathBuf,
         format: ExportFormat,
     },
+    /// Build (or incrementally sync) a graph of a git repository.
+    IngestGit {
+        db_dir: PathBuf,
+        opts: ingest_git::IngestGitOpts,
+    },
     /// Wire the /mushroom skill and MCP server into Claude Code / Cursor.
     Install(install::InstallOpts),
     /// Undo what `install` wrote (manifest-driven).
     Uninstall(install::InstallOpts),
+    /// Body of the Claude Code UserPromptSubmit hook: reads a prompt payload on
+    /// stdin, prints related graph facts on stdout.
+    Recall {
+        db_dir: PathBuf,
+    },
+    Version,
     Help,
 }
 
@@ -200,6 +216,7 @@ Usage:
   mushroomdb mcp <db-dir>
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
+  mushroomdb recall <db-dir>       hook body: reads a prompt payload on stdin, prints related graph facts
   mushroomdb suggest <db-dir>
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
@@ -210,10 +227,12 @@ Usage:
                                       WARNING: unsafe against a concurrently running serve process;
                                       use POST /backup on the HTTP server for live-serve backups
   mushroomdb export <db-dir> <dest> --format jsonl|parquet   export all data
+  mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]...   graph a git repo (authors, commits, files, co-change + ownership rules); re-run to sync
   mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
   mushroomdb algo wcc <db-dir> [--top N]
   mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
+  mushroomdb --version
   mushroomdb --help
 
 Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
@@ -264,6 +283,58 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
     })
 }
 
+fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
+    let mut positional = Vec::new();
+    let mut exclude = Vec::new();
+    let mut max_commits_per_file = ingest_git::DEFAULT_MAX_COMMITS_PER_FILE;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--exclude" {
+            exclude.push(
+                args.get(i + 1)
+                    .copied()
+                    .ok_or_else(|| "missing value for --exclude".to_string())?
+                    .to_string(),
+            );
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--exclude=") {
+            exclude.push(val.to_string());
+            i += 1;
+        } else if a == "--max-commits-per-file" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --max-commits-per-file".to_string())?;
+            max_commits_per_file = val
+                .parse()
+                .map_err(|e| format!("bad --max-commits-per-file: {e}"))?;
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--max-commits-per-file=") {
+            max_commits_per_file = val
+                .parse()
+                .map_err(|e| format!("bad --max-commits-per-file: {e}"))?;
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else {
+            positional.push(a);
+            i += 1;
+        }
+    }
+    let [db_dir, repo] = positional.as_slice() else {
+        return Err("ingest-git requires <db-dir> <repo-dir>".into());
+    };
+    Ok(Command::IngestGit {
+        db_dir: PathBuf::from(db_dir),
+        opts: ingest_git::IngestGitOpts {
+            repo: PathBuf::from(repo),
+            exclude,
+            max_commits_per_file,
+        },
+    })
+}
+
 /// Parse argv after the binary name. Hand-rolled — no clap.
 pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
     let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
@@ -272,6 +343,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
     }
     match args[0] {
         "--help" | "-h" | "help" => Ok(Command::Help),
+        "--version" | "-V" | "version" => Ok(Command::Version),
         "serve" => parse_serve(&args[1..]),
         "mcp" => parse_one_dir("mcp", &args[1..]).map(|db_dir| Command::Mcp { db_dir }),
         "stats" => parse_one_dir("stats", &args[1..]).map(|db_dir| Command::Stats { db_dir }),
@@ -286,6 +358,8 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
         "backup" => parse_backup(&args[1..]),
         "export" => parse_export(&args[1..]),
+        "recall" => parse_one_dir("recall", &args[1..]).map(|db_dir| Command::Recall { db_dir }),
+        "ingest-git" => parse_ingest_git(&args[1..]),
         "install" => parse_install_cmd(&args[1..]).map(Command::Install),
         "uninstall" => parse_install_cmd(&args[1..]).map(Command::Uninstall),
         other => Err(format!("unknown command: {other}")),
@@ -663,6 +737,7 @@ pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
         db_dir,
         core_api::OpenOptions {
             auto_migrate: false,
+            ..Default::default()
         },
     )?;
     db.snapshot()?;
@@ -1225,6 +1300,10 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             via_edge: None,
             via_dir: None,
         })?;
+        // Name lookup for `mushroomdb recall`. Adds no nodes or edges.
+        for (label, field) in [("Org", "name"), ("Project", "name"), ("Person", "name")] {
+            w.enable_fulltext(label, field)?;
+        }
     }
 
     let r = db.read();
@@ -2177,6 +2256,17 @@ mod tests {
             ]
         );
 
+        // `recall` needs a name index; enabling it adds no nodes, edges or rules.
+        let db = SharedDb::open(&dir).expect("reopen demo");
+        assert_eq!(
+            db.read().fulltext_pairs(),
+            vec![
+                ("Org".to_string(), "name".to_string()),
+                ("Person".to_string(), "name".to_string()),
+                ("Project".to_string(), "name".to_string()),
+            ]
+        );
+
         let mut auto = out.auto_fk_rules.clone();
         auto.sort();
         assert_eq!(
@@ -2707,5 +2797,71 @@ mod tests {
             err.contains("tls-cert"),
             "--tls-key alone must mention --tls-cert in error, got {err}"
         );
+    }
+
+    #[test]
+    fn version_flag_parses() {
+        assert_eq!(parse_args(&["--version"]).unwrap(), Command::Version);
+        assert_eq!(parse_args(&["-V"]).unwrap(), Command::Version);
+        assert_eq!(parse_args(&["version"]).unwrap(), Command::Version);
+    }
+
+    #[test]
+    fn recall_parses_one_dir_and_is_listed_in_usage() {
+        assert_eq!(
+            parse_args(&["recall", "/tmp/db"]).unwrap(),
+            Command::Recall {
+                db_dir: PathBuf::from("/tmp/db")
+            }
+        );
+        assert!(parse_args(&["recall"]).is_err(), "db-dir is required");
+        assert!(usage().contains("mushroomdb recall <db-dir>"));
+    }
+
+    #[test]
+    fn ingest_git_parses_excludes() {
+        let cmd = parse_args(&[
+            "ingest-git",
+            "/tmp/db",
+            "/tmp/repo",
+            "--exclude",
+            "target/",
+            "--exclude=*.lock",
+            "--max-commits-per-file",
+            "50",
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::IngestGit {
+                db_dir: PathBuf::from("/tmp/db"),
+                opts: ingest_git::IngestGitOpts {
+                    repo: PathBuf::from("/tmp/repo"),
+                    exclude: vec!["target/".into(), "*.lock".into()],
+                    max_commits_per_file: 50,
+                },
+            }
+        );
+        // Defaults and arity.
+        let Command::IngestGit { opts, .. } =
+            parse_args(&["ingest-git", "/tmp/db", "/tmp/repo"]).unwrap()
+        else {
+            panic!("expected IngestGit");
+        };
+        assert!(opts.exclude.is_empty());
+        assert_eq!(
+            opts.max_commits_per_file,
+            ingest_git::DEFAULT_MAX_COMMITS_PER_FILE
+        );
+        assert!(parse_args(&["ingest-git", "/tmp/db"]).is_err());
+        assert!(parse_args(&["ingest-git", "/tmp/db", "/tmp/repo", "--nope"]).is_err());
+        assert!(parse_args(&["ingest-git", "/tmp/db", "/tmp/repo", "--exclude"]).is_err());
+        assert!(usage().contains("mushroomdb ingest-git <db-dir> <repo-dir>"));
+    }
+
+    #[test]
+    fn version_constant_matches_cargo() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(usage().contains("--version"));
     }
 }

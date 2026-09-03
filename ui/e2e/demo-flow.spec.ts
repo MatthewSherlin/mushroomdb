@@ -50,7 +50,8 @@ test.describe("demo flow", () => {
 
     // FK-derived ORG still covers auto-inference (not the user-edge path).
     await openRule(page, "auto_fk_person_org_id");
-    await expect(page.locator(".why-etype")).toHaveText("ORG");
+    // auto-FK edges now carry weight 1 (v0.5.0), so the why-panel shows "ORG · 1".
+    await expect(page.locator(".why-etype")).toHaveText("ORG · 1");
     await expect(page.locator(".why")).not.toContainText("related");
     await expect(page.locator(".why-line")).toContainText("org_id");
   });

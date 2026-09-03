@@ -419,7 +419,7 @@ Response: array of explanation objects:
     "edge_type": "PROJECT",
     "src": "person-01",
     "dst": "proj-01",
-    "weight": null,
+    "weight": 1.0,
     "approximate": false
   },
   {

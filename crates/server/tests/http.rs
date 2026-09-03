@@ -492,6 +492,7 @@ async fn stats_round_trips_serialize() {
         nodes_live: 1,
         nodes_tombstoned: 2,
         edges: 3,
+        chain_truncations: 0,
         rules: vec![RuleStats {
             name: "r".into(),
             edges: 4,
@@ -629,7 +630,8 @@ async fn explain_happy_path() {
     assert_eq!(v[0]["edge_type"], json!("WORKS_AT"));
     assert_eq!(v[0]["src_key"], json!("p1"));
     assert_eq!(v[0]["dst_key"], json!("o1"));
-    assert_eq!(v[0]["weight"], Json::Null);
+    // works_at stores no weight prop; explain recomputes the KeyMatch score.
+    assert_eq!(v[0]["weight"], json!(1.0));
     assert_eq!(v[0]["predicate"]["kind"], json!("key_match"));
     assert_eq!(v[0]["predicate"]["fields"], json!(["org_id"]));
     let pred = v[0]["predicate"].as_object().expect("predicate object");
@@ -1218,6 +1220,7 @@ fn wire_types_serialize() {
         nodes_tombstoned: 0,
         edges: 0,
         rules: vec![],
+        chain_truncations: 0,
     };
     serde_json::to_value(&stats).unwrap();
     serde_json::to_value(&RuleStats {
@@ -1246,6 +1249,7 @@ fn wire_types_serialize() {
         dst_key: "b".into(),
         weight: Some(0.5),
         predicate: PredicateSummary::from(&Predicate::KeyMatch { field: "fk".into() }),
+        via_edge: None,
     })
     .unwrap();
     assert_eq!(expl["predicate"]["kind"], json!("key_match"));

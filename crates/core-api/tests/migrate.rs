@@ -53,6 +53,7 @@ fn auto_migrate_false_leaves_disk_untouched() {
         &dir,
         OpenOptions {
             auto_migrate: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -102,6 +103,7 @@ fn wal_preserved_by_auto_migrate() {
             &dir,
             OpenOptions {
                 auto_migrate: false,
+                ..Default::default()
             },
         )
         .unwrap();

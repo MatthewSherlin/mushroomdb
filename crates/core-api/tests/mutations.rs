@@ -759,6 +759,7 @@ fn stats_live_and_tombstoned_after_delete_node() {
             nodes_tombstoned: 0,
             edges: 1,
             rules: vec![],
+            chain_truncations: 0,
         }
     );
     db.delete_node("a").unwrap();

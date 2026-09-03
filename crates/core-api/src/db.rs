@@ -269,6 +269,12 @@ pub struct Stats {
     pub nodes_tombstoned: usize,
     pub edges: u64,
     pub rules: Vec<RuleStats>,
+    /// How many writes hit the rule-chaining depth cap with work still pending,
+    /// since this handle was opened. Non-zero means some derived edges beyond
+    /// the cap are stale and no single later write will repair them: split the
+    /// rule chain or shorten it. Never persisted, so it resets on reopen.
+    #[serde(default)]
+    pub chain_truncations: u64,
 }
 
 /// One rule's provenance size, trip latch, and fire counter.
@@ -509,6 +515,12 @@ pub struct Explanation {
     pub dst_key: String,
     pub weight: Option<f64>,
     pub predicate: PredicateSummary,
+    /// For a via-hop rule, the edge type the rule hops over to reach its
+    /// candidates. `None` for a plain two-node rule. A via-hop rule whose
+    /// `via_edge` is itself rule-derived is the chaining case: the hop edge
+    /// was written by another rule in the same commit.
+    #[serde(default)]
+    pub via_edge: Option<String>,
 }
 
 /// Report returned by [`GraphDb::backup_to`].
@@ -862,9 +874,41 @@ fn eval_set_return_func<F: Fs>(
             Some(Value::Int(n)) => Ok(Some(Value::Int(n))),
             Some(_) => Ok(None),
         },
+        "decay" => {
+            if vals.len() != 3 {
+                return Err(GraphError::QueryError {
+                    detail: format!("decay() requires exactly 3 arguments, got {}", vals.len()),
+                });
+            }
+            match (vals[0].clone(), vals[1].clone(), vals[2].clone()) {
+                (None, _, _) | (_, None, _) | (_, _, None) => Ok(None),
+                (Some(b), Some(a), Some(h)) => {
+                    let numeric = |v: Value| -> Result<f64> {
+                        match v {
+                            Value::Int(n) => Ok(n as f64),
+                            Value::Float(f) => Ok(f),
+                            other => Err(GraphError::QueryError {
+                                detail: format!(
+                                    "decay() requires numeric arguments, got {other:?}"
+                                ),
+                            }),
+                        }
+                    };
+                    let b = numeric(b)?;
+                    let a = numeric(a)?;
+                    let h = numeric(h)?;
+                    if h <= 0.0 {
+                        return Err(GraphError::QueryError {
+                            detail: "decay() requires halflife > 0".into(),
+                        });
+                    }
+                    Ok(Some(Value::Float(b * 0.5f64.powf(a / h))))
+                }
+            }
+        }
         _ => Err(GraphError::QueryError {
             detail: format!(
-                "unknown function `{name}`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches"
+                "unknown function `{name}`; supported: toLower, toUpper, size, coalesce, type, abs, round, decay"
             ),
         }),
     }
@@ -1202,11 +1246,25 @@ pub struct OpenOptions {
     /// Set to `false` to open a store without touching any on-disk files
     /// (useful for read-only inspection of a store at an older format).
     pub auto_migrate: bool,
+
+    /// Write the valid WAL prefix back over a torn tail on open (default
+    /// `true`). Truncating a genuinely torn tail is correct crash recovery.
+    ///
+    /// Set to `false` for an unattended reader. The valid prefix is still
+    /// decoded and replayed in memory, but nothing is written: the store has
+    /// no cross-process lock, so a reader that opens while another process is
+    /// mid-append would otherwise discard a frame that writer believes
+    /// durable. `mushroomdb recall`, which runs on every prompt, passes
+    /// `false` for exactly this reason.
+    pub repair_wal: bool,
 }
 
 impl Default for OpenOptions {
     fn default() -> Self {
-        Self { auto_migrate: true }
+        Self {
+            auto_migrate: true,
+            repair_wal: true,
+        }
     }
 }
 
@@ -1343,12 +1401,16 @@ impl GraphDb<RealFs> {
     /// deletes any leftover `.bak` file.
     ///
     /// WAL-only stores (no snapshot) are never auto-migrated on open.
+    ///
+    /// `opts.repair_wal` controls the other write this function can make; see
+    /// [`OpenOptions::repair_wal`]. With both flags `false` the open touches
+    /// no file on disk.
     pub fn open_with_options(dir: &std::path::Path, opts: OpenOptions) -> Result<Self> {
         // Header-only peek — 6 bytes, no full decode.
         let snap_version = snapshot_version_at(dir)?;
 
         // Full load: decode snapshot + replay WAL + rebuild indexes.
-        let mut db = Self::open_with(RealFs::new(dir)?)?;
+        let mut db = Self::open_with_repair(RealFs::new(dir)?, opts.repair_wal)?;
 
         if opts.auto_migrate {
             match snap_version {
@@ -1449,7 +1511,15 @@ impl GraphDb<RealFs> {
 }
 
 impl<F: Fs> GraphDb<F> {
+    /// Open over an arbitrary [`Fs`], repairing a torn WAL tail as usual.
     pub fn open_with(fs: F) -> Result<Self> {
+        Self::open_with_repair(fs, true)
+    }
+
+    /// As [`GraphDb::open_with`], but `repair_wal: false` decodes the valid WAL
+    /// prefix without writing the truncation back. See
+    /// [`OpenOptions::repair_wal`].
+    pub fn open_with_repair(fs: F, repair_wal: bool) -> Result<Self> {
         let mut db = Self {
             fs,
             ids: IdMap::new(),
@@ -1565,7 +1635,10 @@ impl<F: Fs> GraphDb<F> {
         }
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
-        if valid_len < bytes.len() {
+        // The valid prefix is replayed either way; `repair_wal` only decides
+        // whether the truncation is written back. A reader that races a live
+        // appender must not persist a truncation the writer never asked for.
+        if valid_len < bytes.len() && repair_wal {
             db.fs.write_atomic(FileId::Wal, &bytes[..valid_len])?;
         }
         // WAL-present path: build indexes eagerly BEFORE replay so that the
@@ -3408,6 +3481,50 @@ impl<F: Fs> GraphDb<F> {
                     pending.insert(new_key.clone(), id);
                     out.push(rec);
                 }
+                // # Symbol-order invariant (load-bearing)
+                //
+                // Write-time and replay-time symbol assignment must agree: every
+                // symbol in a `Batch` frame has to receive the same dense id when
+                // the frame's records are replayed in order as it received when
+                // the frame was written.
+                //
+                // A rule's backfill interns its `edge_type` lazily
+                // (`core_rules::engine`, every `g.syms.intern(&def.edge_type)`
+                // site), and that backfill runs from `apply` — during the
+                // `CreateRule` record itself, and again from any later
+                // `InsertNodeId` in the same frame that makes the rule fire. At
+                // write time the whole batch is rewritten before any of it is
+                // applied, so a later `InsertEdge` in the same batch would win the
+                // lower id for its edge type; on replay the rule's lazy intern
+                // gets there first and steals it, and the `Intern` record fails at
+                // the `wal intern assigned …` check in `apply`.
+                //
+                // Pre-interning the rule's `edge_type` here, and emitting its
+                // `Intern` record ahead of the `CreateRule` record, makes both
+                // orders identical. `weight_prop` needs no pre-intern:
+                // `EdgeProps::set` keys props by `String`, never through the
+                // interner. `via_edge` needs none either: via-hop rules resolve it
+                // with `syms.get` and skip when it is absent.
+                //
+                // `RebuildRule` and `DeleteRule` need no such handling here:
+                // `RebuildRule` has no `BatchOp` variant, so it never appears
+                // inside a `Batch` today — it is only ever issued as its own
+                // standalone commit (`rebuild_rule`, or the auto-rebuild path
+                // that logs it as a second commit after the triggering op).
+                // `DeleteRule` does have a `BatchOp` variant and can appear
+                // inside a `Batch`, but it carries only a rule `name` — no
+                // `edge_type` or other symbol that needs pre-interning — so
+                // only `CreateRule` needs this arm.
+                WalRecord::CreateRule { ref def_bytes } => {
+                    let def = decode_rule_def(def_bytes).map_err(|e| GraphError::Corrupt {
+                        detail: format!("CreateRule def_bytes deserialize failed: {e}"),
+                    })?;
+                    let (etype, intern) = self.intern_wal(&def.edge_type);
+                    if interned.insert(etype) {
+                        out.push(intern);
+                    }
+                    out.push(rec);
+                }
                 other => out.push(other),
             }
         }
@@ -3521,12 +3638,19 @@ impl<F: Fs> GraphDb<F> {
         // or views being present).  Enable emission for this apply if it is
         // currently off, then restore the original state unconditionally via an
         // RAII guard — this prevents a panic in apply() from leaking the flag.
+        // The same guard resets the engine's transient chaining state. A panic
+        // unwinding out of a rule hook would otherwise leave `chain_depth`
+        // non-zero, which makes every later `begin_chain` decide chaining is
+        // already running and silently switch it off for good.
         struct RestoreEmitDeltas(*mut RuleEngine, bool);
         impl Drop for RestoreEmitDeltas {
             fn drop(&mut self) {
                 // SAFETY: pointer into self (GraphDb); guard is dropped within
                 // this frame before log_then_apply_with returns.
-                unsafe { (*self.0).set_emit_deltas(self.1) };
+                unsafe {
+                    (*self.0).set_emit_deltas(self.1);
+                    (*self.0).reset_chain_state();
+                }
             }
         }
         let original_emit = self.engine.emit_deltas();
@@ -3935,16 +4059,24 @@ impl<F: Fs> GraphDb<F> {
                 .iter()
                 .map(|d| {
                     if d.fired {
-                        let weight = self
-                            .edge_props
-                            .get(d.etype_sym, d.src_id, d.dst_id, "weight")
-                            .and_then(|v| {
-                                if let core_storage::Value::Float(f) = v {
-                                    Some(*f)
-                                } else {
-                                    None
-                                }
-                            });
+                        // The score lives under the rule's declared weight_prop,
+                        // which is not always the literal "weight".
+                        let prop = self
+                            .engine
+                            .rules()
+                            .find(|r| r.name == d.rule)
+                            .and_then(|r| r.weight_prop.as_deref());
+                        let weight = prop.and_then(|p| {
+                            self.edge_props
+                                .get(d.etype_sym, d.src_id, d.dst_id, p)
+                                .and_then(|v| {
+                                    if let core_storage::Value::Float(f) = v {
+                                        Some(*f)
+                                    } else {
+                                        None
+                                    }
+                                })
+                        });
                         DbEvent::EdgeFired {
                             rule: d.rule.clone(),
                             src_key: d.src_key.clone(),
@@ -4580,7 +4712,7 @@ impl<F: Fs> GraphDb<F> {
                             bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
                                 detail: format!("serialize rule: {e}"),
                             })?;
-                        preview.note_create_rule(&def.name);
+                        preview.note_create_rule(&def);
                         recs.push(WalRecord::CreateRule { def_bytes });
                     }
                     BatchOp::DeleteRule { name } => {
@@ -5137,6 +5269,17 @@ impl<F: Fs> GraphDb<F> {
     /// Whether `(label, field)` is currently indexed for full-text search.
     pub fn is_fulltext_enabled(&self, label: &str, field: &str) -> bool {
         self.fulltext.is_enabled(label, field)
+    }
+
+    /// Every `(label, field)` pair with a live full-text index, sorted.
+    ///
+    /// Note that [`GraphDb::search`] is keyed by field alone — a pair only
+    /// declares which nodes are *indexed*, so callers that want to search
+    /// everything indexed should query each distinct field once.
+    pub fn fulltext_pairs(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = self.fulltext.enabled_pairs().cloned().collect();
+        v.sort();
+        v
     }
 
     /// Enable an equality index for all nodes of `label` on scalar property
@@ -7708,7 +7851,7 @@ impl<F: Fs> GraphDb<F> {
                     detail: format!("v8: provenance dst id {dst} not in id table"),
                 })?
                 .to_string();
-            let weight = rule_def.weight_prop.as_deref().and_then(|prop| {
+            let stored = rule_def.weight_prop.as_deref().and_then(|prop| {
                 self.edge_props_view()
                     .get(etype, src, dst, prop)
                     .and_then(|v| {
@@ -7718,6 +7861,28 @@ impl<F: Fs> GraphDb<F> {
                             None
                         }
                     })
+            });
+            // Rules that store no weight (KeyMatch/FieldEqual defaults, auto-FK)
+            // still have a score: recompute it from the predicate so explain
+            // never reports "no score" for an edge the engine scored.  Via-hop
+            // rules score over their via set, not over (src, dst), so leave
+            // those None rather than report a number the rule did not produce.
+            let weight = stored.or_else(|| {
+                if rule_def.via_edge.is_some() {
+                    return None;
+                }
+                let props_view = build_props_view(&self.props, &self.base);
+                let src_get = |field: &str| props_view.get(src, field).map(|vr| vr.into_value());
+                let dst_get = |field: &str| props_view.get(dst, field).map(|vr| vr.into_value());
+                let src_view = NodeView {
+                    key: &src_key,
+                    props: &src_get,
+                };
+                let dst_view = NodeView {
+                    key: &dst_key,
+                    props: &dst_get,
+                };
+                evaluate(&rule_def.predicate, &src_view, &dst_view)
             });
             results.push(Explanation {
                 rule: rule_name.to_string(),
@@ -7729,6 +7894,7 @@ impl<F: Fs> GraphDb<F> {
                     approximate: rule_def.approximate,
                     ..PredicateSummary::from(&rule_def.predicate)
                 },
+                via_edge: rule_def.via_edge.clone(),
             });
         }
 
@@ -8668,6 +8834,7 @@ impl<F: Fs> GraphDb<F> {
             nodes_tombstoned: self.ids.len() - self.ids.live_len(),
             edges: self.topo_view().edge_count(),
             rules,
+            chain_truncations: self.engine.chain_truncations(),
         }
     }
 
@@ -9221,6 +9388,11 @@ struct Overlay {
     deleted_edges: BTreeSet<(String, String, String)>,
     extra_rules: BTreeSet<String>,
     deleted_rules: BTreeSet<String>,
+    /// `rule name → (via_edge, edge_type)` for every via-hop rule accepted
+    /// earlier in this batch. Feeds the rule-chain cycle check, which otherwise
+    /// sees only the rules already committed to the engine. Keyed by name so a
+    /// later `DeleteRule` in the same batch drops the arc with the rule.
+    extra_rule_arcs: BTreeMap<String, (String, String)>,
 }
 
 /// Read-only view of live db state plus a batch overlay. Shared by single-op
@@ -9228,6 +9400,44 @@ struct Overlay {
 struct MutPreview<'a, F: Fs> {
     db: &'a GraphDb<F>,
     overlay: Overlay,
+}
+
+/// Shortest path from `start` to `target` following `arcs` (`from → to`), or
+/// `None` if `target` is unreachable.
+///
+/// Used for rule-chain cycle detection, where an arc is "a rule hops over
+/// `from` and writes `to`". Breadth-first over BTree-ordered adjacency, so the
+/// reported path is stable for a given rule set, and iterative so a pathological
+/// rule graph cannot overflow the stack.
+fn find_cycle_through(arcs: &[(String, String)], start: &str, target: &str) -> Option<Vec<String>> {
+    let mut adj: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (from, to) in arcs {
+        adj.entry(from.as_str()).or_default().insert(to.as_str());
+    }
+    let mut parent: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
+    let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+    visited.insert(start);
+    queue.push_back(start);
+    while let Some(node) = queue.pop_front() {
+        if node == target {
+            let mut path = vec![node.to_string()];
+            let mut cur = node;
+            while let Some(&p) = parent.get(cur) {
+                path.push(p.to_string());
+                cur = p;
+            }
+            path.reverse();
+            return Some(path);
+        }
+        for &next in adj.get(node).into_iter().flatten() {
+            if visited.insert(next) {
+                parent.insert(next, node);
+                queue.push_back(next);
+            }
+        }
+    }
+    None
 }
 
 impl<'a, F: Fs> MutPreview<'a, F> {
@@ -9492,6 +9702,36 @@ impl<'a, F: Fs> MutPreview<'a, F> {
                 detail: format!("rule {:?} already exists", def.name),
             });
         }
+        // Rule-chain cycle rejection. Derived edges feed via-hop rules, so a
+        // rule set forms a graph whose arcs are "hops over `via_edge`, writes
+        // `edge_type`". A cycle in that graph is a rule set that would re-fire
+        // itself forever; the engine's depth cap would silently truncate it
+        // instead, leaving an arbitrary partial result. Reject it here, the one
+        // place that sees the whole rule set.
+        //
+        // Rules accepted earlier in the same batch count too: the overlay
+        // carries their arcs, so a cycle cannot be assembled one op at a time.
+        if let Some(via) = def.via_edge.as_deref() {
+            if via == def.edge_type {
+                return Err(GraphError::RuleInvalid {
+                    detail: format!("rule chain cycle: {} -> {}", via, def.edge_type),
+                });
+            }
+            let mut arcs: Vec<(String, String)> = self
+                .db
+                .engine
+                .rules()
+                .filter(|r| !self.overlay.deleted_rules.contains(&r.name))
+                .filter_map(|r| r.via_edge.clone().map(|v| (v, r.edge_type.clone())))
+                .collect();
+            arcs.extend(self.overlay.extra_rule_arcs.values().cloned());
+            arcs.push((via.to_string(), def.edge_type.clone()));
+            if let Some(path) = find_cycle_through(&arcs, &def.edge_type, via) {
+                return Err(GraphError::RuleInvalid {
+                    detail: format!("rule chain cycle: {} -> {}", via, path.join(" -> ")),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -9560,9 +9800,17 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             .retain(|(_, s, d)| s != key && d != key);
     }
 
-    fn note_create_rule(&mut self, name: &str) {
-        self.overlay.deleted_rules.remove(name);
-        self.overlay.extra_rules.insert(name.to_string());
+    fn note_create_rule(&mut self, def: &RuleDef) {
+        self.overlay.deleted_rules.remove(&def.name);
+        self.overlay.extra_rules.insert(def.name.clone());
+        // Rules accepted earlier in this batch are not in the engine yet, so
+        // the cycle check would not see their arcs. Keep the arc, not just the
+        // name, so a batch cannot smuggle in a cycle one op at a time.
+        if let Some(via) = def.via_edge.clone() {
+            self.overlay
+                .extra_rule_arcs
+                .insert(def.name.clone(), (via, def.edge_type.clone()));
+        }
     }
 
     fn check_rename_node(&self, old: &str, new: &str) -> Result<()> {
@@ -9615,6 +9863,9 @@ impl<'a, F: Fs> MutPreview<'a, F> {
 
     fn note_delete_rule(&mut self, name: &str) {
         self.overlay.extra_rules.remove(name);
+        // Drop its chain arc too: a rule created and then deleted in the same
+        // batch must not make a later, legal rule look like a cycle.
+        self.overlay.extra_rule_arcs.remove(name);
         self.overlay.deleted_rules.insert(name.to_string());
         // Treat the deleted rule's current provenance as gone so a later
         // delete_edge of those triples is a no-op (matches sequential).

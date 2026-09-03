@@ -165,7 +165,7 @@ Example response:
     "edge_type": "SAME_ROLE",
     "src_key": "alice",
     "dst_key": "bob",
-    "weight": null,
+    "weight": 1.0,
     "predicate": { "kind": "FieldEqual", "field": "role" }
   }
 ]
@@ -187,11 +187,17 @@ are 96% similar and they share the role `"engineer"`.
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain_association` | Show which rules and scores produced edges between two nodes. |
 | `explain` | Alias for `explain_association`. |
-| `query` | Run a Cypher query (read or write). Pass `mask` (array of node keys) for an ACL-scoped read — writes are rejected when `mask` is set. |
+| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read. See [Trust model](#trust-model) below. |
 | `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter. |
 | `node_info` | Return a node's key, label, and all properties. |
 | `node_edges` | Return all edges incident on a node. |
 | `stats` | Return live node, edge, and rule counts. |
+
+---
+
+## Trust model
+
+`mushroomdb mcp` is a local stdio process with no auth. Masks passed via `mask` are cooperative — the caller supplies them, and nothing on the MCP path enforces them. Real access control is the HTTP server's role tokens (`mushroomdb serve --role-token`); never present an MCP mask as a security boundary.
 
 ---
 

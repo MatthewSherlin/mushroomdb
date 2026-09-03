@@ -7,7 +7,7 @@ use cli::{
 };
 use core_api::SharedDb;
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,6 +19,33 @@ fn main() -> ExitCode {
         Ok(Command::Help) => {
             print!("{}", usage());
             ExitCode::SUCCESS
+        }
+        Ok(Command::Recall { db_dir }) => {
+            let mut raw = String::new();
+            let _ = io::stdin().read_to_string(&mut raw);
+            // Not `print!`: that panics on EPIPE (exit 101) if the hook runner
+            // closes the pipe. Every write error is swallowed instead.
+            let digest = cli::recall::run_recall(&db_dir, &raw);
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(digest.as_bytes());
+            let _ = stdout.flush();
+            ExitCode::SUCCESS // never block the prompt
+        }
+        Ok(Command::Version) => {
+            println!("mushroomdb {}", cli::VERSION);
+            ExitCode::SUCCESS
+        }
+        Ok(Command::IngestGit { db_dir, opts }) => {
+            match cli::ingest_git::run_ingest_git(&db_dir, &opts) {
+                Ok(report) => {
+                    print!("{}", cli::ingest_git::format_ingest_git(&report));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Ok(Command::Serve {
             db_dir,

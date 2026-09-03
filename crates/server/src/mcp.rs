@@ -889,7 +889,10 @@ fn tools_list() -> Js {
                         "dst_label": { "type": "string" },
                         "predicate": { "type": "object" },
                         "edge_type": { "type": "string" },
-                        "weight_prop": { "type": ["string", "null"] },
+                        "weight_prop": {
+                            "type": ["string", "null"],
+                            "description": "Edge property that stores the score (default: weight)."
+                        },
                         "max_edges": { "type": ["integer", "null"] }
                     },
                     "required": ["name", "src_label", "dst_label", "predicate", "edge_type"]

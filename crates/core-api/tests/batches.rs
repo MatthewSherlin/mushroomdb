@@ -411,7 +411,9 @@ fn create_rule_then_delete_edge_in_same_batch_is_dropped_not_rule_owned() {
         .commit()
         .unwrap();
 
-    // Delete was dropped: WAL Batch contains CreateRule only.
+    // Delete was dropped: WAL Batch contains CreateRule and nothing else, apart
+    // from the pre-intern of the rule's edge type that keeps write-time and
+    // replay-time symbol assignment in step (see `rewrite_wal_dense_inner`).
     // After the batch commit, the rule fires (a and b share "x" tag), so one or more
     // DerivedEdgeAdded history-marker frames are appended after the batch frame.
     let wal = std::fs::read(dir.join("wal.bin")).unwrap();
@@ -420,8 +422,13 @@ fn create_rule_then_delete_edge_in_same_batch_is_dropped_not_rule_owned() {
     assert!(!recs.is_empty(), "must have at least the Batch frame");
     match &recs[0] {
         WalRecord::Batch(inner) => {
-            assert_eq!(inner.len(), 1);
-            assert!(matches!(inner[0], WalRecord::CreateRule { .. }));
+            assert_eq!(inner.len(), 2, "got {inner:?}");
+            assert!(
+                matches!(&inner[0], WalRecord::Intern { text, .. } if text == "REL"),
+                "got {:?}",
+                inner[0]
+            );
+            assert!(matches!(inner[1], WalRecord::CreateRule { .. }));
         }
         other => panic!("expected Batch, got {other:?}"),
     }

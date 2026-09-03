@@ -1,5 +1,94 @@
 # Changelog
 
+## v0.5.0 — 2026-09-03
+
+### The memory release (format-stable)
+
+No format change — upgrade in place from any 0.4.x store. Snapshot VERSION stays V8; WAL
+discriminants unchanged (0–22). `mushroomdb verify` opens a 0.4.4 store unchanged.
+
+#### Front door
+
+- **`mushroomdb recall <db>` and a UserPromptSubmit hook.** `install` now writes a Claude Code
+  `hooks.UserPromptSubmit` entry (5 s timeout) that runs `recall`, which reads the prompt payload,
+  runs a text-only search over every full-text-indexed field, and prints a short digest of related
+  nodes and their strongest edges before the assistant answers. Opens the store without migration
+  or WAL repair (`auto_migrate: false`, `repair_wal: false`), so a hook that fires on every prompt
+  writes nothing to it; the digest opens with a line framing its content as untrusted graph data
+  and strips control characters from every rendered value. Never blocks a prompt (empty output,
+  exit 0 on any error), shell-quotes paths, and `uninstall` removes exactly the entry it added.
+  Cursor gets no hook (its contract is undocumented); the rules file remains the mechanism there.
+- **The skill tells the truth.** `mask` is documented as the allow-list it is (the 0.4.x skill said
+  the opposite); `ingest_json.edges`, `create_rule.max_edges`, `find_similar.mask/limit`, and the
+  `hybrid_search` `label` caveat are documented; the MCP server's no-auth trust model is stated.
+- **Bootstrap from the repo you are in.** `/mushroom` prefers `ingest-git` inside a git repository
+  and falls back to the demo store elsewhere; every command line quotes the binary and store paths.
+- **`mushroomdb --version`.**
+
+#### Codebase graph
+
+- **`mushroomdb ingest-git <db> <repo> [--exclude <pattern>]...`** builds Author / Commit / File
+  nodes, `TOUCHED` edges, auto-FK `AUTHOR` and `TOP_AUTHOR`, and two rules: `co_changed`
+  (File→File, Jaccard over commit lists) and `knows` (Author→File via `TOP_AUTHOR`). Full-text on
+  `File.path`, `Commit.message`, `Author.name`. Re-runs are incremental from a recorded head sha:
+  adds, modifies, deletes and renames are applied so derived edges retract or follow the file. Paths
+  are stored unescaped (`core.quotePath=false`). README first screen and
+  `docs/assets/ingest-git-cascade.gif` (tape: `scripts/ingest-git-cascade.tape`) show it on this
+  repository.
+- **Ownership tracks reality across syncs.** Each `File` node carries an additive `author_counts`
+  prop (a list of `"email<TAB>count"` strings) holding the per-author commit distribution, so an
+  incremental run resumes the real counts instead of crediting the whole prior history to the
+  current `top_author_id`. Without it a second author's commits reset on every sync and ownership
+  could never change hands; `TOP_AUTHOR` and the `KNOWS` edges that hop over it went stale
+  silently. An incremental sync and a full re-ingest of the same repository now agree. A store
+  built by 0.4.x has no `author_counts` yet: it falls back to the old approximation until the next
+  touch of each file, and a full re-ingest repairs it at once. The `File.alive` prop, which was
+  only ever written as `true`, is gone.
+- **`File.n_commits` is the true total.** It was written as the length of the capped `commits`
+  list, so a file past `--max-commits-per-file` (default 200) reported a history frozen at the cap
+  — contradicting the documented "counts every commit that ever touched the file". It now carries
+  the real count, which is also what `author_counts` sums to.
+
+#### Engine
+
+- **Rule chaining.** A derived edge now feeds via-hop rules in the same write: when a `TOP_AUTHOR`
+  edge moves, the `KNOWS` edges that hop over it re-derive immediately. Bounded to
+  `MAX_CHAIN_DEPTH = 4` levels, fire-once per `(rule, source)` per level, deltas consumed in append
+  order, rules in name order, so open/replay re-derives identically. Every via-edge dependency
+  cycle is rejected at `create_rule` (including within one batch) with `rule chain cycle: …`.
+  Truncated chains are counted in `stats().chain_truncations`. `explain` reports `via_edge` for
+  chained rules. Views over rule-fed edge types are updated exactly once per chained change.
+  Rules that feed on view values remain designed, not built (see `docs/site/roadmap-moat.md`).
+- **Every derived edge explains its score.** `explain` recomputes the predicate score for rules
+  that store no weight (1.0 for KeyMatch/FieldEqual); via-hop rules report their stored score only.
+  MCP and HTTP `create_rule` default `weight_prop` to `weight`, so `r.weight` is populated in
+  Cypher rows. Subscription `EdgeFired.weight` reads the rule's declared `weight_prop`.
+- **Via-hop rules rebuild correctly.** `rebuild` and the delete-time backfill evaluate via-hop
+  rules through the via path; previously a rebuild dropped every via-derived edge.
+- **Deleting a node can no longer resurrect edges onto it** during chained re-derivation
+  (doomed-node filter); provenance stays equal to the live topology.
+- **WAL replay fix.** An ingest that both created an auto-FK rule and inserted user edges of a
+  new type in one call wrote a frame that failed to replay (`wal intern assigned N+1 …`). Rule edge
+  types are now pre-interned at the `CreateRule` position; existing stores are unaffected.
+- **`decay(base, age, halflife)` Cypher scalar** = `base * 0.5^(age / halflife)`; pair it with
+  `edge_history` or a `since` property you maintain.
+
+#### Tests and docs
+
+- Slow-query tests are slow by construction (cross product), not by CPU speed.
+- New suites: `explain_weight`, `recall`, `ingest_git`, `ingest_edges_replay`, `chaining`,
+  `via_rebuild`, install hook coverage.
+- Docs: `docs/site/ingest-git.md` (new), `skill.md` (hook, bootstrap), `rules.md` (chaining,
+  score semantics, retraction GIF), `mcp.md` (trust model, allow-list), `format-stability.md`
+  (discriminant range 0–22, `Intern` placement note), `roadmap-moat.md` §2 status.
+
+#### Deferred (v0.6)
+
+- Rules fed by view aggregates; namespaces; bi-temporal valid-time; larger-than-RAM storage;
+  LongMemEval; a sim-harness oracle for multi-level chaining; rename-aware `report.deleted`
+  accounting in `ingest-git`; `create_rule` via backfill and `rebuild` remain separate
+  implementations.
+
 ## v0.4.5 — 2026-09-03
 
 ### `install` writes an MCP command that actually resolves (format-stable)

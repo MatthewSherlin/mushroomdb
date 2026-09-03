@@ -13,13 +13,23 @@ The graph stays true as data changes: when a property is SET, rules retract stal
 
 ## Bootstrap
 
-If `{{DB_PATH}}` does not exist, seed it first:
+If `{{DB_PATH}}` does not exist, seed it first. Pick the source that matches where you are:
+
+- **Inside a git repository:** graph it — authors, commits and files become nodes; `CO_CHANGED` and `KNOWS` edges are derived by rule.
 
 ```
-{{BIN}} demo {{DB_PATH}}
+'{{BIN}}' ingest-git '{{DB_PATH}}' . --exclude 'node_modules/' --exclude 'target/' --exclude 'vendor/'
 ```
 
-Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If it already exists, the MCP server is connected and ready.
+Re-run the same command any time to sync new commits (it is incremental).
+
+- **No repository:** seed the instant demo graph instead:
+
+```
+'{{BIN}}' demo '{{DB_PATH}}'
+```
+
+Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If `{{DB_PATH}}` already exists, the MCP server is connected and ready.
 
 ## Memory-first behavior
 
@@ -42,7 +52,7 @@ Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If it already ex
 - Propose `create_rule` and confirm with the user before creating. Show the predicate and what edges it would derive. Never create rules silently.
 
 **When acting for a restricted audience:**
-- Pass `mask` on `query` with the list of node keys to exclude.
+- Pass `mask` on `query` with the **allow-list** of node keys the caller may see; everything else is omitted.
 
 **For history questions ("when did...", "was X ever linked to Y"):**
 - Use `node_history` and `edge_history` for full audit trails.
@@ -55,18 +65,20 @@ Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If it already ex
 
 - Never invent graph contents. If a tool returns empty, say so.
 - Surface tool errors verbatim — do not guess.
-- This store is local and alpha. Durability requires manual snapshots: `{{BIN}} snapshot {{DB_PATH}} <output-file>`.
+- This store is local and alpha. Durability requires manual snapshots: `'{{BIN}}' snapshot '{{DB_PATH}}' <output-file>`.
 - When showing derived edges, always report which rule produced them — use `explain` or `explain_association` to get the rule name, never assert it from memory.
+- The MCP server has no auth; masks are cooperative. Real ACL = HTTP role tokens.
 
 ## Tools (use these names exactly)
 
 `query` · `ingest_json` · `create_rule` · `explain` · `explain_association` · `stats` · `neighborhood` · `node_info` · `node_edges` · `upsert_entity` · `find_similar` · `hybrid_search` · `node_history` · `edge_history` · `was_linked` · `rename_node`
 
 Key signatures:
-- `query`: `cypher`, optional `params`, optional `mask` (array of node keys to hide)
+- `query`: `cypher`, optional `params`, optional `mask` (allow-list of node keys)
 - `explain` / `explain_association`: `a`, `b` (aliases — same implementation)
 - `hybrid_search`: `query_text`, `text_field`; optional `vector` (bring-your-own embedding), `vector_field`, `label`, `k`
 - `neighborhood`: `key`, optional `depth`, `direction`, `edge_types`
 - `upsert_entity`: `key`, `props`, optional `label`
 - `was_linked`: `a`, `b`, `edge_type`, `at_commit`
 - `rename_node`: `old_key`, `new_key`
+- `create_rule`: … optional `weight_prop` (default `weight`), `max_edges`
