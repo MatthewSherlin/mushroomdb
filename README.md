@@ -16,24 +16,22 @@ Explain any link with one call. SQLite for relationships. Built-in 16-tool MCP s
 
 ---
 
-## Agent memory in 30 seconds
+## A graph of your repo that stays true — in 30 seconds
 
-![A SET retriggers a rule: a derived edge is retracted, another fires, and explain shows the arithmetic](docs/assets/rule-fire-explain.gif)
-
-**Install:**
+![Ingest this repository, query which files co-change, hand one file to a new owner, and watch the KNOWS edges follow in the same write](docs/assets/ingest-git-cascade.gif)
 
 ```sh
-npx mushroomdb install
+npx mushroomdb install                        # /mushroom skill + MCP server + recall hook
+mushroomdb ingest-git ~/.mushroomdb/memory .  # Author, Commit, File nodes; CO_CHANGED + KNOWS by rule
 ```
 
-Open **Claude Code** and type `/mushroom`, or open **Cursor** (rules apply automatically).
+- **Live, not a snapshot.** One `SET f.top_author_id = …` moves the `TOP_AUTHOR` edge *and* re-derives that author's `KNOWS` edges before the write closes — the `SET` in the GIF above is that one write.
+- **Retracts instead of going stale.** Re-run `ingest-git` to sync: only new commits replay, deleted files drop their derived edges, and renamed files carry their history to the new path.
+- **Knows who's allowed to see it.** Pass a `mask` with a query and the same graph answers differently per caller; write statements are rejected on masked queries.
+- **Answers what it said last week.** `mushroomdb asof ./db --commit 5 --query "…"` replays the WAL to a past commit, derived edges included.
+- **Explains any link.** `explain` names the rule and the score behind an edge, so *"which files change together with `src/api.rs`, and why?"* has an answer your assistant can quote instead of a guess.
 
-- **Instant demo store:** no store yet? The skill runs `mushroomdb demo` and seeds 10 Orgs, 20 Projects, 30 People, and 334 edges in seconds — ready to query.
-- **Memory-first behavior:** before answering questions about entities or relationships, the assistant queries the graph. State a durable fact and it's persisted. Set a property and the graph reacts — rules retract stale edges and fire new ones automatically.
-- **Explain on demand:** ask "why are X and Y related" and the assistant calls `explain` and surfaces the rule name and score, not just a summary.
-
-Access is enforced per query via node masks — same graph, different views for different callers.
-`mushroomdb install` writes a skill file + MCP config entry. `mushroomdb uninstall` removes exactly what install wrote.
+Local, single binary, nothing to run alongside it. Pre-1.0 alpha — APIs and formats may change between minor versions.
 
 ---
 
