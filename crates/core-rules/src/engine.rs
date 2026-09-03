@@ -1,4 +1,4 @@
-use crate::def::{evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef};
+use crate::def::{evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef, MAX_KEYMATCH_LIST};
 use crate::hnsw::HnswIndex;
 use crate::index::{
     candidate_spec, candidate_spec_approx_with_k, ivf_drift_rebuild_threshold, CandidateSpec,
@@ -271,14 +271,15 @@ fn candidate_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
 
 /// Rule-aware src-side lookup spec. KeyMatch is still exact on the src side
 /// regardless of `approximate` (the approximation is on the dst candidate set).
-/// For KeyMatch-rooted predicates, src side is indexed as Scalar (FK field
-/// value → node bucket) so reverse lookup uses the dst key. Non-KeyMatch
-/// `All` uses the full [`candidate_spec_for`] Intersect (not `parts[0]`).
+/// For KeyMatch-rooted predicates, src side is indexed as `ScalarOrElements`
+/// (FK field value → node bucket, one bucket per element for a list-valued
+/// field) so reverse lookup uses the dst key. Non-KeyMatch `All` uses the full
+/// [`candidate_spec_for`] Intersect (not `parts[0]`).
 fn src_lookup_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
     if is_keymatch_rooted(&def.predicate) {
         let field =
             keymatch_field(&def.predicate).expect("keymatch-rooted predicate has a KeyMatch field");
-        CandidateSpec::Scalar { field }
+        CandidateSpec::ScalarOrElements { field }
     } else {
         candidate_spec_for(def)
     }
@@ -346,6 +347,17 @@ fn compute_desired(
                     Some(dst_id) => std::iter::once(dst_id).collect(),
                     None => BTreeSet::new(),
                 },
+                // A list-valued FK names one dst per string element (first
+                // MAX_KEYMATCH_LIST in stored order). Elements naming no live
+                // node drop out here; duplicates collapse into the set.
+                Some(Value::List(items)) => items
+                    .iter()
+                    .take(MAX_KEYMATCH_LIST)
+                    .filter_map(|v| match v {
+                        Value::Str(target_key) => g.ids.get(target_key),
+                        _ => None,
+                    })
+                    .collect(),
                 _ => BTreeSet::new(),
             }
         } else {

@@ -1237,3 +1237,153 @@ fn via_hop_new_via_node_insert_after_rule_creation() {
         "proj_b (tech) gets no FIT"
     );
 }
+
+/// A list-valued FK field ingested from JSON: one edge per element that names a
+/// live node, retracted per element when the element goes away.
+#[test]
+fn ingest_json_list_fk_plus_keymatch_rule_yields_edges() {
+    use core_api::{AutoFk, EdgeEvent, IngestOptions};
+    let dir = tmp("rules-list-fk");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let opts = IngestOptions {
+        key_field: "id".into(),
+        auto_fk: AutoFk::Off,
+    };
+    db.ingest_json(
+        "Mod",
+        r#"[{"id": "a.rs"}, {"id": "b.rs"}, {"id": "c.rs"}]"#,
+        &opts,
+    )
+    .unwrap();
+    db.create_rule(RuleDef {
+        name: "imports".into(),
+        src_label: "File".into(),
+        dst_label: "Mod".into(),
+        predicate: Predicate::KeyMatch {
+            field: "imports".into(),
+        },
+        edge_type: "IMPORTS".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    // "ghost.rs" names no node; the other two do.
+    db.ingest_json(
+        "File",
+        r#"[{"id": "main.rs", "imports": ["a.rs", "ghost.rs", "b.rs"]}]"#,
+        &opts,
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "b.rs"],
+        "one edge per list element that names a live Mod"
+    );
+
+    // Drop "b.rs", add "c.rs": one prop write retracts one edge and fires one.
+    db.set_prop(
+        "main.rs",
+        "imports",
+        Value::List(vec![Value::Str("a.rs".into()), Value::Str("c.rs".into())]),
+    )
+    .unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "c.rs"]
+    );
+
+    let hist = db.edge_history("main.rs", "b.rs").unwrap();
+    assert_eq!(hist.items.len(), 2, "b.rs history: {:?}", hist.items);
+    assert_eq!(hist.items[0].event, EdgeEvent::Added);
+    assert_eq!(hist.items[1].event, EdgeEvent::Retracted);
+    assert_eq!(
+        hist.items[1].rule,
+        Some("imports".to_string()),
+        "per-element retraction carries rule attribution"
+    );
+
+    // Derived edges are not WAL-logged: replay must re-derive the same set.
+    drop(db);
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "c.rs"],
+        "list-derived edges survive replay"
+    );
+
+    // Same over a snapshot base, where the candidate index is built lazily on
+    // the first mutation rather than at open time.
+    db.snapshot().unwrap();
+    drop(db);
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "c.rs"],
+        "list-derived edges survive a snapshot"
+    );
+    db.set_prop(
+        "main.rs",
+        "imports",
+        Value::List(vec![Value::Str("a.rs".into()), Value::Str("b.rs".into())]),
+    )
+    .unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "b.rs"],
+        "element swap after a snapshot re-links through the rebuilt index"
+    );
+}
+
+/// `explain` on a list-derived edge reports the rule's `KeyMatch { field }`
+/// predicate exactly as it does for a scalar FK.
+#[test]
+fn explain_reports_keymatch_for_list_edge() {
+    let dir = tmp("rules-list-explain");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Mod", "a.rs", vec![]).unwrap();
+    db.create_rule(RuleDef {
+        name: "imports".into(),
+        src_label: "File".into(),
+        dst_label: "Mod".into(),
+        predicate: Predicate::KeyMatch {
+            field: "imports".into(),
+        },
+        edge_type: "IMPORTS".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    db.insert_node(
+        "File",
+        "main.rs",
+        vec![(
+            "imports".into(),
+            Value::List(vec![Value::Str("a.rs".into())]),
+        )],
+    )
+    .unwrap();
+
+    let ex = db.explain("main.rs", "a.rs").unwrap();
+    assert_eq!(ex.len(), 1);
+    assert_eq!(ex[0].rule, "imports");
+    assert_eq!(ex[0].edge_type, "IMPORTS");
+    assert_eq!(
+        ex[0].predicate,
+        PredicateSummary::from(&Predicate::KeyMatch {
+            field: "imports".into()
+        }),
+        "explain reports KeyMatch for a list-derived edge"
+    );
+    // The rule stores no weight_prop, so explain recomputes the predicate
+    // score — 1.0, the same as a scalar KeyMatch.
+    assert_eq!(ex[0].weight, Some(1.0));
+}

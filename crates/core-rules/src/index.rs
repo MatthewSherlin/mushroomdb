@@ -1,4 +1,4 @@
-use crate::def::Predicate;
+use crate::def::{Predicate, MAX_KEYMATCH_LIST};
 use crate::hnsw::HnswIndex;
 use core_storage::{list_tokens, Value, ValueKey};
 use std::collections::{BTreeMap, BTreeSet};
@@ -337,6 +337,17 @@ pub enum CandidateSpec<'a> {
     Tokens {
         field: &'a str,
     },
+    /// Src side of a `KeyMatch`-rooted rule: the FK field's scalar value, or —
+    /// when that value is a list — one bucket per **string** element (the first
+    /// [`MAX_KEYMATCH_LIST`] in stored order, non-strings skipped).
+    ///
+    /// The reverse lookup always probes with a single key (the destination
+    /// node's key), so a multi-valued FK has to fan out at index time: a src
+    /// node listing n keys sits in n buckets and is found through any of them.
+    /// A scalar value indexes exactly as [`CandidateSpec::Scalar`] does.
+    ScalarOrElements {
+        field: &'a str,
+    },
     NumericBucket {
         field: &'a str,
         tolerance: f64,
@@ -668,6 +679,16 @@ impl SideIndex {
                 .as_ref()
                 .and_then(list_tokens)
                 .unwrap_or_default(),
+            CandidateSpec::ScalarOrElements { field } => match get(field) {
+                Some(Value::List(items)) => items
+                    .iter()
+                    .take(MAX_KEYMATCH_LIST)
+                    .filter(|v| matches!(v, Value::Str(_)))
+                    .filter_map(ValueKey::from_value)
+                    .collect(),
+                Some(v) => ValueKey::from_value(&v).into_iter().collect(),
+                None => BTreeSet::new(),
+            },
             CandidateSpec::NumericBucket { field, tolerance } => get(field)
                 .as_ref()
                 .and_then(as_finite_f64)
@@ -708,9 +729,10 @@ impl SideIndex {
 
     fn probe_keys(spec: &CandidateSpec, get: &dyn Fn(&str) -> Option<Value>) -> BTreeSet<ValueKey> {
         match spec {
-            CandidateSpec::ByKey | CandidateSpec::Scalar { .. } | CandidateSpec::Tokens { .. } => {
-                Self::index_keys(spec, get)
-            }
+            CandidateSpec::ByKey
+            | CandidateSpec::Scalar { .. }
+            | CandidateSpec::Tokens { .. }
+            | CandidateSpec::ScalarOrElements { .. } => Self::index_keys(spec, get),
             CandidateSpec::NumericBucket { field, tolerance } => get(field)
                 .as_ref()
                 .and_then(as_finite_f64)

@@ -187,6 +187,16 @@ pub const DEFAULT_SCORED_TOP_K: u64 = 32;
 /// Per-source top-k when a KeyMatch-rooted rule omits `max_edges`.
 pub const DEFAULT_KEYMATCH_TOP_K: u64 = 1;
 
+/// How many elements of a list-valued `KeyMatch` field are considered.
+///
+/// A `KeyMatch` field holding a `Value::List` acts as a set of foreign keys:
+/// each string element that names a live destination node yields its own edge.
+/// Only the first `MAX_KEYMATCH_LIST` elements in stored order participate —
+/// in matching, in the src-side index, and in candidate lookup — so one node
+/// can never fan out without bound. Elements past the cap are ignored
+/// deterministically: the same list always produces the same edges.
+pub const MAX_KEYMATCH_LIST: usize = 512;
+
 /// KeyMatch itself, or `All` whose first element is KeyMatch-rooted.
 /// `Any` is never KeyMatch-rooted — the FK fast-path does not apply to OR.
 pub fn is_keymatch_rooted(p: &Predicate) -> bool {
@@ -317,6 +327,15 @@ pub fn evaluate(pred: &Predicate, src: &NodeView, dst: &NodeView) -> Option<f64>
     match pred {
         Predicate::KeyMatch { field } => match (src.props)(field)? {
             Value::Str(s) if s == dst.key => Some(1.0),
+            // A list-valued field is a set of foreign keys: it matches when any
+            // of its first `MAX_KEYMATCH_LIST` elements is the dst key. Only
+            // string elements can name a node; others are skipped but still
+            // count against the cap, so the cap depends on stored order alone.
+            Value::List(items) => items
+                .iter()
+                .take(MAX_KEYMATCH_LIST)
+                .any(|v| matches!(v, Value::Str(s) if s == dst.key))
+                .then_some(1.0),
             _ => None,
         },
         Predicate::FieldEqual { field } => {

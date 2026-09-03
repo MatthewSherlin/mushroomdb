@@ -58,6 +58,20 @@ field matches an Org's key gets a `ORG` edge to that Org. After the demo,
 
 **Score:** 1.0 when the field matches the destination key.
 
+**List-valued fields (multi-valued FK):** when the field holds a list instead
+of a string, it is read as a *set* of foreign keys. Every string element that
+names a live destination node gets its own edge, so
+`File.imports = ["a.rs", "b.rs"]` yields two `IMPORTS` edges. Elements that name
+nothing are ignored until that node appears, at which point the edge is filled
+in; drop an element and only that edge is retracted, in the same write. Non-string
+elements are skipped and duplicates collapse into a single edge. At most
+`MAX_KEYMATCH_LIST` = 512 elements are considered, in stored order, so one node
+can never fan out without bound — the same list always produces the same edges.
+Note that `max_edges` still caps the result per source node: leave it unset (the
+Rust `None`) for a rule that should fire on every element, since a KeyMatch rule
+created without it over MCP, HTTP, or the Python binding defaults to
+`max_edges: 1` and keeps only the lexicographically first destination.
+
 ---
 
 ### 2. FieldEqual
