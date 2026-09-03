@@ -19,6 +19,7 @@
 
 use crate::CliError;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -60,23 +61,52 @@ pub enum BinaryLocation {
 }
 
 /// Decide how the MCP entry should invoke mushroomdb, from the real
-/// environment: PATH lookup first, else the current executable.
+/// environment.
 pub fn detect_binary_location() -> BinaryLocation {
-    if bin_on_path() {
-        return BinaryLocation::OnPath;
-    }
     match std::env::current_exe() {
-        Ok(exe) => BinaryLocation::CopyFrom(exe),
+        Ok(exe) => classify_binary_location(std::env::var_os("PATH").as_deref(), &exe),
         // Cannot locate ourselves — fall back to the bare name rather than fail.
         Err(_) => BinaryLocation::OnPath,
     }
 }
 
-fn bin_on_path() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
+/// Pure classifier behind [`detect_binary_location`]: decide whether the
+/// `mushroomdb` that PATH resolves to is the executable now running.
+///
+/// A file named `mushroomdb` on PATH is not enough. `npx mushroomdb install`
+/// prepends `~/.npm/_npx/<hash>/node_modules/.bin` to PATH, and the
+/// `mushroomdb` there is npm's Node shim (`#!/usr/bin/env node`), not our
+/// native binary; `npm i -g mushroomdb` installs the same shim. Treating that
+/// as "on PATH" wrote a bare `mushroomdb` command that resolved only inside
+/// the npx-spawned shell, so the MCP server and recall hook died with ENOENT
+/// everywhere else (the v0.5.0 bug).
+///
+/// So: take the first PATH hit — that is what a bare name would resolve to —
+/// and canonicalize both it and `current_exe`. Equal paths mean the bare name
+/// runs this very executable, including via a symlink (how `cargo install` and
+/// Homebrew expose it), which is the one case where the bare name is safe and
+/// survives upgrades. Anything else — a shim, a different build, no hit at
+/// all — means naming the copy explicitly.
+pub fn classify_binary_location(path_var: Option<&OsStr>, current_exe: &Path) -> BinaryLocation {
+    let copy = || BinaryLocation::CopyFrom(current_exe.to_path_buf());
+
+    // What a bare `mushroomdb` would resolve to: the first PATH entry holding
+    // a file by that name (`is_file` follows symlinks, so links count).
+    let Some(hit) = path_var.and_then(|p| {
+        std::env::split_paths(p)
+            .map(|dir| dir.join(BIN_NAME))
+            .find(|candidate| candidate.is_file())
+    }) else {
+        return copy();
     };
-    std::env::split_paths(&path).any(|dir| dir.join(BIN_NAME).is_file())
+
+    // Identity, not name. Canonicalizing resolves symlinks and `..`, so a link
+    // to us compares equal; if either side cannot be resolved we cannot prove
+    // it is us, and copying is the answer that always works.
+    match (fs::canonicalize(&hit), fs::canonicalize(current_exe)) {
+        (Ok(on_path), Ok(running)) if on_path == running => BinaryLocation::OnPath,
+        _ => copy(),
+    }
 }
 
 /// Stable, install-owned location for the copied binary (user-level, so a
