@@ -826,6 +826,26 @@ fn eval_set_return_func<F: Fs>(
         };
         return Ok(match_rs.get(row, &rel_type_alias(rel)).cloned());
     }
+    if norm == "key" {
+        if args.len() != 1 {
+            return Err(GraphError::QueryError {
+                detail: format!("key() requires exactly 1 argument, got {}", args.len()),
+            });
+        }
+        let Operand::Var(var) = &args[0] else {
+            return Err(GraphError::QueryError {
+                detail: "key() argument must be a node variable (e.g. key(n))".into(),
+            });
+        };
+        if rel_vars.iter().any(|r| r == var) {
+            return Err(GraphError::QueryError {
+                detail: format!("key() argument `{var}` is a relationship, not a node"),
+            });
+        }
+        // MATCH rows bind node variables to their key string, so the column
+        // value *is* the key.
+        return Ok(match_rs.get(row, var).cloned());
+    }
     let mut vals = Vec::with_capacity(args.len());
     for arg in args {
         vals.push(eval_set_return_operand(
@@ -908,7 +928,7 @@ fn eval_set_return_func<F: Fs>(
         }
         _ => Err(GraphError::QueryError {
             detail: format!(
-                "unknown function `{name}`; supported: toLower, toUpper, size, coalesce, type, abs, round, decay"
+                "unknown function `{name}`; supported: toLower, toUpper, size, coalesce, type, abs, round, decay, key"
             ),
         }),
     }

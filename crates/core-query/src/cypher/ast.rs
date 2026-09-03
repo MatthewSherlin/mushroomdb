@@ -200,7 +200,8 @@ pub enum Operand {
     ///
     /// Supported functions (case-insensitive): `toLower`, `toUpper`, `size`,
     /// `coalesce`, `type`, `abs`, `round`, `textMatches`, `contains`,
-    /// `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`.
+    /// `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`,
+    /// `key`.
     /// Unknown names → named error at execution time listing the supported
     /// set (see `SCALAR_FUNCS` in `exec.rs`).
     FuncCall {

@@ -2374,3 +2374,87 @@ fn decay_rejects_bad_arity_and_halflife() {
         .is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── key() scalar ──────────────────────────────────────────────────────────
+
+#[test]
+fn key_scalar_projects_the_node_key() {
+    let dir = tmp("key-scalar");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "alice", vec![("age".into(), Value::Int(30))])
+        .unwrap();
+    db.insert_node("N", "bob", vec![("age".into(), Value::Int(41))])
+        .unwrap();
+
+    let rs = db
+        .query(
+            "MATCH (n:N) RETURN key(n) AS k ORDER BY k",
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 2);
+    assert_eq!(get_val(&rs, 0, "k"), Some(Value::Str("alice".into())));
+    assert_eq!(get_val(&rs, 1, "k"), Some(Value::Str("bob".into())));
+
+    // Composes with other scalars, and works as a WHERE predicate.
+    let rs = db
+        .query(
+            "MATCH (n:N) WHERE key(n) = 'alice' RETURN toUpper(key(n)) AS k",
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(get_val(&rs, 0, "k"), Some(Value::Str("ALICE".into())));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn key_scalar_in_write_statement_return() {
+    let dir = tmp("key-write");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "alice", vec![("age".into(), Value::Int(30))])
+        .unwrap();
+    let rs = db
+        .query_write(
+            "MATCH (n:N) SET n.age = 31 RETURN key(n) AS k",
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(get_val(&rs, 0, "k"), Some(Value::Str("alice".into())));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn key_scalar_rejects_non_node_arguments() {
+    let dir = tmp("key-err");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "alice", vec![("age".into(), Value::Int(30))])
+        .unwrap();
+    db.insert_node("N", "bob", vec![("age".into(), Value::Int(41))])
+        .unwrap();
+    db.insert_edge("KNOWS", "alice", "bob").unwrap();
+
+    // Property expression, not a node variable.
+    assert!(db
+        .query("MATCH (n:N) RETURN key(n.age) AS k", &Default::default())
+        .is_err());
+    // Wrong arity.
+    assert!(db
+        .query("MATCH (n:N) RETURN key(n, n) AS k", &Default::default())
+        .is_err());
+    // Relationship variable.
+    assert!(db
+        .query(
+            "MATCH (a:N)-[r:KNOWS]->(b:N) RETURN key(r) AS k",
+            &Default::default()
+        )
+        .is_err());
+    assert!(db
+        .query_write(
+            "MATCH (a:N)-[r:KNOWS]->(b:N) SET a.age = 1 RETURN key(r) AS k",
+            &Default::default()
+        )
+        .is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
