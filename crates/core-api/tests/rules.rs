@@ -212,7 +212,8 @@ fn explain_reports_rule_provenance_and_weights() {
     assert_eq!(ex[0].rule, "shared");
     assert_eq!(ex[0].weight, Some(1.0));
     assert_eq!(ex[1].rule, "works_at");
-    assert_eq!(ex[1].weight, None);
+    // works_at stores no weight_prop; explain recomputes the KeyMatch score.
+    assert_eq!(ex[1].weight, Some(1.0));
     db.insert_node("Org", "o2", vec![]).unwrap();
     assert!(db.explain("p1", "o2").unwrap().is_empty());
     assert!(matches!(

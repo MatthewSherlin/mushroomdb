@@ -50,7 +50,7 @@ Predicate::KeyMatch { field: "org_id".into() }
 field matches an Org's key gets a `ORG` edge to that Org. After the demo,
 30 such edges exist (one per Person).
 
-**Score:** none (the `weight_prop` field is ignored; explain shows `weight=none`).
+**Score:** 1.0 when the field matches the destination key.
 
 ---
 
@@ -65,6 +65,9 @@ Predicate::FieldEqual { field: "industry".into() }
 ```
 
 **Score:** 1.0 when the fields match; the edge is not written when they differ.
+
+Scores are stored on the edge under `weight_prop` (MCP default `weight`);
+`explain` reports the score even for rules that store none.
 
 **Example:** two Talent nodes both with `industry = "architecture"` get a
 `INDUSTRY_ALIGNMENT` edge between them (score 1.0).
@@ -266,7 +269,7 @@ Response:
 ```json
 [
   {"rule": "auto_fk_person_project_id", "edge_type": "PROJECT",
-   "src": "person-01", "dst": "proj-01", "weight": null},
+   "src": "person-01", "dst": "proj-01", "weight": 1.0},
   {"rule": "skill_fit", "edge_type": "FIT",
    "src": "person-01", "dst": "proj-01", "weight": 1.0}
 ]

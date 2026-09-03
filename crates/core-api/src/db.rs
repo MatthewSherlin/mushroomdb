@@ -3935,16 +3935,24 @@ impl<F: Fs> GraphDb<F> {
                 .iter()
                 .map(|d| {
                     if d.fired {
-                        let weight = self
-                            .edge_props
-                            .get(d.etype_sym, d.src_id, d.dst_id, "weight")
-                            .and_then(|v| {
-                                if let core_storage::Value::Float(f) = v {
-                                    Some(*f)
-                                } else {
-                                    None
-                                }
-                            });
+                        // The score lives under the rule's declared weight_prop,
+                        // which is not always the literal "weight".
+                        let prop = self
+                            .engine
+                            .rules()
+                            .find(|r| r.name == d.rule)
+                            .and_then(|r| r.weight_prop.as_deref());
+                        let weight = prop.and_then(|p| {
+                            self.edge_props
+                                .get(d.etype_sym, d.src_id, d.dst_id, p)
+                                .and_then(|v| {
+                                    if let core_storage::Value::Float(f) = v {
+                                        Some(*f)
+                                    } else {
+                                        None
+                                    }
+                                })
+                        });
                         DbEvent::EdgeFired {
                             rule: d.rule.clone(),
                             src_key: d.src_key.clone(),
@@ -7708,7 +7716,7 @@ impl<F: Fs> GraphDb<F> {
                     detail: format!("v8: provenance dst id {dst} not in id table"),
                 })?
                 .to_string();
-            let weight = rule_def.weight_prop.as_deref().and_then(|prop| {
+            let stored = rule_def.weight_prop.as_deref().and_then(|prop| {
                 self.edge_props_view()
                     .get(etype, src, dst, prop)
                     .and_then(|v| {
@@ -7718,6 +7726,28 @@ impl<F: Fs> GraphDb<F> {
                             None
                         }
                     })
+            });
+            // Rules that store no weight (KeyMatch/FieldEqual defaults, auto-FK)
+            // still have a score: recompute it from the predicate so explain
+            // never reports "no score" for an edge the engine scored.  Via-hop
+            // rules score over their via set, not over (src, dst), so leave
+            // those None rather than report a number the rule did not produce.
+            let weight = stored.or_else(|| {
+                if rule_def.via_edge.is_some() {
+                    return None;
+                }
+                let props_view = build_props_view(&self.props, &self.base);
+                let src_get = |field: &str| props_view.get(src, field).map(|vr| vr.into_value());
+                let dst_get = |field: &str| props_view.get(dst, field).map(|vr| vr.into_value());
+                let src_view = NodeView {
+                    key: &src_key,
+                    props: &src_get,
+                };
+                let dst_view = NodeView {
+                    key: &dst_key,
+                    props: &dst_get,
+                };
+                evaluate(&rule_def.predicate, &src_view, &dst_view)
             });
             results.push(Explanation {
                 rule: rule_name.to_string(),

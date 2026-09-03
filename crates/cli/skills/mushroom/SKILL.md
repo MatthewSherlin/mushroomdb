@@ -172,7 +172,7 @@ columns: p.id, proj.id, r.score
 ```
 
 ```
-rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=none
+rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=1.0
 ```
 
 The `FIT` row is absent — the `skill_fit` rule retracted that edge when skills changed. The FK rule (person-01's id is a prefix of proj-01) is structural and stays regardless of skill overlap.

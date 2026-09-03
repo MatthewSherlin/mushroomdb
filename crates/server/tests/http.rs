@@ -629,7 +629,8 @@ async fn explain_happy_path() {
     assert_eq!(v[0]["edge_type"], json!("WORKS_AT"));
     assert_eq!(v[0]["src_key"], json!("p1"));
     assert_eq!(v[0]["dst_key"], json!("o1"));
-    assert_eq!(v[0]["weight"], Json::Null);
+    // works_at stores no weight prop; explain recomputes the KeyMatch score.
+    assert_eq!(v[0]["weight"], json!(1.0));
     assert_eq!(v[0]["predicate"]["kind"], json!("key_match"));
     assert_eq!(v[0]["predicate"]["fields"], json!(["org_id"]));
     let pred = v[0]["predicate"].as_object().expect("predicate object");

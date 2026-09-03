@@ -165,7 +165,7 @@ Example response:
     "edge_type": "SAME_ROLE",
     "src_key": "alice",
     "dst_key": "bob",
-    "weight": null,
+    "weight": 1.0,
     "predicate": { "kind": "FieldEqual", "field": "role" }
   }
 ]

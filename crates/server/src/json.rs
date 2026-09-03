@@ -236,12 +236,17 @@ pub(crate) fn node_history_json(key: &str, entries: &[HistoryEntry], total_commi
 }
 
 /// Deserialize a `RuleDef` from HTTP/MCP JSON. Omitted or null `max_edges`
-/// fills `default_max_edges`. Do not add `#[serde(default)]` on
-/// `RuleDef.max_edges` — bincode is positional.
+/// fills `default_max_edges`; omitted or null `weight_prop` fills `"weight"`
+/// so a rule created over the wire always stores its score somewhere
+/// queryable. Do not add `#[serde(default)]` on `RuleDef.max_edges` — bincode
+/// is positional.
 pub(crate) fn rule_def_from_json(v: Js) -> Result<RuleDef, String> {
     let mut def: RuleDef = serde_json::from_value(v).map_err(|e| e.to_string())?;
     if def.max_edges.is_none() {
         def.max_edges = Some(default_max_edges(&def.predicate));
+    }
+    if def.weight_prop.is_none() {
+        def.weight_prop = Some("weight".into());
     }
     Ok(def)
 }

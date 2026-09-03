@@ -520,7 +520,8 @@ fn agent_memory_loop() {
     assert_eq!(expl[0]["edge_type"], json!("ORG"));
     assert_eq!(expl[0]["src_key"], json!("p1"));
     assert_eq!(expl[0]["dst_key"], json!("acme"));
-    assert_eq!(expl[0]["weight"], Js::Null);
+    // auto-FK stores no weight prop; explain recomputes the KeyMatch score.
+    assert_eq!(expl[0]["weight"], json!(1.0));
     assert_eq!(expl[0]["predicate"]["kind"], json!("key_match"));
     assert_eq!(expl[0]["predicate"]["fields"], json!(["org_id"]));
 }
@@ -723,6 +724,66 @@ fn ingest_edges_and_create_rule_tools() {
     let edges = db.read().node_edges("a").unwrap();
     assert!(edges.iter().any(|e| e.edge_type == "KNOWS" && !e.derived));
     assert!(db.read().rules().iter().any(|r| r.name == "founded_within"));
+}
+
+/// Binding: create_rule without `weight_prop` stores the score under `weight`,
+/// so a derived edge's score is queryable instead of null.
+#[test]
+fn mcp_create_rule_defaults_weight_prop_to_weight() {
+    let db = open("default-weight-prop");
+    {
+        let mut w = db.write();
+        for key in ["p1", "p2"] {
+            w.insert_node(
+                "Person",
+                key,
+                vec![("industry".into(), Value::Str("design".into()))],
+            )
+            .unwrap();
+        }
+        for key in ["o1", "o2"] {
+            w.insert_node(
+                "Org",
+                key,
+                vec![("industry".into(), Value::Str("design".into()))],
+            )
+            .unwrap();
+        }
+    }
+    let stdin = format!(
+        "{}{}",
+        call(
+            1,
+            "create_rule",
+            json!({
+                "name": "same",
+                "src_label": "Person",
+                "dst_label": "Org",
+                "predicate": {"FieldEqual": {"field": "industry"}},
+                "edge_type": "SAME"
+            }),
+        ),
+        call(
+            2,
+            "query",
+            json!({"cypher": "MATCH (p:Person)-[r:SAME]->(o:Org) RETURN r.weight LIMIT 1"}),
+        ),
+    );
+    let (res, out) = exchange(db.clone(), &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    assert_eq!(replies.len(), 2);
+    assert_eq!(
+        content_json(&replies[0]),
+        json!({"ok": true, "name": "same"})
+    );
+    let q = content_json(&replies[1]);
+    assert_eq!(q["columns"], json!(["r.weight"]));
+    assert_eq!(
+        q["rows"][0][0],
+        json!(1.0),
+        "score must be stored under the default weight prop, got {q}"
+    );
 }
 
 /// Binding: ingest_json mixed batch is atomic — a bad edge persists no nodes.

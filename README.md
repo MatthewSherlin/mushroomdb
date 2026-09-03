@@ -390,7 +390,7 @@ columns: p, proj, score
   p=person-01  proj=proj-20  score=0.5
 
 == explain (person-01, proj-01) ==
-  rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=none
+  rule=auto_fk_person_project_id  type=PROJECT  person-01→proj-01  weight=1.0
   rule=skill_fit  type=FIT  person-01→proj-01  weight=1.0
 
 == serve ==
