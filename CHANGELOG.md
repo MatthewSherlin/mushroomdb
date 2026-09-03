@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.5.1 — 2026-09-03
+
+- **Fix: `npx mushroomdb install` wrote a bare `mushroomdb` command** because npm's shim on PATH
+  looked like the binary; install now writes the bare name only when the PATH entry is this
+  executable, otherwise copies the binary to `~/.mushroomdb/bin`. `npx` prepends
+  `~/.npm/_npx/<hash>/node_modules/.bin` to PATH and the `mushroomdb` there is npm's Node entry
+  point, so the bare name resolved inside the npx shell and nowhere else — the MCP server and the
+  recall hook failed with ENOENT after install. `npm i -g mushroomdb` installs the same shim and
+  now copies too. Classification compares canonicalized paths, so a symlink to the real binary
+  (`cargo install`, Homebrew) still gets the upgrade-safe bare name.
+
 ## v0.5.0 — 2026-09-03
 
 ### The memory release (format-stable)

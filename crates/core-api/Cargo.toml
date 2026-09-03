@@ -14,15 +14,15 @@ readme = "../../README.md"
 name = "core_api"
 
 [dependencies]
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.5.0" }
-core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.5.0" }
-core-query = { package = "mushroomdb-query", path = "../core-query", version = "0.5.0" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.5.1" }
+core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.5.1" }
+core-query = { package = "mushroomdb-query", path = "../core-query", version = "0.5.1" }
 bincode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.5.0" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.5.1" }
 # Path-only (no version): sim-harness is publish=false; a version key makes
 # `cargo publish -p mushroomdb` try to resolve it on the index and fail.
 sim-harness = { path = "../sim-harness" }
