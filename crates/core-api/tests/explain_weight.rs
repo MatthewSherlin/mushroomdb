@@ -139,3 +139,75 @@ fn stored_weight_prop_still_wins() {
     assert_eq!(rs.get(0, "r.weight"), Some(&Value::Float(1.0)));
     assert_eq!(db.explain("p1", "o1").unwrap()[0].weight, Some(1.0));
 }
+
+/// A via-hop rule scores `(via, dst)`, not `(src, dst)`. The fixture gives the
+/// src node its own matching `industry` so a naive recompute over the pair
+/// would return a fabricated 1.0; explain must report no score instead.
+fn via_rule(weight_prop: Option<&str>) -> RuleDef {
+    RuleDef {
+        name: "fit".into(),
+        src_label: "Person".into(),
+        dst_label: "Project".into(),
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
+        edge_type: "FIT".into(),
+        weight_prop: weight_prop.map(str::to_string),
+        max_edges: None,
+        approximate: false,
+        via_label: Some("Org".into()),
+        via_edge: Some("WORKS_AT".into()),
+        via_dir: None,
+    }
+}
+
+fn via_fixture(dir: &std::path::Path) -> GraphDb<core_storage::fs::RealFs> {
+    let mut db = GraphDb::open(dir).unwrap();
+    db.insert_node(
+        "Org",
+        "techcorp",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    // alice carries the field herself — the naive recompute trap.
+    db.insert_node(
+        "Person",
+        "alice",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Project",
+        "proj_a",
+        vec![("industry".into(), Value::Str("tech".into()))],
+    )
+    .unwrap();
+    db.insert_edge("WORKS_AT", "alice", "techcorp").unwrap();
+    db
+}
+
+#[test]
+fn via_hop_without_weight_prop_reports_no_score() {
+    let mut db = via_fixture(&tmp("via-none"));
+    db.create_rule(via_rule(None)).unwrap();
+    let ex = db.explain("alice", "proj_a").unwrap();
+    assert_eq!(ex.len(), 1);
+    assert_eq!(ex[0].rule, "fit");
+    assert_eq!(
+        ex[0].weight, None,
+        "via-hop scores over the via set; explain must not recompute over (src, dst)"
+    );
+}
+
+#[test]
+fn via_hop_with_weight_prop_reports_the_stored_score() {
+    let mut db = via_fixture(&tmp("via-stored"));
+    db.create_rule(via_rule(Some("score"))).unwrap();
+    let ex = db.explain("alice", "proj_a").unwrap();
+    assert_eq!(ex.len(), 1);
+    assert_eq!(
+        ex[0].weight,
+        Some(1.0),
+        "a via-hop rule that stores its score still reports it"
+    );
+}

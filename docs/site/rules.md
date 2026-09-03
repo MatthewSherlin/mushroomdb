@@ -67,7 +67,9 @@ Predicate::FieldEqual { field: "industry".into() }
 **Score:** 1.0 when the fields match; the edge is not written when they differ.
 
 Scores are stored on the edge under `weight_prop` (MCP default `weight`);
-`explain` reports the score even for rules that store none.
+`explain` reports the score even for rules that store none. Via-hop rules are
+the exception: they score over the via set, so `explain` reports their stored
+score only.
 
 **Example:** two Talent nodes both with `industry = "architecture"` get a
 `INDUSTRY_ALIGNMENT` edge between them (score 1.0).

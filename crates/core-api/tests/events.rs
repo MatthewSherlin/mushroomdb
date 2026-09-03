@@ -385,6 +385,58 @@ fn subscribe_rule_events_arrive_after_commit_in_order() {
     );
 }
 
+/// Binding: `EdgeFired.weight` is read under the rule's declared `weight_prop`,
+/// not a hardcoded "weight" property. A rule that stores its score reports it;
+/// a rule that stores none reports `None`.
+#[test]
+fn edge_fired_weight_uses_the_rules_weight_prop() {
+    let dir = tmp("sub-weight");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // overlap_rule stores its score under "score".
+    db.create_rule(overlap_rule("scored", "SCORED")).unwrap();
+    let mut unscored = overlap_rule("unscored", "UNSCORED");
+    unscored.weight_prop = None;
+    db.create_rule(unscored).unwrap();
+
+    let scored_sub = db.subscribe_rule("scored").unwrap();
+    let unscored_sub = db.subscribe_rule("unscored").unwrap();
+
+    // tags {x,y} vs {x} → jaccard 1/2 = 0.5, which meets the rule's min.
+    db.write_batch(|b| {
+        b.insert_node("A", "n1", vec![("tags".into(), tags(&["x", "y"]))]);
+        b.insert_node("A", "n2", vec![("tags".into(), tags(&["x"]))]);
+    })
+    .unwrap();
+
+    let scored = drain_sub(&scored_sub);
+    assert!(!scored.is_empty(), "expected fire events for scored rule");
+    for ev in &scored {
+        match ev {
+            DbEvent::EdgeFired { weight, .. } => assert_eq!(
+                *weight,
+                Some(0.5),
+                "score is stored under \"score\", not \"weight\""
+            ),
+            other => panic!("expected EdgeFired, got {other:?}"),
+        }
+    }
+
+    let unscored = drain_sub(&unscored_sub);
+    assert!(
+        !unscored.is_empty(),
+        "expected fire events for unscored rule"
+    );
+    for ev in &unscored {
+        match ev {
+            DbEvent::EdgeFired { weight, .. } => {
+                assert_eq!(*weight, None, "a rule storing no weight reports none")
+            }
+            other => panic!("expected EdgeFired, got {other:?}"),
+        }
+    }
+}
+
 /// Invariant 2: bounded queue with Lagged overflow.  Queue of size 2; fire
 /// more events than capacity; consumer reads Lagged marker.
 #[test]
