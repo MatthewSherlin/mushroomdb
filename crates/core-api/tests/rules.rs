@@ -1307,6 +1307,21 @@ fn ingest_json_list_fk_plus_keymatch_rule_yields_edges() {
         "per-element retraction carries rule attribution"
     );
 
+    // The removed element's retraction and the added element's firing are one
+    // transaction: both land in the commit the single set_prop produced.
+    let hist_c = db.edge_history("main.rs", "c.rs").unwrap();
+    assert_eq!(hist_c.items.len(), 1, "c.rs history: {:?}", hist_c.items);
+    assert_eq!(hist_c.items[0].event, EdgeEvent::Added);
+    assert_eq!(
+        hist.items[1].commit, hist_c.items[0].commit,
+        "retracting b.rs and firing c.rs share one commit"
+    );
+
+    // The element present in both lists never churns: one Added, no retraction.
+    let hist_a = db.edge_history("main.rs", "a.rs").unwrap();
+    assert_eq!(hist_a.items.len(), 1, "a.rs history: {:?}", hist_a.items);
+    assert_eq!(hist_a.items[0].event, EdgeEvent::Added);
+
     // Derived edges are not WAL-logged: replay must re-derive the same set.
     drop(db);
     let mut db = GraphDb::open(&dir).unwrap();
@@ -1386,4 +1401,118 @@ fn explain_reports_keymatch_for_list_edge() {
     // The rule stores no weight_prop, so explain recomputes the predicate
     // score — 1.0, the same as a scalar KeyMatch.
     assert_eq!(ex[0].weight, Some(1.0));
+}
+
+/// The capped apply path — `max_edges: Some(512)` is what every front door
+/// (HTTP, MCP, Python, auto-FK) stores for a KeyMatch rule, and it routes
+/// through `filter_src_top_k` + `apply_per_src_top_k` rather than the uncapped
+/// branch the other list tests exercise.
+#[test]
+fn list_fk_fires_per_element_at_the_default_cap() {
+    use core_api::{EdgeEvent, DEFAULT_KEYMATCH_TOP_K};
+    let dir = tmp("rules-list-default-cap");
+    let mut db = GraphDb::open(&dir).unwrap();
+    for k in ["a.rs", "b.rs", "c.rs"] {
+        db.insert_node("Mod", k, vec![]).unwrap();
+    }
+    db.create_rule(RuleDef {
+        name: "imports".into(),
+        src_label: "File".into(),
+        dst_label: "Mod".into(),
+        predicate: Predicate::KeyMatch {
+            field: "imports".into(),
+        },
+        edge_type: "IMPORTS".into(),
+        weight_prop: None,
+        max_edges: Some(DEFAULT_KEYMATCH_TOP_K),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    db.insert_node(
+        "File",
+        "main.rs",
+        vec![(
+            "imports".into(),
+            Value::List(vec![
+                Value::Str("a.rs".into()),
+                Value::Str("b.rs".into()),
+                Value::Str("c.rs".into()),
+            ]),
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "b.rs", "c.rs"],
+        "the stored default cap fires on every element, not just the first"
+    );
+
+    // Per-element retraction through the top-k apply path.
+    db.set_prop(
+        "main.rs",
+        "imports",
+        Value::List(vec![Value::Str("a.rs".into()), Value::Str("c.rs".into())]),
+    )
+    .unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "c.rs"]
+    );
+    let hist = db.edge_history("main.rs", "b.rs").unwrap();
+    assert_eq!(hist.items.len(), 2, "b.rs history: {:?}", hist.items);
+    assert_eq!(hist.items[1].event, EdgeEvent::Retracted);
+    let hist_a = db.edge_history("main.rs", "a.rs").unwrap();
+    assert_eq!(hist_a.items.len(), 1, "surviving element does not churn");
+}
+
+/// Under a cap smaller than the number of live targets, which elements win is
+/// decided by **destination key ascending**, not by the list's stored order:
+/// every list element scores 1.0, so `filter_src_top_k`'s score-DESC sort is a
+/// tie and its key-ASC tiebreak decides.
+#[test]
+fn list_fk_under_a_small_cap_keeps_the_lowest_destination_keys() {
+    let dir = tmp("rules-list-small-cap");
+    let mut db = GraphDb::open(&dir).unwrap();
+    for k in ["a.rs", "b.rs", "c.rs"] {
+        db.insert_node("Mod", k, vec![]).unwrap();
+    }
+    db.create_rule(RuleDef {
+        name: "imports".into(),
+        src_label: "File".into(),
+        dst_label: "Mod".into(),
+        predicate: Predicate::KeyMatch {
+            field: "imports".into(),
+        },
+        edge_type: "IMPORTS".into(),
+        weight_prop: None,
+        max_edges: Some(2),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    // Stored in descending key order, so stored order and key order disagree.
+    db.insert_node(
+        "File",
+        "main.rs",
+        vec![(
+            "imports".into(),
+            Value::List(vec![
+                Value::Str("c.rs".into()),
+                Value::Str("b.rs".into()),
+                Value::Str("a.rs".into()),
+            ]),
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "b.rs"],
+        "cap of 2 over 3 targets keeps the two lowest destination keys, \
+         not the two first-listed elements"
+    );
 }

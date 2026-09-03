@@ -58,6 +58,8 @@ export type KeyMatchHit = {
   label: string;
   field: string;
   value: string;
+  /** True when the field holds a list of keys and `value` is one element. */
+  inList?: boolean;
 };
 
 export type WhyModel =
@@ -357,18 +359,30 @@ export function keyMatchFromProps(
 ): KeyMatchHit | undefined {
   const srcHit = fkField(src.props, dst.key);
   if (srcHit !== undefined) {
-    return { label: src.label, field: srcHit, value: dst.key };
+    return {
+      label: src.label,
+      field: srcHit.field,
+      value: dst.key,
+      inList: srcHit.inList,
+    };
   }
   const dstHit = fkField(dst.props, src.key);
   if (dstHit !== undefined) {
-    return { label: dst.label, field: dstHit, value: src.key };
+    return {
+      label: dst.label,
+      field: dstHit.field,
+      value: src.key,
+      inList: dstHit.inList,
+    };
   }
   return undefined;
 }
 
 export function formatKeyMatchLine(hit: KeyMatchHit): string {
   const head = hit.label !== "" ? `${hit.label.toLowerCase()}.` : "";
-  return `${head}${hit.field} = "${hit.value}" → ${hit.value}`;
+  // A list-valued key field holds the destination key among its elements.
+  const rel = hit.inList === true ? "∋" : "=";
+  return `${head}${hit.field} ${rel} "${hit.value}" → ${hit.value}`;
 }
 
 export type FieldEqualHit = {
@@ -877,11 +891,13 @@ function keyMatchFromField(
   if (field === undefined) {
     return undefined;
   }
-  if ((src.props ?? {})[field] === dst.key) {
-    return { label: src.label, field, value: dst.key };
+  const srcHit = keyHit((src.props ?? {})[field], dst.key);
+  if (srcHit !== undefined) {
+    return { label: src.label, field, value: dst.key, inList: srcHit.inList };
   }
-  if ((dst.props ?? {})[field] === src.key) {
-    return { label: dst.label, field, value: src.key };
+  const dstHit = keyHit((dst.props ?? {})[field], src.key);
+  if (dstHit !== undefined) {
+    return { label: dst.label, field, value: src.key, inList: dstHit.inList };
   }
   return undefined;
 }
@@ -1115,16 +1131,47 @@ function tokenList(value: unknown): string[] | undefined {
   return tokens;
 }
 
+/**
+ * How many elements of a list-valued key field the server considers
+ * (`MAX_KEYMATCH_LIST` in `core_rules::def`). Mirrored here so the UI never
+ * claims a match the engine would not have made.
+ */
+const MAX_KEYMATCH_LIST = 512;
+
+/**
+ * Whether a property value names `target`: the scalar equals it, or the value
+ * is a list-valued foreign key holding it among its first
+ * `MAX_KEYMATCH_LIST` elements. Returns which of the two it was, so the
+ * rendered line can say `=` or `∋`.
+ */
+function keyHit(
+  value: unknown,
+  target: string,
+): { inList: boolean } | undefined {
+  if (value === target) {
+    return { inList: false };
+  }
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, MAX_KEYMATCH_LIST)) {
+      if (item === target) {
+        return { inList: true };
+      }
+    }
+  }
+  return undefined;
+}
+
 function fkField(
   props: Record<string, unknown> | undefined,
   target: string,
-): string | undefined {
+): { field: string; inList: boolean } | undefined {
   if (props === undefined) {
     return undefined;
   }
   for (const field of Object.keys(props).sort()) {
-    if (props[field] === target) {
-      return field;
+    const hit = keyHit(props[field], target);
+    if (hit !== undefined) {
+      return { field, inList: hit.inList };
     }
   }
   return undefined;

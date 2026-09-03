@@ -240,7 +240,7 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb query  ` | Run a Cypher read or write (`--query` also accepted) |
 | `mushroomdb asof  --commit N` | Read-only view at a WAL commit |
 | `mushroomdb stats ` | Print node/edge/rule counts |
-| `mushroomdb suggest ` | Rank candidate linking rules (scored top-k 32, KeyMatch 1) |
+| `mushroomdb suggest ` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
 | `mushroomdb schema apply  ` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
 | `mushroomdb snapshot  [--keep-wal]` | Write `snapshot.bin` (truncates WAL unless `--keep-wal`) |
 | `mushroomdb verify ` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch |

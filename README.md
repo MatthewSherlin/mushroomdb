@@ -231,7 +231,7 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted) |
 | `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit |
 | `mushroomdb stats <dir>` | Print node/edge/rule counts |
-| `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 1) |
+| `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
 | `mushroomdb snapshot <dir> [--keep-wal]` | Write `snapshot.bin` (truncates WAL unless `--keep-wal`) |
 | `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch |
