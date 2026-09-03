@@ -23,7 +23,12 @@ fn main() -> ExitCode {
         Ok(Command::Recall { db_dir }) => {
             let mut raw = String::new();
             let _ = io::stdin().read_to_string(&mut raw);
-            print!("{}", cli::recall::run_recall(&db_dir, &raw));
+            // Not `print!`: that panics on EPIPE (exit 101) if the hook runner
+            // closes the pipe. Every write error is swallowed instead.
+            let digest = cli::recall::run_recall(&db_dir, &raw);
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(digest.as_bytes());
+            let _ = stdout.flush();
             ExitCode::SUCCESS // never block the prompt
         }
         Ok(Command::Version) => {

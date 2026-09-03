@@ -84,9 +84,10 @@ fn recall_drops_trailing_nodes_rather_than_blow_the_size_budget() {
         out.starts_with(&format!("mushroomdb recall ({printed} related nodes")),
         "{out}"
     );
+    // Header, hint and elision marker are charged against the same budget.
     assert!(
-        out.len() < 2200,
-        "digest stayed bounded: {} bytes",
+        out.len() <= 1800,
+        "whole digest must fit the budget: {} bytes",
         out.len()
     );
 }
@@ -96,6 +97,40 @@ fn recall_is_silent_when_no_fulltext_index_is_enabled() {
     let dir = tmp("nofts");
     drop(core_api::GraphDb::open(&dir).expect("open"));
     assert_eq!(run_recall(&dir, r#"{"prompt":"Person 1"}"#), "");
+}
+
+#[test]
+fn recall_writes_nothing_to_an_empty_directory() {
+    let dir = tmp("emptydir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    assert_eq!(run_recall(&dir, r#"{"prompt":"Person 1"}"#), "");
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert!(left.is_empty(), "recall must not create files: {left:?}");
+}
+
+#[test]
+fn recall_leaves_an_old_format_store_byte_identical() {
+    // The default OpenOptions would migrate this V5 snapshot in place and write
+    // a .bak. A prompt hook must only read.
+    let bytes = include_bytes!("../../core-api/tests/fixtures/golden_v5.bin");
+    let dir = tmp("v5");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("snapshot.bin"), bytes).expect("snapshot");
+    std::fs::write(dir.join("wal.bin"), b"").expect("wal");
+
+    assert_eq!(run_recall(&dir, r#"{"prompt":"Person 1"}"#), "");
+    assert_eq!(
+        std::fs::read(dir.join("snapshot.bin")).expect("reread"),
+        bytes,
+        "recall must not rewrite the snapshot"
+    );
+    assert!(
+        !dir.join("snapshot.bin.bak").exists(),
+        "recall must not write a .bak"
+    );
 }
 
 #[test]

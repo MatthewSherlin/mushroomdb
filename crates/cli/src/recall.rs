@@ -5,7 +5,7 @@
 //! short plain-text digest of matching nodes and their strongest edges.
 //! Silent (empty output, exit 0) on any error — a recall hook must never
 //! block or slow the user's prompt.
-use core_api::{GraphDb, Value};
+use core_api::{GraphDb, OpenOptions, Value};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -78,10 +78,20 @@ pub fn run_recall(db_dir: &Path, hook_stdin: &str) -> String {
     else {
         return String::new();
     };
+    // Guard the open: `RealFs::new` runs `create_dir_all`, so without this a
+    // hook pointed at a typo'd path would keep creating empty directories.
     if !db_dir.exists() {
         return String::new();
     }
-    let Ok(db) = GraphDb::open(db_dir) else {
+    // `auto_migrate: false` — the default rewrites an old-format snapshot and
+    // deletes a stale `.bak`. A digest that fires on every prompt, under a 5 s
+    // kill and with no cross-process lock, must never write to the user's store.
+    let Ok(db) = GraphDb::open_with_options(
+        db_dir,
+        OpenOptions {
+            auto_migrate: false,
+        },
+    ) else {
         return String::new();
     };
     // `search` matches on a field across every label, so one call per distinct
@@ -125,8 +135,18 @@ pub fn run_recall(db_dir: &Path, hook_stdin: &str) -> String {
         .collect();
 
     // Blocks are rendered first so the header can count what actually printed.
+    // The header (which carries the store path), the hint and the elision marker
+    // are charged up front, so MAX_OUTPUT_BYTES bounds the whole digest rather
+    // than only the node blocks. The reservation uses `hits.len()`, an upper
+    // bound on the count the header ends up printing.
+    let header_reserved = header(hits.len(), db_dir).len();
+    let Some(mut budget) =
+        MAX_OUTPUT_BYTES.checked_sub(header_reserved + HINT.len() + ELISION.len())
+    else {
+        // Pathologically long store path: nothing useful fits.
+        return String::new();
+    };
     let mut blocks: Vec<String> = Vec::new();
-    let mut budget = MAX_OUTPUT_BYTES;
     let mut truncated = false;
     for (key, _score) in &hits {
         let node = db.node_ref(key);
@@ -204,19 +224,25 @@ pub fn run_recall(db_dir: &Path, hook_stdin: &str) -> String {
         return String::new();
     }
 
-    let mut out = format!(
-        "mushroomdb recall ({} related nodes in {}):\n",
-        blocks.len(),
-        db_dir.display()
-    );
+    let mut out = header(blocks.len(), db_dir);
     for block in &blocks {
         out.push_str(block);
     }
     if truncated {
-        out.push_str("    …\n");
+        out.push_str(ELISION);
     }
-    out.push_str("(query the mushroomdb MCP tools before answering about these entities)\n");
+    out.push_str(HINT);
     out
+}
+
+const HINT: &str = "(query the mushroomdb MCP tools before answering about these entities)\n";
+const ELISION: &str = "    …\n";
+
+fn header(count: usize, db_dir: &Path) -> String {
+    format!(
+        "mushroomdb recall ({count} related nodes in {}):\n",
+        db_dir.display()
+    )
 }
 
 fn as_f64(v: &Value) -> Option<f64> {
