@@ -697,6 +697,25 @@ field matches an Org's key gets a `ORG` edge to that Org. After the demo,
 
 **Score:** 1.0 when the field matches the destination key.
 
+**List-valued fields (multi-valued FK):** when the field holds a list instead
+of a string, it is read as a *set* of foreign keys. Every string element that
+names a live destination node gets its own edge, so
+`File.imports = ["a.rs", "b.rs"]` yields two `IMPORTS` edges. Elements that name
+nothing are ignored until that node appears, at which point the edge is filled
+in; drop an element and only that edge is retracted, in the same write. Non-string
+elements are skipped and duplicates collapse into a single edge. At most
+`MAX_KEYMATCH_LIST` = 512 elements are considered, in stored order, so one node
+can never fan out without bound — the same list always produces the same edges.
+
+Firing per element is the default, not an opt-in: a KeyMatch rule that omits
+`max_edges` gets 512, the same number, from every front door that fills the
+cap — `POST /rules`, MCP `create_rule`, the Python binding, `suggest`, and the
+auto-FK rules declared at ingest time. A scalar FK field names at most one
+destination, so the higher cap is inert there and scalar rules behave exactly as
+they did. Rules stored before this change keep the `max_edges` they were written
+with, so a rule saved with `max_edges: 1` still keeps a single destination per
+source until it is recreated.
+
 ---
 
 ### 2. FieldEqual
@@ -2324,7 +2343,9 @@ Body is a `RuleDef` object:
 ```
 
 Omitted or JSON-null `max_edges` fills the default after deserialize: **32**
-for scored predicates, **1** for KeyMatch (and KeyMatch-rooted `All`). Rust
+for scored predicates, **512** for KeyMatch (and KeyMatch-rooted `All`) — one
+per element a list-valued FK field can name; a scalar FK field still resolves to
+at most one destination, so the higher cap is inert there. Rust
 `max_edges: None` remains the 1,000,000 global-budget hatch; HTTP cannot
 express that hatch (null fills the default). Python `None` and a missing key
 behave the same as HTTP null — both fill the predicate default.
@@ -2899,7 +2920,7 @@ db.create_rule(clone)
 ```
 
 **`max_edges` semantics:** Python `None` and a missing key both fill the
-predicate default (32 for scored predicates, 1 for KeyMatch). This is the same
+predicate default (32 for scored predicates, 512 for KeyMatch). This is the same
 as HTTP `null` — neither Python nor HTTP can express the Rust `max_edges: None`
 global-budget hatch (1,000,000 per source). Use the Rust API directly if you
 need the uncapped budget.
@@ -4225,7 +4246,7 @@ Already-existing rules (including auto-FK rules created at ingest time) are neve
 Suggested `RuleDef.max_edges` is never `None`. Omitted caps fill
 `default_max_edges(&predicate)`: **32** for scored predicates (Overlap,
 NumericWithin, GeoRadius, VectorSimilar, and `All`/`Any` that are not
-KeyMatch-rooted) and **1** for KeyMatch (and KeyMatch-rooted `All`). HTTP
+KeyMatch-rooted) and **512** for KeyMatch (and KeyMatch-rooted `All`). HTTP
 `POST /rules` and MCP `create_rule` apply the same fill when `max_edges` is
 absent or JSON-null. Python `create_rule`: missing dict key fills the
 default; explicit `None` stays uncapped (`DEFAULT_MAX_EDGES` = 1,000,000).

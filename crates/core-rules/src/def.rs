@@ -185,7 +185,12 @@ pub const MAX_PREDICATE_NESTING_DEPTH: usize = 4;
 pub const DEFAULT_SCORED_TOP_K: u64 = 32;
 
 /// Per-source top-k when a KeyMatch-rooted rule omits `max_edges`.
-pub const DEFAULT_KEYMATCH_TOP_K: u64 = 1;
+///
+/// Equal to [`MAX_KEYMATCH_LIST`], the most destinations a single `KeyMatch`
+/// source can ever name: a list-valued FK field must fire on every element by
+/// default. A scalar FK field names at most one destination, so the higher cap
+/// is inert there — the top-k filter has nothing to truncate.
+pub const DEFAULT_KEYMATCH_TOP_K: u64 = MAX_KEYMATCH_LIST as u64;
 
 /// How many elements of a list-valued `KeyMatch` field are considered.
 ///
@@ -1473,9 +1478,11 @@ mod tests {
     }
 
     #[test]
-    fn default_max_edges_keymatch_is_1_else_32() {
+    fn default_max_edges_keymatch_is_512_else_32() {
         assert_eq!(DEFAULT_SCORED_TOP_K, 32);
-        assert_eq!(DEFAULT_KEYMATCH_TOP_K, 1);
+        // One per element of a list-valued FK field; inert for a scalar one.
+        assert_eq!(DEFAULT_KEYMATCH_TOP_K, 512);
+        assert_eq!(DEFAULT_KEYMATCH_TOP_K, MAX_KEYMATCH_LIST as u64);
         assert_eq!(
             default_max_edges(&Predicate::KeyMatch { field: "fk".into() }),
             DEFAULT_KEYMATCH_TOP_K

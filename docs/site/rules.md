@@ -67,10 +67,15 @@ in; drop an element and only that edge is retracted, in the same write. Non-stri
 elements are skipped and duplicates collapse into a single edge. At most
 `MAX_KEYMATCH_LIST` = 512 elements are considered, in stored order, so one node
 can never fan out without bound — the same list always produces the same edges.
-Note that `max_edges` still caps the result per source node: leave it unset (the
-Rust `None`) for a rule that should fire on every element, since a KeyMatch rule
-created without it over MCP, HTTP, or the Python binding defaults to
-`max_edges: 1` and keeps only the lexicographically first destination.
+
+Firing per element is the default, not an opt-in: a KeyMatch rule that omits
+`max_edges` gets 512, the same number, from every front door that fills the
+cap — `POST /rules`, MCP `create_rule`, the Python binding, `suggest`, and the
+auto-FK rules declared at ingest time. A scalar FK field names at most one
+destination, so the higher cap is inert there and scalar rules behave exactly as
+they did. Rules stored before this change keep the `max_edges` they were written
+with, so a rule saved with `max_edges: 1` still keeps a single destination per
+source until it is recreated.
 
 ---
 

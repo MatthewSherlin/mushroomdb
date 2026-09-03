@@ -267,7 +267,7 @@ use the same stemmer — do not re-stem query tokens.
 manual mkdir required.
 
 `max_edges` in `create_rule`: Python `None` and a missing key both fill the predicate
-default (32 for scored predicates, 1 for KeyMatch). This is the same as HTTP null.
+default (32 for scored predicates, 512 for KeyMatch). This is the same as HTTP null.
 Neither Python nor HTTP can express the Rust `max_edges: None` global-budget hatch
 (1,000,000 per source); use the Rust API directly for that.
 

@@ -376,7 +376,9 @@ Body is a `RuleDef` object:
 ```
 
 Omitted or JSON-null `max_edges` fills the default after deserialize: **32**
-for scored predicates, **1** for KeyMatch (and KeyMatch-rooted `All`). Rust
+for scored predicates, **512** for KeyMatch (and KeyMatch-rooted `All`) — one
+per element a list-valued FK field can name; a scalar FK field still resolves to
+at most one destination, so the higher cap is inert there. Rust
 `max_edges: None` remains the 1,000,000 global-budget hatch; HTTP cannot
 express that hatch (null fills the default). Python `None` and a missing key
 behave the same as HTTP null — both fill the predicate default.
@@ -956,7 +958,7 @@ db.create_rule(clone)
 ```
 
 **`max_edges` semantics:** Python `None` and a missing key both fill the
-predicate default (32 for scored predicates, 1 for KeyMatch). This is the same
+predicate default (32 for scored predicates, 512 for KeyMatch). This is the same
 as HTTP `null` — neither Python nor HTTP can express the Rust `max_edges: None`
 global-budget hatch (1,000,000 per source). Use the Rust API directly if you
 need the uncapped budget.

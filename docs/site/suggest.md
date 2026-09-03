@@ -41,7 +41,7 @@ Already-existing rules (including auto-FK rules created at ingest time) are neve
 Suggested `RuleDef.max_edges` is never `None`. Omitted caps fill
 `default_max_edges(&predicate)`: **32** for scored predicates (Overlap,
 NumericWithin, GeoRadius, VectorSimilar, and `All`/`Any` that are not
-KeyMatch-rooted) and **1** for KeyMatch (and KeyMatch-rooted `All`). HTTP
+KeyMatch-rooted) and **512** for KeyMatch (and KeyMatch-rooted `All`). HTTP
 `POST /rules` and MCP `create_rule` apply the same fill when `max_edges` is
 absent or JSON-null. Python `create_rule`: missing dict key fills the
 default; explicit `None` stays uncapped (`DEFAULT_MAX_EDGES` = 1,000,000).

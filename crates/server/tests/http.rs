@@ -1171,7 +1171,7 @@ async fn create_rule_http_and_validation() {
     );
 }
 
-/// Binding: omitted JSON `max_edges` fills `default_max_edges` (scored=32, KeyMatch=1).
+/// Binding: omitted JSON `max_edges` fills `default_max_edges` (scored=32, KeyMatch=512).
 #[tokio::test]
 async fn create_rule_http_omitted_max_edges_fills_default() {
     let (app, db) = open("rules-omit-max");
@@ -1208,7 +1208,7 @@ async fn create_rule_http_omitted_max_edges_fills_default() {
             .find(|r| r.name == "works_at")
             .unwrap()
             .max_edges,
-        Some(1)
+        Some(512)
     );
 }
 
