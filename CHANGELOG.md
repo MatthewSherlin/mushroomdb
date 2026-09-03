@@ -41,6 +41,8 @@ The gaps a real integrator hit using the Python binding, closed:
 - **Concurrency documented (docs only; no lock in this release).** One writer process per store;
   a handle sees only the commits made through it; there is no cross-process lock yet, and no
   `reopen()` — close and `open` again to pick up another process's writes.
+- **Fix: MCP `initialize` now returns `serverInfo.version`.** Claude Code rejected the handshake
+  without it, so the server never connected in Claude Code before this release.
 
 ## v0.5.1 — 2026-09-03
 

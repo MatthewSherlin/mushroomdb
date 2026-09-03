@@ -777,7 +777,7 @@ Response:
   "result": {
     "capabilities": {"tools": {}},
     "protocolVersion": "2024-11-05",
-    "serverInfo": {"name": "mushroomdb"}
+    "serverInfo": {"name": "mushroomdb", "version": "0.5.2"}
   }
 }
 ```
