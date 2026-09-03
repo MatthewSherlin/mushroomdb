@@ -550,6 +550,43 @@ fn a_batch_cannot_assemble_a_cycle_one_rule_at_a_time() {
 }
 
 #[test]
+fn a_rule_deleted_within_a_batch_stops_counting_towards_cycles() {
+    // The arc a batch-created rule contributes has to leave with the rule. If it
+    // lingers, the second `first` below — legal on its own, since the rule it
+    // would have cycled with no longer exists — is rejected as a cycle.
+    let dir = tmp("batch-cycle-delete");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("A", "a", vec![("k".into(), Value::Str("x".into()))])
+        .unwrap();
+    db.insert_node("B", "b", vec![("k".into(), Value::Str("x".into()))])
+        .unwrap();
+    let hop = |name: &str, via: &str, writes: &str| RuleDef {
+        name: name.into(),
+        src_label: "A".into(),
+        dst_label: "B".into(),
+        predicate: Predicate::FieldEqual { field: "k".into() },
+        edge_type: writes.into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("B".into()),
+        via_edge: Some(via.into()),
+        via_dir: Some(Direction::Out),
+    };
+    db.batch()
+        .create_rule(hop("first", "X", "Y"))
+        .delete_rule("first")
+        .create_rule(hop("second", "Y", "X"))
+        .commit()
+        .unwrap();
+    assert_eq!(db.rules().len(), 1);
+    assert_eq!(db.rules()[0].name, "second");
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.rules().len(), 1, "and that is what was logged");
+}
+
+#[test]
 fn a_view_over_a_chained_edge_type_updates_exactly_once_per_chained_delta() {
     // `authored` counts KNOWS edges, which only ever change through the chain.
     // If chained deltas were dropped the view would stay at its backfill value;

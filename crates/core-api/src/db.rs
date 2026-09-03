@@ -9317,10 +9317,11 @@ struct Overlay {
     deleted_edges: BTreeSet<(String, String, String)>,
     extra_rules: BTreeSet<String>,
     deleted_rules: BTreeSet<String>,
-    /// `(via_edge, edge_type)` for every via-hop rule accepted earlier in this
-    /// batch. Feeds the rule-chain cycle check, which otherwise sees only the
-    /// rules already committed to the engine.
-    extra_rule_arcs: Vec<(String, String)>,
+    /// `rule name → (via_edge, edge_type)` for every via-hop rule accepted
+    /// earlier in this batch. Feeds the rule-chain cycle check, which otherwise
+    /// sees only the rules already committed to the engine. Keyed by name so a
+    /// later `DeleteRule` in the same batch drops the arc with the rule.
+    extra_rule_arcs: BTreeMap<String, (String, String)>,
 }
 
 /// Read-only view of live db state plus a batch overlay. Shared by single-op
@@ -9652,7 +9653,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
                 .filter(|r| !self.overlay.deleted_rules.contains(&r.name))
                 .filter_map(|r| r.via_edge.clone().map(|v| (v, r.edge_type.clone())))
                 .collect();
-            arcs.extend(self.overlay.extra_rule_arcs.iter().cloned());
+            arcs.extend(self.overlay.extra_rule_arcs.values().cloned());
             arcs.push((via.to_string(), def.edge_type.clone()));
             if let Some(path) = find_cycle_through(&arcs, &def.edge_type, via) {
                 return Err(GraphError::RuleInvalid {
@@ -9737,7 +9738,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         if let Some(via) = def.via_edge.clone() {
             self.overlay
                 .extra_rule_arcs
-                .push((via, def.edge_type.clone()));
+                .insert(def.name.clone(), (via, def.edge_type.clone()));
         }
     }
 
@@ -9791,6 +9792,9 @@ impl<'a, F: Fs> MutPreview<'a, F> {
 
     fn note_delete_rule(&mut self, name: &str) {
         self.overlay.extra_rules.remove(name);
+        // Drop its chain arc too: a rule created and then deleted in the same
+        // batch must not make a later, legal rule look like a cycle.
+        self.overlay.extra_rule_arcs.remove(name);
         self.overlay.deleted_rules.insert(name.to_string());
         // Treat the deleted rule's current provenance as gone so a later
         // delete_edge of those triples is a no-op (matches sequential).

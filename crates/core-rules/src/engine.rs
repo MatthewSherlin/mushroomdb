@@ -1218,6 +1218,7 @@ fn apply_streaming_rebuild_top_k(
     def: &RuleDef,
     k: u64,
     index: &RuleIndex,
+    doomed: Option<u32>,
     prov: &mut ProvSets<'_>,
     g: &mut GraphMut<'_>,
 ) {
@@ -1245,9 +1246,103 @@ fn apply_streaming_rebuild_top_k(
     }
 
     for src in all_srcs {
-        let desired_src = compute_desired(def, index, src, true, g);
+        // A via-hop rule evaluates its predicate between the *via* node and the
+        // dst, so the candidate index cannot express it; see `apply_via_rebuild`.
+        let desired_src = if def.via_edge.is_some() {
+            compute_desired_via(def, ViaAnchor::Src(src), doomed, g)
+        } else {
+            compute_desired(def, index, src, true, g)
+        };
         let top_k = filter_src_top_k(desired_src, k, g.ids);
         apply_per_src_top_k(def, src, top_k, prov, g);
+    }
+}
+
+/// Full recompute of a via-hop rule's edge set, one source at a time.
+///
+/// Via-hop rules are never rebuilt through the candidate index. `compute_desired`
+/// evaluates the rule's predicate between the source and the destination, but a
+/// via-hop rule evaluates it between the *via* node and the destination — so the
+/// index path returns an empty desired set and silently retracts every edge the
+/// rule legitimately owns. This is the via counterpart of
+/// [`apply_streaming_rebuild`] and keeps its all-or-nothing budget contract:
+/// over budget leaves provenance untouched and the tripped latch set.
+///
+/// Retraction is scoped per source rather than through `by_node`, so the result
+/// does not depend on the order sources are visited even when a rule's
+/// `src_label` and `dst_label` are the same.
+fn apply_via_rebuild(
+    def: &RuleDef,
+    doomed: Option<u32>,
+    prov: &mut ProvSets<'_>,
+    tripped: &mut bool,
+    g: &mut GraphMut<'_>,
+) {
+    let budget = edge_budget(def);
+    let et = g.syms.intern(&def.edge_type);
+
+    // Sources: every node this rule currently derives an edge from (its label
+    // may have changed since), plus every live src-label node. BTree order.
+    let mut sources: BTreeSet<u32> = prov
+        .set
+        .iter()
+        .filter(|(t, _, _)| *t == et)
+        .map(|(_, s, _)| *s)
+        .collect();
+    let src_sym = g.syms.get(&def.src_label);
+    for id in 0..g.ids.len() as u32 {
+        if let Some(s) = g.labels.get(id as usize).copied() {
+            if s != u32::MAX && Some(s) == src_sym {
+                sources.insert(id);
+            }
+        }
+    }
+    let sources: Vec<u32> = sources.into_iter().collect();
+
+    // Pass 1: does the whole desired set fit? Rebuild is the only exit from the
+    // tripped latch, and it is all-or-nothing.
+    let mut total: u64 = 0;
+    for &src in &sources {
+        total += compute_desired_via(def, ViaAnchor::Src(src), doomed, g).len() as u64;
+        if total > budget {
+            *tripped = true;
+            return; // provenance untouched; latch stays set
+        }
+    }
+    *tripped = false;
+
+    // Pass 2: per source, retract what it no longer derives, then add what it
+    // does. Pass 1 proved the total fits, so no trip guard is needed here.
+    for src in sources {
+        let desired = compute_desired_via(def, ViaAnchor::Src(src), doomed, g);
+        let current: Vec<Triple> = prov
+            .set
+            .iter()
+            .filter(|&&(t, s, _)| t == et && s == src)
+            .copied()
+            .collect();
+        for triple in current {
+            let (t, s, d) = triple;
+            if !desired.contains_key(&(s, d)) {
+                g.topo.remove_edge(t, s, d);
+                g.edge_props.remove_edge(t, s, d);
+                prov.remove(&def.name, triple, g.ids, g.syms);
+            }
+        }
+        for ((s, d), score) in desired {
+            let triple = (et, s, d);
+            let already = prov.contains(&triple);
+            if !already && g.topo.add_edge(et, s, d) {
+                prov.insert(&def.name, triple, g.ids, g.syms);
+            }
+            // Only weight edges this rule owns; a pre-existing user edge is not
+            // ours to annotate.
+            if already || prov.contains(&triple) {
+                if let Some(p) = &def.weight_prop {
+                    g.edge_props.set(et, s, d, p, Value::Float(score));
+                }
+            }
+        }
     }
 }
 
@@ -3017,7 +3112,14 @@ impl RuleEngine {
         for (rule_name, src) in topk_backfill {
             let def = self.rules[&rule_name].clone();
             let k = def.max_edges.unwrap(); // guarded by filter above
-            let desired_src = compute_desired(&def, &self.indexes[&rule_name], src, true, g);
+                                            // Via-hop rules cannot be evaluated through the candidate index; the
+                                            // index path would return nothing and retract this source's whole
+                                            // set. `self.doomed` keeps the node being deleted out of the result.
+            let desired_src = if def.via_edge.is_some() {
+                compute_desired_via(&def, ViaAnchor::Src(src), self.doomed, g)
+            } else {
+                compute_desired(&def, &self.indexes[&rule_name], src, true, g)
+            };
             let top_k = filter_src_top_k(desired_src, k, g.ids);
             let mut prov = ProvSets {
                 set: self.provenance.entry(rule_name.clone()).or_default(),
@@ -3039,6 +3141,11 @@ impl RuleEngine {
     /// provenance is left completely untouched and `tripped` stays true
     /// (rebuild-is-noop for at/over-cap rules). Always counts as a fire
     /// evaluation per participating node. Returns Err if unknown.
+    ///
+    /// A via-hop rule is never rebuilt through the candidate index — its
+    /// predicate holds between the via node and the destination, which the
+    /// index cannot express — so it goes through [`apply_via_rebuild`] or the
+    /// via arm of [`apply_streaming_rebuild_top_k`] instead.
     pub fn rebuild(&mut self, name: &str, g: &mut GraphMut<'_>) -> Result<(), String> {
         let scope = self.begin_chain();
         let out = self.rebuild_inner(name, g);
@@ -3087,6 +3194,10 @@ impl RuleEngine {
         // Streaming rebuild: branches on max_edges semantics.
         //   None    → global-budget path (may no-op if still over budget)
         //   Some(k) → per-source top-k rebuild (always converges; no tripped latch)
+        // Via-hop rules take the via path in both arms: their predicate is
+        // evaluated between the via node and the dst, which the candidate index
+        // cannot express.
+        let doomed = self.doomed;
         let mut prov = ProvSets {
             set: self.provenance.get_mut(name).unwrap(),
             owned: &mut self.owned,
@@ -3097,10 +3208,14 @@ impl RuleEngine {
             emit: self.emit_deltas,
         };
         if let Some(k) = def.max_edges {
-            apply_streaming_rebuild_top_k(&def, k, &self.indexes[name], &mut prov, g);
+            apply_streaming_rebuild_top_k(&def, k, &self.indexes[name], doomed, &mut prov, g);
         } else {
             let tripped = self.tripped.get_mut(name).unwrap();
-            apply_streaming_rebuild(&def, &self.indexes[name], &mut prov, tripped, g);
+            if def.via_edge.is_some() {
+                apply_via_rebuild(&def, doomed, &mut prov, tripped, g);
+            } else {
+                apply_streaming_rebuild(&def, &self.indexes[name], &mut prov, tripped, g);
+            }
         }
         let fires = self.fires.entry(name.to_string()).or_default();
         bump_fires_for_participants(&def, g, fires);
