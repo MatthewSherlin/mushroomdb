@@ -44,6 +44,10 @@ discriminants unchanged (0–22). `mushroomdb verify` opens a 0.4.4 store unchan
   built by 0.4.x has no `author_counts` yet: it falls back to the old approximation until the next
   touch of each file, and a full re-ingest repairs it at once. The `File.alive` prop, which was
   only ever written as `true`, is gone.
+- **`File.n_commits` is the true total.** It was written as the length of the capped `commits`
+  list, so a file past `--max-commits-per-file` (default 200) reported a history frozen at the cap
+  — contradicting the documented "counts every commit that ever touched the file". It now carries
+  the real count, which is also what `author_counts` sums to.
 
 #### Engine
 

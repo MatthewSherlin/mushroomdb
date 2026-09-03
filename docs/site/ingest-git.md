@@ -33,7 +33,10 @@ file named `HEAD` would otherwise collide with the marker.
 Note that `n_commits` counts every commit that ever touched the file, while
 `commits` holds only the most recent `--max-commits-per-file` shas (default
 200). The cap bounds both node size and the cost of the overlap the
-`co_changed` rule computes.
+`co_changed` rule computes. Past the cap the two disagree on purpose:
+`n_commits` keeps counting and the list stops growing, so a file with 900
+commits reports `n_commits = 900` beside 200 shas. `author_counts` sums to
+`n_commits`, not to the length of the list.
 
 `author_counts` is the per-author commit distribution for that file, stored as
 a list of `"email<TAB>count"` strings in email order. It is what makes

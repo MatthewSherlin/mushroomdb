@@ -254,7 +254,11 @@ fn file_props(st: &FileState, path: &str) -> Vec<(String, Value)> {
             "commits".into(),
             Value::List(commits.iter().map(|s| Value::Str(s.clone())).collect()),
         ),
-        ("n_commits".into(), Value::Int(commits.len() as i64)),
+        // The true total, which past `--max-commits-per-file` is larger than
+        // the `commits` list it is stored beside. It is also what
+        // `author_counts` sums to, so the two props agree at any history
+        // length.
+        ("n_commits".into(), Value::Int(st.n_commits as i64)),
         ("top_author_id".into(), Value::Str(st.top_author())),
         // Written on every touch so the next incremental run can rebuild the
         // distribution instead of crediting the whole history to the incumbent.
@@ -774,6 +778,30 @@ mod tests {
         assert_eq!(st.commits, vec!["sha3", "sha4", "shaX"]);
         assert_eq!(st.n_commits, 6);
         assert_eq!(st.top_author(), "b@x.test");
+
+        // Past the cap the stored `n_commits` is the true total, not the length
+        // of the truncated `commits` list, and `author_counts` sums to the same
+        // number. A file over `--max-commits-per-file` would otherwise report a
+        // history frozen at the cap.
+        let m: BTreeMap<_, _> = file_props(&st, "src/hot.rs").into_iter().collect();
+        assert_eq!(m["n_commits"], Value::Int(6));
+        let Value::List(commits) = &m["commits"] else {
+            panic!("commits must be a list");
+        };
+        assert_eq!(commits.len(), 3, "the list is still capped at 3");
+        assert!(
+            matches!(m["n_commits"], Value::Int(n) if n as usize > commits.len()),
+            "n_commits must exceed the capped list once the cap is passed"
+        );
+        assert_eq!(
+            m["author_counts"],
+            Value::List(vec![
+                Value::Str("a@x.test\t1".into()),
+                Value::Str("b@x.test\t5".into()),
+            ]),
+            "the per-author counts sum to n_commits, not to the capped list"
+        );
+
         let mut tie = FileState::default();
         tie.touch("s", "b@x.test", 10);
         tie.touch("s", "a@x.test", 10);
