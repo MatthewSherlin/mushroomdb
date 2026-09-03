@@ -13,13 +13,23 @@ The graph stays true as data changes: when a property is SET, rules retract stal
 
 ## Bootstrap
 
-If `{{DB_PATH}}` does not exist, seed it first:
+If `{{DB_PATH}}` does not exist, seed it first. Pick the source that matches where you are:
+
+- **Inside a git repository:** graph it — authors, commits and files become nodes; `CO_CHANGED` and `KNOWS` edges are derived by rule.
 
 ```
-{{BIN}} demo {{DB_PATH}}
+'{{BIN}}' ingest-git '{{DB_PATH}}' . --exclude 'node_modules/' --exclude 'target/' --exclude 'vendor/'
 ```
 
-Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If it already exists, the MCP server is connected and ready.
+Re-run the same command any time to sync new commits (it is incremental).
+
+- **No repository:** seed the instant demo graph instead:
+
+```
+'{{BIN}}' demo '{{DB_PATH}}'
+```
+
+Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If `{{DB_PATH}}` already exists, the MCP server is connected and ready.
 
 ## Memory-first behavior
 
@@ -55,7 +65,7 @@ Seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, ~334 edges. If it already ex
 
 - Never invent graph contents. If a tool returns empty, say so.
 - Surface tool errors verbatim — do not guess.
-- This store is local and alpha. Durability requires manual snapshots: `{{BIN}} snapshot {{DB_PATH}} <output-file>`.
+- This store is local and alpha. Durability requires manual snapshots: `'{{BIN}}' snapshot '{{DB_PATH}}' <output-file>`.
 - When showing derived edges, always report which rule produced them — use `explain` or `explain_association` to get the rule name, never assert it from memory.
 - The MCP server has no auth; masks are cooperative. Real ACL = HTTP role tokens.
 

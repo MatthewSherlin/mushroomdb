@@ -529,7 +529,7 @@ fn off_path_install_copies_binary_and_writes_absolute_command() {
     // SKILL.md bootstrap uses the same absolute path so `demo` works too.
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
     assert!(
-        skill.contains(&format!("{} demo {}", copied.display(), db.display())),
+        skill.contains(&format!("'{}' demo '{}'", copied.display(), db.display())),
         "SKILL.md bootstrap does not use the copied binary path"
     );
     assert!(
@@ -601,7 +601,7 @@ fn reinstall_repairs_stale_command_for_same_db() {
     assert_eq!(mcp["mcpServers"]["other"]["command"], "other-tool");
     // Skill bootstrap uses the repaired command too.
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
-    assert!(skill.contains(&format!("{} demo {}", copied.display(), db.display())));
+    assert!(skill.contains(&format!("'{}' demo '{}'", copied.display(), db.display())));
 }
 
 // ---------------------------------------------------------------------------
@@ -721,10 +721,10 @@ fn on_path_install_uses_bare_name_everywhere() {
     install_on_path(&root, &home, &opts).expect("install");
 
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
-    assert!(skill.contains(&format!("mushroomdb demo {}", db.display())));
+    assert!(skill.contains(&format!("'mushroomdb' demo '{}'", db.display())));
     assert!(!skill.contains("{{BIN}}"));
     let rules = read(&root, ".cursor/rules/mushroom.mdc");
-    assert!(rules.contains(&format!("mushroomdb demo {}", db.display())));
+    assert!(rules.contains(&format!("'mushroomdb' demo '{}'", db.display())));
     assert!(!rules.contains("{{BIN}}"));
     assert_absent(&home, ".mushroomdb/bin/mushroomdb");
 }
@@ -1028,6 +1028,10 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
         assert!(
             text.contains("no auth"),
             "{name}: MCP trust model undocumented"
+        );
+        assert!(
+            text.contains("ingest-git"),
+            "{name}: ingest-git bootstrap undocumented"
         );
     }
     assert!(

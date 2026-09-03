@@ -15,17 +15,23 @@ The graph stays true as your data changes: when you SET a property, rules retrac
 
 ## Bootstrap
 
-**First time — `{{DB_PATH}}` does not exist yet:**
+**First time — `{{DB_PATH}}` does not exist yet.** Pick the source that matches where you are:
 
-Run this in a terminal to seed an instant graph you can explore:
+- **Inside a git repository (most common):** graph it. Authors, commits and files become nodes; `CO_CHANGED` and `KNOWS` edges are derived by rule and retract when files move or die.
 
 ```
-{{BIN}} demo {{DB_PATH}}
+'{{BIN}}' ingest-git '{{DB_PATH}}' . --exclude 'node_modules/' --exclude 'target/' --exclude 'vendor/'
 ```
 
-This seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, and 334 edges. It takes a few seconds.
+Re-run the same command any time to sync new commits (it is incremental).
 
-**`{{DB_PATH}}` already exists:** the MCP server connected automatically when Claude Code started. Skip ahead to querying.
+- **No repository:** seed the instant demo graph (10 Orgs, 20 Projects, 30 People, 7 rule sets, 334 edges):
+
+```
+'{{BIN}}' demo '{{DB_PATH}}'
+```
+
+**`{{DB_PATH}}` already exists:** the MCP server connected automatically when Claude Code started. Skip ahead to querying. If a `UserPromptSubmit` hook is installed, related facts are already in your context under "mushroomdb recall".
 
 ---
 
@@ -63,7 +69,7 @@ When asked about the overall state of the graph, run `stats` before drilling int
 
 - **Never invent graph contents.** If `query` returns empty, say so and offer to ingest or upsert.
 - **Surface errors verbatim.** If a tool call fails, show the error message — do not guess what the graph contains.
-- **This store is local and alpha.** No cloud sync. If durability matters, the user should snapshot: `{{BIN}} snapshot {{DB_PATH}} <output-file>`.
+- **This store is local and alpha.** No cloud sync. If durability matters, the user should snapshot: `'{{BIN}}' snapshot '{{DB_PATH}}' <output-file>`.
 - **Attribute derived edges.** When showing rule-fired edges, always note which rule produced them. Use `explain` or `explain_association` to get the rule name. Never assert a rule name from memory.
 - **This MCP server has no auth.** `mushroomdb mcp` is a local stdio process; masks here are cooperative (the caller supplies them). Real access control is the HTTP server's role tokens (`mushroomdb serve --role-token`). Never present an MCP mask as a security boundary.
 
@@ -96,12 +102,12 @@ All 16 tools. Use these names exactly.
 
 ## 60-second demo
 
-Walk through this after `{{BIN}} demo {{DB_PATH}}`. Every command is copy-pasteable; the outputs below are from a real run.
+Walk through this after `'{{BIN}}' demo '{{DB_PATH}}'`. Every command is copy-pasteable; the outputs below are from a real run.
 
 ### Step 1 — Seed (terminal)
 
 ```
-{{BIN}} demo {{DB_PATH}}
+'{{BIN}}' demo '{{DB_PATH}}'
 ```
 
 ```
@@ -191,4 +197,100 @@ At commit 10 (before the SET), the edge existed. The store keeps the full versio
 
 ---
 
-For more: `{{BIN}} --help` · [docs](https://github.com/MatthewSherlin/mushroomdb/tree/main/docs/site)
+## 60-second codebase walkthrough
+
+Walk through this after `'{{BIN}}' ingest-git '{{DB_PATH}}' .`. Every command is copy-pasteable; the outputs below are from a real `ingest-git` run against this repository's own history. Commit numbers grow with the repo's history — the `at_commit` values below matched this specific run; read a node's actual sequence back with `node_history` before reusing them.
+
+### Step 1 — Find the tightest couplings (`query`)
+
+```cypher
+MATCH (f:File)-[r:CO_CHANGED]->(g:File)
+RETURN f.id, g.id, r.score
+ORDER BY r.score DESC LIMIT 5
+```
+
+```
+columns: f.id, g.id, r.score
+  f.id=.dockerignore  g.id=packaging/npm/.gitignore  r.score=1.0
+  f.id=.dockerignore  g.id=packaging/npm/bin/mushroomdb.js  r.score=1.0
+  f.id=.github/ISSUE_TEMPLATE/bug.yml  g.id=.github/ISSUE_TEMPLATE/feature.yml  r.score=1.0
+  f.id=.github/ISSUE_TEMPLATE/feature.yml  g.id=.github/ISSUE_TEMPLATE/bug.yml  r.score=1.0
+  f.id=benchmarks/adapters/__init__.py  g.id=benchmarks/datasets.py  r.score=1.0
+```
+
+### Step 2 — Explain one pair (`explain`)
+
+```json
+{ "a": "benchmarks/adapters/kuzu.py", "b": "benchmarks/adapters/memgraph.py" }
+```
+
+```
+rule=co_changed  type=CO_CHANGED  benchmarks/adapters/kuzu.py→benchmarks/adapters/memgraph.py  weight=1.0
+rule=co_changed  type=CO_CHANGED  benchmarks/adapters/memgraph.py→benchmarks/adapters/kuzu.py  weight=1.0
+```
+
+Both files' commit lists overlap at least 25% (jaccard on `commits`), so `co_changed` links them both ways at weight 1.0 — every commit that touched one touched the other.
+
+### Step 3 — See what an author already knows (`node_edges`)
+
+```json
+{ "key": "71659168+MatthewSherlin@users.noreply.github.com" }
+```
+
+Filtered to `KNOWS` edges: none yet — this author identity isn't `TOP_AUTHOR` on any file, so `knows` has nothing to expand from.
+
+### Step 4 — Reassign a file's ownership (`query` with SET)
+
+```cypher
+MATCH (f:File {id: 'benchmarks/adapters/kuzu.py'})
+SET f.top_author_id = '71659168+MatthewSherlin@users.noreply.github.com'
+RETURN f.id, f.top_author_id
+```
+
+```
+columns: f.id, f.top_author_id
+  f.id=benchmarks/adapters/kuzu.py  f.top_author_id=71659168+MatthewSherlin@users.noreply.github.com
+```
+
+`TOP_AUTHOR` is a direct auto-FK rule on `top_author_id`, so it retracts and refires in the same transaction:
+
+```cypher
+MATCH (f:File {id:'benchmarks/adapters/kuzu.py'})-[:TOP_AUTHOR]->(a:Author) RETURN f.id, a.id
+```
+
+```
+columns: f.id, a.id
+  f.id=benchmarks/adapters/kuzu.py  a.id=71659168+MatthewSherlin@users.noreply.github.com
+```
+
+### Step 5 — `KNOWS` hasn't moved yet (`was_linked`)
+
+```json
+{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 14 }
+```
+
+```json
+{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 14, "linked": false }
+```
+
+`KNOWS` is a two-hop rule (`Author` →`TOP_AUTHOR`→ `File` →overlap→ `File`) — it does not chain off the `TOP_AUTHOR` edge that another rule just wrote in the same transaction. It re-derives the next time a write touches the file directly, which in normal use is the next `ingest-git` sync that records a new commit against it.
+
+### Step 6 — After the next touch, `KNOWS` catches up (`was_linked`)
+
+A real `ingest-git` sync makes this write for you the moment a new commit touches the file. To see it now:
+
+```cypher
+MATCH (f:File {id:'benchmarks/adapters/kuzu.py'})
+SET f.commits = ['c7121a713915489bd214e3dba60cf0c51cb595fb', '44c9987dbbede3d99621ffceb3ec25d1450613d3', '5b1b03c16e4e5b3de4a350fe4d7cbebca0669d0c']
+RETURN f.id
+```
+
+```json
+{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 17, "linked": true }
+```
+
+`node_edges` on that author now lists `benchmarks/adapters/kuzu.py` among the files they `KNOWS`.
+
+---
+
+For more: `'{{BIN}}' --help` · [docs](https://github.com/MatthewSherlin/mushroomdb/tree/main/docs/site)
