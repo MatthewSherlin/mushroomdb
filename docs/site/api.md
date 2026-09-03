@@ -842,19 +842,69 @@ manual `mkdir` is required.
 
 ### Insert nodes
 
-`insert_node(label, key, props)` — same argument order as Rust.
+`insert_node(label, key, props)` — same argument order as Rust. Raises if the
+key is already live.
 
 ```python
 db.insert_node("Person", "alice", {"skills": ["graph", "rust"]})
 db.insert_node("Org", "acme", {"skills": ["graph", "rust", "search"]})
 ```
 
-### Batch ingest
+### Upsert nodes
+
+`upsert_node(label, key, props)` returns `"inserted"` or `"updated"`.
 
 ```python
-rows = [{"id": f"node-{i}", "value": i} for i in range(10000)]
-db.ingest_batch("Person", rows)
+db.upsert_node("Person", "alice", {"team": "red"})   # "inserted"
+db.upsert_node("Person", "alice", {"team": "blue"})  # "updated"
 ```
+
+On update it writes only the fields present in `props` whose value differs from
+the stored one. Fields you do not pass are left untouched, and an unchanged
+field produces no WAL record — so rules do not re-fire needlessly. An existing
+key under a different label raises `ValueError`: relabelling a node is not an
+upsert.
+
+### Set and remove properties
+
+```python
+db.set_prop("alice", "team", "green")
+db.remove_prop("alice", "team")        # True if removed, False if already absent
+db.set_prop("alice", "team", None)     # identical to remove_prop
+```
+
+Python has no distinct "null property" and the store has no null `Value`, so
+`None` means absent. Removing a field a rule watches retracts the edges that
+field derived.
+
+### Delete a node
+
+```python
+report = db.delete_node("alice")
+# {"manual_edges": 1, "derived_edges": 3}
+```
+
+Deletes the node and every incident edge, returning counts of the user-inserted
+and rule-derived edges removed. An unknown or already-deleted key raises
+`RuntimeError` (`KeyNotFound`).
+
+### Batch ingest
+
+`ingest_batch(nodes, edges=None)` commits every node and edge in a single WAL
+frame. Each node is a `{key, label, props}` dict; each edge is a
+`{edge_type, src, dst}` dict.
+
+```python
+nodes = [
+    {"key": f"node-{i}", "label": "Person", "props": {"value": i}}
+    for i in range(10000)
+]
+report = db.ingest_batch(nodes)
+# {"inserted": 10000, "edges_inserted": 0, "row_errors": [], ...}
+```
+
+A bad edge rejects the entire batch. Keep each call to ≤10,000 nodes: one
+giant WAL frame's fsync cost dominates and negates the batching benefit.
 
 ### Create a rule
 
@@ -863,12 +913,41 @@ db.create_rule({
     "name": "skill_fit",
     "src_label": "Person",
     "dst_label": "Org",
-    "predicate": {"Overlap": {"field": "skills", "min": 0.5}},
+    "predicate": {"kind": "overlap", "fields": ["skills"], "min": 0.5},
     "edge_type": "FIT",
     "weight_prop": "score",
     "max_edges": None,
     "approximate": False,
 })
+```
+
+`create_rule` returns `True` when it created the rule. Pass
+`if_not_exists=True` to get `False` instead of an exception when a rule of that
+name is already registered:
+
+```python
+db.create_rule(rule, if_not_exists=True)   # True first time, False after
+```
+
+**Predicate shape.** The canonical form is the snake_case one that `explain`
+emits, so an explanation round-trips straight back into a new rule:
+
+| `kind` | extra keys |
+|---|---|
+| `key_match`, `field_equal` | — |
+| `overlap`, `vector_similar` | `min` |
+| `numeric_within` | `tolerance` |
+| `geo_radius` | `km` |
+| `all`, `any` | `parts` (a list of nested predicates) |
+
+The field name comes from `fields[0]` (a bare `"field"` string is also
+accepted). The Rust-native externally-tagged form still works:
+`{"Overlap": {"field": "skills", "min": 0.5}}`, `{"All": [ … ]}`.
+
+```python
+why = db.explain("alice", "acme")
+clone = {**base_rule, "name": "skill_fit_v2", "predicate": why[0]["predicate"]}
+db.create_rule(clone)
 ```
 
 **`max_edges` semantics:** Python `None` and a missing key both fill the
@@ -913,6 +992,19 @@ string, so string values are safe against injection regardless of content.
 `query_with_params(cypher, params)` is a retained back-compat alias for
 `query(cypher, params=params)`.
 
+`query_write(cypher, params=None)` takes the same three param shapes:
+
+```python
+db.query_write(
+    "MATCH (n:Person) WHERE key(n) = $k SET n.age = 31 RETURN key(n)",
+    {"k": "alice"},
+)
+```
+
+A node's key is not a property, so `n.key` does not resolve. Project or filter
+on it with the `key(n)` scalar function, available in both read queries and
+write-statement `RETURN` projections. See [query.md](query.md).
+
 The dict keys in each row are the **RETURN aliases** from the query — `p`, `o`,
 and `score` in the example above. Bare `RETURN n` yields `{"n": ...}`; `RETURN
 n.age AS age` yields `{"age": ...}`.
@@ -920,10 +1012,13 @@ n.age AS age` yields `{"age": ...}`.
 ### Traversal
 
 ```python
-edges = db.node_edges("alice")   # list of EdgeInfo dicts
-info  = db.node_info("alice")    # {key, label, props}
-neighbors = db.neighbors("alice", depth=1, direction="out")
+edges = db.node_edges("alice")   # [{edge_type, src_key, dst_key, derived}, ...]
+info  = db.node_info("alice")    # {key, label, props}; None for an unknown key
+neighbors = db.neighbors("alice", "KNOWS", "out")   # one hop, list of keys
 ```
+
+`node_info` returns `None` for an unknown key; `node_edges` raises
+`RuntimeError`. The asymmetry mirrors the Rust API (`Option` vs `Result`).
 
 ### Rename a node
 
@@ -948,8 +1043,10 @@ already exists, `edge_inserted` is `False` (idempotent).
 
 ```python
 explanation = db.explain("alice", "acme")
-# list of dicts: rule, edge_type, src, dst, weight
+# [{"rule", "edge_type", "src_key", "dst_key", "weight", "predicate"}, ...]
 ```
+
+`predicate` is the snake_case summary shape that `create_rule` accepts verbatim.
 
 ### Stats
 
@@ -957,6 +1054,34 @@ explanation = db.explain("alice", "acme")
 s = db.stats()
 # {"nodes_live": N, "nodes_tombstoned": 0, "edges": E, "rules": [...]}
 ```
+
+### Concurrency
+
+**One writer process per store.** There is no cross-process lock yet (planned);
+opening the same directory from two processes that both write can corrupt it.
+Keep all writes in a single process.
+
+**A handle sees only the commits made through it.** It does not poll the store,
+so writes another process made after you opened are invisible to your handle.
+There is no `reopen()` — close and open again:
+
+```python
+db.close()
+db = mushroomdb.GraphDb.open("./db")
+```
+
+Within one process the handle is guarded by a mutex, so calls from multiple
+threads are serialized and safe. They are not isolated transactions: readers
+can observe intermediate states while a batch is being applied. See
+[durability.md](durability.md) for the WAL and crash-atomicity guarantees.
+
+### Type stubs
+
+The wheel ships `__init__.pyi` (generated from
+`bindings/python/mushroomdb.pyi`) plus a `py.typed` marker, so mypy and
+Pyright pick up signatures with no extra configuration. Every method also
+carries a docstring and a `__text_signature__`, so `help(mushroomdb.GraphDb)`
+is useful at the REPL.
 
 ### Snapshot
 
