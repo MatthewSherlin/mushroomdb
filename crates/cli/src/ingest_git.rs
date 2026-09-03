@@ -97,25 +97,12 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, CliErr
         .map_err(|e| CliError(format!("cannot run git in {}: {e}", repo.display())))
 }
 
-/// `git log --reverse --name-status -M --format=<RS>%H<US>%an<US>%ae<US>%at<US>%s [range]`
+/// `git log --reverse --name-status -M --format=<RS>%H<US>%an<US>%ae<US>%at<US>%s <range>`
 ///
-/// Returns oldest commit first. An empty repository (no `HEAD`) yields an
-/// empty list rather than an error.
-fn read_log(repo: &Path, since: Option<&str>) -> Result<Vec<GitCommit>, CliError> {
-    if !git_output(repo, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])?
-        .status
-        .success()
-    {
-        // No commits yet (or not a checkout with a HEAD): nothing to ingest.
-        let probe = git_output(repo, &["rev-parse", "--git-dir"])?;
-        if !probe.status.success() {
-            return Err(CliError(format!(
-                "not a git repository: {}",
-                repo.display()
-            )));
-        }
-        return Ok(Vec::new());
-    }
+/// Returns oldest commit first. The walk ends at `head` — never at the symbolic
+/// `HEAD` — so the range is pinned to the same sha the caller will record as the
+/// sync marker. See [`head_sha`] for why that matters.
+fn read_log(repo: &Path, since: Option<&str>, head: &str) -> Result<Vec<GitCommit>, CliError> {
     if let Some(s) = since {
         let spec = format!("{s}^{{commit}}");
         if !git_output(repo, &["cat-file", "-e", &spec])?
@@ -149,9 +136,10 @@ fn read_log(repo: &Path, since: Option<&str>) -> Result<Vec<GitCommit>, CliError
         // to a skipped or shortened message, never a panic or a wrong sha.
         "--format=%x1e%H%x1f%an%x1f%ae%x1f%at%x1f%s",
     ]);
-    if let Some(s) = since {
-        cmd.arg(format!("{s}..HEAD"));
-    }
+    match since {
+        Some(s) => cmd.arg(format!("{s}..{head}")),
+        None => cmd.arg(head),
+    };
     let out = cmd
         .output()
         .map_err(|e| CliError(format!("cannot run git: {e}")))?;
@@ -202,30 +190,43 @@ fn read_log(repo: &Path, since: Option<&str>) -> Result<Vec<GitCommit>, CliError
     Ok(commits)
 }
 
-/// The commit the next incremental run resumes from.
+/// Resolve `HEAD` to a concrete sha. `Ok(None)` means the repository has no
+/// commits yet; a path that is not a repository at all is an error.
 ///
-/// Asked of git directly rather than taken from `log.last()`. In practice the
-/// two agree — a reachability walk always emits its tip first, so reversing it
-/// puts `HEAD` last even across merges with badly skewed commit dates — but
-/// that equality is a property of the traversal and of this module's parser
-/// (a record the parser skips would shift the last entry), not something the
-/// resume marker should depend on. `rev-parse` is exact by construction.
-fn head_sha(repo: &Path) -> Result<String, CliError> {
-    let out = git_output(repo, &["rev-parse", "HEAD"])?;
+/// Called **before** [`read_log`], and the resulting sha is both the end of the
+/// walk and the recorded sync marker. Resolving it afterwards instead would open
+/// a window: a commit landing between the walk and the `rev-parse` would push
+/// the marker past a commit that was never ingested, and every later run would
+/// skip it silently. Pinning both to one sha closes that window — a commit that
+/// lands mid-run is simply outside this range and gets picked up next time.
+///
+/// Asking git also beats taking `log.last()`. The two agree in practice, since a
+/// reachability walk emits its tip first and reversing puts it last, but that is
+/// a property of the traversal and of this module's parser rather than something
+/// the resume marker should rest on.
+fn head_sha(repo: &Path) -> Result<Option<String>, CliError> {
+    let out = git_output(repo, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])?;
     if !out.status.success() {
-        return Err(CliError(format!(
-            "git rev-parse HEAD failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        // No commits yet, or not a repository at all — only the latter is an error.
+        if !git_output(repo, &["rev-parse", "--git-dir"])?
+            .status
+            .success()
+        {
+            return Err(CliError(format!(
+                "not a git repository: {}",
+                repo.display()
+            )));
+        }
+        return Ok(None);
     }
     let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if sha.is_empty() {
         return Err(CliError(format!(
-            "git rev-parse HEAD returned nothing for {}",
+            "git could not resolve HEAD in {}",
             repo.display()
         )));
     }
-    Ok(sha)
+    Ok(Some(sha))
 }
 
 fn file_props(path: &str, commits: &[String], top_author: &str) -> Vec<(String, Value)> {
@@ -365,18 +366,21 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
             })
     };
     let incremental = since.is_some();
-    let log = read_log(&opts.repo, since.as_deref())?;
     let mut report = IngestGitReport {
         incremental,
         ..Default::default()
     };
+    // Pin the end of the walk and the marker to one sha, resolved first. A
+    // commit landing mid-run then falls outside this range instead of being
+    // skipped by a marker that advanced past it.
+    let Some(head) = head_sha(&opts.repo)? else {
+        return Ok(report); // repository has no commits yet
+    };
+    let log = read_log(&opts.repo, since.as_deref(), &head)?;
     if log.is_empty() {
         // Nothing new: leave the store untouched so `commit_seq` does not move.
         return Ok(report);
     }
-    // Resolved before the first write so a git failure cannot leave the store
-    // updated with no matching sync marker.
-    let head = head_sha(&opts.repo)?;
 
     let mut w = db.write();
     let ingest = IngestOptions::default(); // key `id`, auto-FK suffix `_id`

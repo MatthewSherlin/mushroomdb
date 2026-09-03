@@ -106,8 +106,11 @@ A run with no new commits writes nothing at all: `commit_seq` does not move.
 Merge commits appear as `Commit` nodes with no `TOUCHED` edges, since
 `--name-status` reports no changes for them by default.
 
-Each run records `git rev-parse HEAD` as the next resume point, so the range the
-following run asks for is exact. If the recorded head is no longer in the
+Each run resolves `git rev-parse HEAD` before it walks anything, ends the walk at
+that sha rather than at the symbolic `HEAD`, and records the same sha as the next
+resume point. A commit landing while the run is in flight therefore falls outside
+the range and is picked up by the following run, instead of being skipped by a
+marker that had advanced past it. If the recorded head is no longer in the
 repository (history was rewritten, or the database was pointed at a different
 repo), the command fails rather than double-counting; ingest into a fresh
 database directory. A repository with no commits yet reports zeros and writes

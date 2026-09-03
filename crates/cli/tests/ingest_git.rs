@@ -96,6 +96,58 @@ fn seed_repo() -> PathBuf {
     repo
 }
 
+fn rev_parse_head(repo: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn sync_marker(db_dir: &Path) -> String {
+    let db = GraphDb::open(db_dir).unwrap();
+    let sha = db
+        .node_ref("__mushroomdb_git_sync__")
+        .and_then(|n| n.prop("sha"));
+    match sha {
+        Some(core_api::Value::Str(s)) => s,
+        other => panic!("no sync marker sha: {other:?}"),
+    }
+}
+
+/// The marker must equal the head the walk was bounded by, and every commit it
+/// can reach must already be a `Commit` node. A marker that ran ahead of the
+/// walk would silently skip those commits on every later run.
+fn assert_marker_covers_everything_ingested(db_dir: &Path, repo: &Path) {
+    let marker = sync_marker(db_dir);
+    let db = GraphDb::open(db_dir).unwrap();
+    assert_eq!(
+        marker,
+        rev_parse_head(repo),
+        "marker must be the head the walk ended on"
+    );
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-list", &marker])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let listed = String::from_utf8(out.stdout).unwrap();
+    let mut n = 0;
+    for sha in listed.lines() {
+        assert!(
+            db.has_node(sha),
+            "{sha} is reachable from the marker but was never ingested"
+        );
+        n += 1;
+    }
+    assert!(n > 0, "rev-list returned nothing");
+}
+
 fn opts(repo: &Path) -> IngestGitOpts {
     IngestGitOpts {
         repo: repo.to_path_buf(),
@@ -174,6 +226,8 @@ fn rerun_is_incremental_and_delete_retracts_edges() {
             .get(0, "n"),
         Some(&core_api::Value::Int(5))
     );
+    drop(db);
+    assert_marker_covers_everything_ingested(&db_dir, &repo);
 }
 
 #[test]
@@ -539,12 +593,12 @@ fn sync_marker_is_head_across_a_merge_with_skewed_dates() {
     .trim()
     .to_string();
 
-    let db = GraphDb::open(&db_dir).unwrap();
     assert_eq!(
-        db.node_ref("__mushroomdb_git_sync__").unwrap().prop("sha"),
-        Some(core_api::Value::Str(real_head.clone())),
+        sync_marker(&db_dir),
+        real_head,
         "the marker is exactly rev-parse HEAD"
     );
+    let db = GraphDb::open(&db_dir).unwrap();
     assert!(db.has_node("src/side.rs"));
     assert!(
         db.neighbors(&real_head, "TOUCHED", Direction::Out)
