@@ -109,7 +109,9 @@ struct ChainScope {
     cursor: usize,
     /// `emit_deltas` at hook entry, restored on exit.
     prev_emit: bool,
-    /// Whether this hook is the top-level one *and* some rule hops over an
+    /// `chain_scope_open` at hook entry, restored on exit.
+    prev_scope_open: bool,
+    /// Whether this hook is the outermost one *and* some rule hops over an
     /// edge type, i.e. chaining can do anything at all.
     active: bool,
 }
@@ -231,11 +233,16 @@ pub struct RuleEngine {
     /// while [`RuleEngine::chain_from`] re-enters `on_edge_changed`. Non-zero
     /// suppresses re-entrant chaining and enables the fire-once guard.
     chain_depth: usize,
-    /// `(rule id, rule src)` pairs already recomputed during the current
-    /// top-level write. Cleared at the start of every `chain_from`. Each entry
-    /// is a *full* recompute of that src's desired set, so recomputing it a
-    /// second time within one write can only repeat work.
+    /// `(rule ordinal, rule src)` pairs already recomputed during the current
+    /// top-level write, where the ordinal is the rule's position in the
+    /// BTree-ordered rule set. Cleared at the start of every `chain_from`. Each
+    /// entry is a *full* recompute of that src's desired set, so recomputing it
+    /// a second time within one write can only repeat work.
     chain_fired: BTreeSet<(u32, u32)>,
+    /// Whether a [`ChainScope`] is already open further up the stack. One hook
+    /// calling another (`delete_rule` → `rebuild`) must chain once, at the
+    /// outermost exit, not once per frame.
+    chain_scope_open: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,20 +1375,24 @@ impl RuleEngine {
     /// could consume that rule's fresh edges are themselves via-hop rules, and
     /// any such rule would already have made `chaining_possible` true.
     fn begin_chain(&mut self) -> ChainScope {
-        let active = self.chain_depth == 0 && self.chaining_possible();
+        let prev_scope_open = self.chain_scope_open;
+        let active = !prev_scope_open && self.chain_depth == 0 && self.chaining_possible();
         let prev_emit = self.emit_deltas;
         if active {
             self.emit_deltas = true;
         }
+        self.chain_scope_open = true;
         ChainScope {
             cursor: self.pending_deltas.len(),
             prev_emit,
+            prev_scope_open,
             active,
         }
     }
 
-    /// Close a chaining scope: run the chain, then restore `emit_deltas`.
+    /// Close a chaining scope: run the chain, then restore what was saved.
     fn end_chain(&mut self, scope: ChainScope, g: &mut GraphMut<'_>) {
+        self.chain_scope_open = scope.prev_scope_open;
         if scope.active {
             self.chain_from(scope.cursor, g);
         }
@@ -1615,6 +1626,7 @@ impl RuleEngine {
             lazy_hnsw: OnceLock::new(),
             chain_depth: 0,
             chain_fired: BTreeSet::new(),
+            chain_scope_open: false,
         }
     }
 
@@ -2286,6 +2298,10 @@ impl RuleEngine {
         if !self.rules.contains_key(name) {
             return Err(format!("rule {:?} not found", name));
         }
+        // Retracting a rule's edges chains: a via-hop rule that hopped over them
+        // loses its own derived edges in the same commit. The scope spans the
+        // survivor rebuilds below too, so the chain runs once at the end.
+        let scope = self.begin_chain();
         let def = self.rules.remove(name).unwrap();
         self.indexes.remove(name);
         self.tripped.remove(name);
@@ -2324,6 +2340,7 @@ impl RuleEngine {
             // rebuild returns Err only for unknown rules; survivor is live.
             let _ = self.rebuild(&survivor, g);
         }
+        self.end_chain(scope, g);
         Ok(())
     }
 
@@ -2942,6 +2959,8 @@ impl RuleEngine {
         if !self.rules.contains_key(name) {
             return Err(format!("rule {:?} not found", name));
         }
+        // No-op when a caller (`delete_rule`) already holds a scope.
+        let scope = self.begin_chain();
         self.rebuild_needed.remove(name);
         let def = self.rules[name].clone();
 
@@ -2994,6 +3013,7 @@ impl RuleEngine {
         let fires = self.fires.entry(name.to_string()).or_default();
         bump_fires_for_participants(&def, g, fires);
 
+        self.end_chain(scope, g);
         Ok(())
     }
 

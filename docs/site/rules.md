@@ -292,7 +292,8 @@ one write cascades: setting `File.top_author_id` refires the FK rule that
 owns `TOP_AUTHOR`, and the new `TOP_AUTHOR` edge immediately refires every
 via-hop rule that hops over `TOP_AUTHOR` — `KNOWS`, say. All of it lands in
 the same commit. Retraction chains the same way: an edge that disappears
-takes the edges derived from it with it.
+takes the edges derived from it with it — including when the edge disappears
+because you deleted the rule that owned it, or removed one of its endpoints.
 
 The rules of the cascade:
 

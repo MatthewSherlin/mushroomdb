@@ -314,6 +314,27 @@ fn depth_cap_terminates_long_chains() {
 }
 
 #[test]
+fn deleting_the_upstream_rule_retracts_downstream_edges() {
+    // Deleting `top_author` retracts every TOP_AUTHOR edge; `knows` hops over
+    // exactly those, so it loses its edges in the same write rather than
+    // keeping a set derived from a hop that no longer exists.
+    let dir = tmp("delete-upstream");
+    let mut db = GraphDb::open(&dir).unwrap();
+    seed(&mut db);
+    assert_eq!(knows(&db, "alice"), vec!["api", "model"]);
+    db.delete_rule("top_author").unwrap();
+    assert!(db
+        .neighbors("api", "TOP_AUTHOR", Direction::Out)
+        .unwrap()
+        .is_empty());
+    assert_eq!(knows(&db, "alice"), Vec::<String>::new());
+    // And the retraction is durable, not just a live-memory effect.
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(knows(&db, "alice"), Vec::<String>::new());
+}
+
+#[test]
 fn one_level_rules_are_unchanged() {
     // The existing rules suite is the regression oracle; this pins that a plain
     // rule set produces no chained fires.
