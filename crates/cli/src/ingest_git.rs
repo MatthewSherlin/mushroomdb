@@ -9,7 +9,7 @@
 //! |---|---|---|
 //! | `Author` | email | `name` |
 //! | `Commit` | full sha | `message`, `ts`, `author_id` |
-//! | `File` | path | `path`, `dir`, `ext`, `commits`, `n_commits`, `top_author_id`, `alive` |
+//! | `File` | path | `path`, `dir`, `ext`, `commits`, `n_commits`, `top_author_id`, `author_counts` |
 //! | `GitSync` | `"__mushroomdb_git_sync__"` | `sha` |
 //!
 //! Edges: user `TOUCHED` Commit→File, auto-FK `AUTHOR` Commit→Author and
@@ -229,7 +229,12 @@ fn head_sha(repo: &Path) -> Result<Option<String>, CliError> {
     Ok(Some(sha))
 }
 
-fn file_props(path: &str, commits: &[String], top_author: &str) -> Vec<(String, Value)> {
+/// Separator inside an `author_counts` entry. An email address cannot contain a
+/// tab, so `email\tcount` round-trips unambiguously.
+const AUTHOR_COUNT_SEP: char = '\t';
+
+fn file_props(st: &FileState, path: &str) -> Vec<(String, Value)> {
+    let commits = &st.commits;
     let dir = path
         .rsplit_once('/')
         .map(|(d, _)| d)
@@ -250,8 +255,10 @@ fn file_props(path: &str, commits: &[String], top_author: &str) -> Vec<(String, 
             Value::List(commits.iter().map(|s| Value::Str(s.clone())).collect()),
         ),
         ("n_commits".into(), Value::Int(commits.len() as i64)),
-        ("top_author_id".into(), Value::Str(top_author.into())),
-        ("alive".into(), Value::Bool(true)),
+        ("top_author_id".into(), Value::Str(st.top_author())),
+        // Written on every touch so the next incremental run can rebuild the
+        // distribution instead of crediting the whole history to the incumbent.
+        ("author_counts".into(), st.author_counts_value()),
     ]
 }
 
@@ -282,11 +289,42 @@ impl FileState {
             .map(|(a, _)| a.clone())
             .unwrap_or_default()
     }
+
+    /// The per-author distribution as a `File.author_counts` prop: a list of
+    /// `"email\tcount"` strings in email order.
+    ///
+    /// This is the state an incremental run needs and cannot recompute — the
+    /// walk only sees the new window, and `top_author_id` alone cannot say how
+    /// far ahead the incumbent is. Without it a challenger's commits reset on
+    /// every sync and ownership can never change.
+    fn author_counts_value(&self) -> Value {
+        Value::List(
+            self.by_author
+                .iter()
+                .map(|(email, n)| Value::Str(format!("{email}{AUTHOR_COUNT_SEP}{n}")))
+                .collect(),
+        )
+    }
+
+    /// Inverse of [`FileState::author_counts_value`]. Entries that are not
+    /// `email<TAB>count` are skipped rather than failing the run.
+    fn set_author_counts(&mut self, list: &[Value]) {
+        for v in list {
+            let Value::Str(s) = v else { continue };
+            let Some((email, n)) = s.rsplit_once(AUTHOR_COUNT_SEP) else {
+                continue;
+            };
+            let Ok(n) = n.parse::<usize>() else { continue };
+            if !email.is_empty() {
+                *self.by_author.entry(email.to_string()).or_default() += n;
+            }
+        }
+    }
 }
 
 /// Cypher behind [`file_state_from`] — every live `File` node's cumulative state.
 const FILE_STATE_QUERY: &str = "MATCH (f:File) RETURN f.id AS id, f.commits AS commits, \
-     f.n_commits AS n, f.top_author_id AS top";
+     f.n_commits AS n, f.top_author_id AS top, f.author_counts AS author_counts";
 
 /// Rebuild the in-memory per-file state from the `File` nodes already in the
 /// graph so incremental runs keep `commits` and ownership counts cumulative.
@@ -310,8 +348,18 @@ fn file_state_from(rs: &ResultSet) -> BTreeMap<String, FileState> {
         if let Some(Value::Int(n)) = rs.get(i, "n") {
             st.n_commits = *n as usize;
         }
-        if let Some(Value::Str(t)) = rs.get(i, "top") {
-            st.by_author.insert(t.clone(), st.n_commits.max(1));
+        match rs.get(i, "author_counts") {
+            Some(Value::List(l)) => st.set_author_counts(l),
+            // A node written before `author_counts` existed (a store built by
+            // 0.4.x). Fall back to the old approximation — the whole prior
+            // history credited to the incumbent — so those stores keep
+            // working. The prop is written on the next touch, from which point
+            // ownership tracks reality; a full re-ingest repairs it at once.
+            _ => {
+                if let Some(Value::Str(t)) = rs.get(i, "top") {
+                    st.by_author.insert(t.clone(), st.n_commits.max(1));
+                }
+            }
         }
         files.insert(id, st);
     }
@@ -515,7 +563,7 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
         if incremental && !walk.dirty.contains(path) {
             continue;
         }
-        let props = file_props(path, &st.commits, &st.top_author());
+        let props = file_props(st, path);
         if w.has_node(path) {
             for (k, v) in props {
                 w.set_prop(path, &k, v)?;
@@ -653,16 +701,67 @@ mod tests {
 
     #[test]
     fn file_props_split_dir_and_ext() {
-        let p = file_props("src/a/b.rs", &["sha1".into()], "a@x.test");
-        let m: BTreeMap<_, _> = p.into_iter().collect();
+        let mut st = FileState::default();
+        st.touch("sha1", "a@x.test", 200);
+        let m: BTreeMap<_, _> = file_props(&st, "src/a/b.rs").into_iter().collect();
         assert_eq!(m["dir"], Value::Str("src/a".into()));
         assert_eq!(m["ext"], Value::Str("rs".into()));
         assert_eq!(m["n_commits"], Value::Int(1));
         assert_eq!(m["id"], Value::Str("src/a/b.rs".into()));
-        let top = file_props("README", &[], "a@x.test");
-        let m: BTreeMap<_, _> = top.into_iter().collect();
+        assert_eq!(m["top_author_id"], Value::Str("a@x.test".into()));
+        assert_eq!(
+            m["author_counts"],
+            Value::List(vec![Value::Str("a@x.test\t1".into())])
+        );
+        let m: BTreeMap<_, _> = file_props(&FileState::default(), "README")
+            .into_iter()
+            .collect();
         assert_eq!(m["dir"], Value::Str(String::new()));
         assert_eq!(m["ext"], Value::Str(String::new()));
+    }
+
+    /// The prop is the whole point of the incremental fix: it must survive a
+    /// round trip so the next run resumes the real distribution, not the
+    /// incumbent's total.
+    #[test]
+    fn author_counts_round_trip_preserves_the_distribution() {
+        let mut st = FileState::default();
+        for _ in 0..3 {
+            st.touch("s", "alice@x.test", 200);
+        }
+        for _ in 0..4 {
+            st.touch("s", "bob@x.test", 200);
+        }
+        let Value::List(encoded) = st.author_counts_value() else {
+            panic!("author_counts must be a list");
+        };
+        assert_eq!(
+            encoded,
+            vec![
+                Value::Str("alice@x.test\t3".into()),
+                Value::Str("bob@x.test\t4".into()),
+            ],
+            "email order, so the prop is stable across runs"
+        );
+        let mut reloaded = FileState::default();
+        reloaded.set_author_counts(&encoded);
+        assert_eq!(reloaded.by_author, st.by_author);
+        assert_eq!(reloaded.top_author(), "bob@x.test");
+    }
+
+    /// Malformed entries are skipped, not fatal: the run degrades to the counts
+    /// it can read rather than refusing to sync.
+    #[test]
+    fn author_counts_skips_entries_it_cannot_parse() {
+        let mut st = FileState::default();
+        st.set_author_counts(&[
+            Value::Str("alice@x.test\t2".into()),
+            Value::Str("no-tab-here".into()),
+            Value::Str("bob@x.test\tnotanumber".into()),
+            Value::Str("\t5".into()),
+            Value::Int(7),
+        ]);
+        assert_eq!(st.by_author, BTreeMap::from([("alice@x.test".into(), 2)]));
     }
 
     #[test]

@@ -1604,7 +1604,8 @@ impl RuleEngine {
     /// pending, since this engine was constructed. A non-zero value means some
     /// derived edges beyond the cap are stale: the store is not a fixpoint of
     /// its own rule set, and no single later write will repair it. Not
-    /// persisted, so it resets on reopen.
+    /// persisted; replay re-runs the same hooks, so the value is re-derived
+    /// identically on reopen.
     pub fn chain_truncations(&self) -> u64 {
         self.chain_truncations
     }

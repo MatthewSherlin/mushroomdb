@@ -737,6 +737,7 @@ pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
         db_dir,
         core_api::OpenOptions {
             auto_migrate: false,
+            ..Default::default()
         },
     )?;
     db.snapshot()?;

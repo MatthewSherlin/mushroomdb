@@ -12,10 +12,12 @@ discriminants unchanged (0–22). `mushroomdb verify` opens a 0.4.4 store unchan
 - **`mushroomdb recall <db>` and a UserPromptSubmit hook.** `install` now writes a Claude Code
   `hooks.UserPromptSubmit` entry (5 s timeout) that runs `recall`, which reads the prompt payload,
   runs a text-only search over every full-text-indexed field, and prints a short digest of related
-  nodes and their strongest edges before the assistant answers. Opens the store read-only
-  (`auto_migrate: false`), never blocks a prompt (empty output, exit 0 on any error), shell-quotes
-  paths, and `uninstall` removes exactly the entry it added. Cursor gets no hook (its contract is
-  undocumented); the rules file remains the mechanism there.
+  nodes and their strongest edges before the assistant answers. Opens the store without migration
+  or WAL repair (`auto_migrate: false`, `repair_wal: false`), so a hook that fires on every prompt
+  writes nothing to it; the digest opens with a line framing its content as untrusted graph data
+  and strips control characters from every rendered value. Never blocks a prompt (empty output,
+  exit 0 on any error), shell-quotes paths, and `uninstall` removes exactly the entry it added.
+  Cursor gets no hook (its contract is undocumented); the rules file remains the mechanism there.
 - **The skill tells the truth.** `mask` is documented as the allow-list it is (the 0.4.x skill said
   the opposite); `ingest_json.edges`, `create_rule.max_edges`, `find_similar.mask/limit`, and the
   `hybrid_search` `label` caveat are documented; the MCP server's no-auth trust model is stated.
@@ -33,6 +35,15 @@ discriminants unchanged (0–22). `mushroomdb verify` opens a 0.4.4 store unchan
   are stored unescaped (`core.quotePath=false`). README first screen and
   `docs/assets/ingest-git-cascade.gif` (tape: `scripts/ingest-git-cascade.tape`) show it on this
   repository.
+- **Ownership tracks reality across syncs.** Each `File` node carries an additive `author_counts`
+  prop (a list of `"email<TAB>count"` strings) holding the per-author commit distribution, so an
+  incremental run resumes the real counts instead of crediting the whole prior history to the
+  current `top_author_id`. Without it a second author's commits reset on every sync and ownership
+  could never change hands; `TOP_AUTHOR` and the `KNOWS` edges that hop over it went stale
+  silently. An incremental sync and a full re-ingest of the same repository now agree. A store
+  built by 0.4.x has no `author_counts` yet: it falls back to the old approximation until the next
+  touch of each file, and a full re-ingest repairs it at once. The `File.alive` prop, which was
+  only ever written as `true`, is gone.
 
 #### Engine
 

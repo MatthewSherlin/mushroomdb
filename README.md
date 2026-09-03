@@ -528,6 +528,12 @@ coordination with a running `mushroomdb serve` process's locking. Do not run
 them against a store a live `serve` process holds — write through the HTTP
 API instead. This is the same hazard the `backup` row above warns about.
 
+The `recall` hook `install` writes is the same hazard unattended: the hook
+opens the store on every prompt. It opens without migration or WAL repair
+(`auto_migrate: false`, `repair_wal: false`) so it writes nothing, but it has
+no coordination with a live `serve` either. Do not point the hook at a store a
+live `serve` process holds.
+
 Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 
 ---

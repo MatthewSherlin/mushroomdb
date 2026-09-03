@@ -320,10 +320,18 @@ fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result
             .unwrap_or(true)
     });
 
+    let before = root.clone();
     if groups.is_empty() {
         root["hooks"].as_object_mut().unwrap().remove(event);
     } else {
         root["hooks"][event] = serde_json::Value::Array(groups);
+    }
+    if root == before {
+        // The event array held none of our commands, so there is nothing to
+        // remove. Writing anyway would re-serialize a file we do not own —
+        // `serde_json` is built without `preserve_order`, so the user's key
+        // order and indentation would be rewritten for no reason.
+        return Ok(());
     }
 
     let json = serde_json::to_string_pretty(&root)

@@ -201,6 +201,8 @@ At commit 10 (before the SET), the edge existed. The store keeps the full versio
 
 Walk through this after `'{{BIN}}' ingest-git '{{DB_PATH}}' .`. Every command is copy-pasteable; the outputs below are from a real `ingest-git` run against this repository's own history. Commit numbers grow with the repo's history — the `at_commit` values below matched this specific run; read a node's actual sequence back with `node_history` before reusing them.
 
+One substitution: `Author` keys are commit email addresses, and the author below is shown by display name (`Matthew Sherlin`) rather than the address the run actually used. Take a real key from your own graph with `MATCH (a:Author) RETURN a.id LIMIT 5` before running Steps 3 to 5.
+
 ### Step 1 — Find the tightest couplings (`query`)
 
 ```cypher
@@ -234,7 +236,7 @@ Both files' commit lists overlap at least 25% (jaccard on `commits`), so `co_cha
 ### Step 3 — See what an author already knows (`node_edges`)
 
 ```json
-{ "key": "71659168+MatthewSherlin@users.noreply.github.com" }
+{ "key": "Matthew Sherlin" }
 ```
 
 Filtered to `KNOWS` edges: none yet — this author identity isn't `TOP_AUTHOR` on any file, so `knows` has nothing to expand from.
@@ -243,13 +245,13 @@ Filtered to `KNOWS` edges: none yet — this author identity isn't `TOP_AUTHOR` 
 
 ```cypher
 MATCH (f:File {id: 'benchmarks/adapters/kuzu.py'})
-SET f.top_author_id = '71659168+MatthewSherlin@users.noreply.github.com'
+SET f.top_author_id = 'Matthew Sherlin'
 RETURN f.id, f.top_author_id
 ```
 
 ```
 columns: f.id, f.top_author_id
-  f.id=benchmarks/adapters/kuzu.py  f.top_author_id=71659168+MatthewSherlin@users.noreply.github.com
+  f.id=benchmarks/adapters/kuzu.py  f.top_author_id=Matthew Sherlin
 ```
 
 `TOP_AUTHOR` is a direct auto-FK rule on `top_author_id`, so it retracts and refires in the same transaction:
@@ -260,25 +262,25 @@ MATCH (f:File {id:'benchmarks/adapters/kuzu.py'})-[:TOP_AUTHOR]->(a:Author) RETU
 
 ```
 columns: f.id, a.id
-  f.id=benchmarks/adapters/kuzu.py  a.id=71659168+MatthewSherlin@users.noreply.github.com
+  f.id=benchmarks/adapters/kuzu.py  a.id=Matthew Sherlin
 ```
 
 ### Step 5 — `KNOWS` moved with it, in the same write (`was_linked`)
 
 ```json
-{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 14 }
+{ "a": "Matthew Sherlin", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 14 }
 ```
 
 ```json
-{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 14, "linked": false }
+{ "a": "Matthew Sherlin", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 14, "linked": false }
 ```
 
 ```json
-{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 15 }
+{ "a": "Matthew Sherlin", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 15 }
 ```
 
 ```json
-{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 15, "linked": true }
+{ "a": "Matthew Sherlin", "b": "benchmarks/adapters/kuzu.py", "edge_type": "KNOWS", "at_commit": 15, "linked": true }
 ```
 
 `KNOWS` is a two-hop rule (`Author` →`TOP_AUTHOR`→ `File` →overlap→ `File`), and rules chain: the `TOP_AUTHOR` edge the FK rule wrote in Step 4 immediately fed `knows`, with no second write. Commit 14 is the `SET` itself; every derived-edge change it caused is recorded one marker commit later, which is why 15 is the first sequence that shows the new link. `TOP_AUTHOR` reads the same way — `false` at 14, `true` at 15.
@@ -286,7 +288,7 @@ columns: f.id, a.id
 ### Step 6 — Ask which hop earned the link (`explain`)
 
 ```json
-{ "a": "71659168+MatthewSherlin@users.noreply.github.com", "b": "benchmarks/adapters/kuzu.py" }
+{ "a": "Matthew Sherlin", "b": "benchmarks/adapters/kuzu.py" }
 ```
 
 ```json

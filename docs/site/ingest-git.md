@@ -23,7 +23,7 @@ ingest-git: 1204 commit(s), 318 file(s), 7 author(s)
 |---|---|---|
 | `Author` | email | `name` |
 | `Commit` | full sha | `message` (subject line), `ts` (unix seconds), `author_id` |
-| `File` | path | `path`, `dir`, `ext`, `commits` (list of shas, newest last, capped), `n_commits`, `top_author_id`, `alive` |
+| `File` | path | `path`, `dir`, `ext`, `commits` (list of shas, newest last, capped), `n_commits`, `top_author_id`, `author_counts` |
 | `GitSync` | `"__mushroomdb_git_sync__"` | `sha` — the last ingested commit, the marker the next run resumes from |
 
 The sync marker's key is deliberately not `HEAD`. Node keys are one namespace
@@ -34,6 +34,13 @@ Note that `n_commits` counts every commit that ever touched the file, while
 `commits` holds only the most recent `--max-commits-per-file` shas (default
 200). The cap bounds both node size and the cost of the overlap the
 `co_changed` rule computes.
+
+`author_counts` is the per-author commit distribution for that file, stored as
+a list of `"email<TAB>count"` strings in email order. It is what makes
+`top_author_id` correct across incremental runs: the walk only sees the new
+window, so without the stored counts a second author's commits would restart
+from zero on every sync and ownership could never change hands. Read it if you
+want the full distribution; `top_author_id` is its argmax.
 
 ## Edges
 
@@ -89,8 +96,11 @@ The first run has no `GitSync` node, so it reads the whole history and creates
 the rules. Every later run reads the `sha` off the `GitSync` node and asks git
 only for `<sha>..HEAD`, then applies the changes in order:
 
-- **Added / modified** — the file's `commits` list, `n_commits`, and
-  `top_author_id` are updated, which re-derives its `CO_CHANGED` edges.
+- **Added / modified** — the file's `commits` list, `n_commits`,
+  `author_counts`, and `top_author_id` are updated, which re-derives its
+  `CO_CHANGED` edges. Because the counts are cumulative and persisted,
+  ownership moves the moment a second author passes the incumbent, and the
+  answer matches a full re-ingest of the same repository.
 - **Deleted** — the `File` node is deleted, so every edge touching it retracts.
   Its commits stay in the graph; only the file node goes.
 - **Renamed** (git's `-M` detection) — the node is renamed, keeping its history,
@@ -132,6 +142,13 @@ directly on disk; the CLI process has no coordination with the server's
 locking, so concurrent writers can corrupt the WAL. For a live-served store,
 write through the HTTP API instead. This mirrors the existing warning on
 `mushroomdb backup` (`mushroomdb --help`).
+
+The recall hook is the same hazard with a different shape: it opens the store
+on every prompt, unattended. It opens without migration or WAL repair
+(`auto_migrate: false`, `repair_wal: false`) so it writes nothing, but it still
+has no coordination with a live `serve`, and a read taken mid-append sees
+whatever prefix was durable at that instant. Do not point the hook at a store a
+live `serve` process holds.
 
 ## What the recall hook sees
 

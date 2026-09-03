@@ -1043,3 +1043,32 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
         "SKILL.md: polymorphic FK pattern undocumented"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test: uninstall against a settings.json whose UserPromptSubmit holds only a
+//       user's own hook has nothing to remove, so it must not rewrite the file
+// ---------------------------------------------------------------------------
+
+#[test]
+fn uninstall_does_not_reformat_settings_it_removes_nothing_from() {
+    let root = temp_dir("no-op-uninstall");
+    let home = temp_dir("no-op-uninstall-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    install_on_path(&root, &home, &opts).expect("install");
+
+    // Hand-edit: our entry is gone, the user's own hook remains, and the file
+    // is laid out the way a person maintains it (4-space indent, own key order).
+    let settings_path = root.join(".claude/settings.json");
+    let user_owned = "{\n    \"hooks\": {\n        \"UserPromptSubmit\": [\n            {\n                \"hooks\": [\n                    {\"type\": \"command\", \"command\": \"echo hi\"}\n                ]\n            }\n        ]\n    },\n    \"env\": {\"FOO\": \"bar\"}\n}\n";
+    fs::write(&settings_path, user_owned).unwrap();
+
+    run_uninstall(&root, &home, &opts).expect("uninstall");
+
+    assert_eq!(
+        read(&root, ".claude/settings.json"),
+        user_owned,
+        "nothing of ours was in the file, so it must be byte-identical"
+    );
+}

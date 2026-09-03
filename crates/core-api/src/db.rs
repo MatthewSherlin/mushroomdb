@@ -1246,11 +1246,25 @@ pub struct OpenOptions {
     /// Set to `false` to open a store without touching any on-disk files
     /// (useful for read-only inspection of a store at an older format).
     pub auto_migrate: bool,
+
+    /// Write the valid WAL prefix back over a torn tail on open (default
+    /// `true`). Truncating a genuinely torn tail is correct crash recovery.
+    ///
+    /// Set to `false` for an unattended reader. The valid prefix is still
+    /// decoded and replayed in memory, but nothing is written: the store has
+    /// no cross-process lock, so a reader that opens while another process is
+    /// mid-append would otherwise discard a frame that writer believes
+    /// durable. `mushroomdb recall`, which runs on every prompt, passes
+    /// `false` for exactly this reason.
+    pub repair_wal: bool,
 }
 
 impl Default for OpenOptions {
     fn default() -> Self {
-        Self { auto_migrate: true }
+        Self {
+            auto_migrate: true,
+            repair_wal: true,
+        }
     }
 }
 
@@ -1387,12 +1401,16 @@ impl GraphDb<RealFs> {
     /// deletes any leftover `.bak` file.
     ///
     /// WAL-only stores (no snapshot) are never auto-migrated on open.
+    ///
+    /// `opts.repair_wal` controls the other write this function can make; see
+    /// [`OpenOptions::repair_wal`]. With both flags `false` the open touches
+    /// no file on disk.
     pub fn open_with_options(dir: &std::path::Path, opts: OpenOptions) -> Result<Self> {
         // Header-only peek — 6 bytes, no full decode.
         let snap_version = snapshot_version_at(dir)?;
 
         // Full load: decode snapshot + replay WAL + rebuild indexes.
-        let mut db = Self::open_with(RealFs::new(dir)?)?;
+        let mut db = Self::open_with_repair(RealFs::new(dir)?, opts.repair_wal)?;
 
         if opts.auto_migrate {
             match snap_version {
@@ -1493,7 +1511,15 @@ impl GraphDb<RealFs> {
 }
 
 impl<F: Fs> GraphDb<F> {
+    /// Open over an arbitrary [`Fs`], repairing a torn WAL tail as usual.
     pub fn open_with(fs: F) -> Result<Self> {
+        Self::open_with_repair(fs, true)
+    }
+
+    /// As [`GraphDb::open_with`], but `repair_wal: false` decodes the valid WAL
+    /// prefix without writing the truncation back. See
+    /// [`OpenOptions::repair_wal`].
+    pub fn open_with_repair(fs: F, repair_wal: bool) -> Result<Self> {
         let mut db = Self {
             fs,
             ids: IdMap::new(),
@@ -1609,7 +1635,10 @@ impl<F: Fs> GraphDb<F> {
         }
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
-        if valid_len < bytes.len() {
+        // The valid prefix is replayed either way; `repair_wal` only decides
+        // whether the truncation is written back. A reader that races a live
+        // appender must not persist a truncation the writer never asked for.
+        if valid_len < bytes.len() && repair_wal {
             db.fs.write_atomic(FileId::Wal, &bytes[..valid_len])?;
         }
         // WAL-present path: build indexes eagerly BEFORE replay so that the

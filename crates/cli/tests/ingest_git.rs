@@ -697,3 +697,79 @@ fn missing_sync_head_errors_without_writing() {
         "a failed run writes nothing"
     );
 }
+
+/// Ownership must be able to change across incremental runs. Per-author counts
+/// are persisted on the `File` node, so a challenger's commits accumulate over
+/// separate syncs instead of being credited to the incumbent on every reload.
+///
+/// alice opens the file with 3 commits, then bob adds 4 — one per incremental
+/// run. Bob leads 4-3 and must own the file, and a full ingest of the same
+/// repository into a fresh store must agree.
+#[test]
+fn ownership_flips_across_incremental_runs() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    for i in 0..3 {
+        commit(
+            &repo,
+            "alice",
+            &format!("alice {i}"),
+            &[("src/api.rs", &format!("a{i}"))],
+        );
+    }
+    let db_dir = tmp("db");
+    let first = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert!(!first.incremental);
+    assert_eq!(
+        GraphDb::open(&db_dir)
+            .unwrap()
+            .node_ref("src/api.rs")
+            .unwrap()
+            .prop("top_author_id"),
+        Some(core_api::Value::Str("alice@x.test".to_string())),
+        "alice owns the file after her three commits"
+    );
+
+    // Four separate incremental syncs, one bob commit each.
+    for i in 0..4 {
+        commit(
+            &repo,
+            "bob",
+            &format!("bob {i}"),
+            &[("src/api.rs", &format!("b{i}"))],
+        );
+        let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+        assert!(r.incremental, "run {i} should be incremental");
+    }
+
+    let incremental_top = GraphDb::open(&db_dir)
+        .unwrap()
+        .node_ref("src/api.rs")
+        .unwrap()
+        .prop("top_author_id");
+    assert_eq!(
+        incremental_top,
+        Some(core_api::Value::Str("bob@x.test".to_string())),
+        "bob has 4 commits to alice's 3, so ownership must move to bob"
+    );
+
+    // A fresh full ingest of the same repository is the oracle.
+    let full_dir = tmp("db-full");
+    run_ingest_git(&full_dir, &opts(&repo)).unwrap();
+    let full_db = GraphDb::open(&full_dir).unwrap();
+    let full_node = full_db.node_ref("src/api.rs").unwrap();
+    assert_eq!(
+        incremental_top,
+        full_node.prop("top_author_id"),
+        "incremental sync must agree with a full ingest of the same repo"
+    );
+    assert_eq!(full_node.prop("n_commits"), Some(core_api::Value::Int(7)));
+
+    // TOP_AUTHOR is an auto-FK on top_author_id, so the edge must follow.
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert_eq!(
+        db.neighbors("src/api.rs", "TOP_AUTHOR", Direction::Out)
+            .unwrap(),
+        vec!["bob@x.test".to_string()],
+    );
+}
