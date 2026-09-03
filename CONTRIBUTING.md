@@ -54,6 +54,12 @@ python -m venv .venv
 .venv/bin/pytest
 ```
 
+### TypeScript client gate (commits touching `clients/typescript/`)
+
+```text
+cd clients/typescript && npm ci && npm run typecheck && npm test
+```
+
 ### Embed gate (commits touching the `embed-ui` feature)
 
 ```text
@@ -61,6 +67,106 @@ cd ui && npm ci && npm run build && cd ..
 cargo test -p mushroomdb-server --features embed-ui
 cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
 ```
+
+### How to run the suite
+
+`cargo test --workspace` is the whole Rust suite, including the deterministic
+simulation tests and the oracle equivalence property tests. It takes a few
+minutes on a laptop. To iterate on one area, scope it: `cargo test -p
+mushroomdb-cli`, `cargo test -p mushroomdb-server`, or a single test by name
+(`cargo test --workspace edge_history`). Run the full gate before you push —
+CI mirrors it exactly.
+
+---
+
+## Distribution and packaging
+
+The user-facing install paths live in `README.md`. The paths below are for
+contributors building or publishing the artifacts themselves.
+
+Tags `v0.4.1`, `v0.4.2`, `v0.4.3`, `v0.4.4`, `v0.4.5`, `v0.5.0`, and `v0.5.1` are published; `npx mushroomdb`,
+the `curl install.sh`, and `ghcr.io/matthewsherlin/mushroomdb` are all live today.
+
+### Build the embedded-UI binary from source
+
+```text
+cd ui && npm ci && npm run build && cd ..
+cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release
+cp target/release/mushroomdb ~/.local/bin/  # or any directory on PATH
+```
+
+Or run directly from the source tree (no copy needed):
+
+```text
+./target/release/mushroomdb demo ./db && ./target/release/mushroomdb serve ./db
+```
+
+Without the embedded binary (cargo only, debug build):
+
+```text
+cargo run -p mushroomdb-cli --bin mushroomdb -- demo ./demo-db
+cargo run -p mushroomdb-cli --bin mushroomdb -- serve ./demo-db
+```
+
+### Docker
+
+```text
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=… ghcr.io/matthewsherlin/mushroomdb
+```
+
+The image CMD runs `mushroomdb serve /data --addr 0.0.0.0:8080 --demo-if-empty`
+(writes the demo graph into the volume when empty, then serves). Non-loopback
+bind requires a token; pass `-e MUSHROOMDB_TOKEN=…` and open
+`http://localhost:8080/?token=…`.
+Explicit two-step:
+
+```text
+docker run --rm -v mushroomdb-data:/data ghcr.io/matthewsherlin/mushroomdb demo /data
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=… -v mushroomdb-data:/data ghcr.io/matthewsherlin/mushroomdb serve /data --addr 0.0.0.0:8080
+```
+
+Local image build:
+
+```text
+docker build -t mushroomdb:local .
+docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=… mushroomdb:local
+```
+
+### curl / install.sh
+
+```text
+curl -fsSL https://raw.githubusercontent.com/MatthewSherlin/mushroomdb/main/packaging/install.sh | sh
+```
+
+Writes `~/.local/bin/mushroomdb` (no sudo). Fetches the matching GitHub
+Release tarball and checksum-verifies it.
+
+### npm
+
+```text
+npx mushroomdb --help
+```
+
+### TypeScript client (install from repo)
+
+The `mushroomdb-client` package wraps the HTTP + WebSocket API with full TypeScript types.
+It is not yet published to npm. Install from the repository:
+
+```sh
+npm install /path/to/graph-db/clients/typescript
+# or in package.json:
+# "mushroomdb-client": "file:../path/to/graph-db/clients/typescript"
+```
+
+```ts
+import { MushroomClient } from 'mushroomdb-client';
+
+const client = new MushroomClient('http://127.0.0.1:8080');
+const result = await client.query('MATCH (p:Person) RETURN p.id LIMIT 5');
+console.log(result.rows);
+```
+
+See [`clients/typescript/README.md`](clients/typescript/README.md) for the full quickstart, API reference, and WebSocket subscription docs.
 
 ---
 
