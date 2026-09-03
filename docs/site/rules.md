@@ -10,9 +10,9 @@ change.
 
 ![Rule fire, retraction, and explain arithmetic on the demo store](../assets/rule-fire-explain.gif)
 
-Reproduce the GIF above with `vhs scripts/rule-fire-explain.tape` — it fires a
-rule, retracts it by changing the property that matched, and calls `explain`
-on both states.
+Reproduce the GIF above with `vhs scripts/rule-fire-explain.tape` — it shows
+the FIT edges before and after a `SET` that retracts one and fires another,
+then calls `explain` on the edge that survives.
 
 ---
 
@@ -80,8 +80,9 @@ score only.
 For a rule declared with no `weight_prop` at all (only reachable via the Rust
 API — the MCP `create_rule` tool always defaults it to `"weight"`), `explain`
 still reports the recomputed score (1.0 for `KeyMatch`/`FieldEqual`), but the
-`EdgeFired` subscription event's `weight` is `None` — omitted from the JSON
-payload — because it only looks up the stored prop, not the predicate.
+`EdgeFired` subscription event's `weight` field (`Option<f64>`) is absent
+(omitted) from the JSON payload — because it only looks up the stored prop,
+not the predicate.
 
 **Example:** two Talent nodes both with `industry = "architecture"` get a
 `INDUSTRY_ALIGNMENT` edge between them (score 1.0).
