@@ -1,0 +1,45 @@
+name: pages
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/site/**"
+      - "docs/assets/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let an in-flight run finish rather than cancelling it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # docs/site holds the page; the GIFs it references live in docs/assets.
+      # Stage both so the deployed site can use root-relative asset paths.
+      - name: Stage site
+        run: |
+          mkdir -p _site
+          find docs/site -maxdepth 1 -type f -exec cp {} _site/ \;
+          cp -R docs/assets _site/assets
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

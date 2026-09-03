@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>mushroomdb — the graph that stays true</title>
+<meta name="description" content="An embedded Rust graph database where edges are a schema declaration: write a rule once, and every write creates, maintains, and retracts the matching edges." />
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --panel: #ffffff;
+    --ink: #1b1a18;
+    --muted: #625d55;
+    --line: #e4e0d8;
+    --accent: #8a3324;
+    --code-bg: #f3f1ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14130f;
+      --panel: #1c1b17;
+      --ink: #ece8e0;
+      --muted: #a49d92;
+      --line: #302e28;
+      --accent: #e58a6d;
+      --code-bg: #23211c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 20px; }
+  a { color: var(--accent); }
+  img { max-width: 100%; height: auto; display: block; }
+
+  header { padding: 56px 0 8px; text-align: center; }
+  header .mark { width: 96px; margin: 0 auto 18px; }
+  h1 {
+    font-size: 40px; line-height: 1.1; margin: 0 0 14px;
+    letter-spacing: -0.02em; font-weight: 700;
+  }
+  .tagline { font-size: 21px; line-height: 1.35; margin: 0 auto 14px; max-width: 34ch; font-weight: 600; }
+  .lede { color: var(--muted); margin: 0 auto 18px; max-width: 60ch; }
+  .alpha { color: var(--muted); font-size: 14px; font-style: italic; margin: 0 0 26px; }
+
+  pre, code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 14px 16px; overflow-x: auto; font-size: 14.5px; margin: 0 0 10px; text-align: left;
+  }
+  .install { max-width: 520px; margin: 0 auto 8px; }
+  .install-note { color: var(--muted); font-size: 14px; margin: 0 0 34px; }
+
+  figure { margin: 0; }
+  figure img { border: 1px solid var(--line); border-radius: 10px; }
+
+  section { padding: 34px 0; border-top: 1px solid var(--line); }
+  section h2 { font-size: 23px; margin: 0 0 10px; letter-spacing: -0.01em; }
+  section p { margin: 0 0 18px; color: var(--muted); max-width: 66ch; }
+  section p strong { color: var(--ink); font-weight: 600; }
+
+  .fits { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  .card h3 { margin: 0 0 10px; font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  .card ul { margin: 0; padding-left: 18px; }
+  .card li { margin-bottom: 8px; }
+  .card li:last-child { margin-bottom: 0; }
+  @media (max-width: 640px) {
+    .fits { grid-template-columns: 1fr; }
+    h1 { font-size: 32px; }
+    .tagline { font-size: 19px; }
+  }
+
+  footer { padding: 30px 0 60px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+  footer nav a { margin-right: 18px; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header>
+    <img class="mark" src="assets/mark-animated.svg" alt="" />
+    <h1>mushroomdb</h1>
+    <p class="tagline">The graph that stays true — and knows who's allowed to see it.</p>
+    <p class="lede">
+      An embedded Rust graph database where edges are a schema declaration: write a rule once, and
+      every write creates, maintains, and retracts the matching edges. Ships a 16-tool MCP server.
+    </p>
+    <p class="alpha">Pre-1.0 alpha — APIs and formats may change between minor versions.</p>
+    <div class="install"><pre><code>npx mushroomdb install</code></pre></div>
+    <p class="install-note">Writes the <code>/mushroom</code> skill, the MCP server entry, and the recall hook for Claude Code or Cursor.</p>
+    <figure>
+      <img src="assets/ingest-git-cascade.gif" alt="Ingesting a repository, querying which files co-change, handing one file to a new owner, and watching the KNOWS edges follow in the same write" />
+    </figure>
+  </header>
+
+  <section>
+    <h2>Declare the rule. The edges maintain themselves.</h2>
+    <p>
+      A rule is a schema object, not a script you re-run: <strong>connect every Person to every Org
+      whose skills overlap theirs by at least 50%</strong>, written once. Every insert and every
+      property change evaluates it incrementally, stores the score on the edge, and retracts the
+      edge when the properties stop matching.
+    </p>
+    <figure>
+      <img src="assets/rule-fire-explain.gif" alt="FIT edges before and after a SET that retracts one and fires another, then explain called on the edge that survives" />
+    </figure>
+  </section>
+
+  <section>
+    <h2>Every derived edge shows its arithmetic.</h2>
+    <p>
+      <strong>explain</strong> names the rule, the field values that matched, and the computed score
+      behind any link. An assistant answering "why are these two related?" can quote the derivation
+      instead of guessing, and the same why panel is built into the bundled graph explorer.
+    </p>
+    <figure>
+      <img src="assets/rules-why.gif" alt="The Rules panel and Why slide-over showing the overlap arithmetic behind a derived edge" />
+    </figure>
+  </section>
+
+  <section>
+    <h2>Point it at a repository and watch it stay current.</h2>
+    <p>
+      <strong>mushroomdb ingest-git</strong> graphs authors, commits, and files, then derives
+      co-change and ownership edges by rule. Re-run it to sync: only new commits replay, deleted
+      files drop their derived edges, and renamed files carry their history to the new path.
+    </p>
+    <figure>
+      <img src="assets/ingest-git-cascade.gif" alt="Ingesting a repository, querying which files co-change, handing one file to a new owner, and watching the KNOWS edges follow in the same write" />
+    </figure>
+  </section>
+
+  <section>
+    <h2>Where it fits</h2>
+    <div class="fits">
+      <div class="card">
+        <h3>What it is</h3>
+        <ul>
+          <li>An embedded, single-binary graph database with a rule engine that maintains edges for you.</li>
+          <li>A 16-tool MCP server plus a <code>/mushroom</code> skill for Claude Code and Cursor.</li>
+          <li>Local-first: your data stays on disk, no cloud service, no LLM in the write path.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>What it isn't</h3>
+        <ul>
+          <li>Not a hosted memory service — no account, no endpoint, nothing to sign up for.</li>
+          <li>Not a vector database. Vector predicates and HNSW are built in; bring your own embeddings.</li>
+          <li>Not a Postgres replacement. Single writer, no interactive transactions, memory-first storage.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <nav>
+      <a href="https://github.com/MatthewSherlin/mushroomdb#readme">README</a>
+      <a href="https://github.com/MatthewSherlin/mushroomdb/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/MatthewSherlin/mushroomdb">GitHub</a>
+      <a href="https://github.com/MatthewSherlin/mushroomdb/issues">Issues</a>
+    </nav>
+    <p>Copyright 2026 Matthew Sherlin. Dual-licensed under MIT or Apache-2.0, at your option.</p>
+  </footer>
+
+</div>
+
+</body>
+</html>
