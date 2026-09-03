@@ -835,10 +835,15 @@ python -m venv .venv
 import mushroomdb
 
 db = mushroomdb.GraphDb.open("/path/to/db")
+reader = mushroomdb.GraphDb.open("/path/to/db", read_only=True)
 ```
 
 `GraphDb.open` creates the database directory if it does not already exist — no
 manual `mkdir` is required.
+
+A read-write handle takes the store's cross-process write lock and raises
+`MushroomBusy` if another one already holds it; `read_only=True` never takes the
+lock. See [Concurrency](#concurrency-1) below.
 
 ### Insert nodes
 
@@ -1057,22 +1062,47 @@ s = db.stats()
 
 ### Concurrency
 
-**One writer process per store.** There is no cross-process lock yet (planned);
-opening the same directory from two processes that both write can corrupt it.
-Keep all writes in a single process.
-
-**A handle sees only the commits made through it.** It does not poll the store,
-so writes another process made after you opened are invisible to your handle.
-There is no `reopen()` — close and open again:
+**One writer at a time across processes.** The store carries an advisory write
+lock. A read-write handle holds it for as long as it is open, so opening a
+second one anywhere on the machine raises `MushroomBusy` rather than letting two
+writers corrupt the store. Nothing was written when it raises, so retrying later
+is safe:
 
 ```python
-db.close()
-db = mushroomdb.GraphDb.open("./db")
+from mushroomdb import GraphDb, MushroomBusy
+
+try:
+    db = GraphDb.open("./db")
+except MushroomBusy:
+    ...  # another process is writing
 ```
+
+**Readers see every commit, after `refresh()`.** A handle does not poll the
+store, so another process's commits stay invisible until you ask for them.
+`refresh()` applies them in place and returns how many arrived — rules fire and
+derived edges appear exactly as on a fresh open, and no `close()` and reopen is
+needed:
+
+```python
+n = db.refresh()
+```
+
+**`read_only=True` never takes the lock.** Such a handle opens immediately even
+while a writer holds it, writes nothing to disk, raises `RuntimeError` on any
+mutation, and can still `refresh()` to follow the writer:
+
+```python
+reader = GraphDb.open("./db", read_only=True)
+reader.refresh()
+```
+
+A commit another process is midway through writing is left alone and picked up
+by the next `refresh()`; a partial write is never an error.
 
 Within one process the handle is guarded by a mutex, so calls from multiple
 threads are serialized and safe. They are not isolated transactions: readers
 can observe intermediate states while a batch is being applied. See
+[concurrency.md](concurrency.md) for the full cross-process model and
 [durability.md](durability.md) for the WAL and crash-atomicity guarantees.
 
 ### Type stubs
@@ -1208,7 +1238,8 @@ async interface. See [timetravel.md](timetravel.md) for the full semantics.
 The bindings expose: `insert_node`, `ingest_batch`, `batch_edges`,
 `create_rule`, `set_prop`, `query` (with `params`), `query_with_params` (alias),
 `explain`, `neighbors`, `node_edges`, `node_info`, `stats`, `snapshot`,
-`rename_node`, `insert_edge_upsert`.
+`refresh`, `rename_node`, `insert_edge_upsert`, plus the `MushroomBusy`
+exception.
 
 `write_batch` is not directly exposed in the Python bindings because Rust
 closures capturing `&mut BatchBuilder` do not map naturally to the Python

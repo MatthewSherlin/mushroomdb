@@ -83,17 +83,20 @@ pub fn run_recall(db_dir: &Path, hook_stdin: &str) -> String {
     if !db_dir.exists() {
         return String::new();
     }
-    // Both flags off — the two writes a plain open can make. `auto_migrate`
-    // rewrites an old-format snapshot and deletes a stale `.bak`; `repair_wal`
-    // writes the valid prefix back over a torn tail. A digest that fires on
-    // every prompt, under a 5 s kill and with no cross-process lock, must never
-    // write to the user's store: a `serve` mid-append would lose a frame it
-    // believes durable. The valid prefix is still replayed in memory.
+    // Read-only, with both write flags off as well. `auto_migrate` rewrites an
+    // old-format snapshot and deletes a stale `.bak`; `repair_wal` writes the
+    // valid prefix back over a torn tail. A digest that fires on every prompt,
+    // under a 5 s kill, must never write to the user's store: a `serve`
+    // mid-append would lose a frame it believes durable. `read_only` also keeps
+    // the hook off the cross-process write lock entirely, so it can never make
+    // a writer wait and never fails because one is running. The valid prefix is
+    // still replayed in memory.
     let Ok(db) = GraphDb::open_with_options(
         db_dir,
         OpenOptions {
             auto_migrate: false,
             repair_wal: false,
+            read_only: true,
         },
     ) else {
         return String::new();

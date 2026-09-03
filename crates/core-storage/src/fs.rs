@@ -61,6 +61,71 @@ pub trait Fs {
         Ok(bytes)
     }
 
+    // ── Cross-process write lock ──────────────────────────────────────────────
+
+    /// Try to take the store's advisory exclusive write lock without blocking.
+    ///
+    /// Returns `Ok(true)` when the lock is now held by this handle, `Ok(false)`
+    /// when another handle holds it.  Taking a lock this handle already holds
+    /// is a successful no-op, so callers may re-acquire freely.
+    ///
+    /// The lock is advisory: it coordinates cooperating mushroomdb processes
+    /// and does not stop an unrelated program from writing the files.
+    ///
+    /// Default: `Ok(true)` — an in-memory store has no other process to
+    /// coordinate with.
+    fn try_lock_exclusive(&mut self) -> std::io::Result<bool> {
+        Ok(true)
+    }
+
+    /// Release the advisory write lock.  No-op when it is not held.
+    ///
+    /// Default: no-op.
+    fn unlock(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    // ── WAL tailing (refresh) ─────────────────────────────────────────────────
+
+    /// Current length of the WAL in bytes.
+    ///
+    /// Must not read file contents: this is the hot half of a staleness check
+    /// and runs on the read path.  The default implementation reads the WAL
+    /// because a generic `Fs` has no cheaper option; `RealFs` overrides it with
+    /// a metadata-only stat.
+    fn wal_len(&self) -> std::io::Result<u64> {
+        Ok(self.read(FileId::Wal)?.len() as u64)
+    }
+
+    /// Read `file` from byte offset `from` to the end.
+    ///
+    /// Returns an empty `Vec` when `from` is at or past the end of the file.
+    /// Used to decode the WAL tail another process appended since this handle
+    /// last consumed it.
+    ///
+    /// The default implementation reads the whole file and slices; `RealFs`
+    /// overrides it with a seek + read of the tail only.
+    fn read_range(&self, file: FileId, from: u64) -> std::io::Result<Vec<u8>> {
+        let bytes = self.read(file)?;
+        let from = from.min(bytes.len() as u64) as usize;
+        Ok(bytes[from..].to_vec())
+    }
+
+    /// Identity of the current snapshot file as `(len, mtime_nanos)`, or `None`
+    /// when no snapshot exists.
+    ///
+    /// A change in this pair means some process replaced the snapshot, so the
+    /// WAL this handle was tailing no longer continues its in-memory state and
+    /// a full reload is required.  Like [`wal_len`](Fs::wal_len) this must not
+    /// read file contents.
+    ///
+    /// Default: length-only identity derived from the snapshot bytes (in-memory
+    /// stores have no mtime); `RealFs` overrides it with a metadata-only stat.
+    fn snapshot_ident(&self) -> std::io::Result<Option<(u64, u64)>> {
+        let len = self.read(FileId::Snapshot)?.len() as u64;
+        Ok(if len == 0 { None } else { Some((len, 0)) })
+    }
+
     // ── WAL archive methods (Task 4: history-preserving snapshots) ─────────────
 
     /// List all WAL archive identifiers, sorted ascending (oldest first).
@@ -163,9 +228,27 @@ pub trait FsIntrospect {
     }
 }
 
+/// Name of the advisory cross-process write lock file.
+///
+/// Always empty: the file exists only to carry the OS lock. It is created on
+/// the first lock attempt and never removed, so the same inode backs the lock
+/// for every process that opens the store.
+pub const LOCK_FILE: &str = "LOCK";
+
 #[derive(Debug)]
 pub struct RealFs {
     dir: PathBuf,
+    /// The single open handle on `LOCK` for this store handle.
+    ///
+    /// Exactly one per `RealFs` on purpose: the OS lock is held per open file
+    /// description, so two handles on `LOCK` inside one process would contend
+    /// with each other. Opened lazily — a `RealFs` created for a one-shot file
+    /// operation never touches the lock file at all.
+    lock: Option<File>,
+    /// Whether [`try_lock_exclusive`](Fs::try_lock_exclusive) currently holds
+    /// the lock. Re-acquiring while held is a no-op; `unlock` on an unheld
+    /// lock is a no-op.
+    lock_held: bool,
 }
 
 impl RealFs {
@@ -173,7 +256,23 @@ impl RealFs {
         std::fs::create_dir_all(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
+            lock: None,
+            lock_held: false,
         })
+    }
+
+    /// Open (creating if needed) this handle's one `LOCK` file descriptor.
+    fn lock_file(&mut self) -> std::io::Result<&File> {
+        if self.lock.is_none() {
+            let f = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(self.dir.join(LOCK_FILE))?;
+            self.lock = Some(f);
+        }
+        Ok(self.lock.as_ref().expect("lock file just opened"))
     }
 
     /// The database directory this filesystem is rooted at.
@@ -243,6 +342,75 @@ impl Fs for RealFs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e),
         }
+    }
+
+    fn try_lock_exclusive(&mut self) -> std::io::Result<bool> {
+        if self.lock_held {
+            return Ok(true);
+        }
+        match self.lock_file()?.try_lock() {
+            Ok(()) => {
+                self.lock_held = true;
+                Ok(true)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    fn unlock(&mut self) -> std::io::Result<()> {
+        if !self.lock_held {
+            return Ok(());
+        }
+        // Clear the flag first: a failed unlock must not leave the handle
+        // believing it still owns a lock it may have lost.
+        self.lock_held = false;
+        match self.lock.as_ref() {
+            Some(f) => f.unlock(),
+            None => Ok(()),
+        }
+    }
+
+    fn wal_len(&self) -> std::io::Result<u64> {
+        match std::fs::metadata(self.path(FileId::Wal)) {
+            Ok(m) => Ok(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn read_range(&self, file: FileId, from: u64) -> std::io::Result<Vec<u8>> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut f = match File::open(self.path(file)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let len = f.metadata()?.len();
+        if from >= len {
+            return Ok(Vec::new());
+        }
+        f.seek(SeekFrom::Start(from))?;
+        let mut buf = Vec::with_capacity((len - from) as usize);
+        f.read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn snapshot_ident(&self) -> std::io::Result<Option<(u64, u64)>> {
+        let m = match std::fs::metadata(self.path(FileId::Snapshot)) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // mtime is a change hint, not a clock: an unreadable or pre-epoch
+        // timestamp degrades to 0, leaving length alone to detect the change.
+        let mtime_nanos = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        Ok(Some((m.len(), mtime_nanos)))
     }
 
     fn list_archives(&self) -> std::io::Result<Vec<u64>> {

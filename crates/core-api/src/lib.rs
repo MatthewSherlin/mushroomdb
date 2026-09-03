@@ -25,7 +25,8 @@ pub use db::{
     snapshot_version_at, write_snapshot_bak, BackupReport, BatchBuilder, BatchOp, DeleteReport,
     EdgeInfo, Explanation, ExportEdge, FsyncPolicy, GraphDb, MaskedEdge, MaskedNodeResult,
     MutationEvent, NodeInfo, NodeRef, OpenOptions, Precondition, PredicateSummary, RuleStats,
-    SlowQueryEntry, SlowQuerySnapshot, SnapshotOptions, Stats, WriteAuthz,
+    SlowQueryEntry, SlowQuerySnapshot, SnapshotOptions, Stats, WriteAuthz, REFRESH_CHECK_INTERVAL,
+    WRITE_LOCK_WAIT,
 };
 
 /// Current on-disk snapshot format version written by this build.
@@ -41,7 +42,7 @@ pub use mask::{MaskMode, NodeMask};
 pub use reader::{CommitDelta, FrozenOverlay, ReaderSnapshot, FOLD_EVERY_K};
 pub use roles::{RoleDef, WriteScope};
 pub use schema::{Schema, SchemaDiff};
-pub use shared::SharedDb;
+pub use shared::{SharedDb, WriteGuard};
 pub use subscription::{DbEvent, Subscription, DEFAULT_SUB_CAPACITY};
 
 /// One verification entry per section: `(section_id, section_name, bytes_checked, result)`.

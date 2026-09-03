@@ -13,6 +13,18 @@ readme = "../../README.md"
 [lib]
 name = "core_api"
 
+# Helper process spawned by `tests/multiprocess.rs`.  Gated behind `mp-test` so
+# a plain `cargo build` / `cargo test --workspace` never builds it; the
+# multi-process suite runs as `cargo test -p mushroomdb --features mp-test`.
+[[bin]]
+name = "mp_worker"
+path = "src/bin/mp_worker.rs"
+required-features = ["mp-test"]
+
+[features]
+# Enables the `mp_worker` helper binary and, with it, `tests/multiprocess.rs`.
+mp-test = []
+
 [dependencies]
 core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.5.2" }
 core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.5.2" }

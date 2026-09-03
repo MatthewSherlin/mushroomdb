@@ -127,6 +127,7 @@ fn repair_wal_false_leaves_a_torn_wal_on_disk() {
             core_api::OpenOptions {
                 auto_migrate: false,
                 repair_wal: false,
+                ..Default::default()
             },
         )
         .unwrap();

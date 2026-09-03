@@ -16,6 +16,11 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --workspace --examples
       - run: cargo test --workspace
+      # Multi-process suite: spawns the `mp_worker` helper binary, which only
+      # exists behind the `mp-test` feature (so a plain workspace test run never
+      # builds it). Cross-process locking has no other coverage.
+      - run: cargo test -p mushroomdb --features mp-test --test multiprocess
+      - run: cargo clippy -p mushroomdb --all-targets --features mp-test -- -D warnings
       # Compile-only: CI runners are too noisy for timing gates.
       - run: cargo bench --no-run
       # TODO: add a Miri job for crates/core-storage (MappedBase::topology/columns/

@@ -224,7 +224,9 @@ fn retention_prunes_oldest_archives() {
         "total commits = floor + surviving frames"
     );
 
-    // Reopen: floor must be persisted.
+    // Reopen: floor must be persisted.  Close first — a read-write handle holds
+    // the store's cross-process write lock for its lifetime.
+    drop(db);
     let db2 = GraphDb::open(&dir).unwrap();
     assert_eq!(
         db2.wal_horizon_floor(),

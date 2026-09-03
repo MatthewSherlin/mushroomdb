@@ -1534,10 +1534,14 @@ fn v8_encode_decode_equivalence() {
     db.insert_edge("KNOWS", "alice", "bob").unwrap();
     db.insert_edge("WORKS_AT", "alice", "acme").unwrap();
     db.snapshot().unwrap();
+    // Capture and close before reopening: a read-write handle holds the store's
+    // cross-process write lock for its lifetime, so two of them cannot overlap.
+    let (nodes, edges) = (db.node_count(), db.edge_count());
+    drop(db);
 
     let db2 = GraphDb::open(&dir).unwrap();
-    assert_eq!(db2.node_count(), db.node_count());
-    assert_eq!(db2.edge_count(), db.edge_count());
+    assert_eq!(db2.node_count(), nodes);
+    assert_eq!(db2.edge_count(), edges);
     assert_eq!(db2.get_prop("alice", "age"), Some(Value::Int(30)));
     assert_eq!(db2.get_prop("bob", "age"), Some(Value::Int(25)));
     assert_eq!(

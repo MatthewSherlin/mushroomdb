@@ -19,16 +19,27 @@ Params = dict[str, Scalar] | Sequence[tuple[str, Scalar]] | None
 Row = dict[str, Any]
 """One result row, keyed by RETURN alias."""
 
+class MushroomBusy(RuntimeError):
+    """Another process holds the store's write lock.
+
+    Nothing was written, so retrying later is always safe. Raised only by write
+    calls: opening read-only and reading never take the lock.
+    """
+
 class GraphDb:
     """An embedded mushroomdb store.
 
-    One writer process per store; a handle sees only the commits made through
-    it. Reopen to pick up another process's writes.
+    One writer at a time across processes. A handle sees commits made through
+    it plus, after `refresh()`, everything other processes have committed.
     """
 
     @staticmethod
-    def open(path: str | PathLike[str]) -> GraphDb:
-        """Open (creating if needed) the database rooted at `path`."""
+    def open(path: str | PathLike[str], read_only: bool = False) -> GraphDb:
+        """Open (creating if needed) the database rooted at `path`.
+
+        Raises `MushroomBusy` if another read-write handle is open. Pass
+        `read_only=True` for a handle that never writes and never waits.
+        """
 
     def insert_node(self, label: str, key: str, props: dict[str, Scalar]) -> None:
         """Insert a new node; raises if `key` is already live."""
@@ -154,6 +165,9 @@ class GraphDb:
 
     def snapshot(self) -> None:
         """Write a durable snapshot and truncate the WAL tail."""
+
+    def refresh(self) -> int:
+        """Apply other processes' commits; return how many were applied."""
 
     def close(self) -> None:
         """Close the handle and release the store."""

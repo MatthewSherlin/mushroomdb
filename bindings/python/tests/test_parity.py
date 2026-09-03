@@ -11,7 +11,7 @@ import inspect
 
 import pytest
 
-from mushroomdb import GraphDb
+from mushroomdb import GraphDb, MushroomBusy
 
 
 def _fit_rule(name: str = "same_team") -> dict:
@@ -402,7 +402,58 @@ def test_query_write_rejects_bad_param_shape(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 8. Type stubs + docstrings
+# 8. Multi-process: write lock, read-only handles, refresh
+# ---------------------------------------------------------------------------
+
+
+def test_second_writer_gets_busy_while_a_handle_is_open(tmp_path):
+    path = str(tmp_path / "db")
+    db = GraphDb.open(path)
+    with pytest.raises(MushroomBusy):
+        GraphDb.open(path)
+    db.close()
+    # Closing releases the lock, so the next writer opens normally.
+    second = GraphDb.open(path)
+    second.close()
+
+
+def test_read_only_open_succeeds_while_a_writer_holds_the_lock(tmp_path):
+    path = str(tmp_path / "db")
+    writer = GraphDb.open(path)
+    writer.insert_node("Person", "alice", {})
+
+    reader = GraphDb.open(path, read_only=True)
+    assert reader.node_info("alice") is not None
+    with pytest.raises(RuntimeError):
+        reader.insert_node("Person", "bob", {})
+    reader.close()
+    writer.close()
+
+
+def test_refresh_picks_up_another_handles_commits(tmp_path):
+    path = str(tmp_path / "db")
+    writer = GraphDb.open(path)
+    writer.insert_node("Person", "alice", {})
+
+    reader = GraphDb.open(path, read_only=True)
+    assert reader.node_info("bob") is None
+
+    writer.insert_node("Person", "bob", {})
+    assert reader.refresh() >= 1
+    assert reader.node_info("bob") is not None
+    # Nothing new to apply the second time.
+    assert reader.refresh() == 0
+
+    reader.close()
+    writer.close()
+
+
+def test_mushroom_busy_is_a_runtime_error(tmp_path):
+    assert issubclass(MushroomBusy, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# 9. Type stubs + docstrings
 # ---------------------------------------------------------------------------
 
 # Every method the binding exposes must carry a docstring and a text signature.
@@ -439,6 +490,7 @@ _DOCUMENTED = [
     "batch_edges",
     "stats",
     "snapshot",
+    "refresh",
     "close",
 ]
 
