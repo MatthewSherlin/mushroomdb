@@ -137,6 +137,9 @@ struct Manifest {
     files: Vec<PathBuf>,
     /// MCP JSON keys added by this install.
     mcp_keys: Vec<ManagedMcpKey>,
+    /// Hook entries added to a settings.json by this install.
+    #[serde(default)]
+    hooks: Vec<ManagedHook>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -145,6 +148,134 @@ struct ManagedMcpKey {
     file: PathBuf,
     /// The key inside `mcpServers`.
     server: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct ManagedHook {
+    /// The settings.json file the hook was added to (absolute path).
+    file: PathBuf,
+    /// The hook event name (e.g. `UserPromptSubmit`).
+    event: String,
+    /// The exact command string that was added.
+    command: String,
+}
+
+/// Claude Code hook event this install wires: fires before each prompt is
+/// sent, so the recall digest lands as context ahead of the user's turn.
+const HOOK_EVENT: &str = "UserPromptSubmit";
+/// Kept short: the hook must never noticeably slow a prompt.
+const HOOK_TIMEOUT_SECS: u64 = 5;
+
+/// The exact command string written into the hook entry.
+fn recall_hook_command(bin_cmd: &str, db_str: &str) -> String {
+    format!("{bin_cmd} recall {db_str}")
+}
+
+/// One `hooks.<event>` array entry in Claude Code's settings.json shape.
+fn hook_entry(command: &str) -> serde_json::Value {
+    serde_json::json!({ "hooks": [ { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS } ] })
+}
+
+/// True if any hook group under `event` contains a command hook equal to `command`.
+fn settings_has_hook(root: &serde_json::Value, event: &str, command: &str) -> bool {
+    root["hooks"][event]
+        .as_array()
+        .map(|groups| {
+            groups.iter().any(|g| {
+                g["hooks"]
+                    .as_array()
+                    .map(|hs| hs.iter().any(|h| h["command"] == command))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Add the recall hook to `settings_file` (created if absent). Idempotent:
+/// no-op if the command is already present under `HOOK_EVENT`. Every other
+/// key in the file — including other hook events and groups — is preserved.
+fn merge_hook_entry(
+    settings_file: &Path,
+    command: &str,
+    manifest: &mut Manifest,
+) -> Result<(), CliError> {
+    let mut root: serde_json::Value = if settings_file.exists() {
+        let raw = fs::read_to_string(settings_file)
+            .map_err(|e| CliError(format!("cannot read {}: {e}", settings_file.display())))?;
+        serde_json::from_str(&raw)
+            .map_err(|e| CliError(format!("invalid JSON in {}: {e}", settings_file.display())))?
+    } else {
+        serde_json::json!({})
+    };
+
+    if settings_has_hook(&root, HOOK_EVENT, command) {
+        return Ok(());
+    }
+
+    if !root["hooks"].is_object() {
+        root["hooks"] = serde_json::json!({});
+    }
+    if !root["hooks"][HOOK_EVENT].is_array() {
+        root["hooks"][HOOK_EVENT] = serde_json::json!([]);
+    }
+    root["hooks"][HOOK_EVENT]
+        .as_array_mut()
+        .unwrap()
+        .push(hook_entry(command));
+
+    let parent = settings_file.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|e| CliError(format!("cannot create {}: {e}", parent.display())))?;
+    let json = serde_json::to_string_pretty(&root)
+        .map_err(|e| CliError(format!("cannot serialize settings: {e}")))?;
+    fs::write(settings_file, json)
+        .map_err(|e| CliError(format!("cannot write {}: {e}", settings_file.display())))?;
+
+    manifest.hooks.push(ManagedHook {
+        file: settings_file.to_path_buf(),
+        event: HOOK_EVENT.into(),
+        command: command.into(),
+    });
+    Ok(())
+}
+
+/// Remove exactly the hook groups whose only command is `command`; drop the
+/// command from mixed groups; leave everything else byte-for-byte equivalent.
+fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result<(), CliError> {
+    if !settings_file.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(settings_file)
+        .map_err(|e| CliError(format!("cannot read {}: {e}", settings_file.display())))?;
+    let mut root: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        CliError(format!(
+            "corrupt settings json at {}: {e}",
+            settings_file.display()
+        ))
+    })?;
+
+    if let Some(groups) = root["hooks"][event].as_array_mut() {
+        for g in groups.iter_mut() {
+            if let Some(hs) = g["hooks"].as_array_mut() {
+                hs.retain(|h| h["command"] != command);
+            }
+        }
+        groups.retain(|g| {
+            g["hooks"]
+                .as_array()
+                .map(|hs| !hs.is_empty())
+                .unwrap_or(true)
+        });
+        if groups.is_empty() {
+            root["hooks"].as_object_mut().unwrap().remove(event);
+        }
+    }
+
+    let json = serde_json::to_string_pretty(&root)
+        .map_err(|e| CliError(format!("cannot serialize settings: {e}")))?;
+    fs::write(settings_file, json)
+        .map_err(|e| CliError(format!("cannot write {}: {e}", settings_file.display())))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +353,9 @@ pub fn run_install_with(
             // Persist whatever was already written (binary copy, earlier
             // platform's files) so uninstall can still clean up after a
             // partial failure. Best effort: the original error wins.
-            let anything_written = !manifest.files.is_empty() || !manifest.mcp_keys.is_empty();
+            let anything_written = !manifest.files.is_empty()
+                || !manifest.mcp_keys.is_empty()
+                || !manifest.hooks.is_empty();
             if anything_written {
                 let merged = union_manifests(load_manifest(&manifest_path), &manifest);
                 let _ = write_manifest(&manifest_path, &merged);
@@ -231,7 +364,8 @@ pub fn run_install_with(
         }
     }
 
-    let anything_written = !manifest.files.is_empty() || !manifest.mcp_keys.is_empty();
+    let anything_written =
+        !manifest.files.is_empty() || !manifest.mcp_keys.is_empty() || !manifest.hooks.is_empty();
 
     if anything_written {
         // Union this-run entries with the existing manifest (dedup by path/key).
@@ -248,6 +382,13 @@ pub fn run_install_with(
             "  added  mcpServers.{} in {}\n",
             k.server,
             k.file.display()
+        ));
+    }
+    for h in &manifest.hooks {
+        out.push_str(&format!(
+            "  added  {} hook in {}\n",
+            h.event,
+            h.file.display()
         ));
     }
     if anything_written {
@@ -328,6 +469,18 @@ pub fn run_uninstall(
                 "removed  mcpServers.{} from {}",
                 key.server,
                 key.file.display()
+            ));
+        }
+    }
+
+    // Remove hooks (before files, same reasoning as MCP keys).
+    for h in &manifest.hooks {
+        if h.file.exists() {
+            remove_hook_entry(&h.file, &h.event, &h.command)?;
+            removed.push(format!(
+                "removed  {} hook from {}",
+                h.event,
+                h.file.display()
             ));
         }
     }
@@ -533,6 +686,18 @@ fn install_claude_code(
     };
     merge_mcp_entry(&mcp_file, db_str, bin_cmd, manifest)?;
 
+    // Recall hook: settings.json in the same scope as the skill.
+    let settings_file = if project_scope {
+        project_root.join(".claude").join("settings.json")
+    } else {
+        home.join(".claude").join("settings.json")
+    };
+    merge_hook_entry(
+        &settings_file,
+        &recall_hook_command(bin_cmd, db_str),
+        manifest,
+    )?;
+
     Ok(())
 }
 
@@ -705,6 +870,11 @@ fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
             .any(|e| e.file == k.file && e.server == k.server);
         if !already {
             existing.mcp_keys.push(k.clone());
+        }
+    }
+    for h in &this_run.hooks {
+        if !existing.hooks.contains(h) {
+            existing.hooks.push(h.clone());
         }
     }
     existing

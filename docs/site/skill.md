@@ -56,6 +56,7 @@ a `PATH` lookup either. The copy is tracked in the manifest and removed by
 | `.mcp.json` | `mcpServers.mushroomdb` entry: `{"command":"<see above>","args":["mcp","<db>"]}`. Created if absent; merged if present. |
 | `.claude/skills/mushroom/.install-manifest.json` | Manifest of everything written — consumed by `uninstall`. |
 | `~/.mushroomdb/bin/mushroomdb` | Only when the binary is not on `PATH`: a copy of the running binary. |
+| `.claude/settings.json` | `hooks.UserPromptSubmit` entry running `<bin> recall <db>` (5 s timeout) so related facts are injected before each prompt. Hooks load at session start: restart Claude Code after install. |
 
 ### Claude Code — user scope (no `--project`)
 
@@ -66,10 +67,15 @@ Same as above but paths are:
 | Skill | `~/.claude/skills/mushroom/SKILL.md` |
 | MCP config | `~/.claude.json` (top-level `mcpServers` key — same structure as project `.mcp.json`) |
 | Manifest | `~/.mushroomdb/install-manifest.json` |
+| Recall hook | `~/.claude/settings.json` — `hooks.UserPromptSubmit` entry running `<bin> recall <db>` (5 s timeout) so related facts are injected before each prompt. Hooks load at session start: restart Claude Code after install. |
 
 **Verified 2026-09-02 by live inspection:** `~/.claude.json` holds the
 top-level `mcpServers` key for Claude Code user-level MCP servers.
-`~/.claude/settings.json` holds env/permissions/hooks but no `mcpServers`.
+`~/.claude/settings.json` holds env/permissions/hooks — `install` merges a
+`hooks.UserPromptSubmit` entry into it without disturbing anything else there.
+
+Cursor gets no hook: its hook contract is undocumented, so the always-apply
+rules file remains the only injection mechanism there.
 
 ### Cursor — project scope (`--project`)
 
