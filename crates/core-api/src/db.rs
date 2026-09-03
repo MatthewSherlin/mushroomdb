@@ -3444,6 +3444,16 @@ impl<F: Fs> GraphDb<F> {
                 // `EdgeProps::set` keys props by `String`, never through the
                 // interner. `via_edge` needs none either: via-hop rules resolve it
                 // with `syms.get` and skip when it is absent.
+                //
+                // `RebuildRule` and `DeleteRule` need no such handling here:
+                // `RebuildRule` has no `BatchOp` variant, so it never appears
+                // inside a `Batch` today — it is only ever issued as its own
+                // standalone commit (`rebuild_rule`, or the auto-rebuild path
+                // that logs it as a second commit after the triggering op).
+                // `DeleteRule` does have a `BatchOp` variant and can appear
+                // inside a `Batch`, but it carries only a rule `name` — no
+                // `edge_type` or other symbol that needs pre-interning — so
+                // only `CreateRule` needs this arm.
                 WalRecord::CreateRule { ref def_bytes } => {
                     let def = decode_rule_def(def_bytes).map_err(|e| GraphError::Corrupt {
                         detail: format!("CreateRule def_bytes deserialize failed: {e}"),

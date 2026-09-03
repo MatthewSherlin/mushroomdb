@@ -187,7 +187,7 @@ are 96% similar and they share the role `"engineer"`.
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain_association` | Show which rules and scores produced edges between two nodes. |
 | `explain` | Alias for `explain_association`. |
-| `query` | Run a Cypher query (read or write). Pass `mask` (array of node keys) for an ACL-scoped read — writes are rejected when `mask` is set. |
+| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read. See [Trust model](#trust-model) below. |
 | `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter. |
 | `node_info` | Return a node's key, label, and all properties. |
 | `node_edges` | Return all edges incident on a node. |

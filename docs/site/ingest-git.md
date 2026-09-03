@@ -124,6 +124,15 @@ containing a tab or a newline, and such a path is stored in that escaped form.
 A commit subject containing a `0x1e` or `0x1f` byte truncates or drops that one
 commit's `message`; the sha and the graph are unaffected.
 
+## Concurrency
+
+Do not run `ingest-git` — or any other CLI write command — against a database
+directory that a running `mushroomdb serve` process holds. Both open the store
+directly on disk; the CLI process has no coordination with the server's
+locking, so concurrent writers can corrupt the WAL. For a live-served store,
+write through the HTTP API instead. This mirrors the existing warning on
+`mushroomdb backup` (`mushroomdb --help`).
+
 ## What the recall hook sees
 
 Once `mushroomdb install` has wired the `UserPromptSubmit` recall hook at this

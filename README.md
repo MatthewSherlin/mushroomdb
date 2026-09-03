@@ -508,6 +508,7 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | `mushroomdb mcp <dir>` | Start a stdio MCP JSON-RPC server for agent tools |
 | `mushroomdb stats <dir>` | Print node/edge/rule counts |
 | `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 1) |
+| `mushroomdb recall <dir>` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin, prints related graph facts. Wired automatically by `mushroomdb install`; see [`docs/site/skill.md`](docs/site/skill.md) |
 | `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit |
 | `mushroomdb algo pagerank <dir> --top 20` | Run PageRank over the unified topology (manual + derived edges) |
 | `mushroomdb algo wcc <dir> --top 50` | Find weakly-connected components |
@@ -519,6 +520,13 @@ HTTP `POST /query` defaults to Arrow IPC. Python bindings return dicts
 | `mushroomdb ingest-git <dir> <repo> [--exclude <pattern>]...` | Graph a git repository: `Author`, `Commit`, and `File` nodes plus `CO_CHANGED` and `KNOWS` rules. Re-run to sync — later runs replay only new commits, so deletes and renames retract or move derived edges. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
 | `mushroomdb install [--platform claude-code\|cursor\|all] [--project] [--db <path>]` | Write the `/mushroom` skill + MCP server entry for Claude Code or Cursor. Auto-detects platform. See [`docs/site/skill.md`](docs/site/skill.md) |
 | `mushroomdb uninstall [--platform claude-code\|cursor\|all] [--project] [--db <path>]` | Remove exactly what `install` wrote (manifest-driven; leaves user files) |
+| `mushroomdb --version` | Print the CLI's version and exit |
+
+**Concurrency:** `ingest-git` and other CLI write commands (`query` writes,
+`schema apply`, etc.) open the database directory directly and have no
+coordination with a running `mushroomdb serve` process's locking. Do not run
+them against a store a live `serve` process holds — write through the HTTP
+API instead. This is the same hazard the `backup` row above warns about.
 
 Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 

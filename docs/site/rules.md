@@ -8,6 +8,12 @@ Derived edges carry rule provenance (visible via `explain` and the UI why
 panel) and are retracted automatically when the properties that matched them
 change.
 
+![Rule fire, retraction, and explain arithmetic on the demo store](../assets/rule-fire-explain.gif)
+
+Reproduce the GIF above with `vhs scripts/rule-fire-explain.tape` — it fires a
+rule, retracts it by changing the property that matched, and calls `explain`
+on both states.
+
 ---
 
 ## Declaring a rule
@@ -70,6 +76,12 @@ Scores are stored on the edge under `weight_prop` (MCP default `weight`);
 `explain` reports the score even for rules that store none. Via-hop rules are
 the exception: they score over the via set, so `explain` reports their stored
 score only.
+
+For a rule declared with no `weight_prop` at all (only reachable via the Rust
+API — the MCP `create_rule` tool always defaults it to `"weight"`), `explain`
+still reports the recomputed score (1.0 for `KeyMatch`/`FieldEqual`), but the
+`EdgeFired` subscription event's `weight` is `None` — omitted from the JSON
+payload — because it only looks up the stored prop, not the predicate.
 
 **Example:** two Talent nodes both with `industry = "architecture"` get a
 `INDUSTRY_ALIGNMENT` edge between them (score 1.0).
@@ -312,7 +324,10 @@ The rules of the cascade:
   full re-evaluation of the source's desired edge set rather than a patch, so
   a second pass at the same level could only repeat itself. Across levels the
   guard is released: a rule that ran at one level still refires at the next if
-  another rule wrote an edge it hops over.
+  another rule wrote an edge it hops over. Each such chained recompute of a
+  via-hop rule increments that rule's `stats().rules[].fires` counter the same
+  as a top-level fire, so a rule that sits deep in a chain reports more fires
+  than the number of writes that triggered it.
 - **Deterministic.** Derived edges are consumed in the order they were
   written and rules are visited in name order, so a chain produces the same
   result every time. WAL replay runs the identical hooks, so a reopened store

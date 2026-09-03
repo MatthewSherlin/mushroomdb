@@ -14,7 +14,10 @@ your assistant can query and update a live graph immediately.
 mushroomdb install --platform claude-code --project
 ```
 
-Then open Claude Code in the same directory and type `/mushroom`.
+Then open Claude Code in the same directory and type `/mushroom`. Inside a
+git repository, the skill's bootstrap prefers `ingest-git` over the demo
+graph, so the first run seeds the store from the repo's own authors, commits,
+and files instead — see [`docs/site/ingest-git.md`](ingest-git.md).
 
 ---
 
