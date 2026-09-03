@@ -5147,6 +5147,17 @@ impl<F: Fs> GraphDb<F> {
         self.fulltext.is_enabled(label, field)
     }
 
+    /// Every `(label, field)` pair with a live full-text index, sorted.
+    ///
+    /// Note that [`GraphDb::search`] is keyed by field alone — a pair only
+    /// declares which nodes are *indexed*, so callers that want to search
+    /// everything indexed should query each distinct field once.
+    pub fn fulltext_pairs(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = self.fulltext.enabled_pairs().cloned().collect();
+        v.sort();
+        v
+    }
+
     /// Enable an equality index for all nodes of `label` on scalar property
     /// `field`. Subsequent `WHERE n.field = value` lookups become O(matches)
     /// instead of an O(N_label) scan. Existing nodes are backfilled; the

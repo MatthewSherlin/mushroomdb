@@ -7,7 +7,7 @@ use cli::{
 };
 use core_api::SharedDb;
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,6 +19,12 @@ fn main() -> ExitCode {
         Ok(Command::Help) => {
             print!("{}", usage());
             ExitCode::SUCCESS
+        }
+        Ok(Command::Recall { db_dir }) => {
+            let mut raw = String::new();
+            let _ = io::stdin().read_to_string(&mut raw);
+            print!("{}", cli::recall::run_recall(&db_dir, &raw));
+            ExitCode::SUCCESS // never block the prompt
         }
         Ok(Command::Version) => {
             println!("mushroomdb {}", cli::VERSION);

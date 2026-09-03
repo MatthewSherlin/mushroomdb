@@ -5,6 +5,7 @@
 
 pub mod export;
 pub mod install;
+pub mod recall;
 
 use core_api::schema::Schema;
 use core_api::{
@@ -152,6 +153,11 @@ pub enum Command {
     Install(install::InstallOpts),
     /// Undo what `install` wrote (manifest-driven).
     Uninstall(install::InstallOpts),
+    /// Body of the Claude Code UserPromptSubmit hook: reads a prompt payload on
+    /// stdin, prints related graph facts on stdout.
+    Recall {
+        db_dir: PathBuf,
+    },
     Version,
     Help,
 }
@@ -204,6 +210,7 @@ Usage:
   mushroomdb mcp <db-dir>
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
+  mushroomdb recall <db-dir>       hook body: reads a prompt payload on stdin, prints related graph facts
   mushroomdb suggest <db-dir>
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
@@ -292,6 +299,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
         "backup" => parse_backup(&args[1..]),
         "export" => parse_export(&args[1..]),
+        "recall" => parse_one_dir("recall", &args[1..]).map(|db_dir| Command::Recall { db_dir }),
         "install" => parse_install_cmd(&args[1..]).map(Command::Install),
         "uninstall" => parse_install_cmd(&args[1..]).map(Command::Uninstall),
         other => Err(format!("unknown command: {other}")),
@@ -1231,6 +1239,10 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             via_edge: None,
             via_dir: None,
         })?;
+        // Name lookup for `mushroomdb recall`. Adds no nodes or edges.
+        for (label, field) in [("Org", "name"), ("Project", "name"), ("Person", "name")] {
+            w.enable_fulltext(label, field)?;
+        }
     }
 
     let r = db.read();
@@ -2183,6 +2195,17 @@ mod tests {
             ]
         );
 
+        // `recall` needs a name index; enabling it adds no nodes, edges or rules.
+        let db = SharedDb::open(&dir).expect("reopen demo");
+        assert_eq!(
+            db.read().fulltext_pairs(),
+            vec![
+                ("Org".to_string(), "name".to_string()),
+                ("Person".to_string(), "name".to_string()),
+                ("Project".to_string(), "name".to_string()),
+            ]
+        );
+
         let mut auto = out.auto_fk_rules.clone();
         auto.sort();
         assert_eq!(
@@ -2720,6 +2743,18 @@ mod tests {
         assert_eq!(parse_args(&["--version"]).unwrap(), Command::Version);
         assert_eq!(parse_args(&["-V"]).unwrap(), Command::Version);
         assert_eq!(parse_args(&["version"]).unwrap(), Command::Version);
+    }
+
+    #[test]
+    fn recall_parses_one_dir_and_is_listed_in_usage() {
+        assert_eq!(
+            parse_args(&["recall", "/tmp/db"]).unwrap(),
+            Command::Recall {
+                db_dir: PathBuf::from("/tmp/db")
+            }
+        );
+        assert!(parse_args(&["recall"]).is_err(), "db-dir is required");
+        assert!(usage().contains("mushroomdb recall <db-dir>"));
     }
 
     #[test]
