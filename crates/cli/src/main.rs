@@ -35,6 +35,18 @@ fn main() -> ExitCode {
             println!("mushroomdb {}", cli::VERSION);
             ExitCode::SUCCESS
         }
+        Ok(Command::IngestGit { db_dir, opts }) => {
+            match cli::ingest_git::run_ingest_git(&db_dir, &opts) {
+                Ok(report) => {
+                    print!("{}", cli::ingest_git::format_ingest_git(&report));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Ok(Command::Serve {
             db_dir,
             addr,

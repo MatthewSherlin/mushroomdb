@@ -56,5 +56,6 @@ after the first `v*` tag is pushed. The source build path is available now.
 - [Quickstart](quickstart.md) — two commands to a running graph explorer
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
+- [Codebase graph](ingest-git.md) — `ingest-git`, its co-change and ownership rules, incremental sync
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
 - [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error

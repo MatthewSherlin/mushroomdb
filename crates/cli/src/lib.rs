@@ -4,6 +4,7 @@
 //! prints what the lib functions return.
 
 pub mod export;
+pub mod ingest_git;
 pub mod install;
 pub mod recall;
 
@@ -149,6 +150,11 @@ pub enum Command {
         dest: PathBuf,
         format: ExportFormat,
     },
+    /// Build (or incrementally sync) a graph of a git repository.
+    IngestGit {
+        db_dir: PathBuf,
+        opts: ingest_git::IngestGitOpts,
+    },
     /// Wire the /mushroom skill and MCP server into Claude Code / Cursor.
     Install(install::InstallOpts),
     /// Undo what `install` wrote (manifest-driven).
@@ -221,6 +227,7 @@ Usage:
                                       WARNING: unsafe against a concurrently running serve process;
                                       use POST /backup on the HTTP server for live-serve backups
   mushroomdb export <db-dir> <dest> --format jsonl|parquet   export all data
+  mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]...   graph a git repo (authors, commits, files, co-change + ownership rules); re-run to sync
   mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
   mushroomdb algo wcc <db-dir> [--top N]
@@ -276,6 +283,58 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
     })
 }
 
+fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
+    let mut positional = Vec::new();
+    let mut exclude = Vec::new();
+    let mut max_commits_per_file = ingest_git::DEFAULT_MAX_COMMITS_PER_FILE;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--exclude" {
+            exclude.push(
+                args.get(i + 1)
+                    .copied()
+                    .ok_or_else(|| "missing value for --exclude".to_string())?
+                    .to_string(),
+            );
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--exclude=") {
+            exclude.push(val.to_string());
+            i += 1;
+        } else if a == "--max-commits-per-file" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --max-commits-per-file".to_string())?;
+            max_commits_per_file = val
+                .parse()
+                .map_err(|e| format!("bad --max-commits-per-file: {e}"))?;
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--max-commits-per-file=") {
+            max_commits_per_file = val
+                .parse()
+                .map_err(|e| format!("bad --max-commits-per-file: {e}"))?;
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else {
+            positional.push(a);
+            i += 1;
+        }
+    }
+    let [db_dir, repo] = positional.as_slice() else {
+        return Err("ingest-git requires <db-dir> <repo-dir>".into());
+    };
+    Ok(Command::IngestGit {
+        db_dir: PathBuf::from(db_dir),
+        opts: ingest_git::IngestGitOpts {
+            repo: PathBuf::from(repo),
+            exclude,
+            max_commits_per_file,
+        },
+    })
+}
+
 /// Parse argv after the binary name. Hand-rolled — no clap.
 pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
     let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
@@ -300,6 +359,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "backup" => parse_backup(&args[1..]),
         "export" => parse_export(&args[1..]),
         "recall" => parse_one_dir("recall", &args[1..]).map(|db_dir| Command::Recall { db_dir }),
+        "ingest-git" => parse_ingest_git(&args[1..]),
         "install" => parse_install_cmd(&args[1..]).map(Command::Install),
         "uninstall" => parse_install_cmd(&args[1..]).map(Command::Uninstall),
         other => Err(format!("unknown command: {other}")),
@@ -2755,6 +2815,47 @@ mod tests {
         );
         assert!(parse_args(&["recall"]).is_err(), "db-dir is required");
         assert!(usage().contains("mushroomdb recall <db-dir>"));
+    }
+
+    #[test]
+    fn ingest_git_parses_excludes() {
+        let cmd = parse_args(&[
+            "ingest-git",
+            "/tmp/db",
+            "/tmp/repo",
+            "--exclude",
+            "target/",
+            "--exclude=*.lock",
+            "--max-commits-per-file",
+            "50",
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::IngestGit {
+                db_dir: PathBuf::from("/tmp/db"),
+                opts: ingest_git::IngestGitOpts {
+                    repo: PathBuf::from("/tmp/repo"),
+                    exclude: vec!["target/".into(), "*.lock".into()],
+                    max_commits_per_file: 50,
+                },
+            }
+        );
+        // Defaults and arity.
+        let Command::IngestGit { opts, .. } =
+            parse_args(&["ingest-git", "/tmp/db", "/tmp/repo"]).unwrap()
+        else {
+            panic!("expected IngestGit");
+        };
+        assert!(opts.exclude.is_empty());
+        assert_eq!(
+            opts.max_commits_per_file,
+            ingest_git::DEFAULT_MAX_COMMITS_PER_FILE
+        );
+        assert!(parse_args(&["ingest-git", "/tmp/db"]).is_err());
+        assert!(parse_args(&["ingest-git", "/tmp/db", "/tmp/repo", "--nope"]).is_err());
+        assert!(parse_args(&["ingest-git", "/tmp/db", "/tmp/repo", "--exclude"]).is_err());
+        assert!(usage().contains("mushroomdb ingest-git <db-dir> <repo-dir>"));
     }
 
     #[test]
