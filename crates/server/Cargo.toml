@@ -18,8 +18,8 @@ embed-ui = ["dep:include_dir"]
 tls = ["dep:axum-server"]
 
 [dependencies]
-core-api = { package = "mushroomdb", path = "../core-api", version = "0.4.4" }
-arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.4.4" }
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.4.5" }
+arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.4.5" }
 # ws enabled now so Task 5 can add GET /watch without a dep bump.
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }

@@ -4,7 +4,7 @@
 //! Drive via `run_install`/`run_uninstall` from the library (never spawn a
 //! subprocess), so tests run without the binary being on PATH.
 
-use cli::install::{run_install, run_uninstall, InstallOpts, Platform};
+use cli::install::{run_install_with, run_uninstall, BinaryLocation, InstallOpts, Platform};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +38,18 @@ fn assert_absent(root: &Path, rel: &str) {
         !root.join(rel).exists(),
         "expected {rel} to be absent but it exists"
     );
+}
+
+/// Install as if `mushroomdb` resolves on PATH (the bare-name MCP command).
+fn install_on_path(root: &Path, home: &Path, opts: &InstallOpts) -> Result<String, cli::CliError> {
+    run_install_with(root, home, opts, &BinaryLocation::OnPath)
+}
+
+/// Write a small fake executable to stand in for the running binary.
+fn fake_exe(dir: &Path, bytes: &[u8]) -> PathBuf {
+    let p = dir.join("fake-mushroomdb");
+    fs::write(&p, bytes).unwrap();
+    p
 }
 
 /// Build opts for a --platform claude-code --project install with a fixed db path.
@@ -78,7 +90,7 @@ fn claude_project_writes_skill_and_mcp() {
     let db = root.join("mushroom-memory");
     let opts = claude_project_opts(&db);
 
-    run_install(&root, &home, &opts).expect("install failed");
+    install_on_path(&root, &home, &opts).expect("install failed");
 
     // Skill file must exist and contain the db path.
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
@@ -116,10 +128,10 @@ fn install_is_idempotent() {
     let db = root.join("mushroom-memory");
     let opts = claude_project_opts(&db);
 
-    run_install(&root, &home, &opts).expect("first install failed");
+    install_on_path(&root, &home, &opts).expect("first install failed");
     let mcp_after_first = read(&root, ".mcp.json");
 
-    run_install(&root, &home, &opts).expect("second install should be a no-op (exit 0)");
+    install_on_path(&root, &home, &opts).expect("second install should be a no-op (exit 0)");
     let mcp_after_second = read(&root, ".mcp.json");
 
     // Content must be identical — no duplication.
@@ -150,8 +162,8 @@ fn double_install_then_uninstall_cleans_up() {
     let db = root.join("mushroom-memory");
     let opts = claude_project_opts(&db);
 
-    run_install(&root, &home, &opts).expect("first install");
-    run_install(&root, &home, &opts).expect("second install (no-op)");
+    install_on_path(&root, &home, &opts).expect("first install");
+    install_on_path(&root, &home, &opts).expect("second install (no-op)");
     run_uninstall(&root, &home, &opts).expect("uninstall after double-install");
 
     // Skill file must be gone.
@@ -181,7 +193,7 @@ fn partial_drift_reinstall_then_uninstall_cleans_all() {
     let opts = claude_project_opts(&db);
 
     // First install — writes SKILL.md + .mcp.json + manifest.
-    run_install(&root, &home, &opts).expect("first install");
+    install_on_path(&root, &home, &opts).expect("first install");
 
     // Simulate user editing SKILL.md (drift).
     let skill_path = root.join(".claude/skills/mushroom/SKILL.md");
@@ -190,7 +202,7 @@ fn partial_drift_reinstall_then_uninstall_cleans_all() {
     // Second install — detects drift, rewrites SKILL.md; MCP entry is intact so
     // nothing is added to manifest.mcp_keys this run. The manifest must be
     // union-merged so the MCP key is NOT dropped from the saved manifest.
-    run_install(&root, &home, &opts).expect("re-install after drift");
+    install_on_path(&root, &home, &opts).expect("re-install after drift");
     assert!(
         skill_path.exists(),
         "SKILL.md should be restored after re-install"
@@ -242,7 +254,7 @@ fn install_refuses_conflicting_mcp_entry() {
     )
     .unwrap();
 
-    let result = run_install(&root, &home, &opts);
+    let result = install_on_path(&root, &home, &opts);
     assert!(result.is_err(), "expected error on conflicting mcp entry");
 
     // The .mcp.json must be unchanged (original content preserved).
@@ -275,7 +287,7 @@ fn uninstall_removes_manifest_contents() {
     )
     .unwrap();
 
-    run_install(&root, &home, &opts).expect("install");
+    install_on_path(&root, &home, &opts).expect("install");
     run_uninstall(&root, &home, &opts).expect("uninstall");
 
     // Files we created must be gone.
@@ -309,7 +321,7 @@ fn cursor_only_writes_cursor_artifacts() {
     let db = root.join("mushroom-memory");
     let opts = cursor_project_opts(&db);
 
-    run_install(&root, &home, &opts).expect("cursor install");
+    install_on_path(&root, &home, &opts).expect("cursor install");
 
     // Cursor rule file must exist.
     let rules = read(&root, ".cursor/rules/mushroom.mdc");
@@ -343,7 +355,7 @@ fn all_platform_writes_both_artifacts() {
     let db = root.join("mushroom-memory");
     let opts = all_project_opts(&db);
 
-    run_install(&root, &home, &opts).expect("all-platform install");
+    install_on_path(&root, &home, &opts).expect("all-platform install");
 
     // Both skill and cursor rules must exist.
     assert!(root.join(".claude/skills/mushroom/SKILL.md").exists());
@@ -371,7 +383,7 @@ fn autodetect_home_claude_selects_claude_code() {
         db: Some(db.clone()),
     };
 
-    run_install(&root, &home, &opts).expect("autodetect install");
+    install_on_path(&root, &home, &opts).expect("autodetect install");
     assert!(root.join(".claude/skills/mushroom/SKILL.md").exists());
     assert_absent(&root, ".cursor/rules/mushroom.mdc");
 }
@@ -395,7 +407,7 @@ fn autodetect_project_cursor_selects_cursor() {
         db: Some(db.clone()),
     };
 
-    run_install(&root, &home, &opts).expect("autodetect cursor install");
+    install_on_path(&root, &home, &opts).expect("autodetect cursor install");
     assert!(root.join(".cursor/rules/mushroom.mdc").exists());
     assert_absent(&root, ".claude/skills/mushroom/SKILL.md");
 }
@@ -416,7 +428,7 @@ fn autodetect_neither_returns_error() {
         db: Some(db),
     };
 
-    let result = run_install(&root, &home, &opts);
+    let result = install_on_path(&root, &home, &opts);
     assert!(result.is_err(), "expected error when no platform detected");
     let msg = result.unwrap_err().0;
     assert!(
@@ -472,4 +484,247 @@ fn parse_install_db_flag() {
         }
         other => panic!("expected Install, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test: binary NOT on PATH → install copies it to ~/.mushroomdb/bin and
+//       writes that absolute path as the MCP command (npx / local build case)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn off_path_install_copies_binary_and_writes_absolute_command() {
+    let root = temp_dir("offpath");
+    let home = temp_dir("offpath-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+    let src = fake_exe(&root, b"#!/bin/sh\necho v1\n");
+
+    run_install_with(&root, &home, &opts, &BinaryLocation::CopyFrom(src.clone()))
+        .expect("off-path install failed");
+
+    // Binary copied to the stable location, byte-identical, executable.
+    let copied = home.join(".mushroomdb/bin/mushroomdb");
+    assert!(
+        copied.exists(),
+        "binary was not copied to ~/.mushroomdb/bin"
+    );
+    assert_eq!(fs::read(&copied).unwrap(), fs::read(&src).unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&copied).unwrap().permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "copied binary is not executable: {mode:o}"
+        );
+    }
+
+    // MCP command is the absolute path of the copy — no PATH lookup needed.
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    let server = &mcp["mcpServers"]["mushroomdb"];
+    assert_eq!(server["command"], copied.to_str().unwrap());
+    assert_eq!(server["args"][0], "mcp");
+    assert_eq!(server["args"][1], db.to_str().unwrap());
+
+    // SKILL.md bootstrap uses the same absolute path so `demo` works too.
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    assert!(
+        skill.contains(&format!("{} demo {}", copied.display(), db.display())),
+        "SKILL.md bootstrap does not use the copied binary path"
+    );
+    assert!(
+        !skill.contains("{{BIN}}"),
+        "unsubstituted {{{{BIN}}}} in SKILL.md"
+    );
+
+    // Manifest tracks the copy so uninstall removes it.
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    let files: Vec<&str> = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        files.contains(&copied.to_str().unwrap()),
+        "manifest does not track copied binary: {files:?}"
+    );
+
+    run_uninstall(&root, &home, &opts).expect("uninstall");
+    assert!(!copied.exists(), "uninstall left the copied binary behind");
+}
+
+// ---------------------------------------------------------------------------
+// Test: existing entry with same db but a stale/broken command is REPAIRED,
+//       not treated as a conflict (the "installed but never on PATH" case)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reinstall_repairs_stale_command_for_same_db() {
+    let root = temp_dir("repair");
+    let home = temp_dir("repair-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+    let src = fake_exe(&root, b"v1");
+
+    // Simulate a prior install that wrote the bare name, which never resolved.
+    let stale = serde_json::json!({
+        "mcpServers": {
+            "mushroomdb": { "command": "mushroomdb", "args": ["mcp", db.to_str().unwrap()] },
+            "other": { "command": "other-tool", "args": [] }
+        }
+    });
+    fs::write(
+        root.join(".mcp.json"),
+        serde_json::to_string_pretty(&stale).unwrap(),
+    )
+    .unwrap();
+
+    run_install_with(&root, &home, &opts, &BinaryLocation::CopyFrom(src))
+        .expect("re-install with same db must repair, not conflict");
+
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    let copied = home.join(".mushroomdb/bin/mushroomdb");
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["command"],
+        copied.to_str().unwrap()
+    );
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"][1],
+        db.to_str().unwrap()
+    );
+    // Unrelated servers untouched.
+    assert_eq!(mcp["mcpServers"]["other"]["command"], "other-tool");
+    // Skill bootstrap uses the repaired command too.
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    assert!(skill.contains(&format!("{} demo {}", copied.display(), db.display())));
+}
+
+// ---------------------------------------------------------------------------
+// Test: re-running install FROM the stable copy itself (src == dest) is a
+//       clean no-op — no error, no self-copy, binary still present
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reinstall_from_stable_copy_is_noop() {
+    let root = temp_dir("selfcopy");
+    let home = temp_dir("selfcopy-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+    let copied = home.join(".mushroomdb/bin/mushroomdb");
+
+    let src = fake_exe(&root, b"v1");
+    run_install_with(&root, &home, &opts, &BinaryLocation::CopyFrom(src)).expect("first");
+
+    let out = run_install_with(
+        &root,
+        &home,
+        &opts,
+        &BinaryLocation::CopyFrom(copied.clone()),
+    )
+    .expect("re-install from the stable copy");
+    assert!(out.contains("already installed"), "{out}");
+    assert_eq!(fs::read(&copied).unwrap(), b"v1");
+}
+
+// ---------------------------------------------------------------------------
+// Test: if a later step fails after the binary was copied, the manifest still
+//       records the copy so uninstall can remove it (no orphan)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn partial_failure_after_copy_still_tracks_binary() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_dir("partial-fail");
+    let home = temp_dir("partial-fail-home");
+    let db = root.join("mushroom-memory");
+    let opts = all_project_opts(&db);
+    let src = fake_exe(&root, b"v1");
+
+    // Claude Code step succeeds; make the Cursor rules dir unwritable so the
+    // second platform fails after the binary copy and the first platform.
+    let rules_dir = root.join(".cursor/rules");
+    fs::create_dir_all(&rules_dir).unwrap();
+    fs::set_permissions(&rules_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = run_install_with(&root, &home, &opts, &BinaryLocation::CopyFrom(src));
+    // Restore perms so temp cleanup works.
+    fs::set_permissions(&rules_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err(), "expected cursor rules write to fail");
+
+    let copied = home.join(".mushroomdb/bin/mushroomdb");
+    assert!(copied.exists());
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    let files: Vec<&str> = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(files.contains(&copied.to_str().unwrap()), "{files:?}");
+
+    run_uninstall(&root, &home, &opts).expect("uninstall after partial failure");
+    assert!(!copied.exists(), "orphaned binary after uninstall");
+}
+
+// ---------------------------------------------------------------------------
+// Test: re-running install from a newer binary refreshes the stable copy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn off_path_reinstall_refreshes_copied_binary() {
+    let root = temp_dir("refresh");
+    let home = temp_dir("refresh-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+    let copied = home.join(".mushroomdb/bin/mushroomdb");
+
+    let v1 = fake_exe(&root, b"v1");
+    run_install_with(&root, &home, &opts, &BinaryLocation::CopyFrom(v1)).expect("v1");
+    assert_eq!(fs::read(&copied).unwrap(), b"v1");
+
+    // Same bytes → no-op.
+    let v1_again = fake_exe(&root, b"v1");
+    let out = run_install_with(&root, &home, &opts, &BinaryLocation::CopyFrom(v1_again))
+        .expect("v1 again");
+    assert!(
+        out.contains("already installed"),
+        "same binary should be a no-op: {out}"
+    );
+
+    // New bytes → copy refreshed.
+    let v2 = fake_exe(&root, b"v2-newer");
+    run_install_with(&root, &home, &opts, &BinaryLocation::CopyFrom(v2)).expect("v2");
+    assert_eq!(fs::read(&copied).unwrap(), b"v2-newer");
+}
+
+// ---------------------------------------------------------------------------
+// Test: on-PATH install substitutes the bare name into the skill bootstrap
+// ---------------------------------------------------------------------------
+
+#[test]
+fn on_path_install_uses_bare_name_everywhere() {
+    let root = temp_dir("onpath-bin");
+    let home = temp_dir("onpath-bin-home");
+    let db = root.join("mushroom-memory");
+    let opts = all_project_opts(&db);
+
+    install_on_path(&root, &home, &opts).expect("install");
+
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    assert!(skill.contains(&format!("mushroomdb demo {}", db.display())));
+    assert!(!skill.contains("{{BIN}}"));
+    let rules = read(&root, ".cursor/rules/mushroom.mdc");
+    assert!(rules.contains(&format!("mushroomdb demo {}", db.display())));
+    assert!(!rules.contains("{{BIN}}"));
+    assert_absent(&home, ".mushroomdb/bin/mushroomdb");
 }

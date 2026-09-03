@@ -17,10 +17,10 @@ The graph stays true as your data changes: when you SET a property, rules retrac
 
 **First time — `{{DB_PATH}}` does not exist yet:**
 
-Run this in a terminal to seed an instant graph you can explore (if `mushroomdb` is not on PATH, install it first with `cargo install mushroomdb-cli` or run it via `npx mushroomdb`):
+Run this in a terminal to seed an instant graph you can explore:
 
 ```
-mushroomdb demo {{DB_PATH}}
+{{BIN}} demo {{DB_PATH}}
 ```
 
 This seeds 10 Orgs, 20 Projects, 30 People, 7 rule sets, and 334 edges. It takes a few seconds.
@@ -63,7 +63,7 @@ When asked about the overall state of the graph, run `stats` before drilling int
 
 - **Never invent graph contents.** If `query` returns empty, say so and offer to ingest or upsert.
 - **Surface errors verbatim.** If a tool call fails, show the error message — do not guess what the graph contains.
-- **This store is local and alpha.** No cloud sync. If durability matters, the user should snapshot: `mushroomdb snapshot {{DB_PATH}} <output-file>`.
+- **This store is local and alpha.** No cloud sync. If durability matters, the user should snapshot: `{{BIN}} snapshot {{DB_PATH}} <output-file>`.
 - **Attribute derived edges.** When showing rule-fired edges, always note which rule produced them. Use `explain` or `explain_association` to get the rule name. Never assert a rule name from memory.
 
 ---
@@ -95,12 +95,12 @@ All 16 tools. Use these names exactly.
 
 ## 60-second demo
 
-Walk through this after `mushroomdb demo {{DB_PATH}}`. Every command is copy-pasteable; the outputs below are from a real run.
+Walk through this after `{{BIN}} demo {{DB_PATH}}`. Every command is copy-pasteable; the outputs below are from a real run.
 
 ### Step 1 — Seed (terminal)
 
 ```
-mushroomdb demo {{DB_PATH}}
+{{BIN}} demo {{DB_PATH}}
 ```
 
 ```
@@ -190,4 +190,4 @@ At commit 10 (before the SET), the edge existed. The store keeps the full versio
 
 ---
 
-For more: `mushroomdb --help` · [docs](https://github.com/MatthewSherlin/mushroomdb/tree/main/docs/site)
+For more: `{{BIN}} --help` · [docs](https://github.com/MatthewSherlin/mushroomdb/tree/main/docs/site)
