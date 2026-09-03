@@ -299,19 +299,28 @@ The rules of the cascade:
 
 - **Depth 4.** A write chains at most four levels past the rule that fired
   first. A longer chain stops there, leaving the levels beyond it at their
-  previous values until the next write touches them. The cap is
-  `MAX_CHAIN_DEPTH`, exported from the crate root.
-- **Once per rule and source.** Within one write, each `(rule, source node)`
-  pair is recomputed at most once. The recompute is a full re-evaluation of
-  that source's desired edge set against the finished topology, so a second
-  pass would only repeat work — except in a diamond, where two chains of
-  different lengths reach the same rule; there the shorter one wins and the
-  longer one is skipped. Prefer rule sets that fan out over ones that
-  reconverge.
+  previous values, and no later write repairs them — a write that touches the
+  root chains four levels again and never reaches the fifth. The cap is
+  `MAX_CHAIN_DEPTH`, exported from the crate root. When a write hits it with
+  work still pending, `stats().chain_truncations` goes up; a non-zero value
+  there means some derived edges are stale and the rule chain needs
+  shortening or splitting. The counter is not persisted, so it starts at zero
+  on every open and is re-accumulated by replay.
+- **Once per rule and source, per level.** Within one chain level each
+  `(rule, source node)` pair is recomputed at most once. Every edge a level
+  consumes was already written before that level began, and a recompute is a
+  full re-evaluation of the source's desired edge set rather than a patch, so
+  a second pass at the same level could only repeat itself. Across levels the
+  guard is released: a rule that ran at one level still refires at the next if
+  another rule wrote an edge it hops over.
 - **Deterministic.** Derived edges are consumed in the order they were
   written and rules are visited in name order, so a chain produces the same
   result every time. WAL replay runs the identical hooks, so a reopened store
-  reproduces the identical chained edges.
+  reproduces the identical chained edges — and the identical truncations.
+- **Nothing derives onto a node being deleted.** A delete retracts that
+  node's derived edges and chains those retractions, but the node is excluded
+  from every role a rule could put it in while the delete is in flight, so the
+  chain cannot hand it a new edge on the way out.
 - **No cycles.** See below.
 
 ### Cycles are rejected at rule creation
@@ -325,9 +334,9 @@ RuleInvalid: rule chain cycle: KNOWS -> TOP_AUTHOR -> KNOWS
 ```
 
 The path names the edge types around the loop. A rule whose `via_edge`
-equals its own `edge_type` is rejected the same way. The check runs against
-the rules already in the store; rules created earlier in the same batch are
-not visible to it, matching the batch rule window that `is_rule_owned` uses.
+equals its own `edge_type` is rejected the same way. Rules created earlier in
+the same batch count too, so a batch cannot assemble a cycle one rule at a
+time and have both halves accepted.
 
 Views are not part of this. A rule cannot read a view, so a view computed
 from derived edges never feeds another rule and cannot close a cycle.

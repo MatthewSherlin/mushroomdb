@@ -1,6 +1,8 @@
 //! Rule chaining: a derived edge feeding a via-hop rule re-derives that rule's
 //! edges in the same write, deterministically, with a depth cap and no cycles.
-use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value};
+use core_api::{
+    Direction, EdgeEvent, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource,
+};
 use core_storage::fs::RealFs;
 
 type Db = GraphDb<RealFs>;
@@ -287,6 +289,11 @@ fn depth_cap_terminates_long_chains() {
             "backfill must derive level {lvl}"
         );
     }
+    assert_eq!(
+        db.stats().chain_truncations,
+        0,
+        "backfill alone reaches a fixpoint"
+    );
     // Break the root: the retraction chains down exactly MAX_CHAIN_DEPTH levels
     // past the level-0 retract, and terminates.
     db.set_prop("n0", "next_id", Value::Str("none".into()))
@@ -299,7 +306,21 @@ fn depth_cap_terminates_long_chains() {
             "level {lvl} must retract"
         );
     }
-    // Restore the root: the same chain re-derives every level within the cap.
+    // The ceiling, pinned: E5 is one level past the cap, so it is NOT retracted
+    // and still points at a via hop that no longer exists. Raising the cap would
+    // clear it and fail here — this is what fixes the cap at exactly 4 rather
+    // than "at least 4".
+    assert!(
+        !db.neighbors("n0", "E5", Direction::Out).unwrap().is_empty(),
+        "E5 is beyond the cap and must be left stale"
+    );
+    assert_eq!(
+        db.stats().chain_truncations,
+        1,
+        "the truncated write must be counted"
+    );
+    // Restore the root: the same chain re-derives every level within the cap,
+    // and truncates in the same place.
     db.set_prop("n0", "next_id", Value::Str("n1".into()))
         .unwrap();
     for lvl in 0..=core_api::MAX_CHAIN_DEPTH {
@@ -310,7 +331,345 @@ fn depth_cap_terminates_long_chains() {
             "level {lvl} must derive"
         );
     }
-    // E5 sits beyond the cap; its state is deliberately unasserted.
+    assert_eq!(db.stats().chain_truncations, 2);
+    // The counter is not persisted; it is re-accumulated by replay, which runs
+    // the identical hooks and therefore truncates in the identical places.
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.stats().chain_truncations,
+        2,
+        "replay must reproduce the same truncations"
+    );
+    assert!(
+        !db.neighbors("n0", "E5", Direction::Out).unwrap().is_empty(),
+        "and the same stale tail"
+    );
+}
+
+#[test]
+fn a_later_level_can_refire_a_rule_an_earlier_level_already_ran() {
+    // Two producers of the same edge type. `x_rule` writes X at level 0;
+    // `a_rule` (hopping over Y) writes a SECOND X edge at level 2. `r_rule`
+    // hops over X and must see both — recomputing at level 1 off the first X
+    // does not excuse it from recomputing at level 2 off the second.
+    let dir = tmp("two-producers");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let t = |k: &str| {
+        vec![
+            ("k".into(), Value::Str(k.into())),
+            ("grp".into(), Value::Str("g".into())),
+        ]
+    };
+    db.insert_node("S", "s", vec![("k".into(), Value::Str("a".into()))])
+        .unwrap();
+    db.insert_node("T", "t1", t("a")).unwrap();
+    db.insert_node("T", "t2", t("b")).unwrap();
+    db.insert_node("U", "u1", vec![("k".into(), Value::Str("a".into()))])
+        .unwrap();
+    db.insert_node("U", "u2", vec![("k".into(), Value::Str("b".into()))])
+        .unwrap();
+    let plain = |name: &str, edge: &str| RuleDef {
+        name: name.into(),
+        src_label: "S".into(),
+        dst_label: "T".into(),
+        predicate: Predicate::KeyMatch {
+            field: "link".into(),
+        },
+        edge_type: edge.into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    };
+    // Rule iteration is BTree name order, so at level 0 the X delta is appended
+    // before the Y delta. That is the order that exposes the bug.
+    db.create_rule(plain("x_rule", "X")).unwrap();
+    db.create_rule(plain("y_rule", "Y")).unwrap();
+    // Hops over Y, writes X: the second producer.
+    db.create_rule(RuleDef {
+        name: "a_rule".into(),
+        src_label: "S".into(),
+        dst_label: "T".into(),
+        predicate: Predicate::FieldEqual {
+            field: "grp".into(),
+        },
+        edge_type: "X".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("T".into()),
+        via_edge: Some("Y".into()),
+        via_dir: Some(Direction::Out),
+    })
+    .unwrap();
+    // Hops over X, writes Z. Its result depends on WHICH T nodes it reaches.
+    db.create_rule(RuleDef {
+        name: "r_rule".into(),
+        src_label: "S".into(),
+        dst_label: "U".into(),
+        predicate: Predicate::FieldEqual { field: "k".into() },
+        edge_type: "Z".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("T".into()),
+        via_edge: Some("X".into()),
+        via_dir: Some(Direction::Out),
+    })
+    .unwrap();
+    assert!(db.neighbors("s", "Z", Direction::Out).unwrap().is_empty());
+
+    db.set_prop("s", "link", Value::Str("t1".into())).unwrap();
+
+    let mut x = db.neighbors("s", "X", Direction::Out).unwrap();
+    x.sort();
+    assert_eq!(x, vec!["t1", "t2"], "both producers of X must have run");
+    let mut z = db.neighbors("s", "Z", Direction::Out).unwrap();
+    z.sort();
+    assert_eq!(
+        z,
+        vec!["u1", "u2"],
+        "u2 is only reachable through the X edge written at level 2"
+    );
+}
+
+#[test]
+fn deleting_a_node_does_not_let_the_chain_re_derive_edges_onto_it() {
+    // `model` is simultaneously a via node for `knows` (alice hops through it)
+    // and one of `knows`'s destination candidates. Deleting it retracts
+    // TOP_AUTHOR(model→alice), which chains into `knows` — while `model` still
+    // carries its label and props. Nothing may re-derive an edge onto it: the
+    // caller strips topology afterwards but never provenance, so a re-derived
+    // edge would leak forever and lie in edge history.
+    let dir = tmp("delete-node");
+    let mut db = GraphDb::open(&dir).unwrap();
+    seed(&mut db);
+    assert_eq!(knows(&db, "alice"), vec!["api", "model"]);
+    // `edge_history` counts WAL frames, which include the derived-edge markers,
+    // so this is not `commit_seq`.
+    let before_delete = db.edge_history("alice", "model").unwrap().total_commits;
+
+    db.delete_node("model").unwrap();
+
+    let check = |db: &Db, label: &str| {
+        assert_eq!(knows(db, "alice"), vec!["api"], "{label}: live KNOWS");
+        let s = db.stats();
+        let per_rule: Vec<(String, u64)> =
+            s.rules.iter().map(|r| (r.name.clone(), r.edges)).collect();
+        assert_eq!(
+            per_rule,
+            vec![("knows".to_string(), 1), ("top_author".to_string(), 1)],
+            "{label}: provenance must match the live topology, with no leak"
+        );
+        // Every edge in this fixture is rule-derived, so the two must agree.
+        assert_eq!(
+            s.edges,
+            s.rules.iter().map(|r| r.edges).sum::<u64>(),
+            "{label}: topology and provenance edge counts must agree"
+        );
+    };
+    // History is WAL-bounded, so it is only meaningful before the snapshot
+    // compacts the frames these events live in.
+    let check_history = |db: &Db, label: &str| {
+        let hist = db.edge_history("alice", "model").unwrap();
+        let bogus: Vec<_> = hist
+            .items
+            .iter()
+            .filter(|e| e.event == EdgeEvent::Added && e.commit >= before_delete)
+            .collect();
+        assert!(
+            bogus.is_empty(),
+            "{label}: no edge may be added to a deleted node, got {bogus:?}"
+        );
+        assert_eq!(
+            hist.items.last().map(|e| &e.event),
+            Some(&EdgeEvent::Retracted),
+            "{label}: the pair's last recorded event must be a retraction"
+        );
+        let now = hist.total_commits - 1;
+        assert!(
+            !db.was_linked("alice", "model", "KNOWS", now).unwrap(),
+            "{label}: a deleted node must not read as linked"
+        );
+    };
+    check(&db, "live");
+    check_history(&db, "live");
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    check(&db, "after wal replay");
+    check_history(&db, "after wal replay");
+    drop(db);
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.snapshot().unwrap();
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    check(&db, "after snapshot roundtrip");
+}
+
+#[test]
+fn a_batch_cannot_assemble_a_cycle_one_rule_at_a_time() {
+    let dir = tmp("batch-cycle");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("A", "a", vec![("k".into(), Value::Str("x".into()))])
+        .unwrap();
+    db.insert_node("B", "b", vec![("k".into(), Value::Str("x".into()))])
+        .unwrap();
+    let hop = |name: &str, via: &str, writes: &str| RuleDef {
+        name: name.into(),
+        src_label: "A".into(),
+        dst_label: "B".into(),
+        predicate: Predicate::FieldEqual { field: "k".into() },
+        edge_type: writes.into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("B".into()),
+        via_edge: Some(via.into()),
+        via_dir: Some(Direction::Out),
+    };
+    // Neither rule closes a cycle on its own; together they do.
+    let err = db
+        .batch()
+        .create_rule(hop("first", "X", "Y"))
+        .create_rule(hop("second", "Y", "X"))
+        .commit()
+        .unwrap_err();
+    match err {
+        GraphError::RuleInvalid { detail } => {
+            assert_eq!(detail, "rule chain cycle: Y -> X -> Y")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(db.rules().len(), 0, "a rejected batch commits nothing");
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.rules().len(), 0, "and nothing was logged");
+}
+
+#[test]
+fn a_view_over_a_chained_edge_type_updates_exactly_once_per_chained_delta() {
+    // `authored` counts KNOWS edges, which only ever change through the chain.
+    // If chained deltas were dropped the view would stay at its backfill value;
+    // if they were applied twice the count would drift off the topology.
+    let dir = tmp("view");
+    let mut db = GraphDb::open(&dir).unwrap();
+    seed(&mut db);
+    db.create_view(ViewDef {
+        name: "knows_out".into(),
+        label: "Author".into(),
+        view_prop: "known_files".into(),
+        source: ViewSource::Degree {
+            edge_type: "KNOWS".into(),
+            direction: Direction::Out,
+        },
+    })
+    .unwrap();
+    let deg = |db: &Db, who: &str| db.get_prop(who, "known_files");
+    assert_eq!(deg(&db, "alice"), Some(Value::Int(2)));
+    assert_eq!(deg(&db, "bob"), Some(Value::Int(0)));
+
+    // One SET: two KNOWS fires for bob, none retracted for alice.
+    db.set_prop("api", "top_author_id", Value::Str("bob".into()))
+        .unwrap();
+    assert_eq!(deg(&db, "bob"), Some(Value::Int(2)));
+    assert_eq!(deg(&db, "alice"), Some(Value::Int(2)));
+
+    // One SET: alice's two KNOWS edges retract.
+    db.set_prop("model", "top_author_id", Value::Str("bob".into()))
+        .unwrap();
+    assert_eq!(deg(&db, "alice"), Some(Value::Int(0)));
+    assert_eq!(deg(&db, "bob"), Some(Value::Int(2)));
+
+    // The view value must equal the live topology, not an accumulated drift.
+    for who in ["alice", "bob"] {
+        assert_eq!(
+            deg(&db, who),
+            Some(Value::Int(knows(&db, who).len() as i64)),
+            "{who}"
+        );
+    }
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    for who in ["alice", "bob"] {
+        assert_eq!(
+            db.get_prop(who, "known_files"),
+            Some(Value::Int(knows(&db, who).len() as i64)),
+            "{who} after replay"
+        );
+    }
+}
+
+#[test]
+fn create_rule_backfill_chains_into_an_existing_via_hop_rule() {
+    // The reverse creation order from `seed`: the consumer exists first, so the
+    // producer's backfill is what has to feed it.
+    let dir = tmp("backfill-chain");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Author", "alice", vec![]).unwrap();
+    db.insert_node(
+        "File",
+        "api",
+        vec![
+            ("commits".into(), strs(&["c1", "c2", "c3"])),
+            ("top_author_id".into(), Value::Str("alice".into())),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "File",
+        "model",
+        vec![
+            ("commits".into(), strs(&["c1", "c2", "c3"])),
+            ("top_author_id".into(), Value::Str("alice".into())),
+        ],
+    )
+    .unwrap();
+    db.create_rule(RuleDef {
+        name: "knows".into(),
+        src_label: "Author".into(),
+        dst_label: "File".into(),
+        predicate: Predicate::Overlap {
+            field: "commits".into(),
+            min: 0.5,
+        },
+        edge_type: "KNOWS".into(),
+        weight_prop: Some("score".into()),
+        max_edges: Some(10),
+        approximate: false,
+        via_label: Some("File".into()),
+        via_edge: Some("TOP_AUTHOR".into()),
+        via_dir: Some(Direction::In),
+    })
+    .unwrap();
+    assert_eq!(knows(&db, "alice"), Vec::<String>::new(), "no hops yet");
+
+    db.create_rule(RuleDef {
+        name: "top_author".into(),
+        src_label: "File".into(),
+        dst_label: "Author".into(),
+        predicate: Predicate::KeyMatch {
+            field: "top_author_id".into(),
+        },
+        edge_type: "TOP_AUTHOR".into(),
+        weight_prop: None,
+        max_edges: Some(1),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    assert_eq!(
+        knows(&db, "alice"),
+        vec!["api", "model"],
+        "the backfill's TOP_AUTHOR edges must feed knows in the same write"
+    );
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(knows(&db, "alice"), vec!["api", "model"], "after replay");
 }
 
 #[test]

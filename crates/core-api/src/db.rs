@@ -269,6 +269,12 @@ pub struct Stats {
     pub nodes_tombstoned: usize,
     pub edges: u64,
     pub rules: Vec<RuleStats>,
+    /// How many writes hit the rule-chaining depth cap with work still pending,
+    /// since this handle was opened. Non-zero means some derived edges beyond
+    /// the cap are stale and no single later write will repair them: split the
+    /// rule chain or shorten it. Never persisted, so it resets on reopen.
+    #[serde(default)]
+    pub chain_truncations: u64,
 }
 
 /// One rule's provenance size, trip latch, and fire counter.
@@ -3561,12 +3567,19 @@ impl<F: Fs> GraphDb<F> {
         // or views being present).  Enable emission for this apply if it is
         // currently off, then restore the original state unconditionally via an
         // RAII guard — this prevents a panic in apply() from leaking the flag.
+        // The same guard resets the engine's transient chaining state. A panic
+        // unwinding out of a rule hook would otherwise leave `chain_depth`
+        // non-zero, which makes every later `begin_chain` decide chaining is
+        // already running and silently switch it off for good.
         struct RestoreEmitDeltas(*mut RuleEngine, bool);
         impl Drop for RestoreEmitDeltas {
             fn drop(&mut self) {
                 // SAFETY: pointer into self (GraphDb); guard is dropped within
                 // this frame before log_then_apply_with returns.
-                unsafe { (*self.0).set_emit_deltas(self.1) };
+                unsafe {
+                    (*self.0).set_emit_deltas(self.1);
+                    (*self.0).reset_chain_state();
+                }
             }
         }
         let original_emit = self.engine.emit_deltas();
@@ -4628,7 +4641,7 @@ impl<F: Fs> GraphDb<F> {
                             bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
                                 detail: format!("serialize rule: {e}"),
                             })?;
-                        preview.note_create_rule(&def.name);
+                        preview.note_create_rule(&def);
                         recs.push(WalRecord::CreateRule { def_bytes });
                     }
                     BatchOp::DeleteRule { name } => {
@@ -8750,6 +8763,7 @@ impl<F: Fs> GraphDb<F> {
             nodes_tombstoned: self.ids.len() - self.ids.live_len(),
             edges: self.topo_view().edge_count(),
             rules,
+            chain_truncations: self.engine.chain_truncations(),
         }
     }
 
@@ -9303,6 +9317,10 @@ struct Overlay {
     deleted_edges: BTreeSet<(String, String, String)>,
     extra_rules: BTreeSet<String>,
     deleted_rules: BTreeSet<String>,
+    /// `(via_edge, edge_type)` for every via-hop rule accepted earlier in this
+    /// batch. Feeds the rule-chain cycle check, which otherwise sees only the
+    /// rules already committed to the engine.
+    extra_rule_arcs: Vec<(String, String)>,
 }
 
 /// Read-only view of live db state plus a batch overlay. Shared by single-op
@@ -9619,9 +9637,8 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         // instead, leaving an arbitrary partial result. Reject it here, the one
         // place that sees the whole rule set.
         //
-        // Same-batch CreateRule ops are not considered: the overlay records
-        // only their names, matching the documented rule window in
-        // `is_rule_owned` and `would_derive`.
+        // Rules accepted earlier in the same batch count too: the overlay
+        // carries their arcs, so a cycle cannot be assembled one op at a time.
         if let Some(via) = def.via_edge.as_deref() {
             if via == def.edge_type {
                 return Err(GraphError::RuleInvalid {
@@ -9635,6 +9652,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
                 .filter(|r| !self.overlay.deleted_rules.contains(&r.name))
                 .filter_map(|r| r.via_edge.clone().map(|v| (v, r.edge_type.clone())))
                 .collect();
+            arcs.extend(self.overlay.extra_rule_arcs.iter().cloned());
             arcs.push((via.to_string(), def.edge_type.clone()));
             if let Some(path) = find_cycle_through(&arcs, &def.edge_type, via) {
                 return Err(GraphError::RuleInvalid {
@@ -9710,9 +9728,17 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             .retain(|(_, s, d)| s != key && d != key);
     }
 
-    fn note_create_rule(&mut self, name: &str) {
-        self.overlay.deleted_rules.remove(name);
-        self.overlay.extra_rules.insert(name.to_string());
+    fn note_create_rule(&mut self, def: &RuleDef) {
+        self.overlay.deleted_rules.remove(&def.name);
+        self.overlay.extra_rules.insert(def.name.clone());
+        // Rules accepted earlier in this batch are not in the engine yet, so
+        // the cycle check would not see their arcs. Keep the arc, not just the
+        // name, so a batch cannot smuggle in a cycle one op at a time.
+        if let Some(via) = def.via_edge.clone() {
+            self.overlay
+                .extra_rule_arcs
+                .push((via, def.edge_type.clone()));
+        }
     }
 
     fn check_rename_node(&self, old: &str, new: &str) -> Result<()> {
