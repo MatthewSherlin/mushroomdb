@@ -24,7 +24,11 @@ ingest-git: 1204 commit(s), 318 file(s), 7 author(s)
 | `Author` | email | `name` |
 | `Commit` | full sha | `message` (subject line), `ts` (unix seconds), `author_id` |
 | `File` | path | `path`, `dir`, `ext`, `commits` (list of shas, newest last, capped), `n_commits`, `top_author_id`, `alive` |
-| `GitSync` | `"HEAD"` | `sha` — the last ingested commit, the marker the next run resumes from |
+| `GitSync` | `"__mushroomdb_git_sync__"` | `sha` — the last ingested commit, the marker the next run resumes from |
+
+The sync marker's key is deliberately not `HEAD`. Node keys are one namespace
+shared with `File` keys, which are repository paths, and a project that ships a
+file named `HEAD` would otherwise collide with the marker.
 
 Note that `n_commits` counts every commit that ever touched the file, while
 `commits` holds only the most recent `--max-commits-per-file` shas (default
@@ -80,8 +84,8 @@ renamed *into* an excluded path is treated as deleted.
 ## Incremental semantics
 
 The first run has no `GitSync` node, so it reads the whole history and creates
-the rules. Every later run reads the `sha` on `GitSync/HEAD` and asks git only
-for `<sha>..HEAD`, then applies the changes in order:
+the rules. Every later run reads the `sha` off the `GitSync` node and asks git
+only for `<sha>..HEAD`, then applies the changes in order:
 
 - **Added / modified** — the file's `commits` list, `n_commits`, and
   `top_author_id` are updated, which re-derives its `CO_CHANGED` edges.
@@ -102,9 +106,18 @@ A run with no new commits writes nothing at all: `commit_seq` does not move.
 Merge commits appear as `Commit` nodes with no `TOUCHED` edges, since
 `--name-status` reports no changes for them by default.
 
-If the recorded head is no longer in the repository (history was rewritten), the
-command fails rather than double-counting; ingest into a fresh database
-directory. A repository with no commits yet reports zeros and writes nothing.
+Each run records `git rev-parse HEAD` as the next resume point, so the range the
+following run asks for is exact. If the recorded head is no longer in the
+repository (history was rewritten, or the database was pointed at a different
+repo), the command fails rather than double-counting; ingest into a fresh
+database directory. A repository with no commits yet reports zeros and writes
+nothing.
+
+Paths are read with `core.quotePath=false`, so non-ASCII filenames are stored as
+written rather than octal-escaped. Git still quotes and escapes a path
+containing a tab or a newline, and such a path is stored in that escaped form.
+A commit subject containing a `0x1e` or `0x1f` byte truncates or drops that one
+commit's `message`; the sha and the graph are unaffected.
 
 ## What the recall hook sees
 

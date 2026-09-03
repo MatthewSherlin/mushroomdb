@@ -435,6 +435,163 @@ fn rename_onto_a_just_deleted_path_replaces_the_old_node() {
     assert_eq!(files.len(), 2, "no duplicate under the reclaimed path");
 }
 
+/// Node keys are one namespace, so a repository file named `HEAD` must not
+/// collide with the `GitSync` marker. If it did, the sha would land on the File
+/// node, no marker would exist, and every run would re-ingest the whole history.
+#[test]
+fn a_repo_file_named_head_does_not_collide_with_the_sync_marker() {
+    let repo = seed_repo();
+    commit(&repo, "bob", "add a HEAD file", &[("HEAD", "not a ref")]);
+    let db_dir = tmp("db");
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!(r.files, 4);
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    let head_file = db.node_ref("HEAD").expect("the repo file keeps its path");
+    assert_eq!(head_file.label(), "File");
+    assert_eq!(
+        head_file.prop("path"),
+        Some(core_api::Value::Str("HEAD".to_string()))
+    );
+    assert!(
+        head_file.prop("sha").is_none(),
+        "the sync sha must not be written onto the File node"
+    );
+    let marker = db
+        .node_ref("__mushroomdb_git_sync__")
+        .expect("sync marker exists under its own key");
+    assert_eq!(marker.label(), "GitSync");
+    assert_eq!(
+        marker.prop("id"),
+        Some(core_api::Value::Str("__mushroomdb_git_sync__".to_string()))
+    );
+    assert!(matches!(marker.prop("sha"), Some(core_api::Value::Str(s)) if s.len() == 40));
+    drop(db);
+
+    // The marker is found again, so the rerun is incremental and writes nothing.
+    let before = GraphDb::open(&db_dir).unwrap().commit_seq();
+    let again = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert!(again.incremental);
+    assert_eq!(again.commits, 0);
+    assert_eq!(GraphDb::open(&db_dir).unwrap().commit_seq(), before);
+}
+
+/// The sync marker is exactly `git rev-parse HEAD`, and a merge whose side
+/// branch is dated years in the future does not disturb that or the incremental
+/// resume. Merge commits themselves carry no `TOUCHED` edges.
+#[test]
+fn sync_marker_is_head_across_a_merge_with_skewed_dates() {
+    let repo = seed_repo();
+    // A side branch off the first commit, dated far in the future, merged back.
+    git(&repo, &["checkout", "-q", "-b", "feat", "HEAD~3"]);
+    let full = repo.join("src/side.rs");
+    std::fs::write(&full, "s1").unwrap();
+    git(&repo, &["add", "-A"]);
+    let st = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "-c",
+            "user.name=bob",
+            "-c",
+            "user.email=bob@x.test",
+            "commit",
+            "-q",
+            "-m",
+            "future side work",
+        ])
+        .env("GIT_AUTHOR_DATE", "2030-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2030-01-01T00:00:00Z")
+        .status()
+        .unwrap();
+    assert!(st.success());
+    git(&repo, &["checkout", "-q", "main"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=alice",
+            "-c",
+            "user.email=alice@x.test",
+            "merge",
+            "-q",
+            "--no-ff",
+            "feat",
+            "-m",
+            "merge the side branch",
+        ],
+    );
+
+    let db_dir = tmp("db");
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!(r.commits, 6, "4 seed + side commit + merge");
+
+    let real_head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert_eq!(
+        db.node_ref("__mushroomdb_git_sync__").unwrap().prop("sha"),
+        Some(core_api::Value::Str(real_head.clone())),
+        "the marker is exactly rev-parse HEAD"
+    );
+    assert!(db.has_node("src/side.rs"));
+    assert!(
+        db.neighbors(&real_head, "TOUCHED", Direction::Out)
+            .unwrap()
+            .is_empty(),
+        "a merge commit reports no file changes"
+    );
+    drop(db);
+
+    // The marker resumes correctly: nothing new, nothing written.
+    let before = GraphDb::open(&db_dir).unwrap().commit_seq();
+    let again = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!(again.commits, 0);
+    assert_eq!(GraphDb::open(&db_dir).unwrap().commit_seq(), before);
+}
+
+/// Non-ASCII paths are stored as written. Without `core.quotePath=false` git
+/// renders them octal-escaped and quoted, so the node key would be mangled and
+/// no later run would match it.
+#[test]
+fn non_ascii_paths_are_stored_unescaped() {
+    let repo = seed_repo();
+    commit(
+        &repo,
+        "bob",
+        "add an accented file",
+        &[("src/café.rs", "c1")],
+    );
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(
+        db.has_node("src/café.rs"),
+        "the real path is the key; keys present: {:?}",
+        db.query("MATCH (f:File) RETURN f.id AS id", &Default::default())
+            .unwrap()
+            .len()
+    );
+    let n = db.node_ref("src/café.rs").unwrap();
+    assert_eq!(
+        n.prop("path"),
+        Some(core_api::Value::Str("src/café.rs".to_string()))
+    );
+    assert_eq!(n.prop("ext"), Some(core_api::Value::Str("rs".to_string())));
+}
+
 /// An initialised repository with no commits reports zeros and writes nothing.
 #[test]
 fn empty_repository_reports_zeros_and_writes_nothing() {

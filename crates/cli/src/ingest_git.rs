@@ -10,7 +10,7 @@
 //! | `Author` | email | `name` |
 //! | `Commit` | full sha | `message`, `ts`, `author_id` |
 //! | `File` | path | `path`, `dir`, `ext`, `commits`, `n_commits`, `top_author_id`, `alive` |
-//! | `GitSync` | `"HEAD"` | `sha` |
+//! | `GitSync` | `"__mushroomdb_git_sync__"` | `sha` |
 //!
 //! Edges: user `TOUCHED` Commit→File, auto-FK `AUTHOR` Commit→Author and
 //! `TOP_AUTHOR` File→Author, rule-derived `CO_CHANGED` File→File and `KNOWS`
@@ -29,7 +29,13 @@ pub const DEFAULT_MAX_COMMITS_PER_FILE: usize = 200;
 const CO_CHANGE_MIN: f64 = 0.25;
 
 /// Key of the singleton `GitSync` node holding the last ingested sha.
-const SYNC_KEY: &str = "HEAD";
+///
+/// Node keys are a single namespace shared with `File` keys, which are repo
+/// paths — so this cannot be `"HEAD"`. A repository with a file named `HEAD`
+/// (git's own `.git/HEAD` aside, plenty of projects ship one) would otherwise
+/// have the sha written onto its `File` node, leaving no sync marker and
+/// forcing a full re-ingest on every run.
+const SYNC_KEY: &str = "__mushroomdb_git_sync__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestGitOpts {
@@ -125,11 +131,22 @@ fn read_log(repo: &Path, since: Option<&str>) -> Result<Vec<GitCommit>, CliError
     }
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo).args([
+        // Without this git renders any non-ASCII byte in a path as an octal
+        // escape, so `src/café.rs` would be stored under a mangled key that no
+        // later run matches. Paths containing a tab or newline stay quoted and
+        // escaped either way — git has to, or they would break the format below.
+        "-c",
+        "core.quotePath=false",
         "log",
         "--reverse",
         "--name-status",
         "-M",
         "--no-color",
+        // Record separator \x1e between commits, unit separator \x1f between
+        // header fields. A commit subject containing either byte splits its own
+        // record: the message is truncated at the first \x1f, and a \x1e drops
+        // the remainder of that commit's header. Accepted — the parse degrades
+        // to a skipped or shortened message, never a panic or a wrong sha.
         "--format=%x1e%H%x1f%an%x1f%ae%x1f%at%x1f%s",
     ]);
     if let Some(s) = since {
@@ -183,6 +200,32 @@ fn read_log(repo: &Path, since: Option<&str>) -> Result<Vec<GitCommit>, CliError
         });
     }
     Ok(commits)
+}
+
+/// The commit the next incremental run resumes from.
+///
+/// Asked of git directly rather than taken from `log.last()`. In practice the
+/// two agree — a reachability walk always emits its tip first, so reversing it
+/// puts `HEAD` last even across merges with badly skewed commit dates — but
+/// that equality is a property of the traversal and of this module's parser
+/// (a record the parser skips would shift the last entry), not something the
+/// resume marker should depend on. `rev-parse` is exact by construction.
+fn head_sha(repo: &Path) -> Result<String, CliError> {
+    let out = git_output(repo, &["rev-parse", "HEAD"])?;
+    if !out.status.success() {
+        return Err(CliError(format!(
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err(CliError(format!(
+            "git rev-parse HEAD returned nothing for {}",
+            repo.display()
+        )));
+    }
+    Ok(sha)
 }
 
 fn file_props(path: &str, commits: &[String], top_author: &str) -> Vec<(String, Value)> {
@@ -331,6 +374,9 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
         // Nothing new: leave the store untouched so `commit_seq` does not move.
         return Ok(report);
     }
+    // Resolved before the first write so a git failure cannot leave the store
+    // updated with no matching sync marker.
+    let head = head_sha(&opts.repo)?;
 
     let mut w = db.write();
     let ingest = IngestOptions::default(); // key `id`, auto-FK suffix `_id`
@@ -544,12 +590,19 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
         }
     }
 
-    // 6. Sync marker for the next incremental run.
-    let head = log.last().map(|c| c.sha.clone()).unwrap_or_default();
+    // 6. Sync marker for the next incremental run, resolved above. It carries
+    //    `id` like every other label here, so the key is readable from Cypher.
     if w.has_node(SYNC_KEY) {
         w.set_prop(SYNC_KEY, "sha", Value::Str(head))?;
     } else {
-        w.insert_node("GitSync", SYNC_KEY, vec![("sha".into(), Value::Str(head))])?;
+        w.insert_node(
+            "GitSync",
+            SYNC_KEY,
+            vec![
+                ("id".into(), Value::Str(SYNC_KEY.into())),
+                ("sha".into(), Value::Str(head)),
+            ],
+        )?;
     }
     Ok(report)
 }
