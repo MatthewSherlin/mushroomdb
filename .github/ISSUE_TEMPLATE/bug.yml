@@ -5,15 +5,16 @@ body:
   - type: markdown
     attributes:
       value: |
-        Before filing, check that you are on the latest commit on `main`
-        and that the Rust gate (`cargo test --workspace`) passes locally.
+        Before filing, check that you are on the latest release (`mushroomdb --version`)
+        or the latest commit on `main`. If you build from source, the Rust gate
+        (`cargo test --workspace`) should pass locally first.
 
   - type: input
     id: version
     attributes:
       label: Version or commit
-      description: Output of `git rev-parse --short HEAD` or the binary version string
-      placeholder: "e.g. a812d29 or v0.1.0"
+      description: Output of `mushroomdb --version`, or `git rev-parse --short HEAD` if you build from source
+      placeholder: "e.g. v0.5.1 or a812d29"
     validations:
       required: true
 
