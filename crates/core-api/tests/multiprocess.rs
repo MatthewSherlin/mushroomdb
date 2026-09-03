@@ -10,12 +10,14 @@
 //!  1. server_handle_sees_child_process_writes_after_refresh
 //!  2. two_writers_serialise_without_corruption
 //!  3. writer_gets_busy_when_lock_held
-//!  4. read_only_open_never_blocks_and_never_locks
-//!  5. refresh_survives_snapshot_by_other_process
-//!  6. partial_trailing_frame_is_not_an_error
-//!  7. derived_edges_fire_on_refreshed_frames
-//!  8. wal_consumed_tracks_bytes_exactly
-//!  9. refresh_on_unchanged_store_is_zero_cost
+//!  4. snapshot_without_the_lock_is_refused
+//!  5. read_only_open_never_blocks_and_never_locks
+//!  6. refresh_survives_snapshot_by_other_process
+//!  7. partial_trailing_frame_is_not_an_error
+//!  8. derived_edges_fire_on_refreshed_frames
+//!  9. refresh_failure_degrades_the_handle
+//! 10. wal_consumed_tracks_bytes_exactly
+//! 11. refresh_on_unchanged_store_is_zero_cost
 
 use core_api::{GraphDb, OpenOptions, Predicate, RuleDef, SharedDb, Value};
 use core_storage::fs::{FileId, Fs, RealFs};
@@ -63,6 +65,23 @@ fn run_worker(dir: &Path, args: &[&str]) -> (i32, String) {
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).trim().to_string(),
     )
+}
+
+/// Every file in the store directory as `(name, length)`, sorted — enough to
+/// catch a create, a delete, or a rewrite.
+fn dir_listing(dir: &Path) -> Vec<(String, u64)> {
+    let mut out: Vec<(String, u64)> = std::fs::read_dir(dir)
+        .expect("read store dir")
+        .map(|e| {
+            let e = e.expect("dir entry");
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                e.metadata().expect("entry metadata").len(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 fn same_team_rule() -> RuleDef {
@@ -161,7 +180,45 @@ fn writer_gets_busy_when_lock_held() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-// ── 4. A read-only open never waits for, and never takes, the lock ────────────
+// ── 4. A snapshot without the lock is refused, not performed ──────────────────
+
+#[test]
+fn snapshot_without_the_lock_is_refused() {
+    let d = tmp("snapshot-busy");
+    let db = SharedDb::open(&d).unwrap();
+    {
+        let mut g = db.write();
+        for i in 0..5 {
+            g.insert_node("Person", &format!("p-{i}"), vec![]).unwrap();
+        }
+    }
+    let wal_before = std::fs::read(d.join("wal.bin")).unwrap();
+
+    // Hold the lock, then have a peer try to snapshot through a write guard —
+    // the guard it gets back has no lock, and a snapshot would replace wal.bin
+    // out from under this process.
+    let guard = db.write();
+    let (code, _) = run_worker(&d, &["snapshot-shared"]);
+    assert_eq!(code, 3, "a snapshot without the lock must report Busy");
+    drop(guard);
+
+    // The WAL is byte-for-byte what it was: the peer wrote nothing.
+    assert_eq!(
+        std::fs::read(d.join("wal.bin")).unwrap(),
+        wal_before,
+        "the refused snapshot must not have touched the WAL"
+    );
+    assert!(!d.join("snapshot.bin").exists(), "no snapshot was written");
+
+    // With the lock free, the same call succeeds.
+    let (code, _) = run_worker(&d, &["snapshot-shared"]);
+    assert_eq!(code, 0, "the snapshot proceeds once the lock is free");
+    assert!(d.join("snapshot.bin").exists());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ── 5. A read-only open never waits for, and never takes, the lock ────────────
 
 #[test]
 fn read_only_open_never_blocks_and_never_locks() {
@@ -185,22 +242,31 @@ fn read_only_open_never_blocks_and_never_locks() {
         "read-only open waited {elapsed:?} — it must not poll the write lock"
     );
 
-    // A read-only handle refuses mutations and writes nothing to disk.
+    // A read-only handle refuses mutations and writes nothing to disk — no WAL
+    // repair, no snapshot migration, no archive sweep, not even a LOCK file.
     let opts = OpenOptions {
         read_only: true,
         ..OpenOptions::default()
     };
+    let before = dir_listing(&d);
     let mut ro = GraphDb::open_with_options(&d, opts).unwrap();
     assert!(matches!(
         ro.insert_node("Person", "bob", vec![]),
         Err(GraphError::ReadOnly)
     ));
+    assert!(matches!(ro.snapshot(), Err(GraphError::ReadOnly)));
+    ro.refresh().expect("a read-only handle can still refresh");
+    assert_eq!(
+        dir_listing(&d),
+        before,
+        "a read-only open must leave every file in the store untouched"
+    );
     drop(ro);
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }
 
-// ── 5. A snapshot taken by another process is absorbed by refresh ─────────────
+// ── 6. A snapshot taken by another process is absorbed by refresh ─────────────
 
 #[test]
 fn refresh_survives_snapshot_by_other_process() {
@@ -226,7 +292,7 @@ fn refresh_survives_snapshot_by_other_process() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-// ── 6. A trailing partial frame is a wait, not a corruption ───────────────────
+// ── 7. A trailing partial frame is a wait, not a corruption ───────────────────
 
 #[test]
 fn partial_trailing_frame_is_not_an_error() {
@@ -263,7 +329,7 @@ fn partial_trailing_frame_is_not_an_error() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-// ── 7. Rules fire on refreshed frames exactly as during open replay ───────────
+// ── 8. Rules fire on refreshed frames exactly as during open replay ───────────
 
 #[test]
 fn derived_edges_fire_on_refreshed_frames() {
@@ -291,7 +357,56 @@ fn derived_edges_fire_on_refreshed_frames() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-// ── 8. The frame cursor advances by exactly the bytes appended ────────────────
+// ── 9. A refresh that cannot apply the tail degrades the handle ───────────────
+
+#[test]
+fn refresh_failure_degrades_the_handle() {
+    let d = tmp("refresh-degrade");
+    let mut db = GraphDb::open(&d).unwrap();
+    db.insert_node("Person", "alice", vec![]).unwrap();
+
+    // A frame that decodes cleanly but cannot be applied: SetProp names a key
+    // no node has. Half of `apply_frames` may land before the failure and the
+    // cursor cannot say how much, so the handle has to stop accepting writes.
+    let frame = encode_record(&WalRecord::SetProp {
+        key: "ghost".into(),
+        field: "x".into(),
+        value: Value::Int(1),
+    });
+    let wal_len_before = std::fs::metadata(d.join("wal.bin")).unwrap().len();
+    RealFs::new(&d)
+        .unwrap()
+        .append(FileId::Wal, &frame)
+        .unwrap();
+
+    let err = db.refresh().unwrap_err();
+    assert!(
+        matches!(err, GraphError::Corrupt { .. }),
+        "expected the apply failure to propagate, got {err:?}"
+    );
+
+    // Degraded: every write refuses until the handle is reopened.
+    let write_err = db.insert_node("Person", "bob", vec![]).unwrap_err();
+    assert!(
+        matches!(write_err, GraphError::Io(_)),
+        "expected the degraded error, got {write_err:?}"
+    );
+    // Snapshots refuse too — they bypass the WAL append path entirely.
+    let snap_err = db.snapshot().unwrap_err();
+    assert!(
+        matches!(snap_err, GraphError::Io(_)),
+        "expected snapshot to refuse on a degraded handle, got {snap_err:?}"
+    );
+
+    // The failed refresh wrote nothing: the WAL still holds exactly the bytes
+    // that were there, including the frame it could not apply.
+    let on_disk = std::fs::metadata(d.join("wal.bin")).unwrap().len();
+    assert_eq!(on_disk, wal_len_before + frame.len() as u64);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ── 10. The frame cursor advances by exactly the bytes appended ───────────────
 
 #[test]
 fn wal_consumed_tracks_bytes_exactly() {
@@ -299,11 +414,21 @@ fn wal_consumed_tracks_bytes_exactly() {
     let mut db = GraphDb::open(&d).unwrap();
     assert_eq!(db.wal_consumed(), 0);
 
+    // A rule makes the writes below emit derived-edge marker frames alongside
+    // the mutation frame. Markers are a separate append with their own cursor
+    // arm, so this is the only way the two-appends-per-commit case is covered.
+    db.create_rule(same_team_rule()).unwrap();
+    let after_rule = std::fs::metadata(d.join("wal.bin")).unwrap().len();
+    assert_eq!(db.wal_consumed(), after_rule);
+
     for i in 0..5 {
         db.insert_node(
             "Person",
             &format!("p-{i}"),
-            vec![("n".into(), Value::Int(i))],
+            vec![
+                ("n".into(), Value::Int(i)),
+                ("team".into(), Value::Str("red".into())),
+            ],
         )
         .unwrap();
         let on_disk = std::fs::metadata(d.join("wal.bin")).unwrap().len();
@@ -314,6 +439,16 @@ fn wal_consumed_tracks_bytes_exactly() {
         );
         assert!(!db.is_stale().unwrap());
     }
+    // Marker frames really were written: without them the WAL would hold only
+    // the six mutation frames, and the cursor assertions above would pass
+    // trivially on the single-append path.
+    let bytes = std::fs::read(d.join("wal.bin")).unwrap();
+    let (frames, _) = decode_all(&bytes);
+    assert!(
+        frames.len() > 6,
+        "expected derived-edge marker frames beyond the 6 mutations, got {}",
+        frames.len()
+    );
 
     // An externally appended frame is decoded from exactly the cursor offset:
     // a cursor off by even one byte would fail to decode this frame.
@@ -334,7 +469,7 @@ fn wal_consumed_tracks_bytes_exactly() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-// ── 9. Refreshing an unchanged store reads no WAL bytes ───────────────────────
+// ── 11. Refreshing an unchanged store reads no WAL bytes ──────────────────────
 
 /// `RealFs` wrapper that counts every call that reads file *contents*.
 /// Metadata-only calls (`wal_len`, `snapshot_ident`) are deliberately not
@@ -378,10 +513,10 @@ impl Fs for CountingRealFs {
     fn snapshot_ident(&self) -> std::io::Result<Option<(u64, u64)>> {
         self.inner.snapshot_ident()
     }
-    fn try_lock_exclusive(&mut self) -> std::io::Result<bool> {
+    fn try_lock_exclusive(&self) -> std::io::Result<bool> {
         self.inner.try_lock_exclusive()
     }
-    fn unlock(&mut self) -> std::io::Result<()> {
+    fn unlock(&self) -> std::io::Result<()> {
         self.inner.unlock()
     }
     fn list_archives(&self) -> std::io::Result<Vec<u64>> {

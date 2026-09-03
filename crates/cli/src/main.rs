@@ -5,13 +5,22 @@ use cli::{
     parse_args, read_stats, run_algo, run_asof, run_backup, run_demo, run_export, run_migrate,
     run_query, run_schema_apply, run_snapshot, run_suggest, run_verify, usage, Command, ServeUi,
 };
-use core_api::SharedDb;
+use core_api::{GraphError, SharedDb};
 use std::collections::HashMap;
 use std::io::{self, Read as _, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
+
+/// How long a server-initiated snapshot waits for the store's cross-process
+/// write lock before giving up.
+///
+/// Short on purpose. A snapshot is an optimisation — it shortens the next
+/// open's replay — so skipping one costs nothing but a longer replay, whereas
+/// blocking the shutdown path or piling up timer ticks behind a busy peer
+/// costs the operator.
+const SNAPSHOT_LOCK_WAIT: Duration = Duration::from_millis(500);
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -293,8 +302,21 @@ fn run_serve(
                 loop {
                     interval.tick().await;
                     let db_snap = db_snap.clone();
-                    match tokio::task::spawn_blocking(move || db_snap.write().snapshot()).await {
+                    // A snapshot replaces wal.bin, so it needs the store's
+                    // cross-process write lock. If another process holds it,
+                    // skip this tick rather than wait: the next one is only a
+                    // period away, and a snapshot is never urgent.
+                    let taken = tokio::task::spawn_blocking(move || {
+                        db_snap.write_with_wait(SNAPSHOT_LOCK_WAIT)?.snapshot()
+                    })
+                    .await;
+                    match taken {
                         Ok(Ok(())) => {}
+                        Ok(Err(GraphError::Busy { .. })) => {
+                            eprintln!(
+                                "snapshot-every skipped: another process holds the write lock"
+                            );
+                        }
                         Ok(Err(e)) => eprintln!("snapshot-every failed: {e}"),
                         Err(e) => eprintln!("snapshot-every task panicked: {e}"),
                     }
@@ -367,7 +389,18 @@ fn run_serve(
             _ = shutdown_signal() => {
                 serve.abort();
                 let _ = serve.await;
-                db.write().snapshot().map_err(|e| e.to_string())?;
+                // Same rule as the periodic snapshot: it needs the store's
+                // write lock. Shutting down without one is fine — the WAL holds
+                // every commit, and the next open replays it.
+                match db.write_with_wait(SNAPSHOT_LOCK_WAIT).and_then(|mut g| g.snapshot()) {
+                    Ok(()) => {}
+                    Err(GraphError::Busy { .. }) => {
+                        eprintln!(
+                            "shutdown snapshot skipped: another process holds the write lock"
+                        );
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
                 Ok(())
             }
         }

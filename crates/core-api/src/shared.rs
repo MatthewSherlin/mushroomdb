@@ -33,7 +33,10 @@
 //!
 //! [`SharedDb::write`] enforces this by acquiring `wal_mu` before the RwLock.
 //! The drain thread acquires `wal_mu` before `inner.write()`.
-//! Readers NEVER acquire `wal_mu` — their p95 latency is unaffected.
+//! Readers NEVER acquire `wal_mu`, nor the cross-process lock — neither a
+//! concurrent fsync nor a peer process holding the store lock lengthens a read.
+//! What a reader can wait on is another thread's RwLock write guard: a direct
+//! writer's mutation, a group apply, or its own periodic refresh.
 //!
 //! Holding `wal_mu` from before [append group frames] through [fsync OR
 //! truncation resolution] closes the truncation race: no concurrent direct
@@ -43,20 +46,30 @@
 //! # Cross-process write lock
 //!
 //! The two locks above serialise writers inside this process. Across processes
-//! the store carries an advisory exclusive lock on its `LOCK` file, taken
-//! third, after both in-process locks:
+//! the store carries an advisory exclusive lock on its `LOCK` file, and it is
+//! taken **between** them, not last. The full order is:
 //!
-//! 3. cross-process `LOCK` — taken last, released first
+//! 1. `wal_mu`
+//! 2. cross-process `LOCK` — polled here, with no RwLock guard held
+//! 3. `inner` (RwLock write guard)
+//!
+//! Waiting for the cross-process lock is the slow step: a busy peer can hold it
+//! for the whole [`WRITE_LOCK_WAIT`](crate::WRITE_LOCK_WAIT) budget. Polling it
+//! before the RwLock is what keeps that wait off the read path — each attempt
+//! takes the RwLock in *read* mode for one `try_lock` syscall and releases it,
+//! so readers are never blocked by another process. Taking `inner.write()`
+//! first would stall every reader in this process behind a peer in another one.
 //!
 //! Both WAL-appending paths take it: [`SharedDb::write`] for the whole guard
 //! scope, and the drain thread for the whole of each group, from before the
 //! first append until after the group's fsync resolves. Releasing it only after
 //! the fsync is what stops another process's snapshot from truncating bytes
-//! this one has written but not yet made durable.
+//! this one has written but not yet made durable. `snapshot_with` refuses to
+//! run without it, for the same reason.
 //!
-//! Taking the lock also refreshes, so a write always applies on top of every
-//! other process's commits. A writer that cannot get the lock within its wait
-//! budget fails with [`GraphError::Busy`], having written nothing.
+//! Entering the write scope also refreshes, so a write always applies on top of
+//! every other process's commits. A writer that cannot get the lock within its
+//! wait budget fails with [`GraphError::Busy`], having written nothing.
 //!
 //! Readers take neither `wal_mu` nor the cross-process lock. They check for
 //! other processes' commits at most once per
@@ -112,7 +125,8 @@
 //! last clone is dropped can be silently lost.
 
 use crate::db::{
-    BatchOp, FsyncPolicy, Precondition, WriteAuthz, REFRESH_CHECK_INTERVAL, WRITE_LOCK_WAIT,
+    BatchOp, FsyncPolicy, Precondition, WriteAuthz, LOCK_POLL_INTERVAL, REFRESH_CHECK_INTERVAL,
+    WRITE_LOCK_WAIT,
 };
 use crate::reader::ReaderSnapshot;
 use crate::GraphDb;
@@ -470,9 +484,10 @@ impl SharedDb {
 
     /// Shared read access. Many readers may hold this concurrently.
     ///
-    /// Readers never acquire the WAL mutex — their p95 latency is unaffected
-    /// by concurrent write or fsync activity — and never wait on the
-    /// cross-process write lock.
+    /// Readers never acquire the WAL mutex and never wait on the cross-process
+    /// write lock, so neither a concurrent fsync nor a peer process writing the
+    /// store lengthens a read. A reader can still wait on another thread's
+    /// RwLock write guard, including the refresh below.
     ///
     /// # Following other processes
     ///
@@ -509,12 +524,14 @@ impl SharedDb {
     /// Do not hold a returned guard while calling any method on the same
     /// [`SharedDb`]; the [`RwLock`] is not re-entrant; doing so deadlocks.
     pub fn write(&self) -> WriteGuard<'_> {
-        let mut guard = self.lock_for_write();
+        let _wal = self.wal_mu.lock().unwrap_or_else(|e| e.into_inner());
+        let acquired = self
+            .poll_cross_process_lock(WRITE_LOCK_WAIT)
+            .unwrap_or(false);
         // The outcome is latched on the db itself, so it surfaces on the first
         // mutation: a denied lock as `Busy`, and a refresh failure under a
         // taken lock as the degraded error (`refresh` marks the handle).
-        let _ = guard.inner.begin_write_lock(WRITE_LOCK_WAIT);
-        guard
+        self.enter_write_scope(_wal, acquired).0
     }
 
     /// Like [`write`](SharedDb::write) but with an explicit wait budget, and
@@ -524,23 +541,56 @@ impl SharedDb {
     /// A zero wait makes exactly one attempt. Nothing is written on failure, so
     /// retrying later is always safe.
     pub fn write_with_wait(&self, wait: Duration) -> Result<WriteGuard<'_>> {
-        let mut guard = self.lock_for_write();
-        match guard.inner.begin_write_lock(wait) {
-            Ok(true) => Ok(guard),
-            Ok(false) => Err(GraphError::Busy { holder: None }),
-            Err(e) => Err(e),
+        let _wal = self.wal_mu.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.poll_cross_process_lock(wait)? {
+            return Err(GraphError::Busy { holder: None });
+        }
+        let (guard, entered) = self.enter_write_scope(_wal, true);
+        entered?;
+        Ok(guard)
+    }
+
+    /// Poll for the store's cross-process write lock, holding **no** in-process
+    /// guard while waiting.
+    ///
+    /// Lock order is `wal_mu` → cross-process `LOCK` → `inner` (RwLock write).
+    /// The caller already holds `wal_mu`, which is what keeps two writers in
+    /// this process from polling at once. Each attempt takes the RwLock in
+    /// *read* mode for the length of one `try_lock` syscall and releases it, so
+    /// concurrent readers are never blocked by a peer process: waiting for a
+    /// busy peer costs readers nothing.
+    fn poll_cross_process_lock(&self, wait: Duration) -> Result<bool> {
+        let deadline = Instant::now() + wait;
+        loop {
+            {
+                let db = self.inner.read().unwrap_or_else(|e| e.into_inner());
+                if db.try_cross_process_lock()? {
+                    return Ok(true);
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(LOCK_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
         }
     }
 
-    /// Take the two in-process locks in the required order and wrap them in a
-    /// guard. The cross-process lock is the caller's business.
-    fn lock_for_write(&self) -> WriteGuard<'_> {
-        // Acquire wal_mu BEFORE the RwLock write guard.  This matches the
-        // drain thread's acquisition order and prevents the truncation race:
-        // no direct write can interleave WAL I/O with an in-progress group.
-        let _wal = self.wal_mu.lock().unwrap_or_else(|e| e.into_inner());
-        let inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        WriteGuard { inner, _wal }
+    /// Take the RwLock write guard, wrap both in-process guards in a
+    /// [`WriteGuard`], and open the write scope with the lock outcome the
+    /// caller already obtained.
+    ///
+    /// The guard is returned even when the scope failed to open, so its `Drop`
+    /// always releases the cross-process lock; the failure rides on the second
+    /// tuple element and is latched on the handle for `write()`'s benefit.
+    fn enter_write_scope<'a>(
+        &'a self,
+        wal: std::sync::MutexGuard<'a, ()>,
+        acquired: bool,
+    ) -> (WriteGuard<'a>, Result<()>) {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let entered = inner.enter_write_scope(acquired);
+        (WriteGuard { inner, _wal: wal }, entered)
     }
 
     /// Capture a lock-free [`ReaderSnapshot`] of the current db state.
@@ -675,6 +725,29 @@ impl SharedDb {
 
 // ── Drain thread ──────────────────────────────────────────────────────────────
 
+/// Poll for the store's cross-process write lock without holding the RwLock
+/// write guard, so a busy peer never stalls this process's readers.
+///
+/// The free-function twin of [`SharedDb::poll_cross_process_lock`]; the drain
+/// thread has the `Arc<RwLock<..>>` but no `SharedDb`. The caller must already
+/// hold `wal_mu`.
+fn poll_cross_process_lock(inner: &Arc<RwLock<GraphDb<RealFs>>>, wait: Duration) -> Result<bool> {
+    let deadline = Instant::now() + wait;
+    loop {
+        {
+            let db = inner.read().unwrap_or_else(|e| e.into_inner());
+            if db.try_cross_process_lock()? {
+                return Ok(true);
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(LOCK_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+    }
+}
+
 fn drain_loop(
     inner: Arc<RwLock<GraphDb<RealFs>>>,
     queue: Arc<WriteQueue>,
@@ -717,15 +790,18 @@ fn drain_loop(
         //
         // The drain thread appends to the WAL without going through
         // `SharedDb::write`, so it must serialise against other processes
-        // itself.  `begin_write_lock` also refreshes under the lock, so the
-        // group applies on top of every commit another process has made.  The
-        // lock is released only after this group's fsync resolves: until then
-        // the tail contains bytes we have not made durable, and another
-        // process's snapshot must not truncate them away.
-        let lock_outcome = {
+        // itself.  Polling happens with NO RwLock guard held (lock order:
+        // wal_mu → cross-process LOCK → inner.write), so a busy peer cannot
+        // stall this process's readers for the duration of the wait.
+        // `enter_write_scope` then refreshes under the lock, so the group
+        // applies on top of every commit another process has made.  The lock is
+        // released only after this group's fsync resolves: until then the tail
+        // contains bytes we have not made durable, and another process's
+        // snapshot must not truncate them away.
+        let lock_outcome = poll_cross_process_lock(&inner, WRITE_LOCK_WAIT).and_then(|acquired| {
             let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
-            db.begin_write_lock(WRITE_LOCK_WAIT)
-        };
+            db.enter_write_scope(acquired).map(|()| acquired)
+        });
         match lock_outcome {
             Ok(true) => {}
             Ok(false) => {

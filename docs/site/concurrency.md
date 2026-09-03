@@ -22,7 +22,8 @@ two such paths and they take it at different granularities.
 **A plain handle holds it for its lifetime.** `GraphDb::open` locks the store
 and keeps it locked until the handle drops. One-shot commands are shaped this
 way, so they serialise against everything else naturally. Opening a second
-read-write handle — in this process or any other — fails immediately with
+read-write handle — in this process or any other — waits up to
+`WRITE_LOCK_WAIT` for the first one to let go, then fails with
 `GraphError::Busy`.
 
 **A shared handle takes it per write.** `SharedDb`, which the server uses, holds
@@ -31,10 +32,22 @@ would shut every other process out. It takes the lock inside
 `SharedDb::write()` instead, and the group-commit writer takes it once per
 group. Between writes the store is free for anyone else.
 
+**Snapshots need it too.** A snapshot replaces the write-ahead log with a fresh
+baseline, so a peer that is appending would be left holding a descriptor on a
+file that no longer exists, silently losing commits it believes durable.
+`snapshot()` therefore refuses with `Busy` unless the caller holds the lock. The
+server's periodic and shutdown snapshots wait briefly, then skip and log a line:
+a missed snapshot only means a longer replay next time, so it is never worth
+delaying a shutdown or queueing behind a busy peer.
+
 Taking the lock also refreshes, so a write always lands on top of every commit
 other processes have made. Releasing happens only after the commit's fsync
 completes: until then the WAL tail holds bytes that are written but not durable,
 and another process must not snapshot around them.
+
+Waiting for the lock never costs readers anything. A writer polls for it before
+it takes any in-process lock, so a busy peer in another process cannot stall
+reads in this one.
 
 The lock is advisory. It coordinates cooperating mushroomdb processes; it does
 not stop an unrelated program from editing the files.
@@ -118,6 +131,12 @@ to do is derived from state that is still there.
 The lock serialises writers; it is not a transaction manager. There are no
 cross-process transactions and no isolation levels. A reader mid-refresh can
 observe a commit boundary but not a half-applied commit.
+
+**Subscriptions do not fire for another process's writes.** Commits absorbed by
+`refresh` replay exactly as they would at open, and open notifies nobody — so a
+mutation subscriber, and the `/watch` and `/subscribe` endpoints built on it,
+see only writes made through this process. The data is there on the next read;
+the notification is not. Poll if you need to react to a hook's writes.
 
 Within one process, `SharedDb` serialises writers with its own locks and readers
 run concurrently. See the durability page for what a commit guarantees once it

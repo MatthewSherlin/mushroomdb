@@ -11,6 +11,7 @@
 //! mp_worker <dir> ro-read              read-only open; print the live node count
 //! mp_worker <dir> busy <wait_ms>       try to take the write lock; exit 3 on Busy
 //! mp_worker <dir> snapshot             take a snapshot (plain handle-lifetime lock)
+//! mp_worker <dir> snapshot-shared      snapshot through a SharedDb write guard
 //! ```
 //!
 //! Exit codes: `0` success, `3` [`GraphError::Busy`], `1` any other failure.
@@ -24,6 +25,23 @@ use std::time::Duration;
 /// writers interleave many times, large enough that the test does not pay one
 /// fsync per node.
 const CHUNK: usize = 50;
+
+/// How many times a chunk retries after `Busy` before giving up.
+///
+/// Contention with another writer is expected here; only a peer that holds the
+/// lock through every retry is a real failure.
+const WRITE_RETRIES: usize = 8;
+
+/// The insert ops for nodes `lo..hi` of this worker's prefix.
+fn chunk_ops(prefix: &str, lo: usize, hi: usize) -> Vec<BatchOp> {
+    (lo..hi)
+        .map(|k| BatchOp::InsertNode {
+            label: "Person".into(),
+            key: format!("{prefix}-{k}"),
+            props: vec![("team".into(), core_api::Value::Str(prefix.into()))],
+        })
+        .collect()
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -47,6 +65,7 @@ fn main() {
             run_busy(dir, Duration::from_millis(ms))
         }
         "snapshot" => run_snapshot(dir),
+        "snapshot-shared" => run_snapshot_shared(dir),
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(2);
@@ -75,16 +94,26 @@ fn run_write(dir: &Path, prefix: &str, n: usize) -> i32 {
     let mut i = 0usize;
     while i < n {
         let hi = (i + CHUNK).min(n);
-        let ops: Vec<BatchOp> = (i..hi)
-            .map(|k| BatchOp::InsertNode {
-                label: "Person".into(),
-                key: format!("{prefix}-{k}"),
-                props: vec![("team".into(), core_api::Value::Str(prefix.into()))],
-            })
-            .collect();
-        if let Err(e) = db.submit_batch(ops) {
-            eprintln!("submit_batch: {e}");
-            return exit_code(&e);
+        let ops = chunk_ops(prefix, i, hi);
+        // `Busy` means a peer held the store lock for the whole wait, which on
+        // a loaded machine says nothing about correctness. Retry with a bounded
+        // backoff so contention shows up as slowness, not as a failed worker;
+        // any other error is real and exits.
+        let mut ops = Some(ops);
+        let mut attempt = 0;
+        loop {
+            match db.submit_batch(ops.take().expect("ops present on each attempt")) {
+                Ok(_) => break,
+                Err(GraphError::Busy { .. }) if attempt < WRITE_RETRIES => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(20 * attempt as u64));
+                    ops = Some(chunk_ops(prefix, i, hi));
+                }
+                Err(e) => {
+                    eprintln!("submit_batch: {e}");
+                    return exit_code(&e);
+                }
+            }
         }
         i = hi;
     }
@@ -161,4 +190,27 @@ fn run_snapshot(dir: &Path) -> i32 {
             exit_code(&e)
         }
     }
+}
+
+/// Snapshot the way a server does: through a `SharedDb` write guard, which
+/// returns a guard even when the cross-process lock was denied.
+///
+/// A snapshot replaces `wal.bin`, so running one without the lock destroys a
+/// peer's acknowledged commits. This is the path that must refuse.
+fn run_snapshot_shared(dir: &Path) -> i32 {
+    let db = match SharedDb::open(dir) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("open: {e}");
+            return exit_code(&e);
+        }
+    };
+    let code = match db.write().snapshot() {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("snapshot: {e}");
+            exit_code(&e)
+        }
+    };
+    code
 }

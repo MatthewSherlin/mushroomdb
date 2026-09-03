@@ -1347,7 +1347,20 @@ pub const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(
 pub const REFRESH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Interval between poll attempts while waiting for the cross-process lock.
-const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+pub(crate) const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Why `load_from_disk` is running, which decides whether it may repair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadOrigin {
+    /// A fresh open. Crash recovery is this handle's job: a torn WAL tail is
+    /// the signature of a crash and truncating it is correct, and archives
+    /// orphaned by an interrupted prune can be swept.
+    Open,
+    /// A reload driven by [`GraphDb::refresh`], because another process
+    /// replaced the snapshot. Nothing here is crash recovery — the store is
+    /// live and someone else is writing it — so this origin writes nothing.
+    Reload,
+}
 
 /// Authorization context carried by `write_batch_authz` / `query_write_authz`.
 ///
@@ -1645,7 +1658,7 @@ impl<F: Fs> GraphDb<F> {
             }
             db.holds_lifetime_lock = true;
         }
-        db.load_from_disk()?;
+        db.load_from_disk(LoadOrigin::Open)?;
         Ok(db)
     }
 
@@ -1748,8 +1761,18 @@ impl<F: Fs> GraphDb<F> {
     /// Split out of the open path so that [`refresh`](GraphDb::refresh) can
     /// rebuild a handle in place, without ownership of `F`, when another
     /// process replaces the snapshot underneath it.
-    fn load_from_disk(&mut self) -> Result<usize> {
-        let repair_wal = self.open_opts.repair_wal && !self.open_opts.read_only;
+    ///
+    /// `origin` decides whether the two repair writes this function can make
+    /// are appropriate; see [`LoadOrigin`].
+    fn load_from_disk(&mut self, origin: LoadOrigin) -> Result<usize> {
+        // Both writes below are crash recovery, and only an open is entitled to
+        // perform them. A read-only handle promises to touch nothing, and a
+        // reload driven by `refresh` is looking at a store another process is
+        // actively writing: what looks like a torn tail there is a peer
+        // mid-append, and what looks like an orphaned archive may be one that
+        // peer is about to reference.
+        let may_repair = origin == LoadOrigin::Open && !self.open_opts.read_only;
+        let repair_wal = self.open_opts.repair_wal && may_repair;
         let db = self;
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
@@ -1758,7 +1781,9 @@ impl<F: Fs> GraphDb<F> {
         // the retention-prune sequence after the floor was written but before
         // all surplus archives were deleted.  Safe to delete: floor already
         // accounts for their frames.
-        db.cleanup_orphaned_archives()?;
+        if may_repair {
+            db.cleanup_orphaned_archives()?;
+        }
         let _t0 = std::time::Instant::now();
         // Peek 6 bytes to determine snapshot version without reading the full
         // file. For RealFs this is a true partial read (O(1)); for SimFs the
@@ -1997,7 +2022,7 @@ impl<F: Fs> GraphDb<F> {
             // it degraded rather than let a caller read an empty graph as if
             // it were the store's contents.
             self.reset_for_reload();
-            return match self.load_from_disk() {
+            return match self.load_from_disk(LoadOrigin::Reload) {
                 Ok(frames) => Ok(frames as u64),
                 Err(e) => {
                     self.degraded = true;
@@ -2050,15 +2075,34 @@ impl<F: Fs> GraphDb<F> {
         self.wal_consumed = len;
     }
 
+    /// One non-blocking attempt at the cross-process write lock.
+    ///
+    /// Takes `&self` so a caller can poll for the lock *before* it acquires the
+    /// in-process write guard. That ordering is what keeps a busy peer in
+    /// another process from stalling this process's readers.
+    ///
+    /// A handle that owns the lock for its lifetime always succeeds.
+    pub(crate) fn try_cross_process_lock(&self) -> Result<bool> {
+        if self.holds_lifetime_lock {
+            return Ok(true);
+        }
+        self.fs.try_lock_exclusive().map_err(GraphError::Io)
+    }
+
     /// Poll for the cross-process write lock until `wait` elapses.
     ///
     /// One attempt is always made, so a zero wait is a single try. Returns
     /// `false` when the lock is still held elsewhere at the deadline; nothing
     /// has been written and retrying later is safe.
-    fn poll_lock(&mut self, wait: std::time::Duration) -> Result<bool> {
+    ///
+    /// Only the plain-`GraphDb` open path uses this, where the caller owns the
+    /// handle outright. [`SharedDb`](crate::SharedDb) polls
+    /// [`try_cross_process_lock`](GraphDb::try_cross_process_lock) itself so
+    /// that it holds no in-process guard while it waits.
+    fn poll_lock(&self, wait: std::time::Duration) -> Result<bool> {
         let deadline = std::time::Instant::now() + wait;
         loop {
-            if self.fs.try_lock_exclusive().map_err(GraphError::Io)? {
+            if self.try_cross_process_lock()? {
                 return Ok(true);
             }
             let now = std::time::Instant::now();
@@ -2069,34 +2113,32 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
-    /// Open a cross-process write scope: take the lock, then refresh so the
-    /// writes about to happen land on top of every other process's commits.
+    /// Open a cross-process write scope, given the outcome of an already-made
+    /// lock attempt.
     ///
-    /// Returns `false` when the lock could not be taken within `wait`. The
-    /// handle then refuses WAL-appending mutations with [`GraphError::Busy`]
-    /// until [`end_write_lock`](GraphDb::end_write_lock) closes the scope, so a
-    /// caller holding a guard cannot write behind another process's back.
+    /// The caller polls for the lock first — outside any in-process guard — and
+    /// passes what it got. On success this refreshes, so the writes about to
+    /// happen land on top of every other process's commits. On failure the
+    /// handle refuses WAL-appending mutations and `snapshot()` with
+    /// [`GraphError::Busy`] until [`end_write_lock`](GraphDb::end_write_lock)
+    /// closes the scope, so a caller holding a guard cannot write behind
+    /// another process's back.
     ///
-    /// A handle that already owns the lock for its lifetime succeeds without
-    /// touching it: no other process can have written, so there is nothing to
-    /// refresh.
-    pub(crate) fn begin_write_lock(&mut self, wait: std::time::Duration) -> Result<bool> {
-        if self.holds_lifetime_lock {
-            self.lock_denied = false;
-            return Ok(true);
-        }
-        let acquired = self.poll_lock(wait)?;
+    /// A handle that already owns the lock for its lifetime skips the refresh:
+    /// no other process can have written, so there is nothing to pick up.
+    pub(crate) fn enter_write_scope(&mut self, acquired: bool) -> Result<()> {
         self.lock_denied = !acquired;
-        if acquired {
-            if let Err(e) = self.refresh() {
-                // Do not hold a lock we cannot use: release it and let the
-                // caller see the underlying failure.
-                let _ = self.fs.unlock();
-                self.lock_denied = true;
-                return Err(e);
-            }
+        if !acquired || self.holds_lifetime_lock {
+            return Ok(());
         }
-        Ok(acquired)
+        if let Err(e) = self.refresh() {
+            // Do not hold a lock we cannot use: release it and let the caller
+            // see the underlying failure.
+            let _ = self.fs.unlock();
+            self.lock_denied = true;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Close a cross-process write scope opened by
@@ -9308,6 +9350,20 @@ impl<F: Fs> GraphDb<F> {
     pub fn snapshot_with(&mut self, opts: SnapshotOptions) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
+        }
+        // A snapshot rewrites `wal.bin` through a tmp+rename, so a peer that is
+        // appending ends up holding a descriptor on an unlinked inode and loses
+        // commits it believes durable. Snapshotting therefore requires the
+        // cross-process write lock, exactly as appending does. Unlike the WAL
+        // append path this does not go through `log_then_apply_with`, so both
+        // guards are repeated here.
+        if self.degraded {
+            return Err(GraphError::Io(std::io::Error::other(
+                "database degraded after group-commit fsync failure; reopen required",
+            )));
+        }
+        if self.lock_denied {
+            return Err(GraphError::Busy { holder: None });
         }
         // Capture whether snapshot.bin already existed BEFORE this snapshot write.
         // Used by the archive path's conservative genesis-chain check: if a prior

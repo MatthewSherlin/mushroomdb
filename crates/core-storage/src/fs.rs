@@ -72,16 +72,20 @@ pub trait Fs {
     /// The lock is advisory: it coordinates cooperating mushroomdb processes
     /// and does not stop an unrelated program from writing the files.
     ///
+    /// Takes `&self`, not `&mut self`, on purpose: a writer must be able to
+    /// poll for the lock without holding the in-process write guard, or a busy
+    /// peer in another process would stall every reader in this one.
+    ///
     /// Default: `Ok(true)` — an in-memory store has no other process to
     /// coordinate with.
-    fn try_lock_exclusive(&mut self) -> std::io::Result<bool> {
+    fn try_lock_exclusive(&self) -> std::io::Result<bool> {
         Ok(true)
     }
 
     /// Release the advisory write lock.  No-op when it is not held.
     ///
     /// Default: no-op.
-    fn unlock(&mut self) -> std::io::Result<()> {
+    fn unlock(&self) -> std::io::Result<()> {
         Ok(())
     }
 
@@ -235,20 +239,27 @@ pub trait FsIntrospect {
 /// for every process that opens the store.
 pub const LOCK_FILE: &str = "LOCK";
 
+/// This handle's one open description of the store's `LOCK` file, plus whether
+/// it currently owns the lock.
+///
+/// Exactly one per `RealFs` on purpose: the OS lock is held per open file
+/// description, so two descriptions of `LOCK` inside one process would contend
+/// with each other. Opened lazily — a `RealFs` created for a one-shot file
+/// operation never touches the lock file at all.
+#[derive(Debug, Default)]
+struct LockState {
+    file: Option<File>,
+    held: bool,
+}
+
 #[derive(Debug)]
 pub struct RealFs {
     dir: PathBuf,
-    /// The single open handle on `LOCK` for this store handle.
-    ///
-    /// Exactly one per `RealFs` on purpose: the OS lock is held per open file
-    /// description, so two handles on `LOCK` inside one process would contend
-    /// with each other. Opened lazily — a `RealFs` created for a one-shot file
-    /// operation never touches the lock file at all.
-    lock: Option<File>,
-    /// Whether [`try_lock_exclusive`](Fs::try_lock_exclusive) currently holds
-    /// the lock. Re-acquiring while held is a no-op; `unlock` on an unheld
-    /// lock is a no-op.
-    lock_held: bool,
+    /// Behind a `Mutex` so the lock can be taken and released through `&self`.
+    /// A writer polls for the cross-process lock *before* it takes the
+    /// in-process write guard, so that a peer holding the lock cannot stall
+    /// this process's readers.
+    lock: std::sync::Mutex<LockState>,
 }
 
 impl RealFs {
@@ -256,23 +267,8 @@ impl RealFs {
         std::fs::create_dir_all(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
-            lock: None,
-            lock_held: false,
+            lock: std::sync::Mutex::new(LockState::default()),
         })
-    }
-
-    /// Open (creating if needed) this handle's one `LOCK` file descriptor.
-    fn lock_file(&mut self) -> std::io::Result<&File> {
-        if self.lock.is_none() {
-            let f = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(self.dir.join(LOCK_FILE))?;
-            self.lock = Some(f);
-        }
-        Ok(self.lock.as_ref().expect("lock file just opened"))
     }
 
     /// The database directory this filesystem is rooted at.
@@ -344,13 +340,25 @@ impl Fs for RealFs {
         }
     }
 
-    fn try_lock_exclusive(&mut self) -> std::io::Result<bool> {
-        if self.lock_held {
+    fn try_lock_exclusive(&self) -> std::io::Result<bool> {
+        let mut state = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.held {
             return Ok(true);
         }
-        match self.lock_file()?.try_lock() {
+        if state.file.is_none() {
+            state.file = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(self.dir.join(LOCK_FILE))?,
+            );
+        }
+        let f = state.file.as_ref().expect("lock file just opened");
+        match f.try_lock() {
             Ok(()) => {
-                self.lock_held = true;
+                state.held = true;
                 Ok(true)
             }
             Err(std::fs::TryLockError::WouldBlock) => Ok(false),
@@ -358,14 +366,15 @@ impl Fs for RealFs {
         }
     }
 
-    fn unlock(&mut self) -> std::io::Result<()> {
-        if !self.lock_held {
+    fn unlock(&self) -> std::io::Result<()> {
+        let mut state = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.held {
             return Ok(());
         }
         // Clear the flag first: a failed unlock must not leave the handle
         // believing it still owns a lock it may have lost.
-        self.lock_held = false;
-        match self.lock.as_ref() {
+        state.held = false;
+        match state.file.as_ref() {
             Some(f) => f.unlock(),
             None => Ok(()),
         }
