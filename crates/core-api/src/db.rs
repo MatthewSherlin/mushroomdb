@@ -6055,7 +6055,15 @@ impl<F: Fs> GraphDb<F> {
     /// within `config.max_iters` and within any time budget.
     pub fn pagerank(&self, config: &crate::algo::PageRankConfig) -> crate::algo::PageRankReport {
         let topo = build_topo_view(&self.topo, &self.base);
-        crate::algo::pagerank(&topo, &self.ids, &self.syms, &self.labels, config)
+        let edge_props = self.edge_props_view();
+        crate::algo::pagerank(
+            &topo,
+            &self.ids,
+            &self.syms,
+            &self.labels,
+            &edge_props,
+            config,
+        )
     }
 
     /// Weakly-connected components over the unified topology (treated as
@@ -6065,7 +6073,15 @@ impl<F: Fs> GraphDb<F> {
     /// (deterministic).  Result sorted by (component_id, key).
     pub fn connected_components(&self, config: &crate::algo::WccConfig) -> crate::algo::WccReport {
         let topo = build_topo_view(&self.topo, &self.base);
-        crate::algo::wcc(&topo, &self.ids, &self.syms, &self.labels, config)
+        let edge_props = self.edge_props_view();
+        crate::algo::wcc(
+            &topo,
+            &self.ids,
+            &self.syms,
+            &self.labels,
+            &edge_props,
+            config,
+        )
     }
 
     /// Degree centrality for every live node.
@@ -6080,7 +6096,33 @@ impl<F: Fs> GraphDb<F> {
         config: &crate::algo::DegreeConfig,
     ) -> crate::algo::DegreeReport {
         let topo = build_topo_view(&self.topo, &self.base);
-        crate::algo::degree_centrality(&topo, &self.ids, &self.syms, &self.labels, config)
+        let edge_props = self.edge_props_view();
+        crate::algo::degree_centrality(
+            &topo,
+            &self.ids,
+            &self.syms,
+            &self.labels,
+            &edge_props,
+            config,
+        )
+    }
+
+    /// Louvain community detection over the unified topology (undirected).
+    ///
+    /// See [`crate::algo::LouvainConfig`] for edge-type/weight/label
+    /// restriction and [`crate::algo::CommunityReport`] for the shape of the
+    /// result (communities sorted size-desc, then smallest member key asc).
+    pub fn communities(&self, config: &crate::algo::LouvainConfig) -> crate::algo::CommunityReport {
+        let topo = build_topo_view(&self.topo, &self.base);
+        let edge_props = self.edge_props_view();
+        crate::algo::louvain(
+            &topo,
+            &self.ids,
+            &self.syms,
+            &self.labels,
+            &edge_props,
+            config,
+        )
     }
 
     /// Write a vector of `(node_key, score)` pairs as `prop_name` on each node,
@@ -7246,6 +7288,56 @@ impl<F: Fs> GraphDb<F> {
                 .then(a.dst.cmp(&b.dst))
         });
         edges
+    }
+
+    /// All directed edges of `edge_type`, with the raw value of `weight_prop`
+    /// on each edge when given.
+    ///
+    /// `weight` is `Some(f)` only when `weight_prop` is set and the edge
+    /// carries that property with a numeric (`Int`/`Float`) value; otherwise
+    /// `None` — callers that want a default weight (e.g. `1.0` for missing
+    /// props) apply it themselves, matching the convention used internally
+    /// by [`GraphDb::pagerank`], [`GraphDb::connected_components`],
+    /// [`GraphDb::degree_centrality`], and [`GraphDb::communities`].
+    ///
+    /// Sorted by `(src, dst)` for determinism. Reads the unified topology
+    /// (manual + rule-derived edges).  An unknown `edge_type` returns an
+    /// empty vec.
+    pub fn weighted_edges(
+        &self,
+        edge_type: &str,
+        weight_prop: Option<&str>,
+    ) -> Vec<(String, String, Option<f64>)> {
+        let Some(etype_sym) = self.syms.get(edge_type) else {
+            return Vec::new();
+        };
+        let tv = self.topo_view();
+        let ep = self.edge_props_view();
+        let mut out = Vec::new();
+        for id in 0..self.ids.len() as u32 {
+            let Some(key) = self.ids.key_of(id) else {
+                continue;
+            };
+            let Some(&sym) = self.labels.get(id as usize) else {
+                continue;
+            };
+            if sym == u32::MAX {
+                continue; // tombstoned
+            }
+            for &nbr in tv.neighbors(etype_sym, Direction::Out, id).as_ref() {
+                let Some(dst_key) = self.ids.key_of(nbr) else {
+                    continue;
+                };
+                let weight = weight_prop.and_then(|prop| match ep.get(etype_sym, id, nbr, prop) {
+                    Some(Value::Float(f)) => Some(f),
+                    Some(Value::Int(i)) => Some(i as f64),
+                    _ => None,
+                });
+                out.push((key.to_string(), dst_key.to_string(), weight));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        out
     }
 
     pub fn nodes_with_label(&self, label: &str) -> Vec<NodeRef<'_, F>> {

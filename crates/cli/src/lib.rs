@@ -11,8 +11,8 @@ pub mod recall;
 use core_api::schema::Schema;
 use core_api::{
     default_max_edges, is_write_query, wal_commit_count_at, AlgoDir, BackupReport, DegreeConfig,
-    Explanation, GraphDb, IngestOptions, PageRankConfig, Predicate, ResultSet, RuleDef,
-    RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
+    Explanation, GraphDb, IngestOptions, LouvainConfig, PageRankConfig, Predicate, ResultSet,
+    RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
 };
 use export::ExportFormat;
 use std::collections::BTreeMap;
@@ -55,10 +55,13 @@ pub enum AlgoSubcmd {
     Pagerank,
     Wcc,
     Degree,
+    Communities,
 }
 
 /// Parsed `mushroomdb` invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// No `Eq` derive: `Algo { min_weight: Option<f64>, .. }` carries a float.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Serve {
         db_dir: PathBuf,
@@ -100,15 +103,22 @@ pub enum Command {
     Suggest {
         db_dir: PathBuf,
     },
-    /// Run a graph algorithm (pagerank / wcc / degree).
+    /// Run a graph algorithm (pagerank / wcc / degree / communities).
     Algo {
         db_dir: PathBuf,
         subcmd: AlgoSubcmd,
         /// Print only the top N results (0 = all).
         top: usize,
         /// Edge direction for degree/pagerank (`out` / `in` / `both`).
-        /// Ignored by `wcc`, which is always undirected.
+        /// Ignored by `wcc` and `communities`, which are always undirected.
         dir: AlgoDir,
+        /// `communities` only: restrict to the union of these edge types
+        /// (`--edge-type T`, repeatable). Empty means all edge types.
+        edge_types: Vec<String>,
+        /// `communities` only: edge property to read as the edge weight.
+        weight_prop: Option<String>,
+        /// `communities` only: drop edges below this resolved weight.
+        min_weight: Option<f64>,
     },
     /// Run a Cypher query (read or write).
     Query {
@@ -232,6 +242,7 @@ Usage:
   mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
   mushroomdb algo wcc <db-dir> [--top N]
   mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
+  mushroomdb algo communities <db-dir> [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]
   mushroomdb --version
   mushroomdb --help
 
@@ -1006,15 +1017,18 @@ fn format_result_set(rs: &ResultSet) -> String {
 
 fn parse_algo(args: &[&str]) -> Result<Command, String> {
     if args.is_empty() {
-        return Err("algo requires a subcommand: pagerank | wcc | degree".to_string());
+        return Err(
+            "algo requires a subcommand: pagerank | wcc | degree | communities".to_string(),
+        );
     }
     let subcmd = match args[0] {
         "pagerank" => AlgoSubcmd::Pagerank,
         "wcc" => AlgoSubcmd::Wcc,
         "degree" => AlgoSubcmd::Degree,
+        "communities" => AlgoSubcmd::Communities,
         other => {
             return Err(format!(
-                "unknown algo subcommand: {other}; expected pagerank | wcc | degree"
+                "unknown algo subcommand: {other}; expected pagerank | wcc | degree | communities"
             ))
         }
     };
@@ -1022,6 +1036,9 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut top: usize = 20;
     let mut dir = AlgoDir::Both;
+    let mut edge_types: Vec<String> = Vec::new();
+    let mut weight_prop: Option<String> = None;
+    let mut min_weight: Option<f64> = None;
     let mut i = 0;
     while i < rest.len() {
         let a = rest[i];
@@ -1049,6 +1066,42 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--dir=") {
             dir = parse_algo_dir(val)?;
             i += 1;
+        } else if a == "--edge-type" {
+            let val = rest
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --edge-type".to_string())?;
+            edge_types.push(val.to_string());
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--edge-type=") {
+            edge_types.push(val.to_string());
+            i += 1;
+        } else if a == "--weight-prop" {
+            let val = rest
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --weight-prop".to_string())?;
+            weight_prop = Some(val.to_string());
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--weight-prop=") {
+            weight_prop = Some(val.to_string());
+            i += 1;
+        } else if a == "--min-weight" {
+            let val = rest
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --min-weight".to_string())?;
+            min_weight = Some(
+                val.parse()
+                    .map_err(|_| format!("--min-weight must be a number, got {val}"))?,
+            );
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--min-weight=") {
+            min_weight = Some(
+                val.parse()
+                    .map_err(|_| format!("--min-weight must be a number, got {val}"))?,
+            );
+            i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -1064,6 +1117,9 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
         subcmd,
         top,
         dir,
+        edge_types,
+        weight_prop,
+        min_weight,
     })
 }
 
@@ -1079,13 +1135,18 @@ fn parse_algo_dir(val: &str) -> Result<AlgoDir, String> {
 
 /// Run a graph algorithm and return a formatted string.
 ///
-/// `dir` selects the edge direction for `degree` and `pagerank`; `wcc` is
-/// always undirected and ignores it.
+/// `dir` selects the edge direction for `degree` and `pagerank`; `wcc` and
+/// `communities` are always undirected and ignore it. `edge_types` /
+/// `weight_prop` / `min_weight` are used by `communities` only.
+#[allow(clippy::too_many_arguments)]
 pub fn run_algo(
     db_dir: &Path,
     subcmd: &AlgoSubcmd,
     top: usize,
     dir: AlgoDir,
+    edge_types: Vec<String>,
+    weight_prop: Option<String>,
+    min_weight: Option<f64>,
 ) -> Result<String, CliError> {
     let db = GraphDb::open(db_dir)?;
     match subcmd {
@@ -1109,6 +1170,16 @@ pub fn run_algo(
             };
             let report = db.degree_centrality(&config);
             Ok(format_degree(&report, top))
+        }
+        AlgoSubcmd::Communities => {
+            let config = LouvainConfig {
+                edge_types,
+                weight_prop,
+                min_weight,
+                ..LouvainConfig::default()
+            };
+            let report = db.communities(&config);
+            Ok(format_communities(&report, top))
         }
     }
 }
@@ -1155,6 +1226,35 @@ fn format_degree(report: &core_api::DegreeReport, top: usize) -> String {
     };
     for (i, (key, deg)) in rows.iter().enumerate() {
         let _ = writeln!(buf, "  {:>4}  {:<40}  degree={}", i + 1, key, deg);
+    }
+    buf
+}
+
+/// One line per community: id, size, cohesion, first 3 members.
+/// Prints `(truncated)` in the header when the time budget fired.
+fn format_communities(report: &core_api::CommunityReport, top: usize) -> String {
+    let mut buf = String::new();
+    let trunc = if report.truncated { " (truncated)" } else { "" };
+    let _ = writeln!(
+        buf,
+        "== communities (modularity={:.2}){trunc} ==",
+        report.modularity
+    );
+    let rows = if top == 0 {
+        report.communities.as_slice()
+    } else {
+        &report.communities[..top.min(report.communities.len())]
+    };
+    for c in rows {
+        let preview: Vec<&str> = c.members.iter().take(3).map(String::as_str).collect();
+        let _ = writeln!(
+            buf,
+            "  {:>4}  size={:<6} cohesion={:<6.2} members=[{}]",
+            c.id,
+            c.members.len(),
+            c.cohesion,
+            preview.join(", ")
+        );
     }
     buf
 }
@@ -2673,6 +2773,65 @@ mod tests {
     #[test]
     fn parse_algo_rejects_unknown_dir() {
         assert!(parse_args(&["algo", "degree", "/db", "--dir", "sideways"]).is_err());
+    }
+
+    #[test]
+    fn parse_algo_communities_parses_edge_type_weight_prop_min_weight() {
+        let cmd = parse_args(&[
+            "algo",
+            "communities",
+            "/db",
+            "--edge-type",
+            "IMPORTS",
+            "--edge-type=CO_CHANGED",
+            "--weight-prop",
+            "score",
+            "--min-weight",
+            "0.3",
+            "--top",
+            "5",
+        ])
+        .unwrap();
+        match cmd {
+            Command::Algo {
+                subcmd,
+                top,
+                edge_types,
+                weight_prop,
+                min_weight,
+                ..
+            } => {
+                assert_eq!(subcmd, AlgoSubcmd::Communities);
+                assert_eq!(top, 5);
+                assert_eq!(
+                    edge_types,
+                    vec!["IMPORTS".to_string(), "CO_CHANGED".to_string()]
+                );
+                assert_eq!(weight_prop, Some("score".to_string()));
+                assert_eq!(min_weight, Some(0.3));
+            }
+            other => panic!("expected Algo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_algo_communities_defaults_have_no_edge_type_or_weight_filter() {
+        let cmd = parse_args(&["algo", "communities", "/db"]).unwrap();
+        match cmd {
+            Command::Algo {
+                subcmd,
+                edge_types,
+                weight_prop,
+                min_weight,
+                ..
+            } => {
+                assert_eq!(subcmd, AlgoSubcmd::Communities);
+                assert!(edge_types.is_empty());
+                assert_eq!(weight_prop, None);
+                assert_eq!(min_weight, None);
+            }
+            other => panic!("expected Algo, got {other:?}"),
+        }
     }
 
     /// I1: exporting a store containing NaN/Inf floats must succeed, not panic.

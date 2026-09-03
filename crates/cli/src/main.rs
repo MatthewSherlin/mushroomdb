@@ -161,7 +161,18 @@ fn main() -> ExitCode {
             subcmd,
             top,
             dir,
-        }) => match run_algo(&db_dir, &subcmd, top, dir) {
+            edge_types,
+            weight_prop,
+            min_weight,
+        }) => match run_algo(
+            &db_dir,
+            &subcmd,
+            top,
+            dir,
+            edge_types,
+            weight_prop,
+            min_weight,
+        ) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS

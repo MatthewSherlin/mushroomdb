@@ -10,7 +10,8 @@ mod shared;
 pub mod subscription;
 
 pub use algo::{
-    AlgoDir, DegreeConfig, DegreeReport, PageRankConfig, PageRankReport, WccConfig, WccReport,
+    AlgoDir, Community, CommunityReport, DegreeConfig, DegreeReport, LouvainConfig, PageRankConfig,
+    PageRankReport, WccConfig, WccReport,
 };
 pub use core_query::{CmpOp, Dir, Filter, ResultSet};
 pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;
