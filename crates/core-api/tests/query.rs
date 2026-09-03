@@ -2410,6 +2410,26 @@ fn key_scalar_projects_the_node_key() {
 }
 
 #[test]
+fn key_scalar_null_binding_from_optional_match() {
+    // key() over a node variable an OPTIONAL MATCH failed to bind → null out,
+    // matching type()'s behaviour on a missed relationship binding.
+    let dir = tmp("key-null");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Kn", "alice", vec![]).unwrap();
+    // b is null because alice has no outgoing KNOWS edges.
+    let rs = db
+        .query(
+            "MATCH (a:Kn) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN key(a) AS ka, key(b) AS kb",
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(get_val(&rs, 0, "ka"), Some(Value::Str("alice".into())));
+    assert_eq!(get_val(&rs, 0, "kb"), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn key_scalar_in_write_statement_return() {
     let dir = tmp("key-write");
     let mut db = GraphDb::open(&dir).unwrap();
