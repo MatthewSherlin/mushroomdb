@@ -1624,6 +1624,7 @@ const SCALAR_FUNCS: &[&str] = &[
     "toInteger",
     "toFloat",
     "toString",
+    "decay",
 ];
 
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
@@ -1876,6 +1877,36 @@ fn eval_func(
                 Some(Value::Bool(b)) => Some(Value::Str(b.to_string())),
                 Some(_) => None, // list/map have no scalar string form
             })
+        }
+        "decay" => {
+            // decay(base, age, halflife) = base * 0.5^(age / halflife).
+            // Null in any argument → null; halflife <= 0 is an error, not a
+            // silent null, since it signals a caller bug (divide-by-zero /
+            // sign-flip), not an absent value.
+            if args.len() != 3 {
+                return Err(format!(
+                    "decay() requires exactly 3 arguments, got {}",
+                    args.len()
+                ));
+            }
+            let base = resolve_operand(view, vars, row, &args[0], params)?;
+            let age = resolve_operand(view, vars, row, &args[1], params)?;
+            let halflife = resolve_operand(view, vars, row, &args[2], params)?;
+            match (base, age, halflife) {
+                (None, _, _) | (_, None, _) | (_, _, None) => Ok(None),
+                (Some(b), Some(a), Some(h)) => {
+                    let b = numeric_val(&b)
+                        .ok_or_else(|| "decay() requires numeric arguments".to_string())?;
+                    let a = numeric_val(&a)
+                        .ok_or_else(|| "decay() requires numeric arguments".to_string())?;
+                    let h = numeric_val(&h)
+                        .ok_or_else(|| "decay() requires numeric arguments".to_string())?;
+                    if h <= 0.0 {
+                        return Err("decay() requires halflife > 0".to_string());
+                    }
+                    Ok(Some(Value::Float(b * 0.5f64.powf(a / h))))
+                }
+            }
         }
         _ => Err(format!(
             "unknown function `{name}`; supported: {}",

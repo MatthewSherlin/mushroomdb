@@ -874,9 +874,41 @@ fn eval_set_return_func<F: Fs>(
             Some(Value::Int(n)) => Ok(Some(Value::Int(n))),
             Some(_) => Ok(None),
         },
+        "decay" => {
+            if vals.len() != 3 {
+                return Err(GraphError::QueryError {
+                    detail: format!("decay() requires exactly 3 arguments, got {}", vals.len()),
+                });
+            }
+            match (vals[0].clone(), vals[1].clone(), vals[2].clone()) {
+                (None, _, _) | (_, None, _) | (_, _, None) => Ok(None),
+                (Some(b), Some(a), Some(h)) => {
+                    let numeric = |v: Value| -> Result<f64> {
+                        match v {
+                            Value::Int(n) => Ok(n as f64),
+                            Value::Float(f) => Ok(f),
+                            other => Err(GraphError::QueryError {
+                                detail: format!(
+                                    "decay() requires numeric arguments, got {other:?}"
+                                ),
+                            }),
+                        }
+                    };
+                    let b = numeric(b)?;
+                    let a = numeric(a)?;
+                    let h = numeric(h)?;
+                    if h <= 0.0 {
+                        return Err(GraphError::QueryError {
+                            detail: "decay() requires halflife > 0".into(),
+                        });
+                    }
+                    Ok(Some(Value::Float(b * 0.5f64.powf(a / h))))
+                }
+            }
+        }
         _ => Err(GraphError::QueryError {
             detail: format!(
-                "unknown function `{name}`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches"
+                "unknown function `{name}`; supported: toLower, toUpper, size, coalesce, type, abs, round, decay"
             ),
         }),
     }

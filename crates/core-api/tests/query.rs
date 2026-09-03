@@ -2318,3 +2318,59 @@ fn query_at_time_travel() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── decay() scalar ────────────────────────────────────────────────────────
+
+#[test]
+fn decay_scalar_halves_every_halflife() {
+    let dir = tmp("decay");
+    let mut db = GraphDb::open(&dir).unwrap();
+    // The Cypher dialect has no bare `null` literal outside `IS NULL`
+    // (see `abs(null - 1.5)` coverage above, which uses a missing property
+    // for the same reason); use a missing property to exercise null
+    // propagation into decay()'s first argument.
+    db.insert_node("N", "x", vec![]).unwrap();
+    let rs = db
+        .query(
+            "MATCH (n:N) RETURN decay(1.0, 10, 10) AS a, decay(0.8, 0, 5) AS b, decay(2.0, 20, 10) AS c, decay(n.missing, 1, 1) AS d LIMIT 1",
+            &Default::default(),
+        )
+        .unwrap();
+    let a = match get_val(&rs, 0, "a") {
+        Some(Value::Float(v)) => v,
+        other => panic!("expected Float for a, got {other:?}"),
+    };
+    let b = match get_val(&rs, 0, "b") {
+        Some(Value::Float(v)) => v,
+        other => panic!("expected Float for b, got {other:?}"),
+    };
+    let c = match get_val(&rs, 0, "c") {
+        Some(Value::Float(v)) => v,
+        other => panic!("expected Float for c, got {other:?}"),
+    };
+    assert!((a - 0.5).abs() < 1e-9);
+    assert!((b - 0.8).abs() < 1e-9);
+    assert!((c - 0.5).abs() < 1e-9);
+    assert_eq!(rs.get(0, "d"), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn decay_rejects_bad_arity_and_halflife() {
+    let dir = tmp("decay-err");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "x", vec![]).unwrap();
+    assert!(db
+        .query(
+            "MATCH (n:N) RETURN decay(1.0, 1) LIMIT 1",
+            &Default::default()
+        )
+        .is_err());
+    assert!(db
+        .query(
+            "MATCH (n:N) RETURN decay(1.0, 1, 0) LIMIT 1",
+            &Default::default()
+        )
+        .is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

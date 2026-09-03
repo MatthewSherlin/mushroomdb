@@ -199,8 +199,10 @@ pub enum Operand {
     /// Scalar function call: `toLower(n.name)`, `size(n.tags)`, `type(r)`, etc.
     ///
     /// Supported functions (case-insensitive): `toLower`, `toUpper`, `size`,
-    /// `coalesce`, `type`, `abs`, `round`.  Unknown names → named error at
-    /// execution time listing the supported set.
+    /// `coalesce`, `type`, `abs`, `round`, `textMatches`, `contains`,
+    /// `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`.
+    /// Unknown names → named error at execution time listing the supported
+    /// set (see `SCALAR_FUNCS` in `exec.rs`).
     FuncCall {
         name: String,
         args: Vec<Operand>,
@@ -247,7 +249,7 @@ pub enum RetVal {
         arg: AggArg,
     },
     /// Scalar function call in a RETURN position, e.g. `toLower(n.name)`.
-    /// The same function set as `Operand::FuncCall`.
+    /// The same function set as `Operand::FuncCall` (see `SCALAR_FUNCS`).
     FuncCall {
         name: String,
         args: Vec<Operand>,
