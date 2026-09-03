@@ -3408,6 +3408,40 @@ impl<F: Fs> GraphDb<F> {
                     pending.insert(new_key.clone(), id);
                     out.push(rec);
                 }
+                // # Symbol-order invariant (load-bearing)
+                //
+                // Write-time and replay-time symbol assignment must agree: every
+                // symbol in a `Batch` frame has to receive the same dense id when
+                // the frame's records are replayed in order as it received when
+                // the frame was written.
+                //
+                // A rule's backfill interns its `edge_type` lazily
+                // (`core_rules::engine`, every `g.syms.intern(&def.edge_type)`
+                // site), and that backfill runs from `apply` — during the
+                // `CreateRule` record itself, and again from any later
+                // `InsertNodeId` in the same frame that makes the rule fire. At
+                // write time the whole batch is rewritten before any of it is
+                // applied, so a later `InsertEdge` in the same batch would win the
+                // lower id for its edge type; on replay the rule's lazy intern
+                // gets there first and steals it, and the `Intern` record fails at
+                // the `wal intern assigned …` check in `apply`.
+                //
+                // Pre-interning the rule's `edge_type` here, and emitting its
+                // `Intern` record ahead of the `CreateRule` record, makes both
+                // orders identical. `weight_prop` needs no pre-intern:
+                // `EdgeProps::set` keys props by `String`, never through the
+                // interner. `via_edge` needs none either: via-hop rules resolve it
+                // with `syms.get` and skip when it is absent.
+                WalRecord::CreateRule { ref def_bytes } => {
+                    let def = decode_rule_def(def_bytes).map_err(|e| GraphError::Corrupt {
+                        detail: format!("CreateRule def_bytes deserialize failed: {e}"),
+                    })?;
+                    let (etype, intern) = self.intern_wal(&def.edge_type);
+                    if interned.insert(etype) {
+                        out.push(intern);
+                    }
+                    out.push(rec);
+                }
                 other => out.push(other),
             }
         }

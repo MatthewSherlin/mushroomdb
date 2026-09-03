@@ -96,6 +96,13 @@ WAL record discriminants 0–20 are append-only: once assigned, a discriminant
 is never reused for a different record shape. New record types receive the next
 available discriminant.
 
+Which `Intern` records a `Batch` frame carries, and where they sit inside it,
+is **not** part of the format contract — only that replaying a frame's records
+in order reproduces the write-time symbol assignment. Since v0.4.5 a `Batch`
+containing `CreateRule` pre-interns the rule's `edge_type` immediately before
+that record, because rule backfill would otherwise intern it lazily on replay
+and take an id a later `Intern` record already claimed.
+
 ### WAL archive sidecar files
 
 Stores that use `snapshot_with(archive_wal: true)` write additional sidecar
