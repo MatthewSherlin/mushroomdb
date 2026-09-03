@@ -13,7 +13,7 @@ description = "Cypher query planner and executor for mushroomdb"
 name = "core_query"
 
 [dependencies]
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.5.1" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.5.2" }
 
 [dev-dependencies]
 proptest = { workspace = true }

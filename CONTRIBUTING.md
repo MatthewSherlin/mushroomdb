@@ -84,7 +84,7 @@ CI mirrors it exactly.
 The user-facing install paths live in `README.md`. The paths below are for
 contributors building or publishing the artifacts themselves.
 
-Tags `v0.4.1`, `v0.4.2`, `v0.4.3`, `v0.4.4`, `v0.4.5`, `v0.5.0`, and `v0.5.1` are published; `npx mushroomdb`,
+Tags `v0.4.1`, `v0.4.2`, `v0.4.3`, `v0.4.4`, `v0.4.5`, `v0.5.0`, `v0.5.1`, and `v0.5.2` are published; `npx mushroomdb`,
 the `curl install.sh`, and `ghcr.io/matthewsherlin/mushroomdb` are all live today.
 
 ### Build the embedded-UI binary from source
