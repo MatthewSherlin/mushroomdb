@@ -98,6 +98,13 @@ completed always sees that commit — the visibility does not depend on how fast
 the peer was. The price is up to two metadata lookups per read, never a file
 read.
 
+That guarantee is only as good as the filesystem underneath it: it assumes a
+`stat` after a peer's write and fsync reports the new length. Local filesystems
+do. A network or overlay mount that caches attributes — NFS, SMB, some
+container layers — can report the old length for as long as its attribute
+timeout, and a read in that window will not see the commit. Keep a store that
+several processes write on a local disk.
+
 ## Read-only handles
 
 `OpenOptions { read_only: true, .. }` opens a handle that:

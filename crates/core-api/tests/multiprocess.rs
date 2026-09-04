@@ -1,10 +1,16 @@
 #![cfg(feature = "mp-test")]
 //! Multi-process safety: advisory cross-process write lock + WAL tailing.
 //!
-//! Every cross-process test spawns the real `mp_worker` binary (built by the
-//! same `mp-test` feature that gates this file), so the behaviour under test is
-//! genuine inter-process contention on the store's `LOCK` file, not an
-//! in-process simulation.
+//! Tests 1-6 and 8 spawn the real `mp_worker` binary (built by the same
+//! `mp-test` feature that gates this file), so what they exercise is genuine
+//! inter-process contention on the store's `LOCK` file, not a simulation.
+//!
+//! Tests 7, 9, 10 and 12 stand a peer in by appending to the WAL through a
+//! second `RealFs` handle in this process. That leaves the same bytes on disk
+//! a peer would, and it is the only way to time the append precisely — mid-
+//! frame (7), unappliable (9), or microseconds before the read that must see
+//! it (12). Test 11 has no peer at all: it wraps the filesystem to prove an
+//! unchanged store costs no content reads.
 //!
 //! Test list:
 //!  1. server_handle_sees_child_process_writes_after_refresh

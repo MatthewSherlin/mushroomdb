@@ -33,7 +33,8 @@ lock. Upgrade in place from any 0.4.x or 0.5.x store.
   open replay uses, so rules fire and derived edges appear identically, and returns the number of
   commits applied. A partial trailing frame is left alone; a peer's snapshot triggers an in-place
   reload. **`is_stale()`** answers the same question with two metadata lookups and no file reads.
-  `SharedDb::read()` calls it for you at most once per 50 ms.
+  `SharedDb::read()` calls it for you on every read, so a peer's completed commit is visible to
+  the next read rather than to the next read after some interval.
 - **`OpenOptions.read_only`** opens a handle that never takes the lock, writes nothing at open (no
   WAL repair write-back, no migration rewrite), returns `ReadOnly` from every mutation, and still
   refreshes. `mushroomdb recall` now opens this way, so the prompt hook cannot delay a writer or

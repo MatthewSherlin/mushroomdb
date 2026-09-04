@@ -1491,10 +1491,8 @@ fn map_reflects_writes_made_by_another_handle() {
             )
             .expect("insert through second handle");
     }
-    // The read path checks for a peer's commits at most once per refresh
-    // interval, so give it one before asking again.
-    std::thread::sleep(std::time::Duration::from_millis(120));
-
+    // No wait: the read path checks the store on every read, so the very next
+    // call sees the other handle's commit.
     let (text, after) = task_reply(&one_task_call(db.clone(), "map", json!({})));
     assert_eq!(
         after["files"],

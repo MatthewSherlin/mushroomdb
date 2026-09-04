@@ -37,24 +37,33 @@ recapture on this post-T3 shape was 4.847 ms ± 0.108 ms → 2.351 ms ± 0.275 m
 dropped (same clone path). `rule_incremental_fire` +9.9% is WAL-fsync noise
 (T1/T2 were 4.73/4.47 ms); the executor is not on that path.
 
-| Bench | T1 | post-T2 | post-T3 | post-T4 | Description |
-|---|---|---|---|---|---|
-| `ingest_10k_nodes` | 411.491 ms ± 3.313 ms | 407.802 ms ± 1.604 ms | 406.320 ms ± 4.387 ms | 404.228 ms ± 3.476 ms | Ingest 10k people/orgs/projects (no rules) into a fresh store |
-| `neighborhood_depth1` | 1.165 µs ± 0.020 µs | 1.145 µs ± 0.014 µs | 1.129 µs ± 0.017 µs | 1.150 µs ± 0.024 µs | BFS depth-1 neighborhood of `person-0001` |
-| `neighborhood_depth2` | 4.283 µs ± 0.026 µs | 4.179 µs ± 0.059 µs | 4.143 µs ± 0.078 µs | 4.204 µs ± 0.060 µs | BFS depth-2 neighborhood of `person-0001` |
-| `cypher_scan_filter_project` | 1.417 ms ± 0.111 ms | 1.375 ms ± 0.029 ms | 1.273 ms ± 0.019 ms | 0.722 ms ± 0.007 ms | `MATCH (n:Person) WHERE n.age > 40 RETURN n LIMIT 100` over 10k |
-| `cypher_two_hop_join` | 4.898 ms ± 0.131 ms | 4.902 ms ± 0.131 ms | 4.787 ms ± 0.045 ms | 2.351 ms ± 0.275 ms§ | `MATCH (p:Person)-[:ON_PROJECT]->(proj:Project)<-[:ON_PROJECT]-(q:Person) RETURN p, proj, q LIMIT 100` |
-| `rule_incremental_fire` | 4.731 ms ± 0.337 ms | 4.472 ms ± 0.243 ms | 3.591 ms ± 0.165 ms | 3.946 ms ± 0.201 ms | One `skills` update on a 10k-node db with 3 rules incl. overlap |
-| `rule_backfill_10k` | 49.050 ms ± 1.118 ms | 51.328 ms ± 0.710 ms | 50.766 ms ± 1.737 ms | 50.403 ms ± 1.240 ms | `create_rule` Overlap backfill on an existing 10k-node db |
-| `explain_pair` | 45.089 µs ± 0.292 µs | 598.838 ns ± 8.688 ns | 606.505 ns ± 6.985 ns | 604.154 ns ± 15.160 ns | `explain(person-0001, proj-0001)` |
-| `explain_pair_dense` | 44.719 µs ± 0.869 µs† | 291.900 ns ± 4.356 ns | 302.533 ns ± 18.718 ns | 301.013 ns ± 4.532 ns | `explain(org-0001, person-00002)` on the 20k-triple hub |
-| `vector_rule_update` | 12.032 ms ± 0.215 ms | 11.277 ms ± 0.229 ms | 8.511 ms ± 0.054 ms‡ | 8.301 ms ± 0.461 ms | One node's embedding update under `VectorSimilar` |
-| `read_contention_1r0w` | 40.393 µs ± 0.793 µs | 37.629 µs ± 1.054 µs | 36.150 µs ± 0.621 µs | 36.286 µs ± 0.531 µs | Solo `run_contention(db, 1, 16, 0)` via `SharedDb` |
-| `read_contention_4r1w` | 70.312 ms ± 4.902 ms | 70.033 ms ± 4.926 ms | 63.392 ms ± 3.846 ms | 65.112 ms ± 2.079 ms | 4 neighborhood readers + 1 prop writer via `SharedDb` |
-| `read_contention_16r1w` | 81.218 ms ± 7.138 ms | 73.753 ms ± 1.640 ms | 74.662 ms ± 7.966 ms | 73.354 ms ± 2.185 ms | 16 neighborhood readers + 1 prop writer via `SharedDb` |
+| Bench | T1 | post-T2 | post-T3 | post-T4 | post-ad71615 | Description |
+|---|---|---|---|---|---|---|
+| `ingest_10k_nodes` | 411.491 ms ± 3.313 ms | 407.802 ms ± 1.604 ms | 406.320 ms ± 4.387 ms | 404.228 ms ± 3.476 ms | — | Ingest 10k people/orgs/projects (no rules) into a fresh store |
+| `neighborhood_depth1` | 1.165 µs ± 0.020 µs | 1.145 µs ± 0.014 µs | 1.129 µs ± 0.017 µs | 1.150 µs ± 0.024 µs | — | BFS depth-1 neighborhood of `person-0001` |
+| `neighborhood_depth2` | 4.283 µs ± 0.026 µs | 4.179 µs ± 0.059 µs | 4.143 µs ± 0.078 µs | 4.204 µs ± 0.060 µs | — | BFS depth-2 neighborhood of `person-0001` |
+| `cypher_scan_filter_project` | 1.417 ms ± 0.111 ms | 1.375 ms ± 0.029 ms | 1.273 ms ± 0.019 ms | 0.722 ms ± 0.007 ms | — | `MATCH (n:Person) WHERE n.age > 40 RETURN n LIMIT 100` over 10k |
+| `cypher_two_hop_join` | 4.898 ms ± 0.131 ms | 4.902 ms ± 0.131 ms | 4.787 ms ± 0.045 ms | 2.351 ms ± 0.275 ms§ | — | `MATCH (p:Person)-[:ON_PROJECT]->(proj:Project)<-[:ON_PROJECT]-(q:Person) RETURN p, proj, q LIMIT 100` |
+| `rule_incremental_fire` | 4.731 ms ± 0.337 ms | 4.472 ms ± 0.243 ms | 3.591 ms ± 0.165 ms | 3.946 ms ± 0.201 ms | — | One `skills` update on a 10k-node db with 3 rules incl. overlap |
+| `rule_backfill_10k` | 49.050 ms ± 1.118 ms | 51.328 ms ± 0.710 ms | 50.766 ms ± 1.737 ms | 50.403 ms ± 1.240 ms | — | `create_rule` Overlap backfill on an existing 10k-node db |
+| `explain_pair` | 45.089 µs ± 0.292 µs | 598.838 ns ± 8.688 ns | 606.505 ns ± 6.985 ns | 604.154 ns ± 15.160 ns | — | `explain(person-0001, proj-0001)` |
+| `explain_pair_dense` | 44.719 µs ± 0.869 µs† | 291.900 ns ± 4.356 ns | 302.533 ns ± 18.718 ns | 301.013 ns ± 4.532 ns | — | `explain(org-0001, person-00002)` on the 20k-triple hub |
+| `vector_rule_update` | 12.032 ms ± 0.215 ms | 11.277 ms ± 0.229 ms | 8.511 ms ± 0.054 ms‡ | 8.301 ms ± 0.461 ms | — | One node's embedding update under `VectorSimilar` |
+| `read_contention_1r0w` | 40.393 µs ± 0.793 µs | 37.629 µs ± 1.054 µs | 36.150 µs ± 0.621 µs | 36.286 µs ± 0.531 µs | 82.598 µs‖ | Solo `run_contention(db, 1, 16, 0)` via `SharedDb` |
+| `read_contention_4r1w` | 70.312 ms ± 4.902 ms | 70.033 ms ± 4.926 ms | 63.392 ms ± 3.846 ms | 65.112 ms ± 2.079 ms | 66.837 ms‖ | 4 neighborhood readers + 1 prop writer via `SharedDb` |
+| `read_contention_16r1w` | 81.218 ms ± 7.138 ms | 73.753 ms ± 1.640 ms | 74.662 ms ± 7.966 ms | 73.354 ms ± 2.185 ms | 72.294 ms‖ | 16 neighborhood readers + 1 prop writer via `SharedDb` |
 
 † T1 number is the 1.2k-hub-in-10k-graph shape. Same-shape T2 before (20k hub) is 25.752 µs ± 0.217 µs → post-T2 291.900 ns (88×).
 ‡ T1/T2 were all dim-64. T3 mixes 32/64/128 so the dim reject fires. Same-shape T3 before (filter off) is 13.457 ms → 8.511 ms (−37%).
 § Dedicated T4 after, paired with the 4.847 ms recapture. Full-suite two-hop was 2.174 ms ± 0.061 ms.
+‖ Read-path cost of `ad71615`, which made `SharedDb::read()` check the store on every read instead of once per 50 ms. Only the `read_contention_*` benches touch that path, so the other rows were not re-measured. Same machine, 2026-09-04, criterion 0.8.2 at `--sample-size 10`, three interleaved pairs against `2d313fa` in a worktree. These are criterion's reported point estimate, not the median ± MAD the other columns carry, so read them against the paired before below rather than against post-T4.
 
 `read_contention_*` figures include thread-spawn + barrier sync; comparable only to other `run_contention` rows (including the new `1r0w`).
+
+The ad71615 pairs, before → after (median of three runs each): `1r0w` 39.019 µs
+→ 82.598 µs (×2.12), `4r1w` 60.577 ms → 66.837 ms (+10.3%), `16r1w` 70.005 ms →
+72.294 ms (+3.3%). `1r0w` is the honest worst case: one thread, 16 reads, no
+writer, and only ~2.3 µs of its own work per read, so the two added `stat` calls
+(~2.7 µs per read) are most of what is measured. The contended rows are
+dominated by the writer's fsyncs and absorb the same cost — `16r1w`'s delta sits
+inside the base's own 69.2–73.3 ms run-to-run spread.

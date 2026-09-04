@@ -50,6 +50,12 @@ another process has appended since. An incomplete trailing frame here means a
 peer is still writing, not that anything crashed, so it is left alone and picked
 up next time. Nothing is written to disk.
 
+Noticing that there is a tail to read is a `stat`, so refresh inherits whatever
+the filesystem says: on a local disk a peer's fsynced write is visible to the
+next check, while a mount that caches attributes (NFS, SMB, some container
+layers) can hide it for as long as its attribute timeout. See
+[Concurrency](concurrency.md).
+
 The distinction matters for unattended readers: a reader that treated a live
 writer's half-written frame as a torn tail, and repaired it, would destroy a
 frame that writer is about to make durable. That is why `repair_wal: false` and

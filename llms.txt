@@ -165,7 +165,8 @@ writes. `snapshot()` refuses without it.
   path the open replay uses, so rules fire and derived edges appear identically. A
   partial trailing frame is left alone. A peer's snapshot triggers a reload.
 - `is_stale() -> bool` — the same question via two metadata lookups, no file reads.
-  `SharedDb::read()` calls it at most once per 50 ms.
+  `SharedDb::read()` calls it on every read, so a peer's completed commit is visible
+  to the next read.
 - `OpenOptions { read_only: true }` — no lock, nothing written at open (no WAL
   repair write-back, no migration rewrite), `ReadOnly` from every mutation,
   `refresh()` still works. Python: `GraphDb.open(path, read_only=True)`.
