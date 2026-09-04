@@ -4487,3 +4487,54 @@ async fn metrics_role_token_is_forbidden() {
         "role token must be 403 on /metrics"
     );
 }
+
+/// A store held by another process's write lock is 503 + `Retry-After`, not 400.
+///
+/// `Busy` is transient and nothing was written, so the response must be one a
+/// standard retry path acts on. The peer is simulated in-process by a plain
+/// read-write `GraphDb` on the same directory: it holds the cross-process
+/// `LOCK` for its whole lifetime through its own open file description, which
+/// contends with the server's exactly as a second process would.
+#[tokio::test]
+async fn busy_write_is_503_with_retry_after() {
+    let dir = tmp("busy-503");
+    let db = SharedDb::open(&dir).unwrap();
+    let app = router(db);
+
+    // Peer holds the store's write lock for as long as this handle lives.
+    let peer = core_api::GraphDb::open(&dir).unwrap();
+
+    let res = app
+        .oneshot(json_req(
+            "POST",
+            "/nodes",
+            json!({"label": "Person", "key": "busy-1"}),
+        ))
+        .await
+        .unwrap();
+    let status = res.status();
+    let retry_after = res
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "busy store must be 503: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(retry_after.as_deref(), Some("1"), "Retry-After: 1 required");
+    let v = parse_json(&body);
+    assert!(
+        v["error"].as_str().unwrap_or_default().contains("busy"),
+        "body keeps the Busy message: {v}"
+    );
+
+    drop(peer);
+}

@@ -668,6 +668,20 @@ fn err_response(detail: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// 503 response for a store held by another process's write lock.
+///
+/// `Busy` is transient and nothing was written, so retrying is always safe.
+/// 503 plus `Retry-After` is what standard client retry middleware keys on;
+/// a 4xx would tell the client the request itself was malformed.
+fn busy_response(detail: String) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, HeaderValue::from_static("1"))],
+        Json(json!({ "error": detail })),
+    )
+        .into_response()
+}
+
 fn graph_err(e: GraphError) -> Response {
     match e {
         // §4.3: role-scoped write denials map to 403 with the verbatim reason
@@ -676,6 +690,8 @@ fn graph_err(e: GraphError) -> Response {
         GraphError::QueryError { detail } | GraphError::IngestError { detail } => {
             err_response(detail)
         }
+        // Transient: another process holds the cross-process write lock.
+        busy @ GraphError::Busy { .. } => busy_response(busy.to_string()),
         other => err_response(other.to_string()),
     }
 }
