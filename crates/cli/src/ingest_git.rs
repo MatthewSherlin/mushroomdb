@@ -154,12 +154,19 @@ struct GitCommit {
 }
 
 /// Simple, dependency-free path matcher. Documented in `docs/site/ingest-git.md`.
+///
+/// A `*.` pattern is a *file-name suffix*, not a single extension: `*.min.js`
+/// matches `ui/bundle.min.js` the same way `*.lock` matches `Cargo.lock`.
+/// Matching only the last dot segment would leave every compound suffix inert,
+/// and a compound suffix is exactly how generated files announce themselves.
 fn excluded(path: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|p| {
         if let Some(prefix) = p.strip_suffix('/') {
             path.starts_with(&format!("{prefix}/"))
-        } else if let Some(ext) = p.strip_prefix("*.") {
-            path.contains('.') && path.rsplit('.').next() == Some(ext)
+        } else if let Some(suffix) = p.strip_prefix('*').filter(|s| s.starts_with('.')) {
+            // The suffix must follow something, so `*.lock` does not claim a
+            // path that is nothing but the suffix itself.
+            path.len() > suffix.len() && path.ends_with(suffix)
         } else {
             path.contains(p.as_str())
         }
@@ -1041,7 +1048,6 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
                 &mut work,
             )?;
         }
-        write_marker(&mut w, p, opts)?;
     }
     report.authors = authors.len();
 
@@ -1113,9 +1119,21 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
             .extend(structure::ensure_rules_and_fulltext(&mut w)?);
     }
 
-    // Last: every commit this run could link is in the graph by now.
+    // Every commit this run could link is in the graph by now.
     if !prs.is_empty() {
         link_prs(&mut w, &prs, &ingest)?;
+    }
+
+    // The markers go last, once every phase of the run has succeeded. They say
+    // how far a *complete* run got, so a failure anywhere above — a working-tree
+    // batch that will not commit, a `gh` link pass that errors — leaves them
+    // where they were and the next run re-walks the same window rather than
+    // stepping over it. Re-walking a window that was partly applied is safe:
+    // commits already in the graph are skipped as duplicate keys, file props
+    // are rewritten from the recomputed state, and a rename whose node already
+    // moved finds nothing to move.
+    for p in &pending {
+        write_marker(&mut w, p, opts)?;
     }
     Ok(report)
 }
@@ -1412,6 +1430,28 @@ mod tests {
         assert!(excluded("ui/node_modules/x/y.js", &pats));
         assert!(!excluded("src/lib.rs", &pats));
         assert!(!excluded("anything", &[]));
+    }
+
+    /// A `*.` pattern is a file-name suffix, so a compound one works. Reading
+    /// only the last dot segment would make `*.min.js` — a default — inert,
+    /// and generated bundles are both the largest files in a tree and the ones
+    /// least worth parsing.
+    #[test]
+    fn a_compound_suffix_pattern_matches() {
+        let defaults: Vec<String> = DEFAULT_EXCLUDES.iter().map(|p| (*p).to_string()).collect();
+        // Not under `dist/`, so only the suffix rule can match it.
+        assert!(excluded("ui/build/bundle.min.js", &defaults));
+        assert!(excluded("bundle.min.js", &defaults));
+        assert!(
+            !excluded("ui/src/app.js", &defaults),
+            "an ordinary source file is not a bundle"
+        );
+        assert!(!excluded("ui/src/minify.js", &defaults));
+        // The single-extension form is unchanged, and a bare suffix is not a
+        // match: `*.lock` means something *dot* lock.
+        assert!(excluded("Cargo.lock", &defaults));
+        assert!(!excluded(".lock", &defaults));
+        assert!(!excluded("src/lib.rs", &defaults));
     }
 
     #[test]

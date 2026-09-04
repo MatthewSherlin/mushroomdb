@@ -484,10 +484,11 @@ fn unchanged_files_are_not_rewritten() {
     let repo = seed_repo();
     let db_dir = tmp("db");
     run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-    let before = {
+    let before_file = {
         let db = GraphDb::open(&db_dir).unwrap();
         db.node_history("src/util.rs").unwrap().len()
     };
+    let before_commits = core_api::wal_commit_count_at(&db_dir).unwrap();
 
     // A second full pass over the same working tree scans every file and
     // writes none of them.
@@ -498,11 +499,123 @@ fn unchanged_files_are_not_rewritten() {
     };
     assert_eq!(report.files_scanned, 5, "every file is read again");
 
+    assert_eq!(
+        core_api::wal_commit_count_at(&db_dir).unwrap(),
+        before_commits,
+        "a re-scan of an unchanged tree must not add a single WAL commit"
+    );
     let db = GraphDb::open(&db_dir).unwrap();
     assert_eq!(
         db.node_history("src/util.rs").unwrap().len(),
-        before,
+        before_file,
         "an unchanged file must produce no write on a re-scan"
+    );
+}
+
+/// The last commit of a run is the sync marker. Anything written after it
+/// would be work the marker already claims to cover, so a failure in that work
+/// would be skipped forever: the next run would resume from a sha past it.
+#[test]
+fn the_sync_marker_is_written_after_the_structure_pass() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    let newest = |key: &str| {
+        db.node_history(key)
+            .unwrap()
+            .iter()
+            .map(|e| e.commit)
+            .max()
+            .unwrap_or_else(|| panic!("no history for {key}"))
+    };
+    let marker = newest("__mushroomdb_git_sync__");
+    for key in [
+        "src/util.rs",
+        "src/net.rs",
+        "docs/guide.md",
+        "src/util.rs#helper",
+    ] {
+        assert!(
+            newest(key) < marker,
+            "{key} was written at commit {} but the marker landed at {marker}",
+            newest(key)
+        );
+    }
+}
+
+/// The failure the marker ordering protects against is a structure batch that
+/// will not commit. An unreadable file is *not* one of those: the pass skips
+/// what it cannot read and the run still succeeds, so the marker advances and
+/// the next run does not retry. This pins that deliberate degradation.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_is_skipped_rather_than_failing_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    let locked = repo.join("src/net.rs");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read(&locked).is_err();
+    // Running as root, or on a filesystem that ignores the mode bits, makes
+    // the file readable anyway; there is nothing to assert then.
+    if !readable {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+
+    let report = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        report.structure.files_scanned, 4,
+        "the unreadable file is skipped, the other four are read: {report:?}"
+    );
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(db.has_node("src/net.rs"), "its history is still ingested");
+    assert_eq!(
+        prop(&db, "src/net.rs", "hash"),
+        None,
+        "but nothing was read"
+    );
+    assert!(!db.has_node("src/net.rs#connect"));
+    assert!(
+        db.has_node("__mushroomdb_git_sync__"),
+        "the run succeeded, so the marker advanced"
+    );
+}
+
+/// `#` is legal in a path, so a file can be named exactly what another file's
+/// symbol key would be. Whichever node holds the key keeps it: overwriting a
+/// `File` node with symbol props would corrupt it.
+#[test]
+fn a_symbol_key_that_collides_with_a_file_leaves_the_file_alone() {
+    let repo = seed_repo();
+    write_files(&repo, &[("src/util.rs#helper", "not a symbol\n")]);
+    commit_all(&repo, "a file named like a symbol key");
+
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert_eq!(
+        prop(&db, "src/util.rs#helper", "path"),
+        Some(Value::Str("src/util.rs#helper".into())),
+        "the File node keeps its own path"
+    );
+    assert_eq!(
+        prop(&db, "src/util.rs#helper", "file_id"),
+        None,
+        "no symbol props were written onto it"
+    );
+    assert_eq!(prop(&db, "src/util.rs#helper", "kind"), None);
+    // The rest of the file is unaffected: `helper` simply has no Symbol node.
+    assert_eq!(prop(&db, "src/util.rs", "symbols_n"), Some(Value::Int(1)));
+    assert_eq!(
+        out(&db, "src/net.rs", "IMPORTS"),
+        vec!["src/util.rs".to_string()]
     );
 }
 

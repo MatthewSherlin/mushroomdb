@@ -14,11 +14,12 @@ mushroomdb ingest-git ~/.mushroomdb/code ~/src/myproject \
 ```
 
 ```
-ingest-git: 620 commit(s), 394 file(s), 2 author(s)
-  scanned 394 file(s): 5553 symbol(s), 429 import(s), 7484 call(s), 304 mention(s)
+ingest-git: 622 commit(s), 396 file(s), 2 author(s)
+  scanned 396 file(s): 5625 symbol(s), 435 import(s), 7521 call(s), 306 mention(s)
   hash-only 22  symbol cap hit on 0
-  rules: auto_fk_commit_author_id, auto_fk_file_top_author_id, co_changed, knows,
-         auto_fk_symbol_file_id, imports, calls, mentions, concept_sources, about_file
+  rules: auto_fk_file_top_author_id, auto_fk_commit_author_id, co_changed, knows,
+         auto_fk_symbol_file_id, imports, calls, mentions, concept_sources,
+         about_author, about_file, about_symbol
 ```
 
 ## Flags
@@ -194,13 +195,17 @@ and imports still land, since those are structure rather than prose.
 
 ## Notes and concepts
 
-Two more rules are declared once their labels appear in the graph, so that
-agent-written nodes join the same graph rather than sitting beside it:
-`about_<label>` turns a `Note.about` list into `ABOUT` edges to files, symbols,
-authors, concepts or other notes, and `concept_sources` turns a
-`Concept.source_files` list into `DESCRIBED_IN` edges. Neither is created by
-this command's own data — they appear on the first run after something writes a
-`Note` or a `Concept`.
+Two more rules stand ready for nodes an agent writes, so that they join this
+graph rather than sitting beside it. `concept_sources` turns a
+`Concept.source_files` list into `DESCRIBED_IN` edges; it is declared on the
+first ingest whether or not a `Concept` exists yet. `about_<label>` turns a
+`Note.about` list into `ABOUT` edges, and because a rule has a single
+destination there is one per label a note can point at — `about_file`,
+`about_symbol`, `about_author`, `about_concept`, `about_note`. Each of those is
+declared once its *destination* label is in the graph, so a first ingest creates
+`about_file`, `about_symbol` and `about_author` — those three labels are what it
+just wrote — and picks up `about_concept` and `about_note` on the first run
+after a `Concept` or a `Note` appears.
 
 ## Exclusion patterns
 
@@ -209,7 +214,7 @@ this command's own data — they appear on the first run after something writes 
 | Pattern | Means | Matches |
 |---|---|---|
 | ends with `/` | path prefix | `target/` matches `target/debug/x.rs`, not `targeted/x.rs` |
-| starts with `*.` | file extension | `*.lock` matches `Cargo.lock`, not `Cargo.toml` |
+| starts with `*.` | file-name suffix | `*.lock` matches `Cargo.lock`, not `Cargo.toml`; `*.min.js` matches `ui/bundle.min.js`, not `ui/app.js` |
 | anything else | substring of the path | `node_modules` matches `ui/node_modules/x/y.js` |
 
 **With no `--exclude` of your own, six defaults apply:** `target/`,
@@ -344,9 +349,13 @@ prints
 error: another mushroomdb process is writing; retry
 ```
 
-and exits **3**, having written nothing. Retrying later is always safe: the run
-either applies its whole window or none of it, and the sync marker only advances
-with the data it covers.
+and exits **3**, having written nothing. Retrying later is always safe. The sync
+marker is the last thing a run writes — after the commit walk, after the
+working-tree pass, after the pull request links — so it only ever advances over
+a window every phase finished. A run that fails part way leaves the marker where
+it was and the next run re-walks the same window, which is harmless: commits
+already in the graph are skipped, file props are rewritten from the recomputed
+state, and a rename whose node already moved finds nothing to move.
 
 ## What the recall hook sees
 

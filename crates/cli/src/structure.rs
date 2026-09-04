@@ -636,19 +636,26 @@ fn plan_file(w: &Db, file: &FileWrite, held: Option<&BTreeSet<String>>, ops: &mu
     }
     for sym in &file.symbols {
         let props = sym.props(&file.path);
-        if w.has_node(&sym.key) {
-            for (field, want) in props {
-                diff_prop(w, &sym.key, field, want, ops);
+        match w.node_ref(&sym.key).map(|n| n.label().to_string()) {
+            // A repository may contain a file whose path is literally another
+            // file's symbol key — `#` is a legal character in a path. The node
+            // that got there first keeps it: writing symbol props onto someone
+            // else's `File` node would corrupt it, and there is no second key
+            // to put the symbol under.
+            Some(label) if label != "Symbol" => continue,
+            Some(_) => {
+                for (field, want) in props {
+                    diff_prop(w, &sym.key, field, want, ops);
+                }
             }
-        } else {
-            ops.push(BatchOp::InsertNode {
+            None => ops.push(BatchOp::InsertNode {
                 label: "Symbol".into(),
                 key: sym.key.clone(),
                 props: props
                     .into_iter()
                     .filter_map(|(f, v)| v.map(|v| (f.to_string(), v)))
                     .collect(),
-            });
+            }),
         }
     }
 }
