@@ -32,9 +32,14 @@ fn main() -> ExitCode {
         Ok(Command::Recall { db_dir, auto }) => {
             let mut raw = String::new();
             let _ = io::stdin().read_to_string(&mut raw);
+            // `run_recall` returns a digest, never an error: it is silent on
+            // every failure by contract. A *panic* is the one way it could
+            // still reach the user, and it would do so before every prompt, so
+            // it is caught here and the digest is simply empty.
+            let digest = silently(|| cli::recall::run_recall(&resolve_db(db_dir, auto), &raw))
+                .unwrap_or_default();
             // Not `print!`: that panics on EPIPE (exit 101) if the hook runner
             // closes the pipe. Every write error is swallowed instead.
-            let digest = cli::recall::run_recall(&resolve_db(db_dir, auto), &raw);
             let mut stdout = io::stdout();
             let _ = stdout.write_all(digest.as_bytes());
             let _ = stdout.flush();
@@ -62,6 +67,10 @@ fn main() -> ExitCode {
             } else {
                 None
             };
+            if files.is_empty() || auto {
+                silent_touch(db_dir, auto, &files, payload.as_deref());
+                return ExitCode::SUCCESS;
+            }
             match cli::ingest_git::run_touch(&resolve_db(db_dir, auto), &files, payload.as_deref())
             {
                 Ok(report) => {
@@ -327,6 +336,40 @@ fn busy_aware(e: &cli::CliError) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Run `f`, returning `None` if it panicked and printing nothing either way.
+///
+/// The panic hook is replaced for the duration: an unwind would otherwise print
+/// a message and a backtrace to stderr and exit 101, which for a hook body is
+/// the noisiest possible outcome and the one a user can do least about. Both
+/// hook bodies (`recall`, and `touch` in hook mode) go through this.
+fn silently<T>(f: impl FnOnce() -> T) -> Option<T> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    std::panic::set_hook(previous);
+    outcome.ok()
+}
+
+/// Run `touch` as a hook body: say nothing, whatever happens, and let the
+/// caller exit 0.
+///
+/// A `PostToolUse` hook fires on every edit the assistant makes, and everything
+/// it writes to either stream lands in the user's session. Almost everything
+/// this command can fail on is *routine* there rather than exceptional — a
+/// payload for a file in some other project, a database that was never built
+/// from a repository, a peer process holding the write lock — and none of it is
+/// the user's problem to read about on every keystroke. So the outcome is
+/// discarded, including the successful report: a line per edit is the loudest
+/// noise of the lot.
+///
+/// Naming files on the command line opts out of all of it: see the `Touch` arm.
+fn silent_touch(db_dir: Option<PathBuf>, auto: bool, files: &[PathBuf], payload: Option<&str>) {
+    let _ = silently(|| {
+        let db = resolve_db(db_dir, auto);
+        cli::ingest_git::run_touch(&db, files, payload)
+    });
 }
 
 /// The database a `<db-dir>`-or-`--auto` command should use.

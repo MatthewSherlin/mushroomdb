@@ -1284,3 +1284,65 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
     );
     assert!(rewritten.starts_with(user_text), "{rewritten}");
 }
+
+// ---------------------------------------------------------------------------
+// Test: a hook file whose mushroomdb block was hand-edited so its closing
+//       marker is gone. Everything after the opening marker could be the
+//       user's own work, so neither merge nor remove may guess.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unterminated_hook_block_is_refused_rather_than_swallowed() {
+    use cli::install::{merge_git_hook, remove_git_hook};
+
+    let dir = temp_dir("git-hook-unterminated");
+    let db = dir.join("mushroom-memory");
+    let hook = dir.join("post-commit");
+
+    // The closing marker is missing: the user deleted it, or an editor mangled
+    // the file. Their `make lint` line sits below what would be our region.
+    let corrupt =
+        "#!/bin/sh\nmake lint\n# >>> mushroomdb >>>\n( mushroomdb sync '/old' & )\necho done\n";
+    fs::write(&hook, corrupt).unwrap();
+
+    let err = merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy())
+        .expect_err("an unterminated block must not be rewritten");
+    assert!(
+        err.0.contains("never closes"),
+        "the message must say what is wrong: {}",
+        err.0
+    );
+    assert!(
+        err.0.contains(&hook.display().to_string()),
+        "and which file: {}",
+        err.0
+    );
+    assert_eq!(
+        fs::read_to_string(&hook).unwrap(),
+        corrupt,
+        "refusing means writing nothing at all"
+    );
+
+    let err = remove_git_hook(&hook).expect_err("removal must refuse too");
+    assert!(err.0.contains("never closes"), "{}", err.0);
+    assert_eq!(
+        fs::read_to_string(&hook).unwrap(),
+        corrupt,
+        "the user's `echo done` must survive"
+    );
+
+    // Repaired by hand, both work again.
+    fs::write(&hook, format!("{corrupt}# <<< mushroomdb <<<\n")).unwrap();
+    assert!(merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    let merged = fs::read_to_string(&hook).unwrap();
+    assert_eq!(
+        merged.matches("# >>> mushroomdb >>>").count(),
+        1,
+        "{merged}"
+    );
+    assert!(merged.contains("make lint"), "{merged}");
+    assert!(
+        !merged.contains("echo done"),
+        "that line was inside our region once the block closed: {merged}"
+    );
+}

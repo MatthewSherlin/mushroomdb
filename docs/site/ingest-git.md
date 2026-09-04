@@ -387,16 +387,32 @@ of them are none of this database's business.
 `touch` does not delete: a file removed from disk keeps whatever the graph last
 recorded about it until the deletion is committed and a `sync` walks it.
 
-Both commands write, so both serialise on the store's write lock and both exit
-**3** with `another mushroomdb process is writing; retry` when another process
-holds it. That is the expected outcome of committing while an ingest is running,
-and a hook should ignore it: the next invocation picks the work up.
+Both commands write, so both serialise on the store's write lock. Run by hand
+they exit **3** with `another mushroomdb process is writing; retry` when another
+process holds it, which is the expected outcome of committing while an ingest is
+running: the next invocation picks the work up.
 
-Both report on stdout and stderr when run by hand, which is what you want at a
-terminal and not what you want from a hook. A hook line should redirect both
-away, the way the block below does — including the error a database that was
-never pointed at a repository returns, `store has no git sync marker; run
-ingest-git first`.
+### Hook mode is silent
+
+`touch` decides which of two callers it has from its arguments, because the two
+want opposite things:
+
+- **Named files on the command line** — a person at a terminal. It prints what
+  it did, prints errors, and exits 1 (or 3 for a busy store).
+- **No named files, or `--auto`** — a hook. It prints nothing on stdout or
+  stderr, ever, and always exits 0. Not on a database that was never pointed at
+  a repository, not on a payload naming a file in some other project, not on a
+  busy store, not on a panic, and not on success either — a line of output per
+  edit is the loudest noise of the lot.
+
+A hook fires on every edit the assistant makes, and everything it writes lands
+in the user's session, so the failures above are routine there rather than
+exceptional. `recall` works the same way and always has: it prints its digest or
+nothing, and exits 0 whatever happens.
+
+`sync` is not silent, because it has no hook mode to detect — it takes a
+database path and nothing else. Redirect it in the hook line, as the block below
+does.
 
 ### Cost
 

@@ -1025,12 +1025,31 @@ pub fn git_hook_block(bin_cmd: &str, db: &str) -> String {
     )
 }
 
-/// `text` with our marked region removed, or `None` when it holds none.
+/// What [`strip_hook_block`] found in a hook file.
+enum Stripped {
+    /// No opening marker: every line belongs to whoever wrote the file.
+    Absent,
+    /// A complete region was removed; this is what is left.
+    Removed(String),
+    /// An opening marker with no closing marker. Where our region ends is
+    /// unknowable, so nothing may be removed.
+    Unterminated,
+}
+
+/// `text` with our marked region removed.
 ///
 /// Blank lines left dangling at the end are dropped, so a merge followed by a
 /// removal returns the original bytes rather than the original plus the blank
 /// separator the merge inserted.
-fn strip_hook_block(text: &str) -> Option<String> {
+///
+/// An opening marker with no closing marker is [`Stripped::Unterminated`]
+/// rather than "ours to the end of the file". Someone hand-edited the region,
+/// and the lines below the opening marker are now as likely to be theirs as
+/// ours — a `make lint` they added under it would be deleted by the guess.
+/// Both public helpers turn this into an error and write nothing, which is the
+/// same rule the rest of this module follows for a config file whose shape it
+/// does not recognise.
+fn strip_hook_block(text: &str) -> Stripped {
     let mut kept: Vec<&str> = Vec::new();
     let mut inside = false;
     let mut found = false;
@@ -1049,7 +1068,10 @@ fn strip_hook_block(text: &str) -> Option<String> {
         kept.push(line);
     }
     if !found {
-        return None;
+        return Stripped::Absent;
+    }
+    if inside {
+        return Stripped::Unterminated;
     }
     while kept.last().is_some_and(|l| l.trim().is_empty()) {
         kept.pop();
@@ -1058,7 +1080,16 @@ fn strip_hook_block(text: &str) -> Option<String> {
     if !out.is_empty() {
         out.push('\n');
     }
-    Some(out)
+    Stripped::Removed(out)
+}
+
+/// The error both helpers return for [`Stripped::Unterminated`].
+fn unterminated(hook_file: &Path) -> CliError {
+    CliError(format!(
+        "{}: a mushroomdb block opens with `{HOOK_BEGIN}` but never closes \
+         — refusing to edit it; delete the block by hand and re-run",
+        hook_file.display()
+    ))
 }
 
 /// What the hook file should contain once `block` is in it.
@@ -1067,10 +1098,14 @@ fn strip_hook_block(text: &str) -> Option<String> {
 /// fresh one appended, so a re-merge of the same block reproduces the same
 /// bytes and a merge of a *different* block rewrites in place instead of
 /// stacking a second region.
-fn merged_hook_text(existing: Option<&str>, block: &str) -> String {
+fn merged_hook_text(existing: Option<&str>, block: &str) -> Result<String, ()> {
     let base = match existing {
         None => String::new(),
-        Some(text) => strip_hook_block(text).unwrap_or_else(|| text.to_string()),
+        Some(text) => match strip_hook_block(text) {
+            Stripped::Absent => text.to_string(),
+            Stripped::Removed(rest) => rest,
+            Stripped::Unterminated => return Err(()),
+        },
     };
     let mut lines: Vec<&str> = base.lines().collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
@@ -1084,7 +1119,7 @@ fn merged_hook_text(existing: Option<&str>, block: &str) -> String {
     let mut out = lines.join("\n");
     out.push_str("\n\n");
     out.push_str(block);
-    out
+    Ok(out)
 }
 
 /// Whether `text` is nothing but an interpreter line — the shape a hook file we
@@ -1099,7 +1134,9 @@ fn only_a_shebang(text: &str) -> bool {
 /// `#!/bin/sh` line) if it is not there. Returns whether anything changed.
 ///
 /// Every line the user has in the file is preserved, and running this twice
-/// with the same arguments writes nothing the second time.
+/// with the same arguments writes nothing the second time. A file whose
+/// mushroomdb block was hand-edited so its closing marker is gone is an error
+/// and is left byte-for-byte alone; see [`strip_hook_block`].
 pub fn merge_git_hook(hook_file: &Path, bin_cmd: &str, db: &str) -> Result<bool, CliError> {
     let existing = if hook_file.exists() {
         Some(
@@ -1109,7 +1146,8 @@ pub fn merge_git_hook(hook_file: &Path, bin_cmd: &str, db: &str) -> Result<bool,
     } else {
         None
     };
-    let next = merged_hook_text(existing.as_deref(), &git_hook_block(bin_cmd, db));
+    let next = merged_hook_text(existing.as_deref(), &git_hook_block(bin_cmd, db))
+        .map_err(|()| unterminated(hook_file))?;
     if existing.as_deref() == Some(next.as_str()) {
         return Ok(false);
     }
@@ -1140,14 +1178,20 @@ pub fn merge_git_hook(hook_file: &Path, bin_cmd: &str, db: &str) -> Result<bool,
 /// wrote has their lines in it and is rewritten rather than removed. An empty
 /// stub of theirs would be deleted too, which git cannot tell apart from the
 /// stub never having existed.
+///
+/// An unterminated block is an error and the file is left alone; see
+/// [`strip_hook_block`].
 pub fn remove_git_hook(hook_file: &Path) -> Result<bool, CliError> {
     if !hook_file.exists() {
         return Ok(false);
     }
     let existing = fs::read_to_string(hook_file)
         .map_err(|e| CliError(format!("cannot read {}: {e}", hook_file.display())))?;
-    let Some(next) = strip_hook_block(&existing) else {
-        return Ok(false); // none of it is ours; leave the file untouched
+    let next = match strip_hook_block(&existing) {
+        // None of it is ours; leave the file untouched.
+        Stripped::Absent => return Ok(false),
+        Stripped::Removed(rest) => rest,
+        Stripped::Unterminated => return Err(unterminated(hook_file)),
     };
     if only_a_shebang(&next) {
         fs::remove_file(hook_file)

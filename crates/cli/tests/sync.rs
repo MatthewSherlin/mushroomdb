@@ -257,6 +257,141 @@ fn sync_reports_busy_when_lock_held() {
 
 // ── touch ───────────────────────────────────────────────────────────────────
 
+/// Run the real binary with `stdin` piped in, and return
+/// `(exit code, stdout, stderr)`.
+fn run_bin(args: &[&str], stdin: &str) -> (Option<i32>, String, String) {
+    use std::io::Write as _;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A `PostToolUse` hook fires on every edit the assistant makes, and whatever
+/// it writes lands in the user's session. Pointed at a database that was never
+/// built from a repository — the common case for a hook installed globally —
+/// it must say nothing at all and exit 0.
+#[test]
+fn touch_hook_mode_is_silent_on_missing_marker() {
+    let db_dir = tmp("db");
+    drop(GraphDb::open(&db_dir).unwrap()); // a real store, but no ingest-git
+    let payload = format!(
+        r#"{{"tool_name":"Edit","tool_input":{{"file_path":{}}}}}"#,
+        serde_json::to_string(&db_dir.join("x.rs").to_string_lossy().into_owned()).unwrap()
+    );
+
+    // Hook mode is "no files on the command line", with or without --auto.
+    let (code, stdout, stderr) = run_bin(&["touch", &db_dir.to_string_lossy()], &payload);
+    assert_eq!(code, Some(0), "a hook must never fail the tool call");
+    assert_eq!(stdout, "", "hook mode prints nothing on stdout");
+    assert_eq!(stderr, "", "hook mode prints nothing on stderr");
+
+    // A database directory that does not exist at all is just as silent, and
+    // must not be created on the way past.
+    let missing = db_dir.join("nope").join("deeper");
+    let (code, stdout, stderr) = run_bin(&["touch", &missing.to_string_lossy()], &payload);
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    assert!(!missing.exists(), "a hook must not seed a database");
+
+    // A person naming files on the command line still gets the error, because
+    // they are owed an answer and nothing is reading their stdout.
+    let (code, _stdout, stderr) = run_bin(
+        &[
+            "touch",
+            &db_dir.to_string_lossy(),
+            &db_dir.join("x.rs").to_string_lossy(),
+        ],
+        "",
+    );
+    assert_eq!(code, Some(1), "explicit files: a real exit code");
+    assert!(
+        stderr.contains("no git sync marker"),
+        "explicit files: a real message, got {stderr:?}"
+    );
+}
+
+/// Anything at all can arrive on a hook's stdin, including nothing. None of it
+/// is worth a word of output.
+#[test]
+fn touch_hook_mode_is_silent_on_garbage_payload() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let db = db_dir.to_string_lossy().into_owned();
+
+    for payload in [
+        "",
+        "not json at all",
+        "{",
+        r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+        r#"{"tool_input":{"file_path":""}}"#,
+        r#"{"tool_input":{"file_path":"/etc/hosts"}}"#,
+        r#"{"tool_input":{"file_path":12345}}"#,
+        r#"{"tool_input":{"edits":"not an array"}}"#,
+        r#"[1,2,3]"#,
+    ] {
+        let (code, stdout, stderr) = run_bin(&["touch", &db], payload);
+        assert_eq!(code, Some(0), "payload {payload:?}");
+        assert_eq!(stdout, "", "payload {payload:?}");
+        assert_eq!(stderr, "", "payload {payload:?}");
+    }
+
+    // A payload that *does* name a known file is equally silent, and still did
+    // the work: the import it dropped is gone from the graph.
+    write_files(&repo, &[("src/net.rs", NET_RS_NO_IMPORT)]);
+    let payload = format!(
+        r#"{{"tool_input":{{"file_path":{}}}}}"#,
+        serde_json::to_string(&repo.join("src/net.rs").to_string_lossy().into_owned()).unwrap()
+    );
+    let (code, stdout, stderr) = run_bin(&["touch", &db], &payload);
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout, "", "a successful hook fire is noise too");
+    assert_eq!(stderr, "");
+    let graph = GraphDb::open(&db_dir).unwrap();
+    assert!(
+        out(&graph, "src/net.rs", "IMPORTS").is_empty(),
+        "silent does not mean idle"
+    );
+}
+
+/// The other hook body, held to the same standard at the process boundary.
+/// `run_recall` is silent on every error by contract, but nothing checked that
+/// the binary around it is.
+#[test]
+fn recall_hook_is_silent_and_exits_zero() {
+    let db_dir = tmp("db");
+    let missing = db_dir.join("never-created");
+    for (dir, payload) in [
+        (&missing, r#"{"prompt":"anything"}"#),
+        (&db_dir, "not json"),
+        (&db_dir, ""),
+        (&db_dir, r#"{"prompt":"nothing here matches"}"#),
+    ] {
+        let (code, stdout, stderr) = run_bin(&["recall", &dir.to_string_lossy()], payload);
+        assert_eq!(code, Some(0), "recall must never block a prompt");
+        assert_eq!(stdout, "", "payload {payload:?}");
+        assert_eq!(stderr, "", "payload {payload:?}");
+    }
+    assert!(!missing.exists(), "recall must not seed a database");
+}
+
 /// The single-file path: one edit, one re-extraction, and the edges the old
 /// content derived are gone.
 #[test]
