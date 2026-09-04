@@ -55,13 +55,13 @@ run against this repository — `ingest-git` took 2.5 s, `map` 0.18 s:
 ```text
 mushroomdb map — 431 files, 6,226 symbols, 652 commits, 2 authors · synced 3s ago at 94719fe
 clusters (co-change + imports)
-  1.  crates, tests  (86 files, cohesion 0.73)  crates/server/tests/http.rs, algo.rs, crates/server/src/http.rs
-  2.  crates, src  (45 files, cohesion 0.67)  pack.rs, lib.rs, types.rs
+  1. <mixed> crates, tests  (86 files, cohesion 0.73)  crates/server/tests/http.rs, algo.rs, crates/server/src/http.rs
+  2. <mixed> crates, src  (45 files, cohesion 0.67)  pack.rs, lib.rs, types.rs
   3. ui src, e2e  (26 files, cohesion 0.89)  api.ts, store.ts, classify.ts
   4. crates/code-extract tests, fixtures  (21 files, cohesion 0.99)  lib.rs, extract.rs, mod.rs
   5. ui fonts, public  (18 files, cohesion 0.89)  IBMPlexMono-Medium.woff2, IBMPlexMono-Regular.woff2, IBMPlexSans-Medium.woff2
   6. crates/core-api src, repograph  (17 files, cohesion 0.72)  facts.rs, render.rs, context.rs
-  7.  crates, bindings  (16 files, cohesion 0.99)  crates/core-bench/Cargo.toml, package.json, crates/sim-harness/Cargo.toml
+  7. <mixed> crates, bindings  (16 files, cohesion 0.99)  crates/core-bench/Cargo.toml, package.json, crates/sim-harness/Cargo.toml
   8. benchmarks adapters, results  (15 files, cohesion 1.00)  run_handrolled.py, datasets.py, handrolled.py
 key files (most depended-on)
   crates/code-extract/src/lib.rs 0.05 · crates/server/tests/http.rs 0.04 · crates/code-extract/tests/extract.rs 0.04 · crates/core-api/tests/algo.rs 0.04 · crates/server/src/http.rs 0.03
@@ -200,7 +200,7 @@ lineage — and rule-derived edges keep those associations fresh as new facts ar
 - Node masks are the ACL primitive: pass `mask: [key1, key2, …]` to `query` to restrict the visible
   node set. Write statements are rejected on masked queries.
   [`docs/site/masks.md`](docs/site/masks.md)
-- Schema-as-code: `mushroomdb schema apply  ` idempotently applies rules, views,
+- Schema-as-code: `mushroomdb schema apply <dir> <schema.json>` idempotently applies rules, views,
   and fulltext indexes, printing a created/updated/unchanged diff.
 
 **Minimal workflow** (four tool calls):
@@ -261,9 +261,9 @@ cargo add mushroomdb              # embedded Rust library
 pip install mushroomdb            # Python bindings
 ```
 
-`install` writes an MCP entry that runs `npx -y mushroomdb@`, so the assistant needs
+`install` writes an MCP entry that runs `npx -y mushroomdb@<version>`, so the assistant needs
 nothing installed globally and nothing is copied into your home directory. Point it at a local
-build with `--command `. `mushroomdb doctor` verifies the result end to end — config entry,
+build with `--command <path>`. `mushroomdb doctor` verifies the result end to end — config entry,
 store, lock, hooks, git hooks, and a real stdio handshake with the configured command.
 
 To see the bundled explorer, write a demo graph and serve it:
@@ -293,33 +293,33 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 
 | Command | What it does |
 |---|---|
-| `mushroomdb install [--platform claude-code\|cursor\|codex\|all] [--project\|--user] [--db ] [--command ] [--no-git-hooks] [--no-prewarm]` | Write the `/mushroom` skill + MCP server entry + prompt, post-edit and git hooks. Auto-detects platform and scope |
-| `mushroomdb uninstall [--platform …] [--project] [--db ]` | Remove exactly what `install` wrote (manifest-driven; leaves user files) |
+| `mushroomdb install [--platform claude-code\|cursor\|codex\|all] [--project\|--user] [--db <path>] [--command <path>] [--no-git-hooks] [--no-prewarm]` | Write the `/mushroom` skill + MCP server entry + prompt, post-edit and git hooks. Auto-detects platform and scope |
+| `mushroomdb uninstall [--platform …] [--project] [--db <path>]` | Remove exactly what `install` wrote (manifest-driven; leaves user files) |
 | `mushroomdb doctor [--project\|--user] [--platform …]` | Verify an install: config entry, npx reachability, store, lock, hooks, git hooks, a real stdio handshake, and duplicate-scope servers. Exit 1 on any `fail` |
-| `mushroomdb ingest-git   [--exclude ]... [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]` | Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHANGED`, `KNOWS`, `IMPORTS`, `CALLS` and `MENTIONS` rules. Re-run to sync. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
-| `mushroomdb map  [--json]` | The repository in one screen: clusters, key files, owners, hot files, and three questions worth asking |
-| `mushroomdb context  ` | One file or symbol from every side. `` is a path, a symbol key, or a bare symbol name |
-| `mushroomdb impact  ...` | What changing these files reaches: co-change partners, importers, and the symbols other files call |
-| `mushroomdb owners  ` | Top author and share, who else knows it, last touch, the last four quarters |
-| `mushroomdb why   ` | Every rule edge between two nodes with its evidence, or the shortest path between them |
-| `mushroomdb sync  [--json]` | Re-sync the repository the store was built from: new commits, then the working tree where it differs from `HEAD`. Takes no repo argument — reads it off the graph. `--json` prints the counts as one object |
-| `mushroomdb touch \|--auto [...]` | Re-extract just these files. With no `` reads them from a `PostToolUse` payload on stdin (hook body) |
-| `mushroomdb recall \|--auto` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin, prints related graph facts. Wired automatically by `install` |
-| `mushroomdb mcp \|--auto` | Start a stdio MCP JSON-RPC server for agent tools |
-| `mushroomdb demo ` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
-| `mushroomdb serve ` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`) |
-| `mushroomdb query  ` | Run a Cypher read or write (`--query` also accepted) |
-| `mushroomdb asof  --commit N` | Read-only view at a WAL commit |
-| `mushroomdb stats ` | Print node/edge/rule counts |
-| `mushroomdb suggest ` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
-| `mushroomdb schema apply  ` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
-| `mushroomdb snapshot  [--keep-wal]` | Write `snapshot.bin` (truncates WAL unless `--keep-wal`) |
-| `mushroomdb verify ` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch |
-| `mushroomdb migrate ` | Migrate an older store format in place |
-| `mushroomdb backup  ` | Copy store files to `` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores |
-| `mushroomdb export   [--format jsonl\|parquet\|graphml]` | Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools |
-| `mushroomdb algo pagerank\|wcc\|degree  [--top N]` | PageRank, weakly-connected components, or degree centrality over manual + derived edges. `--weight-prop`/`--min-weight` weight or filter the edge set |
-| `mushroomdb algo communities  [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]` | Louvain communities with per-community cohesion and overall modularity |
+| `mushroomdb ingest-git <dir> <repo> [--exclude <pattern>]... [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]` | Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHANGED`, `KNOWS`, `IMPORTS`, `CALLS` and `MENTIONS` rules. Re-run to sync. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
+| `mushroomdb map <dir> [--json]` | The repository in one screen: clusters, key files, owners, hot files, and three questions worth asking |
+| `mushroomdb context <dir> <target>` | One file or symbol from every side. `<target>` is a path, a symbol key, or a bare symbol name |
+| `mushroomdb impact <dir> <file>...` | What changing these files reaches: co-change partners, importers, and the symbols other files call |
+| `mushroomdb owners <dir> <path>` | Top author and share, who else knows it, last touch, the last four quarters |
+| `mushroomdb why <dir> <a> <b>` | Every rule edge between two nodes with its evidence, or the shortest path between them |
+| `mushroomdb sync <dir> [--json]` | Re-sync the repository the store was built from: new commits, then the working tree where it differs from `HEAD`. Takes no repo argument — reads it off the graph. `--json` prints the counts as one object |
+| `mushroomdb touch <dir>\|--auto [<file>...]` | Re-extract just these files. With no `<file>` reads them from a `PostToolUse` payload on stdin (hook body) |
+| `mushroomdb recall <dir>\|--auto` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin, prints related graph facts. Wired automatically by `install` |
+| `mushroomdb mcp <dir>\|--auto` | Start a stdio MCP JSON-RPC server for agent tools |
+| `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
+| `mushroomdb serve <dir>` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`) |
+| `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted) |
+| `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit |
+| `mushroomdb stats <dir>` | Print node/edge/rule counts |
+| `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
+| `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
+| `mushroomdb snapshot <dir> [--keep-wal]` | Write `snapshot.bin` (truncates WAL unless `--keep-wal`) |
+| `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch |
+| `mushroomdb migrate <dir>` | Migrate an older store format in place |
+| `mushroomdb backup <dir> <dest>` | Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores |
+| `mushroomdb export <dir> <dest> [--format jsonl\|parquet\|graphml]` | Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools |
+| `mushroomdb algo pagerank\|wcc\|degree <dir> [--top N]` | PageRank, weakly-connected components, or degree centrality over manual + derived edges. `--weight-prop`/`--min-weight` weight or filter the edge set |
+| `mushroomdb algo communities <dir> [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]` | Louvain communities with per-community cohesion and overall modularity |
 | `mushroomdb --version` | Print the CLI's version and exit |
 
 **Concurrency:** every CLI write command, the hooks, and a running `mushroomdb serve` coordinate
@@ -675,9 +675,9 @@ claude plugin install mushroom@mushroomdb
 ```
 
 Open the repository you want graphed and type `/mushroom:mushroom`. Claude Code
-namespaces plugin-provided skills as `/:`. The skill builds the
+namespaces plugin-provided skills as `/<plugin>:<skill>`. The skill builds the
 graph on first use; the plugin's MCP server and both hooks run through
-`npx -y mushroomdb@`.
+`npx -y mushroomdb@<version>`.
 
 The plugin writes no git hooks. To get those — a backgrounded `sync` after each
 commit, checkout and merge — or to install for Cursor or Codex, use the CLI
@@ -696,7 +696,7 @@ which it chose. Project scope writes the MCP entry to `.mcp.json`, the
 `.claude/settings.json`, an ignore line for the store, and a backgrounded
 `sync` into the `post-commit`, `post-checkout` and `post-merge` git hooks.
 
-The MCP entry runs `npx -y mushroomdb@`, so the assistant needs
+The MCP entry runs `npx -y mushroomdb@<version>`, so the assistant needs
 nothing installed globally. To point it at a local build instead:
 
 ```text
@@ -709,7 +709,7 @@ current directory, so the entry that gets written names an absolute path. A
 bare name (`--command mushroomdb`) is a `PATH` lookup and is written as given.
 
 Other flags: `--user`, `--platform codex` (registers through the Codex CLI, and
-needs `uninstall --platform codex` to undo), `--db `, and
+needs `uninstall --platform codex` to undo), `--db <path>`, and
 `--no-git-hooks`. `mushroomdb uninstall` removes exactly what was written. Full
 reference: [`skill.md`](skill.md).
 
@@ -924,7 +924,7 @@ in those parentheses.
 Underneath, the store's own history is queryable too. `edge_history(a, b)` returns
 the add/retract lifecycle of every edge between two nodes with the rule that
 caused each event; `was_linked(a, b, type, at_commit)` answers a point-in-time
-question; `mushroomdb asof  --commit N` opens a read-only view at a past
+question; `mushroomdb asof <db> --commit N` opens a read-only view at a past
 commit with derived edges included. See [Time travel](timetravel.md).
 
 ---
@@ -1234,8 +1234,8 @@ pub struct RuleDef {
     pub dst_label: String,     // destination node label
     pub predicate: Predicate,  // one of the six kinds below
     pub edge_type: String,     // edge type written to the graph
-    pub weight_prop: Option, // if Some, score stored as this edge prop
-    pub max_edges: Option,    // cap on derived edges per rule (recommended)
+    pub weight_prop: Option<String>, // if Some, score stored as this edge prop
+    pub max_edges: Option<usize>,    // cap on derived edges per rule (recommended)
     pub approximate: bool,     // HNSW approximate mode (VectorSimilar only)
 }
 ```
@@ -1304,7 +1304,7 @@ score only.
 For a rule declared with no `weight_prop` at all (only reachable via the Rust
 API — the MCP `create_rule` tool always defaults it to `"weight"`), `explain`
 still reports the recomputed score (1.0 for `KeyMatch`/`FieldEqual`), but the
-`EdgeFired` subscription event's `weight` field (`Option`) is absent
+`EdgeFired` subscription event's `weight` field (`Option<f64>`) is absent
 (omitted) from the JSON payload — because it only looks up the stored prop,
 not the predicate.
 
@@ -1886,7 +1886,7 @@ what is on disk now. `impact` reads its default file list from
 otherwise; with neither available it asks for an explicit `files` list rather
 than guessing.
 
-`sync` runs the same incremental ingest as `mushroomdb sync `, by
+`sync` runs the same incremental ingest as `mushroomdb sync <db>`, by
 re-invoking the binary the server is running from.
 
 ---
@@ -2388,7 +2388,7 @@ let rs = db.query_with_params(
     &[("min", Value::Int(18))],
 )?;
 
-// Low-level form — BTreeMap.
+// Low-level form — BTreeMap<String, Value>.
 use std::collections::BTreeMap;
 let mut params = BTreeMap::new();
 params.insert("min".to_string(), Value::Int(18));
@@ -2449,7 +2449,7 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
 row's value into a list, per group when grouping keys are present).
 
-`CASE WHEN  THEN  … [ELSE ] END` is supported anywhere a
+`CASE WHEN <cond> THEN <value> … [ELSE <value>] END` is supported anywhere a
 scalar expression is (RETURN/WITH/WHERE/SET). `UNION` and `UNION ALL` combine
 read queries with matching column names. Relationship patterns accept
 type alternation: `(a)-[:A|:B]->(b)`.
@@ -2489,7 +2489,7 @@ clear, actionable message; **Absent** = not implemented (not tested here).
 | `MATCH (n)-[r:TYPE]->(m)` directed edge | `MATCH (a)-[:KNOWS]->(b) RETURN a` |
 | `MATCH (n)-[r:TYPE]-(m)` undirected edge | `MATCH (a)-[:KNOWS]-(b) RETURN a` |
 | `MATCH (n)-[r]->(m)` any relationship type | `MATCH (n)-[r]->(m) RETURN type(r)` |
-| `WHERE =, , , =` | `WHERE n.age > 18` |
+| `WHERE =, <>, <, >, <=, >=` | `WHERE n.age > 18` |
 | `WHERE n.prop IN [a, b]` / `IN $list` | `WHERE n.city IN ['Austin', $c]`; `$cities` is `Value::List` |
 | `RETURN DISTINCT` | `RETURN DISTINCT n.city` — hashed after Project; numeric Int/Float unify like grouping; cap 1,000,000 distinct rows |
 | `WHERE AND / OR` | `WHERE n.a = 1 AND n.b = 2` |
@@ -2610,8 +2610,8 @@ Python bindings (via PyO3 / maturin), and the
 Start the server:
 
 ```text
-mushroomdb serve  [--addr 127.0.0.1:8080] [--token ] \
-  [--role-token TOKEN:ROLE]... [--ui ] [--no-ui] [--demo-if-empty]
+mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] \
+  [--role-token TOKEN:ROLE]... [--ui <dist-dir>] [--no-ui] [--demo-if-empty]
 ```
 
 Default bind is `127.0.0.1:8080`. The bound address is printed after the
@@ -2665,7 +2665,7 @@ write endpoints — exactly the v1 read-only behavior.
 **Never-widen invariant:** unknown token → 401; token bound to a role name not
 present in `roles.json` at open time → 401; corrupt `roles.json` → 500 for
 role tokens (full-access token unaffected); empty role → sees zero nodes.
-Role sidecar is stored in `/roles.json` (v1 for read-only roles, v2 when
+Role sidecar is stored in `<db-dir>/roles.json` (v1 for read-only roles, v2 when
 any role carries a write scope).
 
 ---
@@ -2679,11 +2679,11 @@ v0.3 lifts the write ban for roles that explicitly declare write scopes in
 
 ```rust
 pub struct WriteScope {
-    pub create_labels: Vec,      // CREATE nodes under these labels
-    pub update_labels: Vec,      // SET props / MERGE-match on visible nodes
-    pub delete_labels: Vec,      // DELETE / DETACH DELETE visible nodes
-    pub create_edge_types: Vec,  // INSERT EDGE between two visible endpoints
-    pub delete_edge_types: Vec,  // DELETE user-owned edges (not derived)
+    pub create_labels: Vec<String>,      // CREATE nodes under these labels
+    pub update_labels: Vec<String>,      // SET props / MERGE-match on visible nodes
+    pub delete_labels: Vec<String>,      // DELETE / DETACH DELETE visible nodes
+    pub create_edge_types: Vec<String>,  // INSERT EDGE between two visible endpoints
+    pub delete_edge_types: Vec<String>,  // DELETE user-owned edges (not derived)
 }
 ```
 
@@ -3167,7 +3167,7 @@ The server holds the read lock for the **full duration** of the operation: file 
 plus post-copy CRC verification. Writers are blocked for that entire window. For
 stores with large snapshots this may be tens of seconds.
 
-The server copies: `snapshot.bin`, `wal.bin`, all `wal..archive` files,
+The server copies: `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
 `wal.floor`, `wal.genesis`, and `roles.json`. After the copies complete it opens the
 backup read-only and runs the CRC verifier.
 
@@ -3201,7 +3201,7 @@ recovery) workflow using backup together with WAL archives.
 
 ```rust
 let report = db.backup_to(Path::new("/backup/dir"))?;
-// report.files: Vec  — files copied, sorted
+// report.files: Vec<String>  — files copied, sorted
 // report.bytes: u64          — total bytes copied
 // report.verified: bool      — true when post-copy CRC check passed
 ```
@@ -3215,7 +3215,7 @@ against a directory that a separate `mushroomdb serve` process is writing to. Us
 ### Backup (CLI)
 
 ```sh
-mushroomdb backup  
+mushroomdb backup <db-dir> <backup-dir>
 ```
 
 WARNING: unsafe against a concurrently running `mushroomdb serve` process. For
@@ -3224,9 +3224,9 @@ live-served stores use `POST /backup`.
 ### Export (Rust API)
 
 ```rust
-let nodes: Vec     = db.all_nodes_for_export();
-let edges: Vec   = db.all_edges_for_export();
-// ExportEdge { edge_type, src, dst, derived: bool, rule: Option, weight: Option }
+let nodes: Vec<NodeInfo>     = db.all_nodes_for_export();
+let edges: Vec<ExportEdge>   = db.all_edges_for_export();
+// ExportEdge { edge_type, src, dst, derived: bool, rule: Option<String>, weight: Option<f64> }
 ```
 
 Nodes are sorted by key. Edges are sorted by `(edge_type, src, dst)`. Derived
@@ -3235,24 +3235,24 @@ edges include the rule name in `rule`; manually-written edges have `rule: None`.
 ### Export (CLI)
 
 ```sh
-mushroomdb export   [--format jsonl|parquet|graphml]
+mushroomdb export <db-dir> <dest> [--format jsonl|parquet|graphml]
 ```
 
 Default format: `jsonl`.
 
 **JSONL format** (default): writes `nodes.jsonl`, `edges.jsonl`, and `rules.jsonl`
-to `` (a directory). Each line is a JSON object. JSONL output is stable,
+to `<dest>` (a directory). Each line is a JSON object. JSONL output is stable,
 deterministic, and byte-identical between two runs on the same store.
 
 **Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
-and `rules.parquet` to `` (a directory) with Snappy compression (parquet-rs
+and `rules.parquet` to `<dest>` (a directory) with Snappy compression (parquet-rs
 default). Parquet output is **not** byte-identical between parquet-rs library
 versions — use JSONL if you need a stable byte checksum.
 
 **GraphML format** (`--format graphml`): writes a single GraphML file — nodes
 and edges only, since rules have no GraphML analogue — for import into generic
-graph viewers and analysis tools. If `` is an existing directory, the file
-is `/graph.graphml`; otherwise `` is the file path itself. Node
+graph viewers and analysis tools. If `<dest>` is an existing directory, the file
+is `<dest>/graph.graphml`; otherwise `<dest>` is the file path itself. Node
 elements carry a `label` attribute plus every property (lists and maps are
 JSON-encoded as `string`-typed attributes); edge elements carry `type` and
 `derived`, plus `rule` and `weight` when present. `weight` is the creating
@@ -3267,7 +3267,7 @@ under `score`, another a string), the key declares `attr.type="string"` for
 every node rather than risk a value that doesn't fit a narrower type.
 
 **Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as
-JSON `null` (JSONL/Parquet) or an empty `` element (GraphML). Normal
+JSON `null` (JSONL/Parquet) or an empty `<data>` element (GraphML). Normal
 finite floats round-trip correctly.
 
 **Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is
@@ -3374,7 +3374,7 @@ When the server is started with a token, pass `?token=` on the WebSocket URL.
 ## MCP (Model Context Protocol)
 
 ```text
-mushroomdb mcp 
+mushroomdb mcp <db-dir>
 ```
 
 Runs a newline-delimited JSON-RPC 2.0 loop on stdio. No `Content-Length`
@@ -3918,7 +3918,7 @@ if let Some(ev) = sub.recv_timeout(Duration::from_millis(100)) {
 
 ```rust
 pub enum DbEvent {
-    EdgeFired    { rule, src_key, dst_key, edge_type, weight: Option, commit_seq },
+    EdgeFired    { rule, src_key, dst_key, edge_type, weight: Option<f64>, commit_seq },
     EdgeRetracted{ rule, src_key, dst_key, edge_type, commit_seq },
     NodeInserted { label, key, commit_seq },
     NodeDeleted  { key, commit_seq },
@@ -4216,7 +4216,7 @@ GraphError::CasConflict { key: String, expected: u64, actual: u64 }
 ### Persistence
 
 `last_changed` values are stored in V8 snapshot section 11 (LAST_CHANGE,
-`HashMap`) so they survive snapshots. CAS preconditions
+`HashMap<node_id, commit_seq>`) so they survive snapshots. CAS preconditions
 remain trustworthy across restarts.
 
 ---
@@ -4309,12 +4309,12 @@ use core_api::{SnapshotOptions, GraphDb};
 
 db.snapshot_with(SnapshotOptions {
     keep_wal: false,   // truncating snapshot (default)
-    archive_wal: true, // rename the live WAL to wal..archive before truncating
+    archive_wal: true, // rename the live WAL to wal.<N>.archive before truncating
 })?;
 ```
 
 When `archive_wal: true`, the live `wal.bin` is renamed to
-`wal..archive` before the snapshot is written. Subsequent
+`wal.<end_frame_index>.archive` before the snapshot is written. Subsequent
 writes go to a new `wal.bin`. The archive files live alongside `snapshot.bin`
 in the database directory.
 
@@ -4322,7 +4322,7 @@ in the database directory.
 
 | File | Written when | Purpose |
 |---|---|---|
-| `wal..archive` | each `archive_wal` snapshot | renamed WAL segment; N = cumulative end-frame index |
+| `wal.<N>.archive` | each `archive_wal` snapshot | renamed WAL segment; N = cumulative end-frame index |
 | `wal.floor` | first retention prune | 8-byte LE u64; archives at or below this floor are deleted |
 | `wal.genesis` | first archive, also the store's first-ever snapshot | empty marker; signals that the archive chain covers genesis |
 
@@ -4465,7 +4465,7 @@ let results = db.query(
 
 ## API
 
-### `create_view(def: ViewDef) -> Result`
+### `create_view(def: ViewDef) -> Result<()>`
 
 Register a new view.  Backfills values for all existing nodes with the
 matching label.  Fails if:
@@ -4473,12 +4473,12 @@ matching label.  Fails if:
 - `view_prop` is already owned by another view.
 - `view_prop` collides with an existing real node property.
 
-### `delete_view(name: &str) -> Result`
+### `delete_view(name: &str) -> Result<()>`
 
 Remove a view and delete its values from all nodes.  Fails if the view
 does not exist.
 
-### `views() -> Vec`
+### `views() -> Vec<ViewDef>`
 
 Snapshot of all registered view definitions.
 
@@ -4590,7 +4590,7 @@ required.
 ## Searching
 
 ```rust
-// Returns Vec sorted by BM25 score DESC, then key ASC.
+// Returns Vec<(key, f64)> sorted by BM25 score DESC, then key ASC.
 let results = db.search("bio", "rust embedded")?;
 ```
 
@@ -4699,7 +4699,7 @@ dedicated search engine via the subscription API and query both in parallel.
 
 ## Memory model
 
-The index stores per-token position lists (Vec per posting). Memory scales with
+The index stores per-token position lists (Vec<u32> per posting). Memory scales with
 total token occurrences and token repetition within documents. For a typical corpus
 of 10k documents averaging 100 tokens each, the v2 index uses roughly 1.25–3× more
 memory than a v1 (position-free) index, depending on token repetition. There is no
@@ -4748,7 +4748,7 @@ let config = PageRankConfig {
     min_weight: None,       // drop edges below this resolved weight first
 };
 let report = db.pagerank(&config);
-// report.scores: Vec sorted desc, key asc on ties
+// report.scores: Vec<(String, f64)> sorted desc, key asc on ties
 // report.converged: true if power iteration converged
 ```
 
@@ -4768,7 +4768,7 @@ let config = WccConfig {
     min_weight: None,
 };
 let report = db.connected_components(&config);
-// report.components: Vec
+// report.components: Vec<(key, component_id)>
 // component_id = smallest key in the component (deterministic)
 // sorted by (component_id, key)
 ```
@@ -4790,7 +4790,7 @@ let config = DegreeConfig {
     min_weight: None,
 };
 let report = db.degree_centrality(&config);
-// report.scores: Vec sorted desc, key asc on ties
+// report.scores: Vec<(key, u64)> sorted desc, key asc on ties
 ```
 
 **weight_prop / min_weight:** same filter-only semantics as WCC — an edge below `min_weight` (resolved via `weight_prop`, default `1.0`) isn't counted; the degree itself stays an integer count, not a weighted sum.
@@ -4811,7 +4811,7 @@ let config = LouvainConfig {
     node_label: None,         // restrict membership to one label
 };
 let report = db.communities(&config);
-// report.communities: Vec sorted size desc, then smallest member key asc
+// report.communities: Vec<Community> sorted size desc, then smallest member key asc
 // report.modularity: f64, resolution-adjusted
 // report.truncated: true if the time budget fired
 ```
