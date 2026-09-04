@@ -18,14 +18,16 @@
 #        - Repository name: mushroomdb
 #        - Workflow filename: publish.yml
 #      Do this for: mushroomdb-storage, mushroomdb-rules, mushroomdb-query,
-#        mushroomdb, mushroomdb-arrow, mushroomdb-server, mushroomdb-cli
+#        mushroomdb, mushroomdb-arrow, mushroomdb-server, mushroomdb-extract,
+#        mushroomdb-cli
 #   FIRST-PUBLISH BOOTSTRAP: crates.io Trusted Publishing requires the crate
 #   to already exist on the registry before a trusted publisher can be added.
 #   Bootstrap via: cargo login <your-api-token> && cargo publish -p <crate>
 #   (publishing once with a token, then switching to Trusted Publishing for all
 #   subsequent releases). Publish in dependency order:
 #     mushroomdb-storage → mushroomdb-rules → mushroomdb-query → mushroomdb
-#     → mushroomdb-arrow → mushroomdb-server → mushroomdb-cli
+#     → mushroomdb-arrow → mushroomdb-server → mushroomdb-extract
+#     → mushroomdb-cli
 #   Wait ~30 seconds between each publish for the index to update.
 #
 # PYPI (Trusted Publishing — no token):
@@ -109,7 +111,8 @@ jobs:
         run: |
           set -u
           for c in mushroomdb-storage mushroomdb-rules mushroomdb-query \
-                   mushroomdb mushroomdb-arrow mushroomdb-server mushroomdb-cli; do
+                   mushroomdb mushroomdb-arrow mushroomdb-server \
+                   mushroomdb-extract mushroomdb-cli; do
             echo "── publishing $c ──"
             if out=$(cargo publish -p "$c" 2>&1); then
               echo "$out" | tail -3
