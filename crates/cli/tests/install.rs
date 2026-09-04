@@ -452,6 +452,27 @@ fn a_gitignore_we_created_is_removed_again() {
 }
 
 #[test]
+fn uninstall_keeps_a_gitignore_the_user_extended() {
+    let root = temp_dir("gitignore-extended");
+    let home = temp_dir("gitignore-extended-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    // The file exists only because install created it...
+    install_on_path(&root, &home, &opts).expect("install");
+    // ...but by now it is the repository's, and holds a line of the user's.
+    fs::write(root.join(".gitignore"), "mushroom-memory/\nnode_modules/\n").unwrap();
+
+    run_uninstall(&root, &home, &opts).expect("uninstall");
+
+    assert_eq!(
+        read(&root, ".gitignore"),
+        "node_modules/\n",
+        "only our line may go; the file is the user's now"
+    );
+}
+
+#[test]
 fn gitignore_untouched_when_the_store_is_outside_the_project() {
     let root = temp_dir("gitignore-outside");
     let home = temp_dir("gitignore-outside-home");
@@ -637,6 +658,40 @@ fn prewarm_failure_is_a_warning() {
 
 #[test]
 #[cfg(unix)]
+fn prewarm_is_skipped_with_no_prewarm() {
+    let root = temp_dir("prewarm-off");
+    let home = temp_dir("prewarm-off-home");
+    let bin_dir = temp_dir("prewarm-off-bin");
+    let db = root.join("mushroom-memory");
+    let log = bin_dir.join("argv.txt");
+
+    // An `npx` that is right there on the resolution path and must not run.
+    fake_program(
+        &bin_dir,
+        "npx",
+        &format!("printf '%s\\n' \"$@\" > '{}'\n", log.display()),
+    );
+
+    let opts = InstallOpts {
+        prewarm: false,
+        ..claude_project_opts(&db)
+    };
+    let out = run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("install");
+
+    assert!(!log.exists(), "--no-prewarm still spawned npx");
+    assert!(!out.contains("warning"), "{out}");
+    assert!(root.join(".mcp.json").exists());
+}
+
+#[test]
+#[cfg(unix)]
 fn prewarm_success_is_silent() {
     let root = temp_dir("prewarm-ok");
     let home = temp_dir("prewarm-ok-home");
@@ -687,6 +742,7 @@ fn codex_platform_calls_codex_mcp_add() {
     let home = temp_dir("codex-home");
     let bin_dir = temp_dir("codex-bin");
     let db = root.join("mushroom-memory");
+    let hooks = git_repo(&root);
     let log = bin_dir.join("argv.txt");
     fake_program(
         &bin_dir,
@@ -720,6 +776,14 @@ fn codex_platform_calls_codex_mcp_add() {
     // 0.6.0 ships no Codex skill, and Codex config is the CLI's own business.
     assert_absent(&root, ".mcp.json");
     assert_absent(&root, ".claude/skills/mushroom/SKILL.md");
+    // Nothing project-local at all. The ignore line and the git hooks are
+    // shared with whatever else is installed in the repository, and this
+    // install's manifest lives under HOME, so recording them here would let a
+    // Codex uninstall strip them out from under a Claude Code install.
+    assert_absent(&root, ".gitignore");
+    for name in ["post-commit", "post-checkout", "post-merge"] {
+        assert!(!hooks.join(name).exists(), "{name} was written anyway");
+    }
 
     // The manifest remembers it, so uninstall hands the removal back to Codex.
     fs::remove_file(&log).unwrap();
@@ -820,6 +884,185 @@ fn upgrade_rewrites_entry_with_new_version() {
         mcp["mcpServers"]["mushroomdb"]["args"][1],
         format!("mushroomdb@{VERSION}")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Test: an upgrade replaces the settings hooks instead of stacking a second
+//       pair beside them. The 0.5.x pair names a binary that is still on disk,
+//       so leaving them means two recall digests on every prompt.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn upgrade_replaces_stale_hooks_from_a_0_5_install() {
+    let root = temp_dir("upgrade-hooks");
+    let home = temp_dir("upgrade-hooks-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    // What 0.5.x left behind: hooks naming the copied binary, and a hook of
+    // the user's own under another event.
+    let old_bin = home.join(".mushroomdb/bin/mushroomdb");
+    let old_recall = format!("'{}' recall '{}'", old_bin.display(), db.display());
+    let old_touch = format!("'{}' touch '{}'", old_bin.display(), db.display());
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    fs::write(
+        root.join(".claude/settings.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    {"hooks": [{"type": "command", "command": old_recall, "timeout": 5}]}
+                ],
+                "PostToolUse": [
+                    {"matcher": "Edit|Write|MultiEdit",
+                     "hooks": [{"type": "command", "command": old_touch, "timeout": 30, "async": true}]}
+                ],
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": "echo hi"}]}
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // And the manifest that recorded them.
+    let manifest_dir = root.join(".claude/skills/mushroom");
+    fs::create_dir_all(&manifest_dir).unwrap();
+    let settings = root.join(".claude/settings.json");
+    fs::write(
+        manifest_dir.join(".install-manifest.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "files": [manifest_dir.join("SKILL.md").to_str().unwrap()],
+            "mcp_keys": [{"file": root.join(".mcp.json").to_str().unwrap(), "server": "mushroomdb"}],
+            "hooks": [
+                {"file": settings.to_str().unwrap(), "event": "UserPromptSubmit", "command": old_recall},
+                {"file": settings.to_str().unwrap(), "event": "PostToolUse", "command": old_touch}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals())
+        .expect("upgrade install");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    let ups = s["hooks"]["UserPromptSubmit"].as_array().unwrap();
+    assert_eq!(ups.len(), 1, "exactly one recall hook must remain: {s}");
+    assert_eq!(
+        ups[0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} recall '{}'", db.display())
+    );
+    let ptu = s["hooks"]["PostToolUse"].as_array().unwrap();
+    assert_eq!(ptu.len(), 1, "exactly one touch hook must remain: {s}");
+    assert_eq!(
+        ptu[0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} touch '{}'", db.display())
+    );
+    // The user's own hook is not ours to replace.
+    assert_eq!(
+        s["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        "echo hi"
+    );
+    assert!(
+        out.contains("replaced stale UserPromptSubmit hook"),
+        "{out}"
+    );
+
+    // And the manifest now points at the new commands, so uninstall finds them.
+    run_uninstall(&root, &home, &opts).expect("uninstall");
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        s["hooks"]["UserPromptSubmit"].is_null(),
+        "the new hooks must be removable: {s}"
+    );
+    assert_eq!(
+        s["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        "echo hi"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: a relative --command / --db is anchored before anything is written.
+//       The assistant spawns the server from a directory of its own choosing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn relative_command_and_db_are_made_absolute() {
+    let root = temp_dir("relative-paths");
+    let home = temp_dir("relative-paths-home");
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        db: Some(PathBuf::from("./mushroom-memory")),
+        command: Some(PathBuf::from("./target/debug/mushroomdb")),
+        ..base_opts()
+    };
+
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::Explicit(PathBuf::from("./target/debug/mushroomdb")),
+        &no_externals(),
+    )
+    .expect("install");
+
+    let bin = root.join("target/debug/mushroomdb");
+    let db = root.join("mushroom-memory");
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["command"],
+        bin.to_str().unwrap()
+    );
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"],
+        serde_json::json!(["mcp", db.to_str().unwrap()])
+    );
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("'{}' recall '{}'", bin.display(), db.display())
+    );
+    // And the ignore line is still the repository-relative form.
+    assert_eq!(read(&root, ".gitignore"), "mushroom-memory/\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test: an inferred scope that finds no manifest looks at the other one before
+//       telling the user there is nothing to uninstall (0.5.x installed
+//       user-scope inside checkouts, having no scope detection at all)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn uninstall_auto_scope_falls_back_to_the_other_scope() {
+    let root = temp_dir("uninstall-fallback");
+    let home = temp_dir("uninstall-fallback-home");
+    git_repo(&root); // so auto-detection says "project"
+
+    let installed = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::User),
+        ..base_opts()
+    };
+    install_on_path(&root, &home, &installed).expect("user-scope install");
+    assert!(home.join(".claude.json").exists());
+
+    // No --user this time: the checkout says project, and there is nothing there.
+    let bare = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: None,
+        ..base_opts()
+    };
+    let out = run_uninstall(&root, &home, &bare).expect("must find the user-scope install");
+
+    assert!(out.contains("scope  user"), "{out}");
+    let mcp: serde_json::Value = serde_json::from_str(&read(&home, ".claude.json")).unwrap();
+    assert!(mcp["mcpServers"]["mushroomdb"].is_null(), "{mcp}");
+    assert_absent(&home, ".claude/skills/mushroom/SKILL.md");
+
+    // With nothing installed in either scope it still errors.
+    let err = run_uninstall(&root, &home, &bare).expect_err("nothing left");
+    assert!(err.0.contains("no install manifest"), "{}", err.0);
 }
 
 // ---------------------------------------------------------------------------

@@ -29,7 +29,7 @@ and files instead — see [`docs/site/ingest-git.md`](ingest-git.md).
 | `--platform claude-code\|cursor\|codex\|all` | Target platform. Default: auto-detect (reads `~/.claude` / `.cursor/` presence). `all` is Claude Code and Cursor; Codex is opt-in, because registering with it runs another program. |
 | `--project` / `--user` | Scope. Default: auto — project inside a git checkout, user anywhere else. |
 | `--db <path>` | Database directory. Default: `./mushroom-memory` (project) or `~/.mushroomdb/memory` (user). |
-| `--command <path>` | Invoke this binary instead of `npx`. Use it for a local build or a pinned install. |
+| `--command <path>` | Invoke this binary instead of `npx`. Use it for a local build or a pinned install. A relative path is fine to type: it is anchored to the current directory before anything is written, because the assistant spawns the server from a directory of its own. `--db` is anchored the same way. |
 | `--no-git-hooks` | Skip the `post-commit` / `post-checkout` / `post-merge` sync hooks. |
 | `--no-prewarm` | Skip the one-off `npx -y mushroomdb@<version> --version` fetch. |
 
@@ -142,11 +142,22 @@ Codex owns its own configuration, so `install` writes no file for it: it runs
 codex mcp add mushroomdb -- <command> <args…>
 ```
 
-and lets Codex record the server. `uninstall` runs `codex mcp remove
-mushroomdb`. If the `codex` CLI is not on `PATH`, `install` says so and writes
-nothing. 0.6.0 ships no Codex skill — the MCP tool descriptions are what Codex
-reads. The manifest for a Codex-only install lives at
-`~/.mushroomdb/install-manifest-codex.json`.
+and lets Codex record the server. If the `codex` CLI is not on `PATH`,
+`install` says so and writes nothing. 0.6.0 ships no Codex skill — the MCP tool
+descriptions are what Codex reads.
+
+A Codex-only install writes nothing project-local: no ignore line and no git
+hooks, since its manifest lives at
+`~/.mushroomdb/install-manifest-codex.json` and removing it must not strip
+those out from under a Claude Code or Cursor install sharing the repository.
+Pair it with `--platform claude-code` (or run `mushroomdb ingest-git
+--ensure-gitignore`) if you want them.
+
+Undoing it needs the platform named — auto-detection never yields Codex:
+
+```
+mushroomdb uninstall --platform codex
+```
 
 ---
 
@@ -194,6 +205,13 @@ conflict: `install` rewrites the command in place and prints `updated mcp
 command`. This repairs an entry whose bare `mushroomdb` never resolved,
 replaces the absolute path a 0.5.x install wrote, and re-pins an older version.
 
+The two settings hooks are replaced the same way, not added beside the old
+ones: any `UserPromptSubmit` or `PostToolUse` hook running `recall` or `touch`
+against this same database is removed first, whatever binary it names, and
+`install` prints `replaced stale <event> hook`. Without that, a 0.5.x upgrade
+would leave the old pair running the copied binary alongside the new pair, and
+every prompt would carry two recall digests.
+
 ---
 
 ## Uninstall
@@ -205,7 +223,19 @@ mushroomdb uninstall --platform claude-code --project
 Reads the manifest and removes exactly what `install` wrote: the MCP entry, the
 skill or rules file, both settings hooks, the `.gitignore` line, the marked
 block in each git hook, and the Codex registration. User files in the same
-directories, and user lines in the same files, are left untouched.
+directories, and user lines in the same files, are left untouched. A
+`.gitignore` that exists only because `install` created it is deleted too, but
+only when stripping our line leaves it empty — a line you have added since
+keeps the file.
+
+Scope is resolved the same way as for `install`, so a bare `uninstall` inside a
+git checkout looks for the project manifest first. If there is none, it falls
+back to the user manifest before reporting anything, and the summary names the
+scope it used. That is the 0.5.x upgrade path: 0.5.x had no scope detection, so
+its installs inside checkouts are user-scope.
+
+`--platform codex` is required to undo a Codex install; auto-detection never
+yields Codex.
 
 ---
 

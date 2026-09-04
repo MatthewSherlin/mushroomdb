@@ -462,6 +462,10 @@ struct ManagedLine {
     file: PathBuf,
     /// The exact line, without its newline.
     line: String,
+    /// Whether the file itself did not exist before this install. Only such a
+    /// file may be deleted on uninstall, and only if nothing is left in it.
+    #[serde(default)]
+    created: bool,
 }
 
 /// Claude Code hook event this install wires: fires before each prompt is
@@ -614,17 +618,59 @@ fn merge_hook_entry(
 }
 
 /// Remove exactly the hook groups whose only command is `command`; drop the
-/// command from mixed groups; leave everything else semantically unchanged
-/// (every key is re-serialized — comments are not supported since
-/// `serde_json` is strict JSON).
+/// command from mixed groups; leave everything else semantically unchanged.
+fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result<(), CliError> {
+    drop_hooks(settings_file, event, |c| c == command).map(|_| ())
+}
+
+/// Whether `command` is one of our hook bodies for `db`, whatever binary it
+/// names.
+///
+/// The command prefix is exactly what changes between versions — 0.5.x wrote
+/// the absolute path of a copied binary, 0.6.0 writes an `npx` pin, a
+/// developer's `--command` writes a build path — so identity is the tail: the
+/// subcommand and the quoted database this install is wiring. A hook naming a
+/// *different* database belongs to a different install and is not ours to
+/// touch.
+fn is_our_hook_command(command: &str, sub: &str, db_str: &str) -> bool {
+    command.ends_with(&format!(" {sub} {}", sh_quote(db_str)))
+}
+
+/// Take out every hook of ours for `event` that is not the one we are about
+/// to write. Returns whether anything was removed.
+///
+/// Without this an upgrade appends: `merge_hook_entry` matches on the exact
+/// command string, so a 0.5.x entry naming `~/.mushroomdb/bin/mushroomdb` is
+/// not recognised, survives, and keeps running alongside the new one — two
+/// recall digests injected on every prompt.
+fn remove_stale_hooks(
+    settings_file: &Path,
+    event: &str,
+    sub: &str,
+    db_str: &str,
+    desired: &str,
+) -> Result<bool, CliError> {
+    drop_hooks(settings_file, event, |c| {
+        c != desired && is_our_hook_command(c, sub, db_str)
+    })
+}
+
+/// Drop every hook under `event` whose command satisfies `drop_it`, pruning
+/// groups that end up empty. Returns whether the file was rewritten.
 ///
 /// Reads `hooks.<event>` through immutable accessors first, so a settings
 /// file where the user removed the `hooks` key (or `<event>`, or shaped
 /// either as something other than an object/array) is left byte-for-byte
-/// untouched rather than having a stray `null` written back in.
-fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result<(), CliError> {
+/// untouched rather than having a stray `null` written back in. Every other
+/// key is preserved, though the file is re-serialized (comments are not
+/// supported since `serde_json` is strict JSON).
+fn drop_hooks(
+    settings_file: &Path,
+    event: &str,
+    drop_it: impl Fn(&str) -> bool,
+) -> Result<bool, CliError> {
     if !settings_file.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let raw = fs::read_to_string(settings_file)
         .map_err(|e| CliError(format!("cannot read {}: {e}", settings_file.display())))?;
@@ -643,12 +689,12 @@ fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result
     else {
         // No matching (or well-shaped) event array — nothing of ours to
         // remove; leave the file exactly as it is, no write at all.
-        return Ok(());
+        return Ok(false);
     };
 
     for g in groups.iter_mut() {
         if let Some(hs) = g["hooks"].as_array_mut() {
-            hs.retain(|h| h["command"] != command);
+            hs.retain(|h| !h["command"].as_str().is_some_and(&drop_it));
         }
     }
     groups.retain(|g| {
@@ -669,14 +715,14 @@ fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result
         // remove. Writing anyway would re-serialize a file we do not own —
         // `serde_json` is built without `preserve_order`, so the user's key
         // order and indentation would be rewritten for no reason.
-        return Ok(());
+        return Ok(false);
     }
 
     let json = serde_json::to_string_pretty(&root)
         .map_err(|e| CliError(format!("cannot serialize settings: {e}")))?;
     fs::write(settings_file, json)
         .map_err(|e| CliError(format!("cannot write {}: {e}", settings_file.display())))?;
-    Ok(())
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +739,31 @@ struct Ctx<'a> {
     cmd: &'a McpCommand,
     ext: &'a Externals,
     git_hooks: bool,
+    prewarm: bool,
+}
+
+/// Anchor a user-supplied path to `base` when it is relative, and drop any
+/// `./` segments.
+///
+/// A relative `--command` or `--db` is convenient to type and wrong to store:
+/// the assistant spawns the MCP server, and the hooks and git hooks run, from
+/// whatever directory those processes happen to be in, not the one the install
+/// was typed in. Nothing is canonicalized — resolving symlinks would rewrite
+/// a path the user chose deliberately.
+fn absolutise(path: &Path, base: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Install the /mushroom skill and MCP server entry for the resolved platforms.
@@ -728,9 +799,16 @@ pub fn run_install_with(
     let (scope, auto_scope) = resolve_scope(project_root, opts.scope);
     let db = opts
         .db
-        .clone()
+        .as_ref()
+        .map(|d| absolutise(d, project_root))
         .unwrap_or_else(|| default_db(scope, project_root, home));
     let db_str = db.to_string_lossy();
+    // Whatever the caller handed us, what gets written names a binary by a
+    // path that resolves from anywhere.
+    let cmd = &match cmd {
+        McpCommand::Explicit(p) => McpCommand::Explicit(absolutise(p, project_root)),
+        other => other.clone(),
+    };
 
     let resolved = resolve_platform(project_root, home, opts.platform.as_ref())?;
     let platforms = expand_platform(&resolved);
@@ -749,6 +827,7 @@ pub fn run_install_with(
         cmd,
         ext,
         git_hooks: opts.git_hooks,
+        prewarm: opts.prewarm,
     };
 
     let manifest_path = manifest_path(project_root, home, scope, &platforms);
@@ -846,10 +925,19 @@ fn write_everything(
         install_platform(ctx, plat, manifest, notes)?;
     }
 
-    // The repository-level wiring is platform-independent: the store is
-    // ignored by git and the graph is re-synced after commits whichever
-    // assistant reads it.
-    if ctx.scope == Scope::Project {
+    // The repository-level wiring is shared by the platforms whose config
+    // lives in the repository: the store is ignored by git and the graph is
+    // re-synced after commits whichever of them reads it.
+    //
+    // A Codex-only install is excluded. It writes nothing else project-local
+    // (Codex keeps its own config, and the manifest for it lives under the
+    // home directory), so an ignore line and three git hooks recorded there
+    // would be removed by a `uninstall --platform codex` out from under a
+    // Claude Code install that shares the repository and never recorded them.
+    let repo_wiring = platforms
+        .iter()
+        .any(|p| matches!(p, Platform::ClaudeCode | Platform::Cursor));
+    if ctx.scope == Scope::Project && repo_wiring {
         ensure_gitignore_line(ctx, manifest)?;
         if ctx.git_hooks {
             install_git_hooks(ctx, manifest)?;
@@ -879,11 +967,28 @@ pub fn run_uninstall_with(
     opts: &InstallOpts,
     ext: &Externals,
 ) -> Result<String, CliError> {
-    let (scope, _) = resolve_scope(project_root, opts.scope);
+    let (scope, auto_scope) = resolve_scope(project_root, opts.scope);
     let resolved = resolve_platform(project_root, home, opts.platform.as_ref())?;
     let platforms = expand_platform(&resolved);
 
-    let manifest_path = manifest_path(project_root, home, scope, &platforms);
+    let mut scope = scope;
+    let mut manifest_path = manifest_path(project_root, home, scope, &platforms);
+    // An inferred scope is a guess, and guessing wrong here means telling
+    // someone with a perfectly good user-scope install that they have nothing
+    // to uninstall — 0.5.x had no scope detection, so every install made by it
+    // inside a checkout is exactly that case. A scope the user stated is not
+    // second-guessed.
+    if auto_scope && !manifest_path.exists() {
+        let other = match scope {
+            Scope::Project => Scope::User,
+            Scope::User => Scope::Project,
+        };
+        let alt = self::manifest_path(project_root, home, other, &platforms);
+        if alt.exists() {
+            scope = other;
+            manifest_path = alt;
+        }
+    }
     if !manifest_path.exists() {
         return Err(CliError(format!(
             "no install manifest found at {} — nothing to uninstall",
@@ -929,10 +1034,17 @@ pub fn run_uninstall_with(
         }
     }
 
-    // The ignore line, exactly as it was written.
+    // The ignore line, exactly as it was written. A file that exists only
+    // because install created it goes too — but only when our line was all it
+    // ever held; anything the user added to it since is theirs to keep.
     for g in &manifest.gitignore {
         if remove_line(&g.file, &g.line)? {
             removed.push(format!("removed  {} from {}", g.line, g.file.display()));
+        }
+        if g.created && g.file.exists() && file_is_blank(&g.file) {
+            fs::remove_file(&g.file)
+                .map_err(|e| CliError(format!("cannot remove {}: {e}", g.file.display())))?;
+            removed.push(format!("removed  {}", g.file.display()));
         }
     }
 
@@ -969,6 +1081,11 @@ pub fn run_uninstall_with(
     }
 
     let mut out = "mushroomdb uninstalled\n".to_string();
+    out.push_str(&format!(
+        "  scope  {}{}\n",
+        scope.label(),
+        if auto_scope { " (auto-detected)" } else { "" }
+    ));
     for line in &removed {
         out.push_str(&format!("  {line}\n"));
     }
@@ -1204,7 +1321,13 @@ fn install_claude_code(
         Scope::Project => ctx.project_root.join(".claude").join("settings.json"),
         Scope::User => ctx.home.join(".claude").join("settings.json"),
     };
+    // An earlier install of ours for this same store is replaced, not joined:
+    // its command names a binary this version no longer writes, and leaving it
+    // would run both on every prompt.
     let recall = recall_hook_command(&shell, ctx.db);
+    if remove_stale_hooks(&settings_file, HOOK_EVENT, "recall", ctx.db, &recall)? {
+        notes.push(format!("replaced stale {HOOK_EVENT} hook"));
+    }
     merge_hook_entry(
         &settings_file,
         HOOK_EVENT,
@@ -1213,6 +1336,9 @@ fn install_claude_code(
         manifest,
     )?;
     let touch = touch_hook_command(&shell, ctx.db);
+    if remove_stale_hooks(&settings_file, TOUCH_EVENT, "touch", ctx.db, &touch)? {
+        notes.push(format!("replaced stale {TOUCH_EVENT} hook"));
+    }
     merge_hook_entry(
         &settings_file,
         TOUCH_EVENT,
@@ -1331,14 +1457,23 @@ fn ensure_gitignore_line(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), C
     next.push('\n');
     fs::write(&path, next)
         .map_err(|e| CliError(format!("cannot write {}: {e}", path.display())))?;
-    // A `.gitignore` that only exists because of us is ours to take away
-    // again: uninstall strips the line first and then removes the file, so a
-    // repository that had none is left with none.
-    if !existed {
-        manifest.files.push(path.clone());
-    }
-    manifest.gitignore.push(ManagedLine { file: path, line });
+    // `created` is what lets uninstall leave a repository that had no
+    // `.gitignore` with none again — but only if our line is still all that is
+    // in it. Anything the user has added since is theirs, and the file stays.
+    manifest.gitignore.push(ManagedLine {
+        file: path,
+        line,
+        created: !existed,
+    });
     Ok(())
+}
+
+/// Whether the file is gone or holds nothing but whitespace.
+fn file_is_blank(path: &Path) -> bool {
+    match fs::read_to_string(path) {
+        Ok(s) => s.trim().is_empty(),
+        Err(_) => true,
+    }
 }
 
 /// Remove one exact line from a text file. Returns whether anything changed;
@@ -1403,6 +1538,9 @@ fn install_git_hooks(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliEr
 /// skipped when asked to be, and a failure is a line in the summary rather
 /// than a failed install — the entry that was written is correct either way.
 fn prewarm(ctx: &Ctx<'_>) -> Option<String> {
+    if !ctx.prewarm {
+        return None;
+    }
     let McpCommand::Npx { version } = ctx.cmd else {
         return None;
     };

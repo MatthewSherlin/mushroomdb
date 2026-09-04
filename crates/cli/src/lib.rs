@@ -355,8 +355,10 @@ Usage:
 Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
 install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
 the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
---command names one. --no-git-hooks skips the post-commit/checkout/merge sync hooks; --no-prewarm
-skips fetching the pinned package once.
+--command names one (a relative --command or --db is anchored to the current directory).
+--no-git-hooks skips the post-commit/checkout/merge sync hooks; --no-prewarm skips fetching the
+pinned package once. uninstall resolves the same scope and falls back to the other one when the
+inferred scope has no manifest; undoing a Codex install needs --platform codex.
 --auto resolves the database as $CLAUDE_PROJECT_DIR/mushroom-memory, else ./mushroom-memory in a
 git checkout, else ~/.mushroomdb/memory.
 "

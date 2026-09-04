@@ -127,9 +127,13 @@ mushroomdb install --project --platform claude-code \
   --command ./target/release/mushroomdb --no-prewarm
 ```
 
-Other flags: `--user`, `--platform codex` (registers through the Codex CLI),
-`--db <path>`, and `--no-git-hooks`. `mushroomdb uninstall` removes exactly
-what was written. Full reference: [`skill.md`](skill.md).
+A relative `--command` or `--db` is fine to type; both are anchored to the
+current directory, so the entry that gets written names an absolute path.
+
+Other flags: `--user`, `--platform codex` (registers through the Codex CLI, and
+needs `uninstall --platform codex` to undo), `--db <path>`, and
+`--no-git-hooks`. `mushroomdb uninstall` removes exactly what was written. Full
+reference: [`skill.md`](skill.md).
 
 Restart the assistant afterwards — MCP servers and hooks are read at startup.
 
