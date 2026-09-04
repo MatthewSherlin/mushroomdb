@@ -1,11 +1,12 @@
 # Codebase Graph (`ingest-git`)
 
 `mushroomdb ingest-git <db-dir> <repo-dir>` turns a git repository into a graph
-of authors, commits, and files, then derives co-change and ownership edges from
-rules. Re-running the same command against the same database syncs it: only the
-commits after the recorded head are replayed, so deleted files drop out and
-renamed files carry their history to the new path instead of leaving a stale
-node behind.
+of authors, commits, and files, reads the working tree for the symbols each file
+defines and the links between them, then derives every relationship from rules.
+Re-running the same command against the same database syncs it: only the commits
+after the recorded head are replayed, so deleted files drop out and renamed
+files carry their history to the new path instead of leaving a stale node
+behind.
 
 ```
 mushroomdb ingest-git ~/.mushroomdb/code ~/src/myproject \
@@ -13,8 +14,11 @@ mushroomdb ingest-git ~/.mushroomdb/code ~/src/myproject \
 ```
 
 ```
-ingest-git: 1204 commit(s), 318 file(s), 7 author(s)
-  rules: auto_fk_commit_author_id, auto_fk_file_top_author_id, co_changed, knows
+ingest-git: 620 commit(s), 394 file(s), 2 author(s)
+  scanned 394 file(s): 5553 symbol(s), 429 import(s), 7484 call(s), 304 mention(s)
+  hash-only 22  symbol cap hit on 0
+  rules: auto_fk_commit_author_id, auto_fk_file_top_author_id, co_changed, knows,
+         auto_fk_symbol_file_id, imports, calls, mentions, concept_sources, about_file
 ```
 
 ## Flags
@@ -25,6 +29,8 @@ ingest-git: 1204 commit(s), 318 file(s), 7 author(s)
 | `--max-commits-per-file N` | Cap on the stored `commits` list per file (default 200) |
 | `--recurse-submodules` | Also walk every initialised submodule, as its own unit |
 | `--prs` | Ask `gh` for merged pull requests and link them to their commits |
+| `--no-structure` | Skip the working-tree pass: no hashes, symbols, imports, calls or mentions |
+| `--no-docs` | Skip Markdown bodies, headings and mentions; hashes and symbols still land |
 | `--ensure-gitignore` | Add the database directory to the repository's `.gitignore` |
 
 ## Graph shape
@@ -33,7 +39,8 @@ ingest-git: 1204 commit(s), 318 file(s), 7 author(s)
 |---|---|---|
 | `Author` | mailmap-resolved email | `name` |
 | `Commit` | full sha | `message` (subject line), `ts` (unix seconds), `author_id`, `pr_id` (with `--prs`) |
-| `File` | path | `path`, `dir`, `ext`, `commits` (list of shas, newest last, capped), `n_commits`, `top_author_id`, `author_counts` |
+| `File` | path | `path`, `dir`, `ext`, `commits` (list of shas, newest last, capped), `n_commits`, `top_author_id`, `author_counts`, and from the working tree: `hash`, `lines`, `lang`, `symbols_n`, `imports`, `import_lines`, `mentions`, `headings`, `body` |
+| `Symbol` | `"<path>#<qualified name>"` | `name`, `kind`, `path`, `file_id`, `line_start`, `line_end`, `signature`, `doc`, `calls_to`, `call_lines` |
 | `PR` | `"pr:<number>"` | `number`, `title`, `url`, `merged_at`, `author_login` |
 | `GitSync` | `"__mushroomdb_git_sync__"` | `sha` — the last ingested commit, the marker the next run resumes from — plus `repo`, `recurse`, `prs`, `structure`, `docs` |
 
@@ -87,6 +94,12 @@ want the full distribution; `top_author_id` is its argmax.
 | `PR` | `Commit` → `PR` | Auto-FK on `Commit.pr_id` (`--prs`) |
 | `CO_CHANGED` | `File` → `File` | Rule `co_changed` |
 | `KNOWS` | `Author` → `File` | Rule `knows` |
+| `DEFINES` | `Symbol` → `File` | Foreign key on `Symbol.file_id` |
+| `IMPORTS` | `File` → `File` | Rule `imports`, over the `imports` list |
+| `CALLS` | `Symbol` → `Symbol` | Rule `calls`, over the `calls_to` list |
+| `MENTIONS` | `File` → `File` | Rule `mentions`, over the `mentions` list |
+| `DESCRIBED_IN` | `Concept` → `File` | Rule `concept_sources`, over the `source_files` list |
+| `ABOUT` | `Note` → `File`/`Symbol`/`Author`/`Concept`/`Note` | Rule `about_<label>`, over the `about` list |
 
 `top_author_id` is whoever has the most commits on that file. Ties break on the
 lexicographically smallest email so repeated runs agree.
@@ -110,8 +123,81 @@ reassigning a file's `top_author_id` moves both edges in one write: the FK rule
 rewrites `TOP_AUTHOR` and `knows` refires off it before the commit closes.
 
 Both rules are declared once, on the first run, after the nodes exist — so each
-backfills exactly once. `File.path`, `Commit.message`, and `Author.name` are
-also indexed for full-text search on that first run.
+backfills exactly once. The same holds for the structure rules below.
+`File.path`, `Commit.message`, `Author.name`, `File.body`, `File.headings`,
+`Symbol.name` and `Symbol.doc` are all indexed for full-text search.
+
+## The working tree
+
+Git says who changed what. It does not say what the code *is*. After the commit
+walk, `ingest-git` reads every file the history left it — narrowed to the paths
+that exist on disk right now — and records what it finds.
+
+| On | Prop | Meaning |
+|---|---|---|
+| `File` | `hash` | First 16 bytes of the content BLAKE3 digest, 32 hex characters |
+| `File` | `lines`, `lang` | Line count, and one of `rust`, `python`, `typescript`, `tsx`, `javascript`, `go`, `markdown`, `other` |
+| `File` | `symbols_n` | How many `Symbol` nodes this file defines |
+| `File` | `imports` | The `File` keys its imports resolve to |
+| `File` | `import_lines` | `"<key><TAB><line>"` per import site — the evidence behind each edge |
+| `Symbol` | `calls_to` | The `Symbol` keys its calls resolve to |
+| `Symbol` | `call_lines` | `"<key><TAB><line>"` per call site |
+
+Symbols are keyed `<path>#<qualified name>` — `src/store.rs#Store.put` — so two
+files that both define `run` never collide, and a symbol carries its file in its
+key. `file_id` names that file, and the foreign key on it is the `DEFINES` edge.
+
+Resolution is deliberately conservative: an import that names something outside
+the working tree (the standard library, a registry dependency) resolves to
+nothing, and a call whose name has several candidate definitions and no clear
+winner resolves to nothing. A missing edge is easier to live with than a wrong
+one. Language rules are documented in the extraction crate.
+
+Three things are read but not parsed. A file over 1 MB, a file whose leading
+bytes are not text, and a file with an extension no extractor claims all keep
+their `hash`, `lines` and `lang` and contribute nothing else. Past 2,000
+definitions a single file stops contributing symbols; the run reports how many
+files hit that.
+
+**Only differences are written.** Each file's stored props are compared field by
+field against what was just extracted, and its `Symbol` nodes against the
+symbols just found in it. A file whose bytes have not changed produces no write
+at all, so re-running over an unchanged tree leaves the database byte-identical.
+
+**Renames rewrite both sides.** Renaming a file moves its node, but its old
+`Symbol` keys can never be right again: they are deleted and re-created under
+the new path. And a file that imported the old path has that path sitting in its
+`imports` list, so every file naming a key that moved or vanished is extracted
+again — which rewrites the list and lets the rule retract the edge.
+
+`--no-structure` skips this pass entirely. Nothing is removed; the props simply
+stop being maintained.
+
+## Documentation
+
+Markdown files contribute prose as well as structure. With `--docs` (the
+default) a `.md` file stores its `body` (up to 64 KB), its `headings` in
+document order, and its `mentions`: the other files it names, whether in a
+backticked path or a relative link. A mention is a `MENTIONS` edge, so a
+question about a file reaches the document that explains it.
+
+`File.body` and `File.headings` are indexed for full-text search alongside
+`File.path`, and `Symbol.name` and `Symbol.doc` alongside them, so a prompt that
+uses a project's own vocabulary finds the file, the definition and the paragraph
+that introduced it.
+
+`--no-docs` skips all three: no body, no headings, no mentions. Hashes, symbols
+and imports still land, since those are structure rather than prose.
+
+## Notes and concepts
+
+Two more rules are declared once their labels appear in the graph, so that
+agent-written nodes join the same graph rather than sitting beside it:
+`about_<label>` turns a `Note.about` list into `ABOUT` edges to files, symbols,
+authors, concepts or other notes, and `concept_sources` turns a
+`Concept.source_files` list into `DESCRIBED_IN` edges. Neither is created by
+this command's own data — they appear on the first run after something writes a
+`Note` or a `Concept`.
 
 ## Exclusion patterns
 
@@ -122,6 +208,14 @@ also indexed for full-text search on that first run.
 | ends with `/` | path prefix | `target/` matches `target/debug/x.rs`, not `targeted/x.rs` |
 | starts with `*.` | file extension | `*.lock` matches `Cargo.lock`, not `Cargo.toml` |
 | anything else | substring of the path | `node_modules` matches `ui/node_modules/x/y.js` |
+
+**With no `--exclude` of your own, six defaults apply:** `target/`,
+`node_modules/`, `dist/`, `.git/`, `*.lock` and `*.min.js`. These are the paths
+a repository carries that are not its source — build output, vendored
+dependencies, generated bundles, lockfiles nobody reads — and keeping them out
+matters twice over now that the working tree is read: they would otherwise be
+hashed and parsed on every run. Naming any pattern of your own replaces the
+whole default set, so state the ones you still want.
 
 Excluded paths are skipped entirely: no `File` node, no `TOUCHED` edge. A file
 renamed *into* an excluded path is treated as deleted. Patterns are matched
@@ -200,6 +294,11 @@ only for `<sha>..HEAD`, then applies the changes in order:
   no move at all.
 - **Copied** — treated as a new file with no prior history.
 
+The working-tree pass then runs over the paths that window touched, plus every
+file whose `imports` or `mentions` list named a path that moved or vanished. A
+first run, or a run whose recorded flags changed, scans the whole tree instead —
+which is how turning `--no-docs` back off fills in the prose it skipped.
+
 Only the path a file ends the window on decides its fate. A file renamed and
 then deleted in the same window is deleted, not moved onto a dead path; a rename
 onto a path another file just vacated replaces that file's node. Either way one
@@ -249,11 +348,11 @@ with the data it covers.
 ## What the recall hook sees
 
 Once `mushroomdb install` has wired the `UserPromptSubmit` recall hook at this
-database, a prompt naming a file, an author, or words from a commit message
-matches through the full-text indexes on `File.path`, `Author.name`, and
-`Commit.message`. The hook then walks the graph outward, so a prompt about one
-file surfaces the files that change with it and the person who owns it, before
-any file is read.
+database, a prompt naming a file, a definition, an author, or words from a
+commit message or a design document matches through the full-text indexes. The
+hook then walks the graph outward, so a prompt about one file surfaces what it
+imports, what calls into it, the files that change with it, the guide that
+describes it and the person who owns it, before any file is read.
 
 The same data answers direct questions:
 

@@ -9,17 +9,20 @@
 //! |---|---|---|
 //! | `Author` | mailmap-resolved email | `name` |
 //! | `Commit` | full sha | `message`, `ts`, `author_id`, `pr_id` (with `--prs`) |
-//! | `File` | path | `path`, `dir`, `ext`, `commits`, `n_commits`, `top_author_id`, `author_counts` |
+//! | `File` | path | `path`, `dir`, `ext`, `commits`, `n_commits`, `top_author_id`, `author_counts`, plus the working-tree props in [`structure`](crate::structure) |
+//! | `Symbol` | `"<path>#<qualified name>"` | see [`structure`](crate::structure) |
 //! | `PR` | `"pr:<number>"` | `number`, `title`, `url`, `merged_at`, `author_login` |
 //! | `GitSync` | `"__mushroomdb_git_sync__"` | `sha`, `repo`, `recurse`, `prs`, `structure`, `docs` |
 //!
 //! Edges: user `TOUCHED` Commit→File and `MERGED_AS` PR→Commit, auto-FK
 //! `AUTHOR` Commit→Author, `TOP_AUTHOR` File→Author and `PR` Commit→PR,
-//! rule-derived `CO_CHANGED` File→File and `KNOWS` Author→File.
+//! rule-derived `CO_CHANGED` File→File and `KNOWS` Author→File — and, from the
+//! working-tree pass, `DEFINES`, `IMPORTS`, `CALLS` and `MENTIONS`.
 //!
 //! With `--recurse-submodules` each initialised submodule is walked as its own
 //! *unit*: its file keys carry the submodule's path in the parent, and it
 //! resumes from its own `GitSync` marker.
+use crate::structure;
 use crate::CliError;
 use core_api::{
     default_max_edges, Direction, GraphError, IngestOptions, Predicate, ResultSet, RuleDef,
@@ -32,6 +35,21 @@ use std::process::Command;
 /// Cap on the `commits` list stored per file. Bounds both node size and the
 /// cost of the jaccard overlap the `co_changed` rule runs over that list.
 pub const DEFAULT_MAX_COMMITS_PER_FILE: usize = 200;
+
+/// Applied when the user names no `--exclude` pattern of their own.
+///
+/// These are the paths a repository carries that are not its source: build
+/// output, vendored dependencies, generated bundles, and lockfiles nobody
+/// reads. Excluding them keeps them out of the history graph *and* out of the
+/// working-tree pass, which would otherwise hash and parse every one.
+pub const DEFAULT_EXCLUDES: [&str; 6] = [
+    "target/",
+    "node_modules/",
+    "dist/",
+    ".git/",
+    "*.lock",
+    "*.min.js",
+];
 
 /// Minimum jaccard overlap of two files' `commits` lists for `CO_CHANGED`.
 const CO_CHANGE_MIN: f64 = 0.25;
@@ -64,11 +82,11 @@ pub struct IngestGitOpts {
     pub recurse_submodules: bool,
     /// Ask `gh` for merged pull requests and link them to their commits.
     pub prs: bool,
-    /// Extract symbols from source files. Recorded on the `GitSync` node;
-    /// used by structure ingest.
+    /// Read the working tree: content hashes, `Symbol` nodes, imports and
+    /// calls. Off with `--no-structure`. Recorded on the `GitSync` node.
     pub structure: bool,
-    /// Index documentation bodies. Recorded on the `GitSync` node; used by
-    /// structure ingest.
+    /// Index Markdown bodies, headings and mentions. Off with `--no-docs`, and
+    /// inert without `structure`. Recorded on the `GitSync` node.
     pub docs: bool,
     /// Add the database directory to the repository's `.gitignore`.
     pub ensure_gitignore: bool,
@@ -89,6 +107,19 @@ pub struct IngestGitReport {
     pub prs: usize,
     /// Whether this run appended the database directory to `.gitignore`.
     pub gitignore_added: bool,
+    /// What the working-tree pass saw. All zeros with `--no-structure`.
+    pub structure: crate::structure::StructureReport,
+}
+
+/// Paths the commit walk left for the working-tree pass to look at.
+#[derive(Default)]
+struct StructureWork {
+    /// Files added, modified, or renamed *into* this window's paths.
+    touched: BTreeSet<String>,
+    /// Keys that no longer name a file: renamed away, or deleted. Any file
+    /// whose `imports` or `mentions` list still holds one of these has to be
+    /// extracted again, or the edge it derived stays behind.
+    stale: BTreeSet<String>,
 }
 
 /// One git working tree walked by a run: the repository itself, or one of its
@@ -997,9 +1028,18 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     }
 
     let mut authors: BTreeSet<String> = BTreeSet::new();
+    let mut work = StructureWork::default();
     for p in &pending {
         if !p.log.is_empty() {
-            ingest_unit(&mut w, p, opts, &ingest, &mut report, &mut authors)?;
+            ingest_unit(
+                &mut w,
+                p,
+                opts,
+                &ingest,
+                &mut report,
+                &mut authors,
+                &mut work,
+            )?;
         }
         write_marker(&mut w, p, opts)?;
     }
@@ -1050,6 +1090,27 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
                 w.enable_fulltext(l, field)?;
             }
         }
+    }
+
+    // The working tree, on top of the history. It runs after the commit walk
+    // so every `File` node it reads exists, and its rules are declared after
+    // its props so each one backfills exactly once.
+    if opts.structure {
+        // A first run has nothing to be incremental against, and a run whose
+        // flags changed (structure or docs just turned on) has to revisit
+        // files its predecessor deliberately skipped.
+        let full = !report.incremental || pending.iter().any(|p| p.stale);
+        report.structure = if full {
+            structure::refresh_all(&mut w, &repo, "", opts.docs)?
+        } else {
+            let mut paths = work.touched;
+            paths.extend(structure::importers_of(&w, &work.stale)?);
+            let paths: Vec<String> = paths.into_iter().collect();
+            structure::refresh_files(&mut w, &repo, "", &paths, opts.docs)?
+        };
+        report
+            .rules_created
+            .extend(structure::ensure_rules_and_fulltext(&mut w)?);
     }
 
     // Last: every commit this run could link is in the graph by now.
@@ -1104,6 +1165,7 @@ fn ingest_unit(
     ingest: &IngestOptions,
     report: &mut IngestGitReport,
     authors: &mut BTreeSet<String>,
+    work: &mut StructureWork,
 ) -> Result<(), CliError> {
     let log = &p.log;
     let incremental = p.since.is_some();
@@ -1174,6 +1236,16 @@ fn ingest_unit(
                     walk.rename(from, to, exists);
                 }
             }
+        }
+    }
+
+    // What the working-tree pass has to look at afterwards: the paths this
+    // window changed, and the keys it left pointing at nothing. A key that
+    // ended the window live again — a file moved away and back — is neither.
+    work.touched.extend(walk.dirty.iter().cloned());
+    for key in walk.deleted.iter().chain(walk.alias.keys()) {
+        if !walk.files.contains_key(key) {
+            work.stale.insert(key.clone());
         }
     }
 
@@ -1296,6 +1368,19 @@ pub fn format_ingest_git(r: &IngestGitReport) -> String {
             "  submodules {}  pull requests {}\n",
             r.submodules, r.prs
         ));
+    }
+    let s = &r.structure;
+    if s.files_scanned > 0 {
+        out.push_str(&format!(
+            "  scanned {} file(s): {} symbol(s), {} import(s), {} call(s), {} mention(s)\n",
+            s.files_scanned, s.symbols, s.imports, s.calls, s.mentions
+        ));
+        if s.skipped_large + s.symbols_capped > 0 {
+            out.push_str(&format!(
+                "  hash-only {}  symbol cap hit on {}\n",
+                s.skipped_large, s.symbols_capped
+            ));
+        }
     }
     if r.gitignore_added {
         out.push_str("  added the database directory to .gitignore\n");

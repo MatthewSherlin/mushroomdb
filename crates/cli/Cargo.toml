@@ -24,6 +24,7 @@ tls = ["server/tls"]
 
 [dependencies]
 core-api = { package = "mushroomdb", path = "../core-api", version = "0.5.2" }
+code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.5.2" }
 server = { package = "mushroomdb-server", path = "../server", version = "0.5.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }

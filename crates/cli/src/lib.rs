@@ -7,6 +7,7 @@ pub mod export;
 pub mod ingest_git;
 pub mod install;
 pub mod recall;
+pub mod structure;
 
 use core_api::schema::Schema;
 use core_api::{
@@ -238,11 +239,14 @@ Usage:
                                       use POST /backup on the HTTP server for live-serve backups
   mushroomdb export <db-dir> <dest> --format jsonl|parquet   export all data
   mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]... [--max-commits-per-file N]
-                        [--recurse-submodules] [--prs] [--ensure-gitignore]
-                                   graph a git repo (authors, commits, files, co-change + ownership rules); re-run to sync
+                        [--recurse-submodules] [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]
+                                   graph a git repo (authors, commits, files, symbols, imports, calls, mentions); re-run to sync
                                    --recurse-submodules also walks each initialised submodule
                                    --prs links merged pull requests via gh (skipped when gh is unavailable)
+                                   --no-structure skips the working-tree pass (no hashes, symbols, imports or calls)
+                                   --no-docs skips Markdown bodies, headings and mentions
                                    --ensure-gitignore adds the database directory to the repo's .gitignore
+                                   with no --exclude the defaults apply: target/ node_modules/ dist/ .git/ *.lock *.min.js
   mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
   mushroomdb algo wcc <db-dir> [--top N]
@@ -305,6 +309,8 @@ fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
     let mut max_commits_per_file = ingest_git::DEFAULT_MAX_COMMITS_PER_FILE;
     let mut recurse_submodules = false;
     let mut prs = false;
+    let mut structure = true;
+    let mut docs = true;
     let mut ensure_gitignore = false;
     let mut i = 0;
     while i < args.len() {
@@ -314,6 +320,12 @@ fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
             i += 1;
         } else if a == "--prs" {
             prs = true;
+            i += 1;
+        } else if a == "--no-structure" {
+            structure = false;
+            i += 1;
+        } else if a == "--no-docs" {
+            docs = false;
             i += 1;
         } else if a == "--ensure-gitignore" {
             ensure_gitignore = true;
@@ -353,6 +365,15 @@ fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
     let [db_dir, repo] = positional.as_slice() else {
         return Err("ingest-git requires <db-dir> <repo-dir>".into());
     };
+    // Structure ingest reads the working tree, where a repository carries
+    // build output and vendored dependencies that its history does not. A user
+    // who states any pattern of their own is taken to mean exactly that set.
+    if exclude.is_empty() {
+        exclude = ingest_git::DEFAULT_EXCLUDES
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect();
+    }
     Ok(Command::IngestGit {
         db_dir: PathBuf::from(db_dir),
         opts: ingest_git::IngestGitOpts {
@@ -361,10 +382,8 @@ fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
             max_commits_per_file,
             recurse_submodules,
             prs,
-            // No flags yet: structure and documentation extraction are on by
-            // default, and the marker records that for later runs.
-            structure: true,
-            docs: true,
+            structure,
+            docs,
             ensure_gitignore,
         },
     })
@@ -3039,7 +3058,14 @@ mod tests {
         else {
             panic!("expected IngestGit");
         };
-        assert!(opts.exclude.is_empty());
+        assert_eq!(
+            opts.exclude,
+            ingest_git::DEFAULT_EXCLUDES
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect::<Vec<_>>(),
+            "with no --exclude the defaults apply"
+        );
         assert_eq!(
             opts.max_commits_per_file,
             ingest_git::DEFAULT_MAX_COMMITS_PER_FILE
@@ -3049,6 +3075,17 @@ mod tests {
             opts.structure && opts.docs,
             "structure and docs default on and are recorded on the marker"
         );
+        let Command::IngestGit { opts, .. } = parse_args(&[
+            "ingest-git",
+            "/tmp/db",
+            "/tmp/repo",
+            "--no-structure",
+            "--no-docs",
+        ])
+        .unwrap() else {
+            panic!("expected IngestGit");
+        };
+        assert!(!opts.structure && !opts.docs);
         assert!(parse_args(&["ingest-git", "/tmp/db"]).is_err());
         assert!(parse_args(&["ingest-git", "/tmp/db", "/tmp/repo", "--nope"]).is_err());
         assert!(parse_args(&["ingest-git", "/tmp/db", "/tmp/repo", "--exclude"]).is_err());
