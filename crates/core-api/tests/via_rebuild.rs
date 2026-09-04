@@ -388,3 +388,133 @@ fn scores(db: &Db, a: &str) -> Vec<(String, f64)> {
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
+
+// ── The candidate index must be built before anything probes it ──────────────
+//
+// `indexes_populated` is a single flag for the whole engine, but `create_rule`
+// builds only the index of the rule it is creating. A store opened from a
+// snapshot with an empty WAL has every index empty, because the lazy-init guard
+// that fills them runs on the first mutation and `create_rule` is not one. If
+// creating a rule marks the engine ready anyway, the next property write probes
+// indexes that were never built, finds no candidates, and retracts the derived
+// edges of every rule that existed before.
+//
+// Both a via-hop rule and a plain one are covered: the defect is in the flag,
+// not in either rule shape.
+
+/// A rule over labels no node carries, so creating it derives nothing and the
+/// only thing it changes is the engine's idea of whether indexes are built.
+fn inert_rule() -> RuleDef {
+    RuleDef {
+        name: "inert".into(),
+        src_label: "Zeta".into(),
+        dst_label: "Zeta".into(),
+        predicate: Predicate::KeyMatch {
+            field: "zeta_id".into(),
+        },
+        edge_type: "ZETA".into(),
+        weight_prop: None,
+        max_edges: Some(1),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    }
+}
+
+#[test]
+fn creating_a_rule_does_not_strand_a_via_hop_rules_edges() {
+    let dir = tmp("create-rule-via");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        seed_default(&mut db, Some(10));
+        assert_eq!(knows(&db, "alice"), vec!["api", "model"]);
+        // Snapshot leaves the WAL empty, so the reopen below replays nothing
+        // and no index is built at open.
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(knows(&db, "alice"), vec!["api", "model"], "after reopen");
+    db.create_rule(inert_rule()).unwrap();
+    // A watched property on a destination of the via-hop rule.
+    db.set_prop("api", "commits", strs(&["c1", "c2", "c3", "c4"]))
+        .unwrap();
+    assert_eq!(
+        knows(&db, "alice"),
+        vec!["api", "model"],
+        "writing to one destination must not retract the others"
+    );
+}
+
+#[test]
+fn creating_a_rule_does_not_strand_a_plain_rules_edges() {
+    let dir = tmp("create-rule-plain");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        // All three files share every commit, so each co-changes with the other
+        // two. One source with two destinations is what makes the difference
+        // visible: a top-k rule recomputes a source's whole set at once, so an
+        // empty index costs it every edge, not just the one being written to.
+        seed(&mut db, Some(10), "alice", &["c1", "c2", "c3"]);
+        db.create_rule(RuleDef {
+            name: "co_changed".into(),
+            src_label: "File".into(),
+            dst_label: "File".into(),
+            predicate: Predicate::Overlap {
+                field: "commits".into(),
+                min: 0.5,
+            },
+            edge_type: "CO_CHANGED".into(),
+            weight_prop: Some("score".into()),
+            max_edges: Some(10),
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })
+        .unwrap();
+        assert_eq!(
+            db.neighbors("model", "CO_CHANGED", Direction::Out).unwrap(),
+            vec!["api", "docs"]
+        );
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.neighbors("model", "CO_CHANGED", Direction::Out).unwrap(),
+        vec!["api", "docs"],
+        "after reopen"
+    );
+    db.create_rule(inert_rule()).unwrap();
+    // `api` moves to commits nothing else shares, so model no longer co-changes
+    // with it. model's edge to `docs` is untouched by that and must survive.
+    db.set_prop("api", "commits", strs(&["z1", "z2", "z3"]))
+        .unwrap();
+    assert_eq!(
+        db.neighbors("model", "CO_CHANGED", Direction::Out).unwrap(),
+        vec!["docs"],
+        "only the edge the write invalidated may retract"
+    );
+}
+#[test]
+fn a_write_after_a_snapshot_open_does_not_strand_a_via_hop_rules_edges() {
+    let dir = tmp("snapshot-write-via");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        seed_default(&mut db, Some(10));
+        db.snapshot().unwrap();
+    }
+    // No create_rule here: the only thing that happens after the snapshot open
+    // is one property write on a destination of the via-hop rule.
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(knows(&db, "alice"), vec!["api", "model"], "after reopen");
+    db.set_prop("api", "commits", strs(&["c1", "c2", "c3", "c4"]))
+        .unwrap();
+    assert_eq!(
+        knows(&db, "alice"),
+        vec!["api", "model"],
+        "a via-hop rule must still see the via edges its snapshot holds"
+    );
+}

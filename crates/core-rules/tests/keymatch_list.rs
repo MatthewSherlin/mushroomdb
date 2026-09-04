@@ -48,6 +48,7 @@ impl Fx {
             labels: &self.labels,
             props: ColumnsView::owned(&self.props),
             topo: &mut self.topo,
+            base_topo: None,
             edge_props: &mut self.eprops,
         }
     }

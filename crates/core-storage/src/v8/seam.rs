@@ -440,7 +440,10 @@ impl<'a> PartialEq for ValueRef<'a> {
 /// for this field" — the same result the uncached path gives for the same bytes.
 #[derive(Default)]
 pub struct MixedCache {
-    decoded: std::sync::Mutex<HashMap<String, std::sync::Arc<HashMap<u32, Value>>>>,
+    /// An `RwLock` rather than a `Mutex`: after the first read of a field every
+    /// later one is a shared-lock hash lookup, so concurrent readers of a
+    /// `SharedDb` do not queue behind each other on the common path.
+    decoded: std::sync::RwLock<HashMap<String, std::sync::Arc<HashMap<u32, Value>>>>,
 }
 
 impl MixedCache {
@@ -451,17 +454,17 @@ impl MixedCache {
     /// belongs to; the mapping is immutable, so the pairing is fixed.
     pub fn get_or_decode(&self, field: &str, blob: &[u8]) -> std::sync::Arc<HashMap<u32, Value>> {
         {
-            let guard = self.decoded.lock().expect("mixed column cache poisoned");
+            let guard = self.decoded.read().expect("mixed column cache poisoned");
             if let Some(hit) = guard.get(field) {
                 return std::sync::Arc::clone(hit);
             }
         }
-        // Decoded without the lock held: a concurrent miss on the same field
-        // decodes twice and the first insert wins, which costs a little work
-        // but never returns different bytes — the blob cannot change.
+        // Decoded with no lock held: a concurrent miss on the same field decodes
+        // twice and the first insert wins, which costs a little work but never
+        // returns different bytes — the blob cannot change.
         let decoded: std::sync::Arc<HashMap<u32, Value>> =
             std::sync::Arc::new(bincode::deserialize(blob).unwrap_or_default());
-        let mut guard = self.decoded.lock().expect("mixed column cache poisoned");
+        let mut guard = self.decoded.write().expect("mixed column cache poisoned");
         std::sync::Arc::clone(
             guard
                 .entry(field.to_string())

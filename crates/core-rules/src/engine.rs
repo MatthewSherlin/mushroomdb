@@ -5,7 +5,7 @@ use crate::index::{
     RuleIndex,
 };
 use core_storage::v8::encode::{decode_ivf_bytes, decode_provenance_bytes};
-use core_storage::v8::seam::ColumnsView;
+use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::{EdgeProps, IdMap, Interner, Topology, Value};
 
 /// Decode raw IVF section bytes into the `RuleIvfExport` format consumed by
@@ -80,8 +80,36 @@ pub struct GraphMut<'a> {
     pub syms: &'a mut Interner,
     pub labels: &'a [u32],
     pub props: ColumnsView<'a>,
+    /// Edges written since the snapshot. Reads must go through
+    /// [`GraphMut::neighbors`], not this field: on a store opened from a
+    /// snapshot the overlay is empty and every edge lives in `base_topo`.
     pub topo: &'a mut Topology,
+    /// The snapshot's archived CSR, when one is open. `None` for a store with
+    /// no snapshot, where `topo` already holds everything.
+    pub base_topo: Option<&'a core_storage::v8::layout::ArchivedCsr>,
     pub edge_props: &'a mut EdgeProps,
+}
+
+impl GraphMut<'_> {
+    /// Neighbours of `v` over `(etype, dir)`, merging the snapshot base with
+    /// the post-snapshot overlay and subtracting the overlay's tombstones.
+    ///
+    /// A rule that reads the graph's shape — today only a via-hop rule, when it
+    /// expands its hop — must use this rather than `topo` directly. Reading the
+    /// overlay alone on a store opened from a snapshot returns nothing, which a
+    /// via-hop rule cannot distinguish from "this source reaches no via node"
+    /// and answers by retracting every edge it owns.
+    pub fn neighbors(
+        &self,
+        etype: u32,
+        dir: core_storage::Direction,
+        v: u32,
+    ) -> std::borrow::Cow<'_, [u32]> {
+        match self.base_topo {
+            None => TopologyView::owned(self.topo).neighbors(etype, dir, v),
+            Some(base) => TopologyView::with_base(self.topo, base).neighbors(etype, dir, v),
+        }
+    }
 }
 
 /// Used when `RuleDef.max_edges` is `None`.
@@ -623,6 +651,11 @@ fn compute_desired_via(
         _ => None,
     };
 
+    // An `Overlap` score is a Jaccard ratio and so cannot exceed 1.0, which lets
+    // the maximum over via nodes settle early. No other predicate has a bound
+    // this function knows, so none of them takes that exit.
+    let ceiling = matches!(def.predicate, Predicate::Overlap { .. });
+
     let mut out = BTreeMap::new();
 
     for src in srcs {
@@ -632,7 +665,6 @@ fn compute_desired_via(
         };
         // Expand via hops from src.
         let via_neighbors: Vec<u32> = g
-            .topo
             .neighbors(via_etype, via_dir, src)
             .iter()
             .copied()
@@ -642,8 +674,12 @@ fn compute_desired_via(
         if via_neighbors.is_empty() {
             continue;
         }
-        // Membership test for the "destination is its own via" shortcut below.
-        let via_set: BTreeSet<u32> = via_neighbors.iter().copied().collect();
+        // Read only by the ceiling exit, so it is only built when that applies.
+        let via_set: BTreeSet<u32> = if ceiling {
+            via_neighbors.iter().copied().collect()
+        } else {
+            BTreeSet::new()
+        };
 
         // Collect dsts to evaluate: the anchored one, the candidates the index
         // offers for this src's via nodes, or — with no usable index — every
@@ -697,7 +733,6 @@ fn compute_desired_via(
 
             // Score = max over via nodes that satisfy predicate(via, dst).
             //
-            // An `Overlap` score is a Jaccard ratio, so it cannot exceed 1.0.
             // Once some via has scored 1.0 the max is settled and the remaining
             // vias cannot change it — the scan ends there. This is an early exit
             // from a maximum, not a different maximum: the value written to
@@ -708,7 +743,6 @@ fn compute_desired_via(
             // exactly 1.0. Rules whose via and dst carry the same label — one
             // person's files against all files, say — settle on the first
             // comparison instead of after every via.
-            let ceiling = matches!(def.predicate, Predicate::Overlap { .. });
             let mut best: Option<f64> = None;
             let first = (ceiling && via_set.contains(&dst)).then_some(dst);
             for via_id in first.into_iter().chain(via_neighbors.iter().copied()) {
@@ -2416,6 +2450,40 @@ impl RuleEngine {
         Some(result)
     }
 
+    /// Build every rule's candidate index if that has not happened yet.
+    ///
+    /// A store opened from a snapshot whose WAL is empty replays no frames, so
+    /// `consume_retained_state_eager` never runs and every index starts empty.
+    /// The first operation that needs one pays for all of them here.
+    ///
+    /// Retained HNSW and IVF blobs from the snapshot are consumed in the same
+    /// step, so the reindex loads them rather than wiping the graphs they hold.
+    ///
+    /// Every caller that reads `self.indexes` must go through this first.
+    /// `indexes_populated` speaks for the whole engine, and probing an index
+    /// that was never built yields no candidates — which reads as "this rule
+    /// derives nothing" and silently retracts the edges it owns.
+    fn ensure_indexes_populated(&mut self, g: &GraphMut<'_>) {
+        if self.indexes_populated || self.rules.is_empty() {
+            return;
+        }
+        let hnsw = std::mem::take(
+            &mut *self
+                .retained_hnsw_blobs
+                .lock()
+                .expect("retained_hnsw_blobs lock poisoned"),
+        );
+        let ivf_bytes = self
+            .retained_ivf_bytes
+            .lock()
+            .expect("retained_ivf_bytes lock poisoned")
+            .take()
+            .unwrap_or_default();
+        let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
+        self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
+        self.load_hnsw_state(hnsw);
+    }
+
     /// Register a rule and backfill existing nodes.
     /// Returns Err on failed validate() or duplicate name.
     pub fn create_rule(&mut self, def: RuleDef, g: &mut GraphMut<'_>) -> Result<(), String> {
@@ -2423,6 +2491,12 @@ impl RuleEngine {
         if self.rules.contains_key(&def.name) {
             return Err(format!("rule {:?} already exists", def.name));
         }
+        // Before this rule's index is built, because the flag set at the end of
+        // this function claims every rule's index is ready. Creating a rule is
+        // not a mutation, so nothing else would have built the indexes of the
+        // rules that already existed, and the next property write would probe
+        // them empty and retract their edges.
+        self.ensure_indexes_populated(g);
         // Backfilled edges chain like any other derived edge: creating a rule
         // whose edge type an existing via-hop rule hops over recomputes that
         // rule in the same commit.
@@ -2625,23 +2699,7 @@ impl RuleEngine {
         // pays the cost instead.  Subsequent calls skip this branch.
         // Retained HNSW/IVF blobs from the snapshot are consumed here so the
         // reindex does NOT wipe the loaded HNSW graphs.
-        if !self.indexes_populated && !self.rules.is_empty() {
-            let hnsw = std::mem::take(
-                &mut *self
-                    .retained_hnsw_blobs
-                    .lock()
-                    .expect("retained_hnsw_blobs lock poisoned"),
-            );
-            let ivf_bytes = self
-                .retained_ivf_bytes
-                .lock()
-                .expect("retained_ivf_bytes lock poisoned")
-                .take()
-                .unwrap_or_default();
-            let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
-            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
-            self.load_hnsw_state(hnsw);
-        }
+        self.ensure_indexes_populated(g);
 
         let n_label = g.labels.get(n as usize).copied();
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
@@ -2882,7 +2940,7 @@ impl RuleEngine {
                 core_storage::Direction::In => core_storage::Direction::Out,
             };
             if let (Some(via_etype), Some(s_sym)) = (g.syms.get(via_edge_str), src_sym) {
-                for &src in g.topo.neighbors(via_etype, rev_dir, n).as_ref() {
+                for &src in g.neighbors(via_etype, rev_dir, n).as_ref() {
                     if g.labels.get(src as usize).copied() == Some(s_sym) {
                         affected_srcs.insert(src);
                     }
@@ -3001,23 +3059,7 @@ impl RuleEngine {
         self.ensure_provenance_loaded_mut();
         // Lazy index build: same guard as on_node_changed.  Retained snapshot
         // blobs are consumed to avoid wiping any HNSW graphs.
-        if !self.indexes_populated && !self.rules.is_empty() {
-            let hnsw = std::mem::take(
-                &mut *self
-                    .retained_hnsw_blobs
-                    .lock()
-                    .expect("retained_hnsw_blobs lock poisoned"),
-            );
-            let ivf_bytes = self
-                .retained_ivf_bytes
-                .lock()
-                .expect("retained_ivf_bytes lock poisoned")
-                .take()
-                .unwrap_or_default();
-            let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
-            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
-            self.load_hnsw_state(hnsw);
-        }
+        self.ensure_indexes_populated(g);
 
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
         for (rule_idx, rule_name) in rule_names.into_iter().enumerate() {
@@ -3133,23 +3175,7 @@ impl RuleEngine {
         // compute_desired consults the candidate index; an empty index would
         // silently produce no backfill.  Consume retained snapshot blobs here
         // rather than wiping any loaded HNSW graphs.
-        if !self.indexes_populated && !self.rules.is_empty() {
-            let hnsw = std::mem::take(
-                &mut *self
-                    .retained_hnsw_blobs
-                    .lock()
-                    .expect("retained_hnsw_blobs lock poisoned"),
-            );
-            let ivf_bytes = self
-                .retained_ivf_bytes
-                .lock()
-                .expect("retained_ivf_bytes lock poisoned")
-                .take()
-                .unwrap_or_default();
-            let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
-            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
-            self.load_hnsw_state(hnsw);
-        }
+        self.ensure_indexes_populated(g);
 
         let n_label = g.labels.get(n as usize).copied();
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
@@ -3392,6 +3418,7 @@ mod tests {
                 labels: &self.labels,
                 props: ColumnsView::owned(&self.props),
                 topo: &mut self.topo,
+                base_topo: None,
                 edge_props: &mut self.eprops,
             }
         }
@@ -4706,6 +4733,7 @@ mod tests {
                     labels: &fx.labels,
                     props: ColumnsView::owned(&fx.props),
                     topo: &mut fx.topo,
+                    base_topo: None,
                     edge_props: &mut fx.eprops,
                 };
                 let per_src = compute_desired(rule, &idx, id, true, &g);

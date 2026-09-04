@@ -1306,13 +1306,21 @@ fn a_busy_store_exits_three_with_a_retry_message() {
     assert_eq!(r.commits, 4);
 }
 
-/// An incremental run costs work proportional to what the commit touched, not
-/// to how big the repository is.
+/// An incremental run reports what it wrote, and appends a number of WAL
+/// commits set by the commit it picked up rather than by the property count.
 ///
-/// The regression this pins: a run that picked up one commit over eight files
-/// reported `397 file(s)` and wrote one WAL frame per property per file, so
-/// every later open replayed frames for files nothing had touched. Both halves
-/// are asserted — the reported count, and the number of commits the run appends.
+/// Two separate things were wrong, and the two assertions pin one each.
+///
+/// The reported count came from the whole known file set, which an incremental
+/// run loads in order to fold new commits into it — so a run over eight files
+/// announced `397 file(s)`. The write scope was already correct; only the
+/// number printed was wrong.
+///
+/// The properties of each written file went out as one WAL commit apiece. Every
+/// frame is replayed on every later open and re-fires the rules watching the
+/// property it carries, so the shape of the write is a cost the store keeps
+/// paying. Batching them leaves this fixture appending six commits for a
+/// one-file commit; one frame per property makes the same run append thirteen.
 #[test]
 fn an_incremental_run_writes_only_what_the_commit_touched() {
     let repo = tmp("repo");
@@ -1355,7 +1363,7 @@ fn an_incremental_run_writes_only_what_the_commit_touched() {
     let delta = core_api::wal_commit_count_at(&db_dir).unwrap() - before;
     assert!(
         delta <= 8,
-        "one commit over one file appended {delta} WAL commits; \
-         a run must not append work proportional to the repository"
+        "a one-file commit appended {delta} WAL commits; batched it is six, and \
+         one commit per property makes it thirteen"
     );
 }

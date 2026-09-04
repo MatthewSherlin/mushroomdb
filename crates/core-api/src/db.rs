@@ -1018,6 +1018,7 @@ fn make_graph_mut<'a>(
     labels: &'a [u32],
     props: core_storage::v8::seam::ColumnsView<'a>,
     topo: &'a mut Topology,
+    base: &'a Option<std::sync::Arc<core_storage::v8::MappedBase>>,
     edge_props: &'a mut EdgeProps,
 ) -> GraphMut<'a> {
     GraphMut {
@@ -1026,8 +1027,22 @@ fn make_graph_mut<'a>(
         labels,
         props,
         topo,
+        base_topo: base_csr(base),
         edge_props,
     }
+}
+
+/// The archived CSR of an open V8 snapshot, for the rule engine's graph reads.
+///
+/// A store opened from a snapshot keeps its edges in the mapping and its
+/// overlay empty, so a rule that reads the graph's shape has to see both.
+fn base_csr(
+    base: &Option<std::sync::Arc<core_storage::v8::MappedBase>>,
+) -> Option<&core_storage::v8::layout::ArchivedCsr> {
+    base.as_ref().map(|b| {
+        b.topology()
+            .expect("base topology section bounds validated at open")
+    })
 }
 
 /// Build a `ColumnsView` from the disjoint `props` overlay and optional V8 base.
@@ -2720,6 +2735,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_changed(id, None, &mut gm);
@@ -2815,6 +2831,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
@@ -2859,6 +2876,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_changed(id, Some((field, old_value)), &mut gm);
@@ -2986,6 +3004,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_changed(id, None, &mut gm);
@@ -3082,6 +3101,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             build_props_view(&self.props, &self.base),
                             &mut self.topo,
+                            &self.base,
                             &mut self.edge_props,
                         );
                         eng.on_edge_changed(&etype_str, *src, *dst, &mut gm);
@@ -3133,6 +3153,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_changed(*id, Some((field_str.as_str(), old_value)), &mut gm);
@@ -3221,6 +3242,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.create_rule(def, &mut gm)
@@ -3269,6 +3291,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.delete_rule(name, &mut gm)
@@ -3335,6 +3358,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_changed(id, Some((field, old)), &mut gm);
@@ -3447,6 +3471,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
@@ -3496,6 +3521,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_removed(n, &mut gm);
@@ -3601,6 +3627,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.rebuild(name, &mut gm)
