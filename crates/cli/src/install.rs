@@ -196,6 +196,17 @@ const HOOK_EVENT: &str = "UserPromptSubmit";
 /// Kept short: the hook must never noticeably slow a prompt.
 const HOOK_TIMEOUT_SECS: u64 = 5;
 
+/// The second hook event: fires after a tool call, so an edit reaches the
+/// graph while the assistant is still working rather than at the next commit.
+const TOUCH_EVENT: &str = "PostToolUse";
+/// The tools that change a file on disk. Anything else — a read, a search, a
+/// shell command — leaves the working tree as the graph already has it.
+const TOUCH_MATCHER: &str = "Edit|Write|MultiEdit";
+/// Longer than the prompt hook's: re-extracting a file costs more than reading
+/// a digest, and nothing is waiting on the answer. The run is `async`, so this
+/// bounds a background process rather than the assistant's turn.
+const TOUCH_TIMEOUT_SECS: u64 = 30;
+
 /// Single-quote `s` for embedding in a POSIX shell command line, escaping
 /// embedded single quotes as `'\''`. Claude Code runs a `type: "command"`
 /// hook through a shell, so an unquoted path containing whitespace or shell
@@ -210,9 +221,29 @@ fn recall_hook_command(bin_cmd: &str, db_str: &str) -> String {
     format!("{} recall {}", sh_quote(bin_cmd), sh_quote(db_str))
 }
 
+/// The exact command string written into the post-edit hook entry. `touch` in
+/// hook mode prints nothing and exits 0 whatever it is handed.
+fn touch_hook_command(bin_cmd: &str, db_str: &str) -> String {
+    format!("{} touch {}", sh_quote(bin_cmd), sh_quote(db_str))
+}
+
 /// One `hooks.<event>` array entry in Claude Code's settings.json shape.
 fn hook_entry(command: &str) -> serde_json::Value {
     serde_json::json!({ "hooks": [ { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS } ] })
+}
+
+/// The `PostToolUse` entry: matched to the file-editing tools, and `async` so
+/// the assistant's tool call returns without waiting for the re-extraction.
+fn touch_hook_entry(command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "matcher": TOUCH_MATCHER,
+        "hooks": [ {
+            "type": "command",
+            "command": command,
+            "timeout": TOUCH_TIMEOUT_SECS,
+            "async": true
+        } ]
+    })
 }
 
 /// True if any hook group under `event` contains a command hook equal to `command`.
@@ -230,15 +261,20 @@ fn settings_has_hook(root: &serde_json::Value, event: &str, command: &str) -> bo
         .unwrap_or(false)
 }
 
-/// Add the recall hook to `settings_file` (created if absent). Idempotent:
-/// no-op if the command is already present under `HOOK_EVENT`. Every other
-/// key in the file — including other hook events and groups — is preserved.
-/// Errors out (no write) rather than overwriting if `hooks` or
-/// `hooks.<HOOK_EVENT>` already exists with an unexpected JSON type, or if
-/// the file's top level is not a JSON object.
+/// Add one hook to `settings_file` (created if absent). Idempotent: no-op if
+/// `command` is already present under `event`. Every other key in the file —
+/// including other hook events and groups — is preserved. Errors out (no
+/// write) rather than overwriting if `hooks` or `hooks.<event>` already exists
+/// with an unexpected JSON type, or if the file's top level is not a JSON
+/// object.
+///
+/// `entry` is the group to append, built by the caller: the two events this
+/// install wires want different shapes, and only the caller knows which.
 fn merge_hook_entry(
     settings_file: &Path,
+    event: &str,
     command: &str,
+    entry: serde_json::Value,
     manifest: &mut Manifest,
 ) -> Result<(), CliError> {
     let mut root: serde_json::Value = if settings_file.exists() {
@@ -257,7 +293,7 @@ fn merge_hook_entry(
         )));
     }
 
-    if settings_has_hook(&root, HOOK_EVENT, command) {
+    if settings_has_hook(&root, event, command) {
         return Ok(());
     }
 
@@ -274,20 +310,17 @@ fn merge_hook_entry(
             )));
         }
     }
-    match root["hooks"].get(HOOK_EVENT) {
-        None => root["hooks"][HOOK_EVENT] = serde_json::json!([]),
+    match root["hooks"].get(event) {
+        None => root["hooks"][event] = serde_json::json!([]),
         Some(v) if v.is_array() => {}
         Some(_) => {
             return Err(CliError(format!(
-                "{}: \"hooks.{HOOK_EVENT}\" is not a JSON array — refusing to overwrite it",
+                "{}: \"hooks.{event}\" is not a JSON array — refusing to overwrite it",
                 settings_file.display()
             )));
         }
     }
-    root["hooks"][HOOK_EVENT]
-        .as_array_mut()
-        .unwrap()
-        .push(hook_entry(command));
+    root["hooks"][event].as_array_mut().unwrap().push(entry);
 
     let parent = settings_file.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent)
@@ -299,7 +332,7 @@ fn merge_hook_entry(
 
     manifest.hooks.push(ManagedHook {
         file: settings_file.to_path_buf(),
-        event: HOOK_EVENT.into(),
+        event: event.into(),
         command: command.into(),
     });
     Ok(())
@@ -779,15 +812,27 @@ fn install_claude_code(
     };
     merge_mcp_entry(&mcp_file, db_str, bin_cmd, manifest)?;
 
-    // Recall hook: settings.json in the same scope as the skill.
+    // Both hooks: settings.json in the same scope as the skill. The prompt
+    // hook first, so a manifest lists them in the order they were written.
     let settings_file = if project_scope {
         project_root.join(".claude").join("settings.json")
     } else {
         home.join(".claude").join("settings.json")
     };
+    let recall = recall_hook_command(bin_cmd, db_str);
     merge_hook_entry(
         &settings_file,
-        &recall_hook_command(bin_cmd, db_str),
+        HOOK_EVENT,
+        &recall,
+        hook_entry(&recall),
+        manifest,
+    )?;
+    let touch = touch_hook_command(bin_cmd, db_str);
+    merge_hook_entry(
+        &settings_file,
+        TOUCH_EVENT,
+        &touch,
+        touch_hook_entry(&touch),
         manifest,
     )?;
 

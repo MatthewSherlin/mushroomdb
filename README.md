@@ -23,7 +23,7 @@ every write creates, maintains, and retracts the matching edges. Ships a 16-tool
 ## Quick start
 
 ```sh
-npx mushroomdb install                        # /mushroom skill + MCP server + recall hook
+npx mushroomdb install                        # /mushroom skill + MCP server + prompt and post-edit hooks
 mushroomdb ingest-git ~/.mushroomdb/memory .  # Author, Commit, File nodes; CO_CHANGED + KNOWS by rule
 ```
 
@@ -188,7 +188,7 @@ Skill and recall-hook details: [`docs/site/skill.md`](docs/site/skill.md).
 ## Install options
 
 ```sh
-npx mushroomdb install            # skill + MCP server + recall hook, no toolchain needed
+npx mushroomdb install            # skill + MCP server + hooks, no toolchain needed
 cargo install mushroomdb-cli      # `mushroomdb` binary from crates.io (no embedded UI)
 cargo add mushroomdb              # embedded Rust library
 pip install mushroomdb            # Python bindings

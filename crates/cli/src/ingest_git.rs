@@ -54,7 +54,7 @@ const CO_CHANGE_MIN: f64 = 0.25;
 /// (git's own `.git/HEAD` aside, plenty of projects ship one) would otherwise
 /// have the sha written onto its `File` node, leaving no sync marker and
 /// forcing a full re-ingest on every run.
-const SYNC_KEY: &str = "__mushroomdb_git_sync__";
+pub(crate) const SYNC_KEY: &str = "__mushroomdb_git_sync__";
 
 /// What the CLI prints, and exits 3 on, when another process holds the store's
 /// cross-process write lock. Nothing was written, so retrying is always safe.

@@ -940,6 +940,72 @@ fn install_refuses_when_settings_root_is_not_an_object() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: Claude Code install also wires the PostToolUse refresh hook — matched
+//       to the file-editing tools, async, on its own longer budget — and
+//       uninstall takes it back out
+// ---------------------------------------------------------------------------
+
+#[test]
+fn install_writes_post_tool_use_async_hook_and_uninstall_removes_it() {
+    let root = temp_dir("post-tool-use");
+    let home = temp_dir("post-tool-use-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    install_on_path(&root, &home, &opts).expect("install");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    let groups = s["hooks"]["PostToolUse"]
+        .as_array()
+        .expect("PostToolUse array");
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert_eq!(groups[0]["matcher"], "Edit|Write|MultiEdit");
+    let hook = &groups[0]["hooks"][0];
+    assert_eq!(hook["type"], "command");
+    assert_eq!(
+        hook["command"],
+        format!("'mushroomdb' touch '{}'", db.display())
+    );
+    // A re-extraction is not on the prompt's critical path: its own budget,
+    // and it must not hold the tool call open.
+    assert_eq!(hook["timeout"], 30);
+    assert_eq!(hook["async"], true);
+
+    // The prompt hook is still there, and is still the 5 s synchronous one.
+    assert_eq!(s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"], 5);
+
+    // Idempotent: a second install adds no second group.
+    install_on_path(&root, &home, &opts).expect("second install");
+    let s2: serde_json::Value =
+        serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(s2["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+
+    // The manifest tracks it under its own event, so uninstall knows where to
+    // look for it.
+    let m: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    let events: Vec<&str> = m["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .map(|h| h["event"].as_str().expect("event"))
+        .collect();
+    assert_eq!(events, vec!["UserPromptSubmit", "PostToolUse"], "{m}");
+
+    run_uninstall(&root, &home, &opts).expect("uninstall");
+    let s3: serde_json::Value =
+        serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        s3["hooks"]["PostToolUse"].is_null()
+            || s3["hooks"]["PostToolUse"].as_array().unwrap().is_empty(),
+        "PostToolUse must be gone: {s3}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test: uninstall on a group that mixes a user hook with ours removes only
 //       ours and leaves the user's hook in place
 // ---------------------------------------------------------------------------

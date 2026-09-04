@@ -65,7 +65,7 @@ a `PATH` lookup either. The copy is tracked in the manifest and removed by
 | `.mcp.json` | `mcpServers.mushroomdb` entry: `{"command":"<see above>","args":["mcp","<db>"]}`. Created if absent; merged if present. |
 | `.claude/skills/mushroom/.install-manifest.json` | Manifest of everything written — consumed by `uninstall`. |
 | `~/.mushroomdb/bin/mushroomdb` | Only when the binary is not on `PATH`: a copy of the running binary. |
-| `.claude/settings.json` | `hooks.UserPromptSubmit` entry running `<bin> recall <db>` (5 s timeout) so related facts are injected before each prompt. Hooks load at session start: restart Claude Code after install. |
+| `.claude/settings.json` | Two hook entries. `hooks.UserPromptSubmit` runs `<bin> recall <db>` (5 s timeout) so related facts are injected before each prompt; `hooks.PostToolUse`, matched to `Edit|Write|MultiEdit`, runs `<bin> touch <db>` (30 s, `async`) so an edited file reaches the graph without the tool call waiting. Hooks load at session start: restart Claude Code after install. |
 
 ### Claude Code — user scope (no `--project`)
 
@@ -76,7 +76,7 @@ Same as above but paths are:
 | Skill | `~/.claude/skills/mushroom/SKILL.md` |
 | MCP config | `~/.claude.json` (top-level `mcpServers` key — same structure as project `.mcp.json`) |
 | Manifest | `~/.mushroomdb/install-manifest.json` |
-| Recall hook | `~/.claude/settings.json` — `hooks.UserPromptSubmit` entry running `<bin> recall <db>` (5 s timeout) so related facts are injected before each prompt. Hooks load at session start: restart Claude Code after install. |
+| Hooks | `~/.claude/settings.json` — the same `hooks.UserPromptSubmit` and `hooks.PostToolUse` entries as above. Hooks load at session start: restart Claude Code after install. |
 
 **Verified 2026-09-02 by live inspection:** `~/.claude.json` holds the
 top-level `mcpServers` key for Claude Code user-level MCP servers.
@@ -87,12 +87,22 @@ so keys come back alphabetized and indented two spaces. Content is kept,
 layout is not. `uninstall` skips the write entirely when there is nothing of
 ours to remove, so a file we never touched stays byte-identical.
 
-The hook runs `<bin> recall <db>`, which opens the store without migration or
-WAL repair (`auto_migrate: false`, `repair_wal: false`) — it fires on every
-prompt and must not write to the store. Its digest opens with a line marking
-the content as untrusted graph data, and control characters are stripped from
-every rendered value: node keys and names are ingested content, and for an
+The prompt hook runs `<bin> recall <db>`, which opens the store without
+migration or WAL repair (`auto_migrate: false`, `repair_wal: false`) — it fires
+on every prompt and must not write to the store. It prints one of two things:
+the topic digest for the prompt, or — when the payload's `cwd` is a checkout
+with uncommitted changes — a nudge of at most eight lines naming what those
+files reach that is not already in the diff. Both open with a line marking the
+content as untrusted graph data, and control characters are stripped from every
+rendered value: node keys and names are ingested content, and for an
 `ingest-git` store any contributor to the repository controls them.
+
+The `PostToolUse` hook runs `<bin> touch <db>` after an `Edit`, `Write` or
+`MultiEdit`, which re-extracts that one file — symbols, imports, mentions and
+its hash. It is declared `async` so the tool call does not wait on it, and it
+prints nothing and exits 0 whatever it is handed. It is what keeps the prompt
+hook's nudge describing the code as it is now rather than as it was at the last
+commit.
 
 Cursor gets no hook: its hook contract is undocumented, so the always-apply
 rules file remains the only injection mechanism there.
