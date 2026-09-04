@@ -151,7 +151,10 @@ Resolution is deliberately conservative: an import that names something outside
 the working tree (the standard library, a registry dependency) resolves to
 nothing, and a call whose name has several candidate definitions and no clear
 winner resolves to nothing. A missing edge is easier to live with than a wrong
-one. Language rules are documented in the extraction crate.
+one. A call to a name defined once anywhere in the repository resolves to that
+definition, so a distinctive name links across crates while a common one links
+only within its own file or directory. Language rules are documented in the
+extraction crate.
 
 Three things are read but not parsed. A file over 1 MB, a file whose leading
 bytes are not text, and a file with an extension no extractor claims all keep

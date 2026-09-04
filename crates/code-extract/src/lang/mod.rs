@@ -299,8 +299,28 @@ pub(crate) struct DocStyle {
     pub skipped: &'static [&'static str],
     /// Node kinds that wrap a definition, whose own siblings carry the doc.
     pub wrappers: &'static [&'static str],
-    /// When true, only `///`, `//!` and `/** … */` count as documentation.
+    /// When true, only an *outer* doc comment counts: `///` or `/** … */`.
+    ///
+    /// An inner doc comment — `//!`, `/*! … */` — documents the module it sits
+    /// in, not whatever happens to follow it, so it is never a definition's
+    /// doc. Without this, the first item in a file would inherit the module's
+    /// own description.
     pub marker_required: bool,
+}
+
+/// The last row a node's text actually covers.
+///
+/// Some grammars end a line comment at column 0 of the *following* row,
+/// because the node swallows its trailing newline. Taking `end_position().row`
+/// at face value would then make every comment look adjacent to the line after
+/// the blank one below it.
+fn last_row(node: Node) -> usize {
+    let end = node.end_position();
+    if end.column == 0 && end.row > node.start_position().row {
+        end.row - 1
+    } else {
+        end.row
+    }
 }
 
 /// The first line of the doc comment above `node`, if there is one.
@@ -333,11 +353,11 @@ pub(crate) fn doc_above(node: Node, src: &str, style: &DocStyle) -> String {
         if !style.comments.contains(&kind) {
             break;
         }
-        if prev.end_position().row + 1 < next_row {
+        if last_row(prev) + 1 < next_row {
             break;
         }
         let raw = text(prev, src);
-        if style.marker_required && !is_doc_marker(raw) {
+        if style.marker_required && !is_outer_doc_marker(raw) {
             break;
         }
         block.push(raw.to_string());
@@ -351,8 +371,11 @@ pub(crate) fn doc_above(node: Node, src: &str, style: &DocStyle) -> String {
     first_doc_line(&top)
 }
 
-fn is_doc_marker(raw: &str) -> bool {
-    raw.starts_with("///") || raw.starts_with("//!") || raw.starts_with("/**")
+/// Whether `raw` opens a doc comment that documents what comes *after* it.
+/// `//!` and `/*!` are deliberately absent: they document the enclosing
+/// module.
+fn is_outer_doc_marker(raw: &str) -> bool {
+    raw.starts_with("///") || raw.starts_with("/**")
 }
 
 /// Strip comment punctuation and return the first line with content.

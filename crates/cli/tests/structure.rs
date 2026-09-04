@@ -88,16 +88,11 @@ pub fn run() -> u32 {
 }
 ";
 
-/// `FACTOR` sits between the module doc and `helper` deliberately: a doc
-/// comment run reaches back across a blank line, so a `//!` line immediately
-/// above an item is read as that item's doc.
 const UTIL_RS: &str = "//! Shared helpers.
-
-pub const FACTOR: u32 = 2;
 
 /// Double a value.
 pub fn helper(n: u32) -> u32 {
-    n * FACTOR
+    n * 2
 }
 ";
 
@@ -253,7 +248,7 @@ fn first_run_creates_symbols_imports_calls_and_mentions() {
     );
 
     // `symbols_n` and the content hash ride along on the file.
-    assert_eq!(prop(&db, "src/util.rs", "symbols_n"), Some(Value::Int(2)));
+    assert_eq!(prop(&db, "src/util.rs", "symbols_n"), Some(Value::Int(1)));
     assert_eq!(
         prop(&db, "src/util.rs", "lang"),
         Some(Value::Str("rust".into()))

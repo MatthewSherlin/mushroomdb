@@ -1276,3 +1276,81 @@ fn extraction_is_capped_and_repeatable_for_every_fixture() {
         assert_eq!(first.imports, imports, "{fixture} imports are not sorted");
     }
 }
+
+/// A module's own description is not a description of whatever happens to sit
+/// below it. Rust writes one as `//!` and Python as a bare string statement at
+/// the top of the file; in both cases the first definition below is
+/// undocumented until it carries a doc of its own.
+#[test]
+fn module_doc_is_not_attributed_to_first_item() {
+    // Rust, blank line or not: an inner doc comment never documents an item.
+    let spaced = extract(
+        "src/util.rs",
+        b"//! Shared helpers.\n\npub fn helper() -> u32 {\n    2\n}\n",
+    );
+    assert_eq!(doc_of(&spaced, "helper"), "");
+    let touching = extract(
+        "src/util.rs",
+        b"//! Shared helpers.\npub fn helper() -> u32 {\n    2\n}\n",
+    );
+    assert_eq!(doc_of(&touching, "helper"), "");
+    let block = extract(
+        "src/util.rs",
+        b"/*! Shared helpers. */\npub fn helper() -> u32 {\n    2\n}\n",
+    );
+    assert_eq!(doc_of(&block, "helper"), "");
+
+    // And the item's own `///` still wins, even one blank line under a `//!`.
+    let owned = extract(
+        "src/util.rs",
+        b"//! Shared helpers.\n\n/// Double a value.\npub fn helper(n: u32) -> u32 {\n    n * 2\n}\n",
+    );
+    assert_eq!(doc_of(&owned, "helper"), "Double a value.");
+
+    // Python: the module docstring belongs to the module.
+    let module = extract(
+        "app/tick.py",
+        b"\"\"\"Timing helpers.\"\"\"\n\n\ndef tick():\n    return 1\n",
+    );
+    assert_eq!(doc_of(&module, "tick"), "");
+    let documented = extract(
+        "app/tick.py",
+        b"\"\"\"Timing helpers.\"\"\"\n\n\ndef tick():\n    \"\"\"Return a tick.\"\"\"\n    return 1\n",
+    );
+    assert_eq!(doc_of(&documented, "tick"), "Return a tick.");
+
+    // The same holds where a file header is an ordinary comment or a block
+    // comment separated from the first definition.
+    let go = extract(
+        "store/store.go",
+        b"// Package store keeps records.\npackage store\n\nfunc Open() {}\n",
+    );
+    assert_eq!(doc_of(&go, "Open"), "");
+    let ts = extract(
+        "src/index.ts",
+        b"/** Module header. */\n\nexport function run(): number {\n    return 1;\n}\n",
+    );
+    assert_eq!(doc_of(&ts, "run"), "");
+}
+
+/// A blank line between an outer doc comment and its item breaks the
+/// association — the fix that makes the `//!` case above reachable at all.
+#[test]
+fn a_blank_line_detaches_an_outer_doc_comment() {
+    let detached = extract(
+        "src/util.rs",
+        b"/// Double a value.\n\npub fn helper() -> u32 {\n    2\n}\n",
+    );
+    assert_eq!(doc_of(&detached, "helper"), "");
+    let attached = extract(
+        "src/util.rs",
+        b"/// Double a value.\npub fn helper() -> u32 {\n    2\n}\n",
+    );
+    assert_eq!(doc_of(&attached, "helper"), "Double a value.");
+    // A run of `///` lines still reads from the top of the run.
+    let run = extract(
+        "src/util.rs",
+        b"/// First line.\n/// Second line.\npub fn helper() -> u32 {\n    2\n}\n",
+    );
+    assert_eq!(doc_of(&run, "helper"), "First line.");
+}
