@@ -71,15 +71,50 @@ fn heading_of(line: &str) -> Option<&str> {
 /// Backticked tokens that look like a path: at least one dot, followed by a
 /// short extension. `` `src/loader.ts` `` is a mention; `` `let x = 1` `` is
 /// not.
+///
+/// A span opens on a run of backticks and closes on the next run of the same
+/// length, which is how Markdown lets a span contain a literal backtick.
+/// Splitting on single backticks instead would let one such span flip the
+/// parity of the rest of the line and hide every mention after it.
 fn collect_code_mentions(line: &str, out: &mut Vec<String>) {
-    for (index, span) in line.split('`').enumerate() {
-        if index % 2 == 0 {
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        let open = backtick_run(bytes, at);
+        if open == 0 {
+            at += 1;
             continue;
         }
-        if looks_like_path(span) {
-            out.push(span.to_string());
+        let start = at + open;
+        let Some(close) = closing_run(bytes, start, open) else {
+            break;
+        };
+        if let Some(span) = line.get(start..close) {
+            let span = span.trim();
+            if looks_like_path(span) {
+                out.push(span.to_string());
+            }
         }
+        at = close + open;
     }
+}
+
+/// Length of the run of backticks starting at `at`, zero if there is none.
+fn backtick_run(bytes: &[u8], at: usize) -> usize {
+    bytes[at..].iter().take_while(|b| **b == b'`').count()
+}
+
+/// Offset of the next run of exactly `width` backticks at or after `from`.
+fn closing_run(bytes: &[u8], from: usize, width: usize) -> Option<usize> {
+    let mut at = from;
+    while at < bytes.len() {
+        let run = backtick_run(bytes, at);
+        if run == width {
+            return Some(at);
+        }
+        at += run.max(1);
+    }
+    None
 }
 
 fn looks_like_path(span: &str) -> bool {
@@ -203,6 +238,27 @@ mod tests {
         assert!(!looks_like_path("let x = 1"));
         assert!(!looks_like_path("plain"));
         assert!(!looks_like_path("a.averylongextension"));
+    }
+
+    #[test]
+    fn a_double_backtick_span_does_not_hide_later_mentions() {
+        let mut out = Vec::new();
+        collect_code_mentions("a ``holds a ` backtick`` then `src/a.rs` ends", &mut out);
+        assert_eq!(out, vec!["src/a.rs"]);
+
+        let mut out = Vec::new();
+        collect_code_mentions("`src/a.rs` and `docs/b.md`", &mut out);
+        assert_eq!(out, vec!["src/a.rs", "docs/b.md"]);
+
+        // A span Markdown never closes swallows the rest of the line.
+        let mut out = Vec::new();
+        collect_code_mentions("unclosed `src/a.rs", &mut out);
+        assert!(out.is_empty());
+
+        // CommonMark strips one padding space inside a span.
+        let mut out = Vec::new();
+        collect_code_mentions("`` src/a.rs ``", &mut out);
+        assert_eq!(out, vec!["src/a.rs"]);
     }
 
     #[test]

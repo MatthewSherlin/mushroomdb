@@ -227,12 +227,17 @@ pub(crate) fn resolve_import(from: &str, raw: &str, known: &dyn Fn(&str) -> bool
         );
     }
 
-    let segments: Vec<&str> = raw
+    let mut segments: Vec<&str> = raw
         .trim_start_matches("::")
         .split("::")
         .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "*" && *s != "self")
+        .filter(|s| !s.is_empty() && *s != "*")
         .collect();
+    // A trailing `self` (`use a::b::{self}`) names the module the preceding
+    // segments already name. A *leading* `self` is meaningful and kept.
+    while segments.len() > 1 && segments.last() == Some(&"self") {
+        segments.pop();
+    }
     let Some((first, rest)) = segments.split_first() else {
         return Vec::new();
     };
@@ -242,6 +247,7 @@ pub(crate) fn resolve_import(from: &str, raw: &str, known: &dyn Fn(&str) -> bool
             Some(root) => under(&join(&root, "src"), rest, known),
             None => Vec::new(),
         },
+        "self" => under(&module_dir(from), rest, known),
         "super" => {
             let mut base = module_dir(from);
             let mut rest = segments.as_slice();
@@ -292,23 +298,42 @@ fn crate_root(from: &str, known: &dyn Fn(&str) -> bool) -> Option<String> {
     None
 }
 
-/// A leading path segment that names a sibling package directory resolves to
-/// that package's `src/lib.rs`. Package directories are conventionally named
-/// after the package, so `beta_core` also tries `beta-core`.
+/// A leading path segment that names a sibling package resolves to that
+/// package's `src/lib.rs`.
+///
+/// A candidate directory counts as a package only when it has its own
+/// `Cargo.toml`, which is what makes this a package lookup rather than a guess
+/// at a directory name. No layout convention is assumed: the directories
+/// searched are the crate root's parent and every ancestor of the importing
+/// file, so a workspace that keeps its members under `crates/`, `libs/` or
+/// directly at the root all work the same way. Package directories are
+/// conventionally named after the package, so `beta_core` also tries
+/// `beta-core`.
 fn package_root(from: &str, name: &str, known: &dyn Fn(&str) -> bool) -> Vec<String> {
     let mut parents: Vec<String> = Vec::new();
     if let Some(root) = crate_root(from, known) {
         parents.push(parent_dir(&root).to_string());
     }
     parents.extend(ancestors(parent_dir(from)));
-    parents.push("crates".to_string());
-    parents.dedup();
+    // `dedup` only removes neighbours, and these two sources overlap out of
+    // order, so drop repeats by hand.
+    let mut seen: Vec<String> = Vec::new();
+    parents.retain(|parent| {
+        let fresh = !seen.contains(parent);
+        if fresh {
+            seen.push(parent.clone());
+        }
+        fresh
+    });
 
     let variants = [name.to_string(), name.replace('_', "-")];
     let mut candidates = Vec::new();
     for parent in &parents {
         for variant in &variants {
-            candidates.push(join(parent, &format!("{variant}/src/lib.rs")));
+            let dir = join(parent, variant);
+            if known(&join(&dir, "Cargo.toml")) {
+                candidates.push(join(&dir, "src/lib.rs"));
+            }
         }
     }
     first_known(&candidates, known)

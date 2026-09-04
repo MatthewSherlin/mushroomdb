@@ -93,6 +93,32 @@ fn raw_imports(facts: &FileFacts) -> Vec<&str> {
     facts.imports.iter().map(|i| i.raw.as_str()).collect()
 }
 
+/// Independent naive check that every call landed on the innermost symbol
+/// containing it: for each recorded call, no other symbol with a strictly
+/// narrower line range may also contain that line. Quadratic on purpose —
+/// this is the scan the library deliberately does not do.
+fn assert_calls_are_innermost(facts: &FileFacts, label: &str) {
+    for owner in &facts.symbols {
+        let owner_span = owner.line_end - owner.line_start;
+        for (callee, line) in &owner.calls {
+            for other in &facts.symbols {
+                if other.name == owner.name && other.line_start == owner.line_start {
+                    continue;
+                }
+                let contains = other.line_start <= *line && *line <= other.line_end;
+                let narrower = other.line_end - other.line_start < owner_span;
+                assert!(
+                    !(contains && narrower),
+                    "{label}: call to {callee} on line {line} landed on {} \
+                     but {} is narrower and also contains it",
+                    owner.name,
+                    other.name
+                );
+            }
+        }
+    }
+}
+
 // ── Rust resolution ─────────────────────────────────────────────────────────
 
 #[test]
@@ -210,6 +236,100 @@ fn rust_workspace_package_paths_resolve_to_lib_rs() {
             &no_files
         ),
         vec!["crates/beta-core/src/lib.rs"]
+    );
+
+    // No layout convention is assumed: a workspace that keeps its members
+    // somewhere other than `crates/` resolves the same way.
+    let libs = tree(&[
+        "Cargo.toml",
+        "libs/alpha/Cargo.toml",
+        "libs/alpha/src/lib.rs",
+        "libs/gamma-util/Cargo.toml",
+        "libs/gamma-util/src/lib.rs",
+        // A directory with a `src/lib.rs` but no manifest is not a package.
+        "vendored/delta/src/lib.rs",
+    ]);
+    let known = |p: &str| libs.contains(p);
+    assert_eq!(
+        resolve_import(
+            Lang::Rust,
+            "libs/alpha/src/lib.rs",
+            "gamma_util::Thing",
+            &known,
+            &no_files
+        ),
+        vec!["libs/gamma-util/src/lib.rs"]
+    );
+    assert!(resolve_import(
+        Lang::Rust,
+        "libs/alpha/src/lib.rs",
+        "delta::Thing",
+        &known,
+        &no_files
+    )
+    .is_empty());
+}
+
+#[test]
+fn rust_self_paths_resolve_within_the_module_not_a_sibling_package() {
+    // `inner` names both a child module of `net` and a workspace package.
+    // `self::inner` must mean the module.
+    let files = tree(&[
+        "Cargo.toml",
+        "crates/alpha/Cargo.toml",
+        "crates/alpha/src/lib.rs",
+        "crates/alpha/src/util.rs",
+        "crates/alpha/src/net/mod.rs",
+        "crates/alpha/src/net/inner.rs",
+        "crates/inner/Cargo.toml",
+        "crates/inner/src/lib.rs",
+    ]);
+    let known = |p: &str| files.contains(p);
+
+    assert_eq!(
+        resolve_import(
+            Lang::Rust,
+            "crates/alpha/src/net/mod.rs",
+            "self::inner::Thing",
+            &known,
+            &no_files
+        ),
+        vec!["crates/alpha/src/net/inner.rs"]
+    );
+    // Without `self::`, the same first segment is a package name, which is
+    // exactly the wrong edge `self::` has to avoid.
+    assert_eq!(
+        resolve_import(
+            Lang::Rust,
+            "crates/alpha/src/net/mod.rs",
+            "inner::Thing",
+            &known,
+            &no_files
+        ),
+        vec!["crates/inner/src/lib.rs"]
+    );
+    // A non-`mod.rs` file owns a directory named after its stem.
+    assert_eq!(
+        resolve_import(
+            Lang::Rust,
+            "crates/alpha/src/net.rs",
+            "self::inner",
+            &known,
+            &no_files
+        ),
+        vec!["crates/alpha/src/net/inner.rs"]
+    );
+    // A trailing `self` (`use crate::util::{self}`) names the module the
+    // preceding segments already name.
+    assert_eq!(
+        resolve_import(
+            Lang::Rust,
+            "crates/alpha/src/lib.rs",
+            "crate::util::self",
+            &known,
+            &no_files
+        ),
+        vec!["crates/alpha/src/util.rs"]
     );
 }
 
@@ -403,9 +523,14 @@ fn typescript_specifiers_try_extensions_and_index_files() {
         &no_files
     )
     .is_empty());
-    assert!(
-        resolve_import(Lang::TypeScript, "src/index.ts", "react", &known, &no_files).is_empty()
-    );
+    assert!(resolve_import(
+        Lang::TypeScript,
+        "src/index.ts",
+        "somelib",
+        &known,
+        &no_files
+    )
+    .is_empty());
 }
 
 #[test]
@@ -609,6 +734,8 @@ fn markdown_extraction_finds_headings_mentions_and_body() {
         "rust/lib.rs",
         "./notes/deep.md",
         "notes/deep.md",
+        // A double-backtick span earlier on the line must not hide this one.
+        "notes/after.md",
     ] {
         assert!(
             facts.mentions.iter().any(|m| m == expected),
@@ -860,6 +987,78 @@ fn symbols_sorted_by_line_and_qualified() {
 }
 
 #[test]
+fn calls_attach_to_the_innermost_definition_at_scale() {
+    // Five thousand modules, each holding one function that makes one call:
+    // ten thousand definitions and five thousand call sites in one file. The
+    // shape is what a code generator emits, and it is the input a
+    // definition-per-call scan degrades on, so the test is as much about the
+    // attachment finishing as about where the calls land.
+    const BLOCKS: usize = 5_000;
+    let mut source = String::new();
+    for i in 0..BLOCKS {
+        source.push_str(&format!(
+            "pub mod m{i} {{\n    pub fn f{i}() {{\n        g{i}();\n    }}\n}}\n"
+        ));
+    }
+    assert!(
+        source.len() < MAX_FILE_BYTES,
+        "the generated source must stay under the size cap"
+    );
+
+    let facts = extract("src/generated.rs", source.as_bytes());
+    assert_eq!(facts.symbols.len(), BLOCKS * 2);
+
+    for i in 0..BLOCKS {
+        // The call belongs to the function, which is the innermost
+        // definition containing it.
+        assert_eq!(
+            callees(&facts, &format!("m{i}::f{i}")),
+            vec![format!("g{i}").as_str()],
+            "call not attached to m{i}::f{i}"
+        );
+        // Not to the module that merely encloses the function.
+        assert!(
+            callees(&facts, &format!("m{i}")).is_empty(),
+            "call leaked onto the enclosing module m{i}"
+        );
+    }
+
+    // The same generator at a size the naive quadratic check can afford, so
+    // the sweep is pinned against innermost-wins and not just against the
+    // expectations above.
+    let mut small = String::new();
+    for i in 0..200 {
+        small.push_str(&format!(
+            "pub mod s{i} {{\n    pub fn h{i}() {{\n        k{i}();\n    }}\n}}\n"
+        ));
+    }
+    assert_calls_are_innermost(&extract("src/small.rs", small.as_bytes()), "generated");
+
+    // Nesting a call two definitions deep still picks the innermost, and a
+    // call outside every definition is dropped rather than misattached.
+    let nested = "\
+fn top() {
+    outer_call();
+}
+mod a {
+    pub mod b {
+        pub fn deep() {
+            deep_call();
+        }
+    }
+}
+const X: u32 = free_call();
+";
+    let facts = extract("src/nested.rs", nested.as_bytes());
+    assert_eq!(callees(&facts, "top"), vec!["outer_call"]);
+    assert_eq!(callees(&facts, "a::b::deep"), vec!["deep_call"]);
+    assert!(callees(&facts, "a").is_empty());
+    assert!(callees(&facts, "a::b").is_empty());
+    // A call in a const initialiser belongs to that const, not to nothing.
+    assert_eq!(callees(&facts, "X"), vec!["free_call"]);
+}
+
+#[test]
 fn hash_is_stable_and_sensitive() {
     let bytes = read_fixture("rust/lib.rs");
     let first = extract("crates/alpha/src/lib.rs", &bytes);
@@ -1062,6 +1261,7 @@ fn extraction_is_capped_and_repeatable_for_every_fixture() {
     for (fixture, path) in cases {
         let first = facts(fixture, path);
         assert_eq!(first, facts(fixture, path), "{fixture} is not repeatable");
+        assert_calls_are_innermost(&first, fixture);
         for symbol in &first.symbols {
             assert!(symbol.signature.chars().count() <= 200, "{fixture}");
             assert!(symbol.doc.chars().count() <= 200, "{fixture}");

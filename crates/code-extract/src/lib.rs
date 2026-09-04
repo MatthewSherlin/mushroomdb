@@ -229,10 +229,12 @@ fn decode(bytes: &[u8]) -> Option<&str> {
 /// `<dir>/x/mod.rs`. `crate::a::b` resolves under the nearest ancestor
 /// directory that has both a `Cargo.toml` and a `src/`, trying the longest
 /// module prefix first: `src/a/b.rs`, `src/a/b/mod.rs`, `src/a.rs`,
-/// `src/a/mod.rs`. `super::` and `self::` resolve relative to the declaring
-/// file's module directory. A leading segment that names a sibling package
-/// directory (with `_` and `-` treated as interchangeable) resolves to that
-/// package's `src/lib.rs`.
+/// `src/a/mod.rs`. `self::` resolves under the declaring file's module
+/// directory and `super::` one directory further up per `super`. A leading
+/// segment that names a sibling directory holding its own `Cargo.toml` (with
+/// `_` and `-` treated as interchangeable) resolves to that package's
+/// `src/lib.rs`; the directories searched are the crate root's parent and
+/// every ancestor of the declaring file, so no layout convention is assumed.
 ///
 /// **Python.** `a.b` and `.b` resolve to `<dir>/a/b.py` or
 /// `<dir>/a/b/__init__.py`, first relative to the importing file's directory

@@ -135,25 +135,51 @@ pub(crate) fn extract(lang: Lang, src: &str) -> Option<(Vec<SymbolFact>, Vec<Imp
 ///
 /// Calls outside any definition — a top-level statement, a module
 /// initialiser — have no symbol to hang from and are dropped.
-fn attach_calls(defs: &mut [(Range<usize>, SymbolFact)], calls: Vec<(usize, String, u32)>) {
+///
+/// Definition ranges come from a syntax tree, so they nest: two of them are
+/// either disjoint or one contains the other, never partially overlapping.
+/// That lets a single sweep over both lists in position order do the work with
+/// a stack of open definitions, instead of rescanning every definition for
+/// every call site. The parse budget does not cover this step, and a
+/// machine-generated source can hold thousands of each, so the difference is
+/// the difference between linear and quadratic on exactly the input least
+/// likely to have been tried by hand.
+fn attach_calls(defs: &mut [(Range<usize>, SymbolFact)], mut calls: Vec<(usize, String, u32)>) {
+    // Definitions in the order the sweep opens them. Equal starts put the
+    // shorter range later so it lands on top of the stack, and a full tie
+    // falls back to the earlier definition, which is the one a naive
+    // innermost-wins scan would have picked.
+    let mut order: Vec<usize> = (0..defs.len()).collect();
+    order.sort_by(|a, b| {
+        let (left, right) = (&defs[*a].0, &defs[*b].0);
+        left.start
+            .cmp(&right.start)
+            .then(right.end.cmp(&left.end))
+            .then(b.cmp(a))
+    });
+    calls.sort();
+
+    let mut open: Vec<usize> = Vec::new();
+    let mut next = 0;
     for (at, callee, line) in calls {
-        let mut best: Option<usize> = None;
-        for (index, (range, _)) in defs.iter().enumerate() {
-            if !range.contains(&at) {
-                continue;
+        while let Some(index) = order.get(next).copied() {
+            if defs[index].0.start > at {
+                break;
             }
-            let better = match best {
-                None => true,
-                Some(prev) => range.len() < defs[prev].0.len(),
-            };
-            if better {
-                best = Some(index);
-            }
+            open.push(index);
+            next += 1;
         }
-        if let Some(index) = best {
+        while let Some(index) = open.last().copied() {
+            if defs[index].0.end > at {
+                break;
+            }
+            open.pop();
+        }
+        if let Some(index) = open.last().copied() {
             defs[index].1.calls.push((callee, line));
         }
     }
+
     for (_, fact) in defs.iter_mut() {
         fact.calls.sort();
         fact.calls.dedup();
