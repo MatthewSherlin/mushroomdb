@@ -75,7 +75,9 @@ redact() {
 }
 
 fmt_s() { python3 -c 'import sys; print("%.2f s" % (int(sys.argv[1]) / 1000.0))' "$1"; }
-tick() { if [ "$1" = yes ]; then printf 'yes'; else printf '%s' "$1"; fi; }
+# The determinism column is a tick when the two exports matched, and the name
+# of the file that differed when they did not.
+tick() { if [ "$1" = yes ]; then printf '✓'; else printf '%s' "$1"; fi; }
 
 ROWS=""
 NOTES=""

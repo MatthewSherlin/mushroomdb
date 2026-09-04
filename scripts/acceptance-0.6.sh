@@ -354,8 +354,22 @@ INIT_LINE="$WORK/mcp-init.json"
 await_id 1 >"$INIT_LINE" || die "MCP server did not answer initialize"
 assert_contains "$INIT_LINE" '"name":"mushroomdb"' "MCP server answers initialize"
 
-TOUCH_FILES="$(git -C "$WT" ls-files '*.rs' | head -20)"
-PARALLEL="$(printf '%s\n' "$TOUCH_FILES" | wc -l | tr -d ' ')"
+# Exactly 20 concurrent writers, which is the number the step is specified in.
+# The tracked Rust files are cycled to fill the list, so a repository with
+# fewer than 20 of them still gets 20 processes rather than silently fewer.
+PARALLEL=20
+CANDIDATES="$(git -C "$WT" ls-files '*.rs')"
+[ -n "$CANDIDATES" ] || die "no tracked Rust files in $WT to touch"
+TOUCH_FILES=""
+n=0
+while [ "$n" -lt "$PARALLEL" ]; do
+  for f in $CANDIDATES; do
+    [ "$n" -lt "$PARALLEL" ] || break
+    TOUCH_FILES="$TOUCH_FILES $f"
+    n=$((n + 1))
+  done
+done
+
 PIDS=""
 i=0
 for f in $TOUCH_FILES; do
@@ -387,11 +401,33 @@ print(msg["result"]["structuredContent"]["files"])
 ' "$MAP_LINE")"
 assert_eq "$MCP_FILES" "$INGEST_FILES" "the live server's map still counts every ingested file"
 
+# Closing the write end is the EOF. The wait for the server to notice it is
+# bounded: a server that stayed alive past EOF — exactly the bug this step
+# exists to catch — must produce a FAIL line, not an unkillable hang here and
+# a job-timeout kill in CI. A watchdog kills it after 30 s and leaves a flag
+# behind so the failure can say which of the two things went wrong. The
+# watchdog is itself killed the moment `wait` returns, so it can only ever
+# fire while the server is genuinely still running.
 exec 9>&-
+WATCHDOG_FLAG="$WORK/mcp-watchdog.fired"
+( sleep 30
+  if kill -0 "$MCP_PID" 2>/dev/null; then
+    : >"$WATCHDOG_FLAG"
+    kill -9 "$MCP_PID" 2>/dev/null || true
+  fi ) &
+WATCHDOG_PID=$!
+
 MCP_RC=0
 wait "$MCP_PID" || MCP_RC=$?
 MCP_PID="" # reaped: the exit trap must not kill whatever inherits the pid
-assert_eq "$MCP_RC" 0 "the MCP server exits 0 on EOF"
+kill "$WATCHDOG_PID" 2>/dev/null || true
+wait "$WATCHDOG_PID" 2>/dev/null || true
+
+if [ -f "$WATCHDOG_FLAG" ]; then
+  fail "the MCP server exits 0 on EOF — still alive 30 s after the FIFO closed, killed"
+else
+  assert_eq "$MCP_RC" 0 "the MCP server exits 0 on EOF"
+fi
 if [ -s "$MCP_ERR" ]; then sed 's/^/      | stderr: /' "$MCP_ERR"; fi
 
 VERIFY_OUT="$WORK/verify.txt"
