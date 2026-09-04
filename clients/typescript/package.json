@@ -1,6 +1,6 @@
 {
   "name": "mushroomdb-client",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "TypeScript client for the mushroomdb graph database HTTP + WebSocket API",
   "license": "(MIT OR Apache-2.0)",
   "repository": {

@@ -1,6 +1,6 @@
 {
   "name": "mushroom",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "Live code graph for your repo: map, context, impact, owners, why, recall, remember.",
   "author": { "name": "Matthew Sherlin" },
   "repository": "https://github.com/MatthewSherlin/mushroomdb",

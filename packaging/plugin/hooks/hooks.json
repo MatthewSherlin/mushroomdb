@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "npx -y mushroomdb@0.5.2 recall --auto",
+            "command": "npx -y mushroomdb@0.6.0 recall --auto",
             "timeout": 5
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "npx -y mushroomdb@0.5.2 touch --auto",
+            "command": "npx -y mushroomdb@0.6.0 touch --auto",
             "timeout": 30,
             "async": true
           }
