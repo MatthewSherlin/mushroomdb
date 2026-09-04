@@ -3,6 +3,7 @@
 //! The binary in `main.rs` stays thin — it dispatches on [`parse_args`] and
 //! prints what the lib functions return.
 
+pub mod doctor;
 pub mod export;
 pub mod ingest_git;
 pub mod install;
@@ -205,6 +206,8 @@ pub enum Command {
     Install(install::InstallOpts),
     /// Undo what `install` wrote (manifest-driven).
     Uninstall(install::InstallOpts),
+    /// Verify an install end to end: config, store, hooks, and a real MCP handshake.
+    Doctor(doctor::DoctorOpts),
     /// Body of the Claude Code UserPromptSubmit hook: reads a prompt payload on
     /// stdin, prints related graph facts on stdout.
     Recall {
@@ -306,6 +309,9 @@ Usage:
   mushroomdb install [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
                      [--command <path>] [--no-git-hooks] [--no-prewarm]
   mushroomdb uninstall [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
+  mushroomdb doctor [--project|--user] [--platform claude-code|cursor|codex|all]
+                     verify an install: config entry, store, hooks, git hooks, and a real
+                     stdio handshake with the configured MCP command; exits 1 on any `fail`
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
   mushroomdb mcp <db-dir>|--auto
   mushroomdb stats <db-dir>
@@ -437,6 +443,42 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
         git_hooks,
         prewarm,
     })
+}
+
+fn parse_doctor_cmd(args: &[&str]) -> Result<doctor::DoctorOpts, String> {
+    let mut platform: Option<install::Platform> = None;
+    let mut scope: Option<install::Scope> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--platform" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --platform".to_string())?;
+            platform = Some(install::Platform::parse(val)?);
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--platform=") {
+            platform = Some(install::Platform::parse(val)?);
+            i += 1;
+        } else if a == "--project" || a == "--user" {
+            let want = if a == "--project" {
+                install::Scope::Project
+            } else {
+                install::Scope::User
+            };
+            if scope.is_some_and(|s| s != want) {
+                return Err("--project and --user are mutually exclusive".to_string());
+            }
+            scope = Some(want);
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else {
+            return Err(format!("unexpected argument: {a}"));
+        }
+    }
+    Ok(doctor::DoctorOpts { platform, scope })
 }
 
 fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
@@ -579,6 +621,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "ingest-git" => parse_ingest_git(&args[1..]),
         "install" => parse_install_cmd(&args[1..]).map(Command::Install),
         "uninstall" => parse_install_cmd(&args[1..]).map(Command::Uninstall),
+        "doctor" => parse_doctor_cmd(&args[1..]).map(Command::Doctor),
         other => Err(format!("unknown command: {other}")),
     }
 }

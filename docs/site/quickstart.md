@@ -137,6 +137,8 @@ needs `uninstall --platform codex` to undo), `--db <path>`, and
 reference: [`skill.md`](skill.md).
 
 Restart the assistant afterwards — MCP servers and hooks are read at startup.
+Run `mushroomdb doctor` to verify the install end to end, including a real
+handshake with the configured MCP command.
 
 ---
 

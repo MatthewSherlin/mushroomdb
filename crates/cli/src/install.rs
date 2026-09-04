@@ -225,7 +225,7 @@ impl Platform {
         }
     }
 
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Platform::ClaudeCode => "claude-code",
             Platform::Cursor => "cursor",
@@ -243,7 +243,7 @@ pub enum Scope {
 }
 
 impl Scope {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Scope::Project => "project",
             Scope::User => "user",
@@ -283,7 +283,7 @@ pub fn default_db(scope: Scope, project_root: &Path, home: &Path) -> PathBuf {
 /// A git checkout is a project: its store belongs beside it, is ignored by the
 /// repository, and its hooks fire on its commits. Anywhere else there is no
 /// project to scope to, so the install is the user's.
-fn resolve_scope(project_root: &Path, requested: Option<Scope>) -> (Scope, bool) {
+pub(crate) fn resolve_scope(project_root: &Path, requested: Option<Scope>) -> (Scope, bool) {
     match requested {
         Some(s) => (s, false),
         None if project_root.join(".git").exists() => (Scope::Project, true),
@@ -326,7 +326,7 @@ impl Externals {
     }
 
     /// The first executable named `program` on this PATH.
-    fn which(&self, program: &str) -> Option<PathBuf> {
+    pub(crate) fn which(&self, program: &str) -> Option<PathBuf> {
         let path = self.path.as_ref()?;
         std::env::split_paths(path)
             .map(|dir| dir.join(program))
@@ -478,13 +478,13 @@ struct ManagedLine {
 
 /// Claude Code hook event this install wires: fires before each prompt is
 /// sent, so the recall digest lands as context ahead of the user's turn.
-const HOOK_EVENT: &str = "UserPromptSubmit";
+pub(crate) const HOOK_EVENT: &str = "UserPromptSubmit";
 /// Kept short: the hook must never noticeably slow a prompt.
 const HOOK_TIMEOUT_SECS: u64 = 5;
 
 /// The second hook event: fires after a tool call, so an edit reaches the
 /// graph while the assistant is still working rather than at the next commit.
-const TOUCH_EVENT: &str = "PostToolUse";
+pub(crate) const TOUCH_EVENT: &str = "PostToolUse";
 /// The tools that change a file on disk. Anything else — a read, a search, a
 /// shell command — leaves the working tree as the graph already has it.
 const TOUCH_MATCHER: &str = "Edit|Write|MultiEdit";
@@ -534,7 +534,7 @@ fn touch_hook_entry(command: &str) -> serde_json::Value {
 }
 
 /// True if any hook group under `event` contains a command hook equal to `command`.
-fn settings_has_hook(root: &serde_json::Value, event: &str, command: &str) -> bool {
+pub(crate) fn settings_has_hook(root: &serde_json::Value, event: &str, command: &str) -> bool {
     root["hooks"][event]
         .as_array()
         .map(|groups| {
@@ -642,7 +642,7 @@ fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result
 /// subcommand and the quoted database this install is wiring. A hook naming a
 /// *different* database belongs to a different install and is not ours to
 /// touch.
-fn is_our_hook_command(command: &str, sub: &str, db_str: &str) -> bool {
+pub(crate) fn is_our_hook_command(command: &str, sub: &str, db_str: &str) -> bool {
     command.ends_with(&format!(" {sub} {}", sh_quote(db_str)))
 }
 
@@ -1134,7 +1134,7 @@ pub fn run_uninstall_with(
 // Platform resolution
 // ---------------------------------------------------------------------------
 
-fn resolve_platform(
+pub(crate) fn resolve_platform(
     project_root: &Path,
     home: &Path,
     requested: Option<&Platform>,
@@ -1164,7 +1164,7 @@ fn resolve_platform(
 /// is deliberately not in it: it is wired by running the `codex` CLI, which
 /// may not exist, and `--platform all` must not fail on a machine that simply
 /// does not have it.
-fn expand_platform(p: &Platform) -> Vec<Platform> {
+pub(crate) fn expand_platform(p: &Platform) -> Vec<Platform> {
     match p {
         Platform::All => vec![Platform::ClaudeCode, Platform::Cursor],
         other => vec![other.clone()],
@@ -1195,7 +1195,7 @@ fn preflight_check(
     }
 }
 
-fn claude_mcp_file(project_root: &Path, home: &Path, scope: Scope) -> PathBuf {
+pub(crate) fn claude_mcp_file(project_root: &Path, home: &Path, scope: Scope) -> PathBuf {
     match scope {
         Scope::Project => project_root.join(".mcp.json"),
         // User-scope: verified empirically on a live Claude Code install.
@@ -1205,7 +1205,7 @@ fn claude_mcp_file(project_root: &Path, home: &Path, scope: Scope) -> PathBuf {
     }
 }
 
-fn cursor_mcp_file(project_root: &Path, home: &Path, scope: Scope) -> PathBuf {
+pub(crate) fn cursor_mcp_file(project_root: &Path, home: &Path, scope: Scope) -> PathBuf {
     match scope {
         Scope::Project => project_root.join(".cursor").join("mcp.json"),
         Scope::User => home.join(".cursor").join("mcp.json"),
@@ -1217,7 +1217,7 @@ fn cursor_mcp_file(project_root: &Path, home: &Path, scope: Scope) -> PathBuf {
 /// Its position moved between versions — 0.5.x wrote `["mcp", db]`, the npx
 /// form writes `["-y", "mushroomdb@x.y.z", "mcp", db]` — so the subcommand is
 /// what locates it, not an index.
-fn entry_db(entry: &serde_json::Value) -> Option<&str> {
+pub(crate) fn entry_db(entry: &serde_json::Value) -> Option<&str> {
     let args = entry["args"].as_array()?;
     let at = args.iter().position(|a| a == "mcp")?;
     args.get(at + 1)?.as_str()
@@ -1288,7 +1288,7 @@ fn scope_conflict_note(ctx: &Ctx<'_>, platforms: &[Platform]) -> Option<String> 
     ))
 }
 
-fn has_our_server(mcp_file: &Path) -> bool {
+pub(crate) fn has_our_server(mcp_file: &Path) -> bool {
     let Ok(raw) = fs::read_to_string(mcp_file) else {
         return false;
     };
@@ -1453,7 +1453,7 @@ fn install_codex(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliError>
 /// The git hooks a sync belongs in: after a commit lands, after a branch
 /// changes the working tree, and after a merge brings other people's commits
 /// in. All three leave the graph a commit behind if they are skipped.
-const GIT_HOOKS: &[&str] = &["post-commit", "post-checkout", "post-merge"];
+pub(crate) const GIT_HOOKS: &[&str] = &["post-commit", "post-checkout", "post-merge"];
 
 /// The `.gitignore` line for a store kept inside the repository, or `None`
 /// when it is kept outside — a repository has no business ignoring a path it
@@ -1534,7 +1534,7 @@ fn remove_line(path: &Path, line: &str) -> Result<bool, CliError> {
 
 /// The directory holding this checkout's hooks, following the `gitdir:` link a
 /// worktree or submodule leaves in place of a `.git` directory.
-fn git_hooks_dir(project_root: &Path) -> Option<PathBuf> {
+pub(crate) fn git_hooks_dir(project_root: &Path) -> Option<PathBuf> {
     let dot_git = project_root.join(".git");
     if dot_git.is_dir() {
         return Some(dot_git.join("hooks"));

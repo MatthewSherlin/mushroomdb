@@ -323,6 +323,21 @@ fn main() -> ExitCode {
                 Err(e) => fail(&e.to_string()),
             }
         }
+        Ok(Command::Doctor(opts)) => {
+            let home = home_dir();
+            let cwd = std::env::current_dir().unwrap_or_default();
+            match cli::doctor::run_doctor(&cwd, &home, &opts) {
+                Ok(report) => {
+                    print!("{}", report.output);
+                    if report.had_fail {
+                        ExitCode::from(1)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
         Err(e) => {
             let _ = writeln!(io::stderr(), "{e}");
             eprint!("{}", usage());

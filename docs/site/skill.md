@@ -239,6 +239,38 @@ yields Codex.
 
 ---
 
+## Troubleshooting: `mushroomdb doctor`
+
+```
+mushroomdb doctor [--project|--user] [--platform claude-code|cursor|codex|all]
+```
+
+Verifies an install end to end and prints one line per check — `ok`, `warn`,
+or `fail`, with a one-line `fix:` when there is something to run. Exits 1 if
+any check fails, 0 otherwise (`warn` never fails the run). Scope and platform
+resolve the same way as `install`.
+
+Checks, in order:
+
+- **config** — the MCP config file for the resolved scope has a
+  `mcpServers.mushroomdb` entry, and what database it names.
+- **npx** — only when the entry runs `npx`: that `npx` is on PATH, and
+  `npx -y mushroomdb@<version> --version` answers with that version within
+  60s (`warn` on timeout).
+- **store** — the database opens read-only and reports its node/edge counts
+  and whether it is stale (another process has newer commits pending refresh).
+- **lock** — a brief, immediately-released attempt at the write lock; `warn`
+  if another process currently holds it.
+- **hooks** — the `UserPromptSubmit` and `PostToolUse` hooks are present in
+  `settings.json` (Claude Code only).
+- **git-hooks** — the `post-commit` / `post-checkout` / `post-merge` blocks
+  are present (project scope only).
+- **handshake** — spawns the configured command for real, speaks
+  `initialize` and `tools/list` over its stdio with a 10s deadline, and
+  checks the reported version and that the `map` tool is present.
+- **scope** — `warn` if a server also exists in the other scope (both would
+  load into the assistant at once).
+
 ## Troubleshooting
 
 **`cannot auto-detect platform`** — no `~/.claude` or `.cursor/` found. Pass
