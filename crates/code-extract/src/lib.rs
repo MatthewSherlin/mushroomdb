@@ -20,9 +20,16 @@
 //! symbol keys, using caller-supplied lookups:
 //!
 //! * `known(path)` — true when `path` names a file in the working tree.
+//! * `files_in(dir)` — the working-tree paths of the files directly inside
+//!   `dir`, empty when the directory does not exist.
 //! * `by_basename(name)` — every working-tree path whose file name is `name`.
 //!
-//! All paths, in and out, are working-tree-relative and use `/` separators.
+//! All paths, in and out, are working-tree-relative files that use `/`
+//! separators. No result is ever a directory.
+//!
+//! [`SymbolIndex`] keys are `<file path>#<qualified symbol name>`; the caller
+//! builds the index in that shape so [`resolve_call`] can prefer a definition
+//! in the calling file or its directory.
 //!
 //! # Determinism
 //!
@@ -238,12 +245,13 @@ fn decode(bytes: &[u8]) -> Option<&str> {
 /// tries `.ts` and `.tsx`, which is how TypeScript sources refer to their own
 /// compiled output.
 ///
-/// **Go.** Imports are package-granular, so the result is the package
-/// **directory** with a trailing `/`, not a file. `known` is probed with the
-/// same trailing-slash form; a caller whose `known` only answers about files
-/// gets no Go imports. The longest suffix of the import path that names a
-/// directory in the tree wins, which strips the module prefix without needing
-/// to read `go.mod`.
+/// **Go.** Imports name a package, not a file, so the result is every
+/// non-test `.go` file directly inside the matching package directory —
+/// `_test.go` files are excluded, since a test file is never what an import
+/// reaches. The longest suffix of the import path that names a directory
+/// holding Go sources wins, which strips the module prefix without needing to
+/// read `go.mod`. This is the one rule that needs `files_in`; every other
+/// language resolves through `known` alone.
 ///
 /// **Markdown.** Markdown has no imports; use [`resolve_mention`].
 #[must_use]
@@ -252,6 +260,7 @@ pub fn resolve_import(
     from_path: &str,
     raw: &str,
     known: &dyn Fn(&str) -> bool,
+    files_in: &dyn Fn(&str) -> Vec<String>,
 ) -> Vec<String> {
     let from = normalize(from_path);
     let raw = raw.trim();
@@ -261,7 +270,7 @@ pub fn resolve_import(
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
             lang::typescript::resolve_import(&from, raw, known)
         }
-        Lang::Go => lang::go::resolve_import(&from, raw, known),
+        Lang::Go => lang::go::resolve_import(&from, raw, files_in),
         Lang::Markdown | Lang::Other => Vec::new(),
     };
     out.sort();
@@ -273,7 +282,9 @@ pub fn resolve_import(
 ///
 /// A key is `<file path>#<qualified symbol name>` — everything before the
 /// last `#` is taken as the defining file. [`resolve_call`] uses that to
-/// prefer nearby definitions.
+/// prefer nearby definitions, so a caller that builds keys in some other
+/// shape loses the same-file and same-directory tiers and falls back to
+/// repo-wide uniqueness.
 #[derive(Clone, Debug, Default)]
 pub struct SymbolIndex {
     by_name: BTreeMap<String, Vec<String>>,

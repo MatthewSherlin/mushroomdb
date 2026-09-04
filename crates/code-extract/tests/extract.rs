@@ -3,9 +3,10 @@
 //! The fixtures under `tests/fixtures` are synthetic files written for these
 //! tests. Resolution, on the other hand, is tested against *path sets* rather
 //! than a directory tree: the crate never touches the filesystem, so the
-//! working tree it resolves against is whatever the `known` closure says it
-//! is. Building that set in the test is both closer to how the caller uses
-//! the crate and immune to anything cargo does to a fixture directory.
+//! working tree it resolves against is whatever the `known` and `files_in`
+//! closures say it is. Building that set in the test is both closer to how the
+//! caller uses the crate and immune to anything cargo does to a fixture
+//! directory.
 
 use code_extract::{
     extract, lang_of, resolve_call, resolve_import, resolve_mention, FileFacts, Lang, SymbolIndex,
@@ -33,6 +34,24 @@ fn facts(fixture: &str, as_path: &str) -> FileFacts {
 
 fn tree(paths: &[&str]) -> BTreeSet<String> {
     paths.iter().map(|p| (*p).to_string()).collect()
+}
+
+/// Directory enumeration over a path set: the files directly inside `dir`.
+fn files_under(files: &BTreeSet<String>, dir: &str) -> Vec<String> {
+    files
+        .iter()
+        .filter(|path| {
+            let parent = path.rsplit_once('/').map_or("", |(head, _)| head);
+            parent == dir
+        })
+        .cloned()
+        .collect()
+}
+
+/// Every language but Go resolves through `known` alone; this stands in for
+/// the enumeration they never ask for.
+fn no_files(_dir: &str) -> Vec<String> {
+    Vec::new()
 }
 
 fn names(facts: &FileFacts) -> Vec<&str> {
@@ -87,11 +106,23 @@ fn rust_module_declarations_resolve_to_file_or_mod_rs() {
     let known = |p: &str| files.contains(p);
 
     assert_eq!(
-        resolve_import(Lang::Rust, "crates/alpha/src/lib.rs", "mod util", &known),
+        resolve_import(
+            Lang::Rust,
+            "crates/alpha/src/lib.rs",
+            "mod util",
+            &known,
+            &no_files
+        ),
         vec!["crates/alpha/src/util.rs"]
     );
     assert_eq!(
-        resolve_import(Lang::Rust, "crates/alpha/src/lib.rs", "mod net", &known),
+        resolve_import(
+            Lang::Rust,
+            "crates/alpha/src/lib.rs",
+            "mod net",
+            &known,
+            &no_files
+        ),
         vec!["crates/alpha/src/net/mod.rs"]
     );
     assert_eq!(
@@ -99,11 +130,19 @@ fn rust_module_declarations_resolve_to_file_or_mod_rs() {
             Lang::Rust,
             "crates/alpha/src/net/mod.rs",
             "mod client",
-            &known
+            &known,
+            &no_files
         ),
         vec!["crates/alpha/src/net/client.rs"]
     );
-    assert!(resolve_import(Lang::Rust, "crates/alpha/src/lib.rs", "mod absent", &known).is_empty());
+    assert!(resolve_import(
+        Lang::Rust,
+        "crates/alpha/src/lib.rs",
+        "mod absent",
+        &known,
+        &no_files
+    )
+    .is_empty());
 }
 
 #[test]
@@ -124,7 +163,8 @@ fn rust_crate_paths_resolve_under_the_nearest_manifest() {
             Lang::Rust,
             "crates/alpha/src/net/client.rs",
             "crate::util::helper",
-            &known
+            &known,
+            &no_files
         ),
         vec!["crates/alpha/src/util.rs"]
     );
@@ -134,12 +174,20 @@ fn rust_crate_paths_resolve_under_the_nearest_manifest() {
             Lang::Rust,
             "crates/alpha/src/lib.rs",
             "crate::net::client",
-            &known
+            &known,
+            &no_files
         ),
         vec!["crates/alpha/src/net/client.rs"]
     );
     // A `crate::` path in a file with no manifest above it resolves to nothing.
-    assert!(resolve_import(Lang::Rust, "scratch/loose.rs", "crate::util", &known).is_empty());
+    assert!(resolve_import(
+        Lang::Rust,
+        "scratch/loose.rs",
+        "crate::util",
+        &known,
+        &no_files
+    )
+    .is_empty());
 }
 
 #[test]
@@ -158,7 +206,8 @@ fn rust_workspace_package_paths_resolve_to_lib_rs() {
             Lang::Rust,
             "crates/alpha/src/lib.rs",
             "beta_core::Ledger",
-            &known
+            &known,
+            &no_files
         ),
         vec!["crates/beta-core/src/lib.rs"]
     );
@@ -181,7 +230,8 @@ fn rust_super_paths_resolve_relative_to_the_module() {
             Lang::Rust,
             "crates/alpha/src/net/server.rs",
             "super::client::connect",
-            &known
+            &known,
+            &no_files
         ),
         vec!["crates/alpha/src/net/client.rs"]
     );
@@ -190,7 +240,8 @@ fn rust_super_paths_resolve_relative_to_the_module() {
             Lang::Rust,
             "crates/alpha/src/net/client.rs",
             "super::super::util::helper",
-            &known
+            &known,
+            &no_files
         ),
         vec!["crates/alpha/src/util.rs"]
     );
@@ -207,7 +258,14 @@ fn rust_external_crates_resolve_to_nothing() {
 
     for raw in ["std::io::Read", "serde::Serialize", "core::fmt"] {
         assert!(
-            resolve_import(Lang::Rust, "crates/alpha/src/lib.rs", raw, &known).is_empty(),
+            resolve_import(
+                Lang::Rust,
+                "crates/alpha/src/lib.rs",
+                raw,
+                &known,
+                &no_files
+            )
+            .is_empty(),
             "{raw} should not resolve"
         );
     }
@@ -228,15 +286,27 @@ fn python_dotted_modules_resolve_to_files_and_packages() {
     let known = |p: &str| files.contains(p);
 
     assert_eq!(
-        resolve_import(Lang::Python, "app/service.py", "pkg.mod_a", &known),
+        resolve_import(
+            Lang::Python,
+            "app/service.py",
+            "pkg.mod_a",
+            &known,
+            &no_files
+        ),
         vec!["pkg/mod_a.py"]
     );
     assert_eq!(
-        resolve_import(Lang::Python, "app/service.py", "pkg.sub", &known),
+        resolve_import(Lang::Python, "app/service.py", "pkg.sub", &known, &no_files),
         vec!["pkg/sub/__init__.py"]
     );
     assert_eq!(
-        resolve_import(Lang::Python, "app/service.py", "pkg.sub.deep", &known),
+        resolve_import(
+            Lang::Python,
+            "app/service.py",
+            "pkg.sub.deep",
+            &known,
+            &no_files
+        ),
         vec!["pkg/sub/deep.py"]
     );
 }
@@ -247,11 +317,23 @@ fn python_relative_imports_walk_upwards() {
     let known = |p: &str| files.contains(p);
 
     assert_eq!(
-        resolve_import(Lang::Python, "app/service.py", ".sibling", &known),
+        resolve_import(
+            Lang::Python,
+            "app/service.py",
+            ".sibling",
+            &known,
+            &no_files
+        ),
         vec!["app/sibling.py"]
     );
     assert_eq!(
-        resolve_import(Lang::Python, "app/service.py", "..shared.util", &known),
+        resolve_import(
+            Lang::Python,
+            "app/service.py",
+            "..shared.util",
+            &known,
+            &no_files
+        ),
         vec!["shared/util.py"]
     );
 }
@@ -262,9 +344,11 @@ fn python_stdlib_modules_resolve_to_nothing() {
     let files = tree(&["app/service.py", "os.py", "json/__init__.py"]);
     let known = |p: &str| files.contains(p);
 
-    assert!(resolve_import(Lang::Python, "app/service.py", "os", &known).is_empty());
-    assert!(resolve_import(Lang::Python, "app/service.py", "os.path", &known).is_empty());
-    assert!(resolve_import(Lang::Python, "app/service.py", "json", &known).is_empty());
+    assert!(resolve_import(Lang::Python, "app/service.py", "os", &known, &no_files).is_empty());
+    assert!(
+        resolve_import(Lang::Python, "app/service.py", "os.path", &known, &no_files).is_empty()
+    );
+    assert!(resolve_import(Lang::Python, "app/service.py", "json", &known, &no_files).is_empty());
 }
 
 // ── TypeScript and JavaScript resolution ────────────────────────────────────
@@ -281,20 +365,47 @@ fn typescript_specifiers_try_extensions_and_index_files() {
     let known = |p: &str| files.contains(p);
 
     assert_eq!(
-        resolve_import(Lang::TypeScript, "src/index.ts", "./util", &known),
+        resolve_import(
+            Lang::TypeScript,
+            "src/index.ts",
+            "./util",
+            &known,
+            &no_files
+        ),
         vec!["src/util.ts"]
     );
     assert_eq!(
-        resolve_import(Lang::TypeScript, "src/index.ts", "./widget", &known),
+        resolve_import(
+            Lang::TypeScript,
+            "src/index.ts",
+            "./widget",
+            &known,
+            &no_files
+        ),
         vec!["src/widget/index.tsx"]
     );
     // `export … from "./types"` resolves like any other specifier.
     assert_eq!(
-        resolve_import(Lang::TypeScript, "src/index.ts", "./types", &known),
+        resolve_import(
+            Lang::TypeScript,
+            "src/index.ts",
+            "./types",
+            &known,
+            &no_files
+        ),
         vec!["src/types.ts"]
     );
-    assert!(resolve_import(Lang::TypeScript, "src/index.ts", "node:path", &known).is_empty());
-    assert!(resolve_import(Lang::TypeScript, "src/index.ts", "react", &known).is_empty());
+    assert!(resolve_import(
+        Lang::TypeScript,
+        "src/index.ts",
+        "node:path",
+        &known,
+        &no_files
+    )
+    .is_empty());
+    assert!(
+        resolve_import(Lang::TypeScript, "src/index.ts", "react", &known, &no_files).is_empty()
+    );
 }
 
 #[test]
@@ -303,11 +414,23 @@ fn typescript_js_specifiers_fall_back_to_ts_sources() {
     let known = |p: &str| files.contains(p);
 
     assert_eq!(
-        resolve_import(Lang::TypeScript, "src/index.ts", "./legacy.js", &known),
+        resolve_import(
+            Lang::TypeScript,
+            "src/index.ts",
+            "./legacy.js",
+            &known,
+            &no_files
+        ),
         vec!["src/legacy.ts"]
     );
     assert_eq!(
-        resolve_import(Lang::Tsx, "src/widget/index.tsx", "../legacy.js", &known),
+        resolve_import(
+            Lang::Tsx,
+            "src/widget/index.tsx",
+            "../legacy.js",
+            &known,
+            &no_files
+        ),
         vec!["src/legacy.ts"]
     );
 }
@@ -318,11 +441,23 @@ fn javascript_relative_specifiers_resolve() {
     let known = |p: &str| files.contains(p);
 
     assert_eq!(
-        resolve_import(Lang::JavaScript, "src/main.js", "./loader.mjs", &known),
+        resolve_import(
+            Lang::JavaScript,
+            "src/main.js",
+            "./loader.mjs",
+            &known,
+            &no_files
+        ),
         vec!["src/loader.mjs"]
     );
     assert_eq!(
-        resolve_import(Lang::JavaScript, "src/main.js", "./parser", &known),
+        resolve_import(
+            Lang::JavaScript,
+            "src/main.js",
+            "./parser",
+            &known,
+            &no_files
+        ),
         vec!["src/parser.js"]
     );
 }
@@ -330,23 +465,80 @@ fn javascript_relative_specifiers_resolve() {
 // ── Go resolution ───────────────────────────────────────────────────────────
 
 #[test]
-fn go_imports_resolve_to_the_package_directory() {
-    // Go imports are package-granular, so `known` is probed with directories,
-    // written with a trailing slash to keep them distinct from files.
-    let files = tree(&["cmd/app/", "cmd/app/main.go", "store/", "store/store.go"]);
+fn go_imports_resolve_to_every_file_in_the_package() {
+    // A Go import names a package, which is a directory, so one import
+    // reaches every non-test source in it.
+    let files = tree(&[
+        "cmd/app/main.go",
+        "store/store.go",
+        "store/index.go",
+        "store/store_test.go",
+        "store/README.md",
+        "store/deep/deep.go",
+        "docs/store/notes.md",
+    ]);
     let known = |p: &str| files.contains(p);
+    let files_in = |dir: &str| files_under(&files, dir);
 
     assert_eq!(
         resolve_import(
             Lang::Go,
             "cmd/app/main.go",
             "example.com/demo/store",
-            &known
+            &known,
+            &files_in
         ),
-        vec!["store/"]
+        vec!["store/index.go", "store/store.go"]
     );
-    assert!(resolve_import(Lang::Go, "cmd/app/main.go", "fmt", &known).is_empty());
-    assert!(resolve_import(Lang::Go, "cmd/app/main.go", "golang.org/x/sync", &known).is_empty());
+    // A nested package resolves on its own, not through its parent.
+    assert_eq!(
+        resolve_import(
+            Lang::Go,
+            "cmd/app/main.go",
+            "example.com/demo/store/deep",
+            &known,
+            &files_in
+        ),
+        vec!["store/deep/deep.go"]
+    );
+    // A directory that matches by name but holds no Go sources is not the
+    // package, and the search continues to one that is.
+    let prose = tree(&[
+        "cmd/app/main.go",
+        "cmd/app/notes/notes.go",
+        "docs/notes/notes.md",
+        "notes/README.md",
+    ]);
+    assert_eq!(
+        resolve_import(
+            Lang::Go,
+            "cmd/app/main.go",
+            "example.com/demo/notes",
+            &|p: &str| prose.contains(p),
+            &|dir: &str| files_under(&prose, dir)
+        ),
+        vec!["cmd/app/notes/notes.go"]
+    );
+    assert!(resolve_import(Lang::Go, "cmd/app/main.go", "fmt", &known, &files_in).is_empty());
+    assert!(resolve_import(
+        Lang::Go,
+        "cmd/app/main.go",
+        "golang.org/x/sync",
+        &known,
+        &files_in
+    )
+    .is_empty());
+    // Nothing this crate returns is ever a directory.
+    for path in resolve_import(
+        Lang::Go,
+        "cmd/app/main.go",
+        "example.com/demo/store",
+        &known,
+        &files_in,
+    ) {
+        assert!(!path.ends_with('/'), "{path} is a directory");
+        assert!(known(&path), "{path} is not a file in the tree");
+    }
 }
 
 // ── Markdown mentions ───────────────────────────────────────────────────────

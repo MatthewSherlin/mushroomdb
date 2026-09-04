@@ -105,17 +105,25 @@ fn receiver_type(raw: &str) -> String {
 
 // ── resolution ──────────────────────────────────────────────────────────────
 
-/// Resolve a Go import path to the package **directory** it names, with a
-/// trailing `/`. See [`crate::resolve_import`] for why this is a directory
-/// rather than a file.
+/// Resolve a Go import path to every non-test `.go` file in the package
+/// directory it names.
+///
+/// A Go import names a package, and a package is a directory, so one import
+/// reaches every source file in it. `_test.go` files are excluded: they belong
+/// to the package's own test binary and are never what an importer reaches.
 ///
 /// The module prefix is stripped by trying successively shorter suffixes of
-/// the import path, longest first, so `example.com/demo/store` finds
-/// `store/` without anyone reading `go.mod`. Within one suffix the search
-/// starts at the working-tree root and moves inwards, which prefers the
-/// module's own layout over a same-named directory nested beside the
-/// importing file.
-pub(crate) fn resolve_import(from: &str, raw: &str, known: &dyn Fn(&str) -> bool) -> Vec<String> {
+/// the import path, longest first, so `example.com/demo/store` finds `store/`
+/// without anyone reading `go.mod`. Within one suffix the search starts at the
+/// working-tree root and moves inwards, which prefers the module's own layout
+/// over a same-named directory nested beside the importing file. A directory
+/// with no non-test Go sources is not a package, so the search continues past
+/// it.
+pub(crate) fn resolve_import(
+    from: &str,
+    raw: &str,
+    files_in: &dyn Fn(&str) -> Vec<String>,
+) -> Vec<String> {
     let segments: Vec<&str> = raw.split('/').filter(|seg| !seg.is_empty()).collect();
     if segments.is_empty() {
         return Vec::new();
@@ -130,18 +138,35 @@ pub(crate) fn resolve_import(from: &str, raw: &str, known: &dyn Fn(&str) -> bool
             if dir.is_empty() {
                 continue;
             }
-            let probe = format!("{dir}/");
-            if known(&probe) {
-                return vec![probe];
+            let mut sources: Vec<String> = files_in(&dir)
+                .into_iter()
+                .filter(|path| is_package_source(path))
+                .collect();
+            if !sources.is_empty() {
+                sources.sort();
+                sources.dedup();
+                return sources;
             }
         }
     }
     Vec::new()
 }
 
+/// A Go source that belongs to the package proper, not to its test binary.
+fn is_package_source(path: &str) -> bool {
+    path.ends_with(".go") && !path.ends_with("_test.go")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_files_are_not_package_sources() {
+        assert!(is_package_source("store/store.go"));
+        assert!(!is_package_source("store/store_test.go"));
+        assert!(!is_package_source("store/README.md"));
+    }
 
     #[test]
     fn receivers_reduce_to_a_bare_type_name() {
