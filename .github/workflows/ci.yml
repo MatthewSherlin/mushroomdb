@@ -234,3 +234,16 @@ jobs:
           set -euo pipefail
           python3 benchmarks/ci/compare.py results.json benchmarks/baselines/ci.json \
             --threshold 0.15
+
+  plugin-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Major pinned: a schema change in a new major should fail this job
+      # loudly rather than silently pass on a moved goalpost.
+      - run: npm i -g @anthropic-ai/claude-code@2
+      - run: claude plugin validate packaging/plugin --strict
+      - run: bash scripts/render-plugin.sh --check

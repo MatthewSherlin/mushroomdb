@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mushroomdb": {
+      "command": "npx",
+      "args": ["-y", "mushroomdb@0.5.2", "mcp", "--auto"]
+    }
+  }
+}
