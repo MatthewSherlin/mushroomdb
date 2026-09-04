@@ -3,7 +3,7 @@ name: mushroom
 description: Live code graph for this repo: what changes together, who owns what, why two things are linked (with the commits and lines that prove it), 360° context on any symbol, durable notes. Trigger on: impact, blast radius, who owns, why related, what imports, what calls, co-change, history of, remember, recall, map of the codebase.
 ---
 
-# /mushroom
+# /mushroom:mushroom
 
 > **Alpha.** Local only. No data leaves your machine.
 
@@ -55,7 +55,7 @@ None of these replace the calls above. They add context; the tools answer.
 
 ## Learn
 
-The `learn` pass — `/mushroom learn <path>` — turns prose (design docs, ADRs, READMEs) into `Concept` nodes the graph can keep honest.
+The `learn` pass — `/mushroom:mushroom learn <path>` — turns prose (design docs, ADRs, READMEs) into `Concept` nodes the graph can keep honest.
 
 Per run: **at most 20 documents**. Per document: **at most 5 concepts**. One concept is one idea somebody could ask about by name.
 

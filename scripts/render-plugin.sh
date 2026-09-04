@@ -44,6 +44,30 @@ render_file() {
       "$src" > "$dest"
 }
 
+# render_skill <dest>
+#
+# Same as render_file, plus a plugin-only fixup: the shared skill template
+# names its own invocation as `/mushroom` (correct for a `mushroomdb install`
+# project/user skill, invoked bare) but a plugin skill is namespaced by
+# Claude Code as `/<plugin-name>:<skill-name>` — verified empirically against
+# a live `claude --plugin-dir` session, where a plugin named "mushroom" with
+# a skill named "mushroom" registers only as `mushroom:mushroom`, never bare.
+# The shared source file is left untouched (the npx/install path still wants
+# `/mushroom`); only the rendered plugin copy gets the two exact strings that
+# name the invocation corrected. This must stay exact-string, not a blanket
+# `s|/mushroom|...|g` — the same render also substitutes {{DB_PATH}} to
+# `./mushroom-memory`, and a blanket pattern would mangle that into
+# `./mushroom:mushroom-memory`.
+render_skill() {
+  local src="$1" dest="$2"
+  render_file "$src" "$dest"
+  sed -i.bak \
+      -e 's|^# /mushroom$|# /mushroom:mushroom|' \
+      -e 's|`/mushroom learn <path>`|`/mushroom:mushroom learn <path>`|' \
+      "$dest"
+  rm -f "$dest.bak"
+}
+
 if [[ "$CHECK" -eq 1 ]]; then
   OUT="$(mktemp -d)"
   trap 'rm -rf "$OUT"' EXIT
@@ -54,7 +78,6 @@ fi
 mkdir -p \
   "$OUT/packaging/plugin/.claude-plugin" \
   "$OUT/packaging/plugin/skills/mushroom" \
-  "$OUT/packaging/plugin/commands" \
   "$OUT/packaging/plugin/hooks" \
   "$OUT/.claude-plugin"
 
@@ -65,15 +88,13 @@ FILES=(
   "packaging/plugin/hooks/hooks.json"
   ".claude-plugin/marketplace.json"
   "packaging/plugin/skills/mushroom/SKILL.md"
-  "packaging/plugin/commands/mushroom.md"
 )
 
 render_file "$TEMPLATES/plugin.json.tmpl"                     "$OUT/packaging/plugin/.claude-plugin/plugin.json"
 render_file "$TEMPLATES/mcp.json.tmpl"                        "$OUT/packaging/plugin/.mcp.json"
 render_file "$TEMPLATES/hooks.json.tmpl"                      "$OUT/packaging/plugin/hooks/hooks.json"
 render_file "$TEMPLATES/marketplace.json.tmpl"                "$OUT/.claude-plugin/marketplace.json"
-render_file "$ROOT/crates/cli/skills/mushroom/SKILL.md"       "$OUT/packaging/plugin/skills/mushroom/SKILL.md"
-render_file "$TEMPLATES/command-mushroom.md.tmpl"             "$OUT/packaging/plugin/commands/mushroom.md"
+render_skill "$ROOT/crates/cli/skills/mushroom/SKILL.md"      "$OUT/packaging/plugin/skills/mushroom/SKILL.md"
 
 if [[ "$CHECK" -eq 1 ]]; then
   fail=0
