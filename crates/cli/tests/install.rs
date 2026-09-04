@@ -1188,3 +1188,99 @@ fn a_different_native_binary_first_on_path_shadows_us_so_we_copy() {
         "PATH resolves to a binary that is not us, so name the copy explicitly"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test: the git post-commit hook block — writing it twice must be a no-op, and
+//       removing it must leave a user's own hook lines exactly as they were.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
+    use cli::install::{git_hook_block, merge_git_hook, remove_git_hook};
+
+    let dir = temp_dir("git-hook");
+    let db = dir.join("mushroom memory"); // a space, so quoting has to work
+
+    // The block is a marked, self-contained fragment that backgrounds a sync.
+    let block = git_hook_block("mushroomdb", &db.to_string_lossy());
+    assert!(block.starts_with("# >>> mushroomdb >>>\n"), "{block}");
+    assert!(block.ends_with("# <<< mushroomdb <<<\n"), "{block}");
+    assert!(block.contains(" sync "), "{block}");
+    assert!(
+        block.contains(&format!("'{}'", db.display())),
+        "the db path must be shell-quoted: {block}"
+    );
+    assert!(block.contains(">/dev/null 2>&1 &"), "{block}");
+
+    // 1. No hook file yet: one is created, with a shebang, and executable.
+    let hook = dir.join("hooks").join("post-commit");
+    assert!(merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    let created = fs::read_to_string(&hook).unwrap();
+    assert!(created.starts_with("#!/bin/sh\n"), "{created}");
+    assert!(created.contains(&block), "{created}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&hook).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "a git hook has to be executable"
+        );
+    }
+
+    // 2. Idempotent: a second merge changes nothing at all.
+    assert!(
+        !merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy()).unwrap(),
+        "the block is already there"
+    );
+    assert_eq!(fs::read_to_string(&hook).unwrap(), created);
+
+    // 3. Removal deletes the file we created, since nothing of the user's is
+    //    left in it.
+    assert!(remove_git_hook(&hook).unwrap());
+    assert!(!hook.exists(), "an empty hook of ours is removed entirely");
+    assert!(!remove_git_hook(&hook).unwrap(), "already gone");
+
+    // 4. A hook the user wrote: our block is appended, then removed, and their
+    //    file comes back byte-for-byte.
+    let user_hook = dir.join("hooks").join("pre-commit");
+    let user_text = "#!/usr/bin/env bash\nset -eu\nmake lint\n";
+    fs::write(&user_hook, user_text).unwrap();
+
+    assert!(merge_git_hook(&user_hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    let merged = fs::read_to_string(&user_hook).unwrap();
+    assert!(merged.starts_with(user_text), "user lines lead: {merged}");
+    assert!(merged.contains(&block), "{merged}");
+
+    // Idempotent over a user file too.
+    assert!(!merge_git_hook(&user_hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    assert_eq!(fs::read_to_string(&user_hook).unwrap(), merged);
+
+    assert!(remove_git_hook(&user_hook).unwrap());
+    assert_eq!(
+        fs::read_to_string(&user_hook).unwrap(),
+        user_text,
+        "the user's hook must survive removal unchanged"
+    );
+    assert!(
+        !remove_git_hook(&user_hook).unwrap(),
+        "nothing of ours is left to remove"
+    );
+
+    // 5. Changing the database path rewrites the block in place rather than
+    //    stacking a second one.
+    let other = dir.join("other-memory");
+    assert!(merge_git_hook(&user_hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    assert!(merge_git_hook(&user_hook, "mushroomdb", &other.to_string_lossy()).unwrap());
+    let rewritten = fs::read_to_string(&user_hook).unwrap();
+    assert_eq!(
+        rewritten.matches("# >>> mushroomdb >>>").count(),
+        1,
+        "exactly one block: {rewritten}"
+    );
+    assert!(
+        rewritten.contains(&format!("'{}'", other.display())),
+        "{rewritten}"
+    );
+    assert!(rewritten.starts_with(user_text), "{rewritten}");
+}

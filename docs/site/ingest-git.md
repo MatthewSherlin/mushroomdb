@@ -335,6 +335,105 @@ containing a tab or a newline, and such a path is stored in that escaped form.
 A commit subject containing a `0x1e` or `0x1f` byte truncates or drops that one
 commit's `message`; the sha and the graph are unaffected.
 
+## Keeping it current: `sync` and `touch`
+
+`ingest-git` is the command you run. `sync` and `touch` are the two a hook runs,
+and neither takes a repository argument — both read it off the `GitSync` node,
+so a hook line carries only the database path and keeps working when the
+checkout moves.
+
+```
+mushroomdb sync <db-dir>
+mushroomdb touch <db-dir>|--auto [<file>...]
+```
+
+**`sync`** repeats the last `ingest-git` with the flags recorded on the marker
+(`--recurse-submodules`, `--prs`, `--no-structure`, `--no-docs`), then does the
+one thing `ingest-git` cannot: it re-extracts the paths the working tree has
+changed but not committed. Those are `git diff --name-only HEAD` plus
+`git ls-files --others --exclude-standard`, which the commit walk never sees,
+because an uncommitted edit is in no commit. Exclusion patterns are not stored
+on the marker, so `sync` applies the defaults; a database built with custom
+`--exclude` patterns should keep being maintained with `ingest-git`, which takes
+them. The dirty pass covers the root repository only — a submodule's working
+tree is its own checkout's business.
+
+Output names both halves:
+
+```
+ingest-git: 1 commit(s), 4 file(s), 1 author(s) (incremental)
+  scanned 1 file(s): 1 symbol(s), 0 import(s), 0 call(s), 0 mention(s)
+  dirty 1 path(s): scanned 1, 1 symbol(s), 0 import(s), 0 call(s)
+```
+
+`dirty` counts the paths handed to the working-tree pass; `scanned` counts those
+of them the graph actually knows and that are still files on disk, so an
+untracked file with no `File` node yet raises the first number and not the
+second. With nothing dirty, `sync` never enters a write scope at all: no lock is
+taken and `commit_seq` does not move.
+
+**`touch`** re-extracts exactly the files named and nothing else — one edit, one
+file read, one diff against what is stored. With no `<file>` arguments it reads
+them from a `PostToolUse` payload on stdin, taking `tool_input.file_path` and
+`tool_input.edits[].file_path`, so it works as the body of an editor hook.
+Relative paths resolve against the working directory and absolute ones are taken
+as given; both are then resolved through symlinks before being matched against
+the repository. Anything that is not a working-tree file this database knows —
+a path outside the repository, an excluded one, a file the graph has never seen —
+is dropped silently, and a payload that names nothing at all is a no-op rather
+than an error, because the hook fires on every edit the assistant makes and most
+of them are none of this database's business.
+
+`touch` does not delete: a file removed from disk keeps whatever the graph last
+recorded about it until the deletion is committed and a `sync` walks it.
+
+Both commands write, so both serialise on the store's write lock and both exit
+**3** with `another mushroomdb process is writing; retry` when another process
+holds it. That is the expected outcome of committing while an ingest is running,
+and a hook should ignore it: the next invocation picks the work up.
+
+Both report on stdout and stderr when run by hand, which is what you want at a
+terminal and not what you want from a hook. A hook line should redirect both
+away, the way the block below does — including the error a database that was
+never pointed at a repository returns, `store has no git sync marker; run
+ingest-git first`.
+
+### Cost
+
+The work itself is small — re-extracting one file of this repository takes about
+20 ms — but every invocation pays to open the database first, which replays the
+write-ahead log. On a 623-commit graph of this repository (396 files, 5,625
+symbols, a 7 MB log) that open is about 580 ms, so `touch` is about 600 ms end to
+end and `sync` about 1.2 s. Run both in the background from a hook.
+
+### Git hook
+
+`sync` is meant to be backgrounded and silenced, so a commit never waits on it:
+
+```sh
+# >>> mushroomdb >>>
+( 'mushroomdb' sync '/path/to/mushroom-memory' >/dev/null 2>&1 & )
+# <<< mushroomdb <<<
+```
+
+The markers make the block replaceable in place, so re-running the installer
+rewrites it rather than stacking a second copy, and removing it leaves every
+other line of the hook untouched.
+
+### Finding the database without being told
+
+`mcp`, `recall` and `touch` accept `--auto` in place of a path, which resolves,
+in order:
+
+1. `$CLAUDE_PROJECT_DIR/mushroom-memory` — the assistant says which project it
+   is working in, and that is the most specific answer available.
+2. `./mushroom-memory`, but only when the working directory is a git checkout.
+   Without that guard a command run from a home directory would quietly create a
+   database there.
+3. `~/.mushroomdb/memory`, the user-scope default `install` writes.
+
+`mushroomdb --version` (or `mushroomdb version`) prints `mushroomdb <version>`.
+
 ## Concurrency
 
 `ingest-git` takes the store's write lock for the duration of its write pass,

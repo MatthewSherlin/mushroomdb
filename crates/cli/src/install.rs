@@ -990,6 +990,176 @@ fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), CliError> {
 }
 
 // ---------------------------------------------------------------------------
+// Git hook block — `mushroomdb sync` after every commit
+// ---------------------------------------------------------------------------
+//
+// A git hook file belongs to the repository owner, not to us. Everything below
+// therefore edits one marked region and nothing else: the region is rewritten
+// in place when it changes, and removing it restores the user's lines exactly.
+// The pure text transforms are split out from the filesystem wrappers so the
+// merge and removal rules can be reasoned about — and tested — without a disk.
+
+/// Opening marker of the region this module owns inside a git hook.
+pub const HOOK_BEGIN: &str = "# >>> mushroomdb >>>";
+/// Closing marker of that region.
+pub const HOOK_END: &str = "# <<< mushroomdb <<<";
+/// Written as the first line when we create a hook file ourselves.
+const HOOK_SHEBANG: &str = "#!/bin/sh";
+
+/// The block a git hook runs: one backgrounded, silenced `sync`.
+///
+/// Backgrounded (`( … & )` in a subshell, so no job-control notice reaches the
+/// terminal) because a hook must not make `git commit` wait on a graph
+/// refresh, and silenced because a hook that prints — or fails — on a store
+/// that is momentarily busy would be noise on every commit. `sync` exits 3 when
+/// another process holds the write lock, and the next commit picks the work up.
+///
+/// Both interpolations are shell-quoted: a database under a path with a space
+/// in it would otherwise be word-split into two arguments.
+#[must_use]
+pub fn git_hook_block(bin_cmd: &str, db: &str) -> String {
+    format!(
+        "{HOOK_BEGIN}\n( {} sync {} >/dev/null 2>&1 & )\n{HOOK_END}\n",
+        sh_quote(bin_cmd),
+        sh_quote(db)
+    )
+}
+
+/// `text` with our marked region removed, or `None` when it holds none.
+///
+/// Blank lines left dangling at the end are dropped, so a merge followed by a
+/// removal returns the original bytes rather than the original plus the blank
+/// separator the merge inserted.
+fn strip_hook_block(text: &str) -> Option<String> {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut inside = false;
+    let mut found = false;
+    for line in text.lines() {
+        if !inside && line.trim_end() == HOOK_BEGIN {
+            inside = true;
+            found = true;
+            continue;
+        }
+        if inside {
+            if line.trim_end() == HOOK_END {
+                inside = false;
+            }
+            continue;
+        }
+        kept.push(line);
+    }
+    if !found {
+        return None;
+    }
+    while kept.last().is_some_and(|l| l.trim().is_empty()) {
+        kept.pop();
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// What the hook file should contain once `block` is in it.
+///
+/// Idempotent by construction: any existing region is stripped first and the
+/// fresh one appended, so a re-merge of the same block reproduces the same
+/// bytes and a merge of a *different* block rewrites in place instead of
+/// stacking a second region.
+fn merged_hook_text(existing: Option<&str>, block: &str) -> String {
+    let base = match existing {
+        None => String::new(),
+        Some(text) => strip_hook_block(text).unwrap_or_else(|| text.to_string()),
+    };
+    let mut lines: Vec<&str> = base.lines().collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    // A file we are creating needs an interpreter line; one the user wrote
+    // already has whichever they chose, and we must not add a second.
+    if lines.is_empty() {
+        lines.push(HOOK_SHEBANG);
+    }
+    let mut out = lines.join("\n");
+    out.push_str("\n\n");
+    out.push_str(block);
+    out
+}
+
+/// Whether `text` is nothing but an interpreter line — the shape a hook file we
+/// created is left in once our region is stripped out of it.
+fn only_a_shebang(text: &str) -> bool {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .all(|l| l.starts_with("#!"))
+}
+
+/// Put the sync block in `hook_file`, creating the file (mode 755, with a
+/// `#!/bin/sh` line) if it is not there. Returns whether anything changed.
+///
+/// Every line the user has in the file is preserved, and running this twice
+/// with the same arguments writes nothing the second time.
+pub fn merge_git_hook(hook_file: &Path, bin_cmd: &str, db: &str) -> Result<bool, CliError> {
+    let existing = if hook_file.exists() {
+        Some(
+            fs::read_to_string(hook_file)
+                .map_err(|e| CliError(format!("cannot read {}: {e}", hook_file.display())))?,
+        )
+    } else {
+        None
+    };
+    let next = merged_hook_text(existing.as_deref(), &git_hook_block(bin_cmd, db));
+    if existing.as_deref() == Some(next.as_str()) {
+        return Ok(false);
+    }
+    let parent = hook_file.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|e| CliError(format!("cannot create {}: {e}", parent.display())))?;
+    fs::write(hook_file, &next)
+        .map_err(|e| CliError(format!("cannot write {}: {e}", hook_file.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // git ignores a hook that is not executable, so this is not cosmetic.
+        fs::set_permissions(hook_file, fs::Permissions::from_mode(0o755)).map_err(|e| {
+            CliError(format!(
+                "cannot make {} executable: {e}",
+                hook_file.display()
+            ))
+        })?;
+    }
+    Ok(true)
+}
+
+/// Take the sync block back out of `hook_file`. Returns whether anything
+/// changed.
+///
+/// The file itself is deleted only when nothing but an interpreter line is
+/// left, which is exactly the state a hook *we* created is in — a hook the user
+/// wrote has their lines in it and is rewritten rather than removed. An empty
+/// stub of theirs would be deleted too, which git cannot tell apart from the
+/// stub never having existed.
+pub fn remove_git_hook(hook_file: &Path) -> Result<bool, CliError> {
+    if !hook_file.exists() {
+        return Ok(false);
+    }
+    let existing = fs::read_to_string(hook_file)
+        .map_err(|e| CliError(format!("cannot read {}: {e}", hook_file.display())))?;
+    let Some(next) = strip_hook_block(&existing) else {
+        return Ok(false); // none of it is ours; leave the file untouched
+    };
+    if only_a_shebang(&next) {
+        fs::remove_file(hook_file)
+            .map_err(|e| CliError(format!("cannot remove {}: {e}", hook_file.display())))?;
+        return Ok(true);
+    }
+    fs::write(hook_file, next)
+        .map_err(|e| CliError(format!("cannot write {}: {e}", hook_file.display())))?;
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
 

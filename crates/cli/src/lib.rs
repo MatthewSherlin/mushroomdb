@@ -42,6 +42,38 @@ const SAMPLE_EXPLAIN_B: &str = "proj-01";
 /// Build version, printed by `mushroomdb --version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The one line `--version` and the `version` subcommand print.
+#[must_use]
+pub fn version_string() -> String {
+    format!("mushroomdb {VERSION}")
+}
+
+/// Where `--auto` looks for a database, in order.
+///
+/// 1. `$CLAUDE_PROJECT_DIR/mushroom-memory` — the assistant tells a hook which
+///    project it is working in, and that is the most specific answer there is.
+/// 2. `<cwd>/mushroom-memory`, but only when the working directory is a git
+///    checkout. Without that guard a command run from a home directory would
+///    quietly create a store there.
+/// 3. `<home>/.mushroomdb/memory`, the user-scope default `install` writes.
+///
+/// The two project-scoped answers match [`install::InstallOpts::default_db`],
+/// so a hook with `--auto` finds the store `install --project` created.
+#[must_use]
+pub fn resolve_auto_db(
+    env_project_dir: Option<&std::ffi::OsStr>,
+    cwd: &Path,
+    home: &Path,
+) -> PathBuf {
+    if let Some(dir) = env_project_dir.filter(|d| !d.is_empty()) {
+        return Path::new(dir).join("mushroom-memory");
+    }
+    if cwd.join(".git").exists() {
+        return cwd.join("mushroom-memory");
+    }
+    home.join(".mushroomdb").join("memory")
+}
+
 /// How `serve` should mount a UI. Precedence: `--ui dir` > embedded > `--no-ui`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeUi {
@@ -84,7 +116,9 @@ pub enum Command {
         tls_key: Option<PathBuf>,
     },
     Mcp {
-        db_dir: PathBuf,
+        /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
+        db_dir: Option<PathBuf>,
+        auto: bool,
     },
     Stats {
         db_dir: PathBuf,
@@ -173,7 +207,20 @@ pub enum Command {
     /// Body of the Claude Code UserPromptSubmit hook: reads a prompt payload on
     /// stdin, prints related graph facts on stdout.
     Recall {
+        db_dir: Option<PathBuf>,
+        auto: bool,
+    },
+    /// Bring the store up to date with the repository the `GitSync` marker
+    /// names: the commits since the marker, then the dirty working tree.
+    Sync {
         db_dir: PathBuf,
+    },
+    /// Re-extract named files only. Body of the PostToolUse hook, which reads
+    /// the paths off a payload on stdin when none are given on the command line.
+    Touch {
+        db_dir: Option<PathBuf>,
+        auto: bool,
+        files: Vec<PathBuf>,
     },
     Version,
     Help,
@@ -224,10 +271,14 @@ Usage:
   mushroomdb install [--platform claude-code|cursor|all] [--project] [--db <path>]
   mushroomdb uninstall [--platform claude-code|cursor|all] [--project] [--db <path>]
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
-  mushroomdb mcp <db-dir>
+  mushroomdb mcp <db-dir>|--auto
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
-  mushroomdb recall <db-dir>       hook body: reads a prompt payload on stdin, prints related graph facts
+  mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
+  mushroomdb sync <db-dir>         re-sync the repo the store was built from: new commits, then the dirty working tree
+  mushroomdb touch <db-dir>|--auto [<file>...]
+                                   re-extract just these files; with no <file> reads them from a
+                                   PostToolUse payload on stdin (hook body)
   mushroomdb suggest <db-dir>
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
@@ -257,6 +308,8 @@ Usage:
 
 Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
 install defaults: --platform auto-detect, user scope (omit --project for ~/.mushroomdb/memory).
+--auto resolves the database as $CLAUDE_PROJECT_DIR/mushroom-memory, else ./mushroom-memory in a
+git checkout, else ~/.mushroomdb/memory.
 "
 }
 
@@ -399,7 +452,9 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "--help" | "-h" | "help" => Ok(Command::Help),
         "--version" | "-V" | "version" => Ok(Command::Version),
         "serve" => parse_serve(&args[1..]),
-        "mcp" => parse_one_dir("mcp", &args[1..]).map(|db_dir| Command::Mcp { db_dir }),
+        "mcp" => {
+            parse_dir_or_auto("mcp", &args[1..]).map(|(db_dir, auto)| Command::Mcp { db_dir, auto })
+        }
         "stats" => parse_one_dir("stats", &args[1..]).map(|db_dir| Command::Stats { db_dir }),
         "demo" => parse_one_dir("demo", &args[1..]).map(|db_dir| Command::Demo { db_dir }),
         "suggest" => parse_one_dir("suggest", &args[1..]).map(|db_dir| Command::Suggest { db_dir }),
@@ -412,7 +467,10 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
         "backup" => parse_backup(&args[1..]),
         "export" => parse_export(&args[1..]),
-        "recall" => parse_one_dir("recall", &args[1..]).map(|db_dir| Command::Recall { db_dir }),
+        "recall" => parse_dir_or_auto("recall", &args[1..])
+            .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
+        "sync" => parse_one_dir("sync", &args[1..]).map(|db_dir| Command::Sync { db_dir }),
+        "touch" => parse_touch(&args[1..]),
         "ingest-git" => parse_ingest_git(&args[1..]),
         "install" => parse_install_cmd(&args[1..]).map(Command::Install),
         "uninstall" => parse_install_cmd(&args[1..]).map(Command::Uninstall),
@@ -1302,6 +1360,61 @@ fn format_communities(report: &core_api::CommunityReport, top: usize) -> String 
     buf
 }
 
+/// `<db-dir>` or `--auto`, for the commands a hook line invokes.
+///
+/// Exactly one of the two: `--auto` says "work it out from the environment",
+/// which a stated path contradicts rather than refines.
+fn parse_dir_or_auto(cmd: &str, args: &[&str]) -> Result<(Option<PathBuf>, bool), String> {
+    let mut db_dir = None;
+    let mut auto = false;
+    for a in args {
+        if *a == "--auto" {
+            auto = true;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_some() {
+            return Err(format!("unexpected extra argument: {a}"));
+        } else {
+            db_dir = Some(PathBuf::from(*a));
+        }
+    }
+    match (&db_dir, auto) {
+        (Some(_), true) => Err(format!("{cmd}: --auto takes no <db-dir>")),
+        (None, false) => Err(format!("{cmd} requires <db-dir> or --auto")),
+        _ => Ok((db_dir, auto)),
+    }
+}
+
+/// `touch [<db-dir>|--auto] [<file>...]`. The first positional is the database
+/// unless `--auto` already named it, in which case every positional is a file.
+fn parse_touch(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir = None;
+    let mut auto = false;
+    let mut files = Vec::new();
+    for a in args {
+        if *a == "--auto" {
+            auto = true;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_none() && !auto {
+            db_dir = Some(PathBuf::from(*a));
+        } else {
+            files.push(PathBuf::from(*a));
+        }
+    }
+    if db_dir.is_none() && !auto {
+        return Err("touch requires <db-dir> or --auto".into());
+    }
+    if db_dir.is_some() && auto {
+        return Err("touch: --auto takes no <db-dir>".into());
+    }
+    Ok(Command::Touch {
+        db_dir,
+        auto,
+        files,
+    })
+}
+
 fn parse_one_dir(cmd: &str, args: &[&str]) -> Result<PathBuf, String> {
     let mut db_dir = None;
     for a in args {
@@ -1958,8 +2071,9 @@ mod tests {
             Case {
                 args: &["mcp", "/tmp/demo-db"],
                 check: |r| match r {
-                    Ok(Command::Mcp { db_dir }) => {
-                        assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
+                    Ok(Command::Mcp { db_dir, auto }) => {
+                        assert_eq!(db_dir, Some(PathBuf::from("/tmp/demo-db")));
+                        assert!(!auto);
                     }
                     other => panic!("mcp <dir>, got {other:?}"),
                 },
@@ -3013,11 +3127,84 @@ mod tests {
         assert_eq!(
             parse_args(&["recall", "/tmp/db"]).unwrap(),
             Command::Recall {
+                db_dir: Some(PathBuf::from("/tmp/db")),
+                auto: false,
+            }
+        );
+        assert!(
+            parse_args(&["recall"]).is_err(),
+            "one of <db-dir> or --auto is required"
+        );
+        assert!(usage().contains("mushroomdb recall <db-dir>"));
+    }
+
+    /// Every hook-driven command takes either a path or `--auto`, never both
+    /// and never neither.
+    #[test]
+    fn hook_commands_take_a_dir_or_auto() {
+        assert_eq!(
+            parse_args(&["mcp", "--auto"]).unwrap(),
+            Command::Mcp {
+                db_dir: None,
+                auto: true
+            }
+        );
+        assert_eq!(
+            parse_args(&["recall", "--auto"]).unwrap(),
+            Command::Recall {
+                db_dir: None,
+                auto: true
+            }
+        );
+        for cmd in ["mcp", "recall", "touch"] {
+            assert!(parse_args(&[cmd]).is_err(), "{cmd} with no target");
+            assert!(
+                parse_args(&[cmd, "/tmp/db", "--auto"]).is_err(),
+                "{cmd} with both"
+            );
+        }
+        assert!(usage().contains("--auto"));
+    }
+
+    #[test]
+    fn sync_and_touch_parse() {
+        assert_eq!(
+            parse_args(&["sync", "/tmp/db"]).unwrap(),
+            Command::Sync {
                 db_dir: PathBuf::from("/tmp/db")
             }
         );
-        assert!(parse_args(&["recall"]).is_err(), "db-dir is required");
-        assert!(usage().contains("mushroomdb recall <db-dir>"));
+        assert!(parse_args(&["sync"]).is_err(), "db-dir is required");
+
+        // Positional form: the first path is the database, the rest are files.
+        assert_eq!(
+            parse_args(&["touch", "/tmp/db", "src/a.rs", "src/b.rs"]).unwrap(),
+            Command::Touch {
+                db_dir: Some(PathBuf::from("/tmp/db")),
+                auto: false,
+                files: vec![PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")],
+            }
+        );
+        // With --auto every positional is a file.
+        assert_eq!(
+            parse_args(&["touch", "--auto", "src/a.rs"]).unwrap(),
+            Command::Touch {
+                db_dir: None,
+                auto: true,
+                files: vec![PathBuf::from("src/a.rs")],
+            }
+        );
+        // No files at all is the hook form: the paths arrive on stdin.
+        assert_eq!(
+            parse_args(&["touch", "--auto"]).unwrap(),
+            Command::Touch {
+                db_dir: None,
+                auto: true,
+                files: vec![],
+            }
+        );
+        assert!(usage().contains("mushroomdb sync <db-dir>"));
+        assert!(usage().contains("mushroomdb touch"));
     }
 
     #[test]

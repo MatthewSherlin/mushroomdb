@@ -224,8 +224,10 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb install [--platform claude-code\|cursor\|all] [--project] [--db <path>]` | Write the `/mushroom` skill + MCP server entry for Claude Code or Cursor. Auto-detects platform |
 | `mushroomdb uninstall [--platform …] [--project] [--db <path>]` | Remove exactly what `install` wrote (manifest-driven; leaves user files) |
 | `mushroomdb ingest-git <dir> <repo> [--exclude <pattern>]...` | Graph a git repository: `Author`, `Commit`, `File` nodes plus `CO_CHANGED` and `KNOWS` rules. Re-run to sync. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
-| `mushroomdb recall <dir>` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin, prints related graph facts. Wired automatically by `install` |
-| `mushroomdb mcp <dir>` | Start a stdio MCP JSON-RPC server for agent tools |
+| `mushroomdb sync <dir>` | Re-sync the repository the store was built from: new commits, then the working tree where it differs from `HEAD`. Takes no repo argument — reads it off the graph |
+| `mushroomdb touch <dir>\|--auto [<file>...]` | Re-extract just these files. With no `<file>` reads them from a `PostToolUse` payload on stdin (hook body) |
+| `mushroomdb recall <dir>\|--auto` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin, prints related graph facts. Wired automatically by `install` |
+| `mushroomdb mcp <dir>\|--auto` | Start a stdio MCP JSON-RPC server for agent tools |
 | `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
 | `mushroomdb serve <dir>` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`) |
 | `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted) |

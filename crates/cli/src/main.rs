@@ -29,19 +29,50 @@ fn main() -> ExitCode {
             print!("{}", usage());
             ExitCode::SUCCESS
         }
-        Ok(Command::Recall { db_dir }) => {
+        Ok(Command::Recall { db_dir, auto }) => {
             let mut raw = String::new();
             let _ = io::stdin().read_to_string(&mut raw);
             // Not `print!`: that panics on EPIPE (exit 101) if the hook runner
             // closes the pipe. Every write error is swallowed instead.
-            let digest = cli::recall::run_recall(&db_dir, &raw);
+            let digest = cli::recall::run_recall(&resolve_db(db_dir, auto), &raw);
             let mut stdout = io::stdout();
             let _ = stdout.write_all(digest.as_bytes());
             let _ = stdout.flush();
             ExitCode::SUCCESS // never block the prompt
         }
+        Ok(Command::Sync { db_dir }) => match cli::ingest_git::run_sync(&db_dir) {
+            Ok(report) => {
+                print!("{}", cli::ingest_git::format_sync(&report));
+                ExitCode::SUCCESS
+            }
+            Err(e) => busy_aware(&e),
+        },
+        Ok(Command::Touch {
+            db_dir,
+            auto,
+            files,
+        }) => {
+            // Only read stdin when there is nothing on the command line: a hook
+            // pipes a payload, a person does not, and blocking a person's
+            // terminal on a read that will never end is the worse failure.
+            let payload = if files.is_empty() {
+                let mut raw = String::new();
+                let _ = io::stdin().read_to_string(&mut raw);
+                Some(raw)
+            } else {
+                None
+            };
+            match cli::ingest_git::run_touch(&resolve_db(db_dir, auto), &files, payload.as_deref())
+            {
+                Ok(report) => {
+                    print!("{}", cli::ingest_git::format_touch(&report));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => busy_aware(&e),
+            }
+        }
         Ok(Command::Version) => {
-            println!("mushroomdb {}", cli::VERSION);
+            println!("{}", cli::version_string());
             ExitCode::SUCCESS
         }
         Ok(Command::IngestGit { db_dir, opts }) => {
@@ -50,17 +81,7 @@ fn main() -> ExitCode {
                     print!("{}", cli::ingest_git::format_ingest_git(&report));
                     ExitCode::SUCCESS
                 }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    // Exit 3 is "the store is busy, nothing was written" — a
-                    // caller (a git hook, a retry loop) can act on that without
-                    // parsing the message.
-                    if e.0 == cli::ingest_git::BUSY_MESSAGE {
-                        ExitCode::from(3)
-                    } else {
-                        ExitCode::FAILURE
-                    }
-                }
+                Err(e) => busy_aware(&e),
             }
         }
         Ok(Command::Serve {
@@ -130,7 +151,7 @@ fn main() -> ExitCode {
                 tls_key,
             ))
         }
-        Ok(Command::Mcp { db_dir }) => exit(run_mcp(db_dir)),
+        Ok(Command::Mcp { db_dir, auto }) => exit(run_mcp(resolve_db(db_dir, auto))),
         Ok(Command::Stats { db_dir }) => match read_stats(&db_dir) {
             Ok(stats) => {
                 print!("{}", format_stats(&stats));
@@ -294,6 +315,33 @@ fn exit(r: Result<(), String>) -> ExitCode {
 fn fail(msg: &str) -> ExitCode {
     let _ = writeln!(io::stderr(), "{msg}");
     ExitCode::from(1)
+}
+
+/// Report a store-writing command's failure, distinguishing "busy" from the
+/// rest. Exit 3 is "the store is busy, nothing was written" — a caller (a git
+/// hook, a retry loop) can act on that without parsing the message.
+fn busy_aware(e: &cli::CliError) -> ExitCode {
+    let _ = writeln!(io::stderr(), "error: {e}");
+    if e.0 == cli::ingest_git::BUSY_MESSAGE {
+        ExitCode::from(3)
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// The database a `<db-dir>`-or-`--auto` command should use.
+fn resolve_db(db_dir: Option<PathBuf>, auto: bool) -> PathBuf {
+    match db_dir {
+        Some(dir) => dir,
+        None => {
+            debug_assert!(auto, "the parser rejects neither a dir nor --auto");
+            cli::resolve_auto_db(
+                std::env::var_os("CLAUDE_PROJECT_DIR").as_deref(),
+                &std::env::current_dir().unwrap_or_default(),
+                &home_dir(),
+            )
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
