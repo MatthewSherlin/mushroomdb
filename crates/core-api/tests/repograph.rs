@@ -171,6 +171,34 @@ fn map_stale_concepts_counted() {
     )
     .expect("restore hash");
     assert_eq!(repo_map(&db, &MapOptions::default()).stale_concepts, 1);
+
+    // A source file that has gone counts as changed: whatever the concept
+    // described is certainly not there any more.
+    db.delete_node(&file_key(0, 0)).expect("delete the source");
+    assert_eq!(repo_map(&db, &MapOptions::default()).stale_concepts, 2);
+
+    // So do lists that do not pair up — a second source with no second hash
+    // has nothing vouching for it, however well the first one checks out.
+    db.set_prop(
+        "concept:startup",
+        "source_files",
+        core_api::Value::List(vec![
+            core_api::Value::Str(file_key(0, 1)),
+            core_api::Value::Str(file_key(0, 2)),
+        ]),
+    )
+    .expect("two sources");
+    db.set_prop(
+        "concept:startup",
+        "source_hashes",
+        core_api::Value::List(vec![core_api::Value::Str(hash_of(&file_key(0, 1)))]),
+    )
+    .expect("one hash");
+    assert_eq!(
+        repo_map(&db, &MapOptions::default()).stale_concepts,
+        2,
+        "the unpaired source keeps the concept stale even though the paired one matches"
+    );
 }
 
 #[test]
@@ -213,8 +241,12 @@ fn map_render_is_at_most_40_lines_and_deterministic() {
         text.contains("1 concept needs re-learning (source changed)"),
         "the stale concept is reported:\n{text}"
     );
-    // Two decimals for cohesion, three for the PageRank scores the layout pins.
+    // Every float renders at two decimals, cohesion and PageRank alike.
     assert!(text.contains("cohesion 1.00"), "{text}");
+    assert!(
+        text.contains("src/core/c00.rs 0.28"),
+        "key-file scores carry two decimals:\n{text}"
+    );
     assert!(
         text.contains("who owns src/core?"),
         "the ownership question names a directory:\n{text}"

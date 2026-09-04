@@ -213,9 +213,12 @@ fn rank<T: PartialOrd + Copy>(items: &mut [(String, T)]) {
 
 /// Summarise the repository the store was built from.
 ///
-/// Deterministic: given the same store and options the result is identical,
-/// timestamps included, because "now" comes from the graph rather than a
-/// clock. See the module docs for what each section means.
+/// Deterministic for the same store state *and* the same
+/// [`MapOptions::now_ts`]: every collection is sorted, ties break on the key,
+/// and every section but one is decided by the graph alone. The exception is
+/// [`SyncInfo::age_secs`], which without a `now_ts` is measured against the
+/// system clock and so moves between runs. See the module docs for what each
+/// section means and why that one reads a clock.
 #[must_use]
 pub fn repo_map<F: Fs>(db: &GraphDb<F>, opts: &MapOptions) -> RepoMap {
     let deadline =
@@ -524,14 +527,25 @@ fn power_iteration(
 }
 
 /// Concepts whose recorded source hashes no longer match the files they were
-/// learned from. A source file that has since been deleted counts as changed:
-/// what the concept describes is certainly no longer there.
+/// learned from.
+///
+/// Three things count as changed, because in all three the concept can no
+/// longer be trusted to describe what is there:
+///
+/// - a `source_files` entry whose `File` now hashes to something else;
+/// - a `source_files` entry with no `File` behind it at all, deleted or never
+///   written;
+/// - lists of unequal length, where a source has no hash to check it against
+///   or a hash has no source. Nothing pairs them, so nothing vouches for them.
 fn stale_concepts<F: Fs>(db: &GraphDb<F>) -> usize {
     db.nodes_with_label("Concept")
         .iter()
         .filter(|c| {
             let files = str_list(c.prop("source_files"));
             let hashes = str_list(c.prop("source_hashes"));
+            if files.len() != hashes.len() {
+                return true;
+            }
             files
                 .iter()
                 .zip(hashes.iter())

@@ -1246,12 +1246,6 @@ fn parse_algo_dir(val: &str) -> Result<AlgoDir, String> {
     }
 }
 
-/// Run a graph algorithm and return a formatted string.
-///
-/// `dir` selects the edge direction for `degree` and `pagerank`; `wcc` and
-/// `communities` are always undirected and ignore it. `edge_types` /
-/// `weight_prop` / `min_weight` are used by `communities` only.
-#[allow(clippy::too_many_arguments)]
 /// Body of `mushroomdb map <db-dir> [--json]`.
 ///
 /// Opens read-only, with both write paths off: a map is a question, and asking
@@ -1276,6 +1270,12 @@ pub fn run_map(db_dir: &Path, json: bool) -> Result<String, CliError> {
     Ok(repograph::render_map(&map))
 }
 
+/// Run a graph algorithm and return a formatted string.
+///
+/// `dir` selects the edge direction for `degree` and `pagerank`; `wcc` and
+/// `communities` are always undirected and ignore it. `edge_types` /
+/// `weight_prop` / `min_weight` are used by `communities` only.
+#[allow(clippy::too_many_arguments)]
 pub fn run_algo(
     db_dir: &Path,
     subcmd: &AlgoSubcmd,

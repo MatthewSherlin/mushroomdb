@@ -1160,9 +1160,12 @@ pub const SYNCED_AT: &str = "synced_at";
 ///
 /// Props are written only where they differ, so a run that touches one unit
 /// does not churn the markers of the others — and a run that changes nothing
-/// writes nothing at all, [`SYNCED_AT`] included. The stamp therefore means
-/// "when this store last took something new", which is what a reader wants
-/// from it; a no-op re-run leaving it alone is the point, not a gap.
+/// writes nothing at all, [`SYNCED_AT`] included.
+///
+/// The stamp therefore means "when this run last changed this marker": a new
+/// head, or a flag ingested differently from last time. A no-op re-run leaving
+/// it alone is the point rather than a gap — a graph that had nothing to take
+/// is not staler for having checked.
 fn write_marker(w: &mut WriteGuard<'_>, p: &Pending, opts: &IngestGitOpts) -> Result<(), CliError> {
     let Some(head) = p.head.as_deref() else {
         return Ok(()); // no commits, so nothing to resume from

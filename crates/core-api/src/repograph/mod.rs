@@ -6,13 +6,15 @@
 //! same answer serves a CLI, an HTTP response and an MCP tool without being
 //! computed three ways.
 //!
-//! Two rules hold across every tool here. The output is **deterministic**:
-//! collections are sorted, ties break on the key, floats print at a fixed
-//! precision, and "now" is read from the graph rather than from a clock. And
-//! every string that came out of the graph passes through
-//! [`sanitize`](render::sanitize) before it reaches a rendered line, so
-//! repository content cannot forge a header or a line break in an assistant's
-//! context.
+//! Two rules hold across every tool here. The output is **deterministic** for
+//! the same store state and the same caller-supplied "now": collections are
+//! sorted, ties break on the key, floats print at a fixed precision, and every
+//! answer is decided by the graph. The one value that is not is how long ago
+//! the store was synced, which is measured against the system clock unless the
+//! caller pins the time — see [`MapOptions::now_ts`]. And every string that
+//! came out of the graph passes through [`sanitize`](render::sanitize) before
+//! it reaches a rendered line, so repository content cannot forge a header or a
+//! line break in an assistant's context.
 
 mod map;
 pub mod render;

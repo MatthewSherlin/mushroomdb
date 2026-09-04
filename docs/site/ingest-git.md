@@ -481,8 +481,10 @@ state, and a rename whose node already moved finds nothing to move.
 `mushroomdb map <db-dir>` reads the graph back as one screen: the size of the
 repository, the groups of files that change and import together, the files
 everything else leans on, who owns them, what has moved lately, and three
-questions the graph can answer well. Nothing is read from disk and no clock is
-consulted, so the same store always prints the same bytes.
+questions the graph can answer well. Nothing is read from disk: every line
+comes out of the graph, so an unchanged store prints the same bytes from one
+run to the next except for the sync age, which is the one thing measured
+against the system clock.
 
 ```
 mushroomdb map ~/.mushroomdb/code

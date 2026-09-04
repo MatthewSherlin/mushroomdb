@@ -21,6 +21,11 @@
 //! first three files of one directory plus one rotating other, so `CO_CHANGED`
 //! reinforces the same three groups.
 
+// Every integration test is its own crate and includes this file as a private
+// module, so whatever one suite does not call is dead code in that suite's
+// build. The fixture is shared, so that is expected rather than a warning.
+#![allow(dead_code)]
+
 use core_api::{default_max_edges, Direction, GraphDb, Predicate, RuleDef, Value};
 use std::path::{Path, PathBuf};
 

@@ -261,10 +261,13 @@ pub fn render_map(m: &RepoMap) -> String {
 
     if !m.key_files.is_empty() {
         out.push_str("key files (most depended-on)\n");
+        // Two decimals, like every other float here. A PageRank score is a
+        // ranking, and the order it is printed in already carries that; the
+        // number is there for the gap between one file and the next.
         let items: Vec<String> = m
             .key_files
             .iter()
-            .map(|(k, s)| format!("{} {s:.3}", sanitize(k)))
+            .map(|(k, s)| format!("{} {s:.2}", sanitize(k)))
             .collect();
         let _ = writeln!(out, "  {}", items.join(SEP));
     }
