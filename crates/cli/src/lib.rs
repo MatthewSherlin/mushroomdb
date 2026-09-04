@@ -58,7 +58,7 @@ pub fn version_string() -> String {
 ///    quietly create a store there.
 /// 3. `<home>/.mushroomdb/memory`, the user-scope default `install` writes.
 ///
-/// The two project-scoped answers match [`install::InstallOpts::default_db`],
+/// The two project-scoped answers match [`install::default_db`],
 /// so a hook with `--auto` finds the store `install --project` created.
 #[must_use]
 pub fn resolve_auto_db(
@@ -303,8 +303,9 @@ pub fn usage() -> &'static str {
 mushroomdb — embedded graph database
 
 Usage:
-  mushroomdb install [--platform claude-code|cursor|all] [--project] [--db <path>]
-  mushroomdb uninstall [--platform claude-code|cursor|all] [--project] [--db <path>]
+  mushroomdb install [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
+                     [--command <path>] [--no-git-hooks] [--no-prewarm]
+  mushroomdb uninstall [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
   mushroomdb mcp <db-dir>|--auto
   mushroomdb stats <db-dir>
@@ -352,7 +353,10 @@ Usage:
   mushroomdb --help
 
 Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
-install defaults: --platform auto-detect, user scope (omit --project for ~/.mushroomdb/memory).
+install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
+the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
+--command names one. --no-git-hooks skips the post-commit/checkout/merge sync hooks; --no-prewarm
+skips fetching the pinned package once.
 --auto resolves the database as $CLAUDE_PROJECT_DIR/mushroom-memory, else ./mushroom-memory in a
 git checkout, else ~/.mushroomdb/memory.
 "
@@ -360,8 +364,11 @@ git checkout, else ~/.mushroomdb/memory.
 
 fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
     let mut platform: Option<install::Platform> = None;
-    let mut project = false;
+    let mut scope: Option<install::Scope> = None;
     let mut db: Option<PathBuf> = None;
+    let mut command: Option<PathBuf> = None;
+    let mut git_hooks = true;
+    let mut prewarm = true;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -375,8 +382,34 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
         } else if let Some(val) = a.strip_prefix("--platform=") {
             platform = Some(install::Platform::parse(val)?);
             i += 1;
-        } else if a == "--project" {
-            project = true;
+        } else if a == "--project" || a == "--user" {
+            let want = if a == "--project" {
+                install::Scope::Project
+            } else {
+                install::Scope::User
+            };
+            // Two scopes name two different installs; picking one silently
+            // would put files somewhere the user did not ask for.
+            if scope.is_some_and(|s| s != want) {
+                return Err("--project and --user are mutually exclusive".to_string());
+            }
+            scope = Some(want);
+            i += 1;
+        } else if a == "--no-git-hooks" {
+            git_hooks = false;
+            i += 1;
+        } else if a == "--no-prewarm" {
+            prewarm = false;
+            i += 1;
+        } else if a == "--command" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --command".to_string())?;
+            command = Some(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--command=") {
+            command = Some(PathBuf::from(val));
             i += 1;
         } else if a == "--db" {
             let val = args
@@ -396,8 +429,11 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
     }
     Ok(install::InstallOpts {
         platform,
-        project,
+        scope,
         db,
+        command,
+        git_hooks,
+        prewarm,
     })
 }
 

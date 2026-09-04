@@ -1,13 +1,14 @@
-//! `mushroomdb install` / `uninstall` — wire the /mushroom skill and MCP
-//! server into Claude Code and Cursor.
+//! `mushroomdb install` / `uninstall` — wire the /mushroom skill, the MCP
+//! server, the prompt hooks and the git hooks into an assistant.
 //!
 //! # Design notes
 //!
-//! - No network: writes local config only; binary is already on disk.
 //! - Idempotent: running install twice is a no-op (exit 0).
 //! - Non-destructive: refuses to overwrite user files install didn't create.
-//! - Manifest-driven uninstall: tracks every file written; removes exactly
-//!   what install created.
+//! - Manifest-driven uninstall: tracks every file, key, hook, ignore line and
+//!   external registration it wrote; removes exactly that.
+//! - The only network access is the optional pre-warm, which is a best-effort
+//!   warm cache and never fails the install.
 //!
 //! # User-scope MCP config location (verified 2026-09-02 by live inspection)
 //!
@@ -15,13 +16,15 @@
 //! top-level `"mcpServers"` key. This was verified empirically on a live
 //! Claude Code install: `~/.claude/settings.json` holds env/permissions/hooks
 //! but NO mcpServers key. Cursor uses `~/.cursor/mcp.json` (same format as
-//! project-level `.cursor/mcp.json`).
+//! project-level `.cursor/mcp.json`). Codex keeps its own config and is
+//! written through the `codex` CLI rather than by editing a file.
 
 use crate::CliError;
 use serde::{Deserialize, Serialize};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 // Template files embedded at compile time. Files live inside the crates/cli
 // package so `cargo package` includes them in the published tarball.
@@ -32,8 +35,9 @@ const CURSOR_RULES_TEMPLATE: &str = include_str!("../skills/mushroom/cursor-rule
 /// Placeholder string replaced with the real db path in embedded templates.
 const DB_PATH_PLACEHOLDER: &str = "{{DB_PATH}}";
 
-/// Placeholder string replaced with the command that invokes mushroomdb —
-/// the bare name when it is on PATH, else the absolute path of the stable copy.
+/// Placeholder string replaced with the command that invokes mushroomdb.
+/// Substituted with [`McpCommand::shell`], which is already shell-quoted, so
+/// the templates must leave it unquoted.
 const BIN_PLACEHOLDER: &str = "{{BIN}}";
 
 /// The MCP server name we write. Must not be changed without a migration.
@@ -42,35 +46,123 @@ const SERVER_NAME: &str = "mushroomdb";
 /// The binary name looked up on PATH and used as the bare MCP command.
 const BIN_NAME: &str = "mushroomdb";
 
+/// The npm package the `npx` form runs. Same name as the binary.
+const NPM_PACKAGE: &str = "mushroomdb";
+
+/// The version an `npx` entry pins: the one that wrote it.
+const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long the optional pre-warm may take before it is abandoned. A cold
+/// `npx` download of a native package is slow on a slow link, and the whole
+/// point is to pay that cost here rather than at the assistant's first prompt.
+const PREWARM_TIMEOUT_SECS: u64 = 180;
+
+// ---------------------------------------------------------------------------
+// How the server is invoked
+// ---------------------------------------------------------------------------
+
 /// How the MCP server entry (and the skill's bootstrap commands) invoke
 /// mushroomdb.
 ///
-/// The assistant host spawns the MCP server by `command`; a bare name only
-/// works if it resolves on the host's PATH. `npx mushroomdb install` and a
-/// local `target/release` build both run install from a binary that is NOT
-/// on PATH, so writing the bare name silently produces a server that never
-/// connects. In that case we copy the running executable to a stable,
-/// install-owned location and write its absolute path instead.
+/// The assistant host spawns the MCP server by `command`, so that command has
+/// to resolve from *its* process, not from the shell install ran in. A bare
+/// name only works when it resolves on the host's PATH, and the one case where
+/// that is provable is when the `mushroomdb` PATH resolves to is this very
+/// executable. Everything else — npm's Node shim, a different build, a local
+/// `target/release` binary, no hit at all — pins the published package and
+/// lets `npx` fetch it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BinaryLocation {
-    /// `mushroomdb` resolves on PATH: write the bare name (upgrade-safe).
+pub enum McpCommand {
+    /// `npx -y mushroomdb@<version> …` — the default, and the only form that
+    /// works from a machine where nothing is installed globally.
+    Npx { version: String },
+    /// An absolute path the user named with `--command`.
+    Explicit(PathBuf),
+    /// `mushroomdb` resolves on PATH *and* is this executable: the bare name
+    /// is safe and follows upgrades.
     OnPath,
-    /// Not on PATH: copy this executable to `<home>/.mushroomdb/bin/mushroomdb`
-    /// and write that absolute path.
-    CopyFrom(PathBuf),
 }
 
-/// Decide how the MCP entry should invoke mushroomdb, from the real
-/// environment.
-pub fn detect_binary_location() -> BinaryLocation {
-    match std::env::current_exe() {
-        Ok(exe) => classify_binary_location(std::env::var_os("PATH").as_deref(), &exe),
-        // Cannot locate ourselves — fall back to the bare name rather than fail.
-        Err(_) => BinaryLocation::OnPath,
+impl McpCommand {
+    /// The `npx` form pinned to the version of the binary writing it.
+    #[must_use]
+    pub fn npx() -> Self {
+        McpCommand::Npx {
+            version: CRATE_VERSION.to_string(),
+        }
+    }
+
+    /// The program to exec and the arguments that come before the subcommand.
+    fn program(&self) -> (String, Vec<String>) {
+        match self {
+            McpCommand::Npx { version } => (
+                "npx".to_string(),
+                vec!["-y".to_string(), format!("{NPM_PACKAGE}@{version}")],
+            ),
+            McpCommand::Explicit(p) => (p.to_string_lossy().into_owned(), Vec::new()),
+            McpCommand::OnPath => (BIN_NAME.to_string(), Vec::new()),
+        }
+    }
+
+    /// The MCP server entry: `{"command": …, "args": [… , sub, db]}`.
+    ///
+    /// Nothing here is shell-quoted. An MCP host spawns the command with an
+    /// argv, so a path with a space in it is one element and quoting it would
+    /// make the quotes part of the filename.
+    #[must_use]
+    pub fn json_entry(&self, sub: &str, db: &str) -> serde_json::Value {
+        let (command, mut args) = self.program();
+        args.push(sub.to_string());
+        args.push(db.to_string());
+        serde_json::json!({ "command": command, "args": args })
+    }
+
+    /// The same invocation as a command *prefix* for a POSIX shell, already
+    /// quoted where quoting is needed.
+    ///
+    /// Hook entries and the skill's copy-paste lines are read by a shell, so
+    /// an explicit path has to survive a space in it. The bare name and the
+    /// `npx` form contain no metacharacters and are left as they read.
+    #[must_use]
+    pub fn shell(&self) -> String {
+        let (command, args) = self.program();
+        let mut out = match self {
+            McpCommand::Explicit(_) => sh_quote(&command),
+            _ => command,
+        };
+        for a in args {
+            out.push(' ');
+            out.push_str(&a);
+        }
+        out
+    }
+
+    /// The full argv, for handing to another CLI that registers servers.
+    fn argv(&self, sub: &str, db: &str) -> Vec<String> {
+        let (command, mut args) = self.program();
+        args.push(sub.to_string());
+        args.push(db.to_string());
+        let mut out = vec![command];
+        out.extend(args);
+        out
     }
 }
 
-/// Pure classifier behind [`detect_binary_location`]: decide whether the
+/// Decide how the MCP entry should invoke mushroomdb, from the options and the
+/// real environment.
+#[must_use]
+pub fn detect_mcp_command(opts: &InstallOpts) -> McpCommand {
+    if let Some(path) = &opts.command {
+        return McpCommand::Explicit(path.clone());
+    }
+    match std::env::current_exe() {
+        Ok(exe) => classify_mcp_command(std::env::var_os("PATH").as_deref(), &exe),
+        // Cannot locate ourselves — the pinned package always resolves.
+        Err(_) => McpCommand::npx(),
+    }
+}
+
+/// Pure classifier behind [`detect_mcp_command`]: decide whether the
 /// `mushroomdb` that PATH resolves to is the executable now running.
 ///
 /// A file named `mushroomdb` on PATH is not enough. `npx mushroomdb install`
@@ -85,11 +177,9 @@ pub fn detect_binary_location() -> BinaryLocation {
 /// and canonicalize both it and `current_exe`. Equal paths mean the bare name
 /// runs this very executable, including via a symlink (how `cargo install` and
 /// Homebrew expose it), which is the one case where the bare name is safe and
-/// survives upgrades. Anything else — a shim, a different build, no hit at
-/// all — means naming the copy explicitly.
-pub fn classify_binary_location(path_var: Option<&OsStr>, current_exe: &Path) -> BinaryLocation {
-    let copy = || BinaryLocation::CopyFrom(current_exe.to_path_buf());
-
+/// survives upgrades. Anything else means pinning the published package.
+#[must_use]
+pub fn classify_mcp_command(path_var: Option<&OsStr>, current_exe: &Path) -> McpCommand {
     // What a bare `mushroomdb` would resolve to: the first PATH entry holding
     // a file by that name (`is_file` follows symlinks, so links count).
     let Some(hit) = path_var.and_then(|p| {
@@ -97,29 +187,28 @@ pub fn classify_binary_location(path_var: Option<&OsStr>, current_exe: &Path) ->
             .map(|dir| dir.join(BIN_NAME))
             .find(|candidate| candidate.is_file())
     }) else {
-        return copy();
+        return McpCommand::npx();
     };
 
     // Identity, not name. Canonicalizing resolves symlinks and `..`, so a link
     // to us compares equal; if either side cannot be resolved we cannot prove
-    // it is us, and copying is the answer that always works.
+    // it is us, and the pinned package is the answer that always works.
     match (fs::canonicalize(&hit), fs::canonicalize(current_exe)) {
-        (Ok(on_path), Ok(running)) if on_path == running => BinaryLocation::OnPath,
-        _ => copy(),
+        (Ok(on_path), Ok(running)) if on_path == running => McpCommand::OnPath,
+        _ => McpCommand::npx(),
     }
 }
 
-/// Stable, install-owned location for the copied binary (user-level, so a
-/// project-scope install still yields a command that works from any cwd).
-fn stable_bin_path(home: &Path) -> PathBuf {
-    home.join(".mushroomdb").join("bin").join(BIN_NAME)
-}
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
 
 /// Which assistant platform(s) to wire up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Platform {
     ClaudeCode,
     Cursor,
+    Codex,
     All,
 }
 
@@ -128,10 +217,36 @@ impl Platform {
         match s {
             "claude-code" => Ok(Platform::ClaudeCode),
             "cursor" => Ok(Platform::Cursor),
+            "codex" => Ok(Platform::Codex),
             "all" => Ok(Platform::All),
             other => Err(format!(
-                "--platform must be claude-code | cursor | all, got: {other}"
+                "--platform must be claude-code | cursor | codex | all, got: {other}"
             )),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Platform::ClaudeCode => "claude-code",
+            Platform::Cursor => "cursor",
+            Platform::Codex => "codex",
+            Platform::All => "all",
+        }
+    }
+}
+
+/// Where the install lives: alongside one repository, or once for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Project,
+    User,
+}
+
+impl Scope {
+    fn label(self) -> &'static str {
+        match self {
+            Scope::Project => "project",
+            Scope::User => "user",
         }
     }
 }
@@ -141,19 +256,149 @@ impl Platform {
 pub struct InstallOpts {
     /// Which platform to wire up. `None` = auto-detect.
     pub platform: Option<Platform>,
-    /// Project scope (`--project`). If false → user scope.
-    pub project: bool,
+    /// Project or user scope. `None` = auto: project inside a git checkout.
+    pub scope: Option<Scope>,
     /// Database directory. `None` = use the scope default.
     pub db: Option<PathBuf>,
+    /// `--command <path>`: invoke this binary instead of `npx`/the bare name.
+    pub command: Option<PathBuf>,
+    /// Write the `post-commit` / `post-checkout` / `post-merge` sync hooks.
+    pub git_hooks: bool,
+    /// Run `npx -y mushroomdb@<v> --version` once so the first real spawn is
+    /// not a cold download.
+    pub prewarm: bool,
 }
 
-impl InstallOpts {
-    pub fn default_db(&self, project_root: &Path, home: &Path) -> PathBuf {
-        if self.project {
-            project_root.join("mushroom-memory")
-        } else {
-            home.join(".mushroomdb").join("memory")
+/// The store directory an install with no `--db` uses.
+#[must_use]
+pub fn default_db(scope: Scope, project_root: &Path, home: &Path) -> PathBuf {
+    match scope {
+        Scope::Project => project_root.join("mushroom-memory"),
+        Scope::User => home.join(".mushroomdb").join("memory"),
+    }
+}
+
+/// Resolve the scope, and say whether it was inferred.
+///
+/// A git checkout is a project: its store belongs beside it, is ignored by the
+/// repository, and its hooks fire on its commits. Anywhere else there is no
+/// project to scope to, so the install is the user's.
+fn resolve_scope(project_root: &Path, requested: Option<Scope>) -> (Scope, bool) {
+    match requested {
+        Some(s) => (s, false),
+        None if project_root.join(".git").exists() => (Scope::Project, true),
+        None => (Scope::User, true),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External programs
+// ---------------------------------------------------------------------------
+
+/// The world outside the two directories install is given: the programs it
+/// shells out to (`codex`, `npx`) and how long it will wait for them.
+///
+/// Carried explicitly rather than read from the process environment at the
+/// point of use, so a test can point PATH at a directory of stand-ins without
+/// mutating global state that its neighbours share.
+#[derive(Debug, Clone)]
+pub struct Externals {
+    /// PATH used to resolve external programs. `None` resolves nothing.
+    pub path: Option<OsString>,
+    /// Budget for the pre-warm.
+    pub prewarm_timeout: Duration,
+}
+
+impl Externals {
+    /// The real process environment.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::with_path(std::env::var_os("PATH"))
+    }
+
+    /// The same, with an explicit PATH.
+    #[must_use]
+    pub fn with_path(path: Option<OsString>) -> Self {
+        Self {
+            path,
+            prewarm_timeout: Duration::from_secs(PREWARM_TIMEOUT_SECS),
         }
+    }
+
+    /// The first executable named `program` on this PATH.
+    fn which(&self, program: &str) -> Option<PathBuf> {
+        let path = self.path.as_ref()?;
+        std::env::split_paths(path)
+            .map(|dir| dir.join(program))
+            .find(|c| is_executable(c))
+    }
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Run `bin` to completion, returning its stderr (trimmed) on a non-zero exit.
+fn run_and_capture(bin: &Path, args: &[String]) -> Result<(), String> {
+    let out = std::process::Command::new(bin)
+        .args(args)
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let detail = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    };
+    Err(format!(
+        "{} {} exited with {}{detail}",
+        bin.display(),
+        args.join(" "),
+        out.status
+    ))
+}
+
+/// Run `bin`, giving up after `timeout`. Output is discarded — only the exit
+/// status matters — so the child cannot block on a pipe nobody drains.
+fn run_with_timeout(bin: &Path, args: &[String], timeout: Duration) -> Result<(), String> {
+    let mut child = std::process::Command::new(bin)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("exited with {status}")),
+            Ok(None) => {}
+            Err(e) => return Err(format!("cannot wait for {}: {e}", bin.display())),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("timed out after {}s", timeout.as_secs()));
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -170,6 +415,26 @@ struct Manifest {
     /// Hook entries added to a settings.json by this install.
     #[serde(default)]
     hooks: Vec<ManagedHook>,
+    /// Git hook files this install put its block into.
+    #[serde(default)]
+    git_hooks: Vec<PathBuf>,
+    /// Single lines added to a file the user owns (the `.gitignore` entry).
+    #[serde(default)]
+    gitignore: Vec<ManagedLine>,
+    /// Whether a Codex MCP server was registered through the `codex` CLI.
+    #[serde(default)]
+    codex: bool,
+}
+
+impl Manifest {
+    fn is_empty(&self) -> bool {
+        self.files.is_empty()
+            && self.mcp_keys.is_empty()
+            && self.hooks.is_empty()
+            && self.git_hooks.is_empty()
+            && self.gitignore.is_empty()
+            && !self.codex
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -188,6 +453,15 @@ struct ManagedHook {
     event: String,
     /// The exact command string that was added.
     command: String,
+}
+
+/// One line this install appended to a text file the user owns.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct ManagedLine {
+    /// The file the line was added to (absolute path).
+    file: PathBuf,
+    /// The exact line, without its newline.
+    line: String,
 }
 
 /// Claude Code hook event this install wires: fires before each prompt is
@@ -211,20 +485,21 @@ const TOUCH_TIMEOUT_SECS: u64 = 30;
 /// embedded single quotes as `'\''`. Claude Code runs a `type: "command"`
 /// hook through a shell, so an unquoted path containing whitespace or shell
 /// metacharacters is word-split and the hook silently receives the wrong
-/// arguments — quoting both interpolations keeps the command exact.
+/// arguments — quoting keeps the command exact.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The exact command string written into the hook entry.
-fn recall_hook_command(bin_cmd: &str, db_str: &str) -> String {
-    format!("{} recall {}", sh_quote(bin_cmd), sh_quote(db_str))
+/// The exact command string written into the hook entry. `shell` is already
+/// quoted; only the database path still needs it.
+fn recall_hook_command(shell: &str, db_str: &str) -> String {
+    format!("{shell} recall {}", sh_quote(db_str))
 }
 
 /// The exact command string written into the post-edit hook entry. `touch` in
 /// hook mode prints nothing and exits 0 whatever it is handed.
-fn touch_hook_command(bin_cmd: &str, db_str: &str) -> String {
-    format!("{} touch {}", sh_quote(bin_cmd), sh_quote(db_str))
+fn touch_hook_command(shell: &str, db_str: &str) -> String {
+    format!("{shell} touch {}", sh_quote(db_str))
 }
 
 /// One `hooks.<event>` array entry in Claude Code's settings.json shape.
@@ -408,6 +683,18 @@ fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result
 // Public entry points
 // ---------------------------------------------------------------------------
 
+/// Everything the write phase needs, gathered once so the per-step functions
+/// stay readable.
+struct Ctx<'a> {
+    project_root: &'a Path,
+    home: &'a Path,
+    scope: Scope,
+    db: &'a str,
+    cmd: &'a McpCommand,
+    ext: &'a Externals,
+    git_hooks: bool,
+}
+
 /// Install the /mushroom skill and MCP server entry for the resolved platforms.
 ///
 /// `project_root` is the directory where project-scope config files live
@@ -418,33 +705,53 @@ pub fn run_install(
     home: &Path,
     opts: &InstallOpts,
 ) -> Result<String, CliError> {
-    run_install_with(project_root, home, opts, &detect_binary_location())
+    run_install_with(
+        project_root,
+        home,
+        opts,
+        &detect_mcp_command(opts),
+        &Externals::from_env(),
+    )
 }
 
-/// Like [`run_install`], but with the binary location supplied by the caller
-/// instead of detected from PATH / `current_exe`. Tests use this to stay
-/// deterministic; `run_install` is the real-environment wrapper.
+/// Like [`run_install`], but with the server command and the external
+/// environment supplied by the caller instead of detected. Tests use this to
+/// stay deterministic and offline; `run_install` is the real-environment
+/// wrapper.
 pub fn run_install_with(
     project_root: &Path,
     home: &Path,
     opts: &InstallOpts,
-    bin: &BinaryLocation,
+    cmd: &McpCommand,
+    ext: &Externals,
 ) -> Result<String, CliError> {
+    let (scope, auto_scope) = resolve_scope(project_root, opts.scope);
     let db = opts
         .db
         .clone()
-        .unwrap_or_else(|| opts.default_db(project_root, home));
+        .unwrap_or_else(|| default_db(scope, project_root, home));
     let db_str = db.to_string_lossy();
 
     let resolved = resolve_platform(project_root, home, opts.platform.as_ref())?;
     let platforms = expand_platform(&resolved);
 
-    // Check for any conflicts before writing anything (atomic from user's POV).
+    // Check for anything that would make this install fail halfway before
+    // writing a single byte.
     for plat in &platforms {
-        preflight_check(project_root, home, plat, opts.project, &db_str)?;
+        preflight_check(project_root, home, plat, scope, &db_str, ext)?;
     }
 
-    let manifest_path = manifest_path(project_root, home, opts.project, &platforms);
+    let ctx = Ctx {
+        project_root,
+        home,
+        scope,
+        db: &db_str,
+        cmd,
+        ext,
+        git_hooks: opts.git_hooks,
+    };
+
+    let manifest_path = manifest_path(project_root, home, scope, &platforms);
 
     // Load the existing manifest so we can union it with what this run writes.
     // This covers partial-drift re-installs: if SKILL.md was edited but the MCP
@@ -453,53 +760,34 @@ pub fn run_install_with(
     let existing = load_manifest(&manifest_path);
 
     let mut manifest = Manifest::default();
+    let mut notes: Vec<String> = Vec::new();
 
-    // Resolve the command the MCP entry and skill templates will use. For the
-    // off-PATH case this copies the binary first so the path it names exists.
-    let bin_cmd = match bin {
-        BinaryLocation::OnPath => BIN_NAME.to_string(),
-        BinaryLocation::CopyFrom(src) => {
-            let dest = stable_bin_path(home);
-            copy_binary(src, &dest, &mut manifest)?;
-            dest.to_string_lossy().into_owned()
+    let outcome = write_everything(&ctx, &platforms, &mut manifest, &mut notes);
+    if let Err(e) = outcome {
+        // Persist whatever was already written (an earlier platform's files,
+        // a git hook) so uninstall can still clean up after a partial
+        // failure. Best effort: the original error wins.
+        if !manifest.is_empty() {
+            let merged = union_manifests(load_manifest(&manifest_path), &manifest);
+            let _ = write_manifest(&manifest_path, &merged);
         }
-    };
-
-    for plat in &platforms {
-        let step = install_platform(
-            project_root,
-            home,
-            plat,
-            opts.project,
-            &db_str,
-            &bin_cmd,
-            &mut manifest,
-        );
-        if let Err(e) = step {
-            // Persist whatever was already written (binary copy, earlier
-            // platform's files) so uninstall can still clean up after a
-            // partial failure. Best effort: the original error wins.
-            let anything_written = !manifest.files.is_empty()
-                || !manifest.mcp_keys.is_empty()
-                || !manifest.hooks.is_empty();
-            if anything_written {
-                let merged = union_manifests(load_manifest(&manifest_path), &manifest);
-                let _ = write_manifest(&manifest_path, &merged);
-            }
-            return Err(e);
-        }
+        return Err(e);
     }
 
-    let anything_written =
-        !manifest.files.is_empty() || !manifest.mcp_keys.is_empty() || !manifest.hooks.is_empty();
-
+    let anything_written = !manifest.is_empty();
     if anything_written {
         // Union this-run entries with the existing manifest (dedup by path/key).
         let merged = union_manifests(existing, &manifest);
         write_manifest(&manifest_path, &merged)?;
     }
 
-    let mut out = format!("mushroomdb installed ({} platform(s))\n", platforms.len());
+    let labels: Vec<&str> = platforms.iter().map(Platform::label).collect();
+    let mut out = format!("mushroomdb installed ({})\n", labels.join(", "));
+    out.push_str(&format!(
+        "  scope  {}{}\n",
+        scope.label(),
+        if auto_scope { " (auto-detected)" } else { "" }
+    ));
     for f in &manifest.files {
         out.push_str(&format!("  wrote  {}\n", f.display()));
     }
@@ -517,49 +805,60 @@ pub fn run_install_with(
             h.file.display()
         ));
     }
+    for g in &manifest.gitignore {
+        out.push_str(&format!("  added  {} to {}\n", g.line, g.file.display()));
+    }
+    for h in &manifest.git_hooks {
+        out.push_str(&format!("  added  git hook {}\n", h.display()));
+    }
+    if manifest.codex {
+        out.push_str(&format!("  added  codex mcp server {SERVER_NAME}\n"));
+    }
     if anything_written {
         out.push_str(&format!("  manifest  {}\n", manifest_path.display()));
-        out.push_str(&format!(
-            "  mcp command  {bin_cmd}\n  restart your assistant to connect the MCP server\n"
-        ));
+        out.push_str(&format!("  mcp command  {}\n", cmd.shell()));
     } else {
         out.push_str("  (already installed — no changes)\n");
     }
+    for n in &notes {
+        out.push_str(&format!("  {n}\n"));
+    }
+    out.push_str(&format!(
+        "next: restart Claude Code in {}, then type /mushroom\n",
+        project_root.display()
+    ));
     Ok(out)
 }
 
-/// Copy the running binary to its stable location. No-op if the bytes at
-/// `dest` already match `src` (idempotent re-install); overwrites when they
-/// differ (upgrade). Records `dest` in the manifest so uninstall removes it.
-fn copy_binary(src: &Path, dest: &Path, manifest: &mut Manifest) -> Result<(), CliError> {
-    let bytes = fs::read(src)
-        .map_err(|e| CliError(format!("cannot read binary {}: {e}", src.display())))?;
-    if fs::read(dest).map(|cur| cur == bytes).unwrap_or(false) {
-        return Ok(());
+/// The whole write phase, so a failure anywhere in it still leaves the caller
+/// holding the partial manifest.
+fn write_everything(
+    ctx: &Ctx<'_>,
+    platforms: &[Platform],
+    manifest: &mut Manifest,
+    notes: &mut Vec<String>,
+) -> Result<(), CliError> {
+    if let Some(w) = scope_conflict_note(ctx, platforms) {
+        notes.push(w);
     }
-    let parent = dest.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|e| CliError(format!("cannot create {}: {e}", parent.display())))?;
-    // Write to a temp name and rename so a running MCP server holding the old
-    // inode keeps working and the swap is atomic.
-    let tmp = parent.join(format!(".{BIN_NAME}.tmp-{}", std::process::id()));
-    fs::write(&tmp, &bytes)
-        .map_err(|e| CliError(format!("cannot write {}: {e}", tmp.display())))?;
-    let finish = || -> Result<(), CliError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
-                .map_err(|e| CliError(format!("cannot chmod {}: {e}", tmp.display())))?;
+
+    for plat in platforms {
+        install_platform(ctx, plat, manifest, notes)?;
+    }
+
+    // The repository-level wiring is platform-independent: the store is
+    // ignored by git and the graph is re-synced after commits whichever
+    // assistant reads it.
+    if ctx.scope == Scope::Project {
+        ensure_gitignore_line(ctx, manifest)?;
+        if ctx.git_hooks {
+            install_git_hooks(ctx, manifest)?;
         }
-        fs::rename(&tmp, dest)
-            .map_err(|e| CliError(format!("cannot move binary into {}: {e}", dest.display())))
-    };
-    if let Err(e) = finish() {
-        let _ = fs::remove_file(&tmp); // never leave an untracked temp file behind
-        return Err(e);
     }
-    manifest.files.push(dest.to_path_buf());
+
+    if let Some(w) = prewarm(ctx) {
+        notes.push(w);
+    }
     Ok(())
 }
 
@@ -569,10 +868,22 @@ pub fn run_uninstall(
     home: &Path,
     opts: &InstallOpts,
 ) -> Result<String, CliError> {
+    run_uninstall_with(project_root, home, opts, &Externals::from_env())
+}
+
+/// Like [`run_uninstall`], with the external environment supplied by the
+/// caller (Codex removal shells out to the `codex` CLI).
+pub fn run_uninstall_with(
+    project_root: &Path,
+    home: &Path,
+    opts: &InstallOpts,
+    ext: &Externals,
+) -> Result<String, CliError> {
+    let (scope, _) = resolve_scope(project_root, opts.scope);
     let resolved = resolve_platform(project_root, home, opts.platform.as_ref())?;
     let platforms = expand_platform(&resolved);
 
-    let manifest_path = manifest_path(project_root, home, opts.project, &platforms);
+    let manifest_path = manifest_path(project_root, home, scope, &platforms);
     if !manifest_path.exists() {
         return Err(CliError(format!(
             "no install manifest found at {} — nothing to uninstall",
@@ -611,6 +922,37 @@ pub fn run_uninstall(
         }
     }
 
+    // Git hooks: the marked region only, never the user's own lines.
+    for h in &manifest.git_hooks {
+        if remove_git_hook(h)? {
+            removed.push(format!("removed  git hook block from {}", h.display()));
+        }
+    }
+
+    // The ignore line, exactly as it was written.
+    for g in &manifest.gitignore {
+        if remove_line(&g.file, &g.line)? {
+            removed.push(format!("removed  {} from {}", g.line, g.file.display()));
+        }
+    }
+
+    // Codex holds its own config; hand the removal back to its CLI.
+    if manifest.codex {
+        match ext.which("codex") {
+            Some(bin) => {
+                run_and_capture(&bin, &["mcp".into(), "remove".into(), SERVER_NAME.into()])
+                    .map_err(|e| CliError(format!("codex mcp remove failed: {e}")))?;
+                removed.push(format!("removed  codex mcp server {SERVER_NAME}"));
+            }
+            // Not being able to reach `codex` must not strand every other
+            // thing the manifest lists.
+            None => removed.push(
+                "warning: codex is not on PATH — run `codex mcp remove mushroomdb` yourself"
+                    .to_string(),
+            ),
+        }
+    }
+
     // Remove files.
     for f in &manifest.files {
         if f.exists() {
@@ -646,7 +988,8 @@ fn resolve_platform(
         return Ok(p.clone());
     }
 
-    // Auto-detect.
+    // Auto-detect. Codex is never inferred: registering with it runs another
+    // program, which is not something to do because a directory exists.
     let has_claude = home.join(".claude").exists() || project_root.join(".claude").exists();
     let has_cursor = project_root.join(".cursor").exists() || home.join(".cursor").exists();
 
@@ -656,17 +999,20 @@ fn resolve_platform(
         (false, true) => Ok(Platform::Cursor),
         (false, false) => Err(CliError(
             "cannot auto-detect platform: neither ~/.claude nor .cursor/ found.\n\
-             Pass --platform claude-code, --platform cursor, or --platform all."
+             Pass --platform claude-code, --platform cursor, --platform codex, or --platform all."
                 .to_string(),
         )),
     }
 }
 
+/// `All` is the two platforms whose config this program writes itself. Codex
+/// is deliberately not in it: it is wired by running the `codex` CLI, which
+/// may not exist, and `--platform all` must not fail on a machine that simply
+/// does not have it.
 fn expand_platform(p: &Platform) -> Vec<Platform> {
     match p {
         Platform::All => vec![Platform::ClaudeCode, Platform::Cursor],
-        Platform::ClaudeCode => vec![Platform::ClaudeCode],
-        Platform::Cursor => vec![Platform::Cursor],
+        other => vec![other.clone()],
     }
 }
 
@@ -678,41 +1024,57 @@ fn preflight_check(
     project_root: &Path,
     home: &Path,
     platform: &Platform,
-    project_scope: bool,
+    scope: Scope,
     db_str: &str,
+    ext: &Externals,
 ) -> Result<(), CliError> {
     match platform {
         Platform::ClaudeCode => {
-            let mcp_file = if project_scope {
-                project_root.join(".mcp.json")
-            } else {
-                // User-scope: verified empirically on a live Claude Code install.
-                // ~/.claude.json holds top-level mcpServers; ~/.claude/settings.json
-                // holds env/permissions/hooks but no mcpServers key.
-                home.join(".claude.json")
-            };
-            check_mcp_conflict(&mcp_file, db_str)?;
+            check_mcp_conflict(&claude_mcp_file(project_root, home, scope), db_str)
         }
-        Platform::Cursor => {
-            let mcp_file = if project_scope {
-                project_root.join(".cursor").join("mcp.json")
-            } else {
-                home.join(".cursor").join("mcp.json")
-            };
-            check_mcp_conflict(&mcp_file, db_str)?;
-        }
+        Platform::Cursor => check_mcp_conflict(&cursor_mcp_file(project_root, home, scope), db_str),
+        // Nothing of Codex's is a file we read; what can fail early is the CLI
+        // being absent, and that is worth saying before anything is written.
+        Platform::Codex => codex_bin(ext).map(|_| ()),
         Platform::All => unreachable!("expand_platform never produces All"),
     }
-    Ok(())
+}
+
+fn claude_mcp_file(project_root: &Path, home: &Path, scope: Scope) -> PathBuf {
+    match scope {
+        Scope::Project => project_root.join(".mcp.json"),
+        // User-scope: verified empirically on a live Claude Code install.
+        // ~/.claude.json holds top-level mcpServers; ~/.claude/settings.json
+        // holds env/permissions/hooks but no mcpServers key.
+        Scope::User => home.join(".claude.json"),
+    }
+}
+
+fn cursor_mcp_file(project_root: &Path, home: &Path, scope: Scope) -> PathBuf {
+    match scope {
+        Scope::Project => project_root.join(".cursor").join("mcp.json"),
+        Scope::User => home.join(".cursor").join("mcp.json"),
+    }
+}
+
+/// The database an existing entry serves: the argument straight after `mcp`.
+///
+/// Its position moved between versions — 0.5.x wrote `["mcp", db]`, the npx
+/// form writes `["-y", "mushroomdb@x.y.z", "mcp", db]` — so the subcommand is
+/// what locates it, not an index.
+fn entry_db(entry: &serde_json::Value) -> Option<&str> {
+    let args = entry["args"].as_array()?;
+    let at = args.iter().position(|a| a == "mcp")?;
+    args.get(at + 1)?.as_str()
 }
 
 /// Check if a MCP JSON file has a conflicting `mushroomdb` entry.
 ///
-/// A conflict is: the file exists, has `mcpServers.mushroomdb`, and its
-/// `args[1]` (the db path) differs from what we'd write. An entry for the
-/// SAME db with a different `command` is ours to repair (e.g. a bare name
-/// that never resolved, or a stale absolute path after an upgrade), so it is
-/// not a conflict.
+/// A conflict is: the file exists, has `mcpServers.mushroomdb`, and the
+/// database it names differs from what we'd write. An entry for the SAME db
+/// with a different `command` is ours to repair (a bare name that never
+/// resolved, an absolute path from 0.5.x, an older version pin), so it is not
+/// a conflict.
 fn check_mcp_conflict(mcp_file: &Path, db_str: &str) -> Result<(), CliError> {
     if !mcp_file.exists() {
         return Ok(());
@@ -727,11 +1089,7 @@ fn check_mcp_conflict(mcp_file: &Path, db_str: &str) -> Result<(), CliError> {
         return Ok(()); // Key absent — no conflict.
     }
 
-    let existing_db = existing["args"]
-        .get(1)
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
+    let existing_db = entry_db(existing).unwrap_or("");
     if existing_db == db_str {
         return Ok(()); // Same db — idempotent or repairable, no conflict.
     }
@@ -746,31 +1104,64 @@ fn check_mcp_conflict(mcp_file: &Path, db_str: &str) -> Result<(), CliError> {
     )))
 }
 
+/// A server registered in the *other* scope still shows up in the assistant,
+/// and two of them pointed at two stores is a confusing place to be. Say so;
+/// never touch the other scope's file.
+fn scope_conflict_note(ctx: &Ctx<'_>, platforms: &[Platform]) -> Option<String> {
+    if !platforms.contains(&Platform::ClaudeCode) {
+        return None;
+    }
+    let (other, label, flag) = match ctx.scope {
+        Scope::Project => (
+            claude_mcp_file(ctx.project_root, ctx.home, Scope::User),
+            "user",
+            "--user",
+        ),
+        Scope::User => (
+            claude_mcp_file(ctx.project_root, ctx.home, Scope::Project),
+            "project",
+            "--project",
+        ),
+    };
+    if !has_our_server(&other) {
+        return None;
+    }
+    Some(format!(
+        "warning: a {label}-scope mushroomdb server also exists ({}) — \
+         both will load; to remove that one run: mushroomdb uninstall {flag}",
+        other.display()
+    ))
+}
+
+fn has_our_server(mcp_file: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(mcp_file) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .map(|v| !v["mcpServers"][SERVER_NAME].is_null())
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Per-platform installation
 // ---------------------------------------------------------------------------
 
 fn install_platform(
-    project_root: &Path,
-    home: &Path,
+    ctx: &Ctx<'_>,
     platform: &Platform,
-    project_scope: bool,
-    db_str: &str,
-    bin_cmd: &str,
     manifest: &mut Manifest,
+    notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
     match platform {
-        Platform::ClaudeCode => {
-            install_claude_code(project_root, home, project_scope, db_str, bin_cmd, manifest)
-        }
-        Platform::Cursor => {
-            install_cursor(project_root, home, project_scope, db_str, bin_cmd, manifest)
-        }
+        Platform::ClaudeCode => install_claude_code(ctx, manifest, notes),
+        Platform::Cursor => install_cursor(ctx, manifest, notes),
+        Platform::Codex => install_codex(ctx, manifest),
         Platform::All => unreachable!("expand_platform never produces All"),
     }
 }
 
-/// Substitute both template placeholders.
+/// Substitute both template placeholders. `bin_cmd` is the pre-quoted shell
+/// form, so the templates carry `{{BIN}}` unquoted.
 fn render_template(template: &str, db_str: &str, bin_cmd: &str) -> String {
     template
         .replace(DB_PATH_PLACEHOLDER, db_str)
@@ -778,19 +1169,20 @@ fn render_template(template: &str, db_str: &str, bin_cmd: &str) -> String {
 }
 
 fn install_claude_code(
-    project_root: &Path,
-    home: &Path,
-    project_scope: bool,
-    db_str: &str,
-    bin_cmd: &str,
+    ctx: &Ctx<'_>,
     manifest: &mut Manifest,
+    notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
-    let skill_content = render_template(SKILL_TEMPLATE, db_str, bin_cmd);
+    let shell = ctx.cmd.shell();
+    let skill_content = render_template(SKILL_TEMPLATE, ctx.db, &shell);
 
-    let skill_dir = if project_scope {
-        project_root.join(".claude").join("skills").join("mushroom")
-    } else {
-        home.join(".claude").join("skills").join("mushroom")
+    let skill_dir = match ctx.scope {
+        Scope::Project => ctx
+            .project_root
+            .join(".claude")
+            .join("skills")
+            .join("mushroom"),
+        Scope::User => ctx.home.join(".claude").join("skills").join("mushroom"),
     };
     let skill_file = skill_dir.join("SKILL.md");
 
@@ -803,23 +1195,16 @@ fn install_claude_code(
         manifest.files.push(skill_file);
     }
 
-    // MCP JSON. User-scope writes to ~/.claude.json (top-level mcpServers),
-    // not ~/.claude/settings.json (which holds env/hooks, not mcpServers).
-    let mcp_file = if project_scope {
-        project_root.join(".mcp.json")
-    } else {
-        home.join(".claude.json")
-    };
-    merge_mcp_entry(&mcp_file, db_str, bin_cmd, manifest)?;
+    let mcp_file = claude_mcp_file(ctx.project_root, ctx.home, ctx.scope);
+    merge_mcp_entry(&mcp_file, ctx, manifest, notes)?;
 
     // Both hooks: settings.json in the same scope as the skill. The prompt
     // hook first, so a manifest lists them in the order they were written.
-    let settings_file = if project_scope {
-        project_root.join(".claude").join("settings.json")
-    } else {
-        home.join(".claude").join("settings.json")
+    let settings_file = match ctx.scope {
+        Scope::Project => ctx.project_root.join(".claude").join("settings.json"),
+        Scope::User => ctx.home.join(".claude").join("settings.json"),
     };
-    let recall = recall_hook_command(bin_cmd, db_str);
+    let recall = recall_hook_command(&shell, ctx.db);
     merge_hook_entry(
         &settings_file,
         HOOK_EVENT,
@@ -827,7 +1212,7 @@ fn install_claude_code(
         hook_entry(&recall),
         manifest,
     )?;
-    let touch = touch_hook_command(bin_cmd, db_str);
+    let touch = touch_hook_command(&shell, ctx.db);
     merge_hook_entry(
         &settings_file,
         TOUCH_EVENT,
@@ -840,19 +1225,15 @@ fn install_claude_code(
 }
 
 fn install_cursor(
-    project_root: &Path,
-    home: &Path,
-    project_scope: bool,
-    db_str: &str,
-    bin_cmd: &str,
+    ctx: &Ctx<'_>,
     manifest: &mut Manifest,
+    notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
-    let rules_content = render_template(CURSOR_RULES_TEMPLATE, db_str, bin_cmd);
+    let rules_content = render_template(CURSOR_RULES_TEMPLATE, ctx.db, &ctx.cmd.shell());
 
-    let rules_dir = if project_scope {
-        project_root.join(".cursor").join("rules")
-    } else {
-        home.join(".cursor").join("rules")
+    let rules_dir = match ctx.scope {
+        Scope::Project => ctx.project_root.join(".cursor").join("rules"),
+        Scope::User => ctx.home.join(".cursor").join("rules"),
     };
     let rules_file = rules_dir.join("mushroom.mdc");
 
@@ -864,15 +1245,186 @@ fn install_cursor(
         manifest.files.push(rules_file);
     }
 
-    // Cursor MCP JSON.
-    let mcp_file = if project_scope {
-        project_root.join(".cursor").join("mcp.json")
-    } else {
-        home.join(".cursor").join("mcp.json")
-    };
-    merge_mcp_entry(&mcp_file, db_str, bin_cmd, manifest)?;
+    let mcp_file = cursor_mcp_file(ctx.project_root, ctx.home, ctx.scope);
+    merge_mcp_entry(&mcp_file, ctx, manifest, notes)?;
 
     Ok(())
+}
+
+/// The `codex` executable, or an error that says what to do about it.
+fn codex_bin(ext: &Externals) -> Result<PathBuf, CliError> {
+    ext.which("codex").ok_or_else(|| {
+        CliError(
+            "codex was not found on PATH — install the Codex CLI, or drop \
+             `--platform codex`"
+                .to_string(),
+        )
+    })
+}
+
+/// Register the server with Codex through its own CLI.
+///
+/// Codex owns its configuration file and its format is its business, so this
+/// writes nothing: it runs `codex mcp add mushroomdb -- <command> <args…>` and
+/// lets Codex record it. 0.6.0 ships no Codex skill — the MCP tools carry
+/// their own descriptions, which is what Codex reads.
+fn install_codex(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliError> {
+    let bin = codex_bin(ctx.ext)?;
+    let mut args = vec![
+        "mcp".to_string(),
+        "add".to_string(),
+        SERVER_NAME.to_string(),
+        "--".to_string(),
+    ];
+    args.extend(ctx.cmd.argv("mcp", ctx.db));
+    run_and_capture(&bin, &args).map_err(|e| CliError(format!("codex mcp add failed: {e}")))?;
+    manifest.codex = true;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Repository wiring: the ignore line and the sync hooks
+// ---------------------------------------------------------------------------
+
+/// The git hooks a sync belongs in: after a commit lands, after a branch
+/// changes the working tree, and after a merge brings other people's commits
+/// in. All three leave the graph a commit behind if they are skipped.
+const GIT_HOOKS: &[&str] = &["post-commit", "post-checkout", "post-merge"];
+
+/// The `.gitignore` line for a store kept inside the repository, or `None`
+/// when it is kept outside — a repository has no business ignoring a path it
+/// does not contain.
+fn gitignore_line(project_root: &Path, db: &str) -> Option<String> {
+    let rel = Path::new(db).strip_prefix(project_root).ok()?;
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    Some(format!("{}/", rel.to_string_lossy().replace('\\', "/")))
+}
+
+/// Append the store directory to the repository's `.gitignore` unless some
+/// spelling of it is already listed. Creates the file if it is absent.
+fn ensure_gitignore_line(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliError> {
+    let Some(line) = gitignore_line(ctx.project_root, ctx.db) else {
+        return Ok(());
+    };
+    let path = ctx.project_root.join(".gitignore");
+    let existed = path.exists();
+    let current = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(CliError(format!("cannot read {}: {e}", path.display()))),
+    };
+    let bare = line.trim_end_matches('/');
+    if current
+        .lines()
+        .map(str::trim)
+        .any(|l| l == line || l == bare || l == format!("/{line}") || l == format!("/{bare}"))
+    {
+        return Ok(());
+    }
+    let mut next = current;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(&line);
+    next.push('\n');
+    fs::write(&path, next)
+        .map_err(|e| CliError(format!("cannot write {}: {e}", path.display())))?;
+    // A `.gitignore` that only exists because of us is ours to take away
+    // again: uninstall strips the line first and then removes the file, so a
+    // repository that had none is left with none.
+    if !existed {
+        manifest.files.push(path.clone());
+    }
+    manifest.gitignore.push(ManagedLine { file: path, line });
+    Ok(())
+}
+
+/// Remove one exact line from a text file. Returns whether anything changed;
+/// a file that does not hold the line is not rewritten at all.
+fn remove_line(path: &Path, line: &str) -> Result<bool, CliError> {
+    let Ok(current) = fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    if !current.lines().any(|l| l == line) {
+        return Ok(false);
+    }
+    let kept: Vec<&str> = current.lines().filter(|l| *l != line).collect();
+    let mut next = kept.join("\n");
+    if !next.is_empty() {
+        next.push('\n');
+    }
+    fs::write(path, next).map_err(|e| CliError(format!("cannot write {}: {e}", path.display())))?;
+    Ok(true)
+}
+
+/// The directory holding this checkout's hooks, following the `gitdir:` link a
+/// worktree or submodule leaves in place of a `.git` directory.
+fn git_hooks_dir(project_root: &Path) -> Option<PathBuf> {
+    let dot_git = project_root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git.join("hooks"));
+    }
+    let text = fs::read_to_string(&dot_git).ok()?;
+    let target = text.strip_prefix("gitdir:")?.trim();
+    let target = Path::new(target);
+    let resolved = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        project_root.join(target)
+    };
+    Some(resolved.join("hooks"))
+}
+
+fn install_git_hooks(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliError> {
+    // Not a checkout: there is nothing to hook into, and that is not an error.
+    let Some(dir) = git_hooks_dir(ctx.project_root) else {
+        return Ok(());
+    };
+    let shell = ctx.cmd.shell();
+    for name in GIT_HOOKS {
+        let file = dir.join(name);
+        if merge_git_hook(&file, &shell, ctx.db)? {
+            manifest.git_hooks.push(file);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pre-warm
+// ---------------------------------------------------------------------------
+
+/// Fetch the pinned package once, so the assistant's first spawn of the MCP
+/// server is not a cold `npx` download inside a startup timeout.
+///
+/// Best effort in every direction: it only applies to the `npx` form, it is
+/// skipped when asked to be, and a failure is a line in the summary rather
+/// than a failed install — the entry that was written is correct either way.
+fn prewarm(ctx: &Ctx<'_>) -> Option<String> {
+    let McpCommand::Npx { version } = ctx.cmd else {
+        return None;
+    };
+    let args = vec![
+        "-y".to_string(),
+        format!("{NPM_PACKAGE}@{version}"),
+        "--version".to_string(),
+    ];
+    let Some(npx) = ctx.ext.which("npx") else {
+        return Some(
+            "warning: pre-warm skipped — npx is not on PATH; the first MCP \
+             spawn will download the package"
+                .to_string(),
+        );
+    };
+    match run_with_timeout(&npx, &args, ctx.ext.prewarm_timeout) {
+        Ok(()) => None,
+        Err(e) => Some(format!(
+            "warning: pre-warm of {NPM_PACKAGE}@{version} failed ({e}) — \
+             the first MCP spawn will download the package"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -880,12 +1432,14 @@ fn install_cursor(
 // ---------------------------------------------------------------------------
 
 /// Add `mcpServers.mushroomdb` to a JSON config file. Creates the file if
-/// absent. No-op if the entry already matches (idempotent).
+/// absent. No-op if the entry already matches (idempotent). An entry that is
+/// present but different is an upgrade: it is rewritten, and the summary says
+/// so, because a stale command is exactly the failure this replaces.
 fn merge_mcp_entry(
     mcp_file: &Path,
-    db_str: &str,
-    bin_cmd: &str,
+    ctx: &Ctx<'_>,
     manifest: &mut Manifest,
+    notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
     let mut root: serde_json::Value = if mcp_file.exists() {
         let raw = fs::read_to_string(mcp_file)
@@ -901,12 +1455,13 @@ fn merge_mcp_entry(
         root["mcpServers"] = serde_json::json!({});
     }
 
-    let desired = mcp_server_entry(db_str, bin_cmd);
+    let desired = ctx.cmd.json_entry("mcp", ctx.db);
     let existing = &root["mcpServers"][SERVER_NAME];
 
     if existing == &desired {
         return Ok(()); // Exact match — idempotent.
     }
+    let replaced = !existing.is_null();
 
     // Write the entry.
     root["mcpServers"][SERVER_NAME] = desired;
@@ -924,6 +1479,13 @@ fn merge_mcp_entry(
         file: mcp_file.to_path_buf(),
         server: SERVER_NAME.to_string(),
     });
+    if replaced {
+        notes.push(format!(
+            "updated mcp command in {} → {}",
+            mcp_file.display(),
+            ctx.cmd.shell()
+        ));
+    }
 
     Ok(())
 }
@@ -951,13 +1513,6 @@ fn remove_mcp_key(mcp_file: &Path, server: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn mcp_server_entry(db_str: &str, bin_cmd: &str) -> serde_json::Value {
-    serde_json::json!({
-        "command": bin_cmd,
-        "args": ["mcp", db_str]
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Manifest helpers
 // ---------------------------------------------------------------------------
@@ -965,10 +1520,17 @@ fn mcp_server_entry(db_str: &str, bin_cmd: &str) -> serde_json::Value {
 fn manifest_path(
     project_root: &Path,
     home: &Path,
-    project_scope: bool,
+    scope: Scope,
     platforms: &[Platform],
 ) -> PathBuf {
-    if !project_scope {
+    // Codex writes nothing project-local — its registration lives wherever the
+    // Codex CLI keeps it — so a Codex-only install records itself under the
+    // home directory whatever the scope, in its own file so it cannot collide
+    // with a user-scope Claude Code manifest.
+    if platforms == [Platform::Codex] {
+        return home.join(".mushroomdb").join("install-manifest-codex.json");
+    }
+    if scope == Scope::User {
         return home.join(".mushroomdb").join("install-manifest.json");
     }
     // Project scope: prefer the Claude Code location; fall back to Cursor.
@@ -992,10 +1554,10 @@ fn load_manifest(path: &Path) -> Manifest {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
-/// Union `existing` with `this_run`, deduplicating by path (files), by
-/// (file, server) pair (mcp_keys), and by full equality (hooks). Entries from
-/// `this_run` win on collision so the manifest always reflects the latest
-/// state.
+/// Union `existing` with `this_run`, deduplicating by path (files, git hooks),
+/// by (file, server) pair (mcp_keys), and by full equality (hooks, lines).
+/// Entries from `this_run` win on collision so the manifest always reflects
+/// the latest state.
 fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
     for f in &this_run.files {
         if !existing.files.contains(f) {
@@ -1016,6 +1578,17 @@ fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
             existing.hooks.push(h.clone());
         }
     }
+    for h in &this_run.git_hooks {
+        if !existing.git_hooks.contains(h) {
+            existing.git_hooks.push(h.clone());
+        }
+    }
+    for l in &this_run.gitignore {
+        if !existing.gitignore.contains(l) {
+            existing.gitignore.push(l.clone());
+        }
+    }
+    existing.codex |= this_run.codex;
     existing
 }
 
@@ -1059,13 +1632,13 @@ const HOOK_SHEBANG: &str = "#!/bin/sh";
 /// that is momentarily busy would be noise on every commit. `sync` exits 3 when
 /// another process holds the write lock, and the next commit picks the work up.
 ///
-/// Both interpolations are shell-quoted: a database under a path with a space
-/// in it would otherwise be word-split into two arguments.
+/// `shell` is the already-quoted command prefix from [`McpCommand::shell`];
+/// the database path is quoted here, since a path with a space in it would
+/// otherwise be word-split into two arguments.
 #[must_use]
-pub fn git_hook_block(bin_cmd: &str, db: &str) -> String {
+pub fn git_hook_block(shell: &str, db: &str) -> String {
     format!(
-        "{HOOK_BEGIN}\n( {} sync {} >/dev/null 2>&1 & )\n{HOOK_END}\n",
-        sh_quote(bin_cmd),
+        "{HOOK_BEGIN}\n( {shell} sync {} >/dev/null 2>&1 & )\n{HOOK_END}\n",
         sh_quote(db)
     )
 }
@@ -1182,7 +1755,7 @@ fn only_a_shebang(text: &str) -> bool {
 /// with the same arguments writes nothing the second time. A file whose
 /// mushroomdb block was hand-edited so its closing marker is gone is an error
 /// and is left byte-for-byte alone; see [`strip_hook_block`].
-pub fn merge_git_hook(hook_file: &Path, bin_cmd: &str, db: &str) -> Result<bool, CliError> {
+pub fn merge_git_hook(hook_file: &Path, shell: &str, db: &str) -> Result<bool, CliError> {
     let existing = if hook_file.exists() {
         Some(
             fs::read_to_string(hook_file)
@@ -1191,7 +1764,7 @@ pub fn merge_git_hook(hook_file: &Path, bin_cmd: &str, db: &str) -> Result<bool,
     } else {
         None
     };
-    let next = merged_hook_text(existing.as_deref(), &git_hook_block(bin_cmd, db))
+    let next = merged_hook_text(existing.as_deref(), &git_hook_block(shell, db))
         .map_err(|()| unterminated(hook_file))?;
     if existing.as_deref() == Some(next.as_str()) {
         return Ok(false);

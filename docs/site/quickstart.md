@@ -104,6 +104,37 @@ cargo run -p mushroomdb-cli --bin mushroomdb -- serve ./demo-db
 
 ---
 
+## Wire it into an assistant
+
+From the repository you want graphed:
+
+```text
+mushroomdb install
+```
+
+With no flags it detects the assistant (Claude Code, Cursor, or both), picks
+project scope inside a git checkout and user scope anywhere else, and prints
+which it chose. Project scope writes the MCP entry to `.mcp.json`, the
+`/mushroom` skill to `.claude/skills/mushroom/`, the prompt hooks to
+`.claude/settings.json`, an ignore line for the store, and a backgrounded
+`sync` into the `post-commit`, `post-checkout` and `post-merge` git hooks.
+
+The MCP entry runs `npx -y mushroomdb@<version>`, so the assistant needs
+nothing installed globally. To point it at a local build instead:
+
+```text
+mushroomdb install --project --platform claude-code \
+  --command ./target/release/mushroomdb --no-prewarm
+```
+
+Other flags: `--user`, `--platform codex` (registers through the Codex CLI),
+`--db <path>`, and `--no-git-hooks`. `mushroomdb uninstall` removes exactly
+what was written. Full reference: [`skill.md`](skill.md).
+
+Restart the assistant afterwards — MCP servers and hooks are read at startup.
+
+---
+
 ## Rust API
 
 For a programmatic walkthrough from Rust:
