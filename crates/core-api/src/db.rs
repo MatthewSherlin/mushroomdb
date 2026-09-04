@@ -2165,7 +2165,7 @@ impl<F: Fs> GraphDb<F> {
     }
 
     /// Close a cross-process write scope opened by
-    /// [`begin_write_lock`](GraphDb::begin_write_lock): release the lock and
+    /// [`enter_write_scope`](GraphDb::enter_write_scope): release the lock and
     /// clear the Busy latch. Safe to call when the lock was never taken.
     pub(crate) fn end_write_lock(&mut self) {
         self.lock_denied = false;

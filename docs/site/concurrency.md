@@ -45,9 +45,10 @@ other processes have made. Releasing happens only after the commit's fsync
 completes: until then the WAL tail holds bytes that are written but not durable,
 and another process must not snapshot around them.
 
-Waiting for the lock never costs readers anything. A writer polls for it before
-it takes any in-process lock, so a busy peer in another process cannot stall
-reads in this one.
+Waiting for the lock never costs readers anything. A writer takes the WAL mutex,
+then polls for the cross-process lock, and only then takes the in-process write
+lock. Polling happens with no write guard held, so a busy peer in another
+process cannot stall reads in this one.
 
 The lock is advisory. It coordinates cooperating mushroomdb processes; it does
 not stop an unrelated program from editing the files.
@@ -125,6 +126,12 @@ holds open. Three properties make that safe:
 A hook that finds the store busy exits without writing and tries again on the
 next event. That is the intended behaviour, not a failure: the work it was going
 to do is derived from state that is still there.
+
+A long `sync` is the case where that happens for more than an instant: it holds
+the lock for its whole run, so an editor `touch` fired during it waits the
+two-second `WRITE_LOCK_WAIT`, gets `Busy`, and gives up silently with exit 0.
+That edit is not lost — it is re-extracted by the next `touch` on the same file
+or by the next `sync`, which re-reads everything the working tree has changed.
 
 `scripts/acceptance-0.6.sh` exercises this on every release: 20 `touch`
 processes run in parallel against a store a live `mushroomdb mcp` server holds

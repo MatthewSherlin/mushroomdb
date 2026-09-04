@@ -269,7 +269,9 @@ impl Drop for DrainHandle {
 ///
 /// # Lock order
 ///
-/// Acquisition: `wal_mu` → `inner` (RwLock write) → cross-process `LOCK`.
+/// Acquisition: `wal_mu` → cross-process `LOCK` → `inner` (RwLock write). The
+/// cross-process lock is polled with no RwLock write guard held, so a peer
+/// process holding it never stalls this process's readers.
 /// Release: cross-process `LOCK` (in `Drop`), then `inner`, then `wal_mu`
 /// (RAII, struct field declaration order).
 ///
@@ -507,9 +509,11 @@ impl SharedDb {
     /// Exclusive write access, waiting up to [`WRITE_LOCK_WAIT`] for the
     /// store's cross-process write lock.
     ///
-    /// Acquires the WAL mutex first, then the RwLock write guard, satisfying
-    /// the lock order required by the fsync-failure contract (see module doc),
-    /// then the cross-process lock. The returned [`WriteGuard`] releases the
+    /// Acquires the WAL mutex first, then the cross-process lock, then the
+    /// RwLock write guard — the order required by the fsync-failure contract
+    /// (see module doc). Waiting for the cross-process lock happens with no
+    /// RwLock write guard held, which is what keeps a busy peer process off
+    /// this process's read path. The returned [`WriteGuard`] releases the
     /// cross-process lock, then the RwLock, then the WAL mutex on drop.
     ///
     /// # When another process holds the lock

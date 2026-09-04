@@ -400,6 +400,12 @@ they exit **3** with `another mushroomdb process is writing; retry` when another
 process holds it, which is the expected outcome of committing while an ingest is
 running: the next invocation picks the work up.
 
+A long `sync` holds that lock for its whole run, so a `touch` fired by an editor
+hook while it is going waits two seconds for the lock, finds it still held, and
+gives up silently with exit 0. Nothing is lost: that edit is re-extracted by the
+next `touch` on the same file, or by the next `sync`, whose dirty pass re-reads
+every path the working tree has changed.
+
 ### Hook mode is silent
 
 `touch` decides which of two callers it has from its arguments, because the two
