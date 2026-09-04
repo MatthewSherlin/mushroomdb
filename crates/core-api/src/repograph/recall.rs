@@ -4,8 +4,11 @@
 //! tool alike: a hybrid full-text search across every indexed field, reduced
 //! to at most a handful of nodes and their strongest edge each. Query
 //! parsing — turning a raw prompt into the OR-of-terms this module searches
-//! with — is the caller's job, so the same digest serves a JSON hook payload
-//! and a plain `topic` string without this module knowing which it was.
+//! with — stays the caller's job, so the same digest serves a JSON hook payload
+//! and a plain `topic` string without this module knowing which it was. Callers
+//! that hold raw text call [`or_query`] first: it is here, rather than in each
+//! caller, because the hook body and the `recall` MCP tool search the same
+//! index and must not disagree about what a prompt means.
 
 use crate::db::GraphDb;
 use crate::repograph::render::sanitize;
@@ -13,6 +16,10 @@ use core_storage::fs::Fs;
 use core_storage::Value;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+
+/// Distinct search terms taken from one prompt, so a pasted wall of text
+/// cannot turn one call into hundreds of index probes.
+pub const MAX_QUERY_TERMS: usize = 24;
 
 /// Nodes named in the digest.
 pub const MAX_HITS: usize = 6;
@@ -31,6 +38,34 @@ struct EdgeLine {
     weight_prop: Option<String>,
     edge_type: String,
     other: String,
+}
+
+/// Rewrite free-form text as the full-text OR query [`recall_digest`] wants.
+///
+/// Terms inside one group are ANDed by the index, so a natural-language prompt
+/// passed through verbatim matches nothing. Splitting on non-alphanumeric runs
+/// and joining with `OR` ranks by BM25 over whichever words are indexed, and
+/// keeps the caller's punctuation from being read as `-negation` or `prefix*`.
+/// `AND`/`OR` are query keywords, so they are dropped rather than searched.
+///
+/// `None` when nothing searchable is left, which a caller prints nothing for.
+#[must_use]
+pub fn or_query(prompt: &str) -> Option<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for word in prompt.split(|c: char| !c.is_alphanumeric()) {
+        if word.is_empty() || terms.len() >= MAX_QUERY_TERMS {
+            continue;
+        }
+        let term = word.to_lowercase();
+        if term == "and" || term == "or" || terms.contains(&term) {
+            continue;
+        }
+        terms.push(term);
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    Some(terms.join(" OR "))
 }
 
 /// The digest for `prompt` — already an OR-of-terms query, not raw text —

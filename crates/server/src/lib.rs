@@ -3,6 +3,7 @@
 mod http;
 mod json;
 mod mcp;
+mod mcp_tasks;
 mod subscribe;
 mod ws;
 

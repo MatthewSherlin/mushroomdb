@@ -421,8 +421,9 @@ async fn end_to_end_demo_http_watch_mcp() {
     let (req_read, mut req_write) = std::io::pipe().expect("mcp request pipe");
     let (resp_read, resp_write) = std::io::pipe().expect("mcp response pipe");
     let db_mcp = db.clone();
-    let mcp =
-        std::thread::spawn(move || run_mcp_stdio(db_mcp, BufReader::new(req_read), resp_write));
+    let mcp = std::thread::spawn(move || {
+        run_mcp_stdio(db_mcp, None, BufReader::new(req_read), resp_write)
+    });
     let mcp_req = json!({
         "jsonrpc": "2.0",
         "id": 1,

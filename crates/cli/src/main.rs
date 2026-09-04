@@ -58,9 +58,13 @@ fn main() -> ExitCode {
         Ok(Command::Impact { db_dir, files }) => print_or_fail(cli::run_impact(&db_dir, &files)),
         Ok(Command::Owners { db_dir, path }) => print_or_fail(cli::run_owners(&db_dir, &path)),
         Ok(Command::Why { db_dir, a, b }) => print_or_fail(cli::run_why(&db_dir, &a, &b)),
-        Ok(Command::Sync { db_dir }) => match cli::ingest_git::run_sync(&db_dir) {
+        Ok(Command::Sync { db_dir, json }) => match cli::ingest_git::run_sync(&db_dir) {
             Ok(report) => {
-                print!("{}", cli::ingest_git::format_sync(&report));
+                if json {
+                    print!("{}", cli::ingest_git::format_sync_json(&report));
+                } else {
+                    print!("{}", cli::ingest_git::format_sync(&report));
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => busy_aware(&e),
@@ -570,7 +574,9 @@ fn run_mcp(db_dir: PathBuf) -> Result<(), String> {
     let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
     let stdin = io::stdin();
     let stdout = io::stdout();
-    server::run_mcp_stdio(db, stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
+    // The store's path, not just a handle: the `sync` tool re-runs this binary
+    // against the directory, and cannot infer it from an open database.
+    server::run_mcp_stdio(db, Some(db_dir), stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
 }
 
 fn home_dir() -> PathBuf {

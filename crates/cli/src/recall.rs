@@ -11,10 +11,6 @@ use core_api::repograph::recall_digest;
 use core_api::{GraphDb, OpenOptions};
 use std::path::Path;
 
-/// Distinct search terms taken from the prompt, so a pasted wall of text cannot
-/// turn one hook invocation into hundreds of index probes.
-const MAX_QUERY_TERMS: usize = 24;
-
 /// Extract the prompt text from a hook payload. Accepts `prompt`,
 /// `user_prompt`, and `user_input` (the docs disagree on the field name).
 fn prompt_from_payload(raw: &str) -> Option<String> {
@@ -32,27 +28,12 @@ fn prompt_from_payload(raw: &str) -> Option<String> {
 
 /// Rewrite free-form prompt text as a full-text OR query.
 ///
-/// Terms inside one group are ANDed by the index, so a natural-language prompt
-/// passed through verbatim matches nothing. Splitting on non-alphanumeric runs
-/// and joining with `OR` ranks by BM25 over whichever words are indexed, and
-/// keeps the caller's punctuation from being read as `-negation` or `prefix*`.
-/// `AND`/`OR` are query keywords, so they are dropped rather than searched.
+/// The rewrite itself lives in `core_api::repograph::or_query`, because the
+/// `recall` MCP tool applies it to its `topic` argument and the two must not
+/// disagree about what a prompt means. The tests below stay here: this is the
+/// caller whose behaviour they describe.
 fn fulltext_or_query(prompt: &str) -> Option<String> {
-    let mut terms: Vec<String> = Vec::new();
-    for word in prompt.split(|c: char| !c.is_alphanumeric()) {
-        if word.is_empty() || terms.len() >= MAX_QUERY_TERMS {
-            continue;
-        }
-        let term = word.to_lowercase();
-        if term == "and" || term == "or" || terms.contains(&term) {
-            continue;
-        }
-        terms.push(term);
-    }
-    if terms.is_empty() {
-        return None;
-    }
-    Some(terms.join(" OR "))
+    core_api::repograph::or_query(prompt)
 }
 
 pub fn run_recall(db_dir: &Path, hook_stdin: &str) -> String {
@@ -95,7 +76,8 @@ pub fn run_recall(db_dir: &Path, hook_stdin: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fulltext_or_query, prompt_from_payload, MAX_QUERY_TERMS};
+    use super::{fulltext_or_query, prompt_from_payload};
+    use core_api::repograph::MAX_QUERY_TERMS;
 
     #[test]
     fn prompt_is_read_from_any_of_the_three_documented_fields() {

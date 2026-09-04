@@ -55,7 +55,8 @@ pub use map::{repo_map, MapCommunity, MapOptions, RepoMap, SyncInfo};
 pub use owners::{owners, OwnersReport, QUARTERS};
 pub use path::{shortest_path, MAX_HOPS, PATH_EDGES};
 pub use recall::{
-    recall_digest, MAX_EDGES_PER_HIT, MAX_EDGE_CANDIDATES, MAX_HITS, MAX_OUTPUT_BYTES,
+    or_query, recall_digest, MAX_EDGES_PER_HIT, MAX_EDGE_CANDIDATES, MAX_HITS, MAX_OUTPUT_BYTES,
+    MAX_QUERY_TERMS,
 };
 pub use remember::{remember, RememberInput, NOTE_KINDS};
 pub use render::{

@@ -1596,6 +1596,47 @@ pub fn format_touch(r: &structure::StructureReport) -> String {
     )
 }
 
+/// One [`SyncReport`] as a single JSON object, for `sync --json`.
+///
+/// `text` is exactly what [`format_sync`] prints, so a caller that has the
+/// object never has to render the digest a second way and never has to parse
+/// the counts back out of the prose. The MCP `sync` tool is that caller: it
+/// runs this binary and hands both halves straight to the assistant.
+#[must_use]
+pub fn format_sync_json(r: &SyncReport) -> String {
+    let g = &r.git;
+    let s = &r.structure;
+    let gs = &g.structure;
+    let value = serde_json::json!({
+        "text": format_sync(r),
+        "commits": g.commits,
+        "files": g.files,
+        "authors": g.authors,
+        "renamed": g.renamed,
+        "deleted": g.deleted,
+        "incremental": g.incremental,
+        "submodules": g.submodules,
+        "prs": g.prs,
+        "rules_created": g.rules_created,
+        "scanned": {
+            "files": gs.files_scanned,
+            "symbols": gs.symbols,
+            "imports": gs.imports,
+            "calls": gs.calls,
+            "mentions": gs.mentions,
+        },
+        "dirty_refreshed": r.dirty_refreshed,
+        "dirty": {
+            "files": s.files_scanned,
+            "symbols": s.symbols,
+            "imports": s.imports,
+            "calls": s.calls,
+            "mentions": s.mentions,
+        },
+    });
+    format!("{value}\n")
+}
+
 pub fn format_sync(r: &SyncReport) -> String {
     let mut out = format_ingest_git(&r.git);
     let s = &r.structure;

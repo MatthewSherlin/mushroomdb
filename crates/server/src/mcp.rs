@@ -9,9 +9,14 @@
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
 //!   `serverInfo.name` `"mushroomdb"`, `serverInfo.version` (crate version)
 //! - `notifications/initialized` — ignored
-//! - `tools/list` — the twelve tools below, each with a JSON Schema
-//! - `tools/call` — dispatch; success is
-//!   `{content:[{type:"text", text:<json string>}]}`
+//! - `tools/list` — twenty-four tools, each with a JSON Schema: the eight
+//!   repository task tools of [`mcp_tasks`](crate::mcp_tasks) first, then the
+//!   sixteen graph tools below, whose descriptions carry the prefix
+//!   `Advanced: ` so a host ranking tools by description puts the task tools
+//!   in front
+//! - `tools/call` — dispatch; success for a graph tool is
+//!   `{content:[{type:"text", text:<json string>}]}`, and for a task tool the
+//!   rendered digest as text with the report under `structuredContent`
 //!
 //! Unknown methods on a **request** (has `id`) → `-32601`. A notification
 //! (no `id` member) never writes a response, including unknown methods.
@@ -50,10 +55,17 @@ use core_api::{
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 
 /// Run the MCP loop until `reader` hits EOF.
+///
+/// `db_dir` is where the store lives on disk. `mushroomdb mcp <db>` passes it;
+/// a caller that has only a handle passes `None`, and the one tool that needs a
+/// path — `sync`, which re-runs this binary against the store — reports that it
+/// cannot run rather than guessing one.
 pub fn run_mcp_stdio(
     db: SharedDb,
+    db_dir: Option<PathBuf>,
     mut reader: impl BufRead,
     mut writer: impl Write,
 ) -> io::Result<()> {
@@ -66,13 +78,18 @@ pub fn run_mcp_stdio(
         }
         match std::str::from_utf8(&buf) {
             Ok(s) if s.trim().is_empty() => continue,
-            Ok(s) => handle_line(&db, s.trim(), &mut writer)?,
+            Ok(s) => handle_line(&db, db_dir.as_deref(), s.trim(), &mut writer)?,
             Err(_) => write_error(&mut writer, None, -32700, "Parse error")?,
         }
     }
 }
 
-fn handle_line(db: &SharedDb, line: &str, writer: &mut impl Write) -> io::Result<()> {
+fn handle_line(
+    db: &SharedDb,
+    db_dir: Option<&Path>,
+    line: &str,
+    writer: &mut impl Write,
+) -> io::Result<()> {
     let msg: Js = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return write_error(writer, None, -32700, "Parse error"),
@@ -109,12 +126,15 @@ fn handle_line(db: &SharedDb, line: &str, writer: &mut impl Write) -> io::Result
         }
         "tools/call" => {
             if is_request {
-                match dispatch_call(db, obj.get("params")) {
+                match dispatch_call(db, db_dir, obj.get("params")) {
                     CallOutcome::Protocol { code, message } => {
                         write_error(writer, id, code, &message)?;
                     }
                     CallOutcome::ToolOk(payload) => {
                         write_result(writer, id, tool_ok(payload))?;
+                    }
+                    CallOutcome::TaskOk { text, structured } => {
+                        write_result(writer, id, task_ok(&text, structured))?;
                     }
                     CallOutcome::ToolErr(message) => {
                         write_result(writer, id, tool_err(&message))?;
@@ -131,13 +151,23 @@ fn handle_line(db: &SharedDb, line: &str, writer: &mut impl Write) -> io::Result
     Ok(())
 }
 
-enum CallOutcome {
-    Protocol { code: i64, message: String },
+pub(crate) enum CallOutcome {
+    Protocol {
+        code: i64,
+        message: String,
+    },
+    /// A graph tool's JSON payload, returned as a JSON string in `content`.
     ToolOk(Js),
+    /// A task tool's answer: the rendered digest as `content`, and the report
+    /// — carrying that same digest under `text` — as `structuredContent`.
+    TaskOk {
+        text: String,
+        structured: Js,
+    },
     ToolErr(String),
 }
 
-fn dispatch_call(db: &SharedDb, params: Option<&Js>) -> CallOutcome {
+fn dispatch_call(db: &SharedDb, db_dir: Option<&Path>, params: Option<&Js>) -> CallOutcome {
     let Some(params) = params.and_then(Js::as_object) else {
         return protocol_invalid();
     };
@@ -150,6 +180,10 @@ fn dispatch_call(db: &SharedDb, params: Option<&Js>) -> CallOutcome {
         Some(a) if a.is_object() => a,
         Some(_) => return protocol_invalid(),
     };
+    // The repository task tools first, in the order `tools/list` advertises.
+    if let Some(outcome) = crate::mcp_tasks::dispatch(db, db_dir, name, args) {
+        return outcome;
+    }
     match name {
         "query" => tool_query(db, args),
         "ingest_json" => tool_ingest(db, args),
@@ -834,9 +868,31 @@ fn initialize_result() -> Js {
     })
 }
 
+/// The prefix every graph tool's description carries.
+///
+/// A host that ranks tools by their description now has one signal that the
+/// eight repository tools are the ones to reach for first, and that everything
+/// under this prefix is the lower-level surface beneath them.
+const ADVANCED_PREFIX: &str = "Advanced: ";
+
+/// The twenty-four tools: the eight repository task tools, then the sixteen
+/// graph tools with their descriptions prefixed.
 fn tools_list() -> Js {
-    json!({
-        "tools": [
+    let mut tools = crate::mcp_tasks::task_tools();
+    for mut tool in graph_tools() {
+        if let Some(d) = tool.get("description").and_then(Js::as_str) {
+            let prefixed = format!("{ADVANCED_PREFIX}{d}");
+            tool["description"] = Js::String(prefixed);
+        }
+        tools.push(tool);
+    }
+    json!({ "tools": tools })
+}
+
+/// The sixteen graph tools, in the order they have always been listed, with
+/// their descriptions unprefixed. [`tools_list`] adds the prefix.
+fn graph_tools() -> Vec<Js> {
+    let Js::Array(tools) = json!([
             {
                 "name": "query",
                 "description": "Run a Cypher query (read or write) against the graph. When 'mask' is provided, only the listed node keys are visible (read-only).",
@@ -1083,13 +1139,24 @@ fn tools_list() -> Js {
                     "required": ["old_key", "new_key"]
                 }
             }
-        ]
-    })
+    ]) else {
+        unreachable!("the literal above is an array")
+    };
+    tools
 }
 
 fn tool_ok(payload: Js) -> Js {
     json!({
         "content": [{ "type": "text", "text": payload.to_string() }]
+    })
+}
+
+/// A task tool's result: the rendered digest for an assistant to read, and the
+/// report for a program that wants the numbers.
+fn task_ok(text: &str, structured: Js) -> Js {
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": structured
     })
 }
 
@@ -1211,7 +1278,7 @@ mod tests {
     fn roundtrip(db: &SharedDb, request: &str) -> Js {
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        run_mcp_stdio(db.clone(), input.as_bytes(), &mut output).expect("mcp");
+        run_mcp_stdio(db.clone(), None, input.as_bytes(), &mut output).expect("mcp");
         let s = std::str::from_utf8(&output).expect("utf8");
         serde_json::from_str(s.trim()).expect("json response")
     }
@@ -1257,6 +1324,16 @@ mod tests {
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
         for expected in &[
+            // The eight repository task tools, first and in order.
+            "map",
+            "context",
+            "impact",
+            "owners",
+            "why",
+            "recall",
+            "remember",
+            "sync",
+            // The sixteen graph tools.
             "query",
             "ingest_json",
             "create_rule",
@@ -1278,10 +1355,16 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            16,
-            "expected exactly 16 tools, got {}",
+            24,
+            "expected exactly 24 tools, got {}",
             names.len()
         );
+        assert_eq!(
+            &names[..8],
+            ["map", "context", "impact", "owners", "why", "recall", "remember", "sync"],
+            "the task tools come first, in order"
+        );
+        assert_eq!(names[8], "query", "the graph tools follow them");
     }
 
     #[test]

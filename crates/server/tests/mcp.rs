@@ -37,9 +37,19 @@ fn open(name: &str) -> SharedDb {
 }
 
 fn exchange(db: SharedDb, stdin: &str) -> (std::io::Result<()>, Vec<u8>) {
+    exchange_at(db, None, stdin)
+}
+
+/// Like [`exchange`], but tells the loop where the store is on disk — what
+/// `mushroomdb mcp <db>` passes and what the `sync` tool needs.
+fn exchange_at(
+    db: SharedDb,
+    db_dir: Option<PathBuf>,
+    stdin: &str,
+) -> (std::io::Result<()>, Vec<u8>) {
     let mut reader = Cursor::new(stdin.as_bytes().to_vec());
     let mut writer = Cursor::new(Vec::new());
-    let res = run_mcp_stdio(db, &mut reader, &mut writer);
+    let res = run_mcp_stdio(db, db_dir, &mut reader, &mut writer);
     (res, writer.into_inner())
 }
 
@@ -171,7 +181,7 @@ fn tools_list_returns_all_tools_with_schemas() {
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 16);
+    assert_eq!(tools.len(), 24);
 
     let by_name = |n: &str| {
         tools
@@ -674,7 +684,7 @@ fn notification_without_id_emits_no_bytes() {
 fn eof_exits_ok() {
     let mut reader = Cursor::new(Vec::<u8>::new());
     let mut writer = Cursor::new(Vec::new());
-    let res = run_mcp_stdio(open("eof"), &mut reader, &mut writer);
+    let res = run_mcp_stdio(open("eof"), None, &mut reader, &mut writer);
     assert!(res.is_ok(), "{res:?}");
     assert!(writer.into_inner().is_empty());
 }
@@ -968,4 +978,837 @@ fn hybrid_search_text_only_and_missing_field_errors() {
         json!(true),
         "missing query_text must be an error"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task tools: map, context, impact, owners, why, recall, remember, sync
+//
+// These eight answer a question about a graphed repository rather than about
+// the graph API, so they come first in `tools/list` and the sixteen below them
+// are prefixed `Advanced:`. Each returns the rendered digest as its text
+// content and the serialised report — plus that same text — as
+// `structuredContent`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The eight task tools, in the order `tools/list` must list them.
+const TASK_TOOLS: [&str; 8] = [
+    "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
+];
+
+/// The sixteen graph tools, in their established order, after the task tools.
+const ADVANCED_TOOLS: [&str; 16] = [
+    "query",
+    "ingest_json",
+    "create_rule",
+    "explain",
+    "stats",
+    "neighborhood",
+    "node_info",
+    "node_edges",
+    "upsert_entity",
+    "find_similar",
+    "explain_association",
+    "hybrid_search",
+    "node_history",
+    "edge_history",
+    "was_linked",
+    "rename_node",
+];
+
+/// The three files of the synthetic code store, and who tops each.
+const CODE_FILES: [(&str, &str); 3] = [
+    ("src/core.rs", "a@example.test"),
+    ("src/util.rs", "a@example.test"),
+    ("src/web.rs", "b@example.test"),
+];
+/// Commits in the synthetic code store.
+const CODE_COMMITS: usize = 4;
+/// Unix seconds of its oldest commit. Fixed, so nothing here reads a clock.
+const CODE_T0: i64 = 1_700_000_000;
+
+fn s(v: &str) -> Value {
+    Value::Str(v.to_string())
+}
+
+fn list(items: &[String]) -> Value {
+    Value::List(items.iter().map(|i| s(i)).collect())
+}
+
+fn code_sha(i: usize) -> String {
+    format!("{:07x}{:033x}", 0x00ab_cd00usize + i * 4093, i)
+}
+
+/// Files commit `i` touched: every commit touches `core` and `web`, and the
+/// first also touches `util` — so `core`/`web` overlap fully and `core`/`util`
+/// overlap at exactly the `co_changed` threshold.
+fn code_touched(i: usize) -> Vec<&'static str> {
+    if i == 0 {
+        vec!["src/core.rs", "src/util.rs", "src/web.rs"]
+    } else {
+        vec!["src/core.rs", "src/web.rs"]
+    }
+}
+
+/// The rules `ingest-git` declares, reduced to the ones these tools read.
+///
+/// Recreated here rather than imported: core-api's fixture is a private module
+/// of its own test crates, and the server crate cannot reach into it.
+fn code_rules() -> Vec<core_api::RuleDef> {
+    fn key_rule(name: &str, src: &str, dst: &str, field: &str, edge: &str) -> core_api::RuleDef {
+        let predicate = core_api::Predicate::KeyMatch {
+            field: field.into(),
+        };
+        let max_edges = Some(core_api::default_max_edges(&predicate));
+        core_api::RuleDef {
+            name: name.into(),
+            src_label: src.into(),
+            dst_label: dst.into(),
+            predicate,
+            edge_type: edge.into(),
+            weight_prop: None,
+            max_edges,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        }
+    }
+    let mut out = vec![
+        key_rule(
+            "auto_fk_symbol_file_id",
+            "Symbol",
+            "File",
+            "file_id",
+            "DEFINES",
+        ),
+        key_rule("imports", "File", "File", "imports", "IMPORTS"),
+        key_rule("calls", "Symbol", "Symbol", "calls_to", "CALLS"),
+        key_rule(
+            "auto_fk_commit_author_id",
+            "Commit",
+            "Author",
+            "author_id",
+            "AUTHOR",
+        ),
+        key_rule(
+            "auto_fk_file_top_author_id",
+            "File",
+            "Author",
+            "top_author_id",
+            "TOP_AUTHOR",
+        ),
+    ];
+    for label in core_api::repograph::rules::ABOUT_LABELS {
+        out.push(core_api::repograph::rules::about_rule(label));
+    }
+    let co = core_api::Predicate::Overlap {
+        field: "commits".into(),
+        min: 0.25,
+    };
+    out.push(core_api::RuleDef {
+        name: "co_changed".into(),
+        src_label: "File".into(),
+        dst_label: "File".into(),
+        predicate: co.clone(),
+        edge_type: "CO_CHANGED".into(),
+        weight_prop: Some("score".into()),
+        max_edges: Some(10),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    });
+    out.push(core_api::RuleDef {
+        name: "knows".into(),
+        src_label: "Author".into(),
+        dst_label: "File".into(),
+        predicate: co,
+        edge_type: "KNOWS".into(),
+        weight_prop: Some("score".into()),
+        max_edges: Some(20),
+        approximate: false,
+        via_label: Some("File".into()),
+        via_edge: Some("TOP_AUTHOR".into()),
+        via_dir: Some(core_api::Direction::In),
+    });
+    out
+}
+
+/// Write the synthetic code graph into an already-open store.
+fn seed_code_graph(db: &SharedDb) {
+    let mut w = db.write();
+    for (key, name) in [
+        ("a@example.test", "Ada Example"),
+        ("b@example.test", "Bea Example"),
+    ] {
+        w.insert_node("Author", key, vec![("name".into(), s(name))])
+            .expect("author");
+    }
+
+    let mut commits_of: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    let mut authors_of: std::collections::BTreeMap<&str, std::collections::BTreeMap<&str, usize>> =
+        Default::default();
+    for i in 0..CODE_COMMITS {
+        let author = if i % 2 == 0 {
+            "a@example.test"
+        } else {
+            "b@example.test"
+        };
+        for f in code_touched(i) {
+            commits_of.entry(f).or_default().push(code_sha(i));
+            *authors_of.entry(f).or_default().entry(author).or_default() += 1;
+        }
+    }
+
+    for (key, top) in CODE_FILES {
+        let commits = commits_of.get(key).cloned().unwrap_or_default();
+        let counts: Vec<String> = authors_of
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|(email, n)| format!("{email}\t{n}"))
+            .collect();
+        let mut props = vec![
+            ("id".into(), s(key)),
+            ("path".into(), s(key)),
+            ("dir".into(), s("src")),
+            ("ext".into(), s("rs")),
+            ("lang".into(), s("rust")),
+            ("lines".into(), Value::Int(42)),
+            ("top_author_id".into(), s(top)),
+            ("n_commits".into(), Value::Int(commits.len() as i64)),
+            ("commits".into(), list(&commits)),
+            ("author_counts".into(), list(&counts)),
+        ];
+        // Both other files import the core one, and quote the line they did so on.
+        if key != "src/core.rs" {
+            props.push(("imports".into(), list(&["src/core.rs".to_string()])));
+            props.push(("import_lines".into(), list(&["src/core.rs\t3".to_string()])));
+        }
+        w.insert_node("File", key, props).expect("file");
+    }
+
+    for (file, name, callee) in [
+        ("src/core.rs", "core::init", None),
+        ("src/web.rs", "web::serve", Some("src/core.rs#core::init")),
+    ] {
+        let key = format!("{file}#{name}");
+        let mut props = vec![
+            ("id".into(), s(&key)),
+            ("name".into(), s(name)),
+            ("kind".into(), s("function")),
+            ("path".into(), s(file)),
+            ("file_id".into(), s(file)),
+            ("line_start".into(), Value::Int(10)),
+            ("line_end".into(), Value::Int(20)),
+            ("signature".into(), s(&format!("fn {name}()"))),
+            ("doc".into(), s(&format!("what {name} does"))),
+        ];
+        if let Some(target) = callee {
+            props.push(("calls_to".into(), list(&[target.to_string()])));
+            props.push(("call_lines".into(), list(&[format!("{target}\t14")])));
+        }
+        w.insert_node("Symbol", &key, props).expect("symbol");
+    }
+
+    for i in 0..CODE_COMMITS {
+        let sha = code_sha(i);
+        let author = if i % 2 == 0 {
+            "a@example.test"
+        } else {
+            "b@example.test"
+        };
+        w.insert_node(
+            "Commit",
+            &sha,
+            vec![
+                ("id".into(), s(&sha)),
+                ("message".into(), s(&format!("change {i:02}"))),
+                ("ts".into(), Value::Int(CODE_T0 + i as i64 * 86_400)),
+                ("author_id".into(), s(author)),
+            ],
+        )
+        .expect("commit");
+        for f in code_touched(i) {
+            w.insert_edge("TOUCHED", &sha, f).expect("touched");
+        }
+    }
+
+    w.insert_node(
+        "Note",
+        "note:seed",
+        vec![
+            ("id".into(), s("note:seed")),
+            ("text".into(), s("the core module is the entry point")),
+            ("kind".into(), s("note")),
+            ("ts".into(), Value::Int(CODE_T0)),
+            ("source".into(), s("agent")),
+            ("about".into(), list(&["src/core.rs".to_string()])),
+        ],
+    )
+    .expect("note");
+
+    w.insert_node(
+        "GitSync",
+        "__mushroomdb_git_sync__",
+        vec![
+            ("id".into(), s("__mushroomdb_git_sync__")),
+            ("sha".into(), s(&code_sha(CODE_COMMITS - 1))),
+            ("synced_at".into(), Value::Int(CODE_T0 + 4 * 86_400)),
+            // Deliberately not a real path: `context` must still answer from
+            // the graph when the working tree it names is not there.
+            ("repo".into(), s("/nonexistent/mushroomdb-test-repo")),
+            ("recurse".into(), Value::Bool(false)),
+            ("prs".into(), Value::Bool(false)),
+            ("structure".into(), Value::Bool(true)),
+            ("docs".into(), Value::Bool(true)),
+        ],
+    )
+    .expect("gitsync");
+
+    for (label, field) in [("File", "path"), ("Symbol", "name"), ("Note", "text")] {
+        w.enable_fulltext(label, field).expect("fulltext");
+    }
+    for def in code_rules() {
+        w.create_rule(def).expect("rule");
+    }
+}
+
+/// A store shaped the way `ingest-git` leaves one, small enough to assert on.
+fn code_store(name: &str) -> SharedDb {
+    let db = open(name);
+    seed_code_graph(&db);
+    db
+}
+
+/// Unwrap a task tool's reply: the rendered text and the structured report.
+fn task_reply(reply: &Js) -> (String, Js) {
+    assert!(
+        reply.get("error").is_none() || reply["error"].is_null(),
+        "expected tool result, got protocol error: {reply}"
+    );
+    assert!(
+        !reply["result"]["isError"].as_bool().unwrap_or(false),
+        "expected success, got tool error: {reply}"
+    );
+    assert_eq!(reply["result"]["content"][0]["type"], "text");
+    let text = reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("content[0].text string: {reply}"))
+        .to_string();
+    let structured = reply["result"]["structuredContent"].clone();
+    assert!(
+        structured.is_object(),
+        "task tools must return structuredContent: {reply}"
+    );
+    assert_eq!(
+        structured["text"],
+        json!(text),
+        "structuredContent must repeat the rendered text: {reply}"
+    );
+    (text, structured)
+}
+
+/// The text of a tool error reply.
+fn error_text(reply: &Js) -> String {
+    assert_eq!(
+        reply["result"]["isError"],
+        json!(true),
+        "expected a tool error: {reply}"
+    );
+    reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn one_task_call(db: SharedDb, name: &str, args: Js) -> Js {
+    let (res, out) = exchange(db, &call(1, name, args));
+    assert!(res.is_ok(), "{res:?}");
+    parse_lines(&out).remove(0)
+}
+
+/// Binding: 24 tools, task tools first in their fixed order, and every one of
+/// the sixteen graph tools carries the `Advanced:` prefix.
+#[test]
+fn tools_list_has_24_tools_task_tools_first_and_advanced_prefix() {
+    let (res, out) = exchange(open("list-order"), &req(json!(1), "tools/list", None));
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    let tools = replies[0]["result"]["tools"].as_array().expect("tools");
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|t| t["name"].as_str().expect("name"))
+        .collect();
+
+    let expected: Vec<&str> = TASK_TOOLS
+        .iter()
+        .chain(ADVANCED_TOOLS.iter())
+        .copied()
+        .collect();
+    assert_eq!(names, expected, "tools/list order");
+    assert_eq!(tools.len(), 24);
+
+    for t in tools.iter().take(TASK_TOOLS.len()) {
+        let d = t["description"].as_str().expect("description");
+        assert!(
+            !d.starts_with("Advanced:"),
+            "task tool {} must not be prefixed: {d}",
+            t["name"]
+        );
+        assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
+    }
+    for t in tools.iter().skip(TASK_TOOLS.len()) {
+        let d = t["description"].as_str().expect("description");
+        assert!(
+            d.starts_with("Advanced: "),
+            "{} must be prefixed Advanced: got {d}",
+            t["name"]
+        );
+    }
+
+    // The schemas the plan fixes.
+    let by_name = |n: &str| tools.iter().find(|t| t["name"] == n).expect("tool");
+    assert_eq!(by_name("map")["inputSchema"]["properties"], json!({}));
+    assert_eq!(by_name("sync")["inputSchema"]["properties"], json!({}));
+    assert_eq!(
+        by_name("context")["inputSchema"]["required"],
+        json!(["target"])
+    );
+    assert_eq!(
+        by_name("owners")["inputSchema"]["required"],
+        json!(["path"])
+    );
+    assert_eq!(by_name("why")["inputSchema"]["required"], json!(["a", "b"]));
+    assert_eq!(
+        by_name("recall")["inputSchema"]["required"],
+        json!(["topic"])
+    );
+    assert_eq!(
+        by_name("remember")["inputSchema"]["required"],
+        json!(["text"])
+    );
+    assert!(by_name("impact")["inputSchema"].get("required").is_none());
+    assert_eq!(
+        by_name("remember")["inputSchema"]["properties"]["kind"]["enum"],
+        json!(["note", "decision", "todo"])
+    );
+}
+
+/// Binding: the published server card lists exactly the tools the server
+/// serves, in the same order.
+#[test]
+fn server_card_lists_the_same_tools_in_the_same_order() {
+    let card_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.well-known/mcp/server-card.json");
+    let card: Js = serde_json::from_str(&std::fs::read_to_string(&card_path).expect("server card"))
+        .expect("server card json");
+    let listed: Vec<&str> = card["tools"]
+        .as_array()
+        .expect("card tools array")
+        .iter()
+        .map(|t| t.as_str().expect("card tool name"))
+        .collect();
+    let expected: Vec<&str> = TASK_TOOLS
+        .iter()
+        .chain(ADVANCED_TOOLS.iter())
+        .copied()
+        .collect();
+    assert_eq!(listed, expected, "{} is out of date", card_path.display());
+}
+
+/// Binding: `map` on a store with nothing in it names the command that fills it.
+#[test]
+fn map_on_empty_store_is_helpful() {
+    let reply = one_task_call(open("map-empty"), "map", json!({}));
+    let (text, structured) = task_reply(&reply);
+    assert!(
+        text.contains("empty store") && text.contains("ingest-git"),
+        "empty map must say what to run: {text}"
+    );
+    assert_eq!(structured["files"], json!(0));
+    assert_eq!(structured["symbols"], json!(0));
+}
+
+/// Binding: `map` counts what the graph holds and renders the same numbers.
+#[test]
+fn map_reports_the_graphed_repository() {
+    let reply = one_task_call(code_store("map-full"), "map", json!({}));
+    let (text, structured) = task_reply(&reply);
+    assert_eq!(structured["files"], json!(3));
+    assert_eq!(structured["symbols"], json!(2));
+    assert_eq!(structured["commits"], json!(4));
+    assert_eq!(structured["authors"], json!(2));
+    assert!(text.starts_with("mushroomdb map — 3 files"), "{text}");
+    assert!(
+        text.lines().count() <= 40,
+        "map must stay within its line budget: {text}"
+    );
+}
+
+/// Binding: a `map` served from a handle another handle wrote through is
+/// current without the server being restarted.
+#[test]
+fn map_reflects_writes_made_by_another_handle() {
+    let dir = tmp("map-follows");
+    let db = SharedDb::open(&dir).expect("open");
+    seed_code_graph(&db);
+
+    let (_, before) = task_reply(&one_task_call(db.clone(), "map", json!({})));
+    assert_eq!(before["files"], json!(3));
+
+    // A second handle on the same directory — what a git hook is — inserts a
+    // fourth file and exits, releasing the store's write lock.
+    {
+        let mut other = core_api::GraphDb::open(&dir).expect("second handle");
+        other
+            .insert_node(
+                "File",
+                "src/extra.rs",
+                vec![
+                    ("id".into(), s("src/extra.rs")),
+                    ("path".into(), s("src/extra.rs")),
+                    ("dir".into(), s("src")),
+                    ("lang".into(), s("rust")),
+                    ("lines".into(), Value::Int(9)),
+                ],
+            )
+            .expect("insert through second handle");
+    }
+    // The read path checks for a peer's commits at most once per refresh
+    // interval, so give it one before asking again.
+    std::thread::sleep(std::time::Duration::from_millis(120));
+
+    let (text, after) = task_reply(&one_task_call(db.clone(), "map", json!({})));
+    assert_eq!(
+        after["files"],
+        json!(4),
+        "the server must follow the other handle's write: {text}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Binding: `context` on a bare symbol name resolves it and reports its file,
+/// its signature and what calls it.
+#[test]
+fn context_on_symbol() {
+    let reply = one_task_call(
+        code_store("context-symbol"),
+        "context",
+        json!({"target": "core::init"}),
+    );
+    let (text, structured) = task_reply(&reply);
+    assert_eq!(
+        structured["target"]["symbol"]["key"],
+        json!("src/core.rs#core::init")
+    );
+    assert_eq!(structured["file"], json!("src/core.rs"));
+    assert_eq!(structured["signature"], json!("fn core::init()"));
+    let callers: Vec<&str> = structured["callers"]
+        .as_array()
+        .expect("callers")
+        .iter()
+        .map(|c| c[0].as_str().expect("caller key"))
+        .collect();
+    assert_eq!(callers, vec!["src/web.rs#web::serve"]);
+    assert!(text.contains("core::init"), "{text}");
+    assert!(
+        text.lines().count() <= 60,
+        "context must stay within its line budget: {text}"
+    );
+}
+
+/// Binding: `context` on a target the graph does not know says so rather than
+/// failing.
+#[test]
+fn context_on_unknown_target_is_not_an_error() {
+    let reply = one_task_call(
+        code_store("context-unknown"),
+        "context",
+        json!({"target": "nope"}),
+    );
+    let (text, structured) = task_reply(&reply);
+    assert_eq!(structured["target"]["unknown"]["target"], json!("nope"));
+    assert!(!text.is_empty());
+}
+
+/// Binding: `context` without a target is a tool error.
+#[test]
+fn context_without_target_is_a_tool_error() {
+    let reply = one_task_call(code_store("context-no-target"), "context", json!({}));
+    assert!(error_text(&reply).contains("target"));
+}
+
+/// Binding: `impact` on an explicit file list marks the partners that are
+/// themselves in that list.
+#[test]
+fn impact_explicit_files_marks_modified() {
+    let reply = one_task_call(
+        code_store("impact-explicit"),
+        "impact",
+        json!({"files": ["src/core.rs", "src/web.rs"]}),
+    );
+    let (text, structured) = task_reply(&reply);
+    let files = structured["files"].as_array().expect("files");
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["path"], json!("src/core.rs"));
+
+    let partners = files[0]["partners"].as_array().expect("partners");
+    let web = partners
+        .iter()
+        .find(|p| p["path"] == "src/web.rs")
+        .expect("src/web.rs is a co-change partner of src/core.rs");
+    assert_eq!(web["modified"], json!(true), "it is in the changed set");
+    let util = partners.iter().find(|p| p["path"] == "src/util.rs");
+    if let Some(util) = util {
+        assert_eq!(
+            util["modified"],
+            json!(false),
+            "it is not in the changed set"
+        );
+    }
+    assert!(text.contains("src/web.rs 1.00 modified"), "{text}");
+    assert!(
+        text.lines().count() <= 25,
+        "impact must stay within its line budget: {text}"
+    );
+}
+
+/// Binding: `impact` reports a path the graph has never seen as unknown.
+#[test]
+fn impact_reports_unknown_paths() {
+    let reply = one_task_call(
+        code_store("impact-unknown"),
+        "impact",
+        json!({"files": ["src/core.rs", "no/such.rs"]}),
+    );
+    let (text, structured) = task_reply(&reply);
+    assert_eq!(structured["unknown"], json!(["no/such.rs"]));
+    assert!(text.contains("unknown: no/such.rs"), "{text}");
+}
+
+/// Binding: with no `files`, `impact` reads the working tree's diff from the
+/// host's project directory — and says what to do instead when there is no
+/// working tree to read.
+///
+/// Both halves live in one test on purpose: `$CLAUDE_PROJECT_DIR` is
+/// process-global, so two tests setting it would race. No other test in this
+/// binary reads it.
+#[test]
+fn impact_defaults_to_the_project_diff_and_says_so_when_it_cannot() {
+    let repo = tmp("impact-project-repo");
+    std::fs::create_dir_all(repo.join("src")).expect("repo dirs");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.test"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.join("src/core.rs"), "fn init() {}\n").expect("write");
+    git(&["add", "src/core.rs"]);
+    git(&["commit", "-qm", "first"]);
+    // Uncommitted: exactly what `git diff --name-only HEAD` reports.
+    std::fs::write(repo.join("src/core.rs"), "fn init() { /* edited */ }\n").expect("edit");
+
+    let db = code_store("impact-default");
+    std::env::set_var("CLAUDE_PROJECT_DIR", &repo);
+    let (text, structured) = task_reply(&one_task_call(db.clone(), "impact", json!({})));
+    let paths: Vec<&str> = structured["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|f| f["path"].as_str().expect("path"))
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["src/core.rs"],
+        "the uncommitted edit is the default change set: {text}"
+    );
+
+    // With neither a project directory nor a checkout at the marker's `repo`,
+    // there is no diff to default to.
+    std::env::set_var("CLAUDE_PROJECT_DIR", "/nonexistent/mushroomdb-test-project");
+    let reply = one_task_call(db, "impact", json!({}));
+    assert!(
+        error_text(&reply).contains("pass files explicitly"),
+        "{}",
+        error_text(&reply)
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Binding: `owners` names the top author once, with the key in parentheses.
+#[test]
+fn owners_reports_the_top_author() {
+    let reply = one_task_call(
+        code_store("owners-ok"),
+        "owners",
+        json!({"path": "src/core.rs"}),
+    );
+    let (text, structured) = task_reply(&reply);
+    assert_eq!(structured["path"], json!("src/core.rs"));
+    assert!(text.contains("Ada Example (a@example.test)"), "{text}");
+    assert!(
+        text.lines().count() <= 25,
+        "owners must stay within its line budget: {text}"
+    );
+}
+
+/// Binding: `owners` on a path the store holds no file for is a tool error.
+#[test]
+fn owners_unknown_path_error() {
+    let reply = one_task_call(
+        code_store("owners-unknown"),
+        "owners",
+        json!({"path": "no/such.rs"}),
+    );
+    let msg = error_text(&reply);
+    assert!(msg.contains("no/such.rs"), "{msg}");
+}
+
+/// Binding: `why` names both unknown keys rather than only the first.
+#[test]
+fn why_unknown_keys_say_unknown() {
+    let reply = one_task_call(
+        code_store("why-unknown"),
+        "why",
+        json!({"a": "nope", "b": "zzz"}),
+    );
+    let (text, structured) = task_reply(&reply);
+    assert!(text.contains("unknown:"), "{text}");
+    assert_eq!(structured["unknown"], json!(["nope", "zzz"]));
+}
+
+/// Binding: `why` between two co-changed files reports the link and its
+/// evidence.
+#[test]
+fn why_reports_the_link_between_two_files() {
+    let reply = one_task_call(
+        code_store("why-link"),
+        "why",
+        json!({"a": "src/core.rs", "b": "src/web.rs"}),
+    );
+    let (text, structured) = task_reply(&reply);
+    let links = structured["links"].as_array().expect("links");
+    assert!(
+        links.iter().any(|l| l["edge_type"] == "CO_CHANGED"),
+        "expected a CO_CHANGED link: {structured}"
+    );
+    assert!(text.contains("CO_CHANGED"), "{text}");
+    assert!(
+        text.lines().count() <= 25,
+        "why must stay within its line budget: {text}"
+    );
+}
+
+/// Binding: `recall` turns a plain topic into a digest of the nodes nearest it.
+#[test]
+fn recall_returns_digest() {
+    let reply = one_task_call(
+        code_store("recall-topic"),
+        "recall",
+        json!({"topic": "the core module"}),
+    );
+    let (text, structured) = task_reply(&reply);
+    assert_eq!(structured["topic"], json!("the core module"));
+    assert!(
+        text.contains("src/core.rs"),
+        "the digest must name the matching node: {text}"
+    );
+    assert_eq!(structured["digest"], json!(text));
+}
+
+/// Binding: a topic with nothing searchable in it is answered, not an error.
+#[test]
+fn recall_on_an_unsearchable_topic_says_nothing_matched() {
+    let reply = one_task_call(
+        code_store("recall-empty"),
+        "recall",
+        json!({"topic": "!!! ???"}),
+    );
+    let (text, _) = task_reply(&reply);
+    assert!(text.contains("nothing"), "{text}");
+}
+
+/// Binding: `remember` writes a note and returns its key; unknown `about`
+/// keys are all named, and nothing is written.
+#[test]
+fn remember_writes_note_and_rejects_unknown_about() {
+    let db = code_store("remember");
+
+    let reply = one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "core::init is the entry point", "about": ["src/core.rs"], "kind": "decision"}),
+    );
+    let (text, structured) = task_reply(&reply);
+    let key = structured["key"].as_str().expect("key").to_string();
+    assert!(key.starts_with("note:"), "{key}");
+    assert!(text.contains(&key), "{text}");
+    assert!(db.read().has_node(&key), "the note must be in the store");
+
+    // Two unknown keys: both are named, sorted, and nothing is written.
+    let before = db.read().node_count();
+    let reply = one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "about nothing that exists", "about": ["zzz.rs", "no/such.rs"]}),
+    );
+    let msg = error_text(&reply);
+    assert!(
+        msg.contains("no/such.rs") && msg.contains("zzz.rs"),
+        "{msg}"
+    );
+    assert_eq!(db.read().node_count(), before, "nothing may be written");
+}
+
+/// Binding: `remember` needs text.
+#[test]
+fn remember_without_text_is_a_tool_error() {
+    let reply = one_task_call(code_store("remember-no-text"), "remember", json!({}));
+    assert!(error_text(&reply).contains("text"));
+}
+
+/// Binding: `remember` rejects a `kind` outside the enum.
+#[test]
+fn remember_rejects_an_unknown_kind() {
+    let reply = one_task_call(
+        code_store("remember-kind"),
+        "remember",
+        json!({"text": "hello", "kind": "shopping list"}),
+    );
+    assert!(error_text(&reply).contains("kind"));
+}
+
+/// Binding: `sync` cannot run without knowing where the store is, and says so.
+#[test]
+fn sync_without_db_dir_is_a_tool_error() {
+    let reply = one_task_call(code_store("sync-no-dir"), "sync", json!({}));
+    let msg = error_text(&reply);
+    assert!(msg.contains("store path unknown"), "{msg}");
+}
+
+/// Binding: with a store path, `sync` runs this binary and reports what it
+/// could not do rather than panicking.
+#[test]
+fn sync_with_db_dir_reports_the_child_failure() {
+    let dir = tmp("sync-with-dir");
+    let db = SharedDb::open(&dir).expect("open");
+    let (res, out) = exchange_at(db.clone(), Some(dir.clone()), &call(1, "sync", json!({})));
+    assert!(res.is_ok(), "{res:?}");
+    let reply = parse_lines(&out).remove(0);
+    // `current_exe()` under `cargo test` is this test binary, not the CLI, so
+    // the run cannot produce a sync report. What matters is that the tool
+    // reports that as an error instead of hanging or panicking.
+    let msg = error_text(&reply);
+    assert!(msg.contains("sync"), "{msg}");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -215,6 +215,10 @@ pub enum Command {
     /// names: the commits since the marker, then the dirty working tree.
     Sync {
         db_dir: PathBuf,
+        /// Print the report as one JSON object instead of the plain digest.
+        /// The MCP `sync` tool runs this binary and reads that object, so the
+        /// counts reach an assistant without being parsed back out of prose.
+        json: bool,
     },
     /// Re-extract named files only. Body of the PostToolUse hook, which reads
     /// the paths off a payload on stdin when none are given on the command line.
@@ -306,7 +310,7 @@ Usage:
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
   mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
-  mushroomdb sync <db-dir>         re-sync the repo the store was built from: new commits, then the dirty working tree
+  mushroomdb sync <db-dir> [--json] re-sync the repo the store was built from: new commits, then the dirty working tree
   mushroomdb map <db-dir> [--json] summarise the graphed repository: clusters, key files, owners, hot files
                                    --json prints the computed map instead of the rendered digest
   mushroomdb context <db-dir> <target>   one file or symbol from every side: signature, source, callers,
@@ -510,8 +514,10 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "export" => parse_export(&args[1..]),
         "recall" => parse_dir_or_auto("recall", &args[1..])
             .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
-        "sync" => parse_one_dir("sync", &args[1..]).map(|db_dir| Command::Sync { db_dir }),
-        "map" => parse_map(&args[1..]),
+        "sync" => parse_dir_with_json("sync", &args[1..])
+            .map(|(db_dir, json)| Command::Sync { db_dir, json }),
+        "map" => parse_dir_with_json("map", &args[1..])
+            .map(|(db_dir, json)| Command::Map { db_dir, json }),
         "context" => {
             parse_positional("context", &args[1..], 1, 1).map(|(db_dir, rest)| Command::Context {
                 db_dir,
@@ -1580,7 +1586,8 @@ fn parse_positional(
     Ok((db_dir, rest))
 }
 
-fn parse_map(args: &[&str]) -> Result<Command, String> {
+/// `<cmd> <db-dir> [--json]`, shared by `map` and `sync`.
+fn parse_dir_with_json(cmd: &str, args: &[&str]) -> Result<(PathBuf, bool), String> {
     let mut db_dir = None;
     let mut json = false;
     for a in args {
@@ -1594,8 +1601,8 @@ fn parse_map(args: &[&str]) -> Result<Command, String> {
             db_dir = Some(PathBuf::from(*a));
         }
     }
-    let db_dir = db_dir.ok_or_else(|| "map requires <db-dir>".to_string())?;
-    Ok(Command::Map { db_dir, json })
+    let db_dir = db_dir.ok_or_else(|| format!("{cmd} requires <db-dir>"))?;
+    Ok((db_dir, json))
 }
 
 fn parse_one_dir(cmd: &str, args: &[&str]) -> Result<PathBuf, String> {
@@ -3431,7 +3438,15 @@ mod tests {
         assert_eq!(
             parse_args(&["sync", "/tmp/db"]).unwrap(),
             Command::Sync {
-                db_dir: PathBuf::from("/tmp/db")
+                db_dir: PathBuf::from("/tmp/db"),
+                json: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&["sync", "/tmp/db", "--json"]).unwrap(),
+            Command::Sync {
+                db_dir: PathBuf::from("/tmp/db"),
+                json: true,
             }
         );
         assert!(parse_args(&["sync"]).is_err(), "db-dir is required");
