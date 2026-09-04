@@ -1239,6 +1239,58 @@ fn gitsync_records_repo_and_flags() {
     );
 }
 
+/// The marker stamps when the store last took data, which is the only thing
+/// that can tell a reader how stale the graph is: `Commit.ts` says when the
+/// work was written, and on a store synced to head that is indistinguishable
+/// from now.
+#[test]
+fn gitsync_stamps_when_the_store_last_took_data() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    let before = now_unix();
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    let stamp = |dir: &Path| match GraphDb::open(dir)
+        .unwrap()
+        .node_ref("__mushroomdb_git_sync__")
+        .unwrap()
+        .prop("synced_at")
+    {
+        Some(core_api::Value::Int(at)) => at,
+        other => panic!("synced_at must be an integer, got {other:?}"),
+    };
+
+    let first = stamp(&db_dir);
+    assert!(
+        (before..=now_unix()).contains(&first),
+        "the stamp is this run's wall clock, got {first}"
+    );
+
+    // A run that finds nothing new writes nothing at all — the stamp included.
+    // It means "when this store last took something", so leaving it is right.
+    let seq = GraphDb::open(&db_dir).unwrap().commit_seq();
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!(GraphDb::open(&db_dir).unwrap().commit_seq(), seq);
+    assert_eq!(stamp(&db_dir), first);
+
+    // A new commit moves it forward.
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    commit(&repo, "alice", "one more", &[("src/api.rs", "a9")]);
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert!(
+        stamp(&db_dir) > first,
+        "ingesting new commits re-stamps the marker"
+    );
+}
+
+/// Wall-clock seconds, for asserting the stamp lands in this run's window.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
 /// `--ensure-gitignore` adds the database directory to the repository's
 /// `.gitignore` once, and leaves it alone on every later run.
 #[test]

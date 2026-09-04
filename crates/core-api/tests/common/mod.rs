@@ -29,6 +29,9 @@ pub const DAY_SECS: i64 = 86_400;
 const QUARTER: i64 = 91 * DAY_SECS;
 /// `ts` of the oldest commit. An arbitrary fixed epoch — nothing reads a clock.
 pub const T0: i64 = 1_600_000_000;
+/// The `GitSync` marker's `synced_at`: twelve minutes after the newest commit,
+/// so a test that passes `now_ts: Some(SYNCED_AT + 720)` reads `12m ago`.
+pub const SYNCED_AT: i64 = T0 + 4 * QUARTER + 7 * DAY_SECS + 60;
 /// Commits per quarter, over 5 quarters.
 const PER_QUARTER: usize = 8;
 /// Total commits.
@@ -333,6 +336,7 @@ pub fn synthetic_repo_store(dir: &Path) -> GraphDb<core_storage::fs::RealFs> {
         vec![
             ("id".into(), s("__mushroomdb_git_sync__")),
             ("sha".into(), s(&sha(COMMITS - 1))),
+            ("synced_at".into(), Value::Int(SYNCED_AT)),
             ("repo".into(), s("/synthetic/repo")),
             ("recurse".into(), Value::Bool(false)),
             ("prs".into(), Value::Bool(false)),

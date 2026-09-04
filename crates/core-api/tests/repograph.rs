@@ -8,12 +8,22 @@ mod common;
 
 use common::{
     all_files, commit_ts, file_key, hash_of, newest_ts, open, sha, synthetic_repo_store, tmp,
-    COMMITS, DAY_SECS,
+    COMMITS, DAY_SECS, SYNCED_AT,
 };
 use core_api::repograph::{render_map, repo_map, MapOptions};
 
 /// `hot_days` wide enough to cover the whole synthetic history.
 const ALL_TIME: i64 = 10_000;
+
+/// Options with the clock pinned twelve minutes after the fixture's sync, so
+/// the whole digest — the sync age included — is fixed. Twelve minutes is far
+/// short of the 90-day window, so which files count as hot is unchanged.
+fn pinned() -> MapOptions {
+    MapOptions {
+        now_ts: Some(SYNCED_AT + 12 * 60),
+        ..MapOptions::default()
+    }
+}
 
 #[test]
 fn map_names_clusters_by_common_prefix() {
@@ -167,7 +177,7 @@ fn map_stale_concepts_counted() {
 fn map_render_is_at_most_40_lines_and_deterministic() {
     let dir = tmp("map-render");
     let db = synthetic_repo_store(&dir);
-    let m = repo_map(&db, &MapOptions::default());
+    let m = repo_map(&db, &pinned());
     let text = render_map(&m);
 
     assert!(
@@ -175,7 +185,7 @@ fn map_render_is_at_most_40_lines_and_deterministic() {
         "{} lines:\n{text}",
         text.lines().count()
     );
-    assert_eq!(render_map(&repo_map(&db, &MapOptions::default())), text);
+    assert_eq!(render_map(&repo_map(&db, &pinned())), text);
 
     let header = text.lines().next().expect("a header");
     assert!(
@@ -183,8 +193,8 @@ fn map_render_is_at_most_40_lines_and_deterministic() {
         "header: {header}"
     );
     assert!(
-        header.contains(&format!("at {}", &sha(COMMITS - 1)[..7])),
-        "the header names the sha the store synced to: {header}"
+        header.ends_with(&format!("· synced 12m ago at {}", &sha(COMMITS - 1)[..7])),
+        "the header dates the sync and names its sha: {header}"
     );
     for want in [
         "clusters (co-change + imports)",
@@ -213,7 +223,7 @@ fn map_render_is_at_most_40_lines_and_deterministic() {
     // A store built the same way twice renders the same bytes.
     let other = tmp("map-render-2");
     let db2 = synthetic_repo_store(&other);
-    assert_eq!(render_map(&repo_map(&db2, &MapOptions::default())), text);
+    assert_eq!(render_map(&repo_map(&db2, &pinned())), text);
 }
 
 #[test]
@@ -259,29 +269,96 @@ fn map_sanitizes_every_line_it_renders_from_graph_content() {
 fn map_reports_truncation_when_the_budget_is_gone() {
     let dir = tmp("map-budget");
     let db = synthetic_repo_store(&dir);
-    let m = repo_map(
-        &db,
-        &MapOptions {
-            budget_ms: 1,
-            ..MapOptions::default()
-        },
-    );
-    if m.truncated {
-        assert!(render_map(&m)
-            .lines()
-            .next()
-            .unwrap()
-            .contains("(truncated)"));
-    }
-    // A budget of zero means no budget at all, and nothing is dropped.
+
+    // A budget of zero means no budget at all, so nothing is dropped. This is
+    // the engine's own convention for every algorithm config.
     let full = repo_map(
         &db,
         &MapOptions {
             budget_ms: 0,
+            ..pinned()
+        },
+    );
+    assert!(!full.truncated);
+    assert_eq!(full.communities.len(), 3);
+    assert_eq!(full.key_files.len(), 5);
+
+    // A budget too small to finish in may or may not fire on any given
+    // machine, so what is pinned is the invariant: whatever it drops, the map
+    // stays well formed and the header agrees with the flag.
+    let tight = repo_map(
+        &db,
+        &MapOptions {
+            budget_ms: 1,
+            ..pinned()
+        },
+    );
+    let header = render_map(&tight).lines().next().unwrap().to_string();
+    assert_eq!(
+        tight.truncated,
+        header.ends_with("(truncated)"),
+        "the header must say so exactly when the flag is set: {header}"
+    );
+    assert!(tight.key_files.len() <= 5);
+    assert!(tight
+        .key_files
+        .iter()
+        .all(|(k, s)| !k.is_empty() && *s >= 0.0));
+    assert!(tight.communities.len() <= full.communities.len());
+
+    // And the flag always reaches the header, whichever phase set it.
+    let mut forced = full.clone();
+    forced.truncated = true;
+    assert!(render_map(&forced)
+        .lines()
+        .next()
+        .unwrap()
+        .ends_with("(truncated)"));
+}
+
+#[test]
+fn map_dates_the_sync_from_the_marker_not_from_the_commits() {
+    let dir = tmp("map-synced-at");
+    let mut db = synthetic_repo_store(&dir);
+
+    let sync = repo_map(&db, &pinned()).last_sync.expect("a marker");
+    assert_eq!(sync.sha, sha(COMMITS - 1));
+    assert_eq!(
+        sync.synced_at,
+        Some(SYNCED_AT),
+        "the raw stamp is carried through for callers reading the map as data"
+    );
+    assert_eq!(sync.age_secs, Some(12 * 60));
+
+    // The age tracks "now", not the newest commit — which is a minute older
+    // than the sync and would have given a different, useless answer.
+    let later = repo_map(
+        &db,
+        &MapOptions {
+            now_ts: Some(SYNCED_AT + 3 * 3_600),
             ..MapOptions::default()
         },
     );
-    assert!(!full.truncated && full.communities.len() == 3);
+    assert_eq!(later.last_sync.as_ref().unwrap().age_secs, Some(3 * 3_600));
+    assert!(render_map(&later)
+        .lines()
+        .next()
+        .unwrap()
+        .contains("synced 3h ago"));
+
+    // A store written before the marker carried a stamp still names its sha,
+    // just without an age.
+    db.remove_prop("__mushroomdb_git_sync__", "synced_at")
+        .expect("drop the stamp");
+    let old = repo_map(&db, &pinned());
+    let sync = old.last_sync.clone().expect("a marker");
+    assert_eq!(sync.synced_at, None);
+    assert_eq!(sync.age_secs, None);
+    let header = render_map(&old).lines().next().unwrap().to_string();
+    assert!(
+        header.ends_with(&format!("· synced at {}", &sha(COMMITS - 1)[..7])),
+        "no stamp, no age: {header}"
+    );
 }
 
 #[test]

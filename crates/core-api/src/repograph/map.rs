@@ -3,7 +3,8 @@
 //! What a person new to a codebase asks first: how big is it, what are its
 //! parts, which files does everything else lean on, who knows them, and what
 //! has moved lately. Every answer is computed from the graph `ingest-git`
-//! wrote; nothing here reads the working tree or a clock.
+//! wrote; nothing here reads the working tree, and the only clock it reads is
+//! the one behind "synced 3h ago" (see *Time* below).
 //!
 //! # How each answer is found
 //!
@@ -17,11 +18,21 @@
 //!
 //! # Time
 //!
-//! "Now" is [`MapOptions::now_ts`] when given and otherwise the newest
-//! `Commit.ts` in the store — never the wall clock, because a digest must be
-//! byte-identical across runs against an unchanged store. A consequence worth
-//! knowing: on a store synced to its repository's head, the sync age reads as
-//! `0s`, since the head commit *is* the newest timestamp.
+//! Two clocks, for two different questions.
+//!
+//! *Which files are hot* is a question about the store, so it is measured
+//! against the newest `Commit.ts` — the answer then depends on nothing but the
+//! data, and two runs against an unchanged store agree.
+//!
+//! *How stale is the graph* is a question about the present, so it is measured
+//! against the wall clock and the marker's `synced_at`, which `ingest-git`
+//! stamps whenever it takes new data. Reading `Commit.ts` here would be
+//! useless: on a store synced to its repository's head the newest commit *is*
+//! the sync point, so the age would always be `0s`.
+//!
+//! [`MapOptions::now_ts`] overrides both, which is how a test pins the output.
+//! Determinism therefore means byte-identical for the same store *and* the
+//! same `now_ts`; without one, only the sync age moves.
 //!
 //! # Budget
 //!
@@ -41,6 +52,9 @@ use std::time::{Duration, Instant};
 
 /// Key of the singleton marker `ingest-git` writes the synced sha on.
 const SYNC_KEY: &str = "__mushroomdb_git_sync__";
+/// Marker prop holding when the store last took new data, in Unix seconds.
+/// Absent on a store built before it existed.
+const SYNCED_AT: &str = "synced_at";
 /// A `CO_CHANGED` edge below this score is too weak to shape a cluster.
 const CO_CHANGED_MIN_WEIGHT: f64 = 0.3;
 /// Most entries any one-line section prints.
@@ -66,7 +80,9 @@ pub struct MapOptions {
     pub hot_days: i64,
     /// Wall-clock budget in milliseconds. `0` means no budget.
     pub budget_ms: u64,
-    /// Treat this Unix timestamp as now. Defaults to the newest `Commit.ts`.
+    /// Treat this Unix timestamp as now, for both the hot window and the sync
+    /// age. Without it the window falls back to the newest `Commit.ts` and the
+    /// sync age to the wall clock. Set it to pin the whole output.
     pub now_ts: Option<i64>,
 }
 
@@ -82,14 +98,18 @@ impl Default for MapOptions {
     }
 }
 
-/// How current the graph is: the sha it was synced to, and how old that
-/// commit is relative to now.
+/// How current the graph is: the sha it was synced to, and how long ago that
+/// sync ran.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SyncInfo {
     /// The full sha recorded on the `GitSync` marker.
     pub sha: String,
-    /// Seconds between that commit's `ts` and now. `None` when the commit it
-    /// names is not in the graph, so its age cannot be known.
+    /// The marker's `synced_at`: Unix seconds at which this store last took
+    /// new data from the repository. `None` on a store written before the
+    /// marker carried one.
+    pub synced_at: Option<i64>,
+    /// Seconds between `synced_at` and now. `None` whenever `synced_at` is,
+    /// and the digest then reports the sha without an age.
     pub age_secs: Option<i64>,
 }
 
@@ -139,6 +159,14 @@ pub struct RepoMap {
 /// Whether the deadline has passed. `None` is a run with no budget.
 fn spent(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|dl| Instant::now() >= dl)
+}
+
+/// Wall-clock seconds since the Unix epoch. The only clock this module reads,
+/// and only for the sync age — never for anything that decides content.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Milliseconds left, floored at 1 so a budgeted call never reads as
@@ -204,8 +232,7 @@ pub fn repo_map<F: Fs>(db: &GraphDb<F>, opts: &MapOptions) -> RepoMap {
     let symbols = db.nodes_with_label("Symbol").len();
     let authors = db.nodes_with_label("Author").len();
 
-    // Commit timestamps, read once: "now", the sync age and the hot window all
-    // need them.
+    // Commit timestamps, read once: both the hot window and "now" need them.
     let mut commit_ts: BTreeMap<String, i64> = BTreeMap::new();
     for n in db.nodes_with_label("Commit") {
         if let Some(Value::Int(ts)) = n.prop("ts") {
@@ -213,7 +240,13 @@ pub fn repo_map<F: Fs>(db: &GraphDb<F>, opts: &MapOptions) -> RepoMap {
         }
     }
     let commits = db.nodes_with_label("Commit").len();
+    // Two clocks, deliberately. The hot window is measured against the newest
+    // commit, so which files count as hot depends only on the store. The sync
+    // age is measured against the wall clock, because "how stale is my graph"
+    // is a question about the present — and `now_ts` overrides it, which is
+    // how the tests pin the answer.
     let now = opts.now_ts.or_else(|| commit_ts.values().copied().max());
+    let sync_now = opts.now_ts.unwrap_or_else(now_unix);
 
     let mut map = RepoMap {
         files,
@@ -235,12 +268,14 @@ pub fn repo_map<F: Fs>(db: &GraphDb<F>, opts: &MapOptions) -> RepoMap {
     }
 
     map.last_sync = str_prop(db, SYNC_KEY, "sha").map(|sha| {
-        let age_secs = now
-            .zip(commit_ts.get(&sha).copied())
-            .map(|(now, ts)| now - ts);
+        let synced_at = match db.node_ref(SYNC_KEY).and_then(|n| n.prop(SYNCED_AT)) {
+            Some(Value::Int(at)) => Some(at),
+            _ => None, // a store built before the marker carried a stamp
+        };
         SyncInfo {
             sha: sanitize(&sha),
-            age_secs,
+            synced_at,
+            age_secs: synced_at.map(|at| sync_now - at),
         }
     });
 
@@ -250,7 +285,9 @@ pub fn repo_map<F: Fs>(db: &GraphDb<F>, opts: &MapOptions) -> RepoMap {
         truncated = true;
         Vec::new()
     } else {
-        file_pagerank(db, &file_keys)
+        let (scores, hit_budget) = file_pagerank(db, &file_keys, deadline);
+        truncated |= hit_budget;
+        scores
     };
     let by_score: BTreeMap<&str, f64> = scores.iter().map(|(k, s)| (k.as_str(), *s)).collect();
     map.key_files = scores
@@ -374,11 +411,20 @@ pub fn repo_map<F: Fs>(db: &GraphDb<F>, opts: &MapOptions) -> RepoMap {
 /// accumulate across the three sources, and rank flows along the edge — so a
 /// file many others import collects it, which is what "most depended-on"
 /// means. The iteration mirrors [`crate::algo::pagerank`]: same damping,
-/// tolerance, iteration cap and dangling-mass handling.
-fn file_pagerank<F: Fs>(db: &GraphDb<F>, file_keys: &[String]) -> Vec<(String, f64)> {
+/// tolerance, iteration cap, dangling-mass handling and per-iteration budget
+/// check.
+///
+/// Returns the ranking and whether the deadline cut the iteration short. Cut
+/// short, the scores are still a valid partial ranking — more iterations would
+/// only refine them — but the caller reports the map as truncated.
+fn file_pagerank<F: Fs>(
+    db: &GraphDb<F>,
+    file_keys: &[String],
+    deadline: Option<Instant>,
+) -> (Vec<(String, f64)>, bool) {
     let n = file_keys.len();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let idx: BTreeMap<&str, usize> = file_keys
         .iter()
@@ -436,10 +482,33 @@ fn file_pagerank<F: Fs>(db: &GraphDb<F>, file_keys: &[String]) -> Vec<(String, f
         }
     }
 
+    let (pr, hit_budget) = power_iteration(n, &receive_from, &dangling, deadline);
+    let mut scores: Vec<(String, f64)> = file_keys.iter().cloned().zip(pr).collect();
+    rank(&mut scores);
+    (scores, hit_budget)
+}
+
+/// The power iteration itself, split out so the budget check has a test that
+/// does not depend on how fast a machine is.
+///
+/// `receive_from[j]` holds `(i, share)` for every node that sends rank to `j`,
+/// already normalised by `i`'s outgoing weight; `dangling` lists the nodes with
+/// no outgoing weight, whose mass spreads uniformly. Returns the ranks and
+/// whether the deadline fired before convergence — checked before each
+/// iteration, so an already-expired deadline returns the uniform vector.
+fn power_iteration(
+    n: usize,
+    receive_from: &[Vec<(usize, f64)>],
+    dangling: &[usize],
+    deadline: Option<Instant>,
+) -> (Vec<f64>, bool) {
     let nf = n as f64;
     let teleport = (1.0 - DAMPING) / nf;
     let mut pr: Vec<f64> = vec![1.0 / nf; n];
     for _ in 0..MAX_ITERS {
+        if spent(deadline) {
+            return (pr, true);
+        }
         let leaked = dangling.iter().map(|&i| pr[i]).sum::<f64>() * DAMPING / nf;
         let mut next = vec![teleport + leaked; n];
         for (j, slot) in next.iter_mut().enumerate() {
@@ -451,10 +520,7 @@ fn file_pagerank<F: Fs>(db: &GraphDb<F>, file_keys: &[String]) -> Vec<(String, f
             break;
         }
     }
-
-    let mut scores: Vec<(String, f64)> = file_keys.iter().cloned().zip(pr).collect();
-    rank(&mut scores);
-    scores
+    (pr, false)
 }
 
 /// Concepts whose recorded source hashes no longer match the files they were
@@ -517,4 +583,50 @@ fn questions<F: Fs>(db: &GraphDb<F>, map: &RepoMap, ranked: &[(String, f64)]) ->
         out.push(sanitize(&format!("what imports {}?", basename(second))));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Three nodes in a line: 0 → 1 → 2, with 2 dangling.
+    fn line() -> (Vec<Vec<(usize, f64)>>, Vec<usize>) {
+        let receive_from = vec![Vec::new(), vec![(0, 1.0)], vec![(1, 1.0)]];
+        (receive_from, vec![2])
+    }
+
+    #[test]
+    fn an_expired_deadline_stops_the_iteration_before_it_starts() {
+        let (receive_from, dangling) = line();
+        let expired = Some(Instant::now() - Duration::from_secs(1));
+        let (pr, hit) = power_iteration(3, &receive_from, &dangling, expired);
+        assert!(hit, "the budget must be reported as spent");
+        assert_eq!(
+            pr,
+            vec![1.0 / 3.0; 3],
+            "nothing ran, so the ranks are still uniform — a valid partial answer"
+        );
+    }
+
+    #[test]
+    fn without_a_deadline_the_iteration_converges_and_ranks_the_sink_top() {
+        let (receive_from, dangling) = line();
+        let (pr, hit) = power_iteration(3, &receive_from, &dangling, None);
+        assert!(!hit, "no budget means nothing was cut short");
+        assert!(
+            pr[2] > pr[1] && pr[1] > pr[0],
+            "rank flows along the line and pools at the end: {pr:?}"
+        );
+        let total: f64 = pr.iter().sum();
+        assert!((total - 1.0).abs() < 1e-6, "ranks sum to one, got {total}");
+    }
+
+    #[test]
+    fn a_deadline_still_ahead_lets_the_iteration_finish() {
+        let (receive_from, dangling) = line();
+        let ample = Some(Instant::now() + Duration::from_secs(60));
+        let (pr, hit) = power_iteration(3, &receive_from, &dangling, ample);
+        assert!(!hit);
+        assert!(pr[2] > pr[0]);
+    }
 }

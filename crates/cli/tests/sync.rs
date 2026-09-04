@@ -147,6 +147,39 @@ fn out(db: &cli::structure::Db, key: &str, edge: &str) -> Vec<String> {
 
 // ── sync ────────────────────────────────────────────────────────────────────
 
+/// `sync` re-stamps the marker when it takes new commits, so `map` can say how
+/// stale the graph is rather than how old its newest commit is.
+#[test]
+fn sync_restamps_the_marker_when_it_takes_new_commits() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    let stamp = |dir: &Path| match GraphDb::open(dir)
+        .unwrap()
+        .node_ref("__mushroomdb_git_sync__")
+        .unwrap()
+        .prop("synced_at")
+    {
+        Some(core_api::Value::Int(at)) => at,
+        other => panic!("synced_at must be an integer, got {other:?}"),
+    };
+    let first = stamp(&db_dir);
+
+    // Nothing new: the whole run writes nothing, the stamp included.
+    let seq = GraphDb::open(&db_dir).unwrap().commit_seq();
+    run_sync(&db_dir).unwrap();
+    assert_eq!(GraphDb::open(&db_dir).unwrap().commit_seq(), seq);
+    assert_eq!(stamp(&db_dir), first);
+
+    // One new commit, and the sync dates itself.
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    commit(&repo, "add extra", &[("src/extra.rs", "//! Extra.\n")]);
+    let r = run_sync(&db_dir).unwrap();
+    assert_eq!(r.git.commits, 1, "{r:?}");
+    assert!(stamp(&db_dir) > first, "the sync re-stamped the marker");
+}
+
 /// A hook-driven `sync` has to do both halves of the job: walk the commits
 /// that landed since the marker, and re-extract the files the working tree has
 /// changed but not committed. Neither half alone keeps the graph honest.

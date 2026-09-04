@@ -12,7 +12,7 @@
 //! | `File` | path | `path`, `dir`, `ext`, `commits`, `n_commits`, `top_author_id`, `author_counts`, plus the working-tree props in [`structure`](crate::structure) |
 //! | `Symbol` | `"<path>#<qualified name>"` | see [`structure`](crate::structure) |
 //! | `PR` | `"pr:<number>"` | `number`, `title`, `url`, `merged_at`, `author_login` |
-//! | `GitSync` | `"__mushroomdb_git_sync__"` | `sha`, `repo`, `recurse`, `prs`, `structure`, `docs` |
+//! | `GitSync` | `"__mushroomdb_git_sync__"` | `sha`, `synced_at`, `repo`, `recurse`, `prs`, `structure`, `docs` |
 //!
 //! Edges: user `TOUCHED` Commit→File and `MERGED_AS` PR→Commit, auto-FK
 //! `AUTHOR` Commit→Author, `TOP_AUTHOR` File→Author and `PR` Commit→PR,
@@ -1138,10 +1138,31 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     Ok(report)
 }
 
+/// Wall-clock seconds since the Unix epoch, for [`SYNCED_AT`].
+///
+/// This is the one place the ingest reads a clock. A clock before the epoch
+/// reads as `0` rather than going negative.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Marker prop holding when this store last took data from the repository.
+///
+/// `Commit.ts` says when the work was *written*, which on a store synced to
+/// its repository's head is indistinguishable from now — so it cannot answer
+/// "how stale is my graph". This can. Absent on a store built before it
+/// existed, which readers must tolerate.
+pub const SYNCED_AT: &str = "synced_at";
+
 /// Record how far this unit got, and under what flags.
 ///
 /// Props are written only where they differ, so a run that touches one unit
-/// does not churn the markers of the others.
+/// does not churn the markers of the others — and a run that changes nothing
+/// writes nothing at all, [`SYNCED_AT`] included. The stamp therefore means
+/// "when this store last took something new", which is what a reader wants
+/// from it; a no-op re-run leaving it alone is the point, not a gap.
 fn write_marker(w: &mut WriteGuard<'_>, p: &Pending, opts: &IngestGitOpts) -> Result<(), CliError> {
     let Some(head) = p.head.as_deref() else {
         return Ok(()); // no commits, so nothing to resume from
@@ -1152,11 +1173,16 @@ fn write_marker(w: &mut WriteGuard<'_>, p: &Pending, opts: &IngestGitOpts) -> Re
     }
     let key = p.unit.sync_key.clone();
     if w.has_node(&key) {
+        let mut changed = false;
         for (k, v) in props {
             let current = w.node_ref(&key).and_then(|n| n.prop(&k));
             if current.as_ref() != Some(&v) {
                 w.set_prop(&key, &k, v)?;
+                changed = true;
             }
+        }
+        if changed {
+            w.set_prop(&key, SYNCED_AT, Value::Int(now_unix()))?;
         }
         return Ok(());
     }
@@ -1166,6 +1192,7 @@ fn write_marker(w: &mut WriteGuard<'_>, p: &Pending, opts: &IngestGitOpts) -> Re
     // It carries `id` like every other label here, so the key is readable from
     // Cypher.
     props.push(("id".into(), Value::Str(key.clone())));
+    props.push((SYNCED_AT.into(), Value::Int(now_unix())));
     props.sort_by(|a, b| a.0.cmp(&b.0));
     w.insert_node("GitSync", &key, props)?;
     Ok(())

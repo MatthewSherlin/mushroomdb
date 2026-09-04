@@ -43,7 +43,7 @@ ingest-git: 622 commit(s), 396 file(s), 2 author(s)
 | `File` | path | `path`, `dir`, `ext`, `commits` (list of shas, newest last, capped), `n_commits`, `top_author_id`, `author_counts`, and from the working tree: `hash`, `lines`, `lang`, `symbols_n`, `imports`, `import_lines`, `mentions`, `headings`, `body` |
 | `Symbol` | `"<path>#<qualified name>"` | `name`, `kind`, `path`, `file_id`, `line_start`, `line_end`, `signature`, `doc`, `calls_to`, `call_lines` |
 | `PR` | `"pr:<number>"` | `number`, `title`, `url`, `merged_at`, `author_login` |
-| `GitSync` | `"__mushroomdb_git_sync__"` | `sha` — the last ingested commit, the marker the next run resumes from — plus `repo`, `recurse`, `prs`, `structure`, `docs` |
+| `GitSync` | `"__mushroomdb_git_sync__"` | `sha` — the last ingested commit, the marker the next run resumes from — plus `synced_at` (when the store last took new data), `repo`, `recurse`, `prs`, `structure`, `docs` |
 
 The sync marker's key is deliberately not `HEAD`. Node keys are one namespace
 shared with `File` keys, which are repository paths, and a project that ships a
@@ -495,12 +495,17 @@ their members share. Key files are ranked by PageRank over `IMPORTS`,
 symbols. Owners are `TOP_AUTHOR` in-degree, printed by name. Hot files are
 those a commit inside the last 90 days touched, counted over `TOUCHED`.
 
-"Now" is the newest `Commit.ts` in the store rather than the wall clock, which
-is what keeps a re-run byte-identical — so a store synced to its repository's
-head reports a sync age of `0s`. The digest is at most 40 lines and takes a
-few hundred milliseconds on a repository of a few hundred files; when its time
-budget fires, the header ends in `(truncated)`. Add `--json` to get the same
-map as data instead of a digest.
+Two clocks, for two questions. Which files count as hot is measured against
+the newest `Commit.ts`, so the answer depends on the store alone and a re-run
+agrees with itself. How stale the graph is comes from the marker's `synced_at`,
+stamped whenever `ingest-git` or `sync` takes new data, measured against the
+wall clock — `synced 3h ago at 4856f6f`. A store built before that stamp
+existed reports `synced at 4856f6f` with no age.
+
+The digest is at most 40 lines and takes a few hundred milliseconds on a
+repository of a few hundred files; when its time budget fires, the header ends
+in `(truncated)`. Add `--json` to get the same map as data instead of a
+digest.
 
 ## What the recall hook sees
 
