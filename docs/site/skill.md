@@ -29,7 +29,7 @@ and files instead — see [`docs/site/ingest-git.md`](ingest-git.md).
 | `--platform claude-code\|cursor\|codex\|all` | Target platform. Default: auto-detect (reads `~/.claude` / `.cursor/` presence). `all` is Claude Code and Cursor; Codex is opt-in, because registering with it runs another program. |
 | `--project` / `--user` | Scope. Default: auto — project inside a git checkout, user anywhere else. |
 | `--db <path>` | Database directory. Default: `./mushroom-memory` (project) or `~/.mushroomdb/memory` (user). |
-| `--command <path>` | Invoke this binary instead of `npx`. Use it for a local build or a pinned install. A relative path is fine to type: it is anchored to the current directory before anything is written, because the assistant spawns the server from a directory of its own. `--db` is anchored the same way. |
+| `--command <path>` | Invoke this binary instead of `npx`. Use it for a local build or a pinned install. A relative path is fine to type: it is anchored to the current directory before anything is written, because the assistant spawns the server from a directory of its own. `--db` is anchored the same way. A bare name with no separator (`--command mushroomdb`) means a `PATH` lookup and is written exactly as given. |
 | `--no-git-hooks` | Skip the `post-commit` / `post-checkout` / `post-merge` sync hooks. |
 | `--no-prewarm` | Skip the one-off `npx -y mushroomdb@<version> --version` fetch. |
 

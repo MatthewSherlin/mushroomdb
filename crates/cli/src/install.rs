@@ -427,6 +427,14 @@ struct Manifest {
 }
 
 impl Manifest {
+    /// Drop entries no version of this install may act on as written. See
+    /// [`load_manifest`] for why a `.gitignore` in `files` is one of them.
+    fn sanitised(mut self) -> Self {
+        self.files
+            .retain(|f| f.file_name() != Some(OsStr::new(".gitignore")));
+        self
+    }
+
     fn is_empty(&self) -> bool {
         self.files.is_empty()
             && self.mcp_keys.is_empty()
@@ -619,8 +627,10 @@ fn merge_hook_entry(
 
 /// Remove exactly the hook groups whose only command is `command`; drop the
 /// command from mixed groups; leave everything else semantically unchanged.
-fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result<(), CliError> {
-    drop_hooks(settings_file, event, |c| c == command).map(|_| ())
+/// Returns whether the file was rewritten — that is, whether the hook was
+/// there to remove at all.
+fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result<bool, CliError> {
+    drop_hooks(settings_file, event, |c| c == command)
 }
 
 /// Whether `command` is one of our hook bodies for `db`, whatever binary it
@@ -766,6 +776,32 @@ fn absolutise(path: &Path, base: &Path) -> PathBuf {
     out
 }
 
+/// Whether `p` is a program name to be looked up on PATH rather than a file to
+/// be anchored: one plain component, no separator, no `.` or `..`.
+///
+/// `--command mushroomdb` means "whatever `mushroomdb` PATH resolves to" and
+/// stays that way in both forms we write — an MCP host resolves a bare
+/// `command` on PATH, and quoting a bare name in a shell does not defeat the
+/// lookup either. Anchoring it would invent `<cwd>/mushroomdb`, a file that
+/// need not exist, and the install would report success over a server that
+/// cannot spawn.
+fn is_bare_program_name(p: &Path) -> bool {
+    let mut components = p.components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+/// Anchor a `--command` unless it is a bare program name.
+fn absolutise_command(path: &Path, base: &Path) -> PathBuf {
+    if is_bare_program_name(path) {
+        path.to_path_buf()
+    } else {
+        absolutise(path, base)
+    }
+}
+
 /// Install the /mushroom skill and MCP server entry for the resolved platforms.
 ///
 /// `project_root` is the directory where project-scope config files live
@@ -803,10 +839,10 @@ pub fn run_install_with(
         .map(|d| absolutise(d, project_root))
         .unwrap_or_else(|| default_db(scope, project_root, home));
     let db_str = db.to_string_lossy();
-    // Whatever the caller handed us, what gets written names a binary by a
-    // path that resolves from anywhere.
+    // Whatever the caller handed us, what gets written resolves from anywhere:
+    // an absolute path, or a name PATH answers for.
     let cmd = &match cmd {
-        McpCommand::Explicit(p) => McpCommand::Explicit(absolutise(p, project_root)),
+        McpCommand::Explicit(p) => McpCommand::Explicit(absolutise_command(p, project_root)),
         other => other.clone(),
     };
 
@@ -998,15 +1034,18 @@ pub fn run_uninstall_with(
 
     let raw = fs::read_to_string(&manifest_path)
         .map_err(|e| CliError(format!("cannot read manifest: {e}")))?;
-    let manifest: Manifest =
-        serde_json::from_str(&raw).map_err(|e| CliError(format!("corrupt manifest: {e}")))?;
+    let manifest: Manifest = serde_json::from_str::<Manifest>(&raw)
+        .map_err(|e| CliError(format!("corrupt manifest: {e}")))?
+        .sanitised();
 
     let mut removed = Vec::new();
 
     // Remove MCP keys first (before files, in case files include .mcp.json).
+    // Each line is printed only for a removal that happened: after an upgrade
+    // the manifest also lists the commands the upgrade already replaced, and
+    // claiming to have removed those would be a report of work not done.
     for key in &manifest.mcp_keys {
-        if key.file.exists() {
-            remove_mcp_key(&key.file, &key.server)?;
+        if remove_mcp_key(&key.file, &key.server)? {
             removed.push(format!(
                 "removed  mcpServers.{} from {}",
                 key.server,
@@ -1017,8 +1056,7 @@ pub fn run_uninstall_with(
 
     // Remove hooks (before files, same reasoning as MCP keys).
     for h in &manifest.hooks {
-        if h.file.exists() {
-            remove_hook_entry(&h.file, &h.event, &h.command)?;
+        if remove_hook_entry(&h.file, &h.event, &h.command)? {
             removed.push(format!(
                 "removed  {} hook from {}",
                 h.event,
@@ -1631,24 +1669,32 @@ fn merge_mcp_entry(
 /// Remove `mcpServers.<server>` from a JSON config file. Leaves the file in
 /// place (with the key removed) unless `mcpServers` becomes empty, in which
 /// case we still leave the file (the user may have other keys).
-fn remove_mcp_key(mcp_file: &Path, server: &str) -> Result<(), CliError> {
+///
+/// Returns whether the key was there. A file that does not hold it is not
+/// rewritten at all, for the same reason `drop_hooks` does not: re-serializing
+/// a file we take nothing out of would reorder and re-indent the user's keys
+/// for no reason.
+fn remove_mcp_key(mcp_file: &Path, server: &str) -> Result<bool, CliError> {
     if !mcp_file.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let raw = fs::read_to_string(mcp_file)
         .map_err(|e| CliError(format!("cannot read {}: {e}", mcp_file.display())))?;
     let mut root: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| CliError(format!("corrupt mcp json at {}: {e}", mcp_file.display())))?;
 
-    if let Some(servers) = root["mcpServers"].as_object_mut() {
-        servers.remove(server);
+    let removed = root["mcpServers"]
+        .as_object_mut()
+        .is_some_and(|servers| servers.remove(server).is_some());
+    if !removed {
+        return Ok(false);
     }
 
     let json = serde_json::to_string_pretty(&root)
         .map_err(|e| CliError(format!("cannot serialize mcp json: {e}")))?;
     fs::write(mcp_file, json)
         .map_err(|e| CliError(format!("cannot write {}: {e}", mcp_file.display())))?;
-    Ok(())
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1684,12 +1730,22 @@ fn manifest_path(
 }
 
 /// Load an existing manifest from `path`. Returns an empty manifest if absent or unparseable.
+///
+/// A `.gitignore` is never a file this install may delete outright, whatever a
+/// manifest says. An earlier 0.6.0 build recorded a `.gitignore` it created in
+/// `files`, which the uninstall file loop removes unconditionally — taking any
+/// line the user had added to it since. The `gitignore` entry in the same
+/// manifest already carries the one line that is ours, and that is the only
+/// route by which the file may be touched, so the stale `files` entry is
+/// dropped on the way in.
 fn load_manifest(path: &Path) -> Manifest {
     let raw = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(_) => return Manifest::default(),
     };
-    serde_json::from_str(&raw).unwrap_or_default()
+    serde_json::from_str::<Manifest>(&raw)
+        .unwrap_or_default()
+        .sanitised()
 }
 
 /// Union `existing` with `this_run`, deduplicating by path (files, git hooks),

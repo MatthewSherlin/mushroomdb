@@ -1027,6 +1027,84 @@ fn relative_command_and_db_are_made_absolute() {
     assert_eq!(read(&root, ".gitignore"), "mushroom-memory/\n");
 }
 
+#[test]
+fn bare_name_command_is_kept_verbatim() {
+    let root = temp_dir("bare-command");
+    let home = temp_dir("bare-command-home");
+    let db = root.join("mushroom-memory");
+    // `--command mushroomdb` names whatever PATH resolves, not a file here.
+    let bin = PathBuf::from("mushroomdb");
+    let opts = InstallOpts {
+        command: Some(bin.clone()),
+        ..claude_project_opts(&db)
+    };
+
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::Explicit(bin),
+        &no_externals(),
+    )
+    .expect("install");
+
+    // Anchoring it would invent <root>/mushroomdb, which does not exist.
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["command"], "mushroomdb",
+        "a bare program name must survive as a PATH lookup: {mcp}"
+    );
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("'mushroomdb' recall '{}'", db.display()),
+        "quoting a bare name does not defeat the PATH lookup, but inventing a path does"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: a `.gitignore` listed in an older manifest's `files` is still only
+//       ever touched through the managed-line path. The first 0.6.0 build on
+//       this branch recorded it there, and that loop deletes outright.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_gitignore_in_an_older_manifests_files_is_not_deleted() {
+    let root = temp_dir("gitignore-legacy-manifest");
+    let home = temp_dir("gitignore-legacy-manifest-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    install_on_path(&root, &home, &opts).expect("install");
+
+    // Rewrite the manifest the way the earlier build wrote it: the created
+    // `.gitignore` in `files`, and a `gitignore` entry with no `created` key.
+    let manifest_file = root.join(".claude/skills/mushroom/.install-manifest.json");
+    let gitignore = root.join(".gitignore");
+    let mut m: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_file).unwrap()).unwrap();
+    m["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!(gitignore.to_str().unwrap()));
+    m["gitignore"] = serde_json::json!([{
+        "file": gitignore.to_str().unwrap(),
+        "line": "mushroom-memory/"
+    }]);
+    fs::write(&manifest_file, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+
+    // The user has since made the file theirs.
+    fs::write(&gitignore, "mushroom-memory/\nnode_modules/\n").unwrap();
+
+    run_uninstall(&root, &home, &opts).expect("uninstall");
+
+    assert_eq!(
+        read(&root, ".gitignore"),
+        "node_modules/\n",
+        "the file must survive with the user's line"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test: an inferred scope that finds no manifest looks at the other one before
 //       telling the user there is nothing to uninstall (0.5.x installed

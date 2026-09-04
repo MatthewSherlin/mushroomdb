@@ -128,7 +128,8 @@ mushroomdb install --project --platform claude-code \
 ```
 
 A relative `--command` or `--db` is fine to type; both are anchored to the
-current directory, so the entry that gets written names an absolute path.
+current directory, so the entry that gets written names an absolute path. A
+bare name (`--command mushroomdb`) is a `PATH` lookup and is written as given.
 
 Other flags: `--user`, `--platform codex` (registers through the Codex CLI, and
 needs `uninstall --platform codex` to undo), `--db <path>`, and
