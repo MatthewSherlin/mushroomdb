@@ -7,16 +7,24 @@
 //!
 //! | Label | key (`id`) | props |
 //! |---|---|---|
-//! | `Author` | email | `name` |
-//! | `Commit` | full sha | `message`, `ts`, `author_id` |
+//! | `Author` | mailmap-resolved email | `name` |
+//! | `Commit` | full sha | `message`, `ts`, `author_id`, `pr_id` (with `--prs`) |
 //! | `File` | path | `path`, `dir`, `ext`, `commits`, `n_commits`, `top_author_id`, `author_counts` |
-//! | `GitSync` | `"__mushroomdb_git_sync__"` | `sha` |
+//! | `PR` | `"pr:<number>"` | `number`, `title`, `url`, `merged_at`, `author_login` |
+//! | `GitSync` | `"__mushroomdb_git_sync__"` | `sha`, `repo`, `recurse`, `prs`, `structure`, `docs` |
 //!
-//! Edges: user `TOUCHED` Commit→File, auto-FK `AUTHOR` Commit→Author and
-//! `TOP_AUTHOR` File→Author, rule-derived `CO_CHANGED` File→File and `KNOWS`
-//! Author→File.
+//! Edges: user `TOUCHED` Commit→File and `MERGED_AS` PR→Commit, auto-FK
+//! `AUTHOR` Commit→Author, `TOP_AUTHOR` File→Author and `PR` Commit→PR,
+//! rule-derived `CO_CHANGED` File→File and `KNOWS` Author→File.
+//!
+//! With `--recurse-submodules` each initialised submodule is walked as its own
+//! *unit*: its file keys carry the submodule's path in the parent, and it
+//! resumes from its own `GitSync` marker.
 use crate::CliError;
-use core_api::{Direction, IngestOptions, Predicate, ResultSet, RuleDef, SharedDb, Value};
+use core_api::{
+    default_max_edges, Direction, GraphError, IngestOptions, Predicate, ResultSet, RuleDef,
+    SharedDb, Value, WriteGuard, WRITE_LOCK_WAIT,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,6 +45,14 @@ const CO_CHANGE_MIN: f64 = 0.25;
 /// forcing a full re-ingest on every run.
 const SYNC_KEY: &str = "__mushroomdb_git_sync__";
 
+/// What the CLI prints, and exits 3 on, when another process holds the store's
+/// cross-process write lock. Nothing was written, so retrying is always safe.
+pub const BUSY_MESSAGE: &str = "another mushroomdb process is writing; retry";
+
+/// Name of the `Commit.pr_id` foreign-key rule. Identical to the name the
+/// zero-config FK inference would choose, so the two never both create it.
+const PR_FK_RULE: &str = "auto_fk_commit_pr_id";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestGitOpts {
     pub repo: PathBuf,
@@ -44,6 +60,18 @@ pub struct IngestGitOpts {
     /// with `*.` = extension, otherwise = substring of the path.
     pub exclude: Vec<String>,
     pub max_commits_per_file: usize,
+    /// Walk every initialised submodule as its own unit.
+    pub recurse_submodules: bool,
+    /// Ask `gh` for merged pull requests and link them to their commits.
+    pub prs: bool,
+    /// Extract symbols from source files. Recorded on the `GitSync` node;
+    /// used by structure ingest.
+    pub structure: bool,
+    /// Index documentation bodies. Recorded on the `GitSync` node; used by
+    /// structure ingest.
+    pub docs: bool,
+    /// Add the database directory to the repository's `.gitignore`.
+    pub ensure_gitignore: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -55,6 +83,25 @@ pub struct IngestGitReport {
     pub deleted: usize,
     pub incremental: bool,
     pub rules_created: Vec<String>,
+    /// Submodules walked as their own units.
+    pub submodules: usize,
+    /// Pull requests inserted by this run.
+    pub prs: usize,
+    /// Whether this run appended the database directory to `.gitignore`.
+    pub gitignore_added: bool,
+}
+
+/// One git working tree walked by a run: the repository itself, or one of its
+/// submodules.
+///
+/// A submodule's paths are keys under `prefix` (its path in the parent), and it
+/// carries its own sync marker, so the two histories advance independently.
+#[derive(Debug, Clone)]
+struct RepoUnit {
+    path: PathBuf,
+    /// `""` for the repository itself, `"<displaypath>/"` for a submodule.
+    prefix: String,
+    sync_key: String,
 }
 
 #[derive(Debug)]
@@ -97,11 +144,15 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, CliErr
         .map_err(|e| CliError(format!("cannot run git in {}: {e}", repo.display())))
 }
 
-/// `git log --reverse --name-status -M --format=<RS>%H<US>%an<US>%ae<US>%at<US>%s <range>`
+/// `git log --reverse --name-status -M --format=<RS>%H<US>%aN<US>%aE<US>%at<US>%s <range>`
 ///
 /// Returns oldest commit first. The walk ends at `head` — never at the symbolic
 /// `HEAD` — so the range is pinned to the same sha the caller will record as the
 /// sync marker. See [`head_sha`] for why that matters.
+///
+/// `%aN` and `%aE` are the mailmap-resolved name and address, so a repository
+/// with a `.mailmap` reports one identity for a contributor who has committed
+/// under several addresses. Without one they are exactly `%an`/`%ae`.
 fn read_log(repo: &Path, since: Option<&str>, head: &str) -> Result<Vec<GitCommit>, CliError> {
     if let Some(s) = since {
         let spec = format!("{s}^{{commit}}");
@@ -134,7 +185,7 @@ fn read_log(repo: &Path, since: Option<&str>, head: &str) -> Result<Vec<GitCommi
         // record: the message is truncated at the first \x1f, and a \x1e drops
         // the remainder of that commit's header. Accepted — the parse degrades
         // to a skipped or shortened message, never a panic or a wrong sha.
-        "--format=%x1e%H%x1f%an%x1f%ae%x1f%at%x1f%s",
+        "--format=%x1e%H%x1f%aN%x1f%aE%x1f%at%x1f%s",
     ]);
     match since {
         Some(s) => cmd.arg(format!("{s}..{head}")),
@@ -227,6 +278,167 @@ fn head_sha(repo: &Path) -> Result<Option<String>, CliError> {
         )));
     }
     Ok(Some(sha))
+}
+
+/// Absolute, symlink-free form of `p`, falling back to `p` when it cannot be
+/// resolved (a path that does not exist yet, or a permission error). The result
+/// is what `GitSync.repo` records, so a later run can find the repository again
+/// from any working directory.
+fn canonical(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// The submodule paths recorded in a unit's `.gitmodules`, relative to that
+/// unit.
+///
+/// These are the paths git reports as ordinary changes in `--name-status`
+/// output while being gitlinks — a commit pointer, not a file. They get no
+/// `File` node whether or not the submodule is walked, and the list is read
+/// from configuration so it is the same for an uninitialised submodule.
+fn gitlink_paths(unit: &Path) -> BTreeSet<String> {
+    let out = Command::new("git")
+        .arg("config")
+        .arg("--file")
+        .arg(unit.join(".gitmodules"))
+        .args(["--get-regexp", r"^submodule\..*\.path$"])
+        .output();
+    let Ok(out) = out else { return BTreeSet::new() };
+    if !out.status.success() {
+        return BTreeSet::new(); // no .gitmodules, so no submodules
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(_, path)| path.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// The repository itself, then one unit per initialised submodule when
+/// `recurse` is set.
+///
+/// `git submodule foreach` visits only initialised submodules and says nothing
+/// about the rest, which is the behaviour wanted here: a submodule that was
+/// never checked out has no working tree to walk. `$displaypath` is relative to
+/// the top-level repository, so it is exactly the key prefix its files need.
+fn repo_units(repo: &Path, recurse: bool) -> Result<Vec<RepoUnit>, CliError> {
+    let mut units = vec![RepoUnit {
+        path: repo.to_path_buf(),
+        prefix: String::new(),
+        sync_key: SYNC_KEY.to_string(),
+    }];
+    if !recurse {
+        return Ok(units);
+    }
+    let out = git_output(
+        repo,
+        &[
+            "submodule",
+            "foreach",
+            "--quiet",
+            "--recursive",
+            "echo \"$displaypath\"",
+        ],
+    )?;
+    if !out.status.success() {
+        return Ok(units);
+    }
+    let mut paths: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim_end_matches('/').trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    for dp in paths {
+        let path = repo.join(&dp);
+        // `foreach` already skips the uninitialised, but a stale entry or a
+        // removed checkout would otherwise fail the whole run.
+        if !git_output(&path, &["rev-parse", "--git-dir"])?
+            .status
+            .success()
+        {
+            continue;
+        }
+        units.push(RepoUnit {
+            prefix: format!("{dp}/"),
+            sync_key: format!("{SYNC_KEY}:{dp}"),
+            path,
+        });
+    }
+    Ok(units)
+}
+
+/// Rewrite one unit's changes into repository-wide keys: drop gitlinks, then
+/// prepend the unit's prefix so a submodule's `src/lib.rs` is stored under
+/// `vendor/lib/src/lib.rs`.
+///
+/// Done before anything else looks at the log, so exclusion patterns, the
+/// stored keys and the `File` state query all speak the same path.
+fn localise(log: &mut [GitCommit], prefix: &str, gitlinks: &BTreeSet<String>) {
+    let keep = |p: &String| !gitlinks.contains(p.as_str());
+    for c in log.iter_mut() {
+        c.changes.retain(|ch| match ch {
+            Change::Added(p) | Change::Modified(p) | Change::Deleted(p) => keep(p),
+            Change::Renamed { from, to } => keep(from) && keep(to),
+        });
+        if prefix.is_empty() {
+            continue;
+        }
+        for ch in c.changes.iter_mut() {
+            match ch {
+                Change::Added(p) | Change::Modified(p) | Change::Deleted(p) => {
+                    *p = format!("{prefix}{p}")
+                }
+                Change::Renamed { from, to } => {
+                    *from = format!("{prefix}{from}");
+                    *to = format!("{prefix}{to}");
+                }
+            }
+        }
+    }
+}
+
+/// Append `<db dir>/` to the repository's `.gitignore` unless it is already
+/// listed, creating the file if it does not exist. Returns whether it was
+/// written.
+///
+/// A database kept outside the repository is left alone: the repository has no
+/// business ignoring a path it does not contain.
+fn ensure_gitignore(repo: &Path, db_dir: &Path) -> Result<bool, CliError> {
+    let Ok(rel) = canonical(db_dir)
+        .strip_prefix(repo)
+        .map(|p| p.to_path_buf())
+    else {
+        return Ok(false);
+    };
+    if rel.as_os_str().is_empty() {
+        return Ok(false);
+    }
+    let line = format!("{}/", rel.to_string_lossy().replace('\\', "/"));
+    let path = repo.join(".gitignore");
+    let current = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(CliError(format!("cannot read {}: {e}", path.display()))),
+    };
+    let bare = line.trim_end_matches('/');
+    if current
+        .lines()
+        .map(|l| l.trim())
+        .any(|l| l == line || l == bare || l == format!("/{line}") || l == format!("/{bare}"))
+    {
+        return Ok(false);
+    }
+    let mut next = current;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(&line);
+    next.push('\n');
+    std::fs::write(&path, next)
+        .map_err(|e| CliError(format!("cannot write {}: {e}", path.display())))?;
+    Ok(true)
 }
 
 /// Separator inside an `author_counts` entry. An email address cannot contain a
@@ -326,19 +538,275 @@ impl FileState {
     }
 }
 
-/// Cypher behind [`file_state_from`] — every live `File` node's cumulative state.
-const FILE_STATE_QUERY: &str = "MATCH (f:File) RETURN f.id AS id, f.commits AS commits, \
+/// One merged pull request as reported by `gh`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PullRequest {
+    number: i64,
+    title: String,
+    url: String,
+    merged_at: String,
+    author_login: String,
+    /// `mergeCommit.oid`, absent for a pull request merged some other way (or
+    /// whose merge commit has since been rewritten).
+    merge_sha: Option<String>,
+}
+
+fn pr_key(number: i64) -> String {
+    format!("pr:{number}")
+}
+
+/// The pull request number in a squash-merge subject: `\(#(\d+)\)$`.
+///
+/// Hand-rolled rather than pulled in as a dependency — the pattern is anchored
+/// at the end of the subject and made of two literals around a run of digits.
+fn subject_pr(subject: &str) -> Option<i64> {
+    let rest = subject.strip_suffix(')')?;
+    let at = rest.rfind("(#")?;
+    let digits = &rest[at + 2..];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// `gh pr list --state merged` in `repo`, or an empty list with one warning.
+///
+/// Every failure is a skip: `gh` may not be installed, the repository may have
+/// no GitHub remote, and the user may not be authenticated. None of that is a
+/// reason to fail an ingest that is otherwise complete.
+fn fetch_prs(repo: &Path) -> Vec<PullRequest> {
+    let out = Command::new("gh")
+        .current_dir(repo)
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "merged",
+            "--limit",
+            "1000",
+            "--json",
+            "number,title,url,mergedAt,mergeCommit,author",
+        ])
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(_) => {
+            eprintln!("ingest-git: --prs skipped: gh is not on PATH");
+            return Vec::new();
+        }
+    };
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("no detail")
+            .to_string();
+        eprintln!("ingest-git: --prs skipped: gh pr list failed: {detail}");
+        return Vec::new();
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ingest-git: --prs skipped: gh pr list output is not JSON: {e}");
+            return Vec::new();
+        }
+    };
+    let Some(items) = parsed.as_array() else {
+        eprintln!("ingest-git: --prs skipped: gh pr list did not return a list");
+        return Vec::new();
+    };
+    let mut prs: Vec<PullRequest> = items
+        .iter()
+        .filter_map(|v| {
+            let number = v.get("number")?.as_i64()?;
+            let str_at = |k: &str| {
+                v.get(k)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            Some(PullRequest {
+                number,
+                title: str_at("title"),
+                url: str_at("url"),
+                merged_at: str_at("mergedAt"),
+                author_login: v
+                    .get("author")
+                    .and_then(|a| a.get("login"))
+                    .and_then(|l| l.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                merge_sha: v
+                    .get("mergeCommit")
+                    .and_then(|m| m.get("oid"))
+                    .and_then(|o| o.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            })
+        })
+        .collect();
+    // Ascending by number: the insert order, and so the node order, is the
+    // same on every run whatever order gh listed them in.
+    prs.sort_by_key(|p| p.number);
+    prs.dedup_by_key(|p| p.number);
+    prs
+}
+
+/// Insert the `PR` nodes that are new, declare the `Commit.pr_id` foreign key,
+/// and index titles for search. Runs before the commits so the FK resolves.
+fn ingest_prs(
+    w: &mut WriteGuard<'_>,
+    prs: &[PullRequest],
+    ingest: &IngestOptions,
+    report: &mut IngestGitReport,
+) -> Result<(), CliError> {
+    let rows: Vec<BTreeMap<String, Value>> = prs
+        .iter()
+        .filter(|p| !w.has_node(&pr_key(p.number)))
+        .map(|p| {
+            BTreeMap::from([
+                ("id".to_string(), Value::Str(pr_key(p.number))),
+                ("number".to_string(), Value::Int(p.number)),
+                ("title".to_string(), Value::Str(p.title.clone())),
+                ("url".to_string(), Value::Str(p.url.clone())),
+                ("merged_at".to_string(), Value::Str(p.merged_at.clone())),
+                (
+                    "author_login".to_string(),
+                    Value::Str(p.author_login.clone()),
+                ),
+            ])
+        })
+        .collect();
+    if !rows.is_empty() {
+        let r = w.ingest_with_edges("PR", rows, ingest, &[])?;
+        report.prs = r.inserted;
+        report.rules_created.extend(r.rules_created);
+    }
+    // Declared here rather than left to FK inference, which only fires on a
+    // batch of `Commit` rows that already carry `pr_id` — a run that links a
+    // pull request to a commit ingested earlier would otherwise leave the
+    // property with no edge behind it.
+    if !w.rules().iter().any(|r| r.name == PR_FK_RULE) {
+        let predicate = Predicate::KeyMatch {
+            field: "pr_id".into(),
+        };
+        let max_edges = Some(default_max_edges(&predicate));
+        w.create_rule(RuleDef {
+            name: PR_FK_RULE.into(),
+            src_label: "Commit".into(),
+            dst_label: "PR".into(),
+            predicate,
+            edge_type: "PR".into(),
+            weight_prop: None,
+            max_edges,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })?;
+        report.rules_created.push(PR_FK_RULE.to_string());
+    }
+    if !w
+        .fulltext_pairs()
+        .contains(&("PR".to_string(), "title".to_string()))
+    {
+        w.enable_fulltext("PR", "title")?;
+    }
+    Ok(())
+}
+
+/// Point every commit that carries a pull request at it: the merge commit by
+/// sha, a squash merge by its `(#N)` subject. Runs after the commits are in the
+/// graph, so a pull request merged before the last sync is linked too.
+fn link_prs(
+    w: &mut WriteGuard<'_>,
+    prs: &[PullRequest],
+    ingest: &IngestOptions,
+) -> Result<(), CliError> {
+    let by_sha: BTreeMap<&str, i64> = prs
+        .iter()
+        .filter_map(|p| p.merge_sha.as_deref().map(|s| (s, p.number)))
+        .collect();
+    let known: BTreeSet<i64> = prs.iter().map(|p| p.number).collect();
+
+    let rs = w.query(
+        "MATCH (c:Commit) RETURN c.id AS id, c.message AS message, c.pr_id AS pr_id",
+        &BTreeMap::new(),
+    )?;
+    let mut updates: Vec<(String, String)> = Vec::new();
+    let mut links: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+    for i in 0..rs.len() {
+        let Some(Value::Str(sha)) = rs.get(i, "id") else {
+            continue;
+        };
+        let subject = match rs.get(i, "message") {
+            Some(Value::Str(s)) => s.as_str(),
+            _ => "",
+        };
+        let Some(number) = by_sha
+            .get(sha.as_str())
+            .copied()
+            .or_else(|| subject_pr(subject).filter(|n| known.contains(n)))
+        else {
+            continue;
+        };
+        let key = pr_key(number);
+        links.entry(number).or_default().insert(sha.clone());
+        if rs.get(i, "pr_id") != Some(&Value::Str(key.clone())) {
+            updates.push((sha.clone(), key));
+        }
+    }
+    updates.sort(); // by sha: the same store state writes the same records
+    for (sha, key) in updates {
+        w.set_prop(&sha, "pr_id", Value::Str(key))?;
+    }
+
+    let mut edges: Vec<(String, String, String)> = Vec::new();
+    for (number, shas) in links {
+        let src = pr_key(number);
+        let existing: BTreeSet<String> = w
+            .neighbors(&src, "MERGED_AS", Direction::Out)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for sha in shas {
+            if !existing.contains(&sha) {
+                edges.push(("MERGED_AS".to_string(), src.clone(), sha));
+            }
+        }
+    }
+    if !edges.is_empty() {
+        w.ingest_with_edges("PR", Vec::new(), ingest, &edges)?;
+    }
+    Ok(())
+}
+
+/// Cypher behind [`file_state_from`] — the cumulative state of every live
+/// `File` node belonging to one unit.
+///
+/// The prefix filter is what keeps a submodule's files out of the parent's
+/// walk and vice versa. `startsWith` is the documented Cypher form (see
+/// `docs/site/query.md`); the parent unit's empty prefix matches everything, so
+/// its own submodules' keys are dropped in [`file_state_from`].
+const FILE_STATE_QUERY: &str =
+    "MATCH (f:File) WHERE startsWith(f.id, $prefix) RETURN f.id AS id, f.commits AS commits, \
      f.n_commits AS n, f.top_author_id AS top, f.author_counts AS author_counts";
 
 /// Rebuild the in-memory per-file state from the `File` nodes already in the
 /// graph so incremental runs keep `commits` and ownership counts cumulative.
-fn file_state_from(rs: &ResultSet) -> BTreeMap<String, FileState> {
+///
+/// `nested` holds the key prefixes of any submodules inside this unit; their
+/// files belong to their own unit's walk and are dropped here.
+fn file_state_from(rs: &ResultSet, nested: &[String]) -> BTreeMap<String, FileState> {
     let mut files = BTreeMap::new();
     for i in 0..rs.len() {
         let id = match rs.get(i, "id") {
             Some(Value::Str(s)) => s.clone(),
             _ => continue,
         };
+        if nested.iter().any(|p| id.starts_with(p.as_str())) {
+            continue;
+        }
         let mut st = FileState::default();
         if let Some(Value::List(l)) = rs.get(i, "commits") {
             st.commits = l
@@ -406,47 +874,252 @@ impl Walk {
     }
 }
 
+/// The `GitSync` props that say *how* a unit was ingested, as opposed to how
+/// far. Compared against the stored node so that changing a flag refreshes the
+/// marker even when there is nothing new to walk.
+fn marker_flag_props(unit: &RepoUnit, opts: &IngestGitOpts) -> Vec<(String, Value)> {
+    vec![
+        (
+            "repo".into(),
+            Value::Str(unit.path.to_string_lossy().into_owned()),
+        ),
+        ("recurse".into(), Value::Bool(opts.recurse_submodules)),
+        ("prs".into(), Value::Bool(opts.prs)),
+        ("structure".into(), Value::Bool(opts.structure)),
+        ("docs".into(), Value::Bool(opts.docs)),
+    ]
+}
+
+/// One unit and everything read about it before the write pass opens.
+struct Pending {
+    unit: RepoUnit,
+    /// The sha its marker resumes from, absent on a first run.
+    since: Option<String>,
+    /// The stored marker disagrees with this run's flags.
+    stale: bool,
+    /// `None` when the unit has no commits at all.
+    head: Option<String>,
+    log: Vec<GitCommit>,
+    /// Key prefixes of the submodules nested inside this unit, whose files
+    /// belong to their own walk.
+    nested: Vec<String>,
+}
+
 pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitReport, CliError> {
+    // Absolute and symlink-free: it is recorded on the marker, and a later run
+    // has no reason to share this one's working directory.
+    let repo = canonical(&opts.repo);
+    let units = repo_units(&repo, opts.recurse_submodules)?;
+    let prefixes: Vec<String> = units
+        .iter()
+        .map(|u| u.prefix.clone())
+        .filter(|p| !p.is_empty())
+        .collect();
+
     let db = SharedDb::open(db_dir)?;
-    let since: Option<String> = {
-        let r = db.read();
-        r.node_ref(SYNC_KEY)
-            .and_then(|n| n.prop("sha"))
-            .and_then(|v| match v {
-                Value::Str(s) if !s.is_empty() => Some(s),
-                _ => None,
-            })
-    };
-    let incremental = since.is_some();
     let mut report = IngestGitReport {
-        incremental,
+        submodules: units.len() - 1,
         ..Default::default()
     };
-    // Pin the end of the walk and the marker to one sha, resolved first. A
-    // commit landing mid-run then falls outside this range instead of being
-    // skipped by a marker that advanced past it.
-    let Some(head) = head_sha(&opts.repo)? else {
-        return Ok(report); // repository has no commits yet
+    if opts.ensure_gitignore {
+        report.gitignore_added = ensure_gitignore(&repo, db_dir)?;
+    }
+
+    let mut pending: Vec<Pending> = Vec::new();
+    {
+        let r = db.read();
+        for unit in units {
+            let nested = prefixes
+                .iter()
+                .filter(|p| **p != unit.prefix && p.starts_with(&unit.prefix))
+                .cloned()
+                .collect();
+            let (since, stale) = match r.node_ref(&unit.sync_key) {
+                Some(n) => (
+                    match n.prop("sha") {
+                        Some(Value::Str(s)) if !s.is_empty() => Some(s),
+                        _ => None,
+                    },
+                    marker_flag_props(&unit, opts)
+                        .into_iter()
+                        .any(|(k, v)| n.prop(&k) != Some(v)),
+                ),
+                None => (None, false),
+            };
+            pending.push(Pending {
+                unit,
+                since,
+                stale,
+                head: None,
+                log: Vec::new(),
+                nested,
+            });
+        }
+    }
+    // The repository itself is always the first unit, and it is what "this
+    // database has seen this repo before" means.
+    report.incremental = pending[0].since.is_some();
+
+    for p in &mut pending {
+        // Pin the end of the walk and the marker to one sha, resolved first. A
+        // commit landing mid-run then falls outside this range instead of being
+        // skipped by a marker that advanced past it.
+        let Some(head) = head_sha(&p.unit.path)? else {
+            continue; // this unit has no commits yet
+        };
+        let mut log = read_log(&p.unit.path, p.since.as_deref(), &head)?;
+        localise(&mut log, &p.unit.prefix, &gitlink_paths(&p.unit.path));
+        p.head = Some(head);
+        p.log = log;
+    }
+
+    let prs = if opts.prs {
+        fetch_prs(&repo)
+    } else {
+        Vec::new()
     };
-    let log = read_log(&opts.repo, since.as_deref(), &head)?;
-    if log.is_empty() {
+    if prs.is_empty() && pending.iter().all(|p| p.log.is_empty() && !p.stale) {
         // Nothing new: leave the store untouched so `commit_seq` does not move.
         return Ok(report);
     }
 
-    let mut w = db.write();
+    // Held for the rest of the run. Another process holding the store's
+    // cross-process write lock is a retry, not a failure: nothing was written.
+    let mut w = db.write_with_wait(WRITE_LOCK_WAIT).map_err(|e| match e {
+        GraphError::Busy { .. } => CliError(BUSY_MESSAGE.to_string()),
+        other => CliError(other.to_string()),
+    })?;
     let ingest = IngestOptions::default(); // key `id`, auto-FK suffix `_id`
+
+    // Pull requests first: their nodes are what `Commit.pr_id` resolves to.
+    if !prs.is_empty() {
+        ingest_prs(&mut w, &prs, &ingest, &mut report)?;
+    }
+
+    let mut authors: BTreeSet<String> = BTreeSet::new();
+    for p in &pending {
+        if !p.log.is_empty() {
+            ingest_unit(&mut w, p, opts, &ingest, &mut report, &mut authors)?;
+        }
+        write_marker(&mut w, p, opts)?;
+    }
+    report.authors = authors.len();
+
+    // Rules and fulltext, created after the data so each backfills once. They
+    // span every unit, so they are declared once for the database rather than
+    // once per repository walked.
+    if report.commits > 0 && !w.rules().iter().any(|r| r.name == "co_changed") {
+        let co = Predicate::Overlap {
+            field: "commits".into(),
+            min: CO_CHANGE_MIN,
+        };
+        w.create_rule(RuleDef {
+            name: "co_changed".into(),
+            src_label: "File".into(),
+            dst_label: "File".into(),
+            predicate: co.clone(),
+            edge_type: "CO_CHANGED".into(),
+            weight_prop: Some("score".into()),
+            max_edges: Some(10),
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })?;
+        w.create_rule(RuleDef {
+            name: "knows".into(),
+            src_label: "Author".into(),
+            dst_label: "File".into(),
+            predicate: co,
+            edge_type: "KNOWS".into(),
+            weight_prop: Some("score".into()),
+            max_edges: Some(20),
+            approximate: false,
+            via_label: Some("File".into()),
+            via_edge: Some("TOP_AUTHOR".into()),
+            via_dir: Some(Direction::In),
+        })?;
+        report
+            .rules_created
+            .extend(["co_changed".to_string(), "knows".to_string()]);
+        for (l, field) in [("File", "path"), ("Commit", "message"), ("Author", "name")] {
+            if !w
+                .fulltext_pairs()
+                .contains(&(l.to_string(), field.to_string()))
+            {
+                w.enable_fulltext(l, field)?;
+            }
+        }
+    }
+
+    // Last: every commit this run could link is in the graph by now.
+    if !prs.is_empty() {
+        link_prs(&mut w, &prs, &ingest)?;
+    }
+    Ok(report)
+}
+
+/// Record how far this unit got, and under what flags.
+///
+/// Props are written only where they differ, so a run that touches one unit
+/// does not churn the markers of the others.
+fn write_marker(w: &mut WriteGuard<'_>, p: &Pending, opts: &IngestGitOpts) -> Result<(), CliError> {
+    let Some(head) = p.head.as_deref() else {
+        return Ok(()); // no commits, so nothing to resume from
+    };
+    let mut props = marker_flag_props(&p.unit, opts);
+    if !p.log.is_empty() {
+        props.push(("sha".into(), Value::Str(head.to_string())));
+    }
+    let key = p.unit.sync_key.clone();
+    if w.has_node(&key) {
+        for (k, v) in props {
+            let current = w.node_ref(&key).and_then(|n| n.prop(&k));
+            if current.as_ref() != Some(&v) {
+                w.set_prop(&key, &k, v)?;
+            }
+        }
+        return Ok(());
+    }
+    if p.log.is_empty() {
+        return Ok(());
+    }
+    // It carries `id` like every other label here, so the key is readable from
+    // Cypher.
+    props.push(("id".into(), Value::Str(key.clone())));
+    props.sort_by(|a, b| a.0.cmp(&b.0));
+    w.insert_node("GitSync", &key, props)?;
+    Ok(())
+}
+
+/// Walk one unit's new commits into the graph.
+///
+/// Every path in `p.log` is already a repository-wide key, so this is the
+/// single-repository algorithm unchanged: only the `File` state it starts from
+/// and the counts it adds to are scoped to the unit.
+fn ingest_unit(
+    w: &mut WriteGuard<'_>,
+    p: &Pending,
+    opts: &IngestGitOpts,
+    ingest: &IngestOptions,
+    report: &mut IngestGitReport,
+    authors: &mut BTreeSet<String>,
+) -> Result<(), CliError> {
+    let log = &p.log;
+    let incremental = p.since.is_some();
 
     let mut walk = Walk {
         files: if incremental {
-            file_state_from(&w.query(FILE_STATE_QUERY, &BTreeMap::new())?)
+            let params =
+                BTreeMap::from([("prefix".to_string(), Value::Str(p.unit.prefix.clone()))]);
+            file_state_from(&w.query(FILE_STATE_QUERY, &params)?, &p.nested)
         } else {
             BTreeMap::new()
         },
         ..Default::default()
     };
 
-    for c in &log {
+    for c in log {
         walk.authors
             .entry(c.author_email.clone())
             .or_insert_with(|| c.author_name.clone());
@@ -517,9 +1190,9 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
             ])
         })
         .collect();
-    let a = w.ingest_with_edges("Author", author_rows, &ingest, &[])?;
+    let a = w.ingest_with_edges("Author", author_rows, ingest, &[])?;
     report.rules_created.extend(a.rules_created);
-    report.authors = walk.authors.len();
+    authors.extend(walk.authors.keys().cloned());
 
     // 2. Deletes run first so a rename can claim a path freed in this same
     //    window, then renames carry each node (and its history) to its new path.
@@ -576,9 +1249,9 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
             new_file_rows.push(props.into_iter().collect::<BTreeMap<_, _>>());
         }
     }
-    let f = w.ingest_with_edges("File", new_file_rows, &ingest, &[])?;
+    let f = w.ingest_with_edges("File", new_file_rows, ingest, &[])?;
     report.rules_created.extend(f.rules_created);
-    report.files = walk.files.len();
+    report.files += walk.files.len();
 
     // 4. Commits, then their TOUCHED edges. The two must be separate batches:
     //    a batch that both inserts nodes firing a new rule and carries a user
@@ -586,9 +1259,9 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     //    replayed (`Intern` records are emitted in a pre-pass, but on replay the
     //    rule fires — and interns its edge type — before the later `Intern`
     //    record is read). See the report for a reproducer.
-    let c = w.ingest_with_edges("Commit", walk.commit_rows, &ingest, &[])?;
+    let c = w.ingest_with_edges("Commit", walk.commit_rows, ingest, &[])?;
     report.rules_created.extend(c.rules_created);
-    report.commits = log.len();
+    report.commits += log.len();
 
     // Edges name File keys, so files must already exist. A path renamed later
     // in this same window is retargeted to where its node ended up.
@@ -602,65 +1275,9 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
         .filter(|(_, _, p)| walk.files.contains_key(p))
         .collect();
     if !touched.is_empty() {
-        w.ingest_with_edges("Commit", Vec::new(), &ingest, &touched)?;
+        w.ingest_with_edges("Commit", Vec::new(), ingest, &touched)?;
     }
-
-    // 5. Rules and fulltext, first run only. Created after the data so each
-    //    rule backfills once.
-    if !incremental {
-        let co = Predicate::Overlap {
-            field: "commits".into(),
-            min: CO_CHANGE_MIN,
-        };
-        w.create_rule(RuleDef {
-            name: "co_changed".into(),
-            src_label: "File".into(),
-            dst_label: "File".into(),
-            predicate: co.clone(),
-            edge_type: "CO_CHANGED".into(),
-            weight_prop: Some("score".into()),
-            max_edges: Some(10),
-            approximate: false,
-            via_label: None,
-            via_edge: None,
-            via_dir: None,
-        })?;
-        w.create_rule(RuleDef {
-            name: "knows".into(),
-            src_label: "Author".into(),
-            dst_label: "File".into(),
-            predicate: co,
-            edge_type: "KNOWS".into(),
-            weight_prop: Some("score".into()),
-            max_edges: Some(20),
-            approximate: false,
-            via_label: Some("File".into()),
-            via_edge: Some("TOP_AUTHOR".into()),
-            via_dir: Some(Direction::In),
-        })?;
-        report
-            .rules_created
-            .extend(["co_changed".to_string(), "knows".to_string()]);
-        for (l, field) in [("File", "path"), ("Commit", "message"), ("Author", "name")] {
-            w.enable_fulltext(l, field)?;
-        }
-    }
-
-    // 6. Sync marker for the next incremental run, resolved above. It carries
-    //    `id` like every other label here, so the key is readable from Cypher.
-    if w.has_node(SYNC_KEY) {
-        w.set_prop(SYNC_KEY, "sha", Value::Str(head))?;
-    } else {
-        w.insert_node(
-            "GitSync",
-            SYNC_KEY,
-            vec![
-                ("id".into(), Value::Str(SYNC_KEY.into())),
-                ("sha".into(), Value::Str(head)),
-            ],
-        )?;
-    }
-    Ok(report)
+    Ok(())
 }
 
 pub fn format_ingest_git(r: &IngestGitReport) -> String {
@@ -673,6 +1290,15 @@ pub fn format_ingest_git(r: &IngestGitReport) -> String {
     );
     if r.renamed + r.deleted > 0 {
         out.push_str(&format!("  renamed {}  deleted {}\n", r.renamed, r.deleted));
+    }
+    if r.submodules + r.prs > 0 {
+        out.push_str(&format!(
+            "  submodules {}  pull requests {}\n",
+            r.submodules, r.prs
+        ));
+    }
+    if r.gitignore_added {
+        out.push_str("  added the database directory to .gitignore\n");
     }
     if !r.rules_created.is_empty() {
         out.push_str(&format!("  rules: {}\n", r.rules_created.join(", ")));

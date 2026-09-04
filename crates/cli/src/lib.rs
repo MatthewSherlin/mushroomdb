@@ -237,7 +237,12 @@ Usage:
                                       WARNING: unsafe against a concurrently running serve process;
                                       use POST /backup on the HTTP server for live-serve backups
   mushroomdb export <db-dir> <dest> --format jsonl|parquet   export all data
-  mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]...   graph a git repo (authors, commits, files, co-change + ownership rules); re-run to sync
+  mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]... [--max-commits-per-file N]
+                        [--recurse-submodules] [--prs] [--ensure-gitignore]
+                                   graph a git repo (authors, commits, files, co-change + ownership rules); re-run to sync
+                                   --recurse-submodules also walks each initialised submodule
+                                   --prs links merged pull requests via gh (skipped when gh is unavailable)
+                                   --ensure-gitignore adds the database directory to the repo's .gitignore
   mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
   mushroomdb algo wcc <db-dir> [--top N]
@@ -298,10 +303,22 @@ fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
     let mut positional = Vec::new();
     let mut exclude = Vec::new();
     let mut max_commits_per_file = ingest_git::DEFAULT_MAX_COMMITS_PER_FILE;
+    let mut recurse_submodules = false;
+    let mut prs = false;
+    let mut ensure_gitignore = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--exclude" {
+        if a == "--recurse-submodules" {
+            recurse_submodules = true;
+            i += 1;
+        } else if a == "--prs" {
+            prs = true;
+            i += 1;
+        } else if a == "--ensure-gitignore" {
+            ensure_gitignore = true;
+            i += 1;
+        } else if a == "--exclude" {
             exclude.push(
                 args.get(i + 1)
                     .copied()
@@ -342,6 +359,13 @@ fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
             repo: PathBuf::from(repo),
             exclude,
             max_commits_per_file,
+            recurse_submodules,
+            prs,
+            // No flags yet: structure and documentation extraction are on by
+            // default, and the marker records that for later runs.
+            structure: true,
+            docs: true,
+            ensure_gitignore,
         },
     })
 }
@@ -2988,6 +3012,9 @@ mod tests {
             "--exclude=*.lock",
             "--max-commits-per-file",
             "50",
+            "--recurse-submodules",
+            "--prs",
+            "--ensure-gitignore",
         ])
         .unwrap();
         assert_eq!(
@@ -2998,6 +3025,11 @@ mod tests {
                     repo: PathBuf::from("/tmp/repo"),
                     exclude: vec!["target/".into(), "*.lock".into()],
                     max_commits_per_file: 50,
+                    recurse_submodules: true,
+                    prs: true,
+                    structure: true,
+                    docs: true,
+                    ensure_gitignore: true,
                 },
             }
         );
@@ -3011,6 +3043,11 @@ mod tests {
         assert_eq!(
             opts.max_commits_per_file,
             ingest_git::DEFAULT_MAX_COMMITS_PER_FILE
+        );
+        assert!(!opts.recurse_submodules && !opts.prs && !opts.ensure_gitignore);
+        assert!(
+            opts.structure && opts.docs,
+            "structure and docs default on and are recorded on the marker"
         );
         assert!(parse_args(&["ingest-git", "/tmp/db"]).is_err());
         assert!(parse_args(&["ingest-git", "/tmp/db", "/tmp/repo", "--nope"]).is_err());

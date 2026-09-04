@@ -52,7 +52,14 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("error: {e}");
-                    ExitCode::FAILURE
+                    // Exit 3 is "the store is busy, nothing was written" — a
+                    // caller (a git hook, a retry loop) can act on that without
+                    // parsing the message.
+                    if e.0 == cli::ingest_git::BUSY_MESSAGE {
+                        ExitCode::from(3)
+                    } else {
+                        ExitCode::FAILURE
+                    }
                 }
             }
         }

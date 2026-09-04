@@ -17,18 +17,49 @@ ingest-git: 1204 commit(s), 318 file(s), 7 author(s)
   rules: auto_fk_commit_author_id, auto_fk_file_top_author_id, co_changed, knows
 ```
 
+## Flags
+
+| Flag | Effect |
+|---|---|
+| `--exclude <pattern>` | Skip matching paths. Repeatable; see [Exclusion patterns](#exclusion-patterns) |
+| `--max-commits-per-file N` | Cap on the stored `commits` list per file (default 200) |
+| `--recurse-submodules` | Also walk every initialised submodule, as its own unit |
+| `--prs` | Ask `gh` for merged pull requests and link them to their commits |
+| `--ensure-gitignore` | Add the database directory to the repository's `.gitignore` |
+
 ## Graph shape
 
 | Label | key (`id`) | Props |
 |---|---|---|
-| `Author` | email | `name` |
-| `Commit` | full sha | `message` (subject line), `ts` (unix seconds), `author_id` |
+| `Author` | mailmap-resolved email | `name` |
+| `Commit` | full sha | `message` (subject line), `ts` (unix seconds), `author_id`, `pr_id` (with `--prs`) |
 | `File` | path | `path`, `dir`, `ext`, `commits` (list of shas, newest last, capped), `n_commits`, `top_author_id`, `author_counts` |
-| `GitSync` | `"__mushroomdb_git_sync__"` | `sha` — the last ingested commit, the marker the next run resumes from |
+| `PR` | `"pr:<number>"` | `number`, `title`, `url`, `merged_at`, `author_login` |
+| `GitSync` | `"__mushroomdb_git_sync__"` | `sha` — the last ingested commit, the marker the next run resumes from — plus `repo`, `recurse`, `prs`, `structure`, `docs` |
 
 The sync marker's key is deliberately not `HEAD`. Node keys are one namespace
 shared with `File` keys, which are repository paths, and a project that ships a
 file named `HEAD` would otherwise collide with the marker.
+
+Beside the resume sha the marker records how the ingest was run: `repo` is the
+repository's absolute path, and `recurse`, `prs`, `structure` and `docs` are the
+flags it was run under. A later run that changes one of them updates the marker
+even when there is nothing new to walk.
+
+## Author identity and `.mailmap`
+
+Authors are keyed by the address git reports *after* applying the repository's
+`.mailmap`, and `Author.name` is the mailmapped name. A contributor who has
+committed from a work address and a personal one is therefore one `Author` node
+with one set of `KNOWS` edges, as long as the repository maps the addresses
+together:
+
+```
+Alice Example <alice@example.test> <alice.old@example.test>
+```
+
+Without a `.mailmap` nothing changes — the raw commit author name and address
+are used, exactly as before.
 
 Note that `n_commits` counts every commit that ever touched the file, while
 `commits` holds only the most recent `--max-commits-per-file` shas (default
@@ -52,6 +83,8 @@ want the full distribution; `top_author_id` is its argmax.
 | `TOUCHED` | `Commit` → `File` | Written directly from `--name-status` output |
 | `AUTHOR` | `Commit` → `Author` | Auto-FK on `Commit.author_id` |
 | `TOP_AUTHOR` | `File` → `Author` | Auto-FK on `File.top_author_id` |
+| `MERGED_AS` | `PR` → `Commit` | Written from the `gh` listing (`--prs`) |
+| `PR` | `Commit` → `PR` | Auto-FK on `Commit.pr_id` (`--prs`) |
 | `CO_CHANGED` | `File` → `File` | Rule `co_changed` |
 | `KNOWS` | `Author` → `File` | Rule `knows` |
 
@@ -91,7 +124,62 @@ also indexed for full-text search on that first run.
 | anything else | substring of the path | `node_modules` matches `ui/node_modules/x/y.js` |
 
 Excluded paths are skipped entirely: no `File` node, no `TOUCHED` edge. A file
-renamed *into* an excluded path is treated as deleted.
+renamed *into* an excluded path is treated as deleted. Patterns are matched
+against the key a file is stored under, which for a submodule includes the
+submodule's path (`vendor/lib/src/lib.rs`), so `--exclude 'vendor/'` skips a
+whole submodule.
+
+## Submodules
+
+Without `--recurse-submodules` a submodule contributes nothing. The gitlink the
+parent records for it — the entry git reports as an ordinary change while it is
+really a commit pointer — gets no `File` node either; the submodule paths listed
+in `.gitmodules` are always skipped, initialised or not.
+
+With `--recurse-submodules` every *initialised* submodule is walked as its own
+unit. `git submodule foreach --recursive` decides which those are, so a
+submodule that was never checked out is silently skipped rather than failing the
+run. A unit has:
+
+- **Keys under its path in the parent.** A submodule at `vendor/lib` stores its
+  `src/lib.rs` as `vendor/lib/src/lib.rs`, so one query spans the whole tree and
+  two submodules that both contain `src/lib.rs` never collide.
+- **Its own sync marker**, keyed `__mushroomdb_git_sync__:<path>`. Each history
+  advances independently: a commit in the submodule alone re-walks only the
+  submodule.
+- **Its own file state.** The parent's walk never sees a submodule's files, and
+  a submodule's walk never sees the parent's.
+
+Authors, commits and the rules are shared across units, so ownership and
+co-change span the whole tree.
+
+## Pull requests
+
+`--prs` runs `gh pr list --state merged --limit 1000` in the repository and adds
+a `PR` node per merged pull request. Two things link one to its commits:
+
+- the **merge commit** the listing names, matched by sha;
+- a **squash merge**, matched by the `(#123)` that GitHub appends to the
+  subject line — only for numbers the listing actually returned.
+
+A linked commit gets `pr_id`, from which the foreign-key rule derives the
+`Commit` → `PR` edge, and the pull request gets a `MERGED_AS` edge to it.
+Linking runs over every commit in the graph, not just the newly walked ones, so
+adding `--prs` to a database that was ingested without it links its history on
+the next run. `PR.title` is indexed for full-text search.
+
+Everything about this step is best-effort: if `gh` is not installed, the
+repository has no GitHub remote, or the user is not authenticated, the run
+prints one line to stderr and continues. Pull requests are never a reason to
+fail an otherwise complete ingest.
+
+## Keeping the database out of the repository
+
+`--ensure-gitignore` appends the database directory to the repository's
+`.gitignore` — `mushroom-memory/` for `mushroomdb ingest-git ./mushroom-memory .`
+— creating the file if it does not exist. It is idempotent: a second run finds
+the line and changes nothing. A database stored outside the repository is left
+alone, since the repository has no path to ignore.
 
 ## Incremental semantics
 
@@ -118,8 +206,11 @@ onto a path another file just vacated replaces that file's node. Either way one
 `File` node exists per live path, and its `id` always equals its key.
 
 A run with no new commits writes nothing at all: `commit_seq` does not move.
-Merge commits appear as `Commit` nodes with no `TOUCHED` edges, since
-`--name-status` reports no changes for them by default.
+That holds per unit — a run that only re-walks a submodule leaves the parent's
+marker and file nodes untouched. Two things still count as work with no new
+commits: `--prs`, which re-reads the pull request listing every time, and a
+change to the recorded flags. Merge commits appear as `Commit` nodes with no
+`TOUCHED` edges, since `--name-status` reports no changes for them by default.
 
 Each run resolves `git rev-parse HEAD` before it walks anything, ends the walk at
 that sha rather than at the symbolic `HEAD`, and records the same sha as the next
@@ -139,19 +230,21 @@ commit's `message`; the sha and the graph are unaffected.
 
 ## Concurrency
 
-Do not run `ingest-git` — or any other CLI write command — against a database
-directory that a running `mushroomdb serve` process holds. Both open the store
-directly on disk; the CLI process has no coordination with the server's
-locking, so concurrent writers can corrupt the WAL. For a live-served store,
-write through the HTTP API instead. This mirrors the existing warning on
-`mushroomdb backup` (`mushroomdb --help`).
+`ingest-git` takes the store's write lock for the duration of its write pass,
+so it serialises against a running `mushroomdb serve`, a git hook, and any
+other command touching the same directory. See
+[`concurrency.md`](concurrency.md) for the model.
 
-The recall hook is the same hazard with a different shape: it opens the store
-on every prompt, unattended. It opens without migration or WAL repair
-(`auto_migrate: false`, `repair_wal: false`) so it writes nothing, but it still
-has no coordination with a live `serve`, and a read taken mid-append sees
-whatever prefix was durable at that instant. Do not point the hook at a store a
-live `serve` process holds.
+If another process holds the lock for longer than the wait budget, the command
+prints
+
+```
+error: another mushroomdb process is writing; retry
+```
+
+and exits **3**, having written nothing. Retrying later is always safe: the run
+either applies its whole window or none of it, and the sync marker only advances
+with the data it covers.
 
 ## What the recall hook sees
 
