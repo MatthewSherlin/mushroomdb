@@ -674,13 +674,18 @@ pub fn render_why(w: &WhyReport) -> String {
     cap_lines(&out, MAX_TOOL_LINES)
 }
 
-/// Pair off the two edges a symmetric rule writes between the same nodes.
+/// Pair off two edges that say the same thing in opposite directions.
 ///
 /// A rule such as `co_changed` matches both ways round and the engine reports
-/// an edge each way. They are one relationship, and printing the same three
-/// commits twice under it says nothing the first printing did not — so the
-/// second is folded into the first, which then reads `a↔b`. The report itself
-/// keeps both edges: they are what the graph holds.
+/// an edge each way, scored the same and evidenced by the same commits.
+/// Printing those commits twice says nothing the first printing did not, so the
+/// second is folded into the first, which then reads `a↔b`.
+///
+/// The fold requires the score **and** the evidence to be equal, which is what
+/// makes it safe: two files that import each other, or two documents that
+/// mention each other, also have an edge each way, but each carries its own
+/// line of a different file, and each of those lines is printed. The report
+/// itself always keeps both edges — they are what the graph holds.
 fn pair_up(links: &[WhyLink]) -> Vec<(&WhyLink, bool)> {
     let mut out: Vec<(&WhyLink, bool)> = Vec::new();
     let mut folded: Vec<bool> = vec![false; links.len()];
@@ -694,6 +699,8 @@ fn pair_up(links: &[WhyLink]) -> Vec<(&WhyLink, bool)> {
                 && other.rule == link.rule
                 && other.edge_type == link.edge_type
                 && other.direction != link.direction
+                && other.score == link.score
+                && other.evidence == link.evidence
             {
                 folded[j] = true;
                 both_ways = true;

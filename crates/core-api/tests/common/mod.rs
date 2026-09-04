@@ -20,6 +20,12 @@
 //! alone partitions the graph into three components. Every commit touches the
 //! first three files of one directory plus one rotating other, so `CO_CHANGED`
 //! reinforces the same three groups.
+//!
+//! The last file of `tests` doubles as the fixture's **document**: alongside
+//! everything a source file carries it has the three props `ingest-git` writes
+//! for Markdown — `headings`, `body` and a `mentions` list — so the `MENTIONS`
+//! edge and the evidence read off it have something to be read from. It
+//! mentions a file in its own directory, so the three components stay three.
 
 // Every integration test is its own crate and includes this file as a private
 // module, so whatever one suite does not call is dead code in that suite's
@@ -133,6 +139,37 @@ pub fn hash_of(key: &str) -> String {
     format!("{h:016x}")
 }
 
+/// The fixture's one document: the last file of `tests`.
+#[must_use]
+pub fn doc_key() -> String {
+    file_key(2, DIRS[2].1 - 1)
+}
+
+/// The file [`doc_key`]'s body mentions, under the heading [`DOC_HEADING`].
+#[must_use]
+pub fn doc_mentions() -> String {
+    file_key(2, 1)
+}
+
+/// The headings of [`doc_key`], in document order.
+pub const DOC_HEADINGS: [&str; 3] = ["Test notes", "Fixtures", "Running"];
+/// The heading the mention sits under — the second, not the first, so a test
+/// can tell "nearest heading above the mention" from "the document's first".
+pub const DOC_HEADING: &str = DOC_HEADINGS[1];
+
+/// The body of [`doc_key`]: Markdown, with the mention under its second
+/// heading and a heading after it that must not be picked.
+#[must_use]
+pub fn doc_body() -> String {
+    format!(
+        "# {}\n\nWhat the suite covers.\n\n## {}\n\nThe sample is built by `{}`.\n\n## {}\n\ncargo test\n",
+        DOC_HEADINGS[0],
+        DOC_HEADINGS[1],
+        doc_mentions(),
+        DOC_HEADINGS[2],
+    )
+}
+
 /// The author of commit `i`. The four authors take the commits in turn.
 #[must_use]
 pub fn commit_author(i: usize) -> &'static str {
@@ -244,6 +281,13 @@ pub fn synthetic_repo_store(dir: &Path) -> GraphDb<core_storage::fs::RealFs> {
                     "import_lines".into(),
                     list(&[format!("{target}\t{}", 3 + i)]),
                 ));
+            }
+            // The one document: what `ingest-git` writes for a Markdown file,
+            // on top of what every file here carries.
+            if key == doc_key() {
+                props.push(("mentions".into(), list(&[doc_mentions()])));
+                props.push(("headings".into(), list(&DOC_HEADINGS.map(str::to_string))));
+                props.push(("body".into(), s(&doc_body())));
             }
             let cs = commits_of.get(&key).cloned().unwrap_or_default();
             if !cs.is_empty() {

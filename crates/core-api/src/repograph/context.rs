@@ -341,11 +341,42 @@ fn notes_about<F: Fs>(db: &GraphDb<F>, keys: &[String]) -> Vec<(String, String)>
     out
 }
 
+/// Where a `File` key sits in the working tree, or `None` when it does not sit
+/// inside it at all.
+///
+/// A `File` key is graph content: anything that can write a node chooses it,
+/// and nothing constrains it to a repository-relative path. Joined unchecked,
+/// an absolute key would replace the root outright and a `..` component would
+/// climb out of it, so `context` would quote whatever the process can read into
+/// an assistant's context. Three checks, in order:
+///
+/// - the key must be relative and made only of ordinary path segments, which
+///   rules out an absolute path, a Windows drive prefix and every `..`;
+/// - both the root and the joined path are canonicalised, which resolves every
+///   symlink on the way — including one planted inside the tree;
+/// - the result must still be under the canonical root.
+///
+/// Canonicalising also means a key naming a file that is not there fails here
+/// rather than at the read, which is the same answer: no source.
+fn inside_repo(root: &Path, file: &str) -> Option<std::path::PathBuf> {
+    let rel = Path::new(file);
+    if rel
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let real_root = root.canonicalize().ok()?;
+    let real = real_root.join(rel).canonicalize().ok()?;
+    real.starts_with(&real_root).then_some(real)
+}
+
 /// The source of `file` from the working tree: a symbol's own lines, or the
 /// head of the file when no line range is given.
 ///
 /// `repo` wins over the `GitSync` marker, so a caller working in a checkout
-/// elsewhere reads that one. Anything that goes wrong — no repository, no such
+/// elsewhere reads that one. Only a path [`inside_repo`] accepts is read.
+/// Anything that goes wrong — no repository, a key that leaves it, no such
 /// file, unreadable bytes — is simply no source: the rest of the report is
 /// still worth having.
 fn read_source<F: Fs>(
@@ -361,7 +392,7 @@ fn read_source<F: Fs>(
         Some(p) => p.to_path_buf(),
         None => std::path::PathBuf::from(str_prop(db, SYNC_KEY, "repo")?),
     };
-    let text = std::fs::read_to_string(root.join(file)).ok()?;
+    let text = std::fs::read_to_string(inside_repo(&root, file)?).ok()?;
     let (first, last) = lines.unwrap_or((1, u32::MAX));
     let skip = first.saturating_sub(1) as usize;
     let take = (last.saturating_sub(first) as usize).saturating_add(1);

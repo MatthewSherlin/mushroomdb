@@ -95,6 +95,21 @@ pub fn why<F: Fs>(db: &GraphDb<F>, a: &str, b: &str) -> WhyReport {
             via: e.via_edge.as_deref().map(sanitize),
         });
     }
+    // The engine returns provenance in its own stable order; sorting on the
+    // fields themselves means the answer depends on what the links *are*
+    // rather than on the order two stores happened to intern their ids in.
+    report.links.sort_by(|x, y| {
+        x.direction
+            .cmp(&y.direction)
+            .then(x.edge_type.cmp(&y.edge_type))
+            .then(x.rule.cmp(&y.rule))
+            .then(
+                y.score
+                    .partial_cmp(&x.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(x.evidence.cmp(&y.evidence))
+    });
     if report.links.is_empty() {
         report.path = shortest_path(db, a, b, &PATH_EDGES, MAX_HOPS);
     }

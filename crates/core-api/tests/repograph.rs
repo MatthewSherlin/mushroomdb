@@ -7,15 +7,16 @@
 mod common;
 
 use common::{
-    all_files, commit_author, commit_ts, file_key, hash_of, newest_ts, open, sha,
-    synthetic_repo_store, tmp, touched, COMMITS, DAY_SECS, SYNCED_AT,
+    all_files, commit_author, commit_ts, doc_key, doc_mentions, file_key, hash_of, newest_ts, open,
+    sha, synthetic_repo_store, tmp, touched, COMMITS, DAY_SECS, DOC_HEADING, DOC_HEADINGS,
+    SYNCED_AT,
 };
 use core_api::repograph::{
     context, impact, owners, render_context, render_impact, render_map, render_owners, render_why,
     repo_map, shortest_path, why, ImpactOptions, MapOptions, Target,
 };
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `hot_days` wide enough to cover the whole synthetic history.
 const ALL_TIME: i64 = 10_000;
@@ -430,10 +431,15 @@ fn sym(d: usize, i: usize, name: &str) -> String {
 /// call has real source to quote.
 fn work_tree(name: &str) -> PathBuf {
     let dir = tmp(name);
+    write_work_tree(&dir);
+    dir
+}
+
+/// Fill `dir` with the working tree [`work_tree`] describes.
+fn write_work_tree(dir: &Path) {
     std::fs::create_dir_all(dir.join("src/core")).expect("mkdir");
     let body: String = (1..=30).map(|n| format!("// line {n}\n")).collect();
     std::fs::write(dir.join(file_key(0, 1)), body).expect("write source");
-    dir
 }
 
 /// The commits of the synthetic history that touched `path`, oldest first.
@@ -554,6 +560,65 @@ fn context_bare_name_ambiguous_lists_candidates() {
         render_context(&none).contains("unknown: no::such::thing"),
         "{}",
         render_context(&none)
+    );
+}
+
+#[test]
+fn context_never_reads_outside_the_repo() {
+    let root = tmp("context-escape");
+    let repo = root.join("repo");
+    write_work_tree(&repo);
+    // A file next to the working tree, of the kind nobody wants quoted into an
+    // assistant's context.
+    let secret = root.join("secret.env");
+    std::fs::write(&secret, "TOKEN=hunter2\n").expect("write secret");
+
+    let dir = tmp("context-escape-db");
+    let mut db = synthetic_repo_store(&dir);
+    // A `File` key is not constrained to a repo-relative path: anything that
+    // can write a node can choose one. Each of these would read the secret if
+    // the key were joined to the repository root unchecked.
+    let mut escapes = vec![
+        secret.to_string_lossy().to_string(),
+        "../secret.env".to_string(),
+        "src/core/../../secret.env".to_string(),
+    ];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&secret, repo.join("link.env")).expect("symlink");
+        escapes.push("link.env".to_string());
+    }
+    for key in &escapes {
+        db.insert_node(
+            "File",
+            key,
+            vec![
+                ("id".into(), core_api::Value::Str(key.clone())),
+                ("path".into(), core_api::Value::Str(key.clone())),
+            ],
+        )
+        .expect("file");
+    }
+
+    for key in &escapes {
+        let c = context(&db, Some(repo.as_path()), key);
+        assert_eq!(c.target, Target::File { path: key.clone() });
+        assert!(
+            c.source.is_none(),
+            "{key} must not be read from outside the repository: {:?}",
+            c.source
+        );
+        assert!(
+            !render_context(&c).contains("hunter2"),
+            "and nothing of it may reach a rendered line"
+        );
+    }
+
+    // A key inside the tree still reads, so this pins refusal and not breakage.
+    let inside = context(&db, Some(repo.as_path()), &file_key(0, 1));
+    assert!(
+        inside.source.expect("source").starts_with("// line 1"),
+        "a repo-relative key is unaffected"
     );
 }
 
@@ -877,6 +942,154 @@ fn why_import_evidence_has_the_line() {
 }
 
 #[test]
+fn why_mutual_imports_render_both_directions_with_evidence() {
+    let dir = tmp("why-mutual");
+    let mut db = synthetic_repo_store(&dir);
+    let (a, b) = (file_key(0, 0), file_key(0, 1));
+
+    // `b` already imports `a`; make `a` import `b` too, from another line.
+    db.set_prop(
+        &a,
+        "imports",
+        core_api::Value::List(vec![core_api::Value::Str(b.clone())]),
+    )
+    .expect("imports");
+    db.set_prop(
+        &a,
+        "import_lines",
+        core_api::Value::List(vec![core_api::Value::Str(format!("{b}\t9"))]),
+    )
+    .expect("import lines");
+
+    let w = why(&db, &a, &b);
+    let imports: Vec<&core_api::repograph::WhyLink> = w
+        .links
+        .iter()
+        .filter(|l| l.edge_type == "IMPORTS")
+        .collect();
+    assert_eq!(imports.len(), 2, "one edge each way: {:?}", w.links);
+    assert_eq!(
+        imports
+            .iter()
+            .map(|l| l.evidence.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![format!("{a} line 9: import {b}")],
+            vec![format!("{b} line 4: import {a}")],
+        ],
+        "each direction keeps its own line"
+    );
+
+    // Both survive rendering: a mutual pair is two facts, unlike a co-change
+    // edge, whose evidence is the same set of commits whichever way it points.
+    let text = render_why(&w);
+    assert!(text.contains(&format!("{a} line 9: import {b}")), "{text}");
+    assert!(text.contains(&format!("{b} line 4: import {a}")), "{text}");
+    assert_eq!(
+        text.matches("IMPORTS").count(),
+        2,
+        "one line per direction:\n{text}"
+    );
+    assert_eq!(
+        text.matches("CO_CHANGED").count(),
+        1,
+        "while the symmetric edge is folded into one:\n{text}"
+    );
+    assert!(text.lines().count() <= 25, "{text}");
+}
+
+#[test]
+fn why_mentions_evidence_names_the_nearest_heading() {
+    let dir = tmp("why-mentions");
+    let mut db = synthetic_repo_store(&dir);
+    let (doc, file) = (doc_key(), doc_mentions());
+
+    let w = why(&db, &doc, &file);
+    let mention = w
+        .links
+        .iter()
+        .find(|l| l.edge_type == "MENTIONS")
+        .expect("the document mentions the file");
+    assert_eq!(mention.rule, "mentions");
+    assert_eq!(mention.direction, "a→b");
+    assert_eq!(
+        mention.evidence,
+        vec![format!("{doc} mentions {file} under \"{DOC_HEADING}\"")],
+        "the heading above the mention, not the document's first"
+    );
+    assert!(render_why(&w).contains(DOC_HEADING));
+
+    // Without a stored body there is no line to look above, and the document's
+    // first heading is what it is about.
+    db.remove_prop(&doc, "body").expect("drop the body");
+    let w = why(&db, &doc, &file);
+    let mention = w
+        .links
+        .iter()
+        .find(|l| l.edge_type == "MENTIONS")
+        .expect("the edge is unchanged");
+    assert_eq!(
+        mention.evidence,
+        vec![format!(
+            "{doc} mentions {file} under \"{}\"",
+            DOC_HEADINGS[0]
+        )]
+    );
+
+    // With neither, the mention is still reported — just without a place.
+    db.remove_prop(&doc, "headings").expect("drop the headings");
+    let w = why(&db, &doc, &file);
+    assert_eq!(
+        w.links
+            .iter()
+            .find(|l| l.edge_type == "MENTIONS")
+            .expect("the edge is unchanged")
+            .evidence,
+        vec![format!("{doc} mentions {file}")]
+    );
+}
+
+#[test]
+fn why_knows_evidence_names_the_via_file() {
+    let dir = tmp("why-knows");
+    let db = synthetic_repo_store(&dir);
+    let (author, file) = ("a@example.test".to_string(), file_key(0, 0));
+
+    let w = why(&db, &author, &file);
+    let knows = w
+        .links
+        .iter()
+        .find(|l| l.edge_type == "KNOWS")
+        .expect("the rule links the owner of its neighbours to it");
+    assert_eq!(knows.rule, "knows");
+    assert_eq!(knows.direction, "a→b");
+    assert_eq!(
+        knows.via.as_deref(),
+        Some("TOP_AUTHOR"),
+        "the edge type the rule hopped over"
+    );
+
+    // The evidence names the files the author owns that share commits with it,
+    // most shared first, ties on the key.
+    let shared = commits_touching(&file).len();
+    assert_eq!(
+        knows.evidence[0],
+        format!("via {} ({shared} shared commits)", file_key(0, 1))
+    );
+    assert!(
+        knows.evidence.iter().all(|e| !e.contains(&file)),
+        "the file itself is not the file it is known through: {:?}",
+        knows.evidence
+    );
+    let text = render_why(&w);
+    assert!(
+        text.contains("via TOP_AUTHOR") && text.contains(&file_key(0, 1)),
+        "{text}"
+    );
+    assert!(text.lines().count() <= 25, "{text}");
+}
+
+#[test]
 fn why_falls_back_to_shortest_path() {
     let dir = tmp("why-path");
     let db = synthetic_repo_store(&dir);
@@ -1014,9 +1227,12 @@ fn renders_are_deterministic_and_within_limits() {
         render_owners(&owners(&db, &path, None).expect("owners")),
         rendered[2].0
     );
-    let other = tmp("renders-2");
-    let db2 = synthetic_repo_store(&other);
-    let twice = |d: &core_api::GraphDb<core_storage::fs::RealFs>| {
+    // And two stores built the same way answer the same bytes — which is what
+    // determinism means here, and what comparing one store with itself would
+    // not catch.
+    let db2 = synthetic_repo_store(&tmp("renders-2"));
+    let db3 = synthetic_repo_store(&tmp("renders-3"));
+    let digests = |d: &core_api::GraphDb<core_storage::fs::RealFs>| {
         (
             render_why(&why(d, &path, &file_key(0, 1))),
             render_impact(&impact(
@@ -1025,7 +1241,13 @@ fn renders_are_deterministic_and_within_limits() {
                 &BTreeSet::new(),
                 &ImpactOptions::default(),
             )),
+            render_owners(&owners(d, &path, None).expect("owners")),
+            render_context(&context(d, None, &sym(0, 1, "core::run"))),
         )
     };
-    assert_eq!(twice(&db2), twice(&db2), "one store, one answer");
+    assert_eq!(
+        digests(&db2),
+        digests(&db3),
+        "two stores of the same shape, one answer"
+    );
 }
