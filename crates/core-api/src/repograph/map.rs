@@ -43,6 +43,7 @@
 
 use crate::algo::LouvainConfig;
 use crate::db::GraphDb;
+use crate::repograph::facts::{rank, str_list, str_prop};
 use crate::repograph::render::{basename, cluster_name, common_dir_prefix, sanitize};
 use core_storage::fs::Fs;
 use core_storage::Value;
@@ -51,7 +52,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 /// Key of the singleton marker `ingest-git` writes the synced sha on.
-const SYNC_KEY: &str = "__mushroomdb_git_sync__";
+pub(super) const SYNC_KEY: &str = "__mushroomdb_git_sync__";
 /// Marker prop holding when the store last took new data, in Unix seconds.
 /// Absent on a store built before it existed.
 const SYNCED_AT: &str = "synced_at";
@@ -178,37 +179,6 @@ fn remaining_ms(deadline: Option<Instant>) -> u64 {
             .unwrap_or(u64::MAX)
             .max(1),
     }
-}
-
-fn str_prop<F: Fs>(db: &GraphDb<F>, key: &str, field: &str) -> Option<String> {
-    match db.node_ref(key).and_then(|n| n.prop(field)) {
-        Some(Value::Str(s)) => Some(s),
-        _ => None,
-    }
-}
-
-/// The string elements of a list property, in order.
-fn str_list(v: Option<Value>) -> Vec<String> {
-    match v {
-        Some(Value::List(items)) => items
-            .into_iter()
-            .filter_map(|i| match i {
-                Value::Str(s) => Some(s),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Sort `(key, count)` pairs the way every section here prints them: the
-/// biggest first, and equal counts by key so the order never wobbles.
-fn rank<T: PartialOrd + Copy>(items: &mut [(String, T)]) {
-    items.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
 }
 
 /// Summarise the repository the store was built from.

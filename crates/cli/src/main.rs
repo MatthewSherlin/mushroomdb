@@ -52,6 +52,12 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
+        Ok(Command::Context { db_dir, target }) => {
+            print_or_fail(cli::run_context(&db_dir, &target))
+        }
+        Ok(Command::Impact { db_dir, files }) => print_or_fail(cli::run_impact(&db_dir, &files)),
+        Ok(Command::Owners { db_dir, path }) => print_or_fail(cli::run_owners(&db_dir, &path)),
+        Ok(Command::Why { db_dir, a, b }) => print_or_fail(cli::run_why(&db_dir, &a, &b)),
         Ok(Command::Sync { db_dir }) => match cli::ingest_git::run_sync(&db_dir) {
             Ok(report) => {
                 print!("{}", cli::ingest_git::format_sync(&report));
@@ -325,6 +331,18 @@ fn exit(r: Result<(), String>) -> ExitCode {
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&e),
+    }
+}
+
+/// Print a digest, or its error on stderr. The graph tools all answer the same
+/// way: a string on success, one line on stderr and exit 1 otherwise.
+fn print_or_fail(r: Result<String, cli::CliError>) -> ExitCode {
+    match r {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
     }
 }
 

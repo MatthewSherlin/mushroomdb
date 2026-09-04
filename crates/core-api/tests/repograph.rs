@@ -7,10 +7,15 @@
 mod common;
 
 use common::{
-    all_files, commit_ts, file_key, hash_of, newest_ts, open, sha, synthetic_repo_store, tmp,
-    COMMITS, DAY_SECS, SYNCED_AT,
+    all_files, commit_author, commit_ts, file_key, hash_of, newest_ts, open, sha,
+    synthetic_repo_store, tmp, touched, COMMITS, DAY_SECS, SYNCED_AT,
 };
-use core_api::repograph::{render_map, repo_map, MapOptions};
+use core_api::repograph::{
+    context, impact, owners, render_context, render_impact, render_map, render_owners, render_why,
+    repo_map, shortest_path, why, ImpactOptions, MapOptions, Target,
+};
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 /// `hot_days` wide enough to cover the whole synthetic history.
 const ALL_TIME: i64 = 10_000;
@@ -410,4 +415,617 @@ fn the_synthetic_store_has_the_shape_the_suites_assume() {
     assert!(!db.weighted_edges("CO_CHANGED", Some("score")).is_empty());
     assert!(!db.weighted_edges("CALLS", None).is_empty());
     assert!(!db.weighted_edges("TOP_AUTHOR", None).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// `context`, `impact`, `owners`, `why`.
+// ---------------------------------------------------------------------------
+
+/// The key of the symbol named `name` in file `i` of directory `d`.
+fn sym(d: usize, i: usize, name: &str) -> String {
+    format!("{}#{name}", file_key(d, i))
+}
+
+/// A working tree holding one file of thirty numbered lines, so a `context`
+/// call has real source to quote.
+fn work_tree(name: &str) -> PathBuf {
+    let dir = tmp(name);
+    std::fs::create_dir_all(dir.join("src/core")).expect("mkdir");
+    let body: String = (1..=30).map(|n| format!("// line {n}\n")).collect();
+    std::fs::write(dir.join(file_key(0, 1)), body).expect("write source");
+    dir
+}
+
+/// The commits of the synthetic history that touched `path`, oldest first.
+fn commits_touching(path: &str) -> Vec<usize> {
+    (0..COMMITS)
+        .filter(|i| touched(*i).iter().any(|f| f == path))
+        .collect()
+}
+
+#[test]
+fn context_on_symbol_has_source_callers_callees_and_owner() {
+    let dir = tmp("context-symbol");
+    let db = synthetic_repo_store(&dir);
+    let repo = work_tree("context-symbol-tree");
+    let key = sym(0, 1, "core::run");
+
+    let c = context(&db, Some(repo.as_path()), &key);
+    assert_eq!(c.target, Target::Symbol { key: key.clone() });
+    assert!(c.candidates.is_empty(), "an exact key is never ambiguous");
+    assert_eq!(c.signature.as_deref(), Some("fn core::run()"));
+    assert_eq!(c.doc.as_deref(), Some("what core::run does"));
+    assert_eq!(c.lines, Some((11, 21)));
+    assert_eq!(c.file, file_key(0, 1));
+    assert_eq!(
+        c.owner.as_deref(),
+        Some("Ada Example"),
+        "the owner is the file's top author, by name"
+    );
+
+    // The source is the symbol's own lines, read from the working tree.
+    let source = c.source.clone().expect("source from the working tree");
+    assert_eq!(source.lines().count(), 11, "lines 11..=21:\n{source}");
+    assert!(source.starts_with("// line 11"), "{source}");
+    assert!(source.ends_with("// line 21"), "{source}");
+
+    // Three symbols call it, each quoting the line it does so on.
+    let callers: Vec<(String, u32)> = c.callers.clone();
+    assert_eq!(
+        callers,
+        vec![
+            (sym(0, 3, "core::load"), 15),
+            (sym(0, 4, "core::save"), 16),
+            (sym(1, 2, "web::render"), 20),
+        ],
+        "callers are sorted by key and carry the caller's call line"
+    );
+    assert_eq!(c.callees, vec![(sym(0, 0, "core::init"), 13)]);
+
+    // The file's own facts come along: what imports it, what it changes with.
+    assert_eq!(c.imports, vec![file_key(0, 0)]);
+    assert!(c.recent_commits.len() <= 5 && !c.recent_commits.is_empty());
+    let text = render_context(&c);
+    assert!(
+        text.lines().count() <= 60,
+        "{} lines:\n{text}",
+        text.lines().count()
+    );
+    assert!(
+        text.contains("// line 11"),
+        "the excerpt is printed:\n{text}"
+    );
+    assert!(
+        text.contains("Ada Example") && !text.contains("@example.test"),
+        "{text}"
+    );
+}
+
+#[test]
+fn context_bare_name_ambiguous_lists_candidates() {
+    let dir = tmp("context-bare");
+    let mut db = synthetic_repo_store(&dir);
+
+    // A bare name that only one symbol carries resolves to that symbol.
+    let one = context(&db, None, "core::flush");
+    assert_eq!(
+        one.target,
+        Target::Symbol {
+            key: sym(0, 5, "core::flush")
+        }
+    );
+    assert!(one.candidates.is_empty());
+    assert!(
+        one.source.is_none(),
+        "the fixture's repo path does not exist, so there is no source to read"
+    );
+
+    // Give a second symbol the same name and the answer becomes the choice.
+    db.set_prop(
+        &sym(1, 0, "web::serve"),
+        "name",
+        core_api::Value::Str("core::flush".into()),
+    )
+    .expect("rename");
+    let two = context(&db, None, "core::flush");
+    assert_eq!(
+        two.candidates,
+        vec![sym(0, 5, "core::flush"), sym(1, 0, "web::serve")],
+        "both candidates, sorted by key"
+    );
+    assert!(
+        two.signature.is_none() && two.callers.is_empty() && two.file.is_empty(),
+        "an ambiguous target fills nothing else in"
+    );
+    let text = render_context(&two);
+    assert!(text.contains("ambiguous"), "{text}");
+    assert!(text.contains(&sym(1, 0, "web::serve")), "{text}");
+
+    // A name nothing carries is an answer too, not an error.
+    let none = context(&db, None, "no::such::thing");
+    assert_eq!(
+        none.target,
+        Target::Unknown {
+            target: "no::such::thing".into()
+        }
+    );
+    assert!(none.candidates.is_empty());
+    assert!(
+        render_context(&none).contains("unknown: no::such::thing"),
+        "{}",
+        render_context(&none)
+    );
+}
+
+#[test]
+fn context_on_file_lists_importers_partners_commits() {
+    let dir = tmp("context-file");
+    let db = synthetic_repo_store(&dir);
+    let path = file_key(0, 0);
+
+    let c = context(&db, None, &path);
+    assert_eq!(c.target, Target::File { path: path.clone() });
+    assert_eq!(c.file, path);
+    assert_eq!(c.owner.as_deref(), Some("Ada Example"));
+    assert!(c.imports.is_empty(), "the hub imports nothing itself");
+    assert_eq!(
+        c.importers,
+        (1..9).map(|i| file_key(0, i)).collect::<Vec<_>>(),
+        "importers are sorted by key and capped"
+    );
+    assert!(
+        c.partners
+            .iter()
+            .any(|(k, s)| *k == file_key(0, 1) && (*s - 1.0).abs() < 1e-9),
+        "it changes with the other two files every core commit touches: {:?}",
+        c.partners
+    );
+    assert!(
+        c.partners.windows(2).all(|w| w[0].1 >= w[1].1),
+        "partners are ranked by score: {:?}",
+        c.partners
+    );
+
+    // The five newest commits that touched it, newest first.
+    let want: Vec<String> = commits_touching(&path)
+        .into_iter()
+        .rev()
+        .take(5)
+        .map(sha)
+        .collect();
+    let got: Vec<String> = c.recent_commits.iter().map(|(s, _, _)| s.clone()).collect();
+    assert_eq!(got, want);
+    assert!(c.recent_commits.windows(2).all(|w| w[0].1 >= w[1].1));
+
+    // What has been said about it.
+    assert_eq!(
+        c.notes,
+        vec![(
+            "note:0001".to_string(),
+            "the core entry point is worth reading first".to_string()
+        )]
+    );
+    assert_eq!(
+        c.concepts,
+        vec![("concept:startup".to_string(), "startup path".to_string())]
+    );
+}
+
+#[test]
+fn impact_marks_partners_in_the_diff_as_modified() {
+    let dir = tmp("impact-modified");
+    let db = synthetic_repo_store(&dir);
+    let (a, b) = (file_key(0, 0), file_key(0, 1));
+    let modified: BTreeSet<String> = [a.clone(), b.clone()].into_iter().collect();
+
+    let r = impact(
+        &db,
+        std::slice::from_ref(&a),
+        &modified,
+        &ImpactOptions::default(),
+    );
+    assert_eq!(r.files.len(), 1);
+    assert!(r.unknown.is_empty());
+    let f = &r.files[0];
+    assert_eq!(f.path, a);
+    assert_eq!(f.owner.as_deref(), Some("Ada Example"));
+    let inside = f
+        .partners
+        .iter()
+        .find(|p| p.path == b)
+        .expect("the partner in the diff");
+    assert!(inside.modified, "it is in the caller's modified set");
+    assert!((inside.score - 1.0).abs() < 1e-9);
+    assert!(
+        f.partners.iter().any(|p| !p.modified),
+        "and the partners outside it are flagged the other way: {:?}",
+        f.partners
+    );
+    assert!(f.partners.len() <= ImpactOptions::default().max_partners);
+
+    // A partner below the threshold is not worth telling anyone about.
+    let strict = impact(
+        &db,
+        std::slice::from_ref(&a),
+        &modified,
+        &ImpactOptions {
+            min_score: 1.01,
+            ..ImpactOptions::default()
+        },
+    );
+    assert!(strict.files[0].partners.is_empty());
+
+    let text = render_impact(&r);
+    assert!(
+        text.lines().count() <= 25,
+        "{} lines:\n{text}",
+        text.lines().count()
+    );
+    assert!(text.contains("modified"), "{text}");
+}
+
+#[test]
+fn impact_lists_importers_and_symbols_used_elsewhere() {
+    let dir = tmp("impact-importers");
+    let db = synthetic_repo_store(&dir);
+    let a = file_key(0, 0);
+
+    let r = impact(
+        &db,
+        std::slice::from_ref(&a),
+        &BTreeSet::new(),
+        &ImpactOptions::default(),
+    );
+    let f = &r.files[0];
+    assert_eq!(
+        f.importers
+            .iter()
+            .map(|p| p.path.clone())
+            .collect::<Vec<_>>(),
+        (1..7).map(|i| file_key(0, i)).collect::<Vec<_>>(),
+        "importers are sorted by key and capped at max_importers"
+    );
+    assert!(
+        f.importers.iter().all(|p| !p.modified),
+        "nothing was modified"
+    );
+    assert_eq!(
+        f.symbols_used_elsewhere,
+        vec![(sym(0, 0, "core::init"), 3)],
+        "its one symbol is called from three other files"
+    );
+
+    // A file whose symbols nobody else calls says so by staying empty.
+    let leaf = impact(
+        &db,
+        &[file_key(0, 5)],
+        &BTreeSet::new(),
+        &ImpactOptions::default(),
+    );
+    assert!(leaf.files[0].symbols_used_elsewhere.is_empty());
+}
+
+#[test]
+fn impact_reports_unknown_paths() {
+    let dir = tmp("impact-unknown");
+    let db = synthetic_repo_store(&dir);
+    let files = vec!["nope/gone.rs".to_string(), file_key(0, 0)];
+
+    let r = impact(&db, &files, &BTreeSet::new(), &ImpactOptions::default());
+    assert_eq!(r.unknown, vec!["nope/gone.rs".to_string()]);
+    assert_eq!(r.files.len(), 1, "the known path is still reported");
+    let text = render_impact(&r);
+    assert!(text.contains("unknown: nope/gone.rs"), "{text}");
+    assert!(text.lines().count() <= 25);
+}
+
+#[test]
+fn owners_share_and_quarters_from_commits() {
+    let dir = tmp("owners-share");
+    let db = synthetic_repo_store(&dir);
+    let path = file_key(0, 0);
+
+    let o = owners(&db, &path, None).expect("a file the store knows");
+    assert_eq!(o.path, path);
+    let (name, key, share) = o.top.clone().expect("a top author");
+    assert_eq!(
+        (name.as_str(), key.as_str()),
+        ("Ada Example", "a@example.test")
+    );
+    let mine = commits_touching(&path)
+        .into_iter()
+        .filter(|i| commit_author(*i) == "a@example.test")
+        .count();
+    let all = commits_touching(&path).len();
+    assert!(
+        (share - mine as f64 / all as f64).abs() < 1e-9,
+        "share is that author's commits over the file's: {share}"
+    );
+
+    assert_eq!(
+        o.knows.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        vec!["Ada Example".to_string()],
+        "only the author who owns the files it changes with knows it"
+    );
+    let (last_sha, last_ts, subject) = o.last_touch.clone().expect("a last touch");
+    let newest = *commits_touching(&path).last().expect("commits");
+    assert_eq!(last_sha, sha(newest)[..7]);
+    assert_eq!(last_ts, commit_ts(newest));
+    assert_eq!(subject, format!("change {newest:02}"));
+
+    let labels: Vec<String> = o.by_quarter.iter().map(|(q, _, _)| q.clone()).collect();
+    assert_eq!(
+        labels,
+        vec!["2020Q4", "2021Q1", "2021Q2", "2021Q3"],
+        "the last four quarters, oldest first — the fifth is out of the window"
+    );
+    assert_eq!(
+        o.by_quarter.iter().map(|(_, _, n)| *n).collect::<Vec<_>>(),
+        vec![3, 2, 3, 3]
+    );
+    assert_eq!(o.by_quarter[0].1, "Ada Example");
+
+    let text = render_owners(&o);
+    assert!(
+        text.lines().count() <= 25,
+        "{} lines:\n{text}",
+        text.lines().count()
+    );
+    assert!(
+        text.contains("Ada Example (a@example.test)"),
+        "the key is printed once, in parentheses:\n{text}"
+    );
+    assert_eq!(
+        text.matches("@example.test").count(),
+        1,
+        "and nowhere else:\n{text}"
+    );
+}
+
+#[test]
+fn owners_unknown_path_is_none() {
+    let dir = tmp("owners-unknown");
+    let db = synthetic_repo_store(&dir);
+    assert!(owners(&db, "nope/gone.rs", None).is_none());
+    // A node that is not a File is not a file's owner either.
+    assert!(owners(&db, "a@example.test", None).is_none());
+}
+
+#[test]
+fn why_shared_commits_newest_first() {
+    let dir = tmp("why-commits");
+    let db = synthetic_repo_store(&dir);
+    let (a, b) = (file_key(0, 0), file_key(0, 1));
+
+    let w = why(&db, &a, &b);
+    assert!(w.unknown.is_empty() && w.path.is_empty());
+    let co = w
+        .links
+        .iter()
+        .find(|l| l.edge_type == "CO_CHANGED")
+        .expect("they change together");
+    assert_eq!(co.rule, "co_changed");
+    assert!((co.score.expect("a score") - 1.0).abs() < 1e-9);
+    assert!(co.via.is_none());
+
+    let newest = *commits_touching(&a).last().expect("commits");
+    assert!(
+        co.evidence[0].starts_with(&sha(newest)[..7]),
+        "the newest shared commit leads: {:?}",
+        co.evidence
+    );
+    assert!(
+        co.evidence[0].contains(&format!("change {newest:02}")),
+        "with its subject: {:?}",
+        co.evidence
+    );
+    let dates: Vec<&str> = co
+        .evidence
+        .iter()
+        .filter_map(|e| e.split(' ').nth(1))
+        .collect();
+    assert!(
+        dates.windows(2).all(|d| d[0] >= d[1]),
+        "newest first: {dates:?}"
+    );
+
+    let text = render_why(&w);
+    assert!(
+        text.lines().count() <= 25,
+        "{} lines:\n{text}",
+        text.lines().count()
+    );
+    assert!(text.contains("CO_CHANGED"), "{text}");
+}
+
+#[test]
+fn why_import_evidence_has_the_line() {
+    let dir = tmp("why-imports");
+    let db = synthetic_repo_store(&dir);
+    let (a, b) = (file_key(0, 1), file_key(0, 0));
+
+    let w = why(&db, &a, &b);
+    let import = w
+        .links
+        .iter()
+        .find(|l| l.edge_type == "IMPORTS")
+        .expect("a imports b");
+    assert_eq!(import.rule, "imports");
+    assert_eq!(import.direction, "a→b");
+    assert_eq!(
+        import.evidence,
+        vec![format!("{a} line 4: import {b}")],
+        "the evidence quotes the line the import sits on"
+    );
+    assert!(render_why(&w).contains("line 4"));
+
+    // A call is evidenced the same way, from the caller's line.
+    let calls = why(&db, &sym(0, 1, "core::run"), &sym(0, 0, "core::init"));
+    let call = calls
+        .links
+        .iter()
+        .find(|l| l.edge_type == "CALLS")
+        .expect("run calls init");
+    assert_eq!(
+        call.evidence,
+        vec![format!(
+            "{} line 13: call {}",
+            sym(0, 1, "core::run"),
+            sym(0, 0, "core::init")
+        )]
+    );
+}
+
+#[test]
+fn why_falls_back_to_shortest_path() {
+    let dir = tmp("why-path");
+    let db = synthetic_repo_store(&dir);
+    let (a, b) = (file_key(0, 5), file_key(0, 11));
+
+    let w = why(&db, &a, &b);
+    assert!(
+        w.links.is_empty(),
+        "nothing links them directly: {:?}",
+        w.links
+    );
+    assert_eq!(
+        w.path,
+        vec![
+            ("IMPORTS".to_string(), file_key(0, 0)),
+            ("IMPORTS".to_string(), b.clone()),
+        ],
+        "both import the hub, so the hub is the path between them"
+    );
+    let text = render_why(&w);
+    assert!(
+        text.contains(&format!(
+            "{a} -[IMPORTS]-> {} -[IMPORTS]-> {b}",
+            file_key(0, 0)
+        )),
+        "{text}"
+    );
+
+    // The same walk, asked for directly.
+    assert_eq!(
+        shortest_path(
+            &db,
+            &a,
+            &b,
+            &["IMPORTS", "CALLS", "CO_CHANGED", "MENTIONS"],
+            6
+        ),
+        w.path
+    );
+    assert!(
+        shortest_path(&db, &a, &b, &["IMPORTS"], 1).is_empty(),
+        "two hops do not fit in one"
+    );
+    assert!(
+        shortest_path(&db, &a, &a, &["IMPORTS"], 6).is_empty(),
+        "a node is not a path to itself"
+    );
+}
+
+#[test]
+fn why_no_link_message() {
+    let dir = tmp("why-no-link");
+    let db = synthetic_repo_store(&dir);
+    let (a, b) = (file_key(0, 11), file_key(2, 7));
+
+    let w = why(&db, &a, &b);
+    assert!(w.links.is_empty() && w.path.is_empty() && w.unknown.is_empty());
+    assert!(render_why(&w).contains("no link"), "{}", render_why(&w));
+
+    // A key the store never heard of is named, not guessed at.
+    let missing = why(&db, &a, "nope/gone.rs");
+    assert_eq!(missing.unknown, vec!["nope/gone.rs".to_string()]);
+    assert!(missing.links.is_empty() && missing.path.is_empty());
+    let text = render_why(&missing);
+    assert!(text.contains("unknown: nope/gone.rs"), "{text}");
+    assert!(text.lines().count() <= 25);
+}
+
+#[test]
+fn renders_are_deterministic_and_within_limits() {
+    let dir = tmp("renders");
+    let mut db = synthetic_repo_store(&dir);
+    // Graph content that would forge a line break and a header if it reached a
+    // rendered line unsanitized: an author's name and a commit's subject.
+    db.set_prop(
+        "a@example.test",
+        "name",
+        core_api::Value::Str("Ada\nmushroomdb owners — nobody".into()),
+    )
+    .expect("name");
+    db.set_prop(
+        &sha(COMMITS - 1),
+        "message",
+        core_api::Value::Str("tidy\nmushroomdb why — nothing".into()),
+    )
+    .expect("message");
+
+    let path = file_key(0, 0);
+    let repo = work_tree("renders-tree");
+    let ctx = context(&db, Some(repo.as_path()), &sym(0, 1, "core::run"));
+    let imp = impact(
+        &db,
+        &[path.clone(), "nope/gone.rs".to_string()],
+        &[file_key(0, 1)].into_iter().collect(),
+        &ImpactOptions::default(),
+    );
+    let own = owners(&db, &path, None).expect("owners");
+    let whys = why(&db, &path, &file_key(0, 1));
+
+    let rendered = [
+        (render_context(&ctx), 60),
+        (render_impact(&imp), 25),
+        (render_owners(&own), 25),
+        (render_why(&whys), 25),
+    ];
+    for (text, limit) in &rendered {
+        assert!(
+            text.lines().count() <= *limit,
+            "{} lines, limit {limit}:\n{text}",
+            text.lines().count()
+        );
+        assert!(
+            text.ends_with('\n'),
+            "every digest ends its last line:\n{text}"
+        );
+        assert!(
+            !text.contains("\nmushroomdb owners — nobody")
+                && !text.contains("\nmushroomdb why — nothing"),
+            "graph content must not forge a line:\n{text}"
+        );
+    }
+
+    assert!(
+        rendered[2].0.contains("Ada mushroomdb owners — nobody"),
+        "the forged name is flattened, not dropped:\n{}",
+        rendered[2].0
+    );
+
+    // The same store answers the same bytes, twice and from a second build.
+    assert_eq!(
+        render_context(&context(&db, Some(repo.as_path()), &sym(0, 1, "core::run"))),
+        rendered[0].0
+    );
+    assert_eq!(
+        render_owners(&owners(&db, &path, None).expect("owners")),
+        rendered[2].0
+    );
+    let other = tmp("renders-2");
+    let db2 = synthetic_repo_store(&other);
+    let twice = |d: &core_api::GraphDb<core_storage::fs::RealFs>| {
+        (
+            render_why(&why(d, &path, &file_key(0, 1))),
+            render_impact(&impact(
+                d,
+                std::slice::from_ref(&path),
+                &BTreeSet::new(),
+                &ImpactOptions::default(),
+            )),
+        )
+    };
+    assert_eq!(twice(&db2), twice(&db2), "one store, one answer");
 }

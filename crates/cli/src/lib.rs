@@ -17,7 +17,7 @@ use core_api::{
     RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
 };
 use export::ExportFormat;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -231,6 +231,28 @@ pub enum Command {
         /// rendered digest.
         json: bool,
     },
+    /// Everything the graph knows about one file or symbol.
+    Context {
+        db_dir: PathBuf,
+        target: String,
+    },
+    /// What else the named files reach: co-change partners, importers, and the
+    /// symbols other files call.
+    Impact {
+        db_dir: PathBuf,
+        files: Vec<String>,
+    },
+    /// Who has written a file, and when.
+    Owners {
+        db_dir: PathBuf,
+        path: String,
+    },
+    /// What links two nodes, with the evidence behind each link.
+    Why {
+        db_dir: PathBuf,
+        a: String,
+        b: String,
+    },
     Version,
     Help,
 }
@@ -287,6 +309,14 @@ Usage:
   mushroomdb sync <db-dir>         re-sync the repo the store was built from: new commits, then the dirty working tree
   mushroomdb map <db-dir> [--json] summarise the graphed repository: clusters, key files, owners, hot files
                                    --json prints the computed map instead of the rendered digest
+  mushroomdb context <db-dir> <target>   one file or symbol from every side: signature, source, callers,
+                                   callees, importers, co-change partners, commits, notes
+                                   <target> is a file path, a symbol key, or a bare symbol name
+  mushroomdb impact <db-dir> <file>...   what changing these files reaches: partners, importers,
+                                   and the symbols other files call
+  mushroomdb owners <db-dir> <path>      top author and share, who else knows it, last touch, last 4 quarters
+  mushroomdb why <db-dir> <a> <b>        every rule edge between two nodes with its evidence, or the
+                                   shortest path between them
   mushroomdb touch <db-dir>|--auto [<file>...]
                                    re-extract just these files; with no <file> reads them from a
                                    PostToolUse payload on stdin (hook body)
@@ -482,6 +512,25 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
             .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
         "sync" => parse_one_dir("sync", &args[1..]).map(|db_dir| Command::Sync { db_dir }),
         "map" => parse_map(&args[1..]),
+        "context" => {
+            parse_positional("context", &args[1..], 1, 1).map(|(db_dir, rest)| Command::Context {
+                db_dir,
+                target: rest[0].clone(),
+            })
+        }
+        "impact" => parse_positional("impact", &args[1..], 1, usize::MAX)
+            .map(|(db_dir, files)| Command::Impact { db_dir, files }),
+        "owners" => {
+            parse_positional("owners", &args[1..], 1, 1).map(|(db_dir, rest)| Command::Owners {
+                db_dir,
+                path: rest[0].clone(),
+            })
+        }
+        "why" => parse_positional("why", &args[1..], 2, 2).map(|(db_dir, rest)| Command::Why {
+            db_dir,
+            a: rest[0].clone(),
+            b: rest[1].clone(),
+        }),
         "touch" => parse_touch(&args[1..]),
         "ingest-git" => parse_ingest_git(&args[1..]),
         "install" => parse_install_cmd(&args[1..]).map(Command::Install),
@@ -1252,14 +1301,7 @@ fn parse_algo_dir(val: &str) -> Result<AlgoDir, String> {
 /// it must never migrate a snapshot, rewrite a torn WAL tail, or make a writer
 /// wait on the cross-process lock.
 pub fn run_map(db_dir: &Path, json: bool) -> Result<String, CliError> {
-    let db = GraphDb::open_with_options(
-        db_dir,
-        core_api::OpenOptions {
-            auto_migrate: false,
-            repair_wal: false,
-            read_only: true,
-        },
-    )?;
+    let db = open_for_reading(db_dir)?;
     let map = repograph::repo_map(&db, &repograph::MapOptions::default());
     if json {
         let mut out = serde_json::to_string_pretty(&map)
@@ -1268,6 +1310,57 @@ pub fn run_map(db_dir: &Path, json: bool) -> Result<String, CliError> {
         return Ok(out);
     }
     Ok(repograph::render_map(&map))
+}
+
+/// Open a store the way every question about it is asked: read-only, with both
+/// write paths off, so asking never migrates a snapshot, rewrites a torn WAL
+/// tail, or makes a writer wait on the cross-process lock.
+fn open_for_reading(db_dir: &Path) -> Result<structure::Db, CliError> {
+    Ok(GraphDb::open_with_options(
+        db_dir,
+        core_api::OpenOptions {
+            auto_migrate: false,
+            repair_wal: false,
+            read_only: true,
+        },
+    )?)
+}
+
+/// Body of `mushroomdb context <db-dir> <target>`.
+///
+/// The source is quoted from the repository the `GitSync` marker names, which
+/// is the checkout the store was built from.
+pub fn run_context(db_dir: &Path, target: &str) -> Result<String, CliError> {
+    let db = open_for_reading(db_dir)?;
+    Ok(repograph::render_context(&repograph::context(
+        &db, None, target,
+    )))
+}
+
+/// Body of `mushroomdb impact <db-dir> <file>...`.
+///
+/// The files named are taken to be the change, so each is reported and every
+/// partner that is one of them is marked `modified`.
+pub fn run_impact(db_dir: &Path, files: &[String]) -> Result<String, CliError> {
+    let db = open_for_reading(db_dir)?;
+    let modified: BTreeSet<String> = files.iter().cloned().collect();
+    let report = repograph::impact(&db, files, &modified, &repograph::ImpactOptions::default());
+    Ok(repograph::render_impact(&report))
+}
+
+/// Body of `mushroomdb owners <db-dir> <path>`.
+pub fn run_owners(db_dir: &Path, path: &str) -> Result<String, CliError> {
+    let db = open_for_reading(db_dir)?;
+    match repograph::owners(&db, path, None) {
+        Some(report) => Ok(repograph::render_owners(&report)),
+        None => Err(CliError(format!("no file in the store at {path}"))),
+    }
+}
+
+/// Body of `mushroomdb why <db-dir> <a> <b>`.
+pub fn run_why(db_dir: &Path, a: &str, b: &str) -> Result<String, CliError> {
+    let db = open_for_reading(db_dir)?;
+    Ok(repograph::render_why(&repograph::why(&db, a, b)))
 }
 
 /// Run a graph algorithm and return a formatted string.
@@ -1449,6 +1542,42 @@ fn parse_touch(args: &[&str]) -> Result<Command, String> {
         auto,
         files,
     })
+}
+
+/// `<db-dir>` followed by between `min` and `max` further arguments, none of
+/// which may look like a flag.
+///
+/// The graph tools take keys — paths and symbol names — and a key beginning
+/// with `-` is far more likely to be a typo'd flag than a file called `-x`, so
+/// it is refused rather than looked up and reported missing.
+fn parse_positional(
+    cmd: &str,
+    args: &[&str],
+    min: usize,
+    max: usize,
+) -> Result<(PathBuf, Vec<String>), String> {
+    let mut rest: Vec<String> = Vec::new();
+    let mut db_dir: Option<PathBuf> = None;
+    for a in args {
+        if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        }
+        match db_dir {
+            None => db_dir = Some(PathBuf::from(*a)),
+            Some(_) => rest.push((*a).to_string()),
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| format!("{cmd} requires <db-dir>"))?;
+    if rest.len() < min {
+        return Err(format!(
+            "{cmd} requires <db-dir> and {min} more argument{}",
+            if min == 1 { "" } else { "s" }
+        ));
+    }
+    if rest.len() > max {
+        return Err(format!("unexpected extra argument: {}", rest[max]));
+    }
+    Ok((db_dir, rest))
 }
 
 fn parse_map(args: &[&str]) -> Result<Command, String> {
@@ -3212,6 +3341,61 @@ mod tests {
         assert!(parse_args(&["map", "/tmp/db", "/tmp/other"]).is_err());
         assert!(parse_args(&["map", "/tmp/db", "--nope"]).is_err());
         assert!(usage().contains("mushroomdb map <db-dir> [--json]"));
+    }
+
+    #[test]
+    fn the_graph_tools_take_a_dir_and_their_keys() {
+        assert_eq!(
+            parse_args(&["context", "/tmp/db", "src/db.rs#open"]).unwrap(),
+            Command::Context {
+                db_dir: PathBuf::from("/tmp/db"),
+                target: "src/db.rs#open".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(&["impact", "/tmp/db", "a.rs", "b.rs"]).unwrap(),
+            Command::Impact {
+                db_dir: PathBuf::from("/tmp/db"),
+                files: vec!["a.rs".to_string(), "b.rs".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_args(&["owners", "/tmp/db", "a.rs"]).unwrap(),
+            Command::Owners {
+                db_dir: PathBuf::from("/tmp/db"),
+                path: "a.rs".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(&["why", "/tmp/db", "a.rs", "b.rs"]).unwrap(),
+            Command::Why {
+                db_dir: PathBuf::from("/tmp/db"),
+                a: "a.rs".to_string(),
+                b: "b.rs".to_string(),
+            }
+        );
+
+        // Too few arguments, too many, and a key that looks like a flag.
+        for args in [
+            vec!["context", "/tmp/db"],
+            vec!["context", "/tmp/db", "a", "b"],
+            vec!["impact", "/tmp/db"],
+            vec!["owners", "/tmp/db"],
+            vec!["why", "/tmp/db", "a"],
+            vec!["why", "/tmp/db", "a", "b", "c"],
+            vec!["why", "/tmp/db", "-a", "b"],
+            vec!["context"],
+        ] {
+            assert!(parse_args(&args).is_err(), "{args:?} must not parse");
+        }
+        for line in [
+            "mushroomdb context <db-dir> <target>",
+            "mushroomdb impact <db-dir> <file>...",
+            "mushroomdb owners <db-dir> <path>",
+            "mushroomdb why <db-dir> <a> <b>",
+        ] {
+            assert!(usage().contains(line), "usage is missing {line:?}");
+        }
     }
 
     /// Every hook-driven command takes either a path or `--auto`, never both

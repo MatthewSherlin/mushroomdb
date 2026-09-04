@@ -133,6 +133,12 @@ pub fn hash_of(key: &str) -> String {
     format!("{h:016x}")
 }
 
+/// The author of commit `i`. The four authors take the commits in turn.
+#[must_use]
+pub fn commit_author(i: usize) -> &'static str {
+    AUTHORS[i % AUTHORS.len()].0
+}
+
 /// The author who owns file `i` of directory `d`. The last file of `tests`
 /// belongs to the fourth author, so every author owns at least one file.
 #[must_use]
@@ -197,11 +203,22 @@ pub fn synthetic_repo_store(dir: &Path) -> GraphDb<core_storage::fs::RealFs> {
             .expect("author");
     }
 
-    // Which commits touched each file, and which author wrote most of them.
+    // Which commits touched each file, and how they split between authors —
+    // the same two props `ingest-git` writes, so `owners` reads a real
+    // distribution rather than an invented one.
     let mut commits_of: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut authors_of: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<&str, usize>,
+    > = Default::default();
     for i in 0..COMMITS {
         for f in touched(i) {
-            commits_of.entry(f).or_default().push(sha(i));
+            commits_of.entry(f.clone()).or_default().push(sha(i));
+            *authors_of
+                .entry(f)
+                .or_default()
+                .entry(commit_author(i))
+                .or_default() += 1;
         }
     }
 
@@ -232,6 +249,15 @@ pub fn synthetic_repo_store(dir: &Path) -> GraphDb<core_storage::fs::RealFs> {
             if !cs.is_empty() {
                 props.push(("n_commits".into(), Value::Int(cs.len() as i64)));
                 props.push(("commits".into(), list(&cs)));
+                // `email\tcount` in email order, exactly as `ingest-git`
+                // stores the per-file distribution.
+                let counts: Vec<String> = authors_of
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .map(|(email, n)| format!("{email}\t{n}"))
+                    .collect();
+                props.push(("author_counts".into(), list(&counts)));
             }
             db.insert_node("File", &key, props).expect("file");
         }
