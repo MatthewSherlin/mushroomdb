@@ -104,7 +104,7 @@ fn build_cv<'a>(props: &'a ColumnStore, base: &'a Option<Arc<MappedBase>>) -> Co
             let cols = b
                 .columns()
                 .expect("base columns CRC already verified at open");
-            ColumnsView::with_base(props, cols)
+            ColumnsView::with_base_cached(props, cols, b.mixed_cache())
         }
     }
 }

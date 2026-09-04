@@ -292,3 +292,99 @@ fn via_rebuild_survives_wal_replay() {
     );
     assert_eq!(rule_edges(&db, "knows"), 2);
 }
+
+/// Every via-hop score, not just every via-hop edge, survives a reopen.
+///
+/// `compute_desired_via` stops scanning via nodes once one of them scores 1.0,
+/// which an `Overlap` predicate cannot exceed. The stopping point depends on the
+/// order the via nodes come back in, so if the early exit could ever settle on a
+/// different maximum, the score written while the store was live and the score
+/// recomputed during WAL replay would disagree. They must not.
+#[test]
+fn via_hop_overlap_scores_are_the_same_after_replay_and_after_snapshot() {
+    let dir = tmp("overlap-scores");
+    // Partial overlaps, so the scores are spread out rather than all 1.0 —
+    // an early exit that fired too eagerly would show up as a changed score.
+    // `docs` and `extra` belong to bob, so they are destinations alice reaches
+    // only through her own files. A destination that is also one of the source's
+    // via nodes scores 1.0 against itself, which would hide how the maximum was
+    // reached.
+    //
+    // alice's two via files carry different commit sets, and the second scores
+    // higher than the first against both of bob's files. The maximum is
+    // therefore only correct if the scan does not stop at the first via that
+    // scores at all.
+    let live = {
+        let mut db = GraphDb::open(&dir).unwrap();
+        seed(&mut db, Some(10), "bob", &["c1", "c2", "c3", "c4", "c5"]);
+        db.set_prop("model", "commits", strs(&["c1", "c2", "c3", "c4", "c5"]))
+            .unwrap();
+        db.insert_node(
+            "File",
+            "extra",
+            vec![
+                ("commits".into(), strs(&["c1", "c2", "c3", "c4"])),
+                ("top_author_id".into(), Value::Str("bob".into())),
+            ],
+        )
+        .unwrap();
+        let live = scores(&db, "alice");
+        // api scores 3/5 against docs and model scores 5/5; 4/5 and 3/4 against
+        // extra. Pinning them keeps the fixture honest if the seed changes.
+        assert_eq!(
+            live,
+            vec![
+                ("api".to_string(), 1.0),
+                ("docs".to_string(), 1.0),
+                ("extra".to_string(), 0.8),
+                ("model".to_string(), 1.0),
+            ],
+            "the maximum over via nodes, not the first via that scores"
+        );
+        live
+    };
+
+    assert!(
+        live.iter().any(|(_, s)| *s < 1.0),
+        "the fixture must produce partial overlaps, got {live:?}"
+    );
+
+    let replayed = {
+        let db = GraphDb::open(&dir).unwrap();
+        scores(&db, "alice")
+    };
+    assert_eq!(replayed, live, "WAL replay must reproduce the live scores");
+
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.snapshot().unwrap();
+    }
+    let from_snapshot = {
+        let db = GraphDb::open(&dir).unwrap();
+        scores(&db, "alice")
+    };
+    assert_eq!(
+        from_snapshot, live,
+        "a snapshot roundtrip must reproduce the live scores"
+    );
+}
+
+/// `alice`'s KNOWS edges as (destination, score), destination order.
+fn scores(db: &Db, a: &str) -> Vec<(String, f64)> {
+    let mut out: Vec<(String, f64)> = db
+        .neighbors(a, "KNOWS", Direction::Out)
+        .unwrap()
+        .into_iter()
+        .map(|d| {
+            let ex = db.explain(a, &d).unwrap();
+            let s = ex
+                .iter()
+                .find(|e| e.rule == "knows")
+                .and_then(|e| e.weight)
+                .unwrap_or_else(|| panic!("KNOWS {a}->{d} reports no score"));
+            (d, s)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}

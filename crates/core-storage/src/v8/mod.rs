@@ -133,6 +133,8 @@ pub struct MappedBase {
     dir: Vec<SectionEntry>,
     /// Per-section lazy check state: 0=unchecked, 1=ok, 2=bad.
     check_state: [AtomicU8; V8_MAGIC_SECTION_COUNT],
+    /// One decode per `Mixed` column, for the life of this mapping.
+    mixed: crate::v8::seam::MixedCache,
 }
 
 impl MappedBase {
@@ -154,6 +156,7 @@ impl MappedBase {
             backing: Backing::Mapped(mmap),
             dir,
             check_state: std::array::from_fn(|_| AtomicU8::new(STATE_UNCHECKED)),
+            mixed: Default::default(),
         })
     }
 
@@ -168,6 +171,7 @@ impl MappedBase {
             backing: Backing::Owned(bytes),
             dir,
             check_state: std::array::from_fn(|_| AtomicU8::new(STATE_UNCHECKED)),
+            mixed: Default::default(),
         })
     }
 
@@ -407,6 +411,15 @@ impl MappedBase {
         // not a panic. Mitigated by `mushroomdb verify` (full-section CRC32 on demand)
         // and planned Miri/ASAN CI coverage.
         Ok(unsafe { rkyv::access_unchecked::<crate::v8::layout::ArchivedCsrData>(bytes) })
+    }
+
+    /// The memo for this base's `Mixed` columns.
+    ///
+    /// Pair it with [`columns`](Self::columns) via
+    /// `ColumnsView::with_base_cached`; the two always describe the same
+    /// immutable mapping, so a memo can never outlive or mismatch its blobs.
+    pub fn mixed_cache(&self) -> &crate::v8::seam::MixedCache {
+        &self.mixed
     }
 
     /// Zero-copy access to the archived column store.

@@ -1044,7 +1044,7 @@ fn build_props_view<'a>(
             let archived = b
                 .columns()
                 .expect("base columns section bounds validated at open");
-            core_storage::v8::seam::ColumnsView::with_base(props, archived)
+            core_storage::v8::seam::ColumnsView::with_base_cached(props, archived, b.mixed_cache())
         }
     }
 }
@@ -2464,7 +2464,11 @@ impl<F: Fs> GraphDb<F> {
                 let archived = base
                     .columns()
                     .expect("base columns section bounds validated at open");
-                core_storage::v8::seam::ColumnsView::with_base(&self.props, archived)
+                core_storage::v8::seam::ColumnsView::with_base_cached(
+                    &self.props,
+                    archived,
+                    base.mixed_cache(),
+                )
             }
         }
     }
