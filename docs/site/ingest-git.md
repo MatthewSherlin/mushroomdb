@@ -361,10 +361,14 @@ tree is its own checkout's business.
 Output names both halves:
 
 ```
-ingest-git: 1 commit(s), 4 file(s), 1 author(s) (incremental)
+ingest-git: 1 commit(s), 1 file(s), 1 author(s) (incremental)
   scanned 1 file(s): 1 symbol(s), 0 import(s), 0 call(s), 0 mention(s)
   dirty 1 path(s): scanned 1, 1 symbol(s), 0 import(s), 0 call(s)
 ```
+
+The file count is what the run wrote, so on an incremental run it tracks the
+commits picked up rather than the size of the repository: a run that finds one
+commit over one file says one file, whatever else the store already holds.
 
 `dirty` counts the paths handed to the working-tree pass; `scanned` counts those
 of them the graph actually knows and that are still files on disk, so an

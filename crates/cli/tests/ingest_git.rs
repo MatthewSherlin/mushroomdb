@@ -1305,3 +1305,57 @@ fn a_busy_store_exits_three_with_a_retry_message() {
     let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
     assert_eq!(r.commits, 4);
 }
+
+/// An incremental run costs work proportional to what the commit touched, not
+/// to how big the repository is.
+///
+/// The regression this pins: a run that picked up one commit over eight files
+/// reported `397 file(s)` and wrote one WAL frame per property per file, so
+/// every later open replayed frames for files nothing had touched. Both halves
+/// are asserted — the reported count, and the number of commits the run appends.
+#[test]
+fn an_incremental_run_writes_only_what_the_commit_touched() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    // Twenty files, so "proportional to the repo" and "proportional to the
+    // commit" are far enough apart to tell apart.
+    let bodies: Vec<(String, String)> = (0..20)
+        .map(|i| (format!("src/f{i}.rs"), format!("pub fn f{i}() {{}}\n")))
+        .collect();
+    write_files(
+        &repo,
+        &bodies
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    commit_all(&repo, "alice", "twenty files");
+
+    let db_dir = tmp("db");
+    let full = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert!(!full.incremental);
+    assert_eq!(full.files, 20, "the full run does write every file");
+
+    let before = core_api::wal_commit_count_at(&db_dir).unwrap();
+
+    // One commit, one file.
+    commit(
+        &repo,
+        "alice",
+        "touch one",
+        &[("src/f3.rs", "pub fn f3() { let x = 1; }\n")],
+    );
+    let inc = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert!(inc.incremental);
+    assert_eq!(
+        inc.files, 1,
+        "an incremental run reports the files it wrote, not every file it knows"
+    );
+
+    let delta = core_api::wal_commit_count_at(&db_dir).unwrap() - before;
+    assert!(
+        delta <= 8,
+        "one commit over one file appended {delta} WAL commits; \
+         a run must not append work proportional to the repository"
+    );
+}

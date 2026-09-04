@@ -1325,23 +1325,41 @@ fn ingest_unit(
     // 3. File nodes. Existing nodes are updated in place (including `id`, which
     //    must follow the key after a rename); new paths go through ingest so
     //    the `top_author_id` auto-FK rule is inferred.
+    //    Updates to existing nodes go in one batch rather than one WAL commit
+    //    per property. Every frame in the WAL is replayed on every later open,
+    //    and each one re-fires the rules watching the property it carries, so a
+    //    run that appends a frame per property makes every subsequent open
+    //    slower for as long as that frame lives. The op order inside the batch
+    //    is the order the individual writes had, so the resulting state is the
+    //    same one either form produces.
     let mut new_file_rows = Vec::new();
+    let mut updates = Vec::new();
+    let mut written = 0usize;
     for (path, st) in &walk.files {
         if incremental && !walk.dirty.contains(path) {
             continue;
         }
+        written += 1;
         let props = file_props(st, path);
         if w.has_node(path) {
-            for (k, v) in props {
-                w.set_prop(path, &k, v)?;
-            }
+            updates.extend(props.into_iter().map(|(k, v)| (path.clone(), k, v)));
         } else {
             new_file_rows.push(props.into_iter().collect::<BTreeMap<_, _>>());
         }
     }
+    if !updates.is_empty() {
+        let mut b = w.batch();
+        for (key, field, value) in updates {
+            b.set_prop(&key, &field, value);
+        }
+        b.commit()?;
+    }
     let f = w.ingest_with_edges("File", new_file_rows, ingest, &[])?;
     report.rules_created.extend(f.rules_created);
-    report.files += walk.files.len();
+    // What this run wrote, not every file it has ever seen: an incremental run
+    // loads the whole known file set to fold the new commits into it, and
+    // reporting that set made a one-file run print the size of the repository.
+    report.files += written;
 
     // 4. Commits, then their TOUCHED edges. The two must be separate batches:
     //    a batch that both inserts nodes firing a new rule and carries a user
