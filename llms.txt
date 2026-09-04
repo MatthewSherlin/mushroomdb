@@ -245,6 +245,9 @@ HTTP query params: `stub_hidden=true` on `GET /node/{key}`, `GET /node/{key}/edg
 - GraphML: single file (nodes + edges only, no rules) for import into generic graph
   viewers and analysis tools; byte-identical between runs. `<dest>/graph.graphml`
   when `<dest>` is an existing directory, else `<dest>` is the file path itself.
+  `Value::Int` (64-bit) declares `attr.type="long"`, not `"int"` (GraphML's
+  informal convention treats `"int"` as 32-bit). A property name that nodes
+  disagree on the type of declares `attr.type="string"` for every node.
 - NaN/±Inf `Value::Float` → null (JSONL/Parquet) or empty `<data>` (GraphML).
 - Derived edges include rule attribution (`"rule": "name"`); manual edges: `"rule": null`.
 

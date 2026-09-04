@@ -298,7 +298,11 @@ pub fn write_parquet(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum GmlType {
     Boolean,
-    Int,
+    /// `Value::Int` is a 64-bit `i64` (`core_storage::Value::Int`). GraphML's
+    /// informal convention treats `attr.type="int"` as 32-bit, which cannot
+    /// represent the full range; `"long"` is the interoperable choice for a
+    /// 64-bit integer and is what this writer declares.
+    Long,
     Double,
     String,
 }
@@ -307,7 +311,7 @@ impl GmlType {
     fn as_str(self) -> &'static str {
         match self {
             Self::Boolean => "boolean",
-            Self::Int => "int",
+            Self::Long => "long",
             Self::Double => "double",
             Self::String => "string",
         }
@@ -318,7 +322,7 @@ impl GmlType {
 /// JSON-encoded text, so they declare `string`.
 fn value_gml_type(v: &Value) -> GmlType {
     match v {
-        Value::Int(_) => GmlType::Int,
+        Value::Int(_) => GmlType::Long,
         Value::Float(_) => GmlType::Double,
         Value::Bool(_) => GmlType::Boolean,
         Value::Str(_) | Value::List(_) | Value::Map(_) => GmlType::String,
@@ -424,7 +428,20 @@ fn resolve_graphml_dest(dest: &Path) -> Result<PathBuf, crate::CliError> {
 /// `rule` and `weight`. `<key>` elements are declared once per (`for`, name)
 /// pair, node keys before edge keys, each block sorted by attribute name.
 /// Key `id`s are XML-name-safe (`n_<prop>` / `e_<prop>`, sanitized); the
-/// original name is preserved in `attr.name`.
+/// original name is preserved in `attr.name`. A node property literally
+/// named `label` shares the `n_label` key (and `<data>` slot) with the
+/// built-in label field — an accepted collision, since mushroomdb's schema
+/// reserves `label` for the node's type name.
+///
+/// **Type declaration:** a node property's `attr.type` is [`value_gml_type`]
+/// of its value where every node reporting that property name agrees on the
+/// `Value` variant; if two nodes disagree (e.g. one has `Value::Int` under
+/// `score`, another `Value::Str`), the key declares `attr.type="string"` for
+/// every node — a safe fallback, since `string` can hold any value's text
+/// form — rather than picking one node's type and risking a value that
+/// doesn't fit it. `Value::Int` (a 64-bit `i64`) declares `attr.type="long"`,
+/// not `"int"`, since GraphML's informal convention treats `"int"` as
+/// 32-bit and `"long"` is the interoperable choice for the full range.
 ///
 /// `nodes` must be sorted by key and `edges` by `(edge_type, src, dst)` —
 /// same precondition as [`write_jsonl`]. Two runs on the same sorted input
@@ -441,16 +458,27 @@ pub fn write_graphml(
     let file_path = resolve_graphml_dest(dest)?;
 
     // Node keys: `label` plus the union of every prop name across all nodes.
-    // Type is taken from the first occurrence in (already sorted) node order.
-    let mut node_key_types: BTreeMap<String, GmlType> = BTreeMap::new();
-    node_key_types.insert("label".to_string(), GmlType::String);
+    // `Some(t)` while every node reporting this name agrees on type `t`;
+    // `None` once two nodes disagree — resolved to `string` below.
+    let mut node_key_types: BTreeMap<String, Option<GmlType>> = BTreeMap::new();
+    node_key_types.insert("label".to_string(), Some(GmlType::String));
     for node in nodes {
         for (k, v) in &node.props {
+            let t = value_gml_type(v);
             node_key_types
                 .entry(k.clone())
-                .or_insert_with(|| value_gml_type(v));
+                .and_modify(|existing| {
+                    if *existing != Some(t) {
+                        *existing = None;
+                    }
+                })
+                .or_insert(Some(t));
         }
     }
+    let node_key_types: BTreeMap<String, GmlType> = node_key_types
+        .into_iter()
+        .map(|(k, t)| (k, t.unwrap_or(GmlType::String)))
+        .collect();
 
     // Edge keys: a fixed schema, sorted by name.
     let mut edge_key_types: Vec<(&str, GmlType)> = vec![

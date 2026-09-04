@@ -3255,6 +3255,15 @@ mod tests {
             ),
             "must declare the edge weight key"
         );
+        // The demo store's Org nodes carry `founded_year` as a JSON integer
+        // (`Value::Int`, a 64-bit i64). GraphML's informal convention treats
+        // `attr.type="int"` as 32-bit, so this must declare `"long"`.
+        assert!(
+            content.contains(
+                "<key id=\"n_founded_year\" for=\"node\" attr.name=\"founded_year\" attr.type=\"long\"/>"
+            ),
+            "an int-valued prop must declare attr.type=\"long\", not \"int\", got: {content}"
+        );
         assert!(
             content.contains("<graph id=\"G\" edgedefault=\"directed\">"),
             "must declare a single directed graph element"
@@ -3415,6 +3424,58 @@ mod tests {
         assert!(
             content.contains("<data key=\"n_tags\">[&quot;a&quot;,&quot;b&quot;]</data>"),
             "list-valued props must render as XML-escaped JSON text, got: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    /// I2: when nodes disagree on the `Value` variant for a prop name (one
+    /// int, one string), the key must declare `attr.type="string"` — a value
+    /// of either type fits text — rather than picking one node's type and
+    /// risking a value that doesn't fit it.
+    #[test]
+    fn run_export_graphml_mixed_type_prop_declares_string() {
+        use core_api::{GraphDb, Value};
+        let src = tmp("cli-export-gml-mixed-src");
+        let dst_dir = tmp("cli-export-gml-mixed-dst");
+        let dst = dst_dir.join("graph.graphml");
+
+        {
+            let mut db = GraphDb::open(&src).unwrap();
+            db.insert_node("Metric", "m1", vec![("score".into(), Value::Int(5))])
+                .unwrap();
+            db.insert_node(
+                "Metric",
+                "m2",
+                vec![("score".into(), Value::Str("high".into()))],
+            )
+            .unwrap();
+        }
+
+        run_export(&src, &dst, &ExportFormat::Graphml).expect("graphml export");
+        let content = std::fs::read_to_string(&dst).expect("read graphml");
+
+        assert!(
+            content.contains(
+                "<key id=\"n_score\" for=\"node\" attr.name=\"score\" attr.type=\"string\"/>"
+            ),
+            "a prop name with conflicting value types across nodes must declare \
+             attr.type=\"string\", got: {content}"
+        );
+        assert!(
+            !content.contains("attr.name=\"score\" attr.type=\"long\""),
+            "must not declare a narrower type once a conflict is seen, got: {content}"
+        );
+        // Each node's own value still renders in its own literal text form,
+        // regardless of the declared (fallback) attr.type.
+        assert!(
+            content.contains("<data key=\"n_score\">5</data>"),
+            "the int-valued node must still render its literal int text, got: {content}"
+        );
+        assert!(
+            content.contains("<data key=\"n_score\">high</data>"),
+            "the string-valued node must still render its literal string text, got: {content}"
         );
 
         let _ = std::fs::remove_dir_all(&src);

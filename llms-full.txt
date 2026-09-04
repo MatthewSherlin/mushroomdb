@@ -2610,26 +2610,33 @@ mushroomdb export   [--format jsonl|parquet|graphml]
 Default format: `jsonl`.
 
 **JSONL format** (default): writes `nodes.jsonl`, `edges.jsonl`, and `rules.jsonl`
-to  (a directory). Each line is a JSON object. JSONL output is stable,
+to `` (a directory). Each line is a JSON object. JSONL output is stable,
 deterministic, and byte-identical between two runs on the same store.
 
 **Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
-and `rules.parquet` to  (a directory) with Snappy compression (parquet-rs
+and `rules.parquet` to `` (a directory) with Snappy compression (parquet-rs
 default). Parquet output is **not** byte-identical between parquet-rs library
 versions — use JSONL if you need a stable byte checksum.
 
 **GraphML format** (`--format graphml`): writes a single GraphML file — nodes
 and edges only, since rules have no GraphML analogue — for import into generic
-graph viewers and analysis tools. If  is an existing directory, the file
-is /graph.graphml; otherwise  is the file path itself. Node
+graph viewers and analysis tools. If `` is an existing directory, the file
+is `/graph.graphml`; otherwise `` is the file path itself. Node
 elements carry a `label` attribute plus every property (lists and maps are
 JSON-encoded as `string`-typed attributes); edge elements carry `type` and
 `derived`, plus `rule` and `weight` when present. `weight` is the creating
 rule's declared `weight_prop`, read off the edge. GraphML output is
 byte-identical between two runs on the same store.
 
+**GraphML attribute types:** `int` properties (mushroomdb's `Value::Int` is a
+64-bit `i64`) declare `attr.type="long"`, not `"int"` — GraphML's informal
+convention treats `"int"` as 32-bit, so `"long"` is the interoperable choice
+for the full range. If nodes disagree on a property's type (one has an int
+under `score`, another a string), the key declares `attr.type="string"` for
+every node rather than risk a value that doesn't fit a narrower type.
+
 **Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as
-JSON `null` (JSONL/Parquet) or an empty  element (GraphML). Normal
+JSON `null` (JSONL/Parquet) or an empty `` element (GraphML). Normal
 finite floats round-trip correctly.
 
 **Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is

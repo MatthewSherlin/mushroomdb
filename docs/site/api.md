@@ -661,6 +661,13 @@ JSON-encoded as `string`-typed attributes); edge elements carry `type` and
 rule's declared `weight_prop`, read off the edge. GraphML output is
 byte-identical between two runs on the same store.
 
+**GraphML attribute types:** `int` properties (mushroomdb's `Value::Int` is a
+64-bit `i64`) declare `attr.type="long"`, not `"int"` — GraphML's informal
+convention treats `"int"` as 32-bit, so `"long"` is the interoperable choice
+for the full range. If nodes disagree on a property's type (one has an int
+under `score`, another a string), the key declares `attr.type="string"` for
+every node rather than risk a value that doesn't fit a narrower type.
+
 **Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as
 JSON `null` (JSONL/Parquet) or an empty `<data>` element (GraphML). Normal
 finite floats round-trip correctly.
