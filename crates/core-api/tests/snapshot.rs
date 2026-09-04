@@ -1534,10 +1534,14 @@ fn v8_encode_decode_equivalence() {
     db.insert_edge("KNOWS", "alice", "bob").unwrap();
     db.insert_edge("WORKS_AT", "alice", "acme").unwrap();
     db.snapshot().unwrap();
+    // Capture and close before reopening: a read-write handle holds the store's
+    // cross-process write lock for its lifetime, so two of them cannot overlap.
+    let (nodes, edges) = (db.node_count(), db.edge_count());
+    drop(db);
 
     let db2 = GraphDb::open(&dir).unwrap();
-    assert_eq!(db2.node_count(), db.node_count());
-    assert_eq!(db2.edge_count(), db.edge_count());
+    assert_eq!(db2.node_count(), nodes);
+    assert_eq!(db2.edge_count(), edges);
     assert_eq!(db2.get_prop("alice", "age"), Some(Value::Int(30)));
     assert_eq!(db2.get_prop("bob", "age"), Some(Value::Int(25)));
     assert_eq!(
@@ -2667,4 +2671,226 @@ fn encode_v6_richer_roundtrip() {
         "V6 payload never carried wal_truncated; decode must default false"
     );
     assert_rich_state_eq(&decoded);
+}
+
+// ── Mixed columns behind a V8 base ───────────────────────────────────────────
+//
+// `List`- and `Map`-valued properties are stored as one opaque blob per field
+// rather than indexed by node id, so a base read of one node's value has to
+// decode the whole column. That decode is memoized per field for the life of the
+// mapping. These tests pin the two things the memo must not change — the values
+// it returns, and the fact that a read never writes — and the cost it exists to
+// remove.
+
+/// Build `nodes` nodes each carrying a list-valued property, optionally
+/// snapshotting afterwards. Snapshotting truncates the WAL, so a caller that
+/// wants the log itself must pass `false`.
+fn seed_list_props(dir: &std::path::Path, nodes: u32, list_len: u32, snapshot: bool) {
+    let mut db = GraphDb::open(dir).unwrap();
+    // A rule over the list field, so the candidate index has to read `tags` for
+    // every node when it is rebuilt on open. Without one, nothing reads a base
+    // column at open time and the cost this fixture exists to measure never
+    // happens. Tokens are unique per node, so the index is fully populated and
+    // no edges fire: the reads are isolated from the rule's own work.
+    db.create_rule(RuleDef {
+        name: "similar".into(),
+        src_label: "N".into(),
+        dst_label: "N".into(),
+        predicate: Predicate::Overlap {
+            field: "tags".into(),
+            min: 0.5,
+        },
+        edge_type: "SIMILAR".into(),
+        weight_prop: None,
+        max_edges: Some(5),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    for id in 0..nodes {
+        let items: Vec<Value> = (0..list_len)
+            .map(|j| Value::Str(format!("tok-{id}-{j}")))
+            .collect();
+        db.insert_node(
+            "N",
+            &format!("n{id}"),
+            vec![
+                ("tags".into(), Value::List(items)),
+                ("rank".into(), Value::Int(i64::from(id))),
+            ],
+        )
+        .unwrap();
+    }
+    if snapshot {
+        db.snapshot().unwrap();
+    }
+}
+
+#[test]
+fn a_list_prop_reads_the_same_from_a_snapshot_as_it_did_before_one() {
+    let dir = tmp("mixed-values");
+    let before: Vec<Option<Value>> = {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for id in 0..40u32 {
+            let items: Vec<Value> = (0..5).map(|j| Value::Str(format!("t{id}-{j}"))).collect();
+            db.insert_node(
+                "N",
+                &format!("n{id}"),
+                vec![("tags".into(), Value::List(items))],
+            )
+            .unwrap();
+        }
+        let snapshot_of_values = (0..40u32)
+            .map(|id| db.get_prop(&format!("n{id}"), "tags"))
+            .collect();
+        db.snapshot().unwrap();
+        snapshot_of_values
+    };
+
+    let db = GraphDb::open(&dir).unwrap();
+    let after: Vec<Option<Value>> = (0..40u32)
+        .map(|id| db.get_prop(&format!("n{id}"), "tags"))
+        .collect();
+    assert_eq!(
+        after, before,
+        "base reads must match the pre-snapshot values"
+    );
+
+    // Read every node a second time: a memo that returned a different answer on
+    // the second read would show up here.
+    let again: Vec<Option<Value>> = (0..40u32)
+        .map(|id| db.get_prop(&format!("n{id}"), "tags"))
+        .collect();
+    assert_eq!(again, before, "a repeated read must give the same value");
+}
+
+#[test]
+fn an_overlay_write_still_shadows_the_snapshot_value_of_a_list_prop() {
+    let dir = tmp("mixed-overlay");
+    seed_list_props(&dir, 20, 4, true);
+    let mut db = GraphDb::open(&dir).unwrap();
+    let base_value = db.get_prop("n5", "tags").expect("n5 has tags");
+
+    db.set_prop("n5", "tags", Value::List(vec![Value::Str("fresh".into())]))
+        .unwrap();
+    assert_eq!(
+        db.get_prop("n5", "tags"),
+        Some(Value::List(vec![Value::Str("fresh".into())])),
+        "the overlay write must win over the memoized base value"
+    );
+    assert_ne!(db.get_prop("n5", "tags"), Some(base_value));
+    // Its neighbours in the same column are untouched.
+    assert!(db.get_prop("n6", "tags").is_some());
+
+    // And the write survives the reopen that replays it.
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.get_prop("n5", "tags"),
+        Some(Value::List(vec![Value::Str("fresh".into())]))
+    );
+
+    // Removing it uncovers nothing: a tombstone masks the base value.
+    drop(db);
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.remove_prop("n5", "tags").unwrap();
+    assert_eq!(db.get_prop("n5", "tags"), None);
+}
+
+#[test]
+fn a_read_only_handle_reads_list_props_from_a_snapshot_and_writes_nothing() {
+    let dir = tmp("mixed-readonly");
+    seed_list_props(&dir, 20, 4, true);
+    let listing = |d: &std::path::Path| {
+        let mut v: Vec<_> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), e.metadata().unwrap().len())
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let before = listing(&dir);
+
+    let mut ro = GraphDb::open_with_options(
+        &dir,
+        core_api::OpenOptions {
+            read_only: true,
+            ..core_api::OpenOptions::default()
+        },
+    )
+    .unwrap();
+    for id in 0..20u32 {
+        assert!(
+            ro.get_prop(&format!("n{id}"), "tags").is_some(),
+            "n{id} must read its list prop through a read-only handle"
+        );
+    }
+    // Filling the memo is not a write: it lives in the mapping, not the store.
+    assert_eq!(listing(&dir), before, "a read-only open wrote to the store");
+    ro.refresh().expect("a read-only handle can still refresh");
+    assert!(ro.get_prop("n0", "tags").is_some(), "after refresh");
+    assert_eq!(listing(&dir), before, "refresh wrote to the store");
+}
+
+/// Opening a snapshotted store must not cost more than replaying the WAL that
+/// produced it.
+///
+/// The regression: every read of a `Mixed` column from the base decoded that
+/// whole column, so opening a snapshot re-decoded one column per node scanned.
+/// On this store's shape that was gigabytes of bincode and made the snapshot
+/// path 6x *slower* than having no snapshot at all — the one lever a user has
+/// for a slow open made it worse.
+///
+/// The guard is deliberately loose (3x) and the shape deliberately small: this
+/// pins the complexity class, not a number. Debug builds are far too noisy for
+/// even that, so the assertion only runs with optimizations on.
+#[test]
+fn open_after_snapshot_is_not_slower_than_wal_replay() {
+    // Enough nodes that a per-node full-column decode is unmistakable, and a
+    // list long enough that the column is worth decoding.
+    //
+    // The WAL-only baseline is built first and its log copied, so both sides of
+    // the ratio open exactly the same content — a snapshot truncates the WAL it
+    // replaces, so it cannot be the one measured first.
+    let wal_only = tmp("open-ratio-walonly");
+    seed_list_props(&wal_only, 600, 40, false);
+    let dir = tmp("open-ratio");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(wal_only.join("wal.bin"), dir.join("wal.bin")).unwrap();
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.snapshot().unwrap();
+        // One record after the snapshot, as any real store has: a snapshotted
+        // store whose WAL is completely empty skips the index rebuild entirely
+        // and would not exercise the base reads at all.
+        db.set_prop("n0", "rank", Value::Int(-1)).unwrap();
+    }
+
+    let time_open = |d: &std::path::Path| {
+        // One warm-up open, then the measured one, so page-cache state is the
+        // same for both sides of the ratio.
+        drop(GraphDb::open(d).unwrap());
+        let t = std::time::Instant::now();
+        let db = GraphDb::open(d).unwrap();
+        let e = t.elapsed();
+        assert!(db.node_count() > 0);
+        e
+    };
+    let replay = time_open(&wal_only);
+    let snapshot = time_open(&dir);
+
+    if cfg!(debug_assertions) {
+        eprintln!("debug build: open ratio not asserted ({snapshot:?} vs {replay:?})");
+        return;
+    }
+    assert!(
+        snapshot.as_secs_f64() <= replay.as_secs_f64() * 3.0,
+        "opening the snapshot took {snapshot:?} against {replay:?} of WAL replay; \
+         a snapshot must not cost more than the log it replaces"
+    );
 }

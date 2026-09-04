@@ -10,10 +10,11 @@ members = [
     "crates/server",
     "crates/cli",
     "crates/core-bench",
+    "crates/code-extract",
 ]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MatthewSherlin/mushroomdb"

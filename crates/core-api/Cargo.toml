@@ -13,16 +13,28 @@ readme = "../../README.md"
 [lib]
 name = "core_api"
 
+# Helper process spawned by `tests/multiprocess.rs`.  Gated behind `mp-test` so
+# a plain `cargo build` / `cargo test --workspace` never builds it; the
+# multi-process suite runs as `cargo test -p mushroomdb --features mp-test`.
+[[bin]]
+name = "mp_worker"
+path = "src/bin/mp_worker.rs"
+required-features = ["mp-test"]
+
+[features]
+# Enables the `mp_worker` helper binary and, with it, `tests/multiprocess.rs`.
+mp-test = []
+
 [dependencies]
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.5.2" }
-core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.5.2" }
-core-query = { package = "mushroomdb-query", path = "../core-query", version = "0.5.2" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.0" }
+core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.6.0" }
+core-query = { package = "mushroomdb-query", path = "../core-query", version = "0.6.0" }
 bincode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.5.2" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.0" }
 # Path-only (no version): sim-harness is publish=false; a version key makes
 # `cargo publish -p mushroomdb` try to resolve it on the index and fail.
 sim-harness = { path = "../sim-harness" }

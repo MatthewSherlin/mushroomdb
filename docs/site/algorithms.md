@@ -1,6 +1,6 @@
 # Graph Algorithms
 
-mushroomdb ships three built-in graph algorithms that run over the **unified topology** — manual edges you inserted plus derived edges the rule engine maintains. Running PageRank over your derived graph is the showcase: declare rules once, get a ranked graph for free.
+mushroomdb ships four built-in graph algorithms that run over the **unified topology** — manual edges you inserted plus derived edges the rule engine maintains. Running PageRank over your derived graph is the showcase: declare rules once, get a ranked graph for free.
 
 ## Algorithms
 
@@ -16,6 +16,8 @@ let config = PageRankConfig {
     edge_type: None,       // None = all edge types (manual + derived)
     direction: AlgoDir::Out,
     budget_ms: 5_000,
+    weight_prop: None,      // Some("score") to weight mass by an edge property
+    min_weight: None,       // drop edges below this resolved weight first
 };
 let report = db.pagerank(&config);
 // report.scores: Vec<(String, f64)> sorted desc, key asc on ties
@@ -23,6 +25,8 @@ let report = db.pagerank(&config);
 ```
 
 **converged** is always honest: `false` when `max_iters` was reached or the time budget fired before convergence.
+
+**weight_prop / min_weight:** when `weight_prop` is set, a node's out-mass distributes proportionally to that edge property instead of splitting evenly — an edge missing the property (or holding a non-numeric value) falls back to weight `1.0`. `min_weight` drops edges below the threshold before the algorithm runs, whether or not `weight_prop` is set. Both fields default to `None` (existing unweighted behavior, byte-identical).
 
 ### Weakly-Connected Components (WCC)
 
@@ -32,6 +36,8 @@ Finds groups of nodes that are reachable from each other when all edges are trea
 let config = WccConfig {
     edge_type: None,   // None = all edge types
     budget_ms: 5_000,
+    weight_prop: None,  // filter-only: WCC itself is unweighted
+    min_weight: None,
 };
 let report = db.connected_components(&config);
 // report.components: Vec<(key, component_id)>
@@ -40,6 +46,8 @@ let report = db.connected_components(&config);
 ```
 
 **v1 note:** Direction is always undirected. All edges are treated symmetrically regardless of how they were inserted.
+
+**weight_prop / min_weight:** WCC's connectivity itself doesn't use edge weight, but `min_weight` still filters — an edge whose resolved weight (via `weight_prop`, default `1.0` when unset or non-numeric) falls below the threshold is dropped before union-find runs, so a weak edge can stop connecting its endpoints.
 
 ### Degree Centrality
 
@@ -50,10 +58,45 @@ let config = DegreeConfig {
     edge_type: None,
     direction: AlgoDir::Both,  // Out | In | Both
     budget_ms: 5_000,
+    weight_prop: None,          // filter-only: degree stays an unweighted count
+    min_weight: None,
 };
 let report = db.degree_centrality(&config);
 // report.scores: Vec<(key, u64)> sorted desc, key asc on ties
 ```
+
+**weight_prop / min_weight:** same filter-only semantics as WCC — an edge below `min_weight` (resolved via `weight_prop`, default `1.0`) isn't counted; the degree itself stays an integer count, not a weighted sum.
+
+### Louvain Communities
+
+Detects communities by greedily maximizing modularity: local moving (each node joins whichever neighboring community raises modularity most) alternating with aggregation (communities collapse into super-nodes), repeated until stable.
+
+```rust
+let config = LouvainConfig {
+    edge_types: vec![],       // empty = all edge types (union when multiple given)
+    weight_prop: None,        // Some("score") to weight edges
+    min_weight: None,         // drop edges below this resolved weight first
+    resolution: 1.0,          // > 1.0 favors more, smaller communities; < 1.0 fewer, larger
+    max_passes: 10,
+    max_sweeps: 20,
+    budget_ms: 5_000,
+    node_label: None,         // restrict membership to one label
+};
+let report = db.communities(&config);
+// report.communities: Vec<Community> sorted size desc, then smallest member key asc
+// report.modularity: f64, resolution-adjusted
+// report.truncated: true if the time budget fired
+```
+
+Each `Community` carries `id` (0-based, assigned by output order), `members` (sorted keys), `internal_weight` (total weight of edges with both endpoints inside, from the original filtered edges), and `cohesion` — `internal_weight / (internal_weight + weight of edges leaving the community)`, `1.0` for a community with no incident edges at all.
+
+**Determinism:** local moving processes nodes in sorted key order at the base level, and that order propagates deterministically through every aggregated level; ties in the modularity-gain comparison keep the lower community id. The same store state always produces the same report, including after a snapshot reopen.
+
+**Budget:** checked once per sweep (not per node). When it fires, `communities` returns the current partition with `truncated: true` — never an error.
+
+**Weight / label restriction:** `edge_types` is a union filter (empty = all); a resolved weight below `min_weight` drops the edge before the algorithm runs, same rule as PageRank/WCC/degree. `node_label` restricts membership to one label — edges touching a node outside the label set are ignored entirely, not just the excluded node.
+
+**Cohesion formula:** for community `C`, `cohesion = internal_weight(C) / (internal_weight(C) + leaving_weight(C))`, where `leaving_weight(C)` is the summed weight of edges with exactly one endpoint in `C`. Both are computed from the original (filtered) edges, not the internal aggregated levels Louvain builds while running.
 
 ## When to use degree_centrality vs. a Degree view
 
@@ -125,9 +168,12 @@ Each endpoint uses `spawn_blocking` with a read lock — reads don't block other
 mushroomdb algo pagerank ./db --top 20
 mushroomdb algo wcc ./db --top 50
 mushroomdb algo degree ./db --top 20
+mushroomdb algo communities ./db --edge-type IMPORTS --edge-type CO_CHANGED --weight-prop score --min-weight 0.3 --top 10
 ```
 
 `--top N` prints the N highest-ranked results (0 = all). Default is 20.
+
+`algo communities` prints one line per community — id, size, cohesion, and the first 3 members — with `--edge-type` repeatable (empty = all edge types) and `--weight-prop`/`--min-weight` matching the config fields above. The header shows `modularity` and appends `(truncated)` when the time budget fired.
 
 ## As-of instances
 

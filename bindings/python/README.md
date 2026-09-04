@@ -90,18 +90,39 @@ name is already registered.
 
 ## Concurrency
 
-**One writer process per store.** There is no cross-process lock yet (planned);
-opening the same directory from two processes that both write can corrupt it.
-Keep writes in a single process.
-
-A handle sees only the commits made through it. It does not poll the store, so
-writes made by another process after you opened are invisible to your handle.
-To pick them up, close and open again — there is no `reopen()`:
+**One writer at a time across processes; readers see commits after `refresh()`.**
+The store carries an advisory write lock. A read-write handle holds it for as
+long as it is open, so opening a second one anywhere on the machine raises
+`MushroomBusy` rather than letting two writers corrupt the store:
 
 ```python
-db.close()
-db = mushroomdb.GraphDb.open("./db")
+from mushroomdb import GraphDb, MushroomBusy
+
+try:
+    db = GraphDb.open("./db")
+except MushroomBusy:
+    ...  # another process is writing; nothing was changed, retry later
 ```
+
+A handle does not poll the store, so another process's commits stay invisible
+until you ask for them. `refresh()` applies them in place and returns how many
+arrived — no `close()` and reopen:
+
+```python
+n = db.refresh()   # rules fire and derived edges appear, as on a fresh open
+```
+
+Readers never take the lock. `read_only=True` opens immediately even while a
+writer holds it, writes nothing to disk, raises `RuntimeError` on any mutation,
+and can still `refresh()` to follow the writer:
+
+```python
+reader = GraphDb.open("./db", read_only=True)
+reader.refresh()
+```
+
+A commit another process is midway through writing is left alone and picked up
+by the next `refresh()`; a partial write is never an error.
 
 Within one process the handle is guarded by a mutex, so calls from multiple
 threads are serialized and safe. They are not isolated transactions: readers

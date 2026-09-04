@@ -376,7 +376,9 @@ Body is a `RuleDef` object:
 ```
 
 Omitted or JSON-null `max_edges` fills the default after deserialize: **32**
-for scored predicates, **1** for KeyMatch (and KeyMatch-rooted `All`). Rust
+for scored predicates, **512** for KeyMatch (and KeyMatch-rooted `All`) — one
+per element a list-valued FK field can name; a scalar FK field still resolves to
+at most one destination, so the higher cap is inert there. Rust
 `max_edges: None` remains the 1,000,000 global-budget hatch; HTTP cannot
 express that hatch (null fills the default). Python `None` and a missing key
 behave the same as HTTP null — both fill the predicate default.
@@ -626,7 +628,7 @@ live-served stores use `POST /backup`.
 ```rust
 let nodes: Vec<NodeInfo>     = db.all_nodes_for_export();
 let edges: Vec<ExportEdge>   = db.all_edges_for_export();
-// ExportEdge { edge_type, src, dst, derived: bool, rule: Option<String> }
+// ExportEdge { edge_type, src, dst, derived: bool, rule: Option<String>, weight: Option<f64> }
 ```
 
 Nodes are sorted by key. Edges are sorted by `(edge_type, src, dst)`. Derived
@@ -635,25 +637,43 @@ edges include the rule name in `rule`; manually-written edges have `rule: None`.
 ### Export (CLI)
 
 ```sh
-mushroomdb export <db-dir> <dest-dir> [--format jsonl|parquet]
+mushroomdb export <db-dir> <dest> [--format jsonl|parquet|graphml]
 ```
 
 Default format: `jsonl`.
 
 **JSONL format** (default): writes `nodes.jsonl`, `edges.jsonl`, and `rules.jsonl`
-to `<dest-dir>`. Each line is a JSON object. JSONL output is stable, deterministic,
-and byte-identical between two runs on the same store.
+to `<dest>` (a directory). Each line is a JSON object. JSONL output is stable,
+deterministic, and byte-identical between two runs on the same store.
 
 **Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
-and `rules.parquet` with Snappy compression (parquet-rs default). Parquet output
-is **not** byte-identical between parquet-rs library versions — use JSONL if you
-need a stable byte checksum.
+and `rules.parquet` to `<dest>` (a directory) with Snappy compression (parquet-rs
+default). Parquet output is **not** byte-identical between parquet-rs library
+versions — use JSONL if you need a stable byte checksum.
 
-**Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as JSON
-`null` / Parquet null. Normal finite floats round-trip correctly.
+**GraphML format** (`--format graphml`): writes a single GraphML file — nodes
+and edges only, since rules have no GraphML analogue — for import into generic
+graph viewers and analysis tools. If `<dest>` is an existing directory, the file
+is `<dest>/graph.graphml`; otherwise `<dest>` is the file path itself. Node
+elements carry a `label` attribute plus every property (lists and maps are
+JSON-encoded as `string`-typed attributes); edge elements carry `type` and
+`derived`, plus `rule` and `weight` when present. `weight` is the creating
+rule's declared `weight_prop`, read off the edge. GraphML output is
+byte-identical between two runs on the same store.
+
+**GraphML attribute types:** `int` properties (mushroomdb's `Value::Int` is a
+64-bit `i64`) declare `attr.type="long"`, not `"int"` — GraphML's informal
+convention treats `"int"` as 32-bit, so `"long"` is the interoperable choice
+for the full range. If nodes disagree on a property's type (one has an int
+under `score`, another a string), the key declares `attr.type="string"` for
+every node rather than risk a value that doesn't fit a narrower type.
+
+**Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as
+JSON `null` (JSONL/Parquet) or an empty `<data>` element (GraphML). Normal
+finite floats round-trip correctly.
 
 **Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is
-the rule name (present for derived edges, null for manual edges).
+the rule name (present for derived edges, null/omitted for manual edges).
 
 ---
 
@@ -777,7 +797,7 @@ Response:
   "result": {
     "capabilities": {"tools": {}},
     "protocolVersion": "2024-11-05",
-    "serverInfo": {"name": "mushroomdb", "version": "0.5.2"}
+    "serverInfo": {"name": "mushroomdb", "version": "0.6.0"}
   }
 }
 ```
@@ -835,10 +855,15 @@ python -m venv .venv
 import mushroomdb
 
 db = mushroomdb.GraphDb.open("/path/to/db")
+reader = mushroomdb.GraphDb.open("/path/to/db", read_only=True)
 ```
 
 `GraphDb.open` creates the database directory if it does not already exist — no
 manual `mkdir` is required.
+
+A read-write handle takes the store's cross-process write lock and raises
+`MushroomBusy` if another one already holds it; `read_only=True` never takes the
+lock. See [Concurrency](#concurrency-1) below.
 
 ### Insert nodes
 
@@ -951,7 +976,7 @@ db.create_rule(clone)
 ```
 
 **`max_edges` semantics:** Python `None` and a missing key both fill the
-predicate default (32 for scored predicates, 1 for KeyMatch). This is the same
+predicate default (32 for scored predicates, 512 for KeyMatch). This is the same
 as HTTP `null` — neither Python nor HTTP can express the Rust `max_edges: None`
 global-budget hatch (1,000,000 per source). Use the Rust API directly if you
 need the uncapped budget.
@@ -1057,22 +1082,47 @@ s = db.stats()
 
 ### Concurrency
 
-**One writer process per store.** There is no cross-process lock yet (planned);
-opening the same directory from two processes that both write can corrupt it.
-Keep all writes in a single process.
-
-**A handle sees only the commits made through it.** It does not poll the store,
-so writes another process made after you opened are invisible to your handle.
-There is no `reopen()` — close and open again:
+**One writer at a time across processes.** The store carries an advisory write
+lock. A read-write handle holds it for as long as it is open, so opening a
+second one anywhere on the machine raises `MushroomBusy` rather than letting two
+writers corrupt the store. Nothing was written when it raises, so retrying later
+is safe:
 
 ```python
-db.close()
-db = mushroomdb.GraphDb.open("./db")
+from mushroomdb import GraphDb, MushroomBusy
+
+try:
+    db = GraphDb.open("./db")
+except MushroomBusy:
+    ...  # another process is writing
 ```
+
+**Readers see every commit, after `refresh()`.** A handle does not poll the
+store, so another process's commits stay invisible until you ask for them.
+`refresh()` applies them in place and returns how many arrived — rules fire and
+derived edges appear exactly as on a fresh open, and no `close()` and reopen is
+needed:
+
+```python
+n = db.refresh()
+```
+
+**`read_only=True` never takes the lock.** Such a handle opens immediately even
+while a writer holds it, writes nothing to disk, raises `RuntimeError` on any
+mutation, and can still `refresh()` to follow the writer:
+
+```python
+reader = GraphDb.open("./db", read_only=True)
+reader.refresh()
+```
+
+A commit another process is midway through writing is left alone and picked up
+by the next `refresh()`; a partial write is never an error.
 
 Within one process the handle is guarded by a mutex, so calls from multiple
 threads are serialized and safe. They are not isolated transactions: readers
 can observe intermediate states while a batch is being applied. See
+[concurrency.md](concurrency.md) for the full cross-process model and
 [durability.md](durability.md) for the WAL and crash-atomicity guarantees.
 
 ### Type stubs
@@ -1208,7 +1258,8 @@ async interface. See [timetravel.md](timetravel.md) for the full semantics.
 The bindings expose: `insert_node`, `ingest_batch`, `batch_edges`,
 `create_rule`, `set_prop`, `query` (with `params`), `query_with_params` (alias),
 `explain`, `neighbors`, `node_edges`, `node_info`, `stats`, `snapshot`,
-`rename_node`, `insert_edge_upsert`.
+`refresh`, `rename_node`, `insert_edge_upsert`, plus the `MushroomBusy`
+exception.
 
 `write_batch` is not directly exposed in the Python bindings because Rust
 closures capturing `&mut BatchBuilder` do not map naturally to the Python

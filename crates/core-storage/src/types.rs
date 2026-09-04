@@ -109,6 +109,19 @@ pub enum GraphError {
     RoleWriteDenied {
         reason: String,
     },
+    /// The store's advisory cross-process write lock could not be taken within
+    /// the caller's wait budget: another process is writing.
+    ///
+    /// Nothing was written and in-memory state is unchanged, so retrying later
+    /// is always safe. Readers never see this error — reads do not take the
+    /// lock.
+    ///
+    /// `holder` is the process id of the lock holder when the platform makes it
+    /// cheaply knowable, and `None` otherwise. It is a diagnostic hint only;
+    /// never branch on it.
+    Busy {
+        holder: Option<u32>,
+    },
 }
 
 impl std::fmt::Display for GraphError {
@@ -143,6 +156,12 @@ impl std::fmt::Display for GraphError {
             ),
             GraphError::MaskedReadOnly => write!(f, "masked queries are read-only"),
             GraphError::RoleWriteDenied { reason } => write!(f, "{reason}"),
+            GraphError::Busy { holder: Some(pid) } => {
+                write!(f, "store is busy: write lock held by process {pid}")
+            }
+            GraphError::Busy { holder: None } => {
+                write!(f, "store is busy: write lock held by another process")
+            }
         }
     }
 }

@@ -545,7 +545,11 @@ pub struct BackupReport {
 /// One directed edge in export form, with optional rule attribution for derived edges.
 ///
 /// Returned by [`GraphDb::all_edges_for_export`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// Does not derive `Eq`/`Ord`: `weight` is an `f64` and NaN breaks a total
+/// order. Callers that need a stable edge ordering already sort by
+/// `(edge_type, src, dst)` explicitly (see `all_edges_for_export`).
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub struct ExportEdge {
     pub edge_type: String,
     pub src: String,
@@ -553,6 +557,10 @@ pub struct ExportEdge {
     pub derived: bool,
     /// Rule name that created this edge, if derived. `None` for manual edges.
     pub rule: Option<String>,
+    /// The creating rule's declared `weight_prop`, read off this edge, when
+    /// derived and numeric (`Int`/`Float`). `None` for manual edges, derived
+    /// edges whose rule declares no `weight_prop`, or a non-numeric value.
+    pub weight: Option<f64>,
 }
 
 /// Construct the standard write-query result set (columns: created, properties_set, deleted).
@@ -1018,6 +1026,7 @@ fn make_graph_mut<'a>(
     labels: &'a [u32],
     props: core_storage::v8::seam::ColumnsView<'a>,
     topo: &'a mut Topology,
+    base: &'a Option<std::sync::Arc<core_storage::v8::MappedBase>>,
     edge_props: &'a mut EdgeProps,
 ) -> GraphMut<'a> {
     GraphMut {
@@ -1026,8 +1035,22 @@ fn make_graph_mut<'a>(
         labels,
         props,
         topo,
+        base_topo: base_csr(base),
         edge_props,
     }
+}
+
+/// The archived CSR of an open V8 snapshot, for the rule engine's graph reads.
+///
+/// A store opened from a snapshot keeps its edges in the mapping and its
+/// overlay empty, so a rule that reads the graph's shape has to see both.
+fn base_csr(
+    base: &Option<std::sync::Arc<core_storage::v8::MappedBase>>,
+) -> Option<&core_storage::v8::layout::ArchivedCsr> {
+    base.as_ref().map(|b| {
+        b.topology()
+            .expect("base topology section bounds validated at open")
+    })
 }
 
 /// Build a `ColumnsView` from the disjoint `props` overlay and optional V8 base.
@@ -1044,7 +1067,7 @@ fn build_props_view<'a>(
             let archived = b
                 .columns()
                 .expect("base columns section bounds validated at open");
-            core_storage::v8::seam::ColumnsView::with_base(props, archived)
+            core_storage::v8::seam::ColumnsView::with_base_cached(props, archived, b.mixed_cache())
         }
     }
 }
@@ -1244,6 +1267,35 @@ pub struct GraphDb<F: Fs> {
     slow_queries: std::sync::Mutex<SlowQueryLog>,
     /// Instant at which the database was opened (used by `/metrics` uptime).
     started_at: std::time::Instant,
+    // ── Multi-process state (cross-process lock + WAL tailing) ────────────────
+    /// Byte offset of the WAL prefix already applied to in-memory state.
+    ///
+    /// Advanced by exactly the encoded length of every frame this handle
+    /// appends, and by the decoded byte count of every tail
+    /// [`refresh`](GraphDb::refresh) absorbs. Rewound by
+    /// [`set_wal_consumed`](GraphDb::set_wal_consumed) when the group-commit
+    /// drain thread truncates a failed group. Compared against the WAL's
+    /// on-disk length to decide staleness.
+    wal_consumed: u64,
+    /// Identity of the snapshot this handle's base state came from, as
+    /// `(len, mtime_nanos)`. A different value means another process replaced
+    /// the snapshot and the WAL no longer continues our state: refresh reloads.
+    snapshot_ident: Option<(u64, u64)>,
+    /// The options this handle was opened with. Replayed verbatim when
+    /// `refresh` has to rebuild from disk.
+    open_opts: OpenOptions,
+    /// True when this handle holds the cross-process write lock for its whole
+    /// lifetime (a plain read-write open). Per-write lock acquisition is a
+    /// no-op on such a handle, and never releases the lock.
+    holds_lifetime_lock: bool,
+    /// True between a failed lock acquisition and the end of the write scope
+    /// that failed. Makes every WAL-appending mutation in that scope return
+    /// [`GraphError::Busy`] instead of writing.
+    lock_denied: bool,
+    /// True for an as-of view opened via [`GraphDb::open_at`]. Such a view is
+    /// pinned to one commit, so it is never stale and never refreshes — later
+    /// commits by any process are deliberately invisible to it.
+    pinned: bool,
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -1271,12 +1323,25 @@ pub struct OpenOptions {
     /// `true`). Truncating a genuinely torn tail is correct crash recovery.
     ///
     /// Set to `false` for an unattended reader. The valid prefix is still
-    /// decoded and replayed in memory, but nothing is written: the store has
-    /// no cross-process lock, so a reader that opens while another process is
-    /// mid-append would otherwise discard a frame that writer believes
-    /// durable. `mushroomdb recall`, which runs on every prompt, passes
-    /// `false` for exactly this reason.
+    /// decoded and replayed in memory, but nothing is written: a reader that
+    /// opens while another process is mid-append would otherwise discard a
+    /// frame that writer believes durable. `mushroomdb recall`, which runs on
+    /// every prompt, passes `false` for exactly this reason.
     pub repair_wal: bool,
+
+    /// Open without ever writing to the store (default `false`).
+    ///
+    /// A read-only handle:
+    /// - returns [`GraphError::ReadOnly`] from every mutation and from
+    ///   `snapshot()`;
+    /// - performs no disk write at open — no WAL repair write-back and no
+    ///   auto-migration rewrite, whatever the other two flags say;
+    /// - never takes the cross-process write lock, so it opens immediately even
+    ///   while another process is writing, and never makes a writer wait.
+    ///
+    /// [`refresh`](GraphDb::refresh) and [`is_stale`](GraphDb::is_stale) work
+    /// normally, so a read-only handle can follow another process's commits.
+    pub read_only: bool,
 }
 
 impl Default for OpenOptions {
@@ -1284,8 +1349,33 @@ impl Default for OpenOptions {
         Self {
             auto_migrate: true,
             repair_wal: true,
+            read_only: false,
         }
     }
+}
+
+/// How long a writer polls for the cross-process write lock before giving up
+/// with [`GraphError::Busy`].
+///
+/// Long enough to ride out another process's commit (a batch apply plus one
+/// fsync), short enough that a stuck peer surfaces as an error rather than a
+/// hang.
+pub const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Interval between poll attempts while waiting for the cross-process lock.
+pub(crate) const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Why `load_from_disk` is running, which decides whether it may repair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadOrigin {
+    /// A fresh open. Crash recovery is this handle's job: a torn WAL tail is
+    /// the signature of a crash and truncating it is correct, and archives
+    /// orphaned by an interrupted prune can be swept.
+    Open,
+    /// A reload driven by [`GraphDb::refresh`], because another process
+    /// replaced the snapshot. Nothing here is crash recovery — the store is
+    /// live and someone else is writing it — so this origin writes nothing.
+    Reload,
 }
 
 /// Authorization context carried by `write_batch_authz` / `query_write_authz`.
@@ -1426,13 +1516,29 @@ impl GraphDb<RealFs> {
     /// [`OpenOptions::repair_wal`]. With both flags `false` the open touches
     /// no file on disk.
     pub fn open_with_options(dir: &std::path::Path, opts: OpenOptions) -> Result<Self> {
+        Self::open_dir(dir, opts, true)
+    }
+
+    /// Open without taking the cross-process write lock for the handle's
+    /// lifetime.
+    ///
+    /// Only [`SharedDb`](crate::SharedDb) uses this: a long-lived server holds
+    /// its handle open indefinitely, so it takes the lock per write instead of
+    /// keeping every other process out of the store for as long as it runs.
+    pub(crate) fn open_unlocked(dir: &std::path::Path) -> Result<Self> {
+        Self::open_dir(dir, OpenOptions::default(), false)
+    }
+
+    fn open_dir(dir: &std::path::Path, opts: OpenOptions, hold_lock: bool) -> Result<Self> {
         // Header-only peek — 6 bytes, no full decode.
         let snap_version = snapshot_version_at(dir)?;
 
         // Full load: decode snapshot + replay WAL + rebuild indexes.
-        let mut db = Self::open_with_repair(RealFs::new(dir)?, opts.repair_wal)?;
+        let mut db = Self::open_generic(RealFs::new(dir)?, opts, hold_lock)?;
 
-        if opts.auto_migrate {
+        // A read-only handle writes nothing at open, so it never migrates —
+        // the old-format snapshot is loaded and left exactly as it is.
+        if opts.auto_migrate && !opts.read_only {
             match snap_version {
                 Some(ver) if ver < core_storage::snapshot::VERSION => {
                     let _tm = std::time::Instant::now();
@@ -1540,7 +1646,43 @@ impl<F: Fs> GraphDb<F> {
     /// prefix without writing the truncation back. See
     /// [`OpenOptions::repair_wal`].
     pub fn open_with_repair(fs: F, repair_wal: bool) -> Result<Self> {
-        let mut db = Self {
+        Self::open_generic(
+            fs,
+            OpenOptions {
+                repair_wal,
+                ..OpenOptions::default()
+            },
+            true,
+        )
+    }
+
+    /// Shared open path.
+    ///
+    /// `hold_lock` requests the cross-process write lock for the whole handle
+    /// lifetime — the right behaviour for a plain read-write `GraphDb`, whose
+    /// owner writes through it directly. [`SharedDb`](crate::SharedDb) passes
+    /// `false` and takes the lock per write instead, so that a long-lived
+    /// server does not keep every other process out of the store.
+    ///
+    /// A read-only open never takes the lock regardless of `hold_lock`.
+    fn open_generic(fs: F, opts: OpenOptions, hold_lock: bool) -> Result<Self> {
+        let mut db = Self::new_empty(fs, opts);
+        db.read_only = opts.read_only;
+        if hold_lock && !opts.read_only {
+            if !db.poll_lock(WRITE_LOCK_WAIT)? {
+                return Err(GraphError::Busy { holder: None });
+            }
+            db.holds_lifetime_lock = true;
+        }
+        db.load_from_disk(LoadOrigin::Open)?;
+        Ok(db)
+    }
+
+    /// A handle with no state loaded: every field at its empty value, the
+    /// filesystem and options in place. Only [`load_from_disk`] makes it
+    /// usable.
+    fn new_empty(fs: F, opts: OpenOptions) -> Self {
+        Self {
             fs,
             ids: IdMap::new(),
             syms: Interner::new(),
@@ -1584,7 +1726,70 @@ impl<F: Fs> GraphDb<F> {
                 total: 0,
             }),
             started_at: std::time::Instant::now(),
-        };
+            wal_consumed: 0,
+            snapshot_ident: None,
+            open_opts: opts,
+            holds_lifetime_lock: false,
+            lock_denied: false,
+            pinned: false,
+        }
+    }
+
+    /// Return every field describing stored graph state to its empty value,
+    /// leaving this handle's own identity alone.
+    ///
+    /// Preserved on purpose: the filesystem, open options, lock ownership, the
+    /// event sink and subscriptions, fsync policy, degraded flag, and the
+    /// slow-query configuration and log. A caller that registered a sink or a
+    /// subscription keeps it across a reload.
+    fn reset_for_reload(&mut self) {
+        self.ids = IdMap::new();
+        self.syms = Interner::new();
+        self.topo = Topology::new();
+        self.props = ColumnStore::new();
+        self.labels = Vec::new();
+        self.edge_props = EdgeProps::new();
+        self.engine = RuleEngine::new();
+        self.view_store = ViewStore::new();
+        self.fulltext = FulltextIndex::new();
+        self.prop_index = PropertyIndex::new();
+        self.commit_seq = 0;
+        self.roles = Some(vec![]);
+        self.total_wal_commits = 0;
+        self.base = None;
+        self.fold_overlay = None;
+        self.delta_tail = Vec::new();
+        self.commits_since_fold = 0;
+        self.deferred_events = Vec::new();
+        self.v8_sections_loaded
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.last_change = HashMap::new();
+        self.wal_horizon_floor = 0;
+        self.archive_genesis_chain = false;
+        self.pending_write_authz = None;
+        self.wal_consumed = 0;
+        self.snapshot_ident = None;
+    }
+
+    /// Load the snapshot base and replay the WAL into an empty handle — the
+    /// whole of what opening a store does after the struct exists.
+    ///
+    /// Split out of the open path so that [`refresh`](GraphDb::refresh) can
+    /// rebuild a handle in place, without ownership of `F`, when another
+    /// process replaces the snapshot underneath it.
+    ///
+    /// `origin` decides whether the two repair writes this function can make
+    /// are appropriate; see [`LoadOrigin`].
+    fn load_from_disk(&mut self, origin: LoadOrigin) -> Result<usize> {
+        // Both writes below are crash recovery, and only an open is entitled to
+        // perform them. A read-only handle promises to touch nothing, and a
+        // reload driven by `refresh` is looking at a store another process is
+        // actively writing: what looks like a torn tail there is a peer
+        // mid-append, and what looks like an orphaned archive may be one that
+        // peer is about to reference.
+        let may_repair = origin == LoadOrigin::Open && !self.open_opts.read_only;
+        let repair_wal = self.open_opts.repair_wal && may_repair;
+        let db = self;
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
         // Opening cleanup: remove orphaned archives — archives whose frames all
@@ -1592,7 +1797,9 @@ impl<F: Fs> GraphDb<F> {
         // the retention-prune sequence after the floor was written but before
         // all surplus archives were deleted.  Safe to delete: floor already
         // accounts for their frames.
-        db.cleanup_orphaned_archives()?;
+        if may_repair {
+            db.cleanup_orphaned_archives()?;
+        }
         let _t0 = std::time::Instant::now();
         // Peek 6 bytes to determine snapshot version without reading the full
         // file. For RealFs this is a true partial read (O(1)); for SimFs the
@@ -1668,38 +1875,13 @@ impl<F: Fs> GraphDb<F> {
         if !records.is_empty() {
             db.ensure_v8_base_sections_loaded();
             trace_open!("lazy sections loaded (WAL path)", _t0);
-            db.engine.consume_retained_state_eager(
-                &db.ids,
-                &db.syms,
-                &db.labels,
-                build_props_view(&db.props, &db.base),
-            );
         }
-        for rec in records {
-            db.apply(&rec)?;
-            // Drain per-frame to keep pending_deltas O(1) during replay (I-2).
-            // No subscriber exists yet; discard is correct.
-            let _ = db.engine.drain_deltas();
-            // Track commit_seq during replay so last_change entries are
-            // consistent with the seqs assigned by log_then_apply_with on
-            // subsequent live commits.  After N replayed frames, commit_seq=N;
-            // live commits begin at N+1.
-            db.commit_seq += 1;
-            let replay_seq = db.commit_seq;
-            db.update_last_change_from_rec(&rec, replay_seq);
-        }
-        // Enforce I-2: if the per-frame drain above is ever removed or skipped,
-        // this assert catches the regression in debug builds immediately.
-        debug_assert_eq!(
-            db.engine.pending_delta_count(),
-            0,
-            "pending_deltas non-empty after replay — \
-             per-frame drain must run inside the loop to keep memory O(1)"
-        );
-        // T2 note: the per-frame drain IS the suppression seam for replay.
-        // Any future as-of replay path (Plan-15 T2) must drain here to feed
-        // replaying subscribers; the mechanism is already in place.
-        let _ = db.engine.drain_deltas(); // belt-and-braces no-op after loop drain
+        let replayed = db.apply_frames(records)?;
+        // The cursor sits at the end of the valid prefix, not the end of the
+        // file: a torn or still-being-written tail is unconsumed by definition
+        // and stays visible to `is_stale` until it decodes.
+        db.wal_consumed = valid_len as u64;
+        db.snapshot_ident = db.fs.snapshot_ident().map_err(GraphError::Io)?;
         trace_open!("wal replay done", _t0);
         // Rebuild view values after WAL replay only when there is no V8 base.
         // With a V8 base, view values are correct in the snapshot and are updated
@@ -1733,7 +1915,258 @@ impl<F: Fs> GraphDb<F> {
         // Capture the initial MVCC fold so reader() is ready immediately.
         db.fold_now();
         trace_open!("open_with complete", _t0);
-        Ok(db)
+        Ok(replayed)
+    }
+
+    /// Apply decoded WAL frames to in-memory state, exactly as the open-path
+    /// replay does — same `apply` calls, same per-frame delta drain, same
+    /// commit-seq and last-change bookkeeping. Rules therefore fire and derived
+    /// edges appear identically whether a frame arrives at open, from a local
+    /// commit, or from another process by way of [`refresh`](GraphDb::refresh).
+    ///
+    /// Returns the number of frames applied.
+    ///
+    /// Deltas are drained and discarded per frame: replayed frames are already
+    /// reflected on disk, so they are not news to a subscriber, and draining
+    /// inside the loop keeps `pending_deltas` O(1) over a large WAL (I-2).
+    fn apply_frames(&mut self, records: Vec<WalRecord>) -> Result<usize> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        // Materialize any state retained in the mmap base before the first
+        // frame lands, so a replayed record cannot trip the lazy-init guard and
+        // rebuild indexes from an empty graph. Both calls are idempotent.
+        self.ensure_v8_base_sections_loaded();
+        self.engine.consume_retained_state_eager(
+            &self.ids,
+            &self.syms,
+            &self.labels,
+            build_props_view(&self.props, &self.base),
+        );
+        let applied = records.len();
+        for rec in records {
+            self.apply(&rec)?;
+            let _ = self.engine.drain_deltas();
+            // Track commit_seq during replay so last_change entries are
+            // consistent with the seqs assigned by log_then_apply_with on
+            // subsequent live commits.  After N replayed frames, commit_seq=N;
+            // live commits begin at N+1.
+            self.commit_seq += 1;
+            let replay_seq = self.commit_seq;
+            self.update_last_change_from_rec(&rec, replay_seq);
+        }
+        // Enforce I-2: if the per-frame drain above is ever removed or skipped,
+        // this assert catches the regression in debug builds immediately.
+        debug_assert_eq!(
+            self.engine.pending_delta_count(),
+            0,
+            "pending_deltas non-empty after replay — \
+             per-frame drain must run inside the loop to keep memory O(1)"
+        );
+        // T2 note: the per-frame drain IS the suppression seam for replay.
+        // Any future as-of replay path (Plan-15 T2) must drain here to feed
+        // replaying subscribers; the mechanism is already in place.
+        let _ = self.engine.drain_deltas(); // belt-and-braces no-op after loop drain
+        Ok(applied)
+    }
+
+    // ── Multi-process safety: cross-process write lock + WAL tailing ──────────
+    //
+    // mushroomdb is many-readers / one-writer across processes. Writers take an
+    // advisory exclusive lock on the store's `LOCK` file; readers never do.
+    // Every handle tracks how much of the WAL it has consumed, so it can pick
+    // up another process's commits by decoding only the new tail rather than
+    // reopening. See `docs/site/concurrency.md`.
+
+    /// Whether the store on disk has moved ahead of (or out from under) this
+    /// handle's in-memory state.
+    ///
+    /// True when the WAL's length differs from this handle's cursor — another
+    /// process committed, or is mid-append — or when the snapshot file's
+    /// identity changed. Costs two metadata lookups and reads no file contents,
+    /// so it is cheap enough for a read path to call.
+    ///
+    /// Always false for an as-of view from [`GraphDb::open_at`]: such a view is
+    /// pinned to one commit and later commits are deliberately invisible to it.
+    pub fn is_stale(&self) -> Result<bool> {
+        if self.pinned {
+            return Ok(false);
+        }
+        if self.fs.wal_len().map_err(GraphError::Io)? != self.wal_consumed {
+            return Ok(true);
+        }
+        Ok(self.fs.snapshot_ident().map_err(GraphError::Io)? != self.snapshot_ident)
+    }
+
+    /// Bring this handle up to date with every commit other processes have made,
+    /// and return how many frames were applied.
+    ///
+    /// The WAL tail is decoded from this handle's cursor and applied through the
+    /// same path the open replay uses, so rules fire and derived edges appear
+    /// exactly as they would on a fresh open. Interners, id maps and indexes
+    /// stay valid for the same reason.
+    ///
+    /// A frame another process is still writing is left alone: a trailing
+    /// partial frame is a wait, not a corruption, and the handle stays stale
+    /// until that frame is complete. Nothing is written to disk, so a read-only
+    /// handle can refresh freely.
+    ///
+    /// When the snapshot file's identity changed, or the WAL is shorter than
+    /// this handle's cursor, the WAL no longer continues our state — another
+    /// process snapshotted or archived. The handle is then rebuilt from disk
+    /// with the options it was opened with, and the return value is the number
+    /// of frames in the new WAL.
+    ///
+    /// Returns 0 for an as-of view, which never follows later commits.
+    ///
+    /// # Errors
+    ///
+    /// An error here leaves the handle **degraded**: it got partway through
+    /// applying the tail, or partway through a reload, so its in-memory state
+    /// no longer matches any point on disk. Further mutations are refused and
+    /// the handle must be reopened. Nothing on disk was damaged — the store
+    /// itself is fine, and a fresh open recovers it.
+    pub fn refresh(&mut self) -> Result<u64> {
+        if self.pinned {
+            return Ok(0);
+        }
+        let disk_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
+        let wal_len = self.fs.wal_len().map_err(GraphError::Io)?;
+        if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed {
+            // The WAL no longer continues our state: rebuild from disk. State
+            // is cleared first, so a failed load leaves an empty handle — mark
+            // it degraded rather than let a caller read an empty graph as if
+            // it were the store's contents.
+            self.reset_for_reload();
+            return match self.load_from_disk(LoadOrigin::Reload) {
+                Ok(frames) => Ok(frames as u64),
+                Err(e) => {
+                    self.degraded = true;
+                    Err(e)
+                }
+            };
+        }
+        if wal_len == self.wal_consumed {
+            return Ok(0);
+        }
+        let tail = self
+            .fs
+            .read_range(FileId::Wal, self.wal_consumed)
+            .map_err(GraphError::Io)?;
+        let (records, valid_len) = decode_all(&tail);
+        let applied = match self.apply_frames(records) {
+            Ok(n) => n,
+            Err(e) => {
+                // Some frames landed and some did not, and the cursor cannot
+                // say how many. Advancing it would skip the rest; leaving it
+                // would replay what already applied. Neither is recoverable in
+                // place, so refuse further writes and require a reopen.
+                self.degraded = true;
+                return Err(e);
+            }
+        };
+        // Advance by the bytes actually decoded, never by the file length: an
+        // incomplete trailing frame stays unconsumed for the next refresh.
+        self.wal_consumed += valid_len as u64;
+        if applied > 0 {
+            // Peer commits must reach `reader()` snapshots taken from here on.
+            // A full fold is what open does; refresh does not build per-commit
+            // deltas, so there is nothing cheaper that stays correct.
+            self.fold_now();
+        }
+        Ok(applied as u64)
+    }
+
+    /// Byte offset of the WAL prefix this handle has applied.
+    ///
+    /// Exposed for tests that assert the cursor tracks appended bytes exactly.
+    #[doc(hidden)]
+    pub fn wal_consumed(&self) -> u64 {
+        self.wal_consumed
+    }
+
+    /// Rewind the WAL cursor after the group-commit drain thread truncated a
+    /// failed group off the tail, so the cursor still describes the file.
+    pub(crate) fn set_wal_consumed(&mut self, len: u64) {
+        self.wal_consumed = len;
+    }
+
+    /// One non-blocking attempt at the cross-process write lock.
+    ///
+    /// Takes `&self` so a caller can poll for the lock *before* it acquires the
+    /// in-process write guard. That ordering is what keeps a busy peer in
+    /// another process from stalling this process's readers.
+    ///
+    /// A handle that owns the lock for its lifetime always succeeds.
+    pub(crate) fn try_cross_process_lock(&self) -> Result<bool> {
+        if self.holds_lifetime_lock {
+            return Ok(true);
+        }
+        self.fs.try_lock_exclusive().map_err(GraphError::Io)
+    }
+
+    /// Poll for the cross-process write lock until `wait` elapses.
+    ///
+    /// One attempt is always made, so a zero wait is a single try. Returns
+    /// `false` when the lock is still held elsewhere at the deadline; nothing
+    /// has been written and retrying later is safe.
+    ///
+    /// Only the plain-`GraphDb` open path uses this, where the caller owns the
+    /// handle outright. [`SharedDb`](crate::SharedDb) polls
+    /// [`try_cross_process_lock`](GraphDb::try_cross_process_lock) itself so
+    /// that it holds no in-process guard while it waits.
+    fn poll_lock(&self, wait: std::time::Duration) -> Result<bool> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            if self.try_cross_process_lock()? {
+                return Ok(true);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(LOCK_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+        }
+    }
+
+    /// Open a cross-process write scope, given the outcome of an already-made
+    /// lock attempt.
+    ///
+    /// The caller polls for the lock first — outside any in-process guard — and
+    /// passes what it got. On success this refreshes, so the writes about to
+    /// happen land on top of every other process's commits. On failure the
+    /// handle refuses WAL-appending mutations and `snapshot()` with
+    /// [`GraphError::Busy`] until [`end_write_lock`](GraphDb::end_write_lock)
+    /// closes the scope, so a caller holding a guard cannot write behind
+    /// another process's back.
+    ///
+    /// A handle that already owns the lock for its lifetime skips the refresh:
+    /// no other process can have written, so there is nothing to pick up.
+    pub(crate) fn enter_write_scope(&mut self, acquired: bool) -> Result<()> {
+        self.lock_denied = !acquired;
+        if !acquired || self.holds_lifetime_lock {
+            return Ok(());
+        }
+        if let Err(e) = self.refresh() {
+            // Do not hold a lock we cannot use: release it and let the caller
+            // see the underlying failure.
+            let _ = self.fs.unlock();
+            self.lock_denied = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Close a cross-process write scope opened by
+    /// [`enter_write_scope`](GraphDb::enter_write_scope): release the lock and
+    /// clear the Busy latch. Safe to call when the lock was never taken.
+    pub(crate) fn end_write_lock(&mut self) {
+        self.lock_denied = false;
+        if !self.holds_lifetime_lock {
+            // Releasing a lock we do not hold is a no-op; a failure to release
+            // is reported by the OS closing the descriptor at handle drop.
+            let _ = self.fs.unlock();
+        }
     }
 
     /// As-of replay for [`GraphDb::open_at`]: snapshot base (only when the
@@ -2047,7 +2480,11 @@ impl<F: Fs> GraphDb<F> {
                 let archived = base
                     .columns()
                     .expect("base columns section bounds validated at open");
-                core_storage::v8::seam::ColumnsView::with_base(&self.props, archived)
+                core_storage::v8::seam::ColumnsView::with_base_cached(
+                    &self.props,
+                    archived,
+                    base.mixed_cache(),
+                )
             }
         }
     }
@@ -2072,51 +2509,17 @@ impl<F: Fs> GraphDb<F> {
     }
 
     fn open_at_with(fs: F, commit: u64) -> Result<Self> {
-        let mut db = Self {
+        // An as-of view never writes and is pinned to one commit: it takes no
+        // cross-process lock and does not follow later commits.
+        let mut db = Self::new_empty(
             fs,
-            ids: IdMap::new(),
-            syms: Interner::new(),
-            topo: Topology::new(),
-            props: ColumnStore::new(),
-            labels: Vec::new(),
-            edge_props: EdgeProps::new(),
-            engine: RuleEngine::new(),
-            view_store: ViewStore::new(),
-            fulltext: FulltextIndex::new(),
-            prop_index: PropertyIndex::new(),
-            event_sink: None,
-            fsync: FsyncPolicy::Strict,
-            commit_seq: 0,
-            roles: Some(vec![]),
-            subscriptions: Vec::new(),
-            query_subscriptions: Vec::new(),
-            sub_capacity: DEFAULT_SUB_CAPACITY,
-            read_only: false, // set to true after replay
-            total_wal_commits: 0,
-            base: None,
-            fold_overlay: None,
-            delta_tail: Vec::new(),
-            commits_since_fold: 0,
-            defer_events: false,
-            deferred_events: Vec::new(),
-            degraded: false,
-            v8_sections_loaded: std::sync::atomic::AtomicBool::new(false),
-            v8_sections_mutex: std::sync::Mutex::new(()),
-            last_change: HashMap::new(),
-            wal_archive_retention: None,
-            wal_horizon_floor: 0,
-            archive_genesis_chain: false,
-            pending_write_authz: None,
-            slow_query_threshold_ms: std::env::var("MUSHROOMDB_SLOW_QUERY_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100),
-            slow_queries: std::sync::Mutex::new(SlowQueryLog {
-                entries: std::collections::VecDeque::new(),
-                total: 0,
-            }),
-            started_at: std::time::Instant::now(),
-        };
+            OpenOptions {
+                repair_wal: false,
+                auto_migrate: false,
+                read_only: true,
+            },
+        );
+        db.pinned = true; // read_only is set after replay, but pinning is immediate
         db.wal_horizon_floor = db.fs.read_horizon_floor()?;
         db.archive_genesis_chain = db.fs.has_genesis_marker();
         // Same orphaned-archive cleanup as open_with: floor was written first
@@ -2333,6 +2736,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_changed(id, None, &mut gm);
@@ -2428,6 +2832,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
@@ -2472,6 +2877,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_changed(id, Some((field, old_value)), &mut gm);
@@ -2599,6 +3005,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_changed(id, None, &mut gm);
@@ -2695,6 +3102,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.labels,
                             build_props_view(&self.props, &self.base),
                             &mut self.topo,
+                            &self.base,
                             &mut self.edge_props,
                         );
                         eng.on_edge_changed(&etype_str, *src, *dst, &mut gm);
@@ -2746,6 +3154,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_changed(*id, Some((field_str.as_str(), old_value)), &mut gm);
@@ -2834,6 +3243,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.create_rule(def, &mut gm)
@@ -2882,6 +3292,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.delete_rule(name, &mut gm)
@@ -2948,6 +3359,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_changed(id, Some((field, old)), &mut gm);
@@ -3060,6 +3472,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
@@ -3109,6 +3522,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.on_node_removed(n, &mut gm);
@@ -3214,6 +3628,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.labels,
                         build_props_view(&self.props, &self.base),
                         &mut self.topo,
+                        &self.base,
                         &mut self.edge_props,
                     );
                     eng.rebuild(name, &mut gm)
@@ -3623,13 +4038,21 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
-        // Degraded guard: fsync failure left WAL truncated; in-memory state
-        // is ahead of the on-disk WAL, so further mutations would deepen the
-        // divergence.  Reopen the database to recover.
+        // Degraded guard: fsync failure left WAL truncated, or a refresh failed
+        // partway; in-memory state is ahead of (or out of step with) the
+        // on-disk WAL, so further mutations would deepen the divergence.
+        // Reopen the database to recover.  Checked before the lock guard: this
+        // is the more serious condition and the more useful error.
         if self.degraded {
             return Err(GraphError::Io(std::io::Error::other(
                 "database degraded after group-commit fsync failure; reopen required",
             )));
+        }
+        // Cross-process guard: this write scope asked for the store's write
+        // lock and did not get it. Writing anyway would append frames on top of
+        // a WAL another process is extending, so refuse instead.
+        if self.lock_denied {
+            return Err(GraphError::Busy { holder: None });
         }
         // Ensure retained provenance bytes are decoded into the live mutable
         // fields before any mutation touches self.engine.provenance.  This is a
@@ -3649,7 +4072,11 @@ impl<F: Fs> GraphDb<F> {
              a previous apply arm may have accumulated deltas before erroring; \
              the caller must drain_deltas() on any error path before returning"
         );
-        self.fs.append(FileId::Wal, &encode_record(&rec))?;
+        let frame = encode_record(&rec);
+        self.fs.append(FileId::Wal, &frame)?;
+        // The cursor advances by exactly the bytes appended: these frames are
+        // ours and already applied, so a later refresh must not replay them.
+        self.wal_consumed += frame.len() as u64;
         if Self::wal_needs_sync(policy, &rec) {
             self.fs.sync(FileId::Wal)?;
         }
@@ -3743,7 +4170,11 @@ impl<F: Fs> GraphDb<F> {
             };
             // Ignore append errors: markers are best-effort history
             // annotations. Losing them does not affect state correctness.
-            let _ = self.fs.append(FileId::Wal, &encode_record(&marker_frame));
+            // The cursor only advances when the bytes actually landed.
+            let marker_bytes = encode_record(&marker_frame);
+            if self.fs.append(FileId::Wal, &marker_bytes).is_ok() {
+                self.wal_consumed += marker_bytes.len() as u64;
+            }
         }
 
         // Record MVCC CommitDelta for the epoch reader.  The WAL record is
@@ -5656,7 +6087,15 @@ impl<F: Fs> GraphDb<F> {
     /// within `config.max_iters` and within any time budget.
     pub fn pagerank(&self, config: &crate::algo::PageRankConfig) -> crate::algo::PageRankReport {
         let topo = build_topo_view(&self.topo, &self.base);
-        crate::algo::pagerank(&topo, &self.ids, &self.syms, &self.labels, config)
+        let edge_props = self.edge_props_view();
+        crate::algo::pagerank(
+            &topo,
+            &self.ids,
+            &self.syms,
+            &self.labels,
+            &edge_props,
+            config,
+        )
     }
 
     /// Weakly-connected components over the unified topology (treated as
@@ -5666,7 +6105,15 @@ impl<F: Fs> GraphDb<F> {
     /// (deterministic).  Result sorted by (component_id, key).
     pub fn connected_components(&self, config: &crate::algo::WccConfig) -> crate::algo::WccReport {
         let topo = build_topo_view(&self.topo, &self.base);
-        crate::algo::wcc(&topo, &self.ids, &self.syms, &self.labels, config)
+        let edge_props = self.edge_props_view();
+        crate::algo::wcc(
+            &topo,
+            &self.ids,
+            &self.syms,
+            &self.labels,
+            &edge_props,
+            config,
+        )
     }
 
     /// Degree centrality for every live node.
@@ -5681,7 +6128,33 @@ impl<F: Fs> GraphDb<F> {
         config: &crate::algo::DegreeConfig,
     ) -> crate::algo::DegreeReport {
         let topo = build_topo_view(&self.topo, &self.base);
-        crate::algo::degree_centrality(&topo, &self.ids, &self.syms, &self.labels, config)
+        let edge_props = self.edge_props_view();
+        crate::algo::degree_centrality(
+            &topo,
+            &self.ids,
+            &self.syms,
+            &self.labels,
+            &edge_props,
+            config,
+        )
+    }
+
+    /// Louvain community detection over the unified topology (undirected).
+    ///
+    /// See [`crate::algo::LouvainConfig`] for edge-type/weight/label
+    /// restriction and [`crate::algo::CommunityReport`] for the shape of the
+    /// result (communities sorted size-desc, then smallest member key asc).
+    pub fn communities(&self, config: &crate::algo::LouvainConfig) -> crate::algo::CommunityReport {
+        let topo = build_topo_view(&self.topo, &self.base);
+        let edge_props = self.edge_props_view();
+        crate::algo::louvain(
+            &topo,
+            &self.ids,
+            &self.syms,
+            &self.labels,
+            &edge_props,
+            config,
+        )
     }
 
     /// Write a vector of `(node_key, score)` pairs as `prop_name` on each node,
@@ -6786,7 +7259,10 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Derived edges carry `derived: true` and the creating rule's name in `rule`.
     /// Manual edges carry `derived: false` and `rule: None`.
-    /// Deterministic across runs on the same store state.
+    /// `weight` is the creating rule's `weight_prop` value read off the edge
+    /// (numeric only), mirroring the convention used by [`GraphDb::explain`]
+    /// and [`GraphDb::weighted_edges`]. Deterministic across runs on the same
+    /// store state.
     pub fn all_edges_for_export(&self) -> Vec<ExportEdge> {
         self.ensure_v8_base_sections_loaded();
 
@@ -6798,7 +7274,15 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
+        // rule_name → weight_prop, for O(1) lookup per derived edge.
+        let weight_props: HashMap<&str, Option<&str>> = self
+            .engine
+            .rules()
+            .map(|r| (r.name.as_str(), r.weight_prop.as_deref()))
+            .collect();
+
         let tv = self.topo_view();
+        let ep = self.edge_props_view();
         let mut edges = Vec::new();
 
         for id in 0..self.ids.len() as u32 {
@@ -6829,12 +7313,21 @@ impl<F: Fs> GraphDb<F> {
                     let prov_key = (etype_sym, id, nbr);
                     let rule = prov.get(&prov_key).cloned();
                     let derived = rule.is_some();
+                    let weight = rule
+                        .as_deref()
+                        .and_then(|rn| weight_props.get(rn).copied().flatten())
+                        .and_then(|prop| match ep.get(etype_sym, id, nbr, prop) {
+                            Some(Value::Float(f)) => Some(f),
+                            Some(Value::Int(i)) => Some(i as f64),
+                            _ => None,
+                        });
                     edges.push(ExportEdge {
                         edge_type: edge_type.clone(),
                         src: key.to_string(),
                         dst: dst_key.to_string(),
                         derived,
                         rule,
+                        weight,
                     });
                 }
             }
@@ -6847,6 +7340,56 @@ impl<F: Fs> GraphDb<F> {
                 .then(a.dst.cmp(&b.dst))
         });
         edges
+    }
+
+    /// All directed edges of `edge_type`, with the raw value of `weight_prop`
+    /// on each edge when given.
+    ///
+    /// `weight` is `Some(f)` only when `weight_prop` is set and the edge
+    /// carries that property with a numeric (`Int`/`Float`) value; otherwise
+    /// `None` — callers that want a default weight (e.g. `1.0` for missing
+    /// props) apply it themselves, matching the convention used internally
+    /// by [`GraphDb::pagerank`], [`GraphDb::connected_components`],
+    /// [`GraphDb::degree_centrality`], and [`GraphDb::communities`].
+    ///
+    /// Sorted by `(src, dst)` for determinism. Reads the unified topology
+    /// (manual + rule-derived edges).  An unknown `edge_type` returns an
+    /// empty vec.
+    pub fn weighted_edges(
+        &self,
+        edge_type: &str,
+        weight_prop: Option<&str>,
+    ) -> Vec<(String, String, Option<f64>)> {
+        let Some(etype_sym) = self.syms.get(edge_type) else {
+            return Vec::new();
+        };
+        let tv = self.topo_view();
+        let ep = self.edge_props_view();
+        let mut out = Vec::new();
+        for id in 0..self.ids.len() as u32 {
+            let Some(key) = self.ids.key_of(id) else {
+                continue;
+            };
+            let Some(&sym) = self.labels.get(id as usize) else {
+                continue;
+            };
+            if sym == u32::MAX {
+                continue; // tombstoned
+            }
+            for &nbr in tv.neighbors(etype_sym, Direction::Out, id).as_ref() {
+                let Some(dst_key) = self.ids.key_of(nbr) else {
+                    continue;
+                };
+                let weight = weight_prop.and_then(|prop| match ep.get(etype_sym, id, nbr, prop) {
+                    Some(Value::Float(f)) => Some(f),
+                    Some(Value::Int(i)) => Some(i as f64),
+                    _ => None,
+                });
+                out.push((key.to_string(), dst_key.to_string(), weight));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        out
     }
 
     pub fn nodes_with_label(&self, label: &str) -> Vec<NodeRef<'_, F>> {
@@ -8952,6 +9495,20 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // A snapshot rewrites `wal.bin` through a tmp+rename, so a peer that is
+        // appending ends up holding a descriptor on an unlinked inode and loses
+        // commits it believes durable. Snapshotting therefore requires the
+        // cross-process write lock, exactly as appending does. Unlike the WAL
+        // append path this does not go through `log_then_apply_with`, so both
+        // guards are repeated here.
+        if self.degraded {
+            return Err(GraphError::Io(std::io::Error::other(
+                "database degraded after group-commit fsync failure; reopen required",
+            )));
+        }
+        if self.lock_denied {
+            return Err(GraphError::Busy { holder: None });
+        }
         // Capture whether snapshot.bin already existed BEFORE this snapshot write.
         // Used by the archive path's conservative genesis-chain check: if a prior
         // snapshot exists but wal.truncated does not, we cannot distinguish a
@@ -9329,6 +9886,13 @@ impl<F: Fs> GraphDb<F> {
         // self.topo and self.props). Refresh the MVCC fold so future readers
         // see the post-snapshot state rather than stale overlay data.
         self.fold_now();
+        // We wrote the snapshot and (unless keep_wal) replaced the WAL, so both
+        // markers this handle uses to detect other processes' work must be
+        // re-taken from disk. Skipping this would make our own snapshot look
+        // like a peer's on the next staleness check and force a needless
+        // reload.
+        self.wal_consumed = self.fs.wal_len().map_err(GraphError::Io)?;
+        self.snapshot_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
         Ok(())
     }
 }

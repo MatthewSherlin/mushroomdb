@@ -58,6 +58,25 @@ field matches an Org's key gets a `ORG` edge to that Org. After the demo,
 
 **Score:** 1.0 when the field matches the destination key.
 
+**List-valued fields (multi-valued FK):** when the field holds a list instead
+of a string, it is read as a *set* of foreign keys. Every string element that
+names a live destination node gets its own edge, so
+`File.imports = ["a.rs", "b.rs"]` yields two `IMPORTS` edges. Elements that name
+nothing are ignored until that node appears, at which point the edge is filled
+in; drop an element and only that edge is retracted, in the same write. Non-string
+elements are skipped and duplicates collapse into a single edge. At most
+`MAX_KEYMATCH_LIST` = 512 elements are considered, in stored order, so one node
+can never fan out without bound — the same list always produces the same edges.
+
+Firing per element is the default, not an opt-in: a KeyMatch rule that omits
+`max_edges` gets 512, the same number, from every front door that fills the
+cap — `POST /rules`, MCP `create_rule`, the Python binding, `suggest`, and the
+auto-FK rules declared at ingest time. A scalar FK field names at most one
+destination, so the higher cap is inert there and scalar rules behave exactly as
+they did. Rules stored before this change keep the `max_edges` they were written
+with, so a rule saved with `max_edges: 1` still keeps a single destination per
+source until it is recreated.
+
 ---
 
 ### 2. FieldEqual

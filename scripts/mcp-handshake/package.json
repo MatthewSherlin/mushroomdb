@@ -1,0 +1,9 @@
+{
+  "name": "mushroomdb-mcp-handshake",
+  "private": true,
+  "type": "module",
+  "description": "SDK-level MCP handshake check: spawns the mushroomdb MCP server over stdio via the official client SDK and asserts it answers like a real client would see it.",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0"
+  }
+}

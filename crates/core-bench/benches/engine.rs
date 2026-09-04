@@ -353,7 +353,125 @@ fn engine_benches(c: &mut Criterion) {
     vector_rule_update(c);
     vector_semantic_backfill(c);
     field_equal_scale_backfill(c);
+    open_store(c);
     contention(c);
+}
+
+// ── Store open ───────────────────────────────────────────────────────────────
+//
+// Hook bodies (`touch`, `recall`) open the store on every prompt and every
+// edit, so open time is latency the user feels rather than a startup cost
+// amortised over a long-lived process. Both benches build the same store; they
+// differ only in whether a snapshot stands in for the log.
+
+/// A store shaped like a code graph: ~20k nodes, ~13k edges, 400 nodes carrying
+/// a 4 KB body, and five rules — two of them over the list-valued property that
+/// the co-change and authorship rules key on.
+fn open_shaped_store(dir: &std::path::Path) {
+    let mut db = GraphDb::open(dir).expect("open");
+    db.create_rule(rule_skill_fit()).expect("skill_fit");
+    db.create_rule(rule_works_at()).expect("works_at");
+    db.create_rule(rule_on_project()).expect("on_project");
+    db.create_rule(RuleDef {
+        name: "co_changed".into(),
+        src_label: "File".into(),
+        dst_label: "File".into(),
+        predicate: Predicate::Overlap {
+            field: "commits".into(),
+            min: 0.5,
+        },
+        edge_type: "CO_CHANGED".into(),
+        weight_prop: Some("score".into()),
+        max_edges: Some(10),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .expect("co_changed");
+    db.create_rule(RuleDef {
+        name: "knows".into(),
+        src_label: "Author".into(),
+        dst_label: "File".into(),
+        predicate: Predicate::Overlap {
+            field: "commits".into(),
+            min: 0.5,
+        },
+        edge_type: "KNOWS".into(),
+        weight_prop: Some("score".into()),
+        max_edges: Some(20),
+        approximate: false,
+        via_label: Some("File".into()),
+        via_edge: Some("TOP_AUTHOR".into()),
+        via_dir: Some(core_storage::Direction::In),
+    })
+    .expect("knows");
+
+    populate(&mut db, N, SEED);
+
+    // 400 files with bodies and commit lists, plus the authors they hang off.
+    // Forty authors rather than a handful: the via-hop rule expands every one of
+    // a source's files against every destination, so a store where four people
+    // own a hundred files each takes minutes to replay and is no use as a bench.
+    let body = "x".repeat(4096);
+    for a in 0..40u32 {
+        db.insert_node("Author", &format!("author-{a}"), vec![])
+            .expect("author");
+    }
+    for f in 0..400u32 {
+        let commits: Vec<Value> = (0..24)
+            .map(|j| Value::Str(format!("sha-{}-{}", f % 40, j)))
+            .collect();
+        db.insert_node(
+            "File",
+            &format!("file-{f}"),
+            vec![
+                ("body".into(), Value::Str(body.clone())),
+                ("commits".into(), Value::List(commits)),
+                (
+                    "top_author_id".into(),
+                    Value::Str(format!("author-{}", f % 40)),
+                ),
+            ],
+        )
+        .expect("file");
+        db.insert_edge(
+            "TOP_AUTHOR",
+            &format!("file-{f}"),
+            &format!("author-{}", f % 40),
+        )
+        .expect("top_author");
+    }
+}
+
+fn open_store(c: &mut Criterion) {
+    let wal_dir = tmp_dir();
+    open_shaped_store(&wal_dir);
+
+    // The snapshot store gets the same log, then replaces it with a snapshot
+    // and one trailing record — the state a store is in after `snapshot`.
+    let snap_dir = tmp_dir();
+    std::fs::create_dir_all(&snap_dir).expect("mkdir");
+    std::fs::copy(wal_dir.join("wal.bin"), snap_dir.join("wal.bin")).expect("copy wal");
+    {
+        let mut db = GraphDb::open(&snap_dir).expect("open snap");
+        db.snapshot().expect("snapshot");
+        db.set_prop("file-0", "touched", Value::Int(1))
+            .expect("tail");
+    }
+
+    c.bench_function("open_wal_only_this_repo_shape", |b| {
+        b.iter(|| {
+            let db = GraphDb::open(&wal_dir).expect("open");
+            black_box(db.node_count())
+        });
+    });
+    c.bench_function("open_with_snapshot_this_repo_shape", |b| {
+        b.iter(|| {
+            let db = GraphDb::open(&snap_dir).expect("open");
+            black_box(db.node_count())
+        });
+    });
 }
 
 fn ingest_10k_nodes(c: &mut Criterion) {

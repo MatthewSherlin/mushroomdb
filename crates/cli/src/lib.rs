@@ -3,19 +3,22 @@
 //! The binary in `main.rs` stays thin — it dispatches on [`parse_args`] and
 //! prints what the lib functions return.
 
+pub mod doctor;
 pub mod export;
 pub mod ingest_git;
 pub mod install;
 pub mod recall;
+pub mod structure;
 
+use core_api::repograph;
 use core_api::schema::Schema;
 use core_api::{
     default_max_edges, is_write_query, wal_commit_count_at, AlgoDir, BackupReport, DegreeConfig,
-    Explanation, GraphDb, IngestOptions, PageRankConfig, Predicate, ResultSet, RuleDef,
-    RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
+    Explanation, GraphDb, IngestOptions, LouvainConfig, PageRankConfig, Predicate, ResultSet,
+    RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
 };
 use export::ExportFormat;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -41,6 +44,38 @@ const SAMPLE_EXPLAIN_B: &str = "proj-01";
 /// Build version, printed by `mushroomdb --version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The one line `--version` and the `version` subcommand print.
+#[must_use]
+pub fn version_string() -> String {
+    format!("mushroomdb {VERSION}")
+}
+
+/// Where `--auto` looks for a database, in order.
+///
+/// 1. `$CLAUDE_PROJECT_DIR/mushroom-memory` — the assistant tells a hook which
+///    project it is working in, and that is the most specific answer there is.
+/// 2. `<cwd>/mushroom-memory`, but only when the working directory is a git
+///    checkout. Without that guard a command run from a home directory would
+///    quietly create a store there.
+/// 3. `<home>/.mushroomdb/memory`, the user-scope default `install` writes.
+///
+/// The two project-scoped answers match [`install::default_db`],
+/// so a hook with `--auto` finds the store `install --project` created.
+#[must_use]
+pub fn resolve_auto_db(
+    env_project_dir: Option<&std::ffi::OsStr>,
+    cwd: &Path,
+    home: &Path,
+) -> PathBuf {
+    if let Some(dir) = env_project_dir.filter(|d| !d.is_empty()) {
+        return Path::new(dir).join("mushroom-memory");
+    }
+    if cwd.join(".git").exists() {
+        return cwd.join("mushroom-memory");
+    }
+    home.join(".mushroomdb").join("memory")
+}
+
 /// How `serve` should mount a UI. Precedence: `--ui dir` > embedded > `--no-ui`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeUi {
@@ -55,10 +90,13 @@ pub enum AlgoSubcmd {
     Pagerank,
     Wcc,
     Degree,
+    Communities,
 }
 
 /// Parsed `mushroomdb` invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// No `Eq` derive: `Algo { min_weight: Option<f64>, .. }` carries a float.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Serve {
         db_dir: PathBuf,
@@ -80,7 +118,9 @@ pub enum Command {
         tls_key: Option<PathBuf>,
     },
     Mcp {
-        db_dir: PathBuf,
+        /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
+        db_dir: Option<PathBuf>,
+        auto: bool,
     },
     Stats {
         db_dir: PathBuf,
@@ -100,15 +140,22 @@ pub enum Command {
     Suggest {
         db_dir: PathBuf,
     },
-    /// Run a graph algorithm (pagerank / wcc / degree).
+    /// Run a graph algorithm (pagerank / wcc / degree / communities).
     Algo {
         db_dir: PathBuf,
         subcmd: AlgoSubcmd,
         /// Print only the top N results (0 = all).
         top: usize,
         /// Edge direction for degree/pagerank (`out` / `in` / `both`).
-        /// Ignored by `wcc`, which is always undirected.
+        /// Ignored by `wcc` and `communities`, which are always undirected.
         dir: AlgoDir,
+        /// `communities` only: restrict to the union of these edge types
+        /// (`--edge-type T`, repeatable). Empty means all edge types.
+        edge_types: Vec<String>,
+        /// `communities` only: edge property to read as the edge weight.
+        weight_prop: Option<String>,
+        /// `communities` only: drop edges below this resolved weight.
+        min_weight: Option<f64>,
     },
     /// Run a Cypher query (read or write).
     Query {
@@ -159,10 +206,59 @@ pub enum Command {
     Install(install::InstallOpts),
     /// Undo what `install` wrote (manifest-driven).
     Uninstall(install::InstallOpts),
+    /// Verify an install end to end: config, store, hooks, and a real MCP handshake.
+    Doctor(doctor::DoctorOpts),
     /// Body of the Claude Code UserPromptSubmit hook: reads a prompt payload on
     /// stdin, prints related graph facts on stdout.
     Recall {
+        db_dir: Option<PathBuf>,
+        auto: bool,
+    },
+    /// Bring the store up to date with the repository the `GitSync` marker
+    /// names: the commits since the marker, then the dirty working tree.
+    Sync {
         db_dir: PathBuf,
+        /// Print the report as one JSON object instead of the plain digest.
+        /// The MCP `sync` tool runs this binary and reads that object, so the
+        /// counts reach an assistant without being parsed back out of prose.
+        json: bool,
+    },
+    /// Re-extract named files only. Body of the PostToolUse hook, which reads
+    /// the paths off a payload on stdin when none are given on the command line.
+    Touch {
+        db_dir: Option<PathBuf>,
+        auto: bool,
+        files: Vec<PathBuf>,
+    },
+    /// Summarise the repository the store was built from: clusters, key
+    /// files, owners, what is hot, and what is worth asking about.
+    Map {
+        db_dir: PathBuf,
+        /// Print the [`core_api::repograph::RepoMap`] as JSON instead of the
+        /// rendered digest.
+        json: bool,
+    },
+    /// Everything the graph knows about one file or symbol.
+    Context {
+        db_dir: PathBuf,
+        target: String,
+    },
+    /// What else the named files reach: co-change partners, importers, and the
+    /// symbols other files call.
+    Impact {
+        db_dir: PathBuf,
+        files: Vec<String>,
+    },
+    /// Who has written a file, and when.
+    Owners {
+        db_dir: PathBuf,
+        path: String,
+    },
+    /// What links two nodes, with the evidence behind each link.
+    Why {
+        db_dir: PathBuf,
+        a: String,
+        b: String,
     },
     Version,
     Help,
@@ -210,13 +306,31 @@ pub fn usage() -> &'static str {
 mushroomdb — embedded graph database
 
 Usage:
-  mushroomdb install [--platform claude-code|cursor|all] [--project] [--db <path>]
-  mushroomdb uninstall [--platform claude-code|cursor|all] [--project] [--db <path>]
+  mushroomdb install [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
+                     [--command <path>] [--no-git-hooks] [--no-prewarm]
+  mushroomdb uninstall [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
+  mushroomdb doctor [--project|--user] [--platform claude-code|cursor|codex|all]
+                     verify an install: config entry, store, hooks, git hooks, and a real
+                     stdio handshake with the configured MCP command; exits 1 on any `fail`
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
-  mushroomdb mcp <db-dir>
+  mushroomdb mcp <db-dir>|--auto
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
-  mushroomdb recall <db-dir>       hook body: reads a prompt payload on stdin, prints related graph facts
+  mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
+  mushroomdb sync <db-dir> [--json] re-sync the repo the store was built from: new commits, then the dirty working tree
+  mushroomdb map <db-dir> [--json] summarise the graphed repository: clusters, key files, owners, hot files
+                                   --json prints the computed map instead of the rendered digest
+  mushroomdb context <db-dir> <target>   one file or symbol from every side: signature, source, callers,
+                                   callees, importers, co-change partners, commits, notes
+                                   <target> is a file path, a symbol key, or a bare symbol name
+  mushroomdb impact <db-dir> <file>...   what changing these files reaches: partners, importers,
+                                   and the symbols other files call
+  mushroomdb owners <db-dir> <path>      top author and share, who else knows it, last touch, last 4 quarters
+  mushroomdb why <db-dir> <a> <b>        every rule edge between two nodes with its evidence, or the
+                                   shortest path between them
+  mushroomdb touch <db-dir>|--auto [<file>...]
+                                   re-extract just these files; with no <file> reads them from a
+                                   PostToolUse payload on stdin (hook body)
   mushroomdb suggest <db-dir>
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
@@ -226,24 +340,46 @@ Usage:
   mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
                                       WARNING: unsafe against a concurrently running serve process;
                                       use POST /backup on the HTTP server for live-serve backups
-  mushroomdb export <db-dir> <dest> --format jsonl|parquet   export all data
-  mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]...   graph a git repo (authors, commits, files, co-change + ownership rules); re-run to sync
+  mushroomdb export <db-dir> <dest> --format jsonl|parquet|graphml   export all data
+                                      graphml writes one file: <dest>/graph.graphml if <dest> is an
+                                      existing directory, otherwise <dest> is the file path itself
+                                      (nodes + edges only; rules have no GraphML analogue)
+  mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]... [--max-commits-per-file N]
+                        [--recurse-submodules] [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]
+                                   graph a git repo (authors, commits, files, symbols, imports, calls, mentions); re-run to sync
+                                   --recurse-submodules also walks each initialised submodule
+                                   --prs links merged pull requests via gh (skipped when gh is unavailable)
+                                   --no-structure skips the working-tree pass (no hashes, symbols, imports or calls)
+                                   --no-docs skips Markdown bodies, headings and mentions
+                                   --ensure-gitignore adds the database directory to the repo's .gitignore
+                                   with no --exclude the defaults apply: target/ node_modules/ dist/ .git/ *.lock *.min.js
   mushroomdb schema apply <db-dir> <schema.json>
   mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
   mushroomdb algo wcc <db-dir> [--top N]
   mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
+  mushroomdb algo communities <db-dir> [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]
   mushroomdb --version
   mushroomdb --help
 
 Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or MUSHROOMDB_TOKEN.
-install defaults: --platform auto-detect, user scope (omit --project for ~/.mushroomdb/memory).
+install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
+the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
+--command names one (a relative --command or --db is anchored to the current directory).
+--no-git-hooks skips the post-commit/checkout/merge sync hooks; --no-prewarm skips fetching the
+pinned package once. uninstall resolves the same scope and falls back to the other one when the
+inferred scope has no manifest; undoing a Codex install needs --platform codex.
+--auto resolves the database as $CLAUDE_PROJECT_DIR/mushroom-memory, else ./mushroom-memory in a
+git checkout, else ~/.mushroomdb/memory.
 "
 }
 
 fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
     let mut platform: Option<install::Platform> = None;
-    let mut project = false;
+    let mut scope: Option<install::Scope> = None;
     let mut db: Option<PathBuf> = None;
+    let mut command: Option<PathBuf> = None;
+    let mut git_hooks = true;
+    let mut prewarm = true;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -257,8 +393,34 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
         } else if let Some(val) = a.strip_prefix("--platform=") {
             platform = Some(install::Platform::parse(val)?);
             i += 1;
-        } else if a == "--project" {
-            project = true;
+        } else if a == "--project" || a == "--user" {
+            let want = if a == "--project" {
+                install::Scope::Project
+            } else {
+                install::Scope::User
+            };
+            // Two scopes name two different installs; picking one silently
+            // would put files somewhere the user did not ask for.
+            if scope.is_some_and(|s| s != want) {
+                return Err("--project and --user are mutually exclusive".to_string());
+            }
+            scope = Some(want);
+            i += 1;
+        } else if a == "--no-git-hooks" {
+            git_hooks = false;
+            i += 1;
+        } else if a == "--no-prewarm" {
+            prewarm = false;
+            i += 1;
+        } else if a == "--command" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --command".to_string())?;
+            command = Some(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--command=") {
+            command = Some(PathBuf::from(val));
             i += 1;
         } else if a == "--db" {
             let val = args
@@ -278,19 +440,78 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
     }
     Ok(install::InstallOpts {
         platform,
-        project,
+        scope,
         db,
+        command,
+        git_hooks,
+        prewarm,
     })
+}
+
+fn parse_doctor_cmd(args: &[&str]) -> Result<doctor::DoctorOpts, String> {
+    let mut platform: Option<install::Platform> = None;
+    let mut scope: Option<install::Scope> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--platform" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --platform".to_string())?;
+            platform = Some(install::Platform::parse(val)?);
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--platform=") {
+            platform = Some(install::Platform::parse(val)?);
+            i += 1;
+        } else if a == "--project" || a == "--user" {
+            let want = if a == "--project" {
+                install::Scope::Project
+            } else {
+                install::Scope::User
+            };
+            if scope.is_some_and(|s| s != want) {
+                return Err("--project and --user are mutually exclusive".to_string());
+            }
+            scope = Some(want);
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else {
+            return Err(format!("unexpected argument: {a}"));
+        }
+    }
+    Ok(doctor::DoctorOpts { platform, scope })
 }
 
 fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
     let mut positional = Vec::new();
     let mut exclude = Vec::new();
     let mut max_commits_per_file = ingest_git::DEFAULT_MAX_COMMITS_PER_FILE;
+    let mut recurse_submodules = false;
+    let mut prs = false;
+    let mut structure = true;
+    let mut docs = true;
+    let mut ensure_gitignore = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--exclude" {
+        if a == "--recurse-submodules" {
+            recurse_submodules = true;
+            i += 1;
+        } else if a == "--prs" {
+            prs = true;
+            i += 1;
+        } else if a == "--no-structure" {
+            structure = false;
+            i += 1;
+        } else if a == "--no-docs" {
+            docs = false;
+            i += 1;
+        } else if a == "--ensure-gitignore" {
+            ensure_gitignore = true;
+            i += 1;
+        } else if a == "--exclude" {
             exclude.push(
                 args.get(i + 1)
                     .copied()
@@ -325,12 +546,26 @@ fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
     let [db_dir, repo] = positional.as_slice() else {
         return Err("ingest-git requires <db-dir> <repo-dir>".into());
     };
+    // Structure ingest reads the working tree, where a repository carries
+    // build output and vendored dependencies that its history does not. A user
+    // who states any pattern of their own is taken to mean exactly that set.
+    if exclude.is_empty() {
+        exclude = ingest_git::DEFAULT_EXCLUDES
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect();
+    }
     Ok(Command::IngestGit {
         db_dir: PathBuf::from(db_dir),
         opts: ingest_git::IngestGitOpts {
             repo: PathBuf::from(repo),
             exclude,
             max_commits_per_file,
+            recurse_submodules,
+            prs,
+            structure,
+            docs,
+            ensure_gitignore,
         },
     })
 }
@@ -345,7 +580,9 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "--help" | "-h" | "help" => Ok(Command::Help),
         "--version" | "-V" | "version" => Ok(Command::Version),
         "serve" => parse_serve(&args[1..]),
-        "mcp" => parse_one_dir("mcp", &args[1..]).map(|db_dir| Command::Mcp { db_dir }),
+        "mcp" => {
+            parse_dir_or_auto("mcp", &args[1..]).map(|(db_dir, auto)| Command::Mcp { db_dir, auto })
+        }
         "stats" => parse_one_dir("stats", &args[1..]).map(|db_dir| Command::Stats { db_dir }),
         "demo" => parse_one_dir("demo", &args[1..]).map(|db_dir| Command::Demo { db_dir }),
         "suggest" => parse_one_dir("suggest", &args[1..]).map(|db_dir| Command::Suggest { db_dir }),
@@ -358,10 +595,36 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
         "backup" => parse_backup(&args[1..]),
         "export" => parse_export(&args[1..]),
-        "recall" => parse_one_dir("recall", &args[1..]).map(|db_dir| Command::Recall { db_dir }),
+        "recall" => parse_dir_or_auto("recall", &args[1..])
+            .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
+        "sync" => parse_dir_with_json("sync", &args[1..])
+            .map(|(db_dir, json)| Command::Sync { db_dir, json }),
+        "map" => parse_dir_with_json("map", &args[1..])
+            .map(|(db_dir, json)| Command::Map { db_dir, json }),
+        "context" => {
+            parse_positional("context", &args[1..], 1, 1).map(|(db_dir, rest)| Command::Context {
+                db_dir,
+                target: rest[0].clone(),
+            })
+        }
+        "impact" => parse_positional("impact", &args[1..], 1, usize::MAX)
+            .map(|(db_dir, files)| Command::Impact { db_dir, files }),
+        "owners" => {
+            parse_positional("owners", &args[1..], 1, 1).map(|(db_dir, rest)| Command::Owners {
+                db_dir,
+                path: rest[0].clone(),
+            })
+        }
+        "why" => parse_positional("why", &args[1..], 2, 2).map(|(db_dir, rest)| Command::Why {
+            db_dir,
+            a: rest[0].clone(),
+            b: rest[1].clone(),
+        }),
+        "touch" => parse_touch(&args[1..]),
         "ingest-git" => parse_ingest_git(&args[1..]),
         "install" => parse_install_cmd(&args[1..]).map(Command::Install),
         "uninstall" => parse_install_cmd(&args[1..]).map(Command::Uninstall),
+        "doctor" => parse_doctor_cmd(&args[1..]).map(Command::Doctor),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -922,12 +1185,14 @@ fn parse_export(args: &[&str]) -> Result<Command, String> {
                 .get(i + 1)
                 .copied()
                 .ok_or_else(|| "missing value for --format".to_string())?;
-            format = ExportFormat::parse(val)
-                .ok_or_else(|| format!("unknown format '{val}'; expected jsonl or parquet"))?;
+            format = ExportFormat::parse(val).ok_or_else(|| {
+                format!("unknown format '{val}'; expected jsonl, parquet, or graphml")
+            })?;
             i += 2;
         } else if let Some(val) = a.strip_prefix("--format=") {
-            format = ExportFormat::parse(val)
-                .ok_or_else(|| format!("unknown format '{val}'; expected jsonl or parquet"))?;
+            format = ExportFormat::parse(val).ok_or_else(|| {
+                format!("unknown format '{val}'; expected jsonl, parquet, or graphml")
+            })?;
             i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
@@ -977,17 +1242,40 @@ pub fn run_export(db_dir: &Path, dest: &Path, format: &ExportFormat) -> Result<S
     let edge_count = edges.len();
     let rule_count = rules.len();
     match format {
-        ExportFormat::Jsonl => export::write_jsonl(&nodes, &edges, &rules, dest)?,
-        ExportFormat::Parquet => export::write_parquet(&nodes, &edges, &rules, dest)?,
+        ExportFormat::Jsonl => {
+            export::write_jsonl(&nodes, &edges, &rules, dest)?;
+            Ok(format!(
+                "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
+                dest.display(),
+                format.name(),
+                node_count,
+                edge_count,
+                rule_count
+            ))
+        }
+        ExportFormat::Parquet => {
+            export::write_parquet(&nodes, &edges, &rules, dest)?;
+            Ok(format!(
+                "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
+                dest.display(),
+                format.name(),
+                node_count,
+                edge_count,
+                rule_count
+            ))
+        }
+        // GraphML has no rule analogue: only nodes and edges are written.
+        ExportFormat::Graphml => {
+            let file_path = export::write_graphml(&nodes, &edges, dest)?;
+            Ok(format!(
+                "exported to {} (format={}): {} nodes, {} edges\n",
+                file_path.display(),
+                format.name(),
+                node_count,
+                edge_count,
+            ))
+        }
     }
-    Ok(format!(
-        "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
-        dest.display(),
-        format.name(),
-        node_count,
-        edge_count,
-        rule_count
-    ))
 }
 
 fn format_result_set(rs: &ResultSet) -> String {
@@ -1006,15 +1294,18 @@ fn format_result_set(rs: &ResultSet) -> String {
 
 fn parse_algo(args: &[&str]) -> Result<Command, String> {
     if args.is_empty() {
-        return Err("algo requires a subcommand: pagerank | wcc | degree".to_string());
+        return Err(
+            "algo requires a subcommand: pagerank | wcc | degree | communities".to_string(),
+        );
     }
     let subcmd = match args[0] {
         "pagerank" => AlgoSubcmd::Pagerank,
         "wcc" => AlgoSubcmd::Wcc,
         "degree" => AlgoSubcmd::Degree,
+        "communities" => AlgoSubcmd::Communities,
         other => {
             return Err(format!(
-                "unknown algo subcommand: {other}; expected pagerank | wcc | degree"
+                "unknown algo subcommand: {other}; expected pagerank | wcc | degree | communities"
             ))
         }
     };
@@ -1022,6 +1313,9 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut top: usize = 20;
     let mut dir = AlgoDir::Both;
+    let mut edge_types: Vec<String> = Vec::new();
+    let mut weight_prop: Option<String> = None;
+    let mut min_weight: Option<f64> = None;
     let mut i = 0;
     while i < rest.len() {
         let a = rest[i];
@@ -1049,6 +1343,42 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--dir=") {
             dir = parse_algo_dir(val)?;
             i += 1;
+        } else if a == "--edge-type" {
+            let val = rest
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --edge-type".to_string())?;
+            edge_types.push(val.to_string());
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--edge-type=") {
+            edge_types.push(val.to_string());
+            i += 1;
+        } else if a == "--weight-prop" {
+            let val = rest
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --weight-prop".to_string())?;
+            weight_prop = Some(val.to_string());
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--weight-prop=") {
+            weight_prop = Some(val.to_string());
+            i += 1;
+        } else if a == "--min-weight" {
+            let val = rest
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --min-weight".to_string())?;
+            min_weight = Some(
+                val.parse()
+                    .map_err(|_| format!("--min-weight must be a number, got {val}"))?,
+            );
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--min-weight=") {
+            min_weight = Some(
+                val.parse()
+                    .map_err(|_| format!("--min-weight must be a number, got {val}"))?,
+            );
+            i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -1064,6 +1394,9 @@ fn parse_algo(args: &[&str]) -> Result<Command, String> {
         subcmd,
         top,
         dir,
+        edge_types,
+        weight_prop,
+        min_weight,
     })
 }
 
@@ -1077,15 +1410,88 @@ fn parse_algo_dir(val: &str) -> Result<AlgoDir, String> {
     }
 }
 
+/// Body of `mushroomdb map <db-dir> [--json]`.
+///
+/// Opens read-only, with both write paths off: a map is a question, and asking
+/// it must never migrate a snapshot, rewrite a torn WAL tail, or make a writer
+/// wait on the cross-process lock.
+pub fn run_map(db_dir: &Path, json: bool) -> Result<String, CliError> {
+    let db = open_for_reading(db_dir)?;
+    let map = repograph::repo_map(&db, &repograph::MapOptions::default());
+    if json {
+        let mut out = serde_json::to_string_pretty(&map)
+            .map_err(|e| CliError(format!("serialise map: {e}")))?;
+        out.push('\n');
+        return Ok(out);
+    }
+    Ok(repograph::render_map(&map))
+}
+
+/// Open a store the way every question about it is asked: read-only, with both
+/// write paths off, so asking never migrates a snapshot, rewrites a torn WAL
+/// tail, or makes a writer wait on the cross-process lock.
+fn open_for_reading(db_dir: &Path) -> Result<structure::Db, CliError> {
+    Ok(GraphDb::open_with_options(
+        db_dir,
+        core_api::OpenOptions {
+            auto_migrate: false,
+            repair_wal: false,
+            read_only: true,
+        },
+    )?)
+}
+
+/// Body of `mushroomdb context <db-dir> <target>`.
+///
+/// The source is quoted from the repository the `GitSync` marker names, which
+/// is the checkout the store was built from.
+pub fn run_context(db_dir: &Path, target: &str) -> Result<String, CliError> {
+    let db = open_for_reading(db_dir)?;
+    Ok(repograph::render_context(&repograph::context(
+        &db, None, target,
+    )))
+}
+
+/// Body of `mushroomdb impact <db-dir> <file>...`.
+///
+/// The files named are taken to be the change, so each is reported and every
+/// partner that is one of them is marked `modified`.
+pub fn run_impact(db_dir: &Path, files: &[String]) -> Result<String, CliError> {
+    let db = open_for_reading(db_dir)?;
+    let modified: BTreeSet<String> = files.iter().cloned().collect();
+    let report = repograph::impact(&db, files, &modified, &repograph::ImpactOptions::default());
+    Ok(repograph::render_impact(&report))
+}
+
+/// Body of `mushroomdb owners <db-dir> <path>`.
+pub fn run_owners(db_dir: &Path, path: &str) -> Result<String, CliError> {
+    let db = open_for_reading(db_dir)?;
+    match repograph::owners(&db, path, None) {
+        Some(report) => Ok(repograph::render_owners(&report)),
+        None => Err(CliError(format!("no file in the store at {path}"))),
+    }
+}
+
+/// Body of `mushroomdb why <db-dir> <a> <b>`.
+pub fn run_why(db_dir: &Path, a: &str, b: &str) -> Result<String, CliError> {
+    let db = open_for_reading(db_dir)?;
+    Ok(repograph::render_why(&repograph::why(&db, a, b)))
+}
+
 /// Run a graph algorithm and return a formatted string.
 ///
-/// `dir` selects the edge direction for `degree` and `pagerank`; `wcc` is
-/// always undirected and ignores it.
+/// `dir` selects the edge direction for `degree` and `pagerank`; `wcc` and
+/// `communities` are always undirected and ignore it. `edge_types` /
+/// `weight_prop` / `min_weight` are used by `communities` only.
+#[allow(clippy::too_many_arguments)]
 pub fn run_algo(
     db_dir: &Path,
     subcmd: &AlgoSubcmd,
     top: usize,
     dir: AlgoDir,
+    edge_types: Vec<String>,
+    weight_prop: Option<String>,
+    min_weight: Option<f64>,
 ) -> Result<String, CliError> {
     let db = GraphDb::open(db_dir)?;
     match subcmd {
@@ -1109,6 +1515,16 @@ pub fn run_algo(
             };
             let report = db.degree_centrality(&config);
             Ok(format_degree(&report, top))
+        }
+        AlgoSubcmd::Communities => {
+            let config = LouvainConfig {
+                edge_types,
+                weight_prop,
+                min_weight,
+                ..LouvainConfig::default()
+            };
+            let report = db.communities(&config);
+            Ok(format_communities(&report, top))
         }
     }
 }
@@ -1157,6 +1573,145 @@ fn format_degree(report: &core_api::DegreeReport, top: usize) -> String {
         let _ = writeln!(buf, "  {:>4}  {:<40}  degree={}", i + 1, key, deg);
     }
     buf
+}
+
+/// One line per community: id, size, cohesion, first 3 members.
+/// Prints `(truncated)` in the header when the time budget fired.
+fn format_communities(report: &core_api::CommunityReport, top: usize) -> String {
+    let mut buf = String::new();
+    let trunc = if report.truncated { " (truncated)" } else { "" };
+    let _ = writeln!(
+        buf,
+        "== communities (modularity={:.2}){trunc} ==",
+        report.modularity
+    );
+    let rows = if top == 0 {
+        report.communities.as_slice()
+    } else {
+        &report.communities[..top.min(report.communities.len())]
+    };
+    for c in rows {
+        let preview: Vec<&str> = c.members.iter().take(3).map(String::as_str).collect();
+        let _ = writeln!(
+            buf,
+            "  {:>4}  size={:<6} cohesion={:<6.2} members=[{}]",
+            c.id,
+            c.members.len(),
+            c.cohesion,
+            preview.join(", ")
+        );
+    }
+    buf
+}
+
+/// `<db-dir>` or `--auto`, for the commands a hook line invokes.
+///
+/// Exactly one of the two: `--auto` says "work it out from the environment",
+/// which a stated path contradicts rather than refines.
+fn parse_dir_or_auto(cmd: &str, args: &[&str]) -> Result<(Option<PathBuf>, bool), String> {
+    let mut db_dir = None;
+    let mut auto = false;
+    for a in args {
+        if *a == "--auto" {
+            auto = true;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_some() {
+            return Err(format!("unexpected extra argument: {a}"));
+        } else {
+            db_dir = Some(PathBuf::from(*a));
+        }
+    }
+    match (&db_dir, auto) {
+        (Some(_), true) => Err(format!("{cmd}: --auto takes no <db-dir>")),
+        (None, false) => Err(format!("{cmd} requires <db-dir> or --auto")),
+        _ => Ok((db_dir, auto)),
+    }
+}
+
+/// `touch [<db-dir>|--auto] [<file>...]`. The first positional is the database
+/// unless `--auto` already named it, in which case every positional is a file.
+fn parse_touch(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir = None;
+    let mut auto = false;
+    let mut files = Vec::new();
+    for a in args {
+        if *a == "--auto" {
+            auto = true;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_none() && !auto {
+            db_dir = Some(PathBuf::from(*a));
+        } else {
+            files.push(PathBuf::from(*a));
+        }
+    }
+    if db_dir.is_none() && !auto {
+        return Err("touch requires <db-dir> or --auto".into());
+    }
+    if db_dir.is_some() && auto {
+        return Err("touch: --auto takes no <db-dir>".into());
+    }
+    Ok(Command::Touch {
+        db_dir,
+        auto,
+        files,
+    })
+}
+
+/// `<db-dir>` followed by between `min` and `max` further arguments, none of
+/// which may look like a flag.
+///
+/// The graph tools take keys — paths and symbol names — and a key beginning
+/// with `-` is far more likely to be a typo'd flag than a file called `-x`, so
+/// it is refused rather than looked up and reported missing.
+fn parse_positional(
+    cmd: &str,
+    args: &[&str],
+    min: usize,
+    max: usize,
+) -> Result<(PathBuf, Vec<String>), String> {
+    let mut rest: Vec<String> = Vec::new();
+    let mut db_dir: Option<PathBuf> = None;
+    for a in args {
+        if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        }
+        match db_dir {
+            None => db_dir = Some(PathBuf::from(*a)),
+            Some(_) => rest.push((*a).to_string()),
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| format!("{cmd} requires <db-dir>"))?;
+    if rest.len() < min {
+        return Err(format!(
+            "{cmd} requires <db-dir> and {min} more argument{}",
+            if min == 1 { "" } else { "s" }
+        ));
+    }
+    if rest.len() > max {
+        return Err(format!("unexpected extra argument: {}", rest[max]));
+    }
+    Ok((db_dir, rest))
+}
+
+/// `<cmd> <db-dir> [--json]`, shared by `map` and `sync`.
+fn parse_dir_with_json(cmd: &str, args: &[&str]) -> Result<(PathBuf, bool), String> {
+    let mut db_dir = None;
+    let mut json = false;
+    for a in args {
+        if *a == "--json" {
+            json = true;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_some() {
+            return Err(format!("unexpected extra argument: {a}"));
+        } else {
+            db_dir = Some(PathBuf::from(*a));
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| format!("{cmd} requires <db-dir>"))?;
+    Ok((db_dir, json))
 }
 
 fn parse_one_dir(cmd: &str, args: &[&str]) -> Result<PathBuf, String> {
@@ -1815,8 +2370,9 @@ mod tests {
             Case {
                 args: &["mcp", "/tmp/demo-db"],
                 check: |r| match r {
-                    Ok(Command::Mcp { db_dir }) => {
-                        assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
+                    Ok(Command::Mcp { db_dir, auto }) => {
+                        assert_eq!(db_dir, Some(PathBuf::from("/tmp/demo-db")));
+                        assert!(!auto);
                     }
                     other => panic!("mcp <dir>, got {other:?}"),
                 },
@@ -2641,6 +3197,292 @@ mod tests {
     }
 
     #[test]
+    fn parse_export_graphml_flag() {
+        let r = parse_args(&["export", "/db/dir", "/dest", "--format", "graphml"]);
+        match r {
+            Ok(Command::Export { format, .. }) => {
+                assert_eq!(format, ExportFormat::Graphml);
+            }
+            other => panic!("export --format graphml parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_export_graphml_structure() {
+        let src = tmp("cli-export-gml-src");
+        let dst_dir = tmp("cli-export-gml-dst");
+        let dst = dst_dir.join("graph.graphml");
+        let _ = run_demo(&src).expect("demo");
+        run_export(&src, &dst, &ExportFormat::Graphml).expect("graphml export");
+
+        let content = std::fs::read_to_string(&dst).expect("read graphml");
+
+        assert!(
+            content.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"),
+            "must start with an XML declaration"
+        );
+        assert!(
+            content.contains("<graphml xmlns=\"http://graphml.graphdrawing.org/xmlns\">"),
+            "must use the standard GraphML namespace"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"n_label\" for=\"node\" attr.name=\"label\" attr.type=\"string\"/>"
+            ),
+            "must declare the node label key"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"e_type\" for=\"edge\" attr.name=\"type\" attr.type=\"string\"/>"
+            ),
+            "must declare the edge type key"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"e_derived\" for=\"edge\" attr.name=\"derived\" attr.type=\"boolean\"/>"
+            ),
+            "must declare the edge derived key"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"e_rule\" for=\"edge\" attr.name=\"rule\" attr.type=\"string\"/>"
+            ),
+            "must declare the edge rule key"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"e_weight\" for=\"edge\" attr.name=\"weight\" attr.type=\"double\"/>"
+            ),
+            "must declare the edge weight key"
+        );
+        // The demo store's Org nodes carry `founded_year` as a JSON integer
+        // (`Value::Int`, a 64-bit i64). GraphML's informal convention treats
+        // `attr.type="int"` as 32-bit, so this must declare `"long"`.
+        assert!(
+            content.contains(
+                "<key id=\"n_founded_year\" for=\"node\" attr.name=\"founded_year\" attr.type=\"long\"/>"
+            ),
+            "an int-valued prop must declare attr.type=\"long\", not \"int\", got: {content}"
+        );
+        assert!(
+            content.contains("<graph id=\"G\" edgedefault=\"directed\">"),
+            "must declare a single directed graph element"
+        );
+        assert!(content.contains("<node id="), "must contain node elements");
+        assert!(
+            content.contains("<edge id=\"e0\" source=\""),
+            "must contain a sequentially-numbered edge starting at e0"
+        );
+        assert!(
+            content.trim_end().ends_with("</graphml>"),
+            "must close the root element"
+        );
+
+        // The demo store's `skill_fit` rule declares weight_prop "score"; its
+        // derived FIT edges must carry both a rule and a weight in GraphML.
+        assert!(
+            content.contains("<data key=\"e_rule\">skill_fit</data>")
+                || content.contains("<data key=\"e_rule\">founded_within</data>"),
+            "at least one derived edge must carry its rule name"
+        );
+        assert!(
+            content.contains(&format!(
+                "<data key=\"{}\">",
+                "e_weight" /* declared above */
+            )),
+            "at least one derived edge must carry a weight value"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn run_export_graphml_dest_dir_writes_graph_dot_graphml() {
+        let src = tmp("cli-export-gml-dir-src");
+        let dst_dir = tmp("cli-export-gml-dir-dst");
+        std::fs::create_dir_all(&dst_dir).expect("mkdir dest");
+        let _ = run_demo(&src).expect("demo");
+
+        let msg = run_export(&src, &dst_dir, &ExportFormat::Graphml).expect("graphml export");
+
+        assert!(
+            dst_dir.join("graph.graphml").exists(),
+            "an existing directory dest must produce dest/graph.graphml"
+        );
+        assert!(
+            msg.contains("graph.graphml"),
+            "report must name the file actually written, got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    /// python3-gated: parses the exported file with the stdlib XML parser to
+    /// confirm it is well-formed. Skipped (not failed) when python3 is absent.
+    #[test]
+    fn run_export_graphml_is_well_formed_xml() {
+        let has_python3 = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_python3 {
+            eprintln!("skipping run_export_graphml_is_well_formed_xml: python3 not found");
+            return;
+        }
+
+        let src = tmp("cli-export-gml-wf-src");
+        let dst_dir = tmp("cli-export-gml-wf-dst");
+        let dst = dst_dir.join("graph.graphml");
+        let _ = run_demo(&src).expect("demo");
+        run_export(&src, &dst, &ExportFormat::Graphml).expect("graphml export");
+
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import sys, xml.etree.ElementTree as E; E.parse(sys.argv[1])")
+            .arg(&dst)
+            .status()
+            .expect("run python3");
+        assert!(
+            status.success(),
+            "python3's XML parser must accept the exported GraphML file"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn run_export_graphml_two_runs_byte_identical() {
+        let src = tmp("cli-export-gml-bi-src");
+        let dst_dir1 = tmp("cli-export-gml-bi-dst1");
+        let dst_dir2 = tmp("cli-export-gml-bi-dst2");
+        let dst1 = dst_dir1.join("graph.graphml");
+        let dst2 = dst_dir2.join("graph.graphml");
+        let _ = run_demo(&src).expect("demo");
+
+        run_export(&src, &dst1, &ExportFormat::Graphml).expect("first export");
+        run_export(&src, &dst2, &ExportFormat::Graphml).expect("second export");
+
+        let f1 = std::fs::read(&dst1).expect("read first");
+        let f2 = std::fs::read(&dst2).expect("read second");
+        assert_eq!(
+            f1, f2,
+            "graph.graphml must be byte-identical across two export runs"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir1);
+        let _ = std::fs::remove_dir_all(&dst_dir2);
+    }
+
+    #[test]
+    fn run_export_graphml_escapes_and_lists() {
+        use core_api::{GraphDb, Value};
+        let src = tmp("cli-export-gml-esc-src");
+        let dst_dir = tmp("cli-export-gml-esc-dst");
+        let dst = dst_dir.join("graph.graphml");
+
+        {
+            let mut db = GraphDb::open(&src).unwrap();
+            db.insert_node(
+                "Widget",
+                "w1",
+                vec![
+                    (
+                        "title".into(),
+                        Value::Str("Tom & Jerry <says> \"hi\" 'bye'".into()),
+                    ),
+                    (
+                        "tags".into(),
+                        Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+                    ),
+                ],
+            )
+            .unwrap();
+        }
+
+        run_export(&src, &dst, &ExportFormat::Graphml).expect("graphml export");
+        let content = std::fs::read_to_string(&dst).expect("read graphml");
+
+        assert!(
+            content.contains("Tom &amp; Jerry &lt;says&gt; &quot;hi&quot; &apos;bye&apos;"),
+            "special XML characters in string props must be escaped, got: {content}"
+        );
+        assert!(
+            !content.contains("Tom & Jerry <says>"),
+            "unescaped special characters must not appear verbatim"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"n_tags\" for=\"node\" attr.name=\"tags\" attr.type=\"string\"/>"
+            ),
+            "list-valued props must declare attr.type=\"string\""
+        );
+        assert!(
+            content.contains("<data key=\"n_tags\">[&quot;a&quot;,&quot;b&quot;]</data>"),
+            "list-valued props must render as XML-escaped JSON text, got: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    /// I2: when nodes disagree on the `Value` variant for a prop name (one
+    /// int, one string), the key must declare `attr.type="string"` — a value
+    /// of either type fits text — rather than picking one node's type and
+    /// risking a value that doesn't fit it.
+    #[test]
+    fn run_export_graphml_mixed_type_prop_declares_string() {
+        use core_api::{GraphDb, Value};
+        let src = tmp("cli-export-gml-mixed-src");
+        let dst_dir = tmp("cli-export-gml-mixed-dst");
+        let dst = dst_dir.join("graph.graphml");
+
+        {
+            let mut db = GraphDb::open(&src).unwrap();
+            db.insert_node("Metric", "m1", vec![("score".into(), Value::Int(5))])
+                .unwrap();
+            db.insert_node(
+                "Metric",
+                "m2",
+                vec![("score".into(), Value::Str("high".into()))],
+            )
+            .unwrap();
+        }
+
+        run_export(&src, &dst, &ExportFormat::Graphml).expect("graphml export");
+        let content = std::fs::read_to_string(&dst).expect("read graphml");
+
+        assert!(
+            content.contains(
+                "<key id=\"n_score\" for=\"node\" attr.name=\"score\" attr.type=\"string\"/>"
+            ),
+            "a prop name with conflicting value types across nodes must declare \
+             attr.type=\"string\", got: {content}"
+        );
+        assert!(
+            !content.contains("attr.name=\"score\" attr.type=\"long\""),
+            "must not declare a narrower type once a conflict is seen, got: {content}"
+        );
+        // Each node's own value still renders in its own literal text form,
+        // regardless of the declared (fallback) attr.type.
+        assert!(
+            content.contains("<data key=\"n_score\">5</data>"),
+            "the int-valued node must still render its literal int text, got: {content}"
+        );
+        assert!(
+            content.contains("<data key=\"n_score\">high</data>"),
+            "the string-valued node must still render its literal string text, got: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
     fn parse_algo_degree_defaults_dir_both() {
         let cmd = parse_args(&["algo", "degree", "/db"]).unwrap();
         match cmd {
@@ -2673,6 +3515,65 @@ mod tests {
     #[test]
     fn parse_algo_rejects_unknown_dir() {
         assert!(parse_args(&["algo", "degree", "/db", "--dir", "sideways"]).is_err());
+    }
+
+    #[test]
+    fn parse_algo_communities_parses_edge_type_weight_prop_min_weight() {
+        let cmd = parse_args(&[
+            "algo",
+            "communities",
+            "/db",
+            "--edge-type",
+            "IMPORTS",
+            "--edge-type=CO_CHANGED",
+            "--weight-prop",
+            "score",
+            "--min-weight",
+            "0.3",
+            "--top",
+            "5",
+        ])
+        .unwrap();
+        match cmd {
+            Command::Algo {
+                subcmd,
+                top,
+                edge_types,
+                weight_prop,
+                min_weight,
+                ..
+            } => {
+                assert_eq!(subcmd, AlgoSubcmd::Communities);
+                assert_eq!(top, 5);
+                assert_eq!(
+                    edge_types,
+                    vec!["IMPORTS".to_string(), "CO_CHANGED".to_string()]
+                );
+                assert_eq!(weight_prop, Some("score".to_string()));
+                assert_eq!(min_weight, Some(0.3));
+            }
+            other => panic!("expected Algo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_algo_communities_defaults_have_no_edge_type_or_weight_filter() {
+        let cmd = parse_args(&["algo", "communities", "/db"]).unwrap();
+        match cmd {
+            Command::Algo {
+                subcmd,
+                edge_types,
+                weight_prop,
+                min_weight,
+                ..
+            } => {
+                assert_eq!(subcmd, AlgoSubcmd::Communities);
+                assert!(edge_types.is_empty());
+                assert_eq!(weight_prop, None);
+                assert_eq!(min_weight, None);
+            }
+            other => panic!("expected Algo, got {other:?}"),
+        }
     }
 
     /// I1: exporting a store containing NaN/Inf floats must succeed, not panic.
@@ -2811,11 +3712,169 @@ mod tests {
         assert_eq!(
             parse_args(&["recall", "/tmp/db"]).unwrap(),
             Command::Recall {
-                db_dir: PathBuf::from("/tmp/db")
+                db_dir: Some(PathBuf::from("/tmp/db")),
+                auto: false,
             }
         );
-        assert!(parse_args(&["recall"]).is_err(), "db-dir is required");
+        assert!(
+            parse_args(&["recall"]).is_err(),
+            "one of <db-dir> or --auto is required"
+        );
         assert!(usage().contains("mushroomdb recall <db-dir>"));
+    }
+
+    #[test]
+    fn map_parses_a_dir_and_an_optional_json_flag() {
+        assert_eq!(
+            parse_args(&["map", "/tmp/db"]).unwrap(),
+            Command::Map {
+                db_dir: PathBuf::from("/tmp/db"),
+                json: false,
+            }
+        );
+        // The flag may come before or after the directory.
+        let want = Command::Map {
+            db_dir: PathBuf::from("/tmp/db"),
+            json: true,
+        };
+        assert_eq!(parse_args(&["map", "/tmp/db", "--json"]).unwrap(), want);
+        assert_eq!(parse_args(&["map", "--json", "/tmp/db"]).unwrap(), want);
+        assert!(parse_args(&["map"]).is_err(), "<db-dir> is required");
+        assert!(parse_args(&["map", "/tmp/db", "/tmp/other"]).is_err());
+        assert!(parse_args(&["map", "/tmp/db", "--nope"]).is_err());
+        assert!(usage().contains("mushroomdb map <db-dir> [--json]"));
+    }
+
+    #[test]
+    fn the_graph_tools_take_a_dir_and_their_keys() {
+        assert_eq!(
+            parse_args(&["context", "/tmp/db", "src/db.rs#open"]).unwrap(),
+            Command::Context {
+                db_dir: PathBuf::from("/tmp/db"),
+                target: "src/db.rs#open".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(&["impact", "/tmp/db", "a.rs", "b.rs"]).unwrap(),
+            Command::Impact {
+                db_dir: PathBuf::from("/tmp/db"),
+                files: vec!["a.rs".to_string(), "b.rs".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_args(&["owners", "/tmp/db", "a.rs"]).unwrap(),
+            Command::Owners {
+                db_dir: PathBuf::from("/tmp/db"),
+                path: "a.rs".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(&["why", "/tmp/db", "a.rs", "b.rs"]).unwrap(),
+            Command::Why {
+                db_dir: PathBuf::from("/tmp/db"),
+                a: "a.rs".to_string(),
+                b: "b.rs".to_string(),
+            }
+        );
+
+        // Too few arguments, too many, and a key that looks like a flag.
+        for args in [
+            vec!["context", "/tmp/db"],
+            vec!["context", "/tmp/db", "a", "b"],
+            vec!["impact", "/tmp/db"],
+            vec!["owners", "/tmp/db"],
+            vec!["why", "/tmp/db", "a"],
+            vec!["why", "/tmp/db", "a", "b", "c"],
+            vec!["why", "/tmp/db", "-a", "b"],
+            vec!["context"],
+        ] {
+            assert!(parse_args(&args).is_err(), "{args:?} must not parse");
+        }
+        for line in [
+            "mushroomdb context <db-dir> <target>",
+            "mushroomdb impact <db-dir> <file>...",
+            "mushroomdb owners <db-dir> <path>",
+            "mushroomdb why <db-dir> <a> <b>",
+        ] {
+            assert!(usage().contains(line), "usage is missing {line:?}");
+        }
+    }
+
+    /// Every hook-driven command takes either a path or `--auto`, never both
+    /// and never neither.
+    #[test]
+    fn hook_commands_take_a_dir_or_auto() {
+        assert_eq!(
+            parse_args(&["mcp", "--auto"]).unwrap(),
+            Command::Mcp {
+                db_dir: None,
+                auto: true
+            }
+        );
+        assert_eq!(
+            parse_args(&["recall", "--auto"]).unwrap(),
+            Command::Recall {
+                db_dir: None,
+                auto: true
+            }
+        );
+        for cmd in ["mcp", "recall", "touch"] {
+            assert!(parse_args(&[cmd]).is_err(), "{cmd} with no target");
+            assert!(
+                parse_args(&[cmd, "/tmp/db", "--auto"]).is_err(),
+                "{cmd} with both"
+            );
+        }
+        assert!(usage().contains("--auto"));
+    }
+
+    #[test]
+    fn sync_and_touch_parse() {
+        assert_eq!(
+            parse_args(&["sync", "/tmp/db"]).unwrap(),
+            Command::Sync {
+                db_dir: PathBuf::from("/tmp/db"),
+                json: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&["sync", "/tmp/db", "--json"]).unwrap(),
+            Command::Sync {
+                db_dir: PathBuf::from("/tmp/db"),
+                json: true,
+            }
+        );
+        assert!(parse_args(&["sync"]).is_err(), "db-dir is required");
+
+        // Positional form: the first path is the database, the rest are files.
+        assert_eq!(
+            parse_args(&["touch", "/tmp/db", "src/a.rs", "src/b.rs"]).unwrap(),
+            Command::Touch {
+                db_dir: Some(PathBuf::from("/tmp/db")),
+                auto: false,
+                files: vec![PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")],
+            }
+        );
+        // With --auto every positional is a file.
+        assert_eq!(
+            parse_args(&["touch", "--auto", "src/a.rs"]).unwrap(),
+            Command::Touch {
+                db_dir: None,
+                auto: true,
+                files: vec![PathBuf::from("src/a.rs")],
+            }
+        );
+        // No files at all is the hook form: the paths arrive on stdin.
+        assert_eq!(
+            parse_args(&["touch", "--auto"]).unwrap(),
+            Command::Touch {
+                db_dir: None,
+                auto: true,
+                files: vec![],
+            }
+        );
+        assert!(usage().contains("mushroomdb sync <db-dir>"));
+        assert!(usage().contains("mushroomdb touch"));
     }
 
     #[test]
@@ -2829,6 +3888,9 @@ mod tests {
             "--exclude=*.lock",
             "--max-commits-per-file",
             "50",
+            "--recurse-submodules",
+            "--prs",
+            "--ensure-gitignore",
         ])
         .unwrap();
         assert_eq!(
@@ -2839,6 +3901,11 @@ mod tests {
                     repo: PathBuf::from("/tmp/repo"),
                     exclude: vec!["target/".into(), "*.lock".into()],
                     max_commits_per_file: 50,
+                    recurse_submodules: true,
+                    prs: true,
+                    structure: true,
+                    docs: true,
+                    ensure_gitignore: true,
                 },
             }
         );
@@ -2848,11 +3915,34 @@ mod tests {
         else {
             panic!("expected IngestGit");
         };
-        assert!(opts.exclude.is_empty());
+        assert_eq!(
+            opts.exclude,
+            ingest_git::DEFAULT_EXCLUDES
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect::<Vec<_>>(),
+            "with no --exclude the defaults apply"
+        );
         assert_eq!(
             opts.max_commits_per_file,
             ingest_git::DEFAULT_MAX_COMMITS_PER_FILE
         );
+        assert!(!opts.recurse_submodules && !opts.prs && !opts.ensure_gitignore);
+        assert!(
+            opts.structure && opts.docs,
+            "structure and docs default on and are recorded on the marker"
+        );
+        let Command::IngestGit { opts, .. } = parse_args(&[
+            "ingest-git",
+            "/tmp/db",
+            "/tmp/repo",
+            "--no-structure",
+            "--no-docs",
+        ])
+        .unwrap() else {
+            panic!("expected IngestGit");
+        };
+        assert!(!opts.structure && !opts.docs);
         assert!(parse_args(&["ingest-git", "/tmp/db"]).is_err());
         assert!(parse_args(&["ingest-git", "/tmp/db", "/tmp/repo", "--nope"]).is_err());
         assert!(parse_args(&["ingest-git", "/tmp/db", "/tmp/repo", "--exclude"]).is_err());

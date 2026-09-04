@@ -32,9 +32,10 @@ All six compose with `All` to require multiple conditions on the same edge.
 
 ## Positioning
 
-mushroomdb is embedded-first (same process, no network round-trip), like
-DuckDB or SQLite. The optional `serve` command adds an HTTP API and a
-bundled graph explorer when you want them.
+mushroomdb is embedded-first: it runs in your process, against a directory on
+disk, with no network round-trip and no server to start. The optional `serve`
+command adds an HTTP API and a bundled graph explorer when you want them, and
+several processes can share one store — see [Concurrency](concurrency.md).
 
 The roadmap and the benchmark numbers are in [README.md](../../README.md). The
 full design spec is at [docs/design.md](../design.md).
@@ -46,20 +47,27 @@ full design spec is at [docs/design.md](../design.md).
 Pre-1.0 alpha — APIs and formats may change between minor versions. Single
 writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
 
-v0.5.2 is the current release. Install it with `npx mushroomdb install`, which
-writes the `/mushroom` skill, the MCP server entry, and the recall hook for
-Claude Code or Cursor. The crates.io (`cargo install mushroomdb-cli`,
-`cargo add mushroomdb`) and PyPI (`pip install mushroomdb`) packages are live at
-the same version. Docker, `install.sh`, and the build-from-source path are in
+v0.6.0 is the current release. The shortest way in is the Claude Code plugin —
+`claude marketplace add MatthewSherlin/mushroomdb` then `claude plugin install
+mushroom@mushroomdb`, and type `/mushroom:mushroom` in a repository. Or run
+`npx mushroomdb install`, which writes the `/mushroom` skill, the MCP server
+entry, the prompt and post-edit hooks, and the git hooks for Claude Code or
+Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`)
+and PyPI (`pip install mushroomdb`) packages are live at the same version.
+Docker, `install.sh`, and the build-from-source path are in
 [CONTRIBUTING.md](../../CONTRIBUTING.md).
 
 ---
 
 ## Pages in this section
 
-- [Quickstart](quickstart.md) — two commands to a running graph explorer
+- [Quickstart](quickstart.md) — two commands to a running graph explorer, two more to a graphed repository
+- [The live code graph](code-graph.md) — what the repository graph guarantees, measured, and what it does not do
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
-- [Codebase graph](ingest-git.md) — `ingest-git`, its co-change and ownership rules, incremental sync
+- [Codebase graph](ingest-git.md) — `ingest-git`, its rules, submodules, pull requests, incremental sync
+- [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
+- [MCP tools](mcp.md) — the eight task tools and the sixteen graph tools
+- [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
 - [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error

@@ -5,8 +5,8 @@
 //! test with an independent BFS reference.
 
 use core_api::{
-    AlgoDir, DegreeConfig, GraphDb, GraphError, PageRankConfig, Predicate, RuleDef, Value,
-    WccConfig,
+    AlgoDir, DegreeConfig, GraphDb, GraphError, LouvainConfig, PageRankConfig, Predicate, RuleDef,
+    Value, WccConfig,
 };
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -920,6 +920,7 @@ fn wcc_edge_type_filter_nonexistent() {
     let report = db.connected_components(&WccConfig {
         edge_type: Some("NONEXISTENT".into()),
         budget_ms: 5000,
+        ..WccConfig::default()
     });
     let comp_ids: BTreeSet<&str> = report.components.iter().map(|(_, c)| c.as_str()).collect();
     assert_eq!(
@@ -982,5 +983,459 @@ fn pagerank_on_demo_graph() {
     assert!(!report.scores.is_empty());
     let max_score = report.scores[0].1;
     assert!(max_score > 0.0, "max PR score must be positive");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Weight filters: WCC / PageRank
+// ---------------------------------------------------------------------------
+
+/// `min_weight` drops an edge before the algorithm runs: a weighted edge
+/// below the threshold no longer connects its endpoints.
+#[test]
+fn wcc_min_weight_filters_edges() {
+    let dir = tmp("wcc-min-weight");
+    let mut db = open(&dir);
+    // Overlap(tags) score for a/b: intersection={x} (1), union={x,y} (2) → 0.5.
+    db.insert_node(
+        "N",
+        "a",
+        vec![("tags".into(), Value::List(vec![Value::Str("x".into())]))],
+    )
+    .unwrap();
+    db.insert_node(
+        "N",
+        "b",
+        vec![(
+            "tags".into(),
+            Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]),
+        )],
+    )
+    .unwrap();
+    db.create_rule(RuleDef {
+        name: "overlap".into(),
+        src_label: "N".into(),
+        dst_label: "N".into(),
+        predicate: Predicate::Overlap {
+            field: "tags".into(),
+            min: 0.01,
+        },
+        edge_type: "REL".into(),
+        weight_prop: Some("score".into()),
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+
+    // score=0.5 present, no filter → a and b in the same component.
+    let connected = db.connected_components(&WccConfig {
+        weight_prop: Some("score".into()),
+        ..WccConfig::default()
+    });
+    let comp_ids: BTreeSet<&str> = connected
+        .components
+        .iter()
+        .map(|(_, c)| c.as_str())
+        .collect();
+    assert_eq!(
+        comp_ids.len(),
+        1,
+        "unfiltered 0.5-weight edge must connect a and b"
+    );
+
+    // min_weight above the resolved 0.5 score → edge dropped → 2 components.
+    let filtered = db.connected_components(&WccConfig {
+        weight_prop: Some("score".into()),
+        min_weight: Some(0.6),
+        ..WccConfig::default()
+    });
+    let filtered_comp_ids: BTreeSet<&str> = filtered
+        .components
+        .iter()
+        .map(|(_, c)| c.as_str())
+        .collect();
+    assert_eq!(
+        filtered_comp_ids.len(),
+        2,
+        "min_weight=0.6 must drop the 0.5-weight edge, isolating a and b"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PageRank distributes an out-node's mass proportionally to `weight_prop`
+/// when set; without it, mass splits evenly regardless of the stored score.
+#[test]
+fn pagerank_uses_weights_when_prop_set() {
+    let dir = tmp("pr-weighted");
+    let mut db = open(&dir);
+    db.insert_node(
+        "Hub",
+        "hub",
+        vec![(
+            "tags".into(),
+            Value::List(vec![
+                Value::Str("p".into()),
+                Value::Str("q".into()),
+                Value::Str("r".into()),
+            ]),
+        )],
+    )
+    .unwrap();
+    // score(hub,a): intersection={p,q}=2, union={p,q,r}=3 → 2/3.
+    db.insert_node(
+        "Leaf",
+        "a",
+        vec![(
+            "tags".into(),
+            Value::List(vec![Value::Str("p".into()), Value::Str("q".into())]),
+        )],
+    )
+    .unwrap();
+    // score(hub,b): intersection={p}=1, union={p,q,r}=3 → 1/3.
+    db.insert_node(
+        "Leaf",
+        "b",
+        vec![("tags".into(), Value::List(vec![Value::Str("p".into())]))],
+    )
+    .unwrap();
+    db.create_rule(RuleDef {
+        name: "hub-leaf".into(),
+        src_label: "Hub".into(),
+        dst_label: "Leaf".into(),
+        predicate: Predicate::Overlap {
+            field: "tags".into(),
+            min: 0.01,
+        },
+        edge_type: "OUT".into(),
+        weight_prop: Some("score".into()),
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+
+    // Baseline: no weight_prop → hub's mass splits evenly between a and b.
+    let unweighted = db.pagerank(&PageRankConfig {
+        edge_type: Some("OUT".into()),
+        max_iters: 100,
+        ..PageRankConfig::default()
+    });
+    let a_u = unweighted.scores.iter().find(|(k, _)| k == "a").unwrap().1;
+    let b_u = unweighted.scores.iter().find(|(k, _)| k == "b").unwrap().1;
+    assert!(
+        (a_u - b_u).abs() < 1e-9,
+        "without weight_prop, a and b must score equally, got a={a_u} b={b_u}"
+    );
+
+    // Weighted: hub sends 2/3 of its mass to a, 1/3 to b → a must outrank b.
+    let weighted = db.pagerank(&PageRankConfig {
+        edge_type: Some("OUT".into()),
+        weight_prop: Some("score".into()),
+        max_iters: 100,
+        ..PageRankConfig::default()
+    });
+    let a_w = weighted.scores.iter().find(|(k, _)| k == "a").unwrap().1;
+    let b_w = weighted.scores.iter().find(|(k, _)| k == "b").unwrap().1;
+    assert!(
+        a_w > b_w,
+        "with weight_prop, a (2/3 share) must outrank b (1/3 share), got a={a_w} b={b_w}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Louvain community detection
+// ---------------------------------------------------------------------------
+
+/// Fully connect every pair of `keys` under `edge_type` via manual edges.
+fn insert_clique(db: &mut GraphDb<core_storage::fs::RealFs>, edge_type: &str, keys: &[&str]) {
+    for i in 0..keys.len() {
+        for j in (i + 1)..keys.len() {
+            insert_edge(db, edge_type, keys[i], keys[j]);
+        }
+    }
+}
+
+/// Two 4-cliques joined by exactly one bridge edge must split into two
+/// communities matching the cliques.
+#[test]
+fn louvain_splits_two_cliques_joined_by_one_edge() {
+    let dir = tmp("louvain-two-cliques");
+    let mut db = open(&dir);
+    let a = ["a1", "a2", "a3", "a4"];
+    let b = ["b1", "b2", "b3", "b4"];
+    for k in a.iter().chain(b.iter()) {
+        insert_node(&mut db, "N", k);
+    }
+    insert_clique(&mut db, "E", &a);
+    insert_clique(&mut db, "E", &b);
+    insert_edge(&mut db, "E", "a1", "b1");
+
+    let report = db.communities(&LouvainConfig::default());
+    assert_eq!(
+        report.communities.len(),
+        2,
+        "two cliques joined by one weak edge must split into 2 communities, got {:?}",
+        report.communities
+    );
+    let mut member_sets: Vec<BTreeSet<String>> = report
+        .communities
+        .iter()
+        .map(|c| c.members.iter().cloned().collect())
+        .collect();
+    member_sets.sort_by_key(|s| s.iter().next().cloned().unwrap_or_default());
+    let want_a: BTreeSet<String> = a.iter().map(|s| s.to_string()).collect();
+    let want_b: BTreeSet<String> = b.iter().map(|s| s.to_string()).collect();
+    let mut want = vec![want_a, want_b];
+    want.sort_by_key(|s| s.iter().next().cloned().unwrap_or_default());
+    assert_eq!(
+        member_sets, want,
+        "communities must exactly match the two cliques"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Same graph, same config, repeated calls and a reopen must all agree
+/// byte-for-byte on the whole report.
+#[test]
+fn louvain_is_deterministic() {
+    let dir = tmp("louvain-det");
+    {
+        let mut db = open(&dir);
+        let a = ["a1", "a2", "a3", "a4"];
+        let b = ["b1", "b2", "b3", "b4"];
+        for k in a.iter().chain(b.iter()) {
+            insert_node(&mut db, "N", k);
+        }
+        insert_clique(&mut db, "E", &a);
+        insert_clique(&mut db, "E", &b);
+        insert_edge(&mut db, "E", "a1", "b1");
+    }
+
+    let config = LouvainConfig::default();
+    let r1;
+    let r2;
+    {
+        let db1 = open(&dir);
+        r1 = db1.communities(&config);
+        r2 = db1.communities(&config);
+        // db1 drops here, releasing the cross-process lock before reopening.
+    }
+    assert_eq!(
+        r1, r2,
+        "repeated calls on the same handle must agree exactly"
+    );
+
+    let db2 = GraphDb::open(&dir).expect("reopen");
+    let r3 = db2.communities(&config);
+    assert_eq!(r1, r3, "communities must be identical after a reopen");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `min_weight` drops a weak bridge entirely (cohesion goes from <1.0 to
+/// exactly 1.0); a high `resolution` fragments a single dense clique that a
+/// default resolution keeps merged.
+#[test]
+fn louvain_respects_min_weight_and_resolution() {
+    // --- Part 1: weight_prop + min_weight ---------------------------------
+    let dir = tmp("louvain-minweight");
+    let mut db = open(&dir);
+    let a = ["a1", "a2", "a3", "a4"];
+    let b = ["b1", "b2", "b3", "b4"];
+    for k in a.iter().chain(b.iter()) {
+        insert_node(&mut db, "N", k);
+    }
+    insert_clique(&mut db, "CLIQUE", &a); // no "score" prop → default weight 1.0
+    insert_clique(&mut db, "CLIQUE", &b);
+    // Dedicated labels so the bridge rule fires exactly once (src_label !=
+    // dst_label — no mirrored reverse edge).
+    db.insert_node(
+        "BridgeA",
+        "br-a",
+        vec![(
+            "tags".into(),
+            Value::List(vec![
+                Value::Str("shared".into()),
+                Value::Str("only-a".into()),
+            ]),
+        )],
+    )
+    .unwrap();
+    db.insert_node(
+        "BridgeB",
+        "br-b",
+        vec![(
+            "tags".into(),
+            Value::List(vec![
+                Value::Str("shared".into()),
+                Value::Str("only-b".into()),
+            ]),
+        )],
+    )
+    .unwrap();
+    // score(br-a,br-b): intersection={shared}=1, union=3 → 1/3.
+    db.create_rule(RuleDef {
+        name: "bridge".into(),
+        src_label: "BridgeA".into(),
+        dst_label: "BridgeB".into(),
+        predicate: Predicate::Overlap {
+            field: "tags".into(),
+            min: 0.01,
+        },
+        edge_type: "BRIDGE".into(),
+        weight_prop: Some("score".into()),
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    insert_edge(&mut db, "TO_A", "br-a", "a1");
+    insert_edge(&mut db, "TO_B", "br-b", "b1");
+
+    let unfiltered = db.communities(&LouvainConfig {
+        weight_prop: Some("score".into()),
+        ..LouvainConfig::default()
+    });
+    let has_partial_cohesion = unfiltered
+        .communities
+        .iter()
+        .any(|c| c.cohesion < 1.0 && c.cohesion > 0.0);
+    assert!(
+        has_partial_cohesion,
+        "the 1/3-weight bridge must leave some community's cohesion below 1.0, got {:?}",
+        unfiltered.communities
+    );
+
+    let filtered = db.communities(&LouvainConfig {
+        weight_prop: Some("score".into()),
+        min_weight: Some(0.9), // above 1/3, well below the default weight of 1.0
+        ..LouvainConfig::default()
+    });
+    for c in &filtered.communities {
+        assert!(
+            (c.cohesion - 1.0).abs() < 1e-9,
+            "with the bridge filtered out every community must be fully cohesive, got {:?}",
+            filtered.communities
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // --- Part 2: resolution -------------------------------------------------
+    // A single isolated 6-clique: default resolution merges it into one
+    // community; a high resolution's null-model penalty fragments it into
+    // singletons (hand-verified: gain per merge is negative once
+    // resolution*k_i*k_j/(2m) exceeds 1/m for this topology).
+    let dir2 = tmp("louvain-resolution");
+    let mut db2 = open(&dir2);
+    let clique: Vec<String> = (0..6).map(|i| format!("k{i}")).collect();
+    let keys: Vec<&str> = clique.iter().map(|s| s.as_str()).collect();
+    for k in &keys {
+        insert_node(&mut db2, "N", k);
+    }
+    insert_clique(&mut db2, "E", &keys);
+
+    let default_res = db2.communities(&LouvainConfig::default());
+    assert_eq!(
+        default_res.communities.len(),
+        1,
+        "default resolution must keep the isolated 6-clique as one community, got {:?}",
+        default_res.communities
+    );
+
+    let high_res = db2.communities(&LouvainConfig {
+        resolution: 10.0,
+        ..LouvainConfig::default()
+    });
+    assert!(
+        high_res.communities.len() > 1,
+        "resolution=10.0 must fragment the 6-clique into more than one community, got {:?}",
+        high_res.communities
+    );
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// The time budget is checked once per sweep: a large graph with a tiny
+/// budget must come back truncated, never panic or error, and still cover
+/// every node exactly once.
+#[test]
+fn louvain_budget_truncates_honestly() {
+    let dir = tmp("louvain-budget");
+    let mut db = open(&dir);
+    let n = 400usize;
+    let keys: Vec<String> = (0..n).map(|i| format!("n{i:04}")).collect();
+    for k in &keys {
+        insert_node(&mut db, "N", k);
+    }
+    let mut rng: u64 = 0x4d75_7368_726f_6f6d;
+    let lcg = |s: &mut u64| -> u64 {
+        *s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *s
+    };
+    for _ in 0..(n * 3) {
+        let i = (lcg(&mut rng) % n as u64) as usize;
+        let j = (lcg(&mut rng) % n as u64) as usize;
+        if i != j {
+            db.insert_edge("E", &keys[i], &keys[j]).unwrap();
+        }
+    }
+
+    let report = db.communities(&LouvainConfig {
+        budget_ms: 1,
+        max_sweeps: 200,
+        max_passes: 50,
+        ..LouvainConfig::default()
+    });
+    assert!(
+        report.truncated,
+        "a 1ms budget on a 400-node graph must truncate"
+    );
+    let total_members: usize = report.communities.iter().map(|c| c.members.len()).sum();
+    assert_eq!(
+        total_members, n,
+        "truncated report must still cover every node exactly once"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `node_label` restricts membership; edges touching a node outside the
+/// label set are ignored entirely (not just the node).
+#[test]
+fn louvain_node_label_restricts_members() {
+    let dir = tmp("louvain-label");
+    let mut db = open(&dir);
+    let a = ["a1", "a2", "a3"];
+    for k in a {
+        insert_node(&mut db, "A", k);
+    }
+    insert_node(&mut db, "B", "b1");
+    insert_node(&mut db, "B", "b2");
+    insert_clique(&mut db, "E", &a);
+    insert_edge(&mut db, "E", "b1", "b2");
+    // Cross-label edge: must be ignored when restricted to label "A".
+    insert_edge(&mut db, "E", "a1", "b1");
+
+    let report = db.communities(&LouvainConfig {
+        node_label: Some("A".into()),
+        ..LouvainConfig::default()
+    });
+    let all_members: BTreeSet<String> = report
+        .communities
+        .iter()
+        .flat_map(|c| c.members.iter().cloned())
+        .collect();
+    let want: BTreeSet<String> = a.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        all_members, want,
+        "node_label=A must restrict membership to A-labeled nodes only"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

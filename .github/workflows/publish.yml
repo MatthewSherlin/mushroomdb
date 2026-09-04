@@ -18,14 +18,16 @@
 #        - Repository name: mushroomdb
 #        - Workflow filename: publish.yml
 #      Do this for: mushroomdb-storage, mushroomdb-rules, mushroomdb-query,
-#        mushroomdb, mushroomdb-arrow, mushroomdb-server, mushroomdb-cli
+#        mushroomdb, mushroomdb-arrow, mushroomdb-server, mushroomdb-extract,
+#        mushroomdb-cli
 #   FIRST-PUBLISH BOOTSTRAP: crates.io Trusted Publishing requires the crate
 #   to already exist on the registry before a trusted publisher can be added.
 #   Bootstrap via: cargo login <your-api-token> && cargo publish -p <crate>
 #   (publishing once with a token, then switching to Trusted Publishing for all
 #   subsequent releases). Publish in dependency order:
 #     mushroomdb-storage → mushroomdb-rules → mushroomdb-query → mushroomdb
-#     → mushroomdb-arrow → mushroomdb-server → mushroomdb-cli
+#     → mushroomdb-arrow → mushroomdb-server → mushroomdb-extract
+#     → mushroomdb-cli
 #   Wait ~30 seconds between each publish for the index to update.
 #
 # PYPI (Trusted Publishing — no token):
@@ -109,7 +111,8 @@ jobs:
         run: |
           set -u
           for c in mushroomdb-storage mushroomdb-rules mushroomdb-query \
-                   mushroomdb mushroomdb-arrow mushroomdb-server mushroomdb-cli; do
+                   mushroomdb mushroomdb-arrow mushroomdb-server \
+                   mushroomdb-extract mushroomdb-cli; do
             echo "── publishing $c ──"
             if out=$(cargo publish -p "$c" 2>&1); then
               echo "$out" | tail -3
@@ -224,6 +227,11 @@ jobs:
     permissions:
       contents: read
       id-token: write  # Required for --provenance
+    outputs:
+      # The version actually published (or already on the registry), read
+      # from the mutated package.json rather than recomputed from the ref —
+      # smoke-npx needs the exact string npm has, not a guess at it.
+      version: ${{ steps.publish.outputs.version }}
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -250,16 +258,104 @@ jobs:
       # NODE_AUTH_TOKEN is the npm granular token from the NPM_TOKEN secret.
       # Skip if this exact version is already on the registry (idempotent re-runs).
       - name: npm publish mushroomdb
+        id: publish
         working-directory: packaging/npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           VER=$(node -p "require('./package.json').version")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
           if npm view "mushroomdb@$VER" version >/dev/null 2>&1; then
             echo "mushroomdb@$VER already published — skipping"
           else
             npm publish --provenance --access public
           fi
+
+  # Post-publish smoke test: the exact path a new user takes. `npx` fetches
+  # the just-published package into a clean HOME, `install` writes an
+  # .mcp.json pinned to it, and the SDK handshake script spawns that pinned
+  # `npx` command for real — so a break anywhere in the published artifact
+  # (missing bin, bad shebang, a launcher that can't find the native binary)
+  # fails the release, not a user.
+  smoke-npx:
+    name: npx smoke test
+    needs: [publish-npm-launcher]
+    if: ${{ needs.publish-npm-launcher.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: install handshake script deps
+        working-directory: scripts/mcp-handshake
+        run: npm ci
+
+      - name: wait for the published version to propagate on npm
+        env:
+          VER: ${{ needs.publish-npm-launcher.outputs.version }}
+        run: |
+          set -euxo pipefail
+          for i in $(seq 1 45); do
+            if npm view "mushroomdb@$VER" version >/dev/null 2>&1; then
+              echo "mushroomdb@$VER is live on npm"
+              exit 0
+            fi
+            echo "waiting for mushroomdb@$VER to propagate ($i/45)…"
+            sleep 20
+          done
+          echo "mushroomdb@$VER did not appear on the npm registry within 15 minutes" >&2
+          exit 1
+
+      - name: npx install into a fresh project, then SDK handshake against it
+        env:
+          VER: ${{ needs.publish-npm-launcher.outputs.version }}
+        run: |
+          set -euxo pipefail
+
+          # Clean HOME: no pre-warmed npx cache, no pre-existing npm config —
+          # this is a first-time user's environment, not the CI runner's.
+          HOME="$(mktemp -d)"
+          export HOME
+
+          REPO="$(mktemp -d)"
+          cd "$REPO"
+          git init -q
+          git -c user.name=smoke -c user.email=smoke@example.test \
+            commit -q --allow-empty -m "smoke test project"
+
+          npx -y "mushroomdb@$VER" install --project --platform claude-code --no-git-hooks
+
+          test -f .mcp.json
+          command=$(jq -r '.mcpServers.mushroomdb.command' .mcp.json)
+          arg0=$(jq -r '.mcpServers.mushroomdb.args[0]' .mcp.json)
+          arg1=$(jq -r '.mcpServers.mushroomdb.args[1]' .mcp.json)
+          arg2=$(jq -r '.mcpServers.mushroomdb.args[2]' .mcp.json)
+          arg3=$(jq -r '.mcpServers.mushroomdb.args[3]' .mcp.json)
+          test "$command" = "npx"
+          test "$arg0" = "-y"
+          test "$arg1" = "mushroomdb@$VER"
+          test "$arg2" = "mcp"
+          case "$arg3" in
+            /*/mushroom-memory) : ;;
+            *)
+              echo "unexpected db path in .mcp.json args[3]: $arg3" >&2
+              exit 1
+              ;;
+          esac
+
+          OUT=$(node "$GITHUB_WORKSPACE/scripts/mcp-handshake/handshake.mjs" \
+            --config .mcp.json --server mushroomdb \
+            --expect-version "$VER" \
+            --expect-tools map,context,why \
+            --call why '{"a":"nope1","b":"nope2"}')
+          echo "$OUT"
+          echo "$OUT" | grep -q "unknown:"
 
   publish-npm-client:
     name: npm (mushroomdb-client)

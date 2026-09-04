@@ -421,6 +421,58 @@ impl<'a> PartialEq for ValueRef<'a> {
     }
 }
 
+/// Memoized decode of `Mixed` base columns, owned by the `MappedBase`.
+///
+/// Every typed column in a V8 base (`Int`, `Float`, `Bool`, `Str`, `Vector`) is
+/// indexed by node id, so reading one node's value is O(1) against the mmap.  A
+/// `Mixed` column is not: it is a single bincode blob holding *every* node's
+/// value for that field, and `List`- and `Map`-valued properties always land
+/// there (see `Column::promote` in `columns.rs`).  Decoding it per lookup makes
+/// a scan over N nodes cost N full-column decodes.
+///
+/// The columns section is immutable for the life of the mapping — post-snapshot
+/// writes go to the overlay, which `ColumnsView::get` consults first — so each
+/// field is decoded once and reused.  The decoded map is no larger than the
+/// `ColumnStore` representation the same data occupies when no snapshot exists,
+/// so this trades no more memory than a WAL-only open of the same store.
+///
+/// A blob that fails to decode memoizes as empty, which reads back as "no value
+/// for this field" — the same result the uncached path gives for the same bytes.
+#[derive(Default)]
+pub struct MixedCache {
+    /// An `RwLock` rather than a `Mutex`: after the first read of a field every
+    /// later one is a shared-lock hash lookup, so concurrent readers of a
+    /// `SharedDb` do not queue behind each other on the common path.
+    decoded: std::sync::RwLock<HashMap<String, std::sync::Arc<HashMap<u32, Value>>>>,
+}
+
+impl MixedCache {
+    /// Return the decoded form of the `Mixed` column `field`, decoding `blob`
+    /// on the first call and returning the memo on every later call.
+    ///
+    /// `blob` must be the bytes of that field's column in the base this cache
+    /// belongs to; the mapping is immutable, so the pairing is fixed.
+    pub fn get_or_decode(&self, field: &str, blob: &[u8]) -> std::sync::Arc<HashMap<u32, Value>> {
+        {
+            let guard = self.decoded.read().expect("mixed column cache poisoned");
+            if let Some(hit) = guard.get(field) {
+                return std::sync::Arc::clone(hit);
+            }
+        }
+        // Decoded with no lock held: a concurrent miss on the same field decodes
+        // twice and the first insert wins, which costs a little work but never
+        // returns different bytes — the blob cannot change.
+        let decoded: std::sync::Arc<HashMap<u32, Value>> =
+            std::sync::Arc::new(bincode::deserialize(blob).unwrap_or_default());
+        let mut guard = self.decoded.write().expect("mixed column cache poisoned");
+        std::sync::Arc::clone(
+            guard
+                .entry(field.to_string())
+                .or_insert_with(|| std::sync::Arc::clone(&decoded)),
+        )
+    }
+}
+
 /// Overlay-over-base column store view.
 ///
 /// Reads consult the owned overlay `ColumnStore` first; if the field/node is
@@ -438,6 +490,9 @@ impl<'a> PartialEq for ValueRef<'a> {
 pub struct ColumnsView<'a> {
     pub overlay: &'a ColumnStore,
     pub base: Option<&'a crate::v8::layout::ArchivedColumns>,
+    /// Memo for `Mixed` base columns; see [`MixedCache`].  `None` means every
+    /// `Mixed` read decodes the whole column, which is correct but O(column).
+    pub mixed: Option<&'a MixedCache>,
 }
 
 impl<'a> ColumnsView<'a> {
@@ -446,6 +501,7 @@ impl<'a> ColumnsView<'a> {
         Self {
             overlay,
             base: None,
+            mixed: None,
         }
     }
 
@@ -454,10 +510,29 @@ impl<'a> ColumnsView<'a> {
     /// Used when a V8 snapshot is open: `overlay` starts empty (or holds only
     /// post-snapshot mutations) and `base` is the zero-copy archived columns
     /// section from the V8 mmap.
+    ///
+    /// Prefer [`ColumnsView::with_base_cached`] wherever the owning
+    /// [`MappedBase`](crate::v8::MappedBase) is in reach: without a cache every
+    /// read of a `Mixed` column decodes that whole column.
     pub fn with_base(overlay: &'a ColumnStore, base: &'a ArchivedColumns) -> Self {
         Self {
             overlay,
             base: Some(base),
+            mixed: None,
+        }
+    }
+
+    /// Same as [`ColumnsView::with_base`], but reads of `Mixed` columns are
+    /// served from `mixed` instead of decoding the column on every lookup.
+    pub fn with_base_cached(
+        overlay: &'a ColumnStore,
+        base: &'a ArchivedColumns,
+        mixed: &'a MixedCache,
+    ) -> Self {
+        Self {
+            overlay,
+            base: Some(base),
+            mixed: Some(mixed),
         }
     }
 
@@ -529,10 +604,19 @@ impl<'a> ColumnsView<'a> {
                     strings[sid].as_str().to_string(),
                 )))
             }
-            ArchivedColumnData::Mixed(blob) => {
-                let map: HashMap<u32, Value> = bincode::deserialize(blob.as_slice()).ok()?;
-                map.get(&id).cloned().map(ValueRef::Owned)
-            }
+            ArchivedColumnData::Mixed(blob) => match self.mixed {
+                // One decode per field for the life of the mapping. The value
+                // is cloned out, so the `Arc` is released with this expression.
+                Some(cache) => cache
+                    .get_or_decode(field, blob.as_slice())
+                    .get(&id)
+                    .cloned()
+                    .map(ValueRef::Owned),
+                None => {
+                    let map: HashMap<u32, Value> = bincode::deserialize(blob.as_slice()).ok()?;
+                    map.get(&id).cloned().map(ValueRef::Owned)
+                }
+            },
             ArchivedColumnData::Vector { dim, data, present } => {
                 if !archived_bitmap_test(present.as_slice(), id) {
                     return None;

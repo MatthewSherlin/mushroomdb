@@ -23,15 +23,40 @@ struct GraphDb {
 impl GraphDb {
     /// Open (creating if needed) the database rooted at `path`.
     ///
-    /// One writer process per store — see the Concurrency section of the
-    /// binding README.
+    /// A read-write handle holds the store's cross-process write lock for as
+    /// long as it is open, so only one such handle exists at a time across all
+    /// processes. If another one is already open, this raises `MushroomBusy`.
+    ///
+    /// Pass `read_only=True` for a handle that never writes and never takes the
+    /// lock: it opens immediately even while another process is writing, every
+    /// mutation raises `RuntimeError`, and `refresh()` still follows the
+    /// writer's commits. See the Concurrency section of the binding README.
     #[staticmethod]
-    #[pyo3(text_signature = "(path)")]
-    fn open(path: PathBuf) -> PyResult<Self> {
-        let db = CoreDb::open(&path).map_err(graph_err)?;
+    #[pyo3(signature = (path, read_only = false))]
+    #[pyo3(text_signature = "(path, read_only=False)")]
+    fn open(path: PathBuf, read_only: bool) -> PyResult<Self> {
+        let opts = core_api::OpenOptions {
+            read_only,
+            ..core_api::OpenOptions::default()
+        };
+        let db = CoreDb::open_with_options(&path, opts).map_err(graph_err)?;
         Ok(GraphDb {
             inner: Inner(Mutex::new(Some(db))),
         })
+    }
+
+    /// Apply everything other processes have committed since this handle last
+    /// looked, and return how many commits were applied.
+    ///
+    /// A handle does not poll the store, so another process's writes stay
+    /// invisible until you call this. Rules fire and derived edges appear
+    /// exactly as they would on a fresh open. Nothing is written, so a
+    /// `read_only=True` handle can refresh freely.
+    ///
+    /// A commit another process is still writing is left for the next call.
+    #[pyo3(text_signature = "($self)")]
+    fn refresh(&self) -> PyResult<u64> {
+        self.with_mut(|db| db.refresh())
     }
 
     /// Insert a new node.  Raises `RuntimeError` (`DuplicateKey`) if `key` is
@@ -886,6 +911,9 @@ fn lock<T>(m: &Mutex<T>) -> PyResult<std::sync::MutexGuard<'_, T>> {
 fn graph_err(e: GraphError) -> PyErr {
     match e {
         GraphError::QueryError { detail } => PyRuntimeError::new_err(detail),
+        // Busy gets its own exception type: it is the one error a caller is
+        // expected to catch and retry, and matching on a message is not an API.
+        busy @ GraphError::Busy { .. } => MushroomBusy::new_err(busy.to_string()),
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
@@ -1183,8 +1211,18 @@ fn summary_to_py(py: Python<'_>, s: &PredicateSummary) -> PyResult<Py<PyDict>> {
     Ok(d.unbind())
 }
 
+pyo3::create_exception!(
+    mushroomdb,
+    MushroomBusy,
+    PyRuntimeError,
+    "Another process holds the store's write lock.\n\n\
+     Nothing was written, so retrying later is always safe. Raised only by \
+     write calls: opening read-only and reading never take the lock."
+);
+
 #[pymodule]
 fn mushroomdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GraphDb>()?;
+    m.add("MushroomBusy", m.py().get_type::<MushroomBusy>())?;
     Ok(())
 }

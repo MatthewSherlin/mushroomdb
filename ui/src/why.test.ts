@@ -134,6 +134,14 @@ describe("key_match line", () => {
         value: "org-07",
       }),
     ).toBe('org_id = "org-07" → org-07');
+    expect(
+      formatKeyMatchLine({
+        label: "File",
+        field: "imports",
+        value: "a.rs",
+        inList: true,
+      }),
+    ).toBe('file.imports ∋ "a.rs" → a.rs');
   });
 });
 
@@ -325,6 +333,69 @@ describe("buildWhyModel", () => {
       rule: "auto_fk_person_org_id",
       etype: "ORG",
       line: 'person.org_id = "org-07" → org-07',
+    });
+  });
+
+  it("builds a key_match line from a list-valued FK holding the dst key", () => {
+    // The server reads a list KeyMatch field as a set of foreign keys. Without
+    // list awareness this fell through to the field_equality branch and the
+    // shared `region` prop was rendered as the reason for an IMPORTS edge.
+    const model = buildWhyModel({
+      edge: {
+        etype: "IMPORTS",
+        src: "main.rs",
+        dst: "a.rs",
+        derived: true,
+        explanation: exp({
+          rule: "imports",
+          edge_type: "IMPORTS",
+          src_key: "main.rs",
+          dst_key: "a.rs",
+          weight: null,
+        }),
+      },
+      src: {
+        key: "main.rs",
+        label: "File",
+        props: { imports: ["a.rs", "b.rs"], region: "emea" },
+      },
+      dst: { key: "a.rs", label: "Mod", props: { region: "emea" } },
+    });
+    expect(model).toMatchObject({
+      kind: "key_match",
+      rule: "imports",
+      etype: "IMPORTS",
+      line: 'file.imports ∋ "a.rs" → a.rs',
+    });
+  });
+
+  it("builds a key_match line for a list field named by the predicate summary", () => {
+    const model = buildWhyModel({
+      edge: {
+        etype: "IMPORTS",
+        src: "main.rs",
+        dst: "b.rs",
+        derived: true,
+        explanation: exp({
+          rule: "imports",
+          edge_type: "IMPORTS",
+          src_key: "main.rs",
+          dst_key: "b.rs",
+          weight: 1,
+          predicate: pred({ kind: "key_match", fields: ["imports"] }),
+        }),
+      },
+      src: {
+        key: "main.rs",
+        label: "File",
+        props: { imports: ["a.rs", "b.rs"] },
+      },
+      dst: { key: "b.rs", label: "Mod", props: {} },
+    });
+    expect(model).toMatchObject({
+      kind: "key_match",
+      rule: "imports",
+      line: 'file.imports ∋ "b.rs" → b.rs',
     });
   });
 

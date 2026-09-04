@@ -1,6 +1,6 @@
 [package]
 name = "mushroomdb-cli"
-version = "0.5.2"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -23,8 +23,9 @@ embed-ui = ["server/embed-ui"]
 tls = ["server/tls"]
 
 [dependencies]
-core-api = { package = "mushroomdb", path = "../core-api", version = "0.5.2" }
-server = { package = "mushroomdb-server", path = "../server", version = "0.5.2" }
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.6.0" }
+code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.6.0" }
+server = { package = "mushroomdb-server", path = "../server", version = "0.6.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }

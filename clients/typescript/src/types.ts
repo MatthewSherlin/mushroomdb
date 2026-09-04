@@ -193,7 +193,8 @@ export type RulePredicate =
  * Rule definition posted to `POST /rules`.
  *
  * Mirrors `core_rules::RuleDef`. Omit or `max_edges: null` → server fills
- * scored top-k 32, or 1 if the predicate is KeyMatch-rooted. HTTP has no
+ * scored top-k 32, or 512 if the predicate is KeyMatch-rooted (one per element
+ * a list-valued FK field can name). HTTP has no
  * uncapped hatch (Rust/Python explicit `None` still uses the 1_000_000
  * global first-N-by-id budget).
  */
@@ -204,7 +205,7 @@ export interface RuleDef {
   predicate: RulePredicate;
   edge_type: string;
   weight_prop?: string | null;
-  /** Per-source top-k. Omit/`null` fills 32 (scored) or 1 (KeyMatch-rooted). */
+  /** Per-source top-k. Omit/`null` fills 32 (scored) or 512 (KeyMatch-rooted). */
   max_edges?: number | null;
   approximate?: boolean;
 }

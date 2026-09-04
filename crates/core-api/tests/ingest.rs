@@ -1,5 +1,6 @@
 use core_api::{
     AutoFk, Direction, FkSkip, GraphDb, GraphError, IngestOptions, IngestReport, Predicate, Value,
+    DEFAULT_KEYMATCH_TOP_K,
 };
 use core_storage::fs::{FileId, Fs, RealFs};
 use std::collections::BTreeMap;
@@ -76,7 +77,7 @@ fn org_id_auto_links_and_later_insert_fires_rule() {
         }
     );
     assert_eq!(fk.weight_prop, None);
-    assert_eq!(fk.max_edges, Some(1));
+    assert_eq!(fk.max_edges, Some(DEFAULT_KEYMATCH_TOP_K));
 
     assert_eq!(
         db.neighbors("p1", "ORG", Direction::Out).unwrap(),
@@ -136,7 +137,7 @@ fn org_id_auto_links_and_later_insert_fires_rule() {
 }
 
 #[test]
-fn auto_fk_keymatch_is_top_1() {
+fn auto_fk_keymatch_uses_the_keymatch_default() {
     // existing ingest fixture; after ingest, rule auto_fk_person_org_id
     let dir = tmp("ingest-auto-fk-topk");
     let mut db = GraphDb::open(&dir).unwrap();
@@ -156,7 +157,14 @@ fn auto_fk_keymatch_is_top_1() {
         .into_iter()
         .find(|r| r.name == "auto_fk_person_org_id")
         .unwrap();
-    assert_eq!(r.max_edges, Some(1));
+    // 512 = MAX_KEYMATCH_LIST: one edge per element a list-valued FK can name.
+    // A scalar FK field like org_id still resolves to at most one Org.
+    assert_eq!(r.max_edges, Some(DEFAULT_KEYMATCH_TOP_K));
+    assert_eq!(
+        db.neighbors("p1", "ORG", Direction::Out).unwrap(),
+        vec!["acme".to_string()],
+        "a scalar FK still yields exactly one edge"
+    );
 }
 
 /// Binding: matching keys under more than one label → no rule, reason reported.

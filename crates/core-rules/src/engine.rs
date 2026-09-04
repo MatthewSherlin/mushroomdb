@@ -1,11 +1,14 @@
-use crate::def::{evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef};
+use crate::def::{
+    evaluate, is_keymatch_rooted, predicate_contains_keymatch, NodeView, Predicate, RuleDef,
+    MAX_KEYMATCH_LIST,
+};
 use crate::hnsw::HnswIndex;
 use crate::index::{
     candidate_spec, candidate_spec_approx_with_k, ivf_drift_rebuild_threshold, CandidateSpec,
     RuleIndex,
 };
 use core_storage::v8::encode::{decode_ivf_bytes, decode_provenance_bytes};
-use core_storage::v8::seam::ColumnsView;
+use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::{EdgeProps, IdMap, Interner, Topology, Value};
 
 /// Decode raw IVF section bytes into the `RuleIvfExport` format consumed by
@@ -80,8 +83,36 @@ pub struct GraphMut<'a> {
     pub syms: &'a mut Interner,
     pub labels: &'a [u32],
     pub props: ColumnsView<'a>,
+    /// Edges written since the snapshot. Reads must go through
+    /// [`GraphMut::neighbors`], not this field: on a store opened from a
+    /// snapshot the overlay is empty and every edge lives in `base_topo`.
     pub topo: &'a mut Topology,
+    /// The snapshot's archived CSR, when one is open. `None` for a store with
+    /// no snapshot, where `topo` already holds everything.
+    pub base_topo: Option<&'a core_storage::v8::layout::ArchivedCsr>,
     pub edge_props: &'a mut EdgeProps,
+}
+
+impl GraphMut<'_> {
+    /// Neighbours of `v` over `(etype, dir)`, merging the snapshot base with
+    /// the post-snapshot overlay and subtracting the overlay's tombstones.
+    ///
+    /// A rule that reads the graph's shape — today only a via-hop rule, when it
+    /// expands its hop — must use this rather than `topo` directly. Reading the
+    /// overlay alone on a store opened from a snapshot returns nothing, which a
+    /// via-hop rule cannot distinguish from "this source reaches no via node"
+    /// and answers by retracting every edge it owns.
+    pub fn neighbors(
+        &self,
+        etype: u32,
+        dir: core_storage::Direction,
+        v: u32,
+    ) -> std::borrow::Cow<'_, [u32]> {
+        match self.base_topo {
+            None => TopologyView::owned(self.topo).neighbors(etype, dir, v),
+            Some(base) => TopologyView::with_base(self.topo, base).neighbors(etype, dir, v),
+        }
+    }
 }
 
 /// Used when `RuleDef.max_edges` is `None`.
@@ -271,14 +302,15 @@ fn candidate_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
 
 /// Rule-aware src-side lookup spec. KeyMatch is still exact on the src side
 /// regardless of `approximate` (the approximation is on the dst candidate set).
-/// For KeyMatch-rooted predicates, src side is indexed as Scalar (FK field
-/// value → node bucket) so reverse lookup uses the dst key. Non-KeyMatch
-/// `All` uses the full [`candidate_spec_for`] Intersect (not `parts[0]`).
+/// For KeyMatch-rooted predicates, src side is indexed as `ScalarOrElements`
+/// (FK field value → node bucket, one bucket per element for a list-valued
+/// field) so reverse lookup uses the dst key. Non-KeyMatch `All` uses the full
+/// [`candidate_spec_for`] Intersect (not `parts[0]`).
 fn src_lookup_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
     if is_keymatch_rooted(&def.predicate) {
         let field =
             keymatch_field(&def.predicate).expect("keymatch-rooted predicate has a KeyMatch field");
-        CandidateSpec::Scalar { field }
+        CandidateSpec::ScalarOrElements { field }
     } else {
         candidate_spec_for(def)
     }
@@ -303,6 +335,20 @@ fn keymatch_field(p: &Predicate) -> Option<&str> {
         Predicate::Any(_) => None,
         _ => None,
     }
+}
+
+/// Every node id in the graph — the exact candidate set, used when the
+/// candidate index cannot answer the predicate.
+///
+/// A `KeyMatch` outside the FK fast path (under `Any`, or as a non-first
+/// conjunct of `All`) compiles to `CandidateSpec::ByKey`, which yields no index
+/// keys because those candidates are resolved by id lookup instead. Probing the
+/// index for such a predicate silently drops every destination that matches
+/// only through the `KeyMatch` branch, so the full set is the only correct
+/// input. The caller's loop still filters by label and `evaluate()` still
+/// decides each pair, so this trades speed for exactness and nothing else.
+fn all_node_ids(g: &GraphMut<'_>) -> BTreeSet<u32> {
+    (0..g.ids.len() as u32).collect()
 }
 
 /// Compute the set of desired (src, dst) → score edges involving node `n` on
@@ -346,8 +392,21 @@ fn compute_desired(
                     Some(dst_id) => std::iter::once(dst_id).collect(),
                     None => BTreeSet::new(),
                 },
+                // A list-valued FK names one dst per string element (first
+                // MAX_KEYMATCH_LIST in stored order). Elements naming no live
+                // node drop out here; duplicates collapse into the set.
+                Some(Value::List(items)) => items
+                    .iter()
+                    .take(MAX_KEYMATCH_LIST)
+                    .filter_map(|v| match v {
+                        Value::Str(target_key) => g.ids.get(target_key),
+                        _ => None,
+                    })
+                    .collect(),
                 _ => BTreeSet::new(),
             }
+        } else if predicate_contains_keymatch(&def.predicate) {
+            all_node_ids(g)
         } else {
             index.dst_side.candidates(&spec, &n_get)
         }
@@ -359,6 +418,8 @@ fn compute_desired(
             // src nodes whose FK value points to n.
             let key_getter = |_: &str| Some(Value::Str(n_key.to_string()));
             index.src_side.candidates(&src_spec, &key_getter)
+        } else if predicate_contains_keymatch(&def.predicate) {
+            all_node_ids(g)
         } else {
             index.src_side.candidates(&src_spec, &n_get)
         }
@@ -521,8 +582,30 @@ fn compute_desired(
 /// enumerated by scanning `g.labels`, and a node mid-delete still carries its
 /// label and props. Deriving an edge onto it would leave provenance that the
 /// caller's later topology sweep does not clean up.
+///
+/// `index` narrows the destinations considered for each via node. It is the
+/// rule's own `RuleIndex`, whose dst side holds every `dst_label` node keyed by
+/// the same candidate spec the non-via path probes. A via-hop rule evaluates its
+/// predicate between the **via** node and the dst, so probing that side with the
+/// via node's property values is the exact analogue of what `compute_desired`
+/// does with the src node's — the same index, the same spec, one node
+/// substituted. Any destination the probe drops cannot satisfy the predicate,
+/// for the same reason it cannot on the non-via path.
+///
+/// `None` falls back to evaluating every `dst_label` node, which is what this
+/// function did before the index was maintained for via-hop rules. The fallback
+/// is also taken for `KeyMatch`-rooted predicates, whose candidates are resolved
+/// by id lookup rather than through `by_key` (see `compute_desired`).
+///
+/// Only `on_node_changed_via` offers an index, because only there is the index
+/// known to be populated: it runs after the lazy-init guard in
+/// `on_node_changed_inner`, which rebuilds every rule's index before any hook
+/// fires. The rebuild and node-deletion paths pass `None` — an index they have
+/// not established is populated would narrow to nothing and retract a source's
+/// whole edge set.
 fn compute_desired_via(
     def: &RuleDef,
+    index: Option<&RuleIndex>,
     anchor: ViaAnchor,
     doomed: Option<u32>,
     g: &GraphMut<'_>,
@@ -589,6 +672,11 @@ fn compute_desired_via(
         _ => None,
     };
 
+    // An `Overlap` score is a Jaccard ratio and so cannot exceed 1.0, which lets
+    // the maximum over via nodes settle early. No other predicate has a bound
+    // this function knows, so none of them takes that exit.
+    let ceiling = matches!(def.predicate, Predicate::Overlap { .. });
+
     let mut out = BTreeMap::new();
 
     for src in srcs {
@@ -598,7 +686,6 @@ fn compute_desired_via(
         };
         // Expand via hops from src.
         let via_neighbors: Vec<u32> = g
-            .topo
             .neighbors(via_etype, via_dir, src)
             .iter()
             .copied()
@@ -608,10 +695,40 @@ fn compute_desired_via(
         if via_neighbors.is_empty() {
             continue;
         }
+        // Read only by the ceiling exit, so it is only built when that applies.
+        let via_set: BTreeSet<u32> = if ceiling {
+            via_neighbors.iter().copied().collect()
+        } else {
+            BTreeSet::new()
+        };
 
-        // Collect dsts to evaluate: all dst-label nodes or just anchored one.
+        // Collect dsts to evaluate: the anchored one, the candidates the index
+        // offers for this src's via nodes, or — with no usable index — every
+        // dst-label node.
+        // A predicate holding a `KeyMatch` anywhere cannot be narrowed by the
+        // index: `ByKey` contributes no index keys, so a destination matching
+        // only through that branch would never be offered. Fall back to the
+        // exact full candidate set below.
+        let indexed = index.filter(|_| !predicate_contains_keymatch(&def.predicate));
         let dsts: Vec<u32> = if let Some(dst_id) = anchored_dst {
             vec![dst_id]
+        } else if let Some(idx) = indexed {
+            let spec = candidate_spec_for(def);
+            let mut set = BTreeSet::new();
+            for &via_id in &via_neighbors {
+                let via_get = |f: &str| g.props.get(via_id, f).map(|vr| vr.into_value());
+                set.extend(idx.dst_side.candidates(&spec, &via_get));
+            }
+            set.into_iter()
+                .filter(|&id| {
+                    id != src
+                        && Some(id) != doomed
+                        && matches!(
+                            g.labels.get(id as usize).copied(),
+                            Some(s) if s != u32::MAX && s == dst_sym
+                        )
+                })
+                .collect()
         } else {
             (0..g.ids.len() as u32)
                 .filter(|&id| {
@@ -640,8 +757,20 @@ fn compute_desired_via(
             };
 
             // Score = max over via nodes that satisfy predicate(via, dst).
+            //
+            // Once some via has scored 1.0 the max is settled and the remaining
+            // vias cannot change it — the scan ends there. This is an early exit
+            // from a maximum, not a different maximum: the value written to
+            // `out` is what the full scan would have produced.
+            //
+            // The destination is tried first when it is itself one of the vias,
+            // because a token set is identical to itself and therefore scores
+            // exactly 1.0. Rules whose via and dst carry the same label — one
+            // person's files against all files, say — settle on the first
+            // comparison instead of after every via.
             let mut best: Option<f64> = None;
-            for &via_id in &via_neighbors {
+            let first = (ceiling && via_set.contains(&dst)).then_some(dst);
+            for via_id in first.into_iter().chain(via_neighbors.iter().copied()) {
                 let via_key = match g.ids.key_of(via_id) {
                     Some(k) => k,
                     None => continue,
@@ -656,6 +785,9 @@ fn compute_desired_via(
                         None => score,
                         Some(prev) => prev.max(score),
                     });
+                    if ceiling && best == Some(1.0) {
+                        break;
+                    }
                 }
             }
 
@@ -1247,9 +1379,12 @@ fn apply_streaming_rebuild_top_k(
 
     for src in all_srcs {
         // A via-hop rule evaluates its predicate between the *via* node and the
-        // dst, so the candidate index cannot express it; see `apply_via_rebuild`.
+        // dst, so `compute_desired` cannot express it; see `apply_via_rebuild`.
+        // No candidate index is offered either: a rebuild has to stand on its
+        // own, and narrowing against an index this path has not established is
+        // populated would retract the source's whole set if it were empty.
         let desired_src = if def.via_edge.is_some() {
-            compute_desired_via(def, ViaAnchor::Src(src), doomed, g)
+            compute_desired_via(def, None, ViaAnchor::Src(src), doomed, g)
         } else {
             compute_desired(def, index, src, true, g)
         };
@@ -1303,7 +1438,7 @@ fn apply_via_rebuild(
     // tripped latch, and it is all-or-nothing.
     let mut total: u64 = 0;
     for &src in &sources {
-        total += compute_desired_via(def, ViaAnchor::Src(src), doomed, g).len() as u64;
+        total += compute_desired_via(def, None, ViaAnchor::Src(src), doomed, g).len() as u64;
         if total > budget {
             *tripped = true;
             return; // provenance untouched; latch stays set
@@ -1314,7 +1449,7 @@ fn apply_via_rebuild(
     // Pass 2: per source, retract what it no longer derives, then add what it
     // does. Pass 1 proved the total fits, so no trip guard is needed here.
     for src in sources {
-        let desired = compute_desired_via(def, ViaAnchor::Src(src), doomed, g);
+        let desired = compute_desired_via(def, None, ViaAnchor::Src(src), doomed, g);
         let current: Vec<Triple> = prov
             .set
             .iter()
@@ -2340,6 +2475,40 @@ impl RuleEngine {
         Some(result)
     }
 
+    /// Build every rule's candidate index if that has not happened yet.
+    ///
+    /// A store opened from a snapshot whose WAL is empty replays no frames, so
+    /// `consume_retained_state_eager` never runs and every index starts empty.
+    /// The first operation that needs one pays for all of them here.
+    ///
+    /// Retained HNSW and IVF blobs from the snapshot are consumed in the same
+    /// step, so the reindex loads them rather than wiping the graphs they hold.
+    ///
+    /// Every caller that reads `self.indexes` must go through this first.
+    /// `indexes_populated` speaks for the whole engine, and probing an index
+    /// that was never built yields no candidates — which reads as "this rule
+    /// derives nothing" and silently retracts the edges it owns.
+    fn ensure_indexes_populated(&mut self, g: &GraphMut<'_>) {
+        if self.indexes_populated || self.rules.is_empty() {
+            return;
+        }
+        let hnsw = std::mem::take(
+            &mut *self
+                .retained_hnsw_blobs
+                .lock()
+                .expect("retained_hnsw_blobs lock poisoned"),
+        );
+        let ivf_bytes = self
+            .retained_ivf_bytes
+            .lock()
+            .expect("retained_ivf_bytes lock poisoned")
+            .take()
+            .unwrap_or_default();
+        let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
+        self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
+        self.load_hnsw_state(hnsw);
+    }
+
     /// Register a rule and backfill existing nodes.
     /// Returns Err on failed validate() or duplicate name.
     pub fn create_rule(&mut self, def: RuleDef, g: &mut GraphMut<'_>) -> Result<(), String> {
@@ -2347,6 +2516,12 @@ impl RuleEngine {
         if self.rules.contains_key(&def.name) {
             return Err(format!("rule {:?} already exists", def.name));
         }
+        // Before this rule's index is built, because the flag set at the end of
+        // this function claims every rule's index is ready. Creating a rule is
+        // not a mutation, so nothing else would have built the indexes of the
+        // rules that already existed, and the next property write would probe
+        // them empty and retract their edges.
+        self.ensure_indexes_populated(g);
         // Backfilled edges chain like any other derived edge: creating a rule
         // whose edge type an existing via-hop rule hops over recomputes that
         // rule in the same commit.
@@ -2414,7 +2589,7 @@ impl RuleEngine {
                 if src_sym != Some(label_sym) {
                     continue;
                 }
-                let per_src = compute_desired_via(&def, ViaAnchor::Src(id), self.doomed, g);
+                let per_src = compute_desired_via(&def, None, ViaAnchor::Src(id), self.doomed, g);
                 if let Some(k) = def.max_edges {
                     let top_k = filter_src_top_k(per_src, k, g.ids);
                     apply_per_src_top_k(&def, id, top_k, &mut prov, g);
@@ -2549,23 +2724,7 @@ impl RuleEngine {
         // pays the cost instead.  Subsequent calls skip this branch.
         // Retained HNSW/IVF blobs from the snapshot are consumed here so the
         // reindex does NOT wipe the loaded HNSW graphs.
-        if !self.indexes_populated && !self.rules.is_empty() {
-            let hnsw = std::mem::take(
-                &mut *self
-                    .retained_hnsw_blobs
-                    .lock()
-                    .expect("retained_hnsw_blobs lock poisoned"),
-            );
-            let ivf_bytes = self
-                .retained_ivf_bytes
-                .lock()
-                .expect("retained_ivf_bytes lock poisoned")
-                .take()
-                .unwrap_or_default();
-            let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
-            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
-            self.load_hnsw_state(hnsw);
-        }
+        self.ensure_indexes_populated(g);
 
         let n_label = g.labels.get(n as usize).copied();
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
@@ -2722,8 +2881,15 @@ impl RuleEngine {
     /// Inner handler for `on_node_changed` when the rule is a via-hop rule.
     ///
     /// For each role n can play (src, via, dst), computes and applies the
-    /// desired edge set using `compute_desired_via`. Via-hop rules bypass the
-    /// candidate index; no index maintenance is performed here.
+    /// desired edge set using `compute_desired_via`.
+    ///
+    /// The dst side of the rule's candidate index is maintained here, because
+    /// `compute_desired_via` probes it to narrow destinations: a change to a
+    /// `dst_label` node is withdrawn under its previous value and filed under
+    /// the current one, exactly as on the non-via path. The src side is left
+    /// alone — it would hold `src_label` nodes and nothing probes it. A
+    /// predicate the index cannot answer (one holding a `KeyMatch` anywhere)
+    /// falls back to the full candidate set instead.
     ///
     /// Incremental correctness by change class:
     /// - **src prop / insert** (`as_src`): re-expand via from n, recompute all
@@ -2766,6 +2932,32 @@ impl RuleEngine {
         }
         *self.fires.entry(rule_name.to_string()).or_default() += 1;
 
+        // Keep the dst side of this rule's candidate index current.
+        //
+        // Via-hop rules used to leave their index alone because nothing read it;
+        // `compute_desired_via` now probes it to narrow destinations, so a stale
+        // entry would hide a real candidate. Maintenance mirrors the non-via
+        // path: withdraw the node under its previous value, then file it under
+        // the current one. Only the dst side is touched — the src side of a
+        // via-hop rule holds `src_label` nodes, and nothing probes it.
+        if as_dst {
+            let spec = candidate_spec_for(def);
+            let idx = self.indexes.entry(rule_name.to_string()).or_default();
+            if let Some((field, ref old_val)) = changed {
+                let old_val_cloned = old_val.clone();
+                let old_getter = |f: &str| {
+                    if f == field {
+                        old_val_cloned.clone()
+                    } else {
+                        g.props.get(n, f).map(|vr| vr.into_value())
+                    }
+                };
+                idx.dst_side.remove(&spec, n, &old_getter);
+            }
+            let cur_getter = |f: &str| g.props.get(n, f).map(|vr| vr.into_value());
+            idx.dst_side.insert(&spec, n, &cur_getter);
+        }
+
         // Collect affected srcs: union of srcs identified from each role.
         let mut affected_srcs: BTreeSet<u32> = BTreeSet::new();
         if as_src {
@@ -2780,7 +2972,7 @@ impl RuleEngine {
                 core_storage::Direction::In => core_storage::Direction::Out,
             };
             if let (Some(via_etype), Some(s_sym)) = (g.syms.get(via_edge_str), src_sym) {
-                for &src in g.topo.neighbors(via_etype, rev_dir, n).as_ref() {
+                for &src in g.neighbors(via_etype, rev_dir, n).as_ref() {
                     if g.labels.get(src as usize).copied() == Some(s_sym) {
                         affected_srcs.insert(src);
                     }
@@ -2789,7 +2981,13 @@ impl RuleEngine {
         }
         if as_dst {
             // Recompute all srcs whose via-hops might produce edges to n.
-            let desired_touching_n = compute_desired_via(def, ViaAnchor::Dst(n), doomed, g);
+            let desired_touching_n = compute_desired_via(
+                def,
+                self.indexes.get(rule_name),
+                ViaAnchor::Dst(n),
+                doomed,
+                g,
+            );
             for (src, _dst) in desired_touching_n.keys() {
                 affected_srcs.insert(*src);
             }
@@ -2809,6 +3007,9 @@ impl RuleEngine {
 
         // For each affected src, compute desired_via(Src) and apply.
         let affected_srcs: Vec<u32> = affected_srcs.into_iter().collect();
+        // Borrowed before `prov` takes the provenance fields: disjoint fields of
+        // the same struct, so both live across the loop below.
+        let rule_index = self.indexes.get(rule_name);
 
         if let Some(k) = def.max_edges {
             let mut prov = ProvSets {
@@ -2821,7 +3022,8 @@ impl RuleEngine {
                 emit: self.emit_deltas,
             };
             for src in affected_srcs {
-                let desired_src = compute_desired_via(def, ViaAnchor::Src(src), doomed, g);
+                let desired_src =
+                    compute_desired_via(def, rule_index, ViaAnchor::Src(src), doomed, g);
                 let top_k = filter_src_top_k(desired_src, k, g.ids);
                 apply_per_src_top_k(def, src, top_k, &mut prov, g);
             }
@@ -2831,7 +3033,8 @@ impl RuleEngine {
             // Apply per-src so each affected src retracts its stale edges and
             // adds its new desired edges independently.
             for src in affected_srcs {
-                let desired_src = compute_desired_via(def, ViaAnchor::Src(src), doomed, g);
+                let desired_src =
+                    compute_desired_via(def, rule_index, ViaAnchor::Src(src), doomed, g);
                 if !*tripped {
                     let mut prov = ProvSets {
                         set: self.provenance.entry(rule_name.to_string()).or_default(),
@@ -2888,23 +3091,7 @@ impl RuleEngine {
         self.ensure_provenance_loaded_mut();
         // Lazy index build: same guard as on_node_changed.  Retained snapshot
         // blobs are consumed to avoid wiping any HNSW graphs.
-        if !self.indexes_populated && !self.rules.is_empty() {
-            let hnsw = std::mem::take(
-                &mut *self
-                    .retained_hnsw_blobs
-                    .lock()
-                    .expect("retained_hnsw_blobs lock poisoned"),
-            );
-            let ivf_bytes = self
-                .retained_ivf_bytes
-                .lock()
-                .expect("retained_ivf_bytes lock poisoned")
-                .take()
-                .unwrap_or_default();
-            let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
-            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
-            self.load_hnsw_state(hnsw);
-        }
+        self.ensure_indexes_populated(g);
 
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
         for (rule_idx, rule_name) in rule_names.into_iter().enumerate() {
@@ -2957,7 +3144,8 @@ impl RuleEngine {
 
             // Recompute derived edges for rule_src — its via-hop set just changed.
             *self.fires.entry(rule_name.clone()).or_default() += 1;
-            let desired_src = compute_desired_via(&def, ViaAnchor::Src(rule_src), self.doomed, g);
+            let desired_src =
+                compute_desired_via(&def, None, ViaAnchor::Src(rule_src), self.doomed, g);
 
             if let Some(k) = def.max_edges {
                 let mut prov = ProvSets {
@@ -3019,23 +3207,7 @@ impl RuleEngine {
         // compute_desired consults the candidate index; an empty index would
         // silently produce no backfill.  Consume retained snapshot blobs here
         // rather than wiping any loaded HNSW graphs.
-        if !self.indexes_populated && !self.rules.is_empty() {
-            let hnsw = std::mem::take(
-                &mut *self
-                    .retained_hnsw_blobs
-                    .lock()
-                    .expect("retained_hnsw_blobs lock poisoned"),
-            );
-            let ivf_bytes = self
-                .retained_ivf_bytes
-                .lock()
-                .expect("retained_ivf_bytes lock poisoned")
-                .take()
-                .unwrap_or_default();
-            let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
-            self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
-            self.load_hnsw_state(hnsw);
-        }
+        self.ensure_indexes_populated(g);
 
         let n_label = g.labels.get(n as usize).copied();
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
@@ -3117,7 +3289,7 @@ impl RuleEngine {
                                             // index path would return nothing and retract this source's whole
                                             // set. `self.doomed` keeps the node being deleted out of the result.
             let desired_src = if def.via_edge.is_some() {
-                compute_desired_via(&def, ViaAnchor::Src(src), self.doomed, g)
+                compute_desired_via(&def, None, ViaAnchor::Src(src), self.doomed, g)
             } else {
                 compute_desired(&def, &self.indexes[&rule_name], src, true, g)
             };
@@ -3278,6 +3450,7 @@ mod tests {
                 labels: &self.labels,
                 props: ColumnsView::owned(&self.props),
                 topo: &mut self.topo,
+                base_topo: None,
                 edge_props: &mut self.eprops,
             }
         }
@@ -4592,6 +4765,7 @@ mod tests {
                     labels: &fx.labels,
                     props: ColumnsView::owned(&fx.props),
                     topo: &mut fx.topo,
+                    base_topo: None,
                     edge_props: &mut fx.eprops,
                 };
                 let per_src = compute_desired(rule, &idx, id, true, &g);

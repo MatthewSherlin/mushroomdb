@@ -54,13 +54,63 @@ fn commit_all(repo: &Path, author: &str, msg: &str) {
     );
 }
 
+/// Like [`commit_all`] but with the author's email given explicitly, so a test
+/// can commit as the same person under two addresses.
+fn commit_all_as(repo: &Path, name: &str, email: &str, msg: &str) {
+    git(repo, &["add", "-A"]);
+    git(
+        repo,
+        &[
+            "-c",
+            &format!("user.name={name}"),
+            "-c",
+            &format!("user.email={email}"),
+            "commit",
+            "-q",
+            "-m",
+            msg,
+        ],
+    );
+}
+
 fn commit(repo: &Path, author: &str, msg: &str, files: &[(&str, &str)]) {
+    write_files(repo, files);
+    commit_all(repo, author, msg);
+}
+
+fn commit_as(repo: &Path, name: &str, email: &str, msg: &str, files: &[(&str, &str)]) {
+    write_files(repo, files);
+    commit_all_as(repo, name, email, msg);
+}
+
+fn write_files(repo: &Path, files: &[(&str, &str)]) {
     for (p, body) in files {
         let full = repo.join(p);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
         std::fs::write(full, body).unwrap();
     }
-    commit_all(repo, author, msg);
+}
+
+/// Absolute path of a program on the ambient PATH, for the shims below.
+fn which(program: &str) -> String {
+    let out = Command::new("sh")
+        .args(["-c", &format!("command -v {program}")])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{program} is not on PATH");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Write `body` to `dir/name` and make it executable.
+fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let p = dir.join(name);
+    std::fs::write(&p, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    p
 }
 
 /// `git mv`, creating the destination directory first — git will not.
@@ -153,7 +203,18 @@ fn opts(repo: &Path) -> IngestGitOpts {
         repo: repo.to_path_buf(),
         exclude: vec![],
         max_commits_per_file: 200,
+        recurse_submodules: false,
+        prs: false,
+        structure: true,
+        docs: true,
+        ensure_gitignore: false,
     }
+}
+
+/// `std::fs::canonicalize`, which is what `ingest-git` records as `GitSync.repo`
+/// — on macOS the temp dir is a symlink, so the raw path never compares equal.
+fn canonical(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap()
 }
 
 #[test]
@@ -771,5 +832,590 @@ fn ownership_flips_across_incremental_runs() {
         db.neighbors("src/api.rs", "TOP_AUTHOR", Direction::Out)
             .unwrap(),
         vec!["bob@x.test".to_string()],
+    );
+}
+
+/// A parent repository with an initialised submodule checked out at
+/// `vendor/lib`, plus the repository the submodule was cloned from.
+fn seed_repo_with_submodule() -> PathBuf {
+    let lib = tmp("lib");
+    git(&lib, &["init", "-q", "-b", "main"]);
+    commit(&lib, "carol", "lib init", &[("src/lib.rs", "l1")]);
+
+    let app = tmp("app");
+    git(&app, &["init", "-q", "-b", "main"]);
+    commit(&app, "alice", "app init", &[("src/app.rs", "a1")]);
+    git(
+        &app,
+        &[
+            // A file:// submodule source is refused by default since git 2.38.
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            lib.to_str().unwrap(),
+            "vendor/lib",
+        ],
+    );
+    commit_all(&app, "alice", "add the vendored library");
+    app
+}
+
+/// The `sha` on one unit's sync marker, or `None` when it has none. Opens its
+/// own handle, so no other handle may be live when it is called.
+fn marker(db_dir: &Path, key: &str) -> Option<String> {
+    let db = GraphDb::open(db_dir).unwrap();
+    match db.node_ref(key).and_then(|n| n.prop("sha")) {
+        Some(core_api::Value::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
+fn run_cli(db_dir: &Path, repo: &Path, extra: &[&str], path: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("ingest-git")
+        .arg(db_dir)
+        .arg(repo)
+        .args(extra)
+        .env("PATH", path)
+        .output()
+        .unwrap()
+}
+
+/// One person, two addresses, one `.mailmap`: the graph must hold a single
+/// `Author`, keyed by the canonical address, with the canonical name.
+#[test]
+fn mailmap_merges_two_emails_into_one_author() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit_as(
+        &repo,
+        "Alice Example",
+        "alice@x.test",
+        "init api",
+        &[
+            ("src/api.rs", "a1"),
+            (
+                ".mailmap",
+                "Alice Example <alice@x.test> <alice.old@x.test>\n",
+            ),
+        ],
+    );
+    commit_as(
+        &repo,
+        "alice",
+        "alice.old@x.test",
+        "api again, old address",
+        &[("src/api.rs", "a2")],
+    );
+
+    let db_dir = tmp("db");
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!(r.authors, 1, "the two addresses are one author");
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(
+        !db.has_node("alice.old@x.test"),
+        "the mapped-away address must not become an Author"
+    );
+    let a = db.node_ref("alice@x.test").expect("canonical author");
+    assert_eq!(a.label(), "Author");
+    assert_eq!(
+        a.prop("name"),
+        Some(core_api::Value::Str("Alice Example".to_string())),
+        "the mailmap name wins over the raw commit name"
+    );
+    assert_eq!(
+        db.node_ref("src/api.rs").unwrap().prop("top_author_id"),
+        Some(core_api::Value::Str("alice@x.test".to_string())),
+        "both commits count towards the canonical identity"
+    );
+}
+
+/// With `--recurse-submodules` a submodule is its own unit: its file keys carry
+/// the submodule path, and it resumes from its own `GitSync` marker.
+#[test]
+fn recurse_submodules_prefixes_keys_and_keeps_separate_sync_markers() {
+    let app = seed_repo_with_submodule();
+    let sub = app.join("vendor/lib");
+    let db_dir = tmp("db");
+    let mut o = opts(&app);
+    o.recurse_submodules = true;
+
+    let r = run_ingest_git(&db_dir, &o).unwrap();
+    assert_eq!(r.submodules, 1);
+    assert_eq!(
+        (r.commits, r.files, r.authors),
+        (3, 3, 2),
+        "2 parent commits + 1 submodule commit; src/app.rs, .gitmodules, vendor/lib/src/lib.rs"
+    );
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(db.has_node("src/app.rs"));
+    assert!(
+        db.has_node("vendor/lib/src/lib.rs"),
+        "submodule files are keyed by their path in the parent"
+    );
+    assert!(
+        !db.has_node("src/lib.rs"),
+        "the unprefixed submodule path must not appear"
+    );
+    assert!(
+        !db.has_node("vendor/lib"),
+        "the gitlink itself is not a file"
+    );
+    drop(db);
+    assert_eq!(
+        marker(&db_dir, "__mushroomdb_git_sync__"),
+        Some(rev_parse_head(&app))
+    );
+    assert_eq!(
+        marker(&db_dir, "__mushroomdb_git_sync__:vendor/lib"),
+        Some(rev_parse_head(&sub)),
+        "the submodule resumes from its own marker"
+    );
+
+    // A commit inside the submodule only advances the submodule's marker.
+    commit(&sub, "carol", "lib update", &[("src/lib.rs", "l2")]);
+    let again = run_ingest_git(&db_dir, &o).unwrap();
+    assert!(again.incremental);
+    assert_eq!(again.commits, 1, "only the submodule moved");
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert_eq!(
+        db.node_ref("vendor/lib/src/lib.rs")
+            .unwrap()
+            .prop("n_commits"),
+        Some(core_api::Value::Int(2)),
+        "the submodule file keeps its cumulative history"
+    );
+    drop(db);
+    assert_eq!(
+        marker(&db_dir, "__mushroomdb_git_sync__"),
+        Some(rev_parse_head(&app))
+    );
+    assert_eq!(
+        marker(&db_dir, "__mushroomdb_git_sync__:vendor/lib"),
+        Some(rev_parse_head(&sub))
+    );
+}
+
+/// Without the flag the submodule is not walked at all, and the gitlink entry
+/// the parent records for it does not become a `File`.
+#[test]
+fn without_recurse_the_gitlink_is_ignored() {
+    let app = seed_repo_with_submodule();
+    let db_dir = tmp("db");
+    let r = run_ingest_git(&db_dir, &opts(&app)).unwrap();
+    assert_eq!(r.submodules, 0);
+    assert_eq!(
+        (r.commits, r.files),
+        (2, 2),
+        "only the parent's commits, and only src/app.rs and .gitmodules"
+    );
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(db.has_node("src/app.rs") && db.has_node(".gitmodules"));
+    assert!(
+        !db.has_node("vendor/lib"),
+        "the gitlink is a submodule pointer, not a file"
+    );
+    assert!(!db.has_node("vendor/lib/src/lib.rs"));
+    assert!(
+        db.node_ref("__mushroomdb_git_sync__:vendor/lib").is_none(),
+        "no marker for a submodule that was never walked"
+    );
+}
+
+/// `--prs` without `gh` on PATH prints one warning and ingests everything else.
+#[test]
+fn prs_without_gh_is_a_clean_skip() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    // A PATH holding git and nothing else, so `gh` cannot be found.
+    let shim = tmp("shim");
+    write_script(
+        &shim,
+        "git",
+        &format!("#!/bin/sh\nexec {} \"$@\"\n", which("git")),
+    );
+
+    let out = run_cli(&db_dir, &repo, &["--prs"], shim.to_str().unwrap());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a missing gh is not an error: {stderr}"
+    );
+    assert_eq!(
+        stderr.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "exactly one warning line, got: {stderr}"
+    );
+    assert!(stderr.contains("gh"), "the warning names gh: {stderr}");
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(db.has_node("src/api.rs"), "the git ingest still ran");
+    assert_eq!(
+        db.query("MATCH (p:PR) RETURN p.id AS id", &Default::default())
+            .unwrap()
+            .len(),
+        0,
+        "no PR nodes without gh"
+    );
+    assert!(!db
+        .fulltext_pairs()
+        .contains(&("PR".to_string(), "title".to_string())));
+}
+
+/// Merged pull requests become `PR` nodes linked to the commit that carried
+/// them: the merge commit by sha, and a squash merge by its `(#N)` subject.
+#[test]
+fn prs_from_fake_gh_link_merge_and_squash_commits() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(&repo, "alice", "init api", &[("src/api.rs", "a1")]);
+    git(&repo, &["checkout", "-q", "-b", "feat"]);
+    commit(&repo, "bob", "feature work", &[("src/feat.rs", "f1")]);
+    git(&repo, &["checkout", "-q", "main"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=alice",
+            "-c",
+            "user.email=alice@x.test",
+            "merge",
+            "-q",
+            "--no-ff",
+            "feat",
+            "-m",
+            "Merge pull request #7 from example/feat",
+        ],
+    );
+    let merge_sha = rev_parse_head(&repo);
+    commit(&repo, "bob", "add widget (#42)", &[("src/widget.rs", "w1")]);
+    let squash_sha = rev_parse_head(&repo);
+
+    // A fake `gh` first on PATH, printing a fixed listing.
+    let fake = tmp("gh");
+    let json = fake.join("prs.json");
+    std::fs::write(
+        &json,
+        format!(
+            r#"[{{"number":7,"title":"Add the feature","url":"https://example.test/pr/7",
+  "mergedAt":"2026-01-02T00:00:00Z","mergeCommit":{{"oid":"{merge_sha}"}},
+  "author":{{"login":"bobby"}}}},
+ {{"number":42,"title":"Add a widget","url":"https://example.test/pr/42",
+  "mergedAt":"2026-01-03T00:00:00Z","mergeCommit":null,"author":{{"login":"alicia"}}}}]"#
+        ),
+    )
+    .unwrap();
+    write_script(
+        &fake,
+        "gh",
+        &format!("#!/bin/sh\ncat {}\n", json.to_str().unwrap()),
+    );
+    let path = format!(
+        "{}:{}",
+        fake.to_str().unwrap(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let db_dir = tmp("db");
+    let out = run_cli(&db_dir, &repo, &["--prs"], &path);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    let pr = db.node_ref("pr:7").expect("pr:7 exists");
+    assert_eq!(pr.label(), "PR");
+    assert_eq!(pr.prop("number"), Some(core_api::Value::Int(7)));
+    assert_eq!(
+        pr.prop("title"),
+        Some(core_api::Value::Str("Add the feature".to_string()))
+    );
+    assert_eq!(
+        pr.prop("url"),
+        Some(core_api::Value::Str(
+            "https://example.test/pr/7".to_string()
+        ))
+    );
+    assert_eq!(
+        pr.prop("merged_at"),
+        Some(core_api::Value::Str("2026-01-02T00:00:00Z".to_string()))
+    );
+    assert_eq!(
+        pr.prop("author_login"),
+        Some(core_api::Value::Str("bobby".to_string()))
+    );
+
+    // Merge commit: linked by sha.
+    assert_eq!(
+        db.neighbors("pr:7", "MERGED_AS", Direction::Out).unwrap(),
+        vec![merge_sha.clone()]
+    );
+    assert_eq!(
+        db.node_ref(&merge_sha).unwrap().prop("pr_id"),
+        Some(core_api::Value::Str("pr:7".to_string()))
+    );
+    assert_eq!(
+        db.neighbors(&merge_sha, "PR", Direction::Out).unwrap(),
+        vec!["pr:7".to_string()],
+        "the auto-FK on pr_id derives the Commit -> PR edge"
+    );
+
+    // Squash merge: linked by the `(#42)` subject.
+    assert_eq!(
+        db.neighbors("pr:42", "MERGED_AS", Direction::Out).unwrap(),
+        vec![squash_sha.clone()]
+    );
+    assert_eq!(
+        db.node_ref(&squash_sha).unwrap().prop("pr_id"),
+        Some(core_api::Value::Str("pr:42".to_string()))
+    );
+
+    // A commit belonging to no pull request stays unlinked.
+    let unrelated = db
+        .query(
+            "MATCH (c:Commit) WHERE c.message = 'init api' RETURN c.pr_id AS pr",
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(unrelated.get(0, "pr"), None);
+
+    assert!(db
+        .fulltext_pairs()
+        .contains(&("PR".to_string(), "title".to_string())));
+}
+
+/// The sync marker records where the repository is and how it was ingested, so
+/// a later run can repeat the same ingest without being told again.
+#[test]
+fn gitsync_records_repo_and_flags() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    let mut o = opts(&repo);
+    o.recurse_submodules = true;
+    o.prs = false;
+    o.structure = false;
+    o.docs = true;
+    run_ingest_git(&db_dir, &o).unwrap();
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    let m = db.node_ref("__mushroomdb_git_sync__").unwrap();
+    assert_eq!(m.label(), "GitSync");
+    assert_eq!(
+        m.prop("repo"),
+        Some(core_api::Value::Str(
+            canonical(&repo).to_string_lossy().to_string()
+        )),
+        "the repository path is absolute"
+    );
+    assert_eq!(m.prop("recurse"), Some(core_api::Value::Bool(true)));
+    assert_eq!(m.prop("prs"), Some(core_api::Value::Bool(false)));
+    assert_eq!(m.prop("structure"), Some(core_api::Value::Bool(false)));
+    assert_eq!(m.prop("docs"), Some(core_api::Value::Bool(true)));
+    drop(db);
+
+    // Re-running with the same flags and no new commits still writes nothing.
+    let before = GraphDb::open(&db_dir).unwrap().commit_seq();
+    run_ingest_git(&db_dir, &o).unwrap();
+    assert_eq!(GraphDb::open(&db_dir).unwrap().commit_seq(), before);
+
+    // Changing a flag updates the marker even with no new commits.
+    o.structure = true;
+    run_ingest_git(&db_dir, &o).unwrap();
+    assert_eq!(
+        GraphDb::open(&db_dir)
+            .unwrap()
+            .node_ref("__mushroomdb_git_sync__")
+            .unwrap()
+            .prop("structure"),
+        Some(core_api::Value::Bool(true))
+    );
+}
+
+/// The marker stamps when the store last took data, which is the only thing
+/// that can tell a reader how stale the graph is: `Commit.ts` says when the
+/// work was written, and on a store synced to head that is indistinguishable
+/// from now.
+#[test]
+fn gitsync_stamps_when_the_store_last_took_data() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    let before = now_unix();
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    let stamp = |dir: &Path| match GraphDb::open(dir)
+        .unwrap()
+        .node_ref("__mushroomdb_git_sync__")
+        .unwrap()
+        .prop("synced_at")
+    {
+        Some(core_api::Value::Int(at)) => at,
+        other => panic!("synced_at must be an integer, got {other:?}"),
+    };
+
+    let first = stamp(&db_dir);
+    assert!(
+        (before..=now_unix()).contains(&first),
+        "the stamp is this run's wall clock, got {first}"
+    );
+
+    // A run that finds nothing new writes nothing at all — the stamp included.
+    // It means "when this store last took something", so leaving it is right.
+    let seq = GraphDb::open(&db_dir).unwrap().commit_seq();
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!(GraphDb::open(&db_dir).unwrap().commit_seq(), seq);
+    assert_eq!(stamp(&db_dir), first);
+
+    // A new commit moves it forward.
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    commit(&repo, "alice", "one more", &[("src/api.rs", "a9")]);
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert!(
+        stamp(&db_dir) > first,
+        "ingesting new commits re-stamps the marker"
+    );
+}
+
+/// Wall-clock seconds, for asserting the stamp lands in this run's window.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// `--ensure-gitignore` adds the database directory to the repository's
+/// `.gitignore` once, and leaves it alone on every later run.
+#[test]
+fn ensure_gitignore_is_idempotent() {
+    let repo = seed_repo();
+    std::fs::write(repo.join(".gitignore"), "target").unwrap(); // no trailing newline
+    let db_dir = repo.join("mushroom-memory");
+    let mut o = opts(&repo);
+    o.ensure_gitignore = true;
+
+    let first = run_ingest_git(&db_dir, &o).unwrap();
+    assert!(first.gitignore_added);
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".gitignore")).unwrap(),
+        "target\nmushroom-memory/\n"
+    );
+
+    let again = run_ingest_git(&db_dir, &o).unwrap();
+    assert!(!again.gitignore_added, "the line is already there");
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".gitignore")).unwrap(),
+        "target\nmushroom-memory/\n",
+        "a second run must not append a duplicate"
+    );
+
+    // A database outside the repository is not the repository's business.
+    let other = seed_repo();
+    let outside = tmp("db-outside");
+    let mut oo = opts(&other);
+    oo.ensure_gitignore = true;
+    let r = run_ingest_git(&outside, &oo).unwrap();
+    assert!(!r.gitignore_added);
+    assert!(
+        !other.join(".gitignore").exists(),
+        "no .gitignore is created for a database stored elsewhere"
+    );
+}
+
+/// The store takes a cross-process write lock, so a second writer has to be
+/// told to retry rather than failing obscurely or corrupting the WAL.
+#[test]
+fn a_busy_store_exits_three_with_a_retry_message() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    // A plain read-write handle holds the lock for as long as it lives.
+    let holder = GraphDb::open(&db_dir).unwrap();
+
+    let out = run_cli(
+        &db_dir,
+        &repo,
+        &[],
+        &std::env::var("PATH").unwrap_or_default(),
+    );
+    assert_eq!(out.status.code(), Some(3), "Busy is exit code 3");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("another mushroomdb process is writing; retry"),
+        "got: {stderr}"
+    );
+    assert_eq!(holder.commit_seq(), 0, "the busy run wrote nothing");
+    drop(holder);
+
+    // Once the lock is free the same ingest succeeds.
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!(r.commits, 4);
+}
+
+/// An incremental run reports what it wrote, and appends a number of WAL
+/// commits set by the commit it picked up rather than by the property count.
+///
+/// Two separate things were wrong, and the two assertions pin one each.
+///
+/// The reported count came from the whole known file set, which an incremental
+/// run loads in order to fold new commits into it — so a run over eight files
+/// announced `397 file(s)`. The write scope was already correct; only the
+/// number printed was wrong.
+///
+/// The properties of each written file went out as one WAL commit apiece. Every
+/// frame is replayed on every later open and re-fires the rules watching the
+/// property it carries, so the shape of the write is a cost the store keeps
+/// paying. Batching them leaves this fixture appending six commits for a
+/// one-file commit; one frame per property makes the same run append thirteen.
+#[test]
+fn an_incremental_run_writes_only_what_the_commit_touched() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    // Twenty files, so "proportional to the repo" and "proportional to the
+    // commit" are far enough apart to tell apart.
+    let bodies: Vec<(String, String)> = (0..20)
+        .map(|i| (format!("src/f{i}.rs"), format!("pub fn f{i}() {{}}\n")))
+        .collect();
+    write_files(
+        &repo,
+        &bodies
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    commit_all(&repo, "alice", "twenty files");
+
+    let db_dir = tmp("db");
+    let full = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert!(!full.incremental);
+    assert_eq!(full.files, 20, "the full run does write every file");
+
+    let before = core_api::wal_commit_count_at(&db_dir).unwrap();
+
+    // One commit, one file.
+    commit(
+        &repo,
+        "alice",
+        "touch one",
+        &[("src/f3.rs", "pub fn f3() { let x = 1; }\n")],
+    );
+    let inc = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert!(inc.incremental);
+    assert_eq!(
+        inc.files, 1,
+        "an incremental run reports the files it wrote, not every file it knows"
+    );
+
+    let delta = core_api::wal_commit_count_at(&db_dir).unwrap() - before;
+    assert!(
+        delta <= 8,
+        "a one-file commit appended {delta} WAL commits; batched it is six, and \
+         one commit per property makes it thirteen"
     );
 }

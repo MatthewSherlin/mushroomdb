@@ -93,7 +93,7 @@ same inputs, and the coverage table in `docs/site/query.md` is updated.
 ## Before announcing
 
 - [ ] Every command on the README first screen run from a clean machine against the
-      published `0.5.2` artifacts, not a local build.
+      published `0.6.0` artifacts, not a local build.
 - [ ] Badges render on the rendered README (stars, crates.io, npm, PyPI, CI, license).
 - [ ] Pages URL loads, GIFs included, in light and dark browser themes.
 - [ ] `CHANGELOG.md` top entry matches the published tag.

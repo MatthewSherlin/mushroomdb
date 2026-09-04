@@ -34,6 +34,46 @@ The tooling already bounds WAL-only-from-genesis exposure:
 (or snapshot on a schedule). The cost of a periodic snapshot is far smaller than
 a from-genesis rebuild, and it caps how much WAL a crash can leave to replay.
 
+## Recovery vs. refresh
+
+Two different things read the WAL tail, and they are easy to confuse.
+
+**Recovery** happens at open. The snapshot is loaded and the whole WAL is
+replayed on top of it. A torn trailing frame — the signature of a crash mid-
+append — is dropped, and with `repair_wal` on (the default) the valid prefix is
+written back over it. That truncation is correct crash recovery: the frame was
+never fsynced, so no caller was ever told it committed.
+
+**Refresh** happens while the store is open, and it is not recovery. A handle
+tracks how much of the WAL it has applied and, on `refresh()`, decodes only what
+another process has appended since. An incomplete trailing frame here means a
+peer is still writing, not that anything crashed, so it is left alone and picked
+up next time. Nothing is written to disk.
+
+Noticing that there is a tail to read is a `stat`, so refresh inherits whatever
+the filesystem says: on a local disk a peer's fsynced write is visible to the
+next check, while a mount that caches attributes (NFS, SMB, some container
+layers) can hide it for as long as its attribute timeout. See
+[Concurrency](concurrency.md).
+
+The distinction matters for unattended readers: a reader that treated a live
+writer's half-written frame as a torn tail, and repaired it, would destroy a
+frame that writer is about to make durable. That is why `repair_wal: false` and
+`read_only: true` exist, and why the hooks use them. See
+[Concurrency](concurrency.md).
+
+## The `LOCK` file
+
+A store directory holds one extra file for cross-process coordination: `LOCK`,
+always empty. It exists only to carry an advisory OS lock that writers hold
+while they commit. It is created on the first write, never removed, and carries
+no data — deleting it while no process has the store open is harmless, and
+deleting it while one does defeats the coordination for handles opened
+afterwards.
+
+It is not part of the on-disk format: snapshots and WAL frames are unchanged by
+its presence, and a store copied without it works normally.
+
 ## Integrity
 
 `mushroomdb verify <db>` validates a snapshot end to end: per-section CRC32

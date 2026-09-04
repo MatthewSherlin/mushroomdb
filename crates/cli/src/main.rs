@@ -5,13 +5,22 @@ use cli::{
     parse_args, read_stats, run_algo, run_asof, run_backup, run_demo, run_export, run_migrate,
     run_query, run_schema_apply, run_snapshot, run_suggest, run_verify, usage, Command, ServeUi,
 };
-use core_api::SharedDb;
+use core_api::{GraphError, SharedDb};
 use std::collections::HashMap;
 use std::io::{self, Read as _, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
+
+/// How long a server-initiated snapshot waits for the store's cross-process
+/// write lock before giving up.
+///
+/// Short on purpose. A snapshot is an optimisation — it shortens the next
+/// open's replay — so skipping one costs nothing but a longer replay, whereas
+/// blocking the shutdown path or piling up timer ticks behind a busy peer
+/// costs the operator.
+const SNAPSHOT_LOCK_WAIT: Duration = Duration::from_millis(500);
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -20,19 +29,76 @@ fn main() -> ExitCode {
             print!("{}", usage());
             ExitCode::SUCCESS
         }
-        Ok(Command::Recall { db_dir }) => {
+        Ok(Command::Recall { db_dir, auto }) => {
             let mut raw = String::new();
             let _ = io::stdin().read_to_string(&mut raw);
+            // `run_recall` returns a digest, never an error: it is silent on
+            // every failure by contract. A *panic* is the one way it could
+            // still reach the user, and it would do so before every prompt, so
+            // it is caught here and the digest is simply empty.
+            let digest = silently(|| cli::recall::run_recall(&resolve_db(db_dir, auto), &raw))
+                .unwrap_or_default();
             // Not `print!`: that panics on EPIPE (exit 101) if the hook runner
             // closes the pipe. Every write error is swallowed instead.
-            let digest = cli::recall::run_recall(&db_dir, &raw);
             let mut stdout = io::stdout();
             let _ = stdout.write_all(digest.as_bytes());
             let _ = stdout.flush();
             ExitCode::SUCCESS // never block the prompt
         }
+        Ok(Command::Map { db_dir, json }) => match cli::run_map(&db_dir, json) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
+        Ok(Command::Context { db_dir, target }) => {
+            print_or_fail(cli::run_context(&db_dir, &target))
+        }
+        Ok(Command::Impact { db_dir, files }) => print_or_fail(cli::run_impact(&db_dir, &files)),
+        Ok(Command::Owners { db_dir, path }) => print_or_fail(cli::run_owners(&db_dir, &path)),
+        Ok(Command::Why { db_dir, a, b }) => print_or_fail(cli::run_why(&db_dir, &a, &b)),
+        Ok(Command::Sync { db_dir, json }) => match cli::ingest_git::run_sync(&db_dir) {
+            Ok(report) => {
+                if json {
+                    print!("{}", cli::ingest_git::format_sync_json(&report));
+                } else {
+                    print!("{}", cli::ingest_git::format_sync(&report));
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => busy_aware(&e),
+        },
+        Ok(Command::Touch {
+            db_dir,
+            auto,
+            files,
+        }) => {
+            // Only read stdin when there is nothing on the command line: a hook
+            // pipes a payload, a person does not, and blocking a person's
+            // terminal on a read that will never end is the worse failure.
+            let payload = if files.is_empty() {
+                let mut raw = String::new();
+                let _ = io::stdin().read_to_string(&mut raw);
+                Some(raw)
+            } else {
+                None
+            };
+            if files.is_empty() || auto {
+                silent_touch(db_dir, auto, &files, payload.as_deref());
+                return ExitCode::SUCCESS;
+            }
+            match cli::ingest_git::run_touch(&resolve_db(db_dir, auto), &files, payload.as_deref())
+            {
+                Ok(report) => {
+                    print!("{}", cli::ingest_git::format_touch(&report));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => busy_aware(&e),
+            }
+        }
         Ok(Command::Version) => {
-            println!("mushroomdb {}", cli::VERSION);
+            println!("{}", cli::version_string());
             ExitCode::SUCCESS
         }
         Ok(Command::IngestGit { db_dir, opts }) => {
@@ -41,10 +107,7 @@ fn main() -> ExitCode {
                     print!("{}", cli::ingest_git::format_ingest_git(&report));
                     ExitCode::SUCCESS
                 }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
+                Err(e) => busy_aware(&e),
             }
         }
         Ok(Command::Serve {
@@ -114,7 +177,7 @@ fn main() -> ExitCode {
                 tls_key,
             ))
         }
-        Ok(Command::Mcp { db_dir }) => exit(run_mcp(db_dir)),
+        Ok(Command::Mcp { db_dir, auto }) => exit(run_mcp(resolve_db(db_dir, auto))),
         Ok(Command::Stats { db_dir }) => match read_stats(&db_dir) {
             Ok(stats) => {
                 print!("{}", format_stats(&stats));
@@ -152,7 +215,18 @@ fn main() -> ExitCode {
             subcmd,
             top,
             dir,
-        }) => match run_algo(&db_dir, &subcmd, top, dir) {
+            edge_types,
+            weight_prop,
+            min_weight,
+        }) => match run_algo(
+            &db_dir,
+            &subcmd,
+            top,
+            dir,
+            edge_types,
+            weight_prop,
+            min_weight,
+        ) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -249,6 +323,21 @@ fn main() -> ExitCode {
                 Err(e) => fail(&e.to_string()),
             }
         }
+        Ok(Command::Doctor(opts)) => {
+            let home = home_dir();
+            let cwd = std::env::current_dir().unwrap_or_default();
+            match cli::doctor::run_doctor(&cwd, &home, &opts) {
+                Ok(report) => {
+                    print!("{}", report.output);
+                    if report.had_fail {
+                        ExitCode::from(1)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
         Err(e) => {
             let _ = writeln!(io::stderr(), "{e}");
             eprint!("{}", usage());
@@ -264,9 +353,82 @@ fn exit(r: Result<(), String>) -> ExitCode {
     }
 }
 
+/// Print a digest, or its error on stderr. The graph tools all answer the same
+/// way: a string on success, one line on stderr and exit 1 otherwise.
+fn print_or_fail(r: Result<String, cli::CliError>) -> ExitCode {
+    match r {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
 fn fail(msg: &str) -> ExitCode {
     let _ = writeln!(io::stderr(), "{msg}");
     ExitCode::from(1)
+}
+
+/// Report a store-writing command's failure, distinguishing "busy" from the
+/// rest. Exit 3 is "the store is busy, nothing was written" — a caller (a git
+/// hook, a retry loop) can act on that without parsing the message.
+fn busy_aware(e: &cli::CliError) -> ExitCode {
+    let _ = writeln!(io::stderr(), "error: {e}");
+    if e.0 == cli::ingest_git::BUSY_MESSAGE {
+        ExitCode::from(3)
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Run `f`, returning `None` if it panicked and printing nothing either way.
+///
+/// The panic hook is replaced for the duration: an unwind would otherwise print
+/// a message and a backtrace to stderr and exit 101, which for a hook body is
+/// the noisiest possible outcome and the one a user can do least about. Both
+/// hook bodies (`recall`, and `touch` in hook mode) go through this.
+fn silently<T>(f: impl FnOnce() -> T) -> Option<T> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    std::panic::set_hook(previous);
+    outcome.ok()
+}
+
+/// Run `touch` as a hook body: say nothing, whatever happens, and let the
+/// caller exit 0.
+///
+/// A `PostToolUse` hook fires on every edit the assistant makes, and everything
+/// it writes to either stream lands in the user's session. Almost everything
+/// this command can fail on is *routine* there rather than exceptional — a
+/// payload for a file in some other project, a database that was never built
+/// from a repository, a peer process holding the write lock — and none of it is
+/// the user's problem to read about on every keystroke. So the outcome is
+/// discarded, including the successful report: a line per edit is the loudest
+/// noise of the lot.
+///
+/// Naming files on the command line opts out of all of it: see the `Touch` arm.
+fn silent_touch(db_dir: Option<PathBuf>, auto: bool, files: &[PathBuf], payload: Option<&str>) {
+    let _ = silently(|| {
+        let db = resolve_db(db_dir, auto);
+        cli::ingest_git::run_touch(&db, files, payload)
+    });
+}
+
+/// The database a `<db-dir>`-or-`--auto` command should use.
+fn resolve_db(db_dir: Option<PathBuf>, auto: bool) -> PathBuf {
+    match db_dir {
+        Some(dir) => dir,
+        None => {
+            debug_assert!(auto, "the parser rejects neither a dir nor --auto");
+            cli::resolve_auto_db(
+                std::env::var_os("CLAUDE_PROJECT_DIR").as_deref(),
+                &std::env::current_dir().unwrap_or_default(),
+                &home_dir(),
+            )
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -293,8 +455,21 @@ fn run_serve(
                 loop {
                     interval.tick().await;
                     let db_snap = db_snap.clone();
-                    match tokio::task::spawn_blocking(move || db_snap.write().snapshot()).await {
+                    // A snapshot replaces wal.bin, so it needs the store's
+                    // cross-process write lock. If another process holds it,
+                    // skip this tick rather than wait: the next one is only a
+                    // period away, and a snapshot is never urgent.
+                    let taken = tokio::task::spawn_blocking(move || {
+                        db_snap.write_with_wait(SNAPSHOT_LOCK_WAIT)?.snapshot()
+                    })
+                    .await;
+                    match taken {
                         Ok(Ok(())) => {}
+                        Ok(Err(GraphError::Busy { .. })) => {
+                            eprintln!(
+                                "snapshot-every skipped: another process holds the write lock"
+                            );
+                        }
                         Ok(Err(e)) => eprintln!("snapshot-every failed: {e}"),
                         Err(e) => eprintln!("snapshot-every task panicked: {e}"),
                     }
@@ -367,7 +542,18 @@ fn run_serve(
             _ = shutdown_signal() => {
                 serve.abort();
                 let _ = serve.await;
-                db.write().snapshot().map_err(|e| e.to_string())?;
+                // Same rule as the periodic snapshot: it needs the store's
+                // write lock. Shutting down without one is fine — the WAL holds
+                // every commit, and the next open replays it.
+                match db.write_with_wait(SNAPSHOT_LOCK_WAIT).and_then(|mut g| g.snapshot()) {
+                    Ok(()) => {}
+                    Err(GraphError::Busy { .. }) => {
+                        eprintln!(
+                            "shutdown snapshot skipped: another process holds the write lock"
+                        );
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
                 Ok(())
             }
         }
@@ -403,7 +589,9 @@ fn run_mcp(db_dir: PathBuf) -> Result<(), String> {
     let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
     let stdin = io::stdin();
     let stdout = io::stdout();
-    server::run_mcp_stdio(db, stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
+    // The store's path, not just a handle: the `sync` tool re-runs this binary
+    // against the directory, and cannot infer it from an open database.
+    server::run_mcp_stdio(db, Some(db_dir), stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
 }
 
 fn home_dir() -> PathBuf {

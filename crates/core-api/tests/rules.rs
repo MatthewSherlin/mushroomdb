@@ -1237,3 +1237,383 @@ fn via_hop_new_via_node_insert_after_rule_creation() {
         "proj_b (tech) gets no FIT"
     );
 }
+
+/// A list-valued FK field ingested from JSON: one edge per element that names a
+/// live node, retracted per element when the element goes away.
+#[test]
+fn ingest_json_list_fk_plus_keymatch_rule_yields_edges() {
+    use core_api::{AutoFk, EdgeEvent, IngestOptions};
+    let dir = tmp("rules-list-fk");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let opts = IngestOptions {
+        key_field: "id".into(),
+        auto_fk: AutoFk::Off,
+    };
+    db.ingest_json(
+        "Mod",
+        r#"[{"id": "a.rs"}, {"id": "b.rs"}, {"id": "c.rs"}]"#,
+        &opts,
+    )
+    .unwrap();
+    db.create_rule(RuleDef {
+        name: "imports".into(),
+        src_label: "File".into(),
+        dst_label: "Mod".into(),
+        predicate: Predicate::KeyMatch {
+            field: "imports".into(),
+        },
+        edge_type: "IMPORTS".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    // "ghost.rs" names no node; the other two do.
+    db.ingest_json(
+        "File",
+        r#"[{"id": "main.rs", "imports": ["a.rs", "ghost.rs", "b.rs"]}]"#,
+        &opts,
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "b.rs"],
+        "one edge per list element that names a live Mod"
+    );
+
+    // Drop "b.rs", add "c.rs": one prop write retracts one edge and fires one.
+    db.set_prop(
+        "main.rs",
+        "imports",
+        Value::List(vec![Value::Str("a.rs".into()), Value::Str("c.rs".into())]),
+    )
+    .unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "c.rs"]
+    );
+
+    let hist = db.edge_history("main.rs", "b.rs").unwrap();
+    assert_eq!(hist.items.len(), 2, "b.rs history: {:?}", hist.items);
+    assert_eq!(hist.items[0].event, EdgeEvent::Added);
+    assert_eq!(hist.items[1].event, EdgeEvent::Retracted);
+    assert_eq!(
+        hist.items[1].rule,
+        Some("imports".to_string()),
+        "per-element retraction carries rule attribution"
+    );
+
+    // The removed element's retraction and the added element's firing are one
+    // transaction: both land in the commit the single set_prop produced.
+    let hist_c = db.edge_history("main.rs", "c.rs").unwrap();
+    assert_eq!(hist_c.items.len(), 1, "c.rs history: {:?}", hist_c.items);
+    assert_eq!(hist_c.items[0].event, EdgeEvent::Added);
+    assert_eq!(
+        hist.items[1].commit, hist_c.items[0].commit,
+        "retracting b.rs and firing c.rs share one commit"
+    );
+
+    // The element present in both lists never churns: one Added, no retraction.
+    let hist_a = db.edge_history("main.rs", "a.rs").unwrap();
+    assert_eq!(hist_a.items.len(), 1, "a.rs history: {:?}", hist_a.items);
+    assert_eq!(hist_a.items[0].event, EdgeEvent::Added);
+
+    // Derived edges are not WAL-logged: replay must re-derive the same set.
+    drop(db);
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "c.rs"],
+        "list-derived edges survive replay"
+    );
+
+    // Same over a snapshot base, where the candidate index is built lazily on
+    // the first mutation rather than at open time.
+    db.snapshot().unwrap();
+    drop(db);
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "c.rs"],
+        "list-derived edges survive a snapshot"
+    );
+    db.set_prop(
+        "main.rs",
+        "imports",
+        Value::List(vec![Value::Str("a.rs".into()), Value::Str("b.rs".into())]),
+    )
+    .unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "b.rs"],
+        "element swap after a snapshot re-links through the rebuilt index"
+    );
+}
+
+/// `explain` on a list-derived edge reports the rule's `KeyMatch { field }`
+/// predicate exactly as it does for a scalar FK.
+#[test]
+fn explain_reports_keymatch_for_list_edge() {
+    let dir = tmp("rules-list-explain");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Mod", "a.rs", vec![]).unwrap();
+    db.create_rule(RuleDef {
+        name: "imports".into(),
+        src_label: "File".into(),
+        dst_label: "Mod".into(),
+        predicate: Predicate::KeyMatch {
+            field: "imports".into(),
+        },
+        edge_type: "IMPORTS".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    db.insert_node(
+        "File",
+        "main.rs",
+        vec![(
+            "imports".into(),
+            Value::List(vec![Value::Str("a.rs".into())]),
+        )],
+    )
+    .unwrap();
+
+    let ex = db.explain("main.rs", "a.rs").unwrap();
+    assert_eq!(ex.len(), 1);
+    assert_eq!(ex[0].rule, "imports");
+    assert_eq!(ex[0].edge_type, "IMPORTS");
+    assert_eq!(
+        ex[0].predicate,
+        PredicateSummary::from(&Predicate::KeyMatch {
+            field: "imports".into()
+        }),
+        "explain reports KeyMatch for a list-derived edge"
+    );
+    // The rule stores no weight_prop, so explain recomputes the predicate
+    // score — 1.0, the same as a scalar KeyMatch.
+    assert_eq!(ex[0].weight, Some(1.0));
+}
+
+/// The capped apply path — `max_edges: Some(512)` is what every front door
+/// (HTTP, MCP, Python, auto-FK) stores for a KeyMatch rule, and it routes
+/// through `filter_src_top_k` + `apply_per_src_top_k` rather than the uncapped
+/// branch the other list tests exercise.
+#[test]
+fn list_fk_fires_per_element_at_the_default_cap() {
+    use core_api::{EdgeEvent, DEFAULT_KEYMATCH_TOP_K};
+    let dir = tmp("rules-list-default-cap");
+    let mut db = GraphDb::open(&dir).unwrap();
+    for k in ["a.rs", "b.rs", "c.rs"] {
+        db.insert_node("Mod", k, vec![]).unwrap();
+    }
+    db.create_rule(RuleDef {
+        name: "imports".into(),
+        src_label: "File".into(),
+        dst_label: "Mod".into(),
+        predicate: Predicate::KeyMatch {
+            field: "imports".into(),
+        },
+        edge_type: "IMPORTS".into(),
+        weight_prop: None,
+        max_edges: Some(DEFAULT_KEYMATCH_TOP_K),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    db.insert_node(
+        "File",
+        "main.rs",
+        vec![(
+            "imports".into(),
+            Value::List(vec![
+                Value::Str("a.rs".into()),
+                Value::Str("b.rs".into()),
+                Value::Str("c.rs".into()),
+            ]),
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "b.rs", "c.rs"],
+        "the stored default cap fires on every element, not just the first"
+    );
+
+    // Per-element retraction through the top-k apply path.
+    db.set_prop(
+        "main.rs",
+        "imports",
+        Value::List(vec![Value::Str("a.rs".into()), Value::Str("c.rs".into())]),
+    )
+    .unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "c.rs"]
+    );
+    let hist = db.edge_history("main.rs", "b.rs").unwrap();
+    assert_eq!(hist.items.len(), 2, "b.rs history: {:?}", hist.items);
+    assert_eq!(hist.items[1].event, EdgeEvent::Retracted);
+    let hist_a = db.edge_history("main.rs", "a.rs").unwrap();
+    assert_eq!(hist_a.items.len(), 1, "surviving element does not churn");
+}
+
+/// Under a cap smaller than the number of live targets, which elements win is
+/// decided by **destination key ascending**, not by the list's stored order:
+/// every list element scores 1.0, so `filter_src_top_k`'s score-DESC sort is a
+/// tie and its key-ASC tiebreak decides.
+#[test]
+fn list_fk_under_a_small_cap_keeps_the_lowest_destination_keys() {
+    let dir = tmp("rules-list-small-cap");
+    let mut db = GraphDb::open(&dir).unwrap();
+    for k in ["a.rs", "b.rs", "c.rs"] {
+        db.insert_node("Mod", k, vec![]).unwrap();
+    }
+    db.create_rule(RuleDef {
+        name: "imports".into(),
+        src_label: "File".into(),
+        dst_label: "Mod".into(),
+        predicate: Predicate::KeyMatch {
+            field: "imports".into(),
+        },
+        edge_type: "IMPORTS".into(),
+        weight_prop: None,
+        max_edges: Some(2),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    // Stored in descending key order, so stored order and key order disagree.
+    db.insert_node(
+        "File",
+        "main.rs",
+        vec![(
+            "imports".into(),
+            Value::List(vec![
+                Value::Str("c.rs".into()),
+                Value::Str("b.rs".into()),
+                Value::Str("a.rs".into()),
+            ]),
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        db.neighbors("main.rs", "IMPORTS", Direction::Out).unwrap(),
+        vec!["a.rs", "b.rs"],
+        "cap of 2 over 3 targets keeps the two lowest destination keys, \
+         not the two first-listed elements"
+    );
+}
+
+// ── `Any([KeyMatch, …])` on a plain rule ─────────────────────────────────────
+//
+// `KeyMatch` candidates are resolved by id lookup, so `CandidateSpec::ByKey`
+// offers the candidate index nothing to probe. The FK fast path covers a
+// predicate rooted at `KeyMatch`; one held under `Any` is covered by neither,
+// so narrowing through the index would consider only the destinations the other
+// branch reaches. Both branches must derive.
+
+/// `Person.friend_id` names one destination; `Person.city` matches another by
+/// equality. Neither destination is reachable through the other's branch.
+fn seed_any_keymatch(db: &mut GraphDb<RealFs>) {
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node("Person", "bob", vec![]).unwrap();
+    db.insert_node("Person", "carol", vec![]).unwrap();
+    db.create_rule(RuleDef {
+        name: "linked".into(),
+        src_label: "Person".into(),
+        dst_label: "Person".into(),
+        predicate: Predicate::Any(vec![
+            Predicate::KeyMatch {
+                field: "friend_id".into(),
+            },
+            Predicate::FieldEqual {
+                field: "city".into(),
+            },
+        ]),
+        edge_type: "LINKED".into(),
+        weight_prop: None,
+        max_edges: Some(10),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    // bob is named by alice's FK and shares no city; carol shares alice's city
+    // and is named by nothing.
+    db.set_prop("carol", "city", Value::Str("berlin".into()))
+        .unwrap();
+    db.set_prop("bob", "city", Value::Str("lisbon".into()))
+        .unwrap();
+}
+
+fn linked(db: &GraphDb<RealFs>, key: &str) -> Vec<String> {
+    let mut v = db.neighbors(key, "LINKED", Direction::Out).unwrap();
+    v.sort();
+    v
+}
+
+#[test]
+fn any_of_keymatch_and_field_equal_derives_both_branches() {
+    let dir = tmp("any-keymatch-src");
+    let mut db = GraphDb::open(&dir).unwrap();
+    seed_any_keymatch(&mut db);
+
+    // One write on the source, carrying both branches at once.
+    db.set_prop("alice", "friend_id", Value::Str("bob".into()))
+        .unwrap();
+    db.set_prop("alice", "city", Value::Str("berlin".into()))
+        .unwrap();
+    assert_eq!(
+        linked(&db, "alice"),
+        vec!["bob", "carol"],
+        "bob is reachable only through the KeyMatch branch and must be derived"
+    );
+
+    // A rebuild is a full recompute through the same candidate path.
+    db.rebuild_rule("linked").unwrap();
+    assert_eq!(linked(&db, "alice"), vec!["bob", "carol"], "rebuild");
+
+    // Retracting the FK must cost the source only that one destination.
+    db.set_prop("alice", "friend_id", Value::Str("nobody".into()))
+        .unwrap();
+    assert_eq!(linked(&db, "alice"), vec!["carol"]);
+}
+
+#[test]
+fn any_of_keymatch_derives_when_the_destination_is_the_one_written() {
+    // The dst-side probe: the write lands on the node the FK names, so the rule
+    // has to find the *source* that points at it.
+    let dir = tmp("any-keymatch-dst");
+    let mut db = GraphDb::open(&dir).unwrap();
+    seed_any_keymatch(&mut db);
+    db.set_prop("alice", "friend_id", Value::Str("dave".into()))
+        .unwrap();
+    assert_eq!(linked(&db, "alice"), Vec::<String>::new());
+
+    // dave appears later and shares no city with anyone.
+    db.insert_node(
+        "Person",
+        "dave",
+        vec![("city".into(), Value::Str("oslo".into()))],
+    )
+    .unwrap();
+    assert_eq!(
+        linked(&db, "alice"),
+        vec!["dave"],
+        "inserting the named destination must derive the KeyMatch branch"
+    );
+}

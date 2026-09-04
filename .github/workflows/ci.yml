@@ -16,6 +16,11 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --workspace --examples
       - run: cargo test --workspace
+      # Multi-process suite: spawns the `mp_worker` helper binary, which only
+      # exists behind the `mp-test` feature (so a plain workspace test run never
+      # builds it). Cross-process locking has no other coverage.
+      - run: cargo test -p mushroomdb --features mp-test --test multiprocess
+      - run: cargo clippy -p mushroomdb --all-targets --features mp-test -- -D warnings
       # Compile-only: CI runners are too noisy for timing gates.
       - run: cargo bench --no-run
       # TODO: add a Miri job for crates/core-storage (MappedBase::topology/columns/
@@ -229,3 +234,75 @@ jobs:
           set -euo pipefail
           python3 benchmarks/ci/compare.py results.json benchmarks/baselines/ci.json \
             --threshold 0.15
+
+  # SDK-level MCP handshake: speaks to a real `mushroomdb mcp <db>` process
+  # over stdio using the official @modelcontextprotocol/sdk client, not a
+  # hand-rolled JSON-RPC probe, so a break in the wire protocol or the tool
+  # list fails the same way it would for a real assistant host.
+  mcp-handshake:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb
+      - run: npm ci
+        working-directory: scripts/mcp-handshake
+      - run: |
+          set -euo pipefail
+          node handshake.mjs \
+            --command ../../target/debug/mushroomdb \
+            --db "$(mktemp -d)" \
+            --expect-version "$(cargo pkgid -p mushroomdb-cli | sed 's/.*[#@]//')" \
+            --expect-tools map,context,impact,owners,why,recall,remember,sync
+        working-directory: scripts/mcp-handshake
+
+  # The v0.6 code-graph acceptance run: ingest, map, determinism, freshness,
+  # the recall nudge, a 20-writer concurrency stress against a live MCP server,
+  # and timings — all driven through the shipped binary on a real checkout
+  # rather than through unit tests. See scripts/acceptance-0.6.sh.
+  code-graph:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 — the graph is built from history. A shallow checkout
+      # has almost none, so the co-change edges the nudge step asserts on
+      # would never form.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
+      # Release, because the script only asserts its timing budgets against a
+      # release build — a debug binary is ~6x slower and would measure rustc.
+      - run: cargo build --release -p mushroomdb-cli
+      # `gh` is installed on the runner but is not authenticated, so the script
+      # drops `--prs` by itself and says so in its output.
+      #
+      # The budgets here are 3x the local ones (200 ms / 1000 ms). A hosted
+      # runner is too noisy to enforce a latency gate at the product's own
+      # numbers — this repository already keeps its throughput and p95 gates
+      # out of CI for that reason — but 3x still catches a gross regression.
+      # The product numbers are what scripts/bench-code-graph.sh measures.
+      - name: acceptance-0.6
+        run: MUSHROOMDB=target/release/mushroomdb bash scripts/acceptance-0.6.sh
+        env:
+          TOUCH_BUDGET_MS: "600"
+          MAP_BUDGET_MS: "3000"
+
+  plugin-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Major pinned: a schema change in a new major should fail this job
+      # loudly rather than silently pass on a moved goalpost.
+      - run: npm i -g @anthropic-ai/claude-code@2
+      - run: claude plugin validate packaging/plugin --strict
+      - run: bash scripts/render-plugin.sh --check

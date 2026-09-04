@@ -1,6 +1,25 @@
 # Quickstart
 
-Two commands start a populated graph explorer.
+Two commands start a populated graph explorer. Two others graph a repository.
+
+---
+
+## Graph a repository
+
+```text
+mushroomdb ingest-git ./mushroom-memory . --prs --ensure-gitignore
+mushroomdb map ./mushroom-memory
+```
+
+The first walks the git history and the working tree — authors, commits, files,
+symbols, imports, calls and merged pull requests become nodes, and
+`CO_CHANGED` / `KNOWS` / `IMPORTS` / `CALLS` / `MENTIONS` edges are derived by
+rule. On this repository (431 files, 652 commits) it takes about 2.5 s. The
+second reads the graph back as one screen.
+
+From there: `context`, `impact`, `owners`, `why`, `recall` and `remember`, over
+the CLI or as MCP tools. What the graph guarantees, and what it does not:
+[The live code graph](code-graph.md).
 
 ---
 
@@ -101,6 +120,60 @@ Or API-only (no browser):
 ```text
 cargo run -p mushroomdb-cli --bin mushroomdb -- serve ./demo-db
 ```
+
+---
+
+## Wire it into an assistant
+
+The shortest path needs no local binary at all. Install the Claude Code plugin:
+
+```text
+claude marketplace add MatthewSherlin/mushroomdb
+claude plugin install mushroom@mushroomdb
+```
+
+Open the repository you want graphed and type `/mushroom:mushroom`. Claude Code
+namespaces plugin-provided skills as `/<plugin>:<skill>`. The skill builds the
+graph on first use; the plugin's MCP server and both hooks run through
+`npx -y mushroomdb@<version>`.
+
+The plugin writes no git hooks. To get those — a backgrounded `sync` after each
+commit, checkout and merge — or to install for Cursor or Codex, use the CLI
+instead, from the repository you want graphed:
+
+```text
+mushroomdb install
+```
+
+A skill installed this way is invoked bare as `/mushroom`.
+
+With no flags it detects the assistant (Claude Code, Cursor, or both), picks
+project scope inside a git checkout and user scope anywhere else, and prints
+which it chose. Project scope writes the MCP entry to `.mcp.json`, the
+`/mushroom` skill to `.claude/skills/mushroom/`, the prompt hooks to
+`.claude/settings.json`, an ignore line for the store, and a backgrounded
+`sync` into the `post-commit`, `post-checkout` and `post-merge` git hooks.
+
+The MCP entry runs `npx -y mushroomdb@<version>`, so the assistant needs
+nothing installed globally. To point it at a local build instead:
+
+```text
+mushroomdb install --project --platform claude-code \
+  --command ./target/release/mushroomdb --no-prewarm
+```
+
+A relative `--command` or `--db` is fine to type; both are anchored to the
+current directory, so the entry that gets written names an absolute path. A
+bare name (`--command mushroomdb`) is a `PATH` lookup and is written as given.
+
+Other flags: `--user`, `--platform codex` (registers through the Codex CLI, and
+needs `uninstall --platform codex` to undo), `--db <path>`, and
+`--no-git-hooks`. `mushroomdb uninstall` removes exactly what was written. Full
+reference: [`skill.md`](skill.md).
+
+Restart the assistant afterwards — MCP servers and hooks are read at startup.
+Run `mushroomdb doctor` to verify the install end to end, including a real
+handshake with the configured MCP command.
 
 ---
 

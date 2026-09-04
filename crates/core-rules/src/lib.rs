@@ -6,7 +6,7 @@ pub mod suggest;
 pub mod views;
 pub use def::{
     decode_rule_def, default_max_edges, evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef,
-    DEFAULT_KEYMATCH_TOP_K, DEFAULT_SCORED_TOP_K,
+    DEFAULT_KEYMATCH_TOP_K, DEFAULT_SCORED_TOP_K, MAX_KEYMATCH_LIST,
 };
 pub use engine::{
     EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport, MAX_CHAIN_DEPTH,
