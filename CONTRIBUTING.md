@@ -170,6 +170,31 @@ See [`clients/typescript/README.md`](clients/typescript/README.md) for the full 
 
 ---
 
+## SDK-level MCP handshake
+
+`scripts/mcp-handshake/handshake.mjs` speaks to a real `mushroomdb mcp <db>` process
+over stdio using the official `@modelcontextprotocol/sdk` client, rather than a
+hand-rolled JSON-RPC probe, so a break in the wire protocol, the tool list, or the
+reported `serverInfo` fails the same way it would for a real assistant host. It has
+two modes — spawn a binary directly (`--command <bin> --db <dir>`), or read the
+command and args for one server out of an `.mcp.json`-shaped file
+(`--config <file> --server <name>`) — plus optional assertions (`--expect-version`,
+`--expect-tools`) and an optional extra tool call (`--call <tool> <json-args>`) whose
+text output it prints. Run it locally:
+
+```text
+cd scripts/mcp-handshake && npm ci
+node handshake.mjs --command ../../target/debug/mushroomdb --db "$(mktemp -d)" \
+  --expect-version "$(cargo pkgid -p mushroomdb-cli | sed 's/.*[#@]//')"
+```
+
+CI runs it against a freshly built binary (`mcp-handshake` job); the publish workflow
+runs it again after every npm release, against a `.mcp.json` a real `npx install`
+just wrote (`smoke-npx` job), as a check that the published package still works for a
+brand-new user.
+
+---
+
 ## Testing philosophy — DST and oracle equivalence
 
 ### Deterministic simulation testing
