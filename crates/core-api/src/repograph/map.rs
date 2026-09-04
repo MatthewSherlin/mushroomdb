@@ -43,7 +43,7 @@
 
 use crate::algo::LouvainConfig;
 use crate::db::GraphDb;
-use crate::repograph::facts::{rank, str_list, str_prop};
+use crate::repograph::facts::{rank, str_prop};
 use crate::repograph::render::{basename, cluster_name, common_dir_prefix, sanitize};
 use core_storage::fs::Fs;
 use core_storage::Value;
@@ -364,7 +364,7 @@ pub fn repo_map<F: Fs>(db: &GraphDb<F>, opts: &MapOptions) -> RepoMap {
 
     // ── stale concepts ──────────────────────────────────────────────────────
     if !spent(deadline) {
-        map.stale_concepts = stale_concepts(db);
+        map.stale_concepts = super::concepts::stale_concepts(db).len();
     } else {
         truncated = true;
     }
@@ -494,34 +494,6 @@ fn power_iteration(
         }
     }
     (pr, false)
-}
-
-/// Concepts whose recorded source hashes no longer match the files they were
-/// learned from.
-///
-/// Three things count as changed, because in all three the concept can no
-/// longer be trusted to describe what is there:
-///
-/// - a `source_files` entry whose `File` now hashes to something else;
-/// - a `source_files` entry with no `File` behind it at all, deleted or never
-///   written;
-/// - lists of unequal length, where a source has no hash to check it against
-///   or a hash has no source. Nothing pairs them, so nothing vouches for them.
-fn stale_concepts<F: Fs>(db: &GraphDb<F>) -> usize {
-    db.nodes_with_label("Concept")
-        .iter()
-        .filter(|c| {
-            let files = str_list(c.prop("source_files"));
-            let hashes = str_list(c.prop("source_hashes"));
-            if files.len() != hashes.len() {
-                return true;
-            }
-            files
-                .iter()
-                .zip(hashes.iter())
-                .any(|(file, hash)| str_prop(db, file, "hash").as_ref() != Some(hash))
-        })
-        .count()
 }
 
 /// Three questions worth asking of this graph, each naming something the map

@@ -13,6 +13,9 @@
 //! | [`impact`] | what else the files in a diff reach |
 //! | [`owners`] | who has written a file, and when |
 //! | [`why`] | what links two things, with the evidence |
+//! | [`recall::recall_digest`] | which nodes a topic is closest to |
+//! | [`remember::remember`] | write a note the graph can later recall |
+//! | [`stale_concepts`] | which learned concepts have drifted from their sources |
 //!
 //! Two rules hold across every tool here. The output is **deterministic** for
 //! the same store state and the same caller-supplied "now": collections are
@@ -28,20 +31,28 @@
 //! source it quotes comes from the working tree, so what it shows is what is on
 //! disk now.
 
+mod concepts;
 mod context;
 mod facts;
 mod impact;
 mod map;
 mod owners;
 mod path;
+pub mod recall;
+pub mod remember;
 pub mod render;
 mod why;
 
+pub use concepts::stale_concepts;
 pub use context::{context, ContextReport, Target, MAX_SOURCE_LINES};
 pub use impact::{impact, FileImpact, ImpactOptions, ImpactReport, Partner};
 pub use map::{repo_map, MapCommunity, MapOptions, RepoMap, SyncInfo};
 pub use owners::{owners, OwnersReport, QUARTERS};
 pub use path::{shortest_path, MAX_HOPS, PATH_EDGES};
+pub use recall::{
+    recall_digest, MAX_EDGES_PER_HIT, MAX_EDGE_CANDIDATES, MAX_HITS, MAX_OUTPUT_BYTES,
+};
+pub use remember::{remember, RememberInput, NOTE_KINDS};
 pub use render::{
     render_context, render_impact, render_map, render_owners, render_why, sanitize,
     MAX_CONTEXT_LINES, MAX_MAP_LINES, MAX_TOOL_LINES,

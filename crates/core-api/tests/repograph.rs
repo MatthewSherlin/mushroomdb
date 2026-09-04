@@ -12,8 +12,9 @@ use common::{
     SYNCED_AT,
 };
 use core_api::repograph::{
-    context, impact, owners, render_context, render_impact, render_map, render_owners, render_why,
-    repo_map, shortest_path, why, ImpactOptions, MapOptions, Target,
+    context, impact, owners, recall_digest, remember, render_context, render_impact, render_map,
+    render_owners, render_why, repo_map, shortest_path, stale_concepts, why, ImpactOptions,
+    MapOptions, RememberInput, Target,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1249,5 +1250,225 @@ fn renders_are_deterministic_and_within_limits() {
         digests(&db2),
         digests(&db3),
         "two stores of the same shape, one answer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `remember`, `recall`, and concept provenance.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn remember_writes_note_with_about_edges_via_rule() {
+    let dir = tmp("remember-about");
+    let mut db = synthetic_repo_store(&dir);
+    let about = vec![file_key(0, 0), "concept:startup".to_string()];
+    let input = RememberInput {
+        text: "watch this boot path closely",
+        about: &about,
+        kind: "note",
+        ts: newest_ts() + 1,
+    };
+    let key = remember(&mut db, &input).expect("remember");
+    assert!(key.starts_with("note:"), "unexpected key: {key}");
+
+    // The note's own `about` list derives the `ABOUT` edges via the same
+    // `about_<label>` rules `ingest-git`/`structure` declare — nothing here
+    // inserts an edge directly.
+    let mut linked = db
+        .neighbors(&key, "ABOUT", core_api::Direction::Out)
+        .expect("neighbors");
+    linked.sort();
+    let mut want = about.clone();
+    want.sort();
+    assert_eq!(
+        linked, want,
+        "the about list must derive one ABOUT edge per key"
+    );
+
+    assert_eq!(
+        db.node_ref(&key).and_then(|n| n.prop("text")),
+        Some(core_api::Value::Str(
+            "watch this boot path closely".to_string()
+        ))
+    );
+    assert_eq!(
+        db.node_ref(&key).and_then(|n| n.prop("source")),
+        Some(core_api::Value::Str("agent".to_string())),
+        "notes are attributed to the agent that wrote them"
+    );
+}
+
+#[test]
+fn remember_rejects_unknown_about_key() {
+    let dir = tmp("remember-unknown");
+    let mut db = synthetic_repo_store(&dir);
+    // Two missing keys, given out of order: the error must name the first one
+    // once sorted, not the first one given.
+    let about = vec![file_key(0, 0), "nope:2".to_string(), "nope:1".to_string()];
+    let input = RememberInput {
+        text: "dangling about reference",
+        about: &about,
+        kind: "note",
+        ts: newest_ts() + 1,
+    };
+    match remember(&mut db, &input) {
+        Err(core_api::GraphError::KeyNotFound { key }) => {
+            assert_eq!(
+                key, "nope:1",
+                "the first missing key, sorted, must be named"
+            )
+        }
+        other => panic!("expected KeyNotFound, got {other:?}"),
+    }
+    assert_eq!(
+        db.nodes_with_label("Note").len(),
+        1,
+        "a rejected remember must not write a note (the fixture starts with one)"
+    );
+}
+
+#[test]
+fn remember_rejects_bad_text_and_bad_kind() {
+    let dir = tmp("remember-validation");
+    let mut db = synthetic_repo_store(&dir);
+    let ts = newest_ts() + 1;
+
+    for text in ["", "   "] {
+        let input = RememberInput {
+            text,
+            about: &[],
+            kind: "note",
+            ts,
+        };
+        assert!(
+            matches!(
+                remember(&mut db, &input),
+                Err(core_api::GraphError::IngestError { .. })
+            ),
+            "blank text must be rejected: {text:?}"
+        );
+    }
+
+    let too_long = "x".repeat(4001);
+    let input = RememberInput {
+        text: &too_long,
+        about: &[],
+        kind: "note",
+        ts,
+    };
+    assert!(matches!(
+        remember(&mut db, &input),
+        Err(core_api::GraphError::IngestError { .. })
+    ));
+
+    let input = RememberInput {
+        text: "a fine note",
+        about: &[],
+        kind: "reminder",
+        ts,
+    };
+    assert!(matches!(
+        remember(&mut db, &input),
+        Err(core_api::GraphError::IngestError { .. })
+    ));
+}
+
+#[test]
+fn remember_keys_deterministic() {
+    let dir = tmp("remember-keys");
+    let mut db = synthetic_repo_store(&dir);
+    let ts = newest_ts() + 1;
+    let input = RememberInput {
+        text: "same content, twice",
+        about: &[],
+        kind: "note",
+        ts,
+    };
+    let key1 = remember(&mut db, &input).expect("first remember");
+    let before = db.nodes_with_label("Note").len();
+    let key2 = remember(&mut db, &input).expect("second remember");
+    assert_eq!(
+        key1, key2,
+        "the same ts and text must remember to the same key"
+    );
+    assert_eq!(
+        db.nodes_with_label("Note").len(),
+        before,
+        "re-remembering the same ts and text must not duplicate the note"
+    );
+
+    let different_text = RememberInput {
+        text: "different content",
+        about: &[],
+        kind: "note",
+        ts,
+    };
+    let key3 = remember(&mut db, &different_text).expect("third remember");
+    assert_ne!(key1, key3, "different text at the same ts must differ");
+
+    let different_ts = RememberInput {
+        text: "same content, twice",
+        about: &[],
+        kind: "note",
+        ts: ts + 1,
+    };
+    let key4 = remember(&mut db, &different_ts).expect("fourth remember");
+    assert_ne!(key1, key4, "the same text at a different ts must differ");
+}
+
+#[test]
+fn recall_finds_notes_concepts_files_symbols_people() {
+    let dir = tmp("recall-all-labels");
+    let mut db = synthetic_repo_store(&dir);
+    // The full set `ingest-git`, `structure` and `remember` register between
+    // them (see the doc table in `docs/roadmap/v0.6-code-graph-plan.md`),
+    // recreated here since this fixture is built by hand rather than by the
+    // CLI's own ingest path.
+    for (label, field) in [
+        ("File", "path"),
+        ("Symbol", "name"),
+        ("Author", "name"),
+        ("Note", "text"),
+        ("Concept", "name"),
+    ] {
+        db.enable_fulltext(label, field).expect("fulltext");
+    }
+
+    // One distinctive term per label, so each contributes its own top hit.
+    let prompt = "c00 OR init OR ada OR entry OR startup";
+    let out = recall_digest(&db, prompt, "synthetic", 4000);
+
+    for label in ["File", "Symbol", "Author", "Note", "Concept"] {
+        assert!(
+            out.contains(&format!("[{label}]")),
+            "expected a {label} hit in:\n{out}"
+        );
+    }
+    assert!(out.contains("src/core/c00.rs"), "{out}");
+    assert!(out.contains("Ada Example"), "{out}");
+}
+
+#[test]
+fn stale_concepts_detects_changed_source() {
+    let dir = tmp("stale-concepts-detail");
+    let db = synthetic_repo_store(&dir);
+    let stale = stale_concepts(&db);
+    let keys: Vec<&str> = stale.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["concept:routing"],
+        "only the concept recording a hash its file no longer has is stale"
+    );
+    let (_, reason) = &stale[0];
+    assert_eq!(
+        reason,
+        &file_key(1, 0),
+        "the reason names the source file whose hash no longer matches"
+    );
+
+    // `map`'s own count must agree — the two must not be able to diverge.
+    assert_eq!(
+        repo_map(&db, &MapOptions::default()).stale_concepts,
+        stale.len()
     );
 }

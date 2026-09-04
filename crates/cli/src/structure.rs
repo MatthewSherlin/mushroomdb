@@ -64,10 +64,18 @@ pub const DEFINES_RULE: &str = "auto_fk_symbol_file_id";
 pub const ABOUT_LABELS: [&str; 5] = ["Author", "Concept", "File", "Note", "Symbol"];
 
 /// `(label, field)` pairs this module indexes for full-text search.
-pub const FULLTEXT: [(&str, &str); 5] = [
+///
+/// `Note` and `Concept` are indexed here rather than where they are written
+/// (`remember` and the semantic-pass `ingest_json`) because a store synced
+/// after either wrote is still expected to gain the index — `remember` also
+/// ensures its own `Note.text` pair, in case it is the very first write.
+pub const FULLTEXT: [(&str, &str); 8] = [
+    ("Concept", "name"),
+    ("Concept", "summary"),
     ("File", "body"),
     ("File", "headings"),
     ("File", "path"),
+    ("Note", "text"),
     ("Symbol", "doc"),
     ("Symbol", "name"),
 ];
