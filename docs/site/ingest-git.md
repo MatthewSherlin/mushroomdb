@@ -343,9 +343,13 @@ so a hook line carries only the database path and keeps working when the
 checkout moves.
 
 ```
-mushroomdb sync <db-dir>
+mushroomdb sync <db-dir> [--json]
 mushroomdb touch <db-dir>|--auto [<file>...]
 ```
+
+`--json` prints one object instead of the digest: every count, plus a `text`
+field holding the digest itself. That is what the `sync` MCP tool reads, so an
+assistant gets the numbers without parsing them back out of prose.
 
 **`sync`** repeats the last `ingest-git` with the flags recorded on the marker
 (`--recurse-submodules`, `--prs`, `--no-structure`, `--no-docs`), then does the

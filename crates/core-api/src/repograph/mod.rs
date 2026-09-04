@@ -50,13 +50,15 @@ mod why;
 
 pub use concepts::stale_concepts;
 pub use context::{context, ContextReport, Target, MAX_SOURCE_LINES};
-pub use impact::{impact, FileImpact, ImpactOptions, ImpactReport, Partner};
+pub use impact::{
+    impact, path_excluded, FileImpact, ImpactOptions, ImpactReport, Partner, DEFAULT_EXCLUDES,
+};
 pub use map::{repo_map, MapCommunity, MapOptions, RepoMap, SyncInfo};
 pub use owners::{owners, OwnersReport, QUARTERS};
 pub use path::{shortest_path, MAX_HOPS, PATH_EDGES};
 pub use recall::{
     or_query, recall_digest, MAX_EDGES_PER_HIT, MAX_EDGE_CANDIDATES, MAX_HITS, MAX_OUTPUT_BYTES,
-    MAX_QUERY_TERMS,
+    MAX_QUERY_TERMS, UNTRUSTED_FRAMING,
 };
 pub use remember::{remember, RememberInput, NOTE_KINDS};
 pub use render::{

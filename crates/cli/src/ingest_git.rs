@@ -38,18 +38,11 @@ pub const DEFAULT_MAX_COMMITS_PER_FILE: usize = 200;
 
 /// Applied when the user names no `--exclude` pattern of their own.
 ///
-/// These are the paths a repository carries that are not its source: build
-/// output, vendored dependencies, generated bundles, and lockfiles nobody
-/// reads. Excluding them keeps them out of the history graph *and* out of the
-/// working-tree pass, which would otherwise hash and parse every one.
-pub const DEFAULT_EXCLUDES: [&str; 6] = [
-    "target/",
-    "node_modules/",
-    "dist/",
-    ".git/",
-    "*.lock",
-    "*.min.js",
-];
+/// Defined in core-api because the `impact` MCP tool builds its default file
+/// list straight off a working tree and has to leave out exactly what this
+/// ingest leaves out; two lists would let the tool ask about files no store was
+/// ever going to hold.
+pub use core_api::repograph::DEFAULT_EXCLUDES;
 
 /// Minimum jaccard overlap of two files' `commits` lists for `CO_CHANGED`.
 const CO_CHANGE_MIN: f64 = 0.25;
@@ -155,22 +148,11 @@ struct GitCommit {
 
 /// Simple, dependency-free path matcher. Documented in `docs/site/ingest-git.md`.
 ///
-/// A `*.` pattern is a *file-name suffix*, not a single extension: `*.min.js`
-/// matches `ui/bundle.min.js` the same way `*.lock` matches `Cargo.lock`.
-/// Matching only the last dot segment would leave every compound suffix inert,
-/// and a compound suffix is exactly how generated files announce themselves.
+/// The matcher itself is `core_api::repograph::path_excluded`, next to
+/// [`DEFAULT_EXCLUDES`], because the `impact` MCP tool filters a working tree
+/// with the same patterns and must read them the same way.
 fn excluded(path: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|p| {
-        if let Some(prefix) = p.strip_suffix('/') {
-            path.starts_with(&format!("{prefix}/"))
-        } else if let Some(suffix) = p.strip_prefix('*').filter(|s| s.starts_with('.')) {
-            // The suffix must follow something, so `*.lock` does not claim a
-            // path that is nothing but the suffix itself.
-            path.len() > suffix.len() && path.ends_with(suffix)
-        } else {
-            path.contains(p.as_str())
-        }
-    })
+    core_api::repograph::path_excluded(path, patterns)
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, CliError> {

@@ -27,22 +27,38 @@
 //! Two tools look outside the graph. `context` quotes source from the
 //! repository the `GitSync` marker names, which core-api does for us. `impact`
 //! defaults its file list to the current diff, taken from `$CLAUDE_PROJECT_DIR`
-//! when the host sets it and from that same marker otherwise; with neither, it
-//! says to pass files explicitly rather than guessing.
+//! when the host sets it to a checkout and from that same marker otherwise;
+//! with neither, it says to pass files explicitly rather than guessing.
+//!
+//! # Untrusted content
+//!
+//! Everything these tools render came out of the graph, and a graph built by
+//! `ingest-git` holds whatever contributors wrote: author names, paths, commit
+//! subjects, doc comments, and — through `context` — lines of the working tree.
+//! [`ok`] therefore stamps every reply with
+//! [`repograph::UNTRUSTED_FRAMING`], the same marker
+//! `recall_digest` puts on its own digest, so an assistant is told to read the
+//! lines under it as data before it reads any of them. The renderers already
+//! sanitize each line; the framing is what says whose words they are.
 
 use crate::mcp::CallOutcome;
 use core_api::repograph::{
-    self, ImpactOptions, MapOptions, RememberInput, MAX_OUTPUT_BYTES, NOTE_KINDS,
+    self, ImpactOptions, MapOptions, RememberInput, DEFAULT_EXCLUDES, MAX_OUTPUT_BYTES, NOTE_KINDS,
+    UNTRUSTED_FRAMING,
 };
 use core_api::{GraphError, SharedDb};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The `GitSync` marker `ingest-git` writes, and the prop naming the checkout.
 const SYNC_KEY: &str = "__mushroomdb_git_sync__";
 const SYNC_REPO_PROP: &str = "repo";
+
+/// The host's project directory: the checkout an assistant is working in.
+const PROJECT_DIR_VAR: &str = "CLAUDE_PROJECT_DIR";
 
 /// Route a task tool. `None` when `name` is not one of the eight.
 pub(crate) fn dispatch(
@@ -54,7 +70,10 @@ pub(crate) fn dispatch(
     Some(match name {
         "map" => tool_map(db),
         "context" => tool_context(db, args),
-        "impact" => tool_impact(db, args),
+        // The one environment read on this path, done here so every function
+        // below takes the value and can be tested without touching the
+        // process environment.
+        "impact" => tool_impact(db, args, std::env::var_os(PROJECT_DIR_VAR).as_deref()),
         "owners" => tool_owners(db, args),
         "why" => tool_why(db, args),
         "recall" => tool_recall(db, db_dir, args),
@@ -64,9 +83,17 @@ pub(crate) fn dispatch(
     })
 }
 
-/// A successful task reply: the rendered digest, plus the report with that
-/// digest folded in under `text`.
+/// A successful task reply: the rendered digest under the untrusted-data
+/// framing line, plus the report with that same framed text under `text`.
+///
+/// `recall_digest` emits the framing itself, so a digest that already carries
+/// it is left alone rather than marked twice.
 fn ok(text: String, structured: Js) -> CallOutcome {
+    let text = if text.starts_with(UNTRUSTED_FRAMING) {
+        text
+    } else {
+        format!("{UNTRUSTED_FRAMING}{text}")
+    };
     let mut structured = match structured {
         Js::Object(map) => Js::Object(map),
         other => json!({ "report": other }),
@@ -145,13 +172,16 @@ fn tool_context(db: &SharedDb, args: &Js) -> CallOutcome {
 
 // ── impact ───────────────────────────────────────────────────────────────────
 
-fn tool_impact(db: &SharedDb, args: &Js) -> CallOutcome {
+/// `project_dir` is the value of `$CLAUDE_PROJECT_DIR`, passed in rather than
+/// read here so a test can exercise both branches of [`project_repo`] without
+/// mutating the process environment.
+fn tool_impact(db: &SharedDb, args: &Js, project_dir: Option<&OsStr>) -> CallOutcome {
     let mut files = match str_list_arg(args, "files") {
         Ok(f) => f,
         Err(e) => return CallOutcome::ToolErr(e),
     };
     if files.is_empty() {
-        let repo = match project_repo(db) {
+        let repo = match project_repo(db, project_dir) {
             Some(r) => r,
             None => {
                 return CallOutcome::ToolErr(
@@ -183,18 +213,23 @@ fn tool_impact(db: &SharedDb, args: &Js) -> CallOutcome {
     }
 }
 
-/// The checkout a default `impact` reads its diff from: the host's project
-/// directory when it set one, else the repository the store was built from.
+/// The checkout root a default `impact` reads its diff from: the host's
+/// project directory when it named one inside a repository, else the
+/// repository the store was built from.
 ///
 /// `$CLAUDE_PROJECT_DIR` wins because an assistant asking "what does my change
-/// touch" means the tree it is editing, which is where the host put it. The
-/// marker is the fallback for every other caller.
-fn project_repo(db: &SharedDb) -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CLAUDE_PROJECT_DIR") {
-        let path = PathBuf::from(dir);
-        if path.is_dir() {
-            return Some(path);
-        }
+/// touch" means the tree it is editing, which is where the host put it. It has
+/// to be inside a checkout to win, though: a host that points it at a plain
+/// directory has said nothing about the repository the store knows, so the
+/// marker still answers rather than the call failing.
+///
+/// Both branches resolve to the repository **root**, not to the directory that
+/// named it, so the two listings in [`changed_paths`] agree about what their
+/// paths are relative to — and so those paths match `File` keys, which are
+/// root-relative.
+fn project_repo(db: &SharedDb, project_dir: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(root) = project_dir.map(Path::new).and_then(repo_root) {
+        return Some(root);
     }
     let repo = {
         let g = db.read();
@@ -205,26 +240,52 @@ fn project_repo(db: &SharedDb) -> Option<PathBuf> {
                 _ => None,
             })
     }?;
-    let path = PathBuf::from(repo);
-    path.is_dir().then_some(path)
+    repo_root(Path::new(&repo))
 }
 
-/// Paths in `repo` that differ from `HEAD` or are not tracked at all,
-/// repository-relative, sorted and deduplicated.
+/// The root of the checkout `dir` is in, or `None` when it is not in one.
+fn repo_root(dir: &Path) -> Option<PathBuf> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!root.is_empty()).then(|| PathBuf::from(root))
+}
+
+/// Paths under the checkout rooted at `root` that differ from `HEAD` or are not
+/// tracked at all: root-relative, sorted, deduplicated, and filtered by the
+/// same [`DEFAULT_EXCLUDES`] the ingest applied.
+///
+/// The exclusion matters because a path the ingest skipped is a path no `File`
+/// node exists for, and reporting it back as `unknown:` reads like a hole in
+/// the graph rather than a build artefact the store never wanted.
 ///
 /// `-z` rather than the default listing: git escapes and quotes a path holding
 /// a tab, a newline or a non-ASCII byte, and a quoted path matches no key.
-fn changed_paths(repo: &Path) -> Result<Vec<String>, String> {
+/// `root` rather than the directory the caller named: `ls-files` lists relative
+/// to the working directory while `diff` lists relative to the root, so running
+/// both anywhere but the root would mix two conventions in one list.
+fn changed_paths(root: &Path) -> Result<Vec<String>, String> {
     const LISTS: [&[&str]; 2] = [
         &["diff", "--name-only", "-z", "HEAD"],
         &["ls-files", "--others", "--exclude-standard", "-z"],
     ];
+    let excludes: Vec<String> = DEFAULT_EXCLUDES.iter().map(|p| (*p).to_string()).collect();
     let mut out: BTreeSet<String> = BTreeSet::new();
     let mut ran = false;
     for args in LISTS {
         let output = Command::new("git")
             .arg("-C")
-            .arg(repo)
+            .arg(root)
             .args(args)
             .output()
             .map_err(|e| e.to_string())?;
@@ -236,7 +297,7 @@ fn changed_paths(repo: &Path) -> Result<Vec<String>, String> {
         }
         ran = true;
         for path in String::from_utf8_lossy(&output.stdout).split('\0') {
-            if !path.is_empty() {
+            if !path.is_empty() && !repograph::path_excluded(path, &excludes) {
                 out.insert(path.to_string());
             }
         }
@@ -575,4 +636,228 @@ pub(crate) fn task_tools() -> Vec<Js> {
             "inputSchema": { "type": "object", "properties": {} }
         }),
     ]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests: the two things these tools decide before they touch the graph — where
+// a default `impact` reads its diff from, and how that diff is filtered.
+//
+// They live here rather than in `tests/mcp.rs` because `$CLAUDE_PROJECT_DIR`
+// reaches `tool_impact` as an argument, not as a process-global read: setting
+// it for real would race every other test in the binary that calls
+// `std::env::temp_dir()`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_api::Value;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp(name: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("mcp-tasks-{name}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// A checkout holding one committed file, since edited, plus one untracked
+    /// file under an excluded directory.
+    fn dirty_repo(name: &str) -> PathBuf {
+        let repo = tmp(name);
+        std::fs::create_dir_all(repo.join("src")).expect("src");
+        std::fs::create_dir_all(repo.join("target")).expect("target");
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@example.test"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("src/core.rs"), "fn init() {}\n").expect("write");
+        git(&repo, &["add", "src/core.rs"]);
+        git(&repo, &["commit", "-qm", "first"]);
+        std::fs::write(repo.join("src/core.rs"), "fn init() { /* edited */ }\n").expect("edit");
+        // Untracked and excluded at ingest time, so it must not reach the list.
+        std::fs::write(repo.join("target/debug.log"), "noise\n").expect("artefact");
+        repo
+    }
+
+    /// A store holding one `File` node and a `GitSync` marker pointing at `repo`.
+    fn store_for(name: &str, repo: Option<&Path>) -> (SharedDb, PathBuf) {
+        let dir = tmp(name);
+        let db = SharedDb::open(&dir).expect("open");
+        {
+            let mut w = db.write();
+            w.insert_node(
+                "File",
+                "src/core.rs",
+                vec![
+                    ("id".into(), Value::Str("src/core.rs".into())),
+                    ("path".into(), Value::Str("src/core.rs".into())),
+                    ("lines".into(), Value::Int(1)),
+                ],
+            )
+            .expect("file");
+            let marker = repo.map_or_else(
+                || "/nonexistent/mushroomdb-test-repo".to_string(),
+                |r| r.display().to_string(),
+            );
+            w.insert_node(
+                "GitSync",
+                SYNC_KEY,
+                vec![
+                    ("id".into(), Value::Str(SYNC_KEY.into())),
+                    (SYNC_REPO_PROP.into(), Value::Str(marker)),
+                ],
+            )
+            .expect("marker");
+        }
+        (db, dir)
+    }
+
+    fn impact_files(outcome: &CallOutcome) -> Vec<String> {
+        match outcome {
+            CallOutcome::TaskOk { structured, .. } => structured["files"]
+                .as_array()
+                .expect("files")
+                .iter()
+                .map(|f| f["path"].as_str().expect("path").to_string())
+                .collect(),
+            other => panic!("expected a task result, got {}", describe(other)),
+        }
+    }
+
+    fn describe(outcome: &CallOutcome) -> String {
+        match outcome {
+            CallOutcome::ToolErr(m) => format!("tool error: {m}"),
+            CallOutcome::TaskOk { text, .. } => format!("ok: {text}"),
+            CallOutcome::ToolOk(v) => format!("json: {v}"),
+            CallOutcome::Protocol { message, .. } => format!("protocol: {message}"),
+        }
+    }
+
+    /// Binding: with no `files`, the diff comes from the checkout the marker
+    /// names, and excluded artefacts are left out of it.
+    #[test]
+    fn default_files_come_from_the_marker_repo_and_skip_excluded_paths() {
+        let repo = dirty_repo("marker-repo");
+        let (db, dir) = store_for("marker-store", Some(&repo));
+
+        let outcome = tool_impact(&db, &json!({}), None);
+        assert_eq!(
+            impact_files(&outcome),
+            vec!["src/core.rs".to_string()],
+            "the uncommitted edit, and not the build artefact"
+        );
+        match &outcome {
+            CallOutcome::TaskOk { structured, .. } => assert_eq!(
+                structured["unknown"],
+                json!([]),
+                "an excluded path must not come back as unknown"
+            ),
+            other => panic!("{}", describe(other)),
+        }
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Binding: `$CLAUDE_PROJECT_DIR` wins over the marker when it names a
+    /// checkout.
+    #[test]
+    fn the_project_directory_wins_over_the_marker() {
+        let project = dirty_repo("project-repo");
+        // The marker points somewhere that does not exist, so a result at all
+        // proves the project directory was the one read.
+        let (db, dir) = store_for("project-store", None);
+
+        let outcome = tool_impact(&db, &json!({}), Some(project.as_os_str()));
+        assert_eq!(impact_files(&outcome), vec!["src/core.rs".to_string()]);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// Binding: a subdirectory of a checkout resolves to the checkout root, so
+    /// both git listings agree about what their paths are relative to.
+    #[test]
+    fn a_project_subdirectory_resolves_to_the_repository_root() {
+        let repo = dirty_repo("subdir-repo");
+        let (db, dir) = store_for("subdir-store", None);
+
+        let outcome = tool_impact(&db, &json!({}), Some(repo.join("src").as_os_str()));
+        assert_eq!(
+            impact_files(&outcome),
+            vec!["src/core.rs".to_string()],
+            "paths stay root-relative, matching File keys"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Binding: a project directory that is not inside a checkout says nothing
+    /// about the store's repository, so the marker still answers.
+    #[test]
+    fn a_project_directory_outside_a_checkout_falls_back_to_the_marker() {
+        let repo = dirty_repo("fallback-repo");
+        let plain = tmp("fallback-plain");
+        std::fs::create_dir_all(&plain).expect("plain dir");
+        let (db, dir) = store_for("fallback-store", Some(&repo));
+
+        let outcome = tool_impact(&db, &json!({}), Some(plain.as_os_str()));
+        assert_eq!(impact_files(&outcome), vec!["src/core.rs".to_string()]);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&plain);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Binding: with neither a project checkout nor a marker checkout, the tool
+    /// says what the caller must do instead.
+    #[test]
+    fn no_checkout_anywhere_says_pass_files_explicitly() {
+        let (db, dir) = store_for("no-repo-store", None);
+
+        let outcome = tool_impact(
+            &db,
+            &json!({}),
+            Some(OsStr::new("/nonexistent/mushroomdb-test-project")),
+        );
+        match &outcome {
+            CallOutcome::ToolErr(m) => assert!(m.contains("pass files explicitly"), "{m}"),
+            other => panic!("{}", describe(other)),
+        }
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Binding: an explicit `files` list never looks at a repository at all.
+    #[test]
+    fn explicit_files_ignore_the_project_directory() {
+        let (db, dir) = store_for("explicit-store", None);
+
+        let outcome = tool_impact(
+            &db,
+            &json!({"files": ["src/core.rs"]}),
+            Some(OsStr::new("/nonexistent/mushroomdb-test-project")),
+        );
+        assert_eq!(impact_files(&outcome), vec!["src/core.rs".to_string()]);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

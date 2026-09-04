@@ -1214,7 +1214,12 @@ mod tests {
     fn tmp_dir() -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("mcp-test-{}-{}", std::process::id(), n))
+        let d = std::env::temp_dir().join(format!("mcp-test-{}-{}", std::process::id(), n));
+        // These stores are never cleaned up, so a process id the OS hands out
+        // again lands on a previous run's data and every assertion about counts
+        // fails. `tests/mcp.rs::tmp` already clears its path for this reason.
+        let _ = std::fs::remove_dir_all(&d);
+        d
     }
 
     /// Open a SharedDb with two Person nodes and one derived SIMILAR edge.

@@ -19,6 +19,7 @@
 //! `arguments`, and every `GraphError` from core-api (bad Cypher, ingest
 //! shape, unknown key, …).
 
+use core_api::repograph::UNTRUSTED_FRAMING;
 use core_api::{SharedDb, Value};
 use serde_json::{json, Value as Js};
 use server::run_mcp_stdio;
@@ -1281,7 +1282,12 @@ fn code_store(name: &str) -> SharedDb {
     db
 }
 
-/// Unwrap a task tool's reply: the rendered text and the structured report.
+/// Unwrap a task tool's reply: the rendered digest and the structured report.
+///
+/// Asserts the untrusted-data framing line on every task tool that goes through
+/// it — repository content reaches an assistant here, and it has to be marked
+/// as data before the assistant reads a word of it. The digest is returned
+/// **without** that line, so a caller's assertions are about the render.
 fn task_reply(reply: &Js) -> (String, Js) {
     assert!(
         reply.get("error").is_none() || reply["error"].is_null(),
@@ -1306,7 +1312,17 @@ fn task_reply(reply: &Js) -> (String, Js) {
         json!(text),
         "structuredContent must repeat the rendered text: {reply}"
     );
-    (text, structured)
+    let body = text
+        .strip_prefix(UNTRUSTED_FRAMING)
+        .unwrap_or_else(|| {
+            panic!("task tool text must open with the untrusted-data framing line: {text:?}")
+        })
+        .to_string();
+    assert!(
+        !body.contains(UNTRUSTED_FRAMING),
+        "the framing line must be stamped once, not twice: {text:?}"
+    );
+    (body, structured)
 }
 
 /// The text of a tool error reply.
@@ -1588,61 +1604,12 @@ fn impact_reports_unknown_paths() {
     assert!(text.contains("unknown: no/such.rs"), "{text}");
 }
 
-/// Binding: with no `files`, `impact` reads the working tree's diff from the
-/// host's project directory — and says what to do instead when there is no
-/// working tree to read.
-///
-/// Both halves live in one test on purpose: `$CLAUDE_PROJECT_DIR` is
-/// process-global, so two tests setting it would race. No other test in this
-/// binary reads it.
-#[test]
-fn impact_defaults_to_the_project_diff_and_says_so_when_it_cannot() {
-    let repo = tmp("impact-project-repo");
-    std::fs::create_dir_all(repo.join("src")).expect("repo dirs");
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(args)
-            .output()
-            .expect("git");
-        assert!(out.status.success(), "git {args:?}: {out:?}");
-    };
-    git(&["init", "-q"]);
-    git(&["config", "user.email", "t@example.test"]);
-    git(&["config", "user.name", "Test"]);
-    std::fs::write(repo.join("src/core.rs"), "fn init() {}\n").expect("write");
-    git(&["add", "src/core.rs"]);
-    git(&["commit", "-qm", "first"]);
-    // Uncommitted: exactly what `git diff --name-only HEAD` reports.
-    std::fs::write(repo.join("src/core.rs"), "fn init() { /* edited */ }\n").expect("edit");
-
-    let db = code_store("impact-default");
-    std::env::set_var("CLAUDE_PROJECT_DIR", &repo);
-    let (text, structured) = task_reply(&one_task_call(db.clone(), "impact", json!({})));
-    let paths: Vec<&str> = structured["files"]
-        .as_array()
-        .expect("files")
-        .iter()
-        .map(|f| f["path"].as_str().expect("path"))
-        .collect();
-    assert_eq!(
-        paths,
-        vec!["src/core.rs"],
-        "the uncommitted edit is the default change set: {text}"
-    );
-
-    // With neither a project directory nor a checkout at the marker's `repo`,
-    // there is no diff to default to.
-    std::env::set_var("CLAUDE_PROJECT_DIR", "/nonexistent/mushroomdb-test-project");
-    let reply = one_task_call(db, "impact", json!({}));
-    assert!(
-        error_text(&reply).contains("pass files explicitly"),
-        "{}",
-        error_text(&reply)
-    );
-    let _ = std::fs::remove_dir_all(&repo);
-}
+// The default `impact` file list — where the diff comes from, how it is
+// filtered, and what happens with no checkout — is decided before the graph is
+// touched, and is covered by the unit tests in `crates/server/src/mcp_tasks.rs`.
+// They take `$CLAUDE_PROJECT_DIR` as an argument; asserting it here would mean
+// setting a process-global variable in a binary whose other tests read the
+// environment concurrently.
 
 /// Binding: `owners` names the top author once, with the key in parentheses.
 #[test]
@@ -1722,7 +1689,13 @@ fn recall_returns_digest() {
         text.contains("src/core.rs"),
         "the digest must name the matching node: {text}"
     );
-    assert_eq!(structured["digest"], json!(text));
+    // `text` here is the digest with its framing line stripped by `task_reply`,
+    // so putting it back must give exactly what core-api produced.
+    assert_eq!(
+        structured["digest"],
+        json!(format!("{UNTRUSTED_FRAMING}{text}")),
+        "the reply shows the digest unaltered"
+    );
 }
 
 /// Binding: a topic with nothing searchable in it is answered, not an error.
@@ -1811,4 +1784,72 @@ fn sync_with_db_dir_reports_the_child_failure() {
     assert!(msg.contains("sync"), "{msg}");
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Binding: every task tool stamps its text with the untrusted-data framing
+/// line, exactly once, before any repository content.
+///
+/// `task_reply` asserts this on each tool's own test too; this one sweeps all
+/// eight in one place so a ninth tool cannot be added without a framed answer.
+#[test]
+fn every_task_tool_frames_its_text_as_untrusted() {
+    let db = code_store("framing");
+    let args = |tool: &str| match tool {
+        "context" => json!({"target": "core::init"}),
+        "impact" => json!({"files": ["src/core.rs"]}),
+        "owners" => json!({"path": "src/core.rs"}),
+        "why" => json!({"a": "src/core.rs", "b": "src/web.rs"}),
+        "recall" => json!({"topic": "the core module"}),
+        "remember" => json!({"text": "framing check", "about": ["src/core.rs"]}),
+        _ => json!({}),
+    };
+    for tool in TASK_TOOLS {
+        // `sync` has no store path here, so it is the one tool that answers with
+        // an error; a tool error is a message to the caller, not graph content,
+        // and carries no framing by design.
+        if tool == "sync" {
+            let reply = one_task_call(db.clone(), tool, args(tool));
+            assert!(
+                !error_text(&reply).starts_with(UNTRUSTED_FRAMING),
+                "a tool error is not graph content"
+            );
+            continue;
+        }
+        let reply = one_task_call(db.clone(), tool, args(tool));
+        let full = reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{tool}: content[0].text"));
+        assert!(
+            full.starts_with(UNTRUSTED_FRAMING),
+            "{tool} must open with the framing line, got {full:?}"
+        );
+        assert_eq!(
+            full.matches(UNTRUSTED_FRAMING).count(),
+            1,
+            "{tool} must carry the framing line exactly once"
+        );
+        // And the report agrees with what the assistant was shown.
+        assert_eq!(reply["result"]["structuredContent"]["text"], json!(full));
+    }
+}
+
+/// Binding: `recall` carries the framing line its own digest already emits, and
+/// does not gain a second one.
+#[test]
+fn recall_is_framed_once_not_twice() {
+    let reply = one_task_call(
+        code_store("recall-framing"),
+        "recall",
+        json!({"topic": "the core module"}),
+    );
+    let full = reply["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text");
+    assert_eq!(full.matches(UNTRUSTED_FRAMING).count(), 1, "{full}");
+    // The digest core-api produced is what was shown, unaltered.
+    assert_eq!(
+        reply["result"]["structuredContent"]["digest"],
+        json!(full),
+        "recall's own digest already opens with the framing line"
+    );
 }

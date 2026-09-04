@@ -24,6 +24,46 @@ use std::collections::BTreeSet;
 /// becomes a table of contents.
 const MAX_SYMBOLS: usize = 6;
 
+/// The paths a repository carries that are not its source: build output,
+/// vendored dependencies, generated bundles, and lockfiles nobody reads.
+///
+/// Applied when the user names no `--exclude` pattern of their own, which keeps
+/// them out of the history graph *and* out of the working-tree pass. It lives
+/// here, rather than only in the ingest, because a caller that builds a file
+/// list from a working tree — `impact`'s default diff — has to leave out
+/// exactly the paths the ingest left out, or it asks about files no store was
+/// ever going to hold and is told they are unknown.
+pub const DEFAULT_EXCLUDES: [&str; 6] = [
+    "target/",
+    "node_modules/",
+    "dist/",
+    ".git/",
+    "*.lock",
+    "*.min.js",
+];
+
+/// Whether `path` matches any of `patterns`.
+///
+/// A `foo/` pattern is a *directory prefix*. A `*.` pattern is a **file-name
+/// suffix**, not a single extension: `*.min.js` matches `ui/bundle.min.js` the
+/// same way `*.lock` matches `Cargo.lock`. Matching only the last dot segment
+/// would leave every compound suffix inert, and a compound suffix is exactly
+/// how generated files announce themselves. Anything else is a substring.
+#[must_use]
+pub fn path_excluded(path: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|p| {
+        if let Some(prefix) = p.strip_suffix('/') {
+            path.starts_with(&format!("{prefix}/"))
+        } else if let Some(suffix) = p.strip_prefix('*').filter(|s| s.starts_with('.')) {
+            // The suffix must follow something, so `*.lock` does not claim a
+            // path that is nothing but the suffix itself.
+            path.len() > suffix.len() && path.ends_with(suffix)
+        } else {
+            path.contains(p.as_str())
+        }
+    })
+}
+
 /// How much of the graph one `impact` call reports per file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImpactOptions {
