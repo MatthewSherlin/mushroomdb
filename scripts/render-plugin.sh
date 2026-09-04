@@ -23,9 +23,29 @@ if [[ "${1:-}" == "--check" ]]; then
   CHECK=1
 fi
 
-VERSION="$(grep -m1 '^version *= *"' "$ROOT/crates/cli/Cargo.toml" | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+# Primary: ask cargo, which resolves `version.workspace = true` inheritance
+# correctly. `|| true` on the pipeline keeps a cargo failure from tripping
+# `set -e`/pipefail here — an empty $VERSION falls through to the grep
+# fallback below instead of aborting the script.
+VERSION=""
+if command -v cargo >/dev/null 2>&1; then
+  VERSION="$(cargo pkgid -p mushroomdb-cli --manifest-path "$ROOT/Cargo.toml" 2>/dev/null \
+    | sed 's/.*@//' | sed 's/.*#//' || true)"
+fi
 if [[ -z "$VERSION" ]]; then
-  echo "render-plugin.sh: could not read version from crates/cli/Cargo.toml" >&2
+  # Fallback for a machine without cargo on PATH. Only correct because
+  # crates/cli/Cargo.toml pins a literal `version = "…"` today rather than
+  # `version.workspace = true` (unlike most other crates — core-api,
+  # core-query, core-storage, server, code-extract, arrow-bridge, core-rules
+  # all inherit). If crates/cli/Cargo.toml is ever switched to
+  # `version.workspace = true`, this fallback needs to read
+  # `[workspace.package].version` from the root Cargo.toml instead — the
+  # cargo path above already handles that case correctly, so this is only
+  # a safety net for a cargo-less environment.
+  VERSION="$(grep -m1 '^version *= *"' "$ROOT/crates/cli/Cargo.toml" | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+fi
+if [[ -z "$VERSION" ]]; then
+  echo "render-plugin.sh: could not determine the workspace version (tried cargo pkgid and crates/cli/Cargo.toml)" >&2
   exit 1
 fi
 BIN="npx -y mushroomdb@${VERSION}"
@@ -60,12 +80,44 @@ render_file() {
 # `./mushroom:mushroom-memory`.
 render_skill() {
   local src="$1" dest="$2"
+
+  # Assert the source still says what the sed below expects, before relying
+  # on it: a reworded header or learn-line would otherwise make the sed a
+  # silent no-op, and a bare, unnamespaced /mushroom would ship in the
+  # rendered plugin copy with no error anywhere — --check re-renders the
+  # same (now-stale) source and diffs clean, so it cannot catch this either.
+  grep -qxF '# /mushroom' "$src" || {
+    echo "render_skill: $src no longer has the exact '# /mushroom' header — update the sed pattern in render_skill()" >&2
+    exit 1
+  }
+  grep -qF '`/mushroom learn <path>`' "$src" || {
+    echo "render_skill: $src no longer has the exact '/mushroom learn <path>' phrase — update the sed pattern in render_skill()" >&2
+    exit 1
+  }
+
   render_file "$src" "$dest"
   sed -i.bak \
       -e 's|^# /mushroom$|# /mushroom:mushroom|' \
       -e 's|`/mushroom learn <path>`|`/mushroom:mushroom learn <path>`|' \
       "$dest"
   rm -f "$dest.bak"
+
+  # Assert the fixup actually took. A namespaced `/mushroom:mushroom` must
+  # appear at least twice (the header and the learn-line); and no bare
+  # `/mushroom` may remain — except as part of the already-namespaced form
+  # (followed by `:`) or the {{DB_PATH}} value `./mushroom-memory` (followed
+  # by `-`), both of which are correct and not self-references to fix.
+  local namespaced
+  namespaced="$(grep -c '/mushroom:mushroom' "$dest" || true)"
+  if [[ "$namespaced" -lt 2 ]]; then
+    echo "render_skill: expected at least 2 occurrences of /mushroom:mushroom in $dest, found $namespaced" >&2
+    exit 1
+  fi
+  if grep -qE '/mushroom([^:a-zA-Z0-9-]|$)' "$dest"; then
+    echo "render_skill: $dest still has a bare, un-namespaced /mushroom reference:" >&2
+    grep -nE '/mushroom([^:a-zA-Z0-9-]|$)' "$dest" >&2
+    exit 1
+  fi
 }
 
 if [[ "$CHECK" -eq 1 ]]; then
