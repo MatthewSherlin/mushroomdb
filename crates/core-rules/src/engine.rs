@@ -1,4 +1,7 @@
-use crate::def::{evaluate, is_keymatch_rooted, NodeView, Predicate, RuleDef, MAX_KEYMATCH_LIST};
+use crate::def::{
+    evaluate, is_keymatch_rooted, predicate_contains_keymatch, NodeView, Predicate, RuleDef,
+    MAX_KEYMATCH_LIST,
+};
 use crate::hnsw::HnswIndex;
 use crate::index::{
     candidate_spec, candidate_spec_approx_with_k, ivf_drift_rebuild_threshold, CandidateSpec,
@@ -334,6 +337,20 @@ fn keymatch_field(p: &Predicate) -> Option<&str> {
     }
 }
 
+/// Every node id in the graph — the exact candidate set, used when the
+/// candidate index cannot answer the predicate.
+///
+/// A `KeyMatch` outside the FK fast path (under `Any`, or as a non-first
+/// conjunct of `All`) compiles to `CandidateSpec::ByKey`, which yields no index
+/// keys because those candidates are resolved by id lookup instead. Probing the
+/// index for such a predicate silently drops every destination that matches
+/// only through the `KeyMatch` branch, so the full set is the only correct
+/// input. The caller's loop still filters by label and `evaluate()` still
+/// decides each pair, so this trades speed for exactness and nothing else.
+fn all_node_ids(g: &GraphMut<'_>) -> BTreeSet<u32> {
+    (0..g.ids.len() as u32).collect()
+}
+
 /// Compute the set of desired (src, dst) → score edges involving node `n` on
 /// the given side.  Returns an empty map if `n`'s label doesn't match the rule.
 fn compute_desired(
@@ -388,6 +405,8 @@ fn compute_desired(
                     .collect(),
                 _ => BTreeSet::new(),
             }
+        } else if predicate_contains_keymatch(&def.predicate) {
+            all_node_ids(g)
         } else {
             index.dst_side.candidates(&spec, &n_get)
         }
@@ -399,6 +418,8 @@ fn compute_desired(
             // src nodes whose FK value points to n.
             let key_getter = |_: &str| Some(Value::Str(n_key.to_string()));
             index.src_side.candidates(&src_spec, &key_getter)
+        } else if predicate_contains_keymatch(&def.predicate) {
+            all_node_ids(g)
         } else {
             index.src_side.candidates(&src_spec, &n_get)
         }
@@ -684,7 +705,11 @@ fn compute_desired_via(
         // Collect dsts to evaluate: the anchored one, the candidates the index
         // offers for this src's via nodes, or — with no usable index — every
         // dst-label node.
-        let indexed = index.filter(|_| !is_keymatch_rooted(&def.predicate));
+        // A predicate holding a `KeyMatch` anywhere cannot be narrowed by the
+        // index: `ByKey` contributes no index keys, so a destination matching
+        // only through that branch would never be offered. Fall back to the
+        // exact full candidate set below.
+        let indexed = index.filter(|_| !predicate_contains_keymatch(&def.predicate));
         let dsts: Vec<u32> = if let Some(dst_id) = anchored_dst {
             vec![dst_id]
         } else if let Some(idx) = indexed {
@@ -2856,8 +2881,15 @@ impl RuleEngine {
     /// Inner handler for `on_node_changed` when the rule is a via-hop rule.
     ///
     /// For each role n can play (src, via, dst), computes and applies the
-    /// desired edge set using `compute_desired_via`. Via-hop rules bypass the
-    /// candidate index; no index maintenance is performed here.
+    /// desired edge set using `compute_desired_via`.
+    ///
+    /// The dst side of the rule's candidate index is maintained here, because
+    /// `compute_desired_via` probes it to narrow destinations: a change to a
+    /// `dst_label` node is withdrawn under its previous value and filed under
+    /// the current one, exactly as on the non-via path. The src side is left
+    /// alone — it would hold `src_label` nodes and nothing probes it. A
+    /// predicate the index cannot answer (one holding a `KeyMatch` anywhere)
+    /// falls back to the full candidate set instead.
     ///
     /// Incremental correctness by change class:
     /// - **src prop / insert** (`as_src`): re-expand via from n, recompute all

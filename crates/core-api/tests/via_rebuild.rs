@@ -518,3 +518,140 @@ fn a_write_after_a_snapshot_open_does_not_strand_a_via_hop_rules_edges() {
         "a via-hop rule must still see the via edges its snapshot holds"
     );
 }
+
+// ── An `Any` predicate holding a KeyMatch cannot be narrowed by the index ────
+//
+// `KeyMatch` candidates are resolved by id lookup, so the spec it compiles to
+// (`ByKey`) offers the index no keys to probe. Under `Any` the FK fast path
+// does not apply either, so narrowing the candidate set through the index would
+// consider only the destinations the *other* branch reaches, and every
+// destination that matches solely through the `KeyMatch` branch would silently
+// derive no edge. Such a predicate has to fall back to the full candidate set.
+
+/// Author `alice` owns `api`; the rule hops Author → (TOP_AUTHOR, In) → File
+/// and scores that via File against every File.
+///
+/// `Any([KeyMatch { sibling_id }, FieldEqual { team }])` splits the
+/// destinations cleanly: `docs` is named by `api.sibling_id` and shares no
+/// team, so only the KeyMatch branch reaches it; `model` shares `api`'s team
+/// and is named by nothing, so only the FieldEqual branch reaches it.
+fn seed_mixed_any(db: &mut Db) {
+    db.insert_node("Author", "alice", vec![]).unwrap();
+    db.insert_node(
+        "File",
+        "api",
+        vec![
+            ("top_author_id".into(), Value::Str("alice".into())),
+            ("sibling_id".into(), Value::Str("docs".into())),
+            ("team".into(), Value::Str("core".into())),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "File",
+        "docs",
+        vec![("team".into(), Value::Str("other".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "File",
+        "model",
+        vec![("team".into(), Value::Str("core".into()))],
+    )
+    .unwrap();
+    db.create_rule(RuleDef {
+        name: "top_author".into(),
+        src_label: "File".into(),
+        dst_label: "Author".into(),
+        predicate: Predicate::KeyMatch {
+            field: "top_author_id".into(),
+        },
+        edge_type: "TOP_AUTHOR".into(),
+        weight_prop: None,
+        max_edges: Some(1),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    db.create_rule(RuleDef {
+        name: "mixed".into(),
+        src_label: "Author".into(),
+        dst_label: "File".into(),
+        predicate: Predicate::Any(vec![
+            Predicate::KeyMatch {
+                field: "sibling_id".into(),
+            },
+            Predicate::FieldEqual {
+                field: "team".into(),
+            },
+        ]),
+        edge_type: "MIXED".into(),
+        weight_prop: Some("score".into()),
+        max_edges: Some(10),
+        approximate: false,
+        via_label: Some("File".into()),
+        via_edge: Some("TOP_AUTHOR".into()),
+        via_dir: Some(Direction::In),
+    })
+    .unwrap();
+}
+
+fn mixed(db: &Db, a: &str) -> Vec<String> {
+    let mut v = db.neighbors(a, "MIXED", Direction::Out).unwrap();
+    v.sort();
+    v
+}
+
+#[test]
+fn a_via_rule_with_any_of_keymatch_and_field_equal_derives_both_branches() {
+    let dir = tmp("via-any-keymatch");
+    let mut db = GraphDb::open(&dir).unwrap();
+    seed_mixed_any(&mut db);
+    assert_eq!(
+        mixed(&db, "alice"),
+        vec!["api", "docs", "model"],
+        "docs is reachable only through the KeyMatch branch and must be derived"
+    );
+
+    // A rebuild is a full recompute through the same candidate path.
+    db.rebuild_rule("mixed").unwrap();
+    assert_eq!(mixed(&db, "alice"), vec!["api", "docs", "model"], "rebuild");
+
+    // Incremental: retract the KeyMatch branch and only `docs` may leave.
+    db.set_prop("api", "sibling_id", Value::Str("nobody".into()))
+        .unwrap();
+    assert_eq!(mixed(&db, "alice"), vec!["api", "model"]);
+
+    // And it comes back when the field names it again.
+    db.set_prop("api", "sibling_id", Value::Str("docs".into()))
+        .unwrap();
+    assert_eq!(mixed(&db, "alice"), vec!["api", "docs", "model"]);
+}
+
+#[test]
+fn a_via_rule_with_any_of_keymatch_survives_a_snapshot_open() {
+    let dir = tmp("via-any-keymatch-snapshot");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        seed_mixed_any(&mut db);
+        assert_eq!(mixed(&db, "alice"), vec!["api", "docs", "model"]);
+        // Snapshot leaves the WAL empty, so the reopen replays nothing.
+        db.snapshot().unwrap();
+    }
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        mixed(&db, "alice"),
+        vec!["api", "docs", "model"],
+        "after reopen"
+    );
+    // One write on a destination must not cost the source its other edges.
+    db.set_prop("model", "team", Value::Str("core".into()))
+        .unwrap();
+    assert_eq!(
+        mixed(&db, "alice"),
+        vec!["api", "docs", "model"],
+        "the KeyMatch branch must survive a write that only touches the other"
+    );
+}

@@ -213,6 +213,26 @@ pub fn is_keymatch_rooted(p: &Predicate) -> bool {
     }
 }
 
+/// True when a `KeyMatch` appears anywhere in the predicate tree.
+///
+/// Broader than [`is_keymatch_rooted`] and answers a different question: not
+/// "does the FK fast path apply" but "can the candidate index answer this
+/// predicate at all". `KeyMatch` candidates are resolved by id lookup, so the
+/// spec it compiles to (`CandidateSpec::ByKey`) contributes no index keys. A
+/// predicate holding one anywhere the fast path does not cover — under `Any`,
+/// or as a non-first conjunct of `All` — must therefore fall back to the exact
+/// full candidate set, or every destination reachable only through the
+/// `KeyMatch` branch is silently never considered.
+pub fn predicate_contains_keymatch(p: &Predicate) -> bool {
+    match p {
+        Predicate::KeyMatch { .. } => true,
+        Predicate::All(parts) | Predicate::Any(parts) => {
+            parts.iter().any(predicate_contains_keymatch)
+        }
+        _ => false,
+    }
+}
+
 /// Default `RuleDef.max_edges` for suggest, auto-FK, demo, and HTTP omit.
 pub fn default_max_edges(predicate: &Predicate) -> u64 {
     if is_keymatch_rooted(predicate) {

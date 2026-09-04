@@ -1516,3 +1516,104 @@ fn list_fk_under_a_small_cap_keeps_the_lowest_destination_keys() {
          not the two first-listed elements"
     );
 }
+
+// ── `Any([KeyMatch, …])` on a plain rule ─────────────────────────────────────
+//
+// `KeyMatch` candidates are resolved by id lookup, so `CandidateSpec::ByKey`
+// offers the candidate index nothing to probe. The FK fast path covers a
+// predicate rooted at `KeyMatch`; one held under `Any` is covered by neither,
+// so narrowing through the index would consider only the destinations the other
+// branch reaches. Both branches must derive.
+
+/// `Person.friend_id` names one destination; `Person.city` matches another by
+/// equality. Neither destination is reachable through the other's branch.
+fn seed_any_keymatch(db: &mut GraphDb<RealFs>) {
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node("Person", "bob", vec![]).unwrap();
+    db.insert_node("Person", "carol", vec![]).unwrap();
+    db.create_rule(RuleDef {
+        name: "linked".into(),
+        src_label: "Person".into(),
+        dst_label: "Person".into(),
+        predicate: Predicate::Any(vec![
+            Predicate::KeyMatch {
+                field: "friend_id".into(),
+            },
+            Predicate::FieldEqual {
+                field: "city".into(),
+            },
+        ]),
+        edge_type: "LINKED".into(),
+        weight_prop: None,
+        max_edges: Some(10),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    // bob is named by alice's FK and shares no city; carol shares alice's city
+    // and is named by nothing.
+    db.set_prop("carol", "city", Value::Str("berlin".into()))
+        .unwrap();
+    db.set_prop("bob", "city", Value::Str("lisbon".into()))
+        .unwrap();
+}
+
+fn linked(db: &GraphDb<RealFs>, key: &str) -> Vec<String> {
+    let mut v = db.neighbors(key, "LINKED", Direction::Out).unwrap();
+    v.sort();
+    v
+}
+
+#[test]
+fn any_of_keymatch_and_field_equal_derives_both_branches() {
+    let dir = tmp("any-keymatch-src");
+    let mut db = GraphDb::open(&dir).unwrap();
+    seed_any_keymatch(&mut db);
+
+    // One write on the source, carrying both branches at once.
+    db.set_prop("alice", "friend_id", Value::Str("bob".into()))
+        .unwrap();
+    db.set_prop("alice", "city", Value::Str("berlin".into()))
+        .unwrap();
+    assert_eq!(
+        linked(&db, "alice"),
+        vec!["bob", "carol"],
+        "bob is reachable only through the KeyMatch branch and must be derived"
+    );
+
+    // A rebuild is a full recompute through the same candidate path.
+    db.rebuild_rule("linked").unwrap();
+    assert_eq!(linked(&db, "alice"), vec!["bob", "carol"], "rebuild");
+
+    // Retracting the FK must cost the source only that one destination.
+    db.set_prop("alice", "friend_id", Value::Str("nobody".into()))
+        .unwrap();
+    assert_eq!(linked(&db, "alice"), vec!["carol"]);
+}
+
+#[test]
+fn any_of_keymatch_derives_when_the_destination_is_the_one_written() {
+    // The dst-side probe: the write lands on the node the FK names, so the rule
+    // has to find the *source* that points at it.
+    let dir = tmp("any-keymatch-dst");
+    let mut db = GraphDb::open(&dir).unwrap();
+    seed_any_keymatch(&mut db);
+    db.set_prop("alice", "friend_id", Value::Str("dave".into()))
+        .unwrap();
+    assert_eq!(linked(&db, "alice"), Vec::<String>::new());
+
+    // dave appears later and shares no city with anyone.
+    db.insert_node(
+        "Person",
+        "dave",
+        vec![("city".into(), Value::Str("oslo".into()))],
+    )
+    .unwrap();
+    assert_eq!(
+        linked(&db, "alice"),
+        vec!["dave"],
+        "inserting the named destination must derive the KeyMatch branch"
+    );
+}
