@@ -261,6 +261,39 @@ jobs:
             --expect-tools map,context,impact,owners,why,recall,remember,sync
         working-directory: scripts/mcp-handshake
 
+  # The v0.6 code-graph acceptance run: ingest, map, determinism, freshness,
+  # the recall nudge, a 20-writer concurrency stress against a live MCP server,
+  # and timings — all driven through the shipped binary on a real checkout
+  # rather than through unit tests. See scripts/acceptance-0.6.sh.
+  code-graph:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 — the graph is built from history. A shallow checkout
+      # has almost none, so the co-change edges the nudge step asserts on
+      # would never form.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
+      # Release, because the script only asserts its timing budgets against a
+      # release build — a debug binary is ~6x slower and would measure rustc.
+      - run: cargo build --release -p mushroomdb-cli
+      # `gh` is installed on the runner but is not authenticated, so the script
+      # drops `--prs` by itself and says so in its output.
+      #
+      # The budgets here are 3x the local ones (200 ms / 1000 ms). A hosted
+      # runner is too noisy to enforce a latency gate at the product's own
+      # numbers — this repository already keeps its throughput and p95 gates
+      # out of CI for that reason — but 3x still catches a gross regression.
+      # The product numbers are what scripts/bench-code-graph.sh measures.
+      - name: acceptance-0.6
+        run: MUSHROOMDB=target/release/mushroomdb bash scripts/acceptance-0.6.sh
+        env:
+          TOUCH_BUDGET_MS: "600"
+          MAP_BUDGET_MS: "3000"
+
   plugin-validate:
     runs-on: ubuntu-latest
     steps:
