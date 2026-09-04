@@ -45,6 +45,13 @@ fn main() -> ExitCode {
             let _ = stdout.flush();
             ExitCode::SUCCESS // never block the prompt
         }
+        Ok(Command::Map { db_dir, json }) => match cli::run_map(&db_dir, json) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
         Ok(Command::Sync { db_dir }) => match cli::ingest_git::run_sync(&db_dir) {
             Ok(report) => {
                 print!("{}", cli::ingest_git::format_sync(&report));

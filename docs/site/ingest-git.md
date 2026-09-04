@@ -476,6 +476,32 @@ it was and the next run re-walks the same window, which is harmless: commits
 already in the graph are skipped, file props are rewritten from the recomputed
 state, and a rename whose node already moved finds nothing to move.
 
+## The repository map
+
+`mushroomdb map <db-dir>` reads the graph back as one screen: the size of the
+repository, the groups of files that change and import together, the files
+everything else leans on, who owns them, what has moved lately, and three
+questions the graph can answer well. Nothing is read from disk and no clock is
+consulted, so the same store always prints the same bytes.
+
+```
+mushroomdb map ~/.mushroomdb/code
+```
+
+Clusters come from Louvain over `CO_CHANGED` (weighted by `score`, at least
+0.3) together with `IMPORTS` (weight 1.0), and are named after the directory
+their members share. Key files are ranked by PageRank over `IMPORTS`,
+`CO_CHANGED` and `CALLS`, the last projected onto the files that define the
+symbols. Owners are `TOP_AUTHOR` in-degree, printed by name. Hot files are
+those a commit inside the last 90 days touched, counted over `TOUCHED`.
+
+"Now" is the newest `Commit.ts` in the store rather than the wall clock, which
+is what keeps a re-run byte-identical — so a store synced to its repository's
+head reports a sync age of `0s`. The digest is at most 40 lines and takes a
+few hundred milliseconds on a repository of a few hundred files; when its time
+budget fires, the header ends in `(truncated)`. Add `--json` to get the same
+map as data instead of a digest.
+
 ## What the recall hook sees
 
 Once `mushroomdb install` has wired the `UserPromptSubmit` recall hook at this

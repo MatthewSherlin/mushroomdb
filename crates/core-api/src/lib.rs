@@ -4,6 +4,7 @@ pub mod history;
 mod ingest;
 pub mod mask;
 pub mod reader;
+pub mod repograph;
 pub mod roles;
 pub mod schema;
 mod shared;

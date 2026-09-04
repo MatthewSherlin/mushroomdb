@@ -9,6 +9,7 @@ pub mod install;
 pub mod recall;
 pub mod structure;
 
+use core_api::repograph;
 use core_api::schema::Schema;
 use core_api::{
     default_max_edges, is_write_query, wal_commit_count_at, AlgoDir, BackupReport, DegreeConfig,
@@ -222,6 +223,14 @@ pub enum Command {
         auto: bool,
         files: Vec<PathBuf>,
     },
+    /// Summarise the repository the store was built from: clusters, key
+    /// files, owners, what is hot, and what is worth asking about.
+    Map {
+        db_dir: PathBuf,
+        /// Print the [`core_api::repograph::RepoMap`] as JSON instead of the
+        /// rendered digest.
+        json: bool,
+    },
     Version,
     Help,
 }
@@ -276,6 +285,8 @@ Usage:
   mushroomdb demo <db-dir>
   mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
   mushroomdb sync <db-dir>         re-sync the repo the store was built from: new commits, then the dirty working tree
+  mushroomdb map <db-dir> [--json] summarise the graphed repository: clusters, key files, owners, hot files
+                                   --json prints the computed map instead of the rendered digest
   mushroomdb touch <db-dir>|--auto [<file>...]
                                    re-extract just these files; with no <file> reads them from a
                                    PostToolUse payload on stdin (hook body)
@@ -470,6 +481,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "recall" => parse_dir_or_auto("recall", &args[1..])
             .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
         "sync" => parse_one_dir("sync", &args[1..]).map(|db_dir| Command::Sync { db_dir }),
+        "map" => parse_map(&args[1..]),
         "touch" => parse_touch(&args[1..]),
         "ingest-git" => parse_ingest_git(&args[1..]),
         "install" => parse_install_cmd(&args[1..]).map(Command::Install),
@@ -1240,6 +1252,30 @@ fn parse_algo_dir(val: &str) -> Result<AlgoDir, String> {
 /// `communities` are always undirected and ignore it. `edge_types` /
 /// `weight_prop` / `min_weight` are used by `communities` only.
 #[allow(clippy::too_many_arguments)]
+/// Body of `mushroomdb map <db-dir> [--json]`.
+///
+/// Opens read-only, with both write paths off: a map is a question, and asking
+/// it must never migrate a snapshot, rewrite a torn WAL tail, or make a writer
+/// wait on the cross-process lock.
+pub fn run_map(db_dir: &Path, json: bool) -> Result<String, CliError> {
+    let db = GraphDb::open_with_options(
+        db_dir,
+        core_api::OpenOptions {
+            auto_migrate: false,
+            repair_wal: false,
+            read_only: true,
+        },
+    )?;
+    let map = repograph::repo_map(&db, &repograph::MapOptions::default());
+    if json {
+        let mut out = serde_json::to_string_pretty(&map)
+            .map_err(|e| CliError(format!("serialise map: {e}")))?;
+        out.push('\n');
+        return Ok(out);
+    }
+    Ok(repograph::render_map(&map))
+}
+
 pub fn run_algo(
     db_dir: &Path,
     subcmd: &AlgoSubcmd,
@@ -1413,6 +1449,24 @@ fn parse_touch(args: &[&str]) -> Result<Command, String> {
         auto,
         files,
     })
+}
+
+fn parse_map(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir = None;
+    let mut json = false;
+    for a in args {
+        if *a == "--json" {
+            json = true;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_some() {
+            return Err(format!("unexpected extra argument: {a}"));
+        } else {
+            db_dir = Some(PathBuf::from(*a));
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| "map requires <db-dir>".to_string())?;
+    Ok(Command::Map { db_dir, json })
 }
 
 fn parse_one_dir(cmd: &str, args: &[&str]) -> Result<PathBuf, String> {
@@ -3136,6 +3190,28 @@ mod tests {
             "one of <db-dir> or --auto is required"
         );
         assert!(usage().contains("mushroomdb recall <db-dir>"));
+    }
+
+    #[test]
+    fn map_parses_a_dir_and_an_optional_json_flag() {
+        assert_eq!(
+            parse_args(&["map", "/tmp/db"]).unwrap(),
+            Command::Map {
+                db_dir: PathBuf::from("/tmp/db"),
+                json: false,
+            }
+        );
+        // The flag may come before or after the directory.
+        let want = Command::Map {
+            db_dir: PathBuf::from("/tmp/db"),
+            json: true,
+        };
+        assert_eq!(parse_args(&["map", "/tmp/db", "--json"]).unwrap(), want);
+        assert_eq!(parse_args(&["map", "--json", "/tmp/db"]).unwrap(), want);
+        assert!(parse_args(&["map"]).is_err(), "<db-dir> is required");
+        assert!(parse_args(&["map", "/tmp/db", "/tmp/other"]).is_err());
+        assert!(parse_args(&["map", "/tmp/db", "--nope"]).is_err());
+        assert!(usage().contains("mushroomdb map <db-dir> [--json]"));
     }
 
     /// Every hook-driven command takes either a path or `--auto`, never both

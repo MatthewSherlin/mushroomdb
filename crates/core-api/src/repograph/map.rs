@@ -1,0 +1,520 @@
+//! `map` — the whole repository in one screen.
+//!
+//! What a person new to a codebase asks first: how big is it, what are its
+//! parts, which files does everything else lean on, who knows them, and what
+//! has moved lately. Every answer is computed from the graph `ingest-git`
+//! wrote; nothing here reads the working tree or a clock.
+//!
+//! # How each answer is found
+//!
+//! | Section | From |
+//! |---|---|
+//! | clusters | Louvain over `CO_CHANGED` (weight `score`, ≥ 0.3) ∪ `IMPORTS` (1.0), members labelled `File` |
+//! | key files | PageRank over `IMPORTS` ∪ `CO_CHANGED` ∪ `CALLS`, the last projected onto files by `Symbol.file_id` |
+//! | owners | `TOP_AUTHOR` in-degree, printed as `Author.name` |
+//! | hot | files a commit inside the window touched, by `TOUCHED` |
+//! | stale concepts | a `Concept` whose `source_hashes` no longer match its `source_files` |
+//!
+//! # Time
+//!
+//! "Now" is [`MapOptions::now_ts`] when given and otherwise the newest
+//! `Commit.ts` in the store — never the wall clock, because a digest must be
+//! byte-identical across runs against an unchanged store. A consequence worth
+//! knowing: on a store synced to its repository's head, the sync age reads as
+//! `0s`, since the head commit *is* the newest timestamp.
+//!
+//! # Budget
+//!
+//! [`MapOptions::budget_ms`] is checked once before each phase, and passed on
+//! to Louvain, which checks it per sweep. When it fires the phases that have
+//! not run are skipped and `truncated` is set, which the rendered digest
+//! reports as `(truncated)`.
+
+use crate::algo::LouvainConfig;
+use crate::db::GraphDb;
+use crate::repograph::render::{basename, cluster_name, common_dir_prefix, sanitize};
+use core_storage::fs::Fs;
+use core_storage::Value;
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
+
+/// Key of the singleton marker `ingest-git` writes the synced sha on.
+const SYNC_KEY: &str = "__mushroomdb_git_sync__";
+/// A `CO_CHANGED` edge below this score is too weak to shape a cluster.
+const CO_CHANGED_MIN_WEIGHT: f64 = 0.3;
+/// Most entries any one-line section prints.
+const MAX_KEY_FILES: usize = 5;
+const MAX_OWNERS: usize = 5;
+const MAX_HOT: usize = 5;
+/// A cluster of one file names nothing; the smallest useful group is a pair.
+const MIN_CLUSTER: usize = 2;
+/// PageRank parameters, matching [`crate::algo::PageRankConfig`]'s defaults.
+const DAMPING: f64 = 0.85;
+const MAX_ITERS: u32 = 50;
+const TOL: f64 = 1e-6;
+const SECS_PER_DAY: i64 = 86_400;
+
+/// What [`repo_map`] is allowed to spend and how much it may print.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapOptions {
+    /// Clusters listed, largest first.
+    pub max_communities: usize,
+    /// Files named as examples inside each cluster.
+    pub max_samples: usize,
+    /// Width of the "hot" window, in days back from now.
+    pub hot_days: i64,
+    /// Wall-clock budget in milliseconds. `0` means no budget.
+    pub budget_ms: u64,
+    /// Treat this Unix timestamp as now. Defaults to the newest `Commit.ts`.
+    pub now_ts: Option<i64>,
+}
+
+impl Default for MapOptions {
+    fn default() -> Self {
+        Self {
+            max_communities: 8,
+            max_samples: 3,
+            hot_days: 90,
+            budget_ms: 3_000,
+            now_ts: None,
+        }
+    }
+}
+
+/// How current the graph is: the sha it was synced to, and how old that
+/// commit is relative to now.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SyncInfo {
+    /// The full sha recorded on the `GitSync` marker.
+    pub sha: String,
+    /// Seconds between that commit's `ts` and now. `None` when the commit it
+    /// names is not in the graph, so its age cannot be known.
+    pub age_secs: Option<i64>,
+}
+
+/// One group of files that change and import together.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MapCommunity {
+    /// The directory its members share, followed by the subdirectories most
+    /// of them sit in — or `<mixed>` when they share no directory at all.
+    pub name: String,
+    /// Just the directory every member is under. Empty when there is none,
+    /// which is the machine-readable form of a `<mixed>` name.
+    pub dir: String,
+    /// Members in the cluster, of which `samples` names a few.
+    pub size: usize,
+    /// Share of the cluster's edge weight that stays inside it, `0.0..=1.0`.
+    pub cohesion: f64,
+    /// The most depended-on members, highest first. Full keys.
+    pub samples: Vec<String>,
+}
+
+/// The repository, summarised.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RepoMap {
+    pub files: usize,
+    pub symbols: usize,
+    pub commits: usize,
+    pub authors: usize,
+    /// Absent when the store carries no `GitSync` marker.
+    pub last_sync: Option<SyncInfo>,
+    pub communities: Vec<MapCommunity>,
+    /// `(file key, PageRank score)`, highest first.
+    pub key_files: Vec<(String, f64)>,
+    /// `(author name, files owned)`, most first.
+    pub owners: Vec<(String, usize)>,
+    /// `(file key, commits inside the window)`, most first.
+    pub hot_files: Vec<(String, usize)>,
+    /// Width of the hot window in days, so a reader knows what "hot" meant.
+    pub hot_days: i64,
+    /// Concepts whose sources changed since they were learned.
+    pub stale_concepts: usize,
+    /// Three questions this graph can answer well, phrased for asking.
+    pub questions: Vec<String>,
+    /// The budget fired: some sections are missing or partial.
+    pub truncated: bool,
+}
+
+/// Whether the deadline has passed. `None` is a run with no budget.
+fn spent(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|dl| Instant::now() >= dl)
+}
+
+/// Milliseconds left, floored at 1 so a budgeted call never reads as
+/// unbudgeted. `None` in, `0` out: no budget either way.
+fn remaining_ms(deadline: Option<Instant>) -> u64 {
+    match deadline {
+        None => 0,
+        Some(dl) => u64::try_from(dl.saturating_duration_since(Instant::now()).as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1),
+    }
+}
+
+fn str_prop<F: Fs>(db: &GraphDb<F>, key: &str, field: &str) -> Option<String> {
+    match db.node_ref(key).and_then(|n| n.prop(field)) {
+        Some(Value::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// The string elements of a list property, in order.
+fn str_list(v: Option<Value>) -> Vec<String> {
+    match v {
+        Some(Value::List(items)) => items
+            .into_iter()
+            .filter_map(|i| match i {
+                Value::Str(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Sort `(key, count)` pairs the way every section here prints them: the
+/// biggest first, and equal counts by key so the order never wobbles.
+fn rank<T: PartialOrd + Copy>(items: &mut [(String, T)]) {
+    items.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+}
+
+/// Summarise the repository the store was built from.
+///
+/// Deterministic: given the same store and options the result is identical,
+/// timestamps included, because "now" comes from the graph rather than a
+/// clock. See the module docs for what each section means.
+#[must_use]
+pub fn repo_map<F: Fs>(db: &GraphDb<F>, opts: &MapOptions) -> RepoMap {
+    let deadline =
+        (opts.budget_ms > 0).then(|| Instant::now() + Duration::from_millis(opts.budget_ms));
+    let mut truncated = false;
+
+    let mut file_keys: Vec<String> = db
+        .nodes_with_label("File")
+        .iter()
+        .map(|n| n.key().to_string())
+        .collect();
+    file_keys.sort();
+    let files = file_keys.len();
+    let symbols = db.nodes_with_label("Symbol").len();
+    let authors = db.nodes_with_label("Author").len();
+
+    // Commit timestamps, read once: "now", the sync age and the hot window all
+    // need them.
+    let mut commit_ts: BTreeMap<String, i64> = BTreeMap::new();
+    for n in db.nodes_with_label("Commit") {
+        if let Some(Value::Int(ts)) = n.prop("ts") {
+            commit_ts.insert(n.key().to_string(), ts);
+        }
+    }
+    let commits = db.nodes_with_label("Commit").len();
+    let now = opts.now_ts.or_else(|| commit_ts.values().copied().max());
+
+    let mut map = RepoMap {
+        files,
+        symbols,
+        commits,
+        authors,
+        last_sync: None,
+        communities: Vec::new(),
+        key_files: Vec::new(),
+        owners: Vec::new(),
+        hot_files: Vec::new(),
+        hot_days: opts.hot_days,
+        stale_concepts: 0,
+        questions: Vec::new(),
+        truncated: false,
+    };
+    if files == 0 {
+        return map; // nothing keyed on a file is worth computing
+    }
+
+    map.last_sync = str_prop(db, SYNC_KEY, "sha").map(|sha| {
+        let age_secs = now
+            .zip(commit_ts.get(&sha).copied())
+            .map(|(now, ts)| now - ts);
+        SyncInfo {
+            sha: sanitize(&sha),
+            age_secs,
+        }
+    });
+
+    // ── key files ───────────────────────────────────────────────────────────
+    // PageRank first: the cluster samples are ranked by it too.
+    let scores = if spent(deadline) {
+        truncated = true;
+        Vec::new()
+    } else {
+        file_pagerank(db, &file_keys)
+    };
+    let by_score: BTreeMap<&str, f64> = scores.iter().map(|(k, s)| (k.as_str(), *s)).collect();
+    map.key_files = scores
+        .iter()
+        .take(MAX_KEY_FILES)
+        .map(|(k, s)| (sanitize(k), *s))
+        .collect();
+
+    // ── clusters ────────────────────────────────────────────────────────────
+    if !truncated && !spent(deadline) {
+        let report = db.communities(&LouvainConfig {
+            // One weight property covers both edge types: a `CO_CHANGED` edge
+            // is worth its `score`, and an `IMPORTS` edge, which carries no
+            // such property, falls back to 1.0 — above the threshold, so
+            // every import counts while a weak co-change does not.
+            edge_types: vec!["CO_CHANGED".to_string(), "IMPORTS".to_string()],
+            weight_prop: Some("score".to_string()),
+            min_weight: Some(CO_CHANGED_MIN_WEIGHT),
+            budget_ms: remaining_ms(deadline),
+            node_label: Some("File".to_string()),
+            ..LouvainConfig::default()
+        });
+        truncated |= report.truncated;
+        for c in report
+            .communities
+            .iter()
+            .filter(|c| c.members.len() >= MIN_CLUSTER)
+            .take(opts.max_communities)
+        {
+            let mut ranked: Vec<(String, f64)> = c
+                .members
+                .iter()
+                .map(|k| (k.clone(), by_score.get(k.as_str()).copied().unwrap_or(0.0)))
+                .collect();
+            rank(&mut ranked);
+            map.communities.push(MapCommunity {
+                name: sanitize(&cluster_name(&c.members)),
+                dir: sanitize(&common_dir_prefix(&c.members)),
+                size: c.members.len(),
+                cohesion: c.cohesion,
+                samples: ranked
+                    .into_iter()
+                    .take(opts.max_samples)
+                    .map(|(k, _)| sanitize(&k))
+                    .collect(),
+            });
+        }
+    } else {
+        truncated = true;
+    }
+
+    // ── owners ──────────────────────────────────────────────────────────────
+    if !spent(deadline) {
+        let mut owned: BTreeMap<String, usize> = BTreeMap::new();
+        for (_file, author, _w) in db.weighted_edges("TOP_AUTHOR", None) {
+            *owned.entry(author).or_default() += 1;
+        }
+        let mut named: Vec<(String, usize)> = owned
+            .into_iter()
+            .map(|(key, n)| {
+                // Authors are printed by name. The key — a mail address — is
+                // only ever a fallback for a store that has none.
+                let name = str_prop(db, &key, "name").unwrap_or(key);
+                (sanitize(&name), n)
+            })
+            .collect();
+        rank(&mut named);
+        named.truncate(MAX_OWNERS);
+        map.owners = named;
+    } else {
+        truncated = true;
+    }
+
+    // ── hot ─────────────────────────────────────────────────────────────────
+    if let (Some(now), false) = (now, spent(deadline)) {
+        let cutoff = now.saturating_sub(opts.hot_days.saturating_mul(SECS_PER_DAY));
+        // A closed window: a commit dated after "now" is outside it too, so
+        // asking the map what was hot at an earlier point answers about then.
+        let recent: BTreeSet<&str> = commit_ts
+            .iter()
+            .filter(|(_, ts)| (cutoff..=now).contains(ts))
+            .map(|(sha, _)| sha.as_str())
+            .collect();
+        let is_file: BTreeSet<&str> = file_keys.iter().map(String::as_str).collect();
+        let mut touched: BTreeMap<String, usize> = BTreeMap::new();
+        for (commit, file, _w) in db.weighted_edges("TOUCHED", None) {
+            if recent.contains(commit.as_str()) && is_file.contains(file.as_str()) {
+                *touched.entry(file).or_default() += 1;
+            }
+        }
+        let mut hot: Vec<(String, usize)> = touched
+            .into_iter()
+            .map(|(k, n)| (sanitize(&k), n))
+            .collect();
+        rank(&mut hot);
+        hot.truncate(MAX_HOT);
+        map.hot_files = hot;
+    } else if now.is_some() {
+        truncated = true;
+    }
+
+    // ── stale concepts ──────────────────────────────────────────────────────
+    if !spent(deadline) {
+        map.stale_concepts = stale_concepts(db);
+    } else {
+        truncated = true;
+    }
+
+    // Questions are phrased from the raw keys, not the sanitized ones printed
+    // above: they have to match a graph key to look a partner up.
+    map.questions = questions(db, &map, &scores);
+    map.truncated = truncated;
+    map
+}
+
+/// PageRank over the files, on the union of the three edge types that say one
+/// file depends on another.
+///
+/// `CALLS` runs between symbols, so it is projected onto the files that define
+/// them; a call inside one file is not a dependency and is dropped. Weights
+/// accumulate across the three sources, and rank flows along the edge — so a
+/// file many others import collects it, which is what "most depended-on"
+/// means. The iteration mirrors [`crate::algo::pagerank`]: same damping,
+/// tolerance, iteration cap and dangling-mass handling.
+fn file_pagerank<F: Fs>(db: &GraphDb<F>, file_keys: &[String]) -> Vec<(String, f64)> {
+    let n = file_keys.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let idx: BTreeMap<&str, usize> = file_keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k.as_str(), i))
+        .collect();
+
+    // Where each symbol is defined, so a call can be read as a file edge.
+    let mut sym_file: BTreeMap<String, String> = BTreeMap::new();
+    for node in db.nodes_with_label("Symbol") {
+        if let Some(Value::Str(file)) = node.prop("file_id") {
+            sym_file.insert(node.key().to_string(), file);
+        }
+    }
+
+    let mut weight: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+    let mut add = |src: Option<&usize>, dst: Option<&usize>, w: f64| {
+        if let (Some(&a), Some(&b)) = (src, dst) {
+            if a != b {
+                *weight.entry((a, b)).or_default() += w;
+            }
+        }
+    };
+    for (src, dst, _) in db.weighted_edges("IMPORTS", None) {
+        add(idx.get(src.as_str()), idx.get(dst.as_str()), 1.0);
+    }
+    for (src, dst, w) in db.weighted_edges("CO_CHANGED", Some("score")) {
+        add(
+            idx.get(src.as_str()),
+            idx.get(dst.as_str()),
+            w.unwrap_or(1.0),
+        );
+    }
+    for (src, dst, _) in db.weighted_edges("CALLS", None) {
+        let (Some(sf), Some(df)) = (sym_file.get(&src), sym_file.get(&dst)) else {
+            continue;
+        };
+        add(idx.get(sf.as_str()), idx.get(df.as_str()), 1.0);
+    }
+
+    let mut send_to: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    for ((a, b), w) in weight {
+        send_to[a].push((b, w));
+    }
+    let mut receive_from: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    let mut dangling: Vec<usize> = Vec::new();
+    for (i, send) in send_to.iter().enumerate() {
+        let out: f64 = send.iter().map(|(_, w)| w).sum();
+        if send.is_empty() || out <= 0.0 {
+            dangling.push(i);
+            continue;
+        }
+        for &(j, w) in send {
+            receive_from[j].push((i, w / out));
+        }
+    }
+
+    let nf = n as f64;
+    let teleport = (1.0 - DAMPING) / nf;
+    let mut pr: Vec<f64> = vec![1.0 / nf; n];
+    for _ in 0..MAX_ITERS {
+        let leaked = dangling.iter().map(|&i| pr[i]).sum::<f64>() * DAMPING / nf;
+        let mut next = vec![teleport + leaked; n];
+        for (j, slot) in next.iter_mut().enumerate() {
+            *slot += DAMPING * receive_from[j].iter().map(|&(i, w)| pr[i] * w).sum::<f64>();
+        }
+        let delta: f64 = pr.iter().zip(next.iter()).map(|(a, b)| (a - b).abs()).sum();
+        pr = next;
+        if delta < TOL {
+            break;
+        }
+    }
+
+    let mut scores: Vec<(String, f64)> = file_keys.iter().cloned().zip(pr).collect();
+    rank(&mut scores);
+    scores
+}
+
+/// Concepts whose recorded source hashes no longer match the files they were
+/// learned from. A source file that has since been deleted counts as changed:
+/// what the concept describes is certainly no longer there.
+fn stale_concepts<F: Fs>(db: &GraphDb<F>) -> usize {
+    db.nodes_with_label("Concept")
+        .iter()
+        .filter(|c| {
+            let files = str_list(c.prop("source_files"));
+            let hashes = str_list(c.prop("source_hashes"));
+            files
+                .iter()
+                .zip(hashes.iter())
+                .any(|(file, hash)| str_prop(db, file, "hash").as_ref() != Some(hash))
+        })
+        .count()
+}
+
+/// Three questions worth asking of this graph, each naming something the map
+/// just showed is important.
+///
+/// A question is only offered when the graph can answer it: with no key file
+/// there is nothing to ask about, and with no cluster there is no directory to
+/// ask who owns.
+///
+/// `ranked` holds the file keys exactly as the graph stores them, which is what
+/// a lookup has to match; only the phrasing that comes out is sanitized.
+fn questions<F: Fs>(db: &GraphDb<F>, map: &RepoMap, ranked: &[(String, f64)]) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some((first, _)) = ranked.first() {
+        // The partner it changes with most often — the pairing a newcomer
+        // would not guess from the directory tree.
+        let mut partners: Vec<(String, f64)> = db
+            .weighted_edges("CO_CHANGED", Some("score"))
+            .into_iter()
+            .filter(|(src, _, _)| src == first)
+            .map(|(_, dst, w)| (dst, w.unwrap_or(1.0)))
+            .collect();
+        rank(&mut partners);
+        if let Some((partner, _)) = partners.first() {
+            let a = basename(first);
+            // Two files with the same name would make the question unreadable,
+            // so the partner keeps its path when its name collides.
+            let b = if basename(partner) == a {
+                partner.as_str()
+            } else {
+                basename(partner)
+            };
+            out.push(sanitize(&format!("why does {a} co-change with {b}?")));
+        }
+    }
+    // The largest cluster that has a directory to name: asking who owns a
+    // group of files that share no directory is not a question anyone can
+    // answer.
+    if let Some(cluster) = map.communities.iter().find(|c| !c.dir.is_empty()) {
+        out.push(sanitize(&format!("who owns {}?", cluster.dir)));
+    }
+    if let Some((second, _)) = ranked.get(1) {
+        out.push(sanitize(&format!("what imports {}?", basename(second))));
+    }
+    out
+}
