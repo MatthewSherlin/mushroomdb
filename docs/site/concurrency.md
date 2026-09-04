@@ -92,9 +92,11 @@ Nothing is written during a refresh, so a read-only handle can refresh freely.
 `is_stale()` answers the same question without doing the work. It costs two
 metadata lookups and reads no file contents.
 
-`SharedDb::read()` calls this for you, at most once per `REFRESH_CHECK_INTERVAL`
-(50 ms). A server handle therefore stays current without reopening, and a tight
-read loop pays nothing.
+`SharedDb::read()` calls this for you on every read. A server handle therefore
+stays current without reopening, and a read started after a peer's commit
+completed always sees that commit — the visibility does not depend on how fast
+the peer was. The price is up to two metadata lookups per read, never a file
+read.
 
 ## Read-only handles
 

@@ -18,6 +18,7 @@
 //!  9. refresh_failure_degrades_the_handle
 //! 10. wal_consumed_tracks_bytes_exactly
 //! 11. refresh_on_unchanged_store_is_zero_cost
+//! 12. read_sees_a_peer_commit_that_lands_microseconds_later
 
 use core_api::{GraphDb, OpenOptions, Predicate, RuleDef, SharedDb, Value};
 use core_storage::fs::{FileId, Fs, RealFs};
@@ -570,6 +571,49 @@ fn refresh_on_unchanged_store_is_zero_cost() {
         baseline,
         "refreshing an unchanged store must not read any file contents"
     );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ── 12. A peer's commit is visible to the next read, however fast it landed ───
+
+/// The read path must not gate its staleness check on a wall clock.  It used
+/// to: the check ran at most once per 50 ms, so a peer that committed inside
+/// that window stayed invisible until the window expired, and whether a read
+/// saw an already-completed commit depended on how fast the peer had been.
+/// That is what broke test 1 on Linux, where the child writes its 100 nodes
+/// in ~11 ms, while the same code passed on macOS, where merely spawning the
+/// child costs more than the window.
+///
+/// The append below lands microseconds after the first read, so this fails
+/// wherever the check is rate-limited, not only on the fast platform.
+#[test]
+fn read_sees_a_peer_commit_that_lands_microseconds_later() {
+    let d = tmp("fast-peer");
+    let db = SharedDb::open(&d).unwrap();
+    assert_eq!(db.read().node_count(), 0);
+
+    // Stand in for a peer process's commit: a complete frame appended to the
+    // WAL through a separate handle on the same store, with no delay at all
+    // before the read that must see it.
+    let frame = encode_record(&WalRecord::InsertNode {
+        label: "Person".into(),
+        key: "fast".into(),
+        props: vec![],
+    });
+    RealFs::new(&d)
+        .unwrap()
+        .append(FileId::Wal, &frame)
+        .unwrap();
+
+    let g = db.read();
+    assert_eq!(
+        g.node_count(),
+        1,
+        "a read after the peer's commit must absorb it, whatever the clock says"
+    );
+    assert!(g.node_info("fast").is_some());
+    drop(g);
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }

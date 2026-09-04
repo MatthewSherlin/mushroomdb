@@ -27,8 +27,7 @@ pub use db::{
     snapshot_version_at, write_snapshot_bak, BackupReport, BatchBuilder, BatchOp, DeleteReport,
     EdgeInfo, Explanation, ExportEdge, FsyncPolicy, GraphDb, MaskedEdge, MaskedNodeResult,
     MutationEvent, NodeInfo, NodeRef, OpenOptions, Precondition, PredicateSummary, RuleStats,
-    SlowQueryEntry, SlowQuerySnapshot, SnapshotOptions, Stats, WriteAuthz, REFRESH_CHECK_INTERVAL,
-    WRITE_LOCK_WAIT,
+    SlowQueryEntry, SlowQuerySnapshot, SnapshotOptions, Stats, WriteAuthz, WRITE_LOCK_WAIT,
 };
 
 /// Current on-disk snapshot format version written by this build.

@@ -1362,13 +1362,6 @@ impl Default for OpenOptions {
 /// hang.
 pub const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Minimum interval between staleness checks on the [`SharedDb`](crate::SharedDb)
-/// read path.
-///
-/// Reads hotter than this reuse the previous check's outcome, so a tight read
-/// loop pays no per-read stat syscalls.
-pub const REFRESH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
-
 /// Interval between poll attempts while waiting for the cross-process lock.
 pub(crate) const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 

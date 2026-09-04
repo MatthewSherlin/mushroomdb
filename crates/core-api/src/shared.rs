@@ -72,11 +72,10 @@
 //! wait budget fails with [`GraphError::Busy`], having written nothing.
 //!
 //! Readers take neither `wal_mu` nor the cross-process lock. They check for
-//! other processes' commits at most once per
-//! [`REFRESH_CHECK_INTERVAL`](crate::REFRESH_CHECK_INTERVAL) and apply the WAL
-//! tail under the in-process write lock, which is the same lock the drain
-//! thread holds while it appends and applies — so a refresh never observes a
-//! half-committed group.
+//! other processes' commits on every read — a metadata-only staleness check —
+//! and apply the WAL tail under the in-process write lock, which is the same
+//! lock the drain thread holds while it appends and applies — so a refresh
+//! never observes a half-committed group.
 //!
 //! # Fsync-failure contract
 //!
@@ -125,8 +124,7 @@
 //! last clone is dropped can be silently lost.
 
 use crate::db::{
-    BatchOp, FsyncPolicy, Precondition, WriteAuthz, LOCK_POLL_INTERVAL, REFRESH_CHECK_INTERVAL,
-    WRITE_LOCK_WAIT,
+    BatchOp, FsyncPolicy, Precondition, WriteAuthz, LOCK_POLL_INTERVAL, WRITE_LOCK_WAIT,
 };
 use crate::reader::ReaderSnapshot;
 use crate::GraphDb;
@@ -137,7 +135,7 @@ use core_storage::RealFs;
 use core_storage::Result;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -343,13 +341,6 @@ pub struct SharedDb {
     /// across the drain thread and direct writers.  See module-level doc for
     /// the required acquisition order.
     wal_mu: Arc<Mutex<()>>,
-    /// Milliseconds (since `epoch`) at which the read path last checked whether
-    /// another process had committed.  Rate-limits that check to one per
-    /// [`REFRESH_CHECK_INTERVAL`] so a hot read loop pays nothing.
-    last_refresh_check: Arc<AtomicU64>,
-    /// Monotonic origin for `last_refresh_check`.  Set one interval in the past
-    /// so the first read after open always performs the check.
-    epoch: Instant,
 }
 
 const _: () = {
@@ -427,17 +418,24 @@ impl SharedDb {
                 handle: Some(handle),
             }),
             wal_mu,
-            last_refresh_check: Arc::new(AtomicU64::new(0)),
-            // Backdate the origin by one interval so the very first read
-            // performs a staleness check rather than trusting the open.
-            epoch: Instant::now()
-                .checked_sub(REFRESH_CHECK_INTERVAL)
-                .unwrap_or_else(Instant::now),
         }
     }
 
-    /// Check at most once per [`REFRESH_CHECK_INTERVAL`] whether another
-    /// process has committed, and if so absorb its commits.
+    /// Check whether another process has committed, and if so absorb its
+    /// commits.
+    ///
+    /// Runs on every read. The check is metadata-only — one `stat` of the WAL,
+    /// and a second of the snapshot when the WAL length is unchanged — which
+    /// is the price of a handle that follows its peers.
+    ///
+    /// It is deliberately not rate-limited by a timer. A wall-clock window
+    /// makes visibility depend on how fast the peer happened to be: a read
+    /// landing inside the window returns a view that predates a commit which
+    /// had already completed, while the same read on a slower machine would
+    /// have seen it. The child process in `multiprocess.rs` test 1 writes its
+    /// 100 nodes in ~11 ms on Linux — well inside the 50 ms window this check
+    /// used to keep, and outside it on macOS, where spawning the child costs
+    /// more than the window itself.
     ///
     /// Readers never touch the cross-process lock and never block on it: the
     /// worst a reader does is take the in-process write lock briefly to apply
@@ -449,20 +447,7 @@ impl SharedDb {
     /// A staleness check that fails (an unreadable store directory, say) is
     /// treated as "not stale": a read must not fail because the store might
     /// have moved on.
-    fn maybe_refresh(&self) {
-        let now_ms = self.epoch.elapsed().as_millis() as u64;
-        let last = self.last_refresh_check.load(Ordering::Acquire);
-        if now_ms.saturating_sub(last) < REFRESH_CHECK_INTERVAL.as_millis() as u64 {
-            return;
-        }
-        // Exactly one reader per interval runs the check; the rest read on.
-        if self
-            .last_refresh_check
-            .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
+    fn refresh_if_stale(&self) {
         let stale = self
             .inner
             .read()
@@ -493,16 +478,19 @@ impl SharedDb {
     ///
     /// # Following other processes
     ///
-    /// At most once per [`REFRESH_CHECK_INTERVAL`] this checks whether another
-    /// process has committed and, if so, applies its commits before handing out
-    /// the guard. A handle therefore stays current without reopening.
+    /// Every read checks whether another process has committed and, if so,
+    /// applies its commits before handing out the guard. A handle therefore
+    /// stays current without reopening, and the guarantee is not a timing
+    /// accident: a read started after a peer's commit completed sees that
+    /// commit. The check is metadata-only — one or two `stat` calls, no file
+    /// contents — so a read loop pays a syscall, not a reload.
     ///
     /// # Deadlock warning
     ///
     /// Do not hold a returned guard while calling any method on the same
     /// [`SharedDb`]; the [`RwLock`] is not re-entrant; doing so deadlocks.
     pub fn read(&self) -> impl Deref<Target = GraphDb<RealFs>> + '_ {
-        self.maybe_refresh();
+        self.refresh_if_stale();
         self.inner.read().unwrap_or_else(|e| e.into_inner())
     }
 
