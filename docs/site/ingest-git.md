@@ -494,8 +494,22 @@ prints
 error: another mushroomdb process is writing; retry
 ```
 
-and exits **3**, having written nothing. Retrying later is always safe. The sync
-marker is the last thing a run writes — after the commit walk, after the
+and exits **3**, having written nothing. Retrying later is always safe.
+
+The two hooks sit on opposite sides of that lock. The `UserPromptSubmit` hook
+(`mushroomdb recall`) fires on every prompt and must never write, so it opens
+read-only — `read_only: true`, and with `auto_migrate: false` and
+`repair_wal: false` so it cannot rewrite an old-format store or truncate a
+frame a live writer is midway through making durable. It takes no lock, cannot
+be blocked by one, and cannot delay a writer. The `PostToolUse` hook
+(`mushroomdb touch`) does write, so it takes the lock like any other writer. In
+hook form — reading its paths from a payload on stdin, or run with `--auto` — it
+prints nothing and exits 0 whatever happens, busy included: the file it was
+going to re-extract is still on disk, and the next `touch` or `sync` picks it
+up. Run with explicit file arguments it reports normally and exits 3 on busy,
+like every other write command.
+
+The sync marker is the last thing a run writes — after the commit walk, after the
 working-tree pass, after the pull request links — so it only ever advances over
 a window every phase finished. A run that fails part way leaves the marker where
 it was and the next run re-walks the same window, which is harmless: commits

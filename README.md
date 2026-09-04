@@ -12,7 +12,8 @@
 **The graph that stays true — and knows who's allowed to see it.**
 
 An embedded Rust graph database where edges are a schema declaration: write a rule once, and
-every write creates, maintains, and retracts the matching edges. Ships a 16-tool MCP server.
+every write creates, maintains, and retracts the matching edges. Ships a 24-tool MCP server and
+a live graph of the repository it is pointed at.
 
 *Pre-1.0 alpha — APIs and formats may change between minor versions.*
 
@@ -22,17 +23,54 @@ every write creates, maintains, and retracts the matching edges. Ships a 16-tool
 
 ## Quick start
 
+Install the Claude Code plugin, from any directory:
+
 ```sh
-npx mushroomdb install                        # /mushroom skill + MCP server + prompt and post-edit hooks
-mushroomdb ingest-git ~/.mushroomdb/memory .  # Author, Commit, File nodes; CO_CHANGED + KNOWS by rule
+claude marketplace add MatthewSherlin/mushroomdb
+claude plugin install mushroom@mushroomdb
 ```
 
-Then type `/mushroom` in Claude Code (or Cursor) to query, explain, and time-travel that graph
-from the assistant.
+Open the repository you want graphed and type `/mushroom:mushroom`. The skill builds the graph on
+first use and answers with it from then on.
+
+Or install into one project (or your home directory) without the plugin — same skill, invoked
+bare as `/mushroom`:
+
+```sh
+npx mushroomdb install    # /mushroom skill + MCP server + prompt, post-edit and git hooks
+```
+
+Either way, the first thing the assistant does is read the repository back to you. This is a real
+run against this repository — `ingest-git` took 2.5 s, `map` 0.18 s:
+
+```text
+mushroomdb map — 431 files, 6,226 symbols, 652 commits, 2 authors · synced 3s ago at 94719fe
+clusters (co-change + imports)
+  1. <mixed> crates, tests  (86 files, cohesion 0.73)  crates/server/tests/http.rs, algo.rs, crates/server/src/http.rs
+  2. <mixed> crates, src  (45 files, cohesion 0.67)  pack.rs, lib.rs, types.rs
+  3. ui src, e2e  (26 files, cohesion 0.89)  api.ts, store.ts, classify.ts
+  4. crates/code-extract tests, fixtures  (21 files, cohesion 0.99)  lib.rs, extract.rs, mod.rs
+  5. ui fonts, public  (18 files, cohesion 0.89)  IBMPlexMono-Medium.woff2, IBMPlexMono-Regular.woff2, IBMPlexSans-Medium.woff2
+  6. crates/core-api src, repograph  (17 files, cohesion 0.72)  facts.rs, render.rs, context.rs
+  7. <mixed> crates, bindings  (16 files, cohesion 0.99)  crates/core-bench/Cargo.toml, package.json, crates/sim-harness/Cargo.toml
+  8. benchmarks adapters, results  (15 files, cohesion 1.00)  run_handrolled.py, datasets.py, handrolled.py
+key files (most depended-on)
+  crates/code-extract/src/lib.rs 0.05 · crates/server/tests/http.rs 0.04 · crates/code-extract/tests/extract.rs 0.04 · crates/core-api/tests/algo.rs 0.04 · crates/server/src/http.rs 0.03
+owners
+  Matthew Michael Sherlin 431 files
+hot (last 90 days)
+  crates/core-api/src/db.rs 175 · README.md 109 · crates/core-rules/src/engine.rs 56 · crates/core-query/src/cypher/exec.rs 54 · crates/cli/src/lib.rs 51
+ask me: why does lib.rs co-change with extract.rs? · who owns ui? · what imports http.rs?
+```
+
+From there: `context` for one file or symbol from every side, `impact` before an edit, `owners`,
+`why` with the commits that prove a link, `recall` and `remember` for durable notes.
+Full walkthrough: [`docs/site/code-graph.md`](docs/site/code-graph.md).
 
 - **Live, not a snapshot.** One `SET f.top_author_id = …` moves the `TOP_AUTHOR` edge *and*
   re-derives that author's `KNOWS` edges before the write closes — the `SET` in the GIF above is
-  that one write.
+  that one write. An editor hook does the same for your code: `touch` re-extracts an edited file
+  after every `Edit`, `Write` and `MultiEdit`, in about 180 ms on this repository's graph.
 - **Retracts instead of going stale.** Re-run `ingest-git` to sync: only new commits replay,
   deleted files drop their derived edges, and renamed files carry their history to the new path.
 - **Explains any link.** `explain` names the rule and the score behind an edge, so *"which files
@@ -48,7 +86,11 @@ from the assistant.
 **What it is**
 
 - An embedded, single-binary graph database with a rule engine that maintains edges for you.
-- A 16-tool MCP server plus a `/mushroom` skill for Claude Code and Cursor.
+- A 24-tool MCP server plus a `/mushroom` skill and a Claude Code plugin.
+- Safe for several processes at once: one writer at a time behind an advisory `LOCK` file, any
+  number of readers, and every handle picks up a peer's commits by `refresh()` rather than
+  reopening — so a running `serve`, an editor hook, a git hook and a CLI command can share one
+  store. [`docs/site/concurrency.md`](docs/site/concurrency.md)
 - Local-first: your data stays on disk, no cloud service, no LLM in the write path.
 
 **What it isn't**
@@ -159,7 +201,22 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
-**All sixteen MCP tools:**
+**Eight task tools** answer a question about the repository in one call. They are what the skill
+reaches for, and what `tools/list` shows first:
+
+| Tool | Purpose |
+|---|---|
+| `map` | The repository in one screen: size, last sync, clusters, key files, owners, hot files |
+| `context` | One file or symbol from every side: signature, source, callers, callees, importers, co-change partners, commits, notes |
+| `impact` | What changing these files reaches: partners with scores, importers, symbols other files call, owner. Defaults to the working tree's diff |
+| `owners` | Top author and share, who else knows the file, last touch, the split by quarter |
+| `why` | Every rule edge between two nodes with its evidence, or the shortest path when there is none |
+| `recall` | Notes, concepts, files, symbols and people nearest a topic, each with its strongest link |
+| `remember` | Write a note into the graph and return its key |
+| `sync` | Bring the store up to date: commits since the last sync, then the dirty working tree |
+
+**The sixteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
+in `tools/list`, so an assistant knows which surface is the front door:
 
 | Tool | Purpose |
 |---|---|
@@ -181,18 +238,24 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
 | `rename_node` | Rename a node's key; old_key, new_key |
 
 Full walkthrough, tool reference, and Claude Desktop setup: [`docs/site/mcp.md`](docs/site/mcp.md).
-Skill and recall-hook details: [`docs/site/skill.md`](docs/site/skill.md).
+Skill, plugin, and hook details: [`docs/site/skill.md`](docs/site/skill.md).
 
 ---
 
 ## Install options
 
 ```sh
+claude plugin install mushroom@mushroomdb   # after `claude marketplace add MatthewSherlin/mushroomdb`
 npx mushroomdb install            # skill + MCP server + hooks, no toolchain needed
 cargo install mushroomdb-cli      # `mushroomdb` binary from crates.io (no embedded UI)
 cargo add mushroomdb              # embedded Rust library
 pip install mushroomdb            # Python bindings
 ```
+
+`install` writes an MCP entry that runs `npx -y mushroomdb@<version>`, so the assistant needs
+nothing installed globally and nothing is copied into your home directory. Point it at a local
+build with `--command <path>`. `mushroomdb doctor` verifies the result end to end — config entry,
+store, lock, hooks, git hooks, and a real stdio handshake with the configured command.
 
 To see the bundled explorer, write a demo graph and serve it:
 
@@ -221,9 +284,15 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 
 | Command | What it does |
 |---|---|
-| `mushroomdb install [--platform claude-code\|cursor\|all] [--project] [--db <path>]` | Write the `/mushroom` skill + MCP server entry for Claude Code or Cursor. Auto-detects platform |
+| `mushroomdb install [--platform claude-code\|cursor\|codex\|all] [--project\|--user] [--db <path>] [--command <path>] [--no-git-hooks] [--no-prewarm]` | Write the `/mushroom` skill + MCP server entry + prompt, post-edit and git hooks. Auto-detects platform and scope |
 | `mushroomdb uninstall [--platform …] [--project] [--db <path>]` | Remove exactly what `install` wrote (manifest-driven; leaves user files) |
-| `mushroomdb ingest-git <dir> <repo> [--exclude <pattern>]...` | Graph a git repository: `Author`, `Commit`, `File` nodes plus `CO_CHANGED` and `KNOWS` rules. Re-run to sync. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
+| `mushroomdb doctor [--project\|--user] [--platform …]` | Verify an install: config entry, npx reachability, store, lock, hooks, git hooks, a real stdio handshake, and duplicate-scope servers. Exit 1 on any `fail` |
+| `mushroomdb ingest-git <dir> <repo> [--exclude <pattern>]... [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]` | Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHANGED`, `KNOWS`, `IMPORTS`, `CALLS` and `MENTIONS` rules. Re-run to sync. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
+| `mushroomdb map <dir> [--json]` | The repository in one screen: clusters, key files, owners, hot files, and three questions worth asking |
+| `mushroomdb context <dir> <target>` | One file or symbol from every side. `<target>` is a path, a symbol key, or a bare symbol name |
+| `mushroomdb impact <dir> <file>...` | What changing these files reaches: co-change partners, importers, and the symbols other files call |
+| `mushroomdb owners <dir> <path>` | Top author and share, who else knows it, last touch, the last four quarters |
+| `mushroomdb why <dir> <a> <b>` | Every rule edge between two nodes with its evidence, or the shortest path between them |
 | `mushroomdb sync <dir> [--json]` | Re-sync the repository the store was built from: new commits, then the working tree where it differs from `HEAD`. Takes no repo argument — reads it off the graph. `--json` prints the counts as one object |
 | `mushroomdb touch <dir>\|--auto [<file>...]` | Re-extract just these files. With no `<file>` reads them from a `PostToolUse` payload on stdin (hook body) |
 | `mushroomdb recall <dir>\|--auto` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin, prints related graph facts. Wired automatically by `install` |
@@ -240,15 +309,19 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb migrate <dir>` | Migrate an older store format in place |
 | `mushroomdb backup <dir> <dest>` | Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores |
 | `mushroomdb export <dir> <dest> [--format jsonl\|parquet\|graphml]` | Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools |
-| `mushroomdb algo pagerank\|wcc\|degree <dir> [--top N]` | PageRank, weakly-connected components, or degree centrality over manual + derived edges |
+| `mushroomdb algo pagerank\|wcc\|degree <dir> [--top N]` | PageRank, weakly-connected components, or degree centrality over manual + derived edges. `--weight-prop`/`--min-weight` weight or filter the edge set |
+| `mushroomdb algo communities <dir> [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]` | Louvain communities with per-community cohesion and overall modularity |
 | `mushroomdb --version` | Print the CLI's version and exit |
 
-**Concurrency:** `ingest-git` and other CLI write commands open the database directory directly and
-have no coordination with a running `mushroomdb serve` process's locking. Do not run them against a
-store a live `serve` holds — write through the HTTP API instead. The `recall` hook is the same
-hazard unattended: it opens the store on every prompt. It opens without migration or WAL repair
-(`auto_migrate: false`, `repair_wal: false`) so it writes nothing, but it has no coordination with a
-live `serve` either.
+**Concurrency:** every CLI write command, the hooks, and a running `mushroomdb serve` coordinate
+through one advisory `LOCK` file in the store directory, so they are safe to run against the same
+store at the same time. A writer that cannot get the lock within two seconds exits 3 with
+`another mushroomdb process is writing; retry`, having written nothing. Readers never take the
+lock and never wait; `recall` opens read-only (`read_only: true`) so an unattended hook can never
+delay a writer or fail because one is running. What the lock does *not* give you: cross-process
+transactions, and subscription events for a peer's writes — a commit absorbed by `refresh()` is
+visible on the next read but notifies nobody. Full model:
+[`docs/site/concurrency.md`](docs/site/concurrency.md).
 
 Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 
@@ -259,7 +332,8 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 | Limitation | Detail |
 |---|---|
 | Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is deferred. |
-| Single writer, no interactive transactions | One writer, many readers via `RwLock`. `write_batch` commits all ops in one WAL frame (all-or-nothing on crash replay) but is **not isolated**: readers may observe intermediate states while a committed batch is applied in memory. Multi-statement `BEGIN`/`COMMIT` is not supported. |
+| Single writer, no interactive transactions | One writer at a time, many readers — within a process via `RwLock`, across processes via the advisory `LOCK` file. `write_batch` commits all ops in one WAL frame (all-or-nothing on crash replay) but is **not isolated**: readers may observe intermediate states while a committed batch is applied in memory. Multi-statement `BEGIN`/`COMMIT` is not supported, and there are no cross-process transactions. |
+| Peer writes do not notify subscribers | Commits another process made are picked up by `refresh()` and are there on the next read, but they fire no `EdgeFired`/`EdgeRetracted` event, so `/watch` and `/subscribe` see only writes made through this process. Poll if you need to react to a hook's writes. |
 | Cold start without a snapshot re-fires all rules | Snapshots persist derived edges, ANN state, and view definitions. At 100k nodes / ~10M derived edges: **0.02 s** from a V8 snapshot vs **8.16 min** WAL-only (ANN re-fit dominates). Call `snapshot()` before close. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
 | Two-hop Cypher joins at scale | Dense patterns producing >1,000,000 intermediate rows error without `LIMIT`. Add `LIMIT n` — the pull-based executor stops early and never materializes the full binding table. |
 | Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE, MATCH…DETACH DELETE, and MERGE (single-key, with `ON CREATE SET` / `ON MATCH SET`) are supported. Derived edges cannot be deleted manually. Variable-length paths are hard-capped at 10 hops; unbounded `*min..` is rejected at parse time. Full coverage table: [`docs/site/query.md`](docs/site/query.md). |
@@ -319,6 +393,7 @@ graph-db/
 │   ├── core-rules        # linking rules, per-rule indexes, incremental maintenance
 │   ├── core-query        # pull-based interpreter; traversal ops + Cypher subset
 │   ├── core-api          # the one public Rust interface; typed error enums
+│   ├── code-extract      # tree-sitter symbol/import/call extraction; bytes in, facts out
 │   ├── arrow-bridge      # results ↔ Arrow buffers
 │   ├── server            # axum HTTP + WebSocket; serves UI
 │   ├── cli               # mushroomdb binary
@@ -356,7 +431,8 @@ Phases 1–4 and Plan 18 all landed. What remains:
 ## Docs
 
 - [Quickstart](docs/site/quickstart.md) · [Rules](docs/site/rules.md) · [Cypher reference](docs/site/query.md) · [HTTP + MCP API](docs/site/api.md)
-- [Agent skill and recall hook](docs/site/skill.md) · [MCP tools](docs/site/mcp.md) · [Codebase graph](docs/site/ingest-git.md)
+- [The live code graph](docs/site/code-graph.md) · [Concurrency](docs/site/concurrency.md) · [Codebase graph](docs/site/ingest-git.md)
+- [Install, plugin and hooks](docs/site/skill.md) · [MCP tools](docs/site/mcp.md)
 - [Time travel](docs/site/timetravel.md) · [Subscriptions](docs/site/subscriptions.md) · [Views](docs/site/views.md) · [Rule suggestions](docs/site/suggest.md)
 - [Masks and access control](docs/site/masks.md) · [Full-text search](docs/site/fulltext.md) · [Property indexes](docs/site/indexes.md) · [Graph algorithms](docs/site/algorithms.md)
 - [Durability and recovery](docs/site/durability.md) · [Panic policy](docs/site/panic-policy.md) · [Testing](docs/site/testing.md) · [Format stability](docs/format-stability.md)

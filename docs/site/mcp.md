@@ -8,16 +8,26 @@ and explain why two entities are linked.
 
 ---
 
+## Getting the server registered
+
+For Claude Code and Cursor, do not write the config by hand. The plugin
+(`claude marketplace add MatthewSherlin/mushroomdb`, then `claude plugin install
+mushroom@mushroomdb`) or `npx mushroomdb install` writes the entry, picks a
+`command` that will resolve from the assistant's process, and wires the hooks.
+`mushroomdb doctor` then verifies the result with a real stdio handshake. See
+[`skill.md`](skill.md).
+
 ## Claude Desktop configuration
 
-Add mushroomdb as an MCP server in `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Claude Desktop has no installer path, so add mushroomdb by hand in
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "mushroomdb": {
-      "command": "mushroomdb",
-      "args": ["mcp", "/path/to/your/db"]
+      "command": "npx",
+      "args": ["-y", "mushroomdb@0.6.0", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -27,7 +37,15 @@ Replace `/path/to/your/db` with the directory where mushroomdb should store
 data. The directory is created on first launch. Restart Claude Desktop after
 saving.
 
-If you have not installed the binary yet:
+`npx` needs nothing installed globally. If you would rather name a binary, use
+its absolute path — a bare `mushroomdb` resolves only if it is on the `PATH`
+the desktop app inherits, which is usually not your shell's:
+
+```json
+{ "command": "/usr/local/bin/mushroomdb", "args": ["mcp", "/path/to/your/db"] }
+```
+
+To get that binary:
 
 ```sh
 cargo install mushroomdb-cli
@@ -235,6 +253,10 @@ beneath the repository tools above.
 | `node_info` | Return a node's key, label, and all properties. |
 | `node_edges` | Return all edges incident on a node. |
 | `stats` | Return live node, edge, and rule counts. |
+| `node_history` | Every property change for a node since the last truncating snapshot. |
+| `edge_history` | Add/retract lifecycle for all edges between two nodes, with the rule behind each event. |
+| `was_linked` | Point-in-time check: was an edge of this type active at this commit? |
+| `rename_node` | Rename a node's key, preserving all its edges. |
 
 ---
 

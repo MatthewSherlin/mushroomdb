@@ -126,6 +126,14 @@ A hook that finds the store busy exits without writing and tries again on the
 next event. That is the intended behaviour, not a failure: the work it was going
 to do is derived from state that is still there.
 
+`scripts/acceptance-0.6.sh` exercises this on every release: 20 `touch`
+processes run in parallel against a store a live `mushroomdb mcp` server holds
+open, all 20 must exit 0, the server's `map` must still count every ingested
+file afterwards, and `mushroomdb verify` must pass on the result.
+
+`mushroomdb doctor` reports the lock's current state as one of its checks —
+`free`, or a `warn` naming the fact that another process is writing right now.
+
 ## What this does not give you
 
 The lock serialises writers; it is not a transaction manager. There are no

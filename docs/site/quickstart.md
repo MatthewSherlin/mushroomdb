@@ -1,6 +1,25 @@
 # Quickstart
 
-Two commands start a populated graph explorer.
+Two commands start a populated graph explorer. Two others graph a repository.
+
+---
+
+## Graph a repository
+
+```text
+mushroomdb ingest-git ./mushroom-memory . --prs --ensure-gitignore
+mushroomdb map ./mushroom-memory
+```
+
+The first walks the git history and the working tree — authors, commits, files,
+symbols, imports, calls and merged pull requests become nodes, and
+`CO_CHANGED` / `KNOWS` / `IMPORTS` / `CALLS` / `MENTIONS` edges are derived by
+rule. On this repository (431 files, 652 commits) it takes about 2.5 s. The
+second reads the graph back as one screen.
+
+From there: `context`, `impact`, `owners`, `why`, `recall` and `remember`, over
+the CLI or as MCP tools. What the graph guarantees, and what it does not:
+[The live code graph](code-graph.md).
 
 ---
 
@@ -106,11 +125,27 @@ cargo run -p mushroomdb-cli --bin mushroomdb -- serve ./demo-db
 
 ## Wire it into an assistant
 
-From the repository you want graphed:
+The shortest path needs no local binary at all. Install the Claude Code plugin:
+
+```text
+claude marketplace add MatthewSherlin/mushroomdb
+claude plugin install mushroom@mushroomdb
+```
+
+Open the repository you want graphed and type `/mushroom:mushroom`. Claude Code
+namespaces plugin-provided skills as `/<plugin>:<skill>`. The skill builds the
+graph on first use; the plugin's MCP server and both hooks run through
+`npx -y mushroomdb@<version>`.
+
+The plugin writes no git hooks. To get those — a backgrounded `sync` after each
+commit, checkout and merge — or to install for Cursor or Codex, use the CLI
+instead, from the repository you want graphed:
 
 ```text
 mushroomdb install
 ```
+
+A skill installed this way is invoked bare as `/mushroom`.
 
 With no flags it detects the assistant (Claude Code, Cursor, or both), picks
 project scope inside a git checkout and user scope anywhere else, and prints

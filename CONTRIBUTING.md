@@ -34,6 +34,55 @@ cargo bench --no-run
 All five commands must exit 0. The bench step is compile-only (timing gates are
 too noisy on CI runners).
 
+`crates/code-extract` (package `mushroomdb-extract`, lib `code_extract`) is part
+of the workspace and covered by the same gate. It is a pure library — bytes in,
+facts out — and owns every tree-sitter dependency in the tree: it opens no file,
+walks no directory and touches no database, so everything it knows about the
+surrounding tree arrives through caller-supplied closures. Keep it that way; the
+filesystem side lives in `crates/cli/src/structure.rs`.
+
+### Code-graph gate (commits touching `crates/code-extract`, `crates/cli`, or the repograph tools)
+
+```text
+cargo build --release -p mushroomdb-cli
+MUSHROOMDB=target/release/mushroomdb bash scripts/acceptance-0.6.sh
+```
+
+Seven steps in a throwaway `git worktree`, so no tracked file in your checkout is
+ever modified: ingest floors read back with Cypher, `map` under 40 lines, two
+independent ingests exporting identical JSONL, an added import producing a direct
+`IMPORTS` edge with its line number and a reverted import retracting it, the
+dirty-tree nudge, 20 concurrent `touch` processes against a live MCP server
+followed by `verify`, and a timing table.
+
+A debug binary works and is the default, but its timings are 6x the release
+build's, so the two latency assertions print `SKIP` instead of asserting unless
+the binary path contains `/target/release/` or `MUSHROOMDB_RELEASE=1` is set. The
+`code-graph` CI job runs the release form with `TOUCH_BUDGET_MS: 600` and
+`MAP_BUDGET_MS: 3000` — 3x the local targets, because a shared runner is too
+noisy to gate on the real figure.
+
+`bash scripts/bench-code-graph.sh` produces the published table. It needs the
+network for its second row (a shallow clone) and skips that row with a note when
+offline. `BENCH_REPOS` adds further clone URLs; `CLONE_DEPTH` overrides the depth.
+Both scripts need `python3` and are bash 3.2 clean.
+
+### Plugin gate (commits touching `packaging/plugin/`, `scripts/plugin-templates/`, or the skill)
+
+```text
+bash scripts/render-plugin.sh          # re-render after editing a template or bumping the version
+bash scripts/render-plugin.sh --check  # exits 1 on any drift
+claude plugin validate packaging/plugin --strict
+```
+
+Nothing under `packaging/plugin/` or `.claude-plugin/marketplace.json` is
+hand-edited: every one is rendered by `scripts/render-plugin.sh` from the four
+templates in `scripts/plugin-templates/` and from the CLI's real
+`crates/cli/skills/mushroom/SKILL.md`, with `{{VERSION}}`, `{{BIN}}` and
+`{{DB_PATH}}` substituted. The version comes from `crates/cli/Cargo.toml`, so a
+version bump is a re-render. The `plugin-validate` CI job runs both the strict
+validate and the drift check.
+
 ### Node gate (commits touching `ui/`)
 
 ```text
