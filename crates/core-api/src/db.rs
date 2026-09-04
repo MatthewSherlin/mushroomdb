@@ -545,7 +545,11 @@ pub struct BackupReport {
 /// One directed edge in export form, with optional rule attribution for derived edges.
 ///
 /// Returned by [`GraphDb::all_edges_for_export`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// Does not derive `Eq`/`Ord`: `weight` is an `f64` and NaN breaks a total
+/// order. Callers that need a stable edge ordering already sort by
+/// `(edge_type, src, dst)` explicitly (see `all_edges_for_export`).
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub struct ExportEdge {
     pub edge_type: String,
     pub src: String,
@@ -553,6 +557,10 @@ pub struct ExportEdge {
     pub derived: bool,
     /// Rule name that created this edge, if derived. `None` for manual edges.
     pub rule: Option<String>,
+    /// The creating rule's declared `weight_prop`, read off this edge, when
+    /// derived and numeric (`Int`/`Float`). `None` for manual edges, derived
+    /// edges whose rule declares no `weight_prop`, or a non-numeric value.
+    pub weight: Option<f64>,
 }
 
 /// Construct the standard write-query result set (columns: created, properties_set, deleted).
@@ -7258,7 +7266,10 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Derived edges carry `derived: true` and the creating rule's name in `rule`.
     /// Manual edges carry `derived: false` and `rule: None`.
-    /// Deterministic across runs on the same store state.
+    /// `weight` is the creating rule's `weight_prop` value read off the edge
+    /// (numeric only), mirroring the convention used by [`GraphDb::explain`]
+    /// and [`GraphDb::weighted_edges`]. Deterministic across runs on the same
+    /// store state.
     pub fn all_edges_for_export(&self) -> Vec<ExportEdge> {
         self.ensure_v8_base_sections_loaded();
 
@@ -7270,7 +7281,15 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
+        // rule_name → weight_prop, for O(1) lookup per derived edge.
+        let weight_props: HashMap<&str, Option<&str>> = self
+            .engine
+            .rules()
+            .map(|r| (r.name.as_str(), r.weight_prop.as_deref()))
+            .collect();
+
         let tv = self.topo_view();
+        let ep = self.edge_props_view();
         let mut edges = Vec::new();
 
         for id in 0..self.ids.len() as u32 {
@@ -7301,12 +7320,21 @@ impl<F: Fs> GraphDb<F> {
                     let prov_key = (etype_sym, id, nbr);
                     let rule = prov.get(&prov_key).cloned();
                     let derived = rule.is_some();
+                    let weight = rule
+                        .as_deref()
+                        .and_then(|rn| weight_props.get(rn).copied().flatten())
+                        .and_then(|prop| match ep.get(etype_sym, id, nbr, prop) {
+                            Some(Value::Float(f)) => Some(f),
+                            Some(Value::Int(i)) => Some(i as f64),
+                            _ => None,
+                        });
                     edges.push(ExportEdge {
                         edge_type: edge_type.clone(),
                         src: key.to_string(),
                         dst: dst_key.to_string(),
                         derived,
                         rule,
+                        weight,
                     });
                 }
             }

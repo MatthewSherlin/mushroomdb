@@ -340,7 +340,10 @@ Usage:
   mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
                                       WARNING: unsafe against a concurrently running serve process;
                                       use POST /backup on the HTTP server for live-serve backups
-  mushroomdb export <db-dir> <dest> --format jsonl|parquet   export all data
+  mushroomdb export <db-dir> <dest> --format jsonl|parquet|graphml   export all data
+                                      graphml writes one file: <dest>/graph.graphml if <dest> is an
+                                      existing directory, otherwise <dest> is the file path itself
+                                      (nodes + edges only; rules have no GraphML analogue)
   mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]... [--max-commits-per-file N]
                         [--recurse-submodules] [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]
                                    graph a git repo (authors, commits, files, symbols, imports, calls, mentions); re-run to sync
@@ -1182,12 +1185,14 @@ fn parse_export(args: &[&str]) -> Result<Command, String> {
                 .get(i + 1)
                 .copied()
                 .ok_or_else(|| "missing value for --format".to_string())?;
-            format = ExportFormat::parse(val)
-                .ok_or_else(|| format!("unknown format '{val}'; expected jsonl or parquet"))?;
+            format = ExportFormat::parse(val).ok_or_else(|| {
+                format!("unknown format '{val}'; expected jsonl, parquet, or graphml")
+            })?;
             i += 2;
         } else if let Some(val) = a.strip_prefix("--format=") {
-            format = ExportFormat::parse(val)
-                .ok_or_else(|| format!("unknown format '{val}'; expected jsonl or parquet"))?;
+            format = ExportFormat::parse(val).ok_or_else(|| {
+                format!("unknown format '{val}'; expected jsonl, parquet, or graphml")
+            })?;
             i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
@@ -1237,17 +1242,40 @@ pub fn run_export(db_dir: &Path, dest: &Path, format: &ExportFormat) -> Result<S
     let edge_count = edges.len();
     let rule_count = rules.len();
     match format {
-        ExportFormat::Jsonl => export::write_jsonl(&nodes, &edges, &rules, dest)?,
-        ExportFormat::Parquet => export::write_parquet(&nodes, &edges, &rules, dest)?,
+        ExportFormat::Jsonl => {
+            export::write_jsonl(&nodes, &edges, &rules, dest)?;
+            Ok(format!(
+                "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
+                dest.display(),
+                format.name(),
+                node_count,
+                edge_count,
+                rule_count
+            ))
+        }
+        ExportFormat::Parquet => {
+            export::write_parquet(&nodes, &edges, &rules, dest)?;
+            Ok(format!(
+                "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
+                dest.display(),
+                format.name(),
+                node_count,
+                edge_count,
+                rule_count
+            ))
+        }
+        // GraphML has no rule analogue: only nodes and edges are written.
+        ExportFormat::Graphml => {
+            let file_path = export::write_graphml(&nodes, &edges, dest)?;
+            Ok(format!(
+                "exported to {} (format={}): {} nodes, {} edges\n",
+                file_path.display(),
+                format.name(),
+                node_count,
+                edge_count,
+            ))
+        }
     }
-    Ok(format!(
-        "exported to {} (format={}): {} nodes, {} edges, {} rules\n",
-        dest.display(),
-        format.name(),
-        node_count,
-        edge_count,
-        rule_count
-    ))
 }
 
 fn format_result_set(rs: &ResultSet) -> String {
@@ -3166,6 +3194,231 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn parse_export_graphml_flag() {
+        let r = parse_args(&["export", "/db/dir", "/dest", "--format", "graphml"]);
+        match r {
+            Ok(Command::Export { format, .. }) => {
+                assert_eq!(format, ExportFormat::Graphml);
+            }
+            other => panic!("export --format graphml parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_export_graphml_structure() {
+        let src = tmp("cli-export-gml-src");
+        let dst_dir = tmp("cli-export-gml-dst");
+        let dst = dst_dir.join("graph.graphml");
+        let _ = run_demo(&src).expect("demo");
+        run_export(&src, &dst, &ExportFormat::Graphml).expect("graphml export");
+
+        let content = std::fs::read_to_string(&dst).expect("read graphml");
+
+        assert!(
+            content.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"),
+            "must start with an XML declaration"
+        );
+        assert!(
+            content.contains("<graphml xmlns=\"http://graphml.graphdrawing.org/xmlns\">"),
+            "must use the standard GraphML namespace"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"n_label\" for=\"node\" attr.name=\"label\" attr.type=\"string\"/>"
+            ),
+            "must declare the node label key"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"e_type\" for=\"edge\" attr.name=\"type\" attr.type=\"string\"/>"
+            ),
+            "must declare the edge type key"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"e_derived\" for=\"edge\" attr.name=\"derived\" attr.type=\"boolean\"/>"
+            ),
+            "must declare the edge derived key"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"e_rule\" for=\"edge\" attr.name=\"rule\" attr.type=\"string\"/>"
+            ),
+            "must declare the edge rule key"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"e_weight\" for=\"edge\" attr.name=\"weight\" attr.type=\"double\"/>"
+            ),
+            "must declare the edge weight key"
+        );
+        assert!(
+            content.contains("<graph id=\"G\" edgedefault=\"directed\">"),
+            "must declare a single directed graph element"
+        );
+        assert!(content.contains("<node id="), "must contain node elements");
+        assert!(
+            content.contains("<edge id=\"e0\" source=\""),
+            "must contain a sequentially-numbered edge starting at e0"
+        );
+        assert!(
+            content.trim_end().ends_with("</graphml>"),
+            "must close the root element"
+        );
+
+        // The demo store's `skill_fit` rule declares weight_prop "score"; its
+        // derived FIT edges must carry both a rule and a weight in GraphML.
+        assert!(
+            content.contains("<data key=\"e_rule\">skill_fit</data>")
+                || content.contains("<data key=\"e_rule\">founded_within</data>"),
+            "at least one derived edge must carry its rule name"
+        );
+        assert!(
+            content.contains(&format!(
+                "<data key=\"{}\">",
+                "e_weight" /* declared above */
+            )),
+            "at least one derived edge must carry a weight value"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn run_export_graphml_dest_dir_writes_graph_dot_graphml() {
+        let src = tmp("cli-export-gml-dir-src");
+        let dst_dir = tmp("cli-export-gml-dir-dst");
+        std::fs::create_dir_all(&dst_dir).expect("mkdir dest");
+        let _ = run_demo(&src).expect("demo");
+
+        let msg = run_export(&src, &dst_dir, &ExportFormat::Graphml).expect("graphml export");
+
+        assert!(
+            dst_dir.join("graph.graphml").exists(),
+            "an existing directory dest must produce dest/graph.graphml"
+        );
+        assert!(
+            msg.contains("graph.graphml"),
+            "report must name the file actually written, got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    /// python3-gated: parses the exported file with the stdlib XML parser to
+    /// confirm it is well-formed. Skipped (not failed) when python3 is absent.
+    #[test]
+    fn run_export_graphml_is_well_formed_xml() {
+        let has_python3 = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_python3 {
+            eprintln!("skipping run_export_graphml_is_well_formed_xml: python3 not found");
+            return;
+        }
+
+        let src = tmp("cli-export-gml-wf-src");
+        let dst_dir = tmp("cli-export-gml-wf-dst");
+        let dst = dst_dir.join("graph.graphml");
+        let _ = run_demo(&src).expect("demo");
+        run_export(&src, &dst, &ExportFormat::Graphml).expect("graphml export");
+
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import sys, xml.etree.ElementTree as E; E.parse(sys.argv[1])")
+            .arg(&dst)
+            .status()
+            .expect("run python3");
+        assert!(
+            status.success(),
+            "python3's XML parser must accept the exported GraphML file"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn run_export_graphml_two_runs_byte_identical() {
+        let src = tmp("cli-export-gml-bi-src");
+        let dst_dir1 = tmp("cli-export-gml-bi-dst1");
+        let dst_dir2 = tmp("cli-export-gml-bi-dst2");
+        let dst1 = dst_dir1.join("graph.graphml");
+        let dst2 = dst_dir2.join("graph.graphml");
+        let _ = run_demo(&src).expect("demo");
+
+        run_export(&src, &dst1, &ExportFormat::Graphml).expect("first export");
+        run_export(&src, &dst2, &ExportFormat::Graphml).expect("second export");
+
+        let f1 = std::fs::read(&dst1).expect("read first");
+        let f2 = std::fs::read(&dst2).expect("read second");
+        assert_eq!(
+            f1, f2,
+            "graph.graphml must be byte-identical across two export runs"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir1);
+        let _ = std::fs::remove_dir_all(&dst_dir2);
+    }
+
+    #[test]
+    fn run_export_graphml_escapes_and_lists() {
+        use core_api::{GraphDb, Value};
+        let src = tmp("cli-export-gml-esc-src");
+        let dst_dir = tmp("cli-export-gml-esc-dst");
+        let dst = dst_dir.join("graph.graphml");
+
+        {
+            let mut db = GraphDb::open(&src).unwrap();
+            db.insert_node(
+                "Widget",
+                "w1",
+                vec![
+                    (
+                        "title".into(),
+                        Value::Str("Tom & Jerry <says> \"hi\" 'bye'".into()),
+                    ),
+                    (
+                        "tags".into(),
+                        Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+                    ),
+                ],
+            )
+            .unwrap();
+        }
+
+        run_export(&src, &dst, &ExportFormat::Graphml).expect("graphml export");
+        let content = std::fs::read_to_string(&dst).expect("read graphml");
+
+        assert!(
+            content.contains("Tom &amp; Jerry &lt;says&gt; &quot;hi&quot; &apos;bye&apos;"),
+            "special XML characters in string props must be escaped, got: {content}"
+        );
+        assert!(
+            !content.contains("Tom & Jerry <says>"),
+            "unescaped special characters must not appear verbatim"
+        );
+        assert!(
+            content.contains(
+                "<key id=\"n_tags\" for=\"node\" attr.name=\"tags\" attr.type=\"string\"/>"
+            ),
+            "list-valued props must declare attr.type=\"string\""
+        );
+        assert!(
+            content.contains("<data key=\"n_tags\">[&quot;a&quot;,&quot;b&quot;]</data>"),
+            "list-valued props must render as XML-escaped JSON text, got: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst_dir);
     }
 
     #[test]

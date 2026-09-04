@@ -239,10 +239,13 @@ HTTP query params: `stub_hidden=true` on `GET /node/{key}`, `GET /node/{key}/edg
 
 ### Export
 
-- `mushroomdb export <db-dir> <dest> [--format jsonl|parquet]`
+- `mushroomdb export <db-dir> <dest> [--format jsonl|parquet|graphml]`
 - JSONL: stable, deterministic, byte-identical between runs.
 - Parquet: Snappy compression; NOT byte-identical across parquet-rs versions.
-- NaN/±Inf `Value::Float` → null in both formats.
+- GraphML: single file (nodes + edges only, no rules) for import into generic graph
+  viewers and analysis tools; byte-identical between runs. `<dest>/graph.graphml`
+  when `<dest>` is an existing directory, else `<dest>` is the file path itself.
+- NaN/±Inf `Value::Float` → null (JSONL/Parquet) or empty `<data>` (GraphML).
 - Derived edges include rule attribution (`"rule": "name"`); manual edges: `"rule": null`.
 
 ## Full-text search v2 (2026-08-29)

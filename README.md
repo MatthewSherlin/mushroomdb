@@ -239,7 +239,7 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch |
 | `mushroomdb migrate <dir>` | Migrate an older store format in place |
 | `mushroomdb backup <dir> <dest>` | Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores |
-| `mushroomdb export <dir> <dest> [--format jsonl\|parquet]` | Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions |
+| `mushroomdb export <dir> <dest> [--format jsonl\|parquet\|graphml]` | Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools |
 | `mushroomdb algo pagerank\|wcc\|degree <dir> [--top N]` | PageRank, weakly-connected components, or degree centrality over manual + derived edges |
 | `mushroomdb --version` | Print the CLI's version and exit |
 

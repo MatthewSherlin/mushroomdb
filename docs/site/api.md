@@ -628,7 +628,7 @@ live-served stores use `POST /backup`.
 ```rust
 let nodes: Vec<NodeInfo>     = db.all_nodes_for_export();
 let edges: Vec<ExportEdge>   = db.all_edges_for_export();
-// ExportEdge { edge_type, src, dst, derived: bool, rule: Option<String> }
+// ExportEdge { edge_type, src, dst, derived: bool, rule: Option<String>, weight: Option<f64> }
 ```
 
 Nodes are sorted by key. Edges are sorted by `(edge_type, src, dst)`. Derived
@@ -637,25 +637,36 @@ edges include the rule name in `rule`; manually-written edges have `rule: None`.
 ### Export (CLI)
 
 ```sh
-mushroomdb export <db-dir> <dest-dir> [--format jsonl|parquet]
+mushroomdb export <db-dir> <dest> [--format jsonl|parquet|graphml]
 ```
 
 Default format: `jsonl`.
 
 **JSONL format** (default): writes `nodes.jsonl`, `edges.jsonl`, and `rules.jsonl`
-to `<dest-dir>`. Each line is a JSON object. JSONL output is stable, deterministic,
-and byte-identical between two runs on the same store.
+to `<dest>` (a directory). Each line is a JSON object. JSONL output is stable,
+deterministic, and byte-identical between two runs on the same store.
 
 **Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
-and `rules.parquet` with Snappy compression (parquet-rs default). Parquet output
-is **not** byte-identical between parquet-rs library versions — use JSONL if you
-need a stable byte checksum.
+and `rules.parquet` to `<dest>` (a directory) with Snappy compression (parquet-rs
+default). Parquet output is **not** byte-identical between parquet-rs library
+versions — use JSONL if you need a stable byte checksum.
 
-**Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as JSON
-`null` / Parquet null. Normal finite floats round-trip correctly.
+**GraphML format** (`--format graphml`): writes a single GraphML file — nodes
+and edges only, since rules have no GraphML analogue — for import into generic
+graph viewers and analysis tools. If `<dest>` is an existing directory, the file
+is `<dest>/graph.graphml`; otherwise `<dest>` is the file path itself. Node
+elements carry a `label` attribute plus every property (lists and maps are
+JSON-encoded as `string`-typed attributes); edge elements carry `type` and
+`derived`, plus `rule` and `weight` when present. `weight` is the creating
+rule's declared `weight_prop`, read off the edge. GraphML output is
+byte-identical between two runs on the same store.
+
+**Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as
+JSON `null` (JSONL/Parquet) or an empty `<data>` element (GraphML). Normal
+finite floats round-trip correctly.
 
 **Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is
-the rule name (present for derived edges, null for manual edges).
+the rule name (present for derived edges, null/omitted for manual edges).
 
 ---
 

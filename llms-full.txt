@@ -246,7 +246,7 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb verify ` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch |
 | `mushroomdb migrate ` | Migrate an older store format in place |
 | `mushroomdb backup  ` | Copy store files to `` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores |
-| `mushroomdb export   [--format jsonl\|parquet]` | Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions |
+| `mushroomdb export   [--format jsonl\|parquet\|graphml]` | Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools |
 | `mushroomdb algo pagerank\|wcc\|degree  [--top N]` | PageRank, weakly-connected components, or degree centrality over manual + derived edges |
 | `mushroomdb --version` | Print the CLI's version and exit |
 
@@ -2595,7 +2595,7 @@ live-served stores use `POST /backup`.
 ```rust
 let nodes: Vec     = db.all_nodes_for_export();
 let edges: Vec   = db.all_edges_for_export();
-// ExportEdge { edge_type, src, dst, derived: bool, rule: Option }
+// ExportEdge { edge_type, src, dst, derived: bool, rule: Option, weight: Option }
 ```
 
 Nodes are sorted by key. Edges are sorted by `(edge_type, src, dst)`. Derived
@@ -2604,25 +2604,36 @@ edges include the rule name in `rule`; manually-written edges have `rule: None`.
 ### Export (CLI)
 
 ```sh
-mushroomdb export   [--format jsonl|parquet]
+mushroomdb export   [--format jsonl|parquet|graphml]
 ```
 
 Default format: `jsonl`.
 
 **JSONL format** (default): writes `nodes.jsonl`, `edges.jsonl`, and `rules.jsonl`
-to ``. Each line is a JSON object. JSONL output is stable, deterministic,
-and byte-identical between two runs on the same store.
+to  (a directory). Each line is a JSON object. JSONL output is stable,
+deterministic, and byte-identical between two runs on the same store.
 
 **Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
-and `rules.parquet` with Snappy compression (parquet-rs default). Parquet output
-is **not** byte-identical between parquet-rs library versions — use JSONL if you
-need a stable byte checksum.
+and `rules.parquet` to  (a directory) with Snappy compression (parquet-rs
+default). Parquet output is **not** byte-identical between parquet-rs library
+versions — use JSONL if you need a stable byte checksum.
 
-**Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as JSON
-`null` / Parquet null. Normal finite floats round-trip correctly.
+**GraphML format** (`--format graphml`): writes a single GraphML file — nodes
+and edges only, since rules have no GraphML analogue — for import into generic
+graph viewers and analysis tools. If  is an existing directory, the file
+is /graph.graphml; otherwise  is the file path itself. Node
+elements carry a `label` attribute plus every property (lists and maps are
+JSON-encoded as `string`-typed attributes); edge elements carry `type` and
+`derived`, plus `rule` and `weight` when present. `weight` is the creating
+rule's declared `weight_prop`, read off the edge. GraphML output is
+byte-identical between two runs on the same store.
+
+**Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as
+JSON `null` (JSONL/Parquet) or an empty  element (GraphML). Normal
+finite floats round-trip correctly.
 
 **Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is
-the rule name (present for derived edges, null for manual edges).
+the rule name (present for derived edges, null/omitted for manual edges).
 
 ---
 
