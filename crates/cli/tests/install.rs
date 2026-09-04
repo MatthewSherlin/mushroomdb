@@ -526,10 +526,14 @@ fn off_path_install_copies_binary_and_writes_absolute_command() {
     assert_eq!(server["args"][0], "mcp");
     assert_eq!(server["args"][1], db.to_str().unwrap());
 
-    // SKILL.md bootstrap uses the same absolute path so `demo` works too.
+    // SKILL.md bootstrap uses the same absolute path so `ingest-git` works too.
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
     assert!(
-        skill.contains(&format!("'{}' demo '{}'", copied.display(), db.display())),
+        skill.contains(&format!(
+            "{} ingest-git '{}' .",
+            copied.display(),
+            db.display()
+        )),
         "SKILL.md bootstrap does not use the copied binary path"
     );
     assert!(
@@ -601,7 +605,11 @@ fn reinstall_repairs_stale_command_for_same_db() {
     assert_eq!(mcp["mcpServers"]["other"]["command"], "other-tool");
     // Skill bootstrap uses the repaired command too.
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
-    assert!(skill.contains(&format!("'{}' demo '{}'", copied.display(), db.display())));
+    assert!(skill.contains(&format!(
+        "{} ingest-git '{}' .",
+        copied.display(),
+        db.display()
+    )));
 }
 
 // ---------------------------------------------------------------------------
@@ -721,10 +729,10 @@ fn on_path_install_uses_bare_name_everywhere() {
     install_on_path(&root, &home, &opts).expect("install");
 
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
-    assert!(skill.contains(&format!("'mushroomdb' demo '{}'", db.display())));
+    assert!(skill.contains(&format!("mushroomdb ingest-git '{}' .", db.display())));
     assert!(!skill.contains("{{BIN}}"));
     let rules = read(&root, ".cursor/rules/mushroom.mdc");
-    assert!(rules.contains(&format!("'mushroomdb' demo '{}'", db.display())));
+    assert!(rules.contains(&format!("mushroomdb ingest-git '{}' .", db.display())));
     assert!(!rules.contains("{{BIN}}"));
     assert_absent(&home, ".mushroomdb/bin/mushroomdb");
 }
@@ -1056,9 +1064,27 @@ fn uninstall_leaves_mixed_hook_group_with_user_hook_intact() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: the rendered skill states mask semantics correctly (allow-list) and
-//       documents the arguments the MCP server actually accepts
+// Test: the rendered skill states mask semantics correctly (allow-list),
+//       documents the arguments the MCP server actually accepts, and names
+//       every task tool an assistant is expected to reach for. The task tools
+//       are the skill's whole subject; a rewrite that dropped one would leave
+//       the assistant with no instruction to call it.
 // ---------------------------------------------------------------------------
+
+/// The task tools plus the two entry points the skill has to name, written the
+/// way the text writes them so a bare word inside another word cannot pass.
+const REQUIRED_TOOL_MENTIONS: &[&str] = &[
+    "`map`",
+    "`context`",
+    "`impact`",
+    "`owners`",
+    "`why`",
+    "`recall`",
+    "`remember`",
+    "`sync`",
+    "`learn`",
+    "`serve`",
+];
 
 #[test]
 fn skill_text_is_truthful_about_masks_and_tool_args() {
@@ -1099,6 +1125,12 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
             text.contains("ingest-git"),
             "{name}: ingest-git bootstrap undocumented"
         );
+        for tool in REQUIRED_TOOL_MENTIONS {
+            assert!(
+                text.contains(tool),
+                "{name}: {tool} is never named — the assistant has no cue to call it"
+            );
+        }
     }
     assert!(
         skill.contains("`edges`"),
