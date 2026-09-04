@@ -32,6 +32,7 @@
 // build. The fixture is shared, so that is expected rather than a warning.
 #![allow(dead_code)]
 
+use core_api::repograph::rules::{about_rule, concept_sources_rule, ABOUT_LABELS};
 use core_api::{default_max_edges, Direction, GraphDb, Predicate, RuleDef, Value};
 use std::path::{Path, PathBuf};
 
@@ -443,13 +444,7 @@ pub fn rules() -> Vec<RuleDef> {
         key_rule("imports", "File", "File", "imports", "IMPORTS"),
         key_rule("calls", "Symbol", "Symbol", "calls_to", "CALLS"),
         key_rule("mentions", "File", "File", "mentions", "MENTIONS"),
-        key_rule(
-            "concept_sources",
-            "Concept",
-            "File",
-            "source_files",
-            "DESCRIBED_IN",
-        ),
+        concept_sources_rule(),
         key_rule(
             "auto_fk_commit_author_id",
             "Commit",
@@ -465,14 +460,13 @@ pub fn rules() -> Vec<RuleDef> {
             "TOP_AUTHOR",
         ),
     ];
-    for label in ["Author", "Concept", "File", "Note", "Symbol"] {
-        out.push(key_rule(
-            &format!("about_{}", label.to_lowercase()),
-            "Note",
-            label,
-            "about",
-            "ABOUT",
-        ));
+    // `synthetic_repo_store` inserts every node before any rule, so by the
+    // time these backfill, every `ABOUT_LABELS` target already exists — the
+    // same condition `structure::ensure_rules_and_fulltext`'s own gate checks
+    // before it will declare one of these, just satisfied unconditionally
+    // here rather than tested for.
+    for label in ABOUT_LABELS {
+        out.push(about_rule(label));
     }
     let co = Predicate::Overlap {
         field: "commits".into(),

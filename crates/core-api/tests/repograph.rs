@@ -1417,6 +1417,76 @@ fn remember_keys_deterministic() {
 }
 
 #[test]
+fn remember_creates_the_about_rule_for_a_label_seen_for_the_first_time() {
+    // A store with no rules at all — not `synthetic_repo_store`, which
+    // pre-creates every `about_<label>` rule unconditionally. This is the
+    // shape a store has before its first `ingest-git`/`sync`, or one whose
+    // `about` names a `Concept` a semantic pass wrote since the last sync:
+    // `ensure_rules_and_fulltext` has never run, so nothing has declared
+    // `about_concept` yet.
+    let dir = tmp("remember-self-heal");
+    let mut db = open(&dir);
+    db.insert_node(
+        "Concept",
+        "concept:fresh",
+        vec![
+            (
+                "id".to_string(),
+                core_api::Value::Str("concept:fresh".to_string()),
+            ),
+            (
+                "name".to_string(),
+                core_api::Value::Str("fresh".to_string()),
+            ),
+        ],
+    )
+    .expect("concept");
+    assert!(
+        db.rules().is_empty(),
+        "the store must start with no rules at all: {:?}",
+        db.rules()
+    );
+
+    let about = vec!["concept:fresh".to_string()];
+    let input = RememberInput {
+        text: "a note about a concept nothing has synced yet",
+        about: &about,
+        kind: "note",
+        ts: 1,
+    };
+    let key = remember(&mut db, &input).expect("remember must self-heal the missing rule");
+
+    let rule_names: Vec<String> = db.rules().into_iter().map(|r| r.name).collect();
+    assert!(
+        rule_names.contains(&"about_concept".to_string()),
+        "remember must create about_concept itself: {rule_names:?}"
+    );
+    let linked = db
+        .neighbors(&key, "ABOUT", core_api::Direction::Out)
+        .expect("neighbors");
+    assert_eq!(
+        linked,
+        vec!["concept:fresh".to_string()],
+        "the edge must derive in the same commit the rule was created in, not on a later sync"
+    );
+
+    // A second remember naming the same label creates no duplicate rule.
+    let rules_before = db.rules().len();
+    let input2 = RememberInput {
+        text: "a second note about the same concept",
+        about: &about,
+        kind: "note",
+        ts: 2,
+    };
+    remember(&mut db, &input2).expect("second remember");
+    assert_eq!(
+        db.rules().len(),
+        rules_before,
+        "a label whose rule already exists must not get a second one"
+    );
+}
+
+#[test]
 fn recall_finds_notes_concepts_files_symbols_people() {
     let dir = tmp("recall-all-labels");
     let mut db = synthetic_repo_store(&dir);
@@ -1437,15 +1507,36 @@ fn recall_finds_notes_concepts_files_symbols_people() {
     // One distinctive term per label, so each contributes its own top hit.
     let prompt = "c00 OR init OR ada OR entry OR startup";
     let out = recall_digest(&db, prompt, "synthetic", 4000);
+    let lines: Vec<&str> = out.lines().collect();
 
+    // Every hit is `- key [Label] name` immediately followed by up to three
+    // `    edge_type -> other[ (prop w.ww)]` lines — the brief calls for
+    // "each with one strongest edge", so this checks the edge line is
+    // actually there, not just the header that names the label.
     for label in ["File", "Symbol", "Author", "Note", "Concept"] {
+        let marker = format!("[{label}]");
+        let at = lines
+            .iter()
+            .position(|l| l.contains(&marker))
+            .unwrap_or_else(|| panic!("expected a {label} hit in:\n{out}"));
+        let edge_line = lines.get(at + 1).copied().unwrap_or("");
         assert!(
-            out.contains(&format!("[{label}]")),
-            "expected a {label} hit in:\n{out}"
+            edge_line.starts_with("    ") && edge_line.contains(" -> "),
+            "expected {label}'s hit ({:?}) to be followed by its strongest \
+             edge, got {edge_line:?} in:\n{out}",
+            lines[at]
         );
     }
     assert!(out.contains("src/core/c00.rs"), "{out}");
     assert!(out.contains("Ada Example"), "{out}");
+    assert!(
+        out.contains("ABOUT -> src/core/c00.rs"),
+        "the note's edge names its rule and target: {out}"
+    );
+    assert!(
+        out.contains("DESCRIBED_IN -> src/core/c00.rs"),
+        "the concept's edge names its rule and target: {out}"
+    );
 }
 
 #[test]

@@ -3,13 +3,26 @@
 //! The other half of [`recall`](super::recall): where that module reads,
 //! this one writes the one label an assistant is expected to create itself.
 //! A note's `about` list is exactly the field the `about_<label>` rules (see
-//! `structure::ensure_rules_and_fulltext` in the CLI crate) match on, so
-//! writing it derives the `ABOUT` edges in the same commit — nothing here
-//! inserts an edge directly.
+//! [`super::rules`], shared with `structure::ensure_rules_and_fulltext` in
+//! the CLI crate) match on, so writing it derives the `ABOUT` edges in the
+//! same commit — nothing here inserts an edge directly.
+//!
+//! `structure::ensure_rules_and_fulltext` only ever runs from `ingest-git`
+//! and `sync`, and even then only declares an `about_<label>` rule once a
+//! node of that label already exists. A store's very first `remember` call —
+//! or one whose `about` names a `Note` or `Concept` created since the last
+//! sync — would otherwise pass validation and silently write no `ABOUT`
+//! edge at all until the next sync backfills it. [`remember`] closes that
+//! gap itself: before writing, it ensures the specific `about_<label>`
+//! rule(s) its own `about` keys need already exist, creating whichever are
+//! missing from the same shared definitions `structure` uses.
 
 use crate::db::GraphDb;
+use crate::repograph::facts::label_of;
+use crate::repograph::rules::{about_rule, ABOUT_LABELS};
 use core_storage::fs::Fs;
 use core_storage::{GraphError, Result, Value};
+use std::collections::BTreeSet;
 
 /// Text length bounds, in characters, after trimming.
 const MIN_TEXT_CHARS: usize = 1;
@@ -50,9 +63,11 @@ pub struct RememberInput<'a> {
 /// `about` does not affect the key, but does affect which edges backfill
 /// first, which the engine already makes deterministic.
 ///
-/// Also ensures full-text search is enabled on `Note.text`, so a store whose
-/// very first write is a `remember` call — never having gone through
-/// `structure::ensure_rules_and_fulltext` — can still be recalled from.
+/// Also ensures full-text search is enabled on `Note.text`, and that the
+/// `about_<label>` rule for every label named among `about` already exists
+/// (see the module docs), so a store whose very first write is a `remember`
+/// call — never having gone through `structure::ensure_rules_and_fulltext` —
+/// can still be recalled from and still derives its `ABOUT` edges.
 pub fn remember<F: Fs>(w: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result<String> {
     let text = input.text.trim();
     let len = text.chars().count();
@@ -88,6 +103,7 @@ pub fn remember<F: Fs>(w: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result<
     {
         w.enable_fulltext("Note", "text")?;
     }
+    ensure_about_rules(w, &about)?;
 
     let key = note_key(input.ts, text);
     if !w.has_node(&key) {
@@ -107,6 +123,36 @@ pub fn remember<F: Fs>(w: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result<
         w.insert_node("Note", &key, props)?;
     }
     Ok(key)
+}
+
+/// Create whichever `about_<label>` rules `about_keys` need and do not exist
+/// yet, from the same definitions [`about_rule`] gives `structure` — so a
+/// note written before the label's rule was ever backfilled by a sync still
+/// derives its `ABOUT` edge in this commit.
+///
+/// A label outside [`ABOUT_LABELS`] has no rule to create — that key's
+/// `ABOUT` edge simply does not derive, same as it never has; `remember`
+/// only guarantees the edge for the labels the plan enumerates. Idempotent:
+/// existing rule names are read once, so a label whose rule already exists
+/// costs nothing and a repeat call creates nothing new.
+fn ensure_about_rules<F: Fs>(w: &mut GraphDb<F>, about_keys: &[String]) -> Result<()> {
+    let mut labels: BTreeSet<String> = about_keys
+        .iter()
+        .filter_map(|key| label_of(w, key))
+        .filter(|label| ABOUT_LABELS.contains(&label.as_str()))
+        .collect();
+    if labels.is_empty() {
+        return Ok(());
+    }
+    let existing: BTreeSet<String> = w.rules().into_iter().map(|r| r.name).collect();
+    labels.retain(|label| {
+        let name = format!("about_{}", label.to_lowercase());
+        !existing.contains(&name)
+    });
+    for label in labels {
+        w.create_rule(about_rule(&label))?;
+    }
+    Ok(())
 }
 
 /// The key one `remember` call writes to: `"note:"` followed by 16 hex

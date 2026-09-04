@@ -17,6 +17,10 @@
 //! | [`remember::remember`] | write a note the graph can later recall |
 //! | [`stale_concepts`] | which learned concepts have drifted from their sources |
 //!
+//! [`rules`] holds the `about_<label>` and `concept_sources` rule
+//! definitions both `structure::ensure_rules_and_fulltext` (CLI) and
+//! [`remember::remember`] need, so the two cannot declare them differently.
+//!
 //! Two rules hold across every tool here. The output is **deterministic** for
 //! the same store state and the same caller-supplied "now": collections are
 //! sorted, ties break on the key, floats print at a fixed precision, and every
@@ -41,6 +45,7 @@ mod path;
 pub mod recall;
 pub mod remember;
 pub mod render;
+pub mod rules;
 mod why;
 
 pub use concepts::stale_concepts;

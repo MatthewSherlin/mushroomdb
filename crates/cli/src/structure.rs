@@ -36,6 +36,7 @@ use crate::CliError;
 use code_extract::{
     extract, resolve_call, resolve_import, resolve_mention, FileFacts, SymbolIndex, MAX_FILE_BYTES,
 };
+use core_api::repograph::rules::{about_rule, concept_sources_rule, ABOUT_LABELS};
 use core_api::{default_max_edges, BatchOp, Predicate, RuleDef, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -58,10 +59,6 @@ const BATCH_FILES: usize = 500;
 /// and declaring it here is what makes the edge `DEFINES` rather than the
 /// `FILE` that inference would derive from the field name.
 pub const DEFINES_RULE: &str = "auto_fk_symbol_file_id";
-
-/// Labels a `Note.about` entry may point at, in rule-creation order. One
-/// `about_<label>` rule per label, since a rule has a single destination.
-pub const ABOUT_LABELS: [&str; 5] = ["Author", "Concept", "File", "Note", "Symbol"];
 
 /// `(label, field)` pairs this module indexes for full-text search.
 ///
@@ -106,7 +103,11 @@ pub struct StructureReport {
 /// Exported so a test — or a store built some other way — can recreate exactly
 /// the rule set these props expect. [`ensure_rules_and_fulltext`] creates an
 /// `about_<label>` rule only when its destination label is present in the
-/// graph; every other rule here is unconditional.
+/// graph; every other rule here is unconditional. The `about_<label>` and
+/// `concept_sources` definitions themselves come from
+/// [`core_api::repograph::rules`], which `remember` also builds them from —
+/// one definition, so a note written by `remember` and one backfilled by a
+/// sync agree on exactly the same rule.
 #[must_use]
 pub fn rules() -> Vec<RuleDef> {
     let mut out = vec![
@@ -114,22 +115,10 @@ pub fn rules() -> Vec<RuleDef> {
         key_rule("imports", "File", "File", "imports", "IMPORTS"),
         key_rule("calls", "Symbol", "Symbol", "calls_to", "CALLS"),
         key_rule("mentions", "File", "File", "mentions", "MENTIONS"),
-        key_rule(
-            "concept_sources",
-            "Concept",
-            "File",
-            "source_files",
-            "DESCRIBED_IN",
-        ),
+        concept_sources_rule(),
     ];
     for label in ABOUT_LABELS {
-        out.push(key_rule(
-            &format!("about_{}", label.to_lowercase()),
-            "Note",
-            label,
-            "about",
-            "ABOUT",
-        ));
+        out.push(about_rule(label));
     }
     out
 }
