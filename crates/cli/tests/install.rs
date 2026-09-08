@@ -2017,9 +2017,12 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
             !text.contains("keys to hide"),
             "{name}: inverted mask text still present"
         );
+        // The per-tool argument lists moved into `tools/list` itself, which is
+        // the only copy now that the skill no longer restates it. What both
+        // texts must still say is how to see it.
         assert!(
-            text.contains("max_edges"),
-            "{name}: create_rule max_edges undocumented"
+            text.contains("--all-tools"),
+            "{name}: the route to the unlisted tools is undocumented"
         );
         assert!(
             text.contains("no auth"),
@@ -2036,13 +2039,24 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
             );
         }
     }
+    // The skill is re-read every turn, so its size is a per-turn cost. It was
+    // 17,148 bytes, 62% of that worked examples and a table restating what
+    // `tools/list` already carries; the examples now live in
+    // docs/site/code-graph.md. The budget is on the *template*, since the
+    // rendered copy also carries whatever `{{BIN}}` expanded to.
+    let template = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills/mushroom/SKILL.md"),
+    )
+    .expect("skill template");
     assert!(
-        skill.contains("`edges`"),
-        "SKILL.md: ingest_json edges arg undocumented"
+        template.len() <= 6_000,
+        "SKILL.md must stay under 6 KB — it is re-read every turn, got {} bytes",
+        template.len()
     );
     assert!(
-        skill.contains("ambiguous target labels"),
-        "SKILL.md: polymorphic FK pattern undocumented"
+        rules.lines().count() <= 60,
+        "mushroom.mdc must stay short, got {} lines",
+        rules.lines().count()
     );
 }
 
