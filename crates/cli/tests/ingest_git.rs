@@ -933,6 +933,100 @@ fn author_name_is_the_majority_variant() {
     );
 }
 
+/// The `co_changed` rule scores on jaccard similarity, which is a ratio, so a
+/// file that changes with this one often and *also* changes a lot on its own
+/// falls under the floor and gets no edge. `impact` must still name it, by how
+/// many commits the two share, and label it as a count rather than a score.
+#[test]
+fn impact_includes_partners_by_shared_commit_count() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+
+    // `api.rs` and `busy.rs` change together four times; `api.rs` and `pair.rs`
+    // change together three times and almost never apart.
+    for i in 0..4 {
+        commit(
+            &repo,
+            "alice",
+            &format!("api and busy {i}"),
+            &[
+                ("src/api.rs", &format!("a{i}")),
+                ("src/busy.rs", &format!("b{i}")),
+            ],
+        );
+    }
+    for i in 0..3 {
+        commit(
+            &repo,
+            "alice",
+            &format!("api and pair {i}"),
+            &[
+                ("src/api.rs", &format!("a1{i}")),
+                ("src/pair.rs", &format!("p{i}")),
+            ],
+        );
+    }
+    // Twenty commits to `busy.rs` alone drag its similarity to `api.rs` down to
+    // 4/27 without touching how often the two actually change together.
+    for i in 0..20 {
+        commit(
+            &repo,
+            "alice",
+            &format!("busy alone {i}"),
+            &[("src/busy.rs", &format!("solo{i}"))],
+        );
+    }
+
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let db = GraphDb::open(&db_dir).unwrap();
+
+    let mut edges = db
+        .neighbors("src/api.rs", "CO_CHANGED", Direction::Out)
+        .unwrap();
+    edges.extend(
+        db.neighbors("src/api.rs", "CO_CHANGED", Direction::In)
+            .unwrap(),
+    );
+    assert!(
+        !edges.contains(&"src/busy.rs".to_string()),
+        "the rule writes no edge for the busy file: {edges:?}"
+    );
+
+    let r = core_api::repograph::impact(
+        &db,
+        &["src/api.rs".to_string()],
+        &std::collections::BTreeSet::new(),
+        &core_api::repograph::ImpactOptions::default(),
+    );
+    let named: Vec<(&str, Option<usize>)> = r.files[0]
+        .partners
+        .iter()
+        .map(|p| (p.path.as_str(), p.shared_commits))
+        .collect();
+    assert_eq!(
+        named,
+        vec![("src/pair.rs", None), ("src/busy.rs", Some(4))],
+        "the scored partner first, then the one only the commit counts see"
+    );
+
+    let text = core_api::repograph::render_impact(&r);
+    assert!(
+        text.contains("src/busy.rs (4 shared commits)"),
+        "the digest labels it a count, not a score:\n{text}"
+    );
+
+    // `why` says the same thing when asked about the pair the rule skipped.
+    let w = core_api::repograph::why(&db, "src/api.rs", "src/busy.rs");
+    assert!(w.links.is_empty(), "no rule edge to report");
+    assert_eq!(w.shared.as_ref().map(|s| s.count), Some(4));
+    assert!(
+        core_api::repograph::render_why(&w).contains("4 shared commits"),
+        "{}",
+        core_api::repograph::render_why(&w)
+    );
+}
+
 /// A parent repository with an initialised submodule checked out at
 /// `vendor/lib`, plus the repository the submodule was cloned from.
 fn seed_repo_with_submodule() -> PathBuf {

@@ -554,8 +554,17 @@ pub fn render_context(c: &ContextReport) -> String {
 /// nothing left off.
 fn partner_item(p: &Partner, with_score: bool) -> String {
     let mut item = sanitize(&p.path);
-    if with_score {
-        let _ = write!(item, " {:.2}", p.score);
+    // A partner found by how often the two change together carries a count, not
+    // a similarity, and saying so is the point: the two do not compare, and a
+    // reader who sees `0.10` beside `0.78` draws the wrong conclusion.
+    match p.shared_commits {
+        Some(n) => {
+            let _ = write!(item, " ({})", plural(n, "shared commit"));
+        }
+        None if with_score => {
+            let _ = write!(item, " {:.2}", p.score);
+        }
+        None => {}
     }
     if p.modified {
         item.push_str(" modified");
@@ -689,6 +698,16 @@ pub fn render_why(w: &WhyReport) -> String {
             plural(links.len() - MAX_WHY_LINKS, "link")
         );
     }
+    if let Some(shared) = &w.shared {
+        let _ = writeln!(
+            out,
+            "co-change  {}, below the co_changed rule's similarity floor so no edge was written",
+            plural(shared.count, "shared commit")
+        );
+        for line in &shared.evidence {
+            let _ = writeln!(out, "  {}", sanitize(line));
+        }
+    }
     if !w.path.is_empty() {
         let mut walk = sanitize(&w.a);
         for (edge_type, node) in &w.path {
@@ -696,7 +715,7 @@ pub fn render_why(w: &WhyReport) -> String {
         }
         let _ = writeln!(out, "path  {walk}");
     }
-    if w.links.is_empty() && w.path.is_empty() {
+    if w.links.is_empty() && w.path.is_empty() && w.shared.is_none() {
         let _ = writeln!(out, "no link");
     }
     cap_lines(&out, MAX_TOOL_LINES)

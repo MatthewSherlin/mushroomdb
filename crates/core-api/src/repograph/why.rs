@@ -7,15 +7,19 @@
 //! an import sits on, the line a call is made from, the file an author knows
 //! both through, the heading a document mentions something under.
 //!
-//! When no rule links the two at all the answer is the shortest walk between
-//! them — see [`shortest_path`](crate::repograph::shortest_path) — and when
-//! there is not even one of those, `why` says so rather than implying a
-//! connection nobody can name.
+//! When no rule links the two at all, the commits they share are still an
+//! answer — the co-change rule only writes an edge above a similarity floor,
+//! and a pair that changes together often but also changes apart falls under
+//! it. Failing that the answer is the shortest walk between them — see
+//! [`shortest_path`](crate::repograph::shortest_path) — and when there is not
+//! even one of those, `why` says so rather than implying a connection nobody
+//! can name.
 
 use crate::db::GraphDb;
 use crate::repograph::facts::{
     commit_fact, evidence_line, evidence_lines, list_prop, neighbors, str_prop, CommitFact,
 };
+use crate::repograph::impact::MIN_SHARED_COMMITS;
 use crate::repograph::owners::SHA_LEN;
 use crate::repograph::path::{shortest_path, MAX_HOPS, PATH_EDGES};
 use crate::repograph::render::{sanitize, ymd};
@@ -36,10 +40,29 @@ pub struct WhyReport {
     /// Every rule-written edge between them, in either direction.
     pub links: Vec<WhyLink>,
     /// `(edge type, node reached)` hops, filled only when no rule links them
-    /// directly and a walk of at most [`MAX_HOPS`] edges connects them.
+    /// directly, they share too few commits to say anything, and a walk of at
+    /// most [`MAX_HOPS`] edges connects them.
     pub path: Vec<(String, String)>,
+    /// Commits both were touched by, filled only when no `CO_CHANGED` edge
+    /// already carries them.
+    ///
+    /// The `co_changed` rule writes an edge on jaccard similarity, so two files
+    /// that change together often and *also* change apart carry no edge at all
+    /// and would otherwise be reported as unrelated — or as related only by
+    /// whatever else happens to link them. See
+    /// [`MIN_SHARED_COMMITS`](crate::repograph::MIN_SHARED_COMMITS).
+    pub shared: Option<SharedCommits>,
     /// Whichever of `a` and `b` the store has never heard of.
     pub unknown: Vec<String>,
+}
+
+/// How often two files were touched by the same commit, and by which commits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SharedCommits {
+    /// Commits that touched both.
+    pub count: usize,
+    /// The newest few of them, as a digest quotes a commit.
+    pub evidence: Vec<String>,
 }
 
 /// One rule-written edge, and what makes it true.
@@ -71,6 +94,7 @@ pub fn why<F: Fs>(db: &GraphDb<F>, a: &str, b: &str) -> WhyReport {
         b: sanitize(b),
         links: Vec::new(),
         path: Vec::new(),
+        shared: None,
         unknown: Vec::new(),
     };
     for key in [a, b] {
@@ -110,10 +134,36 @@ pub fn why<F: Fs>(db: &GraphDb<F>, a: &str, b: &str) -> WhyReport {
             )
             .then(x.evidence.cmp(&y.evidence))
     });
-    if report.links.is_empty() {
+    // No `CO_CHANGED` edge is not the same as no co-change: the rule only
+    // writes one above a similarity floor, and a pair that changes together
+    // often but also changes apart falls under it. That the two import each
+    // other says nothing about how often they move together, so the commits are
+    // reported alongside whatever links there are — and, when there are none,
+    // instead of a three-hop walk that says less.
+    if !report.links.iter().any(|l| l.edge_type == "CO_CHANGED") {
+        report.shared = shared_commit_count(db, a, b);
+    }
+    if report.links.is_empty() && report.shared.is_none() {
         report.path = shortest_path(db, a, b, &PATH_EDGES, MAX_HOPS);
     }
     report
+}
+
+/// The commits `a` and `b` share, when there are at least
+/// [`MIN_SHARED_COMMITS`] of them. `None` for anything else — a pair that
+/// shares one commit shares a coincidence, and a node with no `commits` list
+/// (a symbol, an author) shares nothing.
+fn shared_commit_count<F: Fs>(db: &GraphDb<F>, a: &str, b: &str) -> Option<SharedCommits> {
+    let theirs: BTreeSet<String> = list_prop(db, b, "commits").into_iter().collect();
+    let count = list_prop(db, a, "commits")
+        .into_iter()
+        .collect::<BTreeSet<String>>()
+        .intersection(&theirs)
+        .count();
+    (count >= MIN_SHARED_COMMITS).then(|| SharedCommits {
+        count,
+        evidence: shared_commits(db, a, b),
+    })
 }
 
 /// The repository facts behind one edge, in the form its kind is read in.

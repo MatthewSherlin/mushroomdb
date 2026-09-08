@@ -263,29 +263,45 @@ fn render_nudge(
         ),
     });
 
-    // Best co-change score per file across the whole diff, strongest first.
-    let mut partners: BTreeMap<String, f64> = BTreeMap::new();
+    // Strongest association per file across the whole diff. A partner the
+    // co-change rule scored and one found by how many commits the two share are
+    // both worth the line, but they are different measures: the scored ones
+    // rank first and each is labelled with the measure it came from.
+    let mut partners: BTreeMap<String, (f64, Option<usize>)> = BTreeMap::new();
     let mut importers: BTreeSet<String> = BTreeSet::new();
     for f in &report.files {
         for p in f.partners.iter().filter(|p| !p.modified) {
-            let slot = partners.entry(p.path.clone()).or_insert(p.score);
-            if p.score > *slot {
-                *slot = p.score;
+            let slot = partners
+                .entry(p.path.clone())
+                .or_insert((p.score, p.shared_commits));
+            if (p.shared_commits.is_none(), p.score) > (slot.1.is_none(), slot.0) {
+                *slot = (p.score, p.shared_commits);
             }
         }
         for p in f.importers.iter().filter(|p| !p.modified) {
             importers.insert(p.path.clone());
         }
     }
-    let mut ranked: Vec<(String, f64)> = partners.into_iter().collect();
-    // Score descending, then key ascending: `BTreeMap` gave us the key order,
-    // and a stable sort keeps it inside a tie.
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut ranked: Vec<(String, (f64, Option<usize>))> = partners.into_iter().collect();
+    // Scored partners first, each measure descending within its own group, then
+    // key ascending: `BTreeMap` gave us the key order and a stable sort keeps it
+    // inside a tie.
+    ranked.sort_by(|a, b| {
+        let key = |(score, shared): &(f64, Option<usize>)| {
+            (shared.is_none(), shared.unwrap_or(0), *score)
+        };
+        key(&b.1)
+            .partial_cmp(&key(&a.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     if !ranked.is_empty() {
         let items: Vec<String> = ranked
             .iter()
             .take(MAX_NUDGE_PARTNERS)
-            .map(|(path, score)| format!("{path} ({score:.2}, not modified)"))
+            .map(|(path, (score, shared))| match shared {
+                Some(n) => format!("{path} ({n} shared commits, not modified)"),
+                None => format!("{path} ({score:.2}, not modified)"),
+            })
             .collect();
         lines.push(format!("  usually changes with: {}", items.join(", ")));
     }

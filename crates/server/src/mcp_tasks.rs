@@ -536,7 +536,7 @@ pub(crate) fn task_tools() -> Vec<Js> {
         }),
         json!({
             "name": "context",
-            "description": "Everything known about one file or symbol: signature, doc, source from the working tree, owner, callers and callees, importers and imports, co-change partners, recent commits, and any notes or concepts about it.",
+            "description": "Everything known about one file or symbol: signature, doc, source from the working tree, owner, every call site into it grouped by calling file, its callees, importers and imports, co-change partners, recent commits, and any notes or concepts about it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -551,7 +551,7 @@ pub(crate) fn task_tools() -> Vec<Js> {
         }),
         json!({
             "name": "impact",
-            "description": "What else the files in a change reach: co-change partners with scores, importers, symbols used elsewhere, and each file's owner. Defaults to the current git diff plus untracked files when no list is given.",
+            "description": "What else the files in a change reach: co-change partners, by similarity score or by how many commits the two share, plus importers, symbols used elsewhere, and each file's owner. Defaults to the current git diff plus untracked files when no list is given.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -580,7 +580,7 @@ pub(crate) fn task_tools() -> Vec<Js> {
         }),
         json!({
             "name": "why",
-            "description": "What links two files, symbols, or people, with the evidence for each link: shared commits, the importing line, the calling line, the file two authors both know. Falls back to the shortest path between them.",
+            "description": "What links two files, symbols, or people, with the evidence for each link: shared commits, the importing line, every calling line, the file two authors both know. With no rule edge it reports the commits the two share, and failing that the shortest path between them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

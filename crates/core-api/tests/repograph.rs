@@ -774,13 +774,16 @@ fn impact_marks_partners_in_the_diff_as_modified() {
     );
     assert!(f.partners.len() <= ImpactOptions::default().max_partners);
 
-    // A partner below the threshold is not worth telling anyone about.
+    // A partner below the threshold is not worth telling anyone about. Both
+    // floors have to be off for the list to be empty: they gate two different
+    // passes, one over the scored edges and one over the commits themselves.
     let strict = impact(
         &db,
         std::slice::from_ref(&a),
         &modified,
         &ImpactOptions {
             min_score: 1.01,
+            min_shared_commits: 0,
             ..ImpactOptions::default()
         },
     );

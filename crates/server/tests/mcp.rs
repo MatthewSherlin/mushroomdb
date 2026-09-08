@@ -1519,13 +1519,24 @@ fn context_on_symbol() {
     );
     assert_eq!(structured["file"], json!("src/core.rs"));
     assert_eq!(structured["signature"], json!("fn core::init()"));
-    let callers: Vec<&str> = structured["callers"]
+    // Callers come back as call sites grouped by the file they sit in.
+    let callers: Vec<(&str, Vec<&str>)> = structured["callers"]
         .as_array()
         .expect("callers")
         .iter()
-        .map(|c| c[0].as_str().expect("caller key"))
+        .map(|c| {
+            (
+                c["file"].as_str().expect("caller file"),
+                c["symbols"]
+                    .as_array()
+                    .expect("caller symbols")
+                    .iter()
+                    .map(|s| s.as_str().expect("caller key"))
+                    .collect(),
+            )
+        })
         .collect();
-    assert_eq!(callers, vec!["src/web.rs#web::serve"]);
+    assert_eq!(callers, vec![("src/web.rs", vec!["src/web.rs#web::serve"])]);
     assert!(text.contains("core::init"), "{text}");
     assert!(
         text.lines().count() <= 60,
