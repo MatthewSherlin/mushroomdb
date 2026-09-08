@@ -1549,6 +1549,67 @@ fn method_calls_only_match_methods_in_the_imported_tier() {
     );
 }
 
+/// A call site and a definition that share nothing but a name are not the same
+/// function. `str(x)` is a Python builtin; that this repository also holds a
+/// Rust `fn str` is a coincidence, and the tiers that search by name alone
+/// turned it into an edge from a `.py` file to a `.rs` one.
+#[test]
+fn calls_never_cross_a_language_boundary() {
+    let mut index = SymbolIndex::new();
+    index.insert("str", "crates/core/tests/suggest.rs#str");
+    index.insert("helper", "app/util.py#helper");
+    index.insert("sibling", "app/neighbour.rs#sibling");
+    let tree = roots(&[]);
+    let here = &scope(&[], &tree);
+
+    // The whole-tree tier: unique, and the wrong language.
+    assert_eq!(
+        resolve_call("app/main.py", &CallFact::plain("str", 1), &index, here),
+        None,
+        "a Python builtin is not this repository's Rust test helper"
+    );
+    assert_eq!(
+        resolve_call(
+            "crates/a/src/lib.rs",
+            &CallFact::plain("str", 1),
+            &index,
+            here
+        ),
+        Some("crates/core/tests/suggest.rs#str".to_string()),
+        "the same call from Rust still resolves"
+    );
+
+    // The same-directory tier is filtered too: sitting beside a file is not a
+    // relationship when the two are not even the same language.
+    assert_eq!(
+        resolve_call("app/main.py", &CallFact::plain("sibling", 1), &index, here),
+        None
+    );
+    assert_eq!(
+        resolve_call("app/main.py", &CallFact::plain("helper", 1), &index, here),
+        Some("app/util.py#helper".to_string())
+    );
+
+    // TypeScript, TSX and JavaScript are one family: a `.ts` module really does
+    // call into a `.tsx` one.
+    let mut web = SymbolIndex::new();
+    web.insert("Widget", "src/ui/widget.tsx#Widget");
+    web.insert("boot", "src/app.js#boot");
+    assert_eq!(
+        resolve_call("src/index.ts", &CallFact::plain("Widget", 1), &web, here),
+        Some("src/ui/widget.tsx#Widget".to_string())
+    );
+    assert_eq!(
+        resolve_call("src/index.ts", &CallFact::plain("boot", 1), &web, here),
+        Some("src/app.js#boot".to_string())
+    );
+    assert_eq!(
+        resolve_call("main.go", &CallFact::plain("boot", 1), &web, here),
+        None,
+        "Go is not part of that family"
+    );
+}
+
 /// The one rule that decides it, stated once and shared by every grammar.
 #[test]
 fn a_dot_in_the_callee_is_what_makes_it_a_method_call() {

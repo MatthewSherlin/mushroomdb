@@ -404,7 +404,9 @@ pub struct CallScope<'a> {
 /// 4. a single definition anywhere in the tree.
 ///
 /// Anything still ambiguous resolves to `None` — a wrong edge is worse than a
-/// missing one.
+/// missing one. The two tiers that search by name rather than by a stated
+/// relationship — the directory and the whole tree — also require the
+/// definition to be in the calling file's language: see [`same_language`].
 ///
 /// # Why imports matter
 ///
@@ -482,7 +484,9 @@ pub fn resolve_call(
         if let Some(key) = pick(&|file, _| file == from) {
             return Some(key);
         }
-        if let Some(key) = pick(&|file, _| parent_dir(file) == from_dir) {
+        if let Some(key) =
+            pick(&|file, _| parent_dir(file) == from_dir && same_language(&from, file))
+        {
             return Some(key);
         }
         // An import brings a *file* into scope, not a type. For a method call
@@ -498,12 +502,36 @@ pub fn resolve_call(
             return Some(key);
         }
         if repo_wide {
-            if let Some(key) = pick(&|_, _| true) {
+            if let Some(key) = pick(&|file, _| same_language(&from, file)) {
                 return Some(key);
             }
         }
     }
     None
+}
+
+/// Whether two files are written in the same language.
+///
+/// A call site and a definition that share nothing but a name are not the same
+/// function. `str(x)` in Python is a builtin; that this repository also holds a
+/// Rust `fn str` is a coincidence, and the tiers that search by name alone —
+/// the same directory, and the whole tree — happily turned it into an edge from
+/// a `.py` file to a `.rs` one.
+///
+/// TypeScript, TSX and JavaScript are one family, because a `.ts` module really
+/// does call into a `.tsx` one and neither is a different language for this
+/// purpose. Every other pairing must match exactly. Two files of unknown type
+/// count as the same language and contribute no symbols either way.
+fn same_language(a: &str, b: &str) -> bool {
+    family(lang_of(a)) == family(lang_of(b))
+}
+
+/// The language a file resolves calls as, collapsing the ECMAScript variants.
+const fn family(lang: Lang) -> Lang {
+    match lang {
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => Lang::TypeScript,
+        other => other,
+    }
 }
 
 /// Whether a `::`-separated path call names anything the working tree holds.
