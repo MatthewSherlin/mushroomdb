@@ -118,9 +118,16 @@ fn doctor_passes_on_fresh_project_install() {
 
     let handshake = find_check(&report.output, "handshake");
     assert!(handshake.starts_with("ok"), "handshake check: {handshake}");
+    // The eleven a default `mushroomdb mcp` advertises: the eight task tools
+    // plus `query`, `ingest_json` and `stats`. The other thirteen stay
+    // callable, and `--all-tools` lists them.
     assert!(
-        handshake.contains("24 tools"),
-        "expected the handshake to report 24 tools: {handshake}"
+        handshake.contains("11 tools"),
+        "expected the handshake to report 11 tools: {handshake}"
+    );
+    assert!(
+        handshake.contains("map present"),
+        "the handshake must prove the task path: {handshake}"
     );
 }
 

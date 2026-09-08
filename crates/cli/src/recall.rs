@@ -401,7 +401,7 @@ mod tests {
     fn prompt_becomes_an_or_query_of_lowercased_alphanumeric_terms() {
         assert_eq!(
             fulltext_or_query("What about Person 1 and Project 5?").as_deref(),
-            Some("what OR about OR person OR 1 OR project OR 5"),
+            Some("person OR 1 OR project OR 5"),
         );
     }
 
@@ -414,6 +414,53 @@ mod tests {
             Some("foo OR bar OR baz"),
         );
         assert_eq!(fulltext_or_query("  ?! ,, "), None);
+    }
+
+    /// Binding: a prompt made only of function words leaves nothing to search
+    /// for, so the hook has nothing to print. An `OR` of stopwords matched
+    /// essentially every indexed document, which is how `the` used to produce
+    /// a full digest of six unrelated nodes.
+    #[test]
+    fn or_query_is_none_for_a_prompt_that_is_all_glue() {
+        for prompt in [
+            "the",
+            "is it done",
+            "ok thanks",
+            "can you do that please",
+            "what do you think about it",
+            "which file has the code",
+        ] {
+            assert_eq!(fulltext_or_query(prompt), None, "{prompt:?}");
+        }
+    }
+
+    /// A prompt can survive the stopwords and still be about nothing the graph
+    /// holds. `weather` is a word, not glue, so it is searched for — and a code
+    /// graph has no hit for it, which is the other way the hook falls silent.
+    #[test]
+    fn or_query_keeps_a_real_word_the_graph_will_not_match() {
+        assert_eq!(
+            fulltext_or_query("what is the weather today?").as_deref(),
+            Some("weather OR today"),
+        );
+    }
+
+    /// Binding: the glue goes and the subject stays — including the words a
+    /// repository question turns on, which are ordinary English too.
+    #[test]
+    fn or_query_keeps_the_subject_of_a_real_question() {
+        assert_eq!(
+            fulltext_or_query("why does install.rs change with tests/install.rs").as_deref(),
+            Some("install OR rs OR change OR tests"),
+        );
+        assert_eq!(
+            fulltext_or_query("please fix the failing test in recall").as_deref(),
+            Some("fix OR failing OR test OR recall"),
+        );
+        assert_eq!(
+            fulltext_or_query("who owns the parser").as_deref(),
+            Some("owns OR parser"),
+        );
     }
 
     #[test]

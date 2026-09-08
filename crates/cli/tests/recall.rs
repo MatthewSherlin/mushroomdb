@@ -159,6 +159,52 @@ fn recall_is_silent_when_nothing_matches_or_store_missing() {
     assert_eq!(run_recall(&dir, "not json"), "");
 }
 
+/// Binding: a prompt that is not about the repository produces no nudge at
+/// all — not a short one, not a framed one, nothing.
+///
+/// This fires before every single user prompt. A digest of six near-random
+/// nodes costs ~350 tokens and, worse, presents unrelated files to the model
+/// as relevant context. The prompt below is the case that used to cost the
+/// most: every one of its words is common enough to match something.
+#[test]
+fn recall_is_silent_on_a_generic_prompt() {
+    let dir = tmp("generic");
+    run_demo(&dir).expect("demo");
+    for prompt in [
+        "what is the weather today",
+        "the",
+        "is it done",
+        "ok thanks",
+        "what do you think about that",
+    ] {
+        let payload = format!(r#"{{"prompt":{}}}"#, json_string(prompt));
+        assert_eq!(run_recall(&dir, &payload), "", "prompt {prompt:?}");
+    }
+}
+
+/// Binding: and the guard does not silence a prompt that names something the
+/// graph holds.
+#[test]
+fn recall_still_fires_on_a_specific_topic() {
+    let dir = tmp("specific");
+    run_demo(&dir).expect("demo");
+    let out = run_recall(&dir, r#"{"prompt":"what does Person 1 work on?"}"#);
+    assert!(out.contains("person-01"), "{out}");
+    assert!(
+        out.lines()
+            .nth(1)
+            .unwrap_or_default()
+            .starts_with("mushroomdb recall"),
+        "{out}"
+    );
+}
+
+/// A JSON string literal, so a prompt with a quote or a backslash in it still
+/// makes a valid payload.
+fn json_string(s: &str) -> String {
+    serde_json::to_string(s).expect("string")
+}
+
 #[test]
 fn digest_opens_by_framing_its_content_as_untrusted_data() {
     let dir = tmp("framing");
