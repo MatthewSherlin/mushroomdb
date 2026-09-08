@@ -476,17 +476,45 @@ pub fn render_context(c: &ContextReport) -> String {
         }
     }
 
-    let calls = |items: &[(String, u32)]| -> Vec<String> {
-        items
-            .iter()
-            .map(|(key, line)| match line {
-                0 => sanitize(key),
-                n => format!("{} line {n}", sanitize(key)),
-            })
-            .collect()
-    };
-    section(&mut out, "callers", &calls(&c.callers));
-    section(&mut out, "callees", &calls(&c.callees));
+    // Callers read as `<file>: <line>, <line>`: every site a signature change
+    // would have to visit, and the file to open to visit them.
+    let mut callers: Vec<String> = c
+        .callers
+        .iter()
+        .map(|s| {
+            let lines: Vec<String> = s
+                .lines
+                .iter()
+                .filter(|n| **n > 0)
+                .map(u32::to_string)
+                .collect();
+            let more = s.sites.saturating_sub(s.lines.len());
+            let mut item = match lines.is_empty() {
+                true => sanitize(&s.file),
+                false => format!("{}: {}", sanitize(&s.file), lines.join(", ")),
+            };
+            if more > 0 {
+                let _ = write!(item, " +{more}");
+            }
+            item
+        })
+        .collect();
+    if c.callers_not_shown > 0 {
+        callers.push(format!(
+            "… {} not shown",
+            plural(c.callers_not_shown, "file")
+        ));
+    }
+    section(&mut out, "callers", &callers);
+    let callees: Vec<String> = c
+        .callees
+        .iter()
+        .map(|(key, line)| match line {
+            0 => sanitize(key),
+            n => format!("{} line {n}", sanitize(key)),
+        })
+        .collect();
+    section(&mut out, "callees", &callees);
     section(
         &mut out,
         "imports",

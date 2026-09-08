@@ -235,7 +235,8 @@ fn rust_workspace_package_paths_resolve_to_lib_rs() {
             &known,
             &no_files
         ),
-        vec!["crates/beta-core/src/lib.rs"]
+        vec!["crates/beta-core/src/lib.rs"],
+        "an item re-exported from the package root resolves to the root"
     );
 
     // No layout convention is assumed: a workspace that keeps its members
@@ -364,6 +365,48 @@ fn rust_super_paths_resolve_relative_to_the_module() {
             &no_files
         ),
         vec!["crates/alpha/src/util.rs"]
+    );
+}
+
+/// A path into a sibling package names the module that defines the item, not
+/// the package root — the same rule `crate::a::b` already follows inside one
+/// package. Naming the defining file is what lets a call resolve across a crate
+/// boundary through the caller's imports.
+#[test]
+fn rust_package_paths_reach_the_defining_module() {
+    let files = tree(&[
+        "Cargo.toml",
+        "crates/alpha/Cargo.toml",
+        "crates/alpha/src/lib.rs",
+        "crates/beta-core/Cargo.toml",
+        "crates/beta-core/src/lib.rs",
+        "crates/beta-core/src/repograph/mod.rs",
+        "crates/beta-core/src/repograph/render.rs",
+    ]);
+    let known = |p: &str| files.contains(p);
+    let resolve = |raw: &str| {
+        resolve_import(
+            Lang::Rust,
+            "crates/alpha/src/lib.rs",
+            raw,
+            &known,
+            &no_files,
+        )
+    };
+
+    assert_eq!(
+        resolve("beta_core::repograph::render::sanitize"),
+        vec!["crates/beta-core/src/repograph/render.rs"],
+        "the trailing item name costs nothing; the module wins"
+    );
+    assert_eq!(
+        resolve("beta_core::repograph::Thing"),
+        vec!["crates/beta-core/src/repograph/mod.rs"]
+    );
+    assert_eq!(
+        resolve("beta_core::Unknown"),
+        vec!["crates/beta-core/src/lib.rs"],
+        "no module answers, so the package root does"
     );
 }
 
@@ -761,6 +804,53 @@ fn markdown_extraction_finds_headings_mentions_and_body() {
 }
 
 // ── per-language extraction ─────────────────────────────────────────────────
+
+/// A macro's arguments are an unparsed token tree, so a call written inside
+/// `format!` or `assert_eq!` is not a `call_expression` and used to be invisible.
+/// In code whose job is rendering that hid most of the call sites there are.
+#[test]
+fn calls_inside_macro_arguments_are_extracted() {
+    let src = r#"
+pub fn render(t: &str) -> String {
+    let plain = sanitize(t);
+    format!("{} {}", repograph::sanitize(t), wrap(sanitize(plain)))
+}
+"#;
+    let facts = code_extract::extract("src/render.rs", src.as_bytes());
+    let calls = &facts
+        .symbols
+        .iter()
+        .find(|s| s.name == "render")
+        .unwrap()
+        .calls;
+    assert_eq!(
+        calls,
+        &vec![
+            ("sanitize".to_string(), 3),
+            ("sanitize".to_string(), 4),
+            ("wrap".to_string(), 4),
+        ],
+        "one entry per call site, macro arguments included, nested calls too"
+    );
+}
+
+/// A `(` that does not directly follow a name is grouping, not an argument
+/// list, so a token run inside a macro is not mistaken for a call.
+#[test]
+fn macro_token_runs_that_are_not_calls_are_left_alone() {
+    let src = r#"
+pub fn check(v: u32) -> bool {
+    assert!(v > (1 + 2));
+    matches!(v, 1 | 2)
+}
+"#;
+    let facts = code_extract::extract("src/check.rs", src.as_bytes());
+    assert!(
+        facts.symbols.iter().all(|s| s.calls.is_empty()),
+        "no calls here: {:?}",
+        facts.symbols.iter().map(|s| &s.calls).collect::<Vec<_>>()
+    );
+}
 
 #[test]
 fn rust_symbols_are_qualified_with_kinds_docs_and_calls() {
@@ -1221,27 +1311,78 @@ fn resolve_call_prefers_same_file_then_directory_then_unique() {
     index.insert("flush", "other/c.rs#Sink.flush");
     index.insert("only", "far/away.rs#only");
     index.insert("Store.flush", "src/a.rs#Store.flush");
+    let none: &[String] = &[];
 
     // Same file wins, even reached through a receiver.
     assert_eq!(
-        resolve_call("src/a.rs", "self.flush", &index),
+        resolve_call("src/a.rs", "self.flush", &index, none),
         Some("src/a.rs#Store.flush".to_string())
     );
     // The fully written name is tried before its last segment.
     assert_eq!(
-        resolve_call("other/c.rs", "Store.flush", &index),
+        resolve_call("other/c.rs", "Store.flush", &index, none),
         Some("src/a.rs#Store.flush".to_string())
     );
     // No definition in this file, two in this directory: ambiguous.
-    assert_eq!(resolve_call("src/c.rs", "flush", &index), None);
+    assert_eq!(resolve_call("src/c.rs", "flush", &index, none), None);
     // Unique anywhere in the tree.
     assert_eq!(
-        resolve_call("src/a.rs", "only", &index),
+        resolve_call("src/a.rs", "only", &index, none),
         Some("far/away.rs#only".to_string())
     );
-    assert_eq!(resolve_call("src/a.rs", "missing", &index), None);
+    assert_eq!(resolve_call("src/a.rs", "missing", &index, none), None);
     assert_eq!(index.len(), 3);
     assert!(!index.is_empty());
+}
+
+/// A name several crates define is ambiguous everywhere except in a file that
+/// imports one of them. Without the import tier every such call is dropped,
+/// which is how a cross-crate caller goes missing from `context`.
+#[test]
+fn resolve_call_uses_imports_to_break_a_repo_wide_tie() {
+    let mut index = SymbolIndex::new();
+    index.insert("sanitize", "crates/alpha/src/render.rs#sanitize");
+    index.insert("sanitize", "crates/beta/src/escape.rs#sanitize");
+
+    // Two definitions, neither near the caller: nothing to choose between.
+    let none: &[String] = &[];
+    assert_eq!(
+        resolve_call("crates/gamma/src/ui.rs", "sanitize", &index, none),
+        None
+    );
+
+    // The caller imports one of them, so that one is what the source named.
+    let imports = vec!["crates/alpha/src/render.rs".to_string()];
+    assert_eq!(
+        resolve_call("crates/gamma/src/ui.rs", "sanitize", &index, &imports),
+        Some("crates/alpha/src/render.rs#sanitize".to_string())
+    );
+    // Written with its module path, which is how a cross-crate call reads.
+    assert_eq!(
+        resolve_call(
+            "crates/gamma/src/ui.rs",
+            "render::sanitize",
+            &index,
+            &imports
+        ),
+        Some("crates/alpha/src/render.rs#sanitize".to_string())
+    );
+    // Importing both leaves it ambiguous: a wrong edge is worse than none.
+    let both = vec![
+        "crates/alpha/src/render.rs".to_string(),
+        "crates/beta/src/escape.rs".to_string(),
+    ];
+    assert_eq!(
+        resolve_call("crates/gamma/src/ui.rs", "sanitize", &index, &both),
+        None
+    );
+
+    // A definition in the caller's own file still wins over an imported one.
+    index.insert("sanitize", "crates/gamma/src/ui.rs#sanitize");
+    assert_eq!(
+        resolve_call("crates/gamma/src/ui.rs", "sanitize", &index, &imports),
+        Some("crates/gamma/src/ui.rs#sanitize".to_string())
+    );
 }
 
 #[test]

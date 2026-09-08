@@ -476,17 +476,23 @@ fn context_on_symbol_has_source_callers_callees_and_owner() {
     assert!(source.starts_with("// line 11"), "{source}");
     assert!(source.ends_with("// line 21"), "{source}");
 
-    // Three symbols call it, each quoting the line it does so on.
-    let callers: Vec<(String, u32)> = c.callers.clone();
+    // Three symbols call it, each in its own file and each quoting the line it
+    // does so on. Files come back with the most call sites first, then by path.
+    let callers: Vec<(String, Vec<String>, Vec<u32>)> = c
+        .callers
+        .iter()
+        .map(|s| (s.file.clone(), s.symbols.clone(), s.lines.clone()))
+        .collect();
     assert_eq!(
         callers,
         vec![
-            (sym(0, 3, "core::load"), 15),
-            (sym(0, 4, "core::save"), 16),
-            (sym(1, 2, "web::render"), 20),
+            (file_key(0, 3), vec![sym(0, 3, "core::load")], vec![15]),
+            (file_key(0, 4), vec![sym(0, 4, "core::save")], vec![16]),
+            (file_key(1, 2), vec![sym(1, 2, "web::render")], vec![20]),
         ],
-        "callers are sorted by key and carry the caller's call line"
+        "call sites are grouped by the file the calls sit in"
     );
+    assert_eq!(c.callers_not_shown, 0);
     assert_eq!(c.callees, vec![(sym(0, 0, "core::init"), 13)]);
 
     // The file's own facts come along: what imports it, what it changes with.
@@ -505,6 +511,65 @@ fn context_on_symbol_has_source_callers_callees_and_owner() {
     assert!(
         text.contains("Ada Example") && !text.contains("@example.test"),
         "{text}"
+    );
+}
+
+/// A `CALLS` edge is written once however many times the call is written, so
+/// counting edges reports a symbol called twelve times from six functions as
+/// six call sites. `context` reads the caller's `call_lines`, which records
+/// every site, and groups them by the file they sit in.
+#[test]
+fn context_lists_every_call_site() {
+    let dir = tmp("context-call-sites");
+    let mut db = synthetic_repo_store(&dir);
+    let target = sym(0, 1, "core::run");
+    let caller = sym(0, 3, "core::load");
+
+    // The same caller, the same one edge, three lines.
+    let sites = core_api::Value::List(
+        [15, 40, 88]
+            .iter()
+            .map(|n| core_api::Value::Str(format!("{target}\t{n}")))
+            .collect(),
+    );
+    db.set_prop(&caller, "call_lines", sites).expect("sites");
+
+    let c = context(&db, None, &target);
+    let group = c
+        .callers
+        .iter()
+        .find(|g| g.file == file_key(0, 3))
+        .expect("the caller's file");
+    assert_eq!(
+        group.lines,
+        vec![15, 40, 88],
+        "every site, not just the first"
+    );
+    assert_eq!(group.sites, 3);
+    assert_eq!(group.symbols, vec![caller.clone()]);
+    assert_eq!(
+        c.callers.first().map(|g| g.file.clone()),
+        Some(file_key(0, 3)),
+        "the file with the most call sites comes first"
+    );
+    assert_eq!(c.callers_not_shown, 0);
+
+    let text = render_context(&c);
+    assert!(
+        text.contains(&format!("{}: 15, 40, 88", file_key(0, 3))),
+        "the digest names the file and every line in it:\n{text}"
+    );
+
+    // `why` quotes the same sites for the same edge.
+    let w = why(&db, &caller, &target);
+    let call = w
+        .links
+        .iter()
+        .find(|l| l.edge_type == "CALLS")
+        .expect("load calls run");
+    assert_eq!(
+        call.evidence,
+        vec![format!("{caller} calls {target} at lines 15, 40, 88")]
     );
 }
 
@@ -925,7 +990,8 @@ fn why_import_evidence_has_the_line() {
     );
     assert!(render_why(&w).contains("line 4"));
 
-    // A call is evidenced the same way, from the caller's line.
+    // A call is evidenced from the caller's lines — every site, since one edge
+    // stands for however many times the call is written.
     let calls = why(&db, &sym(0, 1, "core::run"), &sym(0, 0, "core::init"));
     let call = calls
         .links
@@ -935,7 +1001,7 @@ fn why_import_evidence_has_the_line() {
     assert_eq!(
         call.evidence,
         vec![format!(
-            "{} line 13: call {}",
+            "{} calls {} at line 13",
             sym(0, 1, "core::run"),
             sym(0, 0, "core::init")
         )]

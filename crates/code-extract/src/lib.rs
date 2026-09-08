@@ -29,7 +29,9 @@
 //!
 //! [`SymbolIndex`] keys are `<file path>#<qualified symbol name>`; the caller
 //! builds the index in that shape so [`resolve_call`] can prefer a definition
-//! in the calling file or its directory.
+//! in the calling file or its directory. [`resolve_call`] also takes the
+//! calling file's resolved imports, which is what lets a call reach a
+//! definition in another crate whose name is not unique repository-wide.
 //!
 //! # Determinism
 //!
@@ -328,12 +330,34 @@ impl SymbolIndex {
 ///
 /// The callee is tried as written and then as its last segment, so
 /// `self.flush`, `this.flush` and `Store::flush` all reach `flush`. Within
-/// each attempt the search narrows outwards: a definition in the same file
-/// wins, then one in the same directory, then a single definition anywhere in
-/// the tree. Anything still ambiguous resolves to `None` — a wrong edge is
-/// worse than a missing one.
+/// each attempt the search narrows outwards, and the first tier that yields
+/// exactly one definition wins:
+///
+/// 1. a definition in the same file;
+/// 2. a definition in the same directory;
+/// 3. a definition in a file `from_file` imports;
+/// 4. a single definition anywhere in the tree.
+///
+/// Anything still ambiguous resolves to `None` — a wrong edge is worse than a
+/// missing one.
+///
+/// # Why imports matter
+///
+/// Tier 4 can only answer when the name is unique across the whole repository,
+/// so two crates that each define a `render` left every call to either one
+/// unresolved, and a call that crossed a crate boundary was the common case
+/// for that. `imports` is the caller file's already-resolved import targets —
+/// the same list [`resolve_import`] produced and the `File` node stores — and a
+/// definition living in one of them is the one the source actually named. It
+/// sits below the directory tiers because a file that both imports a module and
+/// defines the name itself means the local one.
 #[must_use]
-pub fn resolve_call(from_file: &str, callee: &str, index: &SymbolIndex) -> Option<String> {
+pub fn resolve_call(
+    from_file: &str,
+    callee: &str,
+    index: &SymbolIndex,
+    imports: &[String],
+) -> Option<String> {
     let from = normalize(from_file);
     let from_dir = parent_dir(&from);
     for name in callee_candidates(callee) {
@@ -357,6 +381,9 @@ pub fn resolve_call(from_file: &str, callee: &str, index: &SymbolIndex) -> Optio
             return Some(key);
         }
         if let Some(key) = pick(&|file| parent_dir(file) == from_dir) {
+            return Some(key);
+        }
+        if let Some(key) = pick(&|file| imports.iter().any(|i| i == file)) {
             return Some(key);
         }
         if let Some(key) = pick(&|_| true) {

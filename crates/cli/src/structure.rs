@@ -18,6 +18,17 @@
 //!
 //! Beside each list sits its evidence: `import_lines` and `call_lines` hold
 //! `"<key>\t<line>"` strings, so a tool can quote the line a link came from.
+//! One entry per call *site*, not one per callee: a symbol that calls another
+//! twelve times contributes twelve entries and one `calls_to` element, which is
+//! what lets `context` name every line a change would have to visit.
+//!
+//! # Resolving a call
+//!
+//! A file's imports are resolved before its calls, and the resolved list is fed
+//! to [`resolve_call`]: a definition living in a file this one imports beats a
+//! same-named definition anywhere else in the tree. Without that a call could
+//! only cross a crate boundary when the callee's name happened to be unique
+//! across the whole repository.
 //!
 //! # What is read
 //!
@@ -570,13 +581,18 @@ fn resolve_file(
         }
     }
 
+    // Calls are resolved against this file's own imports, so a callee defined
+    // in another crate is reachable even when its name is not unique across the
+    // repository. The imports are resolved above, in this same pass.
+    let imported: Vec<String> = imports.iter().cloned().collect();
+
     let mut symbols = Vec::with_capacity(keys.len());
     for (key, at) in keys {
         let fact = &f.symbols[*at];
         let mut calls = BTreeSet::new();
         let mut call_lines = BTreeSet::new();
         for (callee, line) in &fact.calls {
-            let Some(target) = resolve_call(path, callee, index) else {
+            let Some(target) = resolve_call(path, callee, index, &imported) else {
                 continue;
             };
             if &target == key {

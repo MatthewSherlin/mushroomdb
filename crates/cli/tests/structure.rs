@@ -196,6 +196,76 @@ fn all_keys(db: &cli::structure::Db, label: &str) -> Vec<String> {
     v
 }
 
+/// A callee whose name several crates define is ambiguous everywhere except in
+/// a file that imports one of them. Before the importer tier every such call
+/// was dropped, so a `context` on the callee named none of its cross-crate
+/// callers — the one case where an incomplete blast radius is actively unsafe.
+///
+/// The fixture is a two-package workspace where both packages define
+/// `sanitize`, plus a third that imports one of them and calls it — including
+/// from inside a `format!`, whose arguments the grammar leaves unparsed.
+#[test]
+fn calls_resolve_across_crates_via_imports() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(
+        &repo,
+        "workspace",
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("crates/alpha/Cargo.toml", "[package]\nname = \"alpha\"\n"),
+            ("crates/alpha/src/lib.rs", "pub mod render;\n"),
+            (
+                "crates/alpha/src/render.rs",
+                "/// Strip control characters.\npub fn sanitize(s: &str) -> String {\n    s.to_string()\n}\n",
+            ),
+            ("crates/beta/Cargo.toml", "[package]\nname = \"beta\"\n"),
+            (
+                "crates/beta/src/lib.rs",
+                "/// A different escape entirely.\npub fn sanitize(s: &str) -> String {\n    s.to_string()\n}\n",
+            ),
+            ("crates/gamma/Cargo.toml", "[package]\nname = \"gamma\"\n"),
+            (
+                "crates/gamma/src/lib.rs",
+                "use alpha::render::sanitize;\n\n\
+                 pub fn show(t: &str) -> String {\n    \
+                 let head = sanitize(t);\n    \
+                 format!(\"{} {}\", head, sanitize(t))\n}\n",
+            ),
+        ],
+    );
+
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let db = GraphDb::open(&db_dir).unwrap();
+
+    // The `use` names the defining module, not the package root, which is what
+    // makes the call resolvable.
+    assert_eq!(
+        out(&db, "crates/gamma/src/lib.rs", "IMPORTS"),
+        vec!["crates/alpha/src/render.rs".to_string()]
+    );
+    assert_eq!(
+        out(&db, "crates/gamma/src/lib.rs#show", "CALLS"),
+        vec!["crates/alpha/src/render.rs#sanitize".to_string()],
+        "the imported definition wins; beta's same-named function is not it"
+    );
+    // Both sites, the one inside `format!` included.
+    assert_eq!(
+        strings(prop(&db, "crates/gamma/src/lib.rs#show", "call_lines")),
+        vec![
+            "crates/alpha/src/render.rs#sanitize\t4".to_string(),
+            "crates/alpha/src/render.rs#sanitize\t5".to_string(),
+        ]
+    );
+    assert!(
+        db.neighbors("crates/beta/src/lib.rs#sanitize", "CALLS", Direction::In)
+            .unwrap()
+            .is_empty(),
+        "nothing calls beta's sanitize"
+    );
+}
+
 #[test]
 fn first_run_creates_symbols_imports_calls_and_mentions() {
     let repo = seed_repo();

@@ -14,7 +14,7 @@
 
 use crate::db::GraphDb;
 use crate::repograph::facts::{
-    commit_fact, evidence_line, list_prop, neighbors, str_prop, CommitFact,
+    commit_fact, evidence_line, evidence_lines, list_prop, neighbors, str_prop, CommitFact,
 };
 use crate::repograph::owners::SHA_LEN;
 use crate::repograph::path::{shortest_path, MAX_HOPS, PATH_EDGES};
@@ -128,9 +128,18 @@ fn evidence<F: Fs>(db: &GraphDb<F>, edge_type: &str, src: &str, dst: &str) -> Ve
             Some(line) => vec![sanitize(&format!("{src} line {line}: import {dst}"))],
             None => vec![sanitize(&format!("{src} imports {dst}"))],
         },
-        "CALLS" => match evidence_line(&list_prop(db, src, "call_lines"), dst) {
-            Some(line) => vec![sanitize(&format!("{src} line {line}: call {dst}"))],
-            None => vec![sanitize(&format!("{src} calls {dst}"))],
+        // Every site, not the first: one edge stands for however many times the
+        // call is written, and the lines are what a change has to visit.
+        "CALLS" => match evidence_lines(&list_prop(db, src, "call_lines"), dst) {
+            lines if lines.is_empty() => vec![sanitize(&format!("{src} calls {dst}"))],
+            lines => {
+                let shown: Vec<String> = lines.iter().map(u32::to_string).collect();
+                vec![sanitize(&format!(
+                    "{src} calls {dst} at {} {}",
+                    if lines.len() == 1 { "line" } else { "lines" },
+                    shown.join(", ")
+                ))]
+            }
         },
         "KNOWS" => via_files(db, src, dst),
         "MENTIONS" => vec![mention(db, src, dst)],

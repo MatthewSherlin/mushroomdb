@@ -55,6 +55,17 @@ pub(crate) trait Spec: Sync {
     fn imports(&self, node: Node, src: &str) -> Vec<String>;
     /// Interpret a `@call` capture as the callee, as written.
     fn callee(&self, node: Node, src: &str) -> Option<String>;
+
+    /// Calls a `@call` capture contains that the grammar did not parse as
+    /// calls, each with the node they sit on.
+    ///
+    /// Only Rust has any: a macro's arguments are an unparsed token tree, so
+    /// `format!("{}", sanitize(x))` holds a call the grammar never builds a
+    /// `call_expression` for. Every other language leaves this empty and the
+    /// driver treats a `@call` capture as exactly one call.
+    fn hidden_calls<'t>(&self, _node: Node<'t>, _src: &str) -> Vec<(String, Node<'t>)> {
+        Vec::new()
+    }
 }
 
 fn spec_for(lang: Lang) -> Option<&'static dyn Spec> {
@@ -110,6 +121,9 @@ pub(crate) fn extract(lang: Lang, src: &str) -> Option<(Vec<SymbolFact>, Vec<Imp
                 CAP_CALL => {
                     if let Some(callee) = spec.callee(node, src) {
                         calls.push((node.start_byte(), callee, line_of(node)));
+                    }
+                    for (callee, at) in spec.hidden_calls(node, src) {
+                        calls.push((at.start_byte(), callee, line_of(at)));
                     }
                 }
                 _ => {}
