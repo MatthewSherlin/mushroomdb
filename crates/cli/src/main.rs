@@ -177,7 +177,11 @@ fn main() -> ExitCode {
                 tls_key,
             ))
         }
-        Ok(Command::Mcp { db_dir, auto }) => exit(run_mcp(resolve_db(db_dir, auto))),
+        Ok(Command::Mcp {
+            db_dir,
+            auto,
+            all_tools,
+        }) => exit(run_mcp(resolve_db(db_dir, auto), all_tools)),
         Ok(Command::Stats { db_dir }) => match read_stats(&db_dir) {
             Ok(stats) => {
                 print!("{}", format_stats(&stats));
@@ -585,13 +589,14 @@ async fn shutdown_signal() {
     }
 }
 
-fn run_mcp(db_dir: PathBuf) -> Result<(), String> {
+fn run_mcp(db_dir: PathBuf, all_tools: bool) -> Result<(), String> {
     let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
     let stdin = io::stdin();
     let stdout = io::stdout();
     // The store's path, not just a handle: the `sync` tool re-runs this binary
     // against the directory, and cannot infer it from an open database.
-    server::run_mcp_stdio(db, Some(db_dir), stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
+    server::run_mcp_stdio_with(db, Some(db_dir), all_tools, stdin.lock(), stdout.lock())
+        .map_err(|e| e.to_string())
 }
 
 fn home_dir() -> PathBuf {

@@ -9,10 +9,18 @@
 //!
 //! # Shape of a reply
 //!
-//! Every tool here answers with the rendered digest as its text content, and
-//! the serialised report — carrying that same text under `text` — as
-//! `structuredContent`. An assistant reads the digest; a program that wants the
-//! numbers reads the report; neither has to parse the other.
+//! Every tool here answers with the rendered digest as its **text content and
+//! nothing else**. It used to ship the serialised report alongside it as
+//! `structuredContent`, with the same digest repeated under a `text` key: on
+//! seven representative calls that was 11.6 KB of digest against 11.9 KB of
+//! exact duplicate and 15.5 KB of restatement, 3.42× the text an assistant
+//! reads, and it slipped past the renderers' line budgets — a default `impact`
+//! capped its text at 25 lines while shipping 13 KB of uncapped report beside
+//! it. No task tool declares an `outputSchema`, so nothing bound that payload.
+//!
+//! A program that wants the numbers asks for them: every tool takes an
+//! optional `json` boolean, and with it set the reply is the serialised report
+//! as the text content, with no rendered digest.
 //!
 //! # What each one reads and writes
 //!
@@ -60,6 +68,12 @@ const SYNC_REPO_PROP: &str = "repo";
 /// The host's project directory: the checkout an assistant is working in.
 const PROJECT_DIR_VAR: &str = "CLAUDE_PROJECT_DIR";
 
+/// The eight names this module answers to. Listed once, so the `json` argument
+/// below is read for exactly the tools that declare it.
+const TASK_TOOLS: [&str; 8] = [
+    "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
+];
+
 /// Route a task tool. `None` when `name` is not one of the eight.
 pub(crate) fn dispatch(
     db: &SharedDb,
@@ -67,47 +81,76 @@ pub(crate) fn dispatch(
     name: &str,
     args: &Js,
 ) -> Option<CallOutcome> {
+    if !TASK_TOOLS.contains(&name) {
+        return None;
+    }
+    // Every task tool takes the same optional `json`, so it is read and
+    // type-checked once here rather than eight times — and before any work, so
+    // a caller that mistyped it is told so rather than served a digest it did
+    // not ask for.
+    let json_out = match bool_arg(args, "json") {
+        Ok(b) => b,
+        Err(e) => return Some(CallOutcome::ToolErr(e)),
+    };
     Some(match name {
-        "map" => tool_map(db),
-        "context" => tool_context(db, args),
+        "map" => tool_map(db, json_out),
+        "context" => tool_context(db, args, json_out),
         // The one environment read on this path, done here so every function
         // below takes the value and can be tested without touching the
         // process environment.
-        "impact" => tool_impact(db, args, std::env::var_os(PROJECT_DIR_VAR).as_deref()),
-        "owners" => tool_owners(db, args),
-        "why" => tool_why(db, args),
-        "recall" => tool_recall(db, db_dir, args),
-        "remember" => tool_remember(db, args),
-        "sync" => tool_sync(db_dir),
-        _ => return None,
+        "impact" => tool_impact(
+            db,
+            args,
+            std::env::var_os(PROJECT_DIR_VAR).as_deref(),
+            json_out,
+        ),
+        "owners" => tool_owners(db, args, json_out),
+        "why" => tool_why(db, args, json_out),
+        "recall" => tool_recall(db, db_dir, args, json_out),
+        "remember" => tool_remember(db, args, json_out),
+        "sync" => tool_sync(db_dir, json_out),
+        _ => unreachable!("TASK_TOOLS and this match list the same eight names"),
     })
 }
 
-/// A successful task reply: the rendered digest under the untrusted-data
-/// framing line, plus the report with that same framed text under `text`.
+/// A successful task reply.
 ///
-/// `recall_digest` emits the framing itself, so a digest that already carries
-/// it is left alone rather than marked twice.
-fn ok(text: String, structured: Js) -> CallOutcome {
+/// With `json_out` clear — the default — it is the rendered digest under the
+/// untrusted-data framing line, and nothing else: no `structuredContent`, no
+/// second copy of the same text. `recall_digest` emits the framing itself, so
+/// a digest that already carries it is left alone rather than marked twice.
+///
+/// With `json_out` set it is the serialised report as the text content, for a
+/// program that wants the numbers. The report is never rendered in that case,
+/// so nothing is computed twice, and the framing line is left off: JSON is not
+/// prose an assistant is about to read as instructions.
+fn ok<T: serde::Serialize>(
+    json_out: bool,
+    report: &T,
+    render: impl FnOnce(&T) -> String,
+) -> CallOutcome {
+    if json_out {
+        return match serde_json::to_string(report) {
+            Ok(text) => CallOutcome::TaskOk { text },
+            Err(e) => CallOutcome::ToolErr(format!("serialise report: {e}")),
+        };
+    }
+    let text = render(report);
     let text = if text.starts_with(UNTRUSTED_FRAMING) {
         text
     } else {
         format!("{UNTRUSTED_FRAMING}{text}")
     };
-    let mut structured = match structured {
-        Js::Object(map) => Js::Object(map),
-        other => json!({ "report": other }),
-    };
-    if let Some(obj) = structured.as_object_mut() {
-        obj.insert("text".to_string(), Js::String(text.clone()));
-    }
-    CallOutcome::TaskOk { text, structured }
+    CallOutcome::TaskOk { text }
 }
 
-/// Serialise a report, or report the failure as a tool error rather than
-/// dropping the answer.
-fn to_js<T: serde::Serialize>(report: &T) -> Result<Js, String> {
-    serde_json::to_value(report).map_err(|e| format!("serialise report: {e}"))
+/// An optional boolean argument. `Err` when present but wrong-typed.
+fn bool_arg(args: &Js, name: &str) -> Result<bool, String> {
+    match args.get(name) {
+        None | Some(Js::Null) => Ok(false),
+        Some(Js::Bool(b)) => Ok(*b),
+        Some(_) => Err(format!("{name} must be a boolean")),
+    }
 }
 
 /// A required string argument.
@@ -140,20 +183,17 @@ fn str_list_arg(args: &Js, name: &str) -> Result<Vec<String>, String> {
 
 // ── map ──────────────────────────────────────────────────────────────────────
 
-fn tool_map(db: &SharedDb) -> CallOutcome {
+fn tool_map(db: &SharedDb, json_out: bool) -> CallOutcome {
     let map = {
         let g = db.read();
         repograph::repo_map(&*g, &MapOptions::default())
     };
-    match to_js(&map) {
-        Ok(structured) => ok(repograph::render_map(&map), structured),
-        Err(e) => CallOutcome::ToolErr(e),
-    }
+    ok(json_out, &map, repograph::render_map)
 }
 
 // ── context ──────────────────────────────────────────────────────────────────
 
-fn tool_context(db: &SharedDb, args: &Js) -> CallOutcome {
+fn tool_context(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let target = match str_arg(args, "target") {
         Ok(t) => t,
         Err(e) => return CallOutcome::ToolErr(e),
@@ -164,10 +204,7 @@ fn tool_context(db: &SharedDb, args: &Js) -> CallOutcome {
         let g = db.read();
         repograph::context(&*g, None, target)
     };
-    match to_js(&report) {
-        Ok(structured) => ok(repograph::render_context(&report), structured),
-        Err(e) => CallOutcome::ToolErr(e),
-    }
+    ok(json_out, &report, repograph::render_context)
 }
 
 // ── impact ───────────────────────────────────────────────────────────────────
@@ -175,7 +212,12 @@ fn tool_context(db: &SharedDb, args: &Js) -> CallOutcome {
 /// `project_dir` is the value of `$CLAUDE_PROJECT_DIR`, passed in rather than
 /// read here so a test can exercise both branches of [`project_repo`] without
 /// mutating the process environment.
-fn tool_impact(db: &SharedDb, args: &Js, project_dir: Option<&OsStr>) -> CallOutcome {
+fn tool_impact(
+    db: &SharedDb,
+    args: &Js,
+    project_dir: Option<&OsStr>,
+    json_out: bool,
+) -> CallOutcome {
     let mut files = match str_list_arg(args, "files") {
         Ok(f) => f,
         Err(e) => return CallOutcome::ToolErr(e),
@@ -207,10 +249,7 @@ fn tool_impact(db: &SharedDb, args: &Js, project_dir: Option<&OsStr>) -> CallOut
         let g = db.read();
         repograph::impact(&*g, &files, &modified, &ImpactOptions::default())
     };
-    match to_js(&report) {
-        Ok(structured) => ok(repograph::render_impact(&report), structured),
-        Err(e) => CallOutcome::ToolErr(e),
-    }
+    ok(json_out, &report, repograph::render_impact)
 }
 
 /// The checkout root a default `impact` reads its diff from: the host's
@@ -310,7 +349,7 @@ fn changed_paths(root: &Path) -> Result<Vec<String>, String> {
 
 // ── owners ───────────────────────────────────────────────────────────────────
 
-fn tool_owners(db: &SharedDb, args: &Js) -> CallOutcome {
+fn tool_owners(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let path = match str_arg(args, "path") {
         Ok(p) => p,
         Err(e) => return CallOutcome::ToolErr(e),
@@ -322,15 +361,12 @@ fn tool_owners(db: &SharedDb, args: &Js) -> CallOutcome {
     let Some(report) = report else {
         return CallOutcome::ToolErr(format!("no file in the store at {path}"));
     };
-    match to_js(&report) {
-        Ok(structured) => ok(repograph::render_owners(&report), structured),
-        Err(e) => CallOutcome::ToolErr(e),
-    }
+    ok(json_out, &report, repograph::render_owners)
 }
 
 // ── why ──────────────────────────────────────────────────────────────────────
 
-fn tool_why(db: &SharedDb, args: &Js) -> CallOutcome {
+fn tool_why(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let a = match str_arg(args, "a") {
         Ok(v) => v.to_string(),
         Err(e) => return CallOutcome::ToolErr(e),
@@ -346,15 +382,12 @@ fn tool_why(db: &SharedDb, args: &Js) -> CallOutcome {
         let g = db.read();
         repograph::why(&*g, &a, &b)
     };
-    match to_js(&report) {
-        Ok(structured) => ok(repograph::render_why(&report), structured),
-        Err(e) => CallOutcome::ToolErr(e),
-    }
+    ok(json_out, &report, repograph::render_why)
 }
 
 // ── recall ───────────────────────────────────────────────────────────────────
 
-fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js) -> CallOutcome {
+fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) -> CallOutcome {
     let topic = match str_arg(args, "topic") {
         Ok(t) => t.to_string(),
         Err(e) => return CallOutcome::ToolErr(e),
@@ -377,12 +410,16 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js) -> CallOutcome {
     } else {
         digest.clone()
     };
-    ok(text, json!({ "topic": topic, "digest": digest }))
+    ok(
+        json_out,
+        &json!({ "topic": topic, "digest": digest }),
+        |_| text,
+    )
 }
 
 // ── remember ─────────────────────────────────────────────────────────────────
 
-fn tool_remember(db: &SharedDb, args: &Js) -> CallOutcome {
+fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let text = match str_arg(args, "text") {
         Ok(t) => t.to_string(),
         Err(e) => return CallOutcome::ToolErr(e),
@@ -451,8 +488,9 @@ fn tool_remember(db: &SharedDb, args: &Js) -> CallOutcome {
                 ));
             }
             ok(
-                rendered,
-                json!({ "key": key, "kind": kind, "about": about }),
+                json_out,
+                &json!({ "key": key, "kind": kind, "about": about }),
+                |_| rendered,
             )
         }
         Err(e) => CallOutcome::ToolErr(match e {
@@ -472,7 +510,7 @@ fn tool_remember(db: &SharedDb, args: &Js) -> CallOutcome {
 /// about it. The MCP loop is single-threaded, so nothing else is served while
 /// it runs — which is correct, since every other tool would be answering from
 /// the store the child is rewriting.
-fn tool_sync(db_dir: Option<&Path>) -> CallOutcome {
+fn tool_sync(db_dir: Option<&Path>, json_out: bool) -> CallOutcome {
     let Some(db_dir) = db_dir else {
         return CallOutcome::ToolErr(
             "store path unknown: sync needs the directory this server was started on".into(),
@@ -513,21 +551,40 @@ fn tool_sync(db_dir: Option<&Path>) -> CallOutcome {
             repograph::sanitize(stdout.trim())
         ));
     };
-    // The CLI already rendered the digest into the object, so both halves of
-    // the reply come from the one run.
+    // The CLI already rendered the digest into the object, so the digest and
+    // the numbers come from the one run whichever the caller asked for.
     let text = report
         .get("text")
         .and_then(Js::as_str)
         .unwrap_or_default()
         .to_string();
-    ok(text, Js::Object(report))
+    ok(json_out, &Js::Object(report), |_| text)
 }
 
 // ── tools/list ───────────────────────────────────────────────────────────────
 
+/// The `json` argument every task tool takes, added to all eight schemas by
+/// [`task_tools`] rather than written out eight times.
+fn json_arg() -> Js {
+    json!({
+        "type": "boolean",
+        "description": "Answer with the report as JSON, not the rendered digest."
+    })
+}
+
 /// The eight task tools, in the order `tools/list` puts them: the question an
 /// assistant asks first comes first.
 pub(crate) fn task_tools() -> Vec<Js> {
+    let mut tools = task_tool_schemas();
+    for tool in &mut tools {
+        if let Some(props) = tool["inputSchema"]["properties"].as_object_mut() {
+            props.insert("json".to_string(), json_arg());
+        }
+    }
+    tools
+}
+
+fn task_tool_schemas() -> Vec<Js> {
     vec![
         json!({
             "name": "map",
@@ -723,22 +780,35 @@ mod tests {
         (db, dir)
     }
 
-    fn impact_files(outcome: &CallOutcome) -> Vec<String> {
+    /// The report behind a `json: true` reply, which is now the only place a
+    /// caller reads the numbers from: the text content *is* the JSON.
+    fn report(outcome: &CallOutcome) -> Js {
         match outcome {
-            CallOutcome::TaskOk { structured, .. } => structured["files"]
-                .as_array()
-                .expect("files")
-                .iter()
-                .map(|f| f["path"].as_str().expect("path").to_string())
-                .collect(),
+            CallOutcome::TaskOk { text } => {
+                serde_json::from_str(text).expect("a json reply is the serialised report")
+            }
             other => panic!("expected a task result, got {}", describe(other)),
         }
+    }
+
+    fn impact_files(outcome: &CallOutcome) -> Vec<String> {
+        report(outcome)["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .map(|f| f["path"].as_str().expect("path").to_string())
+            .collect()
+    }
+
+    /// `impact` with no `files`, asking for the report rather than the digest.
+    fn impact_report(db: &SharedDb, project_dir: Option<&OsStr>) -> CallOutcome {
+        tool_impact(db, &json!({"json": true}), project_dir, true)
     }
 
     fn describe(outcome: &CallOutcome) -> String {
         match outcome {
             CallOutcome::ToolErr(m) => format!("tool error: {m}"),
-            CallOutcome::TaskOk { text, .. } => format!("ok: {text}"),
+            CallOutcome::TaskOk { text } => format!("ok: {text}"),
             CallOutcome::ToolOk(v) => format!("json: {v}"),
             CallOutcome::Protocol { message, .. } => format!("protocol: {message}"),
         }
@@ -751,20 +821,17 @@ mod tests {
         let repo = dirty_repo("marker-repo");
         let (db, dir) = store_for("marker-store", Some(&repo));
 
-        let outcome = tool_impact(&db, &json!({}), None);
+        let outcome = impact_report(&db, None);
         assert_eq!(
             impact_files(&outcome),
             vec!["src/core.rs".to_string()],
             "the uncommitted edit, and not the build artefact"
         );
-        match &outcome {
-            CallOutcome::TaskOk { structured, .. } => assert_eq!(
-                structured["unknown"],
-                json!([]),
-                "an excluded path must not come back as unknown"
-            ),
-            other => panic!("{}", describe(other)),
-        }
+        assert_eq!(
+            report(&outcome)["unknown"],
+            json!([]),
+            "an excluded path must not come back as unknown"
+        );
 
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
@@ -780,7 +847,7 @@ mod tests {
         // proves the project directory was the one read.
         let (db, dir) = store_for("project-store", None);
 
-        let outcome = tool_impact(&db, &json!({}), Some(project.as_os_str()));
+        let outcome = impact_report(&db, Some(project.as_os_str()));
         assert_eq!(impact_files(&outcome), vec!["src/core.rs".to_string()]);
 
         drop(db);
@@ -795,7 +862,7 @@ mod tests {
         let repo = dirty_repo("subdir-repo");
         let (db, dir) = store_for("subdir-store", None);
 
-        let outcome = tool_impact(&db, &json!({}), Some(repo.join("src").as_os_str()));
+        let outcome = impact_report(&db, Some(repo.join("src").as_os_str()));
         assert_eq!(
             impact_files(&outcome),
             vec!["src/core.rs".to_string()],
@@ -816,7 +883,7 @@ mod tests {
         std::fs::create_dir_all(&plain).expect("plain dir");
         let (db, dir) = store_for("fallback-store", Some(&repo));
 
-        let outcome = tool_impact(&db, &json!({}), Some(plain.as_os_str()));
+        let outcome = impact_report(&db, Some(plain.as_os_str()));
         assert_eq!(impact_files(&outcome), vec!["src/core.rs".to_string()]);
 
         drop(db);
@@ -831,9 +898,8 @@ mod tests {
     fn no_checkout_anywhere_says_pass_files_explicitly() {
         let (db, dir) = store_for("no-repo-store", None);
 
-        let outcome = tool_impact(
+        let outcome = impact_report(
             &db,
-            &json!({}),
             Some(OsStr::new("/nonexistent/mushroomdb-test-project")),
         );
         match &outcome {
@@ -852,8 +918,9 @@ mod tests {
 
         let outcome = tool_impact(
             &db,
-            &json!({"files": ["src/core.rs"]}),
+            &json!({"files": ["src/core.rs"], "json": true}),
             Some(OsStr::new("/nonexistent/mushroomdb-test-project")),
+            true,
         );
         assert_eq!(impact_files(&outcome), vec!["src/core.rs".to_string()]);
 

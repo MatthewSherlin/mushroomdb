@@ -121,6 +121,11 @@ pub enum Command {
         /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
         db_dir: Option<PathBuf>,
         auto: bool,
+        /// `--all-tools`: advertise all twenty-four tools in `tools/list`
+        /// rather than the eleven a coding agent reaches for. The thirteen it
+        /// adds are callable either way; the flag decides what is listed, and
+        /// what every session pays for before its first turn.
+        all_tools: bool,
     },
     Stats {
         db_dir: PathBuf,
@@ -313,7 +318,9 @@ Usage:
                      verify an install: config entry, store, hooks, git hooks, and a real
                      stdio handshake with the configured MCP command; exits 1 on any `fail`
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
-  mushroomdb mcp <db-dir>|--auto
+  mushroomdb mcp <db-dir>|--auto [--all-tools]
+                     --all-tools lists all 24 tools; the default lists the 11 a coding
+                     agent reaches for (the rest stay callable, just unlisted)
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
   mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
@@ -580,9 +587,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "--help" | "-h" | "help" => Ok(Command::Help),
         "--version" | "-V" | "version" => Ok(Command::Version),
         "serve" => parse_serve(&args[1..]),
-        "mcp" => {
-            parse_dir_or_auto("mcp", &args[1..]).map(|(db_dir, auto)| Command::Mcp { db_dir, auto })
-        }
+        "mcp" => parse_mcp(&args[1..]),
         "stats" => parse_one_dir("stats", &args[1..]).map(|db_dir| Command::Stats { db_dir }),
         "demo" => parse_one_dir("demo", &args[1..]).map(|db_dir| Command::Demo { db_dir }),
         "suggest" => parse_one_dir("suggest", &args[1..]).map(|db_dir| Command::Suggest { db_dir }),
@@ -1629,6 +1634,23 @@ fn parse_dir_or_auto(cmd: &str, args: &[&str]) -> Result<(Option<PathBuf>, bool)
     }
 }
 
+/// `mcp [<db-dir>|--auto] [--all-tools]`. Every other flag is
+/// [`parse_dir_or_auto`]'s to reject, so `--all-tools` is stripped here and
+/// the rest of the line parses exactly as `recall`'s does.
+fn parse_mcp(args: &[&str]) -> Result<Command, String> {
+    let all_tools = args.contains(&"--all-tools");
+    let rest: Vec<&str> = args
+        .iter()
+        .copied()
+        .filter(|a| *a != "--all-tools")
+        .collect();
+    parse_dir_or_auto("mcp", &rest).map(|(db_dir, auto)| Command::Mcp {
+        db_dir,
+        auto,
+        all_tools,
+    })
+}
+
 /// `touch [<db-dir>|--auto] [<file>...]`. The first positional is the database
 /// unless `--auto` already named it, in which case every positional is a file.
 fn parse_touch(args: &[&str]) -> Result<Command, String> {
@@ -2370,9 +2392,14 @@ mod tests {
             Case {
                 args: &["mcp", "/tmp/demo-db"],
                 check: |r| match r {
-                    Ok(Command::Mcp { db_dir, auto }) => {
+                    Ok(Command::Mcp {
+                        db_dir,
+                        auto,
+                        all_tools,
+                    }) => {
                         assert_eq!(db_dir, Some(PathBuf::from("/tmp/demo-db")));
                         assert!(!auto);
+                        assert!(!all_tools, "the short list is the default");
                     }
                     other => panic!("mcp <dir>, got {other:?}"),
                 },
@@ -3808,7 +3835,8 @@ mod tests {
             parse_args(&["mcp", "--auto"]).unwrap(),
             Command::Mcp {
                 db_dir: None,
-                auto: true
+                auto: true,
+                all_tools: false
             }
         );
         assert_eq!(
@@ -3826,6 +3854,38 @@ mod tests {
             );
         }
         assert!(usage().contains("--auto"));
+    }
+
+    /// Binding: `--all-tools` is `mcp`'s alone, sits either side of the store
+    /// path, and every other flag is still rejected.
+    #[test]
+    fn mcp_takes_all_tools() {
+        for args in [
+            &["mcp", "/tmp/db", "--all-tools"][..],
+            &["mcp", "--all-tools", "/tmp/db"][..],
+        ] {
+            assert_eq!(
+                parse_args(args).unwrap(),
+                Command::Mcp {
+                    db_dir: Some(PathBuf::from("/tmp/db")),
+                    auto: false,
+                    all_tools: true
+                },
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            parse_args(&["mcp", "--auto", "--all-tools"]).unwrap(),
+            Command::Mcp {
+                db_dir: None,
+                auto: true,
+                all_tools: true
+            }
+        );
+        assert!(parse_args(&["mcp", "--all-tools"]).is_err(), "no target");
+        assert!(parse_args(&["mcp", "/tmp/db", "--nope"]).is_err());
+        assert!(parse_args(&["recall", "/tmp/db", "--all-tools"]).is_err());
+        assert!(usage().contains("--all-tools"));
     }
 
     #[test]
