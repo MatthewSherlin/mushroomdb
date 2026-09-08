@@ -390,14 +390,19 @@ else
   for out in "$WORK"/t.*.out; do sed 's/^/      | /' "$out"; done
 fi
 
-send '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"map","arguments":{}}}'
+# `json: true` asks for the report rather than the digest. A task tool answers
+# with one text block and no `structuredContent`, so this is where the numbers
+# now come from: the text content *is* the serialised report.
+send '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"map","arguments":{"json":true}}}'
 MAP_LINE="$WORK/mcp-map.json"
 await_id 2 >"$MAP_LINE" || die "MCP server did not answer tools/call map"
 
 MCP_FILES="$(python3 -c '
 import json, sys
 msg = json.load(open(sys.argv[1]))
-print(msg["result"]["structuredContent"]["files"])
+result = msg["result"]
+assert "structuredContent" not in result, "a task tool must answer with text alone"
+print(json.loads(result["content"][0]["text"])["files"])
 ' "$MAP_LINE")"
 assert_eq "$MCP_FILES" "$INGEST_FILES" "the live server's map still counts every ingested file"
 

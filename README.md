@@ -215,8 +215,14 @@ reaches for, and what `tools/list` shows first:
 | `remember` | Write a note into the graph and return its key |
 | `sync` | Bring the store up to date: commits since the last sync, then the dirty working tree |
 
+Each of the eight also takes `json: true`, which answers with the raw report instead of the
+rendered digest.
+
 **The sixteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
-in `tools/list`, so an assistant knows which surface is the front door:
+in `tools/list`, so an assistant knows which surface is the front door. A default `tools/list`
+names three of them — `query`, `ingest_json` and `stats` — because the other thirteen schemas cost
+every session more than a coding agent gets back; `mushroomdb mcp <db> --all-tools` advertises the
+whole list, and all sixteen stay callable either way:
 
 | Tool | Purpose |
 |---|---|
