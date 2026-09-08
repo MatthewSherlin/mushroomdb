@@ -51,7 +51,8 @@
 //! write at all, which is what makes a re-run byte-identical.
 use crate::CliError;
 use code_extract::{
-    extract, resolve_call, resolve_import, resolve_mention, FileFacts, SymbolIndex, MAX_FILE_BYTES,
+    extract, resolve_call, resolve_import, resolve_mention, CallScope, FileFacts, SymbolIndex,
+    MAX_FILE_BYTES,
 };
 use core_api::repograph::rules::{about_rule, concept_sources_rule, ABOUT_LABELS};
 use core_api::{default_max_edges, BatchOp, Predicate, RuleDef, Value};
@@ -316,6 +317,36 @@ impl Tree {
     fn by_basename(&self, name: &str) -> Vec<String> {
         self.by_base.get(name).cloned().unwrap_or_default()
     }
+
+    /// Every name a path call may lead with: each directory name in the tree
+    /// and each file's stem, plus the `-`/`_` spelling of both.
+    ///
+    /// A package directory is conventionally `code-extract` while the path that
+    /// reaches it is `code_extract`, so both go in. Anything not in here and
+    /// not a symbol — `std`, `serde_json`, `Vec` — names something outside the
+    /// tree, and [`resolve_call`] gives a call leading with it no edge.
+    fn roots(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for path in &self.files {
+            for (at, part) in path.split('/').enumerate() {
+                let last = at + 1 == path.split('/').count();
+                let name = match last {
+                    true => part.rsplit_once('.').map_or(part, |(stem, _)| stem),
+                    false => part,
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                out.insert(name.to_string());
+                if name.contains('-') {
+                    out.insert(name.replace('-', "_"));
+                } else if name.contains('_') {
+                    out.insert(name.replace('_', "-"));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// One symbol, resolved and ready to store.
@@ -499,9 +530,12 @@ fn refresh(
         keyed.insert(path, keys);
     }
 
+    // What a path call may lead with, computed once for the whole pass.
+    let roots = tree.roots();
+
     let mut writes: Vec<FileWrite> = Vec::new();
     for (path, f) in &facts {
-        let write = resolve_file(path, f, &tree, &index, &keyed[path], with_docs);
+        let write = resolve_file(path, f, &tree, &index, &keyed[path], &roots, with_docs);
         report.files_scanned += 1;
         report.symbols += write.symbols.len();
         report.imports += write.imports.len();
@@ -558,6 +592,7 @@ fn resolve_file(
     tree: &Tree,
     index: &SymbolIndex,
     keys: &[(String, usize)],
+    roots: &BTreeSet<String>,
     with_docs: bool,
 ) -> FileWrite {
     let known = |p: &str| tree.known(p);
@@ -591,6 +626,10 @@ fn resolve_file(
     // in another crate is reachable even when its name is not unique across the
     // repository. The imports are resolved above, in this same pass.
     let imported: Vec<String> = imports.iter().cloned().collect();
+    let scope = CallScope {
+        imports: &imported,
+        roots,
+    };
 
     let mut symbols = Vec::with_capacity(keys.len());
     for (key, at) in keys {
@@ -598,7 +637,7 @@ fn resolve_file(
         let mut calls = BTreeSet::new();
         let mut call_lines = BTreeSet::new();
         for call in &fact.calls {
-            let Some(target) = resolve_call(path, call, index, &imported) else {
+            let Some(target) = resolve_call(path, call, index, &scope) else {
                 continue;
             };
             if &target == key {

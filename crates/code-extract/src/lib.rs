@@ -48,7 +48,7 @@ mod lang;
 
 pub use docs::resolve_mention;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Files larger than this are reduced to hash, language and line count.
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
@@ -375,6 +375,22 @@ impl SymbolIndex {
     }
 }
 
+/// What the calling file can see, beyond the symbol index itself.
+///
+/// Both halves are built by the caller from the working tree it already walked,
+/// so [`resolve_call`] stays a pure function of its inputs.
+#[derive(Clone, Copy, Debug)]
+pub struct CallScope<'a> {
+    /// The calling file's resolved import targets, as [`resolve_import`]
+    /// returned them and the `File` node stores them.
+    pub imports: &'a [String],
+    /// Every name a path call may lead with: package, directory and module
+    /// names the tree holds, each also under the `-`/`_` spelling a package
+    /// path uses. A leading segment that is not in here and is not a symbol
+    /// names a dependency, and a call into a dependency resolves to nothing.
+    pub roots: &'a BTreeSet<String>,
+}
+
 /// Resolve a callee written in `from_file` to the key of the symbol it names.
 ///
 /// The callee is tried as written and then as its last segment, so
@@ -417,14 +433,25 @@ impl SymbolIndex {
 /// is how a static call reads in Python, TypeScript and JavaScript, and is
 /// evidence rather than a guess. `v.collect` falling back to `collect` is the
 /// guess, and it gets no edge — which is the truthful answer for a call into a
-/// dependency the graph does not hold.
+/// dependency the graph does not hold. Tier 3 is narrowed the same way: an
+/// imported match for a method call must itself be a method.
+///
+/// # Calls into a dependency
+///
+/// Before any of that, a path call whose leading segment names nothing in the
+/// tree resolves to nothing at all — see [`path_reaches_the_tree`].
+/// `std::mem::take` is not a call to whatever single `take` this repository
+/// defines.
 #[must_use]
 pub fn resolve_call(
     from_file: &str,
     call: &CallFact,
     index: &SymbolIndex,
-    imports: &[String],
+    scope: &CallScope<'_>,
 ) -> Option<String> {
+    if !path_reaches_the_tree(&call.callee, index, scope.roots) {
+        return None;
+    }
     let from = normalize(from_file);
     let from_dir = parent_dir(&from);
     for name in callee_candidates(&call.callee) {
@@ -440,10 +467,10 @@ pub fn resolve_call(
         if keys.is_empty() {
             continue;
         }
-        let pick = |filter: &dyn Fn(&str) -> bool| -> Option<String> {
+        let pick = |filter: &dyn Fn(&str, &str) -> bool| -> Option<String> {
             let mut hit = None;
             for key in keys {
-                if filter(key_file(key)) {
+                if filter(key_file(key), key_symbol(key)) {
                     if hit.is_some() {
                         return None;
                     }
@@ -452,22 +479,56 @@ pub fn resolve_call(
             }
             hit
         };
-        if let Some(key) = pick(&|file| file == from) {
+        if let Some(key) = pick(&|file, _| file == from) {
             return Some(key);
         }
-        if let Some(key) = pick(&|file| parent_dir(file) == from_dir) {
+        if let Some(key) = pick(&|file, _| parent_dir(file) == from_dir) {
             return Some(key);
         }
-        if let Some(key) = pick(&|file| imports.iter().any(|i| i == file)) {
+        // An import brings a *file* into scope, not a type. For a method call
+        // that is not enough: the receiver's type is unknown, and a free
+        // function in an imported file that happens to share the method's name
+        // is not the thing being called. `repo.join(id)` is `Path::join`, but
+        // the calling file imports a module that defines a `join`. So an
+        // imported match has to be a method — a symbol qualified `Type.name`,
+        // which is how every extractor here names one.
+        if let Some(key) = pick(&|file, symbol| {
+            scope.imports.iter().any(|i| i == file) && (!call.method || symbol.contains('.'))
+        }) {
             return Some(key);
         }
         if repo_wide {
-            if let Some(key) = pick(&|_| true) {
+            if let Some(key) = pick(&|_, _| true) {
                 return Some(key);
             }
         }
     }
     None
+}
+
+/// Whether a `::`-separated path call names anything the working tree holds.
+///
+/// `std::mem::take`, `serde_json::from_str` and `Vec::new` are calls into
+/// dependencies. The graph has no node for any of them, and the tiers below
+/// would happily bind the last segment to whatever single `take`, `from_str` or
+/// `new` the repository happened to define — on this repository that was mostly
+/// test helpers. A path is worth resolving only when its first segment names
+/// something here:
+///
+/// * `crate`, `self`, `super` and `Self`, which are always the current tree;
+/// * a package, directory or module name the caller listed in `roots`;
+/// * a symbol — `Store::flush` leads with a type, not a module.
+///
+/// A callee with no `::` is not a path and passes untouched, which leaves bare
+/// calls and every dotted form to the tiers and the method rule.
+fn path_reaches_the_tree(callee: &str, index: &SymbolIndex, roots: &BTreeSet<String>) -> bool {
+    let Some((first, _)) = callee.split_once("::") else {
+        return true;
+    };
+    let first = first.trim();
+    matches!(first, "crate" | "self" | "super" | "Self")
+        || roots.contains(first)
+        || !index.keys_for(first).is_empty()
 }
 
 /// The callee as written, then its last `.`- or `::`-separated segment.
@@ -489,6 +550,11 @@ fn callee_candidates(callee: &str) -> Vec<String> {
 /// The file half of a symbol key.
 fn key_file(key: &str) -> &str {
     key.rsplit_once('#').map_or(key, |(file, _)| file)
+}
+
+/// The symbol half of a symbol key: the name, qualified within its file.
+fn key_symbol(key: &str) -> &str {
+    key.rsplit_once('#').map_or("", |(_, name)| name)
 }
 
 // ── path helpers ────────────────────────────────────────────────────────────

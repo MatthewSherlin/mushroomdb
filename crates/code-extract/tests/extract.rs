@@ -10,7 +10,7 @@
 
 use code_extract::{
     extract, lang_of, resolve_call, resolve_import, resolve_mention, written_as_method, CallFact,
-    FileFacts, Lang, SymbolIndex, MAX_BODY_BYTES, MAX_FILE_BYTES,
+    CallScope, FileFacts, Lang, SymbolIndex, MAX_BODY_BYTES, MAX_FILE_BYTES,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -87,6 +87,16 @@ fn callees<'a>(facts: &'a FileFacts, name: &str) -> Vec<&'a str> {
         .iter()
         .map(|c| c.callee.as_str())
         .collect()
+}
+
+/// The names a path call may lead with, as the working-tree pass computes them.
+fn roots(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|n| (*n).to_string()).collect()
+}
+
+/// What the calling file can see: its imports and those leading names.
+fn scope<'a>(imports: &'a [String], roots: &'a BTreeSet<String>) -> CallScope<'a> {
+    CallScope { imports, roots }
 }
 
 fn raw_imports(facts: &FileFacts) -> Vec<&str> {
@@ -1312,7 +1322,8 @@ fn resolve_call_prefers_same_file_then_directory_then_unique() {
     index.insert("flush", "other/c.rs#Sink.flush");
     index.insert("only", "far/away.rs#only");
     index.insert("Store.flush", "src/a.rs#Store.flush");
-    let none: &[String] = &[];
+    let no_roots = roots(&[]);
+    let none = &scope(&[], &no_roots);
 
     // Same file wins, even reached through a receiver.
     assert_eq!(
@@ -1358,8 +1369,9 @@ fn method_calls_do_not_resolve_repo_wide() {
     index.insert("collect", "crates/other/tests/helpers.rs#collect");
     index.insert("run", "src/a.rs#Job.run");
     index.insert("start", "src/b.rs#start");
-    index.insert("boot", "crates/dep/src/lib.rs#boot");
-    let none: &[String] = &[];
+    index.insert("boot", "crates/dep/src/lib.rs#Boot.boot");
+    let tree = roots(&["helpers"]);
+    let none = &scope(&[], &tree);
 
     // The one place the old tier fired, and the reason for this rule.
     assert_eq!(
@@ -1426,14 +1438,114 @@ fn method_calls_do_not_resolve_repo_wide() {
     );
     let imports = vec!["crates/dep/src/lib.rs".to_string()];
     assert_eq!(
-        resolve_call("src/a.rs", &CallFact::method("d.boot", 1), &index, &imports),
-        Some("crates/dep/src/lib.rs#boot".to_string()),
-        "an imported file"
+        resolve_call(
+            "src/a.rs",
+            &CallFact::method("d.boot", 1),
+            &index,
+            &scope(&imports, &tree)
+        ),
+        Some("crates/dep/src/lib.rs#Boot.boot".to_string()),
+        "a method in an imported file"
     );
     assert_eq!(
         resolve_call("src/a.rs", &CallFact::method("d.boot", 1), &index, none),
         None,
         "and without the import, nothing"
+    );
+}
+
+/// `std::mem::take` is a call into the standard library. The tiers below have
+/// no node for it and would bind the last segment to whatever single `take` the
+/// repository happened to define — on this repository, a test helper. A path
+/// call resolves only when its leading segment names something here.
+#[test]
+fn external_path_calls_resolve_to_nothing() {
+    let mut index = SymbolIndex::new();
+    index.insert("take", "crates/core/tests/events.rs#take");
+    index.insert("helper", "src/net/util.rs#helper");
+    index.insert("Store", "src/store.rs#Store");
+    index.insert("open", "src/store.rs#Store.open");
+    // `util` is a module in the tree; `std` and `serde_json` are not.
+    let tree = roots(&["util", "net", "src"]);
+    let here = &scope(&[], &tree);
+
+    for external in [
+        "std::mem::take",
+        "core::mem::take",
+        "serde_json::take",
+        "Vec::take",
+        "::std::mem::take",
+    ] {
+        assert_eq!(
+            resolve_call("src/a.rs", &CallFact::plain(external, 1), &index, here),
+            None,
+            "{external} names nothing in this tree"
+        );
+    }
+
+    // A path that does lead somewhere here resolves as it always did.
+    for internal in [
+        "crate::net::util::helper",
+        "self::helper",
+        "super::helper",
+        "Self::helper",
+        "util::helper",
+    ] {
+        assert_eq!(
+            resolve_call("src/a.rs", &CallFact::plain(internal, 1), &index, here),
+            Some("src/net/util.rs#helper".to_string()),
+            "{internal} leads into the tree"
+        );
+    }
+
+    // A leading segment can be a type rather than a module, and a type the
+    // graph holds is just as much "in the tree" as a directory is.
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::plain("Store::open", 1), &index, here),
+        Some("src/store.rs#Store.open".to_string())
+    );
+
+    // A bare call has no leading segment to judge, so nothing changes for it.
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::plain("take", 1), &index, here),
+        Some("crates/core/tests/events.rs#take".to_string())
+    );
+}
+
+/// An import brings a *file* into scope, not a type. For a call written on a
+/// receiver that is not enough: `repo.join(id)` is `Path::join`, but the calling
+/// file imports a module that happens to define a free `join`. An imported match
+/// for a method call has to be a method.
+#[test]
+fn method_calls_only_match_methods_in_the_imported_tier() {
+    let mut index = SymbolIndex::new();
+    index.insert("join", "crates/util/src/paths.rs#join");
+    index.insert("flush", "crates/util/src/paths.rs#Writer.flush");
+    let tree = roots(&["util", "paths"]);
+    let imports = vec!["crates/util/src/paths.rs".to_string()];
+    let seen = &scope(&imports, &tree);
+
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("repo.join", 1), &index, seen),
+        None,
+        "a free function in an imported file is not a method on the receiver"
+    );
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("w.flush", 1), &index, seen),
+        Some("crates/util/src/paths.rs#Writer.flush".to_string()),
+        "a method in an imported file is"
+    );
+    // A bare call is unaffected: nothing about it claims a receiver.
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::plain("join", 1), &index, seen),
+        Some("crates/util/src/paths.rs#join".to_string())
+    );
+    // And the same-file tier still reaches a free function through a receiver,
+    // because a file's own definitions are what it is calling.
+    index.insert("write", "src/a.rs#write");
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("out.write", 1), &index, seen),
+        Some("src/a.rs#write".to_string())
     );
 }
 
@@ -1458,7 +1570,8 @@ fn resolve_call_uses_imports_to_break_a_repo_wide_tie() {
     index.insert("sanitize", "crates/beta/src/escape.rs#sanitize");
 
     // Two definitions, neither near the caller: nothing to choose between.
-    let none: &[String] = &[];
+    let tree = roots(&["render", "escape"]);
+    let none = &scope(&[], &tree);
     assert_eq!(
         resolve_call(
             "crates/gamma/src/ui.rs",
@@ -1476,7 +1589,7 @@ fn resolve_call_uses_imports_to_break_a_repo_wide_tie() {
             "crates/gamma/src/ui.rs",
             &CallFact::plain("sanitize", 1),
             &index,
-            &imports
+            &scope(&imports, &tree)
         ),
         Some("crates/alpha/src/render.rs#sanitize".to_string())
     );
@@ -1486,7 +1599,7 @@ fn resolve_call_uses_imports_to_break_a_repo_wide_tie() {
             "crates/gamma/src/ui.rs",
             &CallFact::plain("render::sanitize", 1),
             &index,
-            &imports
+            &scope(&imports, &tree)
         ),
         Some("crates/alpha/src/render.rs#sanitize".to_string())
     );
@@ -1500,7 +1613,7 @@ fn resolve_call_uses_imports_to_break_a_repo_wide_tie() {
             "crates/gamma/src/ui.rs",
             &CallFact::plain("sanitize", 1),
             &index,
-            &both
+            &scope(&both, &tree)
         ),
         None
     );
@@ -1512,7 +1625,7 @@ fn resolve_call_uses_imports_to_break_a_repo_wide_tie() {
             "crates/gamma/src/ui.rs",
             &CallFact::plain("sanitize", 1),
             &index,
-            &imports
+            &scope(&imports, &tree)
         ),
         Some("crates/gamma/src/ui.rs#sanitize".to_string())
     );

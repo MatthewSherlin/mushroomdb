@@ -285,7 +285,8 @@ fn method_calls_do_not_reach_an_unrelated_function_of_the_same_name() {
             // The only `collect` in the tree, and nothing imports it.
             (
                 "crates/helper/src/lib.rs",
-                "/// Gather the fixtures.\npub fn collect(dir: &str) -> Vec<String> {\n    vec![dir.to_string()]\n}\n",
+                "/// Gather the fixtures.\npub fn collect(dir: &str) -> Vec<String> {\n    vec![dir.to_string()]\n}\n\n\
+                 /// The only `take` in the tree.\npub fn take(n: usize) -> usize {\n    n\n}\n",
             ),
             ("crates/app/Cargo.toml", "[package]\nname = \"app\"\n"),
             (
@@ -294,7 +295,8 @@ fn method_calls_do_not_reach_an_unrelated_function_of_the_same_name() {
                  /// Do the work.\npub fn run(job: &Job) -> u32 {\n    let _ = job;\n    7\n}\n\n\
                  pub fn total(items: &[u32], job: &Job) -> u32 {\n    \
                  let picked: Vec<u32> = items.iter().copied().collect();\n    \
-                 picked.len() as u32 + job.run()\n}\n",
+                 let moved = std::mem::take(&mut picked.clone());\n    \
+                 picked.len() as u32 + moved.len() as u32 + job.run()\n}\n",
             ),
         ],
     );
@@ -313,8 +315,18 @@ fn method_calls_do_not_reach_an_unrelated_function_of_the_same_name() {
             .is_empty(),
         "`.collect()` is a method on a type from outside the tree"
     );
-    // The same-file tier still answers a method call, so the rule costs nothing
-    // real: `job.run()` reaches the `run` defined beside it.
+    // `std::mem::take` is a call into the standard library, and the only `take`
+    // in the tree is a helper in the other crate.
+    assert!(
+        db.neighbors("crates/helper/src/lib.rs#take", "CALLS", Direction::In)
+            .unwrap()
+            .is_empty(),
+        "a path call leading with `std` names nothing here"
+    );
+
+    // The same-file tier still answers a method call, so the rules cost nothing
+    // real: `job.run()` reaches the `run` defined beside it, and it is the only
+    // edge `total` has.
     assert_eq!(
         out(&db, "crates/app/src/lib.rs#total", "CALLS"),
         vec!["crates/app/src/lib.rs#run".to_string()]
