@@ -863,6 +863,45 @@ pub fn check(v: u32) -> bool {
     );
 }
 
+/// A macro's arguments are unparsed, so a tuple-struct *pattern* is the same
+/// three tokens as a call: `matches!(e, Kind::Io(_))` looks exactly like
+/// `wrap(Kind::Io(_))`. Rust settles it by naming — a function is `snake_case`,
+/// a struct or variant is `CamelCase` — so a leading uppercase letter inside a
+/// token tree is not recorded as a call.
+#[test]
+fn a_tuple_struct_pattern_in_a_macro_is_not_a_call() {
+    let src = r#"
+pub fn classify(e: Kind, v: Value) -> Vec<u32> {
+    let listed = vec![Foo(1), Bar(2)];
+    assert!(matches!(e, Kind::Io(_)));
+    assert!(matches!(v, Value::Str(s) if s.is_empty()));
+    debug_assert!(matches!(e, Kind::Eof), "{}", describe(e));
+    listed
+}
+"#;
+    let facts = code_extract::extract("src/classify.rs", src.as_bytes());
+    let calls = &facts
+        .symbols
+        .iter()
+        .find(|s| s.name == "classify")
+        .unwrap()
+        .calls;
+    assert_eq!(
+        calls,
+        &vec![
+            CallFact::plain("describe", 6),
+            CallFact::method("is_empty", 5),
+        ],
+        "the patterns contribute nothing; the guard and the argument still do"
+    );
+    for name in ["Foo", "Bar", "Io", "Str", "Eof"] {
+        assert!(
+            !calls.iter().any(|c| c.callee == name),
+            "{name} is a type or a variant, not a function"
+        );
+    }
+}
+
 #[test]
 fn rust_symbols_are_qualified_with_kinds_docs_and_calls() {
     let facts = facts("rust/lib.rs", "crates/alpha/src/lib.rs");

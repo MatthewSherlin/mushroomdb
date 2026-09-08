@@ -126,6 +126,10 @@ pub(super) fn symbol_file<F: Fs>(db: &GraphDb<F>, symbol: &str) -> Option<String
 /// `File.import_lines` and `Symbol.call_lines` are written alongside the lists
 /// the rules match on, one entry per edge. A malformed entry — no tab, or a
 /// line that is not a number — is skipped rather than guessed at.
+/// The *lowest* line, not the first entry in list order. The list is sorted as
+/// text, so `"…\t100"` used to come before `"…\t15"`; a caller asking for one
+/// line wants the first one in the file. This also reaches `IMPORTS` evidence,
+/// where a file imported on two lines now quotes the earlier one.
 pub(super) fn evidence_line(entries: &[String], target: &str) -> Option<u32> {
     evidence_lines(entries, target).into_iter().next()
 }

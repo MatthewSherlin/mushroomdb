@@ -933,6 +933,88 @@ fn author_name_is_the_majority_variant() {
     );
 }
 
+/// A store built by released 0.6.0 carries `Author` nodes with a `name` and no
+/// `name_counts`, and the name it holds is the *first* spelling that version
+/// saw — which is exactly the wrong one this fix exists to correct. Nothing in
+/// the graph records which spelling each commit used, so the first 0.6.1 sync
+/// walks the log in full and recovers the real distribution. One new commit
+/// must be enough to fix the label, not 500.
+#[test]
+fn legacy_store_recovers_the_majority_name_on_first_sync() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit_as(
+        &repo,
+        "Ada M. Lovelace",
+        "ada@x.test",
+        "long name first",
+        &[("src/api.rs", "a0")],
+    );
+    for i in 0..5 {
+        commit_as(
+            &repo,
+            "Ada Lovelace",
+            "ada@x.test",
+            &format!("short name {i}"),
+            &[("src/api.rs", &format!("a{}", i + 1))],
+        );
+    }
+
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    // Age the store into what 0.6.0 wrote: the first-seen spelling, and no
+    // distribution behind it.
+    {
+        let mut db = GraphDb::open(&db_dir).unwrap();
+        db.set_prop(
+            "ada@x.test",
+            "name",
+            core_api::Value::Str("Ada M. Lovelace".to_string()),
+        )
+        .unwrap();
+        assert!(db.remove_prop("ada@x.test", "name_counts").unwrap());
+    }
+
+    // One new commit, one incremental sync.
+    commit_as(
+        &repo,
+        "Ada Lovelace",
+        "ada@x.test",
+        "one more",
+        &[("src/api.rs", "a6")],
+    );
+    assert!(run_ingest_git(&db_dir, &opts(&repo)).unwrap().incremental);
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    let author = db.node_ref("ada@x.test").unwrap();
+    assert_eq!(
+        author.prop("name"),
+        Some(core_api::Value::Str("Ada Lovelace".to_string())),
+        "6 commits to 1: the recovered majority wins on the first sync"
+    );
+    assert_eq!(
+        author.prop("name_counts"),
+        Some(core_api::Value::List(vec![
+            core_api::Value::Str("Ada M. Lovelace\t1".to_string()),
+            core_api::Value::Str("Ada Lovelace\t6".to_string()),
+        ])),
+        "the whole history, counted once — the window is not added on top"
+    );
+
+    // And it agrees with a full ingest of the same repository.
+    let full_dir = tmp("db-full");
+    run_ingest_git(&full_dir, &opts(&repo)).unwrap();
+    assert_eq!(
+        GraphDb::open(&full_dir)
+            .unwrap()
+            .node_ref("ada@x.test")
+            .unwrap()
+            .prop("name_counts"),
+        author.prop("name_counts")
+    );
+}
+
 /// The `co_changed` rule scores on jaccard similarity, which is a ratio, so a
 /// file that changes with this one often and *also* changes a lot on its own
 /// falls under the floor and gets no edge. `impact` must still name it, by how

@@ -48,7 +48,13 @@ const MAX_CALLS: usize = 8;
 const MAX_CALLER_FILES: usize = 12;
 /// Call sites named per calling file, past which the count stands in for the
 /// lines.
-const MAX_SITES_PER_FILE: usize = 12;
+///
+/// Eight is where the line stops being read and starts being skimmed: what a
+/// reader needs from a file with fifty call sites is the file and the order of
+/// magnitude, not fifty numbers. Naming the file is what makes the answer
+/// complete; naming every line in it is what made the digest twice as wide as
+/// the one it replaced.
+const MAX_SITES_PER_FILE: usize = 8;
 /// Files named on the import lines, each way.
 const MAX_IMPORTS: usize = 8;
 /// Co-change partners named.
@@ -88,8 +94,9 @@ pub struct CallSites {
     pub file: String,
     /// The calling symbols, by key, sorted.
     pub symbols: Vec<String>,
-    /// Every line of `file` a call sits on, ascending. Capped at
-    /// [`MAX_SITES_PER_FILE`]; `sites` is the true total either way.
+    /// Lines of `file` a call sits on, ascending, at most
+    /// [`MAX_SITES_PER_FILE`] of them. `sites` is the true total either way, so
+    /// a reader can always tell a short list from a truncated one.
     pub lines: Vec<u32>,
     /// Call sites in `file`, including any the `lines` cap left out.
     pub sites: usize,

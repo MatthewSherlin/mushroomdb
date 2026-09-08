@@ -243,6 +243,17 @@ fn changed_paths(root: &Path) -> Vec<String> {
 /// files a partner belongs to is a detail the `impact` tool answers on demand.
 /// Partners and importers already in the diff are dropped rather than marked,
 /// because the point of the nudge is what is *not* open yet.
+/// How strong an association is, for the nudge's one line of partners.
+///
+/// Scored partners rank above counted ones, because a similarity the co-change
+/// rule was willing to write an edge for is the stronger claim. Within each
+/// group the measure itself orders them — and the count has to be *in* the key,
+/// or two counted partners compare equal on `(false, 0.0)` and the one that
+/// happened to come first in the report wins instead of the larger count.
+fn rank_key(score: f64, shared: Option<usize>) -> (bool, usize, f64) {
+    (shared.is_none(), shared.unwrap_or(0), score)
+}
+
 fn render_nudge(
     db: &crate::structure::Db,
     report: &ImpactReport,
@@ -274,7 +285,7 @@ fn render_nudge(
             let slot = partners
                 .entry(p.path.clone())
                 .or_insert((p.score, p.shared_commits));
-            if (p.shared_commits.is_none(), p.score) > (slot.1.is_none(), slot.0) {
+            if rank_key(p.score, p.shared_commits) > rank_key(slot.0, slot.1) {
                 *slot = (p.score, p.shared_commits);
             }
         }
@@ -287,11 +298,8 @@ fn render_nudge(
     // key ascending: `BTreeMap` gave us the key order and a stable sort keeps it
     // inside a tie.
     ranked.sort_by(|a, b| {
-        let key = |(score, shared): &(f64, Option<usize>)| {
-            (shared.is_none(), shared.unwrap_or(0), *score)
-        };
-        key(&b.1)
-            .partial_cmp(&key(&a.1))
+        rank_key(b.1 .0, b.1 .1)
+            .partial_cmp(&rank_key(a.1 .0, a.1 .1))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     if !ranked.is_empty() {

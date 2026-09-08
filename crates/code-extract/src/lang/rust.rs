@@ -125,6 +125,24 @@ impl Spec for Rust {
     }
 }
 
+/// Whether a name inside a macro's token tree is a type or a variant rather
+/// than a function.
+///
+/// A token tree is unparsed, so a tuple-struct *pattern* and a call are the
+/// same three tokens: `matches!(e, Kind::Io(_))` looks exactly like
+/// `wrap(Kind::Io(_))`. Rust settles it by convention and by the
+/// `non_snake_case` lint — a function is `snake_case`, a struct or variant is
+/// `CamelCase` — so a leading uppercase letter means this is not a call, and
+/// `Io`, `Some` and `Str` stop being recorded as ones.
+///
+/// The cost is a tuple-struct constructor written inside a macro:
+/// `vec![Foo(1)]` records no call where `let x = Foo(1);` does, because outside
+/// a macro the grammar says which of the two it is and here nothing does. A
+/// constructor is a thin edge to lose; a pattern is a wrong one to keep.
+fn names_a_type(name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase)
+}
+
 /// Collect `name(` shapes inside a macro's token tree.
 ///
 /// A call in an unparsed token tree is an `identifier` immediately followed by
@@ -154,12 +172,14 @@ fn calls_in_token_tree<'t>(
             // A `(` opens an argument list only when it follows the name with
             // nothing in between; anywhere else it is a grouping or a tuple.
             if let Some(prev) = at.checked_sub(1).map(|i| children[i]) {
+                let name = text(prev, src);
                 if prev.kind() == "identifier"
                     && prev.end_byte() == child.start_byte()
                     && src.as_bytes().get(child.start_byte()) == Some(&b'(')
+                    && !names_a_type(name)
                 {
                     let method = at.checked_sub(2).is_some_and(|i| children[i].kind() == ".");
-                    out.push((text(prev, src).to_string(), prev, method));
+                    out.push((name.to_string(), prev, method));
                 }
             }
             calls_in_token_tree(*child, src, out, depth + 1);

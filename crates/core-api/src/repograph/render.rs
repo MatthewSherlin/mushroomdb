@@ -504,7 +504,7 @@ pub fn render_context(c: &ContextReport) -> String {
                 false => format!("{}: {}", sanitize(&s.file), lines.join(", ")),
             };
             if more > 0 {
-                let _ = write!(item, " +{more}");
+                let _ = write!(item, " …(+{more})");
             }
             item
         })

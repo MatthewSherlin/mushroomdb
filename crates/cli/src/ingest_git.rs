@@ -941,35 +941,37 @@ fn file_state_from(rs: &ResultSet, nested: &[String]) -> BTreeMap<String, FileSt
     files
 }
 
-/// Cypher behind [`legacy_author_commits`].
-const AUTHOR_COMMITS_QUERY: &str = "MATCH (c:Commit) RETURN c.author_id AS author";
-
-/// How many commits each of `authors` already has in the graph, for the
-/// authors that carry a `name` but no `name_counts`.
+/// The real per-name distribution for every author of this unit, read from the
+/// whole history rather than from the window.
 ///
-/// Only a store built before `name_counts` existed has such a node, so the scan
-/// runs at most once per store and not at all on a store this version wrote.
-/// The count is per email, which is all the fallback needs: it cannot know
-/// which spelling those commits used, so it credits them to the incumbent.
-fn legacy_author_commits(
+/// A store built by 0.6.0 has `Author` nodes carrying a `name` and no
+/// `name_counts`, and nothing in the graph records which spelling each commit
+/// used — the display name it holds is the *first* one that version happened to
+/// see, which on a repository where one person commits under two names is the
+/// wrong one about as often as not. Guessing from it cannot recover: seeding the
+/// incumbent with the prior commit count makes the true majority wait for more
+/// new commits than the entire history it is already behind by.
+///
+/// So the log is walked in full, once, on the first run that meets such a node.
+/// The result covers every commit up to `head`, this run's window included, so
+/// the caller uses it *instead of* the window rather than on top of it.
+/// A store this version wrote never reaches here.
+fn legacy_name_counts(
     w: &WriteGuard<'_>,
-    authors: &BTreeMap<String, AuthorState>,
-) -> Result<BTreeMap<String, usize>, CliError> {
-    let stale = authors.keys().any(|email| {
-        w.has_node(email)
-            && w.node_ref(email)
+    p: &Pending,
+) -> Result<BTreeMap<String, AuthorState>, CliError> {
+    let mut out: BTreeMap<String, AuthorState> = BTreeMap::new();
+    let stale = p.log.iter().any(|c| {
+        w.has_node(&c.author_email)
+            && w.node_ref(&c.author_email)
                 .and_then(|n| n.prop("name_counts"))
                 .is_none()
     });
-    let mut out = BTreeMap::new();
-    if !stale {
+    let Some(head) = p.head.as_deref().filter(|_| stale) else {
         return Ok(out);
-    }
-    let rs = w.query(AUTHOR_COMMITS_QUERY, &BTreeMap::new())?;
-    for i in 0..rs.len() {
-        if let Some(Value::Str(email)) = rs.get(i, "author") {
-            *out.entry(email.clone()).or_default() += 1;
-        }
+    };
+    for c in read_log(&p.unit.path, None, head)? {
+        out.entry(c.author_email).or_default().touch(&c.author_name);
     }
     Ok(out)
 }
@@ -1402,24 +1404,27 @@ fn ingest_unit(
     //    An email already in the graph keeps its accumulated `name_counts`, so
     //    the display name is the majority spelling over the whole history
     //    rather than over this window.
-    let legacy = legacy_author_commits(w, &walk.authors)?;
+    let legacy = legacy_name_counts(w, p)?;
     let mut author_rows = Vec::new();
     let mut author_updates = Vec::new();
     for (email, seen) in &walk.authors {
         let mut merged = AuthorState::default();
-        match w.node_ref(email).and_then(|n| n.prop("name_counts")) {
-            Some(Value::List(l)) => merged.set_name_counts(&l),
-            // A node written before `name_counts` existed (a store built by
-            // 0.6.x). Credit the incumbent spelling with the commits already in
-            // the graph, so a two-commit sync cannot relabel an identity built
-            // from hundreds. From the next write on the distribution is exact.
-            _ => {
-                if let Some(Value::Str(name)) = w.node_ref(email).and_then(|n| n.prop("name")) {
-                    merged.add(&name, legacy.get(email).copied().unwrap_or(0).max(1));
-                }
+        match (
+            w.node_ref(email).and_then(|n| n.prop("name_counts")),
+            legacy.get(email),
+        ) {
+            // The usual path: what the graph already counted, plus this window.
+            (Some(Value::List(l)), _) => {
+                merged.set_name_counts(&l);
+                merged.absorb(seen);
             }
+            // A node written before `name_counts` existed. The recovered walk
+            // is the whole history and already contains this window, so the
+            // window is not added to it.
+            (_, Some(whole_history)) => merged = whole_history.clone(),
+            // A new author, or a unit whose history was already recovered.
+            _ => merged.absorb(seen),
         }
-        merged.absorb(seen);
         let props = [
             ("name", Value::Str(merged.display_name())),
             ("name_counts", merged.name_counts_value()),

@@ -38,7 +38,7 @@ ingest-git: 622 commit(s), 396 file(s), 2 author(s)
 
 | Label | key (`id`) | Props |
 |---|---|---|
-| `Author` | mailmap-resolved email | `name` |
+| `Author` | mailmap-resolved email | `name` — the spelling on the most commits — and `name_counts`, `"<name><TAB><commits>"` per spelling in first-seen order |
 | `Commit` | full sha | `message` (subject line), `ts` (unix seconds), `author_id`, `pr_id` (with `--prs`) |
 | `File` | path | `path`, `dir`, `ext`, `commits` (list of shas, newest last, capped), `n_commits`, `top_author_id`, `author_counts`, and from the working tree: `hash`, `lines`, `lang`, `symbols_n`, `imports`, `import_lines`, `mentions`, `headings`, `body` |
 | `Symbol` | `"<path>#<qualified name>"` | `name`, `kind`, `path`, `file_id`, `line_start`, `line_end`, `signature`, `doc`, `calls_to`, `call_lines` |
@@ -165,12 +165,46 @@ key. `file_id` names that file, and the foreign key on it is the `DEFINES` edge.
 
 Resolution is deliberately conservative: an import that names something outside
 the working tree (the standard library, a registry dependency) resolves to
-nothing, and a call whose name has several candidate definitions and no clear
-winner resolves to nothing. A missing edge is easier to live with than a wrong
-one. A call to a name defined once anywhere in the repository resolves to that
-definition, so a distinctive name links across crates while a common one links
-only within its own file or directory. Language rules are documented in the
-extraction crate.
+nothing, and a call with several candidate definitions and no clear winner
+resolves to nothing. A missing edge is easier to live with than a wrong one.
+
+A call is resolved by narrowing outwards, and the first tier that finds exactly
+one definition wins. Ambiguity at a tier does not fall through to the next one:
+it ends the search for that name.
+
+| Tier | A definition wins when it is |
+|---|---|
+| 1 | in the calling file |
+| 2 | in the calling file's directory, in the same language |
+| 3 | in a file the calling file imports |
+| 4 | the only one of that name in the repository, in the same language |
+
+Two shapes of call are held to a stricter standard than a bare `name(…)`.
+
+**A call written on a receiver** — `store.flush()`, `os.path.join(…)`, anything
+with a dot in it — never reaches tier 4 on the bare name it falls back to, and at
+tier 3 matches only a *method*, a symbol qualified `Type.name`. The receiver's
+type is not something the graph knows, so `.collect()` is not a call to whatever
+single `collect` the repository happens to define, and importing a file that
+contains a `join` does not make `join` a method on your receiver. What it may
+still match at tier 4 is the name as written when that name carries its receiver:
+`Store.flush` against a symbol qualified `Store.flush`, which is how a static
+call reads in Python, TypeScript and JavaScript.
+
+**A path call** — `a::b::name(…)` — resolves to nothing at all, no tier tried,
+when its leading segment names nothing here: not `crate`, `self`, `super` or
+`Self`; not a package, directory or module in the tree; not a symbol.
+`std::mem::take` is a call into the standard library, not into this
+repository's `take`. A leading segment that is a *type* counts, so
+`Store::flush` resolves normally.
+
+Tiers 2 and 4 also require the definition's file to be in the calling file's
+language, since a name shared across languages is a coincidence rather than a
+call. TypeScript, TSX and JavaScript count as one language; every other pairing
+must match exactly. Tier 1 needs no such check, and tier 3 gets one for free —
+an import only ever resolves within a language.
+
+Language rules are documented in the extraction crate.
 
 Three things are read but not parsed. A file over 1 MB, a file whose leading
 bytes are not text, and a file with an extension no extractor claims all keep
