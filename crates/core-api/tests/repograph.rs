@@ -853,6 +853,32 @@ fn impact_reports_unknown_paths() {
     assert!(text.lines().count() <= 25);
 }
 
+/// Binding: a tree full of untracked artefacts names three of them and counts
+/// the rest, instead of spending the whole 25-line budget on paths the graph
+/// was never asked about.
+#[test]
+fn impact_caps_the_unknown_paths_it_names() {
+    let dir = tmp("impact-unknown-cap");
+    let db = synthetic_repo_store(&dir);
+    let mut files: Vec<String> = (0..20)
+        .map(|i| format!("out/artefact-{i:02}.json"))
+        .collect();
+    files.push(file_key(0, 0));
+
+    let r = impact(&db, &files, &BTreeSet::new(), &ImpactOptions::default());
+    assert_eq!(r.unknown.len(), 20, "the report still holds them all");
+
+    let text = render_impact(&r);
+    let named = text.lines().filter(|l| l.starts_with("unknown: ")).count();
+    assert_eq!(named, 3, "at most three are named: {text}");
+    assert!(text.contains("…and 17 more unknown"), "{text}");
+    assert!(
+        text.contains(&file_key(0, 0)),
+        "the analysis must survive the noise: {text}"
+    );
+    assert!(text.lines().count() <= 25);
+}
+
 #[test]
 fn owners_share_and_quarters_from_commits() {
     let dir = tmp("owners-share");

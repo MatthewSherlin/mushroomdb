@@ -386,6 +386,16 @@ const MAX_SOURCE_PRINTED: usize = 40;
 const MAX_CANDIDATES: usize = 20;
 /// Files [`render_impact`] prints in full.
 const MAX_IMPACT_FILES: usize = 5;
+/// Paths [`render_impact`] names on an `unknown:` line before counting the
+/// rest.
+///
+/// One line per unknown path, written before [`cap_lines`] runs, means a
+/// repository with untracked build or result artefacts spends its whole
+/// budget on them: a default `impact` here rendered 27 lines of which 20 were
+/// `unknown:`, evicting the analysis it was asked for. The defaults
+/// (`target/`, `node_modules/`, `dist/`, …) do not and should not cover every
+/// output directory anyone might have, so the render caps instead.
+const MAX_IMPACT_UNKNOWN: usize = 3;
 /// Links [`render_why`] prints in full.
 const MAX_WHY_LINKS: usize = 5;
 
@@ -591,8 +601,15 @@ pub fn render_impact(r: &ImpactReport) -> String {
             plural(r.files.len() - MAX_IMPACT_FILES, "file")
         );
     }
-    for path in &r.unknown {
+    for path in r.unknown.iter().take(MAX_IMPACT_UNKNOWN) {
         let _ = writeln!(out, "unknown: {}", sanitize(path));
+    }
+    if r.unknown.len() > MAX_IMPACT_UNKNOWN {
+        let _ = writeln!(
+            out,
+            "…and {} more unknown",
+            r.unknown.len() - MAX_IMPACT_UNKNOWN
+        );
     }
     cap_lines(&out, MAX_TOOL_LINES)
 }
