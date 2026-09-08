@@ -213,8 +213,8 @@ break in an agent's context.
 | Tool | Input | Output |
 |---|---|---|
 | `map` | — | The repository in one screen: size, last sync, file clusters, key files, owners, recently-hot files, stale concepts, and questions worth asking next. |
-| `context` | `target` | Everything known about one file or symbol: signature, doc, source from the working tree, owner, callers and callees, importers and imports, co-change partners, recent commits, notes and concepts. An ambiguous bare symbol name returns the candidates. |
-| `impact` | `files?` | Per changed file: co-change partners with scores and whether each is itself modified, importers, symbols used elsewhere, and the owner. Defaults to the working tree's diff against `HEAD` plus untracked files. |
+| `context` | `target` | Everything known about one file or symbol: signature, doc, source from the working tree, owner, every call site into it grouped by calling file, its callees, importers and imports, co-change partners, recent commits, notes and concepts. An ambiguous bare symbol name returns the candidates. |
+| `impact` | `files?` | Per changed file: co-change partners — by similarity score, or by how many commits the two share when the score floor hid them — and whether each is itself modified, plus importers, symbols used elsewhere, and the owner. Defaults to the working tree's diff against `HEAD` plus untracked files. |
 | `owners` | `path` | Top author and share, authors who know the file, the last commit to touch it, and the split by quarter. |
 | `why` | `a`, `b` | Every rule edge between two nodes with its score and evidence, or the shortest path between them when there is no direct link. |
 | `recall` | `topic` | The notes, concepts, files, symbols and people nearest a topic, each with its strongest link. |

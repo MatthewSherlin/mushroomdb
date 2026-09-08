@@ -57,7 +57,7 @@ clusters (co-change + imports)
 key files (most depended-on)
   crates/code-extract/src/lib.rs 0.05 · crates/server/tests/http.rs 0.04 · crates/code-extract/tests/extract.rs 0.04 · crates/core-api/tests/algo.rs 0.04 · crates/server/src/http.rs 0.03
 owners
-  Matthew Michael Sherlin 431 files
+  Matthew Sherlin 431 files
 hot (last 90 days)
   crates/core-api/src/db.rs 175 · README.md 109 · crates/core-rules/src/engine.rs 56 · crates/core-query/src/cypher/exec.rs 54 · crates/cli/src/lib.rs 51
 ask me: why does lib.rs co-change with extract.rs? · who owns ui? · what imports http.rs?

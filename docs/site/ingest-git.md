@@ -113,6 +113,21 @@ overlap of their commit lists is at least 0.25, meaning they are usually
 changed together. The weight is that overlap, so `ORDER BY r.score DESC`
 ranks the tightest couplings first.
 
+Jaccard is a *ratio*, and that cuts both ways. It is what keeps a file everybody
+touches from being everybody's partner, and it is also why a file that changes
+with this one often and *also* changes a lot on its own scores low: on this
+repository `crates/cli/src/lib.rs` shares six of `crates/cli/src/install.rs`'s
+fifteen commits and scores 0.10, which is its third most frequent partner and no
+edge at all.
+
+Lowering the floor does not fix that and costs a lot elsewhere — on this
+repository 1,118 pairs clear 0.25, 1,581 clear 0.15, and `lib.rs` is still under
+both. So the floor stays where it is and `impact` and `why` answer the other
+half of the question directly from the commit lists, naming any file that shares
+at least three commits with the one you asked about and labelling it with the
+count rather than a score. The graph keeps the edges it can defend; the tools
+read the commits when the edges do not have the answer.
+
 **`knows`** — the same predicate as a via-hop: `via_label: "File"`,
 `via_edge: "TOP_AUTHOR"`, `via_dir: In`, edge `KNOWS`, at most 20 edges per
 author. From an author, the hop expands incoming `TOP_AUTHOR` edges to the
@@ -580,7 +595,7 @@ one file edited:
 mushroomdb: you are editing crates/cli/src/install.rs
   usually changes with: crates/cli/tests/install.rs (0.83, not modified), docs/site/skill.md (0.38, not modified)
   imported by: crates/cli/src/lib.rs (not modified)
-  owner: Matthew Michael Sherlin
+  owner: Matthew Sherlin
 (query the mushroomdb MCP tools before answering about these entities)
 ```
 

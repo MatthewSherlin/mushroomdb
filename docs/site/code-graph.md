@@ -47,7 +47,7 @@ you have *not* opened:
 mushroomdb: you are editing crates/cli/src/ingest_git.rs
   usually changes with: docs/site/ingest-git.md (0.71, not modified), crates/cli/tests/ingest_git.rs (0.47, not modified)
   imported by: crates/cli/src/lib.rs (not modified)
-  owner: Matthew Michael Sherlin
+  owner: Matthew Sherlin
 (query the mushroomdb MCP tools before answering about these entities)
 ```
 
@@ -115,9 +115,9 @@ over `git blame`:
 ```
 $ mushroomdb owners ./mushroom-memory crates/cli/src/install.rs
 mushroomdb owners — crates/cli/src/install.rs
-top  Matthew Michael Sherlin (email elided) 1.00 of the file's commits
+top  Matthew Sherlin (email elided) 1.00 of the file's commits
 last touch  84d2f32 2026-09-04 feat(cli): doctor — verifies install, store and a real stdio handshake
-by quarter  2026Q3 Matthew Michael Sherlin 15
+by quarter  2026Q3 Matthew Sherlin 15
 ```
 
 One substitution above: `owners` prints the author key — the commit email — once,
