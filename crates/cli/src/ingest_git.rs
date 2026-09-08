@@ -7,7 +7,7 @@
 //!
 //! | Label | key (`id`) | props |
 //! |---|---|---|
-//! | `Author` | mailmap-resolved email | `name` |
+//! | `Author` | mailmap-resolved email | `name`, `name_counts` |
 //! | `Commit` | full sha | `message`, `ts`, `author_id`, `pr_id` (with `--prs`) |
 //! | `File` | path | `path`, `dir`, `ext`, `commits`, `n_commits`, `top_author_id`, `author_counts`, plus the working-tree props in [`structure`](crate::structure) |
 //! | `Symbol` | `"<path>#<qualified name>"` | see [`structure`](crate::structure) |
@@ -461,9 +461,92 @@ fn ensure_gitignore(repo: &Path, db_dir: &Path) -> Result<bool, CliError> {
     Ok(true)
 }
 
-/// Separator inside an `author_counts` entry. An email address cannot contain a
-/// tab, so `email\tcount` round-trips unambiguously.
+/// Separator inside an `author_counts` or `name_counts` entry. Neither an email
+/// address nor a git author name can contain a tab, so `<text>\tcount`
+/// round-trips unambiguously.
 const AUTHOR_COUNT_SEP: char = '\t';
+
+/// How many commits carried each spelling of one email's `%aN`, in the order
+/// the spellings were first seen.
+///
+/// One person routinely commits under more than one name — `Ada Lovelace` at
+/// work and `Ada M. Lovelace` from a laptop that was configured once and never
+/// again. Merging them on email is right, and every tool that prints an author
+/// then has to choose *which* of the names to show. Showing the first one
+/// walked means a display name decided by the oldest commit in the window,
+/// which on this repository labelled an identity with a name carried by 21% of
+/// its commits.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+struct AuthorState {
+    /// `(name, commits)` in first-seen order, which is what breaks a tie.
+    names: Vec<(String, usize)>,
+}
+
+impl AuthorState {
+    /// Credit one more commit to `name`.
+    fn touch(&mut self, name: &str) {
+        self.add(name, 1);
+    }
+
+    /// Credit `n` more commits to `name`, appending it if it is new. Order is
+    /// preserved, so the entry that was seen first stays first.
+    fn add(&mut self, name: &str, n: usize) {
+        match self.names.iter_mut().find(|(held, _)| held == name) {
+            Some(entry) => entry.1 += n,
+            None => self.names.push((name.to_string(), n)),
+        }
+    }
+
+    /// Fold another window's counts into this one, keeping first-seen order.
+    fn absorb(&mut self, other: &AuthorState) {
+        for (name, n) in &other.names {
+            self.add(name, *n);
+        }
+    }
+
+    /// The name on the most commits. A tie goes to the name seen first, which
+    /// is why the strict `>` matters: it never unseats an equal incumbent.
+    fn display_name(&self) -> String {
+        let mut best: Option<&(String, usize)> = None;
+        for entry in &self.names {
+            if best.is_none_or(|(_, n)| entry.1 > *n) {
+                best = Some(entry);
+            }
+        }
+        best.map(|(name, _)| name.clone()).unwrap_or_default()
+    }
+
+    /// The distribution as an `Author.name_counts` prop: `"name\tcount"`
+    /// strings in first-seen order.
+    ///
+    /// Stored for the same reason `File.author_counts` is: an incremental run
+    /// sees only the new window, and the `name` prop alone cannot say how far
+    /// ahead the incumbent spelling is. Without it every sync would relabel the
+    /// identity from a handful of commits.
+    fn name_counts_value(&self) -> Value {
+        Value::List(
+            self.names
+                .iter()
+                .map(|(name, n)| Value::Str(format!("{name}{AUTHOR_COUNT_SEP}{n}")))
+                .collect(),
+        )
+    }
+
+    /// Inverse of [`AuthorState::name_counts_value`]. Entries that are not
+    /// `name<TAB>count` are skipped rather than failing the run.
+    fn set_name_counts(&mut self, list: &[Value]) {
+        for v in list {
+            let Value::Str(s) = v else { continue };
+            let Some((name, n)) = s.rsplit_once(AUTHOR_COUNT_SEP) else {
+                continue;
+            };
+            let Ok(n) = n.parse::<usize>() else { continue };
+            if !name.is_empty() {
+                self.add(name, n);
+            }
+        }
+    }
+}
 
 fn file_props(st: &FileState, path: &str) -> Vec<(String, Value)> {
     let commits = &st.commits;
@@ -858,11 +941,45 @@ fn file_state_from(rs: &ResultSet, nested: &[String]) -> BTreeMap<String, FileSt
     files
 }
 
+/// Cypher behind [`legacy_author_commits`].
+const AUTHOR_COMMITS_QUERY: &str = "MATCH (c:Commit) RETURN c.author_id AS author";
+
+/// How many commits each of `authors` already has in the graph, for the
+/// authors that carry a `name` but no `name_counts`.
+///
+/// Only a store built before `name_counts` existed has such a node, so the scan
+/// runs at most once per store and not at all on a store this version wrote.
+/// The count is per email, which is all the fallback needs: it cannot know
+/// which spelling those commits used, so it credits them to the incumbent.
+fn legacy_author_commits(
+    w: &WriteGuard<'_>,
+    authors: &BTreeMap<String, AuthorState>,
+) -> Result<BTreeMap<String, usize>, CliError> {
+    let stale = authors.keys().any(|email| {
+        w.has_node(email)
+            && w.node_ref(email)
+                .and_then(|n| n.prop("name_counts"))
+                .is_none()
+    });
+    let mut out = BTreeMap::new();
+    if !stale {
+        return Ok(out);
+    }
+    let rs = w.query(AUTHOR_COMMITS_QUERY, &BTreeMap::new())?;
+    for i in 0..rs.len() {
+        if let Some(Value::Str(email)) = rs.get(i, "author") {
+            *out.entry(email.clone()).or_default() += 1;
+        }
+    }
+    Ok(out)
+}
+
 /// Accumulated effect of one log window, before anything is written.
 #[derive(Default)]
 struct Walk {
     files: BTreeMap<String, FileState>,
-    authors: BTreeMap<String, String>,
+    /// Email → the names its commits were authored under, and how many each.
+    authors: BTreeMap<String, AuthorState>,
     commit_rows: Vec<BTreeMap<String, Value>>,
     touched_edges: Vec<(String, String, String)>,
     /// Paths whose `File` props changed in this window.
@@ -1214,7 +1331,8 @@ fn ingest_unit(
     for c in log {
         walk.authors
             .entry(c.author_email.clone())
-            .or_insert_with(|| c.author_name.clone());
+            .or_default()
+            .touch(&c.author_name);
         walk.commit_rows.push(BTreeMap::from([
             ("id".to_string(), Value::Str(c.sha.clone())),
             ("message".to_string(), Value::Str(c.subject.clone())),
@@ -1281,17 +1399,50 @@ fn ingest_unit(
 
     // 1. Authors first: the auto-FK rules for `Commit.author_id` and
     //    `File.top_author_id` only infer once their targets resolve to Author.
-    let author_rows: Vec<BTreeMap<String, Value>> = walk
-        .authors
-        .iter()
-        .filter(|(email, _)| !w.has_node(email))
-        .map(|(email, name)| {
-            BTreeMap::from([
-                ("id".to_string(), Value::Str(email.clone())),
-                ("name".to_string(), Value::Str(name.clone())),
-            ])
-        })
-        .collect();
+    //    An email already in the graph keeps its accumulated `name_counts`, so
+    //    the display name is the majority spelling over the whole history
+    //    rather than over this window.
+    let legacy = legacy_author_commits(w, &walk.authors)?;
+    let mut author_rows = Vec::new();
+    let mut author_updates = Vec::new();
+    for (email, seen) in &walk.authors {
+        let mut merged = AuthorState::default();
+        match w.node_ref(email).and_then(|n| n.prop("name_counts")) {
+            Some(Value::List(l)) => merged.set_name_counts(&l),
+            // A node written before `name_counts` existed (a store built by
+            // 0.6.x). Credit the incumbent spelling with the commits already in
+            // the graph, so a two-commit sync cannot relabel an identity built
+            // from hundreds. From the next write on the distribution is exact.
+            _ => {
+                if let Some(Value::Str(name)) = w.node_ref(email).and_then(|n| n.prop("name")) {
+                    merged.add(&name, legacy.get(email).copied().unwrap_or(0).max(1));
+                }
+            }
+        }
+        merged.absorb(seen);
+        let props = [
+            ("name", Value::Str(merged.display_name())),
+            ("name_counts", merged.name_counts_value()),
+        ];
+        if w.has_node(email) {
+            for (field, want) in props {
+                if w.node_ref(email).and_then(|n| n.prop(field)).as_ref() != Some(&want) {
+                    author_updates.push((email.clone(), field, want));
+                }
+            }
+        } else {
+            let mut row = BTreeMap::from([("id".to_string(), Value::Str(email.clone()))]);
+            row.extend(props.into_iter().map(|(f, v)| (f.to_string(), v)));
+            author_rows.push(row);
+        }
+    }
+    if !author_updates.is_empty() {
+        let mut b = w.batch();
+        for (key, field, value) in author_updates {
+            b.set_prop(&key, field, value);
+        }
+        b.commit()?;
+    }
     let a = w.ingest_with_edges("Author", author_rows, ingest, &[])?;
     report.rules_created.extend(a.rules_created);
     authors.extend(walk.authors.keys().cloned());

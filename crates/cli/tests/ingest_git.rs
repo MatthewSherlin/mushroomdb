@@ -835,6 +835,104 @@ fn ownership_flips_across_incremental_runs() {
     );
 }
 
+/// One person commits under two spellings of their name from the same address.
+/// The `Author` node must be labelled with the spelling on the most commits,
+/// not the one that happened to come first — and an incremental run that flips
+/// the majority must move the label with it.
+#[test]
+fn author_name_is_the_majority_variant() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    // The long spelling goes first, so "first seen" and "most commits" differ.
+    commit_as(
+        &repo,
+        "Ada M. Lovelace",
+        "ada@x.test",
+        "long name",
+        &[("src/api.rs", "a0")],
+    );
+    for i in 0..3 {
+        commit_as(
+            &repo,
+            "Ada Lovelace",
+            "ada@x.test",
+            &format!("short name {i}"),
+            &[("src/api.rs", &format!("a{}", i + 1))],
+        );
+    }
+
+    let db_dir = tmp("db");
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!(r.authors, 1, "one address is one author");
+    let name = |dir: &Path| {
+        GraphDb::open(dir)
+            .unwrap()
+            .node_ref("ada@x.test")
+            .unwrap()
+            .prop("name")
+    };
+    assert_eq!(
+        name(&db_dir),
+        Some(core_api::Value::Str("Ada Lovelace".to_string())),
+        "3 commits to 1, so the short spelling is the display name"
+    );
+
+    // Three more commits under the long spelling, one incremental run each:
+    // 2-3 (no change), 3-3 (a tie, which the first-seen spelling wins), 4-3.
+    let expected = [
+        ("Ada Lovelace", "at 2-3 the short spelling still leads"),
+        (
+            "Ada M. Lovelace",
+            "at 3-3 the tie goes to the one seen first",
+        ),
+        (
+            "Ada M. Lovelace",
+            "the majority flipped 4-3; the label follows",
+        ),
+    ];
+    for (i, (want, why)) in expected.iter().enumerate() {
+        commit_as(
+            &repo,
+            "Ada M. Lovelace",
+            "ada@x.test",
+            &format!("long name again {i}"),
+            &[("src/api.rs", &format!("a{}", i + 4))],
+        );
+        assert!(run_ingest_git(&db_dir, &opts(&repo)).unwrap().incremental);
+        assert_eq!(
+            name(&db_dir),
+            Some(core_api::Value::Str((*want).to_string())),
+            "{why}"
+        );
+    }
+
+    // A fresh full ingest of the same repository is the oracle for both the
+    // label and the distribution behind it.
+    let full_dir = tmp("db-full");
+    run_ingest_git(&full_dir, &opts(&repo)).unwrap();
+    assert_eq!(name(&db_dir), name(&full_dir));
+    let counts = |dir: &Path| {
+        GraphDb::open(dir)
+            .unwrap()
+            .node_ref("ada@x.test")
+            .unwrap()
+            .prop("name_counts")
+    };
+    assert_eq!(
+        counts(&db_dir),
+        Some(core_api::Value::List(vec![
+            core_api::Value::Str("Ada M. Lovelace\t4".to_string()),
+            core_api::Value::Str("Ada Lovelace\t3".to_string()),
+        ])),
+        "the distribution accumulates across syncs, in first-seen order"
+    );
+    assert_eq!(
+        counts(&db_dir),
+        counts(&full_dir),
+        "incremental syncs must agree with a full ingest"
+    );
+}
+
 /// A parent repository with an initialised submodule checked out at
 /// `vendor/lib`, plus the repository the submodule was cloned from.
 fn seed_repo_with_submodule() -> PathBuf {
