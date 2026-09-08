@@ -30,6 +30,12 @@
 //! only cross a crate boundary when the callee's name happened to be unique
 //! across the whole repository.
 //!
+//! That repository-wide tier is also the only one a call written on a receiver
+//! never reaches. `.collect()` and `.ok()` name methods on types from outside
+//! the tree, and uniqueness would bind them to any single same-named function
+//! it found. A method call resolves through the local and imported tiers or not
+//! at all.
+//!
 //! # What is read
 //!
 //! Only the working tree. The candidates are the `File` nodes git already put
@@ -591,14 +597,14 @@ fn resolve_file(
         let fact = &f.symbols[*at];
         let mut calls = BTreeSet::new();
         let mut call_lines = BTreeSet::new();
-        for (callee, line) in &fact.calls {
-            let Some(target) = resolve_call(path, callee, index, &imported) else {
+        for call in &fact.calls {
+            let Some(target) = resolve_call(path, call, index, &imported) else {
                 continue;
             };
             if &target == key {
                 continue; // a definition calling itself is not a graph edge
             }
-            call_lines.insert(format!("{target}\t{line}"));
+            call_lines.insert(format!("{target}\t{}", call.line));
             calls.insert(target);
         }
         symbols.push(SymbolWrite {

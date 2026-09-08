@@ -110,7 +110,7 @@ impl Spec for Rust {
     /// was invisible to the graph. On this repository that hid every call made
     /// from inside a `format!` — which, in code whose job is rendering, is most
     /// of them.
-    fn hidden_calls<'t>(&self, node: Node<'t>, src: &str) -> Vec<(String, Node<'t>)> {
+    fn hidden_calls<'t>(&self, node: Node<'t>, src: &str) -> Vec<(String, Node<'t>, bool)> {
         if node.kind() != "macro_invocation" {
             return Vec::new();
         }
@@ -133,10 +133,15 @@ impl Spec for Rust {
 /// last segment of the path, since `::` and the segments before it are separate
 /// tokens; that is exactly the form [`crate::resolve_call`] resolves anyway.
 /// Nested token trees are followed, so a call inside a call's arguments counts.
+///
+/// The token before the name says how the call was written. A `.` there is a
+/// receiver — `format!("{}", s.trim())` — and the call is reported as a method
+/// call, which [`crate::resolve_call`] never resolves on repository-wide
+/// uniqueness. `::` or anything else is a path or a bare name.
 fn calls_in_token_tree<'t>(
     node: Node<'t>,
     src: &str,
-    out: &mut Vec<(String, Node<'t>)>,
+    out: &mut Vec<(String, Node<'t>, bool)>,
     depth: u32,
 ) {
     if depth > MAX_TOKEN_TREE_DEPTH {
@@ -153,7 +158,8 @@ fn calls_in_token_tree<'t>(
                     && prev.end_byte() == child.start_byte()
                     && src.as_bytes().get(child.start_byte()) == Some(&b'(')
                 {
-                    out.push((text(prev, src).to_string(), prev));
+                    let method = at.checked_sub(2).is_some_and(|i| children[i].kind() == ".");
+                    out.push((text(prev, src).to_string(), prev, method));
                 }
             }
             calls_in_token_tree(*child, src, out, depth + 1);

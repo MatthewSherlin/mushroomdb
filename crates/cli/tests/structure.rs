@@ -266,6 +266,61 @@ fn calls_resolve_across_crates_via_imports() {
     );
 }
 
+/// A call written on a receiver names a method on a type, and the type is
+/// usually outside the tree entirely. Resolving those on repository-wide
+/// uniqueness bound `.collect()` to whatever single function happened to be
+/// called `collect` — here a test helper in another crate. A method call now
+/// resolves locally or through the caller's imports, or not at all; a call to a
+/// function defined in the same file is unaffected.
+#[test]
+fn method_calls_do_not_reach_an_unrelated_function_of_the_same_name() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(
+        &repo,
+        "workspace",
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("crates/helper/Cargo.toml", "[package]\nname = \"helper\"\n"),
+            // The only `collect` in the tree, and nothing imports it.
+            (
+                "crates/helper/src/lib.rs",
+                "/// Gather the fixtures.\npub fn collect(dir: &str) -> Vec<String> {\n    vec![dir.to_string()]\n}\n",
+            ),
+            ("crates/app/Cargo.toml", "[package]\nname = \"app\"\n"),
+            (
+                "crates/app/src/lib.rs",
+                "/// A job the app runs.\npub struct Job;\n\n\
+                 /// Do the work.\npub fn run(job: &Job) -> u32 {\n    let _ = job;\n    7\n}\n\n\
+                 pub fn total(items: &[u32], job: &Job) -> u32 {\n    \
+                 let picked: Vec<u32> = items.iter().copied().collect();\n    \
+                 picked.len() as u32 + job.run()\n}\n",
+            ),
+        ],
+    );
+
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let db = GraphDb::open(&db_dir).unwrap();
+
+    assert!(
+        db.has_node("crates/helper/src/lib.rs#collect"),
+        "the helper is in the graph; it is the edge to it that must not exist"
+    );
+    assert!(
+        db.neighbors("crates/helper/src/lib.rs#collect", "CALLS", Direction::In)
+            .unwrap()
+            .is_empty(),
+        "`.collect()` is a method on a type from outside the tree"
+    );
+    // The same-file tier still answers a method call, so the rule costs nothing
+    // real: `job.run()` reaches the `run` defined beside it.
+    assert_eq!(
+        out(&db, "crates/app/src/lib.rs#total", "CALLS"),
+        vec!["crates/app/src/lib.rs#run".to_string()]
+    );
+}
+
 #[test]
 fn first_run_creates_symbols_imports_calls_and_mentions() {
     let repo = seed_repo();

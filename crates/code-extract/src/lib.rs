@@ -31,7 +31,9 @@
 //! builds the index in that shape so [`resolve_call`] can prefer a definition
 //! in the calling file or its directory. [`resolve_call`] also takes the
 //! calling file's resolved imports, which is what lets a call reach a
-//! definition in another crate whose name is not unique repository-wide.
+//! definition in another crate whose name is not unique repository-wide — and
+//! is the only thing that can reach one at all for a call written on a
+//! receiver, which never falls back to repository-wide uniqueness.
 //!
 //! # Determinism
 //!
@@ -132,9 +134,56 @@ pub struct SymbolFact {
     /// The first line of the doc comment, at most [`MAX_TEXT_CHARS`]
     /// characters. Empty when the definition is undocumented.
     pub doc: String,
-    /// Callees as written, with the line of the call site. Sorted,
-    /// deduplicated, at most [`MAX_CALLS`] entries.
-    pub calls: Vec<(String, u32)>,
+    /// One entry per call site. Sorted, deduplicated, at most [`MAX_CALLS`]
+    /// entries.
+    pub calls: Vec<CallFact>,
+}
+
+/// One call as written, and enough about how it was written to resolve it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CallFact {
+    /// The callee as written: `flush`, `Store::flush`, `self.flush`.
+    pub callee: String,
+    /// 1-based line of the call site.
+    pub line: u32,
+    /// The call was written in *method* position — a receiver, a dot, a name.
+    /// See [`written_as_method`].
+    pub method: bool,
+}
+
+impl CallFact {
+    /// A call written as a bare name or a path: `flush`, `a::b::flush`.
+    #[must_use]
+    pub fn plain(callee: &str, line: u32) -> Self {
+        CallFact {
+            callee: callee.to_string(),
+            line,
+            method: false,
+        }
+    }
+
+    /// A call written on a receiver: `self.flush`, `store.flush`.
+    #[must_use]
+    pub fn method(callee: &str, line: u32) -> Self {
+        CallFact {
+            callee: callee.to_string(),
+            line,
+            method: true,
+        }
+    }
+}
+
+/// Whether a callee as written names a receiver rather than a path.
+///
+/// Every language here reports the callee as the source wrote it, and in all of
+/// them a `.` separates a value or a module from the name being called —
+/// `self.flush`, `store.flush`, `os.path.join`, `pkg.Func`. A path uses `::`
+/// (Rust) or nothing at all, neither of which contains a dot. So one rule
+/// covers every grammar, and it is the same rule
+/// [`resolve_call`]'s candidate splitting already uses to find the last segment.
+#[must_use]
+pub fn written_as_method(callee: &str) -> bool {
+    callee.contains('.')
 }
 
 /// One import as written in the source.
@@ -351,16 +400,42 @@ impl SymbolIndex {
 /// definition living in one of them is the one the source actually named. It
 /// sits below the directory tiers because a file that both imports a module and
 /// defines the name itself means the local one.
+///
+/// # Why a method call stops at tier 3
+///
+/// Tier 4 is uniqueness, not reachability: it claims any name defined exactly
+/// once anywhere in the tree, whether or not the calling file could name it.
+/// For a bare or path call that is a fair guess, because the source wrote a
+/// name it expected to be in scope. For a call written on a receiver it is not:
+/// `.collect()`, `.take()`, `.get()` and `.ok()` belong to types the graph has
+/// never seen, and the tier happily bound them to whatever single test helper
+/// happened to share the name.
+///
+/// So a [`CallFact::method`] call reaches tier 4 only on the callee **as
+/// written**, never on the bare last segment it falls back to. `Store.flush`
+/// matching a symbol qualified `Store.flush` names the receiver's type, which
+/// is how a static call reads in Python, TypeScript and JavaScript, and is
+/// evidence rather than a guess. `v.collect` falling back to `collect` is the
+/// guess, and it gets no edge — which is the truthful answer for a call into a
+/// dependency the graph does not hold.
 #[must_use]
 pub fn resolve_call(
     from_file: &str,
-    callee: &str,
+    call: &CallFact,
     index: &SymbolIndex,
     imports: &[String],
 ) -> Option<String> {
     let from = normalize(from_file);
     let from_dir = parent_dir(&from);
-    for name in callee_candidates(callee) {
+    for name in callee_candidates(&call.callee) {
+        // A method call reaches the repository-wide tier only on a candidate
+        // that still carries its receiver. `Store.flush` matching a symbol
+        // qualified `Store.flush` names the receiver's type and is evidence;
+        // the bare `flush` it falls back to is a guess, and that guess is what
+        // bound `.collect()` to an unrelated helper. Testing the candidate
+        // rather than its position matters because a call recovered from a
+        // macro's token tree arrives as the bare segment already.
+        let repo_wide = !call.method || written_as_method(&name);
         let keys = index.keys_for(&name);
         if keys.is_empty() {
             continue;
@@ -386,8 +461,10 @@ pub fn resolve_call(
         if let Some(key) = pick(&|file| imports.iter().any(|i| i == file)) {
             return Some(key);
         }
-        if let Some(key) = pick(&|_| true) {
-            return Some(key);
+        if repo_wide {
+            if let Some(key) = pick(&|_| true) {
+                return Some(key);
+            }
         }
     }
     None

@@ -19,7 +19,10 @@ pub(crate) mod rust;
 pub(crate) mod typescript;
 
 use crate::{squeeze, truncate_chars};
-use crate::{ImportFact, Lang, SymbolFact, MAX_CALLS, MAX_TEXT_CHARS, PARSE_BUDGET_MS};
+use crate::{
+    written_as_method, CallFact, ImportFact, Lang, SymbolFact, MAX_CALLS, MAX_TEXT_CHARS,
+    PARSE_BUDGET_MS,
+};
 use std::ops::{ControlFlow, Range};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -57,13 +60,17 @@ pub(crate) trait Spec: Sync {
     fn callee(&self, node: Node, src: &str) -> Option<String>;
 
     /// Calls a `@call` capture contains that the grammar did not parse as
-    /// calls, each with the node they sit on.
+    /// calls: `(callee, the node it sits on, written in method position)`.
     ///
     /// Only Rust has any: a macro's arguments are an unparsed token tree, so
     /// `format!("{}", sanitize(x))` holds a call the grammar never builds a
     /// `call_expression` for. Every other language leaves this empty and the
     /// driver treats a `@call` capture as exactly one call.
-    fn hidden_calls<'t>(&self, _node: Node<'t>, _src: &str) -> Vec<(String, Node<'t>)> {
+    ///
+    /// The method flag is reported rather than derived, because inside a token
+    /// tree the receiver and the dot are separate tokens and the callee comes
+    /// back as the bare last segment — so [`written_as_method`] cannot see it.
+    fn hidden_calls<'t>(&self, _node: Node<'t>, _src: &str) -> Vec<(String, Node<'t>, bool)> {
         Vec::new()
     }
 }
@@ -100,7 +107,8 @@ pub(crate) fn extract(lang: Lang, src: &str) -> Option<(Vec<SymbolFact>, Vec<Imp
     let names = query.capture_names();
     let mut defs: Vec<(Range<usize>, SymbolFact)> = Vec::new();
     let mut imports: Vec<ImportFact> = Vec::new();
-    let mut calls: Vec<(usize, String, u32)> = Vec::new();
+    // `(position, the call)`, so `attach_calls` can sweep them in source order.
+    let mut calls: Vec<(usize, CallFact)> = Vec::new();
 
     let mut matches = cursor.matches(query, tree.root_node(), src.as_bytes());
     while let Some(matched) = matches.next() {
@@ -120,10 +128,25 @@ pub(crate) fn extract(lang: Lang, src: &str) -> Option<(Vec<SymbolFact>, Vec<Imp
                 }
                 CAP_CALL => {
                     if let Some(callee) = spec.callee(node, src) {
-                        calls.push((node.start_byte(), callee, line_of(node)));
+                        let method = written_as_method(&callee);
+                        calls.push((
+                            node.start_byte(),
+                            CallFact {
+                                callee,
+                                line: line_of(node),
+                                method,
+                            },
+                        ));
                     }
-                    for (callee, at) in spec.hidden_calls(node, src) {
-                        calls.push((at.start_byte(), callee, line_of(at)));
+                    for (callee, at, method) in spec.hidden_calls(node, src) {
+                        calls.push((
+                            at.start_byte(),
+                            CallFact {
+                                callee,
+                                line: line_of(at),
+                                method,
+                            },
+                        ));
                     }
                 }
                 _ => {}
@@ -158,7 +181,7 @@ pub(crate) fn extract(lang: Lang, src: &str) -> Option<(Vec<SymbolFact>, Vec<Imp
 /// machine-generated source can hold thousands of each, so the difference is
 /// the difference between linear and quadratic on exactly the input least
 /// likely to have been tried by hand.
-fn attach_calls(defs: &mut [(Range<usize>, SymbolFact)], mut calls: Vec<(usize, String, u32)>) {
+fn attach_calls(defs: &mut [(Range<usize>, SymbolFact)], mut calls: Vec<(usize, CallFact)>) {
     // Definitions in the order the sweep opens them. Equal starts put the
     // shorter range later so it lands on top of the stack, and a full tie
     // falls back to the earlier definition, which is the one a naive
@@ -175,7 +198,7 @@ fn attach_calls(defs: &mut [(Range<usize>, SymbolFact)], mut calls: Vec<(usize, 
 
     let mut open: Vec<usize> = Vec::new();
     let mut next = 0;
-    for (at, callee, line) in calls {
+    for (at, call) in calls {
         while let Some(index) = order.get(next).copied() {
             if defs[index].0.start > at {
                 break;
@@ -190,7 +213,7 @@ fn attach_calls(defs: &mut [(Range<usize>, SymbolFact)], mut calls: Vec<(usize, 
             open.pop();
         }
         if let Some(index) = open.last().copied() {
-            defs[index].1.calls.push((callee, line));
+            defs[index].1.calls.push(call);
         }
     }
 
