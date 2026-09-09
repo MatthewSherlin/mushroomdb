@@ -191,6 +191,19 @@ still match at tier 4 is the name as written when that name carries its receiver
 `Store.flush` against a symbol qualified `Store.flush`, which is how a static
 call reads in Python, TypeScript and JavaScript.
 
+A method is nevertheless *stored* under its type — `Store.flush` — and no
+source writes that form, so the bare name a receiver call falls back to is also
+how a method is reached. Tiers 1 to 3 match a `Type.method` symbol on the bare
+`method`, but only when the receiver says what the type is: `self` (and `this`,
+`cls`) means the type implemented in the calling file, and a variable named
+after its type — `store` for `Store`, `symbol_index` for `SymbolIndex`, case
+and underscores collapsed — means that type. `bytes.len()` names no type the
+graph knows and resolves to nothing, which is the right answer for a slice's
+length. Where a file or directory holds two types with the same method name and
+the receiver reaches both, the calling file's own source decides: the type it
+writes somewhere — `Store::`, `Store {`, `: Store`, `impl Store` — wins, and if
+that still leaves more than one, nothing does.
+
 **A path call** — `a::b::name(…)` — resolves to nothing at all, no tier tried,
 when its leading segment names nothing here: not `crate`, `self`, `super` or
 `Self`; not a package, directory or module in the tree; not a symbol.

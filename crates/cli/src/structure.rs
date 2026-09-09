@@ -34,7 +34,8 @@
 //! never reaches. `.collect()` and `.ok()` name methods on types from outside
 //! the tree, and uniqueness would bind them to any single same-named function
 //! it found. A method call resolves through the local and imported tiers or not
-//! at all.
+//! at all — and it reaches a method there through the bare name the index files
+//! every `Type.method` under, gated on a receiver that says which type it is.
 //!
 //! # What is read
 //!
@@ -51,8 +52,8 @@
 //! write at all, which is what makes a re-run byte-identical.
 use crate::CliError;
 use code_extract::{
-    call_lookup_names, extract, resolve_call, resolve_import, resolve_mention, CallScope,
-    FileFacts, SymbolIndex, MAX_FILE_BYTES,
+    call_lookup_names, extract, indexed_under, mentioned_types, resolve_call, resolve_import,
+    resolve_mention, CallScope, FileFacts, SymbolIndex, MAX_FILE_BYTES,
 };
 use core_api::repograph::rules::{about_rule, concept_sources_rule, ABOUT_LABELS};
 use core_api::{default_max_edges, BatchOp, Predicate, RuleDef, Value};
@@ -501,8 +502,11 @@ fn refresh(
     };
 
     // 3. Extract. The facts are kept: they are both what gets written and what
-    //    the symbol index is built from.
+    //    the symbol index is built from. So are the type names each file
+    //    writes, which is what tells two same-named methods apart when a call
+    //    on a receiver reaches both.
     let mut facts: BTreeMap<String, FileFacts> = BTreeMap::new();
+    let mut types: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut hash_only: BTreeSet<String> = BTreeSet::new();
     for path in &targets {
         let Ok(bytes) = std::fs::read(repo.join(path)) else {
@@ -511,6 +515,7 @@ fn refresh(
         if bytes.len() > MAX_FILE_BYTES || is_binary(&bytes) {
             hash_only.insert(path.clone());
         }
+        types.insert(path.clone(), mentioned_types(&bytes));
         facts.insert(path.clone(), extract(path, &bytes));
     }
 
@@ -560,7 +565,14 @@ fn refresh(
         let Some(Value::Str(name)) = stored.get(i, "name") else {
             continue;
         };
-        if looked_up.as_ref().is_none_or(|names| names.contains(name)) {
+        // A method is filed under its bare name as well as its qualified one,
+        // so a narrowed index has to keep `Store.flush` when something looks
+        // up `flush` — see `indexed_under`.
+        if looked_up.as_ref().is_none_or(|names| {
+            indexed_under(name)
+                .iter()
+                .any(|under| names.contains(under))
+        }) {
             index.insert(name, id);
         }
     }
@@ -580,10 +592,18 @@ fn refresh(
 
     // What a path call may lead with, computed once for the whole pass.
     let roots = tree.roots();
+    let pass = Pass {
+        tree: &tree,
+        index: &index,
+        roots: &roots,
+        with_docs,
+    };
 
+    let no_types = BTreeSet::new();
     let mut writes: Vec<FileWrite> = Vec::new();
     for (path, f) in &facts {
-        let write = resolve_file(path, f, &tree, &index, &keyed[path], &roots, with_docs);
+        let seen = types.get(path).unwrap_or(&no_types);
+        let write = resolve_file(path, f, &keyed[path], seen, &pass);
         report.files_scanned += 1;
         report.symbols += write.symbols.len();
         report.imports += write.imports.len();
@@ -633,16 +653,25 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(8 * 1024)].contains(&0)
 }
 
+/// Everything one file's resolution needs beyond its own facts. Built once for
+/// the whole pass, except `types`, which is per file.
+struct Pass<'a> {
+    tree: &'a Tree,
+    index: &'a SymbolIndex,
+    /// What a path call may lead with, over the whole working tree.
+    roots: &'a BTreeSet<String>,
+    with_docs: bool,
+}
+
 /// Turn one file's raw facts into resolved keys.
 fn resolve_file(
     path: &str,
     f: &FileFacts,
-    tree: &Tree,
-    index: &SymbolIndex,
     keys: &[(String, usize)],
-    roots: &BTreeSet<String>,
-    with_docs: bool,
+    types: &BTreeSet<String>,
+    pass: &Pass<'_>,
 ) -> FileWrite {
+    let (tree, index, with_docs) = (pass.tree, pass.index, pass.with_docs);
     let known = |p: &str| tree.known(p);
     let files_in = |d: &str| tree.files_in(d);
     let by_base = |n: &str| tree.by_basename(n);
@@ -676,7 +705,8 @@ fn resolve_file(
     let imported: Vec<String> = imports.iter().cloned().collect();
     let scope = CallScope {
         imports: &imported,
-        roots,
+        roots: pass.roots,
+        types,
     };
 
     let mut symbols = Vec::with_capacity(keys.len());

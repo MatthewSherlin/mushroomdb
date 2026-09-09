@@ -950,3 +950,117 @@ fn a_narrowed_refresh_resolves_calls_the_same_as_a_whole_tree_one() {
     }
     assert_eq!(calls(&db_dir), whole_tree, "narrowing moved a call edge");
 }
+
+/// A Rust method is stored under its type — `Store.flush` — while every call
+/// to it is written on a receiver, `store.flush()`. Before the index filed
+/// methods under their bare name too, not one method in this repository had a
+/// single incoming `CALLS` edge, so `context` on any of them named no callers
+/// at all.
+#[test]
+fn rust_methods_get_incoming_calls_from_receiver_syntax() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(
+        &repo,
+        "a store and its callers",
+        &[
+            ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+            (
+                "src/store.rs",
+                "//! The store.\n\n\
+                 /// A store.\npub struct Store {\n    pub n: u32,\n}\n\n\
+                 impl Store {\n\
+                 \x20   /// Flush it.\n\
+                 \x20   pub fn flush(&self) -> u32 {\n        self.n\n    }\n\n\
+                 \x20   /// Flush it twice.\n\
+                 \x20   pub fn flush_twice(&self) -> u32 {\n        self.flush() + self.flush()\n    }\n\
+                 }\n",
+            ),
+            (
+                "src/caller.rs",
+                "//! A sibling that holds a Store.\n\n\
+                 /// Do the thing.\npub fn drive(store: &Store) -> u32 {\n    store.flush()\n}\n",
+            ),
+            (
+                "src/lib.rs",
+                "//! Crate root.\n\nmod caller;\nmod store;\n",
+            ),
+        ],
+    );
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let db = GraphDb::open(&db_dir).unwrap();
+
+    let callers = |key: &str| {
+        let mut v = db
+            .neighbors(key, "CALLS", Direction::In)
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        callers("src/store.rs#Store.flush"),
+        vec![
+            "src/caller.rs#drive".to_string(),
+            "src/store.rs#Store.flush_twice".to_string(),
+        ],
+        "both the `self.flush()` inside the type and the `store.flush()` next door"
+    );
+
+    // And a receiver that names no type the graph knows still earns nothing.
+    assert!(
+        callers("src/store.rs#Store.flush_twice").is_empty(),
+        "nothing calls it"
+    );
+}
+
+/// The other half of the same rule: a bare method name is not a claim about
+/// the whole tree. `bytes.len()` is a `Vec`'s length, and binding it to
+/// whichever `Type.len` a repository happens to define is a wrong edge.
+#[test]
+fn a_method_call_on_an_unrelated_receiver_writes_no_edge() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(
+        &repo,
+        "a type with a len, and a caller with a vec",
+        &[
+            ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+            (
+                "src/reg.rs",
+                "//! A registry.\n\n\
+                 /// A registry.\npub struct Registry {\n    pub items: Vec<u32>,\n}\n\n\
+                 impl Registry {\n\
+                 \x20   /// How many.\n\
+                 \x20   pub fn len(&self) -> usize {\n        self.items.len()\n    }\n\
+                 }\n",
+            ),
+            (
+                "src/other.rs",
+                "//! Counts some bytes.\n\n\
+                 /// Count them.\npub fn count(bytes: &[u8]) -> usize {\n    bytes.len()\n}\n",
+            ),
+            ("src/lib.rs", "//! Crate root.\n\nmod other;\nmod reg;\n"),
+        ],
+    );
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let db = GraphDb::open(&db_dir).unwrap();
+
+    assert!(
+        db.has_node("src/reg.rs#Registry.len"),
+        "the method is in the graph"
+    );
+    assert!(
+        db.neighbors("src/other.rs#count", "CALLS", Direction::Out)
+            .unwrap_or_default()
+            .is_empty(),
+        "`bytes.len()` is a slice's length, not the registry's"
+    );
+    assert!(
+        db.neighbors("src/reg.rs#Registry.len", "CALLS", Direction::Out)
+            .unwrap_or_default()
+            .is_empty(),
+        "`self.items.len()` is a vector's length, not a recursive call"
+    );
+}

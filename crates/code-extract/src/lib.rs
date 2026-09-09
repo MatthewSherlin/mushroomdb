@@ -35,6 +35,12 @@
 //! is the only thing that can reach one at all for a call written on a
 //! receiver, which never falls back to repository-wide uniqueness.
 //!
+//! A method is stored qualified — `Store.flush` — and written on a receiver —
+//! `store.flush()` — so the index files it under the bare name too. Those
+//! entries are read only where the receiver identifies the type, because
+//! stripping a receiver says which method is wanted and nothing about what it
+//! belongs to: see [`resolve_call`] and [`mentioned_types`].
+//!
 //! # Determinism
 //!
 //! Every returned collection is sorted and deduplicated, and nothing depends
@@ -341,6 +347,7 @@ pub fn resolve_import(
 #[derive(Clone, Debug, Default)]
 pub struct SymbolIndex {
     by_name: BTreeMap<String, Vec<String>>,
+    by_method: BTreeMap<String, Vec<String>>,
 }
 
 impl SymbolIndex {
@@ -352,10 +359,18 @@ impl SymbolIndex {
     /// Record that `name` is defined by the symbol at `key`. Inserting the
     /// same pair twice is a no-op, and the stored keys stay sorted, so the
     /// index does not depend on insertion order.
+    ///
+    /// A method — a name qualified `Type.method` — is filed twice: under the
+    /// name as written, and under the bare `method`. Source almost never
+    /// writes the qualified form. `store.flush()` says `flush` after the
+    /// receiver is stripped, and without the second entry no call on a
+    /// receiver could ever reach a method definition. The two sets are kept
+    /// apart because they carry different weight: see [`resolve_call`], which
+    /// consults the bare entries only where the tier itself is evidence.
     pub fn insert(&mut self, name: &str, key: &str) {
-        let slot = self.by_name.entry(name.to_string()).or_default();
-        if let Err(at) = slot.binary_search_by(|held| held.as_str().cmp(key)) {
-            slot.insert(at, key.to_string());
+        insert_sorted(self.by_name.entry(name.to_string()).or_default(), key);
+        if let Some(bare) = method_name(name) {
+            insert_sorted(self.by_method.entry(bare.to_string()).or_default(), key);
         }
     }
 
@@ -373,6 +388,92 @@ impl SymbolIndex {
     fn keys_for(&self, name: &str) -> &[String] {
         self.by_name.get(name).map_or(&[], Vec::as_slice)
     }
+
+    /// Keys of the methods whose bare name is `name`, whatever type they
+    /// belong to.
+    fn methods_for(&self, name: &str) -> &[String] {
+        self.by_method.get(name).map_or(&[], Vec::as_slice)
+    }
+}
+
+fn insert_sorted(slot: &mut Vec<String>, key: &str) {
+    if let Err(at) = slot.binary_search_by(|held| held.as_str().cmp(key)) {
+        slot.insert(at, key.to_string());
+    }
+}
+
+/// The bare name of a qualified method: `flush` in `Store.flush`, `None` for a
+/// name that is not written as a method.
+fn method_name(name: &str) -> Option<&str> {
+    let (_, bare) = name.rsplit_once('.')?;
+    (!bare.is_empty()).then_some(bare)
+}
+
+/// The type a method belongs to: `Store` in `Store.flush`, and in
+/// `mod::Store.flush`.
+fn receiver_type(name: &str) -> Option<&str> {
+    let (owner, _) = name.rsplit_once('.')?;
+    let owner = owner.rsplit(['.', ':']).next().unwrap_or(owner);
+    (!owner.is_empty()).then_some(owner)
+}
+
+/// What a call was written on: `store` in `store.flush`, and `symbols` — not
+/// `self` — in `self.symbols.len`. The segment immediately before the method
+/// is the thing whose method is being called.
+fn receiver_of(callee: &str) -> Option<&str> {
+    receiver_type(callee.trim())
+}
+
+/// Whether the receiver a call was written on identifies `symbol`'s type.
+///
+/// This is the guard that keeps the bare-name entries from turning every
+/// `.len()` in the repository into an edge. Stripping the receiver tells you
+/// *which* method is wanted and nothing about *what* it belongs to, and on a
+/// real codebase the reachable `Type.len` is almost never the `Vec` the source
+/// meant. Two receivers say what the type is:
+///
+/// * `self` — and `this`, `cls`, `Self` — is the type being implemented, so a
+///   candidate in the calling file is it. That is where `impl` blocks put
+///   their methods, and it is the case that matters: `self.flush()` is how
+///   most method calls inside a type are written.
+/// * a variable named after its type — `store: Store`, `symbol_index:
+///   SymbolIndex` — which every language here spells consistently enough to be
+///   evidence once case and `_` are collapsed.
+///
+/// Anything else is a variable whose type the graph does not know, and the
+/// truthful answer for it is no edge. That costs real calls — `rs.len()` on a
+/// `ResultSet` gets nothing — and the trade is deliberate: this resolver's
+/// whole design is that a wrong edge is worse than a missing one.
+fn receiver_names(receiver: &str, symbol: &str, in_calling_file: bool) -> bool {
+    if matches!(receiver, "self" | "Self" | "this" | "cls" | "me") {
+        return in_calling_file;
+    }
+    receiver_type(symbol).is_some_and(|ty| squash(receiver) == squash(ty))
+}
+
+/// Lowercased with `_` dropped, so `symbol_index` and `SymbolIndex` meet.
+fn squash(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Every name [`SymbolIndex`] files a definition called `name` under.
+///
+/// The mirror of [`call_lookup_names`], and the other half of what a caller
+/// building a *narrowed* index needs: a `Store.flush` has to be kept when
+/// something looks up the bare `flush`, or a method call loses the very
+/// definition the bare entry exists to reach.
+#[must_use]
+pub fn indexed_under(name: &str) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    if let Some(bare) = method_name(name) {
+        if bare != name {
+            out.push(bare.to_string());
+        }
+    }
+    out
 }
 
 /// What the calling file can see, beyond the symbol index itself.
@@ -389,6 +490,10 @@ pub struct CallScope<'a> {
     /// path uses. A leading segment that is not in here and is not a symbol
     /// names a dependency, and a call into a dependency resolves to nothing.
     pub roots: &'a BTreeSet<String>,
+    /// The type names the calling file's own source writes, as
+    /// [`mentioned_types`] reads them. Used only to choose between method
+    /// definitions a tier has already reached — never to reach one.
+    pub types: &'a BTreeSet<String>,
 }
 
 /// Resolve a callee written in `from_file` to the key of the symbol it names.
@@ -466,7 +571,15 @@ pub fn resolve_call(
         // macro's token tree arrives as the bare segment already.
         let repo_wide = !call.method || written_as_method(&name);
         let keys = index.keys_for(&name);
-        if keys.is_empty() {
+        // The bare-name entries of the index, consulted only for the exact
+        // case they exist for: a call written on a receiver, fallen back to
+        // the bare segment. `store.flush()` reaches `Store.flush` this way and
+        // no other, because no source ever writes the qualified form.
+        let methods: &[String] = match call.method && !written_as_method(&name) {
+            true => index.methods_for(&name),
+            false => &[],
+        };
+        if keys.is_empty() && methods.is_empty() {
             continue;
         }
         let pick = |filter: &dyn Fn(&str, &str) -> bool| -> Option<String> {
@@ -481,12 +594,40 @@ pub fn resolve_call(
             }
             hit
         };
-        if let Some(key) = pick(&|file, _| file == from) {
+        // The same, over the bare-name entries, with two differences. First,
+        // the receiver has to identify the type — see `receiver_names`. Second,
+        // several types in one file or directory can still define the same
+        // method name, and the caller's own source breaks that tie: a file
+        // that writes `Store` is the one calling `Store.flush`, and a file
+        // that never writes the name gets no edge rather than a coin toss.
+        let receiver = receiver_of(&call.callee);
+        let pick_method = |filter: &dyn Fn(&str) -> bool| -> Option<String> {
+            let mut hits: Vec<&String> = methods
+                .iter()
+                .filter(|key| {
+                    filter(key_file(key))
+                        && receiver.is_some_and(|r| {
+                            receiver_names(r, key_symbol(key), key_file(key) == from)
+                        })
+                })
+                .collect();
+            if hits.len() > 1 {
+                hits.retain(|key| {
+                    receiver_type(key_symbol(key)).is_some_and(|t| scope.types.contains(t))
+                });
+            }
+            match hits.as_slice() {
+                [one] => Some((*one).clone()),
+                _ => None,
+            }
+        };
+        let same_dir = |file: &str| parent_dir(file) == from_dir && same_language(&from, file);
+        let imported = |file: &str| scope.imports.iter().any(|i| i == file);
+
+        if let Some(key) = pick(&|file, _| file == from).or_else(|| pick_method(&|f| f == from)) {
             return Some(key);
         }
-        if let Some(key) =
-            pick(&|file, _| parent_dir(file) == from_dir && same_language(&from, file))
-        {
+        if let Some(key) = pick(&|file, _| same_dir(file)).or_else(|| pick_method(&same_dir)) {
             return Some(key);
         }
         // An import brings a *file* into scope, not a type. For a method call
@@ -495,10 +636,14 @@ pub fn resolve_call(
         // is not the thing being called. `repo.join(id)` is `Path::join`, but
         // the calling file imports a module that defines a `join`. So an
         // imported match has to be a method — a symbol qualified `Type.name`,
-        // which is how every extractor here names one.
-        if let Some(key) = pick(&|file, symbol| {
-            scope.imports.iter().any(|i| i == file) && (!call.method || symbol.contains('.'))
-        }) {
+        // which is how every extractor here names one. The bare-name entries
+        // are all methods by construction, and are held to the calling file's
+        // language as well, which the exact-name imports tier does not need to
+        // be: an import is a stated relationship, a bare method name is not.
+        if let Some(key) =
+            pick(&|file, symbol| imported(file) && (!call.method || symbol.contains('.')))
+                .or_else(|| pick_method(&|f| imported(f) && same_language(&from, f)))
+        {
             return Some(key);
         }
         if repo_wide {
@@ -508,6 +653,112 @@ pub fn resolve_call(
         }
     }
     None
+}
+
+/// The type names a file's own source writes.
+///
+/// A call written on a receiver says which method is wanted but not what it
+/// belongs to. When one file or directory holds two types that both define
+/// `flush`, this is the tie-break [`resolve_call`] uses: a file that writes
+/// `Store` somewhere is the one calling `Store.flush`, and a file that never
+/// writes the name is not.
+///
+/// Four spellings count, and they are the ones a type appears in across every
+/// language here: `Store::…`, `Store {`, `: Store` and `impl Store`. Only
+/// names that begin with an uppercase letter are collected — every grammar
+/// here spells its types that way, and the alternative is to treat `if x {` as
+/// naming a type `x`.
+///
+/// Deliberately textual, deliberately cheap, and deliberately unable to *make*
+/// a resolution: it only chooses between candidates a tier has already
+/// reached, so a name it misses costs an edge and never invents one. Binary
+/// input and anything over [`MAX_FILE_BYTES`] yield nothing.
+#[must_use]
+pub fn mentioned_types(bytes: &[u8]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if bytes.len() > MAX_FILE_BYTES {
+        return out;
+    }
+    let Some(text) = decode(bytes) else {
+        return out;
+    };
+    let b = text.as_bytes();
+    let mut at = 0;
+    while at < b.len() {
+        if !is_ident_start(b[at]) {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < b.len() && is_ident_byte(b[at]) {
+            at += 1;
+        }
+        if out.len() >= MAX_MENTIONED_TYPES || !b[start].is_ascii_uppercase() {
+            continue;
+        }
+        if leads_a_path(b, at) || opens_a_literal(b, at) || is_annotated(b, start) {
+            out.insert(text[start..at].to_string());
+        }
+    }
+    out
+}
+
+/// Most type names kept for one file. A generated file can name thousands;
+/// past this the tie-break simply has less to work with, which costs an edge
+/// rather than inventing one.
+const MAX_MENTIONED_TYPES: usize = 1_024;
+
+const fn is_ident_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+const fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// `Store::new` — the identifier ending at `at` is followed by a path
+/// separator.
+fn leads_a_path(b: &[u8], at: usize) -> bool {
+    b.get(at) == Some(&b':') && b.get(at + 1) == Some(&b':')
+}
+
+/// `Store {` — the identifier ending at `at` opens a braced literal or body.
+fn opens_a_literal(b: &[u8], at: usize) -> bool {
+    let mut i = at;
+    while b.get(i) == Some(&b' ') {
+        i += 1;
+    }
+    b.get(i) == Some(&b'{')
+}
+
+/// `: Store` or `impl Store` — the identifier starting at `start` is preceded
+/// by a type annotation or an impl header.
+fn is_annotated(b: &[u8], start: usize) -> bool {
+    let mut i = start;
+    loop {
+        let was = i;
+        // The sigils an annotation can put between the `:` and the name:
+        // `&Path`, `&mut Store`, `Vec<Store>`, `*const Frame`.
+        while i > 0 && matches!(b[i - 1], b' ' | b'\t' | b'&' | b'*' | b'<') {
+            i -= 1;
+        }
+        for word in [b"mut".as_slice(), b"dyn".as_slice(), b"const".as_slice()] {
+            if i >= word.len()
+                && &b[i - word.len()..i] == word
+                && (i == word.len() || !is_ident_byte(b[i - word.len() - 1]))
+            {
+                i -= word.len();
+            }
+        }
+        if i == was {
+            break;
+        }
+    }
+    if i > 0 && b[i - 1] == b':' {
+        return true;
+    }
+    // `impl` must be a word of its own, not the tail of an identifier.
+    i >= 4 && &b[i - 4..i] == b"impl" && (i == 4 || !is_ident_byte(b[i - 5]))
 }
 
 /// Whether two files are written in the same language.

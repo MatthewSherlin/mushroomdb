@@ -9,9 +9,9 @@
 //! directory.
 
 use code_extract::{
-    call_lookup_names, extract, lang_of, resolve_call, resolve_import, resolve_mention,
-    written_as_method, CallFact, CallScope, FileFacts, Lang, SymbolIndex, MAX_BODY_BYTES,
-    MAX_FILE_BYTES,
+    call_lookup_names, extract, indexed_under, lang_of, mentioned_types, resolve_call,
+    resolve_import, resolve_mention, written_as_method, CallFact, CallScope, FileFacts, Lang,
+    SymbolIndex, MAX_BODY_BYTES, MAX_FILE_BYTES,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -95,9 +95,30 @@ fn roots(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|n| (*n).to_string()).collect()
 }
 
+/// A file whose source names no type at all — the default for a test that is
+/// not about the method tie-break.
+static NO_TYPES: BTreeSet<String> = BTreeSet::new();
+
 /// What the calling file can see: its imports and those leading names.
 fn scope<'a>(imports: &'a [String], roots: &'a BTreeSet<String>) -> CallScope<'a> {
-    CallScope { imports, roots }
+    CallScope {
+        imports,
+        roots,
+        types: &NO_TYPES,
+    }
+}
+
+/// The same, for a file whose source writes the named types.
+fn scope_naming<'a>(
+    imports: &'a [String],
+    roots: &'a BTreeSet<String>,
+    types: &'a BTreeSet<String>,
+) -> CallScope<'a> {
+    CallScope {
+        imports,
+        roots,
+        types,
+    }
 }
 
 fn raw_imports(facts: &FileFacts) -> Vec<&str> {
@@ -1932,4 +1953,178 @@ fn call_lookup_names_covers_every_form_the_resolver_tries() {
         call_lookup_names("std::mem::take"),
         vec!["std::mem::take", "take", "std"]
     );
+}
+
+/// Source almost never writes a method's qualified name. `store.flush()` says
+/// `flush` once the receiver is stripped, and a symbol stored as `Store.flush`
+/// was unreachable from it — so no method in the graph had a caller at all.
+/// The index files every method under its bare name too, which is what closes
+/// that gap.
+#[test]
+fn a_method_call_reaches_its_type_through_the_bare_name() {
+    let mut index = SymbolIndex::new();
+    index.insert("Store.flush", "src/a.rs#Store.flush");
+    index.insert("Store", "src/a.rs#Store");
+    let tree = roots(&["a", "b", "src"]);
+    let none = &scope(&[], &tree);
+
+    // Same file, on the type's own receiver.
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("self.flush", 9), &index, none),
+        Some("src/a.rs#Store.flush".to_string())
+    );
+    // Same directory, on a variable named after its type.
+    assert_eq!(
+        resolve_call(
+            "src/b.rs",
+            &CallFact::method("store.flush", 4),
+            &index,
+            none
+        ),
+        Some("src/a.rs#Store.flush".to_string())
+    );
+    // And through an import, from further away.
+    let imports = vec!["src/a.rs".to_string()];
+    assert_eq!(
+        resolve_call(
+            "other/c.rs",
+            &CallFact::method("store.flush", 4),
+            &index,
+            &scope(&imports, &tree)
+        ),
+        Some("src/a.rs#Store.flush".to_string())
+    );
+    // The repository-wide tier stays shut: a bare method name is not a claim
+    // about the whole tree.
+    assert_eq!(
+        resolve_call(
+            "far/away.rs",
+            &CallFact::method("store.flush", 4),
+            &index,
+            none
+        ),
+        None
+    );
+}
+
+/// Stripping the receiver says which method is wanted and nothing about what
+/// it belongs to. Without a receiver that identifies the type, every `.len()`
+/// in a repository would bind to whatever single `Type.len` happened to be
+/// reachable — which is a `Vec`'s length pointed at someone else's type.
+#[test]
+fn a_method_call_on_an_unknown_receiver_gets_no_edge() {
+    let mut index = SymbolIndex::new();
+    index.insert("Store.len", "src/a.rs#Store.len");
+    let tree = roots(&["a", "src"]);
+    let none = &scope(&[], &tree);
+
+    for callee in ["bytes.len", "self.symbols.len", "v.len"] {
+        assert_eq!(
+            resolve_call("src/a.rs", &CallFact::method(callee, 1), &index, none),
+            None,
+            "{callee} names no type, so it earns no edge"
+        );
+    }
+    // A snake_case variable still meets its CamelCase type.
+    index.insert("SymbolIndex.len", "src/b.rs#SymbolIndex.len");
+    assert_eq!(
+        resolve_call(
+            "src/a.rs",
+            &CallFact::method("symbol_index.len", 1),
+            &index,
+            none
+        ),
+        Some("src/b.rs#SymbolIndex.len".to_string())
+    );
+}
+
+/// `self` is the type being implemented, and that is a claim about the calling
+/// file, not about its neighbours.
+#[test]
+fn self_reaches_a_method_only_in_the_calling_file() {
+    let mut index = SymbolIndex::new();
+    index.insert("Store.flush", "src/a.rs#Store.flush");
+    let tree = roots(&["a", "src"]);
+    let none = &scope(&[], &tree);
+
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("self.flush", 1), &index, none),
+        Some("src/a.rs#Store.flush".to_string())
+    );
+    assert_eq!(
+        resolve_call("src/b.rs", &CallFact::method("self.flush", 1), &index, none),
+        None,
+        "`self` in another file is another type"
+    );
+}
+
+/// Two types in one directory can define the same method, and a receiver
+/// named after neither reaches both. The calling file's own source is the
+/// tie-break; a file that names neither type gets no edge.
+#[test]
+fn two_types_sharing_a_method_are_told_apart_by_the_callers_source() {
+    let mut index = SymbolIndex::new();
+    index.insert("Store.flush", "src/a.rs#Store.flush");
+    index.insert("Cache.flush", "src/b.rs#Cache.flush");
+    let tree = roots(&["src"]);
+    let no_imports: Vec<String> = Vec::new();
+
+    // `self.flush` in a third file of the directory reaches neither: `self`
+    // only ever means the calling file.
+    let blind: BTreeSet<String> = BTreeSet::new();
+    assert_eq!(
+        resolve_call(
+            "src/c.rs",
+            &CallFact::method("self.flush", 1),
+            &index,
+            &scope_naming(&no_imports, &tree, &blind)
+        ),
+        None
+    );
+
+    // A receiver named after one of them picks that one, whatever the file
+    // mentions.
+    assert_eq!(
+        resolve_call(
+            "src/c.rs",
+            &CallFact::method("cache.flush", 1),
+            &index,
+            &scope_naming(&no_imports, &tree, &blind)
+        ),
+        Some("src/b.rs#Cache.flush".to_string())
+    );
+}
+
+/// The four spellings a type appears in, and the ones that are not types.
+#[test]
+fn mentioned_types_reads_the_spellings_a_type_appears_in() {
+    let found = mentioned_types(
+        b"use crate::store::Store;\n\
+          impl Cache {\n\
+              fn get(&self, key: &Path) -> Sink {\n\
+                  if ready {\n\
+                      Store::new()\n\
+                  }\n\
+                  Frame { at: 1 }\n\
+              }\n\
+          }\n",
+    );
+    for want in ["Store", "Cache", "Path", "Sink", "Frame"] {
+        assert!(found.contains(want), "{want} missing from {found:?}");
+    }
+    // `ready` opens a brace but is not a type, and a lowercase path segment is
+    // a module rather than one.
+    assert!(!found.contains("ready"), "{found:?}");
+    assert!(!found.contains("crate"), "{found:?}");
+    assert!(
+        mentioned_types(b"pub fn a() {}\0").is_empty(),
+        "binary input"
+    );
+}
+
+/// The mirror of `call_lookup_names`: what a narrowed index has to keep.
+#[test]
+fn indexed_under_names_both_forms_of_a_method() {
+    assert_eq!(indexed_under("helper"), vec!["helper"]);
+    assert_eq!(indexed_under("Store.flush"), vec!["Store.flush", "flush"]);
 }
