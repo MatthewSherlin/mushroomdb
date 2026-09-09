@@ -52,8 +52,8 @@
 //! write at all, which is what makes a re-run byte-identical.
 use crate::CliError;
 use code_extract::{
-    call_lookup_names, extract, indexed_under, mentioned_types, resolve_call, resolve_import,
-    resolve_mention, CallScope, FileFacts, SymbolIndex, MAX_FILE_BYTES,
+    call_lookup_names, extract, indexed_under, resolve_call, resolve_import, resolve_mention,
+    CallScope, FileFacts, SymbolIndex, MAX_FILE_BYTES,
 };
 use core_api::repograph::rules::{about_rule, concept_sources_rule, ABOUT_LABELS};
 use core_api::{default_max_edges, BatchOp, Predicate, RuleDef, Value};
@@ -502,11 +502,8 @@ fn refresh(
     };
 
     // 3. Extract. The facts are kept: they are both what gets written and what
-    //    the symbol index is built from. So are the type names each file
-    //    writes, which is what tells two same-named methods apart when a call
-    //    on a receiver reaches both.
+    //    the symbol index is built from.
     let mut facts: BTreeMap<String, FileFacts> = BTreeMap::new();
-    let mut types: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut hash_only: BTreeSet<String> = BTreeSet::new();
     for path in &targets {
         let Ok(bytes) = std::fs::read(repo.join(path)) else {
@@ -515,7 +512,6 @@ fn refresh(
         if bytes.len() > MAX_FILE_BYTES || is_binary(&bytes) {
             hash_only.insert(path.clone());
         }
-        types.insert(path.clone(), mentioned_types(&bytes));
         facts.insert(path.clone(), extract(path, &bytes));
     }
 
@@ -599,11 +595,9 @@ fn refresh(
         with_docs,
     };
 
-    let no_types = BTreeSet::new();
     let mut writes: Vec<FileWrite> = Vec::new();
     for (path, f) in &facts {
-        let seen = types.get(path).unwrap_or(&no_types);
-        let write = resolve_file(path, f, &keyed[path], seen, &pass);
+        let write = resolve_file(path, f, &keyed[path], &pass);
         report.files_scanned += 1;
         report.symbols += write.symbols.len();
         report.imports += write.imports.len();
@@ -664,13 +658,7 @@ struct Pass<'a> {
 }
 
 /// Turn one file's raw facts into resolved keys.
-fn resolve_file(
-    path: &str,
-    f: &FileFacts,
-    keys: &[(String, usize)],
-    types: &BTreeSet<String>,
-    pass: &Pass<'_>,
-) -> FileWrite {
+fn resolve_file(path: &str, f: &FileFacts, keys: &[(String, usize)], pass: &Pass<'_>) -> FileWrite {
     let (tree, index, with_docs) = (pass.tree, pass.index, pass.with_docs);
     let known = |p: &str| tree.known(p);
     let files_in = |d: &str| tree.files_in(d);
@@ -706,7 +694,6 @@ fn resolve_file(
     let scope = CallScope {
         imports: &imported,
         roots: pass.roots,
-        types,
     };
 
     let mut symbols = Vec::with_capacity(keys.len());

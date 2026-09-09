@@ -9,9 +9,9 @@
 //! directory.
 
 use code_extract::{
-    call_lookup_names, extract, indexed_under, lang_of, mentioned_types, resolve_call,
-    resolve_import, resolve_mention, written_as_method, CallFact, CallScope, FileFacts, Lang,
-    SymbolIndex, MAX_BODY_BYTES, MAX_FILE_BYTES,
+    call_lookup_names, extract, indexed_under, lang_of, resolve_call, resolve_import,
+    resolve_mention, written_as_method, CallFact, CallScope, FileFacts, Lang, SymbolIndex,
+    MAX_BODY_BYTES, MAX_FILE_BYTES,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -95,30 +95,9 @@ fn roots(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|n| (*n).to_string()).collect()
 }
 
-/// A file whose source names no type at all — the default for a test that is
-/// not about the method tie-break.
-static NO_TYPES: BTreeSet<String> = BTreeSet::new();
-
 /// What the calling file can see: its imports and those leading names.
 fn scope<'a>(imports: &'a [String], roots: &'a BTreeSet<String>) -> CallScope<'a> {
-    CallScope {
-        imports,
-        roots,
-        types: &NO_TYPES,
-    }
-}
-
-/// The same, for a file whose source writes the named types.
-fn scope_naming<'a>(
-    imports: &'a [String],
-    roots: &'a BTreeSet<String>,
-    types: &'a BTreeSet<String>,
-) -> CallScope<'a> {
-    CallScope {
-        imports,
-        roots,
-        types,
-    }
+    CallScope { imports, roots }
 }
 
 fn raw_imports(facts: &FileFacts) -> Vec<&str> {
@@ -2058,67 +2037,43 @@ fn self_reaches_a_method_only_in_the_calling_file() {
     );
 }
 
-/// Two types in one directory can define the same method, and a receiver
-/// named after neither reaches both. The calling file's own source is the
-/// tie-break; a file that names neither type gets no edge.
+/// Two types in one directory can define the same method. Only a receiver
+/// that names one of them picks it out; `self` never reaches past the calling
+/// file, so it reaches neither.
 #[test]
-fn two_types_sharing_a_method_are_told_apart_by_the_callers_source() {
+fn two_types_sharing_a_method_need_a_receiver_that_names_one() {
     let mut index = SymbolIndex::new();
     index.insert("Store.flush", "src/a.rs#Store.flush");
     index.insert("Cache.flush", "src/b.rs#Cache.flush");
     let tree = roots(&["src"]);
-    let no_imports: Vec<String> = Vec::new();
+    let none = &scope(&[], &tree);
 
-    // `self.flush` in a third file of the directory reaches neither: `self`
-    // only ever means the calling file.
-    let blind: BTreeSet<String> = BTreeSet::new();
     assert_eq!(
-        resolve_call(
-            "src/c.rs",
-            &CallFact::method("self.flush", 1),
-            &index,
-            &scope_naming(&no_imports, &tree, &blind)
-        ),
-        None
+        resolve_call("src/c.rs", &CallFact::method("self.flush", 1), &index, none),
+        None,
+        "`self` only ever means the calling file"
     );
-
-    // A receiver named after one of them picks that one, whatever the file
-    // mentions.
     assert_eq!(
         resolve_call(
             "src/c.rs",
             &CallFact::method("cache.flush", 1),
             &index,
-            &scope_naming(&no_imports, &tree, &blind)
+            none
         ),
         Some("src/b.rs#Cache.flush".to_string())
     );
-}
-
-/// The four spellings a type appears in, and the ones that are not types.
-#[test]
-fn mentioned_types_reads_the_spellings_a_type_appears_in() {
-    let found = mentioned_types(
-        b"use crate::store::Store;\n\
-          impl Cache {\n\
-              fn get(&self, key: &Path) -> Sink {\n\
-                  if ready {\n\
-                      Store::new()\n\
-                  }\n\
-                  Frame { at: 1 }\n\
-              }\n\
-          }\n",
-    );
-    for want in ["Store", "Cache", "Path", "Sink", "Frame"] {
-        assert!(found.contains(want), "{want} missing from {found:?}");
-    }
-    // `ready` opens a brace but is not a type, and a lowercase path segment is
-    // a module rather than one.
-    assert!(!found.contains("ready"), "{found:?}");
-    assert!(!found.contains("crate"), "{found:?}");
-    assert!(
-        mentioned_types(b"pub fn a() {}\0").is_empty(),
-        "binary input"
+    // Two types whose names collide once case and `_` are dropped leave
+    // nothing to choose between, so neither gets the edge.
+    index.insert("STORE.flush", "src/d.rs#STORE.flush");
+    assert_eq!(
+        resolve_call(
+            "src/c.rs",
+            &CallFact::method("store.flush", 1),
+            &index,
+            none
+        ),
+        None,
+        "`Store` and `STORE` are indistinguishable to this rule"
     );
 }
 

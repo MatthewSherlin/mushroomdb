@@ -39,7 +39,7 @@
 //! `store.flush()` — so the index files it under the bare name too. Those
 //! entries are read only where the receiver identifies the type, because
 //! stripping a receiver says which method is wanted and nothing about what it
-//! belongs to: see [`resolve_call`] and [`mentioned_types`].
+//! belongs to: see [`resolve_call`].
 //!
 //! # Determinism
 //!
@@ -432,7 +432,8 @@ fn receiver_of(callee: &str) -> Option<&str> {
 /// real codebase the reachable `Type.len` is almost never the `Vec` the source
 /// meant. Two receivers say what the type is:
 ///
-/// * `self` — and `this`, `cls`, `Self` — is the type being implemented, so a
+/// * `self` — and `Self`, `this`, `cls`, which are the same idea in the five
+///   languages here — is the type being implemented, so a
 ///   candidate in the calling file is it. That is where `impl` blocks put
 ///   their methods, and it is the case that matters: `self.flush()` is how
 ///   most method calls inside a type are written.
@@ -445,7 +446,7 @@ fn receiver_of(callee: &str) -> Option<&str> {
 /// `ResultSet` gets nothing — and the trade is deliberate: this resolver's
 /// whole design is that a wrong edge is worse than a missing one.
 fn receiver_names(receiver: &str, symbol: &str, in_calling_file: bool) -> bool {
-    if matches!(receiver, "self" | "Self" | "this" | "cls" | "me") {
+    if matches!(receiver, "self" | "Self" | "this" | "cls") {
         return in_calling_file;
     }
     receiver_type(symbol).is_some_and(|ty| squash(receiver) == squash(ty))
@@ -490,10 +491,6 @@ pub struct CallScope<'a> {
     /// path uses. A leading segment that is not in here and is not a symbol
     /// names a dependency, and a call into a dependency resolves to nothing.
     pub roots: &'a BTreeSet<String>,
-    /// The type names the calling file's own source writes, as
-    /// [`mentioned_types`] reads them. Used only to choose between method
-    /// definitions a tier has already reached — never to reach one.
-    pub types: &'a BTreeSet<String>,
 }
 
 /// Resolve a callee written in `from_file` to the key of the symbol it names.
@@ -594,32 +591,25 @@ pub fn resolve_call(
             }
             hit
         };
-        // The same, over the bare-name entries, with two differences. First,
-        // the receiver has to identify the type — see `receiver_names`. Second,
-        // several types in one file or directory can still define the same
-        // method name, and the caller's own source breaks that tie: a file
-        // that writes `Store` is the one calling `Store.flush`, and a file
-        // that never writes the name gets no edge rather than a coin toss.
+        // The same, over the bare-name entries, with one difference: the
+        // receiver has to identify the type — see `receiver_names`. Two
+        // candidates still passing that at one tier means two types whose
+        // names collide once case and `_` are dropped, and there is nothing
+        // left to tell them apart, so neither gets the edge.
         let receiver = receiver_of(&call.callee);
         let pick_method = |filter: &dyn Fn(&str) -> bool| -> Option<String> {
-            let mut hits: Vec<&String> = methods
-                .iter()
-                .filter(|key| {
-                    filter(key_file(key))
-                        && receiver.is_some_and(|r| {
-                            receiver_names(r, key_symbol(key), key_file(key) == from)
-                        })
-                })
-                .collect();
-            if hits.len() > 1 {
-                hits.retain(|key| {
-                    receiver_type(key_symbol(key)).is_some_and(|t| scope.types.contains(t))
-                });
+            let mut hit = None;
+            for key in methods {
+                let named = receiver
+                    .is_some_and(|r| receiver_names(r, key_symbol(key), key_file(key) == from));
+                if filter(key_file(key)) && named {
+                    if hit.is_some() {
+                        return None;
+                    }
+                    hit = Some(key.clone());
+                }
             }
-            match hits.as_slice() {
-                [one] => Some((*one).clone()),
-                _ => None,
-            }
+            hit
         };
         let same_dir = |file: &str| parent_dir(file) == from_dir && same_language(&from, file);
         let imported = |file: &str| scope.imports.iter().any(|i| i == file);
@@ -653,112 +643,6 @@ pub fn resolve_call(
         }
     }
     None
-}
-
-/// The type names a file's own source writes.
-///
-/// A call written on a receiver says which method is wanted but not what it
-/// belongs to. When one file or directory holds two types that both define
-/// `flush`, this is the tie-break [`resolve_call`] uses: a file that writes
-/// `Store` somewhere is the one calling `Store.flush`, and a file that never
-/// writes the name is not.
-///
-/// Four spellings count, and they are the ones a type appears in across every
-/// language here: `Store::…`, `Store {`, `: Store` and `impl Store`. Only
-/// names that begin with an uppercase letter are collected — every grammar
-/// here spells its types that way, and the alternative is to treat `if x {` as
-/// naming a type `x`.
-///
-/// Deliberately textual, deliberately cheap, and deliberately unable to *make*
-/// a resolution: it only chooses between candidates a tier has already
-/// reached, so a name it misses costs an edge and never invents one. Binary
-/// input and anything over [`MAX_FILE_BYTES`] yield nothing.
-#[must_use]
-pub fn mentioned_types(bytes: &[u8]) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    if bytes.len() > MAX_FILE_BYTES {
-        return out;
-    }
-    let Some(text) = decode(bytes) else {
-        return out;
-    };
-    let b = text.as_bytes();
-    let mut at = 0;
-    while at < b.len() {
-        if !is_ident_start(b[at]) {
-            at += 1;
-            continue;
-        }
-        let start = at;
-        while at < b.len() && is_ident_byte(b[at]) {
-            at += 1;
-        }
-        if out.len() >= MAX_MENTIONED_TYPES || !b[start].is_ascii_uppercase() {
-            continue;
-        }
-        if leads_a_path(b, at) || opens_a_literal(b, at) || is_annotated(b, start) {
-            out.insert(text[start..at].to_string());
-        }
-    }
-    out
-}
-
-/// Most type names kept for one file. A generated file can name thousands;
-/// past this the tie-break simply has less to work with, which costs an edge
-/// rather than inventing one.
-const MAX_MENTIONED_TYPES: usize = 1_024;
-
-const fn is_ident_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
-}
-
-const fn is_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-/// `Store::new` — the identifier ending at `at` is followed by a path
-/// separator.
-fn leads_a_path(b: &[u8], at: usize) -> bool {
-    b.get(at) == Some(&b':') && b.get(at + 1) == Some(&b':')
-}
-
-/// `Store {` — the identifier ending at `at` opens a braced literal or body.
-fn opens_a_literal(b: &[u8], at: usize) -> bool {
-    let mut i = at;
-    while b.get(i) == Some(&b' ') {
-        i += 1;
-    }
-    b.get(i) == Some(&b'{')
-}
-
-/// `: Store` or `impl Store` — the identifier starting at `start` is preceded
-/// by a type annotation or an impl header.
-fn is_annotated(b: &[u8], start: usize) -> bool {
-    let mut i = start;
-    loop {
-        let was = i;
-        // The sigils an annotation can put between the `:` and the name:
-        // `&Path`, `&mut Store`, `Vec<Store>`, `*const Frame`.
-        while i > 0 && matches!(b[i - 1], b' ' | b'\t' | b'&' | b'*' | b'<') {
-            i -= 1;
-        }
-        for word in [b"mut".as_slice(), b"dyn".as_slice(), b"const".as_slice()] {
-            if i >= word.len()
-                && &b[i - word.len()..i] == word
-                && (i == word.len() || !is_ident_byte(b[i - word.len() - 1]))
-            {
-                i -= word.len();
-            }
-        }
-        if i == was {
-            break;
-        }
-    }
-    if i > 0 && b[i - 1] == b':' {
-        return true;
-    }
-    // `impl` must be a word of its own, not the tail of an identifier.
-    i >= 4 && &b[i - 4..i] == b"impl" && (i == 4 || !is_ident_byte(b[i - 5]))
 }
 
 /// Whether two files are written in the same language.

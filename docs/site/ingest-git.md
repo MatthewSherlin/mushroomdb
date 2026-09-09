@@ -194,15 +194,15 @@ call reads in Python, TypeScript and JavaScript.
 A method is nevertheless *stored* under its type — `Store.flush` — and no
 source writes that form, so the bare name a receiver call falls back to is also
 how a method is reached. Tiers 1 to 3 match a `Type.method` symbol on the bare
-`method`, but only when the receiver says what the type is: `self` (and `this`,
-`cls`) means the type implemented in the calling file, and a variable named
-after its type — `store` for `Store`, `symbol_index` for `SymbolIndex`, case
-and underscores collapsed — means that type. `bytes.len()` names no type the
-graph knows and resolves to nothing, which is the right answer for a slice's
-length. Where a file or directory holds two types with the same method name and
-the receiver reaches both, the calling file's own source decides: the type it
-writes somewhere — `Store::`, `Store {`, `: Store`, `impl Store` — wins, and if
-that still leaves more than one, nothing does.
+`method`, but only when the receiver says what the type is. Two spellings do:
+`self` (and `Self`, `this`, `cls`) means the type implemented in the calling
+file, and a variable named after its type — `store` for `Store`, `symbol_index`
+for `SymbolIndex`, case and underscores collapsed — means that type. The
+receiver is the segment immediately before the method, so `self.items.len()`
+asks about `items`, not about `self`. `bytes.len()` names no type the graph
+knows and resolves to nothing, which is the right answer for a slice's length.
+If two types still qualify — two names that collide once case and underscores
+are dropped — neither gets the edge.
 
 **A path call** — `a::b::name(…)` — resolves to nothing at all, no tier tried,
 when its leading segment names nothing here: not `crate`, `self`, `super` or
@@ -436,6 +436,16 @@ The file count is what the run wrote, so on an incremental run it tracks the
 commits picked up rather than the size of the repository: a run that finds one
 commit over one file says one file, whatever else the store already holds.
 
+**Snapshots take care of themselves.** Every open reads `wal.bin` whole and
+replays it, so a store left as a long log makes every hook pay for it. A first
+`ingest-git` therefore snapshots before it returns, and a later `ingest-git` or
+`sync` snapshots when the store has none or when the log has grown past 4 MiB
+since the last one. On this repository that is a 288 ms open against a 173 ms
+one. `touch` never snapshots — it runs on every edit, and a snapshot does not
+fit in that budget; the next `sync` picks it up. The folded log is archived
+rather than dropped, so `node_history`, `edge_history`, `was_linked` and `asof`
+keep reaching it: see [Durability](durability.md).
+
 `dirty` counts the paths handed to the working-tree pass; `scanned` counts those
 of them the graph actually knows and that are still files on disk, so an
 untracked file with no `File` node yet raises the first number and not the
@@ -492,11 +502,13 @@ does.
 
 ### Cost
 
-The work itself is small — re-extracting one file of this repository takes about
-20 ms — but every invocation pays to open the database first, which replays the
-write-ahead log. On a 623-commit graph of this repository (396 files, 5,625
-symbols, a 7 MB log) that open is about 580 ms, so `touch` is about 600 ms end to
-end and `sync` about 1.2 s. Run both in the background from a hook.
+The work itself is small — re-extracting one file of this repository takes a few
+milliseconds, and it is bounded by the files named rather than by the size of
+the repository — but every invocation pays to open the database first. On a
+687-commit graph of this repository (435 files, 6,400 symbols) a snapshotted
+open is about 175 ms, so `touch` is about 190 ms end to end: the open is
+essentially all of it. Without a snapshot the same open is about 290 ms, which
+is why an ingest writes one. Run both in the background from a hook.
 
 ### Git hook
 
