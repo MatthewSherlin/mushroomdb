@@ -5,6 +5,7 @@
 //! shortening, and — above all — [`sanitize`], which every string that came
 //! out of the graph must pass through before it reaches a rendered line.
 
+use crate::repograph::brief::BriefReport;
 use crate::repograph::context::{ContextReport, Target};
 use crate::repograph::impact::{FileImpact, ImpactReport, Partner};
 use crate::repograph::map::RepoMap;
@@ -257,6 +258,25 @@ pub fn cap_lines(text: &str, max: usize) -> String {
     out
 }
 
+/// Keep whole lines while they fit in `max` bytes, dropping the rest.
+///
+/// A budget in bytes, unlike one in lines, can fall in the middle of a line —
+/// and half a line is worse than no line: a path cut short still reads as a
+/// path, and a caller acts on it. So the cut is always at a line ending, and
+/// a first line too long to fit yields nothing rather than a fragment.
+#[must_use]
+pub fn cap_bytes(text: &str, max: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max));
+    for line in text.lines() {
+        if out.len() + line.len() + 1 > max {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// The one line a store with nothing in it gets: what is missing, and the
 /// command that fixes it.
 pub const EMPTY_MAP: &str =
@@ -371,6 +391,80 @@ pub fn render_map(m: &RepoMap) -> String {
     }
 
     cap_lines(&out, MAX_MAP_LINES)
+}
+
+/// Longest session brief, in bytes.
+///
+/// A `SessionStart` hook's output is prepended to a session and cached for the
+/// whole of it, so it is paid for once but carried by every turn. Four
+/// thousand bytes is roughly a thousand tokens: enough for two rankings deep
+/// enough to be worth having, short enough that a session that never asks the
+/// graph anything has lost almost nothing.
+pub const MAX_BRIEF_BYTES: usize = 4_000;
+
+/// The one line a store with nothing in it gets as a session opens: what is
+/// missing, and the command that fixes it. The same answer [`EMPTY_MAP`]
+/// gives, for the same reason — there is nothing to be central *in*, and no
+/// point naming a way to reach an empty graph.
+pub const EMPTY_BRIEF: &str =
+    "mushroomdb brief — empty store; run: mushroomdb ingest-git <db> <repo>\n";
+
+/// Render a [`BriefReport`] as the block a session opens with: at most
+/// [`MAX_BRIEF_BYTES`] bytes, byte-identical for the same report.
+///
+/// `reach` is one line naming how to reach the graph from this session, which
+/// only the caller knows — a tool name on the MCP arm, a command on the CLI
+/// arm. It is appended *after* the budget is applied, so the listings above it
+/// give way to it rather than the other way round: a brief that named central
+/// files but not how to ask about them would be a dead end. It is therefore
+/// the one part exempt from the budget, and a caller handing it a `reach`
+/// longer than the whole budget gets that line and nothing else.
+#[must_use]
+pub fn render_brief(b: &BriefReport, reach: &str) -> String {
+    if b.files == 0 {
+        return EMPTY_BRIEF.to_string();
+    }
+    let tail = format!("reach the graph: {}\n", sanitize(reach));
+
+    // The header: what this repository is, how big, and which commit it is at.
+    // No age — see [`BriefReport::last_sync`].
+    let mut head: Vec<String> = Vec::new();
+    if !b.repo.is_empty() {
+        head.push(sanitize(&b.repo));
+    }
+    head.push(plural(b.files, "file"));
+    head.push(plural(b.symbols, "symbol"));
+    head.push(plural(b.edges, "edge"));
+    if let Some(sha) = &b.last_sync {
+        head.push(format!("synced {}", sanitize(sha)));
+    }
+    let mut out = format!("mushroomdb brief — {}\n", head.join(SEP));
+
+    if !b.key_files.is_empty() {
+        out.push_str("key files (by centrality):\n");
+        for (path, role) in &b.key_files {
+            let _ = writeln!(out, "  {}{}", sanitize(path), suffix(role));
+        }
+    }
+    if !b.key_symbols.is_empty() {
+        out.push_str("key symbols (most called):\n");
+        for (key, sig) in &b.key_symbols {
+            let _ = writeln!(out, "  {}{}", sanitize(key), suffix(sig));
+        }
+    }
+
+    let mut capped = cap_bytes(&out, MAX_BRIEF_BYTES.saturating_sub(tail.len()));
+    capped.push_str(&tail);
+    capped
+}
+
+/// What a listing line adds after its key, when the graph had anything to add.
+fn suffix(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", sanitize(detail))
+    }
 }
 
 // ── the four per-node digests ───────────────────────────────────────────────

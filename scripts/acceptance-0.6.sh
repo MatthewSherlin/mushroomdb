@@ -12,7 +12,7 @@
 #   4. freshness       an edit adds an IMPORTS edge; reverting it retracts one
 #   5. nudge           a dirty file makes `recall` name its co-change partners
 #   6. concurrency     20 parallel writers against a live MCP server
-#   7. timings         ingest, touch and map wall-clock
+#   7. timings         ingest, touch, map and brief wall-clock, and the brief's size
 #
 # Usage:
 #   bash scripts/acceptance-0.6.sh
@@ -23,6 +23,7 @@
 #   MUSHROOMDB_RELEASE  set to 1 to force the timing thresholds on
 #   TOUCH_BUDGET_MS     touch latency budget (default 250)
 #   MAP_BUDGET_MS       map latency budget (default 1000)
+#   BRIEF_BUDGET_MS     brief latency budget (default 300)
 #
 # Timing thresholds are asserted only against a release build — a debug build
 # is several times slower for reasons that have nothing to do with the code
@@ -54,6 +55,14 @@ esac
 # sets TOUCH_BUDGET_MS itself and is unaffected.
 TOUCH_BUDGET_MS="${TOUCH_BUDGET_MS:-250}"
 MAP_BUDGET_MS="${MAP_BUDGET_MS:-1000}"
+# The brief runs once per session, but it runs *before* the first turn, so the
+# user waits on it. It is one PageRank over the files and one pass over the
+# CALLS edges — less work than `map`, which also clusters — so its budget is
+# tighter.
+BRIEF_BUDGET_MS="${BRIEF_BUDGET_MS:-300}"
+# What a SessionStart hook may prepend to a session, in bytes. Mirrors
+# `core_api::repograph::MAX_BRIEF_BYTES`, which the renderer enforces.
+BRIEF_MAX_BYTES=4000
 
 # The file whose import is added and retracted in step 4, and made dirty in
 # step 5. It has to be a tracked Rust file that (a) does not already import
@@ -109,6 +118,12 @@ assert_gt() {
 # assert_eq <actual> <expected> <label>
 assert_eq() {
   if [ "$1" = "$2" ]; then pass "$3 ($1)"; else fail "$3 (got $1, want $2)"; fi
+}
+
+# assert_within <actual> <ceiling> <label> — a size budget, asserted on every
+# build: how many bytes something prints does not depend on how it was compiled.
+assert_within() {
+  if [ "$1" -le "$2" ]; then pass "$3 ($1 <= $2)"; else fail "$3 ($1 > $2)"; fi
 }
 
 # assert_le <actual-ms> <budget-ms> <label> — a no-op on a debug build.
@@ -467,19 +482,37 @@ M4="$(run_ms "$MUSHROOMDB" map "$DB")"
 M5="$(run_ms "$MUSHROOMDB" map "$DB")"
 MAP_MS="$(median "$M1" "$M2" "$M3" "$M4" "$M5")"
 
+# The brief is measured the same way, and the first run is kept: a SessionStart
+# hook's output is prepended to every session, so its size is asserted too.
+BRIEF_OUT="$WORK/brief.out"
+B1="$(run_ms_out "$BRIEF_OUT" "$MUSHROOMDB" brief "$DB")"
+B2="$(run_ms "$MUSHROOMDB" brief "$DB")"
+B3="$(run_ms "$MUSHROOMDB" brief "$DB")"
+B4="$(run_ms "$MUSHROOMDB" brief "$DB")"
+B5="$(run_ms "$MUSHROOMDB" brief "$DB")"
+BRIEF_MS="$(median "$B1" "$B2" "$B3" "$B4" "$B5")"
+BRIEF_BYTES="$(wc -c <"$BRIEF_OUT" | tr -d ' ')"
+
 printf '\n  %-24s %10s  %s\n' "measurement" "value" "budget"
 printf '  %-24s %10s  %s\n' "------------------------" "----------" "------"
 printf '  %-24s %10s  %s\n' "ingest (wall clock)" "${INGEST_MS} ms" "-"
 printf '  %-24s %10s  %s\n' "touch one file (median)" "${TOUCH_MS} ms" "${TOUCH_BUDGET_MS} ms"
 printf '  %-24s %10s  %s\n' "map (median)" "${MAP_MS} ms" "${MAP_BUDGET_MS} ms"
+printf '  %-24s %10s  %s\n' "brief (median)" "${BRIEF_MS} ms" "${BRIEF_BUDGET_MS} ms"
+printf '  %-24s %10s  %s\n' "brief size" "${BRIEF_BYTES} B" "${BRIEF_MAX_BYTES} B"
 printf '  %-24s %10s  %s\n' "files ingested" "$INGEST_FILES" "-"
 printf '  %-24s %10s  %s\n' "symbols" "$SYMBOLS" "> 500"
 printf '  %-24s %10s  %s\n' "IMPORTS edges" "$IMPORTS" "> 100"
 printf '  touch runs (ms): %s %s %s %s %s\n' "$T1" "$T2" "$T3" "$T4" "$T5"
-printf '  map runs (ms):   %s %s %s %s %s\n\n' "$M1" "$M2" "$M3" "$M4" "$M5"
+printf '  map runs (ms):   %s %s %s %s %s\n' "$M1" "$M2" "$M3" "$M4" "$M5"
+printf '  brief runs (ms): %s %s %s %s %s\n\n' "$B1" "$B2" "$B3" "$B4" "$B5"
 
 assert_le "$TOUCH_MS" "$TOUCH_BUDGET_MS" "touch latency"
 assert_le "$MAP_MS" "$MAP_BUDGET_MS" "map latency"
+assert_le "$BRIEF_MS" "$BRIEF_BUDGET_MS" "brief latency"
+assert_contains "$BRIEF_OUT" "mushroomdb brief —" "brief renders its header"
+assert_contains "$BRIEF_OUT" "reach the graph:" "brief says how to reach the graph"
+assert_within "$BRIEF_BYTES" "$BRIEF_MAX_BYTES" "brief within its byte budget"
 
 # ── verdict ──────────────────────────────────────────────────────────────────
 

@@ -194,6 +194,19 @@ fn project_install_writes_npx_entry_and_hooks() {
         s["hooks"]["PostToolUse"][0]["matcher"],
         "Edit|Write|MultiEdit"
     );
+    // The third: one brief per session, on no matcher — a session start is not
+    // a tool call — and on the prompt hook's short timeout.
+    let brief = &s["hooks"]["SessionStart"][0]["hooks"][0];
+    assert_eq!(
+        brief["command"],
+        format!("npx -y mushroomdb@{VERSION} brief '{}'", db.display())
+    );
+    assert_eq!(brief["timeout"], 5);
+    assert!(
+        brief.get("async").is_none(),
+        "the brief is awaited: {brief}"
+    );
+    assert!(s["hooks"]["SessionStart"][0].get("matcher").is_none());
 
     // The summary names the command and closes with the one thing left to do.
     assert!(
@@ -248,6 +261,10 @@ fn project_install_writes_auto_entries() {
     assert_eq!(
         s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
         format!("npx -y mushroomdb@{VERSION} touch --auto")
+    );
+    assert_eq!(
+        s["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} brief --auto")
     );
 
     // All three git hook blocks.
@@ -517,7 +534,11 @@ fn upgrade_rewrites_absolute_entries_to_auto() {
     // Exactly one hook per event: the old absolute-path spelling of the same
     // store is ours, and running both would inject two digests every prompt.
     let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    for (event, sub) in [("UserPromptSubmit", "recall"), ("PostToolUse", "touch")] {
+    for (event, sub) in [
+        ("UserPromptSubmit", "recall"),
+        ("PostToolUse", "touch"),
+        ("SessionStart", "brief"),
+    ] {
         let groups = s["hooks"][event].as_array().unwrap();
         let commands: Vec<&str> = groups
             .iter()
@@ -1528,10 +1549,14 @@ fn upgrade_replaces_stale_hooks_from_a_0_5_install() {
         ptu[0]["hooks"][0]["command"],
         format!("npx -y mushroomdb@{VERSION} touch '{}'", db.display())
     );
-    // The user's own hook is not ours to replace.
+    // The user's own hook under our third event is not ours to replace: the
+    // brief joins it, in a group of its own.
+    let ss = s["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(ss.len(), 2, "the user's hook must survive beside ours: {s}");
+    assert_eq!(ss[0]["hooks"][0]["command"], "echo hi");
     assert_eq!(
-        s["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-        "echo hi"
+        ss[1]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} brief '{}'", db.display())
     );
     assert!(
         out.contains("replaced stale UserPromptSubmit hook"),
@@ -2475,7 +2500,11 @@ fn install_writes_post_tool_use_async_hook_and_uninstall_removes_it() {
         .iter()
         .map(|h| h["event"].as_str().expect("event"))
         .collect();
-    assert_eq!(events, vec!["UserPromptSubmit", "PostToolUse"], "{m}");
+    assert_eq!(
+        events,
+        vec!["UserPromptSubmit", "PostToolUse", "SessionStart"],
+        "{m}"
+    );
 
     run_uninstall(&root, &home, &opts).expect("uninstall");
     let s3: serde_json::Value =
@@ -2484,6 +2513,11 @@ fn install_writes_post_tool_use_async_hook_and_uninstall_removes_it() {
         s3["hooks"]["PostToolUse"].is_null()
             || s3["hooks"]["PostToolUse"].as_array().unwrap().is_empty(),
         "PostToolUse must be gone: {s3}"
+    );
+    assert!(
+        s3["hooks"]["SessionStart"].is_null()
+            || s3["hooks"]["SessionStart"].as_array().unwrap().is_empty(),
+        "SessionStart must be gone: {s3}"
     );
 }
 

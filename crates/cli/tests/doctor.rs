@@ -176,7 +176,12 @@ fn doctor_understands_auto_entries() {
     let store = find_check(&report.output, "store");
     assert!(store.starts_with("ok"), "{store}");
     assert!(store.contains(&db.display().to_string()), "{store}");
-    assert!(find_check(&report.output, "hooks").starts_with("ok"));
+    // All three hook events, named: a missing one is a warning, not silence.
+    let hooks = find_check(&report.output, "hooks");
+    assert!(hooks.starts_with("ok"), "{hooks}");
+    for event in ["UserPromptSubmit", "PostToolUse", "SessionStart"] {
+        assert!(hooks.contains(event), "{hooks}");
+    }
     assert!(find_check(&report.output, "git-hooks").starts_with("ok"));
 }
 

@@ -18,8 +18,8 @@
 use crate::install::{
     claude_mcp_file, cursor_mcp_file, default_db, entry_db, expand_platform, git_hooks_dir,
     has_our_server, is_disabled, is_our_hook_command, line_runs_for_store, resolve_platform,
-    resolve_scope, Externals, Platform, Scope, StoreRef, AUTO_ARG, GIT_HOOKS, HOOK_BEGIN,
-    HOOK_EVENT, TOUCH_EVENT,
+    resolve_scope, Externals, Platform, Scope, StoreRef, AUTO_ARG, BRIEF_EVENT, GIT_HOOKS,
+    HOOK_BEGIN, HOOK_EVENT, TOUCH_EVENT,
 };
 use crate::CliError;
 use core_api::{GraphDb, GraphError, OpenOptions};
@@ -573,11 +573,12 @@ fn check_hooks(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef)
     let root = read_json(&settings_file).unwrap_or(Js::Null);
     let has_recall = has_hook_matching(&root, HOOK_EVENT, "recall", store);
     let has_touch = has_hook_matching(&root, TOUCH_EVENT, "touch", store);
-    if has_recall && has_touch {
+    let has_brief = has_hook_matching(&root, BRIEF_EVENT, "brief", store);
+    if has_recall && has_touch && has_brief {
         Check::ok(
             "hooks",
             format!(
-                "{HOOK_EVENT} + {TOUCH_EVENT} present in {}",
+                "{HOOK_EVENT} + {TOUCH_EVENT} + {BRIEF_EVENT} present in {}",
                 settings_file.display()
             ),
         )
@@ -588,6 +589,9 @@ fn check_hooks(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef)
         }
         if !has_touch {
             missing.push(TOUCH_EVENT);
+        }
+        if !has_brief {
+            missing.push(BRIEF_EVENT);
         }
         Check::warn(
             "hooks",

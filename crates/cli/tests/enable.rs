@@ -131,6 +131,7 @@ fn disable_removes_hooks_and_mcp_entry_and_keeps_skill_store_gitignore() {
     let settings_before: serde_json::Value = read_json(&root, ".claude/settings.json");
     assert!(settings_before["hooks"]["UserPromptSubmit"].is_array());
     assert!(settings_before["hooks"]["PostToolUse"].is_array());
+    assert!(settings_before["hooks"]["SessionStart"].is_array());
     for name in ["post-commit", "post-checkout", "post-merge"] {
         assert!(
             fs::read_to_string(hooks_dir.join(name))
@@ -171,6 +172,13 @@ fn disable_removes_hooks_and_mcp_entry_and_keeps_skill_store_gitignore() {
     );
     assert!(
         settings["hooks"]["PostToolUse"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true),
+        "{settings}"
+    );
+    assert!(
+        settings["hooks"]["SessionStart"]
             .as_array()
             .map(|a| a.is_empty())
             .unwrap_or(true),

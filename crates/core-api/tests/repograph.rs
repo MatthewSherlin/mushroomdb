@@ -12,9 +12,9 @@ use common::{
     SYNCED_AT,
 };
 use core_api::repograph::{
-    context, impact, owners, recall_digest, remember, render_context, render_impact, render_map,
-    render_owners, render_why, repo_map, shortest_path, stale_concepts, why, ImpactOptions,
-    MapOptions, RememberInput, Target,
+    brief, context, impact, owners, recall_digest, remember, render_brief, render_context,
+    render_impact, render_map, render_owners, render_why, repo_map, shortest_path, stale_concepts,
+    why, BriefOptions, ImpactOptions, MapOptions, RememberInput, Target,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -417,6 +417,134 @@ fn the_synthetic_store_has_the_shape_the_suites_assume() {
     assert!(!db.weighted_edges("CO_CHANGED", Some("score")).is_empty());
     assert!(!db.weighted_edges("CALLS", None).is_empty());
     assert!(!db.weighted_edges("TOP_AUTHOR", None).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// `brief`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn brief_is_deterministic_and_within_budget() {
+    let dir = tmp("brief-budget");
+    let db = synthetic_repo_store(&dir);
+    let a = brief(&db, &BriefOptions::default());
+    let b = brief(&db, &BriefOptions::default());
+    assert_eq!(a.key_files, b.key_files);
+    assert_eq!(a.key_symbols, b.key_symbols);
+    assert!(a.key_files.len() <= 25 && a.key_symbols.len() <= 25);
+
+    let text = render_brief(&a, "explore <target>");
+    assert!(
+        text.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        "{}",
+        text.len()
+    );
+    assert!(text.starts_with("mushroomdb brief —"), "{text}");
+    assert!(
+        !text.contains("ago"),
+        "no relative times: the brief must be byte-stable across prompts"
+    );
+    assert!(text.contains("reach the graph: explore <target>"), "{text}");
+    assert_eq!(
+        text,
+        render_brief(&b, "explore <target>"),
+        "the same store renders the same bytes"
+    );
+}
+
+#[test]
+fn brief_on_empty_store_renders_one_helpful_line() {
+    let dir = tmp("brief-empty");
+    let db = open(&dir);
+    let b = brief(&db, &BriefOptions::default());
+
+    assert_eq!(b.files, 0);
+    assert!(b.key_files.is_empty() && b.key_symbols.is_empty() && b.last_sync.is_none());
+    let text = render_brief(&b, "explore <target>");
+    assert_eq!(
+        text, "mushroomdb brief — empty store; run: mushroomdb ingest-git <db> <repo>\n",
+        "a session that opens on an empty store is told what is missing, not \
+         how to reach a graph with nothing in it"
+    );
+    assert_eq!(text.lines().count(), 1);
+}
+
+#[test]
+fn brief_ranks_files_by_centrality_and_symbols_by_callers() {
+    let dir = tmp("brief-ranking");
+    let db = synthetic_repo_store(&dir);
+    let b = brief(&db, &BriefOptions::default());
+
+    assert_eq!(b.repo, "repo", "the marker's repo path, by its basename");
+    assert_eq!(b.files, 30);
+    assert_eq!(b.symbols, 12);
+    assert!(b.edges > 0);
+    assert_eq!(b.last_sync.as_deref(), Some(&sha(COMMITS - 1)[..7]));
+
+    // The same ranking `map` prints, just deeper: the three hubs first.
+    let ranked: Vec<&str> = b.key_files.iter().map(|(k, _)| k.as_str()).collect();
+    let m = repo_map(&db, &MapOptions::default());
+    let map_ranked: Vec<&str> = m.key_files.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(
+        ranked.starts_with(&map_ranked),
+        "brief and map must not rank the same files differently:\n{ranked:?}\n{map_ranked:?}"
+    );
+
+    // Symbols come by how many other symbols call them, ties on the key.
+    let called: Vec<&str> = b.key_symbols.iter().map(|(k, _)| k.as_str()).collect();
+    let callers = |key: &str| {
+        db.weighted_edges("CALLS", None)
+            .into_iter()
+            .filter(|(_, dst, _)| dst == key)
+            .count()
+    };
+    let counts: Vec<usize> = called.iter().map(|k| callers(k)).collect();
+    assert!(
+        counts.windows(2).all(|w| w[0] >= w[1]),
+        "most called first: {called:?} {counts:?}"
+    );
+    assert!(
+        b.key_symbols.iter().any(|(_, sig)| sig.starts_with("fn ")),
+        "each symbol carries the first line of its signature: {:?}",
+        b.key_symbols
+    );
+}
+
+#[test]
+fn a_long_brief_is_capped_by_whole_lines_and_keeps_the_reach_line() {
+    let dir = tmp("brief-cap");
+    let db = synthetic_repo_store(&dir);
+    let b = brief(
+        &db,
+        &BriefOptions {
+            max_files: 30,
+            max_symbols: 12,
+        },
+    );
+    // A reach line long enough that the budget cannot hold the whole listing.
+    let reach = format!("explore <target> {}", "x".repeat(3_000));
+    let text = render_brief(&b, &reach);
+    let whole = render_brief(&b, "explore <target>");
+    assert!(
+        text.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        "{}",
+        text.len()
+    );
+    assert!(
+        text.ends_with(&format!("reach the graph: {reach}\n")),
+        "the reach line survives the cap: {text}"
+    );
+    assert!(
+        text.lines().count() < whole.lines().count(),
+        "the long reach line must have pushed listing lines out: {text}"
+    );
+    let kept: Vec<&str> = whole.lines().collect();
+    for line in text.lines().filter(|l| !l.starts_with("reach the graph:")) {
+        assert!(
+            kept.contains(&line),
+            "the cap drops whole lines, never half of one: {line:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

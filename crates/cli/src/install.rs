@@ -262,7 +262,7 @@ pub const AUTO_ARG: &str = "--auto";
 
 /// How the config an install writes names the store.
 ///
-/// A project install writes `--auto`, not a path. The MCP entry, the two
+/// A project install writes `--auto`, not a path. The MCP entry, the three
 /// settings hooks and the three git hook blocks then resolve the store when
 /// they run — `$CLAUDE_PROJECT_DIR/mushroom-memory`, else `mushroom-memory` at
 /// the root of the working tree they were run in.
@@ -502,7 +502,7 @@ pub fn default_db(scope: Scope, project_root: &Path, home: &Path) -> PathBuf {
 /// simply see a graph with nothing in it. So those two get the path.
 ///
 /// The worktree argument is weaker for them in any case. `.mcp.json` and the
-/// two settings hooks are Claude Code's, and they are what a `git worktree`
+/// three settings hooks are Claude Code's, and they are what a `git worktree`
 /// carries across; a Cursor install's committed artifact is one rules file
 /// that names the store in prose.
 fn resolves_at_runtime(platform: &Platform) -> bool {
@@ -1042,12 +1042,21 @@ const TOUCH_MATCHER: &str = "Edit|Write|MultiEdit";
 /// bounds a background process rather than the assistant's turn.
 const TOUCH_TIMEOUT_SECS: u64 = 30;
 
+/// The third hook event: fires once as a session opens, so the assistant knows
+/// what the repository is before it is asked anything.
+///
+/// No matcher — a session start is not a tool call — and not `async`: the
+/// point of the brief is to be there for the first turn, and the host caches
+/// its output for the rest of the session, so it is read once and paid for
+/// once. It shares the prompt hook's [`HOOK_TIMEOUT_SECS`] budget.
+pub(crate) const BRIEF_EVENT: &str = "SessionStart";
+
 /// Single-quote `s` for embedding in a POSIX shell command line, escaping
 /// embedded single quotes as `'\''`. Claude Code runs a `type: "command"`
 /// hook through a shell, so an unquoted path containing whitespace or shell
 /// metacharacters is word-split and the hook silently receives the wrong
 /// arguments — quoting keeps the command exact.
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
@@ -1061,6 +1070,11 @@ fn recall_hook_command(shell: &str, store: &StoreRef) -> String {
 /// hook mode prints nothing and exits 0 whatever it is handed.
 fn touch_hook_command(shell: &str, store: &StoreRef) -> String {
     format!("{shell} touch {}", store.shell_arg())
+}
+
+/// The exact command string written into the session-start hook entry.
+fn brief_hook_command(shell: &str, store: &StoreRef) -> String {
+    format!("{shell} brief {}", store.shell_arg())
 }
 
 /// One `hooks.<event>` array entry in Claude Code's settings.json shape.
@@ -1746,7 +1760,7 @@ pub fn run_uninstall_with(
 // ---------------------------------------------------------------------------
 //
 // `disable` takes the dynamic, per-assistant config off disk — the MCP entry,
-// the two Claude Code hooks, the three git hook blocks, the Codex
+// the three Claude Code hooks, the three git hook blocks, the Codex
 // registration — and leaves everything a person might have customised or that
 // the store depends on: the skill/rules file, the store itself, the
 // `.gitignore` line. `enable` puts the config back, re-derived from whatever
@@ -1862,7 +1876,7 @@ fn repo_store_for_enable(stores: &[(Platform, StoreRef)]) -> StoreRef {
         .expect("enable always resolves at least one platform")
 }
 
-/// Turn an install off: remove the MCP entry, the two Claude Code hooks, the
+/// Turn an install off: remove the MCP entry, the three Claude Code hooks, the
 /// git hook blocks and the Codex registration; leave the skill/rules file, the
 /// store, and the `.gitignore` line untouched. Idempotent.
 pub fn run_disable(
@@ -1952,7 +1966,7 @@ pub fn run_disable_with(
     Ok(out)
 }
 
-/// Turn a disabled install back on. Re-adds the MCP entry, the two Claude Code
+/// Turn a disabled install back on. Re-adds the MCP entry, the three Claude Code
 /// hooks and the git hook blocks using the store a stashed entry named and the
 /// command `install` would resolve right now — not a replay of what
 /// `disable` took out, which may no longer be the fastest path to the
@@ -2365,8 +2379,9 @@ fn install_claude_code(
     let mcp_file = claude_mcp_file(ctx.project_root, ctx.home, ctx.scope);
     merge_mcp_entry(&mcp_file, ctx, store, manifest, notes)?;
 
-    // Both hooks: settings.json in the same scope as the skill. The prompt
-    // hook first, so a manifest lists them in the order they were written.
+    // All three hooks: settings.json in the same scope as the skill. The
+    // prompt hook first, so a manifest lists them in the order they were
+    // written.
     let settings_file = match ctx.scope {
         Scope::Project => ctx.project_root.join(".claude").join("settings.json"),
         Scope::User => ctx.home.join(".claude").join("settings.json"),
@@ -2394,6 +2409,17 @@ fn install_claude_code(
         TOUCH_EVENT,
         &touch,
         touch_hook_entry(&touch),
+        manifest,
+    )?;
+    let brief = brief_hook_command(&shell, store);
+    if remove_stale_hooks(&settings_file, BRIEF_EVENT, "brief", store, &brief)? {
+        notes.push(format!("replaced stale {BRIEF_EVENT} hook"));
+    }
+    merge_hook_entry(
+        &settings_file,
+        BRIEF_EVENT,
+        &brief,
+        hook_entry(&brief),
         manifest,
     )?;
 

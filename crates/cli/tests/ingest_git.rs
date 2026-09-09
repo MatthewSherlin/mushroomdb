@@ -1693,3 +1693,81 @@ fn an_incremental_run_writes_only_what_the_commit_touched() {
          one commit per property makes it thirteen"
     );
 }
+
+/// `brief` is the `SessionStart` hook body, so it is measured by what a host
+/// prepends to a session: the same bytes every time, inside the budget, and
+/// nothing at all when the store cannot be read.
+#[test]
+fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
+    let repo = tmp("brief-repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(
+        &repo,
+        "alice",
+        "core and its callers",
+        &[
+            ("src/core.rs", "pub fn core() {}\n"),
+            (
+                "src/a.rs",
+                "use crate::core;\npub fn a() { core::core(); }\n",
+            ),
+            (
+                "src/b.rs",
+                "use crate::core;\npub fn b() { core::core(); }\n",
+            ),
+        ],
+    );
+
+    let db_dir = tmp("brief-db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    let text = cli::run_brief(&db_dir).expect("brief");
+    assert_eq!(text, cli::run_brief(&db_dir).expect("brief"));
+    assert!(
+        text.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        "{} bytes",
+        text.len()
+    );
+    // The header names the repository, its size and the sha it is at — and no
+    // age, which is what would move between two prompts of one session.
+    let header = text.lines().next().unwrap();
+    let name = repo.file_name().unwrap().to_str().unwrap();
+    let sha = marker(&db_dir, "__mushroomdb_git_sync__").expect("a sync marker");
+    assert!(
+        header.starts_with(&format!(
+            "mushroomdb brief — {name} · 3 files · 3 symbols · "
+        )),
+        "{header}"
+    );
+    assert!(
+        header.ends_with(&format!("· synced {}", &sha[..7])),
+        "{header}"
+    );
+    assert!(!header.contains("ago"), "{header}");
+    assert!(text.contains("src/core.rs"), "{text}");
+    // The last line names both doors, and the CLI one is runnable: `context`
+    // takes a store, so the line has to carry one.
+    let reach = text.lines().next_back().unwrap();
+    assert!(
+        reach.starts_with("reach the graph: context <target> (MCP tool)"),
+        "{reach}"
+    );
+    assert!(
+        reach.ends_with(&format!(" context '{}' <target>", db_dir.display())),
+        "{reach}"
+    );
+
+    // The hook's own contract: a store that cannot be opened at all says
+    // nothing rather than opening a session with an error on stderr and a
+    // non-zero exit.
+    let not_a_store = repo.join("not-a-store");
+    std::fs::write(&not_a_store, "a file where a store would be\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("brief")
+        .arg(&not_a_store)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the hook must never fail a session");
+    assert!(out.stdout.is_empty(), "{:?}", String::from_utf8(out.stdout));
+    assert!(out.stderr.is_empty(), "{:?}", String::from_utf8(out.stderr));
+}

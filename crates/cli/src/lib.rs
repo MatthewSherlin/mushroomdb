@@ -324,6 +324,12 @@ pub enum Command {
         db_dir: Option<PathBuf>,
         auto: bool,
     },
+    /// Body of the Claude Code SessionStart hook: prints the repository in one
+    /// byte-stable block, which the host caches for the whole session.
+    Brief {
+        db_dir: Option<PathBuf>,
+        auto: bool,
+    },
     /// Bring the store up to date with the repository the `GitSync` marker
     /// names: the commits since the marker, then the dirty working tree.
     Sync {
@@ -439,6 +445,9 @@ Usage:
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
   mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
+  mushroomdb brief <db-dir>|--auto    hook body: the repository in one block — size, synced sha, the most
+                                   central files and the most called symbols; byte-stable, so a session
+                                   host caches it once
   mushroomdb sync <db-dir>|--auto [--json]
                                    re-sync the repo the store was built from: new commits, then the
                                    dirty working tree (git hook body)
@@ -767,6 +776,8 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "export" => parse_export(&args[1..]),
         "recall" => parse_dir_or_auto("recall", &args[1..])
             .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
+        "brief" => parse_dir_or_auto("brief", &args[1..])
+            .map(|(db_dir, auto)| Command::Brief { db_dir, auto }),
         "sync" => parse_sync(&args[1..]),
         "map" => parse_dir_with_json("map", &args[1..])
             .map(|(db_dir, json)| Command::Map { db_dir, json }),
@@ -1623,6 +1634,33 @@ pub fn run_map(db_dir: &Path, json: bool) -> Result<String, CliError> {
         return Ok(out);
     }
     Ok(repograph::render_map(&map))
+}
+
+/// Body of `mushroomdb brief <db-dir>|--auto`, the `SessionStart` hook.
+///
+/// Byte-stable for a given store: the host caches this output for the whole
+/// session, so two prompts of the same session must not disagree about what
+/// the repository is. Opened read-only like every other question.
+pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
+    let db = open_for_reading(db_dir)?;
+    let report = repograph::brief(&db, &repograph::BriefOptions::default());
+    Ok(repograph::render_brief(&report, &reach_line(db_dir)))
+}
+
+/// The brief's last line: how to reach the graph from this session.
+///
+/// Two doors, because a session may have either one open — the MCP tool, and
+/// the same question typed at a shell. The command names the binary the way
+/// `install` would resolve it right now, which is the same resolution the
+/// hooks themselves were written with, and it names the store, because
+/// `context` takes one.
+fn reach_line(db_dir: &Path) -> String {
+    let sep = repograph::render::SEP;
+    format!(
+        "context <target> (MCP tool){sep}or: {} context {} <target>",
+        install::detect_mcp_command(None).shell(),
+        install::sh_quote(&db_dir.to_string_lossy())
+    )
 }
 
 /// Open a store the way every question about it is asked: read-only, with both
@@ -4211,7 +4249,21 @@ mod tests {
                 auto: true
             }
         );
-        for cmd in ["mcp", "recall", "touch"] {
+        assert_eq!(
+            parse_args(&["brief", "--auto"]).unwrap(),
+            Command::Brief {
+                db_dir: None,
+                auto: true
+            }
+        );
+        assert_eq!(
+            parse_args(&["brief", "/tmp/db"]).unwrap(),
+            Command::Brief {
+                db_dir: Some(PathBuf::from("/tmp/db")),
+                auto: false
+            }
+        );
+        for cmd in ["mcp", "recall", "touch", "brief"] {
             assert!(parse_args(&[cmd]).is_err(), "{cmd} with no target");
             assert!(
                 parse_args(&[cmd, "/tmp/db", "--auto"]).is_err(),

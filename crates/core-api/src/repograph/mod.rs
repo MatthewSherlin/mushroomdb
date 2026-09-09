@@ -9,6 +9,7 @@
 //! | Tool | Answers |
 //! |---|---|
 //! | [`repo_map`] | what is this repository, in one screen |
+//! | [`brief`] | the same, for the start of a session, in a fixed byte budget |
 //! | [`context`] | everything known about one file or symbol |
 //! | [`impact`] | what else the files in a diff reach |
 //! | [`owners`] | who has written a file, and when |
@@ -35,6 +36,7 @@
 //! source it quotes comes from the working tree, so what it shows is what is on
 //! disk now.
 
+mod brief;
 mod concepts;
 mod context;
 mod facts;
@@ -48,6 +50,7 @@ pub mod render;
 pub mod rules;
 mod why;
 
+pub use brief::{brief, BriefOptions, BriefReport};
 pub use concepts::stale_concepts;
 pub use context::{context, CallSites, ContextReport, Target, MAX_SOURCE_LINES};
 pub use impact::{
@@ -63,7 +66,7 @@ pub use recall::{
 };
 pub use remember::{remember, RememberInput, NOTE_KINDS};
 pub use render::{
-    render_context, render_impact, render_map, render_owners, render_why, sanitize,
-    MAX_CONTEXT_LINES, MAX_MAP_LINES, MAX_TOOL_LINES,
+    render_brief, render_context, render_impact, render_map, render_owners, render_why, sanitize,
+    EMPTY_BRIEF, MAX_BRIEF_BYTES, MAX_CONTEXT_LINES, MAX_MAP_LINES, MAX_TOOL_LINES,
 };
 pub use why::{why, SharedCommits, WhyLink, WhyReport};

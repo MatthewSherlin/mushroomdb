@@ -36,6 +36,21 @@ fn main() -> ExitCode {
             let _ = stdout.flush();
             ExitCode::SUCCESS // never block the prompt
         }
+        Ok(Command::Brief { db_dir, auto }) => {
+            // A SessionStart hook is the first thing a session sees. A store
+            // that cannot be opened at all — missing, held by a writer, not a
+            // store — has no brief to give, and greeting the user with that
+            // error is worse than opening in silence: every failure here
+            // prints nothing and exits 0. (A store that opens but is *empty*
+            // does have something to say, and says it.)
+            let brief = silently(|| cli::run_brief(&resolve_db(db_dir, auto)))
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(brief.as_bytes());
+            let _ = stdout.flush();
+            ExitCode::SUCCESS
+        }
         Ok(Command::Map { db_dir, json }) => match cli::run_map(&db_dir, json) {
             Ok(out) => {
                 print!("{out}");
