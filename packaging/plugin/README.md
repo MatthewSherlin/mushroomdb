@@ -19,14 +19,30 @@ After that it is task-first: `impact` before an edit, `context` on a file or sym
 
 - **MCP server** (`.mcp.json`) — runs `npx -y mushroomdb@<version> mcp --auto`, one process per project, talking to the graph over stdio.
 - **Skill** (`skills/mushroom/SKILL.md`, invoked as `/mushroom:mushroom`).
-- **`UserPromptSubmit` hook** — runs `npx -y mushroomdb@<version> recall --auto` (5 s timeout) before each turn, printing a recall digest of related graph facts as context.
-- **`PostToolUse` hook** (matcher `Edit|Write|MultiEdit`) — runs `npx -y mushroomdb@<version> touch --auto` (30 s timeout, async) after an edit, so the graph re-extracts the changed file without blocking the turn.
+- **`UserPromptSubmit` hook** — runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh recall --auto` (5 s timeout) before each turn, printing a recall digest of related graph facts as context.
+- **`PostToolUse` hook** (matcher `Edit|Write|MultiEdit`) — runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh touch --auto` (30 s timeout, async) after an edit, so the graph re-extracts the changed file without blocking the turn.
 
 The plugin writes **no git hooks** — a plugin has no business editing `.git/hooks`. If you want a commit, checkout or merge to sync the graph, run `mushroomdb install --project` alongside it, or add the hooks yourself.
 
+## `hooks/run.sh` — why the hooks do not call `npx`
+
+`npx -y mushroomdb@<version> …` costs about half a second before it does any work: a cache check, a version resolve, and a Node process of its own. The MCP server pays that once per session, which is fine. The two hooks fire on **every prompt and every file edit**, which is not.
+
+So the hooks call `run.sh` instead. On its first run it asks the package where it lives — `npx -y mushroomdb@<version> --print-launcher`, which prints the absolute path of the package's own launcher script — writes that one line to
+
+```
+${CLAUDE_PLUGIN_DATA:-~/.mushroomdb}/launcher-<version>
+```
+
+and then `exec node <launcher>`. Every later hook reads the cached line and skips straight to the `exec`. Measured on a warm cache: about 510 ms through `npx`, about 130 ms through the cached launcher.
+
+The cache is keyed by version, so a plugin upgrade resolves afresh rather than running the old copy; the stale file from the previous version is a single line and is simply left behind. The path is re-checked every time, since npm's cache can be pruned out from under it. Anything that goes wrong — no `node`, no `npx`, a package older than the flag, a path that no longer exists — falls through to plain `npx -y mushroomdb@<version> "$@"`, which is slower and always correct.
+
+`run.sh` is rendered from `scripts/plugin-templates/run.sh.tmpl` (it embeds the version) and must stay executable; `scripts/render-plugin.sh --check` fails if it is stale or loses its executable bit.
+
 ## `--auto` store location
 
-`--auto` resolves the database as `$CLAUDE_PROJECT_DIR/mushroom-memory` (the environment variable Claude Code sets for plugin MCP servers and hook processes), falling back to `./mushroom-memory` when it is unset. Nothing is written outside the project directory, and the store directory is added to the repository's `.gitignore` on first `ingest-git`.
+`--auto` resolves the database as `$CLAUDE_PROJECT_DIR/mushroom-memory` (the environment variable Claude Code sets for plugin MCP servers and hook processes), falling back to `mushroom-memory` at the root of the working tree the command ran in. That fallback finds a *working tree*, not the `.git` directory worktrees share, so each `git worktree add` gets its own graph rather than reading the checkout next door's. Nothing is written outside the project directory, and the store directory is added to the repository's `.gitignore` on first `ingest-git`.
 
 Several processes can share that store safely: the MCP server, both hooks and any `mushroomdb` command coordinate through one advisory `LOCK` file, and a writer that cannot get it retries on the next event rather than failing the turn. See [`docs/site/concurrency.md`](../../docs/site/concurrency.md).
 

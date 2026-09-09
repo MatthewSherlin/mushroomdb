@@ -22,12 +22,16 @@ correct.
 
 The plugin ships the MCP server (`npx -y mushroomdb@<version> mcp --auto`), the
 skill, and both hooks. `--auto` resolves the store as
-`$CLAUDE_PROJECT_DIR/mushroom-memory`, falling back to `./mushroom-memory`.
-Nothing is written outside the project directory. It writes no git hooks — a
-plugin has no place editing `.git/hooks` — so add them with
+`$CLAUDE_PROJECT_DIR/mushroom-memory`, falling back to `mushroom-memory` at the
+root of the working tree the command ran in, so each `git worktree` gets its
+own graph. Nothing is written outside the project directory. It writes no git
+hooks — a plugin has no place editing `.git/hooks` — so add them with
 `mushroomdb install --project` if you want a commit to sync the graph.
 
-Details and local-development commands:
+The two hooks go through `hooks/run.sh`, which resolves the published package
+once and caches the answer, so no prompt or edit pays for an `npx` spawn.
+
+Details, the cache location and local-development commands:
 [`packaging/plugin/README.md`](../../packaging/plugin/README.md).
 
 ## Route 2 — `mushroomdb install`
@@ -99,10 +103,10 @@ Cursor gets the same content as an always-apply rules file
 |------|-------------|
 | `--platform claude-code\|cursor\|codex\|all` | Target platform. Default: auto-detect (reads `~/.claude` / `.cursor/` presence). `all` is Claude Code and Cursor; Codex is opt-in, because registering with it runs another program. |
 | `--project` / `--user` | Scope. Default: auto — project inside a git checkout, user anywhere else. |
-| `--db <path>` | Database directory. Default: `./mushroom-memory` (project) or `~/.mushroomdb/memory` (user). |
+| `--db <path>` | **Pins** the store to this absolute path. Without it a project install writes `--auto`, which resolves at run time to `$CLAUDE_PROJECT_DIR/mushroom-memory` or `mushroom-memory` at the working tree's root — so committed config is right in every `git worktree` rather than pointing them all at the checkout the install was typed in. A user install always pins `~/.mushroomdb/memory`. |
 | `--command <path>` | Invoke this binary instead of `npx`. Use it for a local build or a pinned install. A relative path is fine to type: it is anchored to the current directory before anything is written, because the assistant spawns the server from a directory of its own. `--db` is anchored the same way. A bare name with no separator (`--command mushroomdb`) means a `PATH` lookup and is written exactly as given. |
 | `--no-git-hooks` | Skip the `post-commit` / `post-checkout` / `post-merge` sync hooks. |
-| `--no-prewarm` | Skip the one-off `npx -y mushroomdb@<version> --version` fetch. |
+| `--no-prewarm` | Reach the network for nothing during the install. That skips both the one-off package fetch and the launcher resolution below, so the hooks keep the slower `npx` form. |
 
 ---
 
@@ -112,11 +116,15 @@ Your assistant spawns the MCP server by the `command` in the config entry, so
 that command must resolve from the assistant's process, not just your shell.
 `install` picks the form that will actually work:
 
+`<store>` below is `--auto` for a project install and an absolute path for a
+user install or a `--db`.
+
 | Situation | `command` / `args` written | Why |
 |-----------|----------------------------|-----|
-| Default | `npx` with `["-y","mushroomdb@<version>","mcp","<db>"]` | Resolves on any machine with Node, needs nothing installed globally, and the version is pinned to the binary that wrote the entry. |
-| The `mushroomdb` on `PATH` is this binary (`cargo install`, Homebrew — a symlink to it counts) | `mushroomdb` with `["mcp","<db>"]` | Bare name follows upgrades automatically. |
-| `--command <path>` | that path, with `["mcp","<db>"]` | You said which binary; nothing is guessed. |
+| Default, package resolved | `node` with `["<launcher.js>","mcp","<store>"]` | The published package, located once at install time. Nothing re-resolves it per invocation. |
+| Default, package not resolved | `npx` with `["-y","mushroomdb@<version>","mcp","<store>"]` | Resolves on any machine with Node, needs nothing installed globally, and the version is pinned to the binary that wrote the entry. |
+| The `mushroomdb` on `PATH` is this binary (`cargo install`, Homebrew — a symlink to it counts) | `mushroomdb` with `["mcp","<store>"]` | Bare name follows upgrades automatically. |
+| `--command <path>` | that path, with `["mcp","<store>"]` | You said which binary; nothing is guessed. |
 
 The bare name is written only when the test passes on identity, not name:
 `install` canonicalizes the `mushroomdb` that `PATH` resolves to and the
@@ -128,10 +136,25 @@ The same command is substituted into the skill's bootstrap lines, shell-quoted
 where a shell will read it, so `ingest-git` and `serve` can be pasted straight
 out of the skill.
 
-If `npx` is on `PATH`, `install` runs `npx -y mushroomdb@<version> --version`
-once (up to 180 s) so the assistant's first spawn is not a cold download. It is
-best effort: a failure prints a warning and the install still succeeds. Skip it
-with `--no-prewarm`.
+### Resolving the package once instead of per invocation
+
+`npx` is not free. Before it runs anything it checks its cache, resolves the
+version and starts a Node process of its own — around half a second on a warm
+cache — and the two hooks below fire on every prompt and every file edit.
+
+So when the `npx` form applies, `install` runs
+`npx -y mushroomdb@<version> --print-launcher` once (up to 180 s). The package
+answers with the absolute path of its own launcher script, and everything
+written — the MCP entry, both hooks, all three git hook blocks — runs
+`node <that path>` instead. That is about a quarter of the wall clock, and the
+same fetch warms the cache, so it replaces the old pre-warm rather than adding
+to it.
+
+It is best effort. If `npx` or `node` is missing, the package is older than the
+flag, or the path it prints is not there, the install prints one warning, keeps
+the `npx` form, and succeeds. `--no-prewarm` skips the whole step, and a later
+`install` (an upgrade, say) re-resolves. `doctor` re-checks that the resolved
+launcher still exists — npm's cache can be pruned — and says so if it does not.
 
 ---
 
@@ -144,9 +167,9 @@ with `--no-prewarm`.
 | `.claude/skills/mushroom/SKILL.md` | The `/mushroom` skill, with `{{DB_PATH}}` and `{{BIN}}` substituted for your db path and the resolved command. |
 | `.mcp.json` | `mcpServers.mushroomdb` entry (see above). Created if absent; merged if present. |
 | `.claude/skills/mushroom/.install-manifest.json` | Manifest of everything written — consumed by `uninstall`. |
-| `.claude/settings.json` | Two hook entries. `hooks.UserPromptSubmit` runs `<bin> recall <db>` (5 s timeout) so related facts are injected before each prompt; `hooks.PostToolUse`, matched to `Edit|Write|MultiEdit`, runs `<bin> touch <db>` (30 s, `async`) so an edited file reaches the graph without the tool call waiting. Hooks load at session start: restart Claude Code after install. |
+| `.claude/settings.json` | Two hook entries. `hooks.UserPromptSubmit` runs `<bin> recall <store>` (5 s timeout) so related facts are injected before each prompt; `hooks.PostToolUse`, matched to `Edit|Write|MultiEdit`, runs `<bin> touch <store>` (30 s, `async`) so an edited file reaches the graph without the tool call waiting. Hooks load at session start: restart Claude Code after install. |
 | `.gitignore` | One line for the store directory, when the store is inside the repository. Removed on uninstall. |
-| `.git/hooks/post-commit`, `post-checkout`, `post-merge` | A marked block running a backgrounded, silenced `<bin> sync <db>`, so the graph follows commits, branch switches and merges. Your own lines in those files are preserved, and only the marked block is removed on uninstall. Skip with `--no-git-hooks`. |
+| `.git/hooks/post-commit`, `post-checkout`, `post-merge` | A marked block running a backgrounded, silenced `<bin> sync <store>`, so the graph follows commits, branch switches and merges. Your own lines in those files are preserved, and only the marked block is removed on uninstall. Skip with `--no-git-hooks`. |
 
 ### Claude Code — user scope (`--user`)
 
@@ -292,10 +315,12 @@ replaces the absolute path a 0.5.x install wrote, and re-pins an older version.
 
 The two settings hooks are replaced the same way, not added beside the old
 ones: any `UserPromptSubmit` or `PostToolUse` hook running `recall` or `touch`
-against this same database is removed first, whatever binary it names, and
-`install` prints `replaced stale <event> hook`. Without that, a 0.5.x upgrade
-would leave the old pair running the copied binary alongside the new pair, and
-every prompt would carry two recall digests.
+against this same store is removed first, whatever binary it names and whichever
+way it spells the store. Both spellings count because 0.6.0 wrote the store's
+absolute path where a project install now writes `--auto`, so an upgrade would
+otherwise leave the old pair running beside the new one and every prompt would
+carry two recall digests. `install` prints `replaced stale <event> hook` when it
+takes one out.
 
 ---
 

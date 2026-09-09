@@ -388,11 +388,11 @@ commit's `message`; the sha and the graph are unaffected.
 
 `ingest-git` is the command you run. `sync` and `touch` are the two a hook runs,
 and neither takes a repository argument — both read it off the `GitSync` node,
-so a hook line carries only the database path and keeps working when the
-checkout moves.
+so a hook line carries only the database and keeps working when the checkout
+moves.
 
 ```
-mushroomdb sync <db-dir> [--json]
+mushroomdb sync <db-dir>|--auto [--json]
 mushroomdb touch <db-dir>|--auto [<file>...]
 ```
 
@@ -491,7 +491,7 @@ end and `sync` about 1.2 s. Run both in the background from a hook.
 
 ```sh
 # >>> mushroomdb >>>
-( 'mushroomdb' sync '/path/to/mushroom-memory' >/dev/null 2>&1 & )
+( 'mushroomdb' sync --auto >/dev/null 2>&1 & )
 # <<< mushroomdb <<<
 ```
 
@@ -499,17 +499,24 @@ The markers make the block replaceable in place, so re-running the installer
 rewrites it rather than stacking a second copy, and removing it leaves every
 other line of the hook untouched.
 
+`--auto` rather than a path is what makes the block correct in more than one
+checkout. Git runs a hook with the working tree it acted on as the working
+directory, and worktrees share one hooks directory, so this single block syncs
+whichever tree the commit landed in. An absolute path here would point every
+`git worktree` at the first checkout's graph. `install --db <path>` writes the
+path instead, for a store deliberately kept somewhere fixed.
+
 ### Editor hook
 
 A commit is not the only thing that changes a file. `install` also wires a
 `PostToolUse` hook matched to `Edit|Write|MultiEdit`, which runs
-`<bin> touch <db>` on the file the tool just wrote:
+`<bin> touch --auto` on the file the tool just wrote:
 
 ```json
 {
   "matcher": "Edit|Write|MultiEdit",
   "hooks": [
-    { "type": "command", "command": "'mushroomdb' touch '/path/to/mushroom-memory'",
+    { "type": "command", "command": "'mushroomdb' touch --auto",
       "timeout": 30, "async": true }
   ]
 }
@@ -523,15 +530,30 @@ concept has gone stale the moment its source file changes.
 
 ### Finding the database without being told
 
-`mcp`, `recall` and `touch` accept `--auto` in place of a path, which resolves,
-in order:
+`mcp`, `recall`, `touch` and `sync` accept `--auto` in place of a path, which
+resolves, in order:
 
 1. `$CLAUDE_PROJECT_DIR/mushroom-memory` — the assistant says which project it
    is working in, and that is the most specific answer available.
-2. `./mushroom-memory`, but only when the working directory is a git checkout.
-   Without that guard a command run from a home directory would quietly create a
-   database there.
+2. `mushroom-memory` at the root of the working tree the current directory is
+   in — the nearest ancestor holding a `.git` entry. Outside a checkout there
+   is no such root, and without that guard a command run from a home directory
+   would quietly create a database there.
 3. `~/.mushroomdb/memory`, the user-scope default `install` writes.
+
+Step 2 finds a *working tree* root, never the `.git` directory several
+worktrees share: a linked worktree keeps a `.git` file at its own root, so each
+`git worktree add` gets its own store. Two checkouts are two different sets of
+files, and a graph built from one answers questions about the other wrongly.
+
+This is why `install --project` writes `--auto` into `.mcp.json`, both settings
+hooks and all three git hook blocks rather than a path. Those files live in the
+repository and get committed; a path baked into them travels to a new worktree
+and points everything there at the original checkout's store. Pass
+`--db <path>` to pin an absolute path instead — that is the flag for a store
+kept deliberately outside the repository. A user-scope install always pins
+`~/.mushroomdb/memory`, since `--auto` inside any checkout would resolve to
+that project instead.
 
 `mushroomdb --version` (or `mushroomdb version`) prints `mushroomdb <version>`.
 

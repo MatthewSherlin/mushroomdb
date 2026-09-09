@@ -134,8 +134,9 @@ claude plugin install mushroom@mushroomdb
 
 Open the repository you want graphed and type `/mushroom:mushroom`. Claude Code
 namespaces plugin-provided skills as `/<plugin>:<skill>`. The skill builds the
-graph on first use; the plugin's MCP server and both hooks run through
-`npx -y mushroomdb@<version>`.
+graph on first use. The MCP server starts through `npx -y mushroomdb@<version>`;
+both hooks go through the plugin's `hooks/run.sh`, which resolves that package
+once and caches the answer, so a prompt or an edit never waits on `npx`.
 
 The plugin writes no git hooks. To get those — a backgrounded `sync` after each
 commit, checkout and merge — or to install for Cursor or Codex, use the CLI
@@ -154,8 +155,17 @@ which it chose. Project scope writes the MCP entry to `.mcp.json`, the
 `.claude/settings.json`, an ignore line for the store, and a backgrounded
 `sync` into the `post-commit`, `post-checkout` and `post-merge` git hooks.
 
-The MCP entry runs `npx -y mushroomdb@<version>`, so the assistant needs
-nothing installed globally. To point it at a local build instead:
+None of those name the store by path: they say `--auto`, and the store is
+resolved when they run. Those files are in the repository and get committed, so
+a path would follow a `git worktree add` across and point the new checkout's
+hooks at the old checkout's graph. With `--auto` each working tree gets its own
+`mushroom-memory`. Pass `--db <path>` to pin an absolute path instead.
+
+The MCP entry runs the published package, so the assistant needs nothing
+installed globally. `install` locates it once (`--print-launcher`) and writes
+`node <launcher>` so the hooks never spawn `npx`; if that resolution fails it
+warns and falls back to `npx -y mushroomdb@<version>`, which still works. To
+point it at a local build instead:
 
 ```text
 mushroomdb install --project --platform claude-code \
