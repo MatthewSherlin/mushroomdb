@@ -72,6 +72,42 @@ def ensure_binary() -> None:
         sh(["cargo", "build", "--release"], cwd=REPO, timeout=3600)
 
 
+def install_subject(subject: Path, extra_install_args: list[str]) -> None:
+    """Clone `subject` if missing, install mushroomdb into it (idempotent),
+    hide the install's dirty-tree artifacts, and ingest its store."""
+    if not subject.exists():
+        print(f"cloning subject -> {subject}")
+        sh(["git", "clone", "-q", str(REPO), str(subject)])
+    if not (subject / ".claude").exists():
+        print(f"installing mushroomdb into {subject.name}")
+        print(sh([
+            str(MUSHROOMDB), "install", "--project",
+            "--platform", "claude-code",
+            "--command", str(MUSHROOMDB),
+            "--no-prewarm", "--no-git-hooks",
+            *extra_install_args,
+        ], cwd=subject))
+    # The install dirties the working tree (.mcp.json, .claude/, .gitignore).
+    # A dirty tree makes the UserPromptSubmit recall hook report the install
+    # artifacts instead of the question, so hide them the way a real project
+    # would have them committed or ignored -- without adding a commit, which
+    # would shift the "last N commits" windows the ground truth depends on.
+    exclude = subject / ".git" / "info" / "exclude"
+    marker = "mushroom-memory/"
+    if marker not in exclude.read_text():
+        sh(["git", "checkout", "--", ".gitignore"], cwd=subject)
+        with exclude.open("a") as fh:
+            fh.write("\n.mcp.json\n.claude/\nmushroom-memory/\n")
+    dirty = sh(["git", "status", "--porcelain"], cwd=subject).strip()
+    if dirty:
+        raise SystemExit(f"{subject.name} clone is not clean after install:\n{dirty}")
+
+    if not (subject / "mushroom-memory").exists():
+        print(f"ingesting {subject.name} store")
+        print(sh([str(MUSHROOMDB), "ingest-git", "./mushroom-memory", "."],
+                 cwd=subject))
+
+
 def setup(force: bool = False, arms: set[str] | None = None) -> None:
     if arms is None:
         arms = {"A", "B", "C", "D"}
@@ -94,65 +130,13 @@ def setup(force: bool = False, arms: set[str] | None = None) -> None:
         if stray.exists():
             raise SystemExit(f"arm A clone is contaminated: {stray}")
 
-    if not SUBJECT_B.exists():
-        print(f"cloning arm B subject -> {SUBJECT_B}")
-        sh(["git", "clone", "-q", str(REPO), str(SUBJECT_B)])
-    if not (SUBJECT_B / ".mcp.json").exists():
-        print("installing mushroomdb into arm B clone")
-        print(sh([
-            str(MUSHROOMDB), "install", "--project",
-            "--platform", "claude-code",
-            "--command", str(MUSHROOMDB),
-            "--no-prewarm", "--no-git-hooks",
-        ], cwd=SUBJECT_B))
-    # The install dirties the working tree (.mcp.json, .claude/, .gitignore).
-    # A dirty tree makes the UserPromptSubmit recall hook report the install
-    # artifacts instead of the question, so hide them the way a real project
-    # would have them committed or ignored -- without adding a commit, which
-    # would shift the "last N commits" windows the ground truth depends on.
-    exclude = SUBJECT_B / ".git" / "info" / "exclude"
-    marker = "mushroom-memory/"
-    if marker not in exclude.read_text():
-        sh(["git", "checkout", "--", ".gitignore"], cwd=SUBJECT_B)
-        with exclude.open("a") as fh:
-            fh.write("\n.mcp.json\n.claude/\nmushroom-memory/\n")
-    dirty = sh(["git", "status", "--porcelain"], cwd=SUBJECT_B).strip()
-    if dirty:
-        raise SystemExit(f"arm B clone is not clean after install:\n{dirty}")
-
-    if not (SUBJECT_B / "mushroom-memory").exists():
-        print("ingesting arm B store")
-        print(sh([str(MUSHROOMDB), "ingest-git", "./mushroom-memory", "."],
-                 cwd=SUBJECT_B))
+    install_subject(SUBJECT_B, [])
 
     # Arm D: mushroomdb installed via `--delivery cli` (no MCP server). That
     # flag doesn't exist on the binary yet (it lands in a later task), so
     # this whole block only runs when D is actually requested.
     if "D" in arms:
-        if not SUBJECT_D.exists():
-            print(f"cloning arm D subject -> {SUBJECT_D}")
-            sh(["git", "clone", "-q", str(REPO), str(SUBJECT_D)])
-        if not (SUBJECT_D / ".claude").exists():
-            print("installing mushroomdb (cli delivery) into arm D clone")
-            print(sh([
-                str(MUSHROOMDB), "install", "--project",
-                "--platform", "claude-code",
-                "--command", str(MUSHROOMDB),
-                "--no-prewarm", "--no-git-hooks",
-                "--delivery", "cli",
-            ], cwd=SUBJECT_D))
-        exclude_d = SUBJECT_D / ".git" / "info" / "exclude"
-        if marker not in exclude_d.read_text():
-            sh(["git", "checkout", "--", ".gitignore"], cwd=SUBJECT_D)
-            with exclude_d.open("a") as fh:
-                fh.write("\n.mcp.json\n.claude/\nmushroom-memory/\n")
-        dirty_d = sh(["git", "status", "--porcelain"], cwd=SUBJECT_D).strip()
-        if dirty_d:
-            raise SystemExit(f"arm D clone is not clean after install:\n{dirty_d}")
-        if not (SUBJECT_D / "mushroom-memory").exists():
-            print("ingesting arm D store")
-            print(sh([str(MUSHROOMDB), "ingest-git", "./mushroom-memory", "."],
-                     cwd=SUBJECT_D))
+        install_subject(SUBJECT_D, ["--delivery", "cli"])
 
     print("regenerating ground truth from arm A clone")
     sh([sys.executable, str(HERE / "ground_truth.py"),
