@@ -275,28 +275,42 @@ fn read_only_open_never_blocks_and_never_locks() {
 
 // ── 6. A snapshot taken by another process is absorbed by refresh ─────────────
 
+/// Both shapes of peer snapshot: the truncating one, and the archiving one
+/// every automatic snapshot now takes. The archiving path rewrites `wal.bin`
+/// *and* `snapshot.bin` and leaves a `wal.<N>.archive` behind, so it is the
+/// variant a live MCP server actually meets under an `ingest-git` or `sync`.
 #[test]
 fn refresh_survives_snapshot_by_other_process() {
-    let d = tmp("peer-snapshot");
-    let db = SharedDb::open(&d).unwrap();
-    {
-        let mut g = db.write();
-        for i in 0..10 {
-            g.insert_node("Person", &format!("p-{i}"), vec![]).unwrap();
+    for kind in ["snapshot", "snapshot-archive"] {
+        let d = tmp(&format!("peer-{kind}"));
+        let db = SharedDb::open(&d).unwrap();
+        {
+            let mut g = db.write();
+            for i in 0..10 {
+                g.insert_node("Person", &format!("p-{i}"), vec![]).unwrap();
+            }
         }
+        assert_eq!(db.read().node_count(), 10);
+
+        let (code, _) = run_worker(&d, &[kind]);
+        assert_eq!(code, 0, "peer {kind} must succeed");
+        if kind == "snapshot-archive" {
+            let archives = std::fs::read_dir(&d)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".archive"))
+                .count();
+            assert_eq!(archives, 1, "the peer archived the WAL it folded in");
+        }
+
+        let mut g = db.write();
+        g.refresh().expect("refresh across a peer's snapshot");
+        assert_eq!(g.node_count(), 10, "state matches after the peer {kind}");
+        assert!(g.node_info("p-7").is_some());
+        drop(g);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
     }
-    assert_eq!(db.read().node_count(), 10);
-
-    let (code, _) = run_worker(&d, &["snapshot"]);
-    assert_eq!(code, 0, "peer snapshot must succeed");
-
-    let mut g = db.write();
-    g.refresh().expect("refresh across a peer's snapshot");
-    assert_eq!(g.node_count(), 10, "state matches after the peer snapshot");
-    assert!(g.node_info("p-7").is_some());
-    drop(g);
-    drop(db);
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 // ── 7. A trailing partial frame is a wait, not a corruption ───────────────────

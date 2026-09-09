@@ -134,8 +134,10 @@ claude plugin install mushroom@mushroomdb
 
 Open the repository you want graphed and type `/mushroom:mushroom`. Claude Code
 namespaces plugin-provided skills as `/<plugin>:<skill>`. The skill builds the
-graph on first use; the plugin's MCP server and both hooks run through
-`npx -y mushroomdb@<version>`.
+graph on first use. The MCP server starts through `npx -y mushroomdb@<version>`;
+both hooks go through the plugin's `hooks/run.sh`, which resolves that package
+to its native binary once and caches the path, so a prompt or an edit never
+waits on `npx`.
 
 The plugin writes no git hooks. To get those — a backgrounded `sync` after each
 commit, checkout and merge — or to install for Cursor or Codex, use the CLI
@@ -154,8 +156,25 @@ which it chose. Project scope writes the MCP entry to `.mcp.json`, the
 `.claude/settings.json`, an ignore line for the store, and a backgrounded
 `sync` into the `post-commit`, `post-checkout` and `post-merge` git hooks.
 
-The MCP entry runs `npx -y mushroomdb@<version>`, so the assistant needs
-nothing installed globally. To point it at a local build instead:
+Inside a git checkout, none of those name the store by path: they say `--auto`,
+and the store is resolved when they run. Those files are in the repository and
+get committed, so a path would follow a `git worktree add` across and point the
+new checkout's hooks at the old checkout's graph. With `--auto` each working
+tree gets its own `mushroom-memory`. Outside a checkout there is no working
+tree root to resolve against, so the store is pinned to the project directory,
+and `--db <path>` pins one anywhere.
+
+A Cursor or Codex install pins the path too. Only Claude Code sets
+`$CLAUDE_PROJECT_DIR`, and without it `--auto` would rest on where the host
+happens to start the server; if that were wrong, the assistant would read an
+empty store under your home directory with nothing reporting an error.
+
+The MCP entry runs the published package, so the assistant needs nothing
+installed globally. `install` locates it once — `--print-binary`, falling back
+to `--print-launcher` — and writes that absolute path, so no hook ever spawns
+`npx`. If neither resolves it warns and falls back to
+`npx -y mushroomdb@<version>`, which still works. To point it at a local build
+instead:
 
 ```text
 mushroomdb install --project --platform claude-code \
@@ -170,6 +189,15 @@ Other flags: `--user`, `--platform codex` (registers through the Codex CLI, and
 needs `uninstall --platform codex` to undo), `--db <path>`, and
 `--no-git-hooks`. `mushroomdb uninstall` removes exactly what was written. Full
 reference: [`skill.md`](skill.md).
+
+### Turning it off
+
+`mushroomdb disable` turns mushroomdb off in a project without uninstalling
+it — the MCP entry, the hooks and the git hook blocks come out; the skill,
+the store and the `.gitignore` line stay. `mushroomdb enable` turns it back
+on, re-resolving the command rather than replaying whatever `disable` took
+out. `mushroomdb install` also re-enables a disabled install. `doctor` reports
+a disabled install as its first line and stops there.
 
 Restart the assistant afterwards — MCP servers and hooks are read at startup.
 Run `mushroomdb doctor` to verify the install end to end, including a real

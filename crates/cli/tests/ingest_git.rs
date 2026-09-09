@@ -835,6 +835,280 @@ fn ownership_flips_across_incremental_runs() {
     );
 }
 
+/// One person commits under two spellings of their name from the same address.
+/// The `Author` node must be labelled with the spelling on the most commits,
+/// not the one that happened to come first — and an incremental run that flips
+/// the majority must move the label with it.
+#[test]
+fn author_name_is_the_majority_variant() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    // The long spelling goes first, so "first seen" and "most commits" differ.
+    commit_as(
+        &repo,
+        "Ada M. Lovelace",
+        "ada@x.test",
+        "long name",
+        &[("src/api.rs", "a0")],
+    );
+    for i in 0..3 {
+        commit_as(
+            &repo,
+            "Ada Lovelace",
+            "ada@x.test",
+            &format!("short name {i}"),
+            &[("src/api.rs", &format!("a{}", i + 1))],
+        );
+    }
+
+    let db_dir = tmp("db");
+    let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    assert_eq!(r.authors, 1, "one address is one author");
+    let name = |dir: &Path| {
+        GraphDb::open(dir)
+            .unwrap()
+            .node_ref("ada@x.test")
+            .unwrap()
+            .prop("name")
+    };
+    assert_eq!(
+        name(&db_dir),
+        Some(core_api::Value::Str("Ada Lovelace".to_string())),
+        "3 commits to 1, so the short spelling is the display name"
+    );
+
+    // Three more commits under the long spelling, one incremental run each:
+    // 2-3 (no change), 3-3 (a tie, which the first-seen spelling wins), 4-3.
+    let expected = [
+        ("Ada Lovelace", "at 2-3 the short spelling still leads"),
+        (
+            "Ada M. Lovelace",
+            "at 3-3 the tie goes to the one seen first",
+        ),
+        (
+            "Ada M. Lovelace",
+            "the majority flipped 4-3; the label follows",
+        ),
+    ];
+    for (i, (want, why)) in expected.iter().enumerate() {
+        commit_as(
+            &repo,
+            "Ada M. Lovelace",
+            "ada@x.test",
+            &format!("long name again {i}"),
+            &[("src/api.rs", &format!("a{}", i + 4))],
+        );
+        assert!(run_ingest_git(&db_dir, &opts(&repo)).unwrap().incremental);
+        assert_eq!(
+            name(&db_dir),
+            Some(core_api::Value::Str((*want).to_string())),
+            "{why}"
+        );
+    }
+
+    // A fresh full ingest of the same repository is the oracle for both the
+    // label and the distribution behind it.
+    let full_dir = tmp("db-full");
+    run_ingest_git(&full_dir, &opts(&repo)).unwrap();
+    assert_eq!(name(&db_dir), name(&full_dir));
+    let counts = |dir: &Path| {
+        GraphDb::open(dir)
+            .unwrap()
+            .node_ref("ada@x.test")
+            .unwrap()
+            .prop("name_counts")
+    };
+    assert_eq!(
+        counts(&db_dir),
+        Some(core_api::Value::List(vec![
+            core_api::Value::Str("Ada M. Lovelace\t4".to_string()),
+            core_api::Value::Str("Ada Lovelace\t3".to_string()),
+        ])),
+        "the distribution accumulates across syncs, in first-seen order"
+    );
+    assert_eq!(
+        counts(&db_dir),
+        counts(&full_dir),
+        "incremental syncs must agree with a full ingest"
+    );
+}
+
+/// A store built by released 0.6.0 carries `Author` nodes with a `name` and no
+/// `name_counts`, and the name it holds is the *first* spelling that version
+/// saw — which is exactly the wrong one this fix exists to correct. Nothing in
+/// the graph records which spelling each commit used, so the first 0.6.1 sync
+/// walks the log in full and recovers the real distribution. One new commit
+/// must be enough to fix the label, not 500.
+#[test]
+fn legacy_store_recovers_the_majority_name_on_first_sync() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit_as(
+        &repo,
+        "Ada M. Lovelace",
+        "ada@x.test",
+        "long name first",
+        &[("src/api.rs", "a0")],
+    );
+    for i in 0..5 {
+        commit_as(
+            &repo,
+            "Ada Lovelace",
+            "ada@x.test",
+            &format!("short name {i}"),
+            &[("src/api.rs", &format!("a{}", i + 1))],
+        );
+    }
+
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    // Age the store into what 0.6.0 wrote: the first-seen spelling, and no
+    // distribution behind it.
+    {
+        let mut db = GraphDb::open(&db_dir).unwrap();
+        db.set_prop(
+            "ada@x.test",
+            "name",
+            core_api::Value::Str("Ada M. Lovelace".to_string()),
+        )
+        .unwrap();
+        assert!(db.remove_prop("ada@x.test", "name_counts").unwrap());
+    }
+
+    // One new commit, one incremental sync.
+    commit_as(
+        &repo,
+        "Ada Lovelace",
+        "ada@x.test",
+        "one more",
+        &[("src/api.rs", "a6")],
+    );
+    assert!(run_ingest_git(&db_dir, &opts(&repo)).unwrap().incremental);
+
+    let db = GraphDb::open(&db_dir).unwrap();
+    let author = db.node_ref("ada@x.test").unwrap();
+    assert_eq!(
+        author.prop("name"),
+        Some(core_api::Value::Str("Ada Lovelace".to_string())),
+        "6 commits to 1: the recovered majority wins on the first sync"
+    );
+    assert_eq!(
+        author.prop("name_counts"),
+        Some(core_api::Value::List(vec![
+            core_api::Value::Str("Ada M. Lovelace\t1".to_string()),
+            core_api::Value::Str("Ada Lovelace\t6".to_string()),
+        ])),
+        "the whole history, counted once — the window is not added on top"
+    );
+
+    // And it agrees with a full ingest of the same repository.
+    let full_dir = tmp("db-full");
+    run_ingest_git(&full_dir, &opts(&repo)).unwrap();
+    assert_eq!(
+        GraphDb::open(&full_dir)
+            .unwrap()
+            .node_ref("ada@x.test")
+            .unwrap()
+            .prop("name_counts"),
+        author.prop("name_counts")
+    );
+}
+
+/// The `co_changed` rule scores on jaccard similarity, which is a ratio, so a
+/// file that changes with this one often and *also* changes a lot on its own
+/// falls under the floor and gets no edge. `impact` must still name it, by how
+/// many commits the two share, and label it as a count rather than a score.
+#[test]
+fn impact_includes_partners_by_shared_commit_count() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+
+    // `api.rs` and `busy.rs` change together four times; `api.rs` and `pair.rs`
+    // change together three times and almost never apart.
+    for i in 0..4 {
+        commit(
+            &repo,
+            "alice",
+            &format!("api and busy {i}"),
+            &[
+                ("src/api.rs", &format!("a{i}")),
+                ("src/busy.rs", &format!("b{i}")),
+            ],
+        );
+    }
+    for i in 0..3 {
+        commit(
+            &repo,
+            "alice",
+            &format!("api and pair {i}"),
+            &[
+                ("src/api.rs", &format!("a1{i}")),
+                ("src/pair.rs", &format!("p{i}")),
+            ],
+        );
+    }
+    // Twenty commits to `busy.rs` alone drag its similarity to `api.rs` down to
+    // 4/27 without touching how often the two actually change together.
+    for i in 0..20 {
+        commit(
+            &repo,
+            "alice",
+            &format!("busy alone {i}"),
+            &[("src/busy.rs", &format!("solo{i}"))],
+        );
+    }
+
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let db = GraphDb::open(&db_dir).unwrap();
+
+    let mut edges = db
+        .neighbors("src/api.rs", "CO_CHANGED", Direction::Out)
+        .unwrap();
+    edges.extend(
+        db.neighbors("src/api.rs", "CO_CHANGED", Direction::In)
+            .unwrap(),
+    );
+    assert!(
+        !edges.contains(&"src/busy.rs".to_string()),
+        "the rule writes no edge for the busy file: {edges:?}"
+    );
+
+    let r = core_api::repograph::impact(
+        &db,
+        &["src/api.rs".to_string()],
+        &std::collections::BTreeSet::new(),
+        &core_api::repograph::ImpactOptions::default(),
+    );
+    let named: Vec<(&str, Option<usize>)> = r.files[0]
+        .partners
+        .iter()
+        .map(|p| (p.path.as_str(), p.shared_commits))
+        .collect();
+    assert_eq!(
+        named,
+        vec![("src/pair.rs", None), ("src/busy.rs", Some(4))],
+        "the scored partner first, then the one only the commit counts see"
+    );
+
+    let text = core_api::repograph::render_impact(&r);
+    assert!(
+        text.contains("src/busy.rs (4 shared commits)"),
+        "the digest labels it a count, not a score:\n{text}"
+    );
+
+    // `why` says the same thing when asked about the pair the rule skipped.
+    let w = core_api::repograph::why(&db, "src/api.rs", "src/busy.rs");
+    assert!(w.links.is_empty(), "no rule edge to report");
+    assert_eq!(w.shared.as_ref().map(|s| s.count), Some(4));
+    assert!(
+        core_api::repograph::render_why(&w).contains("4 shared commits"),
+        "{}",
+        core_api::repograph::render_why(&w)
+    );
+}
+
 /// A parent repository with an initialised submodule checked out at
 /// `vendor/lib`, plus the repository the submodule was cloned from.
 fn seed_repo_with_submodule() -> PathBuf {

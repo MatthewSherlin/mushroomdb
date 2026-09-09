@@ -23,7 +23,13 @@ const QUERY: &str = r"
 (use_declaration) @import
 (mod_item) @import
 (call_expression) @call
+(macro_invocation) @call
 ";
+
+/// How deep a macro's token tree is followed looking for calls. Real nesting
+/// is a handful of levels; the bound keeps a pathological file from recursing
+/// into the stack.
+const MAX_TOKEN_TREE_DEPTH: u32 = 32;
 
 const DOC_STYLE: DocStyle = DocStyle {
     comments: &["line_comment", "block_comment"],
@@ -94,6 +100,90 @@ impl Spec for Rust {
         let function = node.child_by_field_name("function")?;
         let callee = text(function, src).trim();
         (!callee.is_empty() && !callee.contains('\n')).then(|| callee.to_string())
+    }
+
+    /// The calls written inside a macro invocation.
+    ///
+    /// `format!`, `assert_eq!`, `write!` and `vec!` take expressions, but the
+    /// grammar cannot know that: a macro body is a `token_tree` of loose
+    /// tokens, so a call written inside one is never a `call_expression` and
+    /// was invisible to the graph. On this repository that hid every call made
+    /// from inside a `format!` — which, in code whose job is rendering, is most
+    /// of them.
+    fn hidden_calls<'t>(&self, node: Node<'t>, src: &str) -> Vec<(String, Node<'t>, bool)> {
+        if node.kind() != "macro_invocation" {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "token_tree" {
+                calls_in_token_tree(child, src, &mut out, 0);
+            }
+        }
+        out
+    }
+}
+
+/// Whether a name inside a macro's token tree is a type or a variant rather
+/// than a function.
+///
+/// A token tree is unparsed, so a tuple-struct *pattern* and a call are the
+/// same three tokens: `matches!(e, Kind::Io(_))` looks exactly like
+/// `wrap(Kind::Io(_))`. Rust settles it by convention and by the
+/// `non_snake_case` lint — a function is `snake_case`, a struct or variant is
+/// `CamelCase` — so a leading uppercase letter means this is not a call, and
+/// `Io`, `Some` and `Str` stop being recorded as ones.
+///
+/// The cost is a tuple-struct constructor written inside a macro:
+/// `vec![Foo(1)]` records no call where `let x = Foo(1);` does, because outside
+/// a macro the grammar says which of the two it is and here nothing does. A
+/// constructor is a thin edge to lose; a pattern is a wrong one to keep.
+fn names_a_type(name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase)
+}
+
+/// Collect `name(` shapes inside a macro's token tree.
+///
+/// A call in an unparsed token tree is an `identifier` immediately followed by
+/// a `token_tree` — no whitespace between them, which is what separates
+/// `sanitize(x)` from `match x { … }`-style token runs. The identifier is the
+/// last segment of the path, since `::` and the segments before it are separate
+/// tokens; that is exactly the form [`crate::resolve_call`] resolves anyway.
+/// Nested token trees are followed, so a call inside a call's arguments counts.
+///
+/// The token before the name says how the call was written. A `.` there is a
+/// receiver — `format!("{}", s.trim())` — and the call is reported as a method
+/// call, which [`crate::resolve_call`] never resolves on repository-wide
+/// uniqueness. `::` or anything else is a path or a bare name.
+fn calls_in_token_tree<'t>(
+    node: Node<'t>,
+    src: &str,
+    out: &mut Vec<(String, Node<'t>, bool)>,
+    depth: u32,
+) {
+    if depth > MAX_TOKEN_TREE_DEPTH {
+        return;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<Node<'t>> = node.children(&mut cursor).collect();
+    for (at, child) in children.iter().enumerate() {
+        if child.kind() == "token_tree" {
+            // A `(` opens an argument list only when it follows the name with
+            // nothing in between; anywhere else it is a grouping or a tuple.
+            if let Some(prev) = at.checked_sub(1).map(|i| children[i]) {
+                let name = text(prev, src);
+                if prev.kind() == "identifier"
+                    && prev.end_byte() == child.start_byte()
+                    && src.as_bytes().get(child.start_byte()) == Some(&b'(')
+                    && !names_a_type(name)
+                {
+                    let method = at.checked_sub(2).is_some_and(|i| children[i].kind() == ".");
+                    out.push((name.to_string(), prev, method));
+                }
+            }
+            calls_in_token_tree(*child, src, out, depth + 1);
+        }
     }
 }
 
@@ -257,7 +347,7 @@ pub(crate) fn resolve_import(from: &str, raw: &str, known: &dyn Fn(&str) -> bool
             }
             under(&base, rest, known)
         }
-        _ => package_root(from, first, known),
+        _ => package_path(from, first, rest, known),
     }
 }
 
@@ -298,8 +388,40 @@ fn crate_root(from: &str, known: &dyn Fn(&str) -> bool) -> Option<String> {
     None
 }
 
-/// A leading path segment that names a sibling package resolves to that
-/// package's `src/lib.rs`.
+/// A path into a sibling package: the module the remaining segments name,
+/// falling back to the package's `src/lib.rs`.
+///
+/// `beta_core::net::Client` reaches `beta-core/src/net.rs` the same way
+/// `crate::net::Client` reaches `src/net.rs` inside the importing package —
+/// [`under`] tries the longest module prefix first, so the trailing item name
+/// costs nothing. Only when no module answers does the import fall back to the
+/// package root, which is the right answer for `beta_core::Client`, an item
+/// re-exported from `lib.rs`.
+///
+/// Naming the defining module rather than the package root is what lets a call
+/// be resolved across crates: the importer's `imports` then contains the file
+/// the callee is actually defined in.
+fn package_path(
+    from: &str,
+    name: &str,
+    rest: &[&str],
+    known: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    for root in package_roots(from, name, known) {
+        let src = join(&root, "src");
+        let inner = under(&src, rest, known);
+        if !inner.is_empty() {
+            return inner;
+        }
+        let lib = join(&src, "lib.rs");
+        if known(&lib) {
+            return vec![lib];
+        }
+    }
+    Vec::new()
+}
+
+/// Every directory that could be the package `name`, nearest first.
 ///
 /// A candidate directory counts as a package only when it has its own
 /// `Cargo.toml`, which is what makes this a package lookup rather than a guess
@@ -309,7 +431,7 @@ fn crate_root(from: &str, known: &dyn Fn(&str) -> bool) -> Option<String> {
 /// directly at the root all work the same way. Package directories are
 /// conventionally named after the package, so `beta_core` also tries
 /// `beta-core`.
-fn package_root(from: &str, name: &str, known: &dyn Fn(&str) -> bool) -> Vec<String> {
+fn package_roots(from: &str, name: &str, known: &dyn Fn(&str) -> bool) -> Vec<String> {
     let mut parents: Vec<String> = Vec::new();
     if let Some(root) = crate_root(from, known) {
         parents.push(parent_dir(&root).to_string());
@@ -327,14 +449,14 @@ fn package_root(from: &str, name: &str, known: &dyn Fn(&str) -> bool) -> Vec<Str
     });
 
     let variants = [name.to_string(), name.replace('_', "-")];
-    let mut candidates = Vec::new();
+    let mut roots = Vec::new();
     for parent in &parents {
         for variant in &variants {
             let dir = join(parent, variant);
             if known(&join(&dir, "Cargo.toml")) {
-                candidates.push(join(&dir, "src/lib.rs"));
+                roots.push(dir);
             }
         }
     }
-    first_known(&candidates, known)
+    roots
 }

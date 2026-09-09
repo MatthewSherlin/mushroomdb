@@ -243,6 +243,17 @@ fn changed_paths(root: &Path) -> Vec<String> {
 /// files a partner belongs to is a detail the `impact` tool answers on demand.
 /// Partners and importers already in the diff are dropped rather than marked,
 /// because the point of the nudge is what is *not* open yet.
+/// How strong an association is, for the nudge's one line of partners.
+///
+/// Scored partners rank above counted ones, because a similarity the co-change
+/// rule was willing to write an edge for is the stronger claim. Within each
+/// group the measure itself orders them — and the count has to be *in* the key,
+/// or two counted partners compare equal on `(false, 0.0)` and the one that
+/// happened to come first in the report wins instead of the larger count.
+fn rank_key(score: f64, shared: Option<usize>) -> (bool, usize, f64) {
+    (shared.is_none(), shared.unwrap_or(0), score)
+}
+
 fn render_nudge(
     db: &crate::structure::Db,
     report: &ImpactReport,
@@ -263,29 +274,42 @@ fn render_nudge(
         ),
     });
 
-    // Best co-change score per file across the whole diff, strongest first.
-    let mut partners: BTreeMap<String, f64> = BTreeMap::new();
+    // Strongest association per file across the whole diff. A partner the
+    // co-change rule scored and one found by how many commits the two share are
+    // both worth the line, but they are different measures: the scored ones
+    // rank first and each is labelled with the measure it came from.
+    let mut partners: BTreeMap<String, (f64, Option<usize>)> = BTreeMap::new();
     let mut importers: BTreeSet<String> = BTreeSet::new();
     for f in &report.files {
         for p in f.partners.iter().filter(|p| !p.modified) {
-            let slot = partners.entry(p.path.clone()).or_insert(p.score);
-            if p.score > *slot {
-                *slot = p.score;
+            let slot = partners
+                .entry(p.path.clone())
+                .or_insert((p.score, p.shared_commits));
+            if rank_key(p.score, p.shared_commits) > rank_key(slot.0, slot.1) {
+                *slot = (p.score, p.shared_commits);
             }
         }
         for p in f.importers.iter().filter(|p| !p.modified) {
             importers.insert(p.path.clone());
         }
     }
-    let mut ranked: Vec<(String, f64)> = partners.into_iter().collect();
-    // Score descending, then key ascending: `BTreeMap` gave us the key order,
-    // and a stable sort keeps it inside a tie.
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut ranked: Vec<(String, (f64, Option<usize>))> = partners.into_iter().collect();
+    // Scored partners first, each measure descending within its own group, then
+    // key ascending: `BTreeMap` gave us the key order and a stable sort keeps it
+    // inside a tie.
+    ranked.sort_by(|a, b| {
+        rank_key(b.1 .0, b.1 .1)
+            .partial_cmp(&rank_key(a.1 .0, a.1 .1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     if !ranked.is_empty() {
         let items: Vec<String> = ranked
             .iter()
             .take(MAX_NUDGE_PARTNERS)
-            .map(|(path, score)| format!("{path} ({score:.2}, not modified)"))
+            .map(|(path, (score, shared))| match shared {
+                Some(n) => format!("{path} ({n} shared commits, not modified)"),
+                None => format!("{path} ({score:.2}, not modified)"),
+            })
             .collect();
         lines.push(format!("  usually changes with: {}", items.join(", ")));
     }
@@ -385,7 +409,7 @@ mod tests {
     fn prompt_becomes_an_or_query_of_lowercased_alphanumeric_terms() {
         assert_eq!(
             fulltext_or_query("What about Person 1 and Project 5?").as_deref(),
-            Some("what OR about OR person OR 1 OR project OR 5"),
+            Some("person OR 1 OR project OR 5"),
         );
     }
 
@@ -398,6 +422,53 @@ mod tests {
             Some("foo OR bar OR baz"),
         );
         assert_eq!(fulltext_or_query("  ?! ,, "), None);
+    }
+
+    /// Binding: a prompt made only of function words leaves nothing to search
+    /// for, so the hook has nothing to print. An `OR` of stopwords matched
+    /// essentially every indexed document, which is how `the` used to produce
+    /// a full digest of six unrelated nodes.
+    #[test]
+    fn or_query_is_none_for_a_prompt_that_is_all_glue() {
+        for prompt in [
+            "the",
+            "is it done",
+            "ok thanks",
+            "can you do that please",
+            "what do you think about it",
+            "which file has the code",
+        ] {
+            assert_eq!(fulltext_or_query(prompt), None, "{prompt:?}");
+        }
+    }
+
+    /// A prompt can survive the stopwords and still be about nothing the graph
+    /// holds. `weather` is a word, not glue, so it is searched for — and a code
+    /// graph has no hit for it, which is the other way the hook falls silent.
+    #[test]
+    fn or_query_keeps_a_real_word_the_graph_will_not_match() {
+        assert_eq!(
+            fulltext_or_query("what is the weather today?").as_deref(),
+            Some("weather OR today"),
+        );
+    }
+
+    /// Binding: the glue goes and the subject stays — including the words a
+    /// repository question turns on, which are ordinary English too.
+    #[test]
+    fn or_query_keeps_the_subject_of_a_real_question() {
+        assert_eq!(
+            fulltext_or_query("why does install.rs change with tests/install.rs").as_deref(),
+            Some("install OR rs OR change OR tests"),
+        );
+        assert_eq!(
+            fulltext_or_query("please fix the failing test in recall").as_deref(),
+            Some("fix OR failing OR test OR recall"),
+        );
+        assert_eq!(
+            fulltext_or_query("who owns the parser").as_deref(),
+            Some("owns OR parser"),
+        );
     }
 
     #[test]

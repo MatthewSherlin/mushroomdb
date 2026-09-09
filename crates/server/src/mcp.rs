@@ -9,14 +9,16 @@
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
 //!   `serverInfo.name` `"mushroomdb"`, `serverInfo.version` (crate version)
 //! - `notifications/initialized` — ignored
-//! - `tools/list` — twenty-four tools, each with a JSON Schema: the eight
-//!   repository task tools of [`mcp_tasks`](crate::mcp_tasks) first, then the
-//!   sixteen graph tools below, whose descriptions carry the prefix
-//!   `Advanced: ` so a host ranking tools by description puts the task tools
-//!   in front
+//! - `tools/list` — eleven tools by default, each with a JSON Schema: the
+//!   eight repository task tools of [`mcp_tasks`](crate::mcp_tasks) first,
+//!   then `query`, `ingest_json` and `stats`, whose descriptions carry the
+//!   prefix `Advanced: ` so a host ranking tools by description puts the task
+//!   tools in front. `mushroomdb mcp --all-tools` lists all twenty-four; the
+//!   thirteen it adds are callable either way, just not advertised
 //! - `tools/call` — dispatch; success for a graph tool is
-//!   `{content:[{type:"text", text:<json string>}]}`, and for a task tool the
-//!   rendered digest as text with the report under `structuredContent`
+//!   `{content:[{type:"text", text:<json string>}]}`, and for a task tool one
+//!   text block holding the rendered digest — or, with `json: true`, the
+//!   serialised report. No task tool returns `structuredContent`
 //!
 //! Unknown methods on a **request** (has `id`) → `-32601`. A notification
 //! (no `id` member) never writes a response, including unknown methods.
@@ -66,6 +68,21 @@ use std::path::{Path, PathBuf};
 pub fn run_mcp_stdio(
     db: SharedDb,
     db_dir: Option<PathBuf>,
+    reader: impl BufRead,
+    writer: impl Write,
+) -> io::Result<()> {
+    run_mcp_stdio_with(db, db_dir, false, reader, writer)
+}
+
+/// [`run_mcp_stdio`], with the tool list chosen by the caller.
+///
+/// `all_tools` false lists the eight task tools plus `query`, `ingest_json`
+/// and `stats`; true lists all twenty-four. Either way every tool remains
+/// callable — the flag decides what is advertised, not what is served.
+pub fn run_mcp_stdio_with(
+    db: SharedDb,
+    db_dir: Option<PathBuf>,
+    all_tools: bool,
     mut reader: impl BufRead,
     mut writer: impl Write,
 ) -> io::Result<()> {
@@ -78,7 +95,7 @@ pub fn run_mcp_stdio(
         }
         match std::str::from_utf8(&buf) {
             Ok(s) if s.trim().is_empty() => continue,
-            Ok(s) => handle_line(&db, db_dir.as_deref(), s.trim(), &mut writer)?,
+            Ok(s) => handle_line(&db, db_dir.as_deref(), all_tools, s.trim(), &mut writer)?,
             Err(_) => write_error(&mut writer, None, -32700, "Parse error")?,
         }
     }
@@ -87,6 +104,7 @@ pub fn run_mcp_stdio(
 fn handle_line(
     db: &SharedDb,
     db_dir: Option<&Path>,
+    all_tools: bool,
     line: &str,
     writer: &mut impl Write,
 ) -> io::Result<()> {
@@ -121,7 +139,7 @@ fn handle_line(
         }
         "tools/list" => {
             if is_request {
-                write_result(writer, id, tools_list())?;
+                write_result(writer, id, tools_list(all_tools))?;
             }
         }
         "tools/call" => {
@@ -133,8 +151,8 @@ fn handle_line(
                     CallOutcome::ToolOk(payload) => {
                         write_result(writer, id, tool_ok(payload))?;
                     }
-                    CallOutcome::TaskOk { text, structured } => {
-                        write_result(writer, id, task_ok(&text, structured))?;
+                    CallOutcome::TaskOk { text } => {
+                        write_result(writer, id, task_ok(&text))?;
                     }
                     CallOutcome::ToolErr(message) => {
                         write_result(writer, id, tool_err(&message))?;
@@ -158,11 +176,10 @@ pub(crate) enum CallOutcome {
     },
     /// A graph tool's JSON payload, returned as a JSON string in `content`.
     ToolOk(Js),
-    /// A task tool's answer: the rendered digest as `content`, and the report
-    /// — carrying that same digest under `text` — as `structuredContent`.
+    /// A task tool's answer, as text and nothing else: the rendered digest, or
+    /// the serialised report when the call passed `json: true`.
     TaskOk {
         text: String,
-        structured: Js,
     },
     ToolErr(String),
 }
@@ -875,11 +892,31 @@ fn initialize_result() -> Js {
 /// under this prefix is the lower-level surface beneath them.
 const ADVANCED_PREFIX: &str = "Advanced: ";
 
-/// The twenty-four tools: the eight repository task tools, then the sixteen
-/// graph tools with their descriptions prefixed.
-fn tools_list() -> Js {
+/// The graph tools a default `tools/list` keeps, in the order they appear in
+/// [`graph_tools`].
+///
+/// The sixteen graph schemas cost 9,054 of the 12,238 bytes a session paid
+/// before it did anything — 74% of the payload, for a surface a coding agent
+/// rarely reaches: `find_similar` (2,015 B) and `hybrid_search` (1,456 B)
+/// alone outweigh all eight task tools. These three stay because they are the
+/// ones the task tools do not cover and the skill sends an assistant to by
+/// name: an arbitrary Cypher read, a bulk load, and the store's own counts.
+/// The rest are one `--all-tools` away.
+const DEFAULT_GRAPH_TOOLS: [&str; 3] = ["query", "ingest_json", "stats"];
+
+/// The tools `tools/list` advertises: the eight repository task tools, then
+/// the graph tools with their descriptions prefixed.
+///
+/// `all` false — the default — lists eleven: the eight, plus
+/// [`DEFAULT_GRAPH_TOOLS`]. `all` true lists all twenty-four, which is what
+/// `mushroomdb mcp --all-tools` runs.
+fn tools_list(all: bool) -> Js {
     let mut tools = crate::mcp_tasks::task_tools();
     for mut tool in graph_tools() {
+        let name = tool.get("name").and_then(Js::as_str).unwrap_or_default();
+        if !all && !DEFAULT_GRAPH_TOOLS.contains(&name) {
+            continue;
+        }
         if let Some(d) = tool.get("description").and_then(Js::as_str) {
             let prefixed = format!("{ADVANCED_PREFIX}{d}");
             tool["description"] = Js::String(prefixed);
@@ -1151,12 +1188,16 @@ fn tool_ok(payload: Js) -> Js {
     })
 }
 
-/// A task tool's result: the rendered digest for an assistant to read, and the
-/// report for a program that wants the numbers.
-fn task_ok(text: &str, structured: Js) -> Js {
+/// A task tool's result: one text block, and no `structuredContent`.
+///
+/// The report used to ride along beside the digest, repeating it verbatim
+/// under a `text` key. Nothing bound it — no task tool declares an
+/// `outputSchema` — and it tripled the size of every reply, so a caller that
+/// wants the numbers now asks for them with `json: true` and gets the report
+/// *as* the text.
+fn task_ok(text: &str) -> Js {
     json!({
-        "content": [{ "type": "text", "text": text }],
-        "structuredContent": structured
+        "content": [{ "type": "text", "text": text }]
     })
 }
 
@@ -1281,9 +1322,14 @@ mod tests {
     }
 
     fn roundtrip(db: &SharedDb, request: &str) -> Js {
+        roundtrip_with(db, false, request)
+    }
+
+    fn roundtrip_with(db: &SharedDb, all_tools: bool, request: &str) -> Js {
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        run_mcp_stdio(db.clone(), None, input.as_bytes(), &mut output).expect("mcp");
+        run_mcp_stdio_with(db.clone(), None, all_tools, input.as_bytes(), &mut output)
+            .expect("mcp");
         let s = std::str::from_utf8(&output).expect("utf8");
         serde_json::from_str(s.trim()).expect("json response")
     }
@@ -1322,7 +1368,11 @@ mod tests {
     #[test]
     fn test_tools_list_includes_all_expected() {
         let db = demo_db();
-        let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        let resp = roundtrip_with(
+            &db,
+            true,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        );
         let tools = resp["result"]["tools"].as_array().expect("tools array");
         let names: Vec<&str> = tools
             .iter()
@@ -1370,6 +1420,36 @@ mod tests {
             "the task tools come first, in order"
         );
         assert_eq!(names[8], "query", "the graph tools follow them");
+    }
+
+    /// Binding: the default listing is the eight task tools plus the three
+    /// graph tools a coding agent reaches for, and nothing else.
+    #[test]
+    fn tools_list_defaults_to_eleven() {
+        let db = demo_db();
+        let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "map",
+                "context",
+                "impact",
+                "owners",
+                "why",
+                "recall",
+                "remember",
+                "sync",
+                "query",
+                "ingest_json",
+                "stats"
+            ]
+        );
     }
 
     #[test]

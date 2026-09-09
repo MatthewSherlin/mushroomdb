@@ -476,17 +476,23 @@ fn context_on_symbol_has_source_callers_callees_and_owner() {
     assert!(source.starts_with("// line 11"), "{source}");
     assert!(source.ends_with("// line 21"), "{source}");
 
-    // Three symbols call it, each quoting the line it does so on.
-    let callers: Vec<(String, u32)> = c.callers.clone();
+    // Three symbols call it, each in its own file and each quoting the line it
+    // does so on. Files come back with the most call sites first, then by path.
+    let callers: Vec<(String, Vec<String>, Vec<u32>)> = c
+        .callers
+        .iter()
+        .map(|s| (s.file.clone(), s.symbols.clone(), s.lines.clone()))
+        .collect();
     assert_eq!(
         callers,
         vec![
-            (sym(0, 3, "core::load"), 15),
-            (sym(0, 4, "core::save"), 16),
-            (sym(1, 2, "web::render"), 20),
+            (file_key(0, 3), vec![sym(0, 3, "core::load")], vec![15]),
+            (file_key(0, 4), vec![sym(0, 4, "core::save")], vec![16]),
+            (file_key(1, 2), vec![sym(1, 2, "web::render")], vec![20]),
         ],
-        "callers are sorted by key and carry the caller's call line"
+        "call sites are grouped by the file the calls sit in"
     );
+    assert_eq!(c.callers_not_shown, 0);
     assert_eq!(c.callees, vec![(sym(0, 0, "core::init"), 13)]);
 
     // The file's own facts come along: what imports it, what it changes with.
@@ -505,6 +511,65 @@ fn context_on_symbol_has_source_callers_callees_and_owner() {
     assert!(
         text.contains("Ada Example") && !text.contains("@example.test"),
         "{text}"
+    );
+}
+
+/// A `CALLS` edge is written once however many times the call is written, so
+/// counting edges reports a symbol called twelve times from six functions as
+/// six call sites. `context` reads the caller's `call_lines`, which records
+/// every site, and groups them by the file they sit in.
+#[test]
+fn context_lists_every_call_site() {
+    let dir = tmp("context-call-sites");
+    let mut db = synthetic_repo_store(&dir);
+    let target = sym(0, 1, "core::run");
+    let caller = sym(0, 3, "core::load");
+
+    // The same caller, the same one edge, three lines.
+    let sites = core_api::Value::List(
+        [15, 40, 88]
+            .iter()
+            .map(|n| core_api::Value::Str(format!("{target}\t{n}")))
+            .collect(),
+    );
+    db.set_prop(&caller, "call_lines", sites).expect("sites");
+
+    let c = context(&db, None, &target);
+    let group = c
+        .callers
+        .iter()
+        .find(|g| g.file == file_key(0, 3))
+        .expect("the caller's file");
+    assert_eq!(
+        group.lines,
+        vec![15, 40, 88],
+        "every site, not just the first"
+    );
+    assert_eq!(group.sites, 3);
+    assert_eq!(group.symbols, vec![caller.clone()]);
+    assert_eq!(
+        c.callers.first().map(|g| g.file.clone()),
+        Some(file_key(0, 3)),
+        "the file with the most call sites comes first"
+    );
+    assert_eq!(c.callers_not_shown, 0);
+
+    let text = render_context(&c);
+    assert!(
+        text.contains(&format!("{}: 15, 40, 88", file_key(0, 3))),
+        "the digest names the file and every line in it:\n{text}"
+    );
+
+    // `why` quotes the same sites for the same edge.
+    let w = why(&db, &caller, &target);
+    let call = w
+        .links
+        .iter()
+        .find(|l| l.edge_type == "CALLS")
+        .expect("load calls run");
+    assert_eq!(
+        call.evidence,
+        vec![format!("{caller} calls {target} at lines 15, 40, 88")]
     );
 }
 
@@ -709,13 +774,16 @@ fn impact_marks_partners_in_the_diff_as_modified() {
     );
     assert!(f.partners.len() <= ImpactOptions::default().max_partners);
 
-    // A partner below the threshold is not worth telling anyone about.
+    // A partner below the threshold is not worth telling anyone about. Both
+    // floors have to be off for the list to be empty: they gate two different
+    // passes, one over the scored edges and one over the commits themselves.
     let strict = impact(
         &db,
         std::slice::from_ref(&a),
         &modified,
         &ImpactOptions {
             min_score: 1.01,
+            min_shared_commits: 0,
             ..ImpactOptions::default()
         },
     );
@@ -782,6 +850,32 @@ fn impact_reports_unknown_paths() {
     assert_eq!(r.files.len(), 1, "the known path is still reported");
     let text = render_impact(&r);
     assert!(text.contains("unknown: nope/gone.rs"), "{text}");
+    assert!(text.lines().count() <= 25);
+}
+
+/// Binding: a tree full of untracked artefacts names three of them and counts
+/// the rest, instead of spending the whole 25-line budget on paths the graph
+/// was never asked about.
+#[test]
+fn impact_caps_the_unknown_paths_it_names() {
+    let dir = tmp("impact-unknown-cap");
+    let db = synthetic_repo_store(&dir);
+    let mut files: Vec<String> = (0..20)
+        .map(|i| format!("out/artefact-{i:02}.json"))
+        .collect();
+    files.push(file_key(0, 0));
+
+    let r = impact(&db, &files, &BTreeSet::new(), &ImpactOptions::default());
+    assert_eq!(r.unknown.len(), 20, "the report still holds them all");
+
+    let text = render_impact(&r);
+    let named = text.lines().filter(|l| l.starts_with("unknown: ")).count();
+    assert_eq!(named, 3, "at most three are named: {text}");
+    assert!(text.contains("…and 17 more unknown"), "{text}");
+    assert!(
+        text.contains(&file_key(0, 0)),
+        "the analysis must survive the noise: {text}"
+    );
     assert!(text.lines().count() <= 25);
 }
 
@@ -925,7 +1019,8 @@ fn why_import_evidence_has_the_line() {
     );
     assert!(render_why(&w).contains("line 4"));
 
-    // A call is evidenced the same way, from the caller's line.
+    // A call is evidenced from the caller's lines — every site, since one edge
+    // stands for however many times the call is written.
     let calls = why(&db, &sym(0, 1, "core::run"), &sym(0, 0, "core::init"));
     let call = calls
         .links
@@ -935,7 +1030,7 @@ fn why_import_evidence_has_the_line() {
     assert_eq!(
         call.evidence,
         vec![format!(
-            "{} line 13: call {}",
+            "{} calls {} at line 13",
             sym(0, 1, "core::run"),
             sym(0, 0, "core::init")
         )]
@@ -1536,6 +1631,72 @@ fn recall_finds_notes_concepts_files_symbols_people() {
     assert!(
         out.contains("DESCRIBED_IN -> src/core/c00.rs"),
         "the concept's edge names its rule and target: {out}"
+    );
+}
+
+/// Binding: the digest prints the hybrid ranking, in the hybrid ranking's
+/// order, across every indexed field.
+///
+/// The relevance floor reads a different score — the text leg's own BM25 — to
+/// decide whether to print at all. That score is not comparable between fields
+/// (each has its own document count and average length), so if it ever leaked
+/// into the ordering, hits from a small field would jump ahead of hits from a
+/// large one. This fixture spans five fields and pins the order against
+/// `search_hybrid` itself.
+#[test]
+fn recall_prints_hits_in_the_hybrid_ranking_order() {
+    let dir = tmp("recall-hybrid-order");
+    let mut db = synthetic_repo_store(&dir);
+    for (label, field) in [
+        ("File", "path"),
+        ("Symbol", "name"),
+        ("Author", "name"),
+        ("Note", "text"),
+        ("Concept", "name"),
+    ] {
+        db.enable_fulltext(label, field).expect("fulltext");
+    }
+
+    let prompt = "c00 OR init OR ada OR entry OR startup";
+    let out = recall_digest(&db, prompt, "synthetic", 4000);
+
+    // What `recall_digest` does internally, spelled out here against the
+    // public API: best fused score per key across the fields, then score
+    // descending and key ascending.
+    let mut fields: Vec<String> = db.fulltext_pairs().into_iter().map(|(_, f)| f).collect();
+    fields.sort();
+    fields.dedup();
+    let mut best: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for field in &fields {
+        for (key, score) in db.search_hybrid(field, prompt, "embedding", &[], None, 6) {
+            let slot = best.entry(key).or_insert(0.0);
+            if score > *slot {
+                *slot = score;
+            }
+        }
+    }
+    let mut ranked: Vec<(String, f64)> = best.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+
+    let printed: Vec<String> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("- "))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_string)
+        .collect();
+    let expected: Vec<String> = ranked
+        .iter()
+        .take(printed.len())
+        .map(|(k, _)| k.clone())
+        .collect();
+    assert!(!printed.is_empty(), "expected hits in:\n{out}");
+    assert_eq!(
+        printed, expected,
+        "the digest must print the hybrid ranking in its own order:\n{out}"
     );
 }
 

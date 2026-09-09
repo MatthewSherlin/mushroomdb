@@ -16,9 +16,10 @@
 //! `warn` is informational.
 
 use crate::install::{
-    claude_mcp_file, cursor_mcp_file, entry_db, expand_platform, git_hooks_dir, has_our_server,
-    is_our_hook_command, resolve_platform, resolve_scope, Externals, Platform, Scope, GIT_HOOKS,
-    HOOK_BEGIN, HOOK_EVENT, TOUCH_EVENT,
+    claude_mcp_file, cursor_mcp_file, default_db, entry_db, expand_platform, git_hooks_dir,
+    has_our_server, is_disabled, is_our_hook_command, line_runs_for_store, resolve_platform,
+    resolve_scope, Externals, Platform, Scope, StoreRef, AUTO_ARG, GIT_HOOKS, HOOK_BEGIN,
+    HOOK_EVENT, TOUCH_EVENT,
 };
 use crate::CliError;
 use core_api::{GraphDb, GraphError, OpenOptions};
@@ -133,6 +134,17 @@ pub fn run_doctor_with(
     let resolved = resolve_platform(project_root, home, opts.platform.as_ref())?;
     let platforms = expand_platform(&resolved);
 
+    // A disabled install has no config to check — every check below it would
+    // report exactly what `disable` intentionally removed, which is not a
+    // failure. Report the state and stop; `warn` never sets the exit code.
+    if is_disabled(project_root, home, scope, &platforms) {
+        return Ok(DoctorReport {
+            output: Check::warn("state", "disabled — enable with: mushroomdb enable", None)
+                .render(),
+            had_fail: false,
+        });
+    }
+
     let mut checks: Vec<Check> = Vec::new();
     let mut primary: Option<(Platform, ConfigEntry)> = None;
 
@@ -148,11 +160,16 @@ pub fn run_doctor_with(
                 ),
                 None,
             )),
-            Some(mcp_file) => match read_config_entry(&mcp_file) {
+            Some(mcp_file) => match read_config_entry(&mcp_file, project_root, home) {
                 Ok(entry) => {
                     checks.push(Check::ok(
                         "config",
-                        format!("{} — {} -> {}", plat.label(), mcp_file.display(), entry.db),
+                        format!(
+                            "{} — {} -> {}",
+                            plat.label(),
+                            mcp_file.display(),
+                            entry.describe_store()
+                        ),
                     ));
                     if primary.is_none() {
                         primary = Some((plat.clone(), entry));
@@ -163,16 +180,19 @@ pub fn run_doctor_with(
         }
     }
 
-    // 2. npx — only when the resolved command actually is npx.
+    // 2. how the server is spawned — `npx` fetches the package, a resolved
+    //    binary or launcher is a file that has to still be there.
     if let Some((_, entry)) = &primary {
         if entry.command == "npx" {
             checks.push(check_npx(entry, ext));
+        } else if let Some(check) = check_resolved_path(entry) {
+            checks.push(check);
         }
     }
 
     // 3. store, then the write-lock probe (same check family, adjacent lines).
     match &primary {
-        Some((_, entry)) => checks.extend(check_store_and_lock(Path::new(&entry.db))),
+        Some((_, entry)) => checks.extend(check_store_and_lock(entry.store.path())),
         None => checks.push(Check::fail(
             "store",
             "no usable config entry — cannot locate a database to check",
@@ -183,7 +203,7 @@ pub fn run_doctor_with(
     // 4. hooks — Claude Code only; Cursor has no prompt/tool-use hooks to check.
     if platforms.contains(&Platform::ClaudeCode) {
         if let Some((_, entry)) = &primary {
-            checks.push(check_hooks(project_root, home, scope, &entry.db));
+            checks.push(check_hooks(project_root, home, scope, &entry.store));
         }
     }
 
@@ -195,7 +215,7 @@ pub fn run_doctor_with(
             .any(|p| matches!(p, Platform::ClaudeCode | Platform::Cursor))
     {
         if let Some((_, entry)) = &primary {
-            if let Some(check) = check_git_hooks(project_root, &entry.db) {
+            if let Some(check) = check_git_hooks(project_root, &entry.store) {
                 checks.push(check);
             }
         }
@@ -264,9 +284,42 @@ fn mcp_file_for(
 
 /// The MCP server entry doctor found: what it points at and how it is spawned.
 struct ConfigEntry {
-    db: String,
+    /// The store the entry names, as written: a path, or `--auto`.
+    store: StoreRef,
     command: String,
     args: Vec<String>,
+}
+
+impl ConfigEntry {
+    /// How the config line reports the store. An `--auto` entry says what it
+    /// resolves to as well, since that is the directory every check below it
+    /// reads and the one the reader wants to see.
+    fn describe_store(&self) -> String {
+        if self.store.is_auto() {
+            format!("{AUTO_ARG} -> {}", self.store.path().display())
+        } else {
+            self.store.path().display().to_string()
+        }
+    }
+}
+
+/// The store an entry's argument names, resolved the way the command it was
+/// written for would resolve it.
+///
+/// `--auto` is resolved from `project_root` rather than doctor's own working
+/// directory: doctor was already told which project it is checking, and a
+/// report that changes depending on which subdirectory it was typed in would
+/// be a worse report. That is the same directory a hook resolves to, since a
+/// hook walks up to the working tree root from wherever it fired.
+fn entry_store(arg: &str, project_root: &Path, home: &Path) -> StoreRef {
+    if arg == AUTO_ARG {
+        return StoreRef::auto(crate::resolve_auto_db(None, project_root, home));
+    }
+    let path = PathBuf::from(arg);
+    if path == default_db(Scope::Project, project_root, home) {
+        return StoreRef::pinned(path).also_auto();
+    }
+    StoreRef::pinned(path)
 }
 
 fn read_json(path: &Path) -> Result<Js, String> {
@@ -275,7 +328,11 @@ fn read_json(path: &Path) -> Result<Js, String> {
     serde_json::from_str(&raw).map_err(|e| format!("invalid JSON in {}: {e}", path.display()))
 }
 
-fn read_config_entry(mcp_file: &Path) -> Result<ConfigEntry, String> {
+fn read_config_entry(
+    mcp_file: &Path,
+    project_root: &Path,
+    home: &Path,
+) -> Result<ConfigEntry, String> {
     if !mcp_file.exists() {
         return Err(format!("{} does not exist", mcp_file.display()));
     }
@@ -287,14 +344,16 @@ fn read_config_entry(mcp_file: &Path) -> Result<ConfigEntry, String> {
             mcp_file.display()
         ));
     }
-    let db = entry_db(entry)
-        .ok_or_else(|| {
+    let store = entry_store(
+        entry_db(entry).ok_or_else(|| {
             format!(
-                "{}: mushroomdb entry has no `mcp <db>` argument",
+                "{}: mushroomdb entry has no `mcp <db>|--auto` argument",
                 mcp_file.display()
             )
-        })?
-        .to_string();
+        })?,
+        project_root,
+        home,
+    );
     let command = entry["command"]
         .as_str()
         .ok_or_else(|| format!("{}: mushroomdb entry has no `command`", mcp_file.display()))?
@@ -307,7 +366,11 @@ fn read_config_entry(mcp_file: &Path) -> Result<ConfigEntry, String> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(ConfigEntry { db, command, args })
+    Ok(ConfigEntry {
+        store,
+        command,
+        args,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +420,35 @@ fn check_npx(entry: &ConfigEntry, ext: &Externals) -> Check {
         ),
         RunOutcome::Failed(e) => Check::fail("npx", e, None),
     }
+}
+
+/// The resolved-path counterpart to [`check_npx`].
+///
+/// `install` writes a path rather than `npx` so the hooks do not spawn `npx`
+/// on every prompt: the package's native binary, or `node <launcher.js>` when
+/// the binary was not fetched. Both live in npm's cache, and pruning it — or
+/// npx evicting an old version — leaves a command that cannot run. The file
+/// existing is the whole check; what it does once it runs is the handshake's
+/// business.
+///
+/// A bare `command` is a PATH lookup, not a file, and is left to the handshake.
+fn check_resolved_path(entry: &ConfigEntry) -> Option<Check> {
+    let (name, path) = if entry.command == "node" {
+        ("launcher", Path::new(entry.args.first()?))
+    } else if Path::new(&entry.command).is_absolute() {
+        ("binary", Path::new(&entry.command))
+    } else {
+        return None;
+    };
+    Some(if path.is_file() {
+        Check::ok(name, path.display().to_string())
+    } else {
+        Check::fail(
+            name,
+            format!("{} no longer exists", path.display()),
+            Some("mushroomdb install (re-resolves it)".to_string()),
+        )
+    })
 }
 
 enum RunOutcome {
@@ -473,14 +565,14 @@ fn check_store_and_lock(db_dir: &Path) -> Vec<Check> {
 // hooks
 // ---------------------------------------------------------------------------
 
-fn check_hooks(project_root: &Path, home: &Path, scope: Scope, db_str: &str) -> Check {
+fn check_hooks(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef) -> Check {
     let settings_file = match scope {
         Scope::Project => project_root.join(".claude").join("settings.json"),
         Scope::User => home.join(".claude").join("settings.json"),
     };
     let root = read_json(&settings_file).unwrap_or(Js::Null);
-    let has_recall = has_hook_matching(&root, HOOK_EVENT, "recall", db_str);
-    let has_touch = has_hook_matching(&root, TOUCH_EVENT, "touch", db_str);
+    let has_recall = has_hook_matching(&root, HOOK_EVENT, "recall", store);
+    let has_touch = has_hook_matching(&root, TOUCH_EVENT, "touch", store);
     if has_recall && has_touch {
         Check::ok(
             "hooks",
@@ -509,7 +601,7 @@ fn check_hooks(project_root: &Path, home: &Path, scope: Scope, db_str: &str) -> 
     }
 }
 
-fn has_hook_matching(root: &Js, event: &str, sub: &str, db_str: &str) -> bool {
+fn has_hook_matching(root: &Js, event: &str, sub: &str, store: &StoreRef) -> bool {
     root["hooks"][event]
         .as_array()
         .map(|groups| {
@@ -520,7 +612,7 @@ fn has_hook_matching(root: &Js, event: &str, sub: &str, db_str: &str) -> bool {
                         hs.iter().any(|h| {
                             h["command"]
                                 .as_str()
-                                .is_some_and(|c| is_our_hook_command(c, sub, db_str))
+                                .is_some_and(|c| is_our_hook_command(c, sub, store))
                         })
                     })
                     .unwrap_or(false)
@@ -533,13 +625,19 @@ fn has_hook_matching(root: &Js, event: &str, sub: &str, db_str: &str) -> bool {
 // git hooks
 // ---------------------------------------------------------------------------
 
-fn check_git_hooks(project_root: &Path, db_str: &str) -> Option<Check> {
+fn check_git_hooks(project_root: &Path, store: &StoreRef) -> Option<Check> {
     let dir = git_hooks_dir(project_root)?;
+    // The block belongs to this store if it names it either way. An `--auto`
+    // block in a checkout whose store is the default is the same store, and
+    // that is the shape every project install now writes.
     let missing: Vec<&str> = GIT_HOOKS
         .iter()
         .filter(|name| {
             let content = std::fs::read_to_string(dir.join(name)).unwrap_or_default();
-            !(content.contains(HOOK_BEGIN) && content.contains(db_str))
+            let names_store = content
+                .lines()
+                .any(|l| line_runs_for_store(l, "sync", store));
+            !(content.contains(HOOK_BEGIN) && names_store)
         })
         .copied()
         .collect();

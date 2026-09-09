@@ -18,6 +18,24 @@
 //!
 //! Beside each list sits its evidence: `import_lines` and `call_lines` hold
 //! `"<key>\t<line>"` strings, so a tool can quote the line a link came from.
+//! One entry per call *site*, not one per callee: a symbol that calls another
+//! twelve times contributes twelve entries and one `calls_to` element, which is
+//! what lets `context` name every line a change would have to visit.
+//!
+//! # Resolving a call
+//!
+//! A file's imports are resolved before its calls, and the resolved list is fed
+//! to [`resolve_call`]: a definition living in a file this one imports beats a
+//! same-named definition anywhere else in the tree. Without that a call could
+//! only cross a crate boundary when the callee's name happened to be unique
+//! across the whole repository.
+//!
+//! That repository-wide tier is also the only one a call written on a receiver
+//! never reaches. `.collect()` and `.ok()` name methods on types from outside
+//! the tree, and uniqueness would bind them to any single same-named function
+//! it found. A method call resolves through the local and imported tiers or not
+//! at all — and it reaches a method there through the bare name the index files
+//! every `Type.method` under, gated on a receiver that says which type it is.
 //!
 //! # What is read
 //!
@@ -34,7 +52,8 @@
 //! write at all, which is what makes a re-run byte-identical.
 use crate::CliError;
 use code_extract::{
-    extract, resolve_call, resolve_import, resolve_mention, FileFacts, SymbolIndex, MAX_FILE_BYTES,
+    call_lookup_names, extract, indexed_under, resolve_call, resolve_import, resolve_mention,
+    CallScope, FileFacts, SymbolIndex, MAX_FILE_BYTES,
 };
 use core_api::repograph::rules::{about_rule, concept_sources_rule, ABOUT_LABELS};
 use core_api::{default_max_edges, BatchOp, Predicate, RuleDef, Value};
@@ -299,6 +318,36 @@ impl Tree {
     fn by_basename(&self, name: &str) -> Vec<String> {
         self.by_base.get(name).cloned().unwrap_or_default()
     }
+
+    /// Every name a path call may lead with: each directory name in the tree
+    /// and each file's stem, plus the `-`/`_` spelling of both.
+    ///
+    /// A package directory is conventionally `code-extract` while the path that
+    /// reaches it is `code_extract`, so both go in. Anything not in here and
+    /// not a symbol — `std`, `serde_json`, `Vec` — names something outside the
+    /// tree, and [`resolve_call`] gives a call leading with it no edge.
+    fn roots(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for path in &self.files {
+            for (at, part) in path.split('/').enumerate() {
+                let last = at + 1 == path.split('/').count();
+                let name = match last {
+                    true => part.rsplit_once('.').map_or(part, |(stem, _)| stem),
+                    false => part,
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                out.insert(name.to_string());
+                if name.contains('-') {
+                    out.insert(name.replace('-', "_"));
+                } else if name.contains('_') {
+                    out.insert(name.replace('_', "-"));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// One symbol, resolved and ready to store.
@@ -397,6 +446,29 @@ fn symbol_keys(path: &str, facts: &FileFacts) -> (Vec<(String, usize)>, bool) {
     (out, capped)
 }
 
+/// Every index name the calls in `facts` can be looked up under.
+///
+/// [`resolve_call`] reaches the symbol index by name and by nothing else, and
+/// [`call_lookup_names`] says which names one callee produces. So an index
+/// holding every definition of exactly this set resolves identically to one
+/// holding the whole tree — including the repository-wide tier, which turns on
+/// a name being defined exactly once and still sees every definition of the
+/// names it is asked about.
+///
+/// The set depends on the files being extracted and on nothing else, which is
+/// what makes a one-file `touch` cost one file's worth of index.
+fn call_names(facts: &BTreeMap<String, FileFacts>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for f in facts.values() {
+        for sym in &f.symbols {
+            for call in &sym.calls {
+                out.extend(call_lookup_names(&call.callee));
+            }
+        }
+    }
+    out
+}
+
 fn refresh(
     w: &mut Db,
     repo: &Path,
@@ -446,6 +518,16 @@ fn refresh(
     // 4. Symbols already in the graph: so a call can reach a file this pass is
     //    not touching, and so orphans — symbols whose file was renamed away or
     //    deleted, and whose keys can never be right again — can be swept.
+    //
+    //    A pass that was handed a path list narrows both halves. The work here
+    //    used to be the same on a one-file `touch` as on a whole-tree refresh:
+    //    a `has_node` graph read and an index insert for every symbol in the
+    //    repository, which is the part of `touch` that grows with the codebase
+    //    while the useful work stays constant.
+    let looked_up = only.map(|_| call_names(&facts));
+    let responsible: Option<BTreeSet<&str>> =
+        only.map(|paths| paths.iter().map(String::as_str).collect());
+
     let stored = w.query(SYMBOL_QUERY, &BTreeMap::new())?;
     let mut by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut orphans: Vec<String> = Vec::new();
@@ -456,15 +538,37 @@ fn refresh(
         else {
             continue;
         };
-        if !w.has_node(file.as_str()) {
-            orphans.push(id.clone());
-            continue;
+        // `has_node` is a graph read per row, and its answer can only change
+        // what this pass writes for a path the caller named: those are the
+        // files whose symbol set is being rewritten, and the ones the caller
+        // says have moved or gone. A narrowed pass therefore leaves an orphan
+        // it was not told about alone — `refresh_all` sweeps the lot, and
+        // `ingest-git` and `sync` both hand in the keys their commit walk
+        // retired, so nothing is left for a `touch` to find.
+        if responsible
+            .as_ref()
+            .is_none_or(|r| r.contains(file.as_str()))
+        {
+            if !w.has_node(file.as_str()) {
+                orphans.push(id.clone());
+                continue;
+            }
+            by_file.entry(file.clone()).or_default().insert(id.clone());
         }
-        by_file.entry(file.clone()).or_default().insert(id.clone());
         if facts.contains_key(file) || !tree.known(file) {
             continue; // superseded by this pass, or not a working-tree file
         }
-        if let Some(Value::Str(name)) = stored.get(i, "name") {
+        let Some(Value::Str(name)) = stored.get(i, "name") else {
+            continue;
+        };
+        // A method is filed under its bare name as well as its qualified one,
+        // so a narrowed index has to keep `Store.flush` when something looks
+        // up `flush` — see `indexed_under`.
+        if looked_up.as_ref().is_none_or(|names| {
+            indexed_under(name)
+                .iter()
+                .any(|under| names.contains(under))
+        }) {
             index.insert(name, id);
         }
     }
@@ -482,9 +586,18 @@ fn refresh(
         keyed.insert(path, keys);
     }
 
+    // What a path call may lead with, computed once for the whole pass.
+    let roots = tree.roots();
+    let pass = Pass {
+        tree: &tree,
+        index: &index,
+        roots: &roots,
+        with_docs,
+    };
+
     let mut writes: Vec<FileWrite> = Vec::new();
     for (path, f) in &facts {
-        let write = resolve_file(path, f, &tree, &index, &keyed[path], with_docs);
+        let write = resolve_file(path, f, &keyed[path], &pass);
         report.files_scanned += 1;
         report.symbols += write.symbols.len();
         report.imports += write.imports.len();
@@ -534,15 +647,19 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(8 * 1024)].contains(&0)
 }
 
-/// Turn one file's raw facts into resolved keys.
-fn resolve_file(
-    path: &str,
-    f: &FileFacts,
-    tree: &Tree,
-    index: &SymbolIndex,
-    keys: &[(String, usize)],
+/// Everything one file's resolution needs beyond its own facts. Built once for
+/// the whole pass, except `types`, which is per file.
+struct Pass<'a> {
+    tree: &'a Tree,
+    index: &'a SymbolIndex,
+    /// What a path call may lead with, over the whole working tree.
+    roots: &'a BTreeSet<String>,
     with_docs: bool,
-) -> FileWrite {
+}
+
+/// Turn one file's raw facts into resolved keys.
+fn resolve_file(path: &str, f: &FileFacts, keys: &[(String, usize)], pass: &Pass<'_>) -> FileWrite {
+    let (tree, index, with_docs) = (pass.tree, pass.index, pass.with_docs);
     let known = |p: &str| tree.known(p);
     let files_in = |d: &str| tree.files_in(d);
     let by_base = |n: &str| tree.by_basename(n);
@@ -570,19 +687,28 @@ fn resolve_file(
         }
     }
 
+    // Calls are resolved against this file's own imports, so a callee defined
+    // in another crate is reachable even when its name is not unique across the
+    // repository. The imports are resolved above, in this same pass.
+    let imported: Vec<String> = imports.iter().cloned().collect();
+    let scope = CallScope {
+        imports: &imported,
+        roots: pass.roots,
+    };
+
     let mut symbols = Vec::with_capacity(keys.len());
     for (key, at) in keys {
         let fact = &f.symbols[*at];
         let mut calls = BTreeSet::new();
         let mut call_lines = BTreeSet::new();
-        for (callee, line) in &fact.calls {
-            let Some(target) = resolve_call(path, callee, index) else {
+        for call in &fact.calls {
+            let Some(target) = resolve_call(path, call, index, &scope) else {
                 continue;
             };
             if &target == key {
                 continue; // a definition calling itself is not a graph edge
             }
-            call_lines.insert(format!("{target}\t{line}"));
+            call_lines.insert(format!("{target}\t{}", call.line));
             calls.insert(target);
         }
         symbols.push(SymbolWrite {

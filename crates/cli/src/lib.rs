@@ -15,7 +15,7 @@ use core_api::schema::Schema;
 use core_api::{
     default_max_edges, is_write_query, wal_commit_count_at, AlgoDir, BackupReport, DegreeConfig,
     Explanation, GraphDb, IngestOptions, LouvainConfig, PageRankConfig, Predicate, ResultSet,
-    RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
+    RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig, WriteGuard,
 };
 use export::ExportFormat;
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,6 +23,88 @@ use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// What every snapshot mushroomdb takes *on its own* does with the WAL.
+///
+/// An ingest that ends past the WAL threshold, a `serve --snapshot-every`
+/// tick, a graceful shutdown, and a plain `mushroomdb snapshot` all archive the
+/// WAL to `wal.<N>.archive` rather than dropping it. `node_history`,
+/// `edge_history`, `was_linked` and `open_at` all read WAL frames and all
+/// consult archives, so the store opens fast and still remembers how it got
+/// here. A truncating snapshot ends that reach — it deletes the genesis marker
+/// as well as the tail — so it is never something mushroomdb decides for the
+/// user: only `mushroomdb snapshot --truncate` does it.
+pub const AUTOMATIC_SNAPSHOT: SnapshotOptions = SnapshotOptions {
+    keep_wal: false,
+    archive_wal: true,
+};
+
+/// How many WAL archives a snapshot mushroomdb takes *on its own* keeps.
+///
+/// Archiving moves the WAL aside rather than deleting it, so without a bound
+/// every automatic snapshot leaves one more file behind and nothing ever
+/// reclaims them. On a dogfooded repository that is a new archive per
+/// [`SNAPSHOT_WAL_BYTES`] of churn, for as long as the store exists.
+///
+/// Eight is the compromise. The reach archives exist to preserve —
+/// `node_history`, `edge_history`, `was_linked` — is what the bound costs, and
+/// eight archives is eight snapshot intervals of it, which on the 4 MiB
+/// threshold is tens of megabytes of history and weeks of ordinary commit
+/// traffic. Beyond that the disk is a worse trade than the reach.
+///
+/// One consequence is worth stating plainly, because it is not proportional.
+/// The first prune breaks the genesis chain, and `open_at` refuses any commit
+/// it cannot reconstruct from a complete prefix — so from that point it
+/// answers for commits past the last snapshot and no further, even though the
+/// eight retained archives still answer `node_history` and `was_linked` over
+/// their own window. Time travel to a point-in-time state is therefore bounded
+/// by the last snapshot once a store has churned this far; the history reads
+/// are bounded by the retention.
+///
+/// Only the automatic path is bounded. `mushroomdb snapshot` is a thing the
+/// user asked for, and `--retention N` is theirs to set: an explicit snapshot
+/// with no `--retention` still keeps every archive, because deleting history
+/// nobody asked to delete is not a default worth having.
+///
+/// [`SNAPSHOT_WAL_BYTES`]: crate::ingest_git::SNAPSHOT_WAL_BYTES
+pub const AUTO_SNAPSHOT_RETENTION: u32 = 8;
+
+/// Take [`AUTOMATIC_SNAPSHOT`] under a held write lock, keeping
+/// [`AUTO_SNAPSHOT_RETENTION`] archives.
+///
+/// The single place the automatic disposition and the automatic bound are
+/// applied together, so no caller can pick up one without the other.
+///
+/// # Errors
+///
+/// Whatever writing the snapshot returned.
+pub fn snapshot_automatically(db: &mut WriteGuard<'_>) -> Result<(), core_api::GraphError> {
+    db.set_wal_archive_retention(Some(AUTO_SNAPSHOT_RETENTION));
+    db.snapshot_with(AUTOMATIC_SNAPSHOT)
+}
+
+/// How long a server-initiated snapshot waits for the store's cross-process
+/// write lock before giving up.
+///
+/// Short on purpose. A snapshot is an optimisation — it shortens the next
+/// open's replay — so skipping one costs nothing but a longer replay, whereas
+/// blocking the shutdown path or piling up timer ticks behind a busy peer
+/// costs the operator.
+pub const SNAPSHOT_LOCK_WAIT: Duration = Duration::from_millis(500);
+
+/// Take the snapshot `serve` takes — on a `--snapshot-every` tick, and once
+/// more on a graceful shutdown.
+///
+/// Lives here rather than in `main.rs` so the behaviour a running server has is
+/// the behaviour a test can call. `Busy` is the caller's to interpret: a tick
+/// skips it, since the next one is only a period away.
+///
+/// # Errors
+///
+/// Whatever taking the write lock or writing the snapshot returned.
+pub fn snapshot_shared(db: &SharedDb) -> Result<(), core_api::GraphError> {
+    snapshot_automatically(&mut db.write_with_wait(SNAPSHOT_LOCK_WAIT)?)
+}
 
 /// Deterministic demo: 10 Orgs, 20 Projects, 30 People.
 pub const N_ORGS: usize = 10;
@@ -54,9 +136,9 @@ pub fn version_string() -> String {
 ///
 /// 1. `$CLAUDE_PROJECT_DIR/mushroom-memory` — the assistant tells a hook which
 ///    project it is working in, and that is the most specific answer there is.
-/// 2. `<cwd>/mushroom-memory`, but only when the working directory is a git
-///    checkout. Without that guard a command run from a home directory would
-///    quietly create a store there.
+/// 2. `<working-tree root>/mushroom-memory`, but only when the working
+///    directory is inside a git checkout. Without that guard a command run
+///    from a home directory would quietly create a store there.
 /// 3. `<home>/.mushroomdb/memory`, the user-scope default `install` writes.
 ///
 /// The two project-scoped answers match [`install::default_db`],
@@ -70,10 +152,28 @@ pub fn resolve_auto_db(
     if let Some(dir) = env_project_dir.filter(|d| !d.is_empty()) {
         return Path::new(dir).join("mushroom-memory");
     }
-    if cwd.join(".git").exists() {
-        return cwd.join("mushroom-memory");
+    if let Some(root) = worktree_root(cwd) {
+        return root.join("mushroom-memory");
     }
     home.join(".mushroomdb").join("memory")
+}
+
+/// The root of the working tree `dir` sits in: the nearest ancestor holding a
+/// `.git` entry, or `None` outside a checkout.
+///
+/// The answer is a *working tree* root, never the `.git` directory several
+/// worktrees share. A linked worktree keeps a `.git` **file** at its root
+/// (`gitdir: …/worktrees/<name>`) rather than a directory, and both spellings
+/// count here, so `git worktree add` produces a checkout that resolves to its
+/// own store. Two worktrees are two different sets of files, and a graph built
+/// from one answers questions about the other wrongly.
+///
+/// Walking up matters as much as the file/directory distinction: a hook fires
+/// with whatever working directory the tool call had, which is often a
+/// subdirectory, and only the root has the `.git` entry.
+#[must_use]
+pub fn worktree_root(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|d| d.join(".git").exists())
 }
 
 /// How `serve` should mount a UI. Precedence: `--ui dir` > embedded > `--no-ui`.
@@ -121,6 +221,11 @@ pub enum Command {
         /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
         db_dir: Option<PathBuf>,
         auto: bool,
+        /// `--all-tools`: advertise all twenty-four tools in `tools/list`
+        /// rather than the eleven a coding agent reaches for. The thirteen it
+        /// adds are callable either way; the flag decides what is listed, and
+        /// what every session pays for before its first turn.
+        all_tools: bool,
     },
     Stats {
         db_dir: PathBuf,
@@ -163,14 +268,12 @@ pub enum Command {
         /// Positional after dir (remaining args joined), or `--query`.
         cypher: String,
     },
-    /// Write `snapshot.bin` (default truncates WAL unless `--keep-wal`).
+    /// Write `snapshot.bin`. The WAL is archived unless told otherwise.
     Snapshot {
         db_dir: PathBuf,
-        keep_wal: bool,
-        /// Rename WAL to wal.<commit_seq>.archive before writing fresh baseline.
-        archive_wal: bool,
+        wal: WalDisposition,
         /// Keep the newest N archives; prune oldest at snapshot time.
-        /// None = unlimited. Applies only when archive_wal is true.
+        /// None = unlimited. Applies only when the WAL is archived.
         retention: Option<u32>,
     },
     /// Apply a JSON schema file idempotently (`schema apply <db-dir> <schema.json>`).
@@ -206,6 +309,13 @@ pub enum Command {
     Install(install::InstallOpts),
     /// Undo what `install` wrote (manifest-driven).
     Uninstall(install::InstallOpts),
+    /// Turn an install off without removing it: strips the hooks, the MCP
+    /// entry and the git hook blocks; the skill, the store and the
+    /// `.gitignore` line stay.
+    Disable(install::ToggleOpts),
+    /// Turn a disabled install back on, re-deriving the dynamic parts (the
+    /// resolved command, the hooks) rather than replaying stale ones.
+    Enable(install::ToggleOpts),
     /// Verify an install end to end: config, store, hooks, and a real MCP handshake.
     Doctor(doctor::DoctorOpts),
     /// Body of the Claude Code UserPromptSubmit hook: reads a prompt payload on
@@ -217,7 +327,12 @@ pub enum Command {
     /// Bring the store up to date with the repository the `GitSync` marker
     /// names: the commits since the marker, then the dirty working tree.
     Sync {
-        db_dir: PathBuf,
+        /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
+        /// The git hooks `install` writes use that form, so a `git worktree`
+        /// of the repository syncs its own store rather than the one belonging
+        /// to the checkout the install was typed in.
+        db_dir: Option<PathBuf>,
+        auto: bool,
         /// Print the report as one JSON object instead of the plain digest.
         /// The MCP `sync` tool runs this binary and reads that object, so the
         /// counts reach an assistant without being parsed back out of prose.
@@ -309,15 +424,24 @@ Usage:
   mushroomdb install [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
                      [--command <path>] [--no-git-hooks] [--no-prewarm]
   mushroomdb uninstall [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
+  mushroomdb disable [--platform claude-code|cursor|codex|all] [--project|--user]
+                     turn an install off without removing it: hooks, MCP entry and git hook
+                     blocks are removed; the skill, the store and .gitignore stay
+  mushroomdb enable [--platform claude-code|cursor|codex|all] [--project|--user]
+                     turn a disabled install back on
   mushroomdb doctor [--project|--user] [--platform claude-code|cursor|codex|all]
                      verify an install: config entry, store, hooks, git hooks, and a real
                      stdio handshake with the configured MCP command; exits 1 on any `fail`
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
-  mushroomdb mcp <db-dir>|--auto
+  mushroomdb mcp <db-dir>|--auto [--all-tools]
+                     --all-tools lists all 24 tools; the default lists the 11 a coding
+                     agent reaches for (the rest stay callable, just unlisted)
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
   mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
-  mushroomdb sync <db-dir> [--json] re-sync the repo the store was built from: new commits, then the dirty working tree
+  mushroomdb sync <db-dir>|--auto [--json]
+                                   re-sync the repo the store was built from: new commits, then the
+                                   dirty working tree (git hook body)
   mushroomdb map <db-dir> [--json] summarise the graphed repository: clusters, key files, owners, hot files
                                    --json prints the computed map instead of the rendered digest
   mushroomdb context <db-dir> <target>   one file or symbol from every side: signature, source, callers,
@@ -334,7 +458,10 @@ Usage:
   mushroomdb suggest <db-dir>
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
-  mushroomdb snapshot <db-dir> [--keep-wal]
+  mushroomdb snapshot <db-dir> [--keep-wal|--truncate] [--retention N]
+                     folds the WAL into snapshot.bin and archives it as wal.<N>.archive,
+                     so node_history, edge_history, was_linked and asof keep reaching it;
+                     --truncate discards it instead, --keep-wal leaves wal.bin whole
   mushroomdb migrate <db-dir>
   mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
   mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
@@ -365,11 +492,16 @@ Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or
 install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
 the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
 --command names one (a relative --command or --db is anchored to the current directory).
---no-git-hooks skips the post-commit/checkout/merge sync hooks; --no-prewarm skips fetching the
-pinned package once. uninstall resolves the same scope and falls back to the other one when the
-inferred scope has no manifest; undoing a Codex install needs --platform codex.
---auto resolves the database as $CLAUDE_PROJECT_DIR/mushroom-memory, else ./mushroom-memory in a
-git checkout, else ~/.mushroomdb/memory.
+--no-git-hooks skips the post-commit/checkout/merge sync hooks. --no-prewarm means no network and no
+resolution: neither the one-off package fetch nor locating the package's binary, so every hook keeps
+the slower `npx` form.
+uninstall resolves the same scope and falls back to the other one when the inferred scope has no
+manifest; undoing a Codex install needs --platform codex.
+A project install inside a git checkout writes --auto rather than a store path, so each `git
+worktree` gets its own store; outside a checkout, and with --db, the store is pinned to an absolute
+path instead.
+--auto resolves the database as $CLAUDE_PROJECT_DIR/mushroom-memory, else mushroom-memory at the
+root of the working tree the current directory is in, else ~/.mushroomdb/memory.
 "
 }
 
@@ -484,6 +616,46 @@ fn parse_doctor_cmd(args: &[&str]) -> Result<doctor::DoctorOpts, String> {
     Ok(doctor::DoctorOpts { platform, scope })
 }
 
+/// Shared by `mushroomdb enable` and `mushroomdb disable`: the same
+/// `--platform` / `--project` / `--user` flags `doctor` takes, and nothing
+/// else — neither command chooses a store or a binary, so there is no `--db`
+/// or `--command` to parse.
+fn parse_toggle_cmd(args: &[&str]) -> Result<install::ToggleOpts, String> {
+    let mut platform: Option<install::Platform> = None;
+    let mut scope: Option<install::Scope> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--platform" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --platform".to_string())?;
+            platform = Some(install::Platform::parse(val)?);
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--platform=") {
+            platform = Some(install::Platform::parse(val)?);
+            i += 1;
+        } else if a == "--project" || a == "--user" {
+            let want = if a == "--project" {
+                install::Scope::Project
+            } else {
+                install::Scope::User
+            };
+            if scope.is_some_and(|s| s != want) {
+                return Err("--project and --user are mutually exclusive".to_string());
+            }
+            scope = Some(want);
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else {
+            return Err(format!("unexpected argument: {a}"));
+        }
+    }
+    Ok(install::ToggleOpts { platform, scope })
+}
+
 fn parse_ingest_git(args: &[&str]) -> Result<Command, String> {
     let mut positional = Vec::new();
     let mut exclude = Vec::new();
@@ -580,9 +752,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "--help" | "-h" | "help" => Ok(Command::Help),
         "--version" | "-V" | "version" => Ok(Command::Version),
         "serve" => parse_serve(&args[1..]),
-        "mcp" => {
-            parse_dir_or_auto("mcp", &args[1..]).map(|(db_dir, auto)| Command::Mcp { db_dir, auto })
-        }
+        "mcp" => parse_mcp(&args[1..]),
         "stats" => parse_one_dir("stats", &args[1..]).map(|db_dir| Command::Stats { db_dir }),
         "demo" => parse_one_dir("demo", &args[1..]).map(|db_dir| Command::Demo { db_dir }),
         "suggest" => parse_one_dir("suggest", &args[1..]).map(|db_dir| Command::Suggest { db_dir }),
@@ -597,8 +767,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "export" => parse_export(&args[1..]),
         "recall" => parse_dir_or_auto("recall", &args[1..])
             .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
-        "sync" => parse_dir_with_json("sync", &args[1..])
-            .map(|(db_dir, json)| Command::Sync { db_dir, json }),
+        "sync" => parse_sync(&args[1..]),
         "map" => parse_dir_with_json("map", &args[1..])
             .map(|(db_dir, json)| Command::Map { db_dir, json }),
         "context" => {
@@ -624,6 +793,8 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "ingest-git" => parse_ingest_git(&args[1..]),
         "install" => parse_install_cmd(&args[1..]).map(Command::Install),
         "uninstall" => parse_install_cmd(&args[1..]).map(Command::Uninstall),
+        "disable" => parse_toggle_cmd(&args[1..]).map(Command::Disable),
+        "enable" => parse_toggle_cmd(&args[1..]).map(Command::Enable),
         "doctor" => parse_doctor_cmd(&args[1..]).map(Command::Doctor),
         other => Err(format!("unknown command: {other}")),
     }
@@ -923,17 +1094,22 @@ pub fn run_query(db_dir: &Path, cypher: &str) -> Result<String, CliError> {
 
 fn parse_snapshot(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
-    let mut keep_wal = false;
-    let mut archive_wal = false;
+    // Archiving is the default: a snapshot the user did not ask to be
+    // destructive should not cost them their history.
+    let mut wal = WalDisposition::Archive;
     let mut retention: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
         if a == "--keep-wal" {
-            keep_wal = true;
+            wal = WalDisposition::Keep;
+            i += 1;
+        } else if a == "--truncate" {
+            wal = WalDisposition::Truncate;
             i += 1;
         } else if a == "--archive-wal" {
-            archive_wal = true;
+            // Kept for the callers that spelled the default out.
+            wal = WalDisposition::Archive;
             i += 1;
         } else if a.starts_with("--retention=") {
             let v = a.trim_start_matches("--retention=");
@@ -964,8 +1140,7 @@ fn parse_snapshot(args: &[&str]) -> Result<Command, String> {
     let db_dir = db_dir.ok_or_else(|| "snapshot requires <db-dir>".to_string())?;
     Ok(Command::Snapshot {
         db_dir,
-        keep_wal,
-        archive_wal,
+        wal,
         retention,
     })
 }
@@ -1060,28 +1235,51 @@ pub fn run_verify(db_dir: &Path) -> Result<String, CliError> {
     }
 }
 
-/// Open `dir` and write `snapshot.bin`. Default truncates the WAL.
+/// What a snapshot does with the WAL it folds in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalDisposition {
+    /// Move it to `wal.<N>.archive`, where the history reads still find it.
+    /// The default, and what every automatic snapshot does: a store should not
+    /// forget how it got here in exchange for opening faster.
+    #[default]
+    Archive,
+    /// Leave `wal.bin` whole. Every pre-snapshot commit stays in the live WAL,
+    /// and every open replays all of it.
+    Keep,
+    /// Drop it. The smallest directory and the fastest open, at the price of
+    /// every commit before this point: `node_history`, `edge_history`,
+    /// `was_linked` and `open_at` stop reaching them, and any archives an
+    /// earlier snapshot left become unreachable too.
+    Truncate,
+}
+
+impl WalDisposition {
+    fn options(self) -> SnapshotOptions {
+        match self {
+            WalDisposition::Archive => AUTOMATIC_SNAPSHOT,
+            WalDisposition::Keep => SnapshotOptions {
+                keep_wal: true,
+                archive_wal: false,
+            },
+            WalDisposition::Truncate => SnapshotOptions {
+                keep_wal: false,
+                archive_wal: false,
+            },
+        }
+    }
+}
+
+/// Open `dir` and write `snapshot.bin`, archiving the WAL by default.
 pub fn run_snapshot(
     db_dir: &Path,
-    keep_wal: bool,
-    archive_wal: bool,
+    wal: WalDisposition,
     retention: Option<u32>,
 ) -> Result<String, CliError> {
     let mut db = GraphDb::open(db_dir)?;
-    if archive_wal {
+    if wal == WalDisposition::Archive {
         db.set_wal_archive_retention(retention);
-        db.snapshot_with(SnapshotOptions {
-            archive_wal: true,
-            keep_wal: false,
-        })?;
-    } else if keep_wal {
-        db.snapshot_with(SnapshotOptions {
-            keep_wal: true,
-            archive_wal: false,
-        })?;
-    } else {
-        db.snapshot()?;
     }
+    db.snapshot_with(wal.options())?;
     Ok(format!(
         "snapshot written: {}\n",
         db_dir.join("snapshot.bin").display()
@@ -1627,6 +1825,33 @@ fn parse_dir_or_auto(cmd: &str, args: &[&str]) -> Result<(Option<PathBuf>, bool)
         (None, false) => Err(format!("{cmd} requires <db-dir> or --auto")),
         _ => Ok((db_dir, auto)),
     }
+}
+
+/// `mcp [<db-dir>|--auto] [--all-tools]`. Every other flag is
+/// [`parse_dir_or_auto`]'s to reject, so `--all-tools` is stripped here and
+/// the rest of the line parses exactly as `recall`'s does.
+fn parse_mcp(args: &[&str]) -> Result<Command, String> {
+    let all_tools = args.contains(&"--all-tools");
+    let rest: Vec<&str> = args
+        .iter()
+        .copied()
+        .filter(|a| *a != "--all-tools")
+        .collect();
+    parse_dir_or_auto("mcp", &rest).map(|(db_dir, auto)| Command::Mcp {
+        db_dir,
+        auto,
+        all_tools,
+    })
+}
+
+/// `sync <db-dir>|--auto [--json]`. `--auto` is what the git hooks `install`
+/// writes use: git runs a hook with the working tree it acted on as the
+/// working directory, so the store resolves to that tree's own and a second
+/// worktree never syncs the first one's graph.
+fn parse_sync(args: &[&str]) -> Result<Command, String> {
+    let json = args.contains(&"--json");
+    let rest: Vec<&str> = args.iter().copied().filter(|a| *a != "--json").collect();
+    parse_dir_or_auto("sync", &rest).map(|(db_dir, auto)| Command::Sync { db_dir, auto, json })
 }
 
 /// `touch [<db-dir>|--auto] [<file>...]`. The first positional is the database
@@ -2370,9 +2595,14 @@ mod tests {
             Case {
                 args: &["mcp", "/tmp/demo-db"],
                 check: |r| match r {
-                    Ok(Command::Mcp { db_dir, auto }) => {
+                    Ok(Command::Mcp {
+                        db_dir,
+                        auto,
+                        all_tools,
+                    }) => {
                         assert_eq!(db_dir, Some(PathBuf::from("/tmp/demo-db")));
                         assert!(!auto);
+                        assert!(!all_tools, "the short list is the default");
                     }
                     other => panic!("mcp <dir>, got {other:?}"),
                 },
@@ -2638,13 +2868,26 @@ mod tests {
 
     #[test]
     fn parse_snapshot_and_query() {
-        match parse_args(&["snapshot", "/tmp/db"]).unwrap() {
-            Command::Snapshot { keep_wal, .. } => assert!(!keep_wal),
-            other => panic!("{other:?}"),
-        }
-        match parse_args(&["snapshot", "/tmp/db", "--keep-wal"]).unwrap() {
-            Command::Snapshot { keep_wal, .. } => assert!(keep_wal),
-            other => panic!("{other:?}"),
+        // Archiving is what a snapshot does unless the user says otherwise.
+        for (args, want) in [
+            (vec!["snapshot", "/tmp/db"], WalDisposition::Archive),
+            (
+                vec!["snapshot", "/tmp/db", "--archive-wal"],
+                WalDisposition::Archive,
+            ),
+            (
+                vec!["snapshot", "/tmp/db", "--keep-wal"],
+                WalDisposition::Keep,
+            ),
+            (
+                vec!["snapshot", "/tmp/db", "--truncate"],
+                WalDisposition::Truncate,
+            ),
+        ] {
+            match parse_args(&args).unwrap() {
+                Command::Snapshot { wal, .. } => assert_eq!(wal, want, "{args:?}"),
+                other => panic!("{other:?}"),
+            }
         }
         match parse_args(&["query", "/tmp/db", "MATCH (n) RETURN n LIMIT 1"]).unwrap() {
             Command::Query { cypher, .. } => assert!(cypher.contains("MATCH")),
@@ -2964,7 +3207,7 @@ mod tests {
             !dir.join("snapshot.bin").exists(),
             "GraphDb Drop must not snapshot"
         );
-        let out = run_snapshot(&dir, false, false, None).expect("snapshot");
+        let out = run_snapshot(&dir, WalDisposition::Archive, None).expect("snapshot");
         assert!(
             dir.join("snapshot.bin").is_file(),
             "run_snapshot must write snapshot.bin"
@@ -2976,6 +3219,155 @@ mod tests {
         let db = GraphDb::open(&dir).expect("reopen");
         assert!(db.has_node("alice"), "reopen after snapshot must recover");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every snapshot mushroomdb takes on its own — the ingest's, a
+    /// `serve --snapshot-every` tick, the graceful-shutdown one — archives the
+    /// WAL, so a store never loses its past to a write nobody asked for. Only
+    /// an explicit `--truncate` ends that reach.
+    #[test]
+    fn an_automatic_snapshot_keeps_history_reachable_and_truncate_ends_it() {
+        let dir = tmp("snapshot-archive");
+        {
+            let mut db = GraphDb::open(&dir).expect("open");
+            db.insert_node("Person", "alice", vec![]).expect("insert");
+        }
+        let before = wal_commit_count_at(&dir).expect("count");
+        assert!(before > 0, "the insert is a commit");
+
+        // Exactly the call `serve` makes on a tick and on shutdown.
+        {
+            let shared = SharedDb::open(&dir).expect("open");
+            snapshot_shared(&shared).expect("snapshot");
+        }
+
+        let archives = || {
+            std::fs::read_dir(&dir)
+                .expect("read dir")
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".archive"))
+                .count()
+        };
+        assert_eq!(archives(), 1, "the WAL was archived, not dropped");
+        assert!(
+            dir.join("wal.genesis").is_file(),
+            "the genesis marker is what lets asof reach an archived commit"
+        );
+        {
+            let db = GraphDb::open(&dir).expect("reopen");
+            assert!(db.has_node("alice"));
+            assert!(
+                !db.node_history("alice").expect("history").is_empty(),
+                "the insert is still explainable"
+            );
+        }
+        assert!(
+            GraphDb::open_at(&dir, before - 1).is_ok(),
+            "asof still reaches a commit the snapshot folded in"
+        );
+
+        // A truncating snapshot is the destructive one, and only the user asks
+        // for it.
+        run_snapshot(&dir, WalDisposition::Truncate, None).expect("truncate");
+        assert!(
+            !dir.join("wal.genesis").exists(),
+            "truncating ends asof's reach into the archives"
+        );
+        let db = GraphDb::open(&dir).expect("reopen");
+        assert!(
+            db.has_node("alice"),
+            "the data survives; only the past goes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Automatic snapshots keep a bounded number of archives, and the window
+    /// they keep is still reachable.
+    ///
+    /// Archiving moves the WAL aside rather than deleting it, so a store that
+    /// snapshots on every sync would otherwise leave one more file behind for
+    /// every threshold's worth of churn, forever. The bound is the only thing
+    /// that ever reclaims them, and it must not cost the recent past.
+    #[test]
+    fn automatic_snapshots_keep_a_bounded_number_of_archives() {
+        let dir = tmp("snapshot-retention");
+        let archives = |d: &Path| {
+            std::fs::read_dir(d)
+                .expect("read dir")
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".archive"))
+                .count()
+        };
+
+        // Ten rounds of "commit something, then take the snapshot the ingest,
+        // the sync hook and the server tick all take".
+        let rounds = 10;
+        for i in 0..rounds {
+            {
+                let mut db = GraphDb::open(&dir).expect("open");
+                db.insert_node("Person", &format!("p{i}"), vec![])
+                    .expect("insert");
+            }
+            let shared = SharedDb::open(&dir).expect("open shared");
+            snapshot_shared(&shared).expect("snapshot");
+        }
+
+        assert_eq!(
+            archives(&dir),
+            AUTO_SNAPSHOT_RETENTION as usize,
+            "{rounds} automatic snapshots must not leave {rounds} archives"
+        );
+
+        // The bound costs the oldest history, never the data and never the
+        // window it kept.
+        let db = GraphDb::open(&dir).expect("reopen");
+        for i in 0..rounds {
+            assert!(db.has_node(&format!("p{i}")), "p{i} survived the pruning");
+        }
+        // What the bound costs is the oldest history and only that: the two
+        // frames below the floor are gone, and everything the retained
+        // archives still hold is still explainable.
+        assert!(
+            db.node_history("p0").expect("history").is_empty(),
+            "the pruned archives take their history with them"
+        );
+        assert!(
+            !db.node_history("p9").expect("history").is_empty(),
+            "the retained window is still explainable"
+        );
+        drop(db);
+
+        // Pruning breaks the genesis chain, so `open_at` reaches what it can
+        // reconstruct from the snapshot forward: the live WAL.
+        {
+            let mut db = GraphDb::open(&dir).expect("open");
+            db.insert_node("Person", "after", vec![]).expect("insert");
+        }
+        let latest = GraphDb::open(&dir).expect("reopen").commit_seq();
+        assert!(
+            GraphDb::open_at(&dir, latest - 1).is_ok(),
+            "asof still reaches commits past the last snapshot"
+        );
+
+        // The explicit command is the user's, and keeps everything unless the
+        // user says otherwise.
+        let manual = tmp("snapshot-retention-manual");
+        for i in 0..3 {
+            {
+                let mut db = GraphDb::open(&manual).expect("open");
+                db.insert_node("Person", &format!("p{i}"), vec![])
+                    .expect("insert");
+            }
+            run_snapshot(&manual, WalDisposition::Archive, None).expect("snapshot");
+        }
+        assert_eq!(
+            archives(&manual),
+            3,
+            "`mushroomdb snapshot` with no --retention keeps every archive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&manual);
     }
 
     #[test]
@@ -3808,7 +4200,8 @@ mod tests {
             parse_args(&["mcp", "--auto"]).unwrap(),
             Command::Mcp {
                 db_dir: None,
-                auto: true
+                auto: true,
+                all_tools: false
             }
         );
         assert_eq!(
@@ -3828,23 +4221,82 @@ mod tests {
         assert!(usage().contains("--auto"));
     }
 
+    /// Binding: `--all-tools` is `mcp`'s alone, sits either side of the store
+    /// path, and every other flag is still rejected.
+    #[test]
+    fn mcp_takes_all_tools() {
+        for args in [
+            &["mcp", "/tmp/db", "--all-tools"][..],
+            &["mcp", "--all-tools", "/tmp/db"][..],
+        ] {
+            assert_eq!(
+                parse_args(args).unwrap(),
+                Command::Mcp {
+                    db_dir: Some(PathBuf::from("/tmp/db")),
+                    auto: false,
+                    all_tools: true
+                },
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            parse_args(&["mcp", "--auto", "--all-tools"]).unwrap(),
+            Command::Mcp {
+                db_dir: None,
+                auto: true,
+                all_tools: true
+            }
+        );
+        assert!(parse_args(&["mcp", "--all-tools"]).is_err(), "no target");
+        assert!(parse_args(&["mcp", "/tmp/db", "--nope"]).is_err());
+        assert!(parse_args(&["recall", "/tmp/db", "--all-tools"]).is_err());
+        assert!(usage().contains("--all-tools"));
+    }
+
     #[test]
     fn sync_and_touch_parse() {
         assert_eq!(
             parse_args(&["sync", "/tmp/db"]).unwrap(),
             Command::Sync {
-                db_dir: PathBuf::from("/tmp/db"),
+                db_dir: Some(PathBuf::from("/tmp/db")),
+                auto: false,
                 json: false,
             }
         );
         assert_eq!(
             parse_args(&["sync", "/tmp/db", "--json"]).unwrap(),
             Command::Sync {
-                db_dir: PathBuf::from("/tmp/db"),
+                db_dir: Some(PathBuf::from("/tmp/db")),
+                auto: false,
                 json: true,
             }
         );
-        assert!(parse_args(&["sync"]).is_err(), "db-dir is required");
+        // The git hooks `install` writes use `--auto`, so each worktree of a
+        // repository syncs its own store.
+        assert_eq!(
+            parse_args(&["sync", "--auto"]).unwrap(),
+            Command::Sync {
+                db_dir: None,
+                auto: true,
+                json: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&["sync", "--auto", "--json"]).unwrap(),
+            Command::Sync {
+                db_dir: None,
+                auto: true,
+                json: true,
+            }
+        );
+        assert!(
+            parse_args(&["sync"]).is_err(),
+            "one of <db-dir> or --auto is required"
+        );
+        assert!(
+            parse_args(&["sync", "/tmp/db", "--auto"]).is_err(),
+            "--auto and a path contradict each other"
+        );
 
         // Positional form: the first path is the database, the rest are files.
         assert_eq!(

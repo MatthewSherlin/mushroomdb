@@ -138,6 +138,7 @@ FILES=(
   "packaging/plugin/.claude-plugin/plugin.json"
   "packaging/plugin/.mcp.json"
   "packaging/plugin/hooks/hooks.json"
+  "packaging/plugin/hooks/run.sh"
   ".claude-plugin/marketplace.json"
   "packaging/plugin/skills/mushroom/SKILL.md"
 )
@@ -145,8 +146,13 @@ FILES=(
 render_file "$TEMPLATES/plugin.json.tmpl"                     "$OUT/packaging/plugin/.claude-plugin/plugin.json"
 render_file "$TEMPLATES/mcp.json.tmpl"                        "$OUT/packaging/plugin/.mcp.json"
 render_file "$TEMPLATES/hooks.json.tmpl"                      "$OUT/packaging/plugin/hooks/hooks.json"
+render_file "$TEMPLATES/run.sh.tmpl"                          "$OUT/packaging/plugin/hooks/run.sh"
 render_file "$TEMPLATES/marketplace.json.tmpl"                "$OUT/.claude-plugin/marketplace.json"
 render_skill "$ROOT/crates/cli/skills/mushroom/SKILL.md"      "$OUT/packaging/plugin/skills/mushroom/SKILL.md"
+
+# The hooks call run.sh by path, so git has to carry the executable bit: a
+# rendered-but-not-executable script is a hook that silently never runs.
+chmod 0755 "$OUT/packaging/plugin/hooks/run.sh"
 
 if [[ "$CHECK" -eq 1 ]]; then
   fail=0
@@ -160,6 +166,10 @@ if [[ "$CHECK" -eq 1 ]]; then
       fail=1
     fi
   done
+  if [[ ! -x "$ROOT/packaging/plugin/hooks/run.sh" ]]; then
+    echo "render-plugin.sh --check: packaging/plugin/hooks/run.sh is not executable" >&2
+    fail=1
+  fi
   if [[ "$fail" -ne 0 ]]; then
     echo "render-plugin.sh --check: rendered output differs from committed files (version ${VERSION}) — see diff above" >&2
     exit 1

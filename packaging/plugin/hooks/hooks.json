@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "npx -y mushroomdb@0.6.0 recall --auto",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" recall --auto",
             "timeout": 5
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "npx -y mushroomdb@0.6.0 touch --auto",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" touch --auto",
             "timeout": 30,
             "async": true
           }

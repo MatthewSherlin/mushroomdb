@@ -29,7 +29,17 @@
 //!
 //! [`SymbolIndex`] keys are `<file path>#<qualified symbol name>`; the caller
 //! builds the index in that shape so [`resolve_call`] can prefer a definition
-//! in the calling file or its directory.
+//! in the calling file or its directory. [`resolve_call`] also takes the
+//! calling file's resolved imports, which is what lets a call reach a
+//! definition in another crate whose name is not unique repository-wide — and
+//! is the only thing that can reach one at all for a call written on a
+//! receiver, which never falls back to repository-wide uniqueness.
+//!
+//! A method is stored qualified — `Store.flush` — and written on a receiver —
+//! `store.flush()` — so the index files it under the bare name too. Those
+//! entries are read only where the receiver identifies the type, because
+//! stripping a receiver says which method is wanted and nothing about what it
+//! belongs to: see [`resolve_call`].
 //!
 //! # Determinism
 //!
@@ -44,7 +54,7 @@ mod lang;
 
 pub use docs::resolve_mention;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Files larger than this are reduced to hash, language and line count.
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
@@ -130,9 +140,56 @@ pub struct SymbolFact {
     /// The first line of the doc comment, at most [`MAX_TEXT_CHARS`]
     /// characters. Empty when the definition is undocumented.
     pub doc: String,
-    /// Callees as written, with the line of the call site. Sorted,
-    /// deduplicated, at most [`MAX_CALLS`] entries.
-    pub calls: Vec<(String, u32)>,
+    /// One entry per call site. Sorted, deduplicated, at most [`MAX_CALLS`]
+    /// entries.
+    pub calls: Vec<CallFact>,
+}
+
+/// One call as written, and enough about how it was written to resolve it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CallFact {
+    /// The callee as written: `flush`, `Store::flush`, `self.flush`.
+    pub callee: String,
+    /// 1-based line of the call site.
+    pub line: u32,
+    /// The call was written in *method* position — a receiver, a dot, a name.
+    /// See [`written_as_method`].
+    pub method: bool,
+}
+
+impl CallFact {
+    /// A call written as a bare name or a path: `flush`, `a::b::flush`.
+    #[must_use]
+    pub fn plain(callee: &str, line: u32) -> Self {
+        CallFact {
+            callee: callee.to_string(),
+            line,
+            method: false,
+        }
+    }
+
+    /// A call written on a receiver: `self.flush`, `store.flush`.
+    #[must_use]
+    pub fn method(callee: &str, line: u32) -> Self {
+        CallFact {
+            callee: callee.to_string(),
+            line,
+            method: true,
+        }
+    }
+}
+
+/// Whether a callee as written names a receiver rather than a path.
+///
+/// Every language here reports the callee as the source wrote it, and in all of
+/// them a `.` separates a value or a module from the name being called —
+/// `self.flush`, `store.flush`, `os.path.join`, `pkg.Func`. A path uses `::`
+/// (Rust) or nothing at all, neither of which contains a dot. So one rule
+/// covers every grammar, and it is the same rule
+/// [`resolve_call`]'s candidate splitting already uses to find the last segment.
+#[must_use]
+pub fn written_as_method(callee: &str) -> bool {
+    callee.contains('.')
 }
 
 /// One import as written in the source.
@@ -290,6 +347,7 @@ pub fn resolve_import(
 #[derive(Clone, Debug, Default)]
 pub struct SymbolIndex {
     by_name: BTreeMap<String, Vec<String>>,
+    by_method: BTreeMap<String, Vec<String>>,
 }
 
 impl SymbolIndex {
@@ -301,10 +359,18 @@ impl SymbolIndex {
     /// Record that `name` is defined by the symbol at `key`. Inserting the
     /// same pair twice is a no-op, and the stored keys stay sorted, so the
     /// index does not depend on insertion order.
+    ///
+    /// A method — a name qualified `Type.method` — is filed twice: under the
+    /// name as written, and under the bare `method`. Source almost never
+    /// writes the qualified form. `store.flush()` says `flush` after the
+    /// receiver is stripped, and without the second entry no call on a
+    /// receiver could ever reach a method definition. The two sets are kept
+    /// apart because they carry different weight: see [`resolve_call`], which
+    /// consults the bare entries only where the tier itself is evidence.
     pub fn insert(&mut self, name: &str, key: &str) {
-        let slot = self.by_name.entry(name.to_string()).or_default();
-        if let Err(at) = slot.binary_search_by(|held| held.as_str().cmp(key)) {
-            slot.insert(at, key.to_string());
+        insert_sorted(self.by_name.entry(name.to_string()).or_default(), key);
+        if let Some(bare) = method_name(name) {
+            insert_sorted(self.by_method.entry(bare.to_string()).or_default(), key);
         }
     }
 
@@ -322,29 +388,201 @@ impl SymbolIndex {
     fn keys_for(&self, name: &str) -> &[String] {
         self.by_name.get(name).map_or(&[], Vec::as_slice)
     }
+
+    /// Keys of the methods whose bare name is `name`, whatever type they
+    /// belong to.
+    fn methods_for(&self, name: &str) -> &[String] {
+        self.by_method.get(name).map_or(&[], Vec::as_slice)
+    }
+}
+
+fn insert_sorted(slot: &mut Vec<String>, key: &str) {
+    if let Err(at) = slot.binary_search_by(|held| held.as_str().cmp(key)) {
+        slot.insert(at, key.to_string());
+    }
+}
+
+/// The bare name of a qualified method: `flush` in `Store.flush`, `None` for a
+/// name that is not written as a method.
+fn method_name(name: &str) -> Option<&str> {
+    let (_, bare) = name.rsplit_once('.')?;
+    (!bare.is_empty()).then_some(bare)
+}
+
+/// The type a method belongs to: `Store` in `Store.flush`, and in
+/// `mod::Store.flush`.
+fn receiver_type(name: &str) -> Option<&str> {
+    let (owner, _) = name.rsplit_once('.')?;
+    let owner = owner.rsplit(['.', ':']).next().unwrap_or(owner);
+    (!owner.is_empty()).then_some(owner)
+}
+
+/// What a call was written on: `store` in `store.flush`, and `symbols` — not
+/// `self` — in `self.symbols.len`. The segment immediately before the method
+/// is the thing whose method is being called.
+fn receiver_of(callee: &str) -> Option<&str> {
+    receiver_type(callee.trim())
+}
+
+/// Whether the receiver a call was written on identifies `symbol`'s type.
+///
+/// This is the guard that keeps the bare-name entries from turning every
+/// `.len()` in the repository into an edge. Stripping the receiver tells you
+/// *which* method is wanted and nothing about *what* it belongs to, and on a
+/// real codebase the reachable `Type.len` is almost never the `Vec` the source
+/// meant. Two receivers say what the type is:
+///
+/// * `self` — and `Self`, `this`, `cls`, which are the same idea in the five
+///   languages here — is the type being implemented, so a
+///   candidate in the calling file is it. That is where `impl` blocks put
+///   their methods, and it is the case that matters: `self.flush()` is how
+///   most method calls inside a type are written.
+/// * a variable named after its type — `store: Store`, `symbol_index:
+///   SymbolIndex` — which every language here spells consistently enough to be
+///   evidence once case and `_` are collapsed.
+///
+/// Anything else is a variable whose type the graph does not know, and the
+/// truthful answer for it is no edge. That costs real calls — `rs.len()` on a
+/// `ResultSet` gets nothing — and the trade is deliberate: this resolver's
+/// whole design is that a wrong edge is worse than a missing one.
+fn receiver_names(receiver: &str, symbol: &str, in_calling_file: bool) -> bool {
+    if matches!(receiver, "self" | "Self" | "this" | "cls") {
+        return in_calling_file;
+    }
+    receiver_type(symbol).is_some_and(|ty| squash(receiver) == squash(ty))
+}
+
+/// Lowercased with `_` dropped, so `symbol_index` and `SymbolIndex` meet.
+fn squash(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Every name [`SymbolIndex`] files a definition called `name` under.
+///
+/// The mirror of [`call_lookup_names`], and the other half of what a caller
+/// building a *narrowed* index needs: a `Store.flush` has to be kept when
+/// something looks up the bare `flush`, or a method call loses the very
+/// definition the bare entry exists to reach.
+#[must_use]
+pub fn indexed_under(name: &str) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    if let Some(bare) = method_name(name) {
+        if bare != name {
+            out.push(bare.to_string());
+        }
+    }
+    out
+}
+
+/// What the calling file can see, beyond the symbol index itself.
+///
+/// Both halves are built by the caller from the working tree it already walked,
+/// so [`resolve_call`] stays a pure function of its inputs.
+#[derive(Clone, Copy, Debug)]
+pub struct CallScope<'a> {
+    /// The calling file's resolved import targets, as [`resolve_import`]
+    /// returned them and the `File` node stores them.
+    pub imports: &'a [String],
+    /// Every name a path call may lead with: package, directory and module
+    /// names the tree holds, each also under the `-`/`_` spelling a package
+    /// path uses. A leading segment that is not in here and is not a symbol
+    /// names a dependency, and a call into a dependency resolves to nothing.
+    pub roots: &'a BTreeSet<String>,
 }
 
 /// Resolve a callee written in `from_file` to the key of the symbol it names.
 ///
 /// The callee is tried as written and then as its last segment, so
 /// `self.flush`, `this.flush` and `Store::flush` all reach `flush`. Within
-/// each attempt the search narrows outwards: a definition in the same file
-/// wins, then one in the same directory, then a single definition anywhere in
-/// the tree. Anything still ambiguous resolves to `None` — a wrong edge is
-/// worse than a missing one.
+/// each attempt the search narrows outwards, and the first tier that yields
+/// exactly one definition wins:
+///
+/// 1. a definition in the same file;
+/// 2. a definition in the same directory;
+/// 3. a definition in a file `from_file` imports;
+/// 4. a single definition anywhere in the tree.
+///
+/// Anything still ambiguous resolves to `None` — a wrong edge is worse than a
+/// missing one. The two tiers that search by name rather than by a stated
+/// relationship — the directory and the whole tree — also require the
+/// definition to be in the calling file's language: see [`same_language`].
+///
+/// # Why imports matter
+///
+/// Tier 4 can only answer when the name is unique across the whole repository,
+/// so two crates that each define a `render` left every call to either one
+/// unresolved, and a call that crossed a crate boundary was the common case
+/// for that. `imports` is the caller file's already-resolved import targets —
+/// the same list [`resolve_import`] produced and the `File` node stores — and a
+/// definition living in one of them is the one the source actually named. It
+/// sits below the directory tiers because a file that both imports a module and
+/// defines the name itself means the local one.
+///
+/// # Why a method call stops at tier 3
+///
+/// Tier 4 is uniqueness, not reachability: it claims any name defined exactly
+/// once anywhere in the tree, whether or not the calling file could name it.
+/// For a bare or path call that is a fair guess, because the source wrote a
+/// name it expected to be in scope. For a call written on a receiver it is not:
+/// `.collect()`, `.take()`, `.get()` and `.ok()` belong to types the graph has
+/// never seen, and the tier happily bound them to whatever single test helper
+/// happened to share the name.
+///
+/// So a [`CallFact::method`] call reaches tier 4 only on the callee **as
+/// written**, never on the bare last segment it falls back to. `Store.flush`
+/// matching a symbol qualified `Store.flush` names the receiver's type, which
+/// is how a static call reads in Python, TypeScript and JavaScript, and is
+/// evidence rather than a guess. `v.collect` falling back to `collect` is the
+/// guess, and it gets no edge — which is the truthful answer for a call into a
+/// dependency the graph does not hold. Tier 3 is narrowed the same way: an
+/// imported match for a method call must itself be a method.
+///
+/// # Calls into a dependency
+///
+/// Before any of that, a path call whose leading segment names nothing in the
+/// tree resolves to nothing at all — see [`path_reaches_the_tree`].
+/// `std::mem::take` is not a call to whatever single `take` this repository
+/// defines.
 #[must_use]
-pub fn resolve_call(from_file: &str, callee: &str, index: &SymbolIndex) -> Option<String> {
+pub fn resolve_call(
+    from_file: &str,
+    call: &CallFact,
+    index: &SymbolIndex,
+    scope: &CallScope<'_>,
+) -> Option<String> {
+    if !path_reaches_the_tree(&call.callee, index, scope.roots) {
+        return None;
+    }
     let from = normalize(from_file);
     let from_dir = parent_dir(&from);
-    for name in callee_candidates(callee) {
+    for name in callee_candidates(&call.callee) {
+        // A method call reaches the repository-wide tier only on a candidate
+        // that still carries its receiver. `Store.flush` matching a symbol
+        // qualified `Store.flush` names the receiver's type and is evidence;
+        // the bare `flush` it falls back to is a guess, and that guess is what
+        // bound `.collect()` to an unrelated helper. Testing the candidate
+        // rather than its position matters because a call recovered from a
+        // macro's token tree arrives as the bare segment already.
+        let repo_wide = !call.method || written_as_method(&name);
         let keys = index.keys_for(&name);
-        if keys.is_empty() {
+        // The bare-name entries of the index, consulted only for the exact
+        // case they exist for: a call written on a receiver, fallen back to
+        // the bare segment. `store.flush()` reaches `Store.flush` this way and
+        // no other, because no source ever writes the qualified form.
+        let methods: &[String] = match call.method && !written_as_method(&name) {
+            true => index.methods_for(&name),
+            false => &[],
+        };
+        if keys.is_empty() && methods.is_empty() {
             continue;
         }
-        let pick = |filter: &dyn Fn(&str) -> bool| -> Option<String> {
+        let pick = |filter: &dyn Fn(&str, &str) -> bool| -> Option<String> {
             let mut hit = None;
             for key in keys {
-                if filter(key_file(key)) {
+                if filter(key_file(key), key_symbol(key)) {
                     if hit.is_some() {
                         return None;
                     }
@@ -353,17 +591,133 @@ pub fn resolve_call(from_file: &str, callee: &str, index: &SymbolIndex) -> Optio
             }
             hit
         };
-        if let Some(key) = pick(&|file| file == from) {
+        // The same, over the bare-name entries, with one difference: the
+        // receiver has to identify the type — see `receiver_names`. Two
+        // candidates still passing that at one tier means two types whose
+        // names collide once case and `_` are dropped, and there is nothing
+        // left to tell them apart, so neither gets the edge.
+        let receiver = receiver_of(&call.callee);
+        let pick_method = |filter: &dyn Fn(&str) -> bool| -> Option<String> {
+            let mut hit = None;
+            for key in methods {
+                let named = receiver
+                    .is_some_and(|r| receiver_names(r, key_symbol(key), key_file(key) == from));
+                if filter(key_file(key)) && named {
+                    if hit.is_some() {
+                        return None;
+                    }
+                    hit = Some(key.clone());
+                }
+            }
+            hit
+        };
+        let same_dir = |file: &str| parent_dir(file) == from_dir && same_language(&from, file);
+        let imported = |file: &str| scope.imports.iter().any(|i| i == file);
+
+        if let Some(key) = pick(&|file, _| file == from).or_else(|| pick_method(&|f| f == from)) {
             return Some(key);
         }
-        if let Some(key) = pick(&|file| parent_dir(file) == from_dir) {
+        if let Some(key) = pick(&|file, _| same_dir(file)).or_else(|| pick_method(&same_dir)) {
             return Some(key);
         }
-        if let Some(key) = pick(&|_| true) {
+        // An import brings a *file* into scope, not a type. For a method call
+        // that is not enough: the receiver's type is unknown, and a free
+        // function in an imported file that happens to share the method's name
+        // is not the thing being called. `repo.join(id)` is `Path::join`, but
+        // the calling file imports a module that defines a `join`. So an
+        // imported match has to be a method — a symbol qualified `Type.name`,
+        // which is how every extractor here names one. The bare-name entries
+        // are all methods by construction, and are held to the calling file's
+        // language as well, which the exact-name imports tier does not need to
+        // be: an import is a stated relationship, a bare method name is not.
+        if let Some(key) =
+            pick(&|file, symbol| imported(file) && (!call.method || symbol.contains('.')))
+                .or_else(|| pick_method(&|f| imported(f) && same_language(&from, f)))
+        {
             return Some(key);
+        }
+        if repo_wide {
+            if let Some(key) = pick(&|file, _| same_language(&from, file)) {
+                return Some(key);
+            }
         }
     }
     None
+}
+
+/// Whether two files are written in the same language.
+///
+/// A call site and a definition that share nothing but a name are not the same
+/// function. `str(x)` in Python is a builtin; that this repository also holds a
+/// Rust `fn str` is a coincidence, and the tiers that search by name alone —
+/// the same directory, and the whole tree — happily turned it into an edge from
+/// a `.py` file to a `.rs` one.
+///
+/// TypeScript, TSX and JavaScript are one family, because a `.ts` module really
+/// does call into a `.tsx` one and neither is a different language for this
+/// purpose. Every other pairing must match exactly. Two files of unknown type
+/// count as the same language and contribute no symbols either way.
+fn same_language(a: &str, b: &str) -> bool {
+    family(lang_of(a)) == family(lang_of(b))
+}
+
+/// The language a file resolves calls as, collapsing the ECMAScript variants.
+const fn family(lang: Lang) -> Lang {
+    match lang {
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => Lang::TypeScript,
+        other => other,
+    }
+}
+
+/// Whether a `::`-separated path call names anything the working tree holds.
+///
+/// `std::mem::take`, `serde_json::from_str` and `Vec::new` are calls into
+/// dependencies. The graph has no node for any of them, and the tiers below
+/// would happily bind the last segment to whatever single `take`, `from_str` or
+/// `new` the repository happened to define — on this repository that was mostly
+/// test helpers. A path is worth resolving only when its first segment names
+/// something here:
+///
+/// * `crate`, `self`, `super` and `Self`, which are always the current tree;
+/// * a package, directory or module name the caller listed in `roots`;
+/// * a symbol — `Store::flush` leads with a type, not a module.
+///
+/// A callee with no `::` is not a path and passes untouched, which leaves bare
+/// calls and every dotted form to the tiers and the method rule.
+fn path_reaches_the_tree(callee: &str, index: &SymbolIndex, roots: &BTreeSet<String>) -> bool {
+    let Some((first, _)) = callee.split_once("::") else {
+        return true;
+    };
+    let first = first.trim();
+    matches!(first, "crate" | "self" | "super" | "Self")
+        || roots.contains(first)
+        || !index.keys_for(first).is_empty()
+}
+
+/// Every name [`resolve_call`] may look `callee` up under in the index.
+///
+/// The resolver reaches a [`SymbolIndex`] by name and by nothing else: it tries
+/// the callee as written, then its last segment, and before either it asks
+/// whether a `::` path's leading segment names a symbol here
+/// ([`path_reaches_the_tree`]). Those are the only three forms.
+///
+/// That is what lets a caller build a *narrowed* index — one holding only the
+/// definitions a particular pass could need — without changing a single edge.
+/// An index holding every definition of exactly these names answers every
+/// lookup a whole-tree index would, tier for tier, the repository-wide tier
+/// included: that tier turns on a name being defined exactly once, and the
+/// narrowed index still holds every definition of the names it is asked about.
+/// Ask for less than this and resolution silently changes.
+#[must_use]
+pub fn call_lookup_names(callee: &str) -> Vec<String> {
+    let mut out = callee_candidates(callee);
+    if let Some((first, _)) = callee.trim().split_once("::") {
+        let first = first.trim().to_string();
+        if !first.is_empty() && !out.contains(&first) {
+            out.push(first);
+        }
+    }
+    out
 }
 
 /// The callee as written, then its last `.`- or `::`-separated segment.
@@ -385,6 +739,11 @@ fn callee_candidates(callee: &str) -> Vec<String> {
 /// The file half of a symbol key.
 fn key_file(key: &str) -> &str {
     key.rsplit_once('#').map_or(key, |(file, _)| file)
+}
+
+/// The symbol half of a symbol key: the name, qualified within its file.
+fn key_symbol(key: &str) -> &str {
+    key.rsplit_once('#').map_or("", |(_, name)| name)
 }
 
 // ── path helpers ────────────────────────────────────────────────────────────

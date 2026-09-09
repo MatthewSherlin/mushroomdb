@@ -7,7 +7,7 @@
 //!
 //! | Label | key (`id`) | props |
 //! |---|---|---|
-//! | `Author` | mailmap-resolved email | `name` |
+//! | `Author` | mailmap-resolved email | `name`, `name_counts` |
 //! | `Commit` | full sha | `message`, `ts`, `author_id`, `pr_id` (with `--prs`) |
 //! | `File` | path | `path`, `dir`, `ext`, `commits`, `n_commits`, `top_author_id`, `author_counts`, plus the working-tree props in [`structure`](crate::structure) |
 //! | `Symbol` | `"<path>#<qualified name>"` | see [`structure`](crate::structure) |
@@ -46,6 +46,17 @@ pub use core_api::repograph::DEFAULT_EXCLUDES;
 
 /// Minimum jaccard overlap of two files' `commits` lists for `CO_CHANGED`.
 const CO_CHANGE_MIN: f64 = 0.25;
+
+/// WAL bytes past the last snapshot that make writing a new one worthwhile.
+///
+/// Every open reads `wal.bin` whole and replays it frame by frame, so the tail
+/// is paid again on every hook, every MCP start and every CLI call — while a
+/// snapshot is paid once by the run that writes it. Measured on this
+/// repository, an 8.1 MB tail costs 156 ms per open against ~440 ms to
+/// snapshot it away, so a tail this size pays its snapshot back within three
+/// opens. Below the threshold the replay is cheap enough that snapshotting on
+/// every incremental run would cost more than it saves.
+pub const SNAPSHOT_WAL_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Key of the singleton `GitSync` node holding the last ingested sha.
 ///
@@ -461,9 +472,92 @@ fn ensure_gitignore(repo: &Path, db_dir: &Path) -> Result<bool, CliError> {
     Ok(true)
 }
 
-/// Separator inside an `author_counts` entry. An email address cannot contain a
-/// tab, so `email\tcount` round-trips unambiguously.
+/// Separator inside an `author_counts` or `name_counts` entry. Neither an email
+/// address nor a git author name can contain a tab, so `<text>\tcount`
+/// round-trips unambiguously.
 const AUTHOR_COUNT_SEP: char = '\t';
+
+/// How many commits carried each spelling of one email's `%aN`, in the order
+/// the spellings were first seen.
+///
+/// One person routinely commits under more than one name — `Ada Lovelace` at
+/// work and `Ada M. Lovelace` from a laptop that was configured once and never
+/// again. Merging them on email is right, and every tool that prints an author
+/// then has to choose *which* of the names to show. Showing the first one
+/// walked means a display name decided by the oldest commit in the window,
+/// which on this repository labelled an identity with a name carried by 21% of
+/// its commits.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+struct AuthorState {
+    /// `(name, commits)` in first-seen order, which is what breaks a tie.
+    names: Vec<(String, usize)>,
+}
+
+impl AuthorState {
+    /// Credit one more commit to `name`.
+    fn touch(&mut self, name: &str) {
+        self.add(name, 1);
+    }
+
+    /// Credit `n` more commits to `name`, appending it if it is new. Order is
+    /// preserved, so the entry that was seen first stays first.
+    fn add(&mut self, name: &str, n: usize) {
+        match self.names.iter_mut().find(|(held, _)| held == name) {
+            Some(entry) => entry.1 += n,
+            None => self.names.push((name.to_string(), n)),
+        }
+    }
+
+    /// Fold another window's counts into this one, keeping first-seen order.
+    fn absorb(&mut self, other: &AuthorState) {
+        for (name, n) in &other.names {
+            self.add(name, *n);
+        }
+    }
+
+    /// The name on the most commits. A tie goes to the name seen first, which
+    /// is why the strict `>` matters: it never unseats an equal incumbent.
+    fn display_name(&self) -> String {
+        let mut best: Option<&(String, usize)> = None;
+        for entry in &self.names {
+            if best.is_none_or(|(_, n)| entry.1 > *n) {
+                best = Some(entry);
+            }
+        }
+        best.map(|(name, _)| name.clone()).unwrap_or_default()
+    }
+
+    /// The distribution as an `Author.name_counts` prop: `"name\tcount"`
+    /// strings in first-seen order.
+    ///
+    /// Stored for the same reason `File.author_counts` is: an incremental run
+    /// sees only the new window, and the `name` prop alone cannot say how far
+    /// ahead the incumbent spelling is. Without it every sync would relabel the
+    /// identity from a handful of commits.
+    fn name_counts_value(&self) -> Value {
+        Value::List(
+            self.names
+                .iter()
+                .map(|(name, n)| Value::Str(format!("{name}{AUTHOR_COUNT_SEP}{n}")))
+                .collect(),
+        )
+    }
+
+    /// Inverse of [`AuthorState::name_counts_value`]. Entries that are not
+    /// `name<TAB>count` are skipped rather than failing the run.
+    fn set_name_counts(&mut self, list: &[Value]) {
+        for v in list {
+            let Value::Str(s) = v else { continue };
+            let Some((name, n)) = s.rsplit_once(AUTHOR_COUNT_SEP) else {
+                continue;
+            };
+            let Ok(n) = n.parse::<usize>() else { continue };
+            if !name.is_empty() {
+                self.add(name, n);
+            }
+        }
+    }
+}
 
 fn file_props(st: &FileState, path: &str) -> Vec<(String, Value)> {
     let commits = &st.commits;
@@ -858,11 +952,47 @@ fn file_state_from(rs: &ResultSet, nested: &[String]) -> BTreeMap<String, FileSt
     files
 }
 
+/// The real per-name distribution for every author of this unit, read from the
+/// whole history rather than from the window.
+///
+/// A store built by 0.6.0 has `Author` nodes carrying a `name` and no
+/// `name_counts`, and nothing in the graph records which spelling each commit
+/// used — the display name it holds is the *first* one that version happened to
+/// see, which on a repository where one person commits under two names is the
+/// wrong one about as often as not. Guessing from it cannot recover: seeding the
+/// incumbent with the prior commit count makes the true majority wait for more
+/// new commits than the entire history it is already behind by.
+///
+/// So the log is walked in full, once, on the first run that meets such a node.
+/// The result covers every commit up to `head`, this run's window included, so
+/// the caller uses it *instead of* the window rather than on top of it.
+/// A store this version wrote never reaches here.
+fn legacy_name_counts(
+    w: &WriteGuard<'_>,
+    p: &Pending,
+) -> Result<BTreeMap<String, AuthorState>, CliError> {
+    let mut out: BTreeMap<String, AuthorState> = BTreeMap::new();
+    let stale = p.log.iter().any(|c| {
+        w.has_node(&c.author_email)
+            && w.node_ref(&c.author_email)
+                .and_then(|n| n.prop("name_counts"))
+                .is_none()
+    });
+    let Some(head) = p.head.as_deref().filter(|_| stale) else {
+        return Ok(out);
+    };
+    for c in read_log(&p.unit.path, None, head)? {
+        out.entry(c.author_email).or_default().touch(&c.author_name);
+    }
+    Ok(out)
+}
+
 /// Accumulated effect of one log window, before anything is written.
 #[derive(Default)]
 struct Walk {
     files: BTreeMap<String, FileState>,
-    authors: BTreeMap<String, String>,
+    /// Email → the names its commits were authored under, and how many each.
+    authors: BTreeMap<String, AuthorState>,
     commit_rows: Vec<BTreeMap<String, Value>>,
     touched_edges: Vec<(String, String, String)>,
     /// Paths whose `File` props changed in this window.
@@ -923,6 +1053,65 @@ struct Pending {
     /// Key prefixes of the submodules nested inside this unit, whose files
     /// belong to their own walk.
     nested: Vec<String>,
+}
+
+/// Whether `db_dir` would open faster if this run left a snapshot behind.
+///
+/// A full ingest always qualifies: it is the run that writes the whole history
+/// into an empty WAL, and leaving that WAL to be replayed on every subsequent
+/// open is the single largest fixed cost in the hook path. An incremental run
+/// qualifies when the store has no snapshot at all — a store built by an older
+/// release, or one whose full ingest predates this rule — or when the tail
+/// past the last snapshot has grown beyond [`SNAPSHOT_WAL_BYTES`].
+///
+/// The tail *is* `wal.bin`: a snapshot replaces the live WAL with a minimal
+/// baseline, so its length on disk measures exactly what an open has to replay.
+///
+/// Only a run that reached its write phase asks. A run with nothing to take
+/// returns before entering a write scope, so a store with no snapshot and no
+/// new commits keeps waiting for a run that has work — which in the hook path
+/// is the next commit.
+fn snapshot_due(db_dir: &Path, full: bool) -> bool {
+    if full || !db_dir.join("snapshot.bin").exists() {
+        return true;
+    }
+    std::fs::metadata(db_dir.join("wal.bin")).is_ok_and(|m| m.len() > SNAPSHOT_WAL_BYTES)
+}
+
+/// Write a snapshot if one is due, after the run's own writes are committed.
+///
+/// The WAL is archived rather than dropped — see [`AUTOMATIC_SNAPSHOT`], which
+/// every snapshot mushroomdb takes on its own shares — and the archives are
+/// bounded by [`AUTO_SNAPSHOT_RETENTION`], so a store that syncs on every
+/// commit does not grow an archive per 4 MiB of churn forever.
+///
+/// [`AUTOMATIC_SNAPSHOT`]: crate::AUTOMATIC_SNAPSHOT
+/// [`AUTO_SNAPSHOT_RETENTION`]: crate::AUTO_SNAPSHOT_RETENTION
+///
+/// # Why it never fails the run
+///
+/// A snapshot is an optimisation for the *next* open, and the data is already
+/// durable either way:
+///
+/// * `Busy` — another process holds the cross-process write lock. Skipped
+///   without a word; the next run that qualifies takes it.
+/// * anything else — reported on stderr, because a store that cannot be
+///   snapshotted is worth knowing about, and the run still succeeds.
+///
+/// Call this only from a run that reached its write phase. A run with nothing
+/// to do returns before entering a write scope, and taking the lock to
+/// snapshot would turn a genuine no-op into a write.
+fn snapshot_if_due(db: &SharedDb, db_dir: &Path, full: bool) {
+    if !snapshot_due(db_dir, full) {
+        return;
+    }
+    let taken = db
+        .write_with_wait(WRITE_LOCK_WAIT)
+        .and_then(|mut g| crate::snapshot_automatically(&mut g));
+    match taken {
+        Ok(()) | Err(GraphError::Busy { .. }) => {}
+        Err(e) => eprintln!("snapshot skipped: {e}"),
+    }
 }
 
 pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitReport, CliError> {
@@ -1093,6 +1282,11 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
         } else {
             let mut paths = work.touched;
             paths.extend(structure::importers_of(&w, &work.stale)?);
+            // The retired keys themselves, not just the files that named them.
+            // An incremental refresh sweeps orphaned symbols only under the
+            // paths it is handed, and a file this window deleted or renamed
+            // away is exactly where the orphans are.
+            paths.extend(work.stale.iter().cloned());
             let paths: Vec<String> = paths.into_iter().collect();
             structure::refresh_files(&mut w, &repo, "", &paths, opts.docs)?
         };
@@ -1117,6 +1311,12 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     for p in &pending {
         write_marker(&mut w, p, opts)?;
     }
+
+    // Every write this run makes is now committed, so leave the store in the
+    // shape that opens fastest. The guard is released first: `snapshot()` takes
+    // the same cross-process write lock this one holds.
+    drop(w);
+    snapshot_if_due(&db, db_dir, !report.incremental);
     Ok(report)
 }
 
@@ -1214,7 +1414,8 @@ fn ingest_unit(
     for c in log {
         walk.authors
             .entry(c.author_email.clone())
-            .or_insert_with(|| c.author_name.clone());
+            .or_default()
+            .touch(&c.author_name);
         walk.commit_rows.push(BTreeMap::from([
             ("id".to_string(), Value::Str(c.sha.clone())),
             ("message".to_string(), Value::Str(c.subject.clone())),
@@ -1281,17 +1482,53 @@ fn ingest_unit(
 
     // 1. Authors first: the auto-FK rules for `Commit.author_id` and
     //    `File.top_author_id` only infer once their targets resolve to Author.
-    let author_rows: Vec<BTreeMap<String, Value>> = walk
-        .authors
-        .iter()
-        .filter(|(email, _)| !w.has_node(email))
-        .map(|(email, name)| {
-            BTreeMap::from([
-                ("id".to_string(), Value::Str(email.clone())),
-                ("name".to_string(), Value::Str(name.clone())),
-            ])
-        })
-        .collect();
+    //    An email already in the graph keeps its accumulated `name_counts`, so
+    //    the display name is the majority spelling over the whole history
+    //    rather than over this window.
+    let legacy = legacy_name_counts(w, p)?;
+    let mut author_rows = Vec::new();
+    let mut author_updates = Vec::new();
+    for (email, seen) in &walk.authors {
+        let mut merged = AuthorState::default();
+        match (
+            w.node_ref(email).and_then(|n| n.prop("name_counts")),
+            legacy.get(email),
+        ) {
+            // The usual path: what the graph already counted, plus this window.
+            (Some(Value::List(l)), _) => {
+                merged.set_name_counts(&l);
+                merged.absorb(seen);
+            }
+            // A node written before `name_counts` existed. The recovered walk
+            // is the whole history and already contains this window, so the
+            // window is not added to it.
+            (_, Some(whole_history)) => merged = whole_history.clone(),
+            // A new author, or a unit whose history was already recovered.
+            _ => merged.absorb(seen),
+        }
+        let props = [
+            ("name", Value::Str(merged.display_name())),
+            ("name_counts", merged.name_counts_value()),
+        ];
+        if w.has_node(email) {
+            for (field, want) in props {
+                if w.node_ref(email).and_then(|n| n.prop(field)).as_ref() != Some(&want) {
+                    author_updates.push((email.clone(), field, want));
+                }
+            }
+        } else {
+            let mut row = BTreeMap::from([("id".to_string(), Value::Str(email.clone()))]);
+            row.extend(props.into_iter().map(|(f, v)| (f.to_string(), v)));
+            author_rows.push(row);
+        }
+    }
+    if !author_updates.is_empty() {
+        let mut b = w.batch();
+        for (key, field, value) in author_updates {
+            b.set_prop(&key, field, value);
+        }
+        b.commit()?;
+    }
     let a = w.ingest_with_edges("Author", author_rows, ingest, &[])?;
     report.rules_created.extend(a.rules_created);
     authors.extend(walk.authors.keys().cloned());
@@ -1568,6 +1805,12 @@ pub fn run_sync(db_dir: &Path) -> Result<SyncReport, CliError> {
         other => CliError(other.to_string()),
     })?;
     report.structure = structure::refresh_files(&mut w, &repo, "", &paths, opts.docs)?;
+
+    // The history half already snapshotted if this was a first ingest; this
+    // covers the tail the dirty pass just appended. `full` is false because a
+    // sync is by definition a run against a store that already exists.
+    drop(w);
+    snapshot_if_due(&db, db_dir, false);
     Ok(report)
 }
 

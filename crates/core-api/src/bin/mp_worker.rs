@@ -16,7 +16,7 @@
 //!
 //! Exit codes: `0` success, `3` [`GraphError::Busy`], `1` any other failure.
 
-use core_api::{BatchOp, GraphDb, OpenOptions, SharedDb};
+use core_api::{BatchOp, GraphDb, OpenOptions, SharedDb, SnapshotOptions};
 use core_storage::GraphError;
 use std::path::Path;
 use std::time::Duration;
@@ -64,7 +64,14 @@ fn main() {
             let ms: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(500);
             run_busy(dir, Duration::from_millis(ms))
         }
-        "snapshot" => run_snapshot(dir),
+        "snapshot" => run_snapshot(dir, SnapshotOptions::default()),
+        "snapshot-archive" => run_snapshot(
+            dir,
+            SnapshotOptions {
+                keep_wal: false,
+                archive_wal: true,
+            },
+        ),
         "snapshot-shared" => run_snapshot_shared(dir),
         other => {
             eprintln!("unknown command: {other}");
@@ -176,9 +183,9 @@ fn run_busy(dir: &Path, wait: Duration) -> i32 {
     code
 }
 
-fn run_snapshot(dir: &Path) -> i32 {
+fn run_snapshot(dir: &Path, opts: SnapshotOptions) -> i32 {
     match GraphDb::open(dir) {
-        Ok(mut db) => match db.snapshot() {
+        Ok(mut db) => match db.snapshot_with(opts) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("snapshot: {e}");

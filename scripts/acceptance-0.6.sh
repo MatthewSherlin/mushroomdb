@@ -21,7 +21,7 @@
 # Environment:
 #   MUSHROOMDB          binary under test (default: target/debug/mushroomdb)
 #   MUSHROOMDB_RELEASE  set to 1 to force the timing thresholds on
-#   TOUCH_BUDGET_MS     touch latency budget (default 200)
+#   TOUCH_BUDGET_MS     touch latency budget (default 250)
 #   MAP_BUDGET_MS       map latency budget (default 1000)
 #
 # Timing thresholds are asserted only against a release build — a debug build
@@ -47,7 +47,12 @@ case "$MUSHROOMDB" in
   *) MUSHROOMDB="$REPO_ROOT/$MUSHROOMDB" ;;
 esac
 
-TOUCH_BUDGET_MS="${TOUCH_BUDGET_MS:-200}"
+# A `touch` is a process start plus a store open plus about 2 ms of work, and
+# the open is ~175 ms of that on a repository this size. The budget is a guard
+# against the work growing, not a latency target for the open, so it sits far
+# enough above the open that ordinary machine noise does not fail the run. CI
+# sets TOUCH_BUDGET_MS itself and is unaffected.
+TOUCH_BUDGET_MS="${TOUCH_BUDGET_MS:-250}"
 MAP_BUDGET_MS="${MAP_BUDGET_MS:-1000}"
 
 # The file whose import is added and retracted in step 4, and made dirty in
@@ -390,14 +395,19 @@ else
   for out in "$WORK"/t.*.out; do sed 's/^/      | /' "$out"; done
 fi
 
-send '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"map","arguments":{}}}'
+# `json: true` asks for the report rather than the digest. A task tool answers
+# with one text block and no `structuredContent`, so this is where the numbers
+# now come from: the text content *is* the serialised report.
+send '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"map","arguments":{"json":true}}}'
 MAP_LINE="$WORK/mcp-map.json"
 await_id 2 >"$MAP_LINE" || die "MCP server did not answer tools/call map"
 
 MCP_FILES="$(python3 -c '
 import json, sys
 msg = json.load(open(sys.argv[1]))
-print(msg["result"]["structuredContent"]["files"])
+result = msg["result"]
+assert "structuredContent" not in result, "a task tool must answer with text alone"
+print(json.loads(result["content"][0]["text"])["files"])
 ' "$MAP_LINE")"
 assert_eq "$MCP_FILES" "$INGEST_FILES" "the live server's map still counts every ingested file"
 

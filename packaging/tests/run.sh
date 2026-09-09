@@ -18,7 +18,13 @@ case "${os}-${arch}" in
     ;;
 esac
 
-VERSION=0.1.0
+# The npm install.js happy-path check below asks for whatever version is in
+# packaging/npm/package.json (it has no MUSHROOMDB_VERSION override, same as
+# a real `npm install`), so the fake release this script serves has to be
+# built and tagged for that same version — a hardcoded VERSION here silently
+# drifts from package.json on every version bump and 404s that check, along
+# with everything after it in this script.
+VERSION=$(node -pe "require('$NPM/package.json').version")
 TAG=v${VERSION}
 ASSET="mushroomdb-${TAG}-${TARGET}.tar.gz"
 
@@ -86,6 +92,148 @@ test "$st" -ne 0
 grep -q "unsupported platform: win32-x64" "$WORKDIR/bad-sh.err"
 grep -q "darwin-arm64" "$WORKDIR/bad-sh.err"
 grep -q "linux-x64" "$WORKDIR/bad-sh.err"
+
+# A package laid out the way npm leaves one: the real launcher script, and a
+# fake native binary where postinstall would have put it. Built here rather
+# than reusing the download step below, so these checks stand on their own.
+FAKEPKG="$WORKDIR/pkg"
+mkdir -p "$FAKEPKG/bin" "$FAKEPKG/vendor"
+cp "$NPM/bin/mushroomdb.js" "$FAKEPKG/bin/mushroomdb.js"
+cp "$WORKDIR/rel/mushroomdb" "$FAKEPKG/vendor/mushroomdb"
+chmod +x "$FAKEPKG/vendor/mushroomdb"
+# Canonical (symlink-resolved) paths: Node resolves a module's real path, so
+# that is what the launcher prints, and on macOS $TMPDIR is behind /var -> /private/var.
+FAKE_LAUNCHER="$(cd "$FAKEPKG/bin" && pwd -P)/mushroomdb.js"
+FAKE_BINARY="$(cd "$FAKEPKG/vendor" && pwd -P)/mushroomdb"
+
+echo "== launcher --print-binary / --print-launcher"
+# Both answer with an absolute path that is really there. `install` and the
+# plugin's hooks/run.sh ask these once, so no hook has to spawn npx.
+out=$(node "$FAKE_LAUNCHER" --print-binary)
+case "$out" in /*) ;; *) echo "--print-binary must print an absolute path, got: $out" >&2; exit 1 ;; esac
+test "$out" = "$FAKE_BINARY"
+test -x "$out"
+out=$(node "$FAKE_LAUNCHER" --print-launcher)
+test "$out" = "$FAKE_LAUNCHER"
+test -f "$out"
+
+echo "== launcher --print-binary exits 1 with no vendored binary"
+# The caller has to be able to tell "no binary" from a path, so it can fall
+# through to the launcher rung.
+mv "$FAKE_BINARY" "$WORKDIR/stashed-binary"
+set +e
+node "$FAKE_LAUNCHER" --print-binary >"$WORKDIR/nobin.out" 2>"$WORKDIR/nobin.err"
+st=$?
+set -e
+test "$st" -eq 1
+test ! -s "$WORKDIR/nobin.out"
+grep -q "binary is missing" "$WORKDIR/nobin.err"
+# --print-launcher still answers: where this file is stays true either way.
+test "$(node "$FAKE_LAUNCHER" --print-launcher)" = "$FAKE_LAUNCHER"
+mv "$WORKDIR/stashed-binary" "$FAKE_BINARY"
+
+echo "== run_sh_prefers_the_cached_binary"
+# With a cached binary path and no npx anywhere on PATH, run.sh must still
+# work: it execs the cached binary and never reaches a resolution step.
+CACHE_DIR="$WORKDIR/plugindata"
+PLUGIN_VERSION=$(sed -n "s/^VERSION='\\(.*\\)'\$/\\1/p" "$PKG/plugin/hooks/run.sh")
+test -n "$PLUGIN_VERSION"
+mkdir -p "$CACHE_DIR"
+printf '%s\n' "$FAKE_BINARY" > "$CACHE_DIR/binary-${PLUGIN_VERSION}"
+# A launcher cache is there too, and must lose: the binary is the faster rung.
+printf '%s\n' "$FAKE_LAUNCHER" > "$CACHE_DIR/launcher-${PLUGIN_VERSION}"
+out=$(CLAUDE_PLUGIN_DATA="$CACHE_DIR" PATH=/usr/bin:/bin "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+
+echo "== run.sh: no CLAUDE_PLUGIN_DATA and no HOME means no cache at all"
+# The cache may live under $CLAUDE_PLUGIN_DATA or $HOME and nowhere else. A
+# world-writable fallback such as /tmp would let any local user drop in
+# /tmp/.mushroomdb/binary-<version> naming a program of theirs, and the next
+# UserPromptSubmit hook would exec it with the prompt payload on stdin. With
+# neither variable set the script must resolve every time instead — which is
+# observable: a stub npx that logs each call is asked twice for two runs, so
+# nothing was remembered in between, and nothing was read either.
+STUB="$WORKDIR/stub"
+NPXLOG="$WORKDIR/npx-calls"
+mkdir -p "$STUB"
+: > "$NPXLOG"
+{
+  echo "#!/bin/sh"
+  echo "echo call >> '$NPXLOG'"
+  echo "for a in \"\$@\"; do"
+  echo "  [ \"\$a\" = --print-binary ] && { printf '%s\\n' '$FAKE_BINARY'; exit 0; }"
+  echo "done"
+  echo "exit 1"
+} > "$STUB/npx"
+chmod +x "$STUB/npx"
+
+out=$(env -u CLAUDE_PLUGIN_DATA -u HOME PATH="$STUB:/usr/bin:/bin" \
+  "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+out=$(env -u CLAUDE_PLUGIN_DATA -u HOME PATH="$STUB:/usr/bin:/bin" \
+  "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+calls=$(wc -l < "$NPXLOG" | tr -d ' ')
+test "$calls" = 2 || {
+  echo "expected 2 npx calls with no cache directory, got $calls" >&2
+  exit 1
+}
+
+# With $HOME set it caches again, under $HOME: the second run asks nothing.
+HOMEDIR="$WORKDIR/fakehome"
+mkdir -p "$HOMEDIR"
+: > "$NPXLOG"
+out=$(env -u CLAUDE_PLUGIN_DATA HOME="$HOMEDIR" PATH="$STUB:/usr/bin:/bin" \
+  "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+test "$(cat "$HOMEDIR/.mushroomdb/binary-${PLUGIN_VERSION}")" = "$FAKE_BINARY"
+out=$(env -u CLAUDE_PLUGIN_DATA HOME="$HOMEDIR" PATH="$STUB:/usr/bin:/bin" \
+  "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+calls=$(wc -l < "$NPXLOG" | tr -d ' ')
+test "$calls" = 1 || {
+  echo "expected 1 npx call with a cache under HOME, got $calls" >&2
+  exit 1
+}
+
+echo "== run.sh: no cache and no npx is silent, not an error"
+# The last rung is `exec npx`, and `exec` on a program that is not there prints
+# `exec: npx: not found` and exits 127. These hooks run on every prompt and
+# every edit, so that is an error line before every prompt for anyone without
+# npx — and the plugin cannot work without npx either way, so there is nothing
+# to report. Nothing on stdout, nothing on stderr, exit 0.
+NONODE="$WORKDIR/no-npx-bin"
+mkdir -p "$NONODE"
+for prog in sh cat mkdir printf tail; do
+  p=$(command -v "$prog" 2>/dev/null) && ln -sf "$p" "$NONODE/$prog"
+done
+set +e
+env -u CLAUDE_PLUGIN_DATA -u HOME PATH="$NONODE" \
+  "$PKG/plugin/hooks/run.sh" --help \
+  >"$WORKDIR/nonpx.out" 2>"$WORKDIR/nonpx.err"
+st=$?
+set -e
+test "$st" -eq 0 || {
+  echo "run.sh without npx must exit 0, got $st" >&2
+  exit 1
+}
+test ! -s "$WORKDIR/nonpx.out" || {
+  echo "run.sh without npx printed to stdout:" >&2
+  cat "$WORKDIR/nonpx.out" >&2
+  exit 1
+}
+test ! -s "$WORKDIR/nonpx.err" || {
+  echo "run.sh without npx printed to stderr:" >&2
+  cat "$WORKDIR/nonpx.err" >&2
+  exit 1
+}
+
+echo "== run.sh: a cached binary that has gone falls back to the launcher"
+# npm's cache can be pruned. The stale line must be skipped, not trusted.
+printf '%s\n' "$WORKDIR/gone/mushroomdb" > "$CACHE_DIR/binary-${PLUGIN_VERSION}"
+out=$(CLAUDE_PLUGIN_DATA="$CACHE_DIR" "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+rm -rf "$CACHE_DIR"
 
 echo "== npm install.js happy path"
 rm -rf "$NPM/vendor"

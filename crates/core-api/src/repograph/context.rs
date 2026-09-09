@@ -15,11 +15,19 @@
 //! name, which is how a person refers to a function they have only heard of.
 //! Two symbols can share a name, and then the answer is the choice itself — the
 //! candidates and nothing else, so no caller mistakes one for the other.
+//!
+//! # Callers are call sites
+//!
+//! "What calls this" is answered from the callers' `call_lines`, not from the
+//! `CALLS` edges alone, and grouped by the file the calls sit in. An edge is
+//! written once however many times a call is written, so counting edges
+//! reported a symbol called twelve times from six functions as six call sites —
+//! and a person changing a signature has twelve lines to visit, not six.
 
 use crate::db::GraphDb;
 use crate::repograph::facts::{
-    commits_of, evidence_line, int_prop, label_of, list_prop, neighbors, neighbors_both,
-    owner_name, rank, score_of, str_prop, symbol_file,
+    commits_of, evidence_line, evidence_lines, int_prop, label_of, list_prop, neighbors,
+    neighbors_both, owner_name, rank, score_of, str_prop, symbol_file,
 };
 use crate::repograph::map::SYNC_KEY;
 use crate::repograph::render::sanitize;
@@ -27,12 +35,26 @@ use crate::Direction;
 use core_storage::fs::Fs;
 use core_storage::Value;
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Source lines quoted at most, whichever end of a symbol they come from.
 pub const MAX_SOURCE_LINES: usize = 80;
-/// Callers and callees named, each.
+/// Callees named.
 const MAX_CALLS: usize = 8;
+/// Files named on the `callers` line. Generous, because an incomplete answer
+/// here is the one that misleads: a caller left out of a blast radius is a
+/// caller nobody goes and looks at.
+const MAX_CALLER_FILES: usize = 12;
+/// Call sites named per calling file, past which the count stands in for the
+/// lines.
+///
+/// Eight is where the line stops being read and starts being skimmed: what a
+/// reader needs from a file with fifty call sites is the file and the order of
+/// magnitude, not fifty numbers. Naming the file is what makes the answer
+/// complete; naming every line in it is what made the digest twice as wide as
+/// the one it replaced.
+const MAX_SITES_PER_FILE: usize = 8;
 /// Files named on the import lines, each way.
 const MAX_IMPORTS: usize = 8;
 /// Co-change partners named.
@@ -59,6 +81,27 @@ pub enum Target {
     },
 }
 
+/// Everywhere one file calls the target.
+///
+/// A `CALLS` edge says *which symbol* calls another, one edge however many
+/// times the call is written. That answers "who calls this" and cannot answer
+/// "where is it called": a function called twelve times from six others looked
+/// like six call sites. The lines come from the caller's `call_lines`, which
+/// records every site, so this is the whole list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CallSites {
+    /// The file the calling symbols are defined in.
+    pub file: String,
+    /// The calling symbols, by key, sorted.
+    pub symbols: Vec<String>,
+    /// Lines of `file` a call sits on, ascending, at most
+    /// [`MAX_SITES_PER_FILE`] of them. `sites` is the true total either way, so
+    /// a reader can always tell a short list from a truncated one.
+    pub lines: Vec<u32>,
+    /// Call sites in `file`, including any the `lines` cap left out.
+    pub sites: usize,
+}
+
 /// One file or symbol, from every side the graph can see it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ContextReport {
@@ -77,8 +120,11 @@ pub struct ContextReport {
     pub file: String,
     /// The file's top author, by name.
     pub owner: Option<String>,
-    /// `(symbol, the line it calls from)`, sorted by key.
-    pub callers: Vec<(String, u32)>,
+    /// Every call site into the target, grouped by the file the calls sit in,
+    /// most call sites first. See [`CallSites`].
+    pub callers: Vec<CallSites>,
+    /// How many caller files [`MAX_CALLER_FILES`] left out of `callers`.
+    pub callers_not_shown: usize,
     /// `(symbol, the line it is called from)`, sorted by key.
     pub callees: Vec<(String, u32)>,
     pub importers: Vec<String>,
@@ -106,6 +152,7 @@ impl ContextReport {
             file: String::new(),
             owner: None,
             callers: Vec::new(),
+            callers_not_shown: 0,
             callees: Vec::new(),
             importers: Vec::new(),
             imports: Vec::new(),
@@ -131,7 +178,7 @@ pub fn context<F: Fs>(db: &GraphDb<F>, repo: Option<&Path>, target: &str) -> Con
                 path: sanitize(&path),
             });
             let symbols = neighbors(db, &path, "DEFINES", Direction::In);
-            report.callers = callers_of(db, &symbols, &path);
+            (report.callers, report.callers_not_shown) = callers_of(db, &symbols, &path);
             report.callees = callees_of(db, &symbols, &path);
             report.source = read_source(db, repo, &path, None);
             fill_file(db, &mut report, &path);
@@ -147,7 +194,8 @@ pub fn context<F: Fs>(db: &GraphDb<F>, repo: Option<&Path>, target: &str) -> Con
             report.signature = text_prop(db, &key, "signature");
             report.doc = text_prop(db, &key, "doc");
             report.lines = symbol_lines(db, &key);
-            report.callers = callers_of(db, std::slice::from_ref(&key), "");
+            (report.callers, report.callers_not_shown) =
+                callers_of(db, std::slice::from_ref(&key), "");
             report.callees = callees_of(db, std::slice::from_ref(&key), "");
             let file = symbol_file(db, &key).unwrap_or_default();
             report.source = read_source(db, repo, &file, report.lines);
@@ -227,31 +275,51 @@ fn symbol_lines<F: Fs>(db: &GraphDb<F>, key: &str) -> Option<(u32, u32)> {
     Some((start, end.max(start)))
 }
 
-/// Symbols that call any of `symbols`, with the line the call sits on.
+/// Every call site into any of `symbols`, grouped by the file it sits in.
 ///
 /// `exclude_file` drops calls that stay inside one file: asking what calls a
 /// file means what calls it from outside. It is empty when the target is a
 /// symbol, where a caller in the same file is still a caller.
+///
+/// Returns the groups and how many files were cut by [`MAX_CALLER_FILES`].
+/// Files come back with the most call sites first, ties on the path, so a cut
+/// only ever loses the least-involved callers — and the count says so rather
+/// than leaving the answer looking complete.
 fn callers_of<F: Fs>(
     db: &GraphDb<F>,
     symbols: &[String],
     exclude_file: &str,
-) -> Vec<(String, u32)> {
-    let mut out: Vec<(String, u32)> = Vec::new();
+) -> (Vec<CallSites>, usize) {
+    let mut by_file: BTreeMap<String, (BTreeSet<String>, BTreeSet<u32>)> = BTreeMap::new();
     for symbol in symbols {
         for caller in neighbors(db, symbol, "CALLS", Direction::In) {
-            if !exclude_file.is_empty() && symbol_file(db, &caller).as_deref() == Some(exclude_file)
-            {
+            let file = symbol_file(db, &caller).unwrap_or_default();
+            if !exclude_file.is_empty() && file == exclude_file {
                 continue;
             }
-            let line = evidence_line(&list_prop(db, &caller, "call_lines"), symbol).unwrap_or(0);
-            out.push((sanitize(&caller), line));
+            let lines = evidence_lines(&list_prop(db, &caller, "call_lines"), symbol);
+            let slot = by_file.entry(sanitize(&file)).or_default();
+            slot.0.insert(sanitize(&caller));
+            // A call the evidence list has no line for still happened, so the
+            // caller is named; line 0 is how every digest here says "unknown".
+            slot.1
+                .extend(if lines.is_empty() { vec![0] } else { lines });
         }
     }
-    out.sort();
-    out.dedup();
-    out.truncate(MAX_CALLS);
-    out
+    let total = by_file.len();
+    let mut out: Vec<CallSites> = by_file
+        .into_iter()
+        .map(|(file, (symbols, lines))| CallSites {
+            file,
+            symbols: symbols.into_iter().collect(),
+            sites: lines.len(),
+            lines: lines.into_iter().take(MAX_SITES_PER_FILE).collect(),
+        })
+        .collect();
+    out.sort_by(|a, b| b.sites.cmp(&a.sites).then(a.file.cmp(&b.file)));
+    out.truncate(MAX_CALLER_FILES);
+    let cut = total - out.len();
+    (out, cut)
 }
 
 /// Symbols any of `symbols` calls, with the line the call sits on.

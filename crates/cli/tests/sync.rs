@@ -288,6 +288,156 @@ fn sync_reports_busy_when_lock_held() {
     assert_eq!(r.git.commits, 1);
 }
 
+// ── snapshots ───────────────────────────────────────────────────────────────
+
+fn wal_len(db_dir: &Path) -> u64 {
+    std::fs::metadata(db_dir.join("wal.bin")).map_or(0, |m| m.len())
+}
+
+/// Enough Markdown to push one incremental run's WAL tail past
+/// [`cli::ingest_git::SNAPSHOT_WAL_BYTES`]. Each file stores a body prop, so
+/// the WAL grows roughly with the bytes committed.
+fn bulky_docs() -> Vec<(String, String)> {
+    let para = "Nodes and edges and rules and files and symbols and commits. ".repeat(1_000);
+    (0..96)
+        .map(|n| {
+            (
+                format!("docs/page{n}.md"),
+                format!("# Page {n}\n\n{para}\n"),
+            )
+        })
+        .collect()
+}
+
+/// A first ingest is the run that writes the whole history into an empty WAL.
+/// Leaving that WAL to be replayed makes every later open — every hook, every
+/// MCP start — pay for it, so the run that wrote it snapshots it away.
+#[test]
+fn full_ingest_writes_a_snapshot() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    assert!(
+        db_dir.join("snapshot.bin").is_file(),
+        "a full ingest leaves a snapshot behind"
+    );
+    // The default snapshot replaces the WAL with a minimal baseline, so a
+    // reopen replays almost nothing.
+    assert!(
+        wal_len(&db_dir) < cli::ingest_git::SNAPSHOT_WAL_BYTES,
+        "the WAL was replaced by a baseline, not left whole: {} bytes",
+        wal_len(&db_dir)
+    );
+    // And the store still reads correctly through that snapshot — including
+    // the past. The WAL frames were archived, not dropped, so a store does not
+    // forget how its nodes came to be in exchange for opening faster.
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(db.has_node("src/net.rs"), "the graph survived the snapshot");
+    assert_eq!(out(&db, "src/net.rs", "IMPORTS"), vec!["src/util.rs"]);
+    assert!(
+        !db.node_history("src/net.rs").unwrap().is_empty(),
+        "the snapshot kept the history readable"
+    );
+    assert!(
+        db.edge_history("src/net.rs", "src/util.rs")
+            .unwrap()
+            .items
+            .iter()
+            .any(|e| e.edge_type == "IMPORTS"),
+        "the IMPORTS edge is still explainable after the snapshot"
+    );
+}
+
+/// An incremental run snapshots only when the tail it appended is long enough
+/// to be worth the write. A small sync leaves the snapshot alone; a large one
+/// folds itself in.
+#[test]
+fn incremental_sync_snapshots_past_the_threshold() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let first = std::fs::read(db_dir.join("snapshot.bin")).unwrap();
+
+    // A small commit: under the threshold, so the snapshot is not rewritten.
+    commit(&repo, "one more", &[("src/extra.rs", "//! Extra.\n")]);
+    run_sync(&db_dir).unwrap();
+    assert_eq!(
+        std::fs::read(db_dir.join("snapshot.bin")).unwrap(),
+        first,
+        "a small incremental run is not worth a snapshot"
+    );
+    let small_tail = wal_len(&db_dir);
+    assert!(small_tail > 0, "the increment is in the WAL");
+
+    // A bulky one: the tail clears the threshold and is folded in.
+    let docs = bulky_docs();
+    let files: Vec<(&str, &str)> = docs.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    commit(&repo, "a pile of docs", &files);
+    run_sync(&db_dir).unwrap();
+
+    let after = wal_len(&db_dir);
+    assert!(
+        after < small_tail.max(cli::ingest_git::SNAPSHOT_WAL_BYTES),
+        "the long tail was folded into the snapshot, leaving {after} bytes"
+    );
+    assert!(
+        std::fs::metadata(db_dir.join("snapshot.bin"))
+            .unwrap()
+            .len()
+            > first.len() as u64,
+        "the snapshot grew to hold what the WAL no longer carries"
+    );
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(db.has_node("docs/page0.md"), "nothing was lost");
+}
+
+/// `touch` runs on every edit the assistant makes, inside the hook's budget.
+/// A snapshot costs hundreds of milliseconds, so it never takes one — even
+/// when the store has none at all and one would otherwise be due.
+#[test]
+fn touch_never_snapshots() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    // Get the files into the graph, then rewrite every one of them through
+    // `touch` alone. That pushes the WAL tail past the threshold, so a
+    // snapshot is unambiguously due by the time the last edit lands — and only
+    // the rule that `touch` never takes one can keep it away.
+    let docs = bulky_docs();
+    let files: Vec<(&str, &str)> = docs.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    commit(&repo, "a pile of docs", &files);
+    run_sync(&db_dir).unwrap();
+    let before = std::fs::read(db_dir.join("snapshot.bin")).unwrap();
+
+    let edited: Vec<(String, String)> = docs
+        .iter()
+        .map(|(p, b)| (p.clone(), format!("{b}\nEdited by the assistant.\n")))
+        .collect();
+    write_files(
+        &repo,
+        &edited
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let named: Vec<PathBuf> = edited.iter().map(|(p, _)| repo.join(p)).collect();
+    let r = run_touch(&db_dir, &named, None).unwrap();
+    assert_eq!(r.files_scanned, docs.len(), "every edit was taken: {r:?}");
+
+    assert!(
+        wal_len(&db_dir) > cli::ingest_git::SNAPSHOT_WAL_BYTES,
+        "a snapshot is genuinely due: {} bytes of tail",
+        wal_len(&db_dir)
+    );
+    assert_eq!(
+        std::fs::read(db_dir.join("snapshot.bin")).unwrap(),
+        before,
+        "touch stays inside the hook budget and writes no snapshot"
+    );
+}
+
 // ── touch ───────────────────────────────────────────────────────────────────
 
 /// Run the real binary with `stdin` piped in, and return
@@ -566,6 +716,349 @@ fn auto_db_prefers_project_dir_then_git_cwd_then_home() {
     assert_eq!(
         resolve_auto_db(Some(std::ffi::OsStr::new("")), &cwd, &home),
         cwd.join("mushroom-memory")
+    );
+}
+
+/// Every checkout of a repository resolves to its own store, and every
+/// subdirectory of a checkout resolves to that checkout's.
+///
+/// This is what makes committed config safe. `install --project` writes
+/// `--auto` into `.mcp.json`, the settings hooks and the git hooks; those
+/// files travel to a `git worktree`, and a store path baked into them would
+/// point every hook in the new worktree at the old checkout's graph.
+#[test]
+fn auto_db_resolves_to_the_worktree_root() {
+    let repo = tmp("wt-main");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(&repo, "first", &[("src/lib.rs", LIB_RS)]);
+    let home = tmp("wt-home");
+
+    // The root of the main checkout, and any subdirectory of it.
+    assert_eq!(
+        resolve_auto_db(None, &repo, &home),
+        repo.join("mushroom-memory")
+    );
+    assert_eq!(
+        resolve_auto_db(None, &repo.join("src"), &home),
+        repo.join("mushroom-memory"),
+        "a hook fires wherever the tool call was, which is often a subdirectory"
+    );
+
+    // A linked worktree: its own root, never the checkout it was added from.
+    let wt = tmp("wt-linked").join("feature");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        wt.join(".git").is_file(),
+        "a linked worktree marks its root with a .git file, not a directory"
+    );
+    assert_eq!(
+        resolve_auto_db(None, &wt, &home),
+        wt.join("mushroom-memory")
+    );
+    assert_eq!(
+        resolve_auto_db(None, &wt.join("src"), &home),
+        wt.join("mushroom-memory")
+    );
+    assert_ne!(
+        resolve_auto_db(None, &wt, &home),
+        resolve_auto_db(None, &repo, &home),
+        "two working trees are two stores"
+    );
+}
+
+/// The `post-commit` block `install` writes, run for real from inside a
+/// linked worktree, updates that worktree's store and leaves the main
+/// checkout's alone.
+///
+/// Worktrees share one hooks directory, so this is literally the same file
+/// running in both places — the only thing that can tell them apart is that
+/// `sync --auto` resolves the store when it runs.
+#[test]
+fn git_hook_sync_auto_uses_the_worktree_store() {
+    use cli::install::{merge_git_hook, StoreRef};
+
+    let repo = tmp("hook-main");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(&repo, "first", &[("src/lib.rs", LIB_RS)]);
+
+    let wt = tmp("hook-wt").join("feature");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
+    );
+
+    // Each checkout starts with its own store, built from its own files.
+    let main_db = repo.join("mushroom-memory");
+    let wt_db = wt.join("mushroom-memory");
+    run_ingest_git(&main_db, &opts(&repo)).unwrap();
+    run_ingest_git(&wt_db, &opts(&wt)).unwrap();
+    let main_seq_before = GraphDb::open(&main_db).unwrap().commit_seq();
+    let wt_seq_before = GraphDb::open(&wt_db).unwrap().commit_seq();
+
+    // Exactly the block install writes, with the test binary as the command.
+    let bin = env!("CARGO_BIN_EXE_mushroomdb");
+    let hook = repo.join(".git").join("hooks").join("post-commit");
+    let block_written =
+        merge_git_hook(&hook, &format!("'{bin}'"), &StoreRef::auto(main_db.clone())).unwrap();
+    assert!(block_written);
+    assert!(
+        std::fs::read_to_string(&hook)
+            .unwrap()
+            .contains("sync --auto"),
+        "the block resolves the store at run time"
+    );
+
+    // Commit in the worktree. The hook is backgrounded, so wait for it.
+    commit(&wt, "only in the worktree", &[("src/feature.rs", NET_RS)]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if GraphDb::open(&wt_db).unwrap().commit_seq() > wt_seq_before {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the post-commit sync never reached {}",
+            wt_db.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        GraphDb::open(&main_db).unwrap().commit_seq(),
+        main_seq_before,
+        "the other checkout's store must not be touched"
+    );
+}
+
+/// `install` run from inside a linked worktree puts its git hooks where git
+/// will actually run them: the repository's **common** hooks directory.
+///
+/// A linked worktree's gitdir is `<main>/.git/worktrees/<name>`, and that is
+/// what the `gitdir:` link in its `.git` file points at — but git resolves
+/// hooks through the common dir, so a hook written into the worktree's own
+/// gitdir is a file nothing ever executes. This installs from the worktree,
+/// makes a real commit there, and requires the hook to have fired.
+#[test]
+fn install_from_a_worktree_writes_hooks_to_the_common_dir() {
+    use cli::doctor::{run_doctor_with, DoctorOpts};
+    use cli::install::{
+        run_install_with, Externals, InstallOpts, McpCommand, Platform, Scope, HOOK_BEGIN,
+    };
+
+    let repo = tmp("wt-hooks-main");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(&repo, "first", &[("src/lib.rs", LIB_RS)]);
+
+    let wt = tmp("wt-hooks-linked").join("feature");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        wt.join(".git").is_file(),
+        "a linked worktree marks its root with a .git file, not a directory"
+    );
+
+    // Each checkout has its own store, so a hook that fires is visible as a
+    // commit on that checkout's graph and nowhere else.
+    let main_db = repo.join("mushroom-memory");
+    let wt_db = wt.join("mushroom-memory");
+    run_ingest_git(&main_db, &opts(&repo)).unwrap();
+    run_ingest_git(&wt_db, &opts(&wt)).unwrap();
+    let main_seq_before = GraphDb::open(&main_db).unwrap().commit_seq();
+    let wt_seq_before = GraphDb::open(&wt_db).unwrap().commit_seq();
+
+    let home = tmp("wt-hooks-home");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+    let install_opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        db: None, // `--auto`: each checkout resolves its own store
+        command: Some(bin.clone()),
+        git_hooks: true,
+        prewarm: false,
+    };
+    let summary = run_install_with(
+        &wt,
+        &home,
+        &install_opts,
+        &McpCommand::Explicit(bin.clone()),
+        &Externals::with_path(None),
+    )
+    .expect("install from the worktree");
+
+    // The block is in the common dir, and the worktree's own gitdir holds no
+    // hooks at all — writing one there is the whole bug.
+    let common_hook = repo.join(".git").join("hooks").join("post-commit");
+    let block = std::fs::read_to_string(&common_hook).expect("post-commit in the common hooks dir");
+    assert!(
+        block.contains(HOOK_BEGIN),
+        "the block is in {common_hook:?}"
+    );
+    assert!(
+        block.contains("sync --auto"),
+        "the store resolves at run time, per checkout"
+    );
+    let wt_gitdir = repo.join(".git").join("worktrees").join("feature");
+    assert!(wt_gitdir.is_dir(), "the worktree's gitdir exists");
+    assert!(
+        !wt_gitdir.join("hooks").exists(),
+        "nothing may be written to the worktree's own gitdir: git never reads it"
+    );
+    assert!(
+        summary.contains(&common_hook.display().to_string()),
+        "the summary names the file git will run:\n{summary}"
+    );
+
+    // `doctor` must read the same directory, or the failure this fixes stays
+    // invisible from the tool that exists to catch it.
+    let report = run_doctor_with(
+        &wt,
+        &home,
+        &DoctorOpts {
+            platform: Some(Platform::ClaudeCode),
+            scope: Some(Scope::Project),
+        },
+        &Externals::with_path(None),
+    )
+    .expect("doctor");
+    let git_line = report
+        .output
+        .lines()
+        .find(|l| l.contains("git-hooks"))
+        .unwrap_or_else(|| panic!("no git-hooks line in:\n{}", report.output));
+    assert!(
+        git_line.starts_with("ok"),
+        "git-hooks should be ok: {git_line}"
+    );
+    assert!(
+        git_line.contains(&repo.join(".git").join("hooks").display().to_string()),
+        "doctor reports the common hooks dir: {git_line}"
+    );
+
+    // The real thing: commit in the worktree and require the hook to run.
+    commit(&wt, "only in the worktree", &[("src/feature.rs", NET_RS)]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if GraphDb::open(&wt_db).unwrap().commit_seq() > wt_seq_before {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the post-commit hook never reached {}",
+            wt_db.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        GraphDb::open(&main_db).unwrap().commit_seq(),
+        main_seq_before,
+        "the other checkout's store must not be touched"
+    );
+
+    // Installing again from the main checkout targets the same file, so the
+    // block must be merged in place rather than appended a second time.
+    let main_opts = InstallOpts {
+        db: None,
+        ..install_opts
+    };
+    run_install_with(
+        &repo,
+        &home,
+        &main_opts,
+        &McpCommand::Explicit(bin),
+        &Externals::with_path(None),
+    )
+    .expect("install from the main checkout");
+    let after = std::fs::read_to_string(&common_hook).unwrap();
+    assert_eq!(
+        after.matches(HOOK_BEGIN).count(),
+        1,
+        "one block per hook, however many checkouts installed:\n{after}"
+    );
+}
+
+/// A submodule keeps its own hooks: its gitdir has no `commondir`, and git
+/// runs `.git/modules/<path>/hooks` for it.
+///
+/// The two shapes are told apart by that one file, so this is the other half
+/// of [`install_from_a_worktree_writes_hooks_to_the_common_dir`]. The gitdir
+/// link is written by hand rather than by `git submodule add`, which needs a
+/// clonable origin and is blocked over local paths by default on current git.
+#[test]
+fn install_in_a_submodule_keeps_the_submodule_hooks() {
+    use cli::install::{
+        run_install_with, Externals, InstallOpts, McpCommand, Platform, Scope, HOOK_BEGIN,
+    };
+
+    let repo = tmp("sub-hooks-main");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(&repo, "first", &[("src/lib.rs", LIB_RS)]);
+
+    // Exactly the shape git leaves for a submodule: a gitdir link with no
+    // `commondir` beside it.
+    let module = repo.join(".git").join("modules").join("vendor").join("sub");
+    std::fs::create_dir_all(&module).unwrap();
+    let sub = repo.join("vendor").join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join(".git"), format!("gitdir: {}\n", module.display())).unwrap();
+    assert!(
+        !module.join("commondir").exists(),
+        "a submodule's gitdir has no commondir — that is the discriminator"
+    );
+
+    let home = tmp("sub-hooks-home");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+    run_install_with(
+        &sub,
+        &home,
+        &InstallOpts {
+            platform: Some(Platform::ClaudeCode),
+            scope: Some(Scope::Project),
+            db: None,
+            command: Some(bin.clone()),
+            git_hooks: true,
+            prewarm: false,
+        },
+        &McpCommand::Explicit(bin),
+        &Externals::with_path(None),
+    )
+    .expect("install in the submodule");
+
+    let hook = module.join("hooks").join("post-commit");
+    assert!(
+        std::fs::read_to_string(&hook)
+            .unwrap_or_default()
+            .contains(HOOK_BEGIN),
+        "the submodule's own hooks dir holds the block: {hook:?}"
+    );
+    assert!(
+        !repo.join(".git").join("hooks").join("post-commit").exists(),
+        "a submodule must not write into the superproject's hooks"
     );
 }
 

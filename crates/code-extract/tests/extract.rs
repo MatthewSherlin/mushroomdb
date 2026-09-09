@@ -9,7 +9,8 @@
 //! directory.
 
 use code_extract::{
-    extract, lang_of, resolve_call, resolve_import, resolve_mention, FileFacts, Lang, SymbolIndex,
+    call_lookup_names, extract, indexed_under, lang_of, resolve_call, resolve_import,
+    resolve_mention, written_as_method, CallFact, CallScope, FileFacts, Lang, SymbolIndex,
     MAX_BODY_BYTES, MAX_FILE_BYTES,
 };
 use std::collections::BTreeSet;
@@ -85,8 +86,18 @@ fn callees<'a>(facts: &'a FileFacts, name: &str) -> Vec<&'a str> {
         .unwrap_or_else(|| panic!("no symbol {name} in {:?}", names(facts)))
         .calls
         .iter()
-        .map(|(callee, _)| callee.as_str())
+        .map(|c| c.callee.as_str())
         .collect()
+}
+
+/// The names a path call may lead with, as the working-tree pass computes them.
+fn roots(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|n| (*n).to_string()).collect()
+}
+
+/// What the calling file can see: its imports and those leading names.
+fn scope<'a>(imports: &'a [String], roots: &'a BTreeSet<String>) -> CallScope<'a> {
+    CallScope { imports, roots }
 }
 
 fn raw_imports(facts: &FileFacts) -> Vec<&str> {
@@ -100,7 +111,8 @@ fn raw_imports(facts: &FileFacts) -> Vec<&str> {
 fn assert_calls_are_innermost(facts: &FileFacts, label: &str) {
     for owner in &facts.symbols {
         let owner_span = owner.line_end - owner.line_start;
-        for (callee, line) in &owner.calls {
+        for call in &owner.calls {
+            let (callee, line) = (&call.callee, &call.line);
             for other in &facts.symbols {
                 if other.name == owner.name && other.line_start == owner.line_start {
                     continue;
@@ -235,7 +247,8 @@ fn rust_workspace_package_paths_resolve_to_lib_rs() {
             &known,
             &no_files
         ),
-        vec!["crates/beta-core/src/lib.rs"]
+        vec!["crates/beta-core/src/lib.rs"],
+        "an item re-exported from the package root resolves to the root"
     );
 
     // No layout convention is assumed: a workspace that keeps its members
@@ -364,6 +377,48 @@ fn rust_super_paths_resolve_relative_to_the_module() {
             &no_files
         ),
         vec!["crates/alpha/src/util.rs"]
+    );
+}
+
+/// A path into a sibling package names the module that defines the item, not
+/// the package root — the same rule `crate::a::b` already follows inside one
+/// package. Naming the defining file is what lets a call resolve across a crate
+/// boundary through the caller's imports.
+#[test]
+fn rust_package_paths_reach_the_defining_module() {
+    let files = tree(&[
+        "Cargo.toml",
+        "crates/alpha/Cargo.toml",
+        "crates/alpha/src/lib.rs",
+        "crates/beta-core/Cargo.toml",
+        "crates/beta-core/src/lib.rs",
+        "crates/beta-core/src/repograph/mod.rs",
+        "crates/beta-core/src/repograph/render.rs",
+    ]);
+    let known = |p: &str| files.contains(p);
+    let resolve = |raw: &str| {
+        resolve_import(
+            Lang::Rust,
+            "crates/alpha/src/lib.rs",
+            raw,
+            &known,
+            &no_files,
+        )
+    };
+
+    assert_eq!(
+        resolve("beta_core::repograph::render::sanitize"),
+        vec!["crates/beta-core/src/repograph/render.rs"],
+        "the trailing item name costs nothing; the module wins"
+    );
+    assert_eq!(
+        resolve("beta_core::repograph::Thing"),
+        vec!["crates/beta-core/src/repograph/mod.rs"]
+    );
+    assert_eq!(
+        resolve("beta_core::Unknown"),
+        vec!["crates/beta-core/src/lib.rs"],
+        "no module answers, so the package root does"
     );
 }
 
@@ -761,6 +816,92 @@ fn markdown_extraction_finds_headings_mentions_and_body() {
 }
 
 // ── per-language extraction ─────────────────────────────────────────────────
+
+/// A macro's arguments are an unparsed token tree, so a call written inside
+/// `format!` or `assert_eq!` is not a `call_expression` and used to be invisible.
+/// In code whose job is rendering that hid most of the call sites there are.
+#[test]
+fn calls_inside_macro_arguments_are_extracted() {
+    let src = r#"
+pub fn render(t: &str) -> String {
+    let plain = sanitize(t);
+    format!("{} {}", repograph::sanitize(t), wrap(sanitize(plain)))
+}
+"#;
+    let facts = code_extract::extract("src/render.rs", src.as_bytes());
+    let calls = &facts
+        .symbols
+        .iter()
+        .find(|s| s.name == "render")
+        .unwrap()
+        .calls;
+    assert_eq!(
+        calls,
+        &vec![
+            CallFact::plain("sanitize", 3),
+            CallFact::plain("sanitize", 4),
+            CallFact::plain("wrap", 4),
+        ],
+        "one entry per call site, macro arguments included, nested calls too"
+    );
+}
+
+/// A `(` that does not directly follow a name is grouping, not an argument
+/// list, so a token run inside a macro is not mistaken for a call.
+#[test]
+fn macro_token_runs_that_are_not_calls_are_left_alone() {
+    let src = r#"
+pub fn check(v: u32) -> bool {
+    assert!(v > (1 + 2));
+    matches!(v, 1 | 2)
+}
+"#;
+    let facts = code_extract::extract("src/check.rs", src.as_bytes());
+    assert!(
+        facts.symbols.iter().all(|s| s.calls.is_empty()),
+        "no calls here: {:?}",
+        facts.symbols.iter().map(|s| &s.calls).collect::<Vec<_>>()
+    );
+}
+
+/// A macro's arguments are unparsed, so a tuple-struct *pattern* is the same
+/// three tokens as a call: `matches!(e, Kind::Io(_))` looks exactly like
+/// `wrap(Kind::Io(_))`. Rust settles it by naming — a function is `snake_case`,
+/// a struct or variant is `CamelCase` — so a leading uppercase letter inside a
+/// token tree is not recorded as a call.
+#[test]
+fn a_tuple_struct_pattern_in_a_macro_is_not_a_call() {
+    let src = r#"
+pub fn classify(e: Kind, v: Value) -> Vec<u32> {
+    let listed = vec![Foo(1), Bar(2)];
+    assert!(matches!(e, Kind::Io(_)));
+    assert!(matches!(v, Value::Str(s) if s.is_empty()));
+    debug_assert!(matches!(e, Kind::Eof), "{}", describe(e));
+    listed
+}
+"#;
+    let facts = code_extract::extract("src/classify.rs", src.as_bytes());
+    let calls = &facts
+        .symbols
+        .iter()
+        .find(|s| s.name == "classify")
+        .unwrap()
+        .calls;
+    assert_eq!(
+        calls,
+        &vec![
+            CallFact::plain("describe", 6),
+            CallFact::method("is_empty", 5),
+        ],
+        "the patterns contribute nothing; the guard and the argument still do"
+    );
+    for name in ["Foo", "Bar", "Io", "Str", "Eof"] {
+        assert!(
+            !calls.iter().any(|c| c.callee == name),
+            "{name} is a type or a variant, not a function"
+        );
+    }
+}
 
 #[test]
 fn rust_symbols_are_qualified_with_kinds_docs_and_calls() {
@@ -1221,27 +1362,374 @@ fn resolve_call_prefers_same_file_then_directory_then_unique() {
     index.insert("flush", "other/c.rs#Sink.flush");
     index.insert("only", "far/away.rs#only");
     index.insert("Store.flush", "src/a.rs#Store.flush");
+    let no_roots = roots(&[]);
+    let none = &scope(&[], &no_roots);
 
     // Same file wins, even reached through a receiver.
     assert_eq!(
-        resolve_call("src/a.rs", "self.flush", &index),
+        resolve_call("src/a.rs", &CallFact::method("self.flush", 1), &index, none),
         Some("src/a.rs#Store.flush".to_string())
     );
     // The fully written name is tried before its last segment.
     assert_eq!(
-        resolve_call("other/c.rs", "Store.flush", &index),
+        resolve_call(
+            "other/c.rs",
+            &CallFact::method("Store.flush", 1),
+            &index,
+            none
+        ),
         Some("src/a.rs#Store.flush".to_string())
     );
     // No definition in this file, two in this directory: ambiguous.
-    assert_eq!(resolve_call("src/c.rs", "flush", &index), None);
+    assert_eq!(
+        resolve_call("src/c.rs", &CallFact::plain("flush", 1), &index, none),
+        None
+    );
     // Unique anywhere in the tree.
     assert_eq!(
-        resolve_call("src/a.rs", "only", &index),
+        resolve_call("src/a.rs", &CallFact::plain("only", 1), &index, none),
         Some("far/away.rs#only".to_string())
     );
-    assert_eq!(resolve_call("src/a.rs", "missing", &index), None);
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::plain("missing", 1), &index, none),
+        None
+    );
     assert_eq!(index.len(), 3);
     assert!(!index.is_empty());
+}
+
+/// Repository-wide uniqueness is a guess that a call written on a receiver has
+/// not earned: `.collect()` names a method on a type from outside the tree, and
+/// binding it to whatever single function shares the name is a wrong edge.
+/// A method call resolves locally or through the caller's imports, or not at
+/// all.
+#[test]
+fn method_calls_do_not_resolve_repo_wide() {
+    let mut index = SymbolIndex::new();
+    index.insert("collect", "crates/other/tests/helpers.rs#collect");
+    index.insert("run", "src/a.rs#Job.run");
+    index.insert("start", "src/b.rs#start");
+    index.insert("boot", "crates/dep/src/lib.rs#Boot.boot");
+    let tree = roots(&["helpers"]);
+    let none = &scope(&[], &tree);
+
+    // The one place the old tier fired, and the reason for this rule.
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::plain("collect", 1), &index, none),
+        Some("crates/other/tests/helpers.rs#collect".to_string()),
+        "a bare call still gets the repo-wide tier"
+    );
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("v.collect", 1), &index, none),
+        None,
+        "the same name on a receiver does not"
+    );
+
+    // A path call is not a method call, however many segments it has.
+    assert_eq!(
+        resolve_call(
+            "src/a.rs",
+            &CallFact::plain("helpers::collect", 1),
+            &index,
+            none
+        ),
+        Some("crates/other/tests/helpers.rs#collect".to_string())
+    );
+
+    // What a method call keeps is the name it actually wrote. A static call
+    // reads `Type.method` in Python, TypeScript and JavaScript, and a symbol
+    // qualified to exactly that names the receiver's type rather than guessing
+    // at it, so it still resolves anywhere in the tree.
+    index.insert("Sink.drain", "far/away.rs#Sink.drain");
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("Sink.drain", 1), &index, none),
+        Some("far/away.rs#Sink.drain".to_string())
+    );
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("s.drain", 1), &index, none),
+        None,
+        "the same method reached through a value is not the same evidence"
+    );
+    // A call recovered from a macro's token tree arrives as the bare segment
+    // with the receiver already stripped, so the rule has to read the candidate
+    // rather than its position: `writeln!(o, "{}", xs.join(","))` yields
+    // `join`, method, and must not reach a `join` anywhere in the tree.
+    index.insert("join", "crates/util/src/paths.rs#join");
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("join", 1), &index, none),
+        None
+    );
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::plain("join", 1), &index, none),
+        Some("crates/util/src/paths.rs#join".to_string()),
+        "the same name written bare is still a fair guess"
+    );
+
+    // The local tiers still work for a method call.
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("job.run", 1), &index, none),
+        Some("src/a.rs#Job.run".to_string()),
+        "same file"
+    );
+    assert_eq!(
+        resolve_call("src/c.rs", &CallFact::method("h.start", 1), &index, none),
+        Some("src/b.rs#start".to_string()),
+        "same directory"
+    );
+    let imports = vec!["crates/dep/src/lib.rs".to_string()];
+    assert_eq!(
+        resolve_call(
+            "src/a.rs",
+            &CallFact::method("d.boot", 1),
+            &index,
+            &scope(&imports, &tree)
+        ),
+        Some("crates/dep/src/lib.rs#Boot.boot".to_string()),
+        "a method in an imported file"
+    );
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("d.boot", 1), &index, none),
+        None,
+        "and without the import, nothing"
+    );
+}
+
+/// `std::mem::take` is a call into the standard library. The tiers below have
+/// no node for it and would bind the last segment to whatever single `take` the
+/// repository happened to define — on this repository, a test helper. A path
+/// call resolves only when its leading segment names something here.
+#[test]
+fn external_path_calls_resolve_to_nothing() {
+    let mut index = SymbolIndex::new();
+    index.insert("take", "crates/core/tests/events.rs#take");
+    index.insert("helper", "src/net/util.rs#helper");
+    index.insert("Store", "src/store.rs#Store");
+    index.insert("open", "src/store.rs#Store.open");
+    // `util` is a module in the tree; `std` and `serde_json` are not.
+    let tree = roots(&["util", "net", "src"]);
+    let here = &scope(&[], &tree);
+
+    for external in [
+        "std::mem::take",
+        "core::mem::take",
+        "serde_json::take",
+        "Vec::take",
+        "::std::mem::take",
+    ] {
+        assert_eq!(
+            resolve_call("src/a.rs", &CallFact::plain(external, 1), &index, here),
+            None,
+            "{external} names nothing in this tree"
+        );
+    }
+
+    // A path that does lead somewhere here resolves as it always did.
+    for internal in [
+        "crate::net::util::helper",
+        "self::helper",
+        "super::helper",
+        "Self::helper",
+        "util::helper",
+    ] {
+        assert_eq!(
+            resolve_call("src/a.rs", &CallFact::plain(internal, 1), &index, here),
+            Some("src/net/util.rs#helper".to_string()),
+            "{internal} leads into the tree"
+        );
+    }
+
+    // A leading segment can be a type rather than a module, and a type the
+    // graph holds is just as much "in the tree" as a directory is.
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::plain("Store::open", 1), &index, here),
+        Some("src/store.rs#Store.open".to_string())
+    );
+
+    // A bare call has no leading segment to judge, so nothing changes for it.
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::plain("take", 1), &index, here),
+        Some("crates/core/tests/events.rs#take".to_string())
+    );
+}
+
+/// An import brings a *file* into scope, not a type. For a call written on a
+/// receiver that is not enough: `repo.join(id)` is `Path::join`, but the calling
+/// file imports a module that happens to define a free `join`. An imported match
+/// for a method call has to be a method.
+#[test]
+fn method_calls_only_match_methods_in_the_imported_tier() {
+    let mut index = SymbolIndex::new();
+    index.insert("join", "crates/util/src/paths.rs#join");
+    index.insert("flush", "crates/util/src/paths.rs#Writer.flush");
+    let tree = roots(&["util", "paths"]);
+    let imports = vec!["crates/util/src/paths.rs".to_string()];
+    let seen = &scope(&imports, &tree);
+
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("repo.join", 1), &index, seen),
+        None,
+        "a free function in an imported file is not a method on the receiver"
+    );
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("w.flush", 1), &index, seen),
+        Some("crates/util/src/paths.rs#Writer.flush".to_string()),
+        "a method in an imported file is"
+    );
+    // A bare call is unaffected: nothing about it claims a receiver.
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::plain("join", 1), &index, seen),
+        Some("crates/util/src/paths.rs#join".to_string())
+    );
+    // And the same-file tier still reaches a free function through a receiver,
+    // because a file's own definitions are what it is calling.
+    index.insert("write", "src/a.rs#write");
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("out.write", 1), &index, seen),
+        Some("src/a.rs#write".to_string())
+    );
+}
+
+/// A call site and a definition that share nothing but a name are not the same
+/// function. `str(x)` is a Python builtin; that this repository also holds a
+/// Rust `fn str` is a coincidence, and the tiers that search by name alone
+/// turned it into an edge from a `.py` file to a `.rs` one.
+#[test]
+fn calls_never_cross_a_language_boundary() {
+    let mut index = SymbolIndex::new();
+    index.insert("str", "crates/core/tests/suggest.rs#str");
+    index.insert("helper", "app/util.py#helper");
+    index.insert("sibling", "app/neighbour.rs#sibling");
+    let tree = roots(&[]);
+    let here = &scope(&[], &tree);
+
+    // The whole-tree tier: unique, and the wrong language.
+    assert_eq!(
+        resolve_call("app/main.py", &CallFact::plain("str", 1), &index, here),
+        None,
+        "a Python builtin is not this repository's Rust test helper"
+    );
+    assert_eq!(
+        resolve_call(
+            "crates/a/src/lib.rs",
+            &CallFact::plain("str", 1),
+            &index,
+            here
+        ),
+        Some("crates/core/tests/suggest.rs#str".to_string()),
+        "the same call from Rust still resolves"
+    );
+
+    // The same-directory tier is filtered too: sitting beside a file is not a
+    // relationship when the two are not even the same language.
+    assert_eq!(
+        resolve_call("app/main.py", &CallFact::plain("sibling", 1), &index, here),
+        None
+    );
+    assert_eq!(
+        resolve_call("app/main.py", &CallFact::plain("helper", 1), &index, here),
+        Some("app/util.py#helper".to_string())
+    );
+
+    // TypeScript, TSX and JavaScript are one family: a `.ts` module really does
+    // call into a `.tsx` one.
+    let mut web = SymbolIndex::new();
+    web.insert("Widget", "src/ui/widget.tsx#Widget");
+    web.insert("boot", "src/app.js#boot");
+    assert_eq!(
+        resolve_call("src/index.ts", &CallFact::plain("Widget", 1), &web, here),
+        Some("src/ui/widget.tsx#Widget".to_string())
+    );
+    assert_eq!(
+        resolve_call("src/index.ts", &CallFact::plain("boot", 1), &web, here),
+        Some("src/app.js#boot".to_string())
+    );
+    assert_eq!(
+        resolve_call("main.go", &CallFact::plain("boot", 1), &web, here),
+        None,
+        "Go is not part of that family"
+    );
+}
+
+/// The one rule that decides it, stated once and shared by every grammar.
+#[test]
+fn a_dot_in_the_callee_is_what_makes_it_a_method_call() {
+    assert!(written_as_method("self.flush"));
+    assert!(written_as_method("store.inner.flush"));
+    assert!(written_as_method("os.path.join"));
+    assert!(!written_as_method("flush"));
+    assert!(!written_as_method("Store::flush"));
+    assert!(!written_as_method("crate::net::flush"));
+}
+
+/// A name several crates define is ambiguous everywhere except in a file that
+/// imports one of them. Without the import tier every such call is dropped,
+/// which is how a cross-crate caller goes missing from `context`.
+#[test]
+fn resolve_call_uses_imports_to_break_a_repo_wide_tie() {
+    let mut index = SymbolIndex::new();
+    index.insert("sanitize", "crates/alpha/src/render.rs#sanitize");
+    index.insert("sanitize", "crates/beta/src/escape.rs#sanitize");
+
+    // Two definitions, neither near the caller: nothing to choose between.
+    let tree = roots(&["render", "escape"]);
+    let none = &scope(&[], &tree);
+    assert_eq!(
+        resolve_call(
+            "crates/gamma/src/ui.rs",
+            &CallFact::plain("sanitize", 1),
+            &index,
+            none
+        ),
+        None
+    );
+
+    // The caller imports one of them, so that one is what the source named.
+    let imports = vec!["crates/alpha/src/render.rs".to_string()];
+    assert_eq!(
+        resolve_call(
+            "crates/gamma/src/ui.rs",
+            &CallFact::plain("sanitize", 1),
+            &index,
+            &scope(&imports, &tree)
+        ),
+        Some("crates/alpha/src/render.rs#sanitize".to_string())
+    );
+    // Written with its module path, which is how a cross-crate call reads.
+    assert_eq!(
+        resolve_call(
+            "crates/gamma/src/ui.rs",
+            &CallFact::plain("render::sanitize", 1),
+            &index,
+            &scope(&imports, &tree)
+        ),
+        Some("crates/alpha/src/render.rs#sanitize".to_string())
+    );
+    // Importing both leaves it ambiguous: a wrong edge is worse than none.
+    let both = vec![
+        "crates/alpha/src/render.rs".to_string(),
+        "crates/beta/src/escape.rs".to_string(),
+    ];
+    assert_eq!(
+        resolve_call(
+            "crates/gamma/src/ui.rs",
+            &CallFact::plain("sanitize", 1),
+            &index,
+            &scope(&both, &tree)
+        ),
+        None
+    );
+
+    // A definition in the caller's own file still wins over an imported one.
+    index.insert("sanitize", "crates/gamma/src/ui.rs#sanitize");
+    assert_eq!(
+        resolve_call(
+            "crates/gamma/src/ui.rs",
+            &CallFact::plain("sanitize", 1),
+            &index,
+            &scope(&imports, &tree)
+        ),
+        Some("crates/gamma/src/ui.rs#sanitize".to_string())
+    );
 }
 
 #[test]
@@ -1353,4 +1841,245 @@ fn a_blank_line_detaches_an_outer_doc_comment() {
         b"/// First line.\n/// Second line.\npub fn helper() -> u32 {\n    2\n}\n",
     );
     assert_eq!(doc_of(&run, "helper"), "First line.");
+}
+
+/// An incremental pass builds its symbol index from the names its own calls
+/// can look up, rather than from every symbol in the repository. That is only
+/// sound if `call_lookup_names` names every form the resolver tries — so the
+/// narrowed index has to resolve *identically* to the whole-tree one, edge for
+/// edge and absence for absence.
+#[test]
+fn a_narrowed_index_resolves_exactly_as_the_whole_tree_one() {
+    // A tree with all four tiers represented, plus the traps: two same-named
+    // definitions in one directory, a name unique repository-wide, and a call
+    // into a dependency.
+    let entries: [(&str, &str); 10] = [
+        ("flush", "src/a.rs#Store.flush"),
+        ("flush", "src/b.rs#Cache.flush"),
+        ("flush", "other/c.rs#Sink.flush"),
+        ("Store.flush", "src/a.rs#Store.flush"),
+        ("only", "far/away.rs#only"),
+        ("take", "tests/helpers.rs#take"),
+        ("Store", "src/a.rs#Store"),
+        // Never named by any call below: the bulk a whole-tree index carries
+        // and a narrowed one must be free to leave out.
+        ("connect", "src/net.rs#connect"),
+        ("Cache.evict", "src/b.rs#Cache.evict"),
+        ("render", "src/ui.rs#render"),
+    ];
+    let mut full = SymbolIndex::new();
+    for (name, key) in entries {
+        full.insert(name, key);
+    }
+
+    let calls = [
+        CallFact::method("self.flush", 1),
+        CallFact::method("store.flush", 2),
+        CallFact::method("Store.flush", 3),
+        CallFact::plain("flush", 4),
+        CallFact::plain("only", 5),
+        CallFact::plain("Store::flush", 6),
+        CallFact::plain("std::mem::take", 7),
+        CallFact::plain("crate::util::only", 8),
+        CallFact::plain("missing", 9),
+    ];
+
+    // The index a pass over `src/a.rs` alone would build: every definition of
+    // exactly the names those calls look up, and nothing else.
+    let wanted: BTreeSet<String> = calls
+        .iter()
+        .flat_map(|c| call_lookup_names(&c.callee))
+        .collect();
+    let mut narrow = SymbolIndex::new();
+    for (name, key) in entries {
+        if wanted.contains(name) {
+            narrow.insert(name, key);
+        }
+    }
+    assert!(
+        narrow.len() < full.len(),
+        "the narrowed index must actually be smaller"
+    );
+
+    let tree = roots(&["crate", "util", "helpers"]);
+    for from in ["src/a.rs", "src/c.rs", "other/c.rs"] {
+        for imports in [vec![], vec!["src/b.rs".to_string()]] {
+            let scope = scope(&imports, &tree);
+            for call in &calls {
+                assert_eq!(
+                    resolve_call(from, call, &narrow, &scope),
+                    resolve_call(from, call, &full, &scope),
+                    "narrowing changed {} called from {from} with imports {imports:?}",
+                    call.callee
+                );
+            }
+        }
+    }
+}
+
+/// The three forms the resolver reaches the index by, and no others.
+#[test]
+fn call_lookup_names_covers_every_form_the_resolver_tries() {
+    assert_eq!(call_lookup_names("flush"), vec!["flush"]);
+    assert_eq!(call_lookup_names("self.flush"), vec!["self.flush", "flush"]);
+    // A path also has to be asked about by its leading segment: that is the
+    // check that keeps `std::mem::take` from claiming the tree's one `take`.
+    assert_eq!(
+        call_lookup_names("Store::flush"),
+        vec!["Store::flush", "flush", "Store"]
+    );
+    assert_eq!(
+        call_lookup_names("std::mem::take"),
+        vec!["std::mem::take", "take", "std"]
+    );
+}
+
+/// Source almost never writes a method's qualified name. `store.flush()` says
+/// `flush` once the receiver is stripped, and a symbol stored as `Store.flush`
+/// was unreachable from it — so no method in the graph had a caller at all.
+/// The index files every method under its bare name too, which is what closes
+/// that gap.
+#[test]
+fn a_method_call_reaches_its_type_through_the_bare_name() {
+    let mut index = SymbolIndex::new();
+    index.insert("Store.flush", "src/a.rs#Store.flush");
+    index.insert("Store", "src/a.rs#Store");
+    let tree = roots(&["a", "b", "src"]);
+    let none = &scope(&[], &tree);
+
+    // Same file, on the type's own receiver.
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("self.flush", 9), &index, none),
+        Some("src/a.rs#Store.flush".to_string())
+    );
+    // Same directory, on a variable named after its type.
+    assert_eq!(
+        resolve_call(
+            "src/b.rs",
+            &CallFact::method("store.flush", 4),
+            &index,
+            none
+        ),
+        Some("src/a.rs#Store.flush".to_string())
+    );
+    // And through an import, from further away.
+    let imports = vec!["src/a.rs".to_string()];
+    assert_eq!(
+        resolve_call(
+            "other/c.rs",
+            &CallFact::method("store.flush", 4),
+            &index,
+            &scope(&imports, &tree)
+        ),
+        Some("src/a.rs#Store.flush".to_string())
+    );
+    // The repository-wide tier stays shut: a bare method name is not a claim
+    // about the whole tree.
+    assert_eq!(
+        resolve_call(
+            "far/away.rs",
+            &CallFact::method("store.flush", 4),
+            &index,
+            none
+        ),
+        None
+    );
+}
+
+/// Stripping the receiver says which method is wanted and nothing about what
+/// it belongs to. Without a receiver that identifies the type, every `.len()`
+/// in a repository would bind to whatever single `Type.len` happened to be
+/// reachable — which is a `Vec`'s length pointed at someone else's type.
+#[test]
+fn a_method_call_on_an_unknown_receiver_gets_no_edge() {
+    let mut index = SymbolIndex::new();
+    index.insert("Store.len", "src/a.rs#Store.len");
+    let tree = roots(&["a", "src"]);
+    let none = &scope(&[], &tree);
+
+    for callee in ["bytes.len", "self.symbols.len", "v.len"] {
+        assert_eq!(
+            resolve_call("src/a.rs", &CallFact::method(callee, 1), &index, none),
+            None,
+            "{callee} names no type, so it earns no edge"
+        );
+    }
+    // A snake_case variable still meets its CamelCase type.
+    index.insert("SymbolIndex.len", "src/b.rs#SymbolIndex.len");
+    assert_eq!(
+        resolve_call(
+            "src/a.rs",
+            &CallFact::method("symbol_index.len", 1),
+            &index,
+            none
+        ),
+        Some("src/b.rs#SymbolIndex.len".to_string())
+    );
+}
+
+/// `self` is the type being implemented, and that is a claim about the calling
+/// file, not about its neighbours.
+#[test]
+fn self_reaches_a_method_only_in_the_calling_file() {
+    let mut index = SymbolIndex::new();
+    index.insert("Store.flush", "src/a.rs#Store.flush");
+    let tree = roots(&["a", "src"]);
+    let none = &scope(&[], &tree);
+
+    assert_eq!(
+        resolve_call("src/a.rs", &CallFact::method("self.flush", 1), &index, none),
+        Some("src/a.rs#Store.flush".to_string())
+    );
+    assert_eq!(
+        resolve_call("src/b.rs", &CallFact::method("self.flush", 1), &index, none),
+        None,
+        "`self` in another file is another type"
+    );
+}
+
+/// Two types in one directory can define the same method. Only a receiver
+/// that names one of them picks it out; `self` never reaches past the calling
+/// file, so it reaches neither.
+#[test]
+fn two_types_sharing_a_method_need_a_receiver_that_names_one() {
+    let mut index = SymbolIndex::new();
+    index.insert("Store.flush", "src/a.rs#Store.flush");
+    index.insert("Cache.flush", "src/b.rs#Cache.flush");
+    let tree = roots(&["src"]);
+    let none = &scope(&[], &tree);
+
+    assert_eq!(
+        resolve_call("src/c.rs", &CallFact::method("self.flush", 1), &index, none),
+        None,
+        "`self` only ever means the calling file"
+    );
+    assert_eq!(
+        resolve_call(
+            "src/c.rs",
+            &CallFact::method("cache.flush", 1),
+            &index,
+            none
+        ),
+        Some("src/b.rs#Cache.flush".to_string())
+    );
+    // Two types whose names collide once case and `_` are dropped leave
+    // nothing to choose between, so neither gets the edge.
+    index.insert("STORE.flush", "src/d.rs#STORE.flush");
+    assert_eq!(
+        resolve_call(
+            "src/c.rs",
+            &CallFact::method("store.flush", 1),
+            &index,
+            none
+        ),
+        None,
+        "`Store` and `STORE` are indistinguishable to this rule"
+    );
+}
+
+/// The mirror of `call_lookup_names`: what a narrowed index has to keep.
+#[test]
+fn indexed_under_names_both_forms_of_a_method() {
+    assert_eq!(indexed_under("helper"), vec!["helper"]);
+    assert_eq!(indexed_under("Store.flush"), vec!["Store.flush", "flush"]);
 }

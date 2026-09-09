@@ -386,6 +386,16 @@ const MAX_SOURCE_PRINTED: usize = 40;
 const MAX_CANDIDATES: usize = 20;
 /// Files [`render_impact`] prints in full.
 const MAX_IMPACT_FILES: usize = 5;
+/// Paths [`render_impact`] names on an `unknown:` line before counting the
+/// rest.
+///
+/// One line per unknown path, written before [`cap_lines`] runs, means a
+/// repository with untracked build or result artefacts spends its whole
+/// budget on them: a default `impact` here rendered 27 lines of which 20 were
+/// `unknown:`, evicting the analysis it was asked for. The defaults
+/// (`target/`, `node_modules/`, `dist/`, …) do not and should not cover every
+/// output directory anyone might have, so the render caps instead.
+const MAX_IMPACT_UNKNOWN: usize = 3;
 /// Links [`render_why`] prints in full.
 const MAX_WHY_LINKS: usize = 5;
 
@@ -476,17 +486,45 @@ pub fn render_context(c: &ContextReport) -> String {
         }
     }
 
-    let calls = |items: &[(String, u32)]| -> Vec<String> {
-        items
-            .iter()
-            .map(|(key, line)| match line {
-                0 => sanitize(key),
-                n => format!("{} line {n}", sanitize(key)),
-            })
-            .collect()
-    };
-    section(&mut out, "callers", &calls(&c.callers));
-    section(&mut out, "callees", &calls(&c.callees));
+    // Callers read as `<file>: <line>, <line>`: every site a signature change
+    // would have to visit, and the file to open to visit them.
+    let mut callers: Vec<String> = c
+        .callers
+        .iter()
+        .map(|s| {
+            let lines: Vec<String> = s
+                .lines
+                .iter()
+                .filter(|n| **n > 0)
+                .map(u32::to_string)
+                .collect();
+            let more = s.sites.saturating_sub(s.lines.len());
+            let mut item = match lines.is_empty() {
+                true => sanitize(&s.file),
+                false => format!("{}: {}", sanitize(&s.file), lines.join(", ")),
+            };
+            if more > 0 {
+                let _ = write!(item, " …(+{more})");
+            }
+            item
+        })
+        .collect();
+    if c.callers_not_shown > 0 {
+        callers.push(format!(
+            "… {} not shown",
+            plural(c.callers_not_shown, "file")
+        ));
+    }
+    section(&mut out, "callers", &callers);
+    let callees: Vec<String> = c
+        .callees
+        .iter()
+        .map(|(key, line)| match line {
+            0 => sanitize(key),
+            n => format!("{} line {n}", sanitize(key)),
+        })
+        .collect();
+    section(&mut out, "callees", &callees);
     section(
         &mut out,
         "imports",
@@ -526,8 +564,17 @@ pub fn render_context(c: &ContextReport) -> String {
 /// nothing left off.
 fn partner_item(p: &Partner, with_score: bool) -> String {
     let mut item = sanitize(&p.path);
-    if with_score {
-        let _ = write!(item, " {:.2}", p.score);
+    // A partner found by how often the two change together carries a count, not
+    // a similarity, and saying so is the point: the two do not compare, and a
+    // reader who sees `0.10` beside `0.78` draws the wrong conclusion.
+    match p.shared_commits {
+        Some(n) => {
+            let _ = write!(item, " ({})", plural(n, "shared commit"));
+        }
+        None if with_score => {
+            let _ = write!(item, " {:.2}", p.score);
+        }
+        None => {}
     }
     if p.modified {
         item.push_str(" modified");
@@ -554,8 +601,15 @@ pub fn render_impact(r: &ImpactReport) -> String {
             plural(r.files.len() - MAX_IMPACT_FILES, "file")
         );
     }
-    for path in &r.unknown {
+    for path in r.unknown.iter().take(MAX_IMPACT_UNKNOWN) {
         let _ = writeln!(out, "unknown: {}", sanitize(path));
+    }
+    if r.unknown.len() > MAX_IMPACT_UNKNOWN {
+        let _ = writeln!(
+            out,
+            "…and {} more unknown",
+            r.unknown.len() - MAX_IMPACT_UNKNOWN
+        );
     }
     cap_lines(&out, MAX_TOOL_LINES)
 }
@@ -661,6 +715,16 @@ pub fn render_why(w: &WhyReport) -> String {
             plural(links.len() - MAX_WHY_LINKS, "link")
         );
     }
+    if let Some(shared) = &w.shared {
+        let _ = writeln!(
+            out,
+            "co-change  {}, below the co_changed rule's similarity floor so no edge was written",
+            plural(shared.count, "shared commit")
+        );
+        for line in &shared.evidence {
+            let _ = writeln!(out, "  {}", sanitize(line));
+        }
+    }
     if !w.path.is_empty() {
         let mut walk = sanitize(&w.a);
         for (edge_type, node) in &w.path {
@@ -668,7 +732,7 @@ pub fn render_why(w: &WhyReport) -> String {
         }
         let _ = writeln!(out, "path  {walk}");
     }
-    if w.links.is_empty() && w.path.is_empty() {
+    if w.links.is_empty() && w.path.is_empty() && w.shared.is_none() {
         let _ = writeln!(out, "no link");
     }
     cap_lines(&out, MAX_TOOL_LINES)

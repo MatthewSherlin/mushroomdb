@@ -49,20 +49,21 @@ pub mod rules;
 mod why;
 
 pub use concepts::stale_concepts;
-pub use context::{context, ContextReport, Target, MAX_SOURCE_LINES};
+pub use context::{context, CallSites, ContextReport, Target, MAX_SOURCE_LINES};
 pub use impact::{
     impact, path_excluded, FileImpact, ImpactOptions, ImpactReport, Partner, DEFAULT_EXCLUDES,
+    MIN_SHARED_COMMITS,
 };
 pub use map::{repo_map, MapCommunity, MapOptions, RepoMap, SyncInfo};
 pub use owners::{owners, OwnersReport, QUARTERS};
 pub use path::{shortest_path, MAX_HOPS, PATH_EDGES};
 pub use recall::{
     or_query, recall_digest, HINT, MAX_EDGES_PER_HIT, MAX_EDGE_CANDIDATES, MAX_HITS,
-    MAX_OUTPUT_BYTES, MAX_QUERY_TERMS, UNTRUSTED_FRAMING,
+    MAX_OUTPUT_BYTES, MAX_QUERY_TERMS, MIN_HIT_SCORE, UNTRUSTED_FRAMING,
 };
 pub use remember::{remember, RememberInput, NOTE_KINDS};
 pub use render::{
     render_context, render_impact, render_map, render_owners, render_why, sanitize,
     MAX_CONTEXT_LINES, MAX_MAP_LINES, MAX_TOOL_LINES,
 };
-pub use why::{why, WhyLink, WhyReport};
+pub use why::{why, SharedCommits, WhyLink, WhyReport};

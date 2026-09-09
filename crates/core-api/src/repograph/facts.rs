@@ -126,11 +126,32 @@ pub(super) fn symbol_file<F: Fs>(db: &GraphDb<F>, symbol: &str) -> Option<String
 /// `File.import_lines` and `Symbol.call_lines` are written alongside the lists
 /// the rules match on, one entry per edge. A malformed entry — no tab, or a
 /// line that is not a number — is skipped rather than guessed at.
+/// The *lowest* line, not the first entry in list order. The list is sorted as
+/// text, so `"…\t100"` used to come before `"…\t15"`; a caller asking for one
+/// line wants the first one in the file. This also reaches `IMPORTS` evidence,
+/// where a file imported on two lines now quotes the earlier one.
 pub(super) fn evidence_line(entries: &[String], target: &str) -> Option<u32> {
-    entries.iter().find_map(|e| {
-        let (key, line) = e.split_once('\t')?;
-        (key == target).then(|| line.parse().ok())?
-    })
+    evidence_lines(entries, target).into_iter().next()
+}
+
+/// Every line a `"<key>\t<line>"` evidence list records for `target`, ascending
+/// and deduplicated.
+///
+/// The list holds one entry per *site*, so a symbol that calls another twelve
+/// times has twelve entries here and one `calls_to` element. Reading only the
+/// first — which is all an edge can tell you — is what made `context` report a
+/// symbol called twelve times from six functions as six call sites.
+pub(super) fn evidence_lines(entries: &[String], target: &str) -> Vec<u32> {
+    let mut out: Vec<u32> = entries
+        .iter()
+        .filter_map(|e| {
+            let (key, line) = e.split_once('\t')?;
+            (key == target).then(|| line.parse().ok())?
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// One commit, as every digest quotes it.

@@ -9,7 +9,7 @@
 
 use cli::install::{
     classify_mcp_command, run_install_with, run_uninstall, run_uninstall_with, Externals,
-    InstallOpts, McpCommand, Platform, Scope,
+    InstallOpts, McpCommand, Platform, Scope, StoreRef,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -214,6 +214,335 @@ fn project_install_writes_npx_entry_and_hooks() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: a project install names the store `--auto`, so committed config works
+//       in every worktree of the repository
+// ---------------------------------------------------------------------------
+
+#[test]
+fn project_install_writes_auto_entries() {
+    let root = temp_dir("auto-entries");
+    let home = temp_dir("auto-entries-home");
+    let hooks = git_repo(&root);
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals())
+        .expect("install failed");
+
+    // The MCP entry resolves the store when the server starts.
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"],
+        serde_json::json!(["-y", format!("mushroomdb@{VERSION}"), "mcp", "--auto"])
+    );
+
+    // Both settings hooks, unquoted: `--auto` has no metacharacters in it.
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} recall --auto")
+    );
+    assert_eq!(
+        s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} touch --auto")
+    );
+
+    // All three git hook blocks.
+    for name in ["post-commit", "post-checkout", "post-merge"] {
+        let body = fs::read_to_string(hooks.join(name)).unwrap();
+        assert!(
+            body.contains(&format!(
+                "( npx -y mushroomdb@{VERSION} sync --auto >/dev/null 2>&1 & )"
+            )),
+            "{name}: {body}"
+        );
+        assert!(
+            !body.contains(&root.display().to_string()),
+            "{name} must not bake in this checkout's path: {body}"
+        );
+    }
+
+    // The ignore line is still the real directory — a repository ignores a
+    // path, not a flag.
+    assert_eq!(read(&root, ".gitignore"), "mushroom-memory/\n");
+
+    // And the skill, which a person reads and runs by hand, names the store.
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    assert!(
+        skill.contains(&root.join("mushroom-memory").display().to_string()),
+        "the skill names the directory, not --auto"
+    );
+
+    assert!(out.contains("store  --auto"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// Test: only Claude Code resolves the store at run time. Cursor and Codex set
+//       no $CLAUDE_PROJECT_DIR, so `--auto` there would rest on where the host
+//       starts the server — and land on an empty store under $HOME if it
+//       guessed wrong, with nothing reporting an error. They get the path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cursor_install_pins_the_store_path() {
+    let root = temp_dir("cursor-pin");
+    let home = temp_dir("cursor-pin-home");
+    let hooks = git_repo(&root);
+    let db = root.join("mushroom-memory");
+    // No `--db`: this is the default store, which Claude Code would name
+    // `--auto` in the very same repository.
+    let opts = InstallOpts {
+        platform: Some(Platform::Cursor),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals())
+        .expect("install failed");
+
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".cursor/mcp.json")).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"],
+        serde_json::json!([
+            "-y",
+            format!("mushroomdb@{VERSION}"),
+            "mcp",
+            db.to_str().unwrap()
+        ]),
+        "Cursor cannot resolve --auto, so the entry names the directory"
+    );
+    assert!(
+        out.contains(&format!("store  {} (pinned)", db.display())),
+        "{out}"
+    );
+
+    // The git hooks are git's, not Cursor's: git runs a hook with the working
+    // tree it acted on as the working directory, so `--auto` resolves there
+    // with no assistant involved. A Cursor-only install still pins them, so
+    // the whole install spells one store one way.
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert!(
+        body.contains(&format!(" sync '{}' ", db.display())),
+        "{body}"
+    );
+    assert!(!body.contains("--auto"), "{body}");
+    assert_eq!(read(&root, ".gitignore"), "mushroom-memory/\n");
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_install_pins_the_store_path() {
+    let root = temp_dir("codex-pin");
+    let home = temp_dir("codex-pin-home");
+    let bin_dir = temp_dir("codex-pin-bin");
+    git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let log = bin_dir.join("argv.txt");
+    fake_program(
+        &bin_dir,
+        "codex",
+        &format!("printf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+    );
+
+    // No `--db`, same as `cursor_install_pins_the_store_path`.
+    let opts = InstallOpts {
+        platform: Some(Platform::Codex),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("codex install");
+
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        format!(
+            "mcp\nadd\nmushroomdb\n--\nnpx\n-y\nmushroomdb@{VERSION}\nmcp\n{}\n",
+            db.display()
+        ),
+        "Codex is handed the directory, not --auto"
+    );
+}
+
+/// `--platform all` is Claude Code and Cursor together, and they disagree
+/// about the store's spelling — so the summary says which is which, and each
+/// config gets the form its host can actually resolve.
+#[test]
+fn platform_all_gives_each_host_the_form_it_can_resolve() {
+    let root = temp_dir("all-store");
+    let home = temp_dir("all-store-home");
+    let hooks = git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let opts = InstallOpts {
+        platform: Some(Platform::All),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals())
+        .expect("install failed");
+
+    let claude: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(claude["mcpServers"]["mushroomdb"]["args"][3], "--auto");
+    let cursor: serde_json::Value = serde_json::from_str(&read(&root, ".cursor/mcp.json")).unwrap();
+    assert_eq!(
+        cursor["mcpServers"]["mushroomdb"]["args"][3],
+        db.to_str().unwrap()
+    );
+
+    assert!(out.contains("store  claude-code: --auto"), "{out}");
+    assert!(
+        out.contains(&format!("store  cursor: {} (pinned)", db.display())),
+        "{out}"
+    );
+
+    // Claude Code is in the install, so the git hooks match its spelling.
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert!(body.contains("sync --auto"), "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// Test: `--db` opts out and pins the path everywhere
+// ---------------------------------------------------------------------------
+
+#[test]
+fn explicit_db_pins_the_store() {
+    let root = temp_dir("pin-db");
+    let home = temp_dir("pin-db-home");
+    let hooks = git_repo(&root);
+    let db = temp_dir("pin-db-store");
+    let opts = claude_project_opts(&db);
+
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals())
+        .expect("install failed");
+
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"],
+        serde_json::json!([
+            "-y",
+            format!("mushroomdb@{VERSION}"),
+            "mcp",
+            db.to_str().unwrap()
+        ])
+    );
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} recall '{}'", db.display())
+    );
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert!(
+        body.contains(&format!(" sync '{}' ", db.display())),
+        "{body}"
+    );
+    assert!(!body.contains("--auto"), "{body}");
+    assert!(
+        out.contains(&format!("store  {} (pinned)", db.display())),
+        "{out}"
+    );
+
+    // The store is outside the repository, so there is nothing to ignore.
+    assert_absent(&root, ".gitignore");
+}
+
+// ---------------------------------------------------------------------------
+// Test: upgrading a 0.6.0 install rewrites its absolute paths to `--auto`
+//       rather than refusing, and leaves no stale hook behind
+// ---------------------------------------------------------------------------
+
+#[test]
+fn upgrade_rewrites_absolute_entries_to_auto() {
+    let root = temp_dir("upgrade-auto");
+    let home = temp_dir("upgrade-auto-home");
+    let hooks = git_repo(&root);
+    let db = root.join("mushroom-memory");
+
+    // What 0.6.0 wrote: the store's absolute path, everywhere.
+    let old = "npx -y mushroomdb@0.6.0";
+    fs::write(
+        root.join(".mcp.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": { "mushroomdb": {
+                "command": "npx",
+                "args": ["-y", "mushroomdb@0.6.0", "mcp", db.to_str().unwrap()]
+            } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    fs::write(
+        root.join(".claude").join("settings.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [ { "hooks": [
+                    { "type": "command",
+                      "command": format!("{old} recall '{}'", db.display()),
+                      "timeout": 5 }
+                ] } ],
+                "PostToolUse": [ { "matcher": "Edit|Write|MultiEdit", "hooks": [
+                    { "type": "command",
+                      "command": format!("{old} touch '{}'", db.display()),
+                      "timeout": 30, "async": true }
+                ] } ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals())
+        .expect("an entry naming the store --auto now resolves to is an upgrade, not a conflict");
+
+    // Rewritten, and said so.
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(mcp["mcpServers"]["mushroomdb"]["args"][3], "--auto");
+    assert!(out.contains("updated mcp command"), "{out}");
+    assert!(out.contains("mcp --auto"), "{out}");
+
+    // Exactly one hook per event: the old absolute-path spelling of the same
+    // store is ours, and running both would inject two digests every prompt.
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    for (event, sub) in [("UserPromptSubmit", "recall"), ("PostToolUse", "touch")] {
+        let groups = s["hooks"][event].as_array().unwrap();
+        let commands: Vec<&str> = groups
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .map(|h| h["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            commands,
+            vec![format!("npx -y mushroomdb@{VERSION} {sub} --auto")],
+            "{event}"
+        );
+    }
+    assert!(
+        out.contains("replaced stale UserPromptSubmit hook"),
+        "{out}"
+    );
+    assert!(out.contains("replaced stale PostToolUse hook"), "{out}");
+
+    // The git hooks are rewritten in place, not stacked.
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert_eq!(body.matches("mushroomdb >>>").count(), 1, "{body}");
+    assert!(body.contains("sync --auto"), "{body}");
+}
+
+// ---------------------------------------------------------------------------
 // Test: user scope writes only home files, with the user-scope store default
 // ---------------------------------------------------------------------------
 
@@ -281,11 +610,16 @@ fn auto_scope_is_project_inside_git_repo() {
     );
     assert!(root.join(".mcp.json").exists());
     assert_absent(&home, ".claude.json");
-    // The default store is the project one.
+    // The default project store is named `--auto`, not by path: see
+    // `project_install_writes_auto_entries`.
     let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
-    assert_eq!(
-        mcp["mcpServers"]["mushroomdb"]["args"][1],
-        root.join("mushroom-memory").to_str().unwrap()
+    assert_eq!(mcp["mcpServers"]["mushroomdb"]["args"][1], "--auto");
+    assert!(
+        out.contains(&format!(
+            "store  --auto (resolves to {})",
+            root.join("mushroom-memory").display()
+        )),
+        "the summary says where --auto lands: {out}"
     );
 }
 
@@ -613,23 +947,25 @@ fn user_install_warns_about_a_project_scope_server() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: pre-warm is best-effort — a failure is reported, never fatal
+// Test: reaching the package is best-effort — a failure is reported, never
+//       fatal, and it is not then retried as a separate pre-warm
 // ---------------------------------------------------------------------------
 
 #[test]
 #[cfg(unix)]
-fn prewarm_failure_is_a_warning() {
+fn a_failed_resolution_warns_once_and_does_not_also_prewarm() {
     let root = temp_dir("prewarm-fail");
     let home = temp_dir("prewarm-fail-home");
     let bin_dir = temp_dir("prewarm-fail-bin");
     let db = root.join("mushroom-memory");
     let log = bin_dir.join("argv.txt");
 
-    // An `npx` that records what it was asked and then fails.
+    // An `npx` that records what it was asked and then fails. No `node`, so
+    // the launcher rung is skipped: exactly one question gets asked.
     fake_program(
         &bin_dir,
         "npx",
-        &format!("printf '%s\\n' \"$@\" > '{}'\nexit 7\n", log.display()),
+        &format!("printf '%s\\n' \"$@\" >> '{}'\nexit 7\n", log.display()),
     );
 
     let opts = InstallOpts {
@@ -643,17 +979,55 @@ fn prewarm_failure_is_a_warning() {
         &McpCommand::npx(),
         &externals_in(&bin_dir),
     )
-    .expect("a failed pre-warm must not fail the install");
+    .expect("a package that cannot be reached must not fail the install");
 
     assert!(out.contains("warning"), "{out}");
-    assert!(out.contains("pre-warm"), "{out}");
-    // It really did try the pinned package.
+    assert!(out.contains("could not resolve"), "{out}");
+
+    // One spawn, not two. Asking the package anything downloads it first, so
+    // the question the resolution asked *is* the pre-warm; running `--version`
+    // afterwards would fetch the same package a second time to learn nothing.
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
-        format!("-y\nmushroomdb@{VERSION}\n--version\n")
+        format!("-y\nmushroomdb@{VERSION}\n--print-binary\n"),
+        "the failed resolution must not be followed by a separate pre-warm"
     );
-    // And the install itself completed.
+    assert!(!out.contains("pre-warm"), "{out}");
+
+    // And the install itself completed, on the form that always works.
     assert!(root.join(".mcp.json").exists());
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .starts_with("npx -y"));
+}
+
+/// With no `npx` at all nothing was fetched, so the pre-warm's own report of
+/// that is still worth printing.
+#[test]
+#[cfg(unix)]
+fn with_no_npx_the_prewarm_still_says_so() {
+    let root = temp_dir("prewarm-no-npx");
+    let home = temp_dir("prewarm-no-npx-home");
+    let bin_dir = temp_dir("prewarm-no-npx-bin");
+    let db = root.join("mushroom-memory");
+
+    let opts = InstallOpts {
+        prewarm: true,
+        ..claude_project_opts(&db)
+    };
+    let out = run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir), // empty directory: no npx, no node
+    )
+    .expect("install");
+
+    assert!(out.contains("could not resolve"), "{out}");
+    assert!(out.contains("pre-warm skipped"), "{out}");
 }
 
 #[test]
@@ -688,20 +1062,50 @@ fn prewarm_is_skipped_with_no_prewarm() {
     assert!(!log.exists(), "--no-prewarm still spawned npx");
     assert!(!out.contains("warning"), "{out}");
     assert!(root.join(".mcp.json").exists());
+    // With no resolution the hooks keep the `npx` form, which still works.
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .starts_with("npx -y"));
 }
+
+// ---------------------------------------------------------------------------
+// Test: the package is resolved once, at install time, to the thing every
+//       other form ends up running anyway — so no hook spawns `npx`, and none
+//       starts a Node runtime either
+// ---------------------------------------------------------------------------
 
 #[test]
 #[cfg(unix)]
-fn prewarm_success_is_silent() {
-    let root = temp_dir("prewarm-ok");
-    let home = temp_dir("prewarm-ok-home");
-    let bin_dir = temp_dir("prewarm-ok-bin");
-    let db = root.join("mushroom-memory");
-    fake_program(&bin_dir, "npx", "exit 0\n");
+fn hooks_use_the_native_binary_when_resolvable() {
+    let root = temp_dir("binary-ok");
+    let home = temp_dir("binary-ok-home");
+    let bin_dir = temp_dir("binary-ok-bin");
+    let hooks = git_repo(&root);
+    // A binary path with a space in it: whatever npm's cache is called, the
+    // written command has to survive it.
+    let pkg = temp_dir("binary ok pkg");
+    let binary = fake_program(&pkg, "mushroomdb", "exit 0\n");
+    let log = bin_dir.join("argv.txt");
+
+    // An `npx` that answers `--print-binary` with that path.
+    fake_program(
+        &bin_dir,
+        "npx",
+        &format!(
+            "printf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' '{}'\n",
+            log.display(),
+            binary.display()
+        ),
+    );
+    fake_program(&bin_dir, "node", "exit 0\n");
 
     let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
         prewarm: true,
-        ..claude_project_opts(&db)
+        ..base_opts()
     };
     let out = run_install_with(
         &root,
@@ -713,6 +1117,172 @@ fn prewarm_success_is_silent() {
     .expect("install");
 
     assert!(!out.contains("warning"), "{out}");
+
+    // npx ran exactly once, and only to ask where the binary is. The launcher
+    // is never asked for, and the pre-warm is redundant after it — the very
+    // same fetch already warmed the cache.
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        format!("-y\nmushroomdb@{VERSION}\n--print-binary\n"),
+        "npx must be spawned once, and only to resolve the binary"
+    );
+
+    // Every written command runs the binary directly: no `npx`, no `node`.
+    let quoted = format!("'{}'", binary.display());
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("{quoted} recall --auto")
+    );
+    assert_eq!(
+        s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+        format!("{quoted} touch --auto")
+    );
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert!(body.contains(&format!("( {quoted} sync --auto ")), "{body}");
+    for f in ["post-checkout", "post-merge"] {
+        let b = fs::read_to_string(hooks.join(f)).unwrap();
+        assert!(!b.contains("npx") && !b.contains("node "), "{f}: {b}");
+    }
+
+    // The MCP entry too, unquoted: a host spawns an argv, where quotes would
+    // become part of the filename.
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["command"],
+        binary.to_str().unwrap()
+    );
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"],
+        serde_json::json!(["mcp", "--auto"])
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn launcher_is_resolved_once_and_every_hook_calls_node() {
+    let root = temp_dir("launcher-ok");
+    let home = temp_dir("launcher-ok-home");
+    let bin_dir = temp_dir("launcher-ok-bin");
+    let hooks = git_repo(&root);
+    // A launcher path with a space in it: whatever npm's cache is called, the
+    // written command has to survive it.
+    let pkg = temp_dir("launcher ok pkg");
+    let launcher = pkg.join("mushroomdb.js");
+    fs::write(&launcher, "// launcher\n").unwrap();
+    let log = bin_dir.join("argv.txt");
+
+    // An `npx` standing in for a package whose vendored binary was never
+    // fetched: `--print-binary` fails the way the real launcher does, and
+    // `--print-launcher` answers. `node` only has to exist to be usable.
+    fake_program(
+        &bin_dir,
+        "npx",
+        &format!(
+            "printf '%s\\n' \"$@\" >> '{}'\n\
+             for a in \"$@\"; do\n\
+             \x20 [ \"$a\" = --print-binary ] && exit 1\n\
+             done\n\
+             printf '%s\\n' '{}'\n",
+            log.display(),
+            launcher.display()
+        ),
+    );
+    fake_program(&bin_dir, "node", "exit 0\n");
+
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        prewarm: true,
+        ..base_opts()
+    };
+    let out = run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("install");
+
+    assert!(!out.contains("warning"), "{out}");
+
+    // The binary was asked for first and refused; the launcher is the second
+    // rung, not the first choice.
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        format!(
+            "-y\nmushroomdb@{VERSION}\n--print-binary\n\
+             -y\nmushroomdb@{VERSION}\n--print-launcher\n"
+        ),
+        "the binary must be tried before the launcher"
+    );
+
+    // Every written command runs the launcher directly, quoted for the space.
+    let node = format!("node '{}'", launcher.display());
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("{node} recall --auto")
+    );
+    assert_eq!(
+        s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+        format!("{node} touch --auto")
+    );
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert!(body.contains(&format!("( {node} sync --auto ")), "{body}");
+
+    // The MCP entry uses the resolved path too: one spawn per session, but a
+    // session that starts 400 ms sooner is still worth having.
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(mcp["mcpServers"]["mushroomdb"]["command"], "node");
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"],
+        serde_json::json!([launcher.to_str().unwrap(), "mcp", "--auto"]),
+        "an MCP host spawns an argv, so the path is not quoted here"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn an_unresolvable_package_falls_back_to_npx_with_a_warning() {
+    let root = temp_dir("launcher-bad");
+    let home = temp_dir("launcher-bad-home");
+    let bin_dir = temp_dir("launcher-bad-bin");
+    git_repo(&root);
+
+    // An `npx` that answers both questions with a path that is not there, so
+    // every rung of the chain fails and the last one has to hold.
+    fake_program(
+        &bin_dir,
+        "npx",
+        "printf '%s\\n' /nowhere/mushroomdb.js\nexit 0\n",
+    );
+    fake_program(&bin_dir, "node", "exit 0\n");
+
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        prewarm: true,
+        ..base_opts()
+    };
+    let out = run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("a launcher that cannot be resolved must not fail the install");
+
+    assert!(out.contains("could not resolve"), "{out}");
+    assert!(out.contains("/nowhere/mushroomdb.js"), "{out}");
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} recall --auto"),
+        "the slower form still has to work"
+    );
 }
 
 #[test]
@@ -2017,13 +2587,28 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
             !text.contains("keys to hide"),
             "{name}: inverted mask text still present"
         );
+        // The per-tool argument lists moved into `tools/list` itself, which is
+        // the only copy now that the skill no longer restates it. What both
+        // texts must still say is how to see it.
         assert!(
-            text.contains("max_edges"),
-            "{name}: create_rule max_edges undocumented"
+            text.contains("--all-tools"),
+            "{name}: the route to the unlisted tools is undocumented"
         );
         assert!(
             text.contains("no auth"),
             "{name}: MCP trust model undocumented"
+        );
+        // `create_rule` is a store-wide write that keeps firing on every later
+        // ingest, and it is still callable. The consent instruction is the
+        // only thing standing between an assistant and creating one silently.
+        assert!(
+            text.contains("create a rule silently"),
+            "{name}: create_rule consent guardrail missing"
+        );
+        assert!(
+            text.contains("ambiguous target labels"),
+            "{name}: polymorphic FK remedy undocumented — the engine emits that \
+             string and nothing tells the assistant what to do about it"
         );
         assert!(
             text.contains("ingest-git"),
@@ -2036,13 +2621,37 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
             );
         }
     }
+    // The skill is re-read every turn, so its size is a per-turn cost. It was
+    // 17,148 bytes, 62% of that worked examples and a table restating what
+    // `tools/list` already carries; the examples now live in
+    // docs/site/code-graph.md. The budget is on the *template*, since the
+    // rendered copy also carries whatever `{{BIN}}` expanded to.
+    let template = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills/mushroom/SKILL.md"),
+    )
+    .expect("skill template");
     assert!(
-        skill.contains("`edges`"),
-        "SKILL.md: ingest_json edges arg undocumented"
+        template.len() <= 6_000,
+        "SKILL.md must stay under 6 KB — it is re-read every turn, got {} bytes",
+        template.len()
+    );
+    // And the rendered plugin copy, which is the one a plugin user re-reads:
+    // `{{BIN}}` expands to an `npx` invocation there, so it is always the
+    // larger of the two and the budget has to be checked on it directly.
+    let plugin = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/plugin/skills/mushroom/SKILL.md"),
+    )
+    .expect("rendered plugin skill");
+    assert!(
+        plugin.len() <= 6_000,
+        "the rendered plugin SKILL.md must stay under 6 KB too, got {} bytes",
+        plugin.len()
     );
     assert!(
-        skill.contains("ambiguous target labels"),
-        "SKILL.md: polymorphic FK pattern undocumented"
+        rules.lines().count() <= 60,
+        "mushroom.mdc must stay short, got {} lines",
+        rules.lines().count()
     );
 }
 
@@ -2190,7 +2799,7 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
     let db = dir.join("mushroom memory"); // a space, so quoting has to work
 
     // The block is a marked, self-contained fragment that backgrounds a sync.
-    let block = git_hook_block("mushroomdb", &db.to_string_lossy());
+    let block = git_hook_block("mushroomdb", &StoreRef::pinned(&db));
     assert!(block.starts_with("# >>> mushroomdb >>>\n"), "{block}");
     assert!(block.ends_with("# <<< mushroomdb <<<\n"), "{block}");
     assert!(block.contains(" sync "), "{block}");
@@ -2202,7 +2811,7 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
 
     // 1. No hook file yet: one is created, with a shebang, and executable.
     let hook = dir.join("hooks").join("post-commit");
-    assert!(merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    assert!(merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
     let created = fs::read_to_string(&hook).unwrap();
     assert!(created.starts_with("#!/bin/sh\n"), "{created}");
     assert!(created.contains(&block), "{created}");
@@ -2218,7 +2827,7 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
 
     // 2. Idempotent: a second merge changes nothing at all.
     assert!(
-        !merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy()).unwrap(),
+        !merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap(),
         "the block is already there"
     );
     assert_eq!(fs::read_to_string(&hook).unwrap(), created);
@@ -2235,13 +2844,13 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
     let user_text = "#!/usr/bin/env bash\nset -eu\nmake lint\n";
     fs::write(&user_hook, user_text).unwrap();
 
-    assert!(merge_git_hook(&user_hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    assert!(merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
     let merged = fs::read_to_string(&user_hook).unwrap();
     assert!(merged.starts_with(user_text), "user lines lead: {merged}");
     assert!(merged.contains(&block), "{merged}");
 
     // Idempotent over a user file too.
-    assert!(!merge_git_hook(&user_hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    assert!(!merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
     assert_eq!(fs::read_to_string(&user_hook).unwrap(), merged);
 
     assert!(remove_git_hook(&user_hook).unwrap());
@@ -2258,8 +2867,8 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
     // 5. Changing the database path rewrites the block in place rather than
     //    stacking a second one.
     let other = dir.join("other-memory");
-    assert!(merge_git_hook(&user_hook, "mushroomdb", &db.to_string_lossy()).unwrap());
-    assert!(merge_git_hook(&user_hook, "mushroomdb", &other.to_string_lossy()).unwrap());
+    assert!(merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
+    assert!(merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&other)).unwrap());
     let rewritten = fs::read_to_string(&user_hook).unwrap();
     assert_eq!(
         rewritten.matches("# >>> mushroomdb >>>").count(),
@@ -2293,7 +2902,7 @@ fn unterminated_hook_block_is_refused_rather_than_swallowed() {
         "#!/bin/sh\nmake lint\n# >>> mushroomdb >>>\n( mushroomdb sync '/old' & )\necho done\n";
     fs::write(&hook, corrupt).unwrap();
 
-    let err = merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy())
+    let err = merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db))
         .expect_err("an unterminated block must not be rewritten");
     assert!(
         err.0.contains("never closes"),
@@ -2321,7 +2930,7 @@ fn unterminated_hook_block_is_refused_rather_than_swallowed() {
 
     // Repaired by hand, both work again.
     fs::write(&hook, format!("{corrupt}# <<< mushroomdb <<<\n")).unwrap();
-    assert!(merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    assert!(merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
     let merged = fs::read_to_string(&hook).unwrap();
     assert_eq!(
         merged.matches("# >>> mushroomdb >>>").count(),

@@ -57,7 +57,7 @@ clusters (co-change + imports)
 key files (most depended-on)
   crates/code-extract/src/lib.rs 0.05 · crates/server/tests/http.rs 0.04 · crates/code-extract/tests/extract.rs 0.04 · crates/core-api/tests/algo.rs 0.04 · crates/server/src/http.rs 0.03
 owners
-  Matthew Michael Sherlin 431 files
+  Matthew Sherlin 431 files
 hot (last 90 days)
   crates/core-api/src/db.rs 175 · README.md 109 · crates/core-rules/src/engine.rs 56 · crates/core-query/src/cypher/exec.rs 54 · crates/cli/src/lib.rs 51
 ask me: why does lib.rs co-change with extract.rs? · who owns ui? · what imports http.rs?
@@ -215,8 +215,14 @@ reaches for, and what `tools/list` shows first:
 | `remember` | Write a note into the graph and return its key |
 | `sync` | Bring the store up to date: commits since the last sync, then the dirty working tree |
 
+Each of the eight also takes `json: true`, which answers with the raw report instead of the
+rendered digest.
+
 **The sixteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
-in `tools/list`, so an assistant knows which surface is the front door:
+in `tools/list`, so an assistant knows which surface is the front door. A default `tools/list`
+names three of them — `query`, `ingest_json` and `stats` — because the other thirteen schemas cost
+every session more than a coding agent gets back; `mushroomdb mcp <db> --all-tools` advertises the
+whole list, and all sixteen stay callable either way:
 
 | Tool | Purpose |
 |---|---|
@@ -232,7 +238,7 @@ in `tools/list`, so an assistant knows which surface is the front door:
 | `node_info` | Return a node's key, label, and properties |
 | `node_edges` | Return all edges incident on a node |
 | `stats` | Live node, edge, and rule counts |
-| `node_history` | WAL change history for a node (since last truncating snapshot) |
+| `node_history` | WAL change history for a node (archives included; a `snapshot --truncate` ends the reach) |
 | `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
 | `was_linked` | Point-in-time edge check: was an edge active at a given commit? |
 | `rename_node` | Rename a node's key; old_key, new_key |
@@ -286,6 +292,8 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 |---|---|
 | `mushroomdb install [--platform claude-code\|cursor\|codex\|all] [--project\|--user] [--db <path>] [--command <path>] [--no-git-hooks] [--no-prewarm]` | Write the `/mushroom` skill + MCP server entry + prompt, post-edit and git hooks. Auto-detects platform and scope |
 | `mushroomdb uninstall [--platform …] [--project] [--db <path>]` | Remove exactly what `install` wrote (manifest-driven; leaves user files) |
+| `mushroomdb disable [--platform …] [--project\|--user]` | Turn an install off without removing it: strips the MCP entry, the hooks and the git hook blocks. The skill, the store and `.gitignore` stay |
+| `mushroomdb enable [--platform …] [--project\|--user]` | Turn a disabled install back on, re-resolving the command instead of replaying what `disable` removed |
 | `mushroomdb doctor [--project\|--user] [--platform …]` | Verify an install: config entry, npx reachability, store, lock, hooks, git hooks, a real stdio handshake, and duplicate-scope servers. Exit 1 on any `fail` |
 | `mushroomdb ingest-git <dir> <repo> [--exclude <pattern>]... [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]` | Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHANGED`, `KNOWS`, `IMPORTS`, `CALLS` and `MENTIONS` rules. Re-run to sync. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
 | `mushroomdb map <dir> [--json]` | The repository in one screen: clusters, key files, owners, hot files, and three questions worth asking |
@@ -293,7 +301,7 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb impact <dir> <file>...` | What changing these files reaches: co-change partners, importers, and the symbols other files call |
 | `mushroomdb owners <dir> <path>` | Top author and share, who else knows it, last touch, the last four quarters |
 | `mushroomdb why <dir> <a> <b>` | Every rule edge between two nodes with its evidence, or the shortest path between them |
-| `mushroomdb sync <dir> [--json]` | Re-sync the repository the store was built from: new commits, then the working tree where it differs from `HEAD`. Takes no repo argument — reads it off the graph. `--json` prints the counts as one object |
+| `mushroomdb sync <dir>\|--auto [--json]` | Re-sync the repository the store was built from: new commits, then the working tree where it differs from `HEAD`. Takes no repo argument — reads it off the graph. `--json` prints the counts as one object. The git hooks `install` writes use `--auto`, so each worktree syncs its own store |
 | `mushroomdb touch <dir>\|--auto [<file>...]` | Re-extract just these files. With no `<file>` reads them from a `PostToolUse` payload on stdin (hook body) |
 | `mushroomdb recall <dir>\|--auto` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin, prints related graph facts. Wired automatically by `install` |
 | `mushroomdb mcp <dir>\|--auto` | Start a stdio MCP JSON-RPC server for agent tools |
@@ -304,7 +312,7 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb stats <dir>` | Print node/edge/rule counts |
 | `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
-| `mushroomdb snapshot <dir> [--keep-wal]` | Write `snapshot.bin` (truncates WAL unless `--keep-wal`) |
+| `mushroomdb snapshot <dir> [--keep-wal\|--truncate] [--retention N]` | Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole |
 | `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch |
 | `mushroomdb migrate <dir>` | Migrate an older store format in place |
 | `mushroomdb backup <dir> <dest>` | Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores |

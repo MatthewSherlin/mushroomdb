@@ -196,6 +196,143 @@ fn all_keys(db: &cli::structure::Db, label: &str) -> Vec<String> {
     v
 }
 
+/// A callee whose name several crates define is ambiguous everywhere except in
+/// a file that imports one of them. Before the importer tier every such call
+/// was dropped, so a `context` on the callee named none of its cross-crate
+/// callers — the one case where an incomplete blast radius is actively unsafe.
+///
+/// The fixture is a two-package workspace where both packages define
+/// `sanitize`, plus a third that imports one of them and calls it — including
+/// from inside a `format!`, whose arguments the grammar leaves unparsed.
+#[test]
+fn calls_resolve_across_crates_via_imports() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(
+        &repo,
+        "workspace",
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("crates/alpha/Cargo.toml", "[package]\nname = \"alpha\"\n"),
+            ("crates/alpha/src/lib.rs", "pub mod render;\n"),
+            (
+                "crates/alpha/src/render.rs",
+                "/// Strip control characters.\npub fn sanitize(s: &str) -> String {\n    s.to_string()\n}\n",
+            ),
+            ("crates/beta/Cargo.toml", "[package]\nname = \"beta\"\n"),
+            (
+                "crates/beta/src/lib.rs",
+                "/// A different escape entirely.\npub fn sanitize(s: &str) -> String {\n    s.to_string()\n}\n",
+            ),
+            ("crates/gamma/Cargo.toml", "[package]\nname = \"gamma\"\n"),
+            (
+                "crates/gamma/src/lib.rs",
+                "use alpha::render::sanitize;\n\n\
+                 pub fn show(t: &str) -> String {\n    \
+                 let head = sanitize(t);\n    \
+                 format!(\"{} {}\", head, sanitize(t))\n}\n",
+            ),
+        ],
+    );
+
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let db = GraphDb::open(&db_dir).unwrap();
+
+    // The `use` names the defining module, not the package root, which is what
+    // makes the call resolvable.
+    assert_eq!(
+        out(&db, "crates/gamma/src/lib.rs", "IMPORTS"),
+        vec!["crates/alpha/src/render.rs".to_string()]
+    );
+    assert_eq!(
+        out(&db, "crates/gamma/src/lib.rs#show", "CALLS"),
+        vec!["crates/alpha/src/render.rs#sanitize".to_string()],
+        "the imported definition wins; beta's same-named function is not it"
+    );
+    // Both sites, the one inside `format!` included.
+    assert_eq!(
+        strings(prop(&db, "crates/gamma/src/lib.rs#show", "call_lines")),
+        vec![
+            "crates/alpha/src/render.rs#sanitize\t4".to_string(),
+            "crates/alpha/src/render.rs#sanitize\t5".to_string(),
+        ]
+    );
+    assert!(
+        db.neighbors("crates/beta/src/lib.rs#sanitize", "CALLS", Direction::In)
+            .unwrap()
+            .is_empty(),
+        "nothing calls beta's sanitize"
+    );
+}
+
+/// A call written on a receiver names a method on a type, and the type is
+/// usually outside the tree entirely. Resolving those on repository-wide
+/// uniqueness bound `.collect()` to whatever single function happened to be
+/// called `collect` — here a test helper in another crate. A method call now
+/// resolves locally or through the caller's imports, or not at all; a call to a
+/// function defined in the same file is unaffected.
+#[test]
+fn method_calls_do_not_reach_an_unrelated_function_of_the_same_name() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(
+        &repo,
+        "workspace",
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("crates/helper/Cargo.toml", "[package]\nname = \"helper\"\n"),
+            // The only `collect` in the tree, and nothing imports it.
+            (
+                "crates/helper/src/lib.rs",
+                "/// Gather the fixtures.\npub fn collect(dir: &str) -> Vec<String> {\n    vec![dir.to_string()]\n}\n\n\
+                 /// The only `take` in the tree.\npub fn take(n: usize) -> usize {\n    n\n}\n",
+            ),
+            ("crates/app/Cargo.toml", "[package]\nname = \"app\"\n"),
+            (
+                "crates/app/src/lib.rs",
+                "/// A job the app runs.\npub struct Job;\n\n\
+                 /// Do the work.\npub fn run(job: &Job) -> u32 {\n    let _ = job;\n    7\n}\n\n\
+                 pub fn total(items: &[u32], job: &Job) -> u32 {\n    \
+                 let picked: Vec<u32> = items.iter().copied().collect();\n    \
+                 let moved = std::mem::take(&mut picked.clone());\n    \
+                 picked.len() as u32 + moved.len() as u32 + job.run()\n}\n",
+            ),
+        ],
+    );
+
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let db = GraphDb::open(&db_dir).unwrap();
+
+    assert!(
+        db.has_node("crates/helper/src/lib.rs#collect"),
+        "the helper is in the graph; it is the edge to it that must not exist"
+    );
+    assert!(
+        db.neighbors("crates/helper/src/lib.rs#collect", "CALLS", Direction::In)
+            .unwrap()
+            .is_empty(),
+        "`.collect()` is a method on a type from outside the tree"
+    );
+    // `std::mem::take` is a call into the standard library, and the only `take`
+    // in the tree is a helper in the other crate.
+    assert!(
+        db.neighbors("crates/helper/src/lib.rs#take", "CALLS", Direction::In)
+            .unwrap()
+            .is_empty(),
+        "a path call leading with `std` names nothing here"
+    );
+
+    // The same-file tier still answers a method call, so the rules cost nothing
+    // real: `job.run()` reaches the `run` defined beside it, and it is the only
+    // edge `total` has.
+    assert_eq!(
+        out(&db, "crates/app/src/lib.rs#total", "CALLS"),
+        vec!["crates/app/src/lib.rs#run".to_string()]
+    );
+}
+
 #[test]
 fn first_run_creates_symbols_imports_calls_and_mentions() {
     let repo = seed_repo();
@@ -683,5 +820,247 @@ fn import_lines_are_recorded() {
         strings(prop(&db, "src/net.rs#connect", "call_lines")),
         vec!["src/util.rs#helper\t7".to_string()],
         "call evidence carries the call site line"
+    );
+}
+
+/// An incremental refresh is handed the paths it is responsible for, and it
+/// reads the graph for those and for the names its own calls look up — not for
+/// every file and every symbol in the repository.
+///
+/// Both halves are asserted here, because narrowing the reads is only worth
+/// anything if the writes come out the same. The first half is the saving: a
+/// pass told about `src/util.rs` leaves an orphan under `src/net.rs` alone,
+/// where the whole-tree pass sweeps it. The second is the constraint: the
+/// edges the narrowed pass writes are exactly the ones a whole-tree pass
+/// writes, including the repository-wide call tier that turns on a name being
+/// unique across every file.
+#[test]
+fn touch_reads_only_the_touched_files() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    // Strand `src/net.rs#connect`: its file leaves the graph, so its key can
+    // never be right again and a whole-tree pass would sweep it.
+    {
+        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let mut w = shared.write();
+        w.delete_node("src/net.rs").unwrap();
+    }
+    assert!(GraphDb::open(&db_dir)
+        .unwrap()
+        .has_node("src/net.rs#connect"));
+
+    // A pass responsible for one unrelated file does not go looking.
+    let report = {
+        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let mut w = shared.write();
+        cli::structure::refresh_files(&mut w, &repo, "", &["src/util.rs".to_string()], true)
+            .unwrap()
+    };
+    assert_eq!(
+        report.files_scanned, 1,
+        "one file was extracted: {report:?}"
+    );
+    assert!(
+        GraphDb::open(&db_dir)
+            .unwrap()
+            .has_node("src/net.rs#connect"),
+        "an orphan the pass was not told about is not its business"
+    );
+
+    // `src/util.rs` is intact, and the calls into it still resolve — the
+    // narrowed index held every definition of every name it looked up.
+    {
+        let db = GraphDb::open(&db_dir).unwrap();
+        assert_eq!(
+            db.neighbors("src/lib.rs#run", "CALLS", Direction::Out)
+                .unwrap_or_default(),
+            vec!["src/util.rs#helper".to_string()],
+            "a call out of an untouched file still points at the touched one"
+        );
+    }
+
+    // The whole-tree pass, which is told about everything, does sweep it.
+    {
+        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let mut w = shared.write();
+        cli::structure::refresh_all(&mut w, &repo, "", true).unwrap();
+    }
+    assert!(
+        !GraphDb::open(&db_dir)
+            .unwrap()
+            .has_node("src/net.rs#connect"),
+        "refresh_all still sweeps every orphan"
+    );
+}
+
+/// The narrowed index must not change a single resolved call. Two files define
+/// `helper`, so the repository-wide tier cannot fire; one file defines
+/// `connect`, so it can. A refresh of one file has to see both facts.
+#[test]
+fn a_narrowed_refresh_resolves_calls_the_same_as_a_whole_tree_one() {
+    let repo = seed_repo();
+    commit(
+        &repo,
+        "a second helper, and a caller of both names",
+        &[
+            (
+                "src/dup.rs",
+                "//! A second definition of the same name.\n\n\
+                 /// Also doubles.\npub fn helper(n: u32) -> u32 {\n    n + n\n}\n",
+            ),
+            (
+                "src/caller.rs",
+                "//! Calls one ambiguous name and one unique one.\n\n\
+                 /// Do both.\npub fn both() -> u32 {\n    helper(1) + connect(2)\n}\n",
+            ),
+        ],
+    );
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    let calls = |dir: &Path| {
+        GraphDb::open(dir)
+            .unwrap()
+            .neighbors("src/caller.rs#both", "CALLS", Direction::Out)
+            .unwrap_or_default()
+    };
+    let whole_tree = calls(&db_dir);
+    assert_eq!(
+        whole_tree,
+        vec!["src/net.rs#connect".to_string()],
+        "`connect` is unique so it resolves; `helper` is defined twice so it does not"
+    );
+
+    // Rewrite the caller and refresh only it. The answer must not move.
+    write_files(
+        &repo,
+        &[(
+            "src/caller.rs",
+            "//! Calls one ambiguous name and one unique one.\n\n\
+             /// Do both, twice.\npub fn both() -> u32 {\n    helper(1) + connect(2) + connect(3)\n}\n",
+        )],
+    );
+    {
+        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let mut w = shared.write();
+        cli::structure::refresh_files(&mut w, &repo, "", &["src/caller.rs".to_string()], true)
+            .unwrap();
+    }
+    assert_eq!(calls(&db_dir), whole_tree, "narrowing moved a call edge");
+}
+
+/// A Rust method is stored under its type — `Store.flush` — while every call
+/// to it is written on a receiver, `store.flush()`. Before the index filed
+/// methods under their bare name too, not one method in this repository had a
+/// single incoming `CALLS` edge, so `context` on any of them named no callers
+/// at all.
+#[test]
+fn rust_methods_get_incoming_calls_from_receiver_syntax() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(
+        &repo,
+        "a store and its callers",
+        &[
+            ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+            (
+                "src/store.rs",
+                "//! The store.\n\n\
+                 /// A store.\npub struct Store {\n    pub n: u32,\n}\n\n\
+                 impl Store {\n\
+                 \x20   /// Flush it.\n\
+                 \x20   pub fn flush(&self) -> u32 {\n        self.n\n    }\n\n\
+                 \x20   /// Flush it twice.\n\
+                 \x20   pub fn flush_twice(&self) -> u32 {\n        self.flush() + self.flush()\n    }\n\
+                 }\n",
+            ),
+            (
+                "src/caller.rs",
+                "//! A sibling that holds a Store.\n\n\
+                 /// Do the thing.\npub fn drive(store: &Store) -> u32 {\n    store.flush()\n}\n",
+            ),
+            (
+                "src/lib.rs",
+                "//! Crate root.\n\nmod caller;\nmod store;\n",
+            ),
+        ],
+    );
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let db = GraphDb::open(&db_dir).unwrap();
+
+    let callers = |key: &str| {
+        let mut v = db
+            .neighbors(key, "CALLS", Direction::In)
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        callers("src/store.rs#Store.flush"),
+        vec![
+            "src/caller.rs#drive".to_string(),
+            "src/store.rs#Store.flush_twice".to_string(),
+        ],
+        "both the `self.flush()` inside the type and the `store.flush()` next door"
+    );
+
+    // And a receiver that names no type the graph knows still earns nothing.
+    assert!(
+        callers("src/store.rs#Store.flush_twice").is_empty(),
+        "nothing calls it"
+    );
+}
+
+/// The other half of the same rule: a bare method name is not a claim about
+/// the whole tree. `bytes.len()` is a `Vec`'s length, and binding it to
+/// whichever `Type.len` a repository happens to define is a wrong edge.
+#[test]
+fn a_method_call_on_an_unrelated_receiver_writes_no_edge() {
+    let repo = tmp("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(
+        &repo,
+        "a type with a len, and a caller with a vec",
+        &[
+            ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+            (
+                "src/reg.rs",
+                "//! A registry.\n\n\
+                 /// A registry.\npub struct Registry {\n    pub items: Vec<u32>,\n}\n\n\
+                 impl Registry {\n\
+                 \x20   /// How many.\n\
+                 \x20   pub fn len(&self) -> usize {\n        self.items.len()\n    }\n\
+                 }\n",
+            ),
+            (
+                "src/other.rs",
+                "//! Counts some bytes.\n\n\
+                 /// Count them.\npub fn count(bytes: &[u8]) -> usize {\n    bytes.len()\n}\n",
+            ),
+            ("src/lib.rs", "//! Crate root.\n\nmod other;\nmod reg;\n"),
+        ],
+    );
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let db = GraphDb::open(&db_dir).unwrap();
+
+    assert!(
+        db.has_node("src/reg.rs#Registry.len"),
+        "the method is in the graph"
+    );
+    assert!(
+        db.neighbors("src/other.rs#count", "CALLS", Direction::Out)
+            .unwrap_or_default()
+            .is_empty(),
+        "`bytes.len()` is a slice's length, not the registry's"
+    );
+    assert!(
+        db.neighbors("src/reg.rs#Registry.len", "CALLS", Direction::Out)
+            .unwrap_or_default()
+            .is_empty(),
+        "`self.items.len()` is a vector's length, not a recursive call"
     );
 }

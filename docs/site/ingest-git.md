@@ -38,7 +38,7 @@ ingest-git: 622 commit(s), 396 file(s), 2 author(s)
 
 | Label | key (`id`) | Props |
 |---|---|---|
-| `Author` | mailmap-resolved email | `name` |
+| `Author` | mailmap-resolved email | `name` — the spelling on the most commits — and `name_counts`, `"<name><TAB><commits>"` per spelling in first-seen order |
 | `Commit` | full sha | `message` (subject line), `ts` (unix seconds), `author_id`, `pr_id` (with `--prs`) |
 | `File` | path | `path`, `dir`, `ext`, `commits` (list of shas, newest last, capped), `n_commits`, `top_author_id`, `author_counts`, and from the working tree: `hash`, `lines`, `lang`, `symbols_n`, `imports`, `import_lines`, `mentions`, `headings`, `body` |
 | `Symbol` | `"<path>#<qualified name>"` | `name`, `kind`, `path`, `file_id`, `line_start`, `line_end`, `signature`, `doc`, `calls_to`, `call_lines` |
@@ -113,6 +113,21 @@ overlap of their commit lists is at least 0.25, meaning they are usually
 changed together. The weight is that overlap, so `ORDER BY r.score DESC`
 ranks the tightest couplings first.
 
+Jaccard is a *ratio*, and that cuts both ways. It is what keeps a file everybody
+touches from being everybody's partner, and it is also why a file that changes
+with this one often and *also* changes a lot on its own scores low: on this
+repository `crates/cli/src/lib.rs` shares six of `crates/cli/src/install.rs`'s
+fifteen commits and scores 0.10, which is its third most frequent partner and no
+edge at all.
+
+Lowering the floor does not fix that and costs a lot elsewhere — on this
+repository 1,118 pairs clear 0.25, 1,581 clear 0.15, and `lib.rs` is still under
+both. So the floor stays where it is and `impact` and `why` answer the other
+half of the question directly from the commit lists, naming any file that shares
+at least three commits with the one you asked about and labelling it with the
+count rather than a score. The graph keeps the edges it can defend; the tools
+read the commits when the edges do not have the answer.
+
 **`knows`** — the same predicate as a via-hop: `via_label: "File"`,
 `via_edge: "TOP_AUTHOR"`, `via_dir: In`, edge `KNOWS`, at most 20 edges per
 author. From an author, the hop expands incoming `TOP_AUTHOR` edges to the
@@ -150,12 +165,59 @@ key. `file_id` names that file, and the foreign key on it is the `DEFINES` edge.
 
 Resolution is deliberately conservative: an import that names something outside
 the working tree (the standard library, a registry dependency) resolves to
-nothing, and a call whose name has several candidate definitions and no clear
-winner resolves to nothing. A missing edge is easier to live with than a wrong
-one. A call to a name defined once anywhere in the repository resolves to that
-definition, so a distinctive name links across crates while a common one links
-only within its own file or directory. Language rules are documented in the
-extraction crate.
+nothing, and a call with several candidate definitions and no clear winner
+resolves to nothing. A missing edge is easier to live with than a wrong one.
+
+A call is resolved by narrowing outwards, and the first tier that finds exactly
+one definition wins. Ambiguity at a tier does not fall through to the next one:
+it ends the search for that name.
+
+| Tier | A definition wins when it is |
+|---|---|
+| 1 | in the calling file |
+| 2 | in the calling file's directory, in the same language |
+| 3 | in a file the calling file imports |
+| 4 | the only one of that name in the repository, in the same language |
+
+Two shapes of call are held to a stricter standard than a bare `name(…)`.
+
+**A call written on a receiver** — `store.flush()`, `os.path.join(…)`, anything
+with a dot in it — never reaches tier 4 on the bare name it falls back to, and at
+tier 3 matches only a *method*, a symbol qualified `Type.name`. The receiver's
+type is not something the graph knows, so `.collect()` is not a call to whatever
+single `collect` the repository happens to define, and importing a file that
+contains a `join` does not make `join` a method on your receiver. What it may
+still match at tier 4 is the name as written when that name carries its receiver:
+`Store.flush` against a symbol qualified `Store.flush`, which is how a static
+call reads in Python, TypeScript and JavaScript.
+
+A method is nevertheless *stored* under its type — `Store.flush` — and no
+source writes that form, so the bare name a receiver call falls back to is also
+how a method is reached. Tiers 1 to 3 match a `Type.method` symbol on the bare
+`method`, but only when the receiver says what the type is. Two spellings do:
+`self` (and `Self`, `this`, `cls`) means the type implemented in the calling
+file, and a variable named after its type — `store` for `Store`, `symbol_index`
+for `SymbolIndex`, case and underscores collapsed — means that type. The
+receiver is the segment immediately before the method, so `self.items.len()`
+asks about `items`, not about `self`. `bytes.len()` names no type the graph
+knows and resolves to nothing, which is the right answer for a slice's length.
+If two types still qualify — two names that collide once case and underscores
+are dropped — neither gets the edge.
+
+**A path call** — `a::b::name(…)` — resolves to nothing at all, no tier tried,
+when its leading segment names nothing here: not `crate`, `self`, `super` or
+`Self`; not a package, directory or module in the tree; not a symbol.
+`std::mem::take` is a call into the standard library, not into this
+repository's `take`. A leading segment that is a *type* counts, so
+`Store::flush` resolves normally.
+
+Tiers 2 and 4 also require the definition's file to be in the calling file's
+language, since a name shared across languages is a coincidence rather than a
+call. TypeScript, TSX and JavaScript count as one language; every other pairing
+must match exactly. Tier 1 needs no such check, and tier 3 gets one for free —
+an import only ever resolves within a language.
+
+Language rules are documented in the extraction crate.
 
 Three things are read but not parsed. A file over 1 MB, a file whose leading
 bytes are not text, and a file with an extension no extractor claims all keep
@@ -339,11 +401,11 @@ commit's `message`; the sha and the graph are unaffected.
 
 `ingest-git` is the command you run. `sync` and `touch` are the two a hook runs,
 and neither takes a repository argument — both read it off the `GitSync` node,
-so a hook line carries only the database path and keeps working when the
-checkout moves.
+so a hook line carries only the database and keeps working when the checkout
+moves.
 
 ```
-mushroomdb sync <db-dir> [--json]
+mushroomdb sync <db-dir>|--auto [--json]
 mushroomdb touch <db-dir>|--auto [<file>...]
 ```
 
@@ -373,6 +435,16 @@ ingest-git: 1 commit(s), 1 file(s), 1 author(s) (incremental)
 The file count is what the run wrote, so on an incremental run it tracks the
 commits picked up rather than the size of the repository: a run that finds one
 commit over one file says one file, whatever else the store already holds.
+
+**Snapshots take care of themselves.** Every open reads `wal.bin` whole and
+replays it, so a store left as a long log makes every hook pay for it. A first
+`ingest-git` therefore snapshots before it returns, and a later `ingest-git` or
+`sync` snapshots when the store has none or when the log has grown past 4 MiB
+since the last one. On this repository that is a 288 ms open against a 173 ms
+one. `touch` never snapshots — it runs on every edit, and a snapshot does not
+fit in that budget; the next `sync` picks it up. The folded log is archived
+rather than dropped, so `node_history`, `edge_history`, `was_linked` and `asof`
+keep reaching it: see [Durability](durability.md).
 
 `dirty` counts the paths handed to the working-tree pass; `scanned` counts those
 of them the graph actually knows and that are still files on disk, so an
@@ -430,11 +502,13 @@ does.
 
 ### Cost
 
-The work itself is small — re-extracting one file of this repository takes about
-20 ms — but every invocation pays to open the database first, which replays the
-write-ahead log. On a 623-commit graph of this repository (396 files, 5,625
-symbols, a 7 MB log) that open is about 580 ms, so `touch` is about 600 ms end to
-end and `sync` about 1.2 s. Run both in the background from a hook.
+The work itself is small — re-extracting one file of this repository takes a few
+milliseconds, and it is bounded by the files named rather than by the size of
+the repository — but every invocation pays to open the database first. On a
+687-commit graph of this repository (435 files, 6,400 symbols) a snapshotted
+open is about 175 ms, so `touch` is about 190 ms end to end: the open is
+essentially all of it. Without a snapshot the same open is about 290 ms, which
+is why an ingest writes one. Run both in the background from a hook.
 
 ### Git hook
 
@@ -442,7 +516,7 @@ end and `sync` about 1.2 s. Run both in the background from a hook.
 
 ```sh
 # >>> mushroomdb >>>
-( 'mushroomdb' sync '/path/to/mushroom-memory' >/dev/null 2>&1 & )
+( 'mushroomdb' sync --auto >/dev/null 2>&1 & )
 # <<< mushroomdb <<<
 ```
 
@@ -450,17 +524,24 @@ The markers make the block replaceable in place, so re-running the installer
 rewrites it rather than stacking a second copy, and removing it leaves every
 other line of the hook untouched.
 
+`--auto` rather than a path is what makes the block correct in more than one
+checkout. Git runs a hook with the working tree it acted on as the working
+directory, and worktrees share one hooks directory, so this single block syncs
+whichever tree the commit landed in. An absolute path here would point every
+`git worktree` at the first checkout's graph. `install --db <path>` writes the
+path instead, for a store deliberately kept somewhere fixed.
+
 ### Editor hook
 
 A commit is not the only thing that changes a file. `install` also wires a
 `PostToolUse` hook matched to `Edit|Write|MultiEdit`, which runs
-`<bin> touch <db>` on the file the tool just wrote:
+`<bin> touch --auto` on the file the tool just wrote:
 
 ```json
 {
   "matcher": "Edit|Write|MultiEdit",
   "hooks": [
-    { "type": "command", "command": "'mushroomdb' touch '/path/to/mushroom-memory'",
+    { "type": "command", "command": "'mushroomdb' touch --auto",
       "timeout": 30, "async": true }
   ]
 }
@@ -474,15 +555,38 @@ concept has gone stale the moment its source file changes.
 
 ### Finding the database without being told
 
-`mcp`, `recall` and `touch` accept `--auto` in place of a path, which resolves,
-in order:
+`mcp`, `recall`, `touch` and `sync` accept `--auto` in place of a path, which
+resolves, in order:
 
 1. `$CLAUDE_PROJECT_DIR/mushroom-memory` — the assistant says which project it
    is working in, and that is the most specific answer available.
-2. `./mushroom-memory`, but only when the working directory is a git checkout.
-   Without that guard a command run from a home directory would quietly create a
-   database there.
+2. `mushroom-memory` at the root of the working tree the current directory is
+   in — the nearest ancestor holding a `.git` entry. Outside a checkout there
+   is no such root, and without that guard a command run from a home directory
+   would quietly create a database there.
 3. `~/.mushroomdb/memory`, the user-scope default `install` writes.
+
+Step 2 finds a *working tree* root, never the `.git` directory several
+worktrees share: a linked worktree keeps a `.git` file at its own root, so each
+`git worktree add` gets its own store. Two checkouts are two different sets of
+files, and a graph built from one answers questions about the other wrongly.
+
+This is why `install --project` writes `--auto` into `.mcp.json`, both settings
+hooks and all three git hook blocks rather than a path. Those files live in the
+repository and get committed; a path baked into them travels to a new worktree
+and points everything there at the original checkout's store. Pass
+`--db <path>` to pin an absolute path instead — that is the flag for a store
+kept deliberately outside the repository. A user-scope install always pins
+`~/.mushroomdb/memory`, since `--auto` inside any checkout would resolve to
+that project instead.
+
+`--auto` is written only where a resolution step can be relied on to answer.
+A project install *outside* a git checkout has no working tree root for step 2
+to find, so it pins the store to the project directory rather than risk a hook
+that never receives `$CLAUDE_PROJECT_DIR` quietly building a second store under
+the home directory. A Cursor or Codex install pins it for the same reason from
+the other end: neither host sets `$CLAUDE_PROJECT_DIR`, so step 1 never answers
+for them and step 2 would depend on where the host chose to start the server.
 
 `mushroomdb --version` (or `mushroomdb version`) prints `mushroomdb <version>`.
 
@@ -564,6 +668,31 @@ hook then walks the graph outward, so a prompt about one file surfaces what it
 imports, what calls into it, the files that change with it, the guide that
 describes it and the person who owns it, before any file is read.
 
+### When it says nothing
+
+Not every prompt is about the repository, and the hook runs on all of them. Two
+guards keep a conversational turn from being answered with graph content, and
+either one is enough to print nothing at all:
+
+- **Stopwords.** The prompt is searched as an `OR` of its words, and an `OR` of
+  function words matches nearly every indexed document — `the` on its own used
+  to return a full digest of six near-random nodes. 146 English function words
+  and six that say nothing inside a repository (`code`, `file`, `line` and
+  their plurals) are dropped before the search. With no word left, there is no
+  query and no output. The words a repository question turns on — `test`,
+  `fix`, `add`, `call`, `run`, `name`, `key` — are deliberately kept.
+- **A relevance floor.** What survives the stopwords can still match by
+  coincidence, so the best hit's BM25 score has to clear a minimum before
+  anything prints. The floor is low by design: BM25 sums over the terms of an
+  `OR`, so a long vague prompt outscores a short precise one and an absolute
+  floor is a blunt instrument. It catches the degenerate case the stopwords
+  cannot see — a query whose every term is spread evenly across the index.
+
+So `what is the weather today` prints nothing on a code graph, while `why does
+install.rs change with tests/install.rs` prints the digest. A prompt that is
+generic in wording but names something real (`fix the test in recall`) keeps
+`fix`, `test` and `recall` and still fires.
+
 ### When the working tree is dirty
 
 A change already in progress is the more useful subject, so when the prompt
@@ -580,7 +709,7 @@ one file edited:
 mushroomdb: you are editing crates/cli/src/install.rs
   usually changes with: crates/cli/tests/install.rs (0.83, not modified), docs/site/skill.md (0.38, not modified)
   imported by: crates/cli/src/lib.rs (not modified)
-  owner: Matthew Michael Sherlin
+  owner: Matthew Sherlin
 (query the mushroomdb MCP tools before answering about these entities)
 ```
 
@@ -589,7 +718,8 @@ file already open is not news; the first line becomes
 `you are editing crates/cli/src/install.rs (+1 more)`. At most eight lines print
 under the framing line, inside the same byte budget the digest keeps, and the
 whole run took 0.30 s on the 637-commit graph of this repository. A clean
-checkout, or a prompt sent from outside one, gets the topic digest as before.
+checkout, or a prompt sent from outside one, gets the topic digest — or nothing,
+if the prompt is not about this repository.
 
 The same data answers direct questions:
 

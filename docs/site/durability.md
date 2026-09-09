@@ -24,6 +24,13 @@ On open, the store is reconstructed as **snapshot (if present) + WAL tail**:
 
 The tooling already bounds WAL-only-from-genesis exposure:
 
+- **`ingest-git` snapshots itself.** A first ingest always writes one before it
+  returns; a later `ingest-git` or `sync` writes one when the store has no
+  snapshot at all, or when the WAL has grown past 4 MiB since the last one.
+  Measured on a 435-file repository, that is the difference between a 288 ms
+  open and a 173 ms one — paid on every hook, every MCP start and every CLI
+  call until something snapshots. `touch` never snapshots: it runs on every edit
+  and a snapshot would not fit in that budget.
 - The server **snapshots on graceful shutdown** (SIGINT/SIGTERM), so a clean
   restart always recovers from an image.
 - `mushroomdb serve … --snapshot-every <secs>` snapshots periodically, so even
@@ -33,6 +40,58 @@ The tooling already bounds WAL-only-from-genesis exposure:
 **Guidance:** for a long-running vector-rule deployment, set `--snapshot-every`
 (or snapshot on a schedule). The cost of a periodic snapshot is far smaller than
 a from-genesis rebuild, and it caps how much WAL a crash can leave to replay.
+
+## A snapshot does not cost you the past
+
+Folding the WAL into a snapshot is what makes the next open fast, but the WAL is
+also what `node_history`, `edge_history`, `was_linked` and `asof` read. Dropping
+it would leave a store that cannot say how any of its nodes came to be.
+
+So every snapshot mushroomdb takes **on its own** — the ingest's, a
+`--snapshot-every` tick, the shutdown one — and `mushroomdb snapshot <db>` with
+no flags **archive** the WAL rather than dropping it. The frames are renamed to
+`wal.<N>.archive`, which the history reads still scan and the open path does
+not. You end up with a store that opens fast *and* remembers. An automatic
+snapshot keeps the newest eight archives so the directory cannot grow without
+end; see **Disk** below for what that bound costs.
+
+Three flags choose otherwise:
+
+| Command | `wal.bin` after | History reach |
+|---|---|---|
+| `mushroomdb snapshot <db>` | minimal baseline | everything, through the archives |
+| `mushroomdb snapshot <db> --keep-wal` | left whole | everything, and every open replays all of it |
+| `mushroomdb snapshot <db> --truncate` | minimal baseline | only commits after this point |
+
+`--truncate` is the destructive one and nothing chooses it for you. It discards
+the tail and deletes the `wal.genesis` marker, which is what allows `asof` to
+replay archive-resident commits, so any archives an earlier snapshot left become
+unreachable too.
+
+**Disk.** One snapshot moves bytes rather than adding them: the archive holds
+what `wal.bin` was holding anyway. A *series* of them accumulates, because each
+one leaves another `wal.<N>.archive` behind and nothing deletes it. On a
+repository that syncs on every commit that is one new archive per 4 MiB of WAL
+churn, indefinitely.
+
+So the automatic path is bounded and the manual one is not:
+
+| Snapshot | Archives kept |
+|---|---|
+| automatic — the ingest's, `sync`, a `--snapshot-every` tick, shutdown | the newest 8 |
+| `mushroomdb snapshot <db>` | all of them |
+| `mushroomdb snapshot <db> --retention N` | the newest N |
+
+Steady-state archive size is therefore bounded by 8 × the 4 MiB snapshot
+threshold, plus whatever a single oversized run archived in one go. Pruning is
+not free: it advances the history horizon, so `node_history`, `edge_history` and
+`was_linked` stop reaching commits below it, and because the first prune breaks
+the `wal.genesis` chain, `asof` from then on answers for commits after the last
+snapshot rather than replaying into the archives.
+
+The other added cost is one `snapshot.bin`, which is rewritten in place rather
+than accumulated — 37 MB for an 8 MB WAL on a 435-file repository, since a
+snapshot is an expanded image rather than a log.
 
 ## Recovery vs. refresh
 
