@@ -14,8 +14,8 @@ use common::{
 use core_api::repograph::{
     brief, context, context_with, identifier_terms, impact, owners, recall_digest, remember,
     render_brief, render_context, render_impact, render_map, render_owners, render_why, repo_map,
-    shortest_path, stale_concepts, why, BriefOptions, ContextOptions, ImpactOptions, MapOptions,
-    RememberInput, Target, MAX_OUTPUT_BYTES, MAX_QUERY_TERMS, UNTRUSTED_FRAMING,
+    shortest_path, stale_concepts, why, BriefOptions, ContextOptions, ContextReport, ImpactOptions,
+    MapOptions, RememberInput, Target, MAX_OUTPUT_BYTES, MAX_QUERY_TERMS, UNTRUSTED_FRAMING,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1107,6 +1107,70 @@ fn context_on_file_lists_importers_partners_commits() {
     assert_eq!(
         c.concepts,
         vec![("concept:startup".to_string(), "startup path".to_string())]
+    );
+}
+
+/// The same for a file. A file has no line range, so a body-less answer has no
+/// pointer line either: what is left is the file's own facts, and the flag is
+/// the only thing between the two answers.
+#[test]
+fn context_with_on_a_file_answers_from_the_graph_alone() {
+    let dir = tmp("context-options-file");
+    let db = synthetic_repo_store(&dir);
+    // The hub file: the one with importers, partners and notes on it. The
+    // shared tree does not carry it, so this test writes it in — a body has to
+    // be there for `source: true` to differ from the default at all.
+    let repo = work_tree("context-options-file-tree");
+    let path = file_key(0, 0);
+    let body: String = (1..=30).map(|n| format!("// line {n}\n")).collect();
+    std::fs::write(repo.join(&path), body).expect("write the hub file");
+
+    let pointer = context_with(&db, None, &path, &ContextOptions::default());
+    assert_eq!(pointer.target, Target::File { path: path.clone() });
+    assert_eq!(pointer.source, None, "the default reads no working tree");
+    assert_eq!(
+        pointer,
+        context_with(&db, Some(repo.as_path()), &path, &ContextOptions::default()),
+        "a working tree that is there changes nothing when no body was asked for"
+    );
+
+    let text = render_context(&pointer);
+    assert!(
+        text.contains("importers  ") && text.contains("co-change  "),
+        "the file's own facts are all there:\n{text}"
+    );
+    assert!(
+        !text.contains("  at "),
+        "a file has no line range to point at:\n{text}"
+    );
+    assert!(
+        !text.contains("where  lines"),
+        "and nothing on the `where` line stands in for one:\n{text}"
+    );
+
+    // Asking for the body changes the body and nothing else.
+    let full = context_with(
+        &db,
+        Some(repo.as_path()),
+        &path,
+        &ContextOptions { source: true },
+    );
+    assert!(
+        full.source.is_some(),
+        "the head of the file is quoted from the working tree"
+    );
+    assert_eq!(
+        ContextReport {
+            source: None,
+            ..full.clone()
+        },
+        pointer,
+        "the flag decides the body and nothing else"
+    );
+    let full_text = render_context(&full);
+    assert!(
+        full_text.contains("// line 1"),
+        "the body is quoted:\n{full_text}"
     );
 }
 
