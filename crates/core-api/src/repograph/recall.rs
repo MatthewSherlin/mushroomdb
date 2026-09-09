@@ -262,7 +262,13 @@ pub const MIN_HIT_SCORE: f64 = 0.05;
 ///
 /// Punctuation is trimmed at the edges only, so a sentence's full stop comes
 /// off `render_map.` without taking the extension off `src/core.rs.`, and a
-/// leading `.` is left where it belongs (`.gitignore`).
+/// leading `.` is left where it belongs (`.gitignore`). A trailing possessive
+/// goes the same way: `render_map's` is the sentence's grammar wrapped around
+/// a name, and the name is what the index holds.
+///
+/// Quotes of all three kinds are trimmed, but only backticks make a word an
+/// identifier: `"the"` is an ordinary word someone quoted, while `` `the` ``
+/// is a caller pointing at something and saying that is what it is called.
 #[must_use]
 pub fn identifier_terms(prompt: &str) -> Vec<String> {
     // Characters that end a word rather than belong to one, and the ones that
@@ -275,7 +281,13 @@ pub fn identifier_terms(prompt: &str) -> Vec<String> {
     for raw in prompt.split(|c: char| {
         c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '[' | ']' | '?' | '!')
     }) {
-        let t = raw.trim_start_matches(OPEN).trim_end_matches(CLOSE);
+        let trimmed = raw.trim_start_matches(OPEN).trim_end_matches(CLOSE);
+        // The possessive is the sentence's, not the name's — and it is stripped
+        // after the close quotes, so `` `render_map's` `` loses both.
+        let t = trimmed
+            .strip_suffix("'s")
+            .or_else(|| trimmed.strip_suffix("\u{2019}s"))
+            .unwrap_or(trimmed);
         if t.is_empty() || is_stopword(&t.to_ascii_lowercase()) {
             continue;
         }
@@ -495,11 +507,11 @@ fn pointer<F: Fs>(db: &GraphDb<F>, key: &str) -> String {
         .as_ref()
         .and_then(as_line);
     let symbol = first_line(node.prop("name").or_else(|| node.prop("title")));
-    let doc = first_line(
+    let doc = excerpt(&first_line(
         node.prop("doc")
             .or_else(|| node.prop("summary"))
             .or_else(|| node.prop("text")),
-    );
+    ));
 
     let mut out = format!("  {path}");
     if let Some(line) = line {
@@ -560,6 +572,27 @@ fn first_line(v: Option<Value>) -> String {
         Some(Value::Str(s)) => sanitize(s.lines().next().unwrap_or_default().trim()),
         _ => String::new(),
     }
+}
+
+/// Longest excerpt of a doc line a pointer will print, in bytes.
+///
+/// A doc comment's first line is written for a reader of the file, not for this
+/// digest: one that runs to a paragraph would take the whole budget, and a
+/// first hit longer than the budget would print nothing at all. Six pointers
+/// with a cut excerpt each still fit, which is the point of the digest.
+const MAX_EXCERPT_BYTES: usize = 160;
+
+/// `s` cut to [`MAX_EXCERPT_BYTES`] on a character boundary, with an ellipsis
+/// marking the cut. Unchanged when it already fits.
+fn excerpt(s: &str) -> String {
+    if s.len() <= MAX_EXCERPT_BYTES {
+        return s.to_string();
+    }
+    let mut end = MAX_EXCERPT_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", s[..end].trim_end())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

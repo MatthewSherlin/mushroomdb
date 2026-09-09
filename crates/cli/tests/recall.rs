@@ -189,17 +189,33 @@ fn recall_is_silent_when_nothing_matches_or_store_missing() {
     assert_eq!(run_recall(&dir, "not json"), "");
 }
 
-/// Binding: a prompt that is not about the repository produces no nudge at
-/// all — not a short one, not a framed one, nothing.
+/// Binding: a prompt that is not about the repository produces nothing at all
+/// — not a short digest, not a framed one, and not the diff-aware nudge
+/// either.
 ///
 /// This fires before every single user prompt. A digest of six near-random
 /// nodes costs ~350 tokens and, worse, presents unrelated files to the model
-/// as relevant context. The prompt below is the case that used to cost the
-/// most: every one of its words is common enough to match something.
+/// as relevant context. The prompts below are the case that used to cost the
+/// most: every one of their words is common enough to match something.
+///
+/// The checkout is dirty and the payload's `cwd` is in it, so the hook has a
+/// nudge to print and withholds it: without that setup the assertion would
+/// pass on a store with no repository behind it and pin nothing.
 #[test]
 fn recall_is_silent_on_a_generic_prompt() {
-    let dir = tmp("generic");
-    run_demo(&dir).expect("demo");
+    let repo = seed_repo("generic-repo");
+    let db_dir = tmp("generic");
+    ingest(&repo, &db_dir);
+    write_files(
+        &repo,
+        &[("src/util.rs", "//! Shared helpers.\n\npub fn helper() {}\n")],
+    );
+    // The setup is real: an identifier in the prompt does produce the nudge.
+    assert!(
+        run_recall(&db_dir, &payload(&repo, "fix `helper`")).contains("you are editing"),
+        "the checkout must be dirty for this test to bind anything"
+    );
+
     for prompt in [
         "what is the weather today",
         "the",
@@ -207,8 +223,11 @@ fn recall_is_silent_on_a_generic_prompt() {
         "ok thanks",
         "what do you think about that",
     ] {
-        let payload = format!(r#"{{"prompt":{}}}"#, json_string(prompt));
-        assert_eq!(run_recall(&dir, &payload), "", "prompt {prompt:?}");
+        assert_eq!(
+            run_recall(&db_dir, &payload(&repo, prompt)),
+            "",
+            "prompt {prompt:?}"
+        );
     }
 }
 
@@ -227,12 +246,6 @@ fn recall_still_fires_on_a_specific_topic() {
             .starts_with("mushroomdb recall"),
         "{out}"
     );
-}
-
-/// A JSON string literal, so a prompt with a quote or a backslash in it still
-/// makes a valid payload.
-fn json_string(s: &str) -> String {
-    serde_json::to_string(s).expect("string")
 }
 
 #[test]
@@ -443,7 +456,7 @@ fn nudge_names_partners_outside_the_diff_only() {
         ],
     );
 
-    let out = run_recall(&db_dir, &payload(&repo, "hi"));
+    let out = run_recall(&db_dir, &payload(&repo, "fix `helper`"));
     assert_eq!(out.lines().next(), Some(FRAMING), "{out}");
     assert_eq!(
         line(&out, "mushroomdb: you are editing"),
@@ -551,7 +564,7 @@ fn nudge_is_at_most_8_lines_plus_framing() {
         ],
     );
 
-    let out = run_recall(&db_dir, &payload(&repo, "hi"));
+    let out = run_recall(&db_dir, &payload(&repo, "fix `helper`"));
     assert!(out.contains("you are editing"), "expected a nudge: {out}");
     assert_eq!(out.lines().next(), Some(FRAMING), "{out}");
     assert_eq!(out.lines().last(), Some(HINT), "{out}");
@@ -564,6 +577,32 @@ fn nudge_is_at_most_8_lines_plus_framing() {
         out.len() <= 1200,
         "the nudge shares the digest's byte budget: {} bytes",
         out.len()
+    );
+}
+
+/// Binding: the identifier gate comes before the nudge, so a dirty tree is not
+/// enough on its own.
+///
+/// The nudge is a fact about the checkout rather than about what was typed,
+/// which is the argument for printing it whatever the prompt says. It loses to
+/// the one this hook is held to: it fires before *every* prompt, and "ok
+/// thanks" is not a question about the diff. The session brief has already
+/// said the graph is there.
+#[test]
+fn a_prompt_naming_nothing_gets_no_nudge_even_on_a_dirty_tree() {
+    let repo = seed_repo("glue-repo");
+    let db_dir = tmp("glue-db");
+    ingest(&repo, &db_dir);
+    write_files(
+        &repo,
+        &[("src/util.rs", "//! Shared helpers.\n\npub fn helper() {}\n")],
+    );
+
+    assert_eq!(run_recall(&db_dir, &payload(&repo, "ok thanks")), "");
+    // The same dirty tree, one identifier later.
+    assert!(
+        run_recall(&db_dir, &payload(&repo, "ok thanks, now fix `helper`"))
+            .contains("you are editing src/util.rs"),
     );
 }
 
@@ -613,7 +652,7 @@ fn nudge_sees_a_touch_made_moments_ago() {
 
     // The edit is on disk but the graph has not been told: the file still
     // hashes to what the concept recorded, so nothing is stale yet.
-    let before = run_recall(&db_dir, &payload(&repo, "hi"));
+    let before = run_recall(&db_dir, &payload(&repo, "fix `helper`"));
     assert!(before.contains("you are editing src/util.rs"), "{before}");
     assert!(
         !before.contains("concept(s)"),
@@ -625,7 +664,7 @@ fn nudge_sees_a_touch_made_moments_ago() {
     // recall does has to see those frames.
     cli::ingest_git::run_touch(&db_dir, &[repo.join("src/util.rs")], None).expect("touch");
 
-    let after = run_recall(&db_dir, &payload(&repo, "hi"));
+    let after = run_recall(&db_dir, &payload(&repo, "fix `helper`"));
     assert_eq!(
         line(&after, "1 concept(s)"),
         Some("1 concept(s) describe files you changed — say \"re-learn\" to refresh"),

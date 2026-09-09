@@ -1,7 +1,14 @@
 //! `mushroomdb recall <db>`: the body of the UserPromptSubmit hook.
 //!
-//! The hook has two things to say, and says whichever one the moment calls
-//! for.
+//! The hook says nothing at all unless the prompt names something — a path, a
+//! symbol, a word in backticks. That question is asked once, of the prompt, and
+//! it decides both of the shapes below: a prompt made of ordinary words gets no
+//! nudge and no digest. The session brief has already told the assistant this
+//! repository has a graph and how to reach it, so a hook firing on every prompt
+//! has nothing left to say about a prompt that is not about the repository.
+//!
+//! Past that gate the hook has two things to say, and says whichever one the
+//! moment calls for.
 //!
 //! When the prompt arrives from a checkout with a **dirty working tree**, the
 //! change already in progress is the more useful subject: the nudge names what
@@ -11,15 +18,15 @@
 //! only find out by reading half the repository.
 //!
 //! Otherwise the prompt's own words are all there is to go on, and the topic
-//! digest answers: the nodes closest to it and their strongest edges. The
-//! digest itself is [`core_api::repograph::recall_digest`].
+//! digest answers: pointers to the nodes its identifiers name. The digest
+//! itself is [`core_api::repograph::recall_digest`].
 //!
 //! Everything specific to being a hook stays here: reading the payload, opening
 //! the store read-only, keeping inside one byte budget, and staying silent on
 //! any error. A recall hook must never block or slow the user's prompt.
 use core_api::repograph::{
-    impact, path_excluded, recall_digest, sanitize, stale_concepts, FileImpact, ImpactOptions,
-    ImpactReport, DEFAULT_EXCLUDES, HINT, MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING,
+    identifier_terms, impact, path_excluded, recall_digest, sanitize, stale_concepts, FileImpact,
+    ImpactOptions, ImpactReport, DEFAULT_EXCLUDES, HINT, MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING,
 };
 use core_api::{GraphDb, OpenOptions, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,14 +72,20 @@ fn cwd_from_payload(raw: &str) -> Option<PathBuf> {
 /// The hook body: the nudge for the change in progress, or the digest for the
 /// prompt's own identifiers, or nothing.
 ///
-/// The prompt is passed to `recall_digest` as the user typed it. Deciding what
-/// a prompt is *about* is that function's job — it fires only on the tokens
-/// that are code-shaped — and doing it here as well would mean two answers to
-/// the same question, one of them wrong.
+/// A prompt naming nothing code-shaped ends the hook here, before the store is
+/// even opened. The nudge is about the checkout rather than about what was
+/// typed, so it would be tempting to let it answer anyway — but this fires
+/// before *every* prompt, and "ok thanks" on a dirty tree is not a question
+/// about the diff. The prompt itself is passed on as the user typed it:
+/// `recall_digest` asks the same question again of the text it searches, and
+/// the two must not be able to disagree.
 pub fn run_recall(db_dir: &Path, hook_stdin: &str) -> String {
     let Some(prompt) = prompt_from_payload(hook_stdin) else {
         return String::new();
     };
+    if identifier_terms(&prompt).is_empty() {
+        return String::new();
+    }
     // Guard the open: `RealFs::new` runs `create_dir_all`, so without this a
     // hook pointed at a typo'd path would keep creating empty directories.
     if !db_dir.exists() {

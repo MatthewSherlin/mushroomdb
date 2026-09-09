@@ -1900,6 +1900,9 @@ fn remember_creates_the_about_rule_for_a_label_seen_for_the_first_time() {
     );
 }
 
+/// The digest's elision marker, as one line of `out.lines()`.
+const ELISION_LINE: &str = "  …";
+
 /// The synthetic store with the full set of fields `ingest-git`, `structure`
 /// and `remember` index between them (see the doc table in
 /// `docs/roadmap/v0.6-code-graph-plan.md`), enabled here because this fixture
@@ -2059,6 +2062,61 @@ fn recall_reaches_a_prose_node_through_backticks() {
     );
 }
 
+/// Binding: a doc line written for a reader of the file is cut to an excerpt,
+/// so one verbose symbol cannot take the whole budget — or, when it is the
+/// first hit, leave the digest with nothing that fits and print nothing at all.
+#[test]
+fn recall_cuts_a_long_doc_line_to_an_excerpt() {
+    let dir = tmp("recall-long-doc");
+    let mut db = recall_store(&dir);
+    let key = format!("{}#core::verbose", file_key(0, 0));
+    let doc = format!("Verbose. {}", "explanation ".repeat(200));
+    assert!(
+        doc.len() > 2_000,
+        "the fixture must be over-budget on its own"
+    );
+    db.insert_node(
+        "Symbol",
+        &key,
+        vec![
+            ("id".to_string(), core_api::Value::Str(key.clone())),
+            (
+                "name".to_string(),
+                core_api::Value::Str("core::verbose".into()),
+            ),
+            ("path".to_string(), core_api::Value::Str(file_key(0, 0))),
+            ("line_start".to_string(), core_api::Value::Int(99)),
+            ("doc".to_string(), core_api::Value::Str(doc)),
+        ],
+    )
+    .expect("symbol");
+
+    let out = recall_digest(
+        &db,
+        "what does core::verbose do?",
+        "synthetic",
+        MAX_OUTPUT_BYTES,
+    );
+    let pointer = out
+        .lines()
+        .find(|l| l.contains("core::verbose"))
+        .unwrap_or_else(|| panic!("expected the hit in:\n{out}"));
+    assert!(
+        pointer.starts_with(&format!(
+            "  {}:99 core::verbose — Verbose. ",
+            file_key(0, 0)
+        )),
+        "{pointer}"
+    );
+    assert!(pointer.ends_with('…'), "the cut is marked: {pointer}");
+    assert!(
+        pointer.len() < 300,
+        "one pointer, not a paragraph: {} bytes",
+        pointer.len()
+    );
+    assert!(out.len() <= MAX_OUTPUT_BYTES, "{} bytes", out.len());
+}
+
 /// Binding: `identifier_terms` keeps the code-shaped tokens and drops the
 /// words around them — the sentence's full stop included, which has to come
 /// off `render_map.` without taking the extension off `src/core.rs.`.
@@ -2078,6 +2136,18 @@ fn identifier_terms_keep_code_shaped_tokens_only() {
         vec!["render_map"],
         "and prose loses the full stop"
     );
+    for prompt in [
+        "what is render_map's job",
+        "what is render_map\u{2019}s job",
+        "what is `render_map's` job",
+        "what is render_map's.",
+    ] {
+        assert_eq!(
+            identifier_terms(prompt),
+            vec!["render_map"],
+            "the possessive is the sentence's, not the name's: {prompt:?}"
+        );
+    }
     assert!(identifier_terms("please explain how the server starts").is_empty());
     assert!(
         identifier_terms("the code in this file").is_empty(),
@@ -2142,21 +2212,38 @@ fn recall_prints_hits_in_the_hybrid_ranking_order() {
             .then(a.0.cmp(&b.0))
     });
 
-    let printed: Vec<&str> = out.lines().filter(|l| l.starts_with("  ")).collect();
+    // A pointer names the node by path, not by key: for a `Symbol` the key is
+    // `path#name`, and for everything else it is the path itself. The path is
+    // the pointer's first field, minus the `:line` when there is one — so the
+    // printed order is a sequence of paths, comparable outright to the
+    // ranking's. (`concept:startup` is why the `:line` is stripped from the
+    // end and not at the first colon.)
+    let path_of = |line: &str| -> String {
+        let body = line.strip_prefix("  ").unwrap_or(line);
+        let first = body.split(' ').next().unwrap_or(body);
+        match first.rsplit_once(':') {
+            Some((path, num)) if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) => {
+                path.to_string()
+            }
+            _ => first.to_string(),
+        }
+    };
+    let printed: Vec<String> = out
+        .lines()
+        .skip(2)
+        .filter(|l| *l != ELISION_LINE)
+        .map(path_of)
+        .collect();
+    let expected: Vec<String> = ranked
+        .iter()
+        .take(printed.len())
+        .map(|(k, _)| k.split('#').next().unwrap_or(k).to_string())
+        .collect();
     assert!(!printed.is_empty(), "expected hits in:\n{out}");
-    assert!(printed.len() <= ranked.len());
-    for (line, (key, _)) in printed.iter().zip(&ranked) {
-        // A pointer names the node by path and symbol, not by key: for a
-        // `Symbol` the key is `path#name`, and for everything else it is the
-        // path itself.
-        let (path, symbol) = key.split_once('#').unwrap_or((key.as_str(), ""));
-        let body = line.trim_start();
-        assert!(
-            body.starts_with(path) && body.contains(symbol),
-            "the digest must print the hybrid ranking in its own order: \
-             expected {key:?} at {line:?} in\n{out}"
-        );
-    }
+    assert_eq!(
+        printed, expected,
+        "the digest must print the hybrid ranking in its own order:\n{out}"
+    );
 }
 
 #[test]
