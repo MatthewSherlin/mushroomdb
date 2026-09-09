@@ -122,16 +122,27 @@ pub(crate) fn dispatch(
 ///
 /// With `json_out` set it is the serialised report as the text content, for a
 /// program that wants the numbers. The report is never rendered in that case,
-/// so nothing is computed twice, and the framing line is left off: JSON is not
-/// prose an assistant is about to read as instructions.
+/// so nothing is computed twice.
+///
+/// A JSON reply carries **no framing line**: prefixing one would stop the
+/// payload being parseable, and the caller that asked for JSON asked for a
+/// document to parse rather than prose to read. It is still graph content, so
+/// every string in it goes through [`sanitize_json`] first — the escaping
+/// `serde_json` does keeps a control character from breaking the *document*,
+/// but says nothing about what the reader sees once it has parsed it.
 fn ok<T: serde::Serialize>(
     json_out: bool,
     report: &T,
     render: impl FnOnce(&T) -> String,
 ) -> CallOutcome {
     if json_out {
-        return match serde_json::to_string(report) {
-            Ok(text) => CallOutcome::TaskOk { text },
+        return match serde_json::to_value(report) {
+            Ok(mut value) => {
+                sanitize_json(&mut value);
+                CallOutcome::TaskOk {
+                    text: value.to_string(),
+                }
+            }
             Err(e) => CallOutcome::ToolErr(format!("serialise report: {e}")),
         };
     }
@@ -142,6 +153,46 @@ fn ok<T: serde::Serialize>(
         format!("{UNTRUSTED_FRAMING}{text}")
     };
     CallOutcome::TaskOk { text }
+}
+
+/// Replace the control characters in every string of `value` with spaces.
+///
+/// Graph content reaches a JSON reply in the **values**: paths, author names,
+/// commit subjects, note text, quoted source lines. The keys are the report's
+/// own field names, fixed in the Rust types the reports serialise from and in
+/// the `sync` child's `--json` output, so they carry nothing an outsider wrote
+/// and are left alone — rewriting a key could silently merge two of them.
+///
+/// Newline and tab survive; every other control character does not. That is
+/// the one place this differs from [`repograph::sanitize`], and the reason is
+/// what the two channels are. A digest is line-structured, so a newline inside
+/// a value could forge a heading or an extra hit and has to go. A JSON value is
+/// delimited by the grammar, so a newline inside one cannot escape it — and
+/// some of these values *are* multi-line documents: `recall`'s report carries
+/// the whole rendered digest, and `context` carries quoted source. Flattening
+/// those would corrupt the report to defend against nothing. What is still
+/// removed is everything that acts on a reader whatever contains it: escape
+/// sequences, carriage returns that overwrite a line, backspace, `DEL`.
+fn sanitize_json(value: &mut Js) {
+    match value {
+        Js::String(s) => {
+            if s.chars().any(is_forbidden_control) {
+                *s = s
+                    .chars()
+                    .map(|c| if is_forbidden_control(c) { ' ' } else { c })
+                    .collect();
+            }
+        }
+        Js::Array(items) => items.iter_mut().for_each(sanitize_json),
+        Js::Object(map) => map.values_mut().for_each(sanitize_json),
+        _ => {}
+    }
+}
+
+/// A control character with no business in a JSON value: everything ASCII
+/// control except the two that are ordinary text layout.
+fn is_forbidden_control(c: char) -> bool {
+    c.is_ascii_control() && c != '\n' && c != '\t'
 }
 
 /// An optional boolean argument. `Err` when present but wrong-typed.

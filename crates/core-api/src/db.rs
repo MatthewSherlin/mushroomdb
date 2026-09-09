@@ -5821,6 +5821,39 @@ impl<F: Fs> GraphDb<F> {
         results
     }
 
+    /// [`search`](Self::search), stopping at the `k` best hits.
+    ///
+    /// Same ranking and the same deterministic tiebreak, but the index drops
+    /// everything past `k` before any key is resolved, so a caller that wants
+    /// the top few out of a field that matched thousands does not pay to
+    /// materialise and re-sort the tail. `k == 0` means no limit, exactly as
+    /// [`search`](Self::search) behaves.
+    ///
+    /// The BM25 scoring itself is not bounded by `k` — every candidate is
+    /// scored either way — so this trims the resolve and the sort, not the
+    /// search.
+    pub fn search_top(&self, field: &str, query: &str, k: usize) -> Vec<(String, f64)> {
+        // A tombstoned id resolves to nothing, so asking the index for exactly
+        // `k` could return fewer. Over-fetching a little and truncating after
+        // the filter keeps the count right without unbounding the call.
+        let want = if k == 0 { 0 } else { k.saturating_mul(2) };
+        let mut results: Vec<(String, f64)> = self
+            .fulltext
+            .search(field, query, want)
+            .into_iter()
+            .filter_map(|(id, score)| self.ids.key_of(id).map(|key| (key.to_string(), score)))
+            .collect();
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        if k > 0 {
+            results.truncate(k);
+        }
+        results
+    }
+
     /// Hybrid search: Reciprocal Rank Fusion (RRF) over fulltext + vector results.
     ///
     /// Takes up to `4*k` fulltext hits for `(text_field, query_text)` and up to

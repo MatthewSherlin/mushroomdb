@@ -237,6 +237,10 @@ fn is_stopword(term: &str) -> bool {
 /// every document is nearly zero, and a top hit that cannot beat that is a
 /// coincidence, not an answer.
 ///
+/// It gates the digest and nothing else. The hits themselves, and the order
+/// they print in, still come from the hybrid ranking — this score only decides
+/// whether that ranking is worth showing.
+///
 /// It is deliberately low. BM25 sums over the terms of an `OR`, so a long
 /// generic prompt outscores a short specific one, and an absolute floor is a
 /// blunt instrument against exactly the prompts that need filtering — the
@@ -299,18 +303,12 @@ pub fn recall_digest<F: Fs>(
         return String::new();
     }
 
-    // Best score per key across all indexed fields.
-    //
-    // `search` rather than `search_hybrid`: with no embedding to search — and
-    // there is none at hook time — the hybrid call skips its vector leg and
-    // fuses a single list, which replaces every BM25 score with `1/(60+rank)`.
-    // That ranks identically and destroys the only signal there is: the top
-    // hit of any query scores exactly 1/61 whether it matched on a rare
-    // identifier or on the word `the`. Reading the text leg directly keeps the
-    // BM25 score, which is what [`MIN_HIT_SCORE`] is judged against.
+    // Which nodes, and in what order: the hybrid ranking, unchanged. Empty
+    // query vector, so the vector leg is skipped and the fusion runs over the
+    // text leg alone — BM25 order, no embedding needed at hook time.
     let mut best: BTreeMap<String, f64> = BTreeMap::new();
     for field in &fields {
-        for (key, score) in db.search(field, prompt).into_iter().take(MAX_HITS) {
+        for (key, score) in db.search_hybrid(field, prompt, "embedding", &[], None, MAX_HITS) {
             let slot = best.entry(key).or_insert(0.0);
             if score > *slot {
                 *slot = score;
@@ -320,17 +318,27 @@ pub fn recall_digest<F: Fs>(
     if best.is_empty() {
         return String::new();
     }
+
+    // Whether to print at all is a different question from what to print, and
+    // the fused score cannot answer it: RRF replaces every BM25 score with
+    // `1/(60 + rank)`, so the top hit of any query scores exactly 1/61 whether
+    // it matched a rare identifier or the word `the`. The gate therefore reads
+    // the text leg's own best score — one hit per field, so the tail is never
+    // resolved — and leaves the ranking above untouched.
+    let gate = fields
+        .iter()
+        .filter_map(|field| db.search_top(field, prompt, 1).first().map(|(_, s)| *s))
+        .fold(0.0_f64, f64::max);
+    if gate < MIN_HIT_SCORE {
+        return String::new();
+    }
+
     let mut hits: Vec<(String, f64)> = best.into_iter().collect();
     hits.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.0.cmp(&b.0))
     });
-    // Nothing cleared the floor: the prompt happens to share words with the
-    // index and nothing more, so there is no digest to print.
-    if hits.first().is_none_or(|(_, score)| *score < MIN_HIT_SCORE) {
-        return String::new();
-    }
     hits.truncate(MAX_HITS);
 
     // Rule-declared weight property per edge type ("score" from the Rust API,
@@ -494,5 +502,46 @@ fn render(v: &Value) -> String {
         Value::Str(s) => s.clone(),
         Value::Float(f) => format!("{f:.2}"),
         other => format!("{other:?}"),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests: the one property of the stopword lists that is not visible by reading
+// them, and that nothing else would catch.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{is_stopword, CODE_STOPWORDS, STOPWORDS};
+
+    /// Binding: both lists stay sorted and duplicate-free, because
+    /// [`is_stopword`] binary-searches them. An out-of-order insert would
+    /// silently stop matching that word — and every other word past it — with
+    /// nothing else in the suite noticing.
+    #[test]
+    fn the_stopword_lists_are_sorted_and_unique() {
+        for (name, list) in [
+            ("STOPWORDS", &STOPWORDS[..]),
+            ("CODE_STOPWORDS", &CODE_STOPWORDS[..]),
+        ] {
+            for pair in list.windows(2) {
+                assert!(
+                    pair[0] < pair[1],
+                    "{name} must be sorted and duplicate-free: {:?} then {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            // And every word in it is actually found by the lookup that
+            // searches it.
+            for word in list {
+                assert!(is_stopword(word), "{name}: {word:?} is not matched");
+            }
+        }
+        assert!(
+            !is_stopword("install"),
+            "a subject word must stay searchable"
+        );
+        assert!(!is_stopword("test"));
     }
 }

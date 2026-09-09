@@ -1971,6 +1971,86 @@ fn json_true_answers_with_the_report_as_the_text() {
     );
 }
 
+/// Binding: a `json` reply carries no framing line — it is a document to parse,
+/// not prose to read — but every string in it is still sanitized, because the
+/// graph content in it came from the repository just as the digest's did.
+///
+/// `serde_json` escaping keeps a control character from breaking the document.
+/// It does nothing about what the reader sees after parsing, which is where an
+/// escape sequence, a carriage return or a `DEL` would land.
+#[test]
+fn a_json_reply_is_unframed_and_sanitized() {
+    // The reports sanitize the graph content they are built from, so the field
+    // that proves this pass runs is one they do not touch: `recall` echoes the
+    // caller's own topic back verbatim.
+    let hostile = "core \u{1b}[31m\rforged\u{7f} and\ttabbed";
+    let db = code_store("json-sanitize");
+    let reply = one_task_call(
+        db.clone(),
+        "recall",
+        json!({"topic": hostile, "json": true}),
+    );
+    let raw = task_text(&reply);
+    assert!(
+        !raw.starts_with(UNTRUSTED_FRAMING),
+        "a json reply is a document to parse: {raw}"
+    );
+
+    let report: Js = serde_json::from_str(&raw).expect("json reply must parse");
+    let mut strings: Vec<String> = Vec::new();
+    collect_strings(&report, &mut strings);
+    for value in &strings {
+        assert!(
+            !value
+                .chars()
+                .any(|c| c.is_ascii_control() && c != '\n' && c != '\t'),
+            "a control character reached the reply: {value:?}"
+        );
+    }
+    assert_eq!(
+        report["topic"],
+        json!("core  [31m forged  and\ttabbed"),
+        "escapes, carriage return and DEL become spaces; the tab is left alone"
+    );
+
+    // And the same content on the digest path is sanitized as it always was.
+    let text = task_reply(&one_task_call(db, "recall", json!({"topic": hostile})));
+    assert!(
+        !text.chars().any(|c| c.is_ascii_control() && c != '\n'),
+        "the rendered digest keeps its own line structure and nothing else: {text:?}"
+    );
+}
+
+/// Binding: the one control character a JSON value keeps is the newline, and
+/// keeping it is what makes the report faithful.
+///
+/// `recall`'s report carries the whole rendered digest under `digest`, and
+/// `context` carries quoted source. Those newlines are the document's own
+/// structure, not something a contributor injected — a JSON value is delimited
+/// by the grammar, so nothing inside one can forge a line the way it could in
+/// a line-structured digest.
+#[test]
+fn a_json_reply_keeps_the_newlines_of_a_multi_line_value() {
+    let db = code_store("json-multiline");
+    let report = task_report(db, "recall", json!({"topic": "the core module"}));
+    let digest = report["digest"].as_str().expect("digest");
+    assert!(
+        digest.lines().count() > 2,
+        "the rendered digest must survive as a document, not one flat line: {digest:?}"
+    );
+    assert!(digest.starts_with(UNTRUSTED_FRAMING), "{digest:?}");
+}
+
+/// Every string value in a JSON reply, at any depth.
+fn collect_strings(value: &Js, out: &mut Vec<String>) {
+    match value {
+        Js::String(s) => out.push(s.clone()),
+        Js::Array(items) => items.iter().for_each(|v| collect_strings(v, out)),
+        Js::Object(map) => map.values().for_each(|v| collect_strings(v, out)),
+        _ => {}
+    }
+}
+
 /// Binding: `json` is a boolean, and a caller that sends something else is told
 /// so rather than served a digest it did not ask for.
 #[test]

@@ -1,10 +1,11 @@
 //! `mushroomdb recall <db>` reads a Claude Code UserPromptSubmit JSON payload on
 //! stdin and prints related graph facts as plain text (or nothing).
 //!
-//! Two shapes come out of it. When the payload's `cwd` is a checkout with a
+//! Three shapes come out of it. When the payload's `cwd` is a checkout with a
 //! dirty working tree, the hook prints the impact nudge — what the files being
 //! edited reach that is *not* already open. Otherwise it prints the topic
-//! digest for the prompt.
+//! digest for the prompt — or, when the prompt is not about this repository at
+//! all, nothing.
 use cli::recall::run_recall;
 use cli::run_demo;
 use std::path::{Path, PathBuf};

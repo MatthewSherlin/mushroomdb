@@ -1634,6 +1634,72 @@ fn recall_finds_notes_concepts_files_symbols_people() {
     );
 }
 
+/// Binding: the digest prints the hybrid ranking, in the hybrid ranking's
+/// order, across every indexed field.
+///
+/// The relevance floor reads a different score — the text leg's own BM25 — to
+/// decide whether to print at all. That score is not comparable between fields
+/// (each has its own document count and average length), so if it ever leaked
+/// into the ordering, hits from a small field would jump ahead of hits from a
+/// large one. This fixture spans five fields and pins the order against
+/// `search_hybrid` itself.
+#[test]
+fn recall_prints_hits_in_the_hybrid_ranking_order() {
+    let dir = tmp("recall-hybrid-order");
+    let mut db = synthetic_repo_store(&dir);
+    for (label, field) in [
+        ("File", "path"),
+        ("Symbol", "name"),
+        ("Author", "name"),
+        ("Note", "text"),
+        ("Concept", "name"),
+    ] {
+        db.enable_fulltext(label, field).expect("fulltext");
+    }
+
+    let prompt = "c00 OR init OR ada OR entry OR startup";
+    let out = recall_digest(&db, prompt, "synthetic", 4000);
+
+    // What `recall_digest` does internally, spelled out here against the
+    // public API: best fused score per key across the fields, then score
+    // descending and key ascending.
+    let mut fields: Vec<String> = db.fulltext_pairs().into_iter().map(|(_, f)| f).collect();
+    fields.sort();
+    fields.dedup();
+    let mut best: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for field in &fields {
+        for (key, score) in db.search_hybrid(field, prompt, "embedding", &[], None, 6) {
+            let slot = best.entry(key).or_insert(0.0);
+            if score > *slot {
+                *slot = score;
+            }
+        }
+    }
+    let mut ranked: Vec<(String, f64)> = best.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+
+    let printed: Vec<String> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("- "))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_string)
+        .collect();
+    let expected: Vec<String> = ranked
+        .iter()
+        .take(printed.len())
+        .map(|(k, _)| k.clone())
+        .collect();
+    assert!(!printed.is_empty(), "expected hits in:\n{out}");
+    assert_eq!(
+        printed, expected,
+        "the digest must print the hybrid ranking in its own order:\n{out}"
+    );
+}
+
 #[test]
 fn stale_concepts_detects_changed_source() {
     let dir = tmp("stale-concepts-detail");
