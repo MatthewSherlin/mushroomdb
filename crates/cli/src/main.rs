@@ -329,6 +329,28 @@ fn main() -> ExitCode {
                 Err(e) => fail(&e.to_string()),
             }
         }
+        Ok(Command::Disable(opts)) => {
+            let home = home_dir();
+            let cwd = std::env::current_dir().unwrap_or_default();
+            match install::run_disable(&cwd, &home, &opts) {
+                Ok(out) => {
+                    print!("{out}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+        Ok(Command::Enable(opts)) => {
+            let home = home_dir();
+            let cwd = std::env::current_dir().unwrap_or_default();
+            match install::run_enable(&cwd, &home, &opts) {
+                Ok(out) => {
+                    print!("{out}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
         Ok(Command::Doctor(opts)) => {
             let home = home_dir();
             let cwd = std::env::current_dir().unwrap_or_default();

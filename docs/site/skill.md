@@ -366,6 +366,48 @@ yields Codex.
 
 ---
 
+## Turning it off: `enable` / `disable`
+
+```
+mushroomdb disable [--project|--user] [--platform claude-code|cursor|codex|all]
+mushroomdb enable  [--project|--user] [--platform claude-code|cursor|codex|all]
+```
+
+`disable` is one command away from turning mushroomdb off in a project
+without uninstalling it: it removes the MCP entry, the two Claude Code
+settings hooks, the git hook blocks, and the Codex registration. The
+`/mushroom` skill or Cursor rules file, the store itself, and the
+`.gitignore` line all stay — the skill is inert without the server, so
+leaving it costs nothing, and the store is worth keeping if you turn the
+install back on later. Scope and platform resolve the same way as `install`.
+Running it twice is a no-op: the second call reports `mushroomdb is already
+disabled`.
+
+`enable` reverses it. It does not replay what `disable` removed: it
+re-resolves the MCP command the way `install` would right now — so a
+published-package upgrade between the two calls is picked up rather than
+pinned to a path that may no longer exist — and re-adds the hooks and git
+hook blocks against that command. Running `enable` on an install that is not
+disabled is a no-op.
+
+`mushroomdb install` also re-enables a disabled install: it rewrites whatever
+`disable` took off disk the same way it repairs any other drift, and says so
+in its summary. `mushroomdb uninstall` needs no special handling for a
+disabled install — every removal it attempts is already a no-op for whatever
+`disable` already removed, so it cleans up a disabled install exactly as it
+would an active one.
+
+`mushroomdb doctor` reports a disabled install as its very first line —
+`warn state disabled — enable with: mushroomdb enable` — and stops there
+rather than running every other check against config that was intentionally
+removed. `warn` never fails the run, so `doctor` still exits 0.
+
+The plugin route (`claude plugin install`) is not covered by `enable` /
+`disable`: a plugin's MCP server and hooks are turned on and off by Claude
+Code itself (`claude plugin` / the `/plugin` UI), not by this CLI.
+
+---
+
 ## Troubleshooting: `mushroomdb doctor`
 
 ```
@@ -376,6 +418,10 @@ Verifies an install end to end and prints one line per check — `ok`, `warn`,
 or `fail`, with a one-line `fix:` when there is something to run. Exits 1 if
 any check fails, 0 otherwise (`warn` never fails the run). Scope and platform
 resolve the same way as `install`.
+
+If the install at the resolved scope is disabled (see `enable` / `disable`
+above), `doctor` prints only one line — `warn state disabled — enable with:
+mushroomdb enable` — and stops; none of the checks below run.
 
 Checks, in order:
 

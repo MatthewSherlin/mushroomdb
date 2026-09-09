@@ -187,6 +187,15 @@ needs `uninstall --platform codex` to undo), `--db <path>`, and
 `--no-git-hooks`. `mushroomdb uninstall` removes exactly what was written. Full
 reference: [`skill.md`](skill.md).
 
+### Turning it off
+
+`mushroomdb disable` turns mushroomdb off in a project without uninstalling
+it — the MCP entry, the hooks and the git hook blocks come out; the skill,
+the store and the `.gitignore` line stay. `mushroomdb enable` turns it back
+on, re-resolving the command rather than replaying whatever `disable` took
+out. `mushroomdb install` also re-enables a disabled install. `doctor` reports
+a disabled install as its first line and stops there.
+
 Restart the assistant afterwards — MCP servers and hooks are read at startup.
 Run `mushroomdb doctor` to verify the install end to end, including a real
 handshake with the configured MCP command.

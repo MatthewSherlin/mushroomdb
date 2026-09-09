@@ -196,12 +196,17 @@ impl McpCommand {
     }
 }
 
-/// Decide how the MCP entry should invoke mushroomdb, from the options and the
-/// real environment.
+/// Decide how the MCP entry should invoke mushroomdb, from an explicit
+/// `--command` (if any) and the real environment.
+///
+/// `explicit` is `install`'s `--command` flag; `enable` has no such flag and
+/// always passes `None`, so it re-derives whatever `install` would choose
+/// right now rather than replaying what an earlier install or `disable`
+/// recorded.
 #[must_use]
-pub fn detect_mcp_command(opts: &InstallOpts) -> McpCommand {
-    if let Some(path) = &opts.command {
-        return McpCommand::Explicit(path.clone());
+pub fn detect_mcp_command(explicit: Option<&Path>) -> McpCommand {
+    if let Some(path) = explicit {
+        return McpCommand::Explicit(path.to_path_buf());
     }
     match std::env::current_exe() {
         Ok(exe) => classify_mcp_command(std::env::var_os("PATH").as_deref(), &exe),
@@ -459,6 +464,19 @@ pub struct InstallOpts {
     /// Run `npx -y mushroomdb@<v> --version` once so the first real spawn is
     /// not a cold download.
     pub prewarm: bool,
+}
+
+/// Options parsed from `mushroomdb enable [flags]` or `mushroomdb disable [flags]`.
+///
+/// Deliberately narrower than [`InstallOpts`]: neither command takes `--db`,
+/// `--command` or `--no-git-hooks` — they act on whatever an existing install
+/// already recorded, not on a fresh choice of store or binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToggleOpts {
+    /// Which platform to act on. `None` = auto-detect, same as `install`.
+    pub platform: Option<Platform>,
+    /// Project or user scope. `None` = auto: project inside a git checkout.
+    pub scope: Option<Scope>,
 }
 
 /// The store directory an install with no `--db` uses.
@@ -773,6 +791,21 @@ struct Manifest {
     /// Whether a Codex MCP server was registered through the `codex` CLI.
     #[serde(default)]
     codex: bool,
+    /// Whether `disable` has turned this install off. The tracking fields
+    /// above (`mcp_keys`, `hooks`, `git_hooks`, `codex`) still describe what
+    /// the install owns even while disabled — `disable` does not clear them,
+    /// it only takes the config off disk and sets this flag — so `uninstall`
+    /// needs no disabled-aware branch of its own: every removal it attempts
+    /// is already a no-op for whatever `disable` already removed.
+    #[serde(default)]
+    disabled: bool,
+    /// The exact `mcpServers.mushroomdb` entry `disable` removed from each
+    /// file, captured byte-for-byte before the removal. `enable` reads the
+    /// store argument back out of these (see [`store_from_arg`]) rather than
+    /// replaying the entry itself — the command it writes is re-resolved
+    /// fresh, since the published package may have moved since `disable` ran.
+    #[serde(default)]
+    stashed_mcp: Vec<StashedMcpEntry>,
 }
 
 impl Manifest {
@@ -792,6 +825,19 @@ impl Manifest {
             && self.gitignore.is_empty()
             && !self.codex
     }
+}
+
+/// One `mcpServers.<server>` entry [`run_disable_with`] took out of a config
+/// file, kept whole so [`entry_db`] can still read the store argument back out
+/// of it later.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct StashedMcpEntry {
+    /// The JSON file the entry was removed from (absolute path).
+    file: PathBuf,
+    /// The key inside `mcpServers`.
+    server: String,
+    /// The entry itself, exactly as it read before removal.
+    entry: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1177,7 +1223,7 @@ pub fn run_install(
         project_root,
         home,
         opts,
-        &detect_mcp_command(opts),
+        &detect_mcp_command(opts.command.as_deref()),
         &Externals::from_env(),
     )
 }
@@ -1239,10 +1285,18 @@ pub fn run_install_with(
     // entry is still intact, only the file is re-written this run; unioning
     // preserves the MCP key in the saved manifest so uninstall cleans it up too.
     let existing = load_manifest(&manifest_path);
+    // `install` doubles as `enable` for a disabled install: it rewrites
+    // everything `disable` took off disk the same as it would repair any
+    // other drift, so the only extra step is clearing the flag once that
+    // write lands, and saying so in the summary.
+    let was_disabled = existing.disabled;
 
     let mut manifest = Manifest::default();
     let mut notes: Vec<String> = Vec::new();
     notes.extend(launcher_note);
+    if was_disabled {
+        notes.push("this install was disabled — install re-enabled it".to_string());
+    }
 
     let outcome = write_everything(&ctx, &platforms, &mut manifest, &mut notes);
     if let Err(e) = outcome {
@@ -1257,9 +1311,17 @@ pub fn run_install_with(
     }
 
     let anything_written = !manifest.is_empty();
-    if anything_written {
+    if anything_written || was_disabled {
         // Union this-run entries with the existing manifest (dedup by path/key).
-        let merged = union_manifests(existing, &manifest);
+        let mut merged = if anything_written {
+            union_manifests(existing, &manifest)
+        } else {
+            existing
+        };
+        if was_disabled {
+            merged.disabled = false;
+            merged.stashed_mcp.clear();
+        }
         write_manifest(&manifest_path, &merged)?;
     }
 
@@ -1354,6 +1416,46 @@ fn write_everything(
     Ok(())
 }
 
+/// Find the manifest for an existing install, the way `uninstall`, `disable`
+/// and `enable` all need to: an inferred scope that turns up nothing falls
+/// back to the other one before giving up, and giving up is an error naming
+/// `verb`.
+///
+/// An inferred scope is a guess, and guessing wrong here means telling
+/// someone with a perfectly good user-scope install that they have nothing to
+/// act on — 0.5.x had no scope detection, so every install made by it inside a
+/// checkout is exactly that case. A scope the user stated is not
+/// second-guessed. Returns the scope actually used, since a fallback changes it.
+fn locate_manifest(
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
+    auto_scope: bool,
+    platforms: &[Platform],
+    verb: &str,
+) -> Result<(Scope, PathBuf), CliError> {
+    let mut scope = scope;
+    let mut path = manifest_path(project_root, home, scope, platforms);
+    if auto_scope && !path.exists() {
+        let other = match scope {
+            Scope::Project => Scope::User,
+            Scope::User => Scope::Project,
+        };
+        let alt = manifest_path(project_root, home, other, platforms);
+        if alt.exists() {
+            scope = other;
+            path = alt;
+        }
+    }
+    if !path.exists() {
+        return Err(CliError(format!(
+            "no install manifest found at {} — nothing to {verb}",
+            path.display()
+        )));
+    }
+    Ok((scope, path))
+}
+
 /// Uninstall: remove exactly what install wrote. Reads the manifest.
 pub fn run_uninstall(
     project_root: &Path,
@@ -1375,36 +1477,15 @@ pub fn run_uninstall_with(
     let resolved = resolve_platform(project_root, home, opts.platform.as_ref())?;
     let platforms = expand_platform(&resolved);
 
-    let mut scope = scope;
-    let mut manifest_path = manifest_path(project_root, home, scope, &platforms);
-    // An inferred scope is a guess, and guessing wrong here means telling
-    // someone with a perfectly good user-scope install that they have nothing
-    // to uninstall — 0.5.x had no scope detection, so every install made by it
-    // inside a checkout is exactly that case. A scope the user stated is not
-    // second-guessed.
-    if auto_scope && !manifest_path.exists() {
-        let other = match scope {
-            Scope::Project => Scope::User,
-            Scope::User => Scope::Project,
-        };
-        let alt = self::manifest_path(project_root, home, other, &platforms);
-        if alt.exists() {
-            scope = other;
-            manifest_path = alt;
-        }
-    }
-    if !manifest_path.exists() {
-        return Err(CliError(format!(
-            "no install manifest found at {} — nothing to uninstall",
-            manifest_path.display()
-        )));
-    }
-
-    let raw = fs::read_to_string(&manifest_path)
-        .map_err(|e| CliError(format!("cannot read manifest: {e}")))?;
-    let manifest: Manifest = serde_json::from_str::<Manifest>(&raw)
-        .map_err(|e| CliError(format!("corrupt manifest: {e}")))?
-        .sanitised();
+    let (scope, manifest_path) = locate_manifest(
+        project_root,
+        home,
+        scope,
+        auto_scope,
+        &platforms,
+        "uninstall",
+    )?;
+    let manifest = load_manifest(&manifest_path);
 
     let mut removed = Vec::new();
 
@@ -1495,6 +1576,320 @@ pub fn run_uninstall_with(
     for line in &removed {
         out.push_str(&format!("  {line}\n"));
     }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Enable / disable — turn an install off without removing it
+// ---------------------------------------------------------------------------
+//
+// `disable` takes the dynamic, per-assistant config off disk — the MCP entry,
+// the two Claude Code hooks, the three git hook blocks, the Codex
+// registration — and leaves everything a person might have customised or that
+// the store depends on: the skill/rules file, the store itself, the
+// `.gitignore` line. `enable` puts the config back, re-derived from whatever
+// `install` would choose right now rather than replayed byte-for-byte, so an
+// upgrade of the published package between the two calls is picked up instead
+// of pinned to a path that may no longer resolve.
+//
+// Neither command clears `mcp_keys` / `hooks` / `git_hooks` / `codex` on the
+// manifest — those keep describing what the install *owns*, disabled or not —
+// which is what lets `uninstall` work unmodified from a disabled install: it
+// already treats every removal as a no-op when there is nothing left to
+// remove.
+
+fn scope_dir(project_root: &Path, home: &Path, scope: Scope) -> PathBuf {
+    match scope {
+        Scope::Project => project_root.to_path_buf(),
+        Scope::User => home.to_path_buf(),
+    }
+}
+
+/// The `mcpServers.<server>` entry in `mcp_file`, if the file and the entry
+/// both exist.
+fn read_mcp_entry(mcp_file: &Path, server: &str) -> Result<Option<serde_json::Value>, CliError> {
+    if !mcp_file.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(mcp_file)
+        .map_err(|e| CliError(format!("cannot read {}: {e}", mcp_file.display())))?;
+    let root: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| CliError(format!("corrupt mcp json at {}: {e}", mcp_file.display())))?;
+    let entry = &root["mcpServers"][server];
+    Ok(if entry.is_null() {
+        None
+    } else {
+        Some(entry.clone())
+    })
+}
+
+/// Reconstruct the [`StoreRef`] an existing config argument names — the same
+/// argument [`StoreRef::arg`] would have written. `enable` uses this to read
+/// which store a stashed MCP entry (and the hooks wired alongside it) was for.
+fn store_from_arg(arg: &str, project_root: &Path, home: &Path) -> StoreRef {
+    if arg == AUTO_ARG {
+        return StoreRef::auto(crate::resolve_auto_db(None, project_root, home));
+    }
+    let path = PathBuf::from(arg);
+    if path == default_db(Scope::Project, project_root, home) {
+        return StoreRef::pinned(path).also_auto();
+    }
+    StoreRef::pinned(path)
+}
+
+/// The store `enable` should write: whichever one a stashed MCP entry named,
+/// or — for a Codex-only install, which stashes nothing since Codex's config
+/// is not a file this program reads — the same default `install` would pick
+/// with no `--db`. A Codex-only install made with an explicit `--db` cannot be
+/// recovered exactly; `enable` re-registers it at the default store instead,
+/// same as a fresh `install` would without that flag.
+fn recover_store(manifest: &Manifest, project_root: &Path, home: &Path, scope: Scope) -> StoreRef {
+    manifest
+        .stashed_mcp
+        .first()
+        .and_then(|s| entry_db(&s.entry))
+        .map(|arg| store_from_arg(arg, project_root, home))
+        .unwrap_or_else(|| store_ref(project_root, home, scope, None))
+}
+
+/// Turn an install off: remove the MCP entry, the two Claude Code hooks, the
+/// git hook blocks and the Codex registration; leave the skill/rules file, the
+/// store, and the `.gitignore` line untouched. Idempotent.
+pub fn run_disable(
+    project_root: &Path,
+    home: &Path,
+    opts: &ToggleOpts,
+) -> Result<String, CliError> {
+    run_disable_with(project_root, home, opts, &Externals::from_env())
+}
+
+/// Like [`run_disable`], with the external environment supplied by the caller
+/// (Codex removal shells out to the `codex` CLI).
+pub fn run_disable_with(
+    project_root: &Path,
+    home: &Path,
+    opts: &ToggleOpts,
+    ext: &Externals,
+) -> Result<String, CliError> {
+    let (scope, auto_scope) = resolve_scope(project_root, opts.scope);
+    let resolved = resolve_platform(project_root, home, opts.platform.as_ref())?;
+    let platforms = expand_platform(&resolved);
+    let (scope, manifest_path) =
+        locate_manifest(project_root, home, scope, auto_scope, &platforms, "disable")?;
+    let mut manifest = load_manifest(&manifest_path);
+
+    let dir = scope_dir(project_root, home, scope);
+    if manifest.disabled {
+        return Ok(format!(
+            "mushroomdb is already disabled in {}\n",
+            dir.display()
+        ));
+    }
+
+    let mut changed = Vec::new();
+    let mut stashed = Vec::new();
+    for key in &manifest.mcp_keys {
+        let Some(entry) = read_mcp_entry(&key.file, &key.server)? else {
+            continue;
+        };
+        stashed.push(StashedMcpEntry {
+            file: key.file.clone(),
+            server: key.server.clone(),
+            entry,
+        });
+        if remove_mcp_key(&key.file, &key.server)? {
+            changed.push(format!(
+                "disabled  mcpServers.{} in {}",
+                key.server,
+                key.file.display()
+            ));
+        }
+    }
+
+    for h in &manifest.hooks {
+        if remove_hook_entry(&h.file, &h.event, &h.command)? {
+            changed.push(format!(
+                "disabled  {} hook in {}",
+                h.event,
+                h.file.display()
+            ));
+        }
+    }
+
+    for h in &manifest.git_hooks {
+        if remove_git_hook(h)? {
+            changed.push(format!("disabled  git hook block in {}", h.display()));
+        }
+    }
+
+    if manifest.codex {
+        match ext.which("codex") {
+            Some(bin) => {
+                run_and_capture(&bin, &["mcp".into(), "remove".into(), SERVER_NAME.into()])
+                    .map_err(|e| CliError(format!("codex mcp remove failed: {e}")))?;
+                changed.push(format!("disabled  codex mcp server {SERVER_NAME}"));
+            }
+            None => changed.push(
+                "warning: codex is not on PATH — run `codex mcp remove mushroomdb` yourself"
+                    .to_string(),
+            ),
+        }
+    }
+
+    manifest.disabled = true;
+    manifest.stashed_mcp = stashed;
+    write_manifest(&manifest_path, &manifest)?;
+
+    let mut out = String::new();
+    for line in &changed {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "mushroomdb is disabled in {}; enable with: mushroomdb enable\n",
+        dir.display()
+    ));
+    Ok(out)
+}
+
+/// Turn a disabled install back on. Re-adds the MCP entry, the two Claude Code
+/// hooks and the git hook blocks using the store a stashed entry named and the
+/// command `install` would resolve right now — not a replay of what
+/// `disable` took out, which may no longer be the fastest path to the
+/// published package. Idempotent, and a no-op (not an error) when the install
+/// is not disabled.
+pub fn run_enable(project_root: &Path, home: &Path, opts: &ToggleOpts) -> Result<String, CliError> {
+    run_enable_with(
+        project_root,
+        home,
+        opts,
+        &detect_mcp_command(None),
+        &Externals::from_env(),
+    )
+}
+
+/// Like [`run_enable`], with the server command and the external environment
+/// supplied by the caller. Tests use this to stay deterministic and offline.
+pub fn run_enable_with(
+    project_root: &Path,
+    home: &Path,
+    opts: &ToggleOpts,
+    cmd: &McpCommand,
+    ext: &Externals,
+) -> Result<String, CliError> {
+    let (scope, auto_scope) = resolve_scope(project_root, opts.scope);
+    let resolved = resolve_platform(project_root, home, opts.platform.as_ref())?;
+    let platforms = expand_platform(&resolved);
+    let (scope, manifest_path) =
+        locate_manifest(project_root, home, scope, auto_scope, &platforms, "enable")?;
+    let mut manifest = load_manifest(&manifest_path);
+
+    let dir = scope_dir(project_root, home, scope);
+    if !manifest.disabled {
+        return Ok(format!(
+            "mushroomdb is already enabled in {}\n",
+            dir.display()
+        ));
+    }
+
+    let cmd = match cmd {
+        McpCommand::Explicit(p) => McpCommand::Explicit(absolutise_command(p, project_root)),
+        other => other.clone(),
+    };
+    let (cmd, launcher_note) = resolve_fast_command(&cmd, ext);
+    let cmd = &cmd;
+    let store = recover_store(&manifest, project_root, home, scope);
+    let had_git_hooks = !manifest.git_hooks.is_empty();
+
+    let ctx = Ctx {
+        project_root,
+        home,
+        scope,
+        store: &store,
+        cmd,
+        ext,
+        git_hooks: true,
+        prewarm: false,
+    };
+
+    let mut fresh = Manifest::default();
+    let mut notes: Vec<String> = Vec::new();
+    notes.extend(launcher_note);
+    for plat in &platforms {
+        match plat {
+            Platform::ClaudeCode => install_claude_code(&ctx, &mut fresh, &mut notes)?,
+            Platform::Cursor => install_cursor(&ctx, &mut fresh, &mut notes)?,
+            Platform::Codex => install_codex(&ctx, &mut fresh)?,
+            Platform::All => unreachable!("expand_platform never produces All"),
+        }
+    }
+
+    let repo_wiring = platforms
+        .iter()
+        .any(|p| matches!(p, Platform::ClaudeCode | Platform::Cursor));
+    if had_git_hooks && scope == Scope::Project && repo_wiring {
+        install_git_hooks(&ctx, &mut fresh)?;
+    }
+
+    // Fold this run's writes into the manifest: entries for files this run
+    // touched replace what was there before (the command may have re-resolved
+    // to a different path since `disable`); anything this run did not touch
+    // — a platform this call was not asked to enable — survives untouched.
+    let touched_mcp: Vec<&PathBuf> = fresh.mcp_keys.iter().map(|k| &k.file).collect();
+    manifest
+        .mcp_keys
+        .retain(|k| !touched_mcp.contains(&&k.file));
+    manifest.mcp_keys.extend(fresh.mcp_keys.iter().cloned());
+
+    let touched_hooks: Vec<(&PathBuf, &str)> = fresh
+        .hooks
+        .iter()
+        .map(|h| (&h.file, h.event.as_str()))
+        .collect();
+    manifest
+        .hooks
+        .retain(|h| !touched_hooks.contains(&(&h.file, h.event.as_str())));
+    manifest.hooks.extend(fresh.hooks.iter().cloned());
+
+    if !fresh.git_hooks.is_empty() {
+        manifest.git_hooks = fresh.git_hooks.clone();
+    }
+    manifest.codex |= fresh.codex;
+    for f in &fresh.files {
+        if !manifest.files.contains(f) {
+            manifest.files.push(f.clone());
+        }
+    }
+
+    manifest.disabled = false;
+    manifest.stashed_mcp.clear();
+    write_manifest(&manifest_path, &manifest)?;
+
+    let mut out = String::new();
+    for k in &fresh.mcp_keys {
+        out.push_str(&format!(
+            "enabled  mcpServers.{} in {}\n",
+            k.server,
+            k.file.display()
+        ));
+    }
+    for h in &fresh.hooks {
+        out.push_str(&format!(
+            "enabled  {} hook in {}\n",
+            h.event,
+            h.file.display()
+        ));
+    }
+    for g in &fresh.git_hooks {
+        out.push_str(&format!("enabled  git hook {}\n", g.display()));
+    }
+    if fresh.codex {
+        out.push_str(&format!("enabled  codex mcp server {SERVER_NAME}\n"));
+    }
+    for n in &notes {
+        out.push_str(&format!("  {n}\n"));
+    }
+    out.push_str(&format!("mushroomdb is enabled in {}\n", dir.display()));
     Ok(out)
 }
 
@@ -2080,7 +2475,7 @@ fn remove_mcp_key(mcp_file: &Path, server: &str) -> Result<bool, CliError> {
 // Manifest helpers
 // ---------------------------------------------------------------------------
 
-fn manifest_path(
+pub(crate) fn manifest_path(
     project_root: &Path,
     home: &Path,
     scope: Scope,
@@ -2125,6 +2520,19 @@ fn load_manifest(path: &Path) -> Manifest {
     serde_json::from_str::<Manifest>(&raw)
         .unwrap_or_default()
         .sanitised()
+}
+
+/// Whether an install at this scope has been turned off by `disable`. `false`
+/// for a scope with no manifest at all — `doctor` falls through to its normal
+/// "no config entry" checks in that case rather than reporting a disabled
+/// state that was never installed.
+pub(crate) fn is_disabled(
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
+    platforms: &[Platform],
+) -> bool {
+    load_manifest(&manifest_path(project_root, home, scope, platforms)).disabled
 }
 
 /// Union `existing` with `this_run`, deduplicating by path (files, git hooks),

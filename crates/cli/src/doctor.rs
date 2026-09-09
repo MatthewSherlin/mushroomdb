@@ -17,8 +17,9 @@
 
 use crate::install::{
     claude_mcp_file, cursor_mcp_file, default_db, entry_db, expand_platform, git_hooks_dir,
-    has_our_server, is_our_hook_command, line_runs_for_store, resolve_platform, resolve_scope,
-    Externals, Platform, Scope, StoreRef, AUTO_ARG, GIT_HOOKS, HOOK_BEGIN, HOOK_EVENT, TOUCH_EVENT,
+    has_our_server, is_disabled, is_our_hook_command, line_runs_for_store, resolve_platform,
+    resolve_scope, Externals, Platform, Scope, StoreRef, AUTO_ARG, GIT_HOOKS, HOOK_BEGIN,
+    HOOK_EVENT, TOUCH_EVENT,
 };
 use crate::CliError;
 use core_api::{GraphDb, GraphError, OpenOptions};
@@ -132,6 +133,17 @@ pub fn run_doctor_with(
     let (scope, _auto_scope) = resolve_scope(project_root, opts.scope);
     let resolved = resolve_platform(project_root, home, opts.platform.as_ref())?;
     let platforms = expand_platform(&resolved);
+
+    // A disabled install has no config to check — every check below it would
+    // report exactly what `disable` intentionally removed, which is not a
+    // failure. Report the state and stop; `warn` never sets the exit code.
+    if is_disabled(project_root, home, scope, &platforms) {
+        return Ok(DoctorReport {
+            output: Check::warn("state", "disabled — enable with: mushroomdb enable", None)
+                .render(),
+            had_fail: false,
+        });
+    }
 
     let mut checks: Vec<Check> = Vec::new();
     let mut primary: Option<(Platform, ConfigEntry)> = None;
