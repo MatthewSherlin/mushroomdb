@@ -293,7 +293,12 @@ fn resolve<F: Fs>(db: &GraphDb<F>, target: &str) -> Resolved {
 /// A scan of the `Symbol` nodes, which is what an exact-match lookup on a
 /// field with no index costs — and this runs only when the caller's target is
 /// not a key, so a tool call that names one never pays for it.
-fn named_symbols<F: Fs>(db: &GraphDb<F>, name: &str) -> Vec<String> {
+///
+/// Public because "does the graph know this bare name?" is asked outside
+/// `context` too — the `PreToolUse` grep redirect asks it of a search pattern —
+/// and both answers must come from the same lookup, or a redirect could point
+/// at an `explore` that then reports nothing.
+pub fn named_symbols<F: Fs>(db: &GraphDb<F>, name: &str) -> Vec<String> {
     let mut out: Vec<String> = db
         .nodes_with_label("Symbol")
         .iter()

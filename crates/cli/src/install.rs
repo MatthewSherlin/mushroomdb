@@ -515,6 +515,10 @@ pub struct InstallOpts {
     pub prewarm: bool,
     /// `--delivery cli|mcp|both`: which door the Claude Code install opens.
     pub delivery: Delivery,
+    /// `--intercept-grep`: also write the experimental `PreToolUse` hook that
+    /// redirects a `Grep` for a known symbol name to `explore`. Off by
+    /// default — it is the one hook of ours that can block a tool call.
+    pub intercept_grep: bool,
 }
 
 /// Options parsed from `mushroomdb enable [flags]` or `mushroomdb disable [flags]`.
@@ -982,6 +986,14 @@ struct Manifest {
     /// is what every manifest written before this field existed described.
     #[serde(default)]
     delivery: Delivery,
+    /// Whether this install asked for the experimental grep redirect. The
+    /// hook itself is listed in `hooks` like any other, so `uninstall` and
+    /// `disable` need nothing from this field; `enable` reads it to rebuild
+    /// the same install that was disabled, and `doctor` to know whether a
+    /// missing `PreToolUse` hook is a fault or the default. Defaults to
+    /// false, which is what every manifest written before it existed means.
+    #[serde(default)]
+    intercept_grep: bool,
 }
 
 impl Manifest {
@@ -1109,6 +1121,21 @@ const TOUCH_TIMEOUT_SECS: u64 = 30;
 /// once. It shares the prompt hook's [`HOOK_TIMEOUT_SECS`] budget.
 pub(crate) const BRIEF_EVENT: &str = "SessionStart";
 
+/// The optional fourth hook event: fires *before* a tool call, so a search the
+/// graph answers exactly can be turned into an `explore` before it runs.
+///
+/// Written only for `install --intercept-grep` (see
+/// [`InstallOpts::intercept_grep`]). It is the one hook of ours that can block
+/// a tool call — Claude Code reads exit 2 as "refuse this call, and give the
+/// model what stderr said" — so it is opt-in, awaited rather than `async`
+/// (nothing else could block the call), and on the prompt hook's short
+/// [`HOOK_TIMEOUT_SECS`] budget.
+pub(crate) const INTERCEPT_EVENT: &str = "PreToolUse";
+
+/// The one tool it fires for. A `Read`, an `Edit` or a `Bash` is never
+/// redirected: the graph has no better answer to those.
+const INTERCEPT_MATCHER: &str = "Grep";
+
 /// Single-quote `s` for embedding in a POSIX shell command line, escaping
 /// embedded single quotes as `'\''`. Claude Code runs a `type: "command"`
 /// hook through a shell, so an unquoted path containing whitespace or shell
@@ -1135,6 +1162,11 @@ fn brief_hook_command(shell: &str, store: &StoreRef) -> String {
     format!("{shell} brief {}", store.shell_arg())
 }
 
+/// The exact command string written into the grep-redirect hook entry.
+fn intercept_hook_command(shell: &str, store: &StoreRef) -> String {
+    format!("{shell} intercept {}", store.shell_arg())
+}
+
 /// One `hooks.<event>` array entry in Claude Code's settings.json shape.
 fn hook_entry(command: &str) -> serde_json::Value {
     serde_json::json!({ "hooks": [ { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS } ] })
@@ -1150,6 +1182,19 @@ fn touch_hook_entry(command: &str) -> serde_json::Value {
             "command": command,
             "timeout": TOUCH_TIMEOUT_SECS,
             "async": true
+        } ]
+    })
+}
+
+/// The `PreToolUse` entry: matched to `Grep` alone, and awaited — an `async`
+/// hook has already let the tool call through by the time it decides.
+fn intercept_hook_entry(command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "matcher": INTERCEPT_MATCHER,
+        "hooks": [ {
+            "type": "command",
+            "command": command,
+            "timeout": HOOK_TIMEOUT_SECS
         } ]
     })
 }
@@ -1390,6 +1435,9 @@ struct Ctx<'a> {
     /// Which door to open — see [`Delivery`]. Read by [`install_claude_code`],
     /// which is the only writer it changes.
     delivery: Delivery,
+    /// Whether to write the experimental grep redirect. Claude Code only —
+    /// it is a Claude Code hook.
+    intercept_grep: bool,
 }
 
 /// Anchor a user-supplied path to `base` when it is relative, and drop any
@@ -1520,6 +1568,7 @@ pub fn run_install_with(
         git_hooks: opts.git_hooks,
         prewarm: opts.prewarm && !package_fetched,
         delivery: opts.delivery,
+        intercept_grep: opts.intercept_grep,
     };
 
     let manifest_path = manifest_path(project_root, home, scope, &platforms);
@@ -1534,10 +1583,14 @@ pub fn run_install_with(
     // other drift, so the only extra step is clearing the flag once that
     // write lands, and saying so in the summary.
     let was_disabled = existing.disabled;
+    // Turning the redirect off writes nothing new, so the manifest would
+    // otherwise go on claiming a hook this run just removed.
+    let intercept_changed = existing.intercept_grep != opts.intercept_grep;
 
     let mut manifest = Manifest {
         requested_cmd,
         delivery: opts.delivery,
+        intercept_grep: opts.intercept_grep,
         ..Manifest::default()
     };
     let mut notes: Vec<String> = Vec::new();
@@ -1559,7 +1612,7 @@ pub fn run_install_with(
     }
 
     let anything_written = !manifest.is_empty();
-    if anything_written || was_disabled {
+    if anything_written || was_disabled || intercept_changed {
         // Union this-run entries with the existing manifest (dedup by path/key).
         let mut merged = if anything_written {
             union_manifests(existing, &manifest)
@@ -1575,6 +1628,12 @@ pub fn run_install_with(
         // claiming a key that is no longer there.
         if !opts.delivery.wires_mcp() {
             merged.mcp_keys.retain(|k| has_our_server(&k.file));
+        }
+        // Same for the redirect: an install without the flag has just taken
+        // the hook off disk, so the manifest must stop owning it.
+        merged.intercept_grep = opts.intercept_grep;
+        if !opts.intercept_grep {
+            merged.hooks.retain(|h| h.event != INTERCEPT_EVENT);
         }
         write_manifest(&manifest_path, &merged)?;
     }
@@ -2195,6 +2254,9 @@ pub fn run_enable_with(
         // `cli` install has no server to put back, and its skill is the one
         // that teaches the binary.
         delivery: manifest.delivery,
+        // Likewise the redirect: `enable` never adds an experiment the
+        // install it is restoring never had.
+        intercept_grep: manifest.intercept_grep,
     };
 
     let mut fresh = Manifest::default();
@@ -2606,6 +2668,35 @@ fn install_claude_code(
         hook_entry(&brief),
         manifest,
     )?;
+
+    // The fourth hook is opt-in, and an install that does not ask for it takes
+    // back any earlier one of ours for this store — otherwise the experiment
+    // could only ever be turned on.
+    let intercept = intercept_hook_command(&shell, store);
+    if ctx.intercept_grep {
+        if remove_stale_hooks(
+            &settings_file,
+            INTERCEPT_EVENT,
+            "intercept",
+            store,
+            &intercept,
+        )? {
+            notes.push(format!("replaced stale {INTERCEPT_EVENT} hook"));
+        }
+        merge_hook_entry(
+            &settings_file,
+            INTERCEPT_EVENT,
+            &intercept,
+            intercept_hook_entry(&intercept),
+            manifest,
+        )?;
+    } else if drop_hooks(&settings_file, INTERCEPT_EVENT, |c| {
+        is_our_hook_command(c, "intercept", store)
+    })? {
+        notes.push(format!(
+            "removed {INTERCEPT_EVENT} hook — no --intercept-grep"
+        ));
+    }
 
     Ok(())
 }
@@ -3106,6 +3197,18 @@ pub(crate) fn is_disabled(
     load_manifest(&manifest_path(project_root, home, scope, platforms)).disabled
 }
 
+/// Whether an install at this scope asked for the experimental grep redirect.
+/// `false` for a scope with no manifest, and for every manifest written before
+/// the flag existed — `doctor` reports the hook only where one was asked for.
+pub(crate) fn intercept_installed(
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
+    platforms: &[Platform],
+) -> bool {
+    load_manifest(&manifest_path(project_root, home, scope, platforms)).intercept_grep
+}
+
 /// Union `existing` with `this_run`, deduplicating by path (files, git hooks),
 /// by (file, server) pair (mcp_keys), and by full equality (hooks, lines).
 /// Entries from `this_run` win on collision so the manifest always reflects
@@ -3148,6 +3251,9 @@ fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
     // is how a user changes it, and the manifest has to describe what is on
     // disk now, not what an earlier run put there.
     existing.delivery = this_run.delivery;
+    // Same rule for the redirect (and `run_install_with` prunes the hook entry
+    // when the latest run turned it off).
+    existing.intercept_grep = this_run.intercept_grep;
     existing
 }
 

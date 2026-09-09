@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod export;
 pub mod ingest_git;
 pub mod install;
+pub mod intercept;
 pub mod recall;
 pub mod structure;
 
@@ -345,6 +346,14 @@ pub enum Command {
         /// counts reach an assistant without being parsed back out of prose.
         json: bool,
     },
+    /// Body of the optional `PreToolUse` hook: reads a `Grep` tool call on
+    /// stdin and exits 2 with a message when the pattern names a symbol the
+    /// graph holds, so the search becomes an `explore`. Off unless
+    /// `install --intercept-grep` wired it.
+    Intercept {
+        db_dir: Option<PathBuf>,
+        auto: bool,
+    },
     /// Re-extract named files only. Body of the PostToolUse hook, which reads
     /// the paths off a payload on stdin when none are given on the command line.
     Touch {
@@ -442,10 +451,12 @@ mushroomdb — embedded graph database
 Usage:
   mushroomdb install [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
                      [--command <path>] [--no-git-hooks] [--no-prewarm]
-                     [--delivery cli|mcp|both]
+                     [--delivery cli|mcp|both] [--intercept-grep]
                      --delivery cli writes the skill and the hooks and registers no MCP
                      server: the skill teaches `mushroomdb <command>` instead (claude-code
                      only; cursor and codex are always registered as MCP servers)
+                     --intercept-grep adds an experimental PreToolUse hook (matcher Grep)
+                     that redirects a search for a known symbol name to `explore`
   mushroomdb uninstall [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
   mushroomdb disable [--platform claude-code|cursor|codex|all] [--project|--user]
                      turn an install off without removing it: hooks, MCP entry and git hook
@@ -490,6 +501,10 @@ Usage:
   mushroomdb touch <db-dir>|--auto [<file>...]
                                    re-extract just these files; with no <file> reads them from a
                                    PostToolUse payload on stdin (hook body)
+  mushroomdb intercept <db-dir>|--auto
+                                   hook body: reads a PreToolUse Grep payload on stdin; exits 2
+                                   with a one-line pointer to `explore` when the pattern names a
+                                   symbol the graph holds, else exits 0 in silence
   mushroomdb suggest <db-dir>
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
@@ -548,6 +563,7 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
     let mut git_hooks = true;
     let mut prewarm = true;
     let mut delivery = install::Delivery::default();
+    let mut intercept_grep = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -587,6 +603,9 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
         } else if a == "--no-git-hooks" {
             git_hooks = false;
             i += 1;
+        } else if a == "--intercept-grep" {
+            intercept_grep = true;
+            i += 1;
         } else if a == "--no-prewarm" {
             prewarm = false;
             i += 1;
@@ -624,6 +643,7 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
         git_hooks,
         prewarm,
         delivery,
+        intercept_grep,
     })
 }
 
@@ -816,6 +836,8 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
             .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
         "brief" => parse_dir_or_auto("brief", &args[1..])
             .map(|(db_dir, auto)| Command::Brief { db_dir, auto }),
+        "intercept" => parse_dir_or_auto("intercept", &args[1..])
+            .map(|(db_dir, auto)| Command::Intercept { db_dir, auto }),
         "sync" => parse_sync(&args[1..]),
         "map" => parse_dir_with_json("map", &args[1..])
             .map(|(db_dir, json)| Command::Map { db_dir, json }),
@@ -3056,6 +3078,48 @@ mod tests {
                 check: |r| match r {
                     Err(e) => assert!(e.contains("--delivery must be cli | mcp | both"), "{e}"),
                     other => panic!("a bad --delivery must be refused, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["install", "--intercept-grep"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(opts.intercept_grep),
+                    other => panic!("install --intercept-grep, got {other:?}"),
+                },
+            },
+            Case {
+                // The experiment is off unless it is asked for by name.
+                args: &["install"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(!opts.intercept_grep),
+                    other => panic!("install, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["intercept", "--auto"],
+                check: |r| match r {
+                    Ok(Command::Intercept { db_dir, auto }) => {
+                        assert_eq!(db_dir, None);
+                        assert!(auto);
+                    }
+                    other => panic!("intercept --auto, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["intercept", "/tmp/db"],
+                check: |r| match r {
+                    Ok(Command::Intercept { db_dir, auto }) => {
+                        assert_eq!(db_dir, Some(PathBuf::from("/tmp/db")));
+                        assert!(!auto);
+                    }
+                    other => panic!("intercept /tmp/db, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["intercept"],
+                check: |r| match r {
+                    Err(e) => assert!(e.contains("intercept requires <db-dir> or --auto"), "{e}"),
+                    other => panic!("intercept with no store, got {other:?}"),
                 },
             },
         ];

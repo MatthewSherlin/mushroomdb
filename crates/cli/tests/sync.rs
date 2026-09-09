@@ -902,6 +902,7 @@ fn install_from_a_worktree_writes_hooks_to_the_common_dir() {
         git_hooks: true,
         prewarm: false,
         delivery: Delivery::Both,
+        intercept_grep: false,
     };
     let summary = run_install_with(
         &wt,
@@ -1045,6 +1046,7 @@ fn install_in_a_submodule_keeps_the_submodule_hooks() {
             git_hooks: true,
             prewarm: false,
             delivery: Delivery::Both,
+            intercept_grep: false,
         },
         &McpCommand::Explicit(bin),
         &Externals::with_path(None),

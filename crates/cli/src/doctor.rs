@@ -17,9 +17,9 @@
 
 use crate::install::{
     claude_mcp_file, cursor_mcp_file, default_db, entry_db, expand_platform, git_hooks_dir,
-    has_our_server, installed_shape, is_disabled, is_our_hook_command, line_runs_for_store,
-    resolve_platform, resolve_scope, Externals, Platform, Scope, StoreRef, AUTO_ARG, BRIEF_EVENT,
-    GIT_HOOKS, HOOK_BEGIN, HOOK_EVENT, TOUCH_EVENT,
+    has_our_server, installed_shape, intercept_installed, is_disabled, is_our_hook_command,
+    line_runs_for_store, resolve_platform, resolve_scope, Externals, Platform, Scope, StoreRef,
+    AUTO_ARG, BRIEF_EVENT, GIT_HOOKS, HOOK_BEGIN, HOOK_EVENT, INTERCEPT_EVENT, TOUCH_EVENT,
 };
 use crate::CliError;
 use core_api::{GraphDb, GraphError, OpenOptions};
@@ -244,6 +244,12 @@ pub fn run_doctor_with(
     if platforms.contains(&Platform::ClaudeCode) {
         if let Some(store) = &store {
             checks.push(check_hooks(project_root, home, scope, store));
+            // The fourth hook is opt-in, so it earns a line only where the
+            // manifest says this install asked for it. Reporting it otherwise
+            // would say something about every install that is true of none.
+            if intercept_installed(project_root, home, scope, &platforms) {
+                checks.push(check_intercept(project_root, home, scope, store));
+            }
         }
     }
 
@@ -656,6 +662,30 @@ fn check_hooks(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef)
                 settings_file.display()
             ),
             Some("mushroomdb install --platform claude-code".to_string()),
+        )
+    }
+}
+
+/// The experimental grep redirect, for an install whose manifest asked for it.
+fn check_intercept(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef) -> Check {
+    let settings_file = match scope {
+        Scope::Project => project_root.join(".claude").join("settings.json"),
+        Scope::User => home.join(".claude").join("settings.json"),
+    };
+    let root = read_json(&settings_file).unwrap_or(Js::Null);
+    if has_hook_matching(&root, INTERCEPT_EVENT, "intercept", store) {
+        Check::ok(
+            "intercept",
+            format!(
+                "{INTERCEPT_EVENT} (Grep) present in {}",
+                settings_file.display()
+            ),
+        )
+    } else {
+        Check::warn(
+            "intercept",
+            format!("missing {INTERCEPT_EVENT} in {}", settings_file.display()),
+            Some("mushroomdb install --platform claude-code --intercept-grep".to_string()),
         )
     }
 }

@@ -56,7 +56,8 @@ mod why;
 pub use brief::{brief, BriefOptions, BriefReport};
 pub use concepts::stale_concepts;
 pub use context::{
-    context, context_with, CallSites, ContextOptions, ContextReport, Target, MAX_SOURCE_LINES,
+    context, context_with, named_symbols, CallSites, ContextOptions, ContextReport, Target,
+    MAX_SOURCE_LINES,
 };
 pub use explore::{explore, Depth, ExploreReport};
 pub use impact::{

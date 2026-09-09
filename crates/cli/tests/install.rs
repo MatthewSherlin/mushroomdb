@@ -94,6 +94,7 @@ fn base_opts() -> InstallOpts {
         git_hooks: true,
         prewarm: false,
         delivery: Delivery::Both,
+        intercept_grep: false,
     }
 }
 
@@ -3146,5 +3147,135 @@ fn reinstalling_as_cli_removes_the_server_the_earlier_install_registered() {
     assert!(
         skill.contains("--depth context|impact|history|all"),
         "the skill must have been rewritten for the new door:\n{skill}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: --intercept-grep adds a fourth hook, and nothing else does
+// ---------------------------------------------------------------------------
+
+/// The experiment is opt-in, so the default install must leave `PreToolUse`
+/// entirely absent — not present and empty, which would still be a hook array
+/// the user did not ask for.
+#[test]
+fn default_install_writes_no_pretooluse_hook() {
+    let root = temp_dir("no-intercept");
+    let home = temp_dir("no-intercept-home");
+    git_repo(&root);
+
+    install_on_path(
+        &root,
+        &home,
+        &InstallOpts {
+            platform: Some(Platform::ClaudeCode),
+            scope: Some(Scope::Project),
+            ..base_opts()
+        },
+    )
+    .expect("install failed");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        s["hooks"].get("PreToolUse").is_none(),
+        "an install nobody asked for the redirect wrote one: {s}"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["intercept_grep"], false, "{manifest}");
+}
+
+#[test]
+fn intercept_grep_writes_a_grep_matched_pretooluse_hook() {
+    let root = temp_dir("intercept");
+    let home = temp_dir("intercept-home");
+    git_repo(&root);
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        intercept_grep: true,
+        ..base_opts()
+    };
+
+    let out = install_on_path(&root, &home, &opts).expect("install failed");
+    assert!(out.contains("added  PreToolUse hook"), "{out}");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    let group = &s["hooks"]["PreToolUse"][0];
+    assert_eq!(group["matcher"], "Grep");
+    let hook = &group["hooks"][0];
+    assert_eq!(hook["command"], "mushroomdb intercept --auto");
+    assert_eq!(hook["timeout"], 5);
+    assert!(
+        hook.get("async").is_none(),
+        "the decision is awaited — an async hook cannot block a tool call: {hook}"
+    );
+    // The three standing hooks are untouched by the fourth.
+    assert!(s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .is_some_and(|c| c.ends_with("recall --auto")));
+
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["intercept_grep"], true, "{manifest}");
+
+    // Manifest-driven, like every other hook: uninstall takes it back out.
+    run_uninstall(&root, &home, &opts).expect("uninstall failed");
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        s["hooks"].get("PreToolUse").is_none(),
+        "the redirect survived uninstall: {s}"
+    );
+}
+
+/// Re-installing without the flag turns the experiment off: the hook goes, and
+/// the manifest stops claiming it — otherwise `doctor` would keep reporting a
+/// redirect that is no longer wired.
+#[test]
+fn reinstalling_without_the_flag_removes_the_redirect() {
+    let root = temp_dir("intercept-off");
+    let home = temp_dir("intercept-off-home");
+    git_repo(&root);
+    let on = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        intercept_grep: true,
+        ..base_opts()
+    };
+    install_on_path(&root, &home, &on).expect("install with the redirect");
+
+    install_on_path(
+        &root,
+        &home,
+        &InstallOpts {
+            intercept_grep: false,
+            ..on
+        },
+    )
+    .expect("install without it");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        s["hooks"].get("PreToolUse").is_none(),
+        "the redirect survived an install that did not ask for it: {s}"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["intercept_grep"], false, "{manifest}");
+    assert!(
+        !manifest["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["event"] == "PreToolUse"),
+        "the manifest still owns a hook that is gone: {manifest}"
     );
 }

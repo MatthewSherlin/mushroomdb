@@ -51,6 +51,26 @@ fn main() -> ExitCode {
             let _ = stdout.flush();
             ExitCode::SUCCESS
         }
+        Ok(Command::Intercept { db_dir, auto }) => {
+            // Claude Code reads exit 2 as "block this tool call, and give the
+            // model what stderr said"; every other outcome — no opinion, a
+            // store that will not open, a payload that will not parse, a panic
+            // — is exit 0 and not one byte written, so a hook of ours can
+            // never be why a search did not run.
+            let mut raw = String::new();
+            let _ = io::stdin().read_to_string(&mut raw);
+            match silently(|| cli::intercept::run_intercept(&resolve_db(db_dir, auto), &raw))
+                .flatten()
+            {
+                Some(message) => {
+                    let mut stderr = io::stderr();
+                    let _ = writeln!(stderr, "{message}");
+                    let _ = stderr.flush();
+                    ExitCode::from(2)
+                }
+                None => ExitCode::SUCCESS,
+            }
+        }
         Ok(Command::Map { db_dir, json }) => match cli::run_map(&db_dir, json) {
             Ok(out) => {
                 print!("{out}");

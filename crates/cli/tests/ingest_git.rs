@@ -1831,6 +1831,7 @@ fn the_reach_line_on_a_cli_delivery_install_names_only_the_binary() {
             git_hooks: true,
             prewarm: false,
             delivery: cli::install::Delivery::Cli,
+            intercept_grep: false,
         },
         &cli::install::McpCommand::OnPath,
         &cli::install::Externals::with_path(None),

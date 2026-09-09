@@ -75,6 +75,7 @@ fn base_opts() -> InstallOpts {
         git_hooks: true,
         prewarm: false,
         delivery: Delivery::Both,
+        intercept_grep: false,
     }
 }
 
@@ -808,4 +809,63 @@ fn enable_restores_a_cli_delivery_install_without_a_server() {
         post_commit.contains(&db.display().to_string()),
         "{post_commit}"
     );
+}
+
+/// The fourth hook is the manifest's to remember: `disable` takes it off disk
+/// like the other three, and `enable` puts back exactly the install that was
+/// disabled — with the redirect if it had one, without if it did not.
+#[test]
+fn enable_restores_the_grep_redirect_only_when_the_install_had_one() {
+    for intercept_grep in [true, false] {
+        let label = if intercept_grep { "on" } else { "off" };
+        let root = temp_dir(&format!("intercept-{label}"));
+        let home = temp_dir(&format!("intercept-{label}-home"));
+        let db = root.join("mushroom-memory");
+        git_repo(&root);
+        let opts = InstallOpts {
+            intercept_grep,
+            ..claude_project_opts(&db)
+        };
+        install_on_path(&root, &home, &opts).expect("install");
+
+        run_disable_with(
+            &root,
+            &home,
+            &toggle(Platform::ClaudeCode, Scope::Project),
+            &no_externals(),
+        )
+        .expect("disable");
+        let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
+        assert!(
+            settings["hooks"]["PreToolUse"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(true),
+            "the redirect survived disable: {settings}"
+        );
+
+        run_enable_with(
+            &root,
+            &home,
+            &toggle(Platform::ClaudeCode, Scope::Project),
+            &McpCommand::OnPath,
+            &no_externals(),
+        )
+        .expect("enable");
+
+        let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
+        let restored = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .map(str::to_string);
+        if intercept_grep {
+            assert_eq!(
+                restored.as_deref(),
+                Some(format!("mushroomdb intercept '{}'", db.display()).as_str()),
+                "{settings}"
+            );
+            assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Grep");
+        } else {
+            assert_eq!(restored, None, "enable invented a redirect: {settings}");
+        }
+    }
 }

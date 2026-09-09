@@ -66,6 +66,7 @@ fn install_opts(scope: Scope, db: &Path, command: &Path) -> InstallOpts {
         git_hooks: true,
         prewarm: false,
         delivery: Delivery::Both,
+        intercept_grep: false,
     }
 }
 
@@ -201,6 +202,7 @@ fn doctor_understands_auto_entries() {
         git_hooks: true,
         prewarm: false,
         delivery: Delivery::Both,
+        intercept_grep: false,
     };
     run_install_with(
         &root,
@@ -420,5 +422,47 @@ fn doctor_on_cli_delivery_skips_handshake_and_passes() {
             "{name} check: {check}\nfull output:\n{}",
             report.output
         );
+    }
+}
+
+/// The redirect is opt-in, so `doctor` reports it only when the manifest says
+/// this install asked for it. A report line for a hook nobody wired would say
+/// nothing true about the install in front of it.
+#[test]
+fn doctor_reports_the_grep_redirect_only_when_it_is_installed() {
+    for intercept_grep in [true, false] {
+        let label = if intercept_grep { "on" } else { "off" };
+        let root = temp_dir(&format!("intercept-{label}"));
+        let home = temp_dir(&format!("intercept-{label}-home"));
+        git_repo(&root);
+        let db = root.join("mushroom-memory");
+        let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+
+        let opts = InstallOpts {
+            intercept_grep,
+            ..install_opts(Scope::Project, &db, &bin)
+        };
+        run_install_with(
+            &root,
+            &home,
+            &opts,
+            &McpCommand::Explicit(bin),
+            &no_externals(),
+        )
+        .expect("install failed");
+
+        let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+            .expect("doctor errored");
+        let line = report
+            .output
+            .lines()
+            .find(|l| l.split_whitespace().nth(1) == Some("intercept"));
+        if intercept_grep {
+            let line = line.unwrap_or_else(|| panic!("no intercept check:\n{}", report.output));
+            assert!(line.starts_with("ok"), "{line}");
+            assert!(line.contains("PreToolUse"), "{line}");
+        } else {
+            assert_eq!(line, None, "unasked-for line:\n{}", report.output);
+        }
     }
 }
