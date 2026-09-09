@@ -203,9 +203,9 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
             verify = "no run"
         lines.append(
             f"| {r['task']}{flag} | {r.get('key') or '-'} | {r['arm']} | {r['rep']} |"
-            f" {r['input_tokens']} |"
-            f" {r['output_tokens']} | {r['cache_read_tokens']} |"
-            f" {r['cache_creation_tokens']} | {r['total_tokens']} |"
+            f" {fmt(r['input_tokens'])} |"
+            f" {fmt(r['output_tokens'])} | {fmt(r['cache_read_tokens'])} |"
+            f" {fmt(r['cache_creation_tokens'])} | {fmt(r['total_tokens'])} |"
             f" {fmt(r.get('cache_hit_ratio'), 3)} |"
             f" {r['tool_calls_total']} | {r['mcp_calls']} |"
             f" {r.get('graph_calls', 0)} | {r.get('tool_search_calls', 0)} |"

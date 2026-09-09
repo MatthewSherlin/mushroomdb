@@ -21,6 +21,20 @@ def test_usage_of_zero_context_has_zero_ratio():
     assert usage_of({"usage": {}})["cache_hit_ratio"] == 0.0
 
 
+def test_usage_of_missing_result_is_none_not_zero():
+    from run import usage_of
+    u = usage_of(None)
+    for key in ("input_tokens", "output_tokens", "cache_read_tokens",
+                "cache_creation_tokens", "total_tokens", "cache_hit_ratio"):
+        assert u[key] is None, f"{key} should be None, got {u[key]!r}"
+    # A present result event with an empty usage dict still yields zeros,
+    # not None — the cell ran, it just used nothing new.
+    u2 = usage_of({"usage": {}})
+    for key in ("input_tokens", "output_tokens", "cache_read_tokens",
+                "cache_creation_tokens", "total_tokens"):
+        assert u2[key] == 0
+
+
 def test_parse_stream_counts_tool_search_and_graph_calls(tmp_path):
     from run import parse_stream
     events = [

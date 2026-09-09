@@ -131,7 +131,25 @@ def parse_stream(path: Path) -> dict:
 
 
 def usage_of(result_event: dict | None) -> dict:
-    u = (result_event or {}).get("usage") or {}
+    """Token counts for one cell's `result` event.
+
+    `None` for every field when there is no result event at all (a timeout
+    or a hard error killed the cell before it produced one) — those cells
+    used an unknown, not zero, amount of tokens, and a zero would drag the
+    mean toward a number the dead cell never earned. A result event that
+    *did* arrive, even with an empty `usage` dict, yields real zeros: the
+    cell ran and used nothing new.
+    """
+    if result_event is None:
+        return {
+            "input_tokens": None,
+            "output_tokens": None,
+            "cache_read_tokens": None,
+            "cache_creation_tokens": None,
+            "total_tokens": None,
+            "cache_hit_ratio": None,
+        }
+    u = result_event.get("usage") or {}
     tin = int(u.get("input_tokens") or 0)
     tout = int(u.get("output_tokens") or 0)
     cr = int(u.get("cache_read_input_tokens") or 0)
