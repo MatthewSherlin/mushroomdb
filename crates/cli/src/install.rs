@@ -57,6 +57,13 @@ const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// point is to pay that cost here rather than at the assistant's first prompt.
 const PREWARM_TIMEOUT_SECS: u64 = 180;
 
+/// The Node runtime a resolved launcher is handed to. Looked up on PATH: any
+/// machine with `npx` has it, since npm ships with Node.
+const NODE_BIN: &str = "node";
+
+/// The flag the npm launcher answers with its own absolute path.
+const PRINT_LAUNCHER_FLAG: &str = "--print-launcher";
+
 // ---------------------------------------------------------------------------
 // How the server is invoked
 // ---------------------------------------------------------------------------
@@ -73,9 +80,23 @@ const PREWARM_TIMEOUT_SECS: u64 = 180;
 /// lets `npx` fetch it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpCommand {
-    /// `npx -y mushroomdb@<version> …` — the default, and the only form that
-    /// works from a machine where nothing is installed globally.
+    /// `npx -y mushroomdb@<version> …` — the fallback when the package cannot
+    /// be located, and the only form that works from a machine where nothing
+    /// is installed globally.
     Npx { version: String },
+    /// `node <launcher.js> …` — the same published package, resolved to a
+    /// concrete path once at install time instead of on every invocation.
+    ///
+    /// `npx` re-checks its cache, resolves the version and spawns a Node
+    /// process before the first byte of work: measured at 514 ms warm against
+    /// 118 ms for `node <launcher>`. A hook pays that on every prompt and
+    /// every edit, so install pays it once and writes down the answer.
+    NodeLauncher {
+        /// Absolute path to the package's `bin` script.
+        launcher: PathBuf,
+        /// The version it was resolved from; re-resolved on upgrade.
+        version: String,
+    },
     /// An absolute path the user named with `--command`.
     Explicit(PathBuf),
     /// `mushroomdb` resolves on PATH *and* is this executable: the bare name
@@ -99,6 +120,10 @@ impl McpCommand {
                 "npx".to_string(),
                 vec!["-y".to_string(), format!("{NPM_PACKAGE}@{version}")],
             ),
+            McpCommand::NodeLauncher { launcher, .. } => (
+                NODE_BIN.to_string(),
+                vec![launcher.to_string_lossy().into_owned()],
+            ),
             McpCommand::Explicit(p) => (p.to_string_lossy().into_owned(), Vec::new()),
             McpCommand::OnPath => (BIN_NAME.to_string(), Vec::new()),
         }
@@ -121,8 +146,9 @@ impl McpCommand {
     /// quoted where quoting is needed.
     ///
     /// Hook entries and the skill's copy-paste lines are read by a shell, so
-    /// an explicit path has to survive a space in it. The bare name and the
-    /// `npx` form contain no metacharacters and are left as they read.
+    /// an explicit path — and a resolved launcher path, which lives wherever
+    /// npm put it — has to survive a space in it. The bare name and the `npx`
+    /// form contain no metacharacters and are left as they read.
     #[must_use]
     pub fn shell(&self) -> String {
         let (command, args) = self.program();
@@ -132,7 +158,10 @@ impl McpCommand {
         };
         for a in args {
             out.push(' ');
-            out.push_str(&a);
+            match self {
+                McpCommand::NodeLauncher { .. } => out.push_str(&sh_quote(&a)),
+                _ => out.push_str(&a),
+            }
         }
         out
     }
@@ -570,6 +599,116 @@ fn run_with_timeout(bin: &Path, args: &[String], timeout: Duration) -> Result<()
             return Err(format!("timed out after {}s", timeout.as_secs()));
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Run `bin`, capturing stdout and giving up after `timeout`.
+///
+/// The pipe is drained on another thread so a child that writes more than a
+/// pipe buffer cannot deadlock against the timeout loop watching it.
+fn capture_with_timeout(bin: &Path, args: &[String], timeout: Duration) -> Result<String, String> {
+    let mut child = std::process::Command::new(bin)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        let _ = tx.send(out);
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                return Ok(rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default());
+            }
+            Ok(Some(status)) => return Err(format!("exited with {status}")),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {}s", timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => return Err(format!("cannot wait for {}: {e}", bin.display())),
+        }
+    }
+}
+
+/// Ask the published package where its launcher script is, once.
+///
+/// `npx -y mushroomdb@<v> --print-launcher` prints the absolute path of the
+/// `bin` script npm installed, which is a stable file for as long as that
+/// version stays in the npx cache. Writing `node <that path>` into the hooks
+/// takes the whole npx resolution — cache check, version resolve, an extra
+/// Node process — off the per-prompt and per-edit path.
+///
+/// Chosen over `npm root -g` (only finds a *global* install, which the npx
+/// route never makes) and over `npm exec --offline` (still pays npm's own
+/// startup on every call). Asking the package itself is the one answer that is
+/// correct for however it was installed, and it is the same command the
+/// pre-warm already ran, so it costs an install nothing extra.
+///
+/// Every failure is recoverable: the caller keeps the `npx` form.
+fn resolve_launcher(version: &str, ext: &Externals) -> Result<PathBuf, String> {
+    let npx = ext
+        .which("npx")
+        .ok_or_else(|| "npx is not on PATH".to_string())?;
+    if ext.which(NODE_BIN).is_none() {
+        return Err(format!("{NODE_BIN} is not on PATH"));
+    }
+    let args = vec![
+        "-y".to_string(),
+        format!("{NPM_PACKAGE}@{version}"),
+        PRINT_LAUNCHER_FLAG.to_string(),
+    ];
+    let out = capture_with_timeout(&npx, &args, ext.prewarm_timeout)?;
+    // The last non-blank line: npm is entitled to print notices before it.
+    let path = out
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .ok_or_else(|| format!("{NPM_PACKAGE}@{version} {PRINT_LAUNCHER_FLAG} printed nothing"))?;
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(format!("{} is not an absolute path", path.display()));
+    }
+    if !path.is_file() {
+        return Err(format!("{} does not exist", path.display()));
+    }
+    Ok(path)
+}
+
+/// Turn an `npx` command into a resolved `node <launcher>` one where that is
+/// possible, so the hooks it writes do not spawn `npx` on every invocation.
+///
+/// Returns the command to write and, when the resolution failed, the one-line
+/// warning to put in the summary. Anything other than the `npx` form is
+/// already a direct path and is handed back untouched.
+fn resolve_fast_command(cmd: &McpCommand, ext: &Externals) -> (McpCommand, Option<String>) {
+    let McpCommand::Npx { version } = cmd else {
+        return (cmd.clone(), None);
+    };
+    match resolve_launcher(version, ext) {
+        Ok(launcher) => (
+            McpCommand::NodeLauncher {
+                launcher,
+                version: version.clone(),
+            },
+            None,
+        ),
+        Err(e) => (
+            cmd.clone(),
+            Some(format!(
+                "warning: could not resolve the {NPM_PACKAGE}@{version} launcher ({e}) — \
+                 the hooks will spawn npx on every prompt and every edit"
+            )),
+        ),
     }
 }
 
@@ -1019,10 +1158,20 @@ pub fn run_install_with(
     let store = store_ref(project_root, home, scope, opts.db.as_deref());
     // Whatever the caller handed us, what gets written resolves from anywhere:
     // an absolute path, or a name PATH answers for.
-    let cmd = &match cmd {
+    let cmd = match cmd {
         McpCommand::Explicit(p) => McpCommand::Explicit(absolutise_command(p, project_root)),
         other => other.clone(),
     };
+    // Resolve the published package to a concrete launcher once, here, so no
+    // hook has to. Skipped by `--no-prewarm`, which is the flag for "do not
+    // reach the network during this install"; the `npx` form still works, it
+    // is just slower on every invocation.
+    let (cmd, launcher_note) = if opts.prewarm {
+        resolve_fast_command(&cmd, ext)
+    } else {
+        (cmd, None)
+    };
+    let cmd = &cmd;
 
     let resolved = resolve_platform(project_root, home, opts.platform.as_ref())?;
     let platforms = expand_platform(&resolved);
@@ -1054,6 +1203,7 @@ pub fn run_install_with(
 
     let mut manifest = Manifest::default();
     let mut notes: Vec<String> = Vec::new();
+    notes.extend(launcher_note);
 
     let outcome = write_everything(&ctx, &platforms, &mut manifest, &mut notes);
     if let Err(e) = outcome {
@@ -1395,8 +1545,9 @@ pub(crate) fn cursor_mcp_file(project_root: &Path, home: &Path, scope: Scope) ->
 /// which is either a path or `--auto`.
 ///
 /// Its position moved between versions — 0.5.x wrote `["mcp", db]`, the npx
-/// form writes `["-y", "mushroomdb@x.y.z", "mcp", db]` — so the subcommand is
-/// what locates it, not an index.
+/// form writes `["-y", "mushroomdb@x.y.z", "mcp", db]`, a resolved launcher
+/// writes `["<launcher>", "mcp", "--auto"]` — so the subcommand is what
+/// locates it, not an index.
 pub(crate) fn entry_db(entry: &serde_json::Value) -> Option<&str> {
     let args = entry["args"].as_array()?;
     let at = args.iter().position(|a| a == "mcp")?;
@@ -1759,6 +1910,10 @@ fn install_git_hooks(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliEr
 /// Best effort in every direction: it only applies to the `npx` form, it is
 /// skipped when asked to be, and a failure is a line in the summary rather
 /// than a failed install — the entry that was written is correct either way.
+///
+/// A resolved launcher needs none of this: [`resolve_launcher`] ran the very
+/// same fetch to find the path it wrote, so the package is already warm and
+/// the match below falls straight through.
 fn prewarm(ctx: &Ctx<'_>) -> Option<String> {
     if !ctx.prewarm {
         return None;

@@ -1,0 +1,46 @@
+#!/bin/sh
+# mushroomdb plugin hooks: run the package, without paying npx every time.
+#
+# `npx -y mushroomdb@<version> …` costs about half a second before it does any
+# work — a cache check, a version resolve and a Node process of its own — and
+# the hooks that call it fire on every prompt and every file edit. This script
+# pays that once, writes down where the package put its launcher, and execs
+# `node <launcher>` from then on (about a tenth of the time).
+#
+# The cache is one line of text under $CLAUDE_PLUGIN_DATA (or ~/.mushroomdb),
+# named for the version that wrote it, so a plugin upgrade resolves afresh
+# rather than running the old copy. Every failure falls through to the plain
+# `npx` form, which is slower and always correct.
+#
+# Rendered from scripts/plugin-templates/run.sh.tmpl — edit that, then run
+# scripts/render-plugin.sh.
+set -u
+
+VERSION='0.6.0'
+PKG="mushroomdb@${VERSION}"
+CACHE_DIR="${CLAUDE_PLUGIN_DATA:-${HOME:-/tmp}/.mushroomdb}"
+CACHE="${CACHE_DIR}/launcher-${VERSION}"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# 1. The cached answer, if the file it names is still there. npm's cache can
+#    be pruned out from under us, so the path is checked, never trusted.
+if [ -f "$CACHE" ] && have node; then
+  launcher=$(cat "$CACHE" 2>/dev/null) || launcher=''
+  if [ -n "$launcher" ] && [ -f "$launcher" ]; then
+    exec node "$launcher" "$@"
+  fi
+fi
+
+# 2. Ask the package itself where it is, and remember the answer. A version
+#    that predates --print-launcher prints nothing and falls through.
+if have npx && have node; then
+  launcher=$(npx -y "$PKG" --print-launcher 2>/dev/null | tail -n 1)
+  if [ -n "$launcher" ] && [ -f "$launcher" ]; then
+    (mkdir -p "$CACHE_DIR" && printf '%s\n' "$launcher" >"$CACHE") 2>/dev/null
+    exec node "$launcher" "$@"
+  fi
+fi
+
+# 3. Whatever went wrong above, the slow form still works.
+exec npx -y "$PKG" "$@"

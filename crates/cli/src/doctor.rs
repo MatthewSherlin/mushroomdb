@@ -168,10 +168,13 @@ pub fn run_doctor_with(
         }
     }
 
-    // 2. npx — only when the resolved command actually is npx.
+    // 2. how the server is spawned — `npx` fetches the package, a resolved
+    //    launcher is a file that has to still be there.
     if let Some((_, entry)) = &primary {
         if entry.command == "npx" {
             checks.push(check_npx(entry, ext));
+        } else if let Some(check) = check_launcher(entry) {
+            checks.push(check);
         }
     }
 
@@ -405,6 +408,29 @@ fn check_npx(entry: &ConfigEntry, ext: &Externals) -> Check {
         ),
         RunOutcome::Failed(e) => Check::fail("npx", e, None),
     }
+}
+
+/// The resolved-launcher counterpart to [`check_npx`].
+///
+/// `install` writes `node <launcher.js>` so the hooks do not spawn `npx` on
+/// every prompt, and that path lives in npm's cache: pruning the cache, or
+/// npx evicting an old version, leaves a command that cannot run. The file
+/// existing is the whole check — what it does once it runs is the handshake's
+/// business.
+fn check_launcher(entry: &ConfigEntry) -> Option<Check> {
+    if entry.command != "node" {
+        return None;
+    }
+    let launcher = Path::new(entry.args.first()?);
+    Some(if launcher.is_file() {
+        Check::ok("launcher", format!("node {}", launcher.display()))
+    } else {
+        Check::fail(
+            "launcher",
+            format!("{} no longer exists", launcher.display()),
+            Some("mushroomdb install (re-resolves the launcher)".to_string()),
+        )
+    })
 }
 
 enum RunOutcome {

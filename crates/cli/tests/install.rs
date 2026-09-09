@@ -892,6 +892,135 @@ fn prewarm_is_skipped_with_no_prewarm() {
     assert!(!log.exists(), "--no-prewarm still spawned npx");
     assert!(!out.contains("warning"), "{out}");
     assert!(root.join(".mcp.json").exists());
+    // With no resolution the hooks keep the `npx` form, which still works.
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .starts_with("npx -y"));
+}
+
+// ---------------------------------------------------------------------------
+// Test: the package is resolved to a launcher once, at install time, so no
+//       hook spawns `npx` on every prompt and every edit
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn launcher_is_resolved_once_and_every_hook_calls_node() {
+    let root = temp_dir("launcher-ok");
+    let home = temp_dir("launcher-ok-home");
+    let bin_dir = temp_dir("launcher-ok-bin");
+    let hooks = git_repo(&root);
+    // A launcher path with a space in it: whatever npm's cache is called, the
+    // written command has to survive it.
+    let pkg = temp_dir("launcher ok pkg");
+    let launcher = pkg.join("mushroomdb.js");
+    fs::write(&launcher, "// launcher\n").unwrap();
+    let log = bin_dir.join("argv.txt");
+
+    // An `npx` that answers `--print-launcher` with that path, and a `node`
+    // that only has to exist for the resolution to be usable.
+    fake_program(
+        &bin_dir,
+        "npx",
+        &format!(
+            "printf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' '{}'\n",
+            log.display(),
+            launcher.display()
+        ),
+    );
+    fake_program(&bin_dir, "node", "exit 0\n");
+
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        prewarm: true,
+        ..base_opts()
+    };
+    let out = run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("install");
+
+    assert!(!out.contains("warning"), "{out}");
+
+    // npx ran exactly once, for the resolution. The pre-warm is redundant
+    // after it — the very same fetch already warmed the cache.
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        format!("-y\nmushroomdb@{VERSION}\n--print-launcher\n"),
+        "npx must be spawned once, and only to resolve the launcher"
+    );
+
+    // Every written command runs the launcher directly, quoted for the space.
+    let node = format!("node '{}'", launcher.display());
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("{node} recall --auto")
+    );
+    assert_eq!(
+        s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+        format!("{node} touch --auto")
+    );
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert!(body.contains(&format!("( {node} sync --auto ")), "{body}");
+
+    // The MCP entry uses the resolved path too: one spawn per session, but a
+    // session that starts 400 ms sooner is still worth having.
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(mcp["mcpServers"]["mushroomdb"]["command"], "node");
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"],
+        serde_json::json!([launcher.to_str().unwrap(), "mcp", "--auto"]),
+        "an MCP host spawns an argv, so the path is not quoted here"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn an_unresolvable_launcher_falls_back_to_npx_with_a_warning() {
+    let root = temp_dir("launcher-bad");
+    let home = temp_dir("launcher-bad-home");
+    let bin_dir = temp_dir("launcher-bad-bin");
+    git_repo(&root);
+
+    // An `npx` that answers with a path that is not there.
+    fake_program(
+        &bin_dir,
+        "npx",
+        "printf '%s\\n' /nowhere/mushroomdb.js\nexit 0\n",
+    );
+    fake_program(&bin_dir, "node", "exit 0\n");
+
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        prewarm: true,
+        ..base_opts()
+    };
+    let out = run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("a launcher that cannot be resolved must not fail the install");
+
+    assert!(out.contains("could not resolve"), "{out}");
+    assert!(out.contains("/nowhere/mushroomdb.js"), "{out}");
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} recall --auto"),
+        "the slower form still has to work"
+    );
 }
 
 #[test]
