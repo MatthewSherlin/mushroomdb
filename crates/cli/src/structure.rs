@@ -51,8 +51,8 @@
 //! write at all, which is what makes a re-run byte-identical.
 use crate::CliError;
 use code_extract::{
-    extract, resolve_call, resolve_import, resolve_mention, CallScope, FileFacts, SymbolIndex,
-    MAX_FILE_BYTES,
+    call_lookup_names, extract, resolve_call, resolve_import, resolve_mention, CallScope,
+    FileFacts, SymbolIndex, MAX_FILE_BYTES,
 };
 use core_api::repograph::rules::{about_rule, concept_sources_rule, ABOUT_LABELS};
 use core_api::{default_max_edges, BatchOp, Predicate, RuleDef, Value};
@@ -445,6 +445,29 @@ fn symbol_keys(path: &str, facts: &FileFacts) -> (Vec<(String, usize)>, bool) {
     (out, capped)
 }
 
+/// Every index name the calls in `facts` can be looked up under.
+///
+/// [`resolve_call`] reaches the symbol index by name and by nothing else, and
+/// [`call_lookup_names`] says which names one callee produces. So an index
+/// holding every definition of exactly this set resolves identically to one
+/// holding the whole tree — including the repository-wide tier, which turns on
+/// a name being defined exactly once and still sees every definition of the
+/// names it is asked about.
+///
+/// The set depends on the files being extracted and on nothing else, which is
+/// what makes a one-file `touch` cost one file's worth of index.
+fn call_names(facts: &BTreeMap<String, FileFacts>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for f in facts.values() {
+        for sym in &f.symbols {
+            for call in &sym.calls {
+                out.extend(call_lookup_names(&call.callee));
+            }
+        }
+    }
+    out
+}
+
 fn refresh(
     w: &mut Db,
     repo: &Path,
@@ -494,6 +517,16 @@ fn refresh(
     // 4. Symbols already in the graph: so a call can reach a file this pass is
     //    not touching, and so orphans — symbols whose file was renamed away or
     //    deleted, and whose keys can never be right again — can be swept.
+    //
+    //    A pass that was handed a path list narrows both halves. The work here
+    //    used to be the same on a one-file `touch` as on a whole-tree refresh:
+    //    a `has_node` graph read and an index insert for every symbol in the
+    //    repository, which is the part of `touch` that grows with the codebase
+    //    while the useful work stays constant.
+    let looked_up = only.map(|_| call_names(&facts));
+    let responsible: Option<BTreeSet<&str>> =
+        only.map(|paths| paths.iter().map(String::as_str).collect());
+
     let stored = w.query(SYMBOL_QUERY, &BTreeMap::new())?;
     let mut by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut orphans: Vec<String> = Vec::new();
@@ -504,15 +537,30 @@ fn refresh(
         else {
             continue;
         };
-        if !w.has_node(file.as_str()) {
-            orphans.push(id.clone());
-            continue;
+        // `has_node` is a graph read per row, and its answer can only change
+        // what this pass writes for a path the caller named: those are the
+        // files whose symbol set is being rewritten, and the ones the caller
+        // says have moved or gone. A narrowed pass therefore leaves an orphan
+        // it was not told about alone — `refresh_all` sweeps the lot, and
+        // `ingest-git` and `sync` both hand in the keys their commit walk
+        // retired, so nothing is left for a `touch` to find.
+        if responsible
+            .as_ref()
+            .is_none_or(|r| r.contains(file.as_str()))
+        {
+            if !w.has_node(file.as_str()) {
+                orphans.push(id.clone());
+                continue;
+            }
+            by_file.entry(file.clone()).or_default().insert(id.clone());
         }
-        by_file.entry(file.clone()).or_default().insert(id.clone());
         if facts.contains_key(file) || !tree.known(file) {
             continue; // superseded by this pass, or not a working-tree file
         }
-        if let Some(Value::Str(name)) = stored.get(i, "name") {
+        let Some(Value::Str(name)) = stored.get(i, "name") else {
+            continue;
+        };
+        if looked_up.as_ref().is_none_or(|names| names.contains(name)) {
             index.insert(name, id);
         }
     }

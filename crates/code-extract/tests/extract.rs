@@ -9,8 +9,9 @@
 //! directory.
 
 use code_extract::{
-    extract, lang_of, resolve_call, resolve_import, resolve_mention, written_as_method, CallFact,
-    CallScope, FileFacts, Lang, SymbolIndex, MAX_BODY_BYTES, MAX_FILE_BYTES,
+    call_lookup_names, extract, lang_of, resolve_call, resolve_import, resolve_mention,
+    written_as_method, CallFact, CallScope, FileFacts, Lang, SymbolIndex, MAX_BODY_BYTES,
+    MAX_FILE_BYTES,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1840,4 +1841,95 @@ fn a_blank_line_detaches_an_outer_doc_comment() {
         b"/// First line.\n/// Second line.\npub fn helper() -> u32 {\n    2\n}\n",
     );
     assert_eq!(doc_of(&run, "helper"), "First line.");
+}
+
+/// An incremental pass builds its symbol index from the names its own calls
+/// can look up, rather than from every symbol in the repository. That is only
+/// sound if `call_lookup_names` names every form the resolver tries — so the
+/// narrowed index has to resolve *identically* to the whole-tree one, edge for
+/// edge and absence for absence.
+#[test]
+fn a_narrowed_index_resolves_exactly_as_the_whole_tree_one() {
+    // A tree with all four tiers represented, plus the traps: two same-named
+    // definitions in one directory, a name unique repository-wide, and a call
+    // into a dependency.
+    let entries: [(&str, &str); 10] = [
+        ("flush", "src/a.rs#Store.flush"),
+        ("flush", "src/b.rs#Cache.flush"),
+        ("flush", "other/c.rs#Sink.flush"),
+        ("Store.flush", "src/a.rs#Store.flush"),
+        ("only", "far/away.rs#only"),
+        ("take", "tests/helpers.rs#take"),
+        ("Store", "src/a.rs#Store"),
+        // Never named by any call below: the bulk a whole-tree index carries
+        // and a narrowed one must be free to leave out.
+        ("connect", "src/net.rs#connect"),
+        ("Cache.evict", "src/b.rs#Cache.evict"),
+        ("render", "src/ui.rs#render"),
+    ];
+    let mut full = SymbolIndex::new();
+    for (name, key) in entries {
+        full.insert(name, key);
+    }
+
+    let calls = [
+        CallFact::method("self.flush", 1),
+        CallFact::method("store.flush", 2),
+        CallFact::method("Store.flush", 3),
+        CallFact::plain("flush", 4),
+        CallFact::plain("only", 5),
+        CallFact::plain("Store::flush", 6),
+        CallFact::plain("std::mem::take", 7),
+        CallFact::plain("crate::util::only", 8),
+        CallFact::plain("missing", 9),
+    ];
+
+    // The index a pass over `src/a.rs` alone would build: every definition of
+    // exactly the names those calls look up, and nothing else.
+    let wanted: BTreeSet<String> = calls
+        .iter()
+        .flat_map(|c| call_lookup_names(&c.callee))
+        .collect();
+    let mut narrow = SymbolIndex::new();
+    for (name, key) in entries {
+        if wanted.contains(name) {
+            narrow.insert(name, key);
+        }
+    }
+    assert!(
+        narrow.len() < full.len(),
+        "the narrowed index must actually be smaller"
+    );
+
+    let tree = roots(&["crate", "util", "helpers"]);
+    for from in ["src/a.rs", "src/c.rs", "other/c.rs"] {
+        for imports in [vec![], vec!["src/b.rs".to_string()]] {
+            let scope = scope(&imports, &tree);
+            for call in &calls {
+                assert_eq!(
+                    resolve_call(from, call, &narrow, &scope),
+                    resolve_call(from, call, &full, &scope),
+                    "narrowing changed {} called from {from} with imports {imports:?}",
+                    call.callee
+                );
+            }
+        }
+    }
+}
+
+/// The three forms the resolver reaches the index by, and no others.
+#[test]
+fn call_lookup_names_covers_every_form_the_resolver_tries() {
+    assert_eq!(call_lookup_names("flush"), vec!["flush"]);
+    assert_eq!(call_lookup_names("self.flush"), vec!["self.flush", "flush"]);
+    // A path also has to be asked about by its leading segment: that is the
+    // check that keeps `std::mem::take` from claiming the tree's one `take`.
+    assert_eq!(
+        call_lookup_names("Store::flush"),
+        vec!["Store::flush", "flush", "Store"]
+    );
+    assert_eq!(
+        call_lookup_names("std::mem::take"),
+        vec!["std::mem::take", "take", "std"]
+    );
 }

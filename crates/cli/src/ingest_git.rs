@@ -1283,6 +1283,11 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
         } else {
             let mut paths = work.touched;
             paths.extend(structure::importers_of(&w, &work.stale)?);
+            // The retired keys themselves, not just the files that named them.
+            // An incremental refresh sweeps orphaned symbols only under the
+            // paths it is handed, and a file this window deleted or renamed
+            // away is exactly where the orphans are.
+            paths.extend(work.stale.iter().cloned());
             let paths: Vec<String> = paths.into_iter().collect();
             structure::refresh_files(&mut w, &repo, "", &paths, opts.docs)?
         };

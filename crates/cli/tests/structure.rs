@@ -822,3 +822,131 @@ fn import_lines_are_recorded() {
         "call evidence carries the call site line"
     );
 }
+
+/// An incremental refresh is handed the paths it is responsible for, and it
+/// reads the graph for those and for the names its own calls look up — not for
+/// every file and every symbol in the repository.
+///
+/// Both halves are asserted here, because narrowing the reads is only worth
+/// anything if the writes come out the same. The first half is the saving: a
+/// pass told about `src/util.rs` leaves an orphan under `src/net.rs` alone,
+/// where the whole-tree pass sweeps it. The second is the constraint: the
+/// edges the narrowed pass writes are exactly the ones a whole-tree pass
+/// writes, including the repository-wide call tier that turns on a name being
+/// unique across every file.
+#[test]
+fn touch_reads_only_the_touched_files() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    // Strand `src/net.rs#connect`: its file leaves the graph, so its key can
+    // never be right again and a whole-tree pass would sweep it.
+    {
+        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let mut w = shared.write();
+        w.delete_node("src/net.rs").unwrap();
+    }
+    assert!(GraphDb::open(&db_dir)
+        .unwrap()
+        .has_node("src/net.rs#connect"));
+
+    // A pass responsible for one unrelated file does not go looking.
+    let report = {
+        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let mut w = shared.write();
+        cli::structure::refresh_files(&mut w, &repo, "", &["src/util.rs".to_string()], true)
+            .unwrap()
+    };
+    assert_eq!(
+        report.files_scanned, 1,
+        "one file was extracted: {report:?}"
+    );
+    assert!(
+        GraphDb::open(&db_dir)
+            .unwrap()
+            .has_node("src/net.rs#connect"),
+        "an orphan the pass was not told about is not its business"
+    );
+
+    // `src/util.rs` is intact, and the calls into it still resolve — the
+    // narrowed index held every definition of every name it looked up.
+    {
+        let db = GraphDb::open(&db_dir).unwrap();
+        assert_eq!(
+            db.neighbors("src/lib.rs#run", "CALLS", Direction::Out)
+                .unwrap_or_default(),
+            vec!["src/util.rs#helper".to_string()],
+            "a call out of an untouched file still points at the touched one"
+        );
+    }
+
+    // The whole-tree pass, which is told about everything, does sweep it.
+    {
+        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let mut w = shared.write();
+        cli::structure::refresh_all(&mut w, &repo, "", true).unwrap();
+    }
+    assert!(
+        !GraphDb::open(&db_dir)
+            .unwrap()
+            .has_node("src/net.rs#connect"),
+        "refresh_all still sweeps every orphan"
+    );
+}
+
+/// The narrowed index must not change a single resolved call. Two files define
+/// `helper`, so the repository-wide tier cannot fire; one file defines
+/// `connect`, so it can. A refresh of one file has to see both facts.
+#[test]
+fn a_narrowed_refresh_resolves_calls_the_same_as_a_whole_tree_one() {
+    let repo = seed_repo();
+    commit(
+        &repo,
+        "a second helper, and a caller of both names",
+        &[
+            (
+                "src/dup.rs",
+                "//! A second definition of the same name.\n\n\
+                 /// Also doubles.\npub fn helper(n: u32) -> u32 {\n    n + n\n}\n",
+            ),
+            (
+                "src/caller.rs",
+                "//! Calls one ambiguous name and one unique one.\n\n\
+                 /// Do both.\npub fn both() -> u32 {\n    helper(1) + connect(2)\n}\n",
+            ),
+        ],
+    );
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    let calls = |dir: &Path| {
+        GraphDb::open(dir)
+            .unwrap()
+            .neighbors("src/caller.rs#both", "CALLS", Direction::Out)
+            .unwrap_or_default()
+    };
+    let whole_tree = calls(&db_dir);
+    assert_eq!(
+        whole_tree,
+        vec!["src/net.rs#connect".to_string()],
+        "`connect` is unique so it resolves; `helper` is defined twice so it does not"
+    );
+
+    // Rewrite the caller and refresh only it. The answer must not move.
+    write_files(
+        &repo,
+        &[(
+            "src/caller.rs",
+            "//! Calls one ambiguous name and one unique one.\n\n\
+             /// Do both, twice.\npub fn both() -> u32 {\n    helper(1) + connect(2) + connect(3)\n}\n",
+        )],
+    );
+    {
+        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let mut w = shared.write();
+        cli::structure::refresh_files(&mut w, &repo, "", &["src/caller.rs".to_string()], true)
+            .unwrap();
+    }
+    assert_eq!(calls(&db_dir), whole_tree, "narrowing moved a call edge");
+}

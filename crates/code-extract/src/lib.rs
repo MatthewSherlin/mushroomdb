@@ -559,6 +559,32 @@ fn path_reaches_the_tree(callee: &str, index: &SymbolIndex, roots: &BTreeSet<Str
         || !index.keys_for(first).is_empty()
 }
 
+/// Every name [`resolve_call`] may look `callee` up under in the index.
+///
+/// The resolver reaches a [`SymbolIndex`] by name and by nothing else: it tries
+/// the callee as written, then its last segment, and before either it asks
+/// whether a `::` path's leading segment names a symbol here
+/// ([`path_reaches_the_tree`]). Those are the only three forms.
+///
+/// That is what lets a caller build a *narrowed* index — one holding only the
+/// definitions a particular pass could need — without changing a single edge.
+/// An index holding every definition of exactly these names answers every
+/// lookup a whole-tree index would, tier for tier, the repository-wide tier
+/// included: that tier turns on a name being defined exactly once, and the
+/// narrowed index still holds every definition of the names it is asked about.
+/// Ask for less than this and resolution silently changes.
+#[must_use]
+pub fn call_lookup_names(callee: &str) -> Vec<String> {
+    let mut out = callee_candidates(callee);
+    if let Some((first, _)) = callee.trim().split_once("::") {
+        let first = first.trim().to_string();
+        if !first.is_empty() && !out.contains(&first) {
+            out.push(first);
+        }
+    }
+    out
+}
+
 /// The callee as written, then its last `.`- or `::`-separated segment.
 fn callee_candidates(callee: &str) -> Vec<String> {
     let callee = callee.trim();
