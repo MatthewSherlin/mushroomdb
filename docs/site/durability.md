@@ -51,7 +51,9 @@ So every snapshot mushroomdb takes **on its own** — the ingest's, a
 `--snapshot-every` tick, the shutdown one — and `mushroomdb snapshot <db>` with
 no flags **archive** the WAL rather than dropping it. The frames are renamed to
 `wal.<N>.archive`, which the history reads still scan and the open path does
-not. You end up with a store that opens fast *and* remembers.
+not. You end up with a store that opens fast *and* remembers. An automatic
+snapshot keeps the newest eight archives so the directory cannot grow without
+end; see **Disk** below for what that bound costs.
 
 Three flags choose otherwise:
 
@@ -66,13 +68,30 @@ the tail and deletes the `wal.genesis` marker, which is what allows `asof` to
 replay archive-resident commits, so any archives an earlier snapshot left become
 unreachable too.
 
-**Disk.** Archiving moves bytes rather than adding them: the archives hold what
-`wal.bin` was holding anyway. The real added cost is one `snapshot.bin`, which
-is rewritten in place rather than accumulated — 37 MB for an 8 MB WAL on a
-435-file repository, since a snapshot is an expanded image rather than a log.
-If the archives do become the problem, `mushroomdb snapshot <db> --retention N`
-keeps the newest N and prunes the rest; pruning advances the history horizon, so
-what it costs is exactly the reach archiving exists to preserve.
+**Disk.** One snapshot moves bytes rather than adding them: the archive holds
+what `wal.bin` was holding anyway. A *series* of them accumulates, because each
+one leaves another `wal.<N>.archive` behind and nothing deletes it. On a
+repository that syncs on every commit that is one new archive per 4 MiB of WAL
+churn, indefinitely.
+
+So the automatic path is bounded and the manual one is not:
+
+| Snapshot | Archives kept |
+|---|---|
+| automatic — the ingest's, `sync`, a `--snapshot-every` tick, shutdown | the newest 8 |
+| `mushroomdb snapshot <db>` | all of them |
+| `mushroomdb snapshot <db> --retention N` | the newest N |
+
+Steady-state archive size is therefore bounded by 8 × the 4 MiB snapshot
+threshold, plus whatever a single oversized run archived in one go. Pruning is
+not free: it advances the history horizon, so `node_history`, `edge_history` and
+`was_linked` stop reaching commits below it, and because the first prune breaks
+the `wal.genesis` chain, `asof` from then on answers for commits after the last
+snapshot rather than replaying into the archives.
+
+The other added cost is one `snapshot.bin`, which is rewritten in place rather
+than accumulated — 37 MB for an 8 MB WAL on a 435-file repository, since a
+snapshot is an expanded image rather than a log.
 
 ## Recovery vs. refresh
 

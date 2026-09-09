@@ -47,9 +47,11 @@ trimming, and a worktree bug in `install`. All fixed here. No format change.
   gone. **Breaking for a programmatic caller:** pass the new `json: true` argument to get the report
   back as structured text instead of parsing `structuredContent`.
 - **`tools/list` defaults to eleven tools** — the eight task tools plus `query`, `ingest_json` and
-  `stats` — down from all twenty-four. Every tool stays callable either way; `mushroomdb mcp
-  --all-tools` (or `--all-tools` on the plugin's entry) lists the full set, including the sixteen
-  `Advanced:`-prefixed graph tools from v0.6.0.
+  `stats` — down from all twenty-four. Listing is the only thing that narrows: all twenty-four stay
+  callable by name whichever listing is in force, and the skill names the thirteen unlisted ones so
+  an agent can call one without seeing it in a list. `mushroomdb mcp --all-tools` lists the full set
+  instead, including the sixteen `Advanced:`-prefixed graph tools from v0.6.0. The plugin's own MCP
+  entry has no way to pass the flag; it does not need one.
 - **`SKILL.md` shrank from 17.2 KB to under 6 KB.** The worked examples and the sixteen-row advanced
   table moved to `docs/site/code-graph.md`; what's left is the first minute, the task rules, the
   learn pass and one paragraph pointing at `--all-tools`, masks, and `no auth`.
@@ -80,13 +82,22 @@ trimming, and a worktree bug in `install`. All fixed here. No format change.
   rewritten to `--auto` by the next `install`. Cursor and Codex don't set the environment variable
   Claude Code does to make this provable, so they still pin the absolute path; `--db` always pins.
   `recall`, `touch` and the git hooks' `sync` all take `--auto` the same way.
+- **`install` run from inside a linked `git worktree` writes its git hooks where git runs them.**
+  A worktree's `.git` file points at `<main>/.git/worktrees/<name>`, but git resolves hooks through
+  the repository's **common** directory, so the three hooks landed somewhere nothing ever executed
+  and `doctor` reported them present because it read the same wrong path. Both now follow the
+  `commondir` file a linked worktree leaves beside its gitdir. A submodule has no such file and
+  keeps its own hooks, which is what git does for it.
 - **Hooks and the MCP entry call the resolved native binary directly instead of spawning `npx`.**
   Measured on this machine: `npx -y mushroomdb@<version> --version` 756 ms → the vendored binary
   invoked directly, 8 ms. `install` resolves the binary once (falling back to a `node <launcher>`
   form, then to `npx`, on any failure) and writes the resolved command everywhere; `--no-prewarm`
   skips the resolution along with the network fetch it replaces. The plugin's `hooks/run.sh` caches
   the resolved path per version under `$CLAUDE_PLUGIN_DATA` (or `$HOME/.mushroomdb`; no caching at
-  all with neither set, rather than a shared `/tmp` fallback) and re-checks it before every use.
+  all with neither set, rather than a shared `/tmp` fallback) and re-checks it before every use. On
+  a machine with no `npx` at all it now exits 0 in silence instead of printing `exec: npx: not
+  found` before every prompt: the plugin cannot work without `npx` either way, and a hook body that
+  prints on a machine it cannot serve is worse than one that says nothing.
 
 #### Snapshots, and a narrower `touch`
 
@@ -97,6 +108,13 @@ trimming, and a worktree bug in `install`. All fixed here. No format change.
   shutdown, and a bare `mushroomdb snapshot` with no flags) archives the WAL it replaces rather than
   discarding it, so `node_history`, `edge_history`, `was_linked` and `open_at` keep reaching the
   folded history; only the explicit `mushroomdb snapshot --truncate` ends it there.
+- **An automatic snapshot keeps the newest eight WAL archives.** Archiving moves the WAL aside
+  rather than deleting it, so a store that snapshots on every sync would otherwise leave one more
+  `wal.<N>.archive` behind per 4 MiB of churn and never reclaim any of them. The bound applies only
+  to the snapshots mushroomdb takes on its own; `mushroomdb snapshot <db>` still keeps every
+  archive, and `--retention N` sets the number. Pruning advances the history horizon — the reads
+  above stop reaching commits below it, and `open_at` answers for commits after the last snapshot
+  once the first prune has broken the `wal.genesis` chain. See `docs/site/durability.md`.
 - **`touch` narrows its structure pass to the files it was actually given** instead of scanning
   every symbol in the repository, cutting the non-open cost of a one-file `touch` from about 6 ms to
   about 4 ms. Store open still dominates end-to-end time, which is why F5's snapshot change is the
@@ -109,6 +127,14 @@ trimming, and a worktree bug in `install`. All fixed here. No format change.
 - `packaging/tests/run.sh`'s npm-install happy-path check now serves fake release assets for the
   version it's actually installing (read from `packaging/npm/package.json`) instead of a hardcoded
   `0.1.0`, which had been 404ing and skipping every check after it since before this release.
+
+#### Known
+
+- **`snapshot.bin` is much larger than the data it holds.** Every string-typed column carries its
+  own full copy of the store's string table, so an interned string is written once per column —
+  37 MB for a store whose logical properties are under 4 MB on this repository. It costs more from
+  this release on, because `ingest-git` and `sync` now snapshot on their own. The fix needs no
+  format change and is the next release's first storage item.
 
 ## v0.6.0 — 2026-09-04
 
