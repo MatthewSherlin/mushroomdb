@@ -18,7 +18,13 @@ case "${os}-${arch}" in
     ;;
 esac
 
-VERSION=0.1.0
+# The npm install.js happy-path check below asks for whatever version is in
+# packaging/npm/package.json (it has no MUSHROOMDB_VERSION override, same as
+# a real `npm install`), so the fake release this script serves has to be
+# built and tagged for that same version — a hardcoded VERSION here silently
+# drifts from package.json on every version bump and 404s that check, along
+# with everything after it in this script.
+VERSION=$(node -pe "require('$NPM/package.json').version")
 TAG=v${VERSION}
 ASSET="mushroomdb-${TAG}-${TARGET}.tar.gz"
 
