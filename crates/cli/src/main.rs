@@ -58,9 +58,11 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
-        Ok(Command::Context { db_dir, target }) => {
-            print_or_fail(cli::run_context(&db_dir, &target))
-        }
+        Ok(Command::Context {
+            db_dir,
+            target,
+            full,
+        }) => print_or_fail(cli::run_context(&db_dir, &target, full)),
         Ok(Command::Impact { db_dir, files }) => print_or_fail(cli::run_impact(&db_dir, &files)),
         Ok(Command::Owners { db_dir, path }) => print_or_fail(cli::run_owners(&db_dir, &path)),
         Ok(Command::Why { db_dir, a, b }) => print_or_fail(cli::run_why(&db_dir, &a, &b)),

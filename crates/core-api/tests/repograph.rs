@@ -12,10 +12,10 @@ use common::{
     SYNCED_AT,
 };
 use core_api::repograph::{
-    brief, context, identifier_terms, impact, owners, recall_digest, remember, render_brief,
-    render_context, render_impact, render_map, render_owners, render_why, repo_map, shortest_path,
-    stale_concepts, why, BriefOptions, ImpactOptions, MapOptions, RememberInput, Target,
-    MAX_OUTPUT_BYTES, MAX_QUERY_TERMS, UNTRUSTED_FRAMING,
+    brief, context, context_with, identifier_terms, impact, owners, recall_digest, remember,
+    render_brief, render_context, render_impact, render_map, render_owners, render_why, repo_map,
+    shortest_path, stale_concepts, why, BriefOptions, ContextOptions, ImpactOptions, MapOptions,
+    RememberInput, Target, MAX_OUTPUT_BYTES, MAX_QUERY_TERMS, UNTRUSTED_FRAMING,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -830,6 +830,55 @@ fn context_on_symbol_has_source_callers_callees_and_owner() {
     assert!(
         text.contains("Ada Example") && !text.contains("@example.test"),
         "{text}"
+    );
+}
+
+/// The working tree is read only when the caller asks for it. Without a body
+/// the answer is a pointer — the file and the line range to open — and the
+/// graph facts, which is what an assistant needs to decide whether to open the
+/// file at all.
+#[test]
+fn context_with_reads_the_working_tree_only_when_asked() {
+    let dir = tmp("context-options");
+    let db = synthetic_repo_store(&dir);
+    let repo = work_tree("context-options-tree");
+    let key = sym(0, 1, "core::run");
+
+    let pointer = context_with(&db, Some(repo.as_path()), &key, &ContextOptions::default());
+    assert_eq!(pointer.source, None, "the default reads no working tree");
+    assert_eq!(
+        pointer.lines,
+        Some((11, 21)),
+        "the line range is a graph fact and stays"
+    );
+    let text = render_context(&pointer);
+    assert!(
+        text.contains(&format!("  at {}:11-21\n", file_key(0, 1))),
+        "the pointer is one line a reader can open:\n{text}"
+    );
+    assert!(!text.contains("// line 11"), "no body quoted:\n{text}");
+
+    let full = context_with(
+        &db,
+        Some(repo.as_path()),
+        &key,
+        &ContextOptions { source: true },
+    );
+    assert_eq!(
+        full,
+        context(&db, Some(repo.as_path()), &key),
+        "`context` is `context_with` asking for the body"
+    );
+    let full_text = render_context(&full);
+    assert!(
+        full_text.contains("// line 11"),
+        "the body is quoted:\n{full_text}"
+    );
+    assert!(
+        full_text.len() > text.len(),
+        "the pointer is the shorter answer: {} vs {}",
+        text.len(),
+        full_text.len()
     );
 }
 

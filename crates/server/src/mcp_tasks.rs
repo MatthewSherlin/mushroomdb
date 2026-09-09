@@ -51,8 +51,8 @@
 
 use crate::mcp::CallOutcome;
 use core_api::repograph::{
-    self, ImpactOptions, MapOptions, RememberInput, DEFAULT_EXCLUDES, MAX_OUTPUT_BYTES, NOTE_KINDS,
-    UNTRUSTED_FRAMING,
+    self, ContextOptions, ImpactOptions, MapOptions, RememberInput, DEFAULT_EXCLUDES,
+    MAX_OUTPUT_BYTES, NOTE_KINDS, UNTRUSTED_FRAMING,
 };
 use core_api::{GraphError, SharedDb};
 use serde_json::{json, Value as Js};
@@ -249,11 +249,15 @@ fn tool_context(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Ok(t) => t,
         Err(e) => return CallOutcome::ToolErr(e),
     };
+    let full = match bool_arg(args, "full") {
+        Ok(b) => b,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
     // `None` for the repository: core-api falls back to the `GitSync` marker,
     // which is the checkout the store was built from.
     let report = {
         let g = db.read();
-        repograph::context(&*g, None, target)
+        repograph::context_with(&*g, None, target, &ContextOptions { source: full })
     };
     ok(json_out, &report, repograph::render_context)
 }
@@ -642,7 +646,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "context",
-            "description": "Everything known about one file or symbol: signature, doc, source from the working tree, owner, every call site into it grouped by calling file, its callees, importers and imports, co-change partners, recent commits, and any notes or concepts about it.",
+            "description": "Everything known about one file or symbol: where it is as path:start-end, its signature and doc, owner, every call site into it grouped by calling file, its callees, importers and imports, co-change partners, recent commits, and any notes or concepts about it. The body is not quoted unless you ask for it with 'full'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -650,6 +654,10 @@ fn task_tool_schemas() -> Vec<Js> {
                         "type": "string",
                         "minLength": 1,
                         "description": "A file path, a symbol key (path#name), or a bare symbol name. An ambiguous bare name returns the candidates instead."
+                    },
+                    "full": {
+                        "type": "boolean",
+                        "description": "Include the source body (default: pointers and signature only)."
                     }
                 },
                 "required": ["target"]

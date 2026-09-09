@@ -1658,6 +1658,56 @@ fn context_on_symbol() {
     );
 }
 
+/// Binding: a default `context` answers with a pointer and the graph's facts,
+/// inside the reply budget; `full: true` quotes the body from the working tree.
+#[test]
+fn context_answers_with_pointers_by_default_and_bodies_on_full() {
+    let db = code_store("context-pointers");
+    // The seed's marker names a working tree that is not there, so `full`
+    // would have nothing to quote. Point it at a real one.
+    let repo = tmp("context-pointers-tree");
+    std::fs::create_dir_all(repo.join("src")).expect("mkdir");
+    let body: String = (1..=30).map(|n| format!("// line {n}\n")).collect();
+    std::fs::write(repo.join("src/core.rs"), body).expect("write source");
+    db.write()
+        .set_prop(
+            "__mushroomdb_git_sync__",
+            "repo",
+            s(&repo.to_string_lossy()),
+        )
+        .expect("repo");
+
+    let (text, structured) = task_both(db.clone(), "context", json!({"target": "core::init"}));
+    assert!(
+        structured["source"].is_null(),
+        "no body by default: {structured}"
+    );
+    assert!(
+        text.contains("src/core.rs:10-20"),
+        "pointer line present: {text}"
+    );
+    assert!(!text.contains("// line 10"), "no body by default: {text}");
+    assert!(
+        text.len() <= 4_800,
+        "default context reply within budget: {}",
+        text.len()
+    );
+
+    let (full, structured_full) =
+        task_both(db, "context", json!({"target": "core::init", "full": true}));
+    assert!(
+        structured_full["source"].is_string(),
+        "full quotes the working tree: {structured_full}"
+    );
+    assert!(full.contains("// line 10"), "the body is quoted: {full}");
+    assert!(
+        full.len() > text.len(),
+        "the default is the shorter answer: {} vs {}",
+        text.len(),
+        full.len()
+    );
+}
+
 /// Binding: `context` on a target the graph does not know says so rather than
 /// failing.
 #[test]

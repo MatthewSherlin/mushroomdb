@@ -207,7 +207,7 @@ reaches for, and what `tools/list` shows first:
 | Tool | Purpose |
 |---|---|
 | `map` | The repository in one screen: size, last sync, clusters, key files, owners, hot files |
-| `context` | One file or symbol from every side: signature, source, callers, callees, importers, co-change partners, commits, notes |
+| `context` | One file or symbol from every side: where it is as `path:start-end`, signature, callers, callees, importers, co-change partners, commits, notes. `full` adds the body |
 | `impact` | What changing these files reaches: partners with scores, importers, symbols other files call, owner. Defaults to the working tree's diff |
 | `owners` | Top author and share, who else knows the file, last touch, the split by quarter |
 | `why` | Every rule edge between two nodes with its evidence, or the shortest path when there is none |

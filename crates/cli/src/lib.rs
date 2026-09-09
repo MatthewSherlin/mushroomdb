@@ -363,6 +363,9 @@ pub enum Command {
     Context {
         db_dir: PathBuf,
         target: String,
+        /// Quote the body from the working tree. Without it the answer names
+        /// where the body is and leaves the reading to the caller.
+        full: bool,
     },
     /// What else the named files reach: co-change partners, importers, and the
     /// symbols other files call.
@@ -453,9 +456,11 @@ Usage:
                                    dirty working tree (git hook body)
   mushroomdb map <db-dir> [--json] summarise the graphed repository: clusters, key files, owners, hot files
                                    --json prints the computed map instead of the rendered digest
-  mushroomdb context <db-dir> <target>   one file or symbol from every side: signature, source, callers,
+  mushroomdb context <db-dir> <target> [--full]
+                                   one file or symbol from every side: where it is, signature, callers,
                                    callees, importers, co-change partners, commits, notes
                                    <target> is a file path, a symbol key, or a bare symbol name
+                                   --full also quotes the body from the working tree
   mushroomdb impact <db-dir> <file>...   what changing these files reaches: partners, importers,
                                    and the symbols other files call
   mushroomdb owners <db-dir> <path>      top author and share, who else knows it, last touch, last 4 quarters
@@ -781,12 +786,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "sync" => parse_sync(&args[1..]),
         "map" => parse_dir_with_json("map", &args[1..])
             .map(|(db_dir, json)| Command::Map { db_dir, json }),
-        "context" => {
-            parse_positional("context", &args[1..], 1, 1).map(|(db_dir, rest)| Command::Context {
-                db_dir,
-                target: rest[0].clone(),
-            })
-        }
+        "context" => parse_context(&args[1..]),
         "impact" => parse_positional("impact", &args[1..], 1, usize::MAX)
             .map(|(db_dir, files)| Command::Impact { db_dir, files }),
         "owners" => {
@@ -1677,14 +1677,18 @@ fn open_for_reading(db_dir: &Path) -> Result<structure::Db, CliError> {
     )?)
 }
 
-/// Body of `mushroomdb context <db-dir> <target>`.
+/// Body of `mushroomdb context <db-dir> <target> [--full]`.
 ///
-/// The source is quoted from the repository the `GitSync` marker names, which
-/// is the checkout the store was built from.
-pub fn run_context(db_dir: &Path, target: &str) -> Result<String, CliError> {
+/// With `full` the source is quoted from the repository the `GitSync` marker
+/// names, which is the checkout the store was built from. Without it the answer
+/// points at those lines rather than printing them.
+pub fn run_context(db_dir: &Path, target: &str, full: bool) -> Result<String, CliError> {
     let db = open_for_reading(db_dir)?;
-    Ok(repograph::render_context(&repograph::context(
-        &db, None, target,
+    Ok(repograph::render_context(&repograph::context_with(
+        &db,
+        None,
+        target,
+        &repograph::ContextOptions { source: full },
     )))
 }
 
@@ -1956,6 +1960,38 @@ fn parse_positional(
         return Err(format!("unexpected extra argument: {}", rest[max]));
     }
     Ok((db_dir, rest))
+}
+
+/// `context <db-dir> <target> [--full]`.
+///
+/// Its own parser rather than [`parse_positional`], which rejects every flag:
+/// `--full` is the one thing `context` takes beyond its two positionals, and
+/// anything else that looks like a flag is still an error.
+fn parse_context(args: &[&str]) -> Result<Command, String> {
+    let mut rest: Vec<String> = Vec::new();
+    let mut db_dir: Option<PathBuf> = None;
+    let mut full = false;
+    for a in args {
+        if *a == "--full" {
+            full = true;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_none() {
+            db_dir = Some(PathBuf::from(*a));
+        } else {
+            rest.push((*a).to_string());
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| "context requires <db-dir>".to_string())?;
+    match rest.len() {
+        0 => Err("context requires <db-dir> and 1 more argument".to_string()),
+        1 => Ok(Command::Context {
+            db_dir,
+            target: rest.remove(0),
+            full,
+        }),
+        _ => Err(format!("unexpected extra argument: {}", rest[1])),
+    }
 }
 
 /// `<cmd> <db-dir> [--json]`, shared by `map` and `sync`.
@@ -2661,6 +2697,34 @@ mod tests {
                         assert_eq!(db_dir, PathBuf::from("/tmp/demo-db"));
                     }
                     other => panic!("demo <dir>, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["context", "db", "x"],
+                check: |r| match r {
+                    Ok(Command::Context {
+                        db_dir,
+                        target,
+                        full,
+                    }) => {
+                        assert_eq!(db_dir, PathBuf::from("db"));
+                        assert_eq!(target, "x");
+                        assert!(!full, "the default answer is a pointer, not a body");
+                    }
+                    other => panic!("context <dir> <target>, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["context", "db", "x", "--full"],
+                check: |r| {
+                    assert_eq!(
+                        r.unwrap(),
+                        Command::Context {
+                            db_dir: PathBuf::from("db"),
+                            target: "x".into(),
+                            full: true,
+                        }
+                    );
                 },
             },
             Case {
@@ -4182,6 +4246,7 @@ mod tests {
             Command::Context {
                 db_dir: PathBuf::from("/tmp/db"),
                 target: "src/db.rs#open".to_string(),
+                full: false,
             }
         );
         assert_eq!(

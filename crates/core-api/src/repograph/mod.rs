@@ -34,7 +34,8 @@
 //!
 //! [`context`] is the one tool that reads anything outside the graph: the
 //! source it quotes comes from the working tree, so what it shows is what is on
-//! disk now.
+//! disk now. It quotes it only when asked — [`context_with`] with
+//! [`ContextOptions::source`] — and otherwise answers with a pointer to it.
 
 mod brief;
 mod concepts;
@@ -52,7 +53,9 @@ mod why;
 
 pub use brief::{brief, BriefOptions, BriefReport};
 pub use concepts::stale_concepts;
-pub use context::{context, CallSites, ContextReport, Target, MAX_SOURCE_LINES};
+pub use context::{
+    context, context_with, CallSites, ContextOptions, ContextReport, Target, MAX_SOURCE_LINES,
+};
 pub use impact::{
     impact, path_excluded, FileImpact, ImpactOptions, ImpactReport, Partner, DEFAULT_EXCLUDES,
     MIN_SHARED_COMMITS,

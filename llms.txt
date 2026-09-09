@@ -73,7 +73,7 @@ Seven CLI commands read the graph back, and are the same eight MCP task tools:
 | Command | What it answers |
 |---|---|
 | `mushroomdb map <db> [--json]` | the repository in one screen: clusters + cohesion, key files, owners, hot files, three questions |
-| `mushroomdb context <db> <target>` | one file or symbol from every side: signature, source, callers, callees, importers, co-change, commits, notes. `<target>` = path, `path#name`, or a bare symbol name |
+| `mushroomdb context <db> <target> [--full]` | one file or symbol from every side: where it is as `path:start-end`, signature, callers, callees, importers, co-change, commits, notes. `--full` also quotes the body. `<target>` = path, `path#name`, or a bare symbol name |
 | `mushroomdb impact <db> <file>...` | co-change partners with scores + whether modified, importers, symbols other files call, owner. No args = the diff against HEAD plus untracked |
 | `mushroomdb owners <db> <path>` | top author and share, who else knows it, last touch, split by quarter |
 | `mushroomdb why <db> <a> <b>` | every rule edge between two nodes with its evidence lines, else the shortest path |

@@ -547,6 +547,12 @@ fn commit_line(sha: &str, ts: i64, subject: &str) -> String {
 
 /// Render a [`ContextReport`] as the digest an assistant reads: at most
 /// [`MAX_CONTEXT_LINES`] lines, byte-identical for the same report.
+///
+/// A report carrying no `source` — what
+/// [`context_with`](crate::repograph::context_with) answers by default — is
+/// rendered as a pointer instead: `  at path:start-end`, the signature, and the
+/// graph's facts. Nothing stands in for the missing body, because a pointer is
+/// not a truncated body; it is the whole answer to where the body is.
 #[must_use]
 pub fn render_context(c: &ContextReport) -> String {
     let mut out = String::new();
@@ -587,6 +593,12 @@ pub fn render_context(c: &ContextReport) -> String {
         }
     }
 
+    // Without a body below, the line range is the answer to "where is it", and
+    // it reads as a pointer a caller can open: `path:start-end`. With one it is
+    // the excerpt's own heading, and stays on the `where` line beside the owner.
+    if let Some((first, last)) = c.lines.filter(|_| c.source.is_none() && !c.file.is_empty()) {
+        let _ = writeln!(out, "  at {}:{first}-{last}", sanitize(&c.file));
+    }
     if let Some(sig) = &c.signature {
         let _ = writeln!(out, "signature  {}", sanitize(sig));
     }
@@ -594,7 +606,7 @@ pub fn render_context(c: &ContextReport) -> String {
         let _ = writeln!(out, "doc  {}", sanitize(doc));
     }
     let mut about: Vec<String> = Vec::new();
-    if let Some((first, last)) = c.lines {
+    if let Some((first, last)) = c.lines.filter(|_| c.source.is_some()) {
         about.push(format!("lines {first}-{last}"));
     }
     if let Some(owner) = &c.owner {
