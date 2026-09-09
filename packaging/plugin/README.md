@@ -19,6 +19,7 @@ After that it is task-first: `impact` before an edit, `context` on a file or sym
 
 - **MCP server** (`.mcp.json`) — runs `npx -y mushroomdb@<version> mcp --auto`, one process per project, talking to the graph over stdio.
 - **Skill** (`skills/mushroom/SKILL.md`, invoked as `/mushroom:mushroom`).
+- **`SessionStart` hook** — runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh brief --auto` (5 s timeout) as a session opens, printing the repository in one block: how big the graph is, the sha it is synced to, the most central files and the most called symbols. Byte-stable for a given store, so Claude Code caches it for the whole session.
 - **`UserPromptSubmit` hook** — runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh recall --auto` (5 s timeout) before each turn, printing a recall digest of related graph facts as context.
 - **`PostToolUse` hook** (matcher `Edit|Write|MultiEdit`) — runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh touch --auto` (30 s timeout, async) after an edit, so the graph re-extracts the changed file without blocking the turn.
 
