@@ -702,6 +702,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 struct HandshakeOk {
     version: String,
     tool_count: usize,
+    /// The repository task tool the listing carried — see [`TASK_PATH_TOOLS`].
+    task_tool: String,
 }
 
 fn check_handshake(entry: &ConfigEntry) -> Check {
@@ -709,10 +711,12 @@ fn check_handshake(entry: &ConfigEntry) -> Check {
         Ok(HandshakeOk {
             version,
             tool_count,
+            task_tool,
         }) => Check::ok(
             "handshake",
             format!(
-                "initialize + tools/list ok — version {version}, {tool_count} tools (map present)"
+                "initialize + tools/list ok — version {version}, {tool_count} tools \
+                 ({task_tool} present)"
             ),
         ),
         Err(msg) => Check::fail(
@@ -832,12 +836,30 @@ fn self_handshake(command: &str, args: &[String]) -> Result<HandshakeOk, String>
     let tools = list["result"]["tools"]
         .as_array()
         .ok_or_else(|| format!("`{command}`: tools/list response has no tools array"))?;
-    if !tools.iter().any(|t| t["name"].as_str() == Some("map")) {
-        return Err(format!("`{command}`: tools/list does not include `map`"));
-    }
+    let task_tool = tools
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .find(|name| TASK_PATH_TOOLS.contains(name))
+        .ok_or_else(|| {
+            format!(
+                "`{command}`: tools/list includes none of {}",
+                TASK_PATH_TOOLS.join(", ")
+            )
+        })?
+        .to_string();
 
     Ok(HandshakeOk {
         version,
         tool_count: tools.len(),
+        task_tool,
     })
 }
+
+/// The tool names that prove the repository task path is served rather than the
+/// graph API alone.
+///
+/// Either is enough, because which one is listed follows the store: a store
+/// `ingest-git` built advertises `explore` and hides the rest, and any other
+/// store advertises `map` among its eleven. Requiring one particular name would
+/// fail `doctor` on exactly the stores the other surface exists for.
+const TASK_PATH_TOOLS: [&str; 2] = ["explore", "map"];

@@ -12,10 +12,11 @@ use common::{
     SYNCED_AT,
 };
 use core_api::repograph::{
-    brief, context, context_with, identifier_terms, impact, owners, recall_digest, remember,
-    render_brief, render_context, render_impact, render_map, render_owners, render_why, repo_map,
-    shortest_path, stale_concepts, why, BriefOptions, ContextOptions, ContextReport, ImpactOptions,
-    MapOptions, RememberInput, Target, MAX_OUTPUT_BYTES, MAX_QUERY_TERMS, UNTRUSTED_FRAMING,
+    brief, context, context_with, explore, identifier_terms, impact, owners, recall_digest,
+    remember, render_brief, render_context, render_explore, render_impact, render_map,
+    render_owners, render_why, repo_map, shortest_path, stale_concepts, why, BriefOptions,
+    ContextOptions, ContextReport, Depth, ImpactOptions, MapOptions, RememberInput, Target,
+    DEFAULT_EXPLORE_BYTES, MAX_OUTPUT_BYTES, MAX_QUERY_TERMS, UNTRUSTED_FRAMING,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1172,6 +1173,162 @@ fn context_with_on_a_file_answers_from_the_graph_alone() {
         full_text.contains("// line 1"),
         "the body is quoted:\n{full_text}"
     );
+}
+
+/// Binding: `all` is the three answers in one report — the context, the blast
+/// radius of the file behind it, and who owns it — and the digest carries all
+/// three inside the default budget.
+#[test]
+fn explore_all_composes_context_impact_and_history() {
+    let dir = tmp("explore-all");
+    let db = synthetic_repo_store(&dir);
+    let key = sym(0, 1, "core::run");
+
+    let r = explore(&db, None, &key, Depth::All, false);
+    assert_eq!(r.target, key);
+    assert_eq!(r.depth, Depth::All);
+    assert_eq!(r.context.target, Target::Symbol { key: key.clone() });
+    assert_eq!(
+        r.context.source, None,
+        "a body is the caller's to ask for, here as everywhere"
+    );
+
+    let imp = r.impact.as_ref().expect("all carries a blast radius");
+    assert_eq!(
+        imp.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        vec![file_key(0, 1)],
+        "the blast radius is the file the symbol is defined in"
+    );
+    let own = r.owners.as_ref().expect("all carries ownership");
+    assert_eq!(own.path, file_key(0, 1));
+    assert_eq!(
+        own.top.as_ref().map(|(name, _, _)| name.as_str()),
+        Some("Ada Example")
+    );
+    assert_eq!(
+        r.partners, r.context.partners,
+        "the co-change partners are the context's own, not a second computation"
+    );
+    assert!(
+        !r.partners.is_empty(),
+        "the fixture's files change together"
+    );
+
+    let text = render_explore(&r, DEFAULT_EXPLORE_BYTES);
+    assert!(
+        text.len() <= DEFAULT_EXPLORE_BYTES,
+        "{} bytes:\n{text}",
+        text.len()
+    );
+    for want in ["callers", "impact", "owner", "changes with"] {
+        assert!(text.contains(want), "the digest is missing {want}:\n{text}");
+    }
+    assert_eq!(
+        text,
+        render_explore(
+            &explore(&db, None, &key, Depth::All, false),
+            DEFAULT_EXPLORE_BYTES
+        ),
+        "two runs against one store agree byte for byte"
+    );
+}
+
+/// Binding: each depth costs only what it was asked for. `context` reads
+/// neither the blast radius nor the history, and `impact` and `history` take
+/// one each.
+#[test]
+fn each_depth_carries_only_its_own_answer() {
+    let dir = tmp("explore-depths");
+    let db = synthetic_repo_store(&dir);
+    let key = sym(0, 1, "core::run");
+
+    let c = explore(&db, None, &key, Depth::Context, false);
+    assert!(c.impact.is_none() && c.owners.is_none() && c.partners.is_empty());
+    let text = render_explore(&c, DEFAULT_EXPLORE_BYTES);
+    assert!(
+        !text.contains("impact:") && !text.contains("owner:"),
+        "context depth prints the context and nothing else:\n{text}"
+    );
+
+    let i = explore(&db, None, &key, Depth::Impact, false);
+    assert!(i.impact.is_some(), "impact depth carries the blast radius");
+    assert!(i.owners.is_none() && i.partners.is_empty());
+
+    let h = explore(&db, None, &key, Depth::History, false);
+    assert!(h.impact.is_none(), "history depth costs no blast radius");
+    assert!(h.owners.is_some() && !h.partners.is_empty());
+}
+
+/// Binding: a target nothing answers to is the context's answer and nothing
+/// else — there is no file to take a blast radius or an owner of.
+#[test]
+fn explore_on_an_unknown_target_is_the_context_answer_alone() {
+    let dir = tmp("explore-unknown");
+    let db = synthetic_repo_store(&dir);
+
+    let r = explore(&db, None, "no::such::thing", Depth::All, false);
+    assert_eq!(
+        r.context.target,
+        Target::Unknown {
+            target: "no::such::thing".to_string()
+        }
+    );
+    assert!(r.impact.is_none() && r.owners.is_none() && r.partners.is_empty());
+    let text = render_explore(&r, DEFAULT_EXPLORE_BYTES);
+    assert!(text.contains("unknown: no::such::thing"), "{text}");
+}
+
+/// Binding: the budget is a hard ceiling on the digest, and it is spent on
+/// whole lines — a path cut in half still reads as a path, and a caller acts
+/// on it.
+#[test]
+fn explore_renders_within_whatever_budget_it_is_given() {
+    let dir = tmp("explore-budget");
+    let db = synthetic_repo_store(&dir);
+    let r = explore(&db, None, &sym(0, 1, "core::run"), Depth::All, false);
+
+    let full = render_explore(&r, DEFAULT_EXPLORE_BYTES);
+    for budget in [800, 400, 200, 120] {
+        let text = render_explore(&r, budget);
+        assert!(
+            text.len() <= budget,
+            "{budget}: {} bytes:\n{text}",
+            text.len()
+        );
+        assert!(
+            full.starts_with(&text),
+            "a capped digest is a prefix of the whole one:\n{text}"
+        );
+        assert!(
+            text.is_empty() || text.ends_with('\n'),
+            "the cut is at a line ending:\n{text:?}"
+        );
+    }
+
+    // Below the header's own length the header is kept anyway: a reply that
+    // says which target was looked up is an answer, and a blank one is not.
+    // This is the one line the budget does not bind, and the smallest budget
+    // the `explore` tool admits — 200 tokens, 800 bytes — is many times it.
+    let header = full.lines().next().expect("a header");
+    let tiny = render_explore(&r, header.len());
+    assert_eq!(tiny, format!("{header}\n"), "the header survives any budget");
+    assert!(tiny.len() > header.len(), "and costs its newline");
+}
+
+/// Binding: the four depth names parse, and nothing else does.
+#[test]
+fn depth_parses_the_four_names_and_no_others() {
+    for (name, want) in [
+        ("context", Depth::Context),
+        ("impact", Depth::Impact),
+        ("history", Depth::History),
+        ("all", Depth::All),
+    ] {
+        assert_eq!(Depth::parse(name), Some(want), "{name}");
+    }
+    for bad in ["", "Context", "ALL", "everything", "context "] {
+        assert_eq!(Depth::parse(bad), None, "{bad:?} must not parse");
+    }
 }
 
 #[test]

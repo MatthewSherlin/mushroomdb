@@ -221,10 +221,11 @@ pub enum Command {
         /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
         db_dir: Option<PathBuf>,
         auto: bool,
-        /// `--all-tools`: advertise all twenty-four tools in `tools/list`
-        /// rather than the eleven a coding agent reaches for. The thirteen it
-        /// adds are callable either way; the flag decides what is listed, and
-        /// what every session pays for before its first turn.
+        /// `--all-tools`: advertise all twenty-five tools in `tools/list`
+        /// rather than the surface the store chose — three on a store
+        /// `ingest-git` built, eleven on any other. The rest are callable
+        /// either way; the flag decides what is listed, and what every session
+        /// pays for before its first turn.
         all_tools: bool,
     },
     Stats {
@@ -359,6 +360,15 @@ pub enum Command {
         /// rendered digest.
         json: bool,
     },
+    /// One target from as many sides as the depth asks for: the graph's
+    /// `context`, `impact` and `owners` answers behind one command.
+    Explore {
+        db_dir: PathBuf,
+        target: String,
+        depth: repograph::Depth,
+        /// Quote the body from the working tree, as `context --full` does.
+        full: bool,
+    },
     /// Everything the graph knows about one file or symbol.
     Context {
         db_dir: PathBuf,
@@ -443,8 +453,9 @@ Usage:
                      stdio handshake with the configured MCP command; exits 1 on any `fail`
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
   mushroomdb mcp <db-dir>|--auto [--all-tools]
-                     --all-tools lists all 24 tools; the default lists the 11 a coding
-                     agent reaches for (the rest stay callable, just unlisted)
+                     --all-tools lists all 25 tools; the default follows the store — 3 on a
+                     store `ingest-git` built (explore, query, stats), 11 on any other
+                     (the rest stay callable, just unlisted)
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
   mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
@@ -456,6 +467,12 @@ Usage:
                                    dirty working tree (git hook body)
   mushroomdb map <db-dir> [--json] summarise the graphed repository: clusters, key files, owners, hot files
                                    --json prints the computed map instead of the rendered digest
+  mushroomdb explore <db-dir> <target> [--depth context|impact|history|all] [--full]
+                                   one target from as many sides as asked for: the definition and
+                                   its callers (context), the blast radius (impact), the owner and
+                                   what it changes with (history), or all three
+                                   <target> is a file path, a symbol key, or a bare symbol name
+                                   --full also quotes the body from the working tree
   mushroomdb context <db-dir> <target> [--full]
                                    one file or symbol from every side: where it is, signature, callers,
                                    callees, importers, co-change partners, commits, notes
@@ -786,6 +803,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "sync" => parse_sync(&args[1..]),
         "map" => parse_dir_with_json("map", &args[1..])
             .map(|(db_dir, json)| Command::Map { db_dir, json }),
+        "explore" => parse_explore(&args[1..]),
         "context" => parse_context(&args[1..]),
         "impact" => parse_positional("impact", &args[1..], 1, usize::MAX)
             .map(|(db_dir, files)| Command::Impact { db_dir, files }),
@@ -1644,7 +1662,12 @@ pub fn run_map(db_dir: &Path, json: bool) -> Result<String, CliError> {
 pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
     let db = open_for_reading(db_dir)?;
     let report = repograph::brief(&db, &repograph::BriefOptions::default());
-    Ok(repograph::render_brief(&report, &reach_line(db_dir)))
+    let tool = if db.has_node(ingest_git::SYNC_KEY) {
+        "explore"
+    } else {
+        "context"
+    };
+    Ok(repograph::render_brief(&report, &reach_line(db_dir, tool)))
 }
 
 /// The brief's last line: how to reach the graph from this session.
@@ -1652,12 +1675,17 @@ pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
 /// Two doors, because a session may have either one open — the MCP tool, and
 /// the same question typed at a shell. The command names the binary the way
 /// `install` would resolve it right now, which is the same resolution the
-/// hooks themselves were written with, and it names the store, because
-/// `context` takes one.
-fn reach_line(db_dir: &Path) -> String {
+/// hooks themselves were written with, and it names the store, because both
+/// tools take one.
+///
+/// `tool` is the door this store actually has: a store a repository was
+/// ingested into serves `explore`, which is the only tool its MCP surface
+/// advertises, and any other store serves `context`. Naming a tool the session
+/// cannot see would be worse than naming none.
+fn reach_line(db_dir: &Path, tool: &str) -> String {
     let sep = repograph::render::SEP;
     format!(
-        "context <target> (MCP tool){sep}or: {} context {} <target>",
+        "{tool} <target> (MCP tool){sep}or: {} {tool} {} <target>",
         install::detect_mcp_command(None).shell(),
         install::sh_quote(&db_dir.to_string_lossy())
     )
@@ -1675,6 +1703,25 @@ fn open_for_reading(db_dir: &Path) -> Result<structure::Db, CliError> {
             read_only: true,
         },
     )?)
+}
+
+/// Body of `mushroomdb explore <db-dir> <target> [--depth …] [--full]`.
+///
+/// The same composition the MCP `explore` tool serves, rendered within the same
+/// default budget, so a session driving the CLI reads what a session driving
+/// the tool reads.
+pub fn run_explore(
+    db_dir: &Path,
+    target: &str,
+    depth: repograph::Depth,
+    full: bool,
+) -> Result<String, CliError> {
+    let db = open_for_reading(db_dir)?;
+    let report = repograph::explore(&db, None, target, depth, full);
+    Ok(repograph::render_explore(
+        &report,
+        repograph::DEFAULT_EXPLORE_BYTES,
+    ))
 }
 
 /// Body of `mushroomdb context <db-dir> <target> [--full]`.
@@ -1960,6 +2007,53 @@ fn parse_positional(
         return Err(format!("unexpected extra argument: {}", rest[max]));
     }
     Ok((db_dir, rest))
+}
+
+/// `explore <db-dir> <target> [--depth context|impact|history|all] [--full]`.
+///
+/// The depth names are the same four the MCP tool enumerates, parsed by the
+/// same function, so the two doors cannot disagree about what a depth is.
+fn parse_explore(args: &[&str]) -> Result<Command, String> {
+    let mut rest: Vec<String> = Vec::new();
+    let mut db_dir: Option<PathBuf> = None;
+    let mut depth = repograph::Depth::Context;
+    let mut full = false;
+    let mut want_depth = false;
+    for a in args {
+        if want_depth {
+            depth = repograph::Depth::parse(a).ok_or_else(|| {
+                format!(
+                    "--depth must be one of {}, got {a}",
+                    repograph::Depth::NAMES.join(" | ")
+                )
+            })?;
+            want_depth = false;
+        } else if *a == "--depth" {
+            want_depth = true;
+        } else if *a == "--full" {
+            full = true;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_none() {
+            db_dir = Some(PathBuf::from(*a));
+        } else {
+            rest.push((*a).to_string());
+        }
+    }
+    if want_depth {
+        return Err("--depth requires a value".to_string());
+    }
+    let db_dir = db_dir.ok_or_else(|| "explore requires <db-dir>".to_string())?;
+    match rest.len() {
+        0 => Err("explore requires <db-dir> and 1 more argument".to_string()),
+        1 => Ok(Command::Explore {
+            db_dir,
+            target: rest.remove(0),
+            depth,
+            full,
+        }),
+        _ => Err(format!("unexpected extra argument: {}", rest[1])),
+    }
 }
 
 /// `context <db-dir> <target> [--full]`.
@@ -2723,6 +2817,20 @@ mod tests {
                             db_dir: PathBuf::from("db"),
                             target: "x".into(),
                             full: true,
+                        }
+                    );
+                },
+            },
+            Case {
+                args: &["explore", "db", "x", "--depth", "impact"],
+                check: |r| {
+                    assert_eq!(
+                        r.unwrap(),
+                        Command::Explore {
+                            db_dir: PathBuf::from("db"),
+                            target: "x".into(),
+                            depth: repograph::Depth::Impact,
+                            full: false,
                         }
                     );
                 },
@@ -4250,6 +4358,25 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&["explore", "/tmp/db", "open"]).unwrap(),
+            Command::Explore {
+                db_dir: PathBuf::from("/tmp/db"),
+                target: "open".to_string(),
+                depth: repograph::Depth::Context,
+                full: false,
+            },
+            "the default depth is the cheapest one"
+        );
+        assert_eq!(
+            parse_args(&["explore", "/tmp/db", "open", "--depth", "all", "--full"]).unwrap(),
+            Command::Explore {
+                db_dir: PathBuf::from("/tmp/db"),
+                target: "open".to_string(),
+                depth: repograph::Depth::All,
+                full: true,
+            }
+        );
+        assert_eq!(
             parse_args(&["impact", "/tmp/db", "a.rs", "b.rs"]).unwrap(),
             Command::Impact {
                 db_dir: PathBuf::from("/tmp/db"),
@@ -4282,10 +4409,17 @@ mod tests {
             vec!["why", "/tmp/db", "a", "b", "c"],
             vec!["why", "/tmp/db", "-a", "b"],
             vec!["context"],
+            vec!["explore"],
+            vec!["explore", "/tmp/db"],
+            vec!["explore", "/tmp/db", "a", "b"],
+            vec!["explore", "/tmp/db", "a", "--depth"],
+            vec!["explore", "/tmp/db", "a", "--depth", "everything"],
+            vec!["explore", "/tmp/db", "a", "--nope"],
         ] {
             assert!(parse_args(&args).is_err(), "{args:?} must not parse");
         }
         for line in [
+            "mushroomdb explore <db-dir> <target>",
             "mushroomdb context <db-dir> <target>",
             "mushroomdb impact <db-dir> <file>...",
             "mushroomdb owners <db-dir> <path>",

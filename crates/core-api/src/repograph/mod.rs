@@ -8,6 +8,7 @@
 //!
 //! | Tool | Answers |
 //! |---|---|
+//! | [`explore`] | one target from as many sides as asked for: the three below in one call |
 //! | [`repo_map`] | what is this repository, in one screen |
 //! | [`brief`] | the same, for the start of a session, in a fixed byte budget |
 //! | [`context`] | everything known about one file or symbol |
@@ -40,6 +41,7 @@
 mod brief;
 mod concepts;
 mod context;
+mod explore;
 mod facts;
 mod impact;
 mod map;
@@ -56,6 +58,7 @@ pub use concepts::stale_concepts;
 pub use context::{
     context, context_with, CallSites, ContextOptions, ContextReport, Target, MAX_SOURCE_LINES,
 };
+pub use explore::{explore, Depth, ExploreReport};
 pub use impact::{
     impact, path_excluded, FileImpact, ImpactOptions, ImpactReport, Partner, DEFAULT_EXCLUDES,
     MIN_SHARED_COMMITS,
@@ -69,7 +72,8 @@ pub use recall::{
 };
 pub use remember::{remember, RememberInput, NOTE_KINDS};
 pub use render::{
-    render_brief, render_context, render_impact, render_map, render_owners, render_why, sanitize,
-    EMPTY_BRIEF, MAX_BRIEF_BYTES, MAX_CONTEXT_LINES, MAX_MAP_LINES, MAX_TOOL_LINES,
+    render_brief, render_context, render_explore, render_impact, render_map, render_owners,
+    render_why, sanitize, DEFAULT_EXPLORE_BYTES, EMPTY_BRIEF, MAX_BRIEF_BYTES, MAX_CONTEXT_LINES,
+    MAX_MAP_LINES, MAX_TOOL_LINES,
 };
 pub use why::{why, SharedCommits, WhyLink, WhyReport};

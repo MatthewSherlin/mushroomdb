@@ -58,6 +58,12 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
+        Ok(Command::Explore {
+            db_dir,
+            target,
+            depth,
+            full,
+        }) => print_or_fail(cli::run_explore(&db_dir, &target, depth, full)),
         Ok(Command::Context {
             db_dir,
             target,

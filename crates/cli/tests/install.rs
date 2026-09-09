@@ -2582,6 +2582,7 @@ fn uninstall_leaves_mixed_hook_group_with_user_hook_intact() {
 /// The task tools plus the two entry points the skill has to name, written the
 /// way the text writes them so a bare word inside another word cannot pass.
 const REQUIRED_TOOL_MENTIONS: &[&str] = &[
+    "`explore`",
     "`map`",
     "`context`",
     "`impact`",

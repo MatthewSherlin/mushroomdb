@@ -9,12 +9,14 @@
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
 //!   `serverInfo.name` `"mushroomdb"`, `serverInfo.version` (crate version)
 //! - `notifications/initialized` — ignored
-//! - `tools/list` — eleven tools by default, each with a JSON Schema: the
-//!   eight repository task tools of [`mcp_tasks`](crate::mcp_tasks) first,
-//!   then `query`, `ingest_json` and `stats`, whose descriptions carry the
+//! - `tools/list` — the default listing follows the store the server opened
+//!   (see [`Surface`]): a store a repository was ingested into lists three —
+//!   `explore`, `query`, `stats` — and any other store lists today's eleven,
+//!   the eight memory task tools of [`mcp_tasks`](crate::mcp_tasks) followed by
+//!   `query`, `ingest_json` and `stats`. Graph-tool descriptions carry the
 //!   prefix `Advanced: ` so a host ranking tools by description puts the task
-//!   tools in front. `mushroomdb mcp --all-tools` lists all twenty-four; the
-//!   thirteen it adds are callable either way, just not advertised
+//!   tools in front. `mushroomdb mcp --all-tools` lists all twenty-five; the
+//!   rest are callable either way, just not advertised
 //! - `tools/call` — dispatch; success for a graph tool is
 //!   `{content:[{type:"text", text:<json string>}]}`, and for a task tool one
 //!   text block holding the rendered digest — or, with `json: true`, the
@@ -76,9 +78,15 @@ pub fn run_mcp_stdio(
 
 /// [`run_mcp_stdio`], with the tool list chosen by the caller.
 ///
-/// `all_tools` false lists the eight task tools plus `query`, `ingest_json`
-/// and `stats`; true lists all twenty-four. Either way every tool remains
-/// callable — the flag decides what is advertised, not what is served.
+/// `all_tools` false lists what the store's [`Surface`] names — three on a
+/// code graph, eleven on a memory store; true lists all twenty-five. Either
+/// way every tool remains callable — the flag decides what is advertised, not
+/// what is served.
+///
+/// The surface is read once, here, rather than per `tools/list`: a store does
+/// not become a code graph half way through a session, and a listing that
+/// changed under a host that caches it would be worse than one that is merely
+/// stale.
 pub fn run_mcp_stdio_with(
     db: SharedDb,
     db_dir: Option<PathBuf>,
@@ -86,6 +94,7 @@ pub fn run_mcp_stdio_with(
     mut reader: impl BufRead,
     mut writer: impl Write,
 ) -> io::Result<()> {
+    let surface = surface_of(&db);
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -95,7 +104,14 @@ pub fn run_mcp_stdio_with(
         }
         match std::str::from_utf8(&buf) {
             Ok(s) if s.trim().is_empty() => continue,
-            Ok(s) => handle_line(&db, db_dir.as_deref(), all_tools, s.trim(), &mut writer)?,
+            Ok(s) => handle_line(
+                &db,
+                db_dir.as_deref(),
+                all_tools,
+                surface,
+                s.trim(),
+                &mut writer,
+            )?,
             Err(_) => write_error(&mut writer, None, -32700, "Parse error")?,
         }
     }
@@ -105,6 +121,7 @@ fn handle_line(
     db: &SharedDb,
     db_dir: Option<&Path>,
     all_tools: bool,
+    surface: Surface,
     line: &str,
     writer: &mut impl Write,
 ) -> io::Result<()> {
@@ -139,7 +156,7 @@ fn handle_line(
         }
         "tools/list" => {
             if is_request {
-                write_result(writer, id, tools_list(all_tools))?;
+                write_result(writer, id, tools_list(all_tools, surface))?;
             }
         }
         "tools/call" => {
@@ -888,33 +905,93 @@ fn initialize_result() -> Js {
 /// The prefix every graph tool's description carries.
 ///
 /// A host that ranks tools by their description now has one signal that the
-/// eight repository tools are the ones to reach for first, and that everything
+/// repository task tools are the ones to reach for first, and that everything
 /// under this prefix is the lower-level surface beneath them.
 const ADVANCED_PREFIX: &str = "Advanced: ";
 
-/// The graph tools a default `tools/list` keeps, in the order they appear in
-/// [`graph_tools`].
+/// The graph tools a default `tools/list` keeps on a [`Surface::Memory`] store,
+/// in the order they appear in [`graph_tools`].
 ///
 /// The sixteen graph schemas cost 9,054 of the 12,238 bytes a session paid
 /// before it did anything — 74% of the payload, for a surface a coding agent
 /// rarely reaches: `find_similar` (2,015 B) and `hybrid_search` (1,456 B)
-/// alone outweigh all eight task tools. These three stay because they are the
-/// ones the task tools do not cover and the skill sends an assistant to by
-/// name: an arbitrary Cypher read, a bulk load, and the store's own counts.
+/// alone outweigh every task tool put together. These three stay because they
+/// are the ones the task tools do not cover and the skill sends an assistant to
+/// by name: an arbitrary Cypher read, a bulk load, and the store's own counts.
 /// The rest are one `--all-tools` away.
 const DEFAULT_GRAPH_TOOLS: [&str; 3] = ["query", "ingest_json", "stats"];
 
-/// The tools `tools/list` advertises: the eight repository task tools, then
-/// the graph tools with their descriptions prefixed.
+/// The three a code-graph store advertises: one tool to find, one to ask an
+/// arbitrary question, one to size the store.
 ///
-/// `all` false — the default — lists eleven: the eight, plus
-/// [`DEFAULT_GRAPH_TOOLS`]. `all` true lists all twenty-four, which is what
-/// `mushroomdb mcp --all-tools` runs.
-fn tools_list(all: bool) -> Js {
-    let mut tools = crate::mcp_tasks::task_tools();
+/// `ingest_json` is not among them. A store built by `ingest-git` is written by
+/// `sync` and `touch`, not by an assistant bulk-loading rows into it, and the
+/// tool that is never the right one on this surface is the one worth not
+/// listing.
+const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
+
+/// Which door a store is: which default tool list it gets.
+///
+/// Decided from the store the server opened, once, at startup — not from an
+/// install flag — so one `.mcp.json` serves both and neither has to be
+/// configured for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Surface {
+    /// A repository was ingested into this store: the `GitSync` marker is
+    /// there, and `explore` has a code graph to explore.
+    CodeGraph,
+    /// Any other store, including an empty one: today's eleven-tool memory
+    /// surface, where `explore` would have nothing to answer from.
+    Memory,
+}
+
+impl Surface {
+    /// Whether a default `tools/list` on this surface advertises `name`.
+    fn lists(self, name: &str) -> bool {
+        match self {
+            Surface::CodeGraph => CODE_GRAPH_TOOLS.contains(&name),
+            // Every task tool but `explore`, plus the three graph tools.
+            Surface::Memory => {
+                (crate::mcp_tasks::TASK_TOOLS.contains(&name) && name != "explore")
+                    || DEFAULT_GRAPH_TOOLS.contains(&name)
+            }
+        }
+    }
+}
+
+/// The surface the store `db` holds: [`Surface::CodeGraph`] when it carries the
+/// `GitSync` marker `ingest-git` writes, [`Surface::Memory`] otherwise.
+fn surface_of(db: &SharedDb) -> Surface {
+    let ingested = {
+        let g = db.read();
+        g.has_node(crate::mcp_tasks::SYNC_KEY)
+    };
+    if ingested {
+        Surface::CodeGraph
+    } else {
+        Surface::Memory
+    }
+}
+
+/// The tools `tools/list` advertises: the nine repository task tools, then the
+/// graph tools with their descriptions prefixed, filtered by `surface`.
+///
+/// `all` false — the default — lists what `surface` names: three on a code
+/// graph, eleven on a memory store. `all` true lists all twenty-five whichever
+/// the store is, which is what `mushroomdb mcp --all-tools` runs. Either way
+/// every tool stays callable: the flag and the surface decide what is
+/// advertised, not what is served.
+fn tools_list(all: bool, surface: Surface) -> Js {
+    let mut tools: Vec<Js> = Vec::new();
+    for tool in crate::mcp_tasks::task_tools() {
+        let name = tool.get("name").and_then(Js::as_str).unwrap_or_default();
+        if all || surface.lists(name) {
+            tools.push(tool);
+        }
+    }
     for mut tool in graph_tools() {
         let name = tool.get("name").and_then(Js::as_str).unwrap_or_default();
-        if !all && !DEFAULT_GRAPH_TOOLS.contains(&name) {
+        if !all && !surface.lists(name) {
             continue;
         }
         if let Some(d) = tool.get("description").and_then(Js::as_str) {
@@ -1379,7 +1456,8 @@ mod tests {
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
         for expected in &[
-            // The eight repository task tools, first and in order.
+            // The nine repository task tools, first and in order.
+            "explore",
             "map",
             "context",
             "impact",
@@ -1410,22 +1488,26 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            24,
-            "expected exactly 24 tools, got {}",
+            25,
+            "expected exactly 25 tools, got {}",
             names.len()
         );
         assert_eq!(
-            &names[..8],
-            ["map", "context", "impact", "owners", "why", "recall", "remember", "sync"],
+            &names[..9],
+            [
+                "explore", "map", "context", "impact", "owners", "why", "recall", "remember",
+                "sync"
+            ],
             "the task tools come first, in order"
         );
-        assert_eq!(names[8], "query", "the graph tools follow them");
+        assert_eq!(names[9], "query", "the graph tools follow them");
     }
 
-    /// Binding: the default listing is the eight task tools plus the three
-    /// graph tools a coding agent reaches for, and nothing else.
+    /// Binding: on a store no repository was ingested into, the default
+    /// listing is the eight memory task tools plus the three graph tools a
+    /// coding agent reaches for, and nothing else.
     #[test]
-    fn tools_list_defaults_to_eleven() {
+    fn tools_list_defaults_to_eleven_on_a_memory_store() {
         let db = demo_db();
         let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let names: Vec<&str> = resp["result"]["tools"]
@@ -1450,6 +1532,28 @@ mod tests {
                 "stats"
             ]
         );
+    }
+
+    /// Binding: the same server on a store carrying the `GitSync` marker lists
+    /// three. One tool to find, one to query, one to size the store.
+    #[test]
+    fn tools_list_is_three_tools_on_a_code_graph_store() {
+        let db = demo_db();
+        db.write()
+            .insert_node(
+                "GitSync",
+                crate::mcp_tasks::SYNC_KEY,
+                vec![("id".into(), Value::Str(crate::mcp_tasks::SYNC_KEY.into()))],
+            )
+            .expect("marker");
+        let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(names, ["explore", "query", "stats"]);
     }
 
     #[test]

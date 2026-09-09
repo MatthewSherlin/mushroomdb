@@ -7,6 +7,7 @@
 
 use crate::repograph::brief::BriefReport;
 use crate::repograph::context::{ContextReport, Target};
+use crate::repograph::explore::ExploreReport;
 use crate::repograph::impact::{FileImpact, ImpactReport, Partner};
 use crate::repograph::map::RepoMap;
 use crate::repograph::owners::OwnersReport;
@@ -792,6 +793,67 @@ fn render_file_impact(out: &mut String, f: &FileImpact) {
             .map(|(key, n)| format!("{} {}", sanitize(key), plural(*n, "caller")))
             .collect::<Vec<_>>(),
     );
+}
+
+/// What a default `explore` reply may cost, in bytes.
+///
+/// 1,200 tokens at four bytes a token — the budget §4.3 set for a default
+/// `context` reply, which is the largest part of what `explore` composes. A
+/// caller that wants more says so; a caller that says nothing gets an answer it
+/// can afford to have been wrong about.
+pub const DEFAULT_EXPLORE_BYTES: usize = 4_800;
+
+/// Render an [`ExploreReport`] within `budget_bytes`.
+///
+/// The context digest, then the blast radius under an `impact:` heading, then
+/// the two history lines — in that order, because it is the order a reader
+/// stops at: what this is, what it touches, who to ask.
+///
+/// The budget is spent on whole lines ([`cap_bytes`]), so a path is never cut
+/// in half — a half path still reads as a path, and a caller acts on it. The
+/// header line survives any budget: a reply that says which target was looked
+/// up and nothing else is still an answer, and a blank one is not. Every budget
+/// the tool schema admits (200 tokens, 800 bytes) is many times that line, so
+/// the exemption is a floor, not a leak.
+#[must_use]
+pub fn render_explore(r: &ExploreReport, budget_bytes: usize) -> String {
+    let mut out = render_context(&r.context);
+
+    if let Some(imp) = &r.impact {
+        // `render_impact`'s own header counts the files it was given, which is
+        // always the one file this target sits in — the heading says it better.
+        let rendered = render_impact(imp);
+        let mut body = rendered.lines().skip(1).peekable();
+        if body.peek().is_some() {
+            out.push_str("impact:\n");
+            for line in body {
+                let _ = writeln!(out, "  {line}");
+            }
+        }
+    }
+
+    if let Some((name, key, share)) = r.owners.as_ref().and_then(|o| o.top.as_ref()) {
+        let _ = writeln!(
+            out,
+            "owner: {} ({}) {share:.2} of the file's commits",
+            sanitize(name),
+            sanitize(key)
+        );
+    }
+    if !r.partners.is_empty() {
+        let items: Vec<String> = r
+            .partners
+            .iter()
+            .map(|(k, s)| format!("{} {s:.2}", sanitize(k)))
+            .collect();
+        let _ = writeln!(out, "changes with: {}", items.join(SEP));
+    }
+
+    let capped = cap_bytes(&out, budget_bytes);
+    if capped.is_empty() && !out.is_empty() {
+        return cap_lines(&out, 1);
+    }
+    capped
 }
 
 /// Render an [`OwnersReport`]: at most [`MAX_TOOL_LINES`] lines.

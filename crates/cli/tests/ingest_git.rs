@@ -1745,15 +1745,16 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
     );
     assert!(!header.contains("ago"), "{header}");
     assert!(text.contains("src/core.rs"), "{text}");
-    // The last line names both doors, and the CLI one is runnable: `context`
-    // takes a store, so the line has to carry one.
+    // The last line names both doors, and the CLI one is runnable: `explore`
+    // takes a store, so the line has to carry one. This store was built by
+    // `ingest-git`, so the door it names is the code graph's one tool.
     let reach = text.lines().next_back().unwrap();
     assert!(
-        reach.starts_with("reach the graph: context <target> (MCP tool)"),
+        reach.starts_with("reach the graph: explore <target> (MCP tool)"),
         "{reach}"
     );
     assert!(
-        reach.ends_with(&format!(" context '{}' <target>", db_dir.display())),
+        reach.ends_with(&format!(" explore '{}' <target>", db_dir.display())),
         "{reach}"
     );
 

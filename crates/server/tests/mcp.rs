@@ -192,7 +192,7 @@ fn tools_list_returns_all_tools_with_schemas() {
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 24);
+    assert_eq!(tools.len(), 25);
 
     let by_name = |n: &str| {
         tools
@@ -992,18 +992,19 @@ fn hybrid_search_text_only_and_missing_field_errors() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Task tools: map, context, impact, owners, why, recall, remember, sync
+// Task tools: explore, map, context, impact, owners, why, recall, remember,
+// sync
 //
-// These eight answer a question about a graphed repository rather than about
+// These nine answer a question about a graphed repository rather than about
 // the graph API, so they come first in `tools/list` and the graph tools listed
 // beside them are prefixed `Advanced:`. Each returns the rendered digest as
 // its text content and nothing else; a caller that wants the report passes
 // `json: true` and gets it *as* the text.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The eight task tools, in the order `tools/list` must list them.
-const TASK_TOOLS: [&str; 8] = [
-    "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
+/// The nine task tools, in the order `tools/list` must list them.
+const TASK_TOOLS: [&str; 9] = [
+    "explore", "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
 ];
 
 /// The sixteen graph tools, in their established order, after the task tools.
@@ -1383,11 +1384,16 @@ fn one_task_call(db: SharedDb, name: &str, args: Js) -> Js {
 /// bulk load, and the store's own counts. The other thirteen are `--all-tools`.
 const DEFAULT_GRAPH_TOOLS: [&str; 3] = ["query", "ingest_json", "stats"];
 
-/// Binding: the default list is the eight task tools plus those three, in that
-/// order — the sixteen graph schemas cost 74% of what a session paid before it
-/// did anything.
+/// The eight a memory store lists: every task tool but `explore`, which has no
+/// code graph to explore there.
+const MEMORY_TASK_TOOLS: [&str; 8] = [
+    "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
+];
+
+/// Binding: a store no repository was ingested into keeps today's eleven — the
+/// eight memory task tools plus those three graph tools, in that order.
 #[test]
-fn tools_list_defaults_to_the_task_tools() {
+fn a_memory_store_keeps_the_eleven_tool_surface() {
     let (res, out) = exchange(open("list-default"), &req(json!(1), "tools/list", None));
     assert!(res.is_ok(), "{res:?}");
     let replies = parse_lines(&out);
@@ -1396,13 +1402,58 @@ fn tools_list_defaults_to_the_task_tools() {
         .iter()
         .map(|t| t["name"].as_str().expect("name"))
         .collect();
-    let expected: Vec<&str> = TASK_TOOLS
+    let expected: Vec<&str> = MEMORY_TASK_TOOLS
         .iter()
         .chain(DEFAULT_GRAPH_TOOLS.iter())
         .copied()
         .collect();
-    assert_eq!(names, expected, "default tools/list");
+    assert_eq!(names, expected, "default tools/list on a memory store");
     assert_eq!(tools.len(), 11);
+}
+
+/// Binding: a store carrying the `GitSync` marker — a repository was ingested
+/// into it — lists three tools and nothing else. A host defers MCP schemas and
+/// makes the model search for them, so what is listed is what gets found.
+#[test]
+fn a_code_graph_store_lists_three_tools_by_default() {
+    let (res, out) = exchange(
+        code_store("surface-code"),
+        &req(json!(1), "tools/list", None),
+    );
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    let names: Vec<&str> = replies[0]["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, vec!["explore", "query", "stats"]);
+}
+
+/// Binding: the surface decides what is *listed*, never what is served. Every
+/// tool the memory surface advertises is still callable on a code-graph store,
+/// and `explore` is still callable on a memory store.
+#[test]
+fn a_hidden_tool_is_still_callable_on_either_surface() {
+    let map = task_reply(&one_task_call(
+        code_store("surface-hidden"),
+        "map",
+        json!({}),
+    ));
+    assert!(
+        map.starts_with("mushroomdb map —"),
+        "map is unlisted on a code graph but must still answer: {map}"
+    );
+    let explore = task_reply(&one_task_call(
+        open("surface-memory-explore"),
+        "explore",
+        json!({"target": "x"}),
+    ));
+    assert!(
+        explore.contains("unknown: x"),
+        "explore is unlisted on a memory store but must still answer: {explore}"
+    );
 }
 
 /// Binding: an unlisted tool is still served. The flag decides what is
@@ -1421,10 +1472,10 @@ fn an_unlisted_graph_tool_is_still_callable() {
     );
 }
 
-/// Binding: `--all-tools` lists 24, task tools first in their fixed order, and
+/// Binding: `--all-tools` lists 25, task tools first in their fixed order, and
 /// every one of the sixteen graph tools carries the `Advanced:` prefix.
 #[test]
-fn tools_list_has_24_tools_task_tools_first_and_advanced_prefix() {
+fn tools_list_has_25_tools_task_tools_first_and_advanced_prefix() {
     let (res, out) = exchange_all_tools(open("list-order"), &req(json!(1), "tools/list", None));
     assert!(res.is_ok(), "{res:?}");
     let replies = parse_lines(&out);
@@ -1440,7 +1491,7 @@ fn tools_list_has_24_tools_task_tools_first_and_advanced_prefix() {
         .copied()
         .collect();
     assert_eq!(names, expected, "tools/list order");
-    assert_eq!(tools.len(), 24);
+    assert_eq!(tools.len(), 25);
 
     for t in tools.iter().take(TASK_TOOLS.len()) {
         let d = t["description"].as_str().expect("description");
@@ -1496,6 +1547,14 @@ fn tools_list_has_24_tools_task_tools_first_and_advanced_prefix() {
     assert_eq!(
         by_name("context")["inputSchema"]["required"],
         json!(["target"])
+    );
+    assert_eq!(
+        by_name("explore")["inputSchema"]["required"],
+        json!(["target"])
+    );
+    assert_eq!(
+        by_name("explore")["inputSchema"]["properties"]["depth"]["enum"],
+        json!(["context", "impact", "history", "all"])
     );
     assert_eq!(
         by_name("owners")["inputSchema"]["required"],
@@ -1726,6 +1785,73 @@ fn context_on_unknown_target_is_not_an_error() {
 fn context_without_target_is_a_tool_error() {
     let reply = one_task_call(code_store("context-no-target"), "context", json!({}));
     assert!(error_text(&reply).contains("target"));
+}
+
+/// Binding: `explore` at `all` is one call for the three answers — the
+/// context, the blast radius, and who owns it — inside the default budget.
+#[test]
+fn explore_all_composes_context_impact_and_history_within_budget() {
+    let (text, structured) = task_both(
+        code_store("explore-all"),
+        "explore",
+        json!({"target": "core::init", "depth": "all"}),
+    );
+    assert_eq!(
+        structured["context"]["target"]["symbol"]["key"],
+        json!("src/core.rs#core::init")
+    );
+    assert_eq!(structured["depth"], json!("all"));
+    assert!(
+        structured["impact"].is_object() && structured["owners"].is_object(),
+        "all carries the blast radius and the ownership: {structured}"
+    );
+    assert!(text.len() <= 4_800, "{} bytes:\n{text}", text.len());
+    for want in ["callers", "impact", "owner"] {
+        assert!(text.contains(want), "the digest is missing {want}:\n{text}");
+    }
+}
+
+/// Binding: the default depth is `context`, and it costs neither the blast
+/// radius nor the history.
+#[test]
+fn explore_defaults_to_context_depth() {
+    let (text, structured) = task_both(
+        code_store("explore-default"),
+        "explore",
+        json!({"target": "core::init"}),
+    );
+    assert_eq!(structured["depth"], json!("context"));
+    assert!(structured["impact"].is_null() && structured["owners"].is_null());
+    assert!(!text.contains("impact:"), "{text}");
+}
+
+/// Binding: `budget` is in tokens and caps the whole reply, framing included.
+#[test]
+fn explore_budget_caps_the_reply() {
+    let reply = one_task_call(
+        code_store("explore-budget"),
+        "explore",
+        json!({"target": "core::init", "depth": "all", "budget": 200}),
+    );
+    let text = task_reply(&reply);
+    assert!(
+        text.len() <= 200 * 4,
+        "a 200-token budget is 800 bytes, got {}:\n{text}",
+        text.len()
+    );
+    assert!(!text.is_empty(), "the header survives any budget");
+}
+
+/// Binding: a depth that is not one of the four is a tool error naming them.
+#[test]
+fn explore_with_an_unknown_depth_is_a_tool_error() {
+    let reply = one_task_call(
+        code_store("explore-depth"),
+        "explore",
+        json!({"target": "core::init", "depth": "everything"}),
+    );
+    let msg = error_text(&reply);
+    assert!(msg.contains("depth") && msg.contains("history"), "{msg}");
 }
 
 /// Binding: `impact` on an explicit file list marks the partners that are
@@ -1961,12 +2087,12 @@ fn sync_with_db_dir_reports_the_child_failure() {
 /// line, exactly once, before any repository content.
 ///
 /// `task_reply` asserts this on each tool's own test too; this one sweeps all
-/// eight in one place so a ninth tool cannot be added without a framed answer.
+/// nine in one place so a tenth tool cannot be added without a framed answer.
 #[test]
 fn every_task_tool_frames_its_text_as_untrusted() {
     let db = code_store("framing");
     let args = |tool: &str| match tool {
-        "context" => json!({"target": "core::init"}),
+        "explore" | "context" => json!({"target": "core::init"}),
         "impact" => json!({"files": ["src/core.rs"]}),
         "owners" => json!({"path": "src/core.rs"}),
         "why" => json!({"a": "src/core.rs", "b": "src/web.rs"}),

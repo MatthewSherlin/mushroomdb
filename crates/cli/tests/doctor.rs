@@ -118,8 +118,9 @@ fn doctor_passes_on_fresh_project_install() {
 
     let handshake = find_check(&report.output, "handshake");
     assert!(handshake.starts_with("ok"), "handshake check: {handshake}");
-    // The eleven a default `mushroomdb mcp` advertises: the eight task tools
-    // plus `query`, `ingest_json` and `stats`. The other thirteen stay
+    // The eleven a default `mushroomdb mcp` advertises on a memory store —
+    // which is what a fresh install points at: the eight memory task tools
+    // plus `query`, `ingest_json` and `stats`. The other fourteen stay
     // callable, and `--all-tools` lists them.
     assert!(
         handshake.contains("11 tools"),
@@ -128,6 +129,53 @@ fn doctor_passes_on_fresh_project_install() {
     assert!(
         handshake.contains("map present"),
         "the handshake must prove the task path: {handshake}"
+    );
+}
+
+/// Binding: the handshake passes on a store `ingest-git` built, whose default
+/// listing is three tools and does *not* include `map`.
+///
+/// The check proves the repository task path is served, not that one
+/// particular name is listed; a code-graph store serves it through `explore`.
+/// Requiring `map` would fail `doctor` on exactly the stores this surface
+/// exists for.
+#[test]
+fn doctor_handshake_passes_on_a_code_graph_store() {
+    let root = temp_dir("code-graph-handshake");
+    let home = temp_dir("code-graph-handshake-home");
+    git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+
+    let opts = install_opts(Scope::Project, &db, &bin);
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::Explicit(bin.clone()),
+        &no_externals(),
+    )
+    .expect("install failed");
+
+    // The marker `ingest-git` writes is what makes this a code graph.
+    let out = std::process::Command::new(&bin)
+        .arg("query")
+        .arg(&db)
+        .arg("CREATE (n:GitSync {id: '__mushroomdb_git_sync__'})")
+        .output()
+        .expect("query");
+    assert!(out.status.success(), "{out:?}");
+
+    let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+        .expect("doctor errored");
+    let handshake = find_check(&report.output, "handshake");
+    assert!(
+        handshake.starts_with("ok"),
+        "a code-graph store must pass the handshake: {handshake}"
+    );
+    assert!(
+        handshake.contains("3 tools") && handshake.contains("explore present"),
+        "the handshake names the task tool it found: {handshake}"
     );
 }
 
