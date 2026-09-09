@@ -442,6 +442,10 @@ mushroomdb — embedded graph database
 Usage:
   mushroomdb install [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
                      [--command <path>] [--no-git-hooks] [--no-prewarm]
+                     [--delivery cli|mcp|both]
+                     --delivery cli writes the skill and the hooks and registers no MCP
+                     server: the skill teaches `mushroomdb <command>` instead (claude-code
+                     only; cursor and codex are always registered as MCP servers)
   mushroomdb uninstall [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
   mushroomdb disable [--platform claude-code|cursor|codex|all] [--project|--user]
                      turn an install off without removing it: hooks, MCP entry and git hook
@@ -543,10 +547,21 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
     let mut command: Option<PathBuf> = None;
     let mut git_hooks = true;
     let mut prewarm = true;
+    let mut delivery = install::Delivery::default();
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--platform" {
+        if a == "--delivery" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --delivery".to_string())?;
+            delivery = install::Delivery::parse(val)?;
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--delivery=") {
+            delivery = install::Delivery::parse(val)?;
+            i += 1;
+        } else if a == "--platform" {
             let val = args
                 .get(i + 1)
                 .copied()
@@ -608,6 +623,7 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
         command,
         git_hooks,
         prewarm,
+        delivery,
     })
 }
 
@@ -1681,14 +1697,21 @@ pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
 /// `tool` is the door this store actually has: a store a repository was
 /// ingested into serves `explore`, which is the only tool its MCP surface
 /// advertises, and any other store serves `context`. Naming a tool the session
-/// cannot see would be worse than naming none.
+/// cannot see would be worse than naming none — which is also why a `cli`
+/// install, which registers no server at all, gets the shell form alone.
 fn reach_line(db_dir: &Path, tool: &str) -> String {
-    let sep = repograph::render::SEP;
-    format!(
-        "{tool} <target> (MCP tool){sep}or: {} {tool} {} <target>",
+    let shell = format!(
+        "{} {tool} {} <target>",
         install::detect_mcp_command(None).shell(),
         install::sh_quote(&db_dir.to_string_lossy())
-    )
+    );
+    match install::delivery_for_store(db_dir) {
+        install::Delivery::Cli => shell,
+        _ => format!(
+            "{tool} <target> (MCP tool){}or: {shell}",
+            repograph::render::SEP
+        ),
+    }
 }
 
 /// Open a store the way every question about it is asked: read-only, with both
@@ -2996,6 +3019,43 @@ mod tests {
                         assert_eq!(snapshot_every, None);
                     }
                     other => panic!("serve --demo-if-empty docker default, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["install", "--project", "--delivery", "cli"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => {
+                        assert_eq!(opts.scope, Some(install::Scope::Project));
+                        assert_eq!(opts.delivery, install::Delivery::Cli);
+                    }
+                    other => panic!("install --delivery cli, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["install", "--delivery=mcp"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => {
+                        assert_eq!(opts.delivery, install::Delivery::Mcp)
+                    }
+                    other => panic!("install --delivery=mcp, got {other:?}"),
+                },
+            },
+            Case {
+                // No flag is the default, and it is the one that opens both
+                // doors: an upgrade must not quietly drop a user's server.
+                args: &["install"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => {
+                        assert_eq!(opts.delivery, install::Delivery::Both)
+                    }
+                    other => panic!("install, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["install", "--delivery", "sideways"],
+                check: |r| match r {
+                    Err(e) => assert!(e.contains("--delivery must be cli | mcp | both"), "{e}"),
+                    other => panic!("a bad --delivery must be refused, got {other:?}"),
                 },
             },
         ];

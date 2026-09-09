@@ -1805,3 +1805,54 @@ fn the_reach_line_names_context_on_a_store_with_no_git_sync_marker() {
         "{reach}"
     );
 }
+
+/// Binding: on a `--delivery cli` install the brief's last line names the
+/// shell form and nothing else.
+///
+/// The reach line is the one place a session is told how to get at the graph.
+/// A `cli` install registers no MCP server, so naming the tool would send it
+/// at a door that is not there — the same failure as naming `explore` on a
+/// memory store, one layer out.
+#[test]
+fn the_reach_line_on_a_cli_delivery_install_names_only_the_binary() {
+    let root = tmp("brief-cli-delivery");
+    let home = tmp("brief-cli-delivery-home");
+    let db_dir = root.join("mushroom-memory");
+    std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+
+    cli::install::run_install_with(
+        &root,
+        &home,
+        &cli::install::InstallOpts {
+            platform: Some(cli::install::Platform::ClaudeCode),
+            scope: Some(cli::install::Scope::Project),
+            db: Some(db_dir.clone()),
+            command: None,
+            git_hooks: true,
+            prewarm: false,
+            delivery: cli::install::Delivery::Cli,
+        },
+        &cli::install::McpCommand::OnPath,
+        &cli::install::Externals::with_path(None),
+    )
+    .expect("install");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&db_dir)
+        .arg("CREATE (n:File {id: 'a.rs', path: 'a.rs', lines: 1})")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let text = cli::run_brief(&db_dir).expect("brief");
+    let reach = text.lines().next_back().unwrap();
+    assert!(
+        !reach.contains("MCP tool"),
+        "a cli install has no server to name: {reach}"
+    );
+    assert!(
+        reach.ends_with(&format!(" context '{}' <target>", db_dir.display())),
+        "{reach}"
+    );
+}

@@ -6,8 +6,8 @@
 //! of stand-ins or leaves it empty (mirrors `tests/install.rs`).
 
 use cli::install::{
-    run_disable, run_disable_with, run_enable_with, run_install_with, run_uninstall, Externals,
-    InstallOpts, McpCommand, Platform, Scope, ToggleOpts,
+    run_disable, run_disable_with, run_enable_with, run_install_with, run_uninstall, Delivery,
+    Externals, InstallOpts, McpCommand, Platform, Scope, ToggleOpts,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -74,6 +74,7 @@ fn base_opts() -> InstallOpts {
         command: None,
         git_hooks: true,
         prewarm: false,
+        delivery: Delivery::Both,
     }
 }
 
@@ -749,4 +750,62 @@ fn usage_mentions_enable_and_disable() {
     let text = cli::usage();
     assert!(text.contains("mushroomdb enable"), "{text}");
     assert!(text.contains("mushroomdb disable"), "{text}");
+}
+
+/// Binding: `disable`/`enable` on a `--delivery cli` install put back the
+/// install that was there — the hooks, for the store they were written for —
+/// and never a server it never had.
+#[test]
+fn enable_restores_a_cli_delivery_install_without_a_server() {
+    let root = temp_dir("enable-cli-delivery");
+    let home = temp_dir("enable-cli-delivery-home");
+    let hooks_dir = git_repo(&root);
+    // A store the default `--auto` fallback would not find, so a lost store
+    // shows up as a hook naming the wrong path rather than passing by luck.
+    let db = temp_dir("enable-cli-delivery-store").join("elsewhere");
+    let opts = InstallOpts {
+        delivery: Delivery::Cli,
+        ..claude_project_opts(&db)
+    };
+    install_on_path(&root, &home, &opts).expect("install");
+    assert!(!root.join(".mcp.json").exists(), "sanity: no server entry");
+
+    let toggle_opts = toggle(Platform::ClaudeCode, Scope::Project);
+    run_disable_with(&root, &home, &toggle_opts, &no_externals()).expect("disable");
+    let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
+    assert!(
+        settings["hooks"]["SessionStart"]
+            .as_array()
+            .is_none_or(|g| g.is_empty()),
+        "disable must take the hooks off disk: {settings}"
+    );
+
+    let out = run_enable_with(
+        &root,
+        &home,
+        &toggle_opts,
+        &McpCommand::OnPath,
+        &no_externals(),
+    )
+    .expect("enable");
+    assert!(out.contains("mushroomdb is enabled in"), "{out}");
+
+    assert!(
+        !root.join(".mcp.json").exists(),
+        "enable must not open a door this install never had"
+    );
+    let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
+    let brief = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("the SessionStart hook is back")
+        .to_string();
+    assert!(
+        brief.ends_with(&format!("brief '{}'", db.display())),
+        "the hook must name the store it was installed with: {brief}"
+    );
+    let post_commit = fs::read_to_string(hooks_dir.join("post-commit")).unwrap();
+    assert!(
+        post_commit.contains(&db.display().to_string()),
+        "{post_commit}"
+    );
 }

@@ -7,7 +7,9 @@
 //! binary (`CARGO_BIN_EXE_mushroomdb`) rather than simulating anything.
 
 use cli::doctor::{run_doctor_with, DoctorOpts};
-use cli::install::{run_install_with, Externals, InstallOpts, McpCommand, Platform, Scope};
+use cli::install::{
+    run_install_with, Delivery, Externals, InstallOpts, McpCommand, Platform, Scope,
+};
 use core_api::GraphDb;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,6 +65,7 @@ fn install_opts(scope: Scope, db: &Path, command: &Path) -> InstallOpts {
         command: Some(command.to_path_buf()),
         git_hooks: true,
         prewarm: false,
+        delivery: Delivery::Both,
     }
 }
 
@@ -197,6 +200,7 @@ fn doctor_understands_auto_entries() {
         command: Some(bin.clone()),
         git_hooks: true,
         prewarm: false,
+        delivery: Delivery::Both,
     };
     run_install_with(
         &root,
@@ -355,4 +359,66 @@ fn doctor_warns_when_lock_held() {
     );
 
     drop(holder);
+}
+
+/// Binding: a `--delivery cli` install has no MCP entry by design, so the two
+/// checks that read one report `skip` rather than `fail` — and everything that
+/// does not need one (the store, the hooks, the git hooks) still runs, against
+/// the store the install recorded.
+///
+/// `doctor` exits 1 on any `fail`, so a `fail` here would make a perfectly
+/// healthy install look broken every time it was checked.
+#[test]
+fn doctor_on_cli_delivery_skips_handshake_and_passes() {
+    let root = temp_dir("cli-delivery");
+    let home = temp_dir("cli-delivery-home");
+    git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+
+    let opts = InstallOpts {
+        delivery: Delivery::Cli,
+        ..install_opts(Scope::Project, &db, &bin)
+    };
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::Explicit(bin),
+        &no_externals(),
+    )
+    .expect("install failed");
+
+    let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+        .expect("doctor errored");
+
+    assert!(!report.had_fail, "expected no failures:\n{}", report.output);
+    for line in report.output.lines() {
+        assert!(
+            !line.starts_with("fail"),
+            "unexpected fail line: {line}\nfull output:\n{}",
+            report.output
+        );
+    }
+
+    let handshake = find_check(&report.output, "handshake");
+    assert!(
+        handshake.starts_with("skip") && handshake.contains("delivery: cli"),
+        "handshake check: {handshake}"
+    );
+    let config = find_check(&report.output, "config");
+    assert!(
+        config.starts_with("skip") && config.contains("delivery: cli"),
+        "config check: {config}"
+    );
+    // The checks that do not need a server still have to run: this install is
+    // exactly as breakable as any other in its store and its hooks.
+    for name in ["store", "hooks"] {
+        let check = find_check(&report.output, name);
+        assert!(
+            check.starts_with("ok"),
+            "{name} check: {check}\nfull output:\n{}",
+            report.output
+        );
+    }
 }

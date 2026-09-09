@@ -8,7 +8,7 @@
 //! of stand-ins or leaves it empty.
 
 use cli::install::{
-    classify_mcp_command, run_install_with, run_uninstall, run_uninstall_with, Externals,
+    classify_mcp_command, run_install_with, run_uninstall, run_uninstall_with, Delivery, Externals,
     InstallOpts, McpCommand, Platform, Scope, StoreRef,
 };
 use std::fs;
@@ -93,6 +93,7 @@ fn base_opts() -> InstallOpts {
         command: None,
         git_hooks: true,
         prewarm: false,
+        delivery: Delivery::Both,
     }
 }
 
@@ -2691,6 +2692,126 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: every delivery renders a whole skill — the same task tools named, the
+//       same per-turn budget, and none of the region markers the source file
+//       carries to tell the variants apart.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_delivery_variant_names_every_tool_and_fits_the_budget() {
+    let template = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills/mushroom/SKILL.md"),
+    )
+    .expect("skill template");
+
+    for delivery in [Delivery::Mcp, Delivery::Cli, Delivery::Both] {
+        let label = format!("{delivery:?}").to_lowercase();
+        // Rendered the way the plugin copy is, which is the longest `{{BIN}}`
+        // any variant ever carries and so the only worst case worth budgeting.
+        let skill = cli::install::render_template(
+            &template,
+            "./mushroom-memory",
+            &format!("npx -y mushroomdb@{VERSION}"),
+            delivery,
+        );
+        for tool in REQUIRED_TOOL_MENTIONS {
+            assert!(
+                skill.contains(tool),
+                "{label}: {tool} is never named — the assistant has no cue to call it"
+            );
+        }
+        assert!(
+            !skill.contains("<!--"),
+            "{label}: a delivery marker leaked into the rendered skill:\n{skill}"
+        );
+        assert!(
+            !skill.contains("\n\n\n"),
+            "{label}: stripping a region left a hole in the prose:\n{skill}"
+        );
+        assert!(
+            skill.len() <= 6_000,
+            "{label}: the rendered skill must stay under 6 KB, got {} bytes",
+            skill.len()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test: `--delivery cli` teaches the binary and registers no server.
+//
+// The point of the mode is that a session pays nothing to discover the graph:
+// a plain command through `Bash` needs no tool-schema round trip, so the skill
+// and the hooks are the whole install and `.mcp.json` is never written.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn delivery_cli_writes_skill_and_hooks_but_no_mcp_entry() {
+    let root = temp_dir("delivery-cli");
+    let home = temp_dir("delivery-cli-home");
+    git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let opts = InstallOpts {
+        delivery: Delivery::Cli,
+        ..claude_project_opts(&db)
+    };
+    install_on_path(&root, &home, &opts).expect("install");
+
+    assert!(root.join(".claude/skills/mushroom/SKILL.md").is_file());
+    assert_absent(&root, ".mcp.json");
+
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    assert!(
+        skill.contains("explore '") && skill.contains("--depth context|impact|history|all"),
+        "the cli skill must teach the shell form:\n{skill}"
+    );
+    assert!(
+        !skill.contains("MCP tool") && !skill.contains("tools/list"),
+        "the cli skill must not teach a door this install did not wire:\n{skill}"
+    );
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    for event in ["SessionStart", "UserPromptSubmit", "PostToolUse"] {
+        assert!(
+            s["hooks"][event].is_array(),
+            "the {event} hook is missing: {s}"
+        );
+    }
+    assert!(
+        root.join(".git/hooks/post-commit").is_file(),
+        "the git hooks are still written under cli delivery"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: an mcp-delivery install is today's install — the entry is still there,
+//       and the skill it writes is the one that teaches the tools.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn delivery_mcp_writes_the_entry_and_the_tool_skill() {
+    let root = temp_dir("delivery-mcp");
+    let home = temp_dir("delivery-mcp-home");
+    let db = root.join("mushroom-memory");
+    let opts = InstallOpts {
+        delivery: Delivery::Mcp,
+        ..claude_project_opts(&db)
+    };
+    install_on_path(&root, &home, &opts).expect("install");
+
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(mcp["mcpServers"]["mushroomdb"]["command"], "mushroomdb");
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    assert!(
+        skill.contains("tools/list"),
+        "the mcp skill must still teach the served surface:\n{skill}"
+    );
+    assert!(
+        !skill.contains("--depth context|impact|history|all"),
+        "the mcp skill must not carry the cli invocation:\n{skill}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test: uninstall against a settings.json whose UserPromptSubmit holds only a
 //       user's own hook has nothing to remove, so it must not rewrite the file
 // ---------------------------------------------------------------------------
@@ -2976,5 +3097,54 @@ fn unterminated_hook_block_is_refused_rather_than_swallowed() {
     assert!(
         !merged.contains("echo done"),
         "that line was inside our region once the block closed: {merged}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: switching an existing install to `cli` closes the door it opened —
+//       the entry comes back out of .mcp.json and off the manifest, so a later
+//       uninstall is not left claiming a key that is not there.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reinstalling_as_cli_removes_the_server_the_earlier_install_registered() {
+    let root = temp_dir("switch-to-cli");
+    let home = temp_dir("switch-to-cli-home");
+    let db = root.join("mushroom-memory");
+
+    install_on_path(&root, &home, &claude_project_opts(&db)).expect("install both");
+    let before: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert!(!before["mcpServers"]["mushroomdb"].is_null(), "{before}");
+
+    let out = install_on_path(
+        &root,
+        &home,
+        &InstallOpts {
+            delivery: Delivery::Cli,
+            ..claude_project_opts(&db)
+        },
+    )
+    .expect("install cli");
+    assert!(out.contains("removed mcpServers.mushroomdb"), "{out}");
+
+    let after: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert!(
+        after["mcpServers"]["mushroomdb"].is_null(),
+        "the server survived the switch: {after}"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["delivery"], "cli", "{manifest}");
+    assert!(
+        manifest["mcp_keys"].as_array().unwrap().is_empty(),
+        "the manifest still claims a key that is gone: {manifest}"
+    );
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    assert!(
+        skill.contains("--depth context|impact|history|all"),
+        "the skill must have been rewritten for the new door:\n{skill}"
     );
 }

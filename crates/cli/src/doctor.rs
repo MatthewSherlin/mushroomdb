@@ -17,9 +17,9 @@
 
 use crate::install::{
     claude_mcp_file, cursor_mcp_file, default_db, entry_db, expand_platform, git_hooks_dir,
-    has_our_server, is_disabled, is_our_hook_command, line_runs_for_store, resolve_platform,
-    resolve_scope, Externals, Platform, Scope, StoreRef, AUTO_ARG, BRIEF_EVENT, GIT_HOOKS,
-    HOOK_BEGIN, HOOK_EVENT, TOUCH_EVENT,
+    has_our_server, installed_shape, is_disabled, is_our_hook_command, line_runs_for_store,
+    resolve_platform, resolve_scope, Externals, Platform, Scope, StoreRef, AUTO_ARG, BRIEF_EVENT,
+    GIT_HOOKS, HOOK_BEGIN, HOOK_EVENT, TOUCH_EVENT,
 };
 use crate::CliError;
 use core_api::{GraphDb, GraphError, OpenOptions};
@@ -49,6 +49,8 @@ pub struct DoctorReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Ok,
+    /// The check does not apply to this install — not a finding either way.
+    Skip,
     Warn,
     Fail,
 }
@@ -57,6 +59,7 @@ impl Status {
     fn word(self) -> &'static str {
         match self {
             Status::Ok => "ok",
+            Status::Skip => "skip",
             Status::Warn => "warn",
             Status::Fail => "fail",
         }
@@ -76,6 +79,14 @@ impl Check {
     fn ok(name: &'static str, message: impl Into<String>) -> Self {
         Check {
             status: Status::Ok,
+            name,
+            message: message.into(),
+            fix: None,
+        }
+    }
+    fn skip(name: &'static str, message: impl Into<String>) -> Self {
+        Check {
+            status: Status::Skip,
             name,
             message: message.into(),
             fix: None,
@@ -145,12 +156,33 @@ pub fn run_doctor_with(
         });
     }
 
+    // A `cli` install registers no MCP server on purpose, so the two checks
+    // that read one have nothing to read and no fault to report; the store it
+    // is wired to comes from the hooks it did write. Everything else — the
+    // store, the hooks, the git hooks — is as breakable here as anywhere and
+    // still runs.
+    let (delivery, recorded_store) = installed_shape(project_root, home, scope, &platforms);
+    let mcp_delivery = delivery.wires_mcp();
+
     let mut checks: Vec<Check> = Vec::new();
     let mut primary: Option<(Platform, ConfigEntry)> = None;
 
     // 1. config — one line per requested platform; the first entry that reads
     //    cleanly becomes the target of every check below it.
     for plat in &platforms {
+        // A `cli` delivery closes Claude Code's door and no other's: Cursor
+        // and Codex are registered as servers whatever it asked for, so their
+        // entries are still there to check (see [`install::Delivery`]).
+        if !mcp_delivery && matches!(plat, Platform::ClaudeCode) {
+            checks.push(Check::skip(
+                "config",
+                format!(
+                    "delivery: {} — the skill teaches the binary, no MCP entry to check",
+                    delivery.label()
+                ),
+            ));
+            continue;
+        }
         match mcp_file_for(plat, project_root, home, scope) {
             None => checks.push(Check::warn(
                 "config",
@@ -180,6 +212,14 @@ pub fn run_doctor_with(
         }
     }
 
+    // The store every check below reads: the one the config entry names, or —
+    // with no entry to name it — the one this install's hooks were written for.
+    let store: Option<StoreRef> = match &primary {
+        Some((_, entry)) => Some(entry.store.clone()),
+        None if !mcp_delivery => recorded_store,
+        None => None,
+    };
+
     // 2. how the server is spawned — `npx` fetches the package, a resolved
     //    binary or launcher is a file that has to still be there.
     if let Some((_, entry)) = &primary {
@@ -191,19 +231,19 @@ pub fn run_doctor_with(
     }
 
     // 3. store, then the write-lock probe (same check family, adjacent lines).
-    match &primary {
-        Some((_, entry)) => checks.extend(check_store_and_lock(entry.store.path())),
+    match &store {
+        Some(store) => checks.extend(check_store_and_lock(store.path())),
         None => checks.push(Check::fail(
             "store",
-            "no usable config entry — cannot locate a database to check",
+            no_store_message(mcp_delivery),
             Some(install_fix_for_scope(scope)),
         )),
     }
 
     // 4. hooks — Claude Code only; Cursor has no prompt/tool-use hooks to check.
     if platforms.contains(&Platform::ClaudeCode) {
-        if let Some((_, entry)) = &primary {
-            checks.push(check_hooks(project_root, home, scope, &entry.store));
+        if let Some(store) = &store {
+            checks.push(check_hooks(project_root, home, scope, store));
         }
     }
 
@@ -214,8 +254,8 @@ pub fn run_doctor_with(
             .iter()
             .any(|p| matches!(p, Platform::ClaudeCode | Platform::Cursor))
     {
-        if let Some((_, entry)) = &primary {
-            if let Some(check) = check_git_hooks(project_root, &entry.store) {
+        if let Some(store) = &store {
+            if let Some(check) = check_git_hooks(project_root, store) {
                 checks.push(check);
             }
         }
@@ -224,6 +264,11 @@ pub fn run_doctor_with(
     // 6. self-handshake — spawn the configured command for real.
     match &primary {
         Some((_, entry)) => checks.push(check_handshake(entry)),
+        // No entry and none expected: nothing to spawn, and nothing wrong.
+        None if !mcp_delivery => checks.push(Check::skip(
+            "handshake",
+            format!("delivery: {} — no server to spawn", delivery.label()),
+        )),
         None => checks.push(Check::fail(
             "handshake",
             "no usable config entry — nothing to spawn",
@@ -242,6 +287,16 @@ pub fn run_doctor_with(
         output.push_str(&c.render());
     }
     Ok(DoctorReport { output, had_fail })
+}
+
+/// Why doctor could not find a store to check, in the terms of whichever
+/// artifact was supposed to name one.
+fn no_store_message(mcp_delivery: bool) -> &'static str {
+    if mcp_delivery {
+        "no usable config entry — cannot locate a database to check"
+    } else {
+        "no recorded SessionStart hook — cannot locate a database to check"
+    }
 }
 
 fn install_fix_for_scope(scope: Scope) -> String {

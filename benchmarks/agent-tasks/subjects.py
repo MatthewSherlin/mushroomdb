@@ -162,9 +162,10 @@ def install_subject(subject: Path, extra_install_args: list[str],
 def delivery_flag_exists() -> bool:
     """Whether this binary's `install` understands `--delivery`.
 
-    Arm D is defined against a flag that lands later in the plan (§4.5). Until
-    it does, asking for it would fail the install, so setup says so and skips
-    the arm rather than dying — and starts building it the day the flag ships.
+    The flag ships (§4.5), so this is true of any current build. It stays
+    because the harness is also pointed at older binaries — a release under
+    comparison, a bisect — and asking one of those for `--delivery cli` would
+    fail the install; skipping the arm reports that instead of dying.
     """
     p = subprocess.run([str(MUSHROOMDB), "install", "--help"],
                        capture_output=True, text=True, timeout=60)
@@ -212,8 +213,8 @@ def setup(force: bool = False, arms: set[str] | None = None) -> set[str]:
 
     want_d = "D" in arms
     if want_d and not delivery_flag_exists():
-        print("arm D: this binary's install has no --delivery flag yet "
-              "(§4.5); skipping its subjects")
+        print("arm D: this binary's install has no --delivery flag; "
+              "skipping its subjects")
         want_d = False
 
     tasks_path = HERE / "tasks.json"

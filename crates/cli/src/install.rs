@@ -448,6 +448,55 @@ impl Scope {
     }
 }
 
+/// Which door an install opens onto the graph.
+///
+/// A session reaches the same store either way; what differs is what it costs
+/// to get there. An MCP tool's schema is fetched before its first call, so the
+/// first question costs a discovery round trip; a plain command through `Bash`
+/// costs none, at the price of the assistant having to know the invocation —
+/// which is exactly what the skill teaches.
+///
+/// Only the Claude Code install honours this: it is the one platform that gets
+/// a skill, and a skill is the only thing that can teach a binary. Cursor and
+/// Codex are registered as MCP servers whatever is asked for, and
+/// [`install_platform`] says so rather than dropping the flag in silence.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    /// The skill teaches the binary; no MCP server is registered.
+    Cli,
+    /// Today's install: an MCP entry, and a skill that teaches its tools.
+    Mcp,
+    /// Both doors, and a skill that names both.
+    #[default]
+    Both,
+}
+
+impl Delivery {
+    /// Parse a `--delivery` value.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "cli" => Ok(Delivery::Cli),
+            "mcp" => Ok(Delivery::Mcp),
+            "both" => Ok(Delivery::Both),
+            other => Err(format!("--delivery must be cli | mcp | both, got: {other}")),
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Delivery::Cli => "cli",
+            Delivery::Mcp => "mcp",
+            Delivery::Both => "both",
+        }
+    }
+
+    /// Whether this delivery registers an MCP server.
+    pub(crate) fn wires_mcp(self) -> bool {
+        !matches!(self, Delivery::Cli)
+    }
+}
+
 /// Options parsed from `mushroomdb install [flags]` or `mushroomdb uninstall [flags]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallOpts {
@@ -464,6 +513,8 @@ pub struct InstallOpts {
     /// Run `npx -y mushroomdb@<v> --version` once so the first real spawn is
     /// not a cold download.
     pub prewarm: bool,
+    /// `--delivery cli|mcp|both`: which door the Claude Code install opens.
+    pub delivery: Delivery,
 }
 
 /// Options parsed from `mushroomdb enable [flags]` or `mushroomdb disable [flags]`.
@@ -924,6 +975,13 @@ struct Manifest {
     /// for a manifest written before this field existed.
     #[serde(default)]
     requested_cmd: Option<StoredCommand>,
+    /// The door this install opened. `doctor` reads it so it does not report a
+    /// missing MCP entry as a failure on an install that deliberately has
+    /// none, and `enable` reads it so a re-enable rebuilds the same shape of
+    /// install rather than silently adding a server. Defaults to `Both`, which
+    /// is what every manifest written before this field existed described.
+    #[serde(default)]
+    delivery: Delivery,
 }
 
 impl Manifest {
@@ -1329,6 +1387,9 @@ struct Ctx<'a> {
     ext: &'a Externals,
     git_hooks: bool,
     prewarm: bool,
+    /// Which door to open — see [`Delivery`]. Read by [`install_claude_code`],
+    /// which is the only writer it changes.
+    delivery: Delivery,
 }
 
 /// Anchor a user-supplied path to `base` when it is relative, and drop any
@@ -1458,6 +1519,7 @@ pub fn run_install_with(
         ext,
         git_hooks: opts.git_hooks,
         prewarm: opts.prewarm && !package_fetched,
+        delivery: opts.delivery,
     };
 
     let manifest_path = manifest_path(project_root, home, scope, &platforms);
@@ -1475,6 +1537,7 @@ pub fn run_install_with(
 
     let mut manifest = Manifest {
         requested_cmd,
+        delivery: opts.delivery,
         ..Manifest::default()
     };
     let mut notes: Vec<String> = Vec::new();
@@ -1506,6 +1569,12 @@ pub fn run_install_with(
         if was_disabled {
             merged.disabled = false;
             merged.stashed_mcp.clear();
+        }
+        // Re-installing as `cli` over an earlier install just took that
+        // install's server entry off disk; the manifest must not go on
+        // claiming a key that is no longer there.
+        if !opts.delivery.wires_mcp() {
+            merged.mcp_keys.retain(|k| has_our_server(&k.file));
         }
         write_manifest(&manifest_path, &merged)?;
     }
@@ -1545,7 +1614,14 @@ pub fn run_install_with(
     }
     if anything_written {
         out.push_str(&format!("  manifest  {}\n", manifest_path.display()));
-        out.push_str(&format!("  mcp command  {}\n", cmd.shell()));
+        // The hooks and the skill both run this command; only an MCP install
+        // calls it a server, so a `cli` install says what it actually wrote.
+        let label = if opts.delivery.wires_mcp() {
+            "mcp command"
+        } else {
+            "command"
+        };
+        out.push_str(&format!("  {label}  {}\n", cmd.shell()));
         out.push_str(&describe_stores(&stores));
     } else {
         out.push_str("  (already installed — no changes)\n");
@@ -1813,6 +1889,53 @@ fn store_from_arg(arg: &str, project_root: &Path, home: &Path) -> StoreRef {
     StoreRef::pinned(path)
 }
 
+/// The store argument one of our hook commands names.
+///
+/// A hook command is `<binary…> <sub> <store>` and the store is its last word,
+/// written by [`StoreRef::shell_arg`]: `--auto`, or the path in the single
+/// quotes [`sh_quote`] puts round it. This reads that word back.
+fn hook_command_store_arg(command: &str, sub: &str) -> Option<String> {
+    let needle = format!(" {sub} ");
+    let at = command.rfind(&needle)?;
+    let arg = command[at + needle.len()..].trim();
+    if arg.is_empty() {
+        return None;
+    }
+    Some(
+        match arg.strip_prefix('\'').and_then(|a| a.strip_suffix('\'')) {
+            Some(inner) => inner.replace(r"'\''", "'"),
+            None => arg.to_string(),
+        },
+    )
+}
+
+/// The store an install recorded, read back out of its `SessionStart` hook.
+///
+/// A `cli` install registers no MCP server, so the entry every other recovery
+/// path reads the store out of does not exist; the hooks are what it wrote,
+/// and they name the store the same way.
+fn store_from_hooks(manifest: &Manifest, project_root: &Path, home: &Path) -> Option<StoreRef> {
+    manifest
+        .hooks
+        .iter()
+        .find(|h| h.event == BRIEF_EVENT)
+        .and_then(|h| hook_command_store_arg(&h.command, "brief"))
+        .map(|arg| store_from_arg(&arg, project_root, home))
+}
+
+/// What an install at this scope recorded: the door it opened, and the store
+/// its hooks name. Both are `None`/`Both` when there is no manifest at all.
+pub(crate) fn installed_shape(
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
+    platforms: &[Platform],
+) -> (Delivery, Option<StoreRef>) {
+    let manifest = load_manifest(&manifest_path(project_root, home, scope, platforms));
+    let store = store_from_hooks(&manifest, project_root, home);
+    (manifest.delivery, store)
+}
+
 /// The config file `disable` would have stashed `platform`'s MCP entry from —
 /// the same file [`platform_stores`]/[`install_platform`] write to. `None` for
 /// Codex, whose registration is not a file this program reads.
@@ -1849,6 +1972,12 @@ fn recover_store_for(
         .and_then(|file| manifest.stashed_mcp.iter().find(|s| s.file == file))
         .and_then(|s| entry_db(&s.entry))
         .map(|arg| store_from_arg(arg, project_root, home))
+        // A `cli` install stashed no entry, because it registered no server.
+        // Its hooks name the store, and they are recorded too.
+        .or_else(|| match platform {
+            Platform::ClaudeCode => store_from_hooks(manifest, project_root, home),
+            _ => None,
+        })
         .unwrap_or_else(|| {
             store_ref(
                 project_root,
@@ -2062,6 +2191,10 @@ pub fn run_enable_with(
         ext,
         git_hooks: true,
         prewarm: false,
+        // Re-enable the install that was disabled, not a different one: a
+        // `cli` install has no server to put back, and its skill is the one
+        // that teaches the binary.
+        delivery: manifest.delivery,
     };
 
     let mut fresh = Manifest::default();
@@ -2329,6 +2462,16 @@ fn install_platform(
     manifest: &mut Manifest,
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
+    // `--delivery` only has a skill to switch on Claude Code; the other two
+    // are registered as MCP servers whatever was asked for. Say so — a flag
+    // that does nothing is worse when it does it quietly.
+    if !ctx.delivery.wires_mcp() && !matches!(platform, Platform::ClaudeCode) {
+        notes.push(format!(
+            "note: --delivery {} applies to claude-code only — {} was registered as an MCP server",
+            ctx.delivery.label(),
+            platform.label()
+        ));
+    }
     match platform {
         Platform::ClaudeCode => install_claude_code(ctx, store, manifest, notes),
         Platform::Cursor => install_cursor(ctx, store, manifest, notes),
@@ -2337,11 +2480,37 @@ fn install_platform(
     }
 }
 
-/// Substitute both template placeholders. `bin_cmd` is the pre-quoted shell
-/// form, so the templates carry `{{BIN}}` unquoted.
-fn render_template(template: &str, db_str: &str, bin_cmd: &str) -> String {
-    template
-        .replace(DB_PATH_PLACEHOLDER, db_str)
+/// Substitute both template placeholders and keep only the delivery regions
+/// this install wants. `bin_cmd` is the pre-quoted shell form, so the
+/// templates carry `{{BIN}}` unquoted.
+///
+/// One source file describes every delivery, so the variants cannot drift: a
+/// `<!-- cli -->` / `<!-- /cli -->` (or `mcp`) pair marks a block only that
+/// door's reader should see, and `Both` keeps them all. The marker lines
+/// themselves are never written. By convention a region opens immediately
+/// after the paragraph before it and its content starts with the blank line,
+/// so dropping a whole region leaves exactly one blank line behind rather than
+/// a hole in the prose.
+///
+/// Public so the skill's per-turn budget can be measured on every variant
+/// without an install: what this returns is exactly what `install` writes, and
+/// `scripts/render-plugin.sh` mirrors it for the plugin copy.
+pub fn render_template(template: &str, db_str: &str, bin_cmd: &str, delivery: Delivery) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut dropping = false;
+    for line in template.lines() {
+        match line {
+            "<!-- cli -->" => dropping = matches!(delivery, Delivery::Mcp),
+            "<!-- mcp -->" => dropping = matches!(delivery, Delivery::Cli),
+            "<!-- /cli -->" | "<!-- /mcp -->" => dropping = false,
+            _ if dropping => {}
+            _ => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out.replace(DB_PATH_PLACEHOLDER, db_str)
         .replace(BIN_PLACEHOLDER, bin_cmd)
 }
 
@@ -2355,7 +2524,7 @@ fn install_claude_code(
     // The skill is prose a reader follows by hand, so it names the directory
     // the store is in rather than the `--auto` the machine-read config uses.
     let db_str = store.path().to_string_lossy();
-    let skill_content = render_template(SKILL_TEMPLATE, &db_str, &shell);
+    let skill_content = render_template(SKILL_TEMPLATE, &db_str, &shell, ctx.delivery);
 
     let skill_dir = match ctx.scope {
         Scope::Project => ctx
@@ -2376,8 +2545,23 @@ fn install_claude_code(
         manifest.files.push(skill_file);
     }
 
+    // `cli` delivery is defined by what it does *not* write: no server entry,
+    // so nothing in the session pays a tool-discovery round trip before its
+    // first question. The hooks below are written either way — they are the
+    // binary talking to the session, not the session talking to a server.
     let mcp_file = claude_mcp_file(ctx.project_root, ctx.home, ctx.scope);
-    merge_mcp_entry(&mcp_file, ctx, store, manifest, notes)?;
+    if ctx.delivery.wires_mcp() {
+        merge_mcp_entry(&mcp_file, ctx, store, manifest, notes)?;
+    } else if remove_mcp_key(&mcp_file, SERVER_NAME)? {
+        // Switching an existing install to `cli` has to take the server it
+        // already registered back out, or the door this delivery exists to
+        // close would stay open.
+        notes.push(format!(
+            "removed mcpServers.{SERVER_NAME} from {} — delivery: {}",
+            mcp_file.display(),
+            ctx.delivery.label()
+        ));
+    }
 
     // All three hooks: settings.json in the same scope as the skill. The
     // prompt hook first, so a manifest lists them in the order they were
@@ -2433,7 +2617,14 @@ fn install_cursor(
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
     let db_str = store.path().to_string_lossy();
-    let rules_content = render_template(CURSOR_RULES_TEMPLATE, &db_str, &ctx.cmd.shell());
+    // Cursor is always an MCP install (see [`Delivery`]), so its rules file is
+    // rendered for that door whatever `--delivery` asked for.
+    let rules_content = render_template(
+        CURSOR_RULES_TEMPLATE,
+        &db_str,
+        &ctx.cmd.shell(),
+        Delivery::Mcp,
+    );
 
     let rules_dir = match ctx.scope {
         Scope::Project => ctx.project_root.join(".cursor").join("rules"),
@@ -2872,6 +3063,36 @@ fn load_manifest(path: &Path) -> Manifest {
         .sanitised()
 }
 
+/// The door an install opened for the store at `db_dir`.
+///
+/// The `brief` hook is handed a store, not an install, and its last line says
+/// how to reach the graph — so it has to know whether there is a server to
+/// name. A project install keeps its manifest beside the skill it wrote, one
+/// level up from a default store; a user install keeps it beside the store
+/// itself. No manifest there means [`Delivery::Both`]: the reach line names
+/// both doors, which is what every install before this flag wired, and naming
+/// a door too many costs a reader a moment where naming too few would cost
+/// them the graph.
+pub fn delivery_for_store(db_dir: &Path) -> Delivery {
+    let Some(parent) = db_dir.parent() else {
+        return Delivery::default();
+    };
+    let candidates = [
+        parent
+            .join(".claude")
+            .join("skills")
+            .join("mushroom")
+            .join(".install-manifest.json"),
+        parent.join("install-manifest.json"),
+    ];
+    for candidate in candidates {
+        if candidate.is_file() {
+            return load_manifest(&candidate).delivery;
+        }
+    }
+    Delivery::default()
+}
+
 /// Whether an install at this scope has been turned off by `disable`. `false`
 /// for a scope with no manifest at all — `doctor` falls through to its normal
 /// "no config entry" checks in that case rather than reporting a disabled
@@ -2923,6 +3144,10 @@ fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
     if let Some(c) = &this_run.requested_cmd {
         existing.requested_cmd = Some(c.clone());
     }
+    // The latest run's door wins: re-installing with a different `--delivery`
+    // is how a user changes it, and the manifest has to describe what is on
+    // disk now, not what an earlier run put there.
+    existing.delivery = this_run.delivery;
     existing
 }
 
