@@ -402,32 +402,44 @@ pub fn render_map(m: &RepoMap) -> String {
 /// graph anything has lost almost nothing.
 pub const MAX_BRIEF_BYTES: usize = 4_000;
 
-/// The one line a store with nothing in it gets as a session opens: what is
-/// missing, and the command that fixes it. The same answer [`EMPTY_MAP`]
-/// gives, for the same reason — there is nothing to be central *in*, and no
-/// point naming a way to reach an empty graph.
+/// The one line a store with nothing in it at all gets as a session opens:
+/// what is missing, and the command that fixes it. The same answer
+/// [`EMPTY_MAP`] gives, for the same reason — there is nothing to be central
+/// *in*, and no point naming a way to reach an empty graph.
 pub const EMPTY_BRIEF: &str =
     "mushroomdb brief — empty store; run: mushroomdb ingest-git <db> <repo>\n";
+
+/// Headings the two listings sit under.
+const BRIEF_FILES_HEADING: &str = "key files (by centrality):\n";
+const BRIEF_SYMBOLS_HEADING: &str = "key symbols (most called):\n";
 
 /// Render a [`BriefReport`] as the block a session opens with: at most
 /// [`MAX_BRIEF_BYTES`] bytes, byte-identical for the same report.
 ///
 /// `reach` is one line naming how to reach the graph from this session, which
 /// only the caller knows — a tool name on the MCP arm, a command on the CLI
-/// arm. It is appended *after* the budget is applied, so the listings above it
-/// give way to it rather than the other way round: a brief that named central
-/// files but not how to ask about them would be a dead end. It is therefore
-/// the one part exempt from the budget, and a caller handing it a `reach`
-/// longer than the whole budget gets that line and nothing else.
+/// arm. It is fitted first and appended last, so the listings above it give way
+/// to it rather than the other way round: a brief that named central files but
+/// not how to ask about them would be a dead end. It is therefore the one part
+/// exempt from the budget, and a caller handing it a `reach` longer than the
+/// whole budget gets the header and that line.
+///
+/// **Nothing is dropped silently.** When the budget cannot hold both listings
+/// in full, entries come off the end — symbols first, since a file path is the
+/// coarser handle and the one a reader can act on without the graph — and the
+/// listing closes with `  … and N more`, counted. A reader who cannot see that
+/// a list was cut reads a partial ranking as a complete one.
 #[must_use]
 pub fn render_brief(b: &BriefReport, reach: &str) -> String {
-    if b.files == 0 {
+    if b.files == 0 && b.symbols == 0 && b.edges == 0 {
         return EMPTY_BRIEF.to_string();
     }
     let tail = format!("reach the graph: {}\n", sanitize(reach));
+    let budget = MAX_BRIEF_BYTES.saturating_sub(tail.len());
 
     // The header: what this repository is, how big, and which commit it is at.
-    // No age — see [`BriefReport::last_sync`].
+    // No age — see [`BriefReport::last_sync`]. A store no repository was
+    // ingested into has neither a name nor a sha, and says neither.
     let mut head: Vec<String> = Vec::new();
     if !b.repo.is_empty() {
         head.push(sanitize(&b.repo));
@@ -438,24 +450,51 @@ pub fn render_brief(b: &BriefReport, reach: &str) -> String {
     if let Some(sha) = &b.last_sync {
         head.push(format!("synced {}", sanitize(sha)));
     }
-    let mut out = format!("mushroomdb brief — {}\n", head.join(SEP));
+    let header = format!("mushroomdb brief — {}\n", head.join(SEP));
 
-    if !b.key_files.is_empty() {
-        out.push_str("key files (by centrality):\n");
-        for (path, role) in &b.key_files {
-            let _ = writeln!(out, "  {}{}", sanitize(path), suffix(role));
-        }
-    }
-    if !b.key_symbols.is_empty() {
-        out.push_str("key symbols (most called):\n");
-        for (key, sig) in &b.key_symbols {
-            let _ = writeln!(out, "  {}{}", sanitize(key), suffix(sig));
-        }
-    }
+    let mut files: Vec<String> = b
+        .key_files
+        .iter()
+        .map(|(path, role)| format!("  {}{}\n", sanitize(path), suffix(role)))
+        .collect();
+    let mut symbols: Vec<String> = b
+        .key_symbols
+        .iter()
+        .map(|(key, sig)| format!("  {}{}\n", sanitize(key), suffix(sig)))
+        .collect();
 
-    let mut capped = cap_bytes(&out, MAX_BRIEF_BYTES.saturating_sub(tail.len()));
-    capped.push_str(&tail);
-    capped
+    // Drop one entry at a time until what is left — the marker line included,
+    // since it grows a digit of its own — fits. Re-measured each round rather
+    // than solved for, because `… and 9 more` and `… and 10 more` are not the
+    // same length and a budget that is off by one byte is not a budget.
+    let mut dropped = 0;
+    loop {
+        let body = brief_body(&header, &files, &symbols, dropped);
+        if body.len() <= budget || (symbols.is_empty() && files.is_empty()) {
+            return body + &tail;
+        }
+        if symbols.pop().is_none() {
+            files.pop();
+        }
+        dropped += 1;
+    }
+}
+
+/// The brief above its `reach` line, for one candidate set of entries.
+fn brief_body(header: &str, files: &[String], symbols: &[String], dropped: usize) -> String {
+    let mut out = String::from(header);
+    if !files.is_empty() {
+        out.push_str(BRIEF_FILES_HEADING);
+        out.extend(files.iter().map(String::as_str));
+    }
+    if !symbols.is_empty() {
+        out.push_str(BRIEF_SYMBOLS_HEADING);
+        out.extend(symbols.iter().map(String::as_str));
+    }
+    if dropped > 0 {
+        let _ = writeln!(out, "  … and {dropped} more");
+    }
+    out
 }
 
 /// What a listing line adds after its key, when the graph had anything to add.
@@ -896,6 +935,28 @@ fn render_link(out: &mut String, link: &WhyLink, both_ways: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_bytes_keeps_whole_lines_and_never_half_of_one() {
+        let text = "aaaa\nbbbb\ncccc\n"; // three five-byte lines
+        assert_eq!(cap_bytes(text, 15), text, "the whole text fits exactly");
+        assert_eq!(
+            cap_bytes(text, 14),
+            "aaaa\nbbbb\n",
+            "the last line is whole"
+        );
+        assert_eq!(cap_bytes(text, 10), "aaaa\nbbbb\n");
+        assert_eq!(cap_bytes(text, 9), "aaaa\n");
+        assert_eq!(
+            cap_bytes(text, 4),
+            "",
+            "a first line too long yields nothing, never a fragment"
+        );
+        assert_eq!(cap_bytes(text, 0), "");
+        // A line with no trailing newline still costs the one it is given.
+        assert_eq!(cap_bytes("abc", 4), "abc\n");
+        assert_eq!(cap_bytes("abc", 3), "");
+    }
 
     #[test]
     fn a_timestamp_reads_as_a_utc_date_and_a_quarter() {

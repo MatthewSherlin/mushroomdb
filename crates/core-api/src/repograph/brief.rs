@@ -32,13 +32,22 @@ use crate::repograph::render::{basename, dir_components, sanitize, top_tokens};
 use core_storage::fs::Fs;
 use core_storage::Value;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 /// Characters of the synced sha the brief prints — the usual abbreviation,
 /// and the same width [`render_map`](super::render_map) uses.
 const SHORT_SHA: usize = 7;
 /// Subdirectory names a file's role may be built from.
 const ROLE_TOKENS: usize = 2;
+/// What the ranking may spend. The `SessionStart` hook has five seconds, and
+/// a store too large to rank inside three of them yields the partial ranking
+/// the iteration had reached — still a valid ordering, and a partial brief is
+/// worth more at the start of a session than none.
+const RANK_BUDGET: Duration = Duration::from_secs(3);
+/// The edge types that say one file depends on another — the same three
+/// [`file_pagerank`] ranks over.
+const DEPENDENCY_EDGES: [&str; 3] = ["IMPORTS", "CO_CHANGED", "CALLS"];
 
 /// How much of each ranking the brief lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,10 +103,22 @@ pub fn brief<F: Fs>(db: &GraphDb<F>, opts: &BriefOptions) -> BriefReport {
 
     // `file_pagerank` returns the ranking already sorted the way every digest
     // prints one — score first, ties on the key — so the brief takes its head.
-    // No budget: the caller is a hook with five seconds and one job.
-    let (ranked, _truncated) = file_pagerank(db, &file_keys, None);
+    // Cut short by the budget it is a partial ranking, which is still an
+    // ordering; the brief has no "(truncated)" to report and does not pretend
+    // otherwise.
+    let (ranked, _truncated) = file_pagerank(db, &file_keys, Some(Instant::now() + RANK_BUDGET));
+
+    // A file no dependency edge touches has no rank of its own: PageRank
+    // leaves it on the uniform teleport mass, so every such file ties with
+    // every other and the tie breaks alphabetically. `map` only ever showed
+    // five entries, too few for that to surface; twenty-five is deep enough
+    // for a repository's assets to fill the list from the top of the alphabet.
+    // Listing fewer files is better than listing files the graph knows nothing
+    // about, so a file with no edge of the three is not a key file.
+    let connected = connected_files(db);
     let key_files = ranked
         .iter()
+        .filter(|(k, _)| connected.contains(k.as_str()))
         .take(opts.max_files)
         .map(|(k, _)| (sanitize(k), role_of(db, k, &file_keys)))
         .collect();
@@ -136,6 +157,38 @@ pub fn brief<F: Fs>(db: &GraphDb<F>, opts: &BriefOptions) -> BriefReport {
         key_files,
         key_symbols,
     }
+}
+
+/// Every file the graph records a dependency edge for, in either direction.
+///
+/// [`DEPENDENCY_EDGES`] are the three [`file_pagerank`] ranks over. `IMPORTS`
+/// and `CO_CHANGED` name files directly; `CALLS` runs between symbols, so both
+/// of its endpoints are read back to the file that defines them — the same
+/// projection the ranking does, so a file counts as connected exactly when the
+/// ranking had something to say about it.
+///
+/// Keys that are not files come back too (an `IMPORTS` edge to a path the
+/// store has no node for, say); the caller only ever asks about file keys, so
+/// they cost a lookup and change nothing.
+fn connected_files<F: Fs>(db: &GraphDb<F>) -> BTreeSet<String> {
+    let mut sym_file: BTreeMap<String, String> = BTreeMap::new();
+    for node in db.nodes_with_label("Symbol") {
+        if let Some(Value::Str(file)) = node.prop("file_id") {
+            sym_file.insert(node.key().to_string(), file);
+        }
+    }
+    let mut out = BTreeSet::new();
+    for edge_type in DEPENDENCY_EDGES {
+        for (src, dst, _w) in db.weighted_edges(edge_type, None) {
+            for end in [src, dst] {
+                match sym_file.get(&end) {
+                    Some(file) => out.insert(file.clone()),
+                    None => out.insert(end),
+                };
+            }
+        }
+    }
+    out
 }
 
 /// The first line of a signature prop, or nothing for a node without one.

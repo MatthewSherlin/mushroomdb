@@ -539,12 +539,182 @@ fn a_long_brief_is_capped_by_whole_lines_and_keeps_the_reach_line() {
         "the long reach line must have pushed listing lines out: {text}"
     );
     let kept: Vec<&str> = whole.lines().collect();
-    for line in text.lines().filter(|l| !l.starts_with("reach the graph:")) {
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with("reach the graph:") && !l.starts_with("  … and "))
+    {
         assert!(
             kept.contains(&line),
             "the cap drops whole lines, never half of one: {line:?}"
         );
     }
+
+    // What was dropped is said, and counted.
+    let listed = b.key_files.len() + b.key_symbols.len();
+    let shown = text.lines().filter(|l| l.starts_with("  ")).count() - 1; // less the marker
+    let marker = text
+        .lines()
+        .find(|l| l.starts_with("  … and "))
+        .unwrap_or_else(|| panic!("no truncation marker in:\n{text}"));
+    assert_eq!(
+        marker,
+        format!("  … and {} more", listed - shown),
+        "the marker must count the entries actually dropped: {text}"
+    );
+    assert!(
+        text.lines()
+            .next_back()
+            .unwrap()
+            .starts_with("reach the graph:"),
+        "the marker sits above the reach line, not below it: {text}"
+    );
+}
+
+/// Symbols go before files: a path is the coarser handle, and the one a reader
+/// can act on without asking the graph anything.
+#[test]
+fn a_tiny_budget_still_says_how_many_entries_it_dropped() {
+    let dir = tmp("brief-marker");
+    let db = synthetic_repo_store(&dir);
+    let b = brief(&db, &BriefOptions::default());
+
+    // Big enough for the header, a handful of lines and the reach line; far
+    // too small for 25 files and 12 symbols.
+    let reach = format!("explore <target> {}", "x".repeat(3_700));
+    let text = render_brief(&b, &reach);
+
+    assert!(
+        text.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        "{} bytes",
+        text.len()
+    );
+    assert!(text.starts_with("mushroomdb brief —"), "{text}");
+    assert!(
+        text.contains("  … and "),
+        "a listing this heavily cut must say so: {text}"
+    );
+    assert!(
+        text.ends_with(&format!("reach the graph: {reach}\n")),
+        "the reach line survives whatever the budget costs the listings"
+    );
+    assert!(
+        !text.contains("key symbols"),
+        "symbols come off before files: {text}"
+    );
+}
+
+/// PageRank leaves a file no dependency edge touches on the uniform teleport
+/// mass, so every such file ties and the tie breaks alphabetically. At
+/// twenty-five entries deep that is enough to fill the list with fonts and
+/// stylesheets, so the brief lists only files the graph has an edge for.
+#[test]
+fn brief_skips_files_the_graph_has_no_edges_for() {
+    let dir = tmp("brief-edgeless");
+    let mut db = synthetic_repo_store(&dir);
+    // Sorts before every fixture file (`src/…`, `tests/…`), so on a tie it
+    // would rank first and push a real file out of a 25-entry list.
+    let orphan = "aaa-orphan.woff2";
+    db.insert_node(
+        "File",
+        orphan,
+        vec![
+            ("id".into(), core_api::Value::Str(orphan.to_string())),
+            ("path".into(), core_api::Value::Str(orphan.to_string())),
+            ("ext".into(), core_api::Value::Str("woff2".to_string())),
+        ],
+    )
+    .expect("an edgeless file");
+
+    let b = brief(&db, &BriefOptions::default());
+    let listed: Vec<&str> = b.key_files.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(b.files, 31, "the count is of every file, listed or not");
+    assert!(
+        !listed.contains(&orphan),
+        "a file nothing imports, calls or co-changes with is not a key file: {listed:?}"
+    );
+    assert!(
+        listed.contains(&file_key(0, 0).as_str()),
+        "the connected files are still there, ranked as before: {listed:?}"
+    );
+    assert_eq!(listed.len(), 25, "the list is still full: {listed:?}");
+
+    // Even asked for more entries than there are connected files, it lists no
+    // edgeless one rather than padding.
+    let all = brief(
+        &db,
+        &BriefOptions {
+            max_files: 100,
+            max_symbols: 25,
+        },
+    );
+    assert_eq!(
+        all.key_files.len(),
+        30,
+        "thirty connected files, and no more"
+    );
+    assert!(all.key_files.iter().all(|(k, _)| k != orphan));
+}
+
+/// A store with a graph in it but no `GitSync` marker — anything ingested by
+/// hand, or a memory store that grew a code graph — has no repository name and
+/// no sha, and says neither rather than guessing or panicking.
+#[test]
+fn brief_without_a_sync_marker_omits_the_repo_and_the_sha() {
+    let dir = tmp("brief-no-marker");
+    let mut db = synthetic_repo_store(&dir);
+    db.delete_node("__mushroomdb_git_sync__").expect("drop it");
+
+    let b = brief(&db, &BriefOptions::default());
+    assert_eq!(b.repo, "");
+    assert_eq!(b.last_sync, None);
+    assert_eq!(b.files, 30, "the graph itself is untouched");
+    assert!(!b.key_files.is_empty() && !b.key_symbols.is_empty());
+
+    let text = render_brief(&b, "explore <target>");
+    let header = text.lines().next().unwrap();
+    assert_eq!(
+        header,
+        format!(
+            "mushroomdb brief — 30 files · 12 symbols · {} edges",
+            core_api::repograph::render::thousands(b.edges)
+        ),
+        "no name, no sha, and no empty separators where they would have been"
+    );
+    assert!(text.contains("reach the graph: explore <target>"), "{text}");
+}
+
+/// A store with no files but plenty in it — a memory graph — is not an empty
+/// store, and gets a header and a way in rather than "run ingest-git".
+#[test]
+fn brief_on_a_store_with_no_files_still_says_how_to_reach_it() {
+    let dir = tmp("brief-memory-only");
+    let mut db = open(&dir);
+    db.insert_node(
+        "Person",
+        "person:1",
+        vec![("name".into(), core_api::Value::Str("Ada".to_string()))],
+    )
+    .expect("a node that is not a file");
+    db.insert_node(
+        "Person",
+        "person:2",
+        vec![("name".into(), core_api::Value::Str("Grace".to_string()))],
+    )
+    .expect("another");
+    db.insert_edge("KNOWS", "person:1", "person:2")
+        .expect("edge");
+
+    let b = brief(&db, &BriefOptions::default());
+    assert_eq!((b.files, b.symbols), (0, 0));
+    assert_eq!(b.edges, 1);
+
+    let text = render_brief(&b, "explore <target>");
+    assert_eq!(
+        text,
+        "mushroomdb brief — 0 files · 0 symbols · 1 edge\n\
+         reach the graph: explore <target>\n",
+        "a store with a graph in it is not an empty store"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # mushroom — Claude Code plugin
 
-A live code graph of your repository, wired into Claude Code as an MCP server, a `/mushroom:mushroom` skill, and two hooks. Everything here is rendered by `scripts/render-plugin.sh` from `crates/cli/skills/mushroom/SKILL.md` and the templates in `scripts/plugin-templates/` — do not hand-edit the files under this directory or `.claude-plugin/marketplace.json`; re-run the script instead.
+A live code graph of your repository, wired into Claude Code as an MCP server, a `/mushroom:mushroom` skill, and three hooks: `SessionStart` (the session brief), `UserPromptSubmit` (recall) and `PostToolUse` (re-extract what you just edited). Every file under this directory *except this README* is rendered by `scripts/render-plugin.sh` from `crates/cli/skills/mushroom/SKILL.md` and the templates in `scripts/plugin-templates/` — do not hand-edit those, or `.claude-plugin/marketplace.json`; re-run the script instead.
 
 ## Install
 
@@ -26,7 +26,7 @@ The plugin writes **no git hooks** — a plugin has no business editing `.git/ho
 
 ## `hooks/run.sh` — why the hooks do not call `npx`
 
-`npx -y mushroomdb@<version> …` costs about half a second before it does any work: a cache check, a version resolve, and a Node process of its own. The MCP server pays that once per session, which is fine. The two hooks fire on **every prompt and every file edit**, which is not.
+`npx -y mushroomdb@<version> …` costs about half a second before it does any work: a cache check, a version resolve, and a Node process of its own. The MCP server pays that once per session, which is fine, and so does the `SessionStart` hook. The other two fire on **every prompt and every file edit**, which is not.
 
 So the hooks call `run.sh` instead. On its first run it asks the package where its native binary is — `npx -y mushroomdb@<version> --print-binary` — writes that one line to
 
@@ -54,7 +54,7 @@ The cache lives under `$CLAUDE_PLUGIN_DATA` or `$HOME/.mushroomdb` and nowhere e
 
 `--auto` resolves the database as `$CLAUDE_PROJECT_DIR/mushroom-memory` (the environment variable Claude Code sets for plugin MCP servers and hook processes), falling back to `mushroom-memory` at the root of the working tree the command ran in, and to `~/.mushroomdb/memory` outside a checkout. This plugin is Claude Code's, so the first step always answers; `mushroomdb install --platform cursor` or `--platform codex` writes the path instead, because those hosts set no such variable. That fallback finds a *working tree*, not the `.git` directory worktrees share, so each `git worktree add` gets its own graph rather than reading the checkout next door's. Nothing is written outside the project directory, and the store directory is added to the repository's `.gitignore` on first `ingest-git`.
 
-Several processes can share that store safely: the MCP server, both hooks and any `mushroomdb` command coordinate through one advisory `LOCK` file, and a writer that cannot get it retries on the next event rather than failing the turn. See [`docs/site/concurrency.md`](../../docs/site/concurrency.md).
+Several processes can share that store safely: the MCP server, all three hooks and any `mushroomdb` command coordinate through one advisory `LOCK` file, and a writer that cannot get it retries on the next event rather than failing the turn. See [`docs/site/concurrency.md`](../../docs/site/concurrency.md).
 
 ## Troubleshooting
 

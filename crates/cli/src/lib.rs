@@ -446,8 +446,8 @@ Usage:
   mushroomdb demo <db-dir>
   mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
   mushroomdb brief <db-dir>|--auto    hook body: the repository in one block — size, synced sha, the most
-                                   central files and the most called symbols; byte-stable, so a session
-                                   host caches it once
+                                      central files and the most called symbols; byte-stable, so a
+                                      session host caches it once
   mushroomdb sync <db-dir>|--auto [--json]
                                    re-sync the repo the store was built from: new commits, then the
                                    dirty working tree (git hook body)
