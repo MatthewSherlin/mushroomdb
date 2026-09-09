@@ -340,7 +340,12 @@ step "5 — nudge"
 
 printf '%s\n' "$IMPORT_LINE" >>"$WT/$EDIT_FILE"
 NUDGE_OUT="$WORK/nudge.txt"
-printf '{"cwd":"%s","user_input":"hi"}' "$WT" | "$MUSHROOMDB" recall "$DB" >"$NUDGE_OUT"
+# The prompt has to name an identifier: the hook is silent for a prompt that
+# names none — "ok thanks" on a dirty tree is not a question about the diff —
+# and only then does the diff nudge answer in the digest's place. A path is an
+# identifier, so this is the prompt a person editing that file would type.
+printf '{"cwd":"%s","user_input":"what breaks if I touch %s"}' "$WT" "$EDIT_FILE" \
+  | "$MUSHROOMDB" recall "$DB" >"$NUDGE_OUT"
 sed 's/^/  | /' "$NUDGE_OUT"
 assert_contains "$NUDGE_OUT" "usually changes with" "a dirty file makes recall name its co-change partners"
 git -C "$WT" checkout -- "$EDIT_FILE"

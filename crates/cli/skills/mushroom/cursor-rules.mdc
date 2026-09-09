@@ -19,7 +19,7 @@ If `{{DB_PATH}}` does not exist yet, build it once:
 {{BIN}} ingest-git '{{DB_PATH}}' . --prs --ensure-gitignore
 ```
 
-Authors, commits, files, symbols, imports, calls and merged pull requests become nodes; `CO_CHANGED` / `KNOWS` / `IMPORTS` / `CALLS` edges are derived by rule; the store joins `.gitignore`. Then call `map`, print its output verbatim (framing line included), and end the turn with the three questions on its last line. Nothing else on turn one.
+Authors, commits, files, symbols, imports, calls and merged pull requests become nodes; `CO_CHANGED` / `KNOWS` / `IMPORTS` / `CALLS` edges are derived by rule; the store joins `.gitignore`. Then take your bearings from the `SessionStart` brief already in your context — the repository's size, its most central files, its most called symbols — and call `explore <target>` (depth `context`) on the first file or symbol the task names, quoting what it prints, before any `Grep`, file read or plan. On a memory store, where `explore` is unlisted, `map` opens instead.
 
 ## Task rules
 
@@ -31,7 +31,7 @@ The first row that matches the turn is what to call, before answering.
 
 `explore` composes `context`, `impact` (alone with no arguments it reads the current diff) and `owners`; those, `why` (what links two keys, with the evidence), `recall`, `map` and the rest stay callable by name — see **Advanced**. All take `json: true`, the raw report instead of the digest. You want the digest.
 
-A `SessionStart` hook prints the repository in one block — size, synced sha, most central files, most called symbols — and how to reach the graph; a `UserPromptSubmit` hook prints a recall digest when the prompt names an identifier and nothing otherwise; a `PostToolUse` hook refreshes edited files; the git `post-commit` hook runs a silenced `sync`. They add context; the tools answer.
+A `SessionStart` hook is what puts that brief in your context; a `UserPromptSubmit` hook prints a recall digest when the prompt names an identifier, nothing otherwise, and on a dirty tree the diff instead of that digest — the partners and importers you have *not* modified, the owner, and stale concepts; a `PostToolUse` hook refreshes edited files; the git `post-commit` hook runs a silenced `sync`. They add context; the tools answer.
 
 ## Learn
 

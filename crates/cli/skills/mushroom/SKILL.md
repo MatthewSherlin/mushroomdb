@@ -19,7 +19,9 @@ A live graph of this repository at `{{DB_PATH}}`: files, symbols, imports, calls
 
 It writes those nodes; `CO_CHANGED` / `KNOWS` / `IMPORTS` / `CALLS` edges are derived by rule; the store joins `.gitignore`.
 
-**2. Call `map`, print its output verbatim** — framing line included, nothing summarised or reordered — **and end the turn with the three questions on its last line.** Nothing else on turn one: no file reading, no code search, no plan.
+**2. Take your bearings from the `SessionStart` brief** already in your context — the repository's size, its most central files, its most called symbols — not from a search.
+
+**3. Call `explore <target>`** (depth `context`) on the first file or symbol the task names, and quote what it prints — before any `Grep`, file read or plan. On a memory store, where `explore` is unlisted, `map` opens instead.
 
 ## Task rules
 
@@ -39,17 +41,17 @@ The first row that matches the turn is what to call, before you answer.
 
 ### What runs without you
 
-- A `SessionStart` hook prints the repository in one block — size, synced sha, most central files, most called symbols — and how to reach the graph. That is your orientation.
-- A `UserPromptSubmit` hook prints a recall digest when the prompt names an identifier — a path, a `mod::name`, a snake_case word, anything in backticks — and nothing otherwise. On a dirty tree it also names the partners and importers you have *not* modified, the owner, and stale concepts.
+- A `SessionStart` hook is what put that brief in your context, before your first turn.
+- A `UserPromptSubmit` hook prints a recall digest when the prompt names an identifier — a path, a `mod::name`, a snake_case word, anything in backticks — and nothing otherwise. On a dirty tree it prints the diff instead of that digest: the partners and importers you have *not* modified, the owner, and stale concepts.
 - A `PostToolUse` hook runs `touch` after `Edit`, `Write` and `MultiEdit`, so a symbol you just renamed is already in the graph; the git `post-commit` hook, when installed, runs a silenced `sync`. Neither prints anything.
 
 They add context; the tools answer.
 
 ## Learn
 
-The `learn` pass — `/mushroom learn <path>` — turns prose (docs, ADRs, READMEs) into `Concept` nodes. Per run **at most 20 documents**, per document **at most 5 concepts**; one concept is one idea somebody could name.
+The `learn` pass — `/mushroom learn <path>` — turns prose (docs, ADRs, READMEs) into `Concept` nodes. Per run **at most 20 documents**, per document **at most 5 concepts**.
 
-One row per concept: `id` `concept:<kebab-case-name>`, `name` as a person would say it, `summary` in plain sentences, ≤ 300 characters, `source_files` the `File` keys it came from sorted ascending (verify each with `query`), `source_hashes` in that order, `extracted_by` your model name, `extracted_at` an ISO-8601 UTC timestamp.
+One row per concept: `id` `concept:<kebab-case-name>`, `name`, `summary` ≤ 300 characters, `source_files` the `File` keys it came from sorted ascending (verify each with `query`), `source_hashes` in that order, `extracted_by` your model name, `extracted_at` an ISO-8601 UTC timestamp.
 
 One query reads the hashes, in `source_files` order — which is why it is sorted:
 
