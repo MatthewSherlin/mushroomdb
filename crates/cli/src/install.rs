@@ -2567,8 +2567,22 @@ fn remove_line(path: &Path, line: &str) -> Result<bool, CliError> {
     Ok(true)
 }
 
-/// The directory holding this checkout's hooks, following the `gitdir:` link a
-/// worktree or submodule leaves in place of a `.git` directory.
+/// The directory git will actually run this checkout's hooks from, following
+/// the `gitdir:` link a worktree or submodule leaves in place of a `.git`
+/// directory.
+///
+/// The subtlety is the last step. A linked worktree's gitdir is
+/// `<main>/.git/worktrees/<name>`, but git resolves hooks through the
+/// **common** dir — `git rev-parse --git-path hooks` inside a worktree answers
+/// `<main>/.git/hooks`, not the worktree's own. Writing a hook into the
+/// worktree's gitdir puts it somewhere git never looks: the file is there, it
+/// is executable, and nothing ever runs it. A linked worktree records the way
+/// back in a `commondir` file next to its gitdir (contents `../..`), so this
+/// follows it whenever it is there.
+///
+/// A submodule has no `commondir` and its own gitdir *is* its hooks dir
+/// (`.git/modules/<path>/hooks`), which is what the plain resolution already
+/// computes — so the absence of the file is the signal to stop.
 pub(crate) fn git_hooks_dir(project_root: &Path) -> Option<PathBuf> {
     let dot_git = project_root.join(".git");
     if dot_git.is_dir() {
@@ -2582,7 +2596,48 @@ pub(crate) fn git_hooks_dir(project_root: &Path) -> Option<PathBuf> {
     } else {
         project_root.join(target)
     };
-    Some(resolved.join("hooks"))
+    // A linked worktree defers its hooks to the common dir; a submodule keeps
+    // its own. The `commondir` file is what tells the two apart.
+    let base = match fs::read_to_string(resolved.join("commondir")) {
+        Ok(rel) => {
+            let rel_path = PathBuf::from(rel.trim());
+            if rel_path.is_absolute() {
+                rel_path
+            } else {
+                lexically_normalize(&resolved.join(rel_path))
+            }
+        }
+        Err(_) => resolved,
+    };
+    Some(base.join("hooks"))
+}
+
+/// Resolve `.` and `..` in a path textually, without touching the filesystem.
+///
+/// `commondir` is written relative (`../..`), so joining it leaves a path that
+/// works but reads badly in `doctor`'s output and in the manifest. This is
+/// purely cosmetic and deliberately does not canonicalize: resolving symlinks
+/// would rewrite a path the user gave us into one they do not recognise. A
+/// leading `..` with nothing to pop is kept, since dropping it would change
+/// where the path points.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let can_pop = out
+                    .components()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, std::path::Component::Normal(_)));
+                if !can_pop || !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn install_git_hooks(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliError> {

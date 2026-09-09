@@ -847,6 +847,221 @@ fn git_hook_sync_auto_uses_the_worktree_store() {
     );
 }
 
+/// `install` run from inside a linked worktree puts its git hooks where git
+/// will actually run them: the repository's **common** hooks directory.
+///
+/// A linked worktree's gitdir is `<main>/.git/worktrees/<name>`, and that is
+/// what the `gitdir:` link in its `.git` file points at — but git resolves
+/// hooks through the common dir, so a hook written into the worktree's own
+/// gitdir is a file nothing ever executes. This installs from the worktree,
+/// makes a real commit there, and requires the hook to have fired.
+#[test]
+fn install_from_a_worktree_writes_hooks_to_the_common_dir() {
+    use cli::doctor::{run_doctor_with, DoctorOpts};
+    use cli::install::{
+        run_install_with, Externals, InstallOpts, McpCommand, Platform, Scope, HOOK_BEGIN,
+    };
+
+    let repo = tmp("wt-hooks-main");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(&repo, "first", &[("src/lib.rs", LIB_RS)]);
+
+    let wt = tmp("wt-hooks-linked").join("feature");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        wt.join(".git").is_file(),
+        "a linked worktree marks its root with a .git file, not a directory"
+    );
+
+    // Each checkout has its own store, so a hook that fires is visible as a
+    // commit on that checkout's graph and nowhere else.
+    let main_db = repo.join("mushroom-memory");
+    let wt_db = wt.join("mushroom-memory");
+    run_ingest_git(&main_db, &opts(&repo)).unwrap();
+    run_ingest_git(&wt_db, &opts(&wt)).unwrap();
+    let main_seq_before = GraphDb::open(&main_db).unwrap().commit_seq();
+    let wt_seq_before = GraphDb::open(&wt_db).unwrap().commit_seq();
+
+    let home = tmp("wt-hooks-home");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+    let install_opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        db: None, // `--auto`: each checkout resolves its own store
+        command: Some(bin.clone()),
+        git_hooks: true,
+        prewarm: false,
+    };
+    let summary = run_install_with(
+        &wt,
+        &home,
+        &install_opts,
+        &McpCommand::Explicit(bin.clone()),
+        &Externals::with_path(None),
+    )
+    .expect("install from the worktree");
+
+    // The block is in the common dir, and the worktree's own gitdir holds no
+    // hooks at all — writing one there is the whole bug.
+    let common_hook = repo.join(".git").join("hooks").join("post-commit");
+    let block = std::fs::read_to_string(&common_hook).expect("post-commit in the common hooks dir");
+    assert!(
+        block.contains(HOOK_BEGIN),
+        "the block is in {common_hook:?}"
+    );
+    assert!(
+        block.contains("sync --auto"),
+        "the store resolves at run time, per checkout"
+    );
+    let wt_gitdir = repo.join(".git").join("worktrees").join("feature");
+    assert!(wt_gitdir.is_dir(), "the worktree's gitdir exists");
+    assert!(
+        !wt_gitdir.join("hooks").exists(),
+        "nothing may be written to the worktree's own gitdir: git never reads it"
+    );
+    assert!(
+        summary.contains(&common_hook.display().to_string()),
+        "the summary names the file git will run:\n{summary}"
+    );
+
+    // `doctor` must read the same directory, or the failure this fixes stays
+    // invisible from the tool that exists to catch it.
+    let report = run_doctor_with(
+        &wt,
+        &home,
+        &DoctorOpts {
+            platform: Some(Platform::ClaudeCode),
+            scope: Some(Scope::Project),
+        },
+        &Externals::with_path(None),
+    )
+    .expect("doctor");
+    let git_line = report
+        .output
+        .lines()
+        .find(|l| l.contains("git-hooks"))
+        .unwrap_or_else(|| panic!("no git-hooks line in:\n{}", report.output));
+    assert!(
+        git_line.starts_with("ok"),
+        "git-hooks should be ok: {git_line}"
+    );
+    assert!(
+        git_line.contains(&repo.join(".git").join("hooks").display().to_string()),
+        "doctor reports the common hooks dir: {git_line}"
+    );
+
+    // The real thing: commit in the worktree and require the hook to run.
+    commit(&wt, "only in the worktree", &[("src/feature.rs", NET_RS)]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if GraphDb::open(&wt_db).unwrap().commit_seq() > wt_seq_before {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the post-commit hook never reached {}",
+            wt_db.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        GraphDb::open(&main_db).unwrap().commit_seq(),
+        main_seq_before,
+        "the other checkout's store must not be touched"
+    );
+
+    // Installing again from the main checkout targets the same file, so the
+    // block must be merged in place rather than appended a second time.
+    let main_opts = InstallOpts {
+        db: None,
+        ..install_opts
+    };
+    run_install_with(
+        &repo,
+        &home,
+        &main_opts,
+        &McpCommand::Explicit(bin),
+        &Externals::with_path(None),
+    )
+    .expect("install from the main checkout");
+    let after = std::fs::read_to_string(&common_hook).unwrap();
+    assert_eq!(
+        after.matches(HOOK_BEGIN).count(),
+        1,
+        "one block per hook, however many checkouts installed:\n{after}"
+    );
+}
+
+/// A submodule keeps its own hooks: its gitdir has no `commondir`, and git
+/// runs `.git/modules/<path>/hooks` for it.
+///
+/// The two shapes are told apart by that one file, so this is the other half
+/// of [`install_from_a_worktree_writes_hooks_to_the_common_dir`]. The gitdir
+/// link is written by hand rather than by `git submodule add`, which needs a
+/// clonable origin and is blocked over local paths by default on current git.
+#[test]
+fn install_in_a_submodule_keeps_the_submodule_hooks() {
+    use cli::install::{
+        run_install_with, Externals, InstallOpts, McpCommand, Platform, Scope, HOOK_BEGIN,
+    };
+
+    let repo = tmp("sub-hooks-main");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(&repo, "first", &[("src/lib.rs", LIB_RS)]);
+
+    // Exactly the shape git leaves for a submodule: a gitdir link with no
+    // `commondir` beside it.
+    let module = repo.join(".git").join("modules").join("vendor").join("sub");
+    std::fs::create_dir_all(&module).unwrap();
+    let sub = repo.join("vendor").join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join(".git"), format!("gitdir: {}\n", module.display())).unwrap();
+    assert!(
+        !module.join("commondir").exists(),
+        "a submodule's gitdir has no commondir — that is the discriminator"
+    );
+
+    let home = tmp("sub-hooks-home");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+    run_install_with(
+        &sub,
+        &home,
+        &InstallOpts {
+            platform: Some(Platform::ClaudeCode),
+            scope: Some(Scope::Project),
+            db: None,
+            command: Some(bin.clone()),
+            git_hooks: true,
+            prewarm: false,
+        },
+        &McpCommand::Explicit(bin),
+        &Externals::with_path(None),
+    )
+    .expect("install in the submodule");
+
+    let hook = module.join("hooks").join("post-commit");
+    assert!(
+        std::fs::read_to_string(&hook)
+            .unwrap_or_default()
+            .contains(HOOK_BEGIN),
+        "the submodule's own hooks dir holds the block: {hook:?}"
+    );
+    assert!(
+        !repo.join(".git").join("hooks").join("post-commit").exists(),
+        "a submodule must not write into the superproject's hooks"
+    );
+}
+
 /// `--version`, the `version` subcommand and the library function all print
 /// the same crate version.
 #[test]
