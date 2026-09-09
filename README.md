@@ -238,7 +238,7 @@ whole list, and all sixteen stay callable either way:
 | `node_info` | Return a node's key, label, and properties |
 | `node_edges` | Return all edges incident on a node |
 | `stats` | Live node, edge, and rule counts |
-| `node_history` | WAL change history for a node (since last truncating snapshot) |
+| `node_history` | WAL change history for a node (archives included; a `snapshot --truncate` ends the reach) |
 | `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
 | `was_linked` | Point-in-time edge check: was an edge active at a given commit? |
 | `rename_node` | Rename a node's key; old_key, new_key |
@@ -312,7 +312,7 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb stats <dir>` | Print node/edge/rule counts |
 | `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
-| `mushroomdb snapshot <dir> [--keep-wal]` | Write `snapshot.bin` (truncates WAL unless `--keep-wal`) |
+| `mushroomdb snapshot <dir> [--keep-wal\|--truncate] [--retention N]` | Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole |
 | `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch |
 | `mushroomdb migrate <dir>` | Migrate an older store format in place |
 | `mushroomdb backup <dir> <dest>` | Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores |

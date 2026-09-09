@@ -24,6 +24,45 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// What every snapshot mushroomdb takes *on its own* does with the WAL.
+///
+/// An ingest that ends past the WAL threshold, a `serve --snapshot-every`
+/// tick, a graceful shutdown, and a plain `mushroomdb snapshot` all archive the
+/// WAL to `wal.<N>.archive` rather than dropping it. `node_history`,
+/// `edge_history`, `was_linked` and `open_at` all read WAL frames and all
+/// consult archives, so the store opens fast and still remembers how it got
+/// here. A truncating snapshot ends that reach — it deletes the genesis marker
+/// as well as the tail — so it is never something mushroomdb decides for the
+/// user: only `mushroomdb snapshot --truncate` does it.
+pub const AUTOMATIC_SNAPSHOT: SnapshotOptions = SnapshotOptions {
+    keep_wal: false,
+    archive_wal: true,
+};
+
+/// How long a server-initiated snapshot waits for the store's cross-process
+/// write lock before giving up.
+///
+/// Short on purpose. A snapshot is an optimisation — it shortens the next
+/// open's replay — so skipping one costs nothing but a longer replay, whereas
+/// blocking the shutdown path or piling up timer ticks behind a busy peer
+/// costs the operator.
+pub const SNAPSHOT_LOCK_WAIT: Duration = Duration::from_millis(500);
+
+/// Take the snapshot `serve` takes — on a `--snapshot-every` tick, and once
+/// more on a graceful shutdown.
+///
+/// Lives here rather than in `main.rs` so the behaviour a running server has is
+/// the behaviour a test can call. `Busy` is the caller's to interpret: a tick
+/// skips it, since the next one is only a period away.
+///
+/// # Errors
+///
+/// Whatever taking the write lock or writing the snapshot returned.
+pub fn snapshot_shared(db: &SharedDb) -> Result<(), core_api::GraphError> {
+    db.write_with_wait(SNAPSHOT_LOCK_WAIT)?
+        .snapshot_with(AUTOMATIC_SNAPSHOT)
+}
+
 /// Deterministic demo: 10 Orgs, 20 Projects, 30 People.
 pub const N_ORGS: usize = 10;
 pub const N_PROJECTS: usize = 20;
@@ -186,14 +225,12 @@ pub enum Command {
         /// Positional after dir (remaining args joined), or `--query`.
         cypher: String,
     },
-    /// Write `snapshot.bin` (default truncates WAL unless `--keep-wal`).
+    /// Write `snapshot.bin`. The WAL is archived unless told otherwise.
     Snapshot {
         db_dir: PathBuf,
-        keep_wal: bool,
-        /// Rename WAL to wal.<commit_seq>.archive before writing fresh baseline.
-        archive_wal: bool,
+        wal: WalDisposition,
         /// Keep the newest N archives; prune oldest at snapshot time.
-        /// None = unlimited. Applies only when archive_wal is true.
+        /// None = unlimited. Applies only when the WAL is archived.
         retention: Option<u32>,
     },
     /// Apply a JSON schema file idempotently (`schema apply <db-dir> <schema.json>`).
@@ -378,7 +415,10 @@ Usage:
   mushroomdb suggest <db-dir>
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
-  mushroomdb snapshot <db-dir> [--keep-wal]
+  mushroomdb snapshot <db-dir> [--keep-wal|--truncate] [--retention N]
+                     folds the WAL into snapshot.bin and archives it as wal.<N>.archive,
+                     so node_history, edge_history, was_linked and asof keep reaching it;
+                     --truncate discards it instead, --keep-wal leaves wal.bin whole
   mushroomdb migrate <db-dir>
   mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
   mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
@@ -1011,17 +1051,22 @@ pub fn run_query(db_dir: &Path, cypher: &str) -> Result<String, CliError> {
 
 fn parse_snapshot(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
-    let mut keep_wal = false;
-    let mut archive_wal = false;
+    // Archiving is the default: a snapshot the user did not ask to be
+    // destructive should not cost them their history.
+    let mut wal = WalDisposition::Archive;
     let mut retention: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
         if a == "--keep-wal" {
-            keep_wal = true;
+            wal = WalDisposition::Keep;
+            i += 1;
+        } else if a == "--truncate" {
+            wal = WalDisposition::Truncate;
             i += 1;
         } else if a == "--archive-wal" {
-            archive_wal = true;
+            // Kept for the callers that spelled the default out.
+            wal = WalDisposition::Archive;
             i += 1;
         } else if a.starts_with("--retention=") {
             let v = a.trim_start_matches("--retention=");
@@ -1052,8 +1097,7 @@ fn parse_snapshot(args: &[&str]) -> Result<Command, String> {
     let db_dir = db_dir.ok_or_else(|| "snapshot requires <db-dir>".to_string())?;
     Ok(Command::Snapshot {
         db_dir,
-        keep_wal,
-        archive_wal,
+        wal,
         retention,
     })
 }
@@ -1148,28 +1192,51 @@ pub fn run_verify(db_dir: &Path) -> Result<String, CliError> {
     }
 }
 
-/// Open `dir` and write `snapshot.bin`. Default truncates the WAL.
+/// What a snapshot does with the WAL it folds in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalDisposition {
+    /// Move it to `wal.<N>.archive`, where the history reads still find it.
+    /// The default, and what every automatic snapshot does: a store should not
+    /// forget how it got here in exchange for opening faster.
+    #[default]
+    Archive,
+    /// Leave `wal.bin` whole. Every pre-snapshot commit stays in the live WAL,
+    /// and every open replays all of it.
+    Keep,
+    /// Drop it. The smallest directory and the fastest open, at the price of
+    /// every commit before this point: `node_history`, `edge_history`,
+    /// `was_linked` and `open_at` stop reaching them, and any archives an
+    /// earlier snapshot left become unreachable too.
+    Truncate,
+}
+
+impl WalDisposition {
+    fn options(self) -> SnapshotOptions {
+        match self {
+            WalDisposition::Archive => AUTOMATIC_SNAPSHOT,
+            WalDisposition::Keep => SnapshotOptions {
+                keep_wal: true,
+                archive_wal: false,
+            },
+            WalDisposition::Truncate => SnapshotOptions {
+                keep_wal: false,
+                archive_wal: false,
+            },
+        }
+    }
+}
+
+/// Open `dir` and write `snapshot.bin`, archiving the WAL by default.
 pub fn run_snapshot(
     db_dir: &Path,
-    keep_wal: bool,
-    archive_wal: bool,
+    wal: WalDisposition,
     retention: Option<u32>,
 ) -> Result<String, CliError> {
     let mut db = GraphDb::open(db_dir)?;
-    if archive_wal {
+    if wal == WalDisposition::Archive {
         db.set_wal_archive_retention(retention);
-        db.snapshot_with(SnapshotOptions {
-            archive_wal: true,
-            keep_wal: false,
-        })?;
-    } else if keep_wal {
-        db.snapshot_with(SnapshotOptions {
-            keep_wal: true,
-            archive_wal: false,
-        })?;
-    } else {
-        db.snapshot()?;
     }
+    db.snapshot_with(wal.options())?;
     Ok(format!(
         "snapshot written: {}\n",
         db_dir.join("snapshot.bin").display()
@@ -2758,13 +2825,26 @@ mod tests {
 
     #[test]
     fn parse_snapshot_and_query() {
-        match parse_args(&["snapshot", "/tmp/db"]).unwrap() {
-            Command::Snapshot { keep_wal, .. } => assert!(!keep_wal),
-            other => panic!("{other:?}"),
-        }
-        match parse_args(&["snapshot", "/tmp/db", "--keep-wal"]).unwrap() {
-            Command::Snapshot { keep_wal, .. } => assert!(keep_wal),
-            other => panic!("{other:?}"),
+        // Archiving is what a snapshot does unless the user says otherwise.
+        for (args, want) in [
+            (vec!["snapshot", "/tmp/db"], WalDisposition::Archive),
+            (
+                vec!["snapshot", "/tmp/db", "--archive-wal"],
+                WalDisposition::Archive,
+            ),
+            (
+                vec!["snapshot", "/tmp/db", "--keep-wal"],
+                WalDisposition::Keep,
+            ),
+            (
+                vec!["snapshot", "/tmp/db", "--truncate"],
+                WalDisposition::Truncate,
+            ),
+        ] {
+            match parse_args(&args).unwrap() {
+                Command::Snapshot { wal, .. } => assert_eq!(wal, want, "{args:?}"),
+                other => panic!("{other:?}"),
+            }
         }
         match parse_args(&["query", "/tmp/db", "MATCH (n) RETURN n LIMIT 1"]).unwrap() {
             Command::Query { cypher, .. } => assert!(cypher.contains("MATCH")),
@@ -3084,7 +3164,7 @@ mod tests {
             !dir.join("snapshot.bin").exists(),
             "GraphDb Drop must not snapshot"
         );
-        let out = run_snapshot(&dir, false, false, None).expect("snapshot");
+        let out = run_snapshot(&dir, WalDisposition::Archive, None).expect("snapshot");
         assert!(
             dir.join("snapshot.bin").is_file(),
             "run_snapshot must write snapshot.bin"
@@ -3095,6 +3175,66 @@ mod tests {
         );
         let db = GraphDb::open(&dir).expect("reopen");
         assert!(db.has_node("alice"), "reopen after snapshot must recover");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every snapshot mushroomdb takes on its own — the ingest's, a
+    /// `serve --snapshot-every` tick, the graceful-shutdown one — archives the
+    /// WAL, so a store never loses its past to a write nobody asked for. Only
+    /// an explicit `--truncate` ends that reach.
+    #[test]
+    fn an_automatic_snapshot_keeps_history_reachable_and_truncate_ends_it() {
+        let dir = tmp("snapshot-archive");
+        {
+            let mut db = GraphDb::open(&dir).expect("open");
+            db.insert_node("Person", "alice", vec![]).expect("insert");
+        }
+        let before = wal_commit_count_at(&dir).expect("count");
+        assert!(before > 0, "the insert is a commit");
+
+        // Exactly the call `serve` makes on a tick and on shutdown.
+        {
+            let shared = SharedDb::open(&dir).expect("open");
+            snapshot_shared(&shared).expect("snapshot");
+        }
+
+        let archives = || {
+            std::fs::read_dir(&dir)
+                .expect("read dir")
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".archive"))
+                .count()
+        };
+        assert_eq!(archives(), 1, "the WAL was archived, not dropped");
+        assert!(
+            dir.join("wal.genesis").is_file(),
+            "the genesis marker is what lets asof reach an archived commit"
+        );
+        {
+            let db = GraphDb::open(&dir).expect("reopen");
+            assert!(db.has_node("alice"));
+            assert!(
+                !db.node_history("alice").expect("history").is_empty(),
+                "the insert is still explainable"
+            );
+        }
+        assert!(
+            GraphDb::open_at(&dir, before - 1).is_ok(),
+            "asof still reaches a commit the snapshot folded in"
+        );
+
+        // A truncating snapshot is the destructive one, and only the user asks
+        // for it.
+        run_snapshot(&dir, WalDisposition::Truncate, None).expect("truncate");
+        assert!(
+            !dir.join("wal.genesis").exists(),
+            "truncating ends asof's reach into the archives"
+        );
+        let db = GraphDb::open(&dir).expect("reopen");
+        assert!(
+            db.has_node("alice"),
+            "the data survives; only the past goes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

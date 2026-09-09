@@ -357,17 +357,13 @@ fn incremental_sync_snapshots_past_the_threshold() {
     let repo = seed_repo();
     let db_dir = tmp("db");
     run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-    let first = std::fs::metadata(db_dir.join("snapshot.bin"))
-        .unwrap()
-        .len();
+    let first = std::fs::read(db_dir.join("snapshot.bin")).unwrap();
 
     // A small commit: under the threshold, so the snapshot is not rewritten.
     commit(&repo, "one more", &[("src/extra.rs", "//! Extra.\n")]);
     run_sync(&db_dir).unwrap();
     assert_eq!(
-        std::fs::metadata(db_dir.join("snapshot.bin"))
-            .unwrap()
-            .len(),
+        std::fs::read(db_dir.join("snapshot.bin")).unwrap(),
         first,
         "a small incremental run is not worth a snapshot"
     );
@@ -389,7 +385,7 @@ fn incremental_sync_snapshots_past_the_threshold() {
         std::fs::metadata(db_dir.join("snapshot.bin"))
             .unwrap()
             .len()
-            > first,
+            > first.len() as u64,
         "the snapshot grew to hold what the WAL no longer carries"
     );
     let db = GraphDb::open(&db_dir).unwrap();

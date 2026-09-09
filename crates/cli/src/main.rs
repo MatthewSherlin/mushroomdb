@@ -13,15 +13,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// How long a server-initiated snapshot waits for the store's cross-process
-/// write lock before giving up.
-///
-/// Short on purpose. A snapshot is an optimisation — it shortens the next
-/// open's replay — so skipping one costs nothing but a longer replay, whereas
-/// blocking the shutdown path or piling up timer ticks behind a busy peer
-/// costs the operator.
-const SNAPSHOT_LOCK_WAIT: Duration = Duration::from_millis(500);
-
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&raw) {
@@ -248,10 +239,9 @@ fn main() -> ExitCode {
         },
         Ok(Command::Snapshot {
             db_dir,
-            keep_wal,
-            archive_wal,
+            wal,
             retention,
-        }) => match run_snapshot(&db_dir, keep_wal, archive_wal, retention) {
+        }) => match run_snapshot(&db_dir, wal, retention) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -487,10 +477,8 @@ fn run_serve(
                     // cross-process write lock. If another process holds it,
                     // skip this tick rather than wait: the next one is only a
                     // period away, and a snapshot is never urgent.
-                    let taken = tokio::task::spawn_blocking(move || {
-                        db_snap.write_with_wait(SNAPSHOT_LOCK_WAIT)?.snapshot()
-                    })
-                    .await;
+                    let taken =
+                        tokio::task::spawn_blocking(move || cli::snapshot_shared(&db_snap)).await;
                     match taken {
                         Ok(Ok(())) => {}
                         Ok(Err(GraphError::Busy { .. })) => {
@@ -573,7 +561,7 @@ fn run_serve(
                 // Same rule as the periodic snapshot: it needs the store's
                 // write lock. Shutting down without one is fine — the WAL holds
                 // every commit, and the next open replays it.
-                match db.write_with_wait(SNAPSHOT_LOCK_WAIT).and_then(|mut g| g.snapshot()) {
+                match cli::snapshot_shared(&db) {
                     Ok(()) => {}
                     Err(GraphError::Busy { .. }) => {
                         eprintln!(

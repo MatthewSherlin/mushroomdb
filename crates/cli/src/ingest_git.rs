@@ -26,7 +26,7 @@ use crate::structure;
 use crate::CliError;
 use core_api::{
     default_max_edges, Direction, GraphError, IngestOptions, Predicate, ResultSet, RuleDef,
-    SharedDb, SnapshotOptions, Value, WriteGuard, WRITE_LOCK_WAIT,
+    SharedDb, Value, WriteGuard, WRITE_LOCK_WAIT,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1066,6 +1066,11 @@ struct Pending {
 ///
 /// The tail *is* `wal.bin`: a snapshot replaces the live WAL with a minimal
 /// baseline, so its length on disk measures exactly what an open has to replay.
+///
+/// Only a run that reached its write phase asks. A run with nothing to take
+/// returns before entering a write scope, so a store with no snapshot and no
+/// new commits keeps waiting for a run that has work — which in the hook path
+/// is the next commit.
 fn snapshot_due(db_dir: &Path, full: bool) -> bool {
     if full || !db_dir.join("snapshot.bin").exists() {
         return true;
@@ -1075,16 +1080,10 @@ fn snapshot_due(db_dir: &Path, full: bool) -> bool {
 
 /// Write a snapshot if one is due, after the run's own writes are committed.
 ///
-/// # Why the WAL is archived rather than dropped
+/// The WAL is archived rather than dropped — see [`AUTOMATIC_SNAPSHOT`], which
+/// every snapshot mushroomdb takes on its own shares.
 ///
-/// A plain `snapshot()` replaces the live WAL with a minimal baseline and
-/// discards what it held. That is the right trade for a store nobody asks
-/// about the past of — but `node_history`, `edge_history`, `was_linked` and
-/// `open_at` all read the WAL, so folding an ingest's WAL away would make a
-/// store forget how every node in it came to be. Archiving instead moves those
-/// frames to `wal.<N>.archive`, which the history reads still consult and the
-/// *open* path does not, so the open gets faster and nothing is lost. The
-/// price is disk: the frames are moved, not deleted.
+/// [`AUTOMATIC_SNAPSHOT`]: crate::AUTOMATIC_SNAPSHOT
 ///
 /// # Why it never fails the run
 ///
@@ -1103,12 +1102,9 @@ fn snapshot_if_due(db: &SharedDb, db_dir: &Path, full: bool) {
     if !snapshot_due(db_dir, full) {
         return;
     }
-    let taken = db.write_with_wait(WRITE_LOCK_WAIT).and_then(|mut g| {
-        g.snapshot_with(SnapshotOptions {
-            archive_wal: true,
-            keep_wal: false,
-        })
-    });
+    let taken = db
+        .write_with_wait(WRITE_LOCK_WAIT)
+        .and_then(|mut g| g.snapshot_with(crate::AUTOMATIC_SNAPSHOT));
     match taken {
         Ok(()) | Err(GraphError::Busy { .. }) => {}
         Err(e) => eprintln!("snapshot skipped: {e}"),

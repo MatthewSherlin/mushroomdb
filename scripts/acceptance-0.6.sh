@@ -21,7 +21,7 @@
 # Environment:
 #   MUSHROOMDB          binary under test (default: target/debug/mushroomdb)
 #   MUSHROOMDB_RELEASE  set to 1 to force the timing thresholds on
-#   TOUCH_BUDGET_MS     touch latency budget (default 200)
+#   TOUCH_BUDGET_MS     touch latency budget (default 250)
 #   MAP_BUDGET_MS       map latency budget (default 1000)
 #
 # Timing thresholds are asserted only against a release build — a debug build
@@ -47,7 +47,12 @@ case "$MUSHROOMDB" in
   *) MUSHROOMDB="$REPO_ROOT/$MUSHROOMDB" ;;
 esac
 
-TOUCH_BUDGET_MS="${TOUCH_BUDGET_MS:-200}"
+# A `touch` is a process start plus a store open plus about 2 ms of work, and
+# the open is ~175 ms of that on a repository this size. The budget is a guard
+# against the work growing, not a latency target for the open, so it sits far
+# enough above the open that ordinary machine noise does not fail the run. CI
+# sets TOUCH_BUDGET_MS itself and is unaffected.
+TOUCH_BUDGET_MS="${TOUCH_BUDGET_MS:-250}"
 MAP_BUDGET_MS="${MAP_BUDGET_MS:-1000}"
 
 # The file whose import is added and retracted in step 4, and made dirty in
