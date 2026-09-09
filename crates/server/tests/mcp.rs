@@ -1384,11 +1384,12 @@ fn one_task_call(db: SharedDb, name: &str, args: Js) -> Js {
 /// bulk load, and the store's own counts. The other thirteen are `--all-tools`.
 const DEFAULT_GRAPH_TOOLS: [&str; 3] = ["query", "ingest_json", "stats"];
 
-/// The eight a memory store lists: every task tool but `explore`, which has no
-/// code graph to explore there.
-const MEMORY_TASK_TOOLS: [&str; 8] = [
-    "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
-];
+/// The eight a memory store lists: [`TASK_TOOLS`] less `explore`, which has no
+/// code graph to explore there. Derived from the one list this file keeps, so
+/// adding a task tool above cannot leave two lists disagreeing here.
+fn memory_task_tools() -> Vec<&'static str> {
+    TASK_TOOLS.into_iter().filter(|n| *n != "explore").collect()
+}
 
 /// Binding: a store no repository was ingested into keeps today's eleven — the
 /// eight memory task tools plus those three graph tools, in that order.
@@ -1402,10 +1403,9 @@ fn a_memory_store_keeps_the_eleven_tool_surface() {
         .iter()
         .map(|t| t["name"].as_str().expect("name"))
         .collect();
-    let expected: Vec<&str> = MEMORY_TASK_TOOLS
-        .iter()
-        .chain(DEFAULT_GRAPH_TOOLS.iter())
-        .copied()
+    let expected: Vec<&str> = memory_task_tools()
+        .into_iter()
+        .chain(DEFAULT_GRAPH_TOOLS.iter().copied())
         .collect();
     assert_eq!(names, expected, "default tools/list on a memory store");
     assert_eq!(tools.len(), 11);
@@ -1806,9 +1806,19 @@ fn explore_all_composes_context_impact_and_history_within_budget() {
         "all carries the blast radius and the ownership: {structured}"
     );
     assert!(text.len() <= 4_800, "{} bytes:\n{text}", text.len());
-    for want in ["callers", "impact", "owner"] {
+    for want in ["callers", "impact:", "owner:"] {
         assert!(text.contains(want), "the digest is missing {want}:\n{text}");
     }
+    // The partners reach a caller through the report; the digest names them
+    // once, on the context section's own `co-change` line.
+    assert!(
+        structured["partners"].is_array(),
+        "the report carries the co-change partners: {structured}"
+    );
+    assert!(
+        !text.contains("changes with"),
+        "and the digest does not repeat them:\n{text}"
+    );
 }
 
 /// Binding: the default depth is `context`, and it costs neither the blast

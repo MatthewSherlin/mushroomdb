@@ -803,18 +803,21 @@ fn render_file_impact(out: &mut String, f: &FileImpact) {
 /// can afford to have been wrong about.
 pub const DEFAULT_EXPLORE_BYTES: usize = 4_800;
 
-/// Render an [`ExploreReport`] within `budget_bytes`.
+/// Render an [`ExploreReport`] in **no more than** `budget_bytes`.
 ///
 /// The context digest, then the blast radius under an `impact:` heading, then
-/// the two history lines — in that order, because it is the order a reader
-/// stops at: what this is, what it touches, who to ask.
+/// the owner — in that order, because it is the order a reader stops at: what
+/// this is, what it touches, who to ask. The co-change partners are not printed
+/// again here: [`render_context`] has already listed them on its `co-change`
+/// line, and [`ExploreReport::partners`] carries them for a caller reading the
+/// report rather than the digest.
 ///
 /// The budget is spent on whole lines ([`cap_bytes`]), so a path is never cut
 /// in half — a half path still reads as a path, and a caller acts on it. The
-/// header line survives any budget: a reply that says which target was looked
-/// up and nothing else is still an answer, and a blank one is not. Every budget
-/// the tool schema admits (200 tokens, 800 bytes) is many times that line, so
-/// the exemption is a floor, not a leak.
+/// header line is the one exception: rather than answer nothing at all, a
+/// budget too small to hold it gets it cut to fit, on a character boundary.
+/// Every budget the tool schema admits (200 tokens, 800 bytes) is many times a
+/// real header, so that path is for a pathological target, not a small budget.
 #[must_use]
 pub fn render_explore(r: &ExploreReport, budget_bytes: usize) -> String {
     let mut out = render_context(&r.context);
@@ -840,20 +843,21 @@ pub fn render_explore(r: &ExploreReport, budget_bytes: usize) -> String {
             sanitize(key)
         );
     }
-    if !r.partners.is_empty() {
-        let items: Vec<String> = r
-            .partners
-            .iter()
-            .map(|(k, s)| format!("{} {s:.2}", sanitize(k)))
-            .collect();
-        let _ = writeln!(out, "changes with: {}", items.join(SEP));
-    }
 
     let capped = cap_bytes(&out, budget_bytes);
-    if capped.is_empty() && !out.is_empty() {
-        return cap_lines(&out, 1);
+    if !capped.is_empty() || out.is_empty() || budget_bytes == 0 {
+        return capped;
     }
-    capped
+    // The budget cannot hold the header whole — a target long enough to fill it
+    // on its own. Cut it rather than answer nothing: the reply still names what
+    // was looked up, and it still fits. One byte is reserved for the newline,
+    // and the cut walks back to a character boundary so no line ends mid-rune.
+    let head = out.lines().next().unwrap_or_default();
+    let mut end = budget_bytes - 1;
+    while end > 0 && !head.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n", &head[..end])
 }
 
 /// Render an [`OwnersReport`]: at most [`MAX_TOOL_LINES`] lines.

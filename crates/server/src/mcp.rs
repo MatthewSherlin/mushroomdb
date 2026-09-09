@@ -930,6 +930,19 @@ const DEFAULT_GRAPH_TOOLS: [&str; 3] = ["query", "ingest_json", "stats"];
 /// listing.
 const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 
+/// The task tools a memory store advertises: every one but `explore`, which
+/// answers from a code graph there is none of.
+///
+/// Written out rather than derived by subtracting a name from
+/// [`mcp_tasks::TASK_TOOLS`](crate::mcp_tasks): the two lists answer different
+/// questions — what this module *serves* and what a memory store *lists* — and
+/// a tenth task tool should have to say which surface it belongs to rather than
+/// join this one by default. [`memory_surface_is_every_task_tool_but_explore`]
+/// holds the two in step.
+const MEMORY_TASK_TOOLS: [&str; 8] = [
+    "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
+];
+
 /// Which door a store is: which default tool list it gets.
 ///
 /// Decided from the store the server opened, once, at startup — not from an
@@ -950,10 +963,8 @@ impl Surface {
     fn lists(self, name: &str) -> bool {
         match self {
             Surface::CodeGraph => CODE_GRAPH_TOOLS.contains(&name),
-            // Every task tool but `explore`, plus the three graph tools.
             Surface::Memory => {
-                (crate::mcp_tasks::TASK_TOOLS.contains(&name) && name != "explore")
-                    || DEFAULT_GRAPH_TOOLS.contains(&name)
+                MEMORY_TASK_TOOLS.contains(&name) || DEFAULT_GRAPH_TOOLS.contains(&name)
             }
         }
     }
@@ -1531,6 +1542,29 @@ mod tests {
                 "ingest_json",
                 "stats"
             ]
+        );
+    }
+
+    /// Binding: [`MEMORY_TASK_TOOLS`] is exactly the task tools this crate
+    /// serves, less `explore`.
+    ///
+    /// The two lists are written out separately on purpose — see the const's
+    /// own note — so this is what keeps a tenth task tool from being served and
+    /// silently unlisted on every memory store.
+    #[test]
+    fn memory_surface_is_every_task_tool_but_explore() {
+        let served: Vec<&str> = crate::mcp_tasks::TASK_TOOLS
+            .into_iter()
+            .filter(|n| *n != "explore")
+            .collect();
+        assert_eq!(
+            MEMORY_TASK_TOOLS.to_vec(),
+            served,
+            "MEMORY_TASK_TOOLS has drifted from mcp_tasks::TASK_TOOLS"
+        );
+        assert!(
+            CODE_GRAPH_TOOLS.contains(&"explore"),
+            "and `explore` is the task tool the other surface lists"
         );
     }
 

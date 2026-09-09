@@ -1220,9 +1220,20 @@ fn explore_all_composes_context_impact_and_history() {
         "{} bytes:\n{text}",
         text.len()
     );
-    for want in ["callers", "impact", "owner", "changes with"] {
+    for want in ["callers", "impact:", "owner:"] {
         assert!(text.contains(want), "the digest is missing {want}:\n{text}");
     }
+    // The partners are on the report for a caller reading it, but the digest
+    // does not print them twice: `render_context`'s `co-change` line already
+    // carries the same list, and a byte-budgeted digest cannot afford a copy.
+    assert!(
+        !text.contains("changes with"),
+        "the co-change list is printed once, not twice:\n{text}"
+    );
+    assert!(
+        text.contains("co-change  "),
+        "and the one copy is the context digest's own line:\n{text}"
+    );
     assert_eq!(
         text,
         render_explore(
@@ -1305,14 +1316,58 @@ fn explore_renders_within_whatever_budget_it_is_given() {
         );
     }
 
-    // Below the header's own length the header is kept anyway: a reply that
-    // says which target was looked up is an answer, and a blank one is not.
-    // This is the one line the budget does not bind, and the smallest budget
-    // the `explore` tool admits — 200 tokens, 800 bytes — is many times it.
+    // Below the header's own length the header is cut rather than dropped: a
+    // reply that says which target was looked up is an answer, and a blank one
+    // is not. The budget still binds it — that is the whole point of a ceiling.
     let header = full.lines().next().expect("a header");
-    let tiny = render_explore(&r, header.len());
-    assert_eq!(tiny, format!("{header}\n"), "the header survives any budget");
-    assert!(tiny.len() > header.len(), "and costs its newline");
+    assert_eq!(
+        render_explore(&r, header.len() + 1),
+        format!("{header}\n"),
+        "a budget with room for the header and its newline keeps both"
+    );
+    for budget in 0..=header.len() {
+        let tiny = render_explore(&r, budget);
+        assert!(
+            tiny.len() <= budget,
+            "budget {budget} exceeded by {} bytes:\n{tiny:?}",
+            tiny.len()
+        );
+        if budget > 0 {
+            assert!(
+                header.starts_with(tiny.trim_end_matches('\n')),
+                "the cut header is a prefix of the whole one:\n{tiny:?}"
+            );
+        }
+    }
+}
+
+/// Binding: a target whose own name fills the budget is cut on a character
+/// boundary, never mid-rune — the digest is text an assistant reads, and half a
+/// character is not text.
+#[test]
+fn a_target_too_long_for_the_budget_is_cut_on_a_character_boundary() {
+    let dir = tmp("explore-wide-target");
+    let db = synthetic_repo_store(&dir);
+    // Multi-byte throughout, so almost every byte offset is mid-character.
+    let target = "ünbekannt::".repeat(40);
+
+    let r = explore(&db, None, &target, Depth::All, false);
+    for budget in 8..80 {
+        let text = render_explore(&r, budget);
+        assert!(text.len() <= budget, "budget {budget}: {}", text.len());
+        // `String` cannot hold invalid UTF-8, so the check that matters is that
+        // the render did not panic slicing one — and that what came back is a
+        // prefix of the line it cut.
+        let head = render_explore(&r, DEFAULT_EXPLORE_BYTES)
+            .lines()
+            .next()
+            .expect("a header")
+            .to_string();
+        assert!(
+            head.starts_with(text.trim_end_matches('\n')),
+            "budget {budget}: {text:?} is not a prefix of {head:?}"
+        );
+    }
 }
 
 /// Binding: the four depth names parse, and nothing else does.

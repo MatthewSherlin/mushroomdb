@@ -1772,3 +1772,36 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
     assert!(out.stdout.is_empty(), "{:?}", String::from_utf8(out.stdout));
     assert!(out.stderr.is_empty(), "{:?}", String::from_utf8(out.stderr));
 }
+
+/// Binding: on a store no repository was ingested into, the brief's last line
+/// names `context`, not `explore`.
+///
+/// The two lines track the two MCP surfaces: a store with no `GitSync` marker
+/// lists `context` among its eleven and does not list `explore` at all, so
+/// naming `explore` there would send a session at a tool it cannot see.
+#[test]
+fn the_reach_line_names_context_on_a_store_with_no_git_sync_marker() {
+    let db_dir = tmp("brief-memory-db");
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&db_dir)
+        .arg("CREATE (n:File {id: 'a.rs', path: 'a.rs', lines: 1})")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let text = cli::run_brief(&db_dir).expect("brief");
+    let reach = text.lines().next_back().unwrap();
+    assert!(
+        reach.starts_with("reach the graph: context <target> (MCP tool)"),
+        "{reach}"
+    );
+    assert!(
+        !reach.contains("explore"),
+        "a memory store must not be sent at the code-graph tool: {reach}"
+    );
+    assert!(
+        reach.ends_with(&format!(" context '{}' <target>", db_dir.display())),
+        "{reach}"
+    );
+}
