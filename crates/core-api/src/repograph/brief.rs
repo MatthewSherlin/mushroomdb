@@ -45,9 +45,17 @@ const ROLE_TOKENS: usize = 2;
 /// the iteration had reached — still a valid ordering, and a partial brief is
 /// worth more at the start of a session than none.
 const RANK_BUDGET: Duration = Duration::from_secs(3);
-/// The edge types that say one file depends on another — the same three
-/// [`file_pagerank`] ranks over.
-const DEPENDENCY_EDGES: [&str; 3] = ["IMPORTS", "CO_CHANGED", "CALLS"];
+/// The edge types that make a file a candidate for the key-files list: the
+/// *structural* two of the three [`file_pagerank`] ranks over.
+///
+/// `CO_CHANGED` is deliberately not here. It says two files were edited in the
+/// same commits, which is true of every asset added in one go — a directory of
+/// fonts co-changes with itself ten ways and reads to PageRank as a small
+/// tightly-knit cluster. The brief orients an assistant on *code structure*, so
+/// a file qualifies only when something imports it or calls into it; a file
+/// related to the codebase by co-change alone is still reachable through
+/// `context`, `impact` and `why`, which are the tools that ask about it.
+const DEPENDENCY_EDGES: [&str; 2] = ["IMPORTS", "CALLS"];
 
 /// How much of each ranking the brief lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,13 +116,15 @@ pub fn brief<F: Fs>(db: &GraphDb<F>, opts: &BriefOptions) -> BriefReport {
     // otherwise.
     let (ranked, _truncated) = file_pagerank(db, &file_keys, Some(Instant::now() + RANK_BUDGET));
 
-    // A file no dependency edge touches has no rank of its own: PageRank
-    // leaves it on the uniform teleport mass, so every such file ties with
-    // every other and the tie breaks alphabetically. `map` only ever showed
-    // five entries, too few for that to surface; twenty-five is deep enough
-    // for a repository's assets to fill the list from the top of the alphabet.
-    // Listing fewer files is better than listing files the graph knows nothing
-    // about, so a file with no edge of the three is not a key file.
+    // The ranking alone fills the list with a repository's assets. A file
+    // nothing imports has no rank of its own, so PageRank leaves it on the
+    // uniform teleport mass and the tie breaks alphabetically; a directory of
+    // fonts added in one commit does better still, since co-change makes it a
+    // small tightly-knit cluster passing rank around inside itself. `map` only
+    // ever showed five entries, too few for either to surface — twenty-five is
+    // not. So the ranking says what *order* the files come in and
+    // [`DEPENDENCY_EDGES`] says which are eligible at all, and listing fewer
+    // files beats listing files whose structure the graph knows nothing about.
     let connected = connected_files(db);
     let key_files = ranked
         .iter()
@@ -159,13 +169,14 @@ pub fn brief<F: Fs>(db: &GraphDb<F>, opts: &BriefOptions) -> BriefReport {
     }
 }
 
-/// Every file the graph records a dependency edge for, in either direction.
+/// Every file the graph records a [`DEPENDENCY_EDGES`] edge for, in either
+/// direction — the files something imports or calls into.
 ///
-/// [`DEPENDENCY_EDGES`] are the three [`file_pagerank`] ranks over. `IMPORTS`
-/// and `CO_CHANGED` name files directly; `CALLS` runs between symbols, so both
-/// of its endpoints are read back to the file that defines them — the same
-/// projection the ranking does, so a file counts as connected exactly when the
-/// ranking had something to say about it.
+/// `IMPORTS` names files directly; `CALLS` runs between symbols, so both of its
+/// endpoints are read back to the file that defines them, the same projection
+/// [`file_pagerank`] does. A call inside one file counts: it is still the graph
+/// knowing that file's structure, which is what this set is asked about, even
+/// though the ranking drops it as a self-loop.
 ///
 /// Keys that are not files come back too (an `IMPORTS` edge to a path the
 /// store has no node for, say); the caller only ever asks about file keys, so

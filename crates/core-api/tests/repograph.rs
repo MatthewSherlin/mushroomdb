@@ -603,43 +603,63 @@ fn a_tiny_budget_still_says_how_many_entries_it_dropped() {
     );
 }
 
-/// PageRank leaves a file no dependency edge touches on the uniform teleport
-/// mass, so every such file ties and the tie breaks alphabetically. At
-/// twenty-five entries deep that is enough to fill the list with fonts and
-/// stylesheets, so the brief lists only files the graph has an edge for.
+/// A key file is one the graph knows the *structure* of — something imports it
+/// or calls into it. Co-change alone does not qualify: an asset directory
+/// committed in one go co-changes with itself every way there is, which reads
+/// to PageRank as a small tightly-knit cluster and, twenty-five entries deep,
+/// fills the list with fonts and stylesheets. Those files stay reachable
+/// through `context`, `impact` and `why`; they are just not what a session
+/// opens on.
 #[test]
-fn brief_skips_files_the_graph_has_no_edges_for() {
+fn brief_lists_only_files_something_imports_or_calls() {
     let dir = tmp("brief-edgeless");
     let mut db = synthetic_repo_store(&dir);
     // Sorts before every fixture file (`src/…`, `tests/…`), so on a tie it
     // would rank first and push a real file out of a 25-entry list.
-    let orphan = "aaa-orphan.woff2";
+    let asset = "aaa-asset.woff2";
     db.insert_node(
         "File",
-        orphan,
+        asset,
         vec![
-            ("id".into(), core_api::Value::Str(orphan.to_string())),
-            ("path".into(), core_api::Value::Str(orphan.to_string())),
+            ("id".into(), core_api::Value::Str(asset.to_string())),
+            ("path".into(), core_api::Value::Str(asset.to_string())),
             ("ext".into(), core_api::Value::Str("woff2".to_string())),
         ],
     )
-    .expect("an edgeless file");
+    .expect("an asset file");
+    // It is not edgeless: it was committed alongside the busiest file in the
+    // repository, so the graph records the co-change — and it still does not
+    // belong in a list about code structure.
+    db.insert_edge("CO_CHANGED", asset, &file_key(0, 0))
+        .expect("a co-change edge");
+    assert!(
+        db.weighted_edges("CO_CHANGED", None)
+            .iter()
+            .any(|(src, _, _)| src == asset),
+        "the fixture must actually carry the co-change edge"
+    );
+    assert!(
+        !db.weighted_edges("IMPORTS", None)
+            .iter()
+            .any(|(src, dst, _)| src == asset || dst == asset),
+        "and nothing may import it"
+    );
 
     let b = brief(&db, &BriefOptions::default());
     let listed: Vec<&str> = b.key_files.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(b.files, 31, "the count is of every file, listed or not");
     assert!(
-        !listed.contains(&orphan),
-        "a file nothing imports, calls or co-changes with is not a key file: {listed:?}"
+        !listed.contains(&asset),
+        "co-change alone does not make a key file: {listed:?}"
     );
     assert!(
         listed.contains(&file_key(0, 0).as_str()),
-        "the connected files are still there, ranked as before: {listed:?}"
+        "the imported files are still there, ranked as before: {listed:?}"
     );
     assert_eq!(listed.len(), 25, "the list is still full: {listed:?}");
 
-    // Even asked for more entries than there are connected files, it lists no
-    // edgeless one rather than padding.
+    // Even asked for more entries than there are qualifying files, it pads with
+    // nothing.
     let all = brief(
         &db,
         &BriefOptions {
@@ -650,9 +670,9 @@ fn brief_skips_files_the_graph_has_no_edges_for() {
     assert_eq!(
         all.key_files.len(),
         30,
-        "thirty connected files, and no more"
+        "thirty files something imports, and no more"
     );
-    assert!(all.key_files.iter().all(|(k, _)| k != orphan));
+    assert!(all.key_files.iter().all(|(k, _)| k != asset));
 }
 
 /// A store with a graph in it but no `GitSync` marker — anything ingested by
