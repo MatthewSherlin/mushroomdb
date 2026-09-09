@@ -131,6 +131,55 @@ fn doctor_passes_on_fresh_project_install() {
     );
 }
 
+/// A project install now names the store `--auto`, and doctor has to read
+/// that: resolve it the way a hook would, check the store it lands on, and
+/// recognise the hooks and git hook blocks that name it the same way.
+#[test]
+fn doctor_understands_auto_entries() {
+    let root = temp_dir("auto-entry");
+    let home = temp_dir("auto-entry-home");
+    git_repo(&root);
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+
+    // No `--db`: the install writes `--auto` everywhere.
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        db: None,
+        command: Some(bin.clone()),
+        git_hooks: true,
+        prewarm: false,
+    };
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::Explicit(bin),
+        &no_externals(),
+    )
+    .expect("install failed");
+    let db = root.join("mushroom-memory");
+    GraphDb::open(&db).expect("create the store doctor will read");
+
+    let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+        .expect("doctor errored");
+
+    assert!(!report.had_fail, "expected no failures:\n{}", report.output);
+
+    // The config line says both what is written and where it lands.
+    let config = find_check(&report.output, "config");
+    assert!(config.starts_with("ok"), "{config}");
+    assert!(config.contains("--auto ->"), "{config}");
+    assert!(config.contains(&db.display().to_string()), "{config}");
+
+    // And the checks below it read the resolved directory, not the flag.
+    let store = find_check(&report.output, "store");
+    assert!(store.starts_with("ok"), "{store}");
+    assert!(store.contains(&db.display().to_string()), "{store}");
+    assert!(find_check(&report.output, "hooks").starts_with("ok"));
+    assert!(find_check(&report.output, "git-hooks").starts_with("ok"));
+}
+
 #[test]
 fn doctor_fails_when_entry_missing() {
     let root = temp_dir("missing");

@@ -569,6 +569,134 @@ fn auto_db_prefers_project_dir_then_git_cwd_then_home() {
     );
 }
 
+/// Every checkout of a repository resolves to its own store, and every
+/// subdirectory of a checkout resolves to that checkout's.
+///
+/// This is what makes committed config safe. `install --project` writes
+/// `--auto` into `.mcp.json`, the settings hooks and the git hooks; those
+/// files travel to a `git worktree`, and a store path baked into them would
+/// point every hook in the new worktree at the old checkout's graph.
+#[test]
+fn auto_db_resolves_to_the_worktree_root() {
+    let repo = tmp("wt-main");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(&repo, "first", &[("src/lib.rs", LIB_RS)]);
+    let home = tmp("wt-home");
+
+    // The root of the main checkout, and any subdirectory of it.
+    assert_eq!(
+        resolve_auto_db(None, &repo, &home),
+        repo.join("mushroom-memory")
+    );
+    assert_eq!(
+        resolve_auto_db(None, &repo.join("src"), &home),
+        repo.join("mushroom-memory"),
+        "a hook fires wherever the tool call was, which is often a subdirectory"
+    );
+
+    // A linked worktree: its own root, never the checkout it was added from.
+    let wt = tmp("wt-linked").join("feature");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        wt.join(".git").is_file(),
+        "a linked worktree marks its root with a .git file, not a directory"
+    );
+    assert_eq!(
+        resolve_auto_db(None, &wt, &home),
+        wt.join("mushroom-memory")
+    );
+    assert_eq!(
+        resolve_auto_db(None, &wt.join("src"), &home),
+        wt.join("mushroom-memory")
+    );
+    assert_ne!(
+        resolve_auto_db(None, &wt, &home),
+        resolve_auto_db(None, &repo, &home),
+        "two working trees are two stores"
+    );
+}
+
+/// The `post-commit` block `install` writes, run for real from inside a
+/// linked worktree, updates that worktree's store and leaves the main
+/// checkout's alone.
+///
+/// Worktrees share one hooks directory, so this is literally the same file
+/// running in both places — the only thing that can tell them apart is that
+/// `sync --auto` resolves the store when it runs.
+#[test]
+fn git_hook_sync_auto_uses_the_worktree_store() {
+    use cli::install::{merge_git_hook, StoreRef};
+
+    let repo = tmp("hook-main");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(&repo, "first", &[("src/lib.rs", LIB_RS)]);
+
+    let wt = tmp("hook-wt").join("feature");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
+    );
+
+    // Each checkout starts with its own store, built from its own files.
+    let main_db = repo.join("mushroom-memory");
+    let wt_db = wt.join("mushroom-memory");
+    run_ingest_git(&main_db, &opts(&repo)).unwrap();
+    run_ingest_git(&wt_db, &opts(&wt)).unwrap();
+    let main_seq_before = GraphDb::open(&main_db).unwrap().commit_seq();
+    let wt_seq_before = GraphDb::open(&wt_db).unwrap().commit_seq();
+
+    // Exactly the block install writes, with the test binary as the command.
+    let bin = env!("CARGO_BIN_EXE_mushroomdb");
+    let hook = repo.join(".git").join("hooks").join("post-commit");
+    let block_written =
+        merge_git_hook(&hook, &format!("'{bin}'"), &StoreRef::auto(main_db.clone())).unwrap();
+    assert!(block_written);
+    assert!(
+        std::fs::read_to_string(&hook)
+            .unwrap()
+            .contains("sync --auto"),
+        "the block resolves the store at run time"
+    );
+
+    // Commit in the worktree. The hook is backgrounded, so wait for it.
+    commit(&wt, "only in the worktree", &[("src/feature.rs", NET_RS)]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if GraphDb::open(&wt_db).unwrap().commit_seq() > wt_seq_before {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the post-commit sync never reached {}",
+            wt_db.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        GraphDb::open(&main_db).unwrap().commit_seq(),
+        main_seq_before,
+        "the other checkout's store must not be touched"
+    );
+}
+
 /// `--version`, the `version` subcommand and the library function all print
 /// the same crate version.
 #[test]

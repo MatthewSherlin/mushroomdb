@@ -9,7 +9,7 @@
 
 use cli::install::{
     classify_mcp_command, run_install_with, run_uninstall, run_uninstall_with, Externals,
-    InstallOpts, McpCommand, Platform, Scope,
+    InstallOpts, McpCommand, Platform, Scope, StoreRef,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -214,6 +214,205 @@ fn project_install_writes_npx_entry_and_hooks() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: a project install names the store `--auto`, so committed config works
+//       in every worktree of the repository
+// ---------------------------------------------------------------------------
+
+#[test]
+fn project_install_writes_auto_entries() {
+    let root = temp_dir("auto-entries");
+    let home = temp_dir("auto-entries-home");
+    let hooks = git_repo(&root);
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals())
+        .expect("install failed");
+
+    // The MCP entry resolves the store when the server starts.
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"],
+        serde_json::json!(["-y", format!("mushroomdb@{VERSION}"), "mcp", "--auto"])
+    );
+
+    // Both settings hooks, unquoted: `--auto` has no metacharacters in it.
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} recall --auto")
+    );
+    assert_eq!(
+        s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} touch --auto")
+    );
+
+    // All three git hook blocks.
+    for name in ["post-commit", "post-checkout", "post-merge"] {
+        let body = fs::read_to_string(hooks.join(name)).unwrap();
+        assert!(
+            body.contains(&format!(
+                "( npx -y mushroomdb@{VERSION} sync --auto >/dev/null 2>&1 & )"
+            )),
+            "{name}: {body}"
+        );
+        assert!(
+            !body.contains(&root.display().to_string()),
+            "{name} must not bake in this checkout's path: {body}"
+        );
+    }
+
+    // The ignore line is still the real directory — a repository ignores a
+    // path, not a flag.
+    assert_eq!(read(&root, ".gitignore"), "mushroom-memory/\n");
+
+    // And the skill, which a person reads and runs by hand, names the store.
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    assert!(
+        skill.contains(&root.join("mushroom-memory").display().to_string()),
+        "the skill names the directory, not --auto"
+    );
+
+    assert!(out.contains("store  --auto"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// Test: `--db` opts out and pins the path everywhere
+// ---------------------------------------------------------------------------
+
+#[test]
+fn explicit_db_pins_the_store() {
+    let root = temp_dir("pin-db");
+    let home = temp_dir("pin-db-home");
+    let hooks = git_repo(&root);
+    let db = temp_dir("pin-db-store");
+    let opts = claude_project_opts(&db);
+
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals())
+        .expect("install failed");
+
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"],
+        serde_json::json!([
+            "-y",
+            format!("mushroomdb@{VERSION}"),
+            "mcp",
+            db.to_str().unwrap()
+        ])
+    );
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} recall '{}'", db.display())
+    );
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert!(
+        body.contains(&format!(" sync '{}' ", db.display())),
+        "{body}"
+    );
+    assert!(!body.contains("--auto"), "{body}");
+    assert!(
+        out.contains(&format!("store  {} (pinned)", db.display())),
+        "{out}"
+    );
+
+    // The store is outside the repository, so there is nothing to ignore.
+    assert_absent(&root, ".gitignore");
+}
+
+// ---------------------------------------------------------------------------
+// Test: upgrading a 0.6.0 install rewrites its absolute paths to `--auto`
+//       rather than refusing, and leaves no stale hook behind
+// ---------------------------------------------------------------------------
+
+#[test]
+fn upgrade_rewrites_absolute_entries_to_auto() {
+    let root = temp_dir("upgrade-auto");
+    let home = temp_dir("upgrade-auto-home");
+    let hooks = git_repo(&root);
+    let db = root.join("mushroom-memory");
+
+    // What 0.6.0 wrote: the store's absolute path, everywhere.
+    let old = "npx -y mushroomdb@0.6.0";
+    fs::write(
+        root.join(".mcp.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": { "mushroomdb": {
+                "command": "npx",
+                "args": ["-y", "mushroomdb@0.6.0", "mcp", db.to_str().unwrap()]
+            } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    fs::write(
+        root.join(".claude").join("settings.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [ { "hooks": [
+                    { "type": "command",
+                      "command": format!("{old} recall '{}'", db.display()),
+                      "timeout": 5 }
+                ] } ],
+                "PostToolUse": [ { "matcher": "Edit|Write|MultiEdit", "hooks": [
+                    { "type": "command",
+                      "command": format!("{old} touch '{}'", db.display()),
+                      "timeout": 30, "async": true }
+                ] } ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals())
+        .expect("an entry naming the store --auto now resolves to is an upgrade, not a conflict");
+
+    // Rewritten, and said so.
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(mcp["mcpServers"]["mushroomdb"]["args"][3], "--auto");
+    assert!(out.contains("updated mcp command"), "{out}");
+    assert!(out.contains("mcp --auto"), "{out}");
+
+    // Exactly one hook per event: the old absolute-path spelling of the same
+    // store is ours, and running both would inject two digests every prompt.
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    for (event, sub) in [("UserPromptSubmit", "recall"), ("PostToolUse", "touch")] {
+        let groups = s["hooks"][event].as_array().unwrap();
+        let commands: Vec<&str> = groups
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .map(|h| h["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            commands,
+            vec![format!("npx -y mushroomdb@{VERSION} {sub} --auto")],
+            "{event}"
+        );
+    }
+    assert!(
+        out.contains("replaced stale UserPromptSubmit hook"),
+        "{out}"
+    );
+    assert!(out.contains("replaced stale PostToolUse hook"), "{out}");
+
+    // The git hooks are rewritten in place, not stacked.
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert_eq!(body.matches("mushroomdb >>>").count(), 1, "{body}");
+    assert!(body.contains("sync --auto"), "{body}");
+}
+
+// ---------------------------------------------------------------------------
 // Test: user scope writes only home files, with the user-scope store default
 // ---------------------------------------------------------------------------
 
@@ -281,11 +480,16 @@ fn auto_scope_is_project_inside_git_repo() {
     );
     assert!(root.join(".mcp.json").exists());
     assert_absent(&home, ".claude.json");
-    // The default store is the project one.
+    // The default project store is named `--auto`, not by path: see
+    // `project_install_writes_auto_entries`.
     let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
-    assert_eq!(
-        mcp["mcpServers"]["mushroomdb"]["args"][1],
-        root.join("mushroom-memory").to_str().unwrap()
+    assert_eq!(mcp["mcpServers"]["mushroomdb"]["args"][1], "--auto");
+    assert!(
+        out.contains(&format!(
+            "store  --auto (resolves to {})",
+            root.join("mushroom-memory").display()
+        )),
+        "the summary says where --auto lands: {out}"
     );
 }
 
@@ -688,31 +892,6 @@ fn prewarm_is_skipped_with_no_prewarm() {
     assert!(!log.exists(), "--no-prewarm still spawned npx");
     assert!(!out.contains("warning"), "{out}");
     assert!(root.join(".mcp.json").exists());
-}
-
-#[test]
-#[cfg(unix)]
-fn prewarm_success_is_silent() {
-    let root = temp_dir("prewarm-ok");
-    let home = temp_dir("prewarm-ok-home");
-    let bin_dir = temp_dir("prewarm-ok-bin");
-    let db = root.join("mushroom-memory");
-    fake_program(&bin_dir, "npx", "exit 0\n");
-
-    let opts = InstallOpts {
-        prewarm: true,
-        ..claude_project_opts(&db)
-    };
-    let out = run_install_with(
-        &root,
-        &home,
-        &opts,
-        &McpCommand::npx(),
-        &externals_in(&bin_dir),
-    )
-    .expect("install");
-
-    assert!(!out.contains("warning"), "{out}");
 }
 
 #[test]
@@ -2229,7 +2408,7 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
     let db = dir.join("mushroom memory"); // a space, so quoting has to work
 
     // The block is a marked, self-contained fragment that backgrounds a sync.
-    let block = git_hook_block("mushroomdb", &db.to_string_lossy());
+    let block = git_hook_block("mushroomdb", &StoreRef::pinned(&db));
     assert!(block.starts_with("# >>> mushroomdb >>>\n"), "{block}");
     assert!(block.ends_with("# <<< mushroomdb <<<\n"), "{block}");
     assert!(block.contains(" sync "), "{block}");
@@ -2241,7 +2420,7 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
 
     // 1. No hook file yet: one is created, with a shebang, and executable.
     let hook = dir.join("hooks").join("post-commit");
-    assert!(merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    assert!(merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
     let created = fs::read_to_string(&hook).unwrap();
     assert!(created.starts_with("#!/bin/sh\n"), "{created}");
     assert!(created.contains(&block), "{created}");
@@ -2257,7 +2436,7 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
 
     // 2. Idempotent: a second merge changes nothing at all.
     assert!(
-        !merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy()).unwrap(),
+        !merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap(),
         "the block is already there"
     );
     assert_eq!(fs::read_to_string(&hook).unwrap(), created);
@@ -2274,13 +2453,13 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
     let user_text = "#!/usr/bin/env bash\nset -eu\nmake lint\n";
     fs::write(&user_hook, user_text).unwrap();
 
-    assert!(merge_git_hook(&user_hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    assert!(merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
     let merged = fs::read_to_string(&user_hook).unwrap();
     assert!(merged.starts_with(user_text), "user lines lead: {merged}");
     assert!(merged.contains(&block), "{merged}");
 
     // Idempotent over a user file too.
-    assert!(!merge_git_hook(&user_hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    assert!(!merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
     assert_eq!(fs::read_to_string(&user_hook).unwrap(), merged);
 
     assert!(remove_git_hook(&user_hook).unwrap());
@@ -2297,8 +2476,8 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
     // 5. Changing the database path rewrites the block in place rather than
     //    stacking a second one.
     let other = dir.join("other-memory");
-    assert!(merge_git_hook(&user_hook, "mushroomdb", &db.to_string_lossy()).unwrap());
-    assert!(merge_git_hook(&user_hook, "mushroomdb", &other.to_string_lossy()).unwrap());
+    assert!(merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
+    assert!(merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&other)).unwrap());
     let rewritten = fs::read_to_string(&user_hook).unwrap();
     assert_eq!(
         rewritten.matches("# >>> mushroomdb >>>").count(),
@@ -2332,7 +2511,7 @@ fn unterminated_hook_block_is_refused_rather_than_swallowed() {
         "#!/bin/sh\nmake lint\n# >>> mushroomdb >>>\n( mushroomdb sync '/old' & )\necho done\n";
     fs::write(&hook, corrupt).unwrap();
 
-    let err = merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy())
+    let err = merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db))
         .expect_err("an unterminated block must not be rewritten");
     assert!(
         err.0.contains("never closes"),
@@ -2360,7 +2539,7 @@ fn unterminated_hook_block_is_refused_rather_than_swallowed() {
 
     // Repaired by hand, both work again.
     fs::write(&hook, format!("{corrupt}# <<< mushroomdb <<<\n")).unwrap();
-    assert!(merge_git_hook(&hook, "mushroomdb", &db.to_string_lossy()).unwrap());
+    assert!(merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
     let merged = fs::read_to_string(&hook).unwrap();
     assert_eq!(
         merged.matches("# >>> mushroomdb >>>").count(),

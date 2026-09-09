@@ -54,9 +54,9 @@ pub fn version_string() -> String {
 ///
 /// 1. `$CLAUDE_PROJECT_DIR/mushroom-memory` — the assistant tells a hook which
 ///    project it is working in, and that is the most specific answer there is.
-/// 2. `<cwd>/mushroom-memory`, but only when the working directory is a git
-///    checkout. Without that guard a command run from a home directory would
-///    quietly create a store there.
+/// 2. `<working-tree root>/mushroom-memory`, but only when the working
+///    directory is inside a git checkout. Without that guard a command run
+///    from a home directory would quietly create a store there.
 /// 3. `<home>/.mushroomdb/memory`, the user-scope default `install` writes.
 ///
 /// The two project-scoped answers match [`install::default_db`],
@@ -70,10 +70,28 @@ pub fn resolve_auto_db(
     if let Some(dir) = env_project_dir.filter(|d| !d.is_empty()) {
         return Path::new(dir).join("mushroom-memory");
     }
-    if cwd.join(".git").exists() {
-        return cwd.join("mushroom-memory");
+    if let Some(root) = worktree_root(cwd) {
+        return root.join("mushroom-memory");
     }
     home.join(".mushroomdb").join("memory")
+}
+
+/// The root of the working tree `dir` sits in: the nearest ancestor holding a
+/// `.git` entry, or `None` outside a checkout.
+///
+/// The answer is a *working tree* root, never the `.git` directory several
+/// worktrees share. A linked worktree keeps a `.git` **file** at its root
+/// (`gitdir: …/worktrees/<name>`) rather than a directory, and both spellings
+/// count here, so `git worktree add` produces a checkout that resolves to its
+/// own store. Two worktrees are two different sets of files, and a graph built
+/// from one answers questions about the other wrongly.
+///
+/// Walking up matters as much as the file/directory distinction: a hook fires
+/// with whatever working directory the tool call had, which is often a
+/// subdirectory, and only the root has the `.git` entry.
+#[must_use]
+pub fn worktree_root(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|d| d.join(".git").exists())
 }
 
 /// How `serve` should mount a UI. Precedence: `--ui dir` > embedded > `--no-ui`.
@@ -222,7 +240,12 @@ pub enum Command {
     /// Bring the store up to date with the repository the `GitSync` marker
     /// names: the commits since the marker, then the dirty working tree.
     Sync {
-        db_dir: PathBuf,
+        /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
+        /// The git hooks `install` writes use that form, so a `git worktree`
+        /// of the repository syncs its own store rather than the one belonging
+        /// to the checkout the install was typed in.
+        db_dir: Option<PathBuf>,
+        auto: bool,
         /// Print the report as one JSON object instead of the plain digest.
         /// The MCP `sync` tool runs this binary and reads that object, so the
         /// counts reach an assistant without being parsed back out of prose.
@@ -324,7 +347,9 @@ Usage:
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
   mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
-  mushroomdb sync <db-dir> [--json] re-sync the repo the store was built from: new commits, then the dirty working tree
+  mushroomdb sync <db-dir>|--auto [--json]
+                                   re-sync the repo the store was built from: new commits, then the
+                                   dirty working tree (git hook body)
   mushroomdb map <db-dir> [--json] summarise the graphed repository: clusters, key files, owners, hot files
                                    --json prints the computed map instead of the rendered digest
   mushroomdb context <db-dir> <target>   one file or symbol from every side: signature, source, callers,
@@ -372,11 +397,14 @@ Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or
 install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
 the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
 --command names one (a relative --command or --db is anchored to the current directory).
---no-git-hooks skips the post-commit/checkout/merge sync hooks; --no-prewarm skips fetching the
-pinned package once. uninstall resolves the same scope and falls back to the other one when the
-inferred scope has no manifest; undoing a Codex install needs --platform codex.
---auto resolves the database as $CLAUDE_PROJECT_DIR/mushroom-memory, else ./mushroom-memory in a
-git checkout, else ~/.mushroomdb/memory.
+--no-git-hooks skips the post-commit/checkout/merge sync hooks; --no-prewarm skips both fetching the
+pinned package once and resolving its launcher, so the hooks keep the slower `npx` form.
+uninstall resolves the same scope and falls back to the other one when the inferred scope has no
+manifest; undoing a Codex install needs --platform codex.
+A project install writes --auto rather than a store path, so each `git worktree` gets its own
+store; --db pins an absolute path instead.
+--auto resolves the database as $CLAUDE_PROJECT_DIR/mushroom-memory, else mushroom-memory at the
+root of the working tree the current directory is in, else ~/.mushroomdb/memory.
 "
 }
 
@@ -602,8 +630,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "export" => parse_export(&args[1..]),
         "recall" => parse_dir_or_auto("recall", &args[1..])
             .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
-        "sync" => parse_dir_with_json("sync", &args[1..])
-            .map(|(db_dir, json)| Command::Sync { db_dir, json }),
+        "sync" => parse_sync(&args[1..]),
         "map" => parse_dir_with_json("map", &args[1..])
             .map(|(db_dir, json)| Command::Map { db_dir, json }),
         "context" => {
@@ -1649,6 +1676,16 @@ fn parse_mcp(args: &[&str]) -> Result<Command, String> {
         auto,
         all_tools,
     })
+}
+
+/// `sync <db-dir>|--auto [--json]`. `--auto` is what the git hooks `install`
+/// writes use: git runs a hook with the working tree it acted on as the
+/// working directory, so the store resolves to that tree's own and a second
+/// worktree never syncs the first one's graph.
+fn parse_sync(args: &[&str]) -> Result<Command, String> {
+    let json = args.contains(&"--json");
+    let rest: Vec<&str> = args.iter().copied().filter(|a| *a != "--json").collect();
+    parse_dir_or_auto("sync", &rest).map(|(db_dir, auto)| Command::Sync { db_dir, auto, json })
 }
 
 /// `touch [<db-dir>|--auto] [<file>...]`. The first positional is the database
@@ -3893,18 +3930,45 @@ mod tests {
         assert_eq!(
             parse_args(&["sync", "/tmp/db"]).unwrap(),
             Command::Sync {
-                db_dir: PathBuf::from("/tmp/db"),
+                db_dir: Some(PathBuf::from("/tmp/db")),
+                auto: false,
                 json: false,
             }
         );
         assert_eq!(
             parse_args(&["sync", "/tmp/db", "--json"]).unwrap(),
             Command::Sync {
-                db_dir: PathBuf::from("/tmp/db"),
+                db_dir: Some(PathBuf::from("/tmp/db")),
+                auto: false,
                 json: true,
             }
         );
-        assert!(parse_args(&["sync"]).is_err(), "db-dir is required");
+        // The git hooks `install` writes use `--auto`, so each worktree of a
+        // repository syncs its own store.
+        assert_eq!(
+            parse_args(&["sync", "--auto"]).unwrap(),
+            Command::Sync {
+                db_dir: None,
+                auto: true,
+                json: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&["sync", "--auto", "--json"]).unwrap(),
+            Command::Sync {
+                db_dir: None,
+                auto: true,
+                json: true,
+            }
+        );
+        assert!(
+            parse_args(&["sync"]).is_err(),
+            "one of <db-dir> or --auto is required"
+        );
+        assert!(
+            parse_args(&["sync", "/tmp/db", "--auto"]).is_err(),
+            "--auto and a path contradict each other"
+        );
 
         // Positional form: the first path is the database, the rest are files.
         assert_eq!(

@@ -200,6 +200,150 @@ pub fn classify_mcp_command(path_var: Option<&OsStr>, current_exe: &Path) -> Mcp
 }
 
 // ---------------------------------------------------------------------------
+// How the store is named
+// ---------------------------------------------------------------------------
+
+/// The argument every written command uses in place of a store path when the
+/// store is to be resolved at run time.
+pub const AUTO_ARG: &str = "--auto";
+
+/// How the config an install writes names the store.
+///
+/// A project install writes `--auto`, not a path. The MCP entry, the two
+/// settings hooks and the three git hook blocks then resolve the store when
+/// they run — `$CLAUDE_PROJECT_DIR/mushroom-memory`, else `mushroom-memory` at
+/// the root of the working tree they were run in.
+///
+/// The reason is `git worktree`. Those config files live in the repository and
+/// get committed, so an absolute path baked into them follows a new worktree
+/// across and points every hook there at the *other* checkout's store: the
+/// graph then describes files that are not the ones being edited. Resolving at
+/// run time gives each working tree its own store, which is the only answer
+/// that is right in both checkouts.
+///
+/// `--db <path>` opts out and pins an absolute path; user scope always pins
+/// `~/.mushroomdb/memory`, since `--auto` inside any checkout would resolve to
+/// that project instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreRef {
+    /// Where the store actually is for the checkout install ran in. Every
+    /// local decision — the `.gitignore` line, the skill's prose, the
+    /// pre-flight conflict check — needs a real directory whichever form is
+    /// written into the config.
+    path: PathBuf,
+    /// Whether written config says `--auto` rather than that path.
+    auto: bool,
+    /// Whether `--auto` resolves to this same store in this checkout. Always
+    /// true when `auto` is. Also true for a `--db` that happens to name the
+    /// default store, so an upgrade over an `--auto` install replaces its
+    /// hooks instead of running both.
+    auto_equivalent: bool,
+}
+
+impl StoreRef {
+    /// A store the config names `--auto`, living at `path` for this checkout.
+    #[must_use]
+    pub fn auto(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        StoreRef {
+            path,
+            auto: true,
+            auto_equivalent: true,
+        }
+    }
+
+    /// A store the config names by absolute path.
+    #[must_use]
+    pub fn pinned(path: impl Into<PathBuf>) -> Self {
+        StoreRef {
+            path: path.into(),
+            auto: false,
+            auto_equivalent: false,
+        }
+    }
+
+    /// Mark a pinned store as the one `--auto` also resolves to here.
+    #[must_use]
+    pub fn also_auto(mut self) -> Self {
+        self.auto_equivalent = true;
+        self
+    }
+
+    /// Where the store is on this machine, right now.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether written config resolves the store at run time.
+    #[must_use]
+    pub fn is_auto(&self) -> bool {
+        self.auto
+    }
+
+    /// The argument written into an MCP entry's `args` array: `--auto`, or the
+    /// path. Not shell-quoted — an MCP host spawns an argv, where quotes would
+    /// become part of the filename.
+    #[must_use]
+    pub fn arg(&self) -> String {
+        if self.auto {
+            AUTO_ARG.to_string()
+        } else {
+            self.path.to_string_lossy().into_owned()
+        }
+    }
+
+    /// The same argument for a command line a shell reads, quoted where
+    /// quoting is needed. `--auto` needs none; a path may contain a space.
+    #[must_use]
+    pub fn shell_arg(&self) -> String {
+        if self.auto {
+            AUTO_ARG.to_string()
+        } else {
+            sh_quote(&self.path.to_string_lossy())
+        }
+    }
+
+    /// How the summary line describes the store.
+    fn describe(&self) -> String {
+        if self.auto {
+            format!("{AUTO_ARG} (resolves to {})", self.path.display())
+        } else {
+            format!("{} (pinned)", self.path.display())
+        }
+    }
+
+    /// Every command tail a hook of ours for `sub` may end with, for this
+    /// store: the path spelling always, and the `--auto` spelling when that
+    /// resolves here too.
+    ///
+    /// Both are needed because an upgrade must recognise what the *previous*
+    /// version wrote. 0.6.0 wrote an absolute path; this version writes
+    /// `--auto`; either one left behind alongside the other means two recall
+    /// digests on every prompt.
+    fn hook_tails(&self, sub: &str) -> Vec<String> {
+        let mut out = vec![format!(" {sub} {}", sh_quote(&self.path.to_string_lossy()))];
+        if self.auto_equivalent {
+            out.push(format!(" {sub} {AUTO_ARG}"));
+        }
+        out
+    }
+
+    /// Whether an existing config argument names this same store: the same
+    /// spelling, the same path, or `--auto` where `--auto` means this store.
+    ///
+    /// This is what makes an upgrade an upgrade rather than a conflict — a
+    /// 0.6.0 entry naming `<project>/mushroom-memory` is the store `--auto`
+    /// now resolves to, so it is rewritten rather than refused.
+    fn names_same_store(&self, existing_arg: &str) -> bool {
+        if existing_arg == AUTO_ARG {
+            return self.auto_equivalent;
+        }
+        Path::new(existing_arg) == self.path
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
 
@@ -276,6 +420,33 @@ pub fn default_db(scope: Scope, project_root: &Path, home: &Path) -> PathBuf {
         Scope::Project => project_root.join("mushroom-memory"),
         Scope::User => home.join(".mushroomdb").join("memory"),
     }
+}
+
+/// How this install will name the store in everything it writes.
+///
+/// `--auto` is written only where it provably resolves to the same directory:
+/// the default store, in project scope, inside a git checkout. That last
+/// condition is what makes the run-time fallback safe — a hook that never
+/// receives `$CLAUDE_PROJECT_DIR` still finds the store by walking up to the
+/// working tree root, and there is no working tree root to find without it.
+/// Everywhere else the path is pinned, because a wrong `--auto` would silently
+/// build a second store under the home directory.
+fn store_ref(project_root: &Path, home: &Path, scope: Scope, db: Option<&Path>) -> StoreRef {
+    let default = default_db(scope, project_root, home);
+    let Some(pinned) = db.map(|d| absolutise(d, project_root)) else {
+        if scope == Scope::Project && project_root.join(".git").exists() {
+            return StoreRef::auto(default);
+        }
+        return StoreRef::pinned(default);
+    };
+    // A `--db` naming the very store `--auto` resolves to is still pinned —
+    // the user asked for a path — but an `--auto` hook from an earlier install
+    // points at the same place and is this install's to replace.
+    let auto_here = default_db(Scope::Project, project_root, home);
+    if pinned == auto_here {
+        return StoreRef::pinned(pinned).also_auto();
+    }
+    StoreRef::pinned(pinned)
 }
 
 /// Resolve the scope, and say whether it was inferred.
@@ -502,16 +673,16 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The exact command string written into the hook entry. `shell` is already
-/// quoted; only the database path still needs it.
-fn recall_hook_command(shell: &str, db_str: &str) -> String {
-    format!("{shell} recall {}", sh_quote(db_str))
+/// The exact command string written into the hook entry. Both halves arrive
+/// already quoted where quoting is needed.
+fn recall_hook_command(shell: &str, store: &StoreRef) -> String {
+    format!("{shell} recall {}", store.shell_arg())
 }
 
 /// The exact command string written into the post-edit hook entry. `touch` in
 /// hook mode prints nothing and exits 0 whatever it is handed.
-fn touch_hook_command(shell: &str, db_str: &str) -> String {
-    format!("{shell} touch {}", sh_quote(db_str))
+fn touch_hook_command(shell: &str, store: &StoreRef) -> String {
+    format!("{shell} touch {}", store.shell_arg())
 }
 
 /// One `hooks.<event>` array entry in Claude Code's settings.json shape.
@@ -633,17 +804,29 @@ fn remove_hook_entry(settings_file: &Path, event: &str, command: &str) -> Result
     drop_hooks(settings_file, event, |c| c == command)
 }
 
-/// Whether `command` is one of our hook bodies for `db`, whatever binary it
+/// Whether `command` is one of our hook bodies for `store`, whatever binary it
 /// names.
 ///
 /// The command prefix is exactly what changes between versions — 0.5.x wrote
-/// the absolute path of a copied binary, 0.6.0 writes an `npx` pin, a
-/// developer's `--command` writes a build path — so identity is the tail: the
-/// subcommand and the quoted database this install is wiring. A hook naming a
-/// *different* database belongs to a different install and is not ours to
-/// touch.
-pub(crate) fn is_our_hook_command(command: &str, sub: &str, db_str: &str) -> bool {
-    command.ends_with(&format!(" {sub} {}", sh_quote(db_str)))
+/// the absolute path of a copied binary, 0.6.0 an `npx` pin, 0.6.1 a resolved
+/// `node <launcher>`, a developer's `--command` a build path — so identity is
+/// the tail: the subcommand and the store this install is wiring. Both
+/// spellings of that store count, since `--auto` replaced a written path in
+/// 0.6.1 and a hook left behind in the other spelling would run alongside the
+/// new one. A hook naming a *different* store belongs to a different install
+/// and is not ours to touch.
+pub(crate) fn is_our_hook_command(command: &str, sub: &str, store: &StoreRef) -> bool {
+    store
+        .hook_tails(sub)
+        .iter()
+        .any(|tail| command.ends_with(tail))
+}
+
+/// The same identity test for a line that does not *end* with the invocation:
+/// a git hook block backgrounds it and redirects its output, so the store
+/// argument sits in the middle of the line rather than at the end of it.
+pub(crate) fn line_runs_for_store(line: &str, sub: &str, store: &StoreRef) -> bool {
+    store.hook_tails(sub).iter().any(|tail| line.contains(tail))
 }
 
 /// Take out every hook of ours for `event` that is not the one we are about
@@ -657,11 +840,11 @@ fn remove_stale_hooks(
     settings_file: &Path,
     event: &str,
     sub: &str,
-    db_str: &str,
+    store: &StoreRef,
     desired: &str,
 ) -> Result<bool, CliError> {
     drop_hooks(settings_file, event, |c| {
-        c != desired && is_our_hook_command(c, sub, db_str)
+        c != desired && is_our_hook_command(c, sub, store)
     })
 }
 
@@ -745,7 +928,7 @@ struct Ctx<'a> {
     project_root: &'a Path,
     home: &'a Path,
     scope: Scope,
-    db: &'a str,
+    store: &'a StoreRef,
     cmd: &'a McpCommand,
     ext: &'a Externals,
     git_hooks: bool,
@@ -833,12 +1016,7 @@ pub fn run_install_with(
     ext: &Externals,
 ) -> Result<String, CliError> {
     let (scope, auto_scope) = resolve_scope(project_root, opts.scope);
-    let db = opts
-        .db
-        .as_ref()
-        .map(|d| absolutise(d, project_root))
-        .unwrap_or_else(|| default_db(scope, project_root, home));
-    let db_str = db.to_string_lossy();
+    let store = store_ref(project_root, home, scope, opts.db.as_deref());
     // Whatever the caller handed us, what gets written resolves from anywhere:
     // an absolute path, or a name PATH answers for.
     let cmd = &match cmd {
@@ -852,14 +1030,14 @@ pub fn run_install_with(
     // Check for anything that would make this install fail halfway before
     // writing a single byte.
     for plat in &platforms {
-        preflight_check(project_root, home, plat, scope, &db_str, ext)?;
+        preflight_check(project_root, home, plat, scope, &store, ext)?;
     }
 
     let ctx = Ctx {
         project_root,
         home,
         scope,
-        db: &db_str,
+        store: &store,
         cmd,
         ext,
         git_hooks: opts.git_hooks,
@@ -932,6 +1110,7 @@ pub fn run_install_with(
     if anything_written {
         out.push_str(&format!("  manifest  {}\n", manifest_path.display()));
         out.push_str(&format!("  mcp command  {}\n", cmd.shell()));
+        out.push_str(&format!("  store  {}\n", store.describe()));
     } else {
         out.push_str("  (already installed — no changes)\n");
     }
@@ -1180,14 +1359,14 @@ fn preflight_check(
     home: &Path,
     platform: &Platform,
     scope: Scope,
-    db_str: &str,
+    store: &StoreRef,
     ext: &Externals,
 ) -> Result<(), CliError> {
     match platform {
         Platform::ClaudeCode => {
-            check_mcp_conflict(&claude_mcp_file(project_root, home, scope), db_str)
+            check_mcp_conflict(&claude_mcp_file(project_root, home, scope), store)
         }
-        Platform::Cursor => check_mcp_conflict(&cursor_mcp_file(project_root, home, scope), db_str),
+        Platform::Cursor => check_mcp_conflict(&cursor_mcp_file(project_root, home, scope), store),
         // Nothing of Codex's is a file we read; what can fail early is the CLI
         // being absent, and that is worth saying before anything is written.
         Platform::Codex => codex_bin(ext).map(|_| ()),
@@ -1212,7 +1391,8 @@ pub(crate) fn cursor_mcp_file(project_root: &Path, home: &Path, scope: Scope) ->
     }
 }
 
-/// The database an existing entry serves: the argument straight after `mcp`.
+/// The store an existing entry serves: the argument straight after `mcp`,
+/// which is either a path or `--auto`.
 ///
 /// Its position moved between versions — 0.5.x wrote `["mcp", db]`, the npx
 /// form writes `["-y", "mushroomdb@x.y.z", "mcp", db]` — so the subcommand is
@@ -1225,12 +1405,12 @@ pub(crate) fn entry_db(entry: &serde_json::Value) -> Option<&str> {
 
 /// Check if a MCP JSON file has a conflicting `mushroomdb` entry.
 ///
-/// A conflict is: the file exists, has `mcpServers.mushroomdb`, and the
-/// database it names differs from what we'd write. An entry for the SAME db
-/// with a different `command` is ours to repair (a bare name that never
-/// resolved, an absolute path from 0.5.x, an older version pin), so it is not
-/// a conflict.
-fn check_mcp_conflict(mcp_file: &Path, db_str: &str) -> Result<(), CliError> {
+/// A conflict is: the file exists, has `mcpServers.mushroomdb`, and the store
+/// it names differs from the one we'd write. An entry for the SAME store with
+/// a different `command` — or the same store spelled the other way, which is
+/// every 0.6.0 entry now that a project install writes `--auto` — is ours to
+/// repair, so it is not a conflict.
+fn check_mcp_conflict(mcp_file: &Path, store: &StoreRef) -> Result<(), CliError> {
     if !mcp_file.exists() {
         return Ok(());
     }
@@ -1245,8 +1425,8 @@ fn check_mcp_conflict(mcp_file: &Path, db_str: &str) -> Result<(), CliError> {
     }
 
     let existing_db = entry_db(existing).unwrap_or("");
-    if existing_db == db_str {
-        return Ok(()); // Same db — idempotent or repairable, no conflict.
+    if store.names_same_store(existing_db) {
+        return Ok(()); // Same store — idempotent or repairable, no conflict.
     }
 
     Err(CliError(format!(
@@ -1329,7 +1509,10 @@ fn install_claude_code(
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
     let shell = ctx.cmd.shell();
-    let skill_content = render_template(SKILL_TEMPLATE, ctx.db, &shell);
+    // The skill is prose a reader follows by hand, so it names the directory
+    // the store is in rather than the `--auto` the machine-read config uses.
+    let db_str = ctx.store.path().to_string_lossy();
+    let skill_content = render_template(SKILL_TEMPLATE, &db_str, &shell);
 
     let skill_dir = match ctx.scope {
         Scope::Project => ctx
@@ -1362,8 +1545,8 @@ fn install_claude_code(
     // An earlier install of ours for this same store is replaced, not joined:
     // its command names a binary this version no longer writes, and leaving it
     // would run both on every prompt.
-    let recall = recall_hook_command(&shell, ctx.db);
-    if remove_stale_hooks(&settings_file, HOOK_EVENT, "recall", ctx.db, &recall)? {
+    let recall = recall_hook_command(&shell, ctx.store);
+    if remove_stale_hooks(&settings_file, HOOK_EVENT, "recall", ctx.store, &recall)? {
         notes.push(format!("replaced stale {HOOK_EVENT} hook"));
     }
     merge_hook_entry(
@@ -1373,8 +1556,8 @@ fn install_claude_code(
         hook_entry(&recall),
         manifest,
     )?;
-    let touch = touch_hook_command(&shell, ctx.db);
-    if remove_stale_hooks(&settings_file, TOUCH_EVENT, "touch", ctx.db, &touch)? {
+    let touch = touch_hook_command(&shell, ctx.store);
+    if remove_stale_hooks(&settings_file, TOUCH_EVENT, "touch", ctx.store, &touch)? {
         notes.push(format!("replaced stale {TOUCH_EVENT} hook"));
     }
     merge_hook_entry(
@@ -1393,7 +1576,8 @@ fn install_cursor(
     manifest: &mut Manifest,
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
-    let rules_content = render_template(CURSOR_RULES_TEMPLATE, ctx.db, &ctx.cmd.shell());
+    let db_str = ctx.store.path().to_string_lossy();
+    let rules_content = render_template(CURSOR_RULES_TEMPLATE, &db_str, &ctx.cmd.shell());
 
     let rules_dir = match ctx.scope {
         Scope::Project => ctx.project_root.join(".cursor").join("rules"),
@@ -1440,7 +1624,7 @@ fn install_codex(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliError>
         SERVER_NAME.to_string(),
         "--".to_string(),
     ];
-    args.extend(ctx.cmd.argv("mcp", ctx.db));
+    args.extend(ctx.cmd.argv("mcp", &ctx.store.arg()));
     run_and_capture(&bin, &args).map_err(|e| CliError(format!("codex mcp add failed: {e}")))?;
     manifest.codex = true;
     Ok(())
@@ -1458,8 +1642,8 @@ pub(crate) const GIT_HOOKS: &[&str] = &["post-commit", "post-checkout", "post-me
 /// The `.gitignore` line for a store kept inside the repository, or `None`
 /// when it is kept outside — a repository has no business ignoring a path it
 /// does not contain.
-fn gitignore_line(project_root: &Path, db: &str) -> Option<String> {
-    let rel = Path::new(db).strip_prefix(project_root).ok()?;
+fn gitignore_line(project_root: &Path, db: &Path) -> Option<String> {
+    let rel = db.strip_prefix(project_root).ok()?;
     if rel.as_os_str().is_empty() {
         return None;
     }
@@ -1469,7 +1653,7 @@ fn gitignore_line(project_root: &Path, db: &str) -> Option<String> {
 /// Append the store directory to the repository's `.gitignore` unless some
 /// spelling of it is already listed. Creates the file if it is absent.
 fn ensure_gitignore_line(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliError> {
-    let Some(line) = gitignore_line(ctx.project_root, ctx.db) else {
+    let Some(line) = gitignore_line(ctx.project_root, ctx.store.path()) else {
         return Ok(());
     };
     let path = ctx.project_root.join(".gitignore");
@@ -1558,7 +1742,7 @@ fn install_git_hooks(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliEr
     let shell = ctx.cmd.shell();
     for name in GIT_HOOKS {
         let file = dir.join(name);
-        if merge_git_hook(&file, &shell, ctx.db)? {
+        if merge_git_hook(&file, &shell, ctx.store)? {
             manifest.git_hooks.push(file);
         }
     }
@@ -1631,7 +1815,7 @@ fn merge_mcp_entry(
         root["mcpServers"] = serde_json::json!({});
     }
 
-    let desired = ctx.cmd.json_entry("mcp", ctx.db);
+    let desired = ctx.cmd.json_entry("mcp", &ctx.store.arg());
     let existing = &root["mcpServers"][SERVER_NAME];
 
     if existing == &desired {
@@ -1657,9 +1841,10 @@ fn merge_mcp_entry(
     });
     if replaced {
         notes.push(format!(
-            "updated mcp command in {} → {}",
+            "updated mcp command in {} → {} mcp {}",
             mcp_file.display(),
-            ctx.cmd.shell()
+            ctx.cmd.shell(),
+            ctx.store.arg()
         ));
     }
 
@@ -1827,13 +2012,19 @@ const HOOK_SHEBANG: &str = "#!/bin/sh";
 /// another process holds the write lock, and the next commit picks the work up.
 ///
 /// `shell` is the already-quoted command prefix from [`McpCommand::shell`];
-/// the database path is quoted here, since a path with a space in it would
-/// otherwise be word-split into two arguments.
+/// the store contributes either `--auto` or its own quoted path, since a path
+/// with a space in it would otherwise be word-split into two arguments.
+///
+/// `--auto` is what makes the block correct in a `git worktree`. Git runs a
+/// hook with the working tree it acted on as the working directory, so `sync`
+/// walks up from there to that tree's own root and updates that tree's own
+/// store — the same block, committed once, doing the right thing in every
+/// checkout of the repository.
 #[must_use]
-pub fn git_hook_block(shell: &str, db: &str) -> String {
+pub fn git_hook_block(shell: &str, store: &StoreRef) -> String {
     format!(
         "{HOOK_BEGIN}\n( {shell} sync {} >/dev/null 2>&1 & )\n{HOOK_END}\n",
-        sh_quote(db)
+        store.shell_arg()
     )
 }
 
@@ -1949,7 +2140,7 @@ fn only_a_shebang(text: &str) -> bool {
 /// with the same arguments writes nothing the second time. A file whose
 /// mushroomdb block was hand-edited so its closing marker is gone is an error
 /// and is left byte-for-byte alone; see [`strip_hook_block`].
-pub fn merge_git_hook(hook_file: &Path, shell: &str, db: &str) -> Result<bool, CliError> {
+pub fn merge_git_hook(hook_file: &Path, shell: &str, store: &StoreRef) -> Result<bool, CliError> {
     let existing = if hook_file.exists() {
         Some(
             fs::read_to_string(hook_file)
@@ -1958,7 +2149,7 @@ pub fn merge_git_hook(hook_file: &Path, shell: &str, db: &str) -> Result<bool, C
     } else {
         None
     };
-    let next = merged_hook_text(existing.as_deref(), &git_hook_block(shell, db))
+    let next = merged_hook_text(existing.as_deref(), &git_hook_block(shell, store))
         .map_err(|()| unterminated(hook_file))?;
     if existing.as_deref() == Some(next.as_str()) {
         return Ok(false);

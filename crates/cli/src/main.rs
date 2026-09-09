@@ -58,17 +58,19 @@ fn main() -> ExitCode {
         Ok(Command::Impact { db_dir, files }) => print_or_fail(cli::run_impact(&db_dir, &files)),
         Ok(Command::Owners { db_dir, path }) => print_or_fail(cli::run_owners(&db_dir, &path)),
         Ok(Command::Why { db_dir, a, b }) => print_or_fail(cli::run_why(&db_dir, &a, &b)),
-        Ok(Command::Sync { db_dir, json }) => match cli::ingest_git::run_sync(&db_dir) {
-            Ok(report) => {
-                if json {
-                    print!("{}", cli::ingest_git::format_sync_json(&report));
-                } else {
-                    print!("{}", cli::ingest_git::format_sync(&report));
+        Ok(Command::Sync { db_dir, auto, json }) => {
+            match cli::ingest_git::run_sync(&resolve_db(db_dir, auto)) {
+                Ok(report) => {
+                    if json {
+                        print!("{}", cli::ingest_git::format_sync_json(&report));
+                    } else {
+                        print!("{}", cli::ingest_git::format_sync(&report));
+                    }
+                    ExitCode::SUCCESS
                 }
-                ExitCode::SUCCESS
+                Err(e) => busy_aware(&e),
             }
-            Err(e) => busy_aware(&e),
-        },
+        }
         Ok(Command::Touch {
             db_dir,
             auto,
