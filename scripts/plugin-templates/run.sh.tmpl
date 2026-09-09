@@ -12,11 +12,20 @@
 # anyway, so Node's startup is nearly the whole difference — hence the order
 # below.
 #
-# The cache is one line of text per resolved path under $CLAUDE_PLUGIN_DATA (or
-# ~/.mushroomdb), named for the version that wrote it, so a plugin upgrade
-# resolves afresh rather than running the old copy. Every failure falls through
-# to the next rung, ending at the plain `npx` form, which is slower and always
-# correct.
+# The cache is one line of text per resolved path, named for the version that
+# wrote it, so a plugin upgrade resolves afresh rather than running the old
+# copy. Every failure falls through to the next rung, ending at the plain `npx`
+# form, which is slower and always correct.
+#
+# The cache lives under $CLAUDE_PLUGIN_DATA, or $HOME/.mushroomdb, and NOWHERE
+# ELSE. A line in it is a path this script `exec`s with the hook's arguments
+# and the prompt payload on stdin, so where it may be read from is a security
+# question, not a convenience one. Both of those directories are already the
+# user's own — anything able to write there can already edit their shell
+# startup files — but a world-writable fallback such as /tmp would let any
+# local user drop in a path and have the next prompt run it. So when neither
+# variable is set there is no cache at all: the script resolves every time,
+# which is the same graceful degradation as a cache that cannot be written.
 #
 # Rendered from scripts/plugin-templates/run.sh.tmpl — edit that, then run
 # scripts/render-plugin.sh.
@@ -24,18 +33,28 @@ set -u
 
 VERSION='{{VERSION}}'
 PKG="mushroomdb@${VERSION}"
-CACHE_DIR="${CLAUDE_PLUGIN_DATA:-${HOME:-/tmp}/.mushroomdb}"
-CACHE_BINARY="${CACHE_DIR}/binary-${VERSION}"
-CACHE_LAUNCHER="${CACHE_DIR}/launcher-${VERSION}"
+CACHE_DIR="${CLAUDE_PLUGIN_DATA:-}"
+if [ -z "$CACHE_DIR" ] && [ -n "${HOME:-}" ]; then
+  CACHE_DIR="${HOME}/.mushroomdb"
+fi
+CACHE_BINARY=''
+CACHE_LAUNCHER=''
+if [ -n "$CACHE_DIR" ]; then
+  CACHE_BINARY="${CACHE_DIR}/binary-${VERSION}"
+  CACHE_LAUNCHER="${CACHE_DIR}/launcher-${VERSION}"
+fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# read_cache <file> — the single line in it, if the file is readable.
-read_cache() { [ -f "$1" ] && cat "$1" 2>/dev/null; }
+# read_cache <file> — the single line in it, if there is a cache to read.
+read_cache() { [ -n "$1" ] && [ -f "$1" ] && cat "$1" 2>/dev/null; }
 
-# remember <file> <path> — best effort; a cache that cannot be written just
-# means the next hook resolves again.
-remember() { (mkdir -p "$CACHE_DIR" && printf '%s\n' "$2" >"$1") 2>/dev/null; }
+# remember <file> <path> — best effort, and a no-op with no cache directory; a
+# cache that cannot be written just means the next hook resolves again.
+remember() {
+  [ -n "$1" ] || return 0
+  (mkdir -p "$CACHE_DIR" && printf '%s\n' "$2" >"$1") 2>/dev/null
+}
 
 # 1. The cached native binary. npm's cache can be pruned out from under us, so
 #    the path is checked every time, never trusted.

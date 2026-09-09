@@ -156,15 +156,18 @@ which it chose. Project scope writes the MCP entry to `.mcp.json`, the
 `.claude/settings.json`, an ignore line for the store, and a backgrounded
 `sync` into the `post-commit`, `post-checkout` and `post-merge` git hooks.
 
-None of those name the store by path: they say `--auto`, and the store is
-resolved when they run. Those files are in the repository and get committed, so
-a path would follow a `git worktree add` across and point the new checkout's
-hooks at the old checkout's graph. With `--auto` each working tree gets its own
-`mushroom-memory`. Pass `--db <path>` to pin an absolute path instead.
+Inside a git checkout, none of those name the store by path: they say `--auto`,
+and the store is resolved when they run. Those files are in the repository and
+get committed, so a path would follow a `git worktree add` across and point the
+new checkout's hooks at the old checkout's graph. With `--auto` each working
+tree gets its own `mushroom-memory`. Outside a checkout there is no working
+tree root to resolve against, so the store is pinned to the project directory,
+and `--db <path>` pins one anywhere.
 
-None of them name the store by path when the install is inside a git checkout;
-outside one there is no working tree root to resolve against, so the store is
-pinned to the project directory.
+A Cursor or Codex install pins the path too. Only Claude Code sets
+`$CLAUDE_PROJECT_DIR`, and without it `--auto` would rest on where the host
+happens to start the server; if that were wrong, the assistant would read an
+empty store under your home directory with nothing reporting an error.
 
 The MCP entry runs the published package, so the assistant needs nothing
 installed globally. `install` locates it once — `--print-binary`, falling back

@@ -103,7 +103,7 @@ Cursor gets the same content as an always-apply rules file
 |------|-------------|
 | `--platform claude-code\|cursor\|codex\|all` | Target platform. Default: auto-detect (reads `~/.claude` / `.cursor/` presence). `all` is Claude Code and Cursor; Codex is opt-in, because registering with it runs another program. |
 | `--project` / `--user` | Scope. Default: auto — project inside a git checkout, user anywhere else. |
-| `--db <path>` | **Pins** the store to this absolute path. Without it a project install inside a git checkout writes `--auto`, which resolves at run time to `$CLAUDE_PROJECT_DIR/mushroom-memory` or `mushroom-memory` at the working tree's root — so committed config is right in every `git worktree` rather than pointing them all at the checkout the install was typed in. Outside a git checkout there is no working tree root for that fallback to find, so the store is pinned to the project directory. A user install always pins `~/.mushroomdb/memory`. |
+| `--db <path>` | **Pins** the store to this absolute path. Without it, a Claude Code project install inside a git checkout writes `--auto`, which resolves at run time to `$CLAUDE_PROJECT_DIR/mushroom-memory` or `mushroom-memory` at the working tree's root — so committed config is right in every `git worktree` rather than pointing them all at the checkout the install was typed in. The store is pinned instead in three cases: a Cursor or Codex install (see below), an install outside a git checkout (no working tree root for the fallback to find), and a user install (always `~/.mushroomdb/memory`). |
 | `--command <path>` | Invoke this binary instead of `npx`. Use it for a local build or a pinned install. A relative path is fine to type: it is anchored to the current directory before anything is written, because the assistant spawns the server from a directory of its own. `--db` is anchored the same way. A bare name with no separator (`--command mushroomdb`) means a `PATH` lookup and is written exactly as given. |
 | `--no-git-hooks` | Skip the `post-commit` / `post-checkout` / `post-merge` sync hooks. |
 | `--no-prewarm` | No network and no resolution during the install: neither the one-off package fetch nor locating the package's binary. Every hook keeps the slower `npx` form. |
@@ -116,8 +116,27 @@ Your assistant spawns the MCP server by the `command` in the config entry, so
 that command must resolve from the assistant's process, not just your shell.
 `install` picks the form that will actually work:
 
-`<store>` below is `--auto` for a project install and an absolute path for a
-user install or a `--db`.
+`<store>` below is `--auto` for a Claude Code project install and an absolute
+path otherwise.
+
+**Only Claude Code gets `--auto`.** It sets `$CLAUDE_PROJECT_DIR` for both MCP
+servers and hook processes, so the first resolution step always answers however
+the process was started. Cursor and Codex set no such variable, which would
+leave `--auto` resting on the host happening to spawn the server inside the
+checkout; if it did not, resolution would fall through to
+`~/.mushroomdb/memory` — an empty store, with the ignore line and the rules
+file both naming a different directory, and nothing anywhere reporting an
+error. So a `--platform cursor` or `--platform codex` install writes the path,
+and `--platform all` writes `--auto` for Claude Code and the path for Cursor.
+The worktree argument is weaker for them in any case: `.mcp.json` and the two
+settings hooks are Claude Code's, and they are what a `git worktree` carries
+across.
+
+The git hook blocks follow whichever form the assistant config uses. `--auto`
+is safe there on its own terms — git runs a hook with the working tree it acted
+on as the working directory, so the store resolves with no assistant involved —
+but a Cursor-only install still pins them, so one install spells one store one
+way.
 
 | Situation | `command` / `args` written | Why |
 |-----------|----------------------------|-----|

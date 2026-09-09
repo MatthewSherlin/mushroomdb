@@ -555,10 +555,13 @@ kept deliberately outside the repository. A user-scope install always pins
 `~/.mushroomdb/memory`, since `--auto` inside any checkout would resolve to
 that project instead.
 
-`--auto` is written only where step 2 can answer. A project install *outside* a
-git checkout has no working tree root to resolve against, so it pins the store
-to the project directory rather than risk a hook that never receives
-`$CLAUDE_PROJECT_DIR` quietly building a second store under the home directory.
+`--auto` is written only where a resolution step can be relied on to answer.
+A project install *outside* a git checkout has no working tree root for step 2
+to find, so it pins the store to the project directory rather than risk a hook
+that never receives `$CLAUDE_PROJECT_DIR` quietly building a second store under
+the home directory. A Cursor or Codex install pins it for the same reason from
+the other end: neither host sets `$CLAUDE_PROJECT_DIR`, so step 1 never answers
+for them and step 2 would depend on where the host chose to start the server.
 
 `mushroomdb --version` (or `mushroomdb version`) prints `mushroomdb <version>`.
 

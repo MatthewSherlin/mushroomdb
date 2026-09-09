@@ -139,6 +139,57 @@ printf '%s\n' "$FAKE_LAUNCHER" > "$CACHE_DIR/launcher-${PLUGIN_VERSION}"
 out=$(CLAUDE_PLUGIN_DATA="$CACHE_DIR" PATH=/usr/bin:/bin "$PKG/plugin/hooks/run.sh" --help)
 test "$out" = "fake-ok --help"
 
+echo "== run.sh: no CLAUDE_PLUGIN_DATA and no HOME means no cache at all"
+# The cache may live under $CLAUDE_PLUGIN_DATA or $HOME and nowhere else. A
+# world-writable fallback such as /tmp would let any local user drop in
+# /tmp/.mushroomdb/binary-<version> naming a program of theirs, and the next
+# UserPromptSubmit hook would exec it with the prompt payload on stdin. With
+# neither variable set the script must resolve every time instead — which is
+# observable: a stub npx that logs each call is asked twice for two runs, so
+# nothing was remembered in between, and nothing was read either.
+STUB="$WORKDIR/stub"
+NPXLOG="$WORKDIR/npx-calls"
+mkdir -p "$STUB"
+: > "$NPXLOG"
+{
+  echo "#!/bin/sh"
+  echo "echo call >> '$NPXLOG'"
+  echo "for a in \"\$@\"; do"
+  echo "  [ \"\$a\" = --print-binary ] && { printf '%s\\n' '$FAKE_BINARY'; exit 0; }"
+  echo "done"
+  echo "exit 1"
+} > "$STUB/npx"
+chmod +x "$STUB/npx"
+
+out=$(env -u CLAUDE_PLUGIN_DATA -u HOME PATH="$STUB:/usr/bin:/bin" \
+  "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+out=$(env -u CLAUDE_PLUGIN_DATA -u HOME PATH="$STUB:/usr/bin:/bin" \
+  "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+calls=$(wc -l < "$NPXLOG" | tr -d ' ')
+test "$calls" = 2 || {
+  echo "expected 2 npx calls with no cache directory, got $calls" >&2
+  exit 1
+}
+
+# With $HOME set it caches again, under $HOME: the second run asks nothing.
+HOMEDIR="$WORKDIR/fakehome"
+mkdir -p "$HOMEDIR"
+: > "$NPXLOG"
+out=$(env -u CLAUDE_PLUGIN_DATA HOME="$HOMEDIR" PATH="$STUB:/usr/bin:/bin" \
+  "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+test "$(cat "$HOMEDIR/.mushroomdb/binary-${PLUGIN_VERSION}")" = "$FAKE_BINARY"
+out=$(env -u CLAUDE_PLUGIN_DATA HOME="$HOMEDIR" PATH="$STUB:/usr/bin:/bin" \
+  "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+calls=$(wc -l < "$NPXLOG" | tr -d ' ')
+test "$calls" = 1 || {
+  echo "expected 1 npx call with a cache under HOME, got $calls" >&2
+  exit 1
+}
+
 echo "== run.sh: a cached binary that has gone falls back to the launcher"
 # npm's cache can be pruned. The stale line must be skipped, not trusted.
 printf '%s\n' "$WORKDIR/gone/mushroomdb" > "$CACHE_DIR/binary-${PLUGIN_VERSION}"

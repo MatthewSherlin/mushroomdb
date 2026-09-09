@@ -280,6 +280,136 @@ fn project_install_writes_auto_entries() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: only Claude Code resolves the store at run time. Cursor and Codex set
+//       no $CLAUDE_PROJECT_DIR, so `--auto` there would rest on where the host
+//       starts the server — and land on an empty store under $HOME if it
+//       guessed wrong, with nothing reporting an error. They get the path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cursor_install_pins_the_store_path() {
+    let root = temp_dir("cursor-pin");
+    let home = temp_dir("cursor-pin-home");
+    let hooks = git_repo(&root);
+    let db = root.join("mushroom-memory");
+    // No `--db`: this is the default store, which Claude Code would name
+    // `--auto` in the very same repository.
+    let opts = InstallOpts {
+        platform: Some(Platform::Cursor),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals())
+        .expect("install failed");
+
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".cursor/mcp.json")).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"],
+        serde_json::json!([
+            "-y",
+            format!("mushroomdb@{VERSION}"),
+            "mcp",
+            db.to_str().unwrap()
+        ]),
+        "Cursor cannot resolve --auto, so the entry names the directory"
+    );
+    assert!(
+        out.contains(&format!("store  {} (pinned)", db.display())),
+        "{out}"
+    );
+
+    // The git hooks are git's, not Cursor's: git runs a hook with the working
+    // tree it acted on as the working directory, so `--auto` resolves there
+    // with no assistant involved. A Cursor-only install still pins them, so
+    // the whole install spells one store one way.
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert!(
+        body.contains(&format!(" sync '{}' ", db.display())),
+        "{body}"
+    );
+    assert!(!body.contains("--auto"), "{body}");
+    assert_eq!(read(&root, ".gitignore"), "mushroom-memory/\n");
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_install_pins_the_store_path() {
+    let root = temp_dir("codex-pin");
+    let home = temp_dir("codex-pin-home");
+    let bin_dir = temp_dir("codex-pin-bin");
+    git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let log = bin_dir.join("argv.txt");
+    fake_program(
+        &bin_dir,
+        "codex",
+        &format!("printf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+    );
+
+    // No `--db`, same as `cursor_install_pins_the_store_path`.
+    let opts = InstallOpts {
+        platform: Some(Platform::Codex),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("codex install");
+
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        format!(
+            "mcp\nadd\nmushroomdb\n--\nnpx\n-y\nmushroomdb@{VERSION}\nmcp\n{}\n",
+            db.display()
+        ),
+        "Codex is handed the directory, not --auto"
+    );
+}
+
+/// `--platform all` is Claude Code and Cursor together, and they disagree
+/// about the store's spelling — so the summary says which is which, and each
+/// config gets the form its host can actually resolve.
+#[test]
+fn platform_all_gives_each_host_the_form_it_can_resolve() {
+    let root = temp_dir("all-store");
+    let home = temp_dir("all-store-home");
+    let hooks = git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let opts = InstallOpts {
+        platform: Some(Platform::All),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+
+    let out = run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals())
+        .expect("install failed");
+
+    let claude: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(claude["mcpServers"]["mushroomdb"]["args"][3], "--auto");
+    let cursor: serde_json::Value = serde_json::from_str(&read(&root, ".cursor/mcp.json")).unwrap();
+    assert_eq!(
+        cursor["mcpServers"]["mushroomdb"]["args"][3],
+        db.to_str().unwrap()
+    );
+
+    assert!(out.contains("store  claude-code: --auto"), "{out}");
+    assert!(
+        out.contains(&format!("store  cursor: {} (pinned)", db.display())),
+        "{out}"
+    );
+
+    // Claude Code is in the install, so the git hooks match its spelling.
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert!(body.contains("sync --auto"), "{body}");
+}
+
+// ---------------------------------------------------------------------------
 // Test: `--db` opts out and pins the path everywhere
 // ---------------------------------------------------------------------------
 
@@ -817,23 +947,25 @@ fn user_install_warns_about_a_project_scope_server() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: pre-warm is best-effort — a failure is reported, never fatal
+// Test: reaching the package is best-effort — a failure is reported, never
+//       fatal, and it is not then retried as a separate pre-warm
 // ---------------------------------------------------------------------------
 
 #[test]
 #[cfg(unix)]
-fn prewarm_failure_is_a_warning() {
+fn a_failed_resolution_warns_once_and_does_not_also_prewarm() {
     let root = temp_dir("prewarm-fail");
     let home = temp_dir("prewarm-fail-home");
     let bin_dir = temp_dir("prewarm-fail-bin");
     let db = root.join("mushroom-memory");
     let log = bin_dir.join("argv.txt");
 
-    // An `npx` that records what it was asked and then fails.
+    // An `npx` that records what it was asked and then fails. No `node`, so
+    // the launcher rung is skipped: exactly one question gets asked.
     fake_program(
         &bin_dir,
         "npx",
-        &format!("printf '%s\\n' \"$@\" > '{}'\nexit 7\n", log.display()),
+        &format!("printf '%s\\n' \"$@\" >> '{}'\nexit 7\n", log.display()),
     );
 
     let opts = InstallOpts {
@@ -847,17 +979,55 @@ fn prewarm_failure_is_a_warning() {
         &McpCommand::npx(),
         &externals_in(&bin_dir),
     )
-    .expect("a failed pre-warm must not fail the install");
+    .expect("a package that cannot be reached must not fail the install");
 
     assert!(out.contains("warning"), "{out}");
-    assert!(out.contains("pre-warm"), "{out}");
-    // It really did try the pinned package.
+    assert!(out.contains("could not resolve"), "{out}");
+
+    // One spawn, not two. Asking the package anything downloads it first, so
+    // the question the resolution asked *is* the pre-warm; running `--version`
+    // afterwards would fetch the same package a second time to learn nothing.
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
-        format!("-y\nmushroomdb@{VERSION}\n--version\n")
+        format!("-y\nmushroomdb@{VERSION}\n--print-binary\n"),
+        "the failed resolution must not be followed by a separate pre-warm"
     );
-    // And the install itself completed.
+    assert!(!out.contains("pre-warm"), "{out}");
+
+    // And the install itself completed, on the form that always works.
     assert!(root.join(".mcp.json").exists());
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .starts_with("npx -y"));
+}
+
+/// With no `npx` at all nothing was fetched, so the pre-warm's own report of
+/// that is still worth printing.
+#[test]
+#[cfg(unix)]
+fn with_no_npx_the_prewarm_still_says_so() {
+    let root = temp_dir("prewarm-no-npx");
+    let home = temp_dir("prewarm-no-npx-home");
+    let bin_dir = temp_dir("prewarm-no-npx-bin");
+    let db = root.join("mushroom-memory");
+
+    let opts = InstallOpts {
+        prewarm: true,
+        ..claude_project_opts(&db)
+    };
+    let out = run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir), // empty directory: no npx, no node
+    )
+    .expect("install");
+
+    assert!(out.contains("could not resolve"), "{out}");
+    assert!(out.contains("pre-warm skipped"), "{out}");
 }
 
 #[test]

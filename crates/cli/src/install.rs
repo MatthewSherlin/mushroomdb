@@ -488,22 +488,121 @@ pub fn default_db(scope: Scope, project_root: &Path, home: &Path) -> PathBuf {
     }
 }
 
-/// How this install will name the store in everything it writes.
+/// Whether this platform's host guarantees `--auto` resolves to this project.
+///
+/// Only Claude Code does. It sets `$CLAUDE_PROJECT_DIR` for both MCP servers
+/// and hook processes, so the first resolution step always answers, whatever
+/// working directory the process happens to have.
+///
+/// Cursor and Codex set no such variable. `--auto` there would rest entirely
+/// on the host spawning the server inside the checkout, and if it did not,
+/// resolution would fall through to `~/.mushroomdb/memory`: an empty store,
+/// with the `.gitignore` line and the rules file both naming a different
+/// directory, and nothing anywhere reporting an error. The assistant would
+/// simply see a graph with nothing in it. So those two get the path.
+///
+/// The worktree argument is weaker for them in any case. `.mcp.json` and the
+/// two settings hooks are Claude Code's, and they are what a `git worktree`
+/// carries across; a Cursor install's committed artifact is one rules file
+/// that names the store in prose.
+fn resolves_at_runtime(platform: &Platform) -> bool {
+    match platform {
+        Platform::ClaudeCode => true,
+        Platform::Cursor | Platform::Codex => false,
+        // `expand_platform` never produces it; false is the safe reading.
+        Platform::All => false,
+    }
+}
+
+/// How each requested platform will name the store, in the order they were
+/// asked for.
+fn platform_stores(
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
+    db: Option<&Path>,
+    platforms: &[Platform],
+) -> Vec<(Platform, StoreRef)> {
+    platforms
+        .iter()
+        .map(|p| {
+            (
+                p.clone(),
+                store_ref(project_root, home, scope, db, resolves_at_runtime(p)),
+            )
+        })
+        .collect()
+}
+
+/// The summary's `store` line(s).
+///
+/// One line when every platform names the store the same way, which is every
+/// single-platform install and most `--platform all` ones. When they differ —
+/// Claude Code resolving `--auto` beside a Cursor entry that cannot — each is
+/// labelled, because "which one is pinned" is exactly what a reader needs.
+fn describe_stores(stores: &[(Platform, StoreRef)]) -> String {
+    let all_same = stores.windows(2).all(|w| w[0].1 == w[1].1);
+    match stores.first() {
+        None => String::new(),
+        Some((_, first)) if all_same => format!("  store  {}\n", first.describe()),
+        _ => stores
+            .iter()
+            .map(|(p, s)| format!("  store  {}: {}\n", p.label(), s.describe()))
+            .collect(),
+    }
+}
+
+/// The store the *repository* wiring names: the `.gitignore` line and the
+/// three git hook blocks.
+///
+/// `--auto` is safe here on its own terms, whatever platform asked for the
+/// install: git runs a hook with the working tree it acted on as the working
+/// directory, so the store resolves from that tree with no assistant, and no
+/// `$CLAUDE_PROJECT_DIR`, involved. It is written when any installed platform
+/// writes it, so the git hooks and the assistant's own config agree — and
+/// pinned otherwise, so a Cursor-only install is one store spelled one way.
+fn repo_store_ref(
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
+    db: Option<&Path>,
+    platforms: &[Platform],
+) -> StoreRef {
+    let runtime_ok = platforms.iter().any(resolves_at_runtime);
+    store_ref(project_root, home, scope, db, runtime_ok)
+}
+
+/// How one platform will name the store in everything written for it.
 ///
 /// `--auto` is written only where it provably resolves to the same directory:
-/// the default store, in project scope, inside a git checkout. That last
-/// condition is what makes the run-time fallback safe — a hook that never
-/// receives `$CLAUDE_PROJECT_DIR` still finds the store by walking up to the
-/// working tree root, and there is no working tree root to find without it.
-/// Everywhere else the path is pinned, because a wrong `--auto` would silently
-/// build a second store under the home directory.
-fn store_ref(project_root: &Path, home: &Path, scope: Scope, db: Option<&Path>) -> StoreRef {
+/// the default store, in project scope, inside a git checkout, for a host that
+/// resolves it (`runtime_ok`, from [`resolves_at_runtime`]). The checkout
+/// condition is what makes the fallback safe — a hook that never receives
+/// `$CLAUDE_PROJECT_DIR` still finds the store by walking up to the working
+/// tree root, and there is no working tree root to find without it. Everywhere
+/// else the path is pinned, because a wrong `--auto` would silently build a
+/// second store under the home directory and report nothing.
+fn store_ref(
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
+    db: Option<&Path>,
+    runtime_ok: bool,
+) -> StoreRef {
     let default = default_db(scope, project_root, home);
     let Some(pinned) = db.map(|d| absolutise(d, project_root)) else {
-        if scope == Scope::Project && project_root.join(".git").exists() {
+        if runtime_ok && scope == Scope::Project && project_root.join(".git").exists() {
             return StoreRef::auto(default);
         }
-        return StoreRef::pinned(default);
+        // Pinned, but `--auto` would still name this same directory in project
+        // scope — so a `--auto` entry an earlier build wrote here is this
+        // install's to rewrite rather than a conflicting one to refuse.
+        let pinned = StoreRef::pinned(default);
+        return if scope == Scope::Project {
+            pinned.also_auto()
+        } else {
+            pinned
+        };
     };
     // A `--db` naming the very store `--auto` resolves to is still pinned —
     // the user asked for a path — but an `--auto` hook from an earlier install
@@ -728,13 +827,20 @@ fn ask_package(version: &str, flag: &str, ext: &Externals) -> Result<PathBuf, St
 ///    binary was never fetched, and only when `node` is on PATH to run it.
 /// 3. **`npx`**, unchanged, with a warning saying the hooks will be slow.
 ///
-/// Returns the command to write and, when both resolutions failed, the one-line
-/// warning for the summary. Anything other than the `npx` form is already a
-/// direct path and is handed back untouched.
-fn resolve_fast_command(cmd: &McpCommand, ext: &Externals) -> (McpCommand, Option<String>) {
+/// Returns the command to write; the one-line warning for the summary when
+/// every rung failed; and whether the package was fetched on the way, which
+/// tells the caller the separate pre-warm has nothing left to do. Anything
+/// other than the `npx` form is already a direct path and is handed back
+/// untouched.
+fn resolve_fast_command(cmd: &McpCommand, ext: &Externals) -> (McpCommand, Option<String>, bool) {
     let McpCommand::Npx { version } = cmd else {
-        return (cmd.clone(), None);
+        return (cmd.clone(), None, false);
     };
+    // Asking the package anything downloads it first, so one question warms
+    // the cache exactly as the pre-warm's `--version` would. If `npx` is not
+    // there to ask, nothing was fetched and the pre-warm's own report of that
+    // is worth having.
+    let fetched = ext.which("npx").is_some();
     let binary_err = match ask_package(version, PRINT_BINARY_FLAG, ext) {
         Ok(binary) => {
             return (
@@ -743,6 +849,7 @@ fn resolve_fast_command(cmd: &McpCommand, ext: &Externals) -> (McpCommand, Optio
                     version: version.clone(),
                 },
                 None,
+                fetched,
             )
         }
         Err(e) => e,
@@ -757,6 +864,7 @@ fn resolve_fast_command(cmd: &McpCommand, ext: &Externals) -> (McpCommand, Optio
                     version: version.clone(),
                 },
                 None,
+                fetched,
             );
         }
     }
@@ -766,6 +874,7 @@ fn resolve_fast_command(cmd: &McpCommand, ext: &Externals) -> (McpCommand, Optio
             "warning: could not resolve {NPM_PACKAGE}@{version} to a path ({binary_err}) — \
              the hooks will spawn npx on every prompt and every edit"
         )),
+        fetched,
     )
 }
 
@@ -1152,7 +1261,11 @@ struct Ctx<'a> {
     project_root: &'a Path,
     home: &'a Path,
     scope: Scope,
-    store: &'a StoreRef,
+    /// The store the repository wiring names — the `.gitignore` line and the
+    /// git hook blocks. Each platform's own config gets its own [`StoreRef`],
+    /// passed to the per-platform writers, because only Claude Code can
+    /// resolve `--auto`; see [`repo_store_ref`] and [`resolves_at_runtime`].
+    repo_store: &'a StoreRef,
     cmd: &'a McpCommand,
     ext: &'a Externals,
     git_hooks: bool,
@@ -1240,7 +1353,6 @@ pub fn run_install_with(
     ext: &Externals,
 ) -> Result<String, CliError> {
     let (scope, auto_scope) = resolve_scope(project_root, opts.scope);
-    let store = store_ref(project_root, home, scope, opts.db.as_deref());
     // Whatever the caller handed us, what gets written resolves from anywhere:
     // an absolute path, or a name PATH answers for.
     let cmd = match cmd {
@@ -1251,31 +1363,37 @@ pub fn run_install_with(
     // hook has to. Skipped by `--no-prewarm`, which is the flag for "do not
     // reach the network during this install"; the `npx` form still works, it
     // is just slower on every invocation.
-    let (cmd, launcher_note) = if opts.prewarm {
+    let (cmd, launcher_note, package_fetched) = if opts.prewarm {
         resolve_fast_command(&cmd, ext)
     } else {
-        (cmd, None)
+        (cmd, None, false)
     };
     let cmd = &cmd;
 
     let resolved = resolve_platform(project_root, home, opts.platform.as_ref())?;
     let platforms = expand_platform(&resolved);
 
+    // Each platform names the store in its own terms: only Claude Code can be
+    // relied on to resolve `--auto`. The repository wiring gets its own, since
+    // git resolves it without any assistant.
+    let stores = platform_stores(project_root, home, scope, opts.db.as_deref(), &platforms);
+    let repo_store = repo_store_ref(project_root, home, scope, opts.db.as_deref(), &platforms);
+
     // Check for anything that would make this install fail halfway before
     // writing a single byte.
-    for plat in &platforms {
-        preflight_check(project_root, home, plat, scope, &store, ext)?;
+    for (plat, store) in &stores {
+        preflight_check(project_root, home, plat, scope, store, ext)?;
     }
 
     let ctx = Ctx {
         project_root,
         home,
         scope,
-        store: &store,
+        repo_store: &repo_store,
         cmd,
         ext,
         git_hooks: opts.git_hooks,
-        prewarm: opts.prewarm,
+        prewarm: opts.prewarm && !package_fetched,
     };
 
     let manifest_path = manifest_path(project_root, home, scope, &platforms);
@@ -1298,7 +1416,7 @@ pub fn run_install_with(
         notes.push("this install was disabled — install re-enabled it".to_string());
     }
 
-    let outcome = write_everything(&ctx, &platforms, &mut manifest, &mut notes);
+    let outcome = write_everything(&ctx, &stores, &mut manifest, &mut notes);
     if let Err(e) = outcome {
         // Persist whatever was already written (an earlier platform's files,
         // a git hook) so uninstall can still clean up after a partial
@@ -1361,7 +1479,7 @@ pub fn run_install_with(
     if anything_written {
         out.push_str(&format!("  manifest  {}\n", manifest_path.display()));
         out.push_str(&format!("  mcp command  {}\n", cmd.shell()));
-        out.push_str(&format!("  store  {}\n", store.describe()));
+        out.push_str(&describe_stores(&stores));
     } else {
         out.push_str("  (already installed — no changes)\n");
     }
@@ -1379,16 +1497,17 @@ pub fn run_install_with(
 /// holding the partial manifest.
 fn write_everything(
     ctx: &Ctx<'_>,
-    platforms: &[Platform],
+    stores: &[(Platform, StoreRef)],
     manifest: &mut Manifest,
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
-    if let Some(w) = scope_conflict_note(ctx, platforms) {
+    let platforms: Vec<Platform> = stores.iter().map(|(p, _)| p.clone()).collect();
+    if let Some(w) = scope_conflict_note(ctx, &platforms) {
         notes.push(w);
     }
 
-    for plat in platforms {
-        install_platform(ctx, plat, manifest, notes)?;
+    for (plat, store) in stores {
+        install_platform(ctx, plat, store, manifest, notes)?;
     }
 
     // The repository-level wiring is shared by the platforms whose config
@@ -1643,13 +1762,19 @@ fn store_from_arg(arg: &str, project_root: &Path, home: &Path) -> StoreRef {
 /// with no `--db`. A Codex-only install made with an explicit `--db` cannot be
 /// recovered exactly; `enable` re-registers it at the default store instead,
 /// same as a fresh `install` would without that flag.
-fn recover_store(manifest: &Manifest, project_root: &Path, home: &Path, scope: Scope) -> StoreRef {
+fn recover_store(
+    manifest: &Manifest,
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
+    platforms: &[Platform],
+) -> StoreRef {
     manifest
         .stashed_mcp
         .first()
         .and_then(|s| entry_db(&s.entry))
         .map(|arg| store_from_arg(arg, project_root, home))
-        .unwrap_or_else(|| store_ref(project_root, home, scope, None))
+        .unwrap_or_else(|| repo_store_ref(project_root, home, scope, None, platforms))
 }
 
 /// Turn an install off: remove the MCP entry, the two Claude Code hooks, the
@@ -1796,16 +1921,19 @@ pub fn run_enable_with(
         McpCommand::Explicit(p) => McpCommand::Explicit(absolutise_command(p, project_root)),
         other => other.clone(),
     };
-    let (cmd, launcher_note) = resolve_fast_command(&cmd, ext);
+    let (cmd, launcher_note, _) = resolve_fast_command(&cmd, ext);
     let cmd = &cmd;
-    let store = recover_store(&manifest, project_root, home, scope);
+    // What `disable` stashed already carries the spelling each platform was
+    // installed with, so `enable` re-writes exactly that rather than deciding
+    // afresh; only a Codex-only install, which stashes nothing, falls back.
+    let store = recover_store(&manifest, project_root, home, scope, &platforms);
     let had_git_hooks = !manifest.git_hooks.is_empty();
 
     let ctx = Ctx {
         project_root,
         home,
         scope,
-        store: &store,
+        repo_store: &store,
         cmd,
         ext,
         git_hooks: true,
@@ -1817,9 +1945,9 @@ pub fn run_enable_with(
     notes.extend(launcher_note);
     for plat in &platforms {
         match plat {
-            Platform::ClaudeCode => install_claude_code(&ctx, &mut fresh, &mut notes)?,
-            Platform::Cursor => install_cursor(&ctx, &mut fresh, &mut notes)?,
-            Platform::Codex => install_codex(&ctx, &mut fresh)?,
+            Platform::ClaudeCode => install_claude_code(&ctx, &store, &mut fresh, &mut notes)?,
+            Platform::Cursor => install_cursor(&ctx, &store, &mut fresh, &mut notes)?,
+            Platform::Codex => install_codex(&ctx, &store, &mut fresh)?,
             Platform::All => unreachable!("expand_platform never produces All"),
         }
     }
@@ -2069,13 +2197,14 @@ pub(crate) fn has_our_server(mcp_file: &Path) -> bool {
 fn install_platform(
     ctx: &Ctx<'_>,
     platform: &Platform,
+    store: &StoreRef,
     manifest: &mut Manifest,
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
     match platform {
-        Platform::ClaudeCode => install_claude_code(ctx, manifest, notes),
-        Platform::Cursor => install_cursor(ctx, manifest, notes),
-        Platform::Codex => install_codex(ctx, manifest),
+        Platform::ClaudeCode => install_claude_code(ctx, store, manifest, notes),
+        Platform::Cursor => install_cursor(ctx, store, manifest, notes),
+        Platform::Codex => install_codex(ctx, store, manifest),
         Platform::All => unreachable!("expand_platform never produces All"),
     }
 }
@@ -2090,13 +2219,14 @@ fn render_template(template: &str, db_str: &str, bin_cmd: &str) -> String {
 
 fn install_claude_code(
     ctx: &Ctx<'_>,
+    store: &StoreRef,
     manifest: &mut Manifest,
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
     let shell = ctx.cmd.shell();
     // The skill is prose a reader follows by hand, so it names the directory
     // the store is in rather than the `--auto` the machine-read config uses.
-    let db_str = ctx.store.path().to_string_lossy();
+    let db_str = store.path().to_string_lossy();
     let skill_content = render_template(SKILL_TEMPLATE, &db_str, &shell);
 
     let skill_dir = match ctx.scope {
@@ -2119,7 +2249,7 @@ fn install_claude_code(
     }
 
     let mcp_file = claude_mcp_file(ctx.project_root, ctx.home, ctx.scope);
-    merge_mcp_entry(&mcp_file, ctx, manifest, notes)?;
+    merge_mcp_entry(&mcp_file, ctx, store, manifest, notes)?;
 
     // Both hooks: settings.json in the same scope as the skill. The prompt
     // hook first, so a manifest lists them in the order they were written.
@@ -2130,8 +2260,8 @@ fn install_claude_code(
     // An earlier install of ours for this same store is replaced, not joined:
     // its command names a binary this version no longer writes, and leaving it
     // would run both on every prompt.
-    let recall = recall_hook_command(&shell, ctx.store);
-    if remove_stale_hooks(&settings_file, HOOK_EVENT, "recall", ctx.store, &recall)? {
+    let recall = recall_hook_command(&shell, store);
+    if remove_stale_hooks(&settings_file, HOOK_EVENT, "recall", store, &recall)? {
         notes.push(format!("replaced stale {HOOK_EVENT} hook"));
     }
     merge_hook_entry(
@@ -2141,8 +2271,8 @@ fn install_claude_code(
         hook_entry(&recall),
         manifest,
     )?;
-    let touch = touch_hook_command(&shell, ctx.store);
-    if remove_stale_hooks(&settings_file, TOUCH_EVENT, "touch", ctx.store, &touch)? {
+    let touch = touch_hook_command(&shell, store);
+    if remove_stale_hooks(&settings_file, TOUCH_EVENT, "touch", store, &touch)? {
         notes.push(format!("replaced stale {TOUCH_EVENT} hook"));
     }
     merge_hook_entry(
@@ -2158,10 +2288,11 @@ fn install_claude_code(
 
 fn install_cursor(
     ctx: &Ctx<'_>,
+    store: &StoreRef,
     manifest: &mut Manifest,
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
-    let db_str = ctx.store.path().to_string_lossy();
+    let db_str = store.path().to_string_lossy();
     let rules_content = render_template(CURSOR_RULES_TEMPLATE, &db_str, &ctx.cmd.shell());
 
     let rules_dir = match ctx.scope {
@@ -2179,7 +2310,7 @@ fn install_cursor(
     }
 
     let mcp_file = cursor_mcp_file(ctx.project_root, ctx.home, ctx.scope);
-    merge_mcp_entry(&mcp_file, ctx, manifest, notes)?;
+    merge_mcp_entry(&mcp_file, ctx, store, manifest, notes)?;
 
     Ok(())
 }
@@ -2201,7 +2332,7 @@ fn codex_bin(ext: &Externals) -> Result<PathBuf, CliError> {
 /// writes nothing: it runs `codex mcp add mushroomdb -- <command> <args…>` and
 /// lets Codex record it. 0.6.0 ships no Codex skill — the MCP tools carry
 /// their own descriptions, which is what Codex reads.
-fn install_codex(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliError> {
+fn install_codex(ctx: &Ctx<'_>, store: &StoreRef, manifest: &mut Manifest) -> Result<(), CliError> {
     let bin = codex_bin(ctx.ext)?;
     let mut args = vec![
         "mcp".to_string(),
@@ -2209,7 +2340,7 @@ fn install_codex(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliError>
         SERVER_NAME.to_string(),
         "--".to_string(),
     ];
-    args.extend(ctx.cmd.argv("mcp", &ctx.store.arg()));
+    args.extend(ctx.cmd.argv("mcp", &store.arg()));
     run_and_capture(&bin, &args).map_err(|e| CliError(format!("codex mcp add failed: {e}")))?;
     manifest.codex = true;
     Ok(())
@@ -2238,7 +2369,7 @@ fn gitignore_line(project_root: &Path, db: &Path) -> Option<String> {
 /// Append the store directory to the repository's `.gitignore` unless some
 /// spelling of it is already listed. Creates the file if it is absent.
 fn ensure_gitignore_line(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliError> {
-    let Some(line) = gitignore_line(ctx.project_root, ctx.store.path()) else {
+    let Some(line) = gitignore_line(ctx.project_root, ctx.repo_store.path()) else {
         return Ok(());
     };
     let path = ctx.project_root.join(".gitignore");
@@ -2327,7 +2458,7 @@ fn install_git_hooks(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliEr
     let shell = ctx.cmd.shell();
     for name in GIT_HOOKS {
         let file = dir.join(name);
-        if merge_git_hook(&file, &shell, ctx.store)? {
+        if merge_git_hook(&file, &shell, ctx.repo_store)? {
             manifest.git_hooks.push(file);
         }
     }
@@ -2345,9 +2476,11 @@ fn install_git_hooks(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliEr
 /// skipped when asked to be, and a failure is a line in the summary rather
 /// than a failed install — the entry that was written is correct either way.
 ///
-/// A resolved launcher needs none of this: [`resolve_launcher`] ran the very
-/// same fetch to find the path it wrote, so the package is already warm and
-/// the match below falls straight through.
+/// Whenever [`resolve_fast_command`] got as far as asking `npx` anything, it
+/// already ran this fetch — asking the package a question downloads it first —
+/// so the caller clears `Ctx::prewarm` and this does not run a second time.
+/// The match below is the remaining guard: a resolved binary or launcher is
+/// not the `npx` form and needs no warming either way.
 fn prewarm(ctx: &Ctx<'_>) -> Option<String> {
     if !ctx.prewarm {
         return None;
@@ -2387,6 +2520,7 @@ fn prewarm(ctx: &Ctx<'_>) -> Option<String> {
 fn merge_mcp_entry(
     mcp_file: &Path,
     ctx: &Ctx<'_>,
+    store: &StoreRef,
     manifest: &mut Manifest,
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
@@ -2404,7 +2538,7 @@ fn merge_mcp_entry(
         root["mcpServers"] = serde_json::json!({});
     }
 
-    let desired = ctx.cmd.json_entry("mcp", &ctx.store.arg());
+    let desired = ctx.cmd.json_entry("mcp", &store.arg());
     let existing = &root["mcpServers"][SERVER_NAME];
 
     if existing == &desired {
@@ -2433,7 +2567,7 @@ fn merge_mcp_entry(
             "updated mcp command in {} → {} mcp {}",
             mcp_file.display(),
             ctx.cmd.shell(),
-            ctx.store.arg()
+            store.arg()
         ));
     }
 
