@@ -12,6 +12,10 @@ use cli::install::{
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The version an `npx` entry pins. Same crate, so the same constant the
+/// installer compiles in.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ---------------------------------------------------------------------------
 // Helpers (same shapes as tests/install.rs)
 // ---------------------------------------------------------------------------
@@ -43,6 +47,21 @@ fn no_externals() -> Externals {
     Externals::with_path(None)
 }
 
+/// Externals that resolve programs out of `dir` and nowhere else.
+fn externals_in(dir: &Path) -> Externals {
+    Externals::with_path(Some(dir.as_os_str().to_os_string()))
+}
+
+/// Write an executable shell script named `name` into `dir`.
+#[cfg(unix)]
+fn fake_program(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join(name);
+    fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
 fn install_on_path(root: &Path, home: &Path, opts: &InstallOpts) -> Result<String, cli::CliError> {
     run_install_with(root, home, opts, &McpCommand::OnPath, &no_externals())
 }
@@ -63,6 +82,16 @@ fn claude_project_opts(db: &Path) -> InstallOpts {
         platform: Some(Platform::ClaudeCode),
         scope: Some(Scope::Project),
         db: Some(db.to_path_buf()),
+        ..base_opts()
+    }
+}
+
+/// `--platform codex --project`, no `--db` — the default store, which is the
+/// one `enable`'s fallback recovers (a Codex-only install stashes no store).
+fn codex_project_opts() -> InstallOpts {
+    InstallOpts {
+        platform: Some(Platform::Codex),
+        scope: Some(Scope::Project),
         ..base_opts()
     }
 }
@@ -204,21 +233,79 @@ fn disable_is_idempotent() {
 // enable
 // ---------------------------------------------------------------------------
 
+/// `enable` re-resolves an `npx`-form command fresh rather than replaying
+/// whatever `disable` last saw — the published package may have moved to a
+/// different cached path in between. Installed with prewarm off (the entry is
+/// written as the literal `npx` request, unresolved); enabled with prewarm's
+/// resolver pointed at a fake `npx` that answers `--print-binary` with a real
+/// file. The written entry must be *that* file, not the literal string `npx`
+/// replayed from the stash and not any path chosen at install time.
 #[test]
-fn enable_restores_everything_with_current_shapes() {
-    let root = temp_dir("enable");
-    let home = temp_dir("enable-home");
+fn enable_reresolves_an_npx_command_to_its_current_shape() {
+    let root = temp_dir("enable-npx");
+    let home = temp_dir("enable-npx-home");
     let db = root.join("mushroom-memory");
     let hooks_dir = git_repo(&root);
     let opts = claude_project_opts(&db);
 
-    let old_bin = root.join("old-mushroomdb");
-    fs::write(&old_bin, b"old").unwrap();
+    run_install_with(&root, &home, &opts, &McpCommand::npx(), &no_externals()).expect("install");
+    let before: serde_json::Value = read_json(&root, ".mcp.json");
+    assert_eq!(
+        before["mcpServers"]["mushroomdb"]["command"], "npx",
+        "sanity: install with no prewarm writes the literal npx form"
+    );
+
+    let toggle_opts = toggle(Platform::ClaudeCode, Scope::Project);
+    run_disable_with(&root, &home, &toggle_opts, &no_externals()).expect("disable");
+
+    let bin_dir = temp_dir("enable-npx-bin");
+    let resolved = fake_program(&bin_dir, "resolved-mushroomdb", "exit 0\n");
+    fake_program(
+        &bin_dir,
+        "npx",
+        &format!("printf '%s\\n' '{}'\n", resolved.display()),
+    );
+    let out = run_enable_with(
+        &root,
+        &home,
+        &toggle_opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("enable");
+    assert!(out.contains("mushroomdb is enabled in"), "{out}");
+
+    let mcp: serde_json::Value = read_json(&root, ".mcp.json");
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["command"],
+        resolved.to_string_lossy().as_ref(),
+        "{mcp}"
+    );
+
+    for name in ["post-commit", "post-checkout", "post-merge"] {
+        let text = fs::read_to_string(hooks_dir.join(name)).unwrap();
+        assert!(text.contains(resolved.to_str().unwrap()), "{name}: {text}");
+    }
+}
+
+/// I1: `enable` restores an explicit `--command` pin verbatim rather than
+/// falling back to auto-detection, even though the caller's `cmd` argument
+/// (what `run_enable`'s real entrypoint always passes) names something else
+/// entirely.
+#[test]
+fn enable_restores_an_explicit_command() {
+    let root = temp_dir("enable-explicit");
+    let home = temp_dir("enable-explicit-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    let pinned = root.join("pinned-mushroomdb");
+    fs::write(&pinned, b"pinned").unwrap();
     run_install_with(
         &root,
         &home,
         &opts,
-        &McpCommand::Explicit(old_bin.clone()),
+        &McpCommand::Explicit(pinned.clone()),
         &no_externals(),
     )
     .expect("install");
@@ -226,53 +313,130 @@ fn enable_restores_everything_with_current_shapes() {
     let toggle_opts = toggle(Platform::ClaudeCode, Scope::Project);
     run_disable_with(&root, &home, &toggle_opts, &no_externals()).expect("disable");
 
-    // A different binary is "current" by the time enable runs — the
-    // published package moved, or a developer pointed --command elsewhere.
-    let new_bin = root.join("new-mushroomdb");
-    fs::write(&new_bin, b"new").unwrap();
+    // The auto-detected fallback `run_enable`'s real entrypoint would pass —
+    // deliberately something other than `pinned`, to prove it is not used.
     let out = run_enable_with(
         &root,
         &home,
         &toggle_opts,
-        &McpCommand::Explicit(new_bin.clone()),
+        &McpCommand::OnPath,
+        &no_externals(),
+    )
+    .expect("enable");
+    assert!(!out.contains("warning"), "{out}");
+
+    let mcp: serde_json::Value = read_json(&root, ".mcp.json");
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["command"],
+        pinned.to_string_lossy().as_ref(),
+        "{mcp}"
+    );
+
+    let manifest: serde_json::Value = read_json(&root, MANIFEST_REL);
+    assert_eq!(manifest["disabled"], false, "{manifest}");
+}
+
+/// I1: when the pinned binary a stash recorded no longer exists, `enable`
+/// falls back to the caller's auto-detected command and says so.
+#[test]
+fn enable_falls_back_and_warns_when_the_pinned_binary_is_gone() {
+    let root = temp_dir("enable-missing-pin");
+    let home = temp_dir("enable-missing-pin-home");
+    let db = root.join("mushroom-memory");
+    let opts = claude_project_opts(&db);
+
+    let pinned = root.join("pinned-mushroomdb");
+    fs::write(&pinned, b"pinned").unwrap();
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::Explicit(pinned.clone()),
+        &no_externals(),
+    )
+    .expect("install");
+
+    let toggle_opts = toggle(Platform::ClaudeCode, Scope::Project);
+    run_disable_with(&root, &home, &toggle_opts, &no_externals()).expect("disable");
+
+    fs::remove_file(&pinned).unwrap();
+    let out = run_enable_with(
+        &root,
+        &home,
+        &toggle_opts,
+        &McpCommand::OnPath,
+        &no_externals(),
+    )
+    .expect("enable");
+    assert!(out.contains("warning"), "{out}");
+    assert!(out.contains(pinned.to_str().unwrap()), "{out}");
+
+    let mcp: serde_json::Value = read_json(&root, ".mcp.json");
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["command"], "mushroomdb",
+        "{mcp}"
+    );
+}
+
+/// Task 4 review finding, wired into `enable` here: after a `--platform all`
+/// install, Claude Code and Cursor name the store differently (only Claude
+/// Code resolves `--auto`; Cursor gets the pinned path — see
+/// `platform_all_gives_each_host_the_form_it_can_resolve` in
+/// tests/install.rs). A single recovered store applied to every platform
+/// during `enable` would write Claude Code's `--auto` into Cursor's
+/// `.cursor/mcp.json`, which Cursor cannot resolve — the same empty-store bug
+/// Task 4 fixed for a fresh install. `enable` must recover each platform's
+/// store from its own stashed entry and keep them apart.
+#[test]
+fn enable_after_platform_all_keeps_each_hosts_store_form() {
+    let root = temp_dir("enable-all");
+    let home = temp_dir("enable-all-home");
+    let db = root.join("mushroom-memory");
+    git_repo(&root);
+    let opts = InstallOpts {
+        platform: Some(Platform::All),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+    install_on_path(&root, &home, &opts).expect("install");
+
+    // Sanity: install itself gives each host the form it can resolve.
+    let claude_before: serde_json::Value = read_json(&root, ".mcp.json");
+    assert_eq!(
+        claude_before["mcpServers"]["mushroomdb"]["args"][1],
+        "--auto"
+    );
+    let cursor_before: serde_json::Value = read_json(&root, ".cursor/mcp.json");
+    assert_eq!(
+        cursor_before["mcpServers"]["mushroomdb"]["args"][1],
+        db.to_str().unwrap()
+    );
+
+    let toggle_opts = toggle(Platform::All, Scope::Project);
+    run_disable_with(&root, &home, &toggle_opts, &no_externals()).expect("disable");
+    assert!(read_json(&root, ".mcp.json")["mcpServers"]["mushroomdb"].is_null());
+    assert!(read_json(&root, ".cursor/mcp.json")["mcpServers"]["mushroomdb"].is_null());
+
+    let out = run_enable_with(
+        &root,
+        &home,
+        &toggle_opts,
+        &McpCommand::OnPath,
         &no_externals(),
     )
     .expect("enable");
     assert!(out.contains("mushroomdb is enabled in"), "{out}");
 
-    let mcp: serde_json::Value = read_json(&root, ".mcp.json");
-    let command = mcp["mcpServers"]["mushroomdb"]["command"].as_str().unwrap();
-    assert_eq!(command, new_bin.to_string_lossy(), "{mcp}");
-    assert_ne!(command, old_bin.to_string_lossy());
-    // The store name survived even though the command changed.
+    let claude: serde_json::Value = read_json(&root, ".mcp.json");
     assert_eq!(
-        mcp["mcpServers"]["mushroomdb"]["args"][1].as_str().unwrap(),
-        db.to_string_lossy()
+        claude["mcpServers"]["mushroomdb"]["args"][1], "--auto",
+        "Claude Code must keep --auto after enable: {claude}"
     );
-
-    let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
-    let recall_cmd = settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap();
-    assert!(
-        recall_cmd.contains(new_bin.to_str().unwrap()),
-        "{recall_cmd}"
-    );
-    assert!(
-        !recall_cmd.contains(old_bin.to_str().unwrap()),
-        "{recall_cmd}"
-    );
-
-    for name in ["post-commit", "post-checkout", "post-merge"] {
-        let text = fs::read_to_string(hooks_dir.join(name)).unwrap();
-        assert!(text.contains(new_bin.to_str().unwrap()), "{name}: {text}");
-    }
-
-    let manifest: serde_json::Value = read_json(&root, MANIFEST_REL);
-    assert_eq!(manifest["disabled"], false, "{manifest}");
-    assert!(
-        manifest["stashed_mcp"].as_array().unwrap().is_empty(),
-        "{manifest}"
+    let cursor: serde_json::Value = read_json(&root, ".cursor/mcp.json");
+    assert_eq!(
+        cursor["mcpServers"]["mushroomdb"]["args"][1],
+        db.to_str().unwrap(),
+        "Cursor must keep its pinned path after enable, not Claude Code's --auto: {cursor}"
     );
 }
 
@@ -369,6 +533,143 @@ fn uninstall_from_disabled_state_is_clean() {
             serde_json::from_str(&fs::read_to_string(root.join(".mcp.json")).unwrap()).unwrap();
         assert!(mcp["mcpServers"]["mushroomdb"].is_null(), "{mcp}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// codex
+// ---------------------------------------------------------------------------
+
+/// I2: `disable` hands the Codex removal back to `codex mcp remove`, the same
+/// way `uninstall` already does (see `codex_platform_calls_codex_mcp_add` in
+/// tests/install.rs, which this mirrors).
+#[test]
+fn disable_calls_codex_mcp_remove() {
+    let root = temp_dir("disable-codex");
+    let home = temp_dir("disable-codex-home");
+    let bin_dir = temp_dir("disable-codex-bin");
+    let log = bin_dir.join("argv.txt");
+    fake_program(
+        &bin_dir,
+        "codex",
+        &format!("printf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+    );
+
+    let opts = codex_project_opts();
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("codex install");
+    fs::remove_file(&log).unwrap();
+
+    let out = run_disable_with(
+        &root,
+        &home,
+        &toggle(Platform::Codex, Scope::Project),
+        &externals_in(&bin_dir),
+    )
+    .expect("disable");
+    assert!(out.contains("disabled"), "{out}");
+
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "mcp\nremove\nmushroomdb\n"
+    );
+
+    let manifest: serde_json::Value = read_json(&home, ".mushroomdb/install-manifest-codex.json");
+    assert_eq!(manifest["disabled"], true, "{manifest}");
+}
+
+/// I2: `enable` re-registers Codex through `codex mcp add`, using the store
+/// the original install used (recovered from the default — Codex's own
+/// config is not a file this program reads, see `recover_store_for`) and the
+/// command `enable` resolved (the `npx` form, since nothing here stashed a
+/// different pin).
+#[test]
+fn enable_calls_codex_mcp_add() {
+    let root = temp_dir("enable-codex");
+    let home = temp_dir("enable-codex-home");
+    let bin_dir = temp_dir("enable-codex-bin");
+    let log = bin_dir.join("argv.txt");
+    fake_program(
+        &bin_dir,
+        "codex",
+        &format!("printf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+    );
+
+    let opts = codex_project_opts();
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("codex install");
+
+    let toggle_opts = toggle(Platform::Codex, Scope::Project);
+    run_disable_with(&root, &home, &toggle_opts, &externals_in(&bin_dir)).expect("disable");
+    fs::remove_file(&log).unwrap();
+
+    let out = run_enable_with(
+        &root,
+        &home,
+        &toggle_opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("enable");
+    assert!(out.contains("mushroomdb is enabled in"), "{out}");
+
+    let db = root.join("mushroom-memory");
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        format!(
+            "mcp\nadd\nmushroomdb\n--\nnpx\n-y\nmushroomdb@{VERSION}\nmcp\n{}\n",
+            db.display()
+        )
+    );
+
+    let manifest: serde_json::Value = read_json(&home, ".mushroomdb/install-manifest-codex.json");
+    assert_eq!(manifest["disabled"], false, "{manifest}");
+}
+
+// ---------------------------------------------------------------------------
+// nothing installed
+// ---------------------------------------------------------------------------
+
+/// M2: `disable`/`enable` share `uninstall`'s "no manifest" error rather than
+/// panicking or reporting success over nothing.
+#[test]
+fn disable_with_nothing_installed_errors_clearly() {
+    let root = temp_dir("disable-nothing");
+    let home = temp_dir("disable-nothing-home");
+    let err = run_disable_with(
+        &root,
+        &home,
+        &toggle(Platform::ClaudeCode, Scope::Project),
+        &no_externals(),
+    )
+    .expect_err("nothing installed");
+    assert!(err.0.contains("disable"), "{}", err.0);
+}
+
+#[test]
+fn enable_with_nothing_installed_errors_clearly() {
+    let root = temp_dir("enable-nothing");
+    let home = temp_dir("enable-nothing-home");
+    let err = run_enable_with(
+        &root,
+        &home,
+        &toggle(Platform::ClaudeCode, Scope::Project),
+        &McpCommand::OnPath,
+        &no_externals(),
+    )
+    .expect_err("nothing installed");
+    assert!(err.0.contains("enable"), "{}", err.0);
 }
 
 // ---------------------------------------------------------------------------

@@ -915,6 +915,15 @@ struct Manifest {
     /// fresh, since the published package may have moved since `disable` ran.
     #[serde(default)]
     stashed_mcp: Vec<StashedMcpEntry>,
+    /// The command `install` (or the last successful `enable`) was asked to
+    /// write, *before* [`resolve_fast_command`] turned an `Npx` request into a
+    /// concrete native-binary or launcher path. `enable` reads this back so it
+    /// can tell an explicit `--command` pin apart from an `npx` resolution
+    /// that happened to land on the same shape of value (an absolute path) —
+    /// something the resolved JSON entry alone cannot distinguish. `None` only
+    /// for a manifest written before this field existed.
+    #[serde(default)]
+    requested_cmd: Option<StoredCommand>,
 }
 
 impl Manifest {
@@ -947,6 +956,42 @@ struct StashedMcpEntry {
     server: String,
     /// The entry itself, exactly as it read before removal.
     entry: serde_json::Value,
+}
+
+/// The three requestable shapes of [`McpCommand`] — the ones a caller can ask
+/// for, as opposed to [`McpCommand::NativeBinary`]/[`McpCommand::NodeLauncher`],
+/// which only [`resolve_fast_command`] ever produces, by resolving an `Npx`
+/// request. Serializable so a manifest can carry it across a `disable`/`enable`
+/// round trip.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+enum StoredCommand {
+    Npx { version: String },
+    Explicit(PathBuf),
+    OnPath,
+}
+
+impl StoredCommand {
+    /// The request behind `cmd`, or `None` for a value only resolution
+    /// produces — there is nothing to remember about those beyond the `Npx`
+    /// request that led to them, which is captured before resolution runs.
+    fn from_mcp(cmd: &McpCommand) -> Option<Self> {
+        match cmd {
+            McpCommand::Npx { version } => Some(StoredCommand::Npx {
+                version: version.clone(),
+            }),
+            McpCommand::Explicit(p) => Some(StoredCommand::Explicit(p.clone())),
+            McpCommand::OnPath => Some(StoredCommand::OnPath),
+            McpCommand::NativeBinary { .. } | McpCommand::NodeLauncher { .. } => None,
+        }
+    }
+
+    fn into_mcp(self) -> McpCommand {
+        match self {
+            StoredCommand::Npx { version } => McpCommand::Npx { version },
+            StoredCommand::Explicit(p) => McpCommand::Explicit(p),
+            StoredCommand::OnPath => McpCommand::OnPath,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1359,6 +1404,11 @@ pub fn run_install_with(
         McpCommand::Explicit(p) => McpCommand::Explicit(absolutise_command(p, project_root)),
         other => other.clone(),
     };
+    // What was actually asked for, before resolution turns an `Npx` request
+    // into a concrete path — `enable` reads this back later to tell an
+    // explicit `--command` pin apart from a resolved `npx` path, which the
+    // written JSON entry alone cannot distinguish (both are absolute paths).
+    let requested_cmd = StoredCommand::from_mcp(&cmd);
     // Resolve the published package to a concrete launcher once, here, so no
     // hook has to. Skipped by `--no-prewarm`, which is the flag for "do not
     // reach the network during this install"; the `npx` form still works, it
@@ -1409,7 +1459,10 @@ pub fn run_install_with(
     // write lands, and saying so in the summary.
     let was_disabled = existing.disabled;
 
-    let mut manifest = Manifest::default();
+    let mut manifest = Manifest {
+        requested_cmd,
+        ..Manifest::default()
+    };
     let mut notes: Vec<String> = Vec::new();
     notes.extend(launcher_note);
     if was_disabled {
@@ -1654,21 +1707,11 @@ pub fn run_uninstall_with(
         }
     }
 
-    // Codex holds its own config; hand the removal back to its CLI.
+    // Codex holds its own config; hand the removal back to its CLI. Not being
+    // able to reach `codex` must not strand every other thing the manifest
+    // lists.
     if manifest.codex {
-        match ext.which("codex") {
-            Some(bin) => {
-                run_and_capture(&bin, &["mcp".into(), "remove".into(), SERVER_NAME.into()])
-                    .map_err(|e| CliError(format!("codex mcp remove failed: {e}")))?;
-                removed.push(format!("removed  codex mcp server {SERVER_NAME}"));
-            }
-            // Not being able to reach `codex` must not strand every other
-            // thing the manifest lists.
-            None => removed.push(
-                "warning: codex is not on PATH — run `codex mcp remove mushroomdb` yourself"
-                    .to_string(),
-            ),
-        }
+        remove_codex(ext, &mut removed, "removed")?;
     }
 
     // Remove files.
@@ -1756,25 +1799,67 @@ fn store_from_arg(arg: &str, project_root: &Path, home: &Path) -> StoreRef {
     StoreRef::pinned(path)
 }
 
-/// The store `enable` should write: whichever one a stashed MCP entry named,
-/// or — for a Codex-only install, which stashes nothing since Codex's config
-/// is not a file this program reads — the same default `install` would pick
-/// with no `--db`. A Codex-only install made with an explicit `--db` cannot be
-/// recovered exactly; `enable` re-registers it at the default store instead,
-/// same as a fresh `install` would without that flag.
-fn recover_store(
-    manifest: &Manifest,
+/// The config file `disable` would have stashed `platform`'s MCP entry from —
+/// the same file [`platform_stores`]/[`install_platform`] write to. `None` for
+/// Codex, whose registration is not a file this program reads.
+fn platform_mcp_file(
+    platform: &Platform,
     project_root: &Path,
     home: &Path,
     scope: Scope,
-    platforms: &[Platform],
+) -> Option<PathBuf> {
+    match platform {
+        Platform::ClaudeCode => Some(claude_mcp_file(project_root, home, scope)),
+        Platform::Cursor => Some(cursor_mcp_file(project_root, home, scope)),
+        Platform::Codex | Platform::All => None,
+    }
+}
+
+/// The store `enable` should write for `platform`: whichever one that
+/// platform's own stashed MCP entry named, matched by which file it was
+/// stashed from — Claude Code and Cursor can disagree (only Claude Code
+/// resolves `--auto`; see [`resolves_at_runtime`]), so a single stash entry
+/// must never be applied to every platform. Falls back to the same default
+/// `install` would pick with no `--db` when nothing was stashed for this
+/// platform — always true for Codex, whose registration is not a file this
+/// program reads, so a Codex install made with an explicit `--db` cannot be
+/// recovered exactly and is re-registered at the default store instead.
+fn recover_store_for(
+    manifest: &Manifest,
+    platform: &Platform,
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
 ) -> StoreRef {
-    manifest
-        .stashed_mcp
-        .first()
+    platform_mcp_file(platform, project_root, home, scope)
+        .and_then(|file| manifest.stashed_mcp.iter().find(|s| s.file == file))
         .and_then(|s| entry_db(&s.entry))
         .map(|arg| store_from_arg(arg, project_root, home))
-        .unwrap_or_else(|| repo_store_ref(project_root, home, scope, None, platforms))
+        .unwrap_or_else(|| {
+            store_ref(
+                project_root,
+                home,
+                scope,
+                None,
+                resolves_at_runtime(platform),
+            )
+        })
+}
+
+/// The store the repository wiring (`.gitignore`, the git hook blocks) should
+/// name for `enable`: whichever recovered per-platform store resolves at
+/// runtime (Claude Code's, when present — same preference [`repo_store_ref`]
+/// gives a fresh install), else the first platform's. Mirrors
+/// [`repo_store_ref`], sourced from what was actually recovered rather than
+/// recomputed independently, so it can never disagree with what
+/// `install_claude_code`/`install_cursor` just wrote.
+fn repo_store_for_enable(stores: &[(Platform, StoreRef)]) -> StoreRef {
+    stores
+        .iter()
+        .find(|(p, _)| resolves_at_runtime(p))
+        .or_else(|| stores.first())
+        .map(|(_, s)| s.clone())
+        .expect("enable always resolves at least one platform")
 }
 
 /// Turn an install off: remove the MCP entry, the two Claude Code hooks, the
@@ -1848,17 +1933,7 @@ pub fn run_disable_with(
     }
 
     if manifest.codex {
-        match ext.which("codex") {
-            Some(bin) => {
-                run_and_capture(&bin, &["mcp".into(), "remove".into(), SERVER_NAME.into()])
-                    .map_err(|e| CliError(format!("codex mcp remove failed: {e}")))?;
-                changed.push(format!("disabled  codex mcp server {SERVER_NAME}"));
-            }
-            None => changed.push(
-                "warning: codex is not on PATH — run `codex mcp remove mushroomdb` yourself"
-                    .to_string(),
-            ),
-        }
+        remove_codex(ext, &mut changed, "disabled")?;
     }
 
     manifest.disabled = true;
@@ -1917,23 +1992,58 @@ pub fn run_enable_with(
         ));
     }
 
-    let cmd = match cmd {
+    // Restore what was actually requested before, not the caller's
+    // auto-detected `cmd` — that would silently drop an explicit `--command`
+    // pin the moment it was disabled. `Npx` is re-resolved below exactly like
+    // `install` would (the "current shapes" part); `Explicit` is used
+    // verbatim unless the binary it names is gone, in which case this falls
+    // back to the caller's `cmd` and says so. A manifest with no stash at all
+    // (written before this field existed) also falls back, silently — there
+    // is nothing to have dropped.
+    let mut notes: Vec<String> = Vec::new();
+    let base_cmd = match manifest.requested_cmd.clone() {
+        Some(StoredCommand::Explicit(p)) if is_bare_program_name(&p) || p.is_file() => {
+            McpCommand::Explicit(p)
+        }
+        Some(StoredCommand::Explicit(p)) => {
+            notes.push(format!(
+                "warning: the pinned command {} no longer exists — re-detected the command instead",
+                p.display()
+            ));
+            cmd.clone()
+        }
+        Some(other) => other.into_mcp(),
+        None => cmd.clone(),
+    };
+    let base_cmd = match &base_cmd {
         McpCommand::Explicit(p) => McpCommand::Explicit(absolutise_command(p, project_root)),
         other => other.clone(),
     };
-    let (cmd, launcher_note, _) = resolve_fast_command(&cmd, ext);
+    let (cmd, launcher_note, _) = resolve_fast_command(&base_cmd, ext);
     let cmd = &cmd;
-    // What `disable` stashed already carries the spelling each platform was
-    // installed with, so `enable` re-writes exactly that rather than deciding
-    // afresh; only a Codex-only install, which stashes nothing, falls back.
-    let store = recover_store(&manifest, project_root, home, scope, &platforms);
+    notes.extend(launcher_note);
+
+    // Each platform's own stashed entry says which store *that* platform was
+    // installed with — Claude Code and Cursor can disagree, since only Claude
+    // Code resolves `--auto`. A Codex-only install stashes nothing and falls
+    // back to the same default a fresh install would pick.
+    let stores: Vec<(Platform, StoreRef)> = platforms
+        .iter()
+        .map(|p| {
+            (
+                p.clone(),
+                recover_store_for(&manifest, p, project_root, home, scope),
+            )
+        })
+        .collect();
+    let repo_store = repo_store_for_enable(&stores);
     let had_git_hooks = !manifest.git_hooks.is_empty();
 
     let ctx = Ctx {
         project_root,
         home,
         scope,
-        repo_store: &store,
+        repo_store: &repo_store,
         cmd,
         ext,
         git_hooks: true,
@@ -1941,13 +2051,11 @@ pub fn run_enable_with(
     };
 
     let mut fresh = Manifest::default();
-    let mut notes: Vec<String> = Vec::new();
-    notes.extend(launcher_note);
-    for plat in &platforms {
+    for (plat, store) in &stores {
         match plat {
-            Platform::ClaudeCode => install_claude_code(&ctx, &store, &mut fresh, &mut notes)?,
-            Platform::Cursor => install_cursor(&ctx, &store, &mut fresh, &mut notes)?,
-            Platform::Codex => install_codex(&ctx, &store, &mut fresh)?,
+            Platform::ClaudeCode => install_claude_code(&ctx, store, &mut fresh, &mut notes)?,
+            Platform::Cursor => install_cursor(&ctx, store, &mut fresh, &mut notes)?,
+            Platform::Codex => install_codex(&ctx, store, &mut fresh)?,
             Platform::All => unreachable!("expand_platform never produces All"),
         }
     }
@@ -1991,6 +2099,12 @@ pub fn run_enable_with(
 
     manifest.disabled = false;
     manifest.stashed_mcp.clear();
+    // Remember what was actually used this round — the restored pin, the
+    // fallback it took because that pin was gone, or the unresolved `Npx`
+    // request (never the resolved native-binary/launcher path resolution
+    // turned it into) — so the *next* `disable`/`enable` round trip starts
+    // from what is actually true now rather than a permanently stale pin.
+    manifest.requested_cmd = StoredCommand::from_mcp(&base_cmd);
     write_manifest(&manifest_path, &manifest)?;
 
     let mut out = String::new();
@@ -2324,6 +2438,27 @@ fn codex_bin(ext: &Externals) -> Result<PathBuf, CliError> {
                 .to_string(),
         )
     })
+}
+
+/// Take the Codex registration back out, through `codex mcp remove`. Appends
+/// one line to `out` on success (`"{verb}  codex mcp server mushroomdb"`), or
+/// a warning naming the manual fallback when `codex` cannot be reached — not
+/// being able to reach it must not strand every other thing the caller is
+/// removing. Shared by `uninstall` and `disable`, which take the registration
+/// off disk the same way and differ only in whether they still own it after.
+fn remove_codex(ext: &Externals, out: &mut Vec<String>, verb: &str) -> Result<(), CliError> {
+    match ext.which("codex") {
+        Some(bin) => {
+            run_and_capture(&bin, &["mcp".into(), "remove".into(), SERVER_NAME.into()])
+                .map_err(|e| CliError(format!("codex mcp remove failed: {e}")))?;
+            out.push(format!("{verb}  codex mcp server {SERVER_NAME}"));
+        }
+        None => out.push(
+            "warning: codex is not on PATH — run `codex mcp remove mushroomdb` yourself"
+                .to_string(),
+        ),
+    }
+    Ok(())
 }
 
 /// Register the server with Codex through its own CLI.
@@ -2704,6 +2839,9 @@ fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
         }
     }
     existing.codex |= this_run.codex;
+    if let Some(c) = &this_run.requested_cmd {
+        existing.requested_cmd = Some(c.clone());
+    }
     existing
 }
 

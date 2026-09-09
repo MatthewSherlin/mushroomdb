@@ -402,12 +402,17 @@ install back on later. Scope and platform resolve the same way as `install`.
 Running it twice is a no-op: the second call reports `mushroomdb is already
 disabled`.
 
-`enable` reverses it. It does not replay what `disable` removed: it
-re-resolves the MCP command the way `install` would right now — so a
-published-package upgrade between the two calls is picked up rather than
-pinned to a path that may no longer exist — and re-adds the hooks and git
-hook blocks against that command. Running `enable` on an install that is not
-disabled is a no-op.
+`enable` reverses it. What it restores depends on how the install named its
+command: an explicit `mushroomdb install --command <path>` pin comes back
+verbatim, and only falls back to auto-detection — with a warning naming the
+missing path — if that binary is gone by the time `enable` runs. The default
+`npx` form is re-resolved fresh instead of replayed, the same way `install`
+would resolve it right now, so a published-package upgrade between `disable`
+and `enable` is picked up rather than pinned to a path that may no longer
+exist. Either way the two hooks and the git hook blocks are re-added against
+whichever command that resolves to, and each platform's store is recovered
+from what its own MCP entry named — Claude Code and Cursor can be pinned
+differently. Running `enable` on an install that is not disabled is a no-op.
 
 `mushroomdb install` also re-enables a disabled install: it rewrites whatever
 `disable` took off disk the same way it repairs any other drift, and says so
