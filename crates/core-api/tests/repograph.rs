@@ -12,9 +12,10 @@ use common::{
     SYNCED_AT,
 };
 use core_api::repograph::{
-    brief, context, impact, owners, recall_digest, remember, render_brief, render_context,
-    render_impact, render_map, render_owners, render_why, repo_map, shortest_path, stale_concepts,
-    why, BriefOptions, ImpactOptions, MapOptions, RememberInput, Target,
+    brief, context, identifier_terms, impact, owners, recall_digest, remember, render_brief,
+    render_context, render_impact, render_map, render_owners, render_why, repo_map, shortest_path,
+    stale_concepts, why, BriefOptions, ImpactOptions, MapOptions, RememberInput, Target,
+    MAX_OUTPUT_BYTES, MAX_QUERY_TERMS, UNTRUSTED_FRAMING,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1899,14 +1900,12 @@ fn remember_creates_the_about_rule_for_a_label_seen_for_the_first_time() {
     );
 }
 
-#[test]
-fn recall_finds_notes_concepts_files_symbols_people() {
-    let dir = tmp("recall-all-labels");
-    let mut db = synthetic_repo_store(&dir);
-    // The full set `ingest-git`, `structure` and `remember` register between
-    // them (see the doc table in `docs/roadmap/v0.6-code-graph-plan.md`),
-    // recreated here since this fixture is built by hand rather than by the
-    // CLI's own ingest path.
+/// The synthetic store with the full set of fields `ingest-git`, `structure`
+/// and `remember` index between them (see the doc table in
+/// `docs/roadmap/v0.6-code-graph-plan.md`), enabled here because this fixture
+/// is built by hand rather than by the CLI's own ingest path.
+fn recall_store(dir: &Path) -> core_api::GraphDb<core_storage::fs::RealFs> {
+    let mut db = synthetic_repo_store(dir);
     for (label, field) in [
         ("File", "path"),
         ("Symbol", "name"),
@@ -1916,39 +1915,186 @@ fn recall_finds_notes_concepts_files_symbols_people() {
     ] {
         db.enable_fulltext(label, field).expect("fulltext");
     }
+    db
+}
 
-    // One distinctive term per label, so each contributes its own top hit.
-    let prompt = "c00 OR init OR ada OR entry OR startup";
-    let out = recall_digest(&db, prompt, "synthetic", 4000);
-    let lines: Vec<&str> = out.lines().collect();
-
-    // Every hit is `- key [Label] name` immediately followed by up to three
-    // `    edge_type -> other[ (prop w.ww)]` lines — the brief calls for
-    // "each with one strongest edge", so this checks the edge line is
-    // actually there, not just the header that names the label.
-    for label in ["File", "Symbol", "Author", "Note", "Concept"] {
-        let marker = format!("[{label}]");
-        let at = lines
-            .iter()
-            .position(|l| l.contains(&marker))
-            .unwrap_or_else(|| panic!("expected a {label} hit in:\n{out}"));
-        let edge_line = lines.get(at + 1).copied().unwrap_or("");
-        assert!(
-            edge_line.starts_with("    ") && edge_line.contains(" -> "),
-            "expected {label}'s hit ({:?}) to be followed by its strongest \
-             edge, got {edge_line:?} in:\n{out}",
-            lines[at]
+/// Binding: a prompt with no code-shaped token in it is not a question about
+/// this repository, so the digest that fires before every prompt says nothing
+/// — before any search runs, not after ranking six near-random nodes.
+#[test]
+fn recall_is_silent_on_prose_without_identifiers() {
+    let dir = tmp("recall-prose");
+    let db = recall_store(&dir);
+    for prompt in [
+        "please explain how the server starts",
+        "what changed here recently",
+        "write a test for the parser",
+    ] {
+        assert_eq!(
+            recall_digest(&db, prompt, "synthetic", MAX_OUTPUT_BYTES),
+            "",
+            "{prompt:?}"
         );
     }
-    assert!(out.contains("src/core/c00.rs"), "{out}");
-    assert!(out.contains("Ada Example"), "{out}");
+}
+
+/// Binding: a prompt that names symbols is answered with pointers — one
+/// indented `path:line symbol — first doc line` per hit and nothing else. No
+/// edge lines, and no closing nudge: the session brief already told the
+/// assistant how to reach the graph.
+#[test]
+fn recall_prints_pointers_for_a_named_symbol() {
+    let dir = tmp("recall-pointers");
+    let db = recall_store(&dir);
+    let out = recall_digest(
+        &db,
+        "why does core::init call web::serve?",
+        "synthetic",
+        MAX_OUTPUT_BYTES,
+    );
+
+    assert!(out.starts_with(UNTRUSTED_FRAMING), "{out}");
     assert!(
-        out.contains("ABOUT -> src/core/c00.rs"),
-        "the note's edge names its rule and target: {out}"
+        out.lines()
+            .nth(1)
+            .unwrap_or_default()
+            .starts_with("mushroomdb recall"),
+        "{out}"
+    );
+    assert!(out.contains("src/core/c00.rs:"), "{out}");
+    assert!(out.contains("core::init"), "{out}");
+    assert!(
+        out.contains("— what core::init does"),
+        "the pointer carries the symbol's first doc line: {out}"
+    );
+    assert!(out.contains("src/web/w00.rs:"), "{out}");
+    assert!(!out.contains(" -> "), "no edge lines: {out}");
+    assert!(
+        !out.contains("(query the mushroomdb MCP tools"),
+        "no nudge: {out}"
+    );
+    for line in out.lines().skip(2) {
+        assert!(
+            line.starts_with("  "),
+            "every line under the header is one pointer: {line:?} in\n{out}"
+        );
+    }
+    assert!(out.len() <= MAX_OUTPUT_BYTES, "{} bytes", out.len());
+}
+
+/// Binding: a `File` hit has no symbol and no line to point at, so it is its
+/// path and what the graph says the file is.
+#[test]
+fn recall_points_at_a_file_by_path_and_role() {
+    let dir = tmp("recall-file");
+    let mut db = recall_store(&dir);
+    db.insert_node(
+        "File",
+        "src/web/w99.rs",
+        vec![
+            (
+                "id".to_string(),
+                core_api::Value::Str("src/web/w99.rs".into()),
+            ),
+            (
+                "path".to_string(),
+                core_api::Value::Str("src/web/w99.rs".into()),
+            ),
+            (
+                "role".to_string(),
+                core_api::Value::Str("the web entry point".into()),
+            ),
+        ],
+    )
+    .expect("file");
+
+    let out = recall_digest(
+        &db,
+        "what is in src/core/c00.rs?",
+        "synthetic",
+        MAX_OUTPUT_BYTES,
     );
     assert!(
-        out.contains("DESCRIBED_IN -> src/core/c00.rs"),
-        "the concept's edge names its rule and target: {out}"
+        out.lines().any(|l| l == "  src/core/c00.rs"),
+        "a file with no role is its path alone: {out}"
+    );
+
+    let out = recall_digest(
+        &db,
+        "what is src/web/w99.rs?",
+        "synthetic",
+        MAX_OUTPUT_BYTES,
+    );
+    assert!(
+        out.lines()
+            .any(|l| l == "  src/web/w99.rs — the web entry point"),
+        "{out}"
+    );
+}
+
+/// Binding: backticks make a word an identifier. A note or a concept is named
+/// in prose, so quoting is how a prompt says "this is a thing, not a word" —
+/// and without the quotes the same prompt is silent.
+#[test]
+fn recall_reaches_a_prose_node_through_backticks() {
+    let dir = tmp("recall-backticks");
+    let db = recall_store(&dir);
+    let out = recall_digest(
+        &db,
+        "what does `startup` cover?",
+        "synthetic",
+        MAX_OUTPUT_BYTES,
+    );
+    assert!(out.contains("concept:startup"), "{out}");
+    assert!(out.contains("startup path"), "{out}");
+    assert_eq!(
+        recall_digest(
+            &db,
+            "what does startup cover?",
+            "synthetic",
+            MAX_OUTPUT_BYTES
+        ),
+        "",
+        "the same words unquoted are prose"
+    );
+}
+
+/// Binding: `identifier_terms` keeps the code-shaped tokens and drops the
+/// words around them — the sentence's full stop included, which has to come
+/// off `render_map.` without taking the extension off `src/core.rs.`.
+#[test]
+fn identifier_terms_keep_code_shaped_tokens_only() {
+    assert_eq!(
+        identifier_terms("the `render_map` fn and web::serve and src/core.rs but not words"),
+        vec!["render_map", "web::serve", "src/core.rs"]
+    );
+    assert_eq!(
+        identifier_terms("it lives in src/core.rs."),
+        vec!["src/core.rs"],
+        "a path keeps its extension when the sentence ends"
+    );
+    assert_eq!(
+        identifier_terms("look at render_map."),
+        vec!["render_map"],
+        "and prose loses the full stop"
+    );
+    assert!(identifier_terms("please explain how the server starts").is_empty());
+    assert!(
+        identifier_terms("the code in this file").is_empty(),
+        "a word that says nothing inside a repository is not an identifier"
+    );
+    assert_eq!(
+        identifier_terms("does core::init call core::init twice"),
+        vec!["core::init"],
+        "a repeat is one term"
+    );
+    let many: String = (0..MAX_QUERY_TERMS + 5)
+        .map(|i| format!("a_{i} "))
+        .collect();
+    assert_eq!(
+        identifier_terms(&many).len(),
+        MAX_QUERY_TERMS,
+        "a pasted wall of code cannot turn one prompt into hundreds of probes"
     );
 }
 
@@ -1964,29 +2110,25 @@ fn recall_finds_notes_concepts_files_symbols_people() {
 #[test]
 fn recall_prints_hits_in_the_hybrid_ranking_order() {
     let dir = tmp("recall-hybrid-order");
-    let mut db = synthetic_repo_store(&dir);
-    for (label, field) in [
-        ("File", "path"),
-        ("Symbol", "name"),
-        ("Author", "name"),
-        ("Note", "text"),
-        ("Concept", "name"),
-    ] {
-        db.enable_fulltext(label, field).expect("fulltext");
-    }
+    let db = recall_store(&dir);
 
-    let prompt = "c00 OR init OR ada OR entry OR startup";
+    let prompt = "does core::init or web::serve belong in src/core/c00.rs?";
     let out = recall_digest(&db, prompt, "synthetic", 4000);
 
     // What `recall_digest` does internally, spelled out here against the
-    // public API: best fused score per key across the fields, then score
-    // descending and key ascending.
+    // public API: every identifier searched as a phrase, best fused score per
+    // key across the fields, then score descending and key ascending.
+    let query: String = identifier_terms(prompt)
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<String>>()
+        .join(" OR ");
     let mut fields: Vec<String> = db.fulltext_pairs().into_iter().map(|(_, f)| f).collect();
     fields.sort();
     fields.dedup();
     let mut best: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
     for field in &fields {
-        for (key, score) in db.search_hybrid(field, prompt, "embedding", &[], None, 6) {
+        for (key, score) in db.search_hybrid(field, &query, "embedding", &[], None, 6) {
             let slot = best.entry(key).or_insert(0.0);
             if score > *slot {
                 *slot = score;
@@ -2000,22 +2142,21 @@ fn recall_prints_hits_in_the_hybrid_ranking_order() {
             .then(a.0.cmp(&b.0))
     });
 
-    let printed: Vec<String> = out
-        .lines()
-        .filter_map(|l| l.strip_prefix("- "))
-        .filter_map(|l| l.split_whitespace().next())
-        .map(str::to_string)
-        .collect();
-    let expected: Vec<String> = ranked
-        .iter()
-        .take(printed.len())
-        .map(|(k, _)| k.clone())
-        .collect();
+    let printed: Vec<&str> = out.lines().filter(|l| l.starts_with("  ")).collect();
     assert!(!printed.is_empty(), "expected hits in:\n{out}");
-    assert_eq!(
-        printed, expected,
-        "the digest must print the hybrid ranking in its own order:\n{out}"
-    );
+    assert!(printed.len() <= ranked.len());
+    for (line, (key, _)) in printed.iter().zip(&ranked) {
+        // A pointer names the node by path and symbol, not by key: for a
+        // `Symbol` the key is `path#name`, and for everything else it is the
+        // path itself.
+        let (path, symbol) = key.split_once('#').unwrap_or((key.as_str(), ""));
+        let body = line.trim_start();
+        assert!(
+            body.starts_with(path) && body.contains(symbol),
+            "the digest must print the hybrid ranking in its own order: \
+             expected {key:?} at {line:?} in\n{out}"
+        );
+    }
 }
 
 #[test]

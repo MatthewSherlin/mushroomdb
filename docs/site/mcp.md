@@ -243,7 +243,7 @@ break in an agent's context.
 | `impact` | `files?` | Per changed file: co-change partners — by similarity score, or by how many commits the two share when the score floor hid them — and whether each is itself modified, plus importers, symbols used elsewhere, and the owner. Defaults to the working tree's diff against `HEAD` plus untracked files. |
 | `owners` | `path` | Top author and share, authors who know the file, the last commit to touch it, and the split by quarter. |
 | `why` | `a`, `b` | Every rule edge between two nodes with its score and evidence, or the shortest path between them when there is no direct link. |
-| `recall` | `topic` | The notes, concepts, files, symbols and people nearest a topic, each with its strongest link. |
+| `recall` | `topic` | One pointer per hit — `path:line symbol — first doc line` — for the identifiers a topic names: a path, a `mod::name`, a snake_case word, or any word in backticks. |
 | `remember` | `text`, `about?`, `kind?` | Writes a note into the graph and returns its key. Every key in `about` must already exist. |
 | `sync` | — | Brings the store up to date with the repository it was built from: the commits since the last sync, then the files that differ from `HEAD`. |
 

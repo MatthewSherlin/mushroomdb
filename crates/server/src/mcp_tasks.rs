@@ -444,14 +444,12 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
         Err(e) => return CallOutcome::ToolErr(e),
     };
     let label = db_dir.map_or_else(|| "store".to_string(), |d| d.display().to_string());
-    // The same rewrite the `recall` hook applies to a prompt: terms inside one
-    // full-text group are ANDed, so raw prose matches nothing.
-    let digest = match repograph::or_query(&topic) {
-        Some(query) => {
-            let g = db.read();
-            repograph::recall_digest(&*g, &query, &label, MAX_OUTPUT_BYTES)
-        }
-        None => String::new(),
+    // The topic goes in as the caller wrote it: `recall_digest` searches the
+    // identifiers in it, and it is the same call the `recall` hook makes, so
+    // the two cannot disagree about what a topic means.
+    let digest = {
+        let g = db.read();
+        repograph::recall_digest(&*g, &topic, &label, MAX_OUTPUT_BYTES)
     };
     let text = if digest.is_empty() {
         format!(
@@ -700,14 +698,14 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "recall",
-            "description": "What the graph already knows about a topic: the closest notes, concepts, files, symbols and people, each with its strongest link.",
+            "description": "Where the graph says a topic lives: one pointer per hit — path:line, the symbol, and the first line of its doc — across notes, concepts, files, symbols and people.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "topic": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Free-form text. Searched as an OR of its words."
+                        "description": "Free-form text. The identifiers in it — a path, a `mod::name`, a snake_case word, or any word in backticks — are searched as phrases; a topic naming none of those matches nothing."
                     }
                 },
                 "required": ["topic"]

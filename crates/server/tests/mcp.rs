@@ -1792,15 +1792,16 @@ fn why_reports_the_link_between_two_files() {
     );
 }
 
-/// Binding: `recall` turns a plain topic into a digest of the nodes nearest it.
+/// Binding: `recall` turns a topic that names something into a digest of
+/// pointers to the nodes nearest it.
 #[test]
 fn recall_returns_digest() {
     let (text, structured) = task_both(
         code_store("recall-topic"),
         "recall",
-        json!({"topic": "the core module"}),
+        json!({"topic": "src/core.rs"}),
     );
-    assert_eq!(structured["topic"], json!("the core module"));
+    assert_eq!(structured["topic"], json!("src/core.rs"));
     assert!(
         text.contains("src/core.rs"),
         "the digest must name the matching node: {text}"
@@ -1919,7 +1920,7 @@ fn every_task_tool_frames_its_text_as_untrusted() {
         "impact" => json!({"files": ["src/core.rs"]}),
         "owners" => json!({"path": "src/core.rs"}),
         "why" => json!({"a": "src/core.rs", "b": "src/web.rs"}),
-        "recall" => json!({"topic": "the core module"}),
+        "recall" => json!({"topic": "src/core.rs"}),
         "remember" => json!({"text": "framing check", "about": ["src/core.rs"]}),
         _ => json!({}),
     };
@@ -2032,7 +2033,7 @@ fn a_json_reply_is_unframed_and_sanitized() {
 #[test]
 fn a_json_reply_keeps_the_newlines_of_a_multi_line_value() {
     let db = code_store("json-multiline");
-    let report = task_report(db, "recall", json!({"topic": "the core module"}));
+    let report = task_report(db, "recall", json!({"topic": "src/core.rs"}));
     let digest = report["digest"].as_str().expect("digest");
     assert!(
         digest.lines().count() > 2,
@@ -2064,12 +2065,12 @@ fn a_wrong_typed_json_argument_is_a_tool_error() {
 #[test]
 fn recall_is_framed_once_not_twice() {
     let db = code_store("recall-framing");
-    let reply = one_task_call(db.clone(), "recall", json!({"topic": "the core module"}));
+    let reply = one_task_call(db.clone(), "recall", json!({"topic": "src/core.rs"}));
     let full = task_text(&reply);
     assert_eq!(full.matches(UNTRUSTED_FRAMING).count(), 1, "{full}");
     // The digest core-api produced is what was shown, unaltered.
     assert_eq!(
-        task_report(db, "recall", json!({"topic": "the core module"}))["digest"],
+        task_report(db, "recall", json!({"topic": "src/core.rs"}))["digest"],
         json!(full),
         "recall's own digest already opens with the framing line"
     );

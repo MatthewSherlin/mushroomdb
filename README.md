@@ -211,7 +211,7 @@ reaches for, and what `tools/list` shows first:
 | `impact` | What changing these files reaches: partners with scores, importers, symbols other files call, owner. Defaults to the working tree's diff |
 | `owners` | Top author and share, who else knows the file, last touch, the split by quarter |
 | `why` | Every rule edge between two nodes with its evidence, or the shortest path when there is none |
-| `recall` | Notes, concepts, files, symbols and people nearest a topic, each with its strongest link |
+| `recall` | One pointer per hit — `path:line symbol — first doc line` — for the identifiers in a topic |
 | `remember` | Write a note into the graph and return its key |
 | `sync` | Bring the store up to date: commits since the last sync, then the dirty working tree |
 
