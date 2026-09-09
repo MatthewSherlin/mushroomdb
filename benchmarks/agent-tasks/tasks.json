@@ -1,0 +1,1288 @@
+{
+  "repo": "/private/var/folders/94/19gj_1654c56m8bf5z_gf1240000gn/T/agent-bench/subject",
+  "head": "c61ac919e365e43e62ee25698a5b2c1a11260f7f",
+  "head_short": "c61ac91",
+  "repo2": "/private/var/folders/94/19gj_1654c56m8bf5z_gf1240000gn/T/agent-bench/subject2",
+  "head2": "95f8322ee1dcda7ceace7b1c4f6c9915b36d748f",
+  "prefix": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.",
+  "change_prefix": "Work in this repository. Make the change described below, then run the test command it names and make sure it passes. Leave the edits in the working tree: do not commit, do not stash, do not revert.",
+  "tasks": [
+    {
+      "id": 1,
+      "key": "r1-change-1",
+      "repo": "R1",
+      "kind": "change",
+      "prompt": "`pub fn cap_lines` in `crates/core-api/src/repograph/render.rs` reads as if it capped the length of a line; it caps how many lines a string keeps. Rename it to `cap_line_count` everywhere in this workspace: the definition, every call site, the doc-comment links that name it, and its own unit tests. Nothing else about its behaviour changes.\n\nTest command: `cargo test -p mushroomdb --lib repograph::render`",
+      "truth": {
+        "files": [
+          "crates/core-api/src/repograph/render.rs"
+        ]
+      },
+      "checks": [],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": {
+        "cmd": [
+          "cargo",
+          "test",
+          "-p",
+          "mushroomdb",
+          "--lib",
+          "repograph::render"
+        ]
+      },
+      "full_prompt": "Work in this repository. Make the change described below, then run the test command it names and make sure it passes. Leave the edits in the working tree: do not commit, do not stash, do not revert.\n\n`pub fn cap_lines` in `crates/core-api/src/repograph/render.rs` reads as if it capped the length of a line; it caps how many lines a string keeps. Rename it to `cap_line_count` everywhere in this workspace: the definition, every call site, the doc-comment links that name it, and its own unit tests. Nothing else about its behaviour changes.\n\nTest command: `cargo test -p mushroomdb --lib repograph::render`",
+      "min_stock_turns": 6
+    },
+    {
+      "id": 2,
+      "key": "r1-change-2",
+      "repo": "R1",
+      "kind": "change",
+      "prompt": "`mushroomdb map <db-dir> --json` prints the computed map instead of the rendered digest. `mushroomdb owners <db-dir> <path>` has no such flag. Add `--json` to `owners` the same way `map` does it: parse the flag into the `Owners` command, dispatch it in the binary, print the JSON form of what the owners report holds, name the flag in the usage text, and extend the `parse_args_table` unit test with the new spellings (flag before and after the positional arguments).\n\nTest command: `cargo test -p mushroomdb-cli --lib parse_args_table`",
+      "truth": {
+        "files": [
+          "crates/cli/src/lib.rs",
+          "crates/cli/src/main.rs"
+        ]
+      },
+      "checks": [],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": {
+        "cmd": [
+          "cargo",
+          "test",
+          "-p",
+          "mushroomdb-cli",
+          "--lib",
+          "parse_args_table"
+        ]
+      },
+      "full_prompt": "Work in this repository. Make the change described below, then run the test command it names and make sure it passes. Leave the edits in the working tree: do not commit, do not stash, do not revert.\n\n`mushroomdb map <db-dir> --json` prints the computed map instead of the rendered digest. `mushroomdb owners <db-dir> <path>` has no such flag. Add `--json` to `owners` the same way `map` does it: parse the flag into the `Owners` command, dispatch it in the binary, print the JSON form of what the owners report holds, name the flag in the usage text, and extend the `parse_args_table` unit test with the new spellings (flag before and after the positional arguments).\n\nTest command: `cargo test -p mushroomdb-cli --lib parse_args_table`",
+      "min_stock_turns": 31
+    },
+    {
+      "id": 3,
+      "key": "r1-change-3",
+      "repo": "R1",
+      "kind": "change",
+      "prompt": "`render_impact` in `crates/core-api/src/repograph/render.rs` caps how many files it prints at the private constant `MAX_IMPACT_FILES`. Make that cap a setting: add a `max_files` field to `ImpactOptions` in `crates/core-api/src/repograph/impact.rs`, defaulting to the value the constant holds today; change `render_impact` to take the options by reference and use `max_files` in place of the constant; update every caller in the workspace to pass the options it already has (or the default).\n\nTest command: `cargo test -p mushroomdb-server --test mcp impact`",
+      "truth": {
+        "files": [
+          "crates/cli/src/lib.rs",
+          "crates/core-api/src/repograph/impact.rs",
+          "crates/core-api/src/repograph/render.rs",
+          "crates/server/src/mcp_tasks.rs"
+        ]
+      },
+      "checks": [],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": {
+        "cmd": [
+          "cargo",
+          "test",
+          "-p",
+          "mushroomdb-server",
+          "--test",
+          "mcp",
+          "impact"
+        ]
+      },
+      "full_prompt": "Work in this repository. Make the change described below, then run the test command it names and make sure it passes. Leave the edits in the working tree: do not commit, do not stash, do not revert.\n\n`render_impact` in `crates/core-api/src/repograph/render.rs` caps how many files it prints at the private constant `MAX_IMPACT_FILES`. Make that cap a setting: add a `max_files` field to `ImpactOptions` in `crates/core-api/src/repograph/impact.rs`, defaulting to the value the constant holds today; change `render_impact` to take the options by reference and use `max_files` in place of the constant; update every caller in the workspace to pass the options it already has (or the default).\n\nTest command: `cargo test -p mushroomdb-server --test mcp impact`",
+      "min_stock_turns": 30
+    },
+    {
+      "id": 4,
+      "key": "r1-blast-1",
+      "repo": "R1",
+      "kind": "blast",
+      "prompt": "`pub fn sanitize` is defined in `crates/core-api/src/repograph/render.rs`. Other places in this workspace define their own function of the same name, and the test fixtures do too; those are different functions and are not part of the answer. If this one changed its signature, which files under `crates/` would need attention? Give the file paths.",
+      "truth": {
+        "files": [
+          "crates/cli/src/recall.rs",
+          "crates/core-api/src/repograph/context.rs",
+          "crates/core-api/src/repograph/impact.rs",
+          "crates/core-api/src/repograph/map.rs",
+          "crates/core-api/src/repograph/owners.rs",
+          "crates/core-api/src/repograph/recall.rs",
+          "crates/core-api/src/repograph/why.rs"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "crates/cli/src/recall.rs"
+        },
+        {
+          "kind": "text",
+          "value": "crates/core-api/src/repograph/context.rs"
+        },
+        {
+          "kind": "text",
+          "value": "crates/core-api/src/repograph/impact.rs"
+        },
+        {
+          "kind": "text",
+          "value": "crates/core-api/src/repograph/map.rs"
+        },
+        {
+          "kind": "text",
+          "value": "crates/core-api/src/repograph/owners.rs"
+        },
+        {
+          "kind": "text",
+          "value": "crates/core-api/src/repograph/recall.rs"
+        },
+        {
+          "kind": "text",
+          "value": "crates/core-api/src/repograph/why.rs"
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\n`pub fn sanitize` is defined in `crates/core-api/src/repograph/render.rs`. Other places in this workspace define their own function of the same name, and the test fixtures do too; those are different functions and are not part of the answer. If this one changed its signature, which files under `crates/` would need attention? Give the file paths.",
+      "min_stock_turns": 21
+    },
+    {
+      "id": 5,
+      "key": "r1-blast-2",
+      "repo": "R1",
+      "kind": "blast",
+      "prompt": "`pub fn node_ref` is defined once in this workspace, in `crates/core-api/src/db.rs`. If its signature changed, which other files under `crates/*/src/` would need attention, and in which function does each of them call it? Give one line per file: the file path, then the name of a function in it that calls `node_ref`.",
+      "truth": {
+        "callers": [
+          {
+            "path": "crates/cli/src/ingest_git.rs",
+            "functions": [
+              "legacy_name_counts",
+              "run_ingest_git",
+              "write_marker",
+              "ingest_unit",
+              "marker_of"
+            ]
+          },
+          {
+            "path": "crates/cli/src/recall.rs",
+            "functions": [
+              "nudge_root",
+              "stale_concepts_describing"
+            ]
+          },
+          {
+            "path": "crates/cli/src/structure.rs",
+            "functions": [
+              "plan_file",
+              "diff_prop"
+            ]
+          },
+          {
+            "path": "crates/core-api/src/ingest.rs",
+            "functions": [
+              "infer_auto_fk"
+            ]
+          },
+          {
+            "path": "crates/core-api/src/repograph/facts.rs",
+            "functions": [
+              "str_prop",
+              "int_prop",
+              "list_prop",
+              "label_of"
+            ]
+          },
+          {
+            "path": "crates/core-api/src/repograph/map.rs",
+            "functions": [
+              "repo_map"
+            ]
+          },
+          {
+            "path": "crates/core-api/src/repograph/recall.rs",
+            "functions": [
+              "recall_digest"
+            ]
+          },
+          {
+            "path": "crates/server/src/http.rs",
+            "functions": [
+              "neighborhood"
+            ]
+          },
+          {
+            "path": "crates/server/src/mcp.rs",
+            "functions": [
+              "tool_neighborhood"
+            ]
+          },
+          {
+            "path": "crates/server/src/mcp_tasks.rs",
+            "functions": [
+              "project_repo"
+            ]
+          }
+        ]
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "crates/cli/src/ingest_git.rs"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "legacy_name_counts",
+            "run_ingest_git",
+            "write_marker",
+            "ingest_unit",
+            "marker_of"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "crates/cli/src/recall.rs"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "nudge_root",
+            "stale_concepts_describing"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "crates/cli/src/structure.rs"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "plan_file",
+            "diff_prop"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "crates/core-api/src/ingest.rs"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "infer_auto_fk"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "crates/core-api/src/repograph/facts.rs"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "str_prop",
+            "int_prop",
+            "list_prop",
+            "label_of"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "crates/core-api/src/repograph/map.rs"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "repo_map"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "crates/core-api/src/repograph/recall.rs"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "recall_digest"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "crates/server/src/http.rs"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "neighborhood"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "crates/server/src/mcp.rs"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "tool_neighborhood"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "crates/server/src/mcp_tasks.rs"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "project_repo"
+          ],
+          "min": 1
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\n`pub fn node_ref` is defined once in this workspace, in `crates/core-api/src/db.rs`. If its signature changed, which other files under `crates/*/src/` would need attention, and in which function does each of them call it? Give one line per file: the file path, then the name of a function in it that calls `node_ref`.",
+      "min_stock_turns": 19
+    },
+    {
+      "id": 6,
+      "key": "r1-localize-1",
+      "repo": "R1",
+      "kind": "localize",
+      "prompt": "A client writes through the HTTP API while another process holds the store's cross-process write lock. The write does not happen, nothing is corrupted, and the same request would succeed a moment later \u2014 but the client's own retry layer treats the reply as a permanent failure and gives up. Which file decides that reply, which function builds it, and which function routes the error into it? Give the file path and the two function names.",
+      "truth": {
+        "file": "crates/server/src/http.rs",
+        "builder": "busy_response",
+        "builder_line": 676,
+        "router": "graph_err",
+        "router_line": 685
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "crates/server/src/http.rs"
+        },
+        {
+          "kind": "text",
+          "value": "busy_response"
+        },
+        {
+          "kind": "text",
+          "value": "graph_err"
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\nA client writes through the HTTP API while another process holds the store's cross-process write lock. The write does not happen, nothing is corrupted, and the same request would succeed a moment later \u2014 but the client's own retry layer treats the reply as a permanent failure and gives up. Which file decides that reply, which function builds it, and which function routes the error into it? Give the file path and the two function names.",
+      "min_stock_turns": 10
+    },
+    {
+      "id": 7,
+      "key": "r1-localize-2",
+      "repo": "R1",
+      "kind": "localize",
+      "prompt": "A derived-edge rule whose condition is an OR, with a foreign-key match in one of its branches, produces no edges at all through that branch: the destinations only that branch could reach are silently missing, while the rule itself reports no error. The narrowing of the candidate set is what drops them. Which file and which function decide whether narrowing is safe for such a condition, and name a function that consults that decision. Give the file path and the two function names.",
+      "truth": {
+        "file": "crates/core-rules/src/def.rs",
+        "decider": "predicate_contains_keymatch",
+        "decider_line": 226,
+        "consumer_file": "crates/core-rules/src/engine.rs",
+        "consumers": [
+          "compute_desired",
+          "compute_desired_via"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "crates/core-rules/src/def.rs"
+        },
+        {
+          "kind": "text",
+          "value": "predicate_contains_keymatch"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "compute_desired",
+            "compute_desired_via"
+          ],
+          "min": 1
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\nA derived-edge rule whose condition is an OR, with a foreign-key match in one of its branches, produces no edges at all through that branch: the destinations only that branch could reach are silently missing, while the rule itself reports no error. The narrowing of the candidate set is what drops them. Which file and which function decide whether narrowing is safe for such a condition, and name a function that consults that decision. Give the file path and the two function names.",
+      "min_stock_turns": 6
+    },
+    {
+      "id": 8,
+      "key": "r1-navigate-1",
+      "repo": "R1",
+      "kind": "navigate",
+      "prompt": "A snapshot taken automatically keeps only a bounded number of WAL archives. Where is that bound declared \u2014 file path and line number \u2014 what is it called, which function applies it to a store, and name one function that calls that one.",
+      "truth": {
+        "const_file": "crates/cli/src/lib.rs",
+        "const_line": 70,
+        "const": "AUTO_SNAPSHOT_RETENTION",
+        "applies": "snapshot_automatically",
+        "callers": [
+          {
+            "path": "crates/cli/src/ingest_git.rs",
+            "function": "snapshot_if_due"
+          },
+          {
+            "path": "crates/cli/src/lib.rs",
+            "function": "snapshot_shared"
+          }
+        ]
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "crates/cli/src/lib.rs"
+        },
+        {
+          "kind": "line",
+          "file": "crates/cli/src/lib.rs",
+          "line": 70,
+          "tol": 2
+        },
+        {
+          "kind": "text",
+          "value": "AUTO_SNAPSHOT_RETENTION"
+        },
+        {
+          "kind": "text",
+          "value": "snapshot_automatically"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "snapshot_if_due",
+            "snapshot_shared"
+          ],
+          "min": 1
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\nA snapshot taken automatically keeps only a bounded number of WAL archives. Where is that bound declared \u2014 file path and line number \u2014 what is it called, which function applies it to a store, and name one function that calls that one.",
+      "min_stock_turns": 12
+    },
+    {
+      "id": 9,
+      "key": "r1-navigate-2",
+      "repo": "R1",
+      "kind": "navigate",
+      "prompt": "The MCP server answers to more tools than it lists by default. Which function builds the listing and decides how much of it to show \u2014 give its file path and line number \u2014 what is the command-line switch that asks for the full listing, and in which file and at which line is that switch parsed?",
+      "truth": {
+        "list_file": "crates/server/src/mcp.rs",
+        "list_line": 913,
+        "list_fn": "tools_list",
+        "flag": "--all-tools",
+        "flag_file": "crates/cli/src/lib.rs",
+        "flag_line": 1834
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "crates/server/src/mcp.rs"
+        },
+        {
+          "kind": "line",
+          "file": "crates/server/src/mcp.rs",
+          "line": 913,
+          "tol": 2
+        },
+        {
+          "kind": "text",
+          "value": "tools_list"
+        },
+        {
+          "kind": "text",
+          "value": "--all-tools"
+        },
+        {
+          "kind": "text",
+          "value": "crates/cli/src/lib.rs"
+        },
+        {
+          "kind": "line",
+          "file": "crates/cli/src/lib.rs",
+          "line": 1834,
+          "tol": 2
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\nThe MCP server answers to more tools than it lists by default. Which function builds the listing and decides how much of it to show \u2014 give its file path and line number \u2014 what is the command-line switch that asks for the full listing, and in which file and at which line is that switch parsed?",
+      "min_stock_turns": 6
+    },
+    {
+      "id": 10,
+      "key": "r1-history-1",
+      "repo": "R1",
+      "kind": "history",
+      "prompt": "Over the last 300 commits, which 5 files change in the same commit as `crates/cli/src/install.rs` most often? Give the 5 paths. Then, for the three it changes with most often: the short SHA of the most recent commit that touched that file and `crates/cli/src/install.rs` together \u2014 one SHA each \u2014 and, for the closest one of all, who has written it most, counted by commits that touch it.",
+      "truth": {
+        "top5": [
+          {
+            "path": "crates/cli/tests/install.rs",
+            "commits": 18
+          },
+          {
+            "path": "docs/site/skill.md",
+            "commits": 14
+          },
+          {
+            "path": "crates/cli/src/lib.rs",
+            "commits": 9
+          },
+          {
+            "path": "docs/site/quickstart.md",
+            "commits": 7
+          },
+          {
+            "path": "README.md",
+            "commits": 6
+          }
+        ],
+        "tied_for_last": [
+          "README.md",
+          "crates/cli/src/main.rs",
+          "docs/site/ingest-git.md"
+        ],
+        "runner_up": [
+          [
+            "crates/cli/src/main.rs",
+            6
+          ],
+          [
+            "docs/site/ingest-git.md",
+            6
+          ],
+          [
+            "crates/cli/src/doctor.rs",
+            5
+          ]
+        ],
+        "partner": "crates/cli/tests/install.rs",
+        "partner_author": "Matthew Sherlin",
+        "partner_email": "mattssherlin@gmail.com",
+        "partner_commits": 23,
+        "partner_name_variants": [
+          "Matthew Sherlin",
+          "Matthew Michael Sherlin"
+        ],
+        "last_shared_shas": [
+          "145d580",
+          "52c02ba",
+          "ca3d484"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "crates/cli/tests/install.rs"
+        },
+        {
+          "kind": "text",
+          "value": "docs/site/skill.md"
+        },
+        {
+          "kind": "text",
+          "value": "crates/cli/src/lib.rs"
+        },
+        {
+          "kind": "text",
+          "value": "docs/site/quickstart.md"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "README.md",
+            "crates/cli/src/main.rs",
+            "docs/site/ingest-git.md"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "author",
+          "values": [
+            "Matthew Sherlin",
+            "Matthew Michael Sherlin"
+          ],
+          "email": "mattssherlin@gmail.com"
+        },
+        {
+          "kind": "sha",
+          "value": "145d580"
+        },
+        {
+          "kind": "sha",
+          "value": "52c02ba"
+        },
+        {
+          "kind": "sha",
+          "value": "ca3d484"
+        }
+      ],
+      "extras": {
+        "kind": "sha",
+        "allowed": [
+          "145d580",
+          "52c02ba",
+          "ca3d484"
+        ]
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\nOver the last 300 commits, which 5 files change in the same commit as `crates/cli/src/install.rs` most often? Give the 5 paths. Then, for the three it changes with most often: the short SHA of the most recent commit that touched that file and `crates/cli/src/install.rs` together \u2014 one SHA each \u2014 and, for the closest one of all, who has written it most, counted by commits that touch it.",
+      "min_stock_turns": 11
+    },
+    {
+      "id": 11,
+      "key": "r2-change-1",
+      "repo": "R2",
+      "kind": "change",
+      "prompt": "Three helpers in `fastapi/dependencies/models.py` are memoised with `@lru_cache(maxsize=_CALLABLE_CLASSIFICATION_CACHE_SIZE)`. Make that bound settable at run time: add a `set_callable_classification_cache_size(size: int)` function to the same module that rebuilds all three caches at the new size and leaves them empty \u2014 an `lru_cache` cannot be resized in place \u2014 keeping 4096 as the default, and make sure the module's own callers go through whatever the current wrappers are. Add a test to `tests/test_dependency_models.py` that after setting the size to 1 the classification of two different callables leaves a cache holding one entry (`cache_info()`).\n\nTest command: `python -m pytest tests/test_dependency_models.py -q -x`",
+      "truth": {
+        "files": [
+          "fastapi/dependencies/models.py",
+          "tests/test_dependency_models.py"
+        ]
+      },
+      "checks": [],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": {
+        "cmd": [
+          "python",
+          "-m",
+          "pytest",
+          "tests/test_dependency_models.py",
+          "-q",
+          "-x"
+        ]
+      },
+      "full_prompt": "Work in this repository. Make the change described below, then run the test command it names and make sure it passes. Leave the edits in the working tree: do not commit, do not stash, do not revert.\n\nThree helpers in `fastapi/dependencies/models.py` are memoised with `@lru_cache(maxsize=_CALLABLE_CLASSIFICATION_CACHE_SIZE)`. Make that bound settable at run time: add a `set_callable_classification_cache_size(size: int)` function to the same module that rebuilds all three caches at the new size and leaves them empty \u2014 an `lru_cache` cannot be resized in place \u2014 keeping 4096 as the default, and make sure the module's own callers go through whatever the current wrappers are. Add a test to `tests/test_dependency_models.py` that after setting the size to 1 the classification of two different callables leaves a cache holding one entry (`cache_info()`).\n\nTest command: `python -m pytest tests/test_dependency_models.py -q -x`",
+      "min_stock_turns": 14
+    },
+    {
+      "id": 12,
+      "key": "r2-change-2",
+      "repo": "R2",
+      "kind": "change",
+      "prompt": "Server-sent-event responses ping an idle connection on a fixed interval: the module-level `_PING_INTERVAL` in `fastapi/sse.py`, read by the streaming request handler in `fastapi/routing.py`. Make it a per-response setting: add a `ping_interval: float | None = None` argument to `EventSourceResponse.__init__` and keep it on the instance; have the streaming handler use the response's value when it has one and the module constant otherwise; add a test to `tests/test_sse.py` that a response with a short interval pings sooner than the default would.\n\nTest command: `python -m pytest tests/test_sse.py -q -x`",
+      "truth": {
+        "files": [
+          "fastapi/routing.py",
+          "fastapi/sse.py",
+          "tests/test_sse.py"
+        ]
+      },
+      "checks": [],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": {
+        "cmd": [
+          "python",
+          "-m",
+          "pytest",
+          "tests/test_sse.py",
+          "-q",
+          "-x"
+        ]
+      },
+      "full_prompt": "Work in this repository. Make the change described below, then run the test command it names and make sure it passes. Leave the edits in the working tree: do not commit, do not stash, do not revert.\n\nServer-sent-event responses ping an idle connection on a fixed interval: the module-level `_PING_INTERVAL` in `fastapi/sse.py`, read by the streaming request handler in `fastapi/routing.py`. Make it a per-response setting: add a `ping_interval: float | None = None` argument to `EventSourceResponse.__init__` and keep it on the instance; have the streaming handler use the response's value when it has one and the module constant otherwise; add a test to `tests/test_sse.py` that a response with a short interval pings sooner than the default would.\n\nTest command: `python -m pytest tests/test_sse.py -q -x`",
+      "min_stock_turns": 23
+    },
+    {
+      "id": 13,
+      "key": "r2-change-3",
+      "repo": "R2",
+      "kind": "change",
+      "prompt": "`get_swagger_ui_html` takes a `swagger_ui_parameters` mapping that the application threads through from its own constructor argument, and writes those keys into the page it renders. `get_redoc_html` has no equivalent. Add one: a `redoc_ui_parameters: dict[str, Any] | None = None` argument on `get_redoc_html` whose keys are written onto the rendered Redoc element, a matching `redoc_ui_parameters` argument on the application that is stored and passed to it by the built-in `/redoc` route, and a test in `tests/test_local_docs.py` that a value passed there reaches the rendered HTML.\n\nTest command: `python -m pytest tests/test_local_docs.py -q -x`",
+      "truth": {
+        "files": [
+          "fastapi/applications.py",
+          "fastapi/openapi/docs.py",
+          "tests/test_local_docs.py"
+        ]
+      },
+      "checks": [],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": {
+        "cmd": [
+          "python",
+          "-m",
+          "pytest",
+          "tests/test_local_docs.py",
+          "-q",
+          "-x"
+        ]
+      },
+      "full_prompt": "Work in this repository. Make the change described below, then run the test command it names and make sure it passes. Leave the edits in the working tree: do not commit, do not stash, do not revert.\n\n`get_swagger_ui_html` takes a `swagger_ui_parameters` mapping that the application threads through from its own constructor argument, and writes those keys into the page it renders. `get_redoc_html` has no equivalent. Add one: a `redoc_ui_parameters: dict[str, Any] | None = None` argument on `get_redoc_html` whose keys are written onto the rendered Redoc element, a matching `redoc_ui_parameters` argument on the application that is stored and passed to it by the built-in `/redoc` route, and a test in `tests/test_local_docs.py` that a value passed there reaches the rendered HTML.\n\nTest command: `python -m pytest tests/test_local_docs.py -q -x`",
+      "min_stock_turns": 24
+    },
+    {
+      "id": 14,
+      "key": "r2-blast-1",
+      "repo": "R2",
+      "kind": "blast",
+      "prompt": "`lenient_issubclass` is defined in `fastapi/_compat/shared.py`. If its signature changed, which other files under `fastapi/` would need attention, and which functions in them call it? Give one line per file: the file path, then up to two functions in that file that call it.",
+      "truth": {
+        "callers": [
+          {
+            "path": "fastapi/_compat/v2.py",
+            "functions": [
+              "get_model_fields",
+              "get_flat_models_from_annotation",
+              "get_flat_models_from_field"
+            ]
+          },
+          {
+            "path": "fastapi/dependencies/utils.py",
+            "functions": [
+              "_get_flat_fields_from_params",
+              "add_non_field_param_to_dependency",
+              "analyze_param",
+              "request_params_to_args",
+              "is_union_of_base_models",
+              "_should_embed_body_fields",
+              "request_body_to_args"
+            ]
+          },
+          {
+            "path": "fastapi/openapi/utils.py",
+            "functions": [
+              "_get_openapi_operation_parameters",
+              "get_openapi_path"
+            ]
+          },
+          {
+            "path": "fastapi/routing.py",
+            "functions": [
+              "get_request_handler",
+              "_populate_api_route_state"
+            ]
+          }
+        ],
+        "definition": "fastapi/_compat/shared.py"
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "fastapi/_compat/v2.py"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "get_model_fields",
+            "get_flat_models_from_annotation",
+            "get_flat_models_from_field"
+          ],
+          "min": 2
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/dependencies/utils.py"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "_get_flat_fields_from_params",
+            "add_non_field_param_to_dependency",
+            "analyze_param",
+            "request_params_to_args",
+            "is_union_of_base_models",
+            "_should_embed_body_fields",
+            "request_body_to_args"
+          ],
+          "min": 2
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/openapi/utils.py"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "_get_openapi_operation_parameters",
+            "get_openapi_path"
+          ],
+          "min": 2
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/routing.py"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "get_request_handler",
+            "_populate_api_route_state"
+          ],
+          "min": 2
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\n`lenient_issubclass` is defined in `fastapi/_compat/shared.py`. If its signature changed, which other files under `fastapi/` would need attention, and which functions in them call it? Give one line per file: the file path, then up to two functions in that file that call it.",
+      "min_stock_turns": 7
+    },
+    {
+      "id": 15,
+      "key": "r2-blast-2",
+      "repo": "R2",
+      "kind": "blast",
+      "prompt": "`jsonable_encoder` is defined in `fastapi/encoders.py`. If its signature changed, which other files under `fastapi/` would need attention, and in which function or method does each of them call it? Give one line per file: the file path, then the name of the calling function.",
+      "truth": {
+        "callers": [
+          {
+            "path": "fastapi/exception_handlers.py",
+            "functions": [
+              "request_validation_exception_handler",
+              "websocket_request_validation_exception_handler"
+            ]
+          },
+          {
+            "path": "fastapi/openapi/docs.py",
+            "functions": [
+              "get_swagger_ui_html"
+            ]
+          },
+          {
+            "path": "fastapi/openapi/utils.py",
+            "functions": [
+              "_get_openapi_security_definitions",
+              "_get_openapi_operation_parameters",
+              "get_openapi_operation_request_body",
+              "get_openapi"
+            ]
+          },
+          {
+            "path": "fastapi/routing.py",
+            "functions": [
+              "serialize_response",
+              "_serialize_data",
+              "_serialize_sse_item"
+            ]
+          }
+        ],
+        "definition": "fastapi/encoders.py"
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "fastapi/exception_handlers.py"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "request_validation_exception_handler",
+            "websocket_request_validation_exception_handler"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/openapi/docs.py"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "get_swagger_ui_html"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/openapi/utils.py"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "_get_openapi_security_definitions",
+            "_get_openapi_operation_parameters",
+            "get_openapi_operation_request_body",
+            "get_openapi"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/routing.py"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "serialize_response",
+            "_serialize_data",
+            "_serialize_sse_item"
+          ],
+          "min": 1
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\n`jsonable_encoder` is defined in `fastapi/encoders.py`. If its signature changed, which other files under `fastapi/` would need attention, and in which function or method does each of them call it? Give one line per file: the file path, then the name of the calling function.",
+      "min_stock_turns": 10
+    },
+    {
+      "id": 16,
+      "key": "r2-localize-1",
+      "repo": "R2",
+      "kind": "localize",
+      "prompt": "A path operation declares a query parameter as a list whose element type carries its own metadata annotation \u2014 an annotated type nested inside the sequence. The parameter stops behaving like a sequence: a repeated query key arrives as a single value instead of a list, and no error is raised. Which file holds the two predicates that decide whether an annotation is a sequence and whether it is a sequence of scalars? Name the file, both predicates, and the two functions elsewhere in the package that ask them while a parameter is analysed.",
+      "truth": {
+        "file": "fastapi/_compat/shared.py",
+        "predicates": [
+          "field_annotation_is_sequence",
+          "field_annotation_is_scalar_sequence"
+        ],
+        "askers": [
+          "_get_multidict_value",
+          "analyze_param"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "fastapi/_compat/shared.py"
+        },
+        {
+          "kind": "text",
+          "value": "field_annotation_is_sequence"
+        },
+        {
+          "kind": "text",
+          "value": "field_annotation_is_scalar_sequence"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "_get_multidict_value",
+            "analyze_param"
+          ],
+          "min": 2
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\nA path operation declares a query parameter as a list whose element type carries its own metadata annotation \u2014 an annotated type nested inside the sequence. The parameter stops behaving like a sequence: a repeated query key arrives as a single value instead of a list, and no error is raised. Which file holds the two predicates that decide whether an annotation is a sequence and whether it is a sequence of scalars? Name the file, both predicates, and the two functions elsewhere in the package that ask them while a parameter is analysed.",
+      "min_stock_turns": 9
+    },
+    {
+      "id": 17,
+      "key": "r2-localize-2",
+      "repo": "R2",
+      "kind": "localize",
+      "prompt": "A router declares a path operation that streams items of a declared type. Mounted directly on the application it serialises them with that type; mounted through another router, the declared item type is lost and the stream is serialised without it, silently. Which file holds the state that carries that type onto a route, what is the route attribute called, which function sets it, and name a function that calls that one. Give the file path, the attribute, and the two function names.",
+      "truth": {
+        "file": "fastapi/routing.py",
+        "attribute": "stream_item_type",
+        "setter": "_populate_api_route_state",
+        "setter_line": 961,
+        "callers": [
+          "__init__",
+          "from_api_route"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "fastapi/routing.py"
+        },
+        {
+          "kind": "text",
+          "value": "stream_item_type"
+        },
+        {
+          "kind": "text",
+          "value": "_populate_api_route_state"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "__init__",
+            "from_api_route"
+          ],
+          "min": 1
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\nA router declares a path operation that streams items of a declared type. Mounted directly on the application it serialises them with that type; mounted through another router, the declared item type is lost and the stream is serialised without it, silently. Which file holds the state that carries that type onto a route, what is the route attribute called, which function sets it, and name a function that calls that one. Give the file path, the attribute, and the two function names.",
+      "min_stock_turns": 8
+    },
+    {
+      "id": 18,
+      "key": "r2-navigate-1",
+      "repo": "R2",
+      "kind": "navigate",
+      "prompt": "Trace how a route's declared response model reaches the generated OpenAPI document. Name, with the file each one lives in: the function that builds one path's entry in the document; the helper it calls to turn a model field into a JSON-Schema fragment, and the file that actually defines that helper rather than the one it is imported from; the function that collects every model's definitions once for the whole document; and the module-level constant that names the prefix those fragments refer to each other by.",
+      "truth": {
+        "path_builder": "get_openapi_path",
+        "path_builder_file": "fastapi/openapi/utils.py",
+        "path_builder_line": 311,
+        "schema_helper": "get_schema_from_model_field",
+        "definitions": "get_definitions",
+        "helpers_file": "fastapi/_compat/v2.py",
+        "prefix": "REF_PREFIX",
+        "prefix_file": "fastapi/openapi/constants.py"
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "get_openapi_path"
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/openapi/utils.py"
+        },
+        {
+          "kind": "text",
+          "value": "get_schema_from_model_field"
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/_compat/v2.py"
+        },
+        {
+          "kind": "text",
+          "value": "get_definitions"
+        },
+        {
+          "kind": "text",
+          "value": "REF_PREFIX"
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/openapi/constants.py"
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\nTrace how a route's declared response model reaches the generated OpenAPI document. Name, with the file each one lives in: the function that builds one path's entry in the document; the helper it calls to turn a model field into a JSON-Schema fragment, and the file that actually defines that helper rather than the one it is imported from; the function that collects every model's definitions once for the whole document; and the module-level constant that names the prefix those fragments refer to each other by.",
+      "min_stock_turns": 9
+    },
+    {
+      "id": 19,
+      "key": "r2-navigate-2",
+      "repo": "R2",
+      "kind": "navigate",
+      "prompt": "A router included in another router does not always name its own response class; when it does not, the parent's choice is used, and a sentinel tells the two apart. Which function resolves that \u2014 give its name and the file it is defined in \u2014 where is it applied to the response class (file path and line number), and what is the sentinel type called?",
+      "truth": {
+        "resolver": "get_value_or_default",
+        "resolver_file": "fastapi/utils.py",
+        "use_file": "fastapi/routing.py",
+        "use_line": 1329,
+        "sentinel": "DefaultPlaceholder"
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "get_value_or_default"
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/utils.py"
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/routing.py"
+        },
+        {
+          "kind": "line",
+          "file": "fastapi/routing.py",
+          "line": 1329,
+          "tol": 3
+        },
+        {
+          "kind": "text",
+          "value": "DefaultPlaceholder"
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\nA router included in another router does not always name its own response class; when it does not, the parent's choice is used, and a sentinel tells the two apart. Which function resolves that \u2014 give its name and the file it is defined in \u2014 where is it applied to the response class (file path and line number), and what is the sentinel type called?",
+      "min_stock_turns": 6
+    },
+    {
+      "id": 20,
+      "key": "r2-history-1",
+      "repo": "R2",
+      "kind": "history",
+      "prompt": "Over the last 2000 commits, which 5 files change in the same commit as `fastapi/routing.py` most often? Give the 5 paths. Then, for the three it changes with most often: the short SHA of the most recent commit that touched that file and `fastapi/routing.py` together \u2014 one SHA each \u2014 and, for the closest one of all, who has written it most, counted by commits that touch it.",
+      "truth": {
+        "top5": [
+          {
+            "path": "fastapi/dependencies/utils.py",
+            "commits": 16
+          },
+          {
+            "path": "fastapi/openapi/utils.py",
+            "commits": 15
+          },
+          {
+            "path": "fastapi/_compat/v2.py",
+            "commits": 11
+          },
+          {
+            "path": "fastapi/applications.py",
+            "commits": 11
+          },
+          {
+            "path": "fastapi/encoders.py",
+            "commits": 9
+          }
+        ],
+        "tied_for_last": [
+          "fastapi/encoders.py",
+          "pyproject.toml"
+        ],
+        "runner_up": [
+          [
+            "pyproject.toml",
+            9
+          ],
+          [
+            "fastapi/params.py",
+            8
+          ],
+          [
+            "fastapi/utils.py",
+            8
+          ]
+        ],
+        "partner": "fastapi/dependencies/utils.py",
+        "partner_author": "Sebasti\u00e1n Ram\u00edrez",
+        "partner_email": "tiangolo@gmail.com",
+        "partner_commits": 89,
+        "partner_name_variants": [
+          "Sebasti\u00e1n Ram\u00edrez"
+        ],
+        "last_shared_shas": [
+          "23e4a1043",
+          "027082950",
+          "5d5666bec"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "text",
+          "value": "fastapi/dependencies/utils.py"
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/openapi/utils.py"
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/_compat/v2.py"
+        },
+        {
+          "kind": "text",
+          "value": "fastapi/applications.py"
+        },
+        {
+          "kind": "any_of",
+          "values": [
+            "fastapi/encoders.py",
+            "pyproject.toml"
+          ],
+          "min": 1
+        },
+        {
+          "kind": "author",
+          "values": [
+            "Sebasti\u00e1n Ram\u00edrez"
+          ],
+          "email": "tiangolo@gmail.com"
+        },
+        {
+          "kind": "sha",
+          "value": "23e4a1043"
+        },
+        {
+          "kind": "sha",
+          "value": "027082950"
+        },
+        {
+          "kind": "sha",
+          "value": "5d5666bec"
+        }
+      ],
+      "extras": {
+        "kind": "sha",
+        "allowed": [
+          "23e4a1043",
+          "027082950",
+          "5d5666bec"
+        ]
+      },
+      "full_prompt": "Answer using only this repository. Be concise: give the facts asked for, one per line, nothing else.\n\nOver the last 2000 commits, which 5 files change in the same commit as `fastapi/routing.py` most often? Give the 5 paths. Then, for the three it changes with most often: the short SHA of the most recent commit that touched that file and `fastapi/routing.py` together \u2014 one SHA each \u2014 and, for the closest one of all, who has written it most, counted by commits that touch it.",
+      "min_stock_turns": 11
+    }
+  ],
+  "pilot": {
+    "run": "20260909T173733Z-pilot",
+    "min_turns": 6,
+    "dropped": [],
+    "rounds": [
+      {
+        "run": "20260909T171500Z-pilot",
+        "tasks": "all 20",
+        "dropped_under_the_floor": [
+          "r1-blast-2",
+          "r1-localize-2",
+          "r1-history-1",
+          "r2-change-1",
+          "r2-blast-1",
+          "r2-localize-1",
+          "r2-localize-2",
+          "r2-navigate-1",
+          "r2-history-1"
+        ]
+      },
+      {
+        "run": "20260909T173209Z-pilot",
+        "tasks": "the nine replacements",
+        "dropped_under_the_floor": [
+          "r1-history-1",
+          "r2-history-1"
+        ]
+      },
+      {
+        "run": "20260909T173733Z-pilot",
+        "tasks": "the two rebuilt history tasks",
+        "dropped_under_the_floor": []
+      }
+    ]
+  }
+}
