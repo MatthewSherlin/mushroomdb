@@ -1081,9 +1081,12 @@ fn snapshot_due(db_dir: &Path, full: bool) -> bool {
 /// Write a snapshot if one is due, after the run's own writes are committed.
 ///
 /// The WAL is archived rather than dropped — see [`AUTOMATIC_SNAPSHOT`], which
-/// every snapshot mushroomdb takes on its own shares.
+/// every snapshot mushroomdb takes on its own shares — and the archives are
+/// bounded by [`AUTO_SNAPSHOT_RETENTION`], so a store that syncs on every
+/// commit does not grow an archive per 4 MiB of churn forever.
 ///
 /// [`AUTOMATIC_SNAPSHOT`]: crate::AUTOMATIC_SNAPSHOT
+/// [`AUTO_SNAPSHOT_RETENTION`]: crate::AUTO_SNAPSHOT_RETENTION
 ///
 /// # Why it never fails the run
 ///
@@ -1104,7 +1107,7 @@ fn snapshot_if_due(db: &SharedDb, db_dir: &Path, full: bool) {
     }
     let taken = db
         .write_with_wait(WRITE_LOCK_WAIT)
-        .and_then(|mut g| g.snapshot_with(crate::AUTOMATIC_SNAPSHOT));
+        .and_then(|mut g| crate::snapshot_automatically(&mut g));
     match taken {
         Ok(()) | Err(GraphError::Busy { .. }) => {}
         Err(e) => eprintln!("snapshot skipped: {e}"),
