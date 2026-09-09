@@ -613,6 +613,31 @@ hook then walks the graph outward, so a prompt about one file surfaces what it
 imports, what calls into it, the files that change with it, the guide that
 describes it and the person who owns it, before any file is read.
 
+### When it says nothing
+
+Not every prompt is about the repository, and the hook runs on all of them. Two
+guards keep a conversational turn from being answered with graph content, and
+either one is enough to print nothing at all:
+
+- **Stopwords.** The prompt is searched as an `OR` of its words, and an `OR` of
+  function words matches nearly every indexed document — `the` on its own used
+  to return a full digest of six near-random nodes. 146 English function words
+  and six that say nothing inside a repository (`code`, `file`, `line` and
+  their plurals) are dropped before the search. With no word left, there is no
+  query and no output. The words a repository question turns on — `test`,
+  `fix`, `add`, `call`, `run`, `name`, `key` — are deliberately kept.
+- **A relevance floor.** What survives the stopwords can still match by
+  coincidence, so the best hit's BM25 score has to clear a minimum before
+  anything prints. The floor is low by design: BM25 sums over the terms of an
+  `OR`, so a long vague prompt outscores a short precise one and an absolute
+  floor is a blunt instrument. It catches the degenerate case the stopwords
+  cannot see — a query whose every term is spread evenly across the index.
+
+So `what is the weather today` prints nothing on a code graph, while `why does
+install.rs change with tests/install.rs` prints the digest. A prompt that is
+generic in wording but names something real (`fix the test in recall`) keeps
+`fix`, `test` and `recall` and still fires.
+
 ### When the working tree is dirty
 
 A change already in progress is the more useful subject, so when the prompt
@@ -638,7 +663,8 @@ file already open is not news; the first line becomes
 `you are editing crates/cli/src/install.rs (+1 more)`. At most eight lines print
 under the framing line, inside the same byte budget the digest keeps, and the
 whole run took 0.30 s on the 637-commit graph of this repository. A clean
-checkout, or a prompt sent from outside one, gets the topic digest as before.
+checkout, or a prompt sent from outside one, gets the topic digest — or nothing,
+if the prompt is not about this repository.
 
 The same data answers direct questions:
 

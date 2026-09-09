@@ -172,13 +172,27 @@ ours to remove, so a file we never touched stays byte-identical.
 
 The prompt hook runs `<bin> recall <db>`, which opens the store without
 migration or WAL repair (`auto_migrate: false`, `repair_wal: false`) — it fires
-on every prompt and must not write to the store. It prints one of two things:
-the topic digest for the prompt, or — when the payload's `cwd` is a checkout
-with uncommitted changes — a nudge of at most eight lines naming what those
-files reach that is not already in the diff. Both open with a line marking the
-content as untrusted graph data, and control characters are stripped from every
-rendered value: node keys and names are ingested content, and for an
-`ingest-git` store any contributor to the repository controls them.
+on every prompt and must not write to the store. It prints one of three things:
+
+1. **A nudge**, when the payload's `cwd` is a checkout with uncommitted
+   changes — at most eight lines naming what those files reach that is not
+   already in the diff. A change in progress is the more useful subject.
+2. **The topic digest** for the prompt, when the tree is clean and the prompt
+   is about something the graph holds.
+3. **Nothing at all**, when the prompt is not about this repository. A prompt
+   made only of function words (`the`, `is it done`, `ok thanks`) leaves no
+   search term behind, and a prompt whose best hit cannot clear a relevance
+   floor has matched by coincidence rather than by subject. Either way the
+   hook exits 0 having written nothing — no framing line, no header.
+
+The third case is the common one for conversational turns, and it is the point:
+an unrelated digest costs the model a few hundred tokens *and* puts six
+unrelated files in front of it as though they were relevant.
+
+The first two open with a line marking the content as untrusted graph data, and
+control characters are stripped from every rendered value: node keys and names
+are ingested content, and for an `ingest-git` store any contributor to the
+repository controls them.
 
 The `PostToolUse` hook runs `<bin> touch <db>` after an `Edit`, `Write` or
 `MultiEdit`, which re-extracts that one file — symbols, imports, mentions and

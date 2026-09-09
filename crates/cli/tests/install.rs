@@ -2028,6 +2028,18 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
             text.contains("no auth"),
             "{name}: MCP trust model undocumented"
         );
+        // `create_rule` is a store-wide write that keeps firing on every later
+        // ingest, and it is still callable. The consent instruction is the
+        // only thing standing between an assistant and creating one silently.
+        assert!(
+            text.contains("create a rule silently"),
+            "{name}: create_rule consent guardrail missing"
+        );
+        assert!(
+            text.contains("ambiguous target labels"),
+            "{name}: polymorphic FK remedy undocumented — the engine emits that \
+             string and nothing tells the assistant what to do about it"
+        );
         assert!(
             text.contains("ingest-git"),
             "{name}: ingest-git bootstrap undocumented"
@@ -2052,6 +2064,19 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
         template.len() <= 6_000,
         "SKILL.md must stay under 6 KB — it is re-read every turn, got {} bytes",
         template.len()
+    );
+    // And the rendered plugin copy, which is the one a plugin user re-reads:
+    // `{{BIN}}` expands to an `npx` invocation there, so it is always the
+    // larger of the two and the budget has to be checked on it directly.
+    let plugin = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/plugin/skills/mushroom/SKILL.md"),
+    )
+    .expect("rendered plugin skill");
+    assert!(
+        plugin.len() <= 6_000,
+        "the rendered plugin SKILL.md must stay under 6 KB too, got {} bytes",
+        plugin.len()
     );
     assert!(
         rules.lines().count() <= 60,
