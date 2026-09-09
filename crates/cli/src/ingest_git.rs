@@ -26,7 +26,7 @@ use crate::structure;
 use crate::CliError;
 use core_api::{
     default_max_edges, Direction, GraphError, IngestOptions, Predicate, ResultSet, RuleDef,
-    SharedDb, Value, WriteGuard, WRITE_LOCK_WAIT,
+    SharedDb, SnapshotOptions, Value, WriteGuard, WRITE_LOCK_WAIT,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -46,6 +46,17 @@ pub use core_api::repograph::DEFAULT_EXCLUDES;
 
 /// Minimum jaccard overlap of two files' `commits` lists for `CO_CHANGED`.
 const CO_CHANGE_MIN: f64 = 0.25;
+
+/// WAL bytes past the last snapshot that make writing a new one worthwhile.
+///
+/// Every open reads `wal.bin` whole and replays it frame by frame, so the tail
+/// is paid again on every hook, every MCP start and every CLI call — while a
+/// snapshot is paid once by the run that writes it. Measured on this
+/// repository, an 8.1 MB tail costs 156 ms per open against ~440 ms to
+/// snapshot it away, so a tail this size pays its snapshot back within three
+/// opens. Below the threshold the replay is cheap enough that snapshotting on
+/// every incremental run would cost more than it saves.
+pub const SNAPSHOT_WAL_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Key of the singleton `GitSync` node holding the last ingested sha.
 ///
@@ -1044,6 +1055,66 @@ struct Pending {
     nested: Vec<String>,
 }
 
+/// Whether `db_dir` would open faster if this run left a snapshot behind.
+///
+/// A full ingest always qualifies: it is the run that writes the whole history
+/// into an empty WAL, and leaving that WAL to be replayed on every subsequent
+/// open is the single largest fixed cost in the hook path. An incremental run
+/// qualifies when the store has no snapshot at all — a store built by an older
+/// release, or one whose full ingest predates this rule — or when the tail
+/// past the last snapshot has grown beyond [`SNAPSHOT_WAL_BYTES`].
+///
+/// The tail *is* `wal.bin`: a snapshot replaces the live WAL with a minimal
+/// baseline, so its length on disk measures exactly what an open has to replay.
+fn snapshot_due(db_dir: &Path, full: bool) -> bool {
+    if full || !db_dir.join("snapshot.bin").exists() {
+        return true;
+    }
+    std::fs::metadata(db_dir.join("wal.bin")).is_ok_and(|m| m.len() > SNAPSHOT_WAL_BYTES)
+}
+
+/// Write a snapshot if one is due, after the run's own writes are committed.
+///
+/// # Why the WAL is archived rather than dropped
+///
+/// A plain `snapshot()` replaces the live WAL with a minimal baseline and
+/// discards what it held. That is the right trade for a store nobody asks
+/// about the past of — but `node_history`, `edge_history`, `was_linked` and
+/// `open_at` all read the WAL, so folding an ingest's WAL away would make a
+/// store forget how every node in it came to be. Archiving instead moves those
+/// frames to `wal.<N>.archive`, which the history reads still consult and the
+/// *open* path does not, so the open gets faster and nothing is lost. The
+/// price is disk: the frames are moved, not deleted.
+///
+/// # Why it never fails the run
+///
+/// A snapshot is an optimisation for the *next* open, and the data is already
+/// durable either way:
+///
+/// * `Busy` — another process holds the cross-process write lock. Skipped
+///   without a word; the next run that qualifies takes it.
+/// * anything else — reported on stderr, because a store that cannot be
+///   snapshotted is worth knowing about, and the run still succeeds.
+///
+/// Call this only from a run that reached its write phase. A run with nothing
+/// to do returns before entering a write scope, and taking the lock to
+/// snapshot would turn a genuine no-op into a write.
+fn snapshot_if_due(db: &SharedDb, db_dir: &Path, full: bool) {
+    if !snapshot_due(db_dir, full) {
+        return;
+    }
+    let taken = db.write_with_wait(WRITE_LOCK_WAIT).and_then(|mut g| {
+        g.snapshot_with(SnapshotOptions {
+            archive_wal: true,
+            keep_wal: false,
+        })
+    });
+    match taken {
+        Ok(()) | Err(GraphError::Busy { .. }) => {}
+        Err(e) => eprintln!("snapshot skipped: {e}"),
+    }
+}
+
 pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitReport, CliError> {
     // Absolute and symlink-free: it is recorded on the marker, and a later run
     // has no reason to share this one's working directory.
@@ -1236,6 +1307,12 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     for p in &pending {
         write_marker(&mut w, p, opts)?;
     }
+
+    // Every write this run makes is now committed, so leave the store in the
+    // shape that opens fastest. The guard is released first: `snapshot()` takes
+    // the same cross-process write lock this one holds.
+    drop(w);
+    snapshot_if_due(&db, db_dir, !report.incremental);
     Ok(report)
 }
 
@@ -1724,6 +1801,12 @@ pub fn run_sync(db_dir: &Path) -> Result<SyncReport, CliError> {
         other => CliError(other.to_string()),
     })?;
     report.structure = structure::refresh_files(&mut w, &repo, "", &paths, opts.docs)?;
+
+    // The history half already snapshotted if this was a first ingest; this
+    // covers the tail the dirty pass just appended. `full` is false because a
+    // sync is by definition a run against a store that already exists.
+    drop(w);
+    snapshot_if_due(&db, db_dir, false);
     Ok(report)
 }
 

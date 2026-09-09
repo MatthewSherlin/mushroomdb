@@ -288,6 +288,160 @@ fn sync_reports_busy_when_lock_held() {
     assert_eq!(r.git.commits, 1);
 }
 
+// ── snapshots ───────────────────────────────────────────────────────────────
+
+fn wal_len(db_dir: &Path) -> u64 {
+    std::fs::metadata(db_dir.join("wal.bin")).map_or(0, |m| m.len())
+}
+
+/// Enough Markdown to push one incremental run's WAL tail past
+/// [`cli::ingest_git::SNAPSHOT_WAL_BYTES`]. Each file stores a body prop, so
+/// the WAL grows roughly with the bytes committed.
+fn bulky_docs() -> Vec<(String, String)> {
+    let para = "Nodes and edges and rules and files and symbols and commits. ".repeat(1_000);
+    (0..96)
+        .map(|n| {
+            (
+                format!("docs/page{n}.md"),
+                format!("# Page {n}\n\n{para}\n"),
+            )
+        })
+        .collect()
+}
+
+/// A first ingest is the run that writes the whole history into an empty WAL.
+/// Leaving that WAL to be replayed makes every later open — every hook, every
+/// MCP start — pay for it, so the run that wrote it snapshots it away.
+#[test]
+fn full_ingest_writes_a_snapshot() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    assert!(
+        db_dir.join("snapshot.bin").is_file(),
+        "a full ingest leaves a snapshot behind"
+    );
+    // The default snapshot replaces the WAL with a minimal baseline, so a
+    // reopen replays almost nothing.
+    assert!(
+        wal_len(&db_dir) < cli::ingest_git::SNAPSHOT_WAL_BYTES,
+        "the WAL was replaced by a baseline, not left whole: {} bytes",
+        wal_len(&db_dir)
+    );
+    // And the store still reads correctly through that snapshot — including
+    // the past. The WAL frames were archived, not dropped, so a store does not
+    // forget how its nodes came to be in exchange for opening faster.
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(db.has_node("src/net.rs"), "the graph survived the snapshot");
+    assert_eq!(out(&db, "src/net.rs", "IMPORTS"), vec!["src/util.rs"]);
+    assert!(
+        !db.node_history("src/net.rs").unwrap().is_empty(),
+        "the snapshot kept the history readable"
+    );
+    assert!(
+        db.edge_history("src/net.rs", "src/util.rs")
+            .unwrap()
+            .items
+            .iter()
+            .any(|e| e.edge_type == "IMPORTS"),
+        "the IMPORTS edge is still explainable after the snapshot"
+    );
+}
+
+/// An incremental run snapshots only when the tail it appended is long enough
+/// to be worth the write. A small sync leaves the snapshot alone; a large one
+/// folds itself in.
+#[test]
+fn incremental_sync_snapshots_past_the_threshold() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+    let first = std::fs::metadata(db_dir.join("snapshot.bin"))
+        .unwrap()
+        .len();
+
+    // A small commit: under the threshold, so the snapshot is not rewritten.
+    commit(&repo, "one more", &[("src/extra.rs", "//! Extra.\n")]);
+    run_sync(&db_dir).unwrap();
+    assert_eq!(
+        std::fs::metadata(db_dir.join("snapshot.bin"))
+            .unwrap()
+            .len(),
+        first,
+        "a small incremental run is not worth a snapshot"
+    );
+    let small_tail = wal_len(&db_dir);
+    assert!(small_tail > 0, "the increment is in the WAL");
+
+    // A bulky one: the tail clears the threshold and is folded in.
+    let docs = bulky_docs();
+    let files: Vec<(&str, &str)> = docs.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    commit(&repo, "a pile of docs", &files);
+    run_sync(&db_dir).unwrap();
+
+    let after = wal_len(&db_dir);
+    assert!(
+        after < small_tail.max(cli::ingest_git::SNAPSHOT_WAL_BYTES),
+        "the long tail was folded into the snapshot, leaving {after} bytes"
+    );
+    assert!(
+        std::fs::metadata(db_dir.join("snapshot.bin"))
+            .unwrap()
+            .len()
+            > first,
+        "the snapshot grew to hold what the WAL no longer carries"
+    );
+    let db = GraphDb::open(&db_dir).unwrap();
+    assert!(db.has_node("docs/page0.md"), "nothing was lost");
+}
+
+/// `touch` runs on every edit the assistant makes, inside the hook's budget.
+/// A snapshot costs hundreds of milliseconds, so it never takes one — even
+/// when the store has none at all and one would otherwise be due.
+#[test]
+fn touch_never_snapshots() {
+    let repo = seed_repo();
+    let db_dir = tmp("db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    // Get the files into the graph, then rewrite every one of them through
+    // `touch` alone. That pushes the WAL tail past the threshold, so a
+    // snapshot is unambiguously due by the time the last edit lands — and only
+    // the rule that `touch` never takes one can keep it away.
+    let docs = bulky_docs();
+    let files: Vec<(&str, &str)> = docs.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    commit(&repo, "a pile of docs", &files);
+    run_sync(&db_dir).unwrap();
+    let before = std::fs::read(db_dir.join("snapshot.bin")).unwrap();
+
+    let edited: Vec<(String, String)> = docs
+        .iter()
+        .map(|(p, b)| (p.clone(), format!("{b}\nEdited by the assistant.\n")))
+        .collect();
+    write_files(
+        &repo,
+        &edited
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let named: Vec<PathBuf> = edited.iter().map(|(p, _)| repo.join(p)).collect();
+    let r = run_touch(&db_dir, &named, None).unwrap();
+    assert_eq!(r.files_scanned, docs.len(), "every edit was taken: {r:?}");
+
+    assert!(
+        wal_len(&db_dir) > cli::ingest_git::SNAPSHOT_WAL_BYTES,
+        "a snapshot is genuinely due: {} bytes of tail",
+        wal_len(&db_dir)
+    );
+    assert_eq!(
+        std::fs::read(db_dir.join("snapshot.bin")).unwrap(),
+        before,
+        "touch stays inside the hook budget and writes no snapshot"
+    );
+}
+
 // ── touch ───────────────────────────────────────────────────────────────────
 
 /// Run the real binary with `stdin` piped in, and return
