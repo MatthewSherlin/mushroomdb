@@ -86,5 +86,11 @@ if have npx; then
   fi
 fi
 
-# 4. Whatever went wrong above, the slow form still works.
+# 4. Whatever went wrong above, the slow form still works — when there is an
+#    npx to run it with. Without one there is no rung left, and `exec` on a
+#    missing program prints `run.sh: line N: exec: npx: not found` and exits
+#    127. On UserPromptSubmit that is an error line before every prompt. The
+#    plugin cannot work without npx either way, so nothing is lost by saying
+#    so quietly: a hook that has nothing to do exits 0 and prints nothing.
+have npx || exit 0
 exec npx -y "$PKG" "$@"

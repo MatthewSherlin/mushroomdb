@@ -196,6 +196,38 @@ test "$calls" = 1 || {
   exit 1
 }
 
+echo "== run.sh: no cache and no npx is silent, not an error"
+# The last rung is `exec npx`, and `exec` on a program that is not there prints
+# `exec: npx: not found` and exits 127. These hooks run on every prompt and
+# every edit, so that is an error line before every prompt for anyone without
+# npx — and the plugin cannot work without npx either way, so there is nothing
+# to report. Nothing on stdout, nothing on stderr, exit 0.
+NONODE="$WORKDIR/no-npx-bin"
+mkdir -p "$NONODE"
+for prog in sh cat mkdir printf tail; do
+  p=$(command -v "$prog" 2>/dev/null) && ln -sf "$p" "$NONODE/$prog"
+done
+set +e
+env -u CLAUDE_PLUGIN_DATA -u HOME PATH="$NONODE" \
+  "$PKG/plugin/hooks/run.sh" --help \
+  >"$WORKDIR/nonpx.out" 2>"$WORKDIR/nonpx.err"
+st=$?
+set -e
+test "$st" -eq 0 || {
+  echo "run.sh without npx must exit 0, got $st" >&2
+  exit 1
+}
+test ! -s "$WORKDIR/nonpx.out" || {
+  echo "run.sh without npx printed to stdout:" >&2
+  cat "$WORKDIR/nonpx.out" >&2
+  exit 1
+}
+test ! -s "$WORKDIR/nonpx.err" || {
+  echo "run.sh without npx printed to stderr:" >&2
+  cat "$WORKDIR/nonpx.err" >&2
+  exit 1
+}
+
 echo "== run.sh: a cached binary that has gone falls back to the launcher"
 # npm's cache can be pruned. The stale line must be skipped, not trusted.
 printf '%s\n' "$WORKDIR/gone/mushroomdb" > "$CACHE_DIR/binary-${PLUGIN_VERSION}"
