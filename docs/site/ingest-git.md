@@ -555,6 +555,11 @@ kept deliberately outside the repository. A user-scope install always pins
 `~/.mushroomdb/memory`, since `--auto` inside any checkout would resolve to
 that project instead.
 
+`--auto` is written only where step 2 can answer. A project install *outside* a
+git checkout has no working tree root to resolve against, so it pins the store
+to the project directory rather than risk a hook that never receives
+`$CLAUDE_PROJECT_DIR` quietly building a second store under the home directory.
+
 `mushroomdb --version` (or `mushroomdb version`) prints `mushroomdb <version>`.
 
 ## Concurrency

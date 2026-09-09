@@ -901,9 +901,92 @@ fn prewarm_is_skipped_with_no_prewarm() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: the package is resolved to a launcher once, at install time, so no
-//       hook spawns `npx` on every prompt and every edit
+// Test: the package is resolved once, at install time, to the thing every
+//       other form ends up running anyway — so no hook spawns `npx`, and none
+//       starts a Node runtime either
 // ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn hooks_use_the_native_binary_when_resolvable() {
+    let root = temp_dir("binary-ok");
+    let home = temp_dir("binary-ok-home");
+    let bin_dir = temp_dir("binary-ok-bin");
+    let hooks = git_repo(&root);
+    // A binary path with a space in it: whatever npm's cache is called, the
+    // written command has to survive it.
+    let pkg = temp_dir("binary ok pkg");
+    let binary = fake_program(&pkg, "mushroomdb", "exit 0\n");
+    let log = bin_dir.join("argv.txt");
+
+    // An `npx` that answers `--print-binary` with that path.
+    fake_program(
+        &bin_dir,
+        "npx",
+        &format!(
+            "printf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' '{}'\n",
+            log.display(),
+            binary.display()
+        ),
+    );
+    fake_program(&bin_dir, "node", "exit 0\n");
+
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        prewarm: true,
+        ..base_opts()
+    };
+    let out = run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::npx(),
+        &externals_in(&bin_dir),
+    )
+    .expect("install");
+
+    assert!(!out.contains("warning"), "{out}");
+
+    // npx ran exactly once, and only to ask where the binary is. The launcher
+    // is never asked for, and the pre-warm is redundant after it — the very
+    // same fetch already warmed the cache.
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        format!("-y\nmushroomdb@{VERSION}\n--print-binary\n"),
+        "npx must be spawned once, and only to resolve the binary"
+    );
+
+    // Every written command runs the binary directly: no `npx`, no `node`.
+    let quoted = format!("'{}'", binary.display());
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        format!("{quoted} recall --auto")
+    );
+    assert_eq!(
+        s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+        format!("{quoted} touch --auto")
+    );
+    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
+    assert!(body.contains(&format!("( {quoted} sync --auto ")), "{body}");
+    for f in ["post-checkout", "post-merge"] {
+        let b = fs::read_to_string(hooks.join(f)).unwrap();
+        assert!(!b.contains("npx") && !b.contains("node "), "{f}: {b}");
+    }
+
+    // The MCP entry too, unquoted: a host spawns an argv, where quotes would
+    // become part of the filename.
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["command"],
+        binary.to_str().unwrap()
+    );
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["args"],
+        serde_json::json!(["mcp", "--auto"])
+    );
+}
 
 #[test]
 #[cfg(unix)]
@@ -919,13 +1002,18 @@ fn launcher_is_resolved_once_and_every_hook_calls_node() {
     fs::write(&launcher, "// launcher\n").unwrap();
     let log = bin_dir.join("argv.txt");
 
-    // An `npx` that answers `--print-launcher` with that path, and a `node`
-    // that only has to exist for the resolution to be usable.
+    // An `npx` standing in for a package whose vendored binary was never
+    // fetched: `--print-binary` fails the way the real launcher does, and
+    // `--print-launcher` answers. `node` only has to exist to be usable.
     fake_program(
         &bin_dir,
         "npx",
         &format!(
-            "printf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' '{}'\n",
+            "printf '%s\\n' \"$@\" >> '{}'\n\
+             for a in \"$@\"; do\n\
+             \x20 [ \"$a\" = --print-binary ] && exit 1\n\
+             done\n\
+             printf '%s\\n' '{}'\n",
             log.display(),
             launcher.display()
         ),
@@ -949,12 +1037,15 @@ fn launcher_is_resolved_once_and_every_hook_calls_node() {
 
     assert!(!out.contains("warning"), "{out}");
 
-    // npx ran exactly once, for the resolution. The pre-warm is redundant
-    // after it — the very same fetch already warmed the cache.
+    // The binary was asked for first and refused; the launcher is the second
+    // rung, not the first choice.
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
-        format!("-y\nmushroomdb@{VERSION}\n--print-launcher\n"),
-        "npx must be spawned once, and only to resolve the launcher"
+        format!(
+            "-y\nmushroomdb@{VERSION}\n--print-binary\n\
+             -y\nmushroomdb@{VERSION}\n--print-launcher\n"
+        ),
+        "the binary must be tried before the launcher"
     );
 
     // Every written command runs the launcher directly, quoted for the space.
@@ -984,13 +1075,14 @@ fn launcher_is_resolved_once_and_every_hook_calls_node() {
 
 #[test]
 #[cfg(unix)]
-fn an_unresolvable_launcher_falls_back_to_npx_with_a_warning() {
+fn an_unresolvable_package_falls_back_to_npx_with_a_warning() {
     let root = temp_dir("launcher-bad");
     let home = temp_dir("launcher-bad-home");
     let bin_dir = temp_dir("launcher-bad-bin");
     git_repo(&root);
 
-    // An `npx` that answers with a path that is not there.
+    // An `npx` that answers both questions with a path that is not there, so
+    // every rung of the chain fails and the last one has to hold.
     fake_program(
         &bin_dir,
         "npx",

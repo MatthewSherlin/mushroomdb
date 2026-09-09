@@ -61,6 +61,9 @@ const PREWARM_TIMEOUT_SECS: u64 = 180;
 /// machine with `npx` has it, since npm ships with Node.
 const NODE_BIN: &str = "node";
 
+/// The flag the npm launcher answers with the vendored native binary's path.
+const PRINT_BINARY_FLAG: &str = "--print-binary";
+
 /// The flag the npm launcher answers with its own absolute path.
 const PRINT_LAUNCHER_FLAG: &str = "--print-launcher";
 
@@ -84,13 +87,26 @@ pub enum McpCommand {
     /// be located, and the only form that works from a machine where nothing
     /// is installed globally.
     Npx { version: String },
-    /// `node <launcher.js> …` — the same published package, resolved to a
-    /// concrete path once at install time instead of on every invocation.
+    /// The published package's own native binary, located once at install time
+    /// and run directly. The fast form, and what a hook gets whenever the
+    /// package has been fetched.
     ///
-    /// `npx` re-checks its cache, resolves the version and spawns a Node
-    /// process before the first byte of work: measured at 514 ms warm against
-    /// 118 ms for `node <launcher>`. A hook pays that on every prompt and
-    /// every edit, so install pays it once and writes down the answer.
+    /// Everything else in this enum that reaches the published package ends up
+    /// running this exact file; the difference is what it costs to get there.
+    /// Measured warm, `--version` end to end: `npx` 514 ms, `node <launcher>`
+    /// 118 ms, this 7 ms. Node's own startup is nearly all of the difference —
+    /// the launcher script's only job is to spawn this binary — and a hook pays
+    /// it on every prompt and every edit.
+    NativeBinary {
+        /// Absolute path to the vendored executable.
+        binary: PathBuf,
+        /// The version it was resolved from; re-resolved on upgrade.
+        version: String,
+    },
+    /// `node <launcher.js> …` — the same published package reached through its
+    /// npm shim. The fallback for an install whose native binary could not be
+    /// located (a postinstall that never fetched it, say): still resolved once
+    /// rather than on every invocation, just through a Node startup.
     NodeLauncher {
         /// Absolute path to the package's `bin` script.
         launcher: PathBuf,
@@ -120,6 +136,9 @@ impl McpCommand {
                 "npx".to_string(),
                 vec!["-y".to_string(), format!("{NPM_PACKAGE}@{version}")],
             ),
+            McpCommand::NativeBinary { binary, .. } => {
+                (binary.to_string_lossy().into_owned(), Vec::new())
+            }
             McpCommand::NodeLauncher { launcher, .. } => (
                 NODE_BIN.to_string(),
                 vec![launcher.to_string_lossy().into_owned()],
@@ -146,14 +165,14 @@ impl McpCommand {
     /// quoted where quoting is needed.
     ///
     /// Hook entries and the skill's copy-paste lines are read by a shell, so
-    /// an explicit path — and a resolved launcher path, which lives wherever
-    /// npm put it — has to survive a space in it. The bare name and the `npx`
-    /// form contain no metacharacters and are left as they read.
+    /// an explicit path — and a resolved binary or launcher path, which lives
+    /// wherever npm put it — has to survive a space in it. The bare name and
+    /// the `npx` form contain no metacharacters and are left as they read.
     #[must_use]
     pub fn shell(&self) -> String {
         let (command, args) = self.program();
         let mut out = match self {
-            McpCommand::Explicit(_) => sh_quote(&command),
+            McpCommand::Explicit(_) | McpCommand::NativeBinary { .. } => sh_quote(&command),
             _ => command,
         };
         for a in args {
@@ -640,32 +659,28 @@ fn capture_with_timeout(bin: &Path, args: &[String], timeout: Duration) -> Resul
     }
 }
 
-/// Ask the published package where its launcher script is, once.
+/// Ask the published package where something of its own is, once.
 ///
-/// `npx -y mushroomdb@<v> --print-launcher` prints the absolute path of the
-/// `bin` script npm installed, which is a stable file for as long as that
-/// version stays in the npx cache. Writing `node <that path>` into the hooks
-/// takes the whole npx resolution — cache check, version resolve, an extra
-/// Node process — off the per-prompt and per-edit path.
+/// `flag` is [`PRINT_BINARY_FLAG`] or [`PRINT_LAUNCHER_FLAG`]; the package
+/// answers with an absolute path and exits. Writing that path into the hooks
+/// takes the whole npx resolution — cache check, version resolve, an extra Node
+/// process — off the per-prompt and per-edit path.
 ///
 /// Chosen over `npm root -g` (only finds a *global* install, which the npx
 /// route never makes) and over `npm exec --offline` (still pays npm's own
 /// startup on every call). Asking the package itself is the one answer that is
-/// correct for however it was installed, and it is the same command the
-/// pre-warm already ran, so it costs an install nothing extra.
+/// correct for however it was installed, and it is the same fetch the pre-warm
+/// already ran, so it costs an install nothing extra.
 ///
-/// Every failure is recoverable: the caller keeps the `npx` form.
-fn resolve_launcher(version: &str, ext: &Externals) -> Result<PathBuf, String> {
+/// Every failure is recoverable: the caller falls back a step.
+fn ask_package(version: &str, flag: &str, ext: &Externals) -> Result<PathBuf, String> {
     let npx = ext
         .which("npx")
         .ok_or_else(|| "npx is not on PATH".to_string())?;
-    if ext.which(NODE_BIN).is_none() {
-        return Err(format!("{NODE_BIN} is not on PATH"));
-    }
     let args = vec![
         "-y".to_string(),
         format!("{NPM_PACKAGE}@{version}"),
-        PRINT_LAUNCHER_FLAG.to_string(),
+        flag.to_string(),
     ];
     let out = capture_with_timeout(&npx, &args, ext.prewarm_timeout)?;
     // The last non-blank line: npm is entitled to print notices before it.
@@ -673,7 +688,7 @@ fn resolve_launcher(version: &str, ext: &Externals) -> Result<PathBuf, String> {
         .lines()
         .map(str::trim)
         .rfind(|l| !l.is_empty())
-        .ok_or_else(|| format!("{NPM_PACKAGE}@{version} {PRINT_LAUNCHER_FLAG} printed nothing"))?;
+        .ok_or_else(|| format!("{NPM_PACKAGE}@{version} {flag} printed nothing"))?;
     let path = PathBuf::from(path);
     if !path.is_absolute() {
         return Err(format!("{} is not an absolute path", path.display()));
@@ -684,32 +699,56 @@ fn resolve_launcher(version: &str, ext: &Externals) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Turn an `npx` command into a resolved `node <launcher>` one where that is
-/// possible, so the hooks it writes do not spawn `npx` on every invocation.
+/// Turn an `npx` command into a resolved, directly-runnable one, so the hooks
+/// it writes do not spawn `npx` on every invocation.
 ///
-/// Returns the command to write and, when the resolution failed, the one-line
-/// warning to put in the summary. Anything other than the `npx` form is
-/// already a direct path and is handed back untouched.
+/// Three rungs, best first:
+///
+/// 1. **The native binary** (`--print-binary`). What every other form ends up
+///    running anyway, reached without a Node startup in front of it.
+/// 2. **`node <launcher>`** (`--print-launcher`). For a package whose vendored
+///    binary was never fetched, and only when `node` is on PATH to run it.
+/// 3. **`npx`**, unchanged, with a warning saying the hooks will be slow.
+///
+/// Returns the command to write and, when both resolutions failed, the one-line
+/// warning for the summary. Anything other than the `npx` form is already a
+/// direct path and is handed back untouched.
 fn resolve_fast_command(cmd: &McpCommand, ext: &Externals) -> (McpCommand, Option<String>) {
     let McpCommand::Npx { version } = cmd else {
         return (cmd.clone(), None);
     };
-    match resolve_launcher(version, ext) {
-        Ok(launcher) => (
-            McpCommand::NodeLauncher {
-                launcher,
-                version: version.clone(),
-            },
-            None,
-        ),
-        Err(e) => (
-            cmd.clone(),
-            Some(format!(
-                "warning: could not resolve the {NPM_PACKAGE}@{version} launcher ({e}) — \
-                 the hooks will spawn npx on every prompt and every edit"
-            )),
-        ),
+    let binary_err = match ask_package(version, PRINT_BINARY_FLAG, ext) {
+        Ok(binary) => {
+            return (
+                McpCommand::NativeBinary {
+                    binary,
+                    version: version.clone(),
+                },
+                None,
+            )
+        }
+        Err(e) => e,
+    };
+    // No binary. The launcher is the same package one Node startup away, and
+    // it is only worth writing if `node` is there to run it.
+    if ext.which(NODE_BIN).is_some() {
+        if let Ok(launcher) = ask_package(version, PRINT_LAUNCHER_FLAG, ext) {
+            return (
+                McpCommand::NodeLauncher {
+                    launcher,
+                    version: version.clone(),
+                },
+                None,
+            );
+        }
     }
+    (
+        cmd.clone(),
+        Some(format!(
+            "warning: could not resolve {NPM_PACKAGE}@{version} to a path ({binary_err}) — \
+             the hooks will spawn npx on every prompt and every edit"
+        )),
+    )
 }
 
 // ---------------------------------------------------------------------------

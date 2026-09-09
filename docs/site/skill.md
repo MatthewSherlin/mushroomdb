@@ -103,10 +103,10 @@ Cursor gets the same content as an always-apply rules file
 |------|-------------|
 | `--platform claude-code\|cursor\|codex\|all` | Target platform. Default: auto-detect (reads `~/.claude` / `.cursor/` presence). `all` is Claude Code and Cursor; Codex is opt-in, because registering with it runs another program. |
 | `--project` / `--user` | Scope. Default: auto — project inside a git checkout, user anywhere else. |
-| `--db <path>` | **Pins** the store to this absolute path. Without it a project install writes `--auto`, which resolves at run time to `$CLAUDE_PROJECT_DIR/mushroom-memory` or `mushroom-memory` at the working tree's root — so committed config is right in every `git worktree` rather than pointing them all at the checkout the install was typed in. A user install always pins `~/.mushroomdb/memory`. |
+| `--db <path>` | **Pins** the store to this absolute path. Without it a project install inside a git checkout writes `--auto`, which resolves at run time to `$CLAUDE_PROJECT_DIR/mushroom-memory` or `mushroom-memory` at the working tree's root — so committed config is right in every `git worktree` rather than pointing them all at the checkout the install was typed in. Outside a git checkout there is no working tree root for that fallback to find, so the store is pinned to the project directory. A user install always pins `~/.mushroomdb/memory`. |
 | `--command <path>` | Invoke this binary instead of `npx`. Use it for a local build or a pinned install. A relative path is fine to type: it is anchored to the current directory before anything is written, because the assistant spawns the server from a directory of its own. `--db` is anchored the same way. A bare name with no separator (`--command mushroomdb`) means a `PATH` lookup and is written exactly as given. |
 | `--no-git-hooks` | Skip the `post-commit` / `post-checkout` / `post-merge` sync hooks. |
-| `--no-prewarm` | Reach the network for nothing during the install. That skips both the one-off package fetch and the launcher resolution below, so the hooks keep the slower `npx` form. |
+| `--no-prewarm` | No network and no resolution during the install: neither the one-off package fetch nor locating the package's binary. Every hook keeps the slower `npx` form. |
 
 ---
 
@@ -121,8 +121,9 @@ user install or a `--db`.
 
 | Situation | `command` / `args` written | Why |
 |-----------|----------------------------|-----|
-| Default, package resolved | `node` with `["<launcher.js>","mcp","<store>"]` | The published package, located once at install time. Nothing re-resolves it per invocation. |
-| Default, package not resolved | `npx` with `["-y","mushroomdb@<version>","mcp","<store>"]` | Resolves on any machine with Node, needs nothing installed globally, and the version is pinned to the binary that wrote the entry. |
+| Default, binary located | that absolute path, with `["mcp","<store>"]` | The published package's own native binary, found once at install time. Nothing re-resolves it, and nothing starts a Node runtime in front of it. |
+| Default, only the launcher located | `node` with `["<launcher.js>","mcp","<store>"]` | The same package through its npm shim, for an install whose binary was never fetched. Still resolved once, just a Node startup slower. |
+| Default, neither located | `npx` with `["-y","mushroomdb@<version>","mcp","<store>"]` | Resolves on any machine with Node, needs nothing installed globally, and the version is pinned to the binary that wrote the entry. |
 | The `mushroomdb` on `PATH` is this binary (`cargo install`, Homebrew — a symlink to it counts) | `mushroomdb` with `["mcp","<store>"]` | Bare name follows upgrades automatically. |
 | `--command <path>` | that path, with `["mcp","<store>"]` | You said which binary; nothing is guessed. |
 
@@ -142,19 +143,35 @@ out of the skill.
 version and starts a Node process of its own — around half a second on a warm
 cache — and the two hooks below fire on every prompt and every file edit.
 
-So when the `npx` form applies, `install` runs
-`npx -y mushroomdb@<version> --print-launcher` once (up to 180 s). The package
-answers with the absolute path of its own launcher script, and everything
-written — the MCP entry, both hooks, all three git hook blocks — runs
-`node <that path>` instead. That is about a quarter of the wall clock, and the
-same fetch warms the cache, so it replaces the old pre-warm rather than adding
-to it.
+So when the `npx` form applies, `install` asks the package where it is, once
+(up to 180 s), and writes that path into everything: the MCP entry, both hooks
+and all three git hook blocks.
 
-It is best effort. If `npx` or `node` is missing, the package is older than the
-flag, or the path it prints is not there, the install prints one warning, keeps
-the `npx` form, and succeeds. `--no-prewarm` skips the whole step, and a later
-`install` (an upgrade, say) re-resolves. `doctor` re-checks that the resolved
-launcher still exists — npm's cache can be pruned — and says so if it does not.
+| Asked | Answer | Written |
+|---|---|---|
+| `--print-binary` | the vendored native binary for this platform | `'<binary>' recall --auto` |
+| `--print-launcher` | the package's own launcher script | `node '<launcher>' recall --auto` |
+
+The binary is tried first and is much the better answer. The launcher is only a
+shim that starts a Node runtime and then spawns that same binary, and Node's
+startup is nearly the whole difference. Measured warm, `--version` end to end:
+
+| | |
+|---|---:|
+| `npx -y mushroomdb@<version>` | 514 ms |
+| `node <launcher>` | 118 ms |
+| the native binary | 7 ms |
+
+A hook pays that on every prompt and every edit, so it is worth the one
+question. The same fetch warms the npm cache, so this replaces the old pre-warm
+rather than adding to it.
+
+It is best effort, and every rung falls through to the next: no binary drops to
+the launcher (when `node` is on PATH to run it), neither drops to `npx`, and
+that last case prints one warning and still succeeds. `--no-prewarm` skips the
+whole step. A later `install` — an upgrade, say — re-resolves. `doctor`
+re-checks that the resolved path still exists, since npm's cache can be pruned,
+and says so if it does not.
 
 ---
 

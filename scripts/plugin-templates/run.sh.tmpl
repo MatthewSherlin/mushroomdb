@@ -4,13 +4,19 @@
 # `npx -y mushroomdb@<version> …` costs about half a second before it does any
 # work — a cache check, a version resolve and a Node process of its own — and
 # the hooks that call it fire on every prompt and every file edit. This script
-# pays that once, writes down where the package put its launcher, and execs
-# `node <launcher>` from then on (about a tenth of the time).
+# pays that once, writes down where the package put its native binary, and
+# execs that binary from then on.
 #
-# The cache is one line of text under $CLAUDE_PLUGIN_DATA (or ~/.mushroomdb),
-# named for the version that wrote it, so a plugin upgrade resolves afresh
-# rather than running the old copy. Every failure falls through to the plain
-# `npx` form, which is slower and always correct.
+# Measured warm, `--version` end to end: npx 514 ms, `node <launcher>` 118 ms,
+# the native binary 7 ms. The launcher is only a shim that spawns the binary
+# anyway, so Node's startup is nearly the whole difference — hence the order
+# below.
+#
+# The cache is one line of text per resolved path under $CLAUDE_PLUGIN_DATA (or
+# ~/.mushroomdb), named for the version that wrote it, so a plugin upgrade
+# resolves afresh rather than running the old copy. Every failure falls through
+# to the next rung, ending at the plain `npx` form, which is slower and always
+# correct.
 #
 # Rendered from scripts/plugin-templates/run.sh.tmpl — edit that, then run
 # scripts/render-plugin.sh.
@@ -19,28 +25,47 @@ set -u
 VERSION='{{VERSION}}'
 PKG="mushroomdb@${VERSION}"
 CACHE_DIR="${CLAUDE_PLUGIN_DATA:-${HOME:-/tmp}/.mushroomdb}"
-CACHE="${CACHE_DIR}/launcher-${VERSION}"
+CACHE_BINARY="${CACHE_DIR}/binary-${VERSION}"
+CACHE_LAUNCHER="${CACHE_DIR}/launcher-${VERSION}"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# 1. The cached answer, if the file it names is still there. npm's cache can
-#    be pruned out from under us, so the path is checked, never trusted.
-if [ -f "$CACHE" ] && have node; then
-  launcher=$(cat "$CACHE" 2>/dev/null) || launcher=''
-  if [ -n "$launcher" ] && [ -f "$launcher" ]; then
-    exec node "$launcher" "$@"
+# read_cache <file> — the single line in it, if the file is readable.
+read_cache() { [ -f "$1" ] && cat "$1" 2>/dev/null; }
+
+# remember <file> <path> — best effort; a cache that cannot be written just
+# means the next hook resolves again.
+remember() { (mkdir -p "$CACHE_DIR" && printf '%s\n' "$2" >"$1") 2>/dev/null; }
+
+# 1. The cached native binary. npm's cache can be pruned out from under us, so
+#    the path is checked every time, never trusted.
+cached=$(read_cache "$CACHE_BINARY") || cached=''
+if [ -n "$cached" ] && [ -x "$cached" ]; then
+  exec "$cached" "$@"
+fi
+
+# 2. The cached launcher, for a package whose binary was never fetched.
+cached=$(read_cache "$CACHE_LAUNCHER") || cached=''
+if [ -n "$cached" ] && [ -f "$cached" ] && have node; then
+  exec node "$cached" "$@"
+fi
+
+# 3. Ask the package itself, and remember the answer. A version that predates
+#    these flags prints nothing and falls through.
+if have npx; then
+  binary=$(npx -y "$PKG" --print-binary 2>/dev/null | tail -n 1)
+  if [ -n "$binary" ] && [ -x "$binary" ]; then
+    remember "$CACHE_BINARY" "$binary"
+    exec "$binary" "$@"
+  fi
+  if have node; then
+    launcher=$(npx -y "$PKG" --print-launcher 2>/dev/null | tail -n 1)
+    if [ -n "$launcher" ] && [ -f "$launcher" ]; then
+      remember "$CACHE_LAUNCHER" "$launcher"
+      exec node "$launcher" "$@"
+    fi
   fi
 fi
 
-# 2. Ask the package itself where it is, and remember the answer. A version
-#    that predates --print-launcher prints nothing and falls through.
-if have npx && have node; then
-  launcher=$(npx -y "$PKG" --print-launcher 2>/dev/null | tail -n 1)
-  if [ -n "$launcher" ] && [ -f "$launcher" ]; then
-    (mkdir -p "$CACHE_DIR" && printf '%s\n' "$launcher" >"$CACHE") 2>/dev/null
-    exec node "$launcher" "$@"
-  fi
-fi
-
-# 3. Whatever went wrong above, the slow form still works.
+# 4. Whatever went wrong above, the slow form still works.
 exec npx -y "$PKG" "$@"

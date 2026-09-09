@@ -87,6 +87,65 @@ grep -q "unsupported platform: win32-x64" "$WORKDIR/bad-sh.err"
 grep -q "darwin-arm64" "$WORKDIR/bad-sh.err"
 grep -q "linux-x64" "$WORKDIR/bad-sh.err"
 
+# A package laid out the way npm leaves one: the real launcher script, and a
+# fake native binary where postinstall would have put it. Built here rather
+# than reusing the download step below, so these checks stand on their own.
+FAKEPKG="$WORKDIR/pkg"
+mkdir -p "$FAKEPKG/bin" "$FAKEPKG/vendor"
+cp "$NPM/bin/mushroomdb.js" "$FAKEPKG/bin/mushroomdb.js"
+cp "$WORKDIR/rel/mushroomdb" "$FAKEPKG/vendor/mushroomdb"
+chmod +x "$FAKEPKG/vendor/mushroomdb"
+# Canonical (symlink-resolved) paths: Node resolves a module's real path, so
+# that is what the launcher prints, and on macOS $TMPDIR is behind /var -> /private/var.
+FAKE_LAUNCHER="$(cd "$FAKEPKG/bin" && pwd -P)/mushroomdb.js"
+FAKE_BINARY="$(cd "$FAKEPKG/vendor" && pwd -P)/mushroomdb"
+
+echo "== launcher --print-binary / --print-launcher"
+# Both answer with an absolute path that is really there. `install` and the
+# plugin's hooks/run.sh ask these once, so no hook has to spawn npx.
+out=$(node "$FAKE_LAUNCHER" --print-binary)
+case "$out" in /*) ;; *) echo "--print-binary must print an absolute path, got: $out" >&2; exit 1 ;; esac
+test "$out" = "$FAKE_BINARY"
+test -x "$out"
+out=$(node "$FAKE_LAUNCHER" --print-launcher)
+test "$out" = "$FAKE_LAUNCHER"
+test -f "$out"
+
+echo "== launcher --print-binary exits 1 with no vendored binary"
+# The caller has to be able to tell "no binary" from a path, so it can fall
+# through to the launcher rung.
+mv "$FAKE_BINARY" "$WORKDIR/stashed-binary"
+set +e
+node "$FAKE_LAUNCHER" --print-binary >"$WORKDIR/nobin.out" 2>"$WORKDIR/nobin.err"
+st=$?
+set -e
+test "$st" -eq 1
+test ! -s "$WORKDIR/nobin.out"
+grep -q "binary is missing" "$WORKDIR/nobin.err"
+# --print-launcher still answers: where this file is stays true either way.
+test "$(node "$FAKE_LAUNCHER" --print-launcher)" = "$FAKE_LAUNCHER"
+mv "$WORKDIR/stashed-binary" "$FAKE_BINARY"
+
+echo "== run_sh_prefers_the_cached_binary"
+# With a cached binary path and no npx anywhere on PATH, run.sh must still
+# work: it execs the cached binary and never reaches a resolution step.
+CACHE_DIR="$WORKDIR/plugindata"
+PLUGIN_VERSION=$(sed -n "s/^VERSION='\\(.*\\)'\$/\\1/p" "$PKG/plugin/hooks/run.sh")
+test -n "$PLUGIN_VERSION"
+mkdir -p "$CACHE_DIR"
+printf '%s\n' "$FAKE_BINARY" > "$CACHE_DIR/binary-${PLUGIN_VERSION}"
+# A launcher cache is there too, and must lose: the binary is the faster rung.
+printf '%s\n' "$FAKE_LAUNCHER" > "$CACHE_DIR/launcher-${PLUGIN_VERSION}"
+out=$(CLAUDE_PLUGIN_DATA="$CACHE_DIR" PATH=/usr/bin:/bin "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+
+echo "== run.sh: a cached binary that has gone falls back to the launcher"
+# npm's cache can be pruned. The stale line must be skipped, not trusted.
+printf '%s\n' "$WORKDIR/gone/mushroomdb" > "$CACHE_DIR/binary-${PLUGIN_VERSION}"
+out=$(CLAUDE_PLUGIN_DATA="$CACHE_DIR" "$PKG/plugin/hooks/run.sh" --help)
+test "$out" = "fake-ok --help"
+rm -rf "$CACHE_DIR"
+
 echo "== npm install.js happy path"
 rm -rf "$NPM/vendor"
 MUSHROOMDB_RELEASE_BASE="$BASE" node "$NPM/install.js" | tee "$WORKDIR/npm-out"

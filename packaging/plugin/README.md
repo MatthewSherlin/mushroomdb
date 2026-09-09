@@ -28,21 +28,29 @@ The plugin writes **no git hooks** — a plugin has no business editing `.git/ho
 
 `npx -y mushroomdb@<version> …` costs about half a second before it does any work: a cache check, a version resolve, and a Node process of its own. The MCP server pays that once per session, which is fine. The two hooks fire on **every prompt and every file edit**, which is not.
 
-So the hooks call `run.sh` instead. On its first run it asks the package where it lives — `npx -y mushroomdb@<version> --print-launcher`, which prints the absolute path of the package's own launcher script — writes that one line to
+So the hooks call `run.sh` instead. On its first run it asks the package where its native binary is — `npx -y mushroomdb@<version> --print-binary` — writes that one line to
 
 ```
-${CLAUDE_PLUGIN_DATA:-~/.mushroomdb}/launcher-<version>
+${CLAUDE_PLUGIN_DATA:-~/.mushroomdb}/binary-<version>
 ```
 
-and then `exec node <launcher>`. Every later hook reads the cached line and skips straight to the `exec`. Measured on a warm cache: about 510 ms through `npx`, about 130 ms through the cached launcher.
+and then `exec`s it. Every later hook reads the cached line and skips straight to the `exec`. Measured warm, `--version` end to end:
 
-The cache is keyed by version, so a plugin upgrade resolves afresh rather than running the old copy; the stale file from the previous version is a single line and is simply left behind. The path is re-checked every time, since npm's cache can be pruned out from under it. Anything that goes wrong — no `node`, no `npx`, a package older than the flag, a path that no longer exists — falls through to plain `npx -y mushroomdb@<version> "$@"`, which is slower and always correct.
+| | |
+|---|---:|
+| `npx -y mushroomdb@<version>` | 514 ms |
+| `node <launcher>` | 118 ms |
+| the native binary | 7 ms |
+
+The launcher is only a shim that starts a Node runtime and then spawns that same binary, which is why the binary is asked for first. `--print-launcher` is the second rung, cached separately as `launcher-<version>`, for a package whose binary was never fetched; `npx -y mushroomdb@<version> "$@"` is the last, slower and always correct.
+
+The caches are keyed by version, so a plugin upgrade resolves afresh rather than running the old copy; the previous version's files are single lines and are simply left behind. Every cached path is re-checked before use, since npm's cache can be pruned out from under it.
 
 `run.sh` is rendered from `scripts/plugin-templates/run.sh.tmpl` (it embeds the version) and must stay executable; `scripts/render-plugin.sh --check` fails if it is stale or loses its executable bit.
 
 ## `--auto` store location
 
-`--auto` resolves the database as `$CLAUDE_PROJECT_DIR/mushroom-memory` (the environment variable Claude Code sets for plugin MCP servers and hook processes), falling back to `mushroom-memory` at the root of the working tree the command ran in. That fallback finds a *working tree*, not the `.git` directory worktrees share, so each `git worktree add` gets its own graph rather than reading the checkout next door's. Nothing is written outside the project directory, and the store directory is added to the repository's `.gitignore` on first `ingest-git`.
+`--auto` resolves the database as `$CLAUDE_PROJECT_DIR/mushroom-memory` (the environment variable Claude Code sets for plugin MCP servers and hook processes), falling back to `mushroom-memory` at the root of the working tree the command ran in, and to `~/.mushroomdb/memory` outside a checkout. That fallback finds a *working tree*, not the `.git` directory worktrees share, so each `git worktree add` gets its own graph rather than reading the checkout next door's. Nothing is written outside the project directory, and the store directory is added to the repository's `.gitignore` on first `ingest-git`.
 
 Several processes can share that store safely: the MCP server, both hooks and any `mushroomdb` command coordinate through one advisory `LOCK` file, and a writer that cannot get it retries on the next event rather than failing the turn. See [`docs/site/concurrency.md`](../../docs/site/concurrency.md).
 

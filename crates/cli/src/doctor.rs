@@ -169,11 +169,11 @@ pub fn run_doctor_with(
     }
 
     // 2. how the server is spawned — `npx` fetches the package, a resolved
-    //    launcher is a file that has to still be there.
+    //    binary or launcher is a file that has to still be there.
     if let Some((_, entry)) = &primary {
         if entry.command == "npx" {
             checks.push(check_npx(entry, ext));
-        } else if let Some(check) = check_launcher(entry) {
+        } else if let Some(check) = check_resolved_path(entry) {
             checks.push(check);
         }
     }
@@ -410,25 +410,31 @@ fn check_npx(entry: &ConfigEntry, ext: &Externals) -> Check {
     }
 }
 
-/// The resolved-launcher counterpart to [`check_npx`].
+/// The resolved-path counterpart to [`check_npx`].
 ///
-/// `install` writes `node <launcher.js>` so the hooks do not spawn `npx` on
-/// every prompt, and that path lives in npm's cache: pruning the cache, or
-/// npx evicting an old version, leaves a command that cannot run. The file
-/// existing is the whole check — what it does once it runs is the handshake's
+/// `install` writes a path rather than `npx` so the hooks do not spawn `npx`
+/// on every prompt: the package's native binary, or `node <launcher.js>` when
+/// the binary was not fetched. Both live in npm's cache, and pruning it — or
+/// npx evicting an old version — leaves a command that cannot run. The file
+/// existing is the whole check; what it does once it runs is the handshake's
 /// business.
-fn check_launcher(entry: &ConfigEntry) -> Option<Check> {
-    if entry.command != "node" {
+///
+/// A bare `command` is a PATH lookup, not a file, and is left to the handshake.
+fn check_resolved_path(entry: &ConfigEntry) -> Option<Check> {
+    let (name, path) = if entry.command == "node" {
+        ("launcher", Path::new(entry.args.first()?))
+    } else if Path::new(&entry.command).is_absolute() {
+        ("binary", Path::new(&entry.command))
+    } else {
         return None;
-    }
-    let launcher = Path::new(entry.args.first()?);
-    Some(if launcher.is_file() {
-        Check::ok("launcher", format!("node {}", launcher.display()))
+    };
+    Some(if path.is_file() {
+        Check::ok(name, path.display().to_string())
     } else {
         Check::fail(
-            "launcher",
-            format!("{} no longer exists", launcher.display()),
-            Some("mushroomdb install (re-resolves the launcher)".to_string()),
+            name,
+            format!("{} no longer exists", path.display()),
+            Some("mushroomdb install (re-resolves it)".to_string()),
         )
     })
 }

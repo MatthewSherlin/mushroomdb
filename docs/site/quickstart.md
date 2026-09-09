@@ -136,7 +136,8 @@ Open the repository you want graphed and type `/mushroom:mushroom`. Claude Code
 namespaces plugin-provided skills as `/<plugin>:<skill>`. The skill builds the
 graph on first use. The MCP server starts through `npx -y mushroomdb@<version>`;
 both hooks go through the plugin's `hooks/run.sh`, which resolves that package
-once and caches the answer, so a prompt or an edit never waits on `npx`.
+to its native binary once and caches the path, so a prompt or an edit never
+waits on `npx`.
 
 The plugin writes no git hooks. To get those — a backgrounded `sync` after each
 commit, checkout and merge — or to install for Cursor or Codex, use the CLI
@@ -161,11 +162,16 @@ a path would follow a `git worktree add` across and point the new checkout's
 hooks at the old checkout's graph. With `--auto` each working tree gets its own
 `mushroom-memory`. Pass `--db <path>` to pin an absolute path instead.
 
+None of them name the store by path when the install is inside a git checkout;
+outside one there is no working tree root to resolve against, so the store is
+pinned to the project directory.
+
 The MCP entry runs the published package, so the assistant needs nothing
-installed globally. `install` locates it once (`--print-launcher`) and writes
-`node <launcher>` so the hooks never spawn `npx`; if that resolution fails it
-warns and falls back to `npx -y mushroomdb@<version>`, which still works. To
-point it at a local build instead:
+installed globally. `install` locates it once — `--print-binary`, falling back
+to `--print-launcher` — and writes that absolute path, so no hook ever spawns
+`npx`. If neither resolves it warns and falls back to
+`npx -y mushroomdb@<version>`, which still works. To point it at a local build
+instead:
 
 ```text
 mushroomdb install --project --platform claude-code \
