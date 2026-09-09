@@ -16,7 +16,11 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ground_truth import line_of, read                            # noqa: E402
 
 R2 = {
     "url": "https://github.com/fastapi/fastapi",
@@ -50,21 +54,9 @@ def ensure_clone(dest: Path) -> Path:
 PKG = R2["package"]
 
 
-def read(repo: Path, rel: str) -> str:
-    return (repo / rel).read_text(encoding="utf-8", errors="replace")
-
-
 def pkg_files(repo: Path) -> list[str]:
     """Every .py file of the library itself, sorted. Tests and docs stay out."""
     return sorted(str(p.relative_to(repo)) for p in (repo / PKG).rglob("*.py"))
-
-
-def line_of(repo: Path, rel: str, pattern: str) -> int:
-    pat = re.compile(pattern)
-    for i, line in enumerate(read(repo, rel).splitlines(), start=1):
-        if pat.search(line):
-            return i
-    raise AssertionError(f"{pattern!r} not found in {rel}")
 
 
 NESTED_DEF = re.compile(r"^\s*(?:async def|def|class)\s+([A-Za-z_]\w*)")

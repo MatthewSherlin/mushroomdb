@@ -287,9 +287,10 @@ def r1_change_2(repo: Path) -> dict:
         "repo": "R1",
         "kind": "change",
         "prompt": (
-            "`mushroomdb map <db-dir> --json` prints the computed map instead of "
-            "the rendered digest. `mushroomdb owners <db-dir> <path>` has no such "
-            "flag. Add `--json` to `owners` the same way `map` does it: parse the "
+            "This crate's `map` subcommand takes a `--json` flag that prints the "
+            "computed map instead of the rendered digest. The `owners` "
+            "subcommand has no such flag. Add `--json` to `owners` the same way "
+            "`map` does it: parse the "
             "flag into the `Owners` command, dispatch it in the binary, print the "
             "JSON form of what the owners report holds, name the flag in the "
             "usage text, and extend the `parse_args_table` unit test with the new "
@@ -380,7 +381,7 @@ def r1_blast_1(repo: Path) -> dict:
             "this workspace define their own function of the same name, and the "
             "test fixtures do too; those are different functions and are not part "
             "of the answer. If this one changed its signature, which files under "
-            "`crates/` would need attention? Give the file paths."
+            "`crates/*/src/` would need attention? Give the file paths."
         ),
         "truth": {"files": hits},
         "checks": [{"kind": "text", "value": h} for h in hits],
@@ -657,7 +658,7 @@ def grade(task: dict, answer: str, diff_files: set[str] | None = None,
     """
     if task.get("kind") == "change":
         want = set(task["truth"]["files"])
-        if verify_rc is None or verify_rc != 0 or not diff_files:
+        if verify_rc != 0 or not diff_files:            # None included
             return {"score": 0.0,
                     "units": [{"fact": "tests pass", "got": verify_rc,
                                "matched": False}],

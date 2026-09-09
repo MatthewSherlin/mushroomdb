@@ -43,7 +43,8 @@ def test_parse_stream_counts_tool_search_and_graph_calls(tmp_path):
 
 
 def test_cell_command_arm_d_has_no_mcp_and_no_prefix():
-    from run import cell_command, MCP_TOOL, SUBJECT_D
+    from run import cell_command
+    from subjects import MCP_TOOL, SUBJECT_D
     cmd, cwd = cell_command("D", "find the retry policy", 30, None)
     assert cwd == SUBJECT_D
     assert "--strict-mcp-config" in cmd
@@ -55,7 +56,8 @@ def test_cell_command_arm_d_has_no_mcp_and_no_prefix():
 
 
 def test_cell_command_arm_c_prefixes_and_allows_mcp():
-    from run import cell_command, MCP_TOOL
+    from run import cell_command
+    from subjects import MCP_TOOL
     cmd, _ = cell_command("C", "q", 12, None)
     assert cmd[2] == "/mushroom q"
     assert MCP_TOOL in cmd[cmd.index("--allowedTools") + 1]
@@ -102,13 +104,13 @@ def test_grade_text_task_unchanged():
 
 
 def test_bootstrap_ci_brackets_the_mean():
-    from run import bootstrap_ci
+    from report import bootstrap_ci
     lo, hi = bootstrap_ci([1.0, 2.0, 3.0, 4.0], n=500, seed=1)
     assert lo <= 2.5 <= hi
 
 
 def test_bootstrap_ci_of_nothing_is_zero():
-    from run import bootstrap_ci
+    from report import bootstrap_ci
     assert bootstrap_ci([]) == (0.0, 0.0)
 
 
@@ -118,7 +120,7 @@ def _row(arm, task, score, cost, adopted, outcome="success"):
 
 
 def test_gate_passes_when_graph_arm_beats_stock():
-    from run import gate_verdict
+    from report import gate_verdict
     rows = []
     for t in range(1, 5):
         rows += [_row("A", t, 0.8, 0.10, False), _row("C", t, 0.9, 0.09, True), _row("D", t, 0.7, 0.05, True)]
@@ -127,7 +129,7 @@ def test_gate_passes_when_graph_arm_beats_stock():
 
 
 def test_gate_fails_on_max_turns_where_stock_succeeds():
-    from run import gate_verdict
+    from report import gate_verdict
     rows = [_row("A", 1, 1.0, 0.1, False), _row("C", 1, 0.0, 0.2, True, "error_max_turns"),
             _row("A", 2, 1.0, 0.1, False), _row("C", 2, 1.0, 0.1, True)]
     v = gate_verdict(rows)
@@ -135,14 +137,14 @@ def test_gate_fails_on_max_turns_where_stock_succeeds():
 
 
 def test_gate_fails_on_low_adoption():
-    from run import gate_verdict
+    from report import gate_verdict
     rows = [_row("A", t, 0.5, 0.1, False) for t in range(1, 6)]
     rows += [_row("C", t, 0.9, 0.05, t <= 3) for t in range(1, 6)]   # 60% adoption
     assert not gate_verdict(rows)["passed"]
 
 
 def test_gate_without_a_stock_arm_cannot_pass():
-    from run import gate_verdict
+    from report import gate_verdict
     v = gate_verdict([_row("C", 1, 1.0, 0.0, True)])
     assert not v["passed"] and v["reasons"] == ["no stock arm"]
 
@@ -167,7 +169,7 @@ def _cell(arm, task, **over):
 
 
 def test_write_summary_reports_the_gate_deltas_and_the_new_columns(tmp_path):
-    from run import write_summary
+    from report import write_summary
     rows = []
     for t in (1, 2):
         rows.append(_cell("A", t, score=0.5, cost_usd=0.20))
@@ -179,6 +181,54 @@ def test_write_summary_reports_the_gate_deltas_and_the_new_columns(tmp_path):
     assert "PASSED" in text
     assert "cache hit" in text and "graph calls" in text
     assert "tool search" in text and "adoption" in text
+
+
+def test_write_summary_survives_cells_that_recorded_nothing(tmp_path):
+    """A timeout and a hard error carry no cost, turns or duration."""
+    from report import write_summary
+    rows = [
+        _cell("A", 1, score=1.0, cost_usd=0.20),
+        _cell("A", 2, score=1.0, cost_usd=0.20),
+        _cell("C", 1, score=0.5, cost_usd=None, num_turns=None, duration_ms=None,
+              timed_out=True, ok=False, result_subtype=None, adopted=True),
+        _cell("C", 2, score=0.0, cost_usd=None, num_turns=None, ok=False,
+              adopted=True, result_subtype="error_max_turns"),
+    ]
+    text = write_summary(tmp_path, rows, {"head_short": "abc1234"}).read_text()
+    assert "cells with no cost recorded | 2 of 4" in text
+    assert "| timeout |" in text and "error_max_turns" in text
+
+
+def test_write_summary_renders_a_failed_gate_with_its_reasons(tmp_path):
+    from report import write_summary
+    rows = []
+    for t in (1, 2, 3):
+        rows.append(_cell("A", t, score=1.0, cost_usd=0.10))
+        rows.append(_cell("C", t, score=0.4, cost_usd=0.30, adopted=False))
+    text = write_summary(tmp_path, rows, {"head_short": "abc1234"}).read_text()
+    assert "FAILED" in text and "Why it failed:" in text
+    assert "correctness" in text and "cost" in text and "adoption" in text
+
+
+def test_write_summary_lists_every_sub_one_cell_for_classification(tmp_path):
+    from report import write_summary
+    rows = [_cell("A", 1, score=1.0, key="r1-change-1"),
+            _cell("A", 2, score=0.5, key="r1-blast-1", missed=["crates/x.rs"])]
+    text = write_summary(tmp_path, rows, {"head_short": "abc1234"}).read_text()
+    assert "## Sub-1.0 cells" in text and "classification" in text
+    body = text.split("## Sub-1.0 cells", 1)[1].split("## Tool adoption", 1)[0]
+    assert "r1-blast-1" in body and "crates/x.rs" in body
+    assert "r1-change-1" not in body       # the cell that scored 1.0 is not listed
+
+
+def test_gate_correctness_is_paired_by_task(tmp_path):
+    """Unpaired means would call this arm worse; paired, it wins every task."""
+    from report import gate_verdict
+    rows = [_row("A", 1, 0.2, 0.10, False), _row("C", 1, 0.4, 0.05, True),
+            _row("A", 2, 1.0, 0.10, False), _row("C", 2, 1.0, 0.05, True),
+            _row("A", 3, 0.2, 0.10, False), _row("C", 3, 0.3, 0.05, True)]
+    rows.append(_row("A", 4, 1.0, 0.10, False))     # a task C never ran
+    assert gate_verdict(rows)["passed"]
 
 
 # --- the task set --------------------------------------------------------
@@ -216,8 +266,19 @@ def test_every_change_task_carries_an_executable_verify_and_file_truth():
 
 def test_every_task_survived_the_pilot_turn_floor():
     tasks = json.loads((HERE / "tasks.json").read_text())["tasks"]
-    assert all(t["min_stock_turns"] >= 6 for t in tasks), \
-        [(t["key"], t.get("min_stock_turns")) for t in tasks]
+    sized = {t["key"]: t.get("min_stock_turns") for t in tasks}
+    unsized = [k for k, n in sized.items() if n is None]
+    assert not unsized, f"never piloted: {unsized} (run `run.py --pilot`)"
+    too_easy = {k: n for k, n in sized.items() if n < 6}
+    assert not too_easy, f"under the six-turn floor: {too_easy}"
+
+
+def test_every_task_carries_the_fingerprint_it_was_sized_at():
+    """A stamp is a measurement of a prompt; the prompt must not have moved."""
+    from run import already_sized
+    tasks = json.loads((HERE / "tasks.json").read_text())["tasks"]
+    stale = [t["key"] for t in tasks if not already_sized(t)]
+    assert not stale, f"prompt or truth changed since the pilot sized it: {stale}"
 
 
 def test_no_prompt_points_the_agent_at_the_graph():
@@ -253,19 +314,87 @@ def test_pilot_drops_only_the_tasks_stock_found_easy():
     assert out["tasks"][1]["min_stock_turns"] == 30      # spent every turn it had
     assert dropped == [("easy", 3)]
     assert out["pilot"]["dropped"] == [{"key": "easy", "turns": 3}]
+    assert out["pilot"]["rounds"][-1]["run"] == "run-1"
 
 
-def test_changed_files_sees_edits_and_new_files(tmp_path):
+def test_apply_pilot_appends_rounds_and_keeps_earlier_stamps():
+    from run import apply_pilot
+    data = {"tasks": [{"id": 1, "key": "one"}, {"id": 2, "key": "two"}],
+            "pilot": {"rounds": [{"run": "round-1", "tasks": [1]}]}}
+    data["tasks"][0]["min_stock_turns"] = 9
+    out, _turns, _dropped = apply_pilot(data, [{"task": 2, "num_turns": 8}],
+                                        30, "round-2")
+    assert out["tasks"][0]["min_stock_turns"] == 9       # untouched by this round
+    assert out["tasks"][1]["min_stock_turns"] == 8
+    assert [r["run"] for r in out["pilot"]["rounds"]] == ["round-1", "round-2"]
+
+
+def test_a_sized_task_is_not_re_run_until_its_prompt_moves():
+    from run import already_sized, apply_pilot, task_fingerprint
+    task = {"id": 1, "key": "one", "full_prompt": "where is x?",
+            "truth": {"file": "a.rs"}}
+    out, _t, _d = apply_pilot({"tasks": [task]}, [{"task": 1, "num_turns": 9}],
+                              30, "round-1")
+    sized = out["tasks"][0]
+    assert already_sized(sized)
+    moved = {**sized, "full_prompt": "where is y?"}
+    assert not already_sized(moved)
+    assert task_fingerprint(sized) != task_fingerprint(moved)
+
+
+# --- change-task plumbing ------------------------------------------------
+
+
+def _git_repo(tmp_path):
     import subprocess
-    from run import changed_files
-    run = lambda *a: subprocess.run(a, cwd=tmp_path, check=True,
+    run = lambda *a: subprocess.run(a, cwd=tmp_path, check=True,      # noqa: E731
                                     capture_output=True, text=True)
     run("git", "init", "-q")
     run("git", "config", "user.email", "t@example.com")
     run("git", "config", "user.name", "t")
     (tmp_path / "a.txt").write_text("one\n")
-    run("git", "add", "a.txt")
+    (tmp_path / ".gitignore").write_text("kept.log\n")
+    run("git", "add", "a.txt", ".gitignore")
     run("git", "commit", "-qm", "first")
+    return run
+
+
+def test_changed_files_sees_edits_and_new_files(tmp_path):
+    from subjects import changed_files
+    _git_repo(tmp_path)
     (tmp_path / "a.txt").write_text("two\n")
     (tmp_path / "b.txt").write_text("new\n")
     assert changed_files(tmp_path) == {"a.txt", "b.txt"}
+
+
+def test_restore_subject_undoes_a_cell_and_says_it_had_to(tmp_path):
+    from subjects import changed_files, restore_subject
+    _git_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("edited by the agent\n")
+    (tmp_path / "b.txt").write_text("new file\n")
+    (tmp_path / "kept.log").write_text("the install's own artifact\n")
+
+    assert restore_subject(tmp_path) is True
+    assert changed_files(tmp_path) == set()
+    assert (tmp_path / "a.txt").read_text() == "one\n"
+    assert not (tmp_path / "b.txt").exists()
+    assert (tmp_path / "kept.log").exists()      # ignored paths are the install
+    assert restore_subject(tmp_path) is False    # a clean clone stays untouched
+
+
+def test_cell_worktree_path_is_stable_per_arm_and_repo():
+    """Cargo fingerprints are keyed on the crate's absolute path."""
+    from subjects import CELLS, cell_worktree
+    a = cell_worktree("B", {"id": 1, "repo": "R1"})
+    b = cell_worktree("B", {"id": 7, "repo": "R1"})
+    assert a == b == CELLS / "B-R1"
+    assert cell_worktree("B", {"id": 1, "repo": "R2"}) != a
+    assert cell_worktree("C", {"id": 1, "repo": "R1"}) != a
+
+
+def test_run_verify_grades_a_missing_command_rather_than_crashing(tmp_path):
+    from run import VERIFY_MISSING_RC, run_verify
+    log = tmp_path / "verify.txt"
+    task = {"repo": "R1", "verify": {"cmd": ["definitely-not-a-real-binary", "-x"]}}
+    assert run_verify(task, tmp_path, log) == VERIFY_MISSING_RC
+    assert "definitely-not-a-real-binary" in log.read_text()
