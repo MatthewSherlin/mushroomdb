@@ -47,7 +47,7 @@ full design spec is at [docs/design.md](../design.md).
 Pre-1.0 alpha — APIs and formats may change between minor versions. Single
 writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
 
-v0.6.1 is the current release. The shortest way in is the Claude Code plugin —
+v0.6.2 is the current release. The shortest way in is the Claude Code plugin —
 `claude marketplace add MatthewSherlin/mushroomdb` then `claude plugin install
 mushroom@mushroomdb`, and type `/mushroom:mushroom` in a repository. Or run
 `npx mushroomdb install`, which writes the `/mushroom` skill, the MCP server
@@ -67,7 +67,7 @@ Docker, `install.sh`, and the build-from-source path are in
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
 - [Codebase graph](ingest-git.md) — `ingest-git`, its rules, submodules, pull requests, incremental sync
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
-- [MCP tools](mcp.md) — the eight task tools and the sixteen graph tools
+- [MCP tools](mcp.md) — the nine task tools, the sixteen graph tools, and the listing each store gets
 - [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
 - [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error

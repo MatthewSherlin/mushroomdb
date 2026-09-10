@@ -135,9 +135,9 @@ claude plugin install mushroom@mushroomdb
 Open the repository you want graphed and type `/mushroom:mushroom`. Claude Code
 namespaces plugin-provided skills as `/<plugin>:<skill>`. The skill builds the
 graph on first use. The MCP server starts through `npx -y mushroomdb@<version>`;
-both hooks go through the plugin's `hooks/run.sh`, which resolves that package
-to its native binary once and caches the path, so a prompt or an edit never
-waits on `npx`.
+all three hooks go through the plugin's `hooks/run.sh`, which resolves that
+package to its native binary once and caches the path, so a session start, a
+prompt or an edit never waits on `npx`.
 
 The plugin writes no git hooks. To get those — a backgrounded `sync` after each
 commit, checkout and merge — or to install for Cursor or Codex, use the CLI
@@ -152,9 +152,11 @@ A skill installed this way is invoked bare as `/mushroom`.
 With no flags it detects the assistant (Claude Code, Cursor, or both), picks
 project scope inside a git checkout and user scope anywhere else, and prints
 which it chose. Project scope writes the MCP entry to `.mcp.json`, the
-`/mushroom` skill to `.claude/skills/mushroom/`, the prompt hooks to
-`.claude/settings.json`, an ignore line for the store, and a backgrounded
-`sync` into the `post-commit`, `post-checkout` and `post-merge` git hooks.
+`/mushroom` skill to `.claude/skills/mushroom/`, three hooks to
+`.claude/settings.json` — `SessionStart` (the repository brief),
+`UserPromptSubmit` (recall) and `PostToolUse` (touch) — an ignore line for the
+store, and a backgrounded `sync` into the `post-commit`, `post-checkout` and
+`post-merge` git hooks.
 
 Inside a git checkout, none of those name the store by path: they say `--auto`,
 and the store is resolved when they run. Those files are in the repository and
@@ -186,8 +188,9 @@ current directory, so the entry that gets written names an absolute path. A
 bare name (`--command mushroomdb`) is a `PATH` lookup and is written as given.
 
 Other flags: `--user`, `--platform codex` (registers through the Codex CLI, and
-needs `uninstall --platform codex` to undo), `--db <path>`, and
-`--no-git-hooks`. `mushroomdb uninstall` removes exactly what was written. Full
+needs `uninstall --platform codex` to undo), `--db <path>`, `--no-git-hooks`,
+`--delivery cli|mcp|both` (with `cli` the skill teaches the binary and no MCP
+server is registered) and the experimental `--intercept-grep`. `mushroomdb uninstall` removes exactly what was written. Full
 reference: [`skill.md`](skill.md).
 
 ### Turning it off
