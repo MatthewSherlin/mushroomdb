@@ -14,7 +14,7 @@ A live graph of this repository at `./mushroom-memory`: files, symbols, imports,
 **1. If `./mushroom-memory` does not exist yet, build it once:**
 
 ```
-npx -y mushroomdb@0.6.1 ingest-git './mushroom-memory' . --prs --ensure-gitignore
+npx -y mushroomdb@0.6.2 ingest-git './mushroom-memory' . --prs --ensure-gitignore
 ```
 
 `CO_CHANGED` / `KNOWS` / `IMPORTS` / `CALLS` edges are derived by rule; the store joins `.gitignore`.
@@ -34,7 +34,8 @@ The first row that matches the turn is what to call, before you answer.
    - `all` — all three in one reply.
 
    Grep finds strings; `explore` answers who calls this, what breaks and who to ask — none of it in the text of a file.
-2. **The user states a decision or a durable fact** → `remember` it: the `text`, and the existing keys it is `about` (each must already exist). Say the key it returns (`note:` plus 16 hex) so the user can cite it.
+2. **The user states a decision or a durable fact** → record it and say the key back (`note:` plus 16 hex) so the user can cite it:
+   `remember` — the `text`, and the existing keys it is `about` (each must already exist).
 3. **Commits have landed, or the brief reports an old sync** → `sync`: the commits since the last sync, then the files that differ from HEAD.
 
 `explore` composes `context`, `impact` (alone with no arguments it reads the current diff) and `owners`; those, `why` (what links two keys, with the evidence), `recall`, `map` and the rest stay callable by name. Prefer the digest to the raw report.
@@ -65,8 +66,8 @@ The `concept_sources` rule links each concept to its sources with `DESCRIBED_IN`
 
 ## Advanced
 
-`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows eleven. All 25 stay callable either way; `npx -y mushroomdb@0.6.1 mcp <db> --all-tools` advertises the rest with their schemas, `ingest_json` for a bulk load among them. **Never create a rule silently:** *propose* `create_rule`, show the predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**: only listed keys are visible, and writes are rejected while set. This server has **no auth** and masks are cooperative — never present one as a security boundary; real access control is `serve --role-token`.
+`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows eleven. All 25 stay callable either way; `npx -y mushroomdb@0.6.2 mcp <db> --all-tools` advertises the rest with their schemas, `ingest_json` for a bulk load among them. **Never create a rule silently:** *propose* `create_rule`, show the predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**: only listed keys are visible, and writes are rejected while set. This server has **no auth** and masks are cooperative — never present one as a security boundary; real access control is `serve --role-token`.
 
-Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`npx -y mushroomdb@0.6.1 serve './mushroom-memory'` → `http://127.0.0.1:8080`), and `doctor` checks the install.
+Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`npx -y mushroomdb@0.6.2 serve './mushroom-memory'` → `http://127.0.0.1:8080`), and `doctor` checks the install.
 
 More: [docs](https://github.com/MatthewSherlin/mushroomdb/tree/main/docs/site)

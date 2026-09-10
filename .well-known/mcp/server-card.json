@@ -2,7 +2,7 @@
   "name": "mushroomdb",
   "description": "Embedded graph database with incremental association rules and a built-in MCP stdio server for AI agents.",
   "repository": "https://github.com/MatthewSherlin/mushroomdb",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "transport": "stdio",
   "tools_note": "Every tool here is callable. A default `tools/list` follows the store the server opened: a store a repository was ingested into advertises three — explore, query, stats — and any other store advertises eleven, the eight memory tools plus query, ingest_json and stats. The rest are hidden rather than absent, because the schemas cost more than a coding agent gets back. Run `mushroomdb mcp <db> --all-tools` to advertise this whole list.",
   "tools": [
