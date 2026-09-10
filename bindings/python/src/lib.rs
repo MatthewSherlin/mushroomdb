@@ -588,6 +588,45 @@ impl GraphDb {
             .collect()
     }
 
+    /// Total number of committed WAL frames visible in the current horizon
+    /// window (the exclusive upper bound for `at_commit` in `was_linked` and
+    /// `commit` in `query_at`).
+    #[pyo3(text_signature = "($self)")]
+    fn wal_total_commits(&self) -> PyResult<u64> {
+        self.with_ref(|db| db.wal_total_commits())
+    }
+
+    /// Per-edge change history between `a` and `b` since the last truncating
+    /// snapshot. Returns `{a, b, events: [{edge_type, commit, event, rule}],
+    /// total_commits}`; `event` is `"Added"` or `"Retracted"`, `rule` is the
+    /// rule name for derived edges and `None` for manually written ones.
+    #[pyo3(text_signature = "($self, a, b)")]
+    fn edge_history(&self, py: Python<'_>, a: &str, b: &str) -> PyResult<Py<PyDict>> {
+        let result = self.with_ref(|db| db.edge_history(a, b))?;
+        let events = result
+            .items
+            .iter()
+            .map(|ev| {
+                let d = PyDict::new(py);
+                d.set_item("edge_type", &ev.edge_type)?;
+                d.set_item("commit", ev.commit)?;
+                let event_str = match ev.event {
+                    core_api::EdgeEvent::Added => "Added",
+                    core_api::EdgeEvent::Retracted => "Retracted",
+                };
+                d.set_item("event", event_str)?;
+                d.set_item("rule", ev.rule.as_deref())?;
+                Ok(d.unbind())
+            })
+            .collect::<PyResult<Vec<Py<PyDict>>>>()?;
+        let out = PyDict::new(py);
+        out.set_item("a", a)?;
+        out.set_item("b", b)?;
+        out.set_item("events", events)?;
+        out.set_item("total_commits", result.total_commits)?;
+        Ok(out.unbind())
+    }
+
     /// Atomically ingest `nodes` (each `{key, label, props}`) and optional
     /// `edges` (each `{edge_type, src, dst}`) in a single WAL commit.
     ///

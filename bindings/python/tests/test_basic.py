@@ -672,6 +672,22 @@ def test_node_history_and_was_linked(tmp_path):
     db.close()
 
 
+def test_total_commits_counts_frames_and_edge_history_lists_events(tmp_path):
+    """wal_total_commits counts WAL frames; edge_history lists add/retract events."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("A", "a", {})
+    db.insert_node("B", "b", {})
+    n0 = db.wal_total_commits()
+    assert db.insert_edge("LINKS", "a", "b")
+    assert db.wal_total_commits() == n0 + 1
+    h = db.edge_history("a", "b")
+    assert h["a"] == "a"
+    assert h["b"] == "b"
+    assert h["total_commits"] == n0 + 1
+    assert any(e["edge_type"] == "LINKS" for e in h["events"])
+    db.close()
+
+
 def test_query_at_time_travel(tmp_path):
     """query_at reads the graph as it existed at a past commit."""
     db = GraphDb.open(str(tmp_path / "db"))

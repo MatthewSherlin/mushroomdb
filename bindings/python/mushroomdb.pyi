@@ -104,6 +104,12 @@ class GraphDb:
     def node_history(self, key: str) -> list[Row]:
         """Per-node change history since the last truncating snapshot."""
 
+    def wal_total_commits(self) -> int:
+        """Total number of committed WAL frames visible in the current horizon."""
+
+    def edge_history(self, a: str, b: str) -> Row:
+        """Per-edge change history between `a` and `b`: `{a, b, events, total_commits}`."""
+
     def was_linked(self, a: str, b: str, edge_type: str, at_commit: int) -> bool:
         """Whether `a` and `b` were linked by `edge_type` at or before `at_commit`."""
 

@@ -478,6 +478,8 @@ _DOCUMENTED = [
     "node_info",
     "node_edges",
     "node_history",
+    "wal_total_commits",
+    "edge_history",
     "was_linked",
     "enable_index",
     "disable_index",
