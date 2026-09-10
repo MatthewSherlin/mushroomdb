@@ -294,6 +294,9 @@ jobs:
         env:
           TOUCH_BUDGET_MS: "600"
           MAP_BUDGET_MS: "3000"
+          # Same reasoning as above: ~2.5-3x the local budgets (300 ms / 400 ms).
+          BRIEF_BUDGET_MS: "800"
+          EXPLORE_BUDGET_MS: "1000"
 
   plugin-validate:
     runs-on: ubuntu-latest
