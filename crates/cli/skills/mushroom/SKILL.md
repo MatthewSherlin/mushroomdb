@@ -24,7 +24,7 @@ A live graph of this repository at `{{DB_PATH}}`: files, symbols, imports, calls
 **3. Call `explore <target>`** (depth `context`) on the first file or symbol the task names, and quote what it prints — before any `Grep`, file read or plan. On a memory store, where `explore` is unlisted, `map` opens instead.
 <!-- cli -->
 
-Or through `Bash`, store first; `query` reaches whatever has no subcommand of its own (`remember` and `ingest_json` among them):
+Or through `Bash`, store first; `query` runs any Cypher, read or write:
 
 ```
 {{BIN}} explore '{{DB_PATH}}' <target> [--depth context|impact|history|all] [--full]
@@ -43,7 +43,13 @@ The first row that matches the turn is what to call, before you answer.
    - `all` — all three in one reply.
 
    Grep finds strings; `explore` answers who calls this, what breaks and who to ask — none of it in the text of a file.
-2. **The user states a decision or a durable fact** → `remember` it: the `text`, and the existing keys it is `about` (each must already exist). Say the key it returns (`note:` plus 16 hex) so the user can cite it.
+2. **The user states a decision or a durable fact** → record it and say the key back (`note:` plus 16 hex) so the user can cite it:
+<!-- mcp -->
+   `remember` — the `text`, and the existing keys it is `about` (each must already exist).
+<!-- /mcp -->
+<!-- cli -->
+   `query` a `CREATE (n:Note {id: "note:…", text: "…"})` — no `remember` subcommand.
+<!-- /cli -->
 3. **Commits have landed, or the brief reports an old sync** → `sync`: the commits since the last sync, then the files that differ from HEAD.
 
 `explore` composes `context`, `impact` (alone with no arguments it reads the current diff) and `owners`; those, `why` (what links two keys, with the evidence), `recall`, `map` and the rest stay callable by name. Prefer the digest to the raw report.
