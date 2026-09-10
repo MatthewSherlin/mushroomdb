@@ -273,8 +273,8 @@ jobs:
 
   # Post-publish smoke test: the exact path a new user takes. `npx` fetches
   # the just-published package into a clean HOME, `install` writes an
-  # .mcp.json pinned to it, and the SDK handshake script spawns that pinned
-  # `npx` command for real — so a break anywhere in the published artifact
+  # .mcp.json pinned to the binary it vendors, and the SDK handshake script
+  # spawns that pinned command for real — so a break anywhere in the published artifact
   # (missing bin, bad shebang, a launcher that can't find the native binary)
   # fails the release, not a user.
   smoke-npx:
@@ -333,18 +333,18 @@ jobs:
 
           test -f .mcp.json
           command=$(jq -r '.mcpServers.mushroomdb.command' .mcp.json)
-          arg0=$(jq -r '.mcpServers.mushroomdb.args[0]' .mcp.json)
-          arg1=$(jq -r '.mcpServers.mushroomdb.args[1]' .mcp.json)
-          arg2=$(jq -r '.mcpServers.mushroomdb.args[2]' .mcp.json)
-          arg3=$(jq -r '.mcpServers.mushroomdb.args[3]' .mcp.json)
-          test "$command" = "npx"
-          test "$arg0" = "-y"
-          test "$arg1" = "mushroomdb@$VER"
-          test "$arg2" = "mcp"
-          case "$arg3" in
-            /*/mushroom-memory) : ;;
+          args=$(jq -r '.mcpServers.mushroomdb.args | join(" ")' .mcp.json)
+          # Since 0.6.1 a Claude Code project install pins the vendored native
+          # binary it resolved from the published package (falling back to
+          # `node <launcher>`, then to `npx`) and resolves the store at --auto.
+          # Accept exactly those three forms; the handshake below proves the
+          # pinned command really answers as $VER.
+          case "$command $args" in
+            "/"*"/node_modules/mushroomdb/vendor/mushroomdb mcp --auto") : ;;
+            "node /"*"/node_modules/mushroomdb/bin/mushroomdb.js mcp --auto") : ;;
+            "npx -y mushroomdb@$VER mcp --auto") : ;;
             *)
-              echo "unexpected db path in .mcp.json args[3]: $arg3" >&2
+              echo "unexpected .mcp.json command: $command $args" >&2
               exit 1
               ;;
           esac
