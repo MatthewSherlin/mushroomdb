@@ -435,29 +435,11 @@ HISTORY_PROBES = 20
 # `insert_node` brought with it. Measured: none — the record carries them.
 INSERT_PROP_SET_RECORDS = 0
 
-# Disagreements the cross-check has already found, filed, and is not going to
-# re-litigate on every run. They are still reported — prefixed, so an unknown
-# disagreement can never hide behind one — and `association/cross-check.md`
-# carries the reproduction and the diagnosis.
-GAP_DELETED_PROPS = "node-history-deleted-props"
-KNOWN_GAP_PREFIX = "known-gap"
-KNOWN_GAPS: dict[str, str] = {
-    GAP_DELETED_PROPS:
-        "`node_history` on a deleted node reports its insert and its delete "
-        "but none of its `prop_set` records: `db.rs`'s SetPropId branch "
-        "resolves the id with `key_of`, which returns None for a tombstoned "
-        "id, while the insert/delete branches match on the key string. "
-        "`edge_history` and `was_linked` use `key_of_historical` instead.",
-}
-
-
-def _gap(gap_id: str, line: str) -> str:
-    return f"{KNOWN_GAP_PREFIX}[{gap_id}]: {line}"
-
-
-def unknown(problems: Iterable[str]) -> list[str]:
-    """The disagreements that are not already filed."""
-    return [p for p in problems if not p.startswith(f"{KNOWN_GAP_PREFIX}[")]
+# Nothing is excused here. The one disagreement this cross-check ever filed —
+# `node_history` losing a deleted node's `prop_set` records to `key_of`
+# returning None for a tombstoned id — was an engine bug, and it is fixed, so
+# every line `cross_check` returns is a real disagreement between the two
+# truths and a task built on it does not ship.
 
 
 def _days_map(store_dir: Path, days: Any) -> dict[int, int]:
@@ -485,9 +467,7 @@ def cross_check(world: dict[str, Any], store_dir: str | Path, days: Any = None, 
     - **history** — `node_history(key)` against the changelog, on keys the
       history deleted or mutated.
 
-    Returns one line per disagreement. A disagreement already filed in
-    `KNOWN_GAPS` is prefixed `known-gap[<id>]`, so `unknown()` gives the ones
-    that still need explaining; an empty `unknown()` means the two truths
+    Returns one line per disagreement. An empty list means the two truths
     agree everywhere the engine claims they should.
     """
     from mushroomdb import GraphDb
@@ -643,13 +623,9 @@ def _history_problems(db, world: dict[str, Any], key: str) -> list[str]:
                  + INSERT_PROP_SET_RECORDS
                  * sum(1 for c in changes if c["op"] == "insert_node"))
     got_sets = kinds.count("prop_set")
-    line = (f"node_history {key}: changelog sets {want_sets} props, "
-            f"engine reports {got_sets}")
-    if wants_delete and want_sets and got_sets == 0:
-        # The filed gap: a tombstone takes the node's property history with it.
-        problems.append(_gap(GAP_DELETED_PROPS, line))
-    elif got_sets != want_sets:
-        problems.append(line)
+    if got_sets != want_sets:
+        problems.append(f"node_history {key}: changelog sets {want_sets} props, "
+                        f"engine reports {got_sets}")
 
     if "node_inserted" not in kinds:
         problems.append(f"node_history {key}: engine never reports node_inserted")
@@ -685,21 +661,19 @@ def main(argv: list[str] | None = None) -> int:
                            history_probes=args.history_probes, progress=True)
     print(f"\nprobes: {args.live_pairs} why, {args.time_probes} time travel, "
           f"{args.history_probes} history")
-    fresh = unknown(problems)
-    print(f"disagreements: {len(problems)} "
-          f"({len(problems) - len(fresh)} already filed, {len(fresh)} new)")
+    print(f"disagreements: {len(problems)}")
     for line in problems:
         print(f"  {line}")
     if args.out:
         # Always, even on a clean run: a file that says "0 disagreements" is
         # the record. Writing only on failure would leave the last bad run's
         # file sitting there looking current.
-        args.out.write_text(_cross_check_md(args, problems, fresh))
+        args.out.write_text(_cross_check_md(args, problems))
         print(f"wrote {args.out}")
-    return 1 if fresh else 0
+    return 1 if problems else 0
 
 
-def _cross_check_md(args, problems: list[str], fresh: list[str]) -> str:
+def _cross_check_md(args, problems: list[str]) -> str:
     lines = [
         "# Association suite — truth vs the engine",
         "",
@@ -708,17 +682,12 @@ def _cross_check_md(args, problems: list[str], fresh: list[str]) -> str:
         f"probes and {args.history_probes} `node_history` probes against the "
         f"brute-force truth.",
         "",
-        f"**{len(fresh)} unexplained disagreement(s)"
-        + ("" if fresh else " — every task's truth stands") + ".**",
+        f"**{len(problems)} disagreement(s)"
+        + ("" if problems else " — every task's truth stands") + ".**",
         "",
     ]
-    for gap_id, prose in KNOWN_GAPS.items():
-        hits = [p for p in problems if p.startswith(f"{KNOWN_GAP_PREFIX}[{gap_id}]")]
-        lines += [f"## Filed: `{gap_id}` ({len(hits)} probes hit it)", "",
-                  prose, ""]
-        lines += [f"- `{h}`" for h in hits[:5]] + [""]
-    if fresh:
-        lines += ["## Unexplained", ""] + [f"- `{f}`" for f in fresh] + [""]
+    if problems:
+        lines += ["## Disagreements", ""] + [f"- `{p}`" for p in problems] + [""]
     return "\n".join(lines)
 
 

@@ -39,6 +39,22 @@ SUBJECT2_E = SCRATCH / "subject2-mdb-i"
 SUBJECT2_F = SCRATCH / "subject2-cli-i"
 R2_VENV = SCRATCH / "venv-r2"            # what `python` means in an R2 verify
 
+# The association suite (v0.6.3 §3): one built world in three forms, each its
+# own self-contained directory. There is no repository and no clone here — a
+# cell is given a copy of one of these three directories.
+ASSOC_BUILD = SCRATCH / "assoc-build"
+SUBJECT_P = ASSOC_BUILD / "files"        # entities/*.json, changes.jsonl, roles
+SUBJECT_Q = ASSOC_BUILD / "sqlite"       # world.sqlite + its schema
+SUBJECT_R = ASSOC_BUILD / "graph"        # the store, and the install that reaches it
+ASSOC_SUBJECTS = {"P": SUBJECT_P, "Q": SUBJECT_Q, "R": SUBJECT_R}
+ASSOC_ARMS = frozenset(ASSOC_SUBJECTS)
+
+# Everything the graph subject may hold once it is provisioned. Three files the
+# builder wrote, the store, and the two artefacts `install --delivery mcp`
+# leaves. Anything else is data the other two arms were not given.
+ASSOC_GRAPH_CONTENTS = ("world.mushroomdb", "README.md", "days.json",
+                        "schema.json", ".mcp.json", ".claude")
+
 SUBJECTS = {
     ("A", "R1"): SUBJECT_A, ("B", "R1"): SUBJECT_B,
     ("C", "R1"): SUBJECT_B, ("D", "R1"): SUBJECT_D,
@@ -68,6 +84,9 @@ ARM_LABEL = {
     "D": "mushroomdb, cli delivery (no MCP)",
     "E": "mushroomdb installed + grep redirect",
     "F": "mushroomdb cli delivery + grep redirect",
+    "P": "files + grep",
+    "Q": "sqlite",
+    "R": "graph",
 }
 
 # What each arm actually is, in one line, for the provenance block of a
@@ -86,11 +105,18 @@ ARM_PROVENANCE = {
          "PreToolUse redirect from `Grep` to `explore`; plain prompt",
     "F": "`mushroomdb install --delivery cli --intercept-grep` — arm D's "
          "install plus that redirect; plain prompt",
+    "P": "the world as `entities/*.json`, `changes.jsonl`, `roles.json` and a "
+         "README describing the rules; no MCP server; plain prompt",
+    "Q": "the same world as `world.sqlite` (`sqlite3` on PATH) with the same "
+         "README and its schema; no MCP server; plain prompt",
+    "R": "the same world as a mushroomdb store — `install --delivery mcp "
+         "--db ./world.mushroomdb` into a directory holding nothing else, so "
+         "the store is the only data path; plain prompt",
 }
 
 # The arms whose session is given the MCP tool. Kept beside the arms rather
 # than read off `cell_command`, which lives in `run.py` and imports this file.
-MCP_ARMS = frozenset({"B", "C", "E"})
+MCP_ARMS = frozenset({"B", "C", "E", "R"})
 
 # Both arms get exactly these tools. `Bash` is unqualified on purpose: the
 # per-command form `Bash(git:*)` denies every pipeline (`git log ... | sort |
@@ -226,7 +252,111 @@ def ensure_r2_venv() -> None:
         raise SystemExit(f"uv sync failed:\n{p.stderr}")
 
 
-def setup(force: bool = False, arms: set[str] | None = None) -> set[str]:
+# --------------------------------------------------------------------------
+# the association suite: one built world, three subject directories
+# --------------------------------------------------------------------------
+
+ASSOC_SEED = 20260910
+ASSOC_SCALE = 2000
+ASSOC_BUILD_TIMEOUT_S = 3600
+
+
+def build_association_world(force: bool = False) -> Path:
+    """The generator's three forms under `ASSOC_BUILD`, built once.
+
+    Deterministic in `ASSOC_SEED`/`ASSOC_SCALE`, and expensive (5-6 minutes at
+    2,000 nodes), so it is rebuilt only when a form is missing or `--force-setup`
+    asks. `association/tasks.json` records the world's digest; a rebuild that
+    moved a fact would be caught there, not here.
+    """
+    from association.build import form_paths
+    where = form_paths(ASSOC_BUILD)
+    if force:
+        shutil.rmtree(ASSOC_BUILD, ignore_errors=True)
+    if all(where[f].exists() for f in ("files", "sqlite", "graph")):
+        print(f"association world already built at {ASSOC_BUILD}; keeping it")
+        return ASSOC_BUILD
+    print(f"building the association world -> {ASSOC_BUILD} (5-6 minutes)")
+    sh([sys.executable, str(HERE / "association" / "build.py"),
+        "--seed", str(ASSOC_SEED), "--scale", str(ASSOC_SCALE),
+        "--out", str(ASSOC_BUILD), "--binary", str(MUSHROOMDB)],
+       cwd=HERE, timeout=ASSOC_BUILD_TIMEOUT_S)
+    return ASSOC_BUILD
+
+
+def install_association_graph(graph: Path) -> None:
+    """Make the store arm R's only data path (§5), and prove it.
+
+    `install --delivery mcp` into the graph form's own directory: an MCP entry
+    pinned to the store with `--db` (never `--auto`, which would walk up and
+    find another store), the skill, the hooks, and no git hooks — the directory
+    is not a repository. The `.gitignore` the install writes for the store is
+    removed again: nothing here is versioned, and it would be a seventh file in
+    a directory whose contents this asserts.
+
+    Idempotent, and it fails loudly rather than handing a run a subject that
+    is not what the summary will say it was.
+    """
+    graph = Path(graph)
+    if not (graph / ".mcp.json").exists():
+        print(f"installing mushroomdb into {graph}")
+        print(sh([
+            str(MUSHROOMDB), "install", "--project",
+            "--platform", "claude-code",
+            "--command", str(MUSHROOMDB),
+            "--no-prewarm", "--no-git-hooks",
+            "--delivery", "mcp",
+            "--db", f"./{ASSOC_GRAPH_CONTENTS[0]}",
+        ], cwd=graph))
+    stray = graph / ".gitignore"
+    if stray.exists():
+        stray.unlink()
+    present = {p.name for p in graph.iterdir()}
+    if present != set(ASSOC_GRAPH_CONTENTS):
+        raise SystemExit(
+            f"the graph subject holds {sorted(present)}, expected "
+            f"{sorted(ASSOC_GRAPH_CONTENTS)}")
+    p = subprocess.run([str(MUSHROOMDB), "doctor", "--project",
+                        "--platform", "claude-code"],
+                       cwd=graph, capture_output=True, text=True, timeout=300)
+    if p.returncode != 0:
+        raise SystemExit(f"doctor failed in {graph}:\n{p.stdout}\n{p.stderr}")
+
+
+def setup_association(force: bool = False) -> set[str]:
+    """Provision arms P, Q and R. Returns the arms it got.
+
+    No clones, no worktrees, no ground-truth regeneration: the three forms are
+    the subjects, and `association/tasks.json` is built by `build_tasks.py`
+    against the world's digest rather than by this function.
+    """
+    ensure_binary()
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    EMPTY_MCP.write_text('{"mcpServers":{}}\n')
+    shutil.rmtree(CELLS, ignore_errors=True)
+    build_association_world(force)
+    install_association_graph(SUBJECT_R)
+    for arm, subject in sorted(ASSOC_SUBJECTS.items()):
+        if not subject.exists():
+            raise SystemExit(f"arm {arm}: no subject at {subject}")
+        print(f"arm {arm}: {subject}")
+    print("setup complete")
+    return set(ASSOC_ARMS)
+
+
+def setup(force: bool = False, arms: set[str] | None = None,
+          suite: str = "code") -> set[str]:
+    """Provision what the requested arms of this suite need.
+
+    The association suite has its own provisioning entirely — see
+    `setup_association`.
+    """
+    if suite == "association":
+        return setup_association(force)
+    return setup_code(force, arms)
+
+
+def setup_code(force: bool = False, arms: set[str] | None = None) -> set[str]:
     """Provision the clones the requested arms need. Returns the arms it got.
 
     The task set is the pin: `tasks.json` names the commit of each subject its
@@ -323,7 +453,34 @@ def setup(force: bool = False, arms: set[str] | None = None) -> set[str]:
 
 
 def subject_root(arm: str, task: dict) -> Path:
+    """Where this arm's data lives. The association arms have one directory
+    each and no repository, so the task's `repo` never enters into it."""
+    if arm in ASSOC_ARMS:
+        return ASSOC_SUBJECTS[arm]
     return SUBJECTS[(arm, task.get("repo", "R1"))]
+
+
+def assoc_cell_dir(arm: str) -> Path:
+    """Where an association cell for this arm runs.
+
+    One path per arm, reused by every cell of that arm: cells run strictly
+    sequentially, and `make_cell_copy` replaces the tree before each one.
+    """
+    return CELLS / f"assoc-{arm}"
+
+
+def make_cell_copy(subject: Path, dest: Path) -> Path:
+    """A fresh copy of a subject directory for one cell.
+
+    The association subjects are not git repositories, so there is no worktree
+    to add and no `git clean` to undo a cell's scratch files — the copy is both.
+    `symlinks=False` on purpose: a link out of the tree would let one cell's
+    writes reach the subject the next cell is copied from.
+    """
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(subject, dest, symlinks=False)
+    return dest
 
 
 def child_env(task: dict | None = None) -> dict[str, str]:

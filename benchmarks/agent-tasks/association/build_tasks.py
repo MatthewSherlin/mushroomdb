@@ -629,9 +629,14 @@ def main(argv: list[str] | None = None) -> int:
                          "its replacement before giving up")
     ap.add_argument("--disagreements", type=Path, default=None,
                     help="file the store's disagreements here")
+    ap.add_argument("--avoid", default="",
+                    help="comma-separated entity keys no task may be built "
+                         "around — how the pilot replaces a task the baseline "
+                         "arm answered under the turn floor")
     args = ap.parse_args(argv)
 
-    avoid: frozenset[str] = frozenset()
+    avoid: frozenset[str] = frozenset(
+        k.strip() for k in args.avoid.split(",") if k.strip())
     filed: list[str] = []
     data = build(args.seed, args.scale, avoid)
     if args.build is not None:

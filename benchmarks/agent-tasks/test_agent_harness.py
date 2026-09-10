@@ -230,7 +230,7 @@ def test_gate_fails_on_low_adoption():
 def test_gate_without_a_stock_arm_cannot_pass():
     from report import gate_verdict
     v = gate_verdict([_row("C", 1, 1.0, 0.0, True)])
-    assert not v["passed"] and v["reasons"] == ["no stock arm"]
+    assert not v["passed"] and v["reasons"] == ["no baseline arm A"]
 
 
 # --- summary -------------------------------------------------------------
@@ -261,7 +261,7 @@ def test_write_summary_reports_the_gate_deltas_and_the_new_columns(tmp_path):
                           graph_calls=2, mcp_calls=2, tool_search_calls=1,
                           cache_hit_ratio=0.9))
     text = write_summary(tmp_path, rows, {"head_short": "abc1234"}).read_text()
-    assert "## Gate" in text and "## Deltas vs stock" in text
+    assert "## Gate" in text and "## Deltas vs arm A" in text
     assert "PASSED" in text
     assert "cache hit" in text and "graph calls" in text
     assert "tool search" in text and "adoption" in text
@@ -856,20 +856,26 @@ def test_the_truth_script_and_the_engine_agree_on_a_small_world(tmp_path):
     Python and the engine's own derivation must name the same relationships,
     live and at a past commit.
 
-    One disagreement is already filed (`association/cross-check.md`) and is
-    allowed through as a known gap. Everything else is a bug in one of the two
-    truths and fails here.
+    Nothing is excused any more: the one disagreement this ever filed was an
+    engine bug and it is fixed, so every line the cross-check returns is a bug
+    in one of the two truths and fails here.
     """
     from association.build import world, write_store
-    from association.truth import GAP_DELETED_PROPS, cross_check, unknown
+    from association.truth import cross_check
     from subjects import MUSHROOMDB
     w = world(seed=7, scale=200)
     write_store(w, tmp_path / "graph", MUSHROOMDB)
     problems = cross_check(w, tmp_path / "graph", seed=7,
                            live_pairs=60, time_probes=6, history_probes=6)
-    assert unknown(problems) == [], unknown(problems)
-    # And the probe is not passing vacuously: it still reaches the filed gap.
-    assert any(GAP_DELETED_PROPS in p for p in problems), problems
+    assert problems == [], problems
+    # And the history probe is not passing vacuously: the keys it picks are
+    # keys the changelog deleted after editing — the shape that used to fail.
+    import random
+    from association.truth import _history_keys
+    picked = _history_keys(random.Random("k"), w, 6)
+    edited_then_deleted = {c["key"] for c in w["changes"] if c["op"] == "set_prop"} \
+        & {c["key"] for c in w["changes"] if c["op"] == "delete_node"}
+    assert set(picked) & edited_then_deleted, picked
 
 
 def test_a_negative_time_probe_always_asks_about_a_derivable_type():
@@ -919,17 +925,18 @@ def test_an_insert_contributes_no_prop_set_records(tmp_path):
         db.close()
 
 
-def test_a_deleted_nodes_property_history_is_the_gap_we_filed(tmp_path):
-    """The filed disagreement, reduced to three calls.
+def test_a_deleted_nodes_property_history_survives_the_tombstone(tmp_path):
+    """The disagreement this suite once filed, reduced to three calls.
 
-    `node_history` keeps a deleted node's insert and its delete but drops
-    every `prop_set` in between: `db.rs`'s `SetPropId` branch resolves the id
-    with `key_of`, which is `None` for a tombstoned id. When this test starts
-    failing the engine has been fixed and `KNOWN_GAPS` should lose the entry.
+    `node_history` used to keep a deleted node's insert and its delete but
+    drop every `prop_set` in between: `db.rs`'s `SetPropId` branch resolved the
+    id with `key_of`, which is `None` for a tombstoned id. It resolves it the
+    way the other branches do now, so the property history outlives the
+    tombstone and the cross-check has no known gap left to excuse.
     """
-    from association.truth import GAP_DELETED_PROPS, KNOWN_GAPS
+    from association import truth
     from mushroomdb import GraphDb
-    assert GAP_DELETED_PROPS in KNOWN_GAPS
+    assert not hasattr(truth, "KNOWN_GAPS"), "the filed gap is fixed; drop it"
     db = GraphDb.open(str(tmp_path / "gap.mushroomdb"))
     try:
         db.insert_node("Talent", "t1", {"industry": "architecture"})
@@ -938,7 +945,7 @@ def test_a_deleted_nodes_property_history_is_the_gap_we_filed(tmp_path):
             "node_inserted", "prop_set"]
         db.delete_node("t1")
         assert [e["kind"] for e in db.node_history("t1")] == [
-            "node_inserted", "node_deleted"]      # the prop_set is gone
+            "node_inserted", "prop_set", "node_deleted"]
     finally:
         db.close()
 
@@ -1036,3 +1043,230 @@ def test_association_tasks_are_not_yet_pilot_sized():
     ship carrying one it never earned."""
     data = json.loads((HERE / "association" / "tasks.json").read_text())
     assert not any("min_baseline_turns" in t for t in data["tasks"])
+
+
+# --------------------------------------------------------------------------
+# association suite: the harness — arms P/Q/R, the suite switch, the gate
+# --------------------------------------------------------------------------
+
+
+def test_cell_command_arm_p_is_the_files_subject_without_mcp():
+    from run import cell_command
+    from subjects import EMPTY_MCP, MCP_TOOL, SUBJECT_P
+    cmd, cwd = cell_command("P", "who matches whom?", 30, None)
+    assert cwd == SUBJECT_P
+    assert cmd[2] == "who matches whom?"
+    assert cmd[cmd.index("--mcp-config") + 1] == str(EMPTY_MCP)
+    tools = cmd[cmd.index("--allowedTools") + 1]
+    assert MCP_TOOL not in tools
+    assert tools == "Read,Grep,Glob,Bash,Edit,Write"
+
+
+def test_cell_command_arm_q_is_the_sqlite_subject_without_mcp():
+    from run import cell_command
+    from subjects import EMPTY_MCP, MCP_TOOL, SUBJECT_Q
+    cmd, cwd = cell_command("Q", "q", 30, None)
+    assert cwd == SUBJECT_Q
+    assert cmd[2] == "q"
+    assert cmd[cmd.index("--mcp-config") + 1] == str(EMPTY_MCP)
+    assert MCP_TOOL not in cmd[cmd.index("--allowedTools") + 1]
+
+
+def test_cell_command_arm_r_is_the_graph_subject_with_mcp():
+    from run import cell_command
+    from subjects import MCP_TOOL, SUBJECT_R
+    cmd, cwd = cell_command("R", "q", 30, None)
+    assert cwd == SUBJECT_R
+    assert cwd.name == "graph"
+    assert cmd[2] == "q"                          # plain prompt, no prefix
+    assert cmd[cmd.index("--mcp-config") + 1] == ".mcp.json"
+    assert MCP_TOOL in cmd[cmd.index("--allowedTools") + 1]
+
+
+def test_the_three_association_subjects_are_the_three_built_forms():
+    from association.build import form_paths
+    from subjects import ASSOC_BUILD, SUBJECT_P, SUBJECT_Q, SUBJECT_R
+    where = form_paths(ASSOC_BUILD)
+    assert (SUBJECT_P, SUBJECT_Q, SUBJECT_R) == (
+        where["files"], where["sqlite"], where["graph"])
+
+
+def test_load_tasks_reads_the_suites_own_file():
+    from run import load_tasks
+    code = load_tasks("code")
+    assert len(code["tasks"]) == 20 and code["tasks"][0]["repo"] in ("R1", "R2")
+    assoc = load_tasks("association")
+    assert assoc["suite"] == "association" and len(assoc["tasks"]) == 20
+    assert all(t["suite"] == "association" for t in assoc["tasks"])
+
+
+def test_suites_pin_the_arms_baseline_and_gate_of_each_suite():
+    from run import SUITES
+    code, assoc = SUITES["code"], SUITES["association"]
+    assert code["arms"] == ["A", "B", "C", "D"] and code["baseline"] == "A"
+    assert code["gate"] == {"require_ci": False, "adoption_gate": True}
+    assert code["graph_arms"] is None            # every arm but A is gated
+    assert code["pilot_floor"] == 6 and code["pilot_arm"] == "A"
+    assert code["turns_field"] == "min_stock_turns"
+    assert code["tasks"].name == "tasks.json"
+
+    assert assoc["arms"] == ["P", "Q", "R"] and assoc["baseline"] == "Q"
+    assert assoc["gate"] == {"require_ci": True, "adoption_gate": False}
+    assert assoc["graph_arms"] == ["R"]          # P is the second baseline
+    assert assoc["pilot_floor"] == 5 and assoc["pilot_arm"] == "Q"
+    assert assoc["turns_field"] == "min_baseline_turns"
+    assert assoc["tasks"].parent.name == "association"
+
+
+def test_paired_deltas_measures_against_the_baseline_it_is_given():
+    from report import paired_deltas
+    rows = [_row("Q", 1, 0.4, 0.1, False), _row("R", 1, 0.9, 0.1, True),
+            _row("P", 1, 0.2, 0.1, False),
+            _row("Q", 2, 0.5, 0.1, False), _row("R", 2, 0.8, 0.1, True),
+            _row("P", 2, 0.1, 0.1, False)]
+    approx = lambda ds: [round(d, 6) for d in ds]                    # noqa: E731
+    assert approx(paired_deltas(rows, "R", "score", baseline="Q")) == [0.5, 0.3]
+    assert approx(paired_deltas(rows, "R", "score", baseline="P")) == [0.7, 0.7]
+    # No baseline cells for that arm means no differences at all, not zeros.
+    assert paired_deltas(rows, "R", "score", baseline="A") == []
+
+
+def _assoc_rows(r_scores, p_scores=None, q_score=0.4, r_cost=0.05,
+                q_cost=0.10, adopted=True):
+    """One rep per task for arms P, Q and R, with R's score per task given."""
+    p_scores = p_scores or [0.2] * len(r_scores)
+    rows = []
+    for t, (rs, ps) in enumerate(zip(r_scores, p_scores), start=1):
+        rows += [_row("Q", t, q_score, q_cost, False),
+                 _row("P", t, ps, q_cost, False),
+                 _row("R", t, rs, r_cost, adopted)]
+    return rows
+
+
+ASSOC_GATE = {"baseline": "Q", "require_ci": True, "adoption_gate": False,
+              "graph_arms": ["R"]}
+
+
+def test_association_gate_passes_when_the_graph_beats_both_baselines():
+    from report import gate_verdict
+    rows = _assoc_rows([0.9] * 6)
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert v["passed"] and v["best_arm"] == "R", v["reasons"]
+
+
+def test_association_gate_fails_when_the_score_interval_includes_zero():
+    """A positive paired mean is not enough: §1.1 wants the interval clear."""
+    from report import gate_verdict
+    rows = _assoc_rows([1.0, 0.0, 0.5, 0.5, 1.0, 0.0], q_score=0.4)
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert not v["passed"]
+    assert any("interval" in r for r in v["reasons"]), v["reasons"]
+
+
+def test_association_gate_fails_when_a_baseline_matches_the_graph():
+    """The correctness leg is 'beats every other arm', not 'beats the
+    baseline': a files arm that scores as well as the graph sinks it, and P
+    winning is never itself a pass — it is the second baseline, not a
+    contender."""
+    from report import gate_verdict
+    rows = _assoc_rows([0.9] * 6, p_scores=[0.95] * 6)
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert not v["passed"] and v["best_arm"] == "R"
+    assert sorted(v["arms"]) == ["R"]
+    assert any("P" in r for r in v["reasons"]), v["reasons"]
+
+
+def test_association_gate_records_adoption_without_gating_it():
+    """In arm R the store is the only data path, so adoption is not a leg."""
+    from report import gate_verdict
+    rows = _assoc_rows([0.9] * 6, adopted=False)
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert v["passed"], v["reasons"]
+    # ... and the same rows fail the code suite's gate, which does gate on it.
+    assert not gate_verdict(rows, baseline="Q")["passed"]
+
+
+def test_association_gate_still_fails_on_cost_and_on_max_turns():
+    from report import gate_verdict
+    dear = _assoc_rows([0.9] * 6, r_cost=0.20)
+    assert any("cost" in r for r in gate_verdict(dear, **ASSOC_GATE)["reasons"])
+    rows = _assoc_rows([0.9] * 6)
+    rows[2]["result_subtype"] = "error_max_turns"
+    reasons = gate_verdict(rows, **ASSOC_GATE)["reasons"]
+    assert any("max-turns" in r for r in reasons), reasons
+
+
+def test_write_summary_names_the_suite_and_the_baseline_arm(tmp_path):
+    from report import write_summary
+    rows = []
+    for t in (1, 2, 3):
+        rows.append(_cell("Q", t, score=0.4, cost_usd=0.10))
+        rows.append(_cell("P", t, score=0.2, cost_usd=0.10))
+        rows.append(_cell("R", t, score=0.9, cost_usd=0.05, adopted=True,
+                          mcp_calls=3, graph_calls=3))
+    text = write_summary(tmp_path, rows, {
+        "suite": "association", "baseline": "Q", "require_ci": True,
+        "adoption_gate": False, "graph_arms": ["R"],
+        "world_digest": "abc123def456", "max_turns": 30}).read_text()
+    assert "- suite: association" in text
+    assert "- baseline arm: Q" in text
+    assert "abc123def456" in text
+    assert "## Deltas vs arm Q" in text
+    from subjects import ARM_PROVENANCE
+    for arm in ("P", "Q", "R"):
+        assert f"- arm {arm} (" in text and ARM_PROVENANCE[arm] in text
+    # The code suite's own footnotes describe a run this one did not do.
+    assert "DEVIATION" not in text and "R2 subject" not in text
+    assert "PASSED" in text
+
+
+def test_write_summary_keeps_the_code_suites_own_provenance(tmp_path):
+    from report import write_summary
+    rows = [_cell("A", 1, score=0.5, cost_usd=0.2),
+            _cell("B", 1, score=0.6, cost_usd=0.1, adopted=True, mcp_calls=1)]
+    text = write_summary(tmp_path, rows, {"head_short": "abc1234"}).read_text()
+    assert "- suite: code" in text and "- baseline arm: A" in text
+    assert "DEVIATION" in text and "R2 subject" in text
+    assert "## Deltas vs arm A" in text
+
+
+def test_the_graph_subject_holds_the_store_the_install_and_nothing_else(tmp_path):
+    """§5: the install goes into an otherwise empty directory, and what it
+    leaves behind is the whole of arm R's world. A stray `.gitignore` (the
+    install writes one) or a leftover build artefact would be data the other
+    two arms do not have."""
+    from association.build import world, write_store
+    from subjects import (ASSOC_GRAPH_CONTENTS, MUSHROOMDB,
+                          install_association_graph)
+    w = world(seed=7, scale=200)
+    graph = tmp_path / "graph"
+    write_store(w, graph, MUSHROOMDB)
+    install_association_graph(graph)                 # raises if doctor fails
+    assert {p.name for p in graph.iterdir()} == set(ASSOC_GRAPH_CONTENTS)
+    assert (graph / ".mcp.json").is_file() and (graph / ".claude").is_dir()
+    assert not (graph / ".gitignore").exists()
+    # Idempotent: setup runs it on every invocation, not only the first.
+    install_association_graph(graph)
+    assert {p.name for p in graph.iterdir()} == set(ASSOC_GRAPH_CONTENTS)
+
+
+def test_an_association_cell_is_a_fresh_copy_of_its_subject(tmp_path):
+    """P/Q/R cells are copies, not worktrees: the subjects are not git repos,
+    and a cell that writes scratch files must not hand them to the next one."""
+    from subjects import assoc_cell_dir, make_cell_copy
+    subject = tmp_path / "subject"
+    (subject / "sub").mkdir(parents=True)
+    (subject / "README.md").write_text("one")
+    (subject / "sub" / "b.json").write_text("two")
+
+    dest = tmp_path / "cells" / "assoc-Q"
+    make_cell_copy(subject, dest)
+    assert (dest / "README.md").read_text() == "one"
+    assert (dest / "sub" / "b.json").read_text() == "two"
+
+    (dest / "scratch.txt").write_text("the agent's leftovers")
+    make_cell_copy(subject, dest)
+    assert not (dest / "scratch.txt").exists()
+    assert not (subject / "scratch.txt").exists()
+
+    assert assoc_cell_dir("R").name == "assoc-R"
