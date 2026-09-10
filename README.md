@@ -223,8 +223,8 @@ rendered digest.
 in `tools/list`, so an assistant knows which surface is the front door. The default listing follows
 the store: a store built by `ingest-git` lists three tools in all — `explore`, `query` and `stats` —
 and any other store lists eleven, the eight task tools other than `explore` plus `query`,
-`ingest_json` and `stats`. All 25 stay callable by name either way, and
-`mushroomdb mcp <db> --all-tools` advertises the whole set:
+`ingest_json` and `stats`. All 25 stay served either way — the listing decides what a session can
+call, not what the server answers — and `mushroomdb mcp <db> --all-tools` lists the whole set:
 
 | Tool | Purpose |
 |---|---|

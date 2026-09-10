@@ -280,9 +280,12 @@ serves both kinds and neither has to be configured for:
 | Built by `ingest-git` (a code graph) | **three** — `explore`, `query`, `stats` |
 | Anything else (a memory store) | **eleven** — the eight task tools other than `explore`, plus `query`, `ingest_json` and `stats` |
 
-All 25 stay callable by name on either surface: the surface decides what is
-listed, not what is served. `mushroomdb mcp <db> --all-tools` advertises the
-whole set with their schemas on either store. Measured on this repository's
+All 25 stay served on either surface: the surface decides what is listed, not
+what the server answers. A session can only call what its client was shown,
+though — on a code-graph store that is `explore`, `query` and `stats`, so a
+note is written with `query` and the sync is the git `post-commit` hook's job.
+`mushroomdb mcp <db> --all-tools` lists the whole set with their schemas on
+either store. Measured on this repository's
 store, the default listing a coding session pays for before its first turn is
 1,593 bytes on a code-graph store against 5,622 on a memory store; the full 25
 are 14,419.
