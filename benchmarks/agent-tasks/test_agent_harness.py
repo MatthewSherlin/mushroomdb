@@ -495,3 +495,47 @@ def test_run_verify_grades_a_missing_command_rather_than_crashing(tmp_path):
     task = {"repo": "R1", "verify": {"cmd": ["definitely-not-a-real-binary", "-x"]}}
     assert run_verify(task, tmp_path, log) == VERIFY_MISSING_RC
     assert "definitely-not-a-real-binary" in log.read_text()
+
+
+# --------------------------------------------------------------------------
+# association suite: one world, three forms
+# --------------------------------------------------------------------------
+
+
+def test_world_is_deterministic_and_the_expected_shape():
+    from association.build import world
+    a, b = world(seed=7, scale=200), world(seed=7, scale=200)
+    assert a["nodes"] == b["nodes"] and a["changes"] == b["changes"]
+    assert len(a["nodes"]) == 200 and len(a["changes"]) == 300 and a["changes"][-1]["day"] <= 89
+    assert {r["name"] for r in a["roles"]} == {"recruiter", "client"}
+
+
+def test_the_three_forms_carry_the_same_base_facts(tmp_path):
+    from association.build import world, write_files, write_sqlite, write_store, equivalent
+    from subjects import MUSHROOMDB
+    w = world(seed=7, scale=200)
+    write_files(w, tmp_path / "files")
+    write_sqlite(w, tmp_path / "world.sqlite")
+    days = write_store(w, tmp_path / "graph", MUSHROOMDB)
+    assert equivalent(tmp_path / "files", tmp_path / "world.sqlite", tmp_path / "graph")
+    assert days[0] >= 0 and days[89] > days[0]
+
+
+def test_a_deleted_key_is_absent_later_and_present_earlier(tmp_path):
+    """Time travel is the point of the graph form: the store must still be
+    able to show a node the changelog removed, at a commit before the removal."""
+    from association.build import world, write_store
+    from subjects import MUSHROOMDB
+    from mushroomdb import GraphDb
+    w = world(seed=7, scale=200)
+    days = write_store(w, tmp_path / "graph", MUSHROOMDB)
+    gone = next(c for c in w["changes"] if c["op"] == "delete_node")
+    before, after = days[gone["day"] - 1], days[89]
+    db = GraphDb.open(str(tmp_path / "graph" / "world.mushroomdb"), read_only=True)
+    try:
+        was = {r["n"] for r in db.query_at(before, "MATCH (n) RETURN n")}
+        now = {r["n"] for r in db.query_at(after, "MATCH (n) RETURN n")}
+    finally:
+        db.close()
+    assert gone["key"] in was
+    assert gone["key"] not in now
