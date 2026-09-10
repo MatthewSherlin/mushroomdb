@@ -2554,26 +2554,88 @@ fn install_platform(
 /// so dropping a whole region leaves exactly one blank line behind rather than
 /// a hole in the prose.
 ///
+/// The regions are checked for well-formedness rather than trusted: an
+/// unterminated `<!-- mcp -->` would silently swallow the rest of the file on
+/// the `cli` variant, and a nested pair would leave the inner close re-opening
+/// the outer region, so both are errors and neither can ship as a short skill
+/// nobody looked at. The two conditions are the same ones the awk twin in
+/// `scripts/render-plugin.sh` fails on.
+///
 /// Public so the skill's per-turn budget can be measured on every variant
 /// without an install: what this returns is exactly what `install` writes, and
 /// `scripts/render-plugin.sh` mirrors it for the plugin copy.
-pub fn render_template(template: &str, db_str: &str, bin_cmd: &str, delivery: Delivery) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut dropping = false;
-    for line in template.lines() {
+pub fn render_template(
+    template: &str,
+    db_str: &str,
+    bin_cmd: &str,
+    delivery: Delivery,
+) -> Result<String, CliError> {
+    /// `("cli", true)` for `<!-- cli -->`, `("cli", false)` for `<!-- /cli -->`.
+    fn marker(line: &str) -> Option<(&'static str, bool)> {
         match line {
-            "<!-- cli -->" => dropping = matches!(delivery, Delivery::Mcp),
-            "<!-- mcp -->" => dropping = matches!(delivery, Delivery::Cli),
-            "<!-- /cli -->" | "<!-- /mcp -->" => dropping = false,
-            _ if dropping => {}
-            _ => {
+            "<!-- cli -->" => Some(("cli", true)),
+            "<!-- mcp -->" => Some(("mcp", true)),
+            "<!-- /cli -->" => Some(("cli", false)),
+            "<!-- /mcp -->" => Some(("mcp", false)),
+            _ => None,
+        }
+    }
+
+    let mut out = String::with_capacity(template.len());
+    let mut open: Option<(&str, usize)> = None;
+    let mut dropping = false;
+    for (i, line) in template.lines().enumerate() {
+        let at = i + 1;
+        match marker(line) {
+            Some((name, true)) => {
+                if let Some((outer, opened)) = open {
+                    return Err(CliError(format!(
+                        "skill template line {at}: <!-- {name} --> opens inside the \
+                         <!-- {outer} --> region opened on line {opened} — delivery \
+                         regions must not nest"
+                    )));
+                }
+                open = Some((name, at));
+                dropping = match name {
+                    "cli" => matches!(delivery, Delivery::Mcp),
+                    _ => matches!(delivery, Delivery::Cli),
+                };
+            }
+            Some((name, false)) => {
+                match open {
+                    None => {
+                        return Err(CliError(format!(
+                            "skill template line {at}: <!-- /{name} --> closes a region \
+                             that was never opened"
+                        )))
+                    }
+                    Some((outer, opened)) if outer != name => {
+                        return Err(CliError(format!(
+                            "skill template line {at}: <!-- /{name} --> closes the \
+                             <!-- {outer} --> region opened on line {opened}"
+                        )))
+                    }
+                    Some(_) => {}
+                }
+                open = None;
+                dropping = false;
+            }
+            None if dropping => {}
+            None => {
                 out.push_str(line);
                 out.push('\n');
             }
         }
     }
-    out.replace(DB_PATH_PLACEHOLDER, db_str)
-        .replace(BIN_PLACEHOLDER, bin_cmd)
+    if let Some((name, opened)) = open {
+        return Err(CliError(format!(
+            "skill template: the <!-- {name} --> region opened on line {opened} is \
+             never closed"
+        )));
+    }
+    Ok(out
+        .replace(DB_PATH_PLACEHOLDER, db_str)
+        .replace(BIN_PLACEHOLDER, bin_cmd))
 }
 
 fn install_claude_code(
@@ -2586,7 +2648,7 @@ fn install_claude_code(
     // The skill is prose a reader follows by hand, so it names the directory
     // the store is in rather than the `--auto` the machine-read config uses.
     let db_str = store.path().to_string_lossy();
-    let skill_content = render_template(SKILL_TEMPLATE, &db_str, &shell, ctx.delivery);
+    let skill_content = render_template(SKILL_TEMPLATE, &db_str, &shell, ctx.delivery)?;
 
     let skill_dir = match ctx.scope {
         Scope::Project => ctx
@@ -2715,7 +2777,7 @@ fn install_cursor(
         &db_str,
         &ctx.cmd.shell(),
         Delivery::Mcp,
-    );
+    )?;
 
     let rules_dir = match ctx.scope {
         Scope::Project => ctx.project_root.join(".cursor").join("rules"),

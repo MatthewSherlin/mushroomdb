@@ -72,12 +72,40 @@ render_file() {
 # keeps the mcp blocks and drops the cli ones; the marker lines themselves are
 # never written either way. Rust's render_template does exactly this — keep the
 # two in step.
+#
+# The regions are checked, not trusted, on the same three conditions Rust
+# errors on: a region that never closes (which would swallow the rest of the
+# file), one that opens inside another, and a close with nothing open. Each
+# renders a plausible-looking skill with its middle missing, which is not a
+# failure a reader of the rendered file would notice.
 strip_delivery() {
   local keep="$1" file="$2"
-  awk -v keep="$keep" '
-    /^<!-- (cli|mcp) -->$/ { split($0, m, " "); drop = (m[2] != keep); next }
-    /^<!-- \/(cli|mcp) -->$/ { drop = 0; next }
+  awk -v keep="$keep" -v file="$file" '
+    function bail(msg) {
+      printf("render-plugin.sh: %s line %d: %s\n", file, FNR, msg) > "/dev/stderr"
+      failed = 1
+      exit 3
+    }
+    /^<!-- (cli|mcp) -->$/ {
+      split($0, m, " ")
+      if (open != "")
+        bail("<!-- " m[2] " --> opens inside the <!-- " open " --> region opened on line " openline)
+      open = m[2]; openline = FNR; drop = (m[2] != keep); next
+    }
+    /^<!-- \/(cli|mcp) -->$/ {
+      split($0, m, " "); name = substr(m[2], 2)
+      if (open == "") bail("<!-- /" name " --> closes a region that was never opened")
+      if (name != open) bail("<!-- /" name " --> closes the <!-- " open " --> region opened on line " openline)
+      open = ""; drop = 0; next
+    }
     !drop
+    END {
+      if (failed) exit 3
+      if (open != "") {
+        printf("render-plugin.sh: %s: the <!-- %s --> region opened on line %d is never closed\n", file, open, openline) > "/dev/stderr"
+        exit 3
+      }
+    }
   ' "$file" > "$file.delivery" && mv "$file.delivery" "$file"
 }
 

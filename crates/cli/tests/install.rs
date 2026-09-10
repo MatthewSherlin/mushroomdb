@@ -2714,7 +2714,8 @@ fn every_delivery_variant_names_every_tool_and_fits_the_budget() {
             "./mushroom-memory",
             &format!("npx -y mushroomdb@{VERSION}"),
             delivery,
-        );
+        )
+        .expect("the committed template's regions are well formed");
         for tool in REQUIRED_TOOL_MENTIONS {
             assert!(
                 skill.contains(tool),
@@ -2735,6 +2736,71 @@ fn every_delivery_variant_names_every_tool_and_fits_the_budget() {
             skill.len()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test: a malformed delivery region is an error, not a quietly shorter skill.
+//
+// An unterminated `<!-- mcp -->` swallows every line after it on the `cli`
+// variant, and a nested pair leaves the inner close re-opening the outer
+// region — both produce a plausible-looking skill that is missing its task
+// rules, which is exactly the failure nobody reads a rendered file to catch.
+// `scripts/render-plugin.sh` fails on the same two conditions.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unterminated_delivery_region_is_an_error() {
+    let template = "# skill\n\
+                    <!-- mcp -->\n\
+                    only the mcp reader sees this\n\
+                    and nothing ever closes it\n";
+    for delivery in [Delivery::Mcp, Delivery::Cli, Delivery::Both] {
+        let err = cli::install::render_template(template, "./db", "mushroomdb", delivery)
+            .expect_err(&format!("{delivery:?}: an unclosed region must not render"));
+        let msg = err.to_string();
+        assert!(msg.contains("<!-- mcp -->"), "{msg}");
+        assert!(
+            msg.contains("line 2") && msg.contains("never closed"),
+            "{msg}"
+        );
+    }
+}
+
+#[test]
+fn a_nested_delivery_region_is_an_error() {
+    let template = "# skill\n\
+                    <!-- mcp -->\n\
+                    the outer region\n\
+                    <!-- cli -->\n\
+                    the inner one\n\
+                    <!-- /cli -->\n\
+                    <!-- /mcp -->\n";
+    for delivery in [Delivery::Mcp, Delivery::Cli, Delivery::Both] {
+        let err = cli::install::render_template(template, "./db", "mushroomdb", delivery)
+            .expect_err(&format!("{delivery:?}: a nested region must not render"));
+        let msg = err.to_string();
+        assert!(msg.contains("must not nest"), "{msg}");
+        assert!(msg.contains("line 4") && msg.contains("line 2"), "{msg}");
+    }
+}
+
+/// A close with nothing open is the third way the pair can be wrong.
+#[test]
+fn a_delivery_region_that_closes_the_wrong_marker_is_an_error() {
+    let mismatched = "<!-- mcp -->\nbody\n<!-- /cli -->\n";
+    let msg = cli::install::render_template(mismatched, "./db", "mushroomdb", Delivery::Both)
+        .expect_err("a mismatched close must not render")
+        .to_string();
+    assert!(
+        msg.contains("<!-- /cli -->") && msg.contains("<!-- mcp -->"),
+        "{msg}"
+    );
+
+    let orphan = "body\n<!-- /mcp -->\n";
+    let msg = cli::install::render_template(orphan, "./db", "mushroomdb", Delivery::Both)
+        .expect_err("a close with nothing open must not render")
+        .to_string();
+    assert!(msg.contains("never opened"), "{msg}");
 }
 
 // ---------------------------------------------------------------------------
