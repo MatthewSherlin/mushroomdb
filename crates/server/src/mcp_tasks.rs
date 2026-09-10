@@ -554,14 +554,7 @@ fn tool_explain_association(db: &SharedDb, args: &Js, json_out: bool) -> CallOut
         let g = db.read();
         match g.explain(&a, &b) {
             Ok(v) => v,
-            Err(e) => {
-                return CallOutcome::ToolErr(match e {
-                    GraphError::QueryError { detail } | GraphError::IngestError { detail } => {
-                        detail
-                    }
-                    other => other.to_string(),
-                })
-            }
+            Err(e) => return CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
         }
     };
     ok(json_out, &report, |found| {

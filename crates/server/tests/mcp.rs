@@ -1518,6 +1518,34 @@ fn explain_association_says_none_when_nothing_links_the_two() {
     assert!(text.contains("\n  none"), "{text}");
 }
 
+/// Binding: a key the graph does not hold is a tool error that names the key,
+/// not an empty answer.
+///
+/// `explain` resolves both keys to dense ids before it looks at an edge, so a
+/// typo cannot come back as "these two are unrelated" — which is the one wrong
+/// answer this tool could give.
+#[test]
+fn explain_association_on_an_unknown_key_names_it() {
+    let db = association_store("explain-unknown");
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "explain_association",
+        json!({"a": "p1", "b": "ghost"}),
+    ));
+    assert!(err.contains("ghost"), "{err}");
+    assert!(
+        !err.contains("relationship(s)"),
+        "an unknown key is an error, not a digest: {err}"
+    );
+
+    let missing_arg = error_text(&one_task_call(
+        db,
+        "explain_association",
+        json!({"a": "p1"}),
+    ));
+    assert!(missing_arg.contains("missing b"), "{missing_arg}");
+}
+
 /// A memory store with two labels and a `client` role that may see only one of
 /// them.
 fn roles_store(name: &str) -> SharedDb {

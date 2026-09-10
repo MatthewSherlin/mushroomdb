@@ -916,7 +916,7 @@ fn tool_rename_node(db: &SharedDb, args: &Js) -> CallOutcome {
     }
 }
 
-fn graph_err_msg(e: GraphError) -> String {
+pub(crate) fn graph_err_msg(e: GraphError) -> String {
     match e {
         GraphError::QueryError { detail } | GraphError::IngestError { detail } => detail,
         other => other.to_string(),
@@ -945,7 +945,7 @@ const ADVANCED_PREFIX: &str = "Advanced: ";
 /// `sync` and `touch`, not by an assistant bulk-loading rows into it, and the
 /// tool that is never the right one on this surface is the one worth not
 /// listing.
-const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
+pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 
 /// The thirteen a memory store advertises, in the order it lists them.
 ///
@@ -965,7 +965,7 @@ const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 /// The code task tools stay served on a memory store, as these stay served on
 /// a code-graph one — [`tools_list`] decides what is *advertised*, never what
 /// is answered.
-const ASSOCIATION_TOOLS: [&str; 13] = [
+pub const ASSOCIATION_TOOLS: [&str; 13] = [
     "query",
     "explain_association",
     "neighborhood",
