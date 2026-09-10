@@ -41,7 +41,7 @@ if str(HERE.parent) not in sys.path:
     sys.path.insert(0, str(HERE.parent))
 
 from association.build import (                     # noqa: E402
-    LAST_DAY, day_date, form_paths, world,
+    LAST_DAY, day_date, form_paths, task_rules, world,
 )
 from association.truth import (                     # noqa: E402
     derived_edges, edges_of, multihop, partners, state_at,
@@ -74,9 +74,12 @@ DUO = ("INDUSTRY_ALIGNMENT", "SPECIALTY_MATCH")
 # `SIMILAR_SIZE` forbidden value catch an answer that names either.
 WHY_TYPES = ("INDUSTRY_ALIGNMENT", "SPECIALTY_MATCH", "LOCATION_FIT",
              "MATCHES_DESIGN_STYLE")
-# The store derives this from a vector the other two forms do not carry, and
-# the graph form's README says to ignore it. Naming it is a wrong answer.
-NOISE_TYPE = "SEMANTIC_MATCH"
+# Every relationship a task may ask about. The store also derives a
+# `SEMANTIC_MATCH` from a vector the other two forms do not carry; it is never
+# a truth value and never a forbidden one — penalising it would cost the graph
+# arm for reading its own data and no other arm anything — so comparisons
+# against the store intersect with this set and the extra type falls away.
+TASK_EDGE_TYPES = frozenset(r["edge_type"] for r in task_rules())
 # One word is both a specialty and a design style, so it never becomes a
 # forbidden specialty: an answer that named it as a shared *style* would be
 # penalised for a specialty it never claimed.
@@ -94,10 +97,17 @@ KINDS = ("why", "multihop", "retraction", "timetravel", "visibility")
 
 
 class Suite:
-    """One world, its live state, and the derived edges over it."""
+    """One world, its live state, and the derived edges over it.
 
-    def __init__(self, seed: int, scale: int) -> None:
+    `avoid` holds entity keys no task may be built around. It is how a task
+    whose truth the engine disputes gets dropped: the disagreement is filed,
+    its target goes into `avoid`, and the next candidate takes its place.
+    """
+
+    def __init__(self, seed: int, scale: int,
+                 avoid: frozenset[str] = frozenset()) -> None:
         self.seed = seed
+        self.avoid = avoid
         self.world = world(seed, scale)
         self.rules = self.world["rules"]
         self.live = state_at(self.world, LAST_DAY)
@@ -138,6 +148,9 @@ def _task(task_id: int, kind: str, n: int, prompt: str, truth: dict[str, Any],
     if overlap:
         raise AssertionError(f"task {task_id}: {sorted(overlap)} is both truth "
                              f"and near-miss")
+    if len(forbid) != FORBIDDEN:
+        raise AssertionError(f"task {task_id}: {len(forbid)} near-misses, "
+                             f"every task carries {FORBIDDEN}")
     for a in values + forbid:
         for b in values + forbid:
             if a != b and a.lower() in b.lower():
@@ -174,8 +187,12 @@ def why_tasks(s: Suite, n: int = 4) -> list[dict[str, Any]]:
     """Pairs where exactly three of the four non-size rules fire.
 
     The size buckets are forced two apart so neither size rule fires, and the
-    talent and the company are forced to have specialties the other lacks, so
-    there is evidence to name and evidence to withhold.
+    pair is forced to have at least three specialties that only one of the two
+    carries. Those are the near-misses: a specialty one side has and the other
+    does not is exactly the one-predicate error a careless reader makes.
+    Company-only ones are preferred; the generator gives an entity at most
+    four specialties, so a pair sharing two cannot have three company-only
+    ones as well, and the talent's own unshared specialties top the count up.
     """
     talents, tasks = s.keys("Talent"), []
     s.rng.shuffle(talents)
@@ -183,8 +200,10 @@ def why_tasks(s: Suite, n: int = 4) -> list[dict[str, Any]]:
     for talent in talents:
         if len(tasks) == n:
             break
+        if talent in s.avoid:
+            continue
         for company in sorted(s.live_linked(talent, ("SPECIALTY_MATCH",), "Company")):
-            if company in seen:
+            if company in seen or company in s.avoid:
                 continue
             tp, cp = s.props(talent), s.props(company)
             if abs((tp["size_bucket"] or 0) - (cp["size_bucket"] or 0)) < 2:
@@ -193,10 +212,13 @@ def why_tasks(s: Suite, n: int = 4) -> list[dict[str, Any]]:
             held = [t for t in WHY_TYPES if t in types]
             if len(held) != 3:
                 continue
-            shared = sorted(set(tp["specialties"]) & set(cp["specialties"]))
-            theirs = sorted(t for t in set(cp["specialties"]) - set(tp["specialties"])
-                            if t not in AMBIGUOUS_TERMS)
-            if len(shared) < 2 or len(theirs) < 2:
+            mine_set, theirs_set = set(tp["specialties"]), set(cp["specialties"])
+            shared = sorted(mine_set & theirs_set)
+            unshared = lambda a, b: sorted(     # noqa: E731
+                t for t in a - b if t not in AMBIGUOUS_TERMS)
+            theirs, mine = unshared(theirs_set, mine_set), unshared(mine_set, theirs_set)
+            near_specialties = (theirs + mine)[:3]
+            if len(shared) < 2 or len(near_specialties) < 3:
                 continue
             missing = [t for t in WHY_TYPES if t not in held]
             seen.add(company)
@@ -207,9 +229,14 @@ def why_tasks(s: Suite, n: int = 4) -> list[dict[str, Any]]:
                 f"per line, and then the specialties the two of them have in "
                 f"common, one per line. {ONLY}",
                 {"target": [talent, company], "as_of": day_date(LAST_DAY),
-                 "types": held, "shared_specialties": shared},
+                 "types": held, "shared_specialties": shared,
+                 "unshared_specialties": near_specialties},
                 held + shared,
-                missing + ["SIMILAR_SIZE", NOISE_TYPE] + theirs[:2]))
+                # The one relationship of the four that does not hold, the
+                # size family (the buckets are two apart, so a single
+                # `SIMILAR_SIZE` catches an answer naming either size rule),
+                # and three specialties only one of the two carries.
+                missing + ["SIMILAR_SIZE"] + near_specialties))
             break
     if len(tasks) != n:
         raise AssertionError(f"only {len(tasks)} why tasks, wanted {n}")
@@ -262,19 +289,29 @@ def multihop_tasks(s: Suite, n: int = 4) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------
 
 
+# Two specialty rewrites and two resizes: an `Overlap` retraction and a
+# `NumericWithin` one, so the two predicates that can partially retract a
+# neighbourhood both get asked about. `industry` and `location` are not here
+# because changing either takes the *whole* neighbourhood, which asks nothing.
+RETRACTION_PLANS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("specialties", TRI),
+    ("specialties", TRI),
+    ("size_bucket", TRI_SIZE),
+    ("size_bucket", TRI_SIZE),
+)
+
+
 def retraction_tasks(s: Suite, n: int = 4) -> list[dict[str, Any]]:
-    """Two specialty rewrites and two resizes, each on a company with a big
-    enough neighbourhood that the counterfactual splits it."""
+    """Each on a company with a neighbourhood big enough that the
+    counterfactual splits it rather than emptying it."""
     tasks: list[dict[str, Any]] = []
     companies = s.keys("Company")
     s.rng.shuffle(companies)
-    plans = [("specialties", TRI), ("specialties", TRI), ("size_bucket", TRI_SIZE)]
-    plans.append(("size_bucket", TRI_SIZE))
     used: set[str] = set()
-    for field, types in plans[:n]:
+    for field, types in RETRACTION_PLANS[:n]:
         picked = None
         for company in companies:
-            if company in used:
+            if company in used or company in s.avoid:
                 continue
             base = s.live_linked(company, types, "Talent")
             if not 12 <= len(base) <= 45:
@@ -294,9 +331,12 @@ def retraction_tasks(s: Suite, n: int = 4) -> list[dict[str, Any]]:
             f"nothing else about the data changed. Which of those talents "
             f"would no longer be linked to it by all three? Name the talent "
             f"keys, one per line. {ONLY}",
+            # `base` is the neighbourhood before the counterfactual — the one
+            # part of a retraction task the engine can be asked about, and
+            # `verify_against_store` asks it with `explain`.
             {"as_of": day_date(LAST_DAY), "target": company,
              "edge_types": list(types), "field": field, "value": value,
-             "linked_before": len(lost) + len(kept)},
+             "base": sorted(lost | kept), "linked_before": len(lost) + len(kept)},
             sorted(lost), s.rng.sample(sorted(kept), FORBIDDEN)))
     return tasks
 
@@ -344,7 +384,7 @@ def timetravel_tasks(s: Suite, n: int = 4) -> list[dict[str, Any]]:
         if len(tasks) == n:
             break
         talent, day = change["key"], change["day"] - 1
-        if talent in used or talent not in s.live:
+        if talent in used or talent in s.avoid or talent not in s.live:
             continue
         nodes = state_at(s.world, day)
         if talent not in nodes:
@@ -392,7 +432,7 @@ def visibility_tasks(s: Suite, n: int = 4) -> list[dict[str, Any]]:
     for combo in VISIBILITY_COMBOS[:n]:
         picked = None
         for talent in talents:
-            if talent in used:
+            if talent in used or talent in s.avoid:
                 continue
             jobs = s.live_linked(talent, combo, "Job")
             hidden = s.live_linked(talent, combo, "Company")
@@ -448,8 +488,9 @@ def world_digest(w: dict[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
-def build(seed: int, scale: int) -> dict[str, Any]:
-    s = Suite(seed, scale)
+def build(seed: int, scale: int,
+          avoid: frozenset[str] = frozenset()) -> dict[str, Any]:
+    s = Suite(seed, scale, avoid)
     tasks: list[dict[str, Any]] = []
     for kind in KINDS:
         tasks.extend(BUILDERS[kind](s))
@@ -467,52 +508,112 @@ def build(seed: int, scale: int) -> dict[str, Any]:
     }
 
 
-def verify_against_store(data: dict[str, Any], build_dir: Path) -> list[str]:
-    """Re-ask the engine every pairwise claim the tasks make about today.
+def task_targets(task: dict[str, Any]) -> set[str]:
+    """The entity keys a task is built around — what goes into `avoid` when
+    the engine disputes its truth."""
+    target = task["truth"].get("target")
+    if target is None:
+        return set()
+    return set(target) if isinstance(target, list) else {target}
 
-    `explain` is a millisecond, so every why pair and every key a visibility
-    task names — answer and near-miss alike — is checked against the store the
-    graph arm will actually be given. The set-shaped kinds are covered by
-    `truth.cross_check`, not here.
+
+def verify_against_store(data: dict[str, Any], build_dir: Path,
+                         progress: bool = False) -> tuple[list[str], set[int]]:
+    """Re-ask the engine every claim the tasks make that it can be asked.
+
+    Four of the five kinds carry a claim the engine can answer directly:
+
+    - **why** — `explain(a, b)` must name exactly the truth's relationships.
+    - **visibility** — `explain` on every answer key and every near-miss key.
+    - **time travel** — `was_linked(a, b, type, commit_of_day)` on every
+      (answer, relationship) pair, which must all be true, and on the
+      near-misses, at least one of whose relationships must be false at that
+      date (a near-miss is "not linked by all of them then", not "linked by
+      none of them").
+    - **retraction** — `explain` on the whole neighbourhood as it stands
+      before the counterfactual. The counterfactual world itself has no
+      commit, so the engine cannot be asked about it.
+
+    **Multi-hop stays Python-only.** Its claim is a count over the whole
+    2,000-node world — for each company, how many qualifying talents reach it
+    by all three relationships — and there is no engine call that answers it
+    without either a `query_at` replay (80-90 s each) or ~840,000 `explain`
+    calls. `truth.cross_check`'s 200 sampled `explain` probes are what stands
+    behind it.
+
+    Returns the disagreements and the ids of the tasks that produced them.
     """
     from mushroomdb import GraphDb
     from association.build import STORE_NAME
 
     problems: list[str] = []
-    store = form_paths(build_dir)["graph"] / STORE_NAME
-    db = GraphDb.open(str(store), read_only=True)
+    bad: set[int] = set()
+    graph = form_paths(build_dir)["graph"]
+    commit_of = {e["day"]: e["commit"]
+                 for e in json.loads((graph / "days.json").read_text())}
+
+    def fail(task: dict[str, Any], line: str) -> None:
+        problems.append(f"task {task['id']} ({task['key']}): {line}")
+        bad.add(task["id"])
+
+    db = GraphDb.open(str(graph / STORE_NAME), read_only=True)
     try:
         for task in data["tasks"]:
-            if task["kind"] == "why":
-                a, b = task["truth"]["target"]
-                want = set(task["truth"]["types"])
-                # Every type but the store-only noise one: a why pair is
-                # picked so no size rule fires, so the store must agree that
-                # none does.
-                got = {r["edge_type"] for r in db.explain(a, b)
-                       if r["edge_type"] != NOISE_TYPE}
+            kind, truth = task["kind"], task["truth"]
+            if progress:
+                print(f"  verifying {task['key']}", flush=True)
+
+            if kind == "why":
+                a, b = truth["target"]
+                want = set(truth["types"])
+                # Intersecting with the nine task rules' types is what drops
+                # the store-only SEMANTIC_MATCH: it is not a type any task
+                # asks about, so the store having it is neither agreement nor
+                # disagreement. A why pair is picked with the size buckets two
+                # apart, so the store must also agree no size rule fires.
+                got = {r["edge_type"] for r in db.explain(a, b)} & TASK_EDGE_TYPES
                 if want != got:
-                    problems.append(f"task {task['id']} why {a} {b}: truth "
-                                    f"{sorted(want)} != store {sorted(got)}")
-            elif task["kind"] == "visibility":
-                target = task["truth"]["target"]
-                want = set(task["truth"]["edge_types"])
-                for key in task["truth"]["answer"]:
+                    fail(task, f"why {a} {b}: truth {sorted(want)} != store "
+                               f"{sorted(got)}")
+
+            elif kind == "visibility":
+                target, want = truth["target"], set(truth["edge_types"])
+                for key in truth["answer"] + truth["forbid"]:
                     got = {r["edge_type"] for r in db.explain(target, key)}
                     if not want <= got:
-                        problems.append(
-                            f"task {task['id']} visibility {target} {key}: "
-                            f"store has {sorted(got)}, wanted {sorted(want)}")
-                for key in task["truth"]["forbid"]:
+                        role = ("answer" if key in truth["answer"]
+                                else "near-miss")
+                        fail(task, f"{role} {target} {key}: store has "
+                                   f"{sorted(got)}, wanted {sorted(want)}")
+
+            elif kind == "retraction":
+                target, want = truth["target"], truth["edge_types"]
+                for key in truth["base"]:
                     got = {r["edge_type"] for r in db.explain(target, key)}
-                    if not want <= got:
-                        problems.append(
-                            f"task {task['id']} near-miss {target} {key} is "
-                            f"not the near-miss it claims: store has "
-                            f"{sorted(got)}")
+                    if not set(want) <= got:
+                        fail(task, f"before the counterfactual {target} {key}: "
+                                   f"store has {sorted(got)}, wanted "
+                                   f"{sorted(want)}")
+
+            elif kind == "timetravel":
+                target, want = truth["target"], truth["edge_types"]
+                commit = commit_of[truth["day"]]
+                for key in truth["answer"]:
+                    for edge_type in want:
+                        if not db.was_linked(target, key, edge_type, commit):
+                            fail(task, f"{target} {key} {edge_type} on "
+                                       f"{truth['as_of']}: truth says linked, "
+                                       f"store says not")
+                for key in truth["forbid"]:
+                    # Short-circuit: one relationship missing is the whole of
+                    # the claim, and each call is ~2.4 s on this store.
+                    if all(db.was_linked(target, key, t, commit) for t in want):
+                        fail(task, f"near-miss {target} {key} on "
+                                   f"{truth['as_of']}: store says it was "
+                                   f"linked by all of {sorted(want)}")
     finally:
         db.close()
-    return problems
+    return problems, bad
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -522,17 +623,48 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=HERE / "tasks.json")
     ap.add_argument("--build", type=Path, default=None,
                     help="a build.py --out directory; re-asks the engine every "
-                         "pairwise claim the tasks make")
+                         "claim the tasks make that it can be asked")
+    ap.add_argument("--rounds", type=int, default=3,
+                    help="how many times to drop a disputed task and pick "
+                         "its replacement before giving up")
+    ap.add_argument("--disagreements", type=Path, default=None,
+                    help="file the store's disagreements here")
     args = ap.parse_args(argv)
 
-    data = build(args.seed, args.scale)
+    avoid: frozenset[str] = frozenset()
+    filed: list[str] = []
+    data = build(args.seed, args.scale, avoid)
     if args.build is not None:
-        problems = verify_against_store(data, args.build)
-        for line in problems:
-            print(f"  store disagrees: {line}")
-        if problems:
+        for attempt in range(1, args.rounds + 1):
+            problems, bad = verify_against_store(data, args.build, progress=True)
+            if not problems:
+                print(f"store agrees with every claim it can be asked "
+                      f"(round {attempt})")
+                break
+            # The spec's rule: a task whose two truths disagree is dropped and
+            # the disagreement filed. Its target goes on the avoid list and
+            # the next candidate takes its place.
+            filed.extend(problems)
+            for line in problems:
+                print(f"  store disagrees: {line}")
+            dropped = {k for t in data["tasks"] if t["id"] in bad
+                       for k in task_targets(t)}
+            if not dropped:
+                print("  nothing to drop: the disputed task has no target")
+                return 1
+            print(f"  dropping {sorted(dropped)} and rebuilding")
+            avoid = avoid | dropped
+            data = build(args.seed, args.scale, avoid)
+        else:
+            print(f"still disagreeing after {args.rounds} rounds")
             return 1
-        print("store agrees with every pairwise claim")
+    if filed and args.disagreements:
+        args.disagreements.write_text(
+            "# Tasks the engine disputed\n\n"
+            + "\n".join(f"- `{line}`" for line in filed) + "\n")
+        print(f"filed {len(filed)} disagreement(s) in {args.disagreements}")
+    if avoid:
+        data["dropped_targets"] = sorted(avoid)
     args.out.write_text(json.dumps(data, indent=2) + "\n")
     print(f"wrote {args.out} (world {data['world_digest']})")
     for task in data["tasks"]:

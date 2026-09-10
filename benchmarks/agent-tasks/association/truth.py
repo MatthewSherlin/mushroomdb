@@ -431,6 +431,10 @@ LIVE_PAIRS = 200
 TIME_PROBES = 20
 HISTORY_PROBES = 20
 
+# How many `prop_set` entries `node_history` reports for the props an
+# `insert_node` brought with it. Measured: none — the record carries them.
+INSERT_PROP_SET_RECORDS = 0
+
 # Disagreements the cross-check has already found, filed, and is not going to
 # re-litigate on every run. They are still reported — prefixed, so an unknown
 # disagreement can never hide behind one — and `association/cross-check.md`
@@ -563,9 +567,14 @@ def _pick_time_probe(rng: random.Random, world: dict[str, Any],
             if linked:
                 return (day, a, b, sorted(linked)[rng.randrange(len(linked))], True)
         else:
-            missing = [t for t in edge_types if t not in linked]
-            if missing and _label_pair_is_possible(nodes, rules, a, b, missing):
-                return (day, a, b, rng.choice(missing), False)
+            # The probed type has to be one a rule could actually derive for
+            # *this* label pair — asking whether a Talent and a Job were ever
+            # `SIMILAR_SIZE` proves nothing, because no rule declares it.
+            # Filtering per type, not over the batch, is what guarantees that.
+            derivable = [t for t in edge_types if t not in linked
+                         and _label_pair_is_possible(nodes, rules, a, b, [t])]
+            if derivable:
+                return (day, a, b, rng.choice(derivable), False)
     return None
 
 
@@ -625,17 +634,21 @@ def _history_problems(db, world: dict[str, Any], key: str) -> list[str]:
             f"node_history {key}: changelog deletes it = {wants_delete}, "
             f"engine reports node_deleted = {'node_deleted' in kinds}")
 
-    want_sets = sum(1 for c in changes if c["op"] == "set_prop")
+    # An `insert_node` carries the whole record on the WAL's InsertNode frame,
+    # so it contributes no `prop_set` entries of its own — a key the changelog
+    # inserted counts exactly like a base one. That is measured, not assumed:
+    # `test_an_insert_contributes_no_prop_set_records` pins it, so if the
+    # engine ever starts writing them this stops being silently wrong.
+    want_sets = (sum(1 for c in changes if c["op"] == "set_prop")
+                 + INSERT_PROP_SET_RECORDS
+                 * sum(1 for c in changes if c["op"] == "insert_node"))
     got_sets = kinds.count("prop_set")
-    inserted = any(c["op"] == "insert_node" for c in changes)
     line = (f"node_history {key}: changelog sets {want_sets} props, "
             f"engine reports {got_sets}")
     if wants_delete and want_sets and got_sets == 0:
         # The filed gap: a tombstone takes the node's property history with it.
         problems.append(_gap(GAP_DELETED_PROPS, line))
-    elif not inserted and got_sets != want_sets:
-        # A node inserted mid-history carries its props as `prop_set` records
-        # on the insert commit, so only base entities count one-to-one.
+    elif got_sets != want_sets:
         problems.append(line)
 
     if "node_inserted" not in kinds:
@@ -677,7 +690,10 @@ def main(argv: list[str] | None = None) -> int:
           f"({len(problems) - len(fresh)} already filed, {len(fresh)} new)")
     for line in problems:
         print(f"  {line}")
-    if args.out and problems:
+    if args.out:
+        # Always, even on a clean run: a file that says "0 disagreements" is
+        # the record. Writing only on failure would leave the last bad run's
+        # file sitting there looking current.
         args.out.write_text(_cross_check_md(args, problems, fresh))
         print(f"wrote {args.out}")
     return 1 if fresh else 0
@@ -698,7 +714,8 @@ def _cross_check_md(args, problems: list[str], fresh: list[str]) -> str:
     ]
     for gap_id, prose in KNOWN_GAPS.items():
         hits = [p for p in problems if p.startswith(f"{KNOWN_GAP_PREFIX}[{gap_id}]")]
-        lines += [f"## Filed: `{gap_id}` ({len(hits)} probes)", "", prose, ""]
+        lines += [f"## Filed: `{gap_id}` ({len(hits)} probes hit it)", "",
+                  prose, ""]
         lines += [f"- `{h}`" for h in hits[:5]] + [""]
     if fresh:
         lines += ["## Unexplained", ""] + [f"- `{f}`" for f in fresh] + [""]

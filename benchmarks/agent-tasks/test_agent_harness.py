@@ -872,6 +872,53 @@ def test_the_truth_script_and_the_engine_agree_on_a_small_world(tmp_path):
     assert any(GAP_DELETED_PROPS in p for p in problems), problems
 
 
+def test_a_negative_time_probe_always_asks_about_a_derivable_type():
+    """A `was_linked` probe that expects False proves nothing if no rule could
+    ever have derived that type for that pair of labels — `SIMILAR_SIZE`
+    between a Talent and a Job is False whatever the engine does."""
+    import random
+    from association.build import world
+    from association.truth import (
+        _label_pair_is_possible, _pick_time_probe, state_at,
+    )
+    w = world(seed=7, scale=200)
+    rules = w["rules"]
+    edge_types = sorted({r["edge_type"] for r in rules})
+    commit_of = {d: d for d in range(90)}
+    rng = random.Random(11)
+    negatives = 0
+    for _ in range(12):
+        probe = _pick_time_probe(rng, w, rules, edge_types, commit_of,
+                                 want_linked=False)
+        assert probe is not None
+        day, a, b, edge_type, expected = probe
+        assert expected is False
+        nodes = state_at(w, day)
+        assert _label_pair_is_possible(nodes, rules, a, b, [edge_type]), (
+            f"{edge_type} is not derivable between {nodes[a]['label']} and "
+            f"{nodes[b]['label']}; the probe proves nothing")
+        negatives += 1
+    assert negatives == 12
+
+
+def test_an_insert_contributes_no_prop_set_records(tmp_path):
+    """What the changelog calls one `insert_node` the engine records as one
+    InsertNode frame carrying the whole record — not a prop_set per field. The
+    history cross-check counts on it, so it is measured rather than assumed."""
+    from association.truth import INSERT_PROP_SET_RECORDS
+    from mushroomdb import GraphDb
+    db = GraphDb.open(str(tmp_path / "insert.mushroomdb"))
+    try:
+        db.insert_node("Talent", "t1", {"industry": "architecture",
+                                        "size_bucket": 2, "status": "published"})
+        kinds = [e["kind"] for e in db.node_history("t1")]
+        assert kinds.count("prop_set") == 3 * INSERT_PROP_SET_RECORDS == 0
+        db.set_prop("t1", "status", "draft")
+        assert [e["kind"] for e in db.node_history("t1")].count("prop_set") == 1
+    finally:
+        db.close()
+
+
 def test_a_deleted_nodes_property_history_is_the_gap_we_filed(tmp_path):
     """The filed disagreement, reduced to three calls.
 
@@ -934,9 +981,9 @@ def test_every_association_task_is_a_bounded_set_question():
         assert t["truth"]["size"] == len(check["values"]), t["id"]
         assert not set(check["values"]) & set(check["forbid"]), t["id"]
         assert len(set(check["values"])) == len(check["values"]), t["id"]
+        assert len(check["forbid"]) == 5, (t["id"], len(check["forbid"]))
         if t["kind"] != "why":
             assert 3 <= t["truth"]["size"] <= 40, (t["id"], t["truth"]["size"])
-            assert len(check["forbid"]) == 5, t["id"]
         # Every value the answer must name has to appear in the answer as a
         # whole token; a value that is a substring of another would be graded
         # by accident.
@@ -948,6 +995,40 @@ def test_every_association_task_is_a_bounded_set_question():
         low = t["full_prompt"].lower()
         echoed = [v for v in check["values"] + check["forbid"] if v.lower() in low]
         assert not echoed, (t["id"], echoed)
+
+
+def test_no_association_task_penalises_an_arm_for_its_own_data():
+    """`SEMANTIC_MATCH` is derived from a vector only the graph form carries.
+    Forbidding it would cost that arm for reading its own store and cost no
+    other arm anything, so no task may name it — as truth or as a near-miss."""
+    data = json.loads((HERE / "association" / "tasks.json").read_text())
+    for t in data["tasks"]:
+        check = t["checks"][0]
+        assert "SEMANTIC_MATCH" not in check["values"] + check["forbid"], t["id"]
+        assert "SEMANTIC_MATCH" not in t["full_prompt"], t["id"]
+
+
+def test_every_engine_checkable_task_records_what_the_engine_was_asked():
+    """Four kinds carry a claim `verify_against_store` can put to the engine;
+    each one has to carry the fields that verification reads."""
+    data = json.loads((HERE / "association" / "tasks.json").read_text())
+    for t in data["tasks"]:
+        truth = t["truth"]
+        if t["kind"] == "why":
+            assert len(truth["target"]) == 2 and truth["types"], t["id"]
+        elif t["kind"] == "visibility":
+            assert truth["target"] and truth["edge_types"], t["id"]
+        elif t["kind"] == "retraction":
+            # The neighbourhood before the counterfactual is what `explain`
+            # can be asked about, so it is recorded, not just counted.
+            assert truth["base"], t["id"]
+            assert len(truth["base"]) == truth["linked_before"], t["id"]
+            assert set(truth["answer"]) <= set(truth["base"]), t["id"]
+            assert set(truth["forbid"]) <= set(truth["base"]), t["id"]
+        elif t["kind"] == "timetravel":
+            assert isinstance(truth["day"], int) and truth["edge_types"], t["id"]
+        else:
+            assert t["kind"] == "multihop", t["id"]
 
 
 def test_association_tasks_are_not_yet_pilot_sized():
