@@ -72,7 +72,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-000141` associated with `company-000153`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-000141` associated with `company-000153`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 6,
+      "pilot_fingerprint": "1b5febf5a43ba895"
     },
     {
       "id": 2,
@@ -139,7 +141,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-000512` associated with `company-000054`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-000512` associated with `company-000054`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 5,
+      "pilot_fingerprint": "7364ef33b807372d"
     },
     {
       "id": 3,
@@ -206,7 +210,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-001202` associated with `company-000014`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-001202` associated with `company-000014`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 7,
+      "pilot_fingerprint": "af6576206069404c"
     },
     {
       "id": 4,
@@ -273,7 +279,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-001307` associated with `company-000220`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-001307` associated with `company-000220`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 5,
+      "pilot_fingerprint": "fe804d93c6886573"
     },
     {
       "id": 5,
@@ -376,7 +384,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 14 different talents whose `status` is `published` and whose `years_of_experience` is 10 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 14 different talents whose `status` is `published` and whose `years_of_experience` is 10 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "714cbc0b5b76f125"
     },
     {
       "id": 6,
@@ -445,7 +455,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 16 different talents whose `status` is `published` and whose `years_of_experience` is 10 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 16 different talents whose `status` is `published` and whose `years_of_experience` is 10 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 13,
+      "pilot_fingerprint": "dbaac4851a5a61c4"
     },
     {
       "id": 7,
@@ -534,7 +546,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 8 different talents whose `status` is `published` and whose `years_of_experience` is 15 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 8 different talents whose `status` is `published` and whose `years_of_experience` is 15 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "2e374a45b1542f30"
     },
     {
       "id": 8,
@@ -601,7 +615,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 9 different talents whose `status` is `published` and whose `years_of_experience` is 15 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 9 different talents whose `status` is `published` and whose `years_of_experience` is 15 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 7,
+      "pilot_fingerprint": "a8dea7e70aea876e"
     },
     {
       "id": 9,
@@ -705,7 +721,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000239` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`. Suppose its `specialties` became [\"institutional\", \"landscape\"] and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000239` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`. Suppose its `specialties` became [\"institutional\", \"landscape\"] and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 10,
+      "pilot_fingerprint": "720a21b1fa882955"
     },
     {
       "id": 10,
@@ -806,7 +824,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000376` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`. Suppose its `specialties` became [\"civic\", \"hospitality\", \"institutional\"] and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000376` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`. Suppose its `specialties` became [\"civic\", \"hospitality\", \"institutional\"] and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "87b4d70469a993f4"
     },
     {
       "id": 11,
@@ -906,7 +926,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000244` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SIMILAR_SIZE` and `LOCATION_FIT`. Suppose its `size_bucket` became 3 and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000244` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SIMILAR_SIZE` and `LOCATION_FIT`. Suppose its `size_bucket` became 3 and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "9ed4a3628254348c"
     },
     {
       "id": 12,
@@ -998,7 +1020,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000235` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SIMILAR_SIZE` and `LOCATION_FIT`. Suppose its `size_bucket` became 3 and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000235` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SIMILAR_SIZE` and `LOCATION_FIT`. Suppose its `size_bucket` became 3 and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "9a96ef9fac676a15"
     },
     {
       "id": 13,
@@ -1062,7 +1086,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-06-19, which companies was `talent-000501` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-06-19, which companies was `talent-000501` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 6,
+      "pilot_fingerprint": "4f44f82daafcb60b"
     },
     {
       "id": 14,
@@ -1122,7 +1148,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-07-12, which companies was `talent-001026` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-07-12, which companies was `talent-001026` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 10,
+      "pilot_fingerprint": "2ef432b7c1f720ba"
     },
     {
       "id": 15,
@@ -1184,7 +1212,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-07-13, which companies was `talent-000641` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-07-13, which companies was `talent-000641` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 7,
+      "pilot_fingerprint": "5266b089bc47b386"
     },
     {
       "id": 16,
@@ -1248,7 +1278,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-07-14, which companies was `talent-000396` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-07-14, which companies was `talent-000396` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "eaa4c55beb75100f"
     },
     {
       "id": 17,
@@ -1350,7 +1382,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-000104` linked to by both `INDUSTRY_ALIGNMENT` and `SPECIALTY_MATCH`? Name their keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-000104` linked to by both `INDUSTRY_ALIGNMENT` and `SPECIALTY_MATCH`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 10,
+      "pilot_fingerprint": "d7004c772c2b2dfa"
     },
     {
       "id": 18,
@@ -1466,7 +1500,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-000450` linked to by both `INDUSTRY_ALIGNMENT` and `SPECIALTY_MATCH`? Name their keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-000450` linked to by both `INDUSTRY_ALIGNMENT` and `SPECIALTY_MATCH`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "8d6d62aff0dc0549"
     },
     {
       "id": 19,
@@ -1521,7 +1557,9 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-001161` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? Name their keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-001161` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 5,
+      "pilot_fingerprint": "20cb509360d09b8d"
     },
     {
       "id": 20,
@@ -1578,7 +1616,48 @@
         "kind": "none"
       },
       "verify": null,
-      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-001408` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? Name their keys, one per line. Name nothing else: no near-misses, no workings."
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-001408` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 7,
+      "pilot_fingerprint": "d537f1d9e69f595b"
     }
-  ]
+  ],
+  "pilot": {
+    "run": "20260910T232303Z-pilot-association",
+    "min_turns": 5,
+    "dropped": [],
+    "rounds": [
+      {
+        "run": "20260910T232133Z-pilot-association",
+        "tasks": [
+          1
+        ],
+        "dropped_under_the_floor": []
+      },
+      {
+        "run": "20260910T232303Z-pilot-association",
+        "tasks": [
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20
+        ],
+        "dropped_under_the_floor": []
+      }
+    ]
+  }
 }

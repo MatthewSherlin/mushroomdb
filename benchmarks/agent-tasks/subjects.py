@@ -49,10 +49,16 @@ SUBJECT_R = ASSOC_BUILD / "graph"        # the store, and the install that reach
 ASSOC_SUBJECTS = {"P": SUBJECT_P, "Q": SUBJECT_Q, "R": SUBJECT_R}
 ASSOC_ARMS = frozenset(ASSOC_SUBJECTS)
 
+# `association.build.STORE_NAME`, repeated rather than imported: this module is
+# imported by `run.py` on every cell and `build.py` pulls in the dogfood
+# generator. `test_the_three_association_subjects_are_the_three_built_forms`
+# is what keeps the two in step.
+ASSOC_STORE_NAME = "world.mushroomdb"
+
 # Everything the graph subject may hold once it is provisioned. Three files the
 # builder wrote, the store, and the two artefacts `install --delivery mcp`
 # leaves. Anything else is data the other two arms were not given.
-ASSOC_GRAPH_CONTENTS = ("world.mushroomdb", "README.md", "days.json",
+ASSOC_GRAPH_CONTENTS = (ASSOC_STORE_NAME, "README.md", "days.json",
                         "schema.json", ".mcp.json", ".claude")
 
 SUBJECTS = {
@@ -306,7 +312,7 @@ def install_association_graph(graph: Path) -> None:
             "--command", str(MUSHROOMDB),
             "--no-prewarm", "--no-git-hooks",
             "--delivery", "mcp",
-            "--db", f"./{ASSOC_GRAPH_CONTENTS[0]}",
+            "--db", f"./{ASSOC_STORE_NAME}",
         ], cwd=graph))
     stray = graph / ".gitignore"
     if stray.exists():
@@ -469,17 +475,49 @@ def assoc_cell_dir(arm: str) -> Path:
     return CELLS / f"assoc-{arm}"
 
 
+def repoint_install(dest: Path, old_root: Path) -> int:
+    """Point a copied install at the copy instead of at what it was copied from.
+
+    `install` writes absolute paths — the MCP server's store argument, and the
+    store in every hook command. Copied verbatim, a cell would open the
+    *subject's* store over MCP: the copy would be decoration, one cell's
+    `remember` would reach the next cell's data, and the summary would describe
+    an isolation the run did not have. Rewritten in bytes, so a file this does
+    not understand is either left alone or corrected wholesale, never half
+    parsed.
+
+    Returns how many files it changed.
+    """
+    old = str(Path(old_root).resolve()).encode()
+    new = str(Path(dest).resolve()).encode()
+    if old == new:
+        return 0
+    targets = [dest / ".mcp.json", *sorted((dest / ".claude").rglob("*"))]
+    changed = 0
+    for path in targets:
+        if not path.is_file():
+            continue
+        blob = path.read_bytes()
+        if old not in blob:
+            continue
+        path.write_bytes(blob.replace(old, new))
+        changed += 1
+    return changed
+
+
 def make_cell_copy(subject: Path, dest: Path) -> Path:
     """A fresh copy of a subject directory for one cell.
 
     The association subjects are not git repositories, so there is no worktree
     to add and no `git clean` to undo a cell's scratch files — the copy is both.
     `symlinks=False` on purpose: a link out of the tree would let one cell's
-    writes reach the subject the next cell is copied from.
+    writes reach the subject the next cell is copied from — and so would the
+    install's absolute paths, which `repoint_install` moves onto the copy.
     """
     shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(subject, dest, symlinks=False)
+    repoint_install(dest, subject)
     return dest
 
 

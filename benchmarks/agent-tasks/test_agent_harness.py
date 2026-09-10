@@ -1038,11 +1038,22 @@ def test_every_engine_checkable_task_records_what_the_engine_was_asked():
             assert t["kind"] == "multihop", t["id"]
 
 
-def test_association_tasks_are_not_yet_pilot_sized():
-    """`min_baseline_turns` is a measurement the pilot makes; a task must not
-    ship carrying one it never earned."""
-    data = json.loads((HERE / "association" / "tasks.json").read_text())
-    assert not any("min_baseline_turns" in t for t in data["tasks"])
+def test_every_association_task_survived_the_pilot_turn_floor():
+    """§3.2: a task the SQLite arm answers in four turns or fewer cannot show
+    a graph win, so it is replaced. What ships carries the measurement that
+    says it was not one of those — earned by `run.py --suite association
+    --pilot`, at the prompt it still has."""
+    from run import SUITES, already_sized
+    field = SUITES["association"]["turns_field"]
+    floor = SUITES["association"]["pilot_floor"]
+    tasks = json.loads((HERE / "association" / "tasks.json").read_text())["tasks"]
+    unsized = [t["key"] for t in tasks if t.get(field) is None]
+    assert not unsized, (f"never piloted: {unsized} (run `run.py --suite "
+                         f"association --pilot`)")
+    too_easy = {t["key"]: t[field] for t in tasks if t[field] < floor}
+    assert not too_easy, f"under the {floor}-turn floor: {too_easy}"
+    stale = [t["key"] for t in tasks if not already_sized(t, field)]
+    assert not stale, f"prompt or truth changed since the pilot sized it: {stale}"
 
 
 # --------------------------------------------------------------------------
@@ -1084,11 +1095,13 @@ def test_cell_command_arm_r_is_the_graph_subject_with_mcp():
 
 
 def test_the_three_association_subjects_are_the_three_built_forms():
-    from association.build import form_paths
-    from subjects import ASSOC_BUILD, SUBJECT_P, SUBJECT_Q, SUBJECT_R
+    from association.build import STORE_NAME, form_paths
+    from subjects import (ASSOC_BUILD, ASSOC_STORE_NAME, SUBJECT_P, SUBJECT_Q,
+                          SUBJECT_R)
     where = form_paths(ASSOC_BUILD)
     assert (SUBJECT_P, SUBJECT_Q, SUBJECT_R) == (
         where["files"], where["sqlite"], where["graph"])
+    assert ASSOC_STORE_NAME == STORE_NAME
 
 
 def test_load_tasks_reads_the_suites_own_file():
@@ -1250,6 +1263,34 @@ def test_the_graph_subject_holds_the_store_the_install_and_nothing_else(tmp_path
     assert {p.name for p in graph.iterdir()} == set(ASSOC_GRAPH_CONTENTS)
 
 
+def test_a_rebuilt_association_set_keeps_the_measurements_it_earned():
+    """Replacing one task must not re-pilot the nineteen that did not move,
+    and must not stamp a replacement with the turn count of the task it
+    replaced."""
+    from run import apply_pilot, carry_pilot_stamps
+    def task(i, prompt):
+        return {"id": i, "key": f"assoc-{i}", "full_prompt": prompt,
+                "truth": {"size": i}, "verify": None}
+    old = [task(1, "why a?"), task(2, "why b?"), task(3, "why c?")]
+    old, _turns, dropped = apply_pilot(
+        {"tasks": old},
+        [{"task": 1, "num_turns": 9}, {"task": 2, "num_turns": 7},
+         {"task": 3, "num_turns": 2}],
+        30, "round-1", floor=5, field="min_baseline_turns")
+    assert dropped == [("assoc-3", 2)]
+
+    # The rebuild reproduces 1 and 2 word for word and puts a new task in
+    # place of 3; 2's own prompt is then edited by hand.
+    fresh = [task(1, "why a?"), {**task(2, "why b, restated?")},
+             task(3, "why d?")]
+    merged, carried = carry_pilot_stamps(old["tasks"], fresh,
+                                         "min_baseline_turns")
+    assert carried == 1
+    assert merged[0]["min_baseline_turns"] == 9
+    assert "min_baseline_turns" not in merged[1]     # the prompt moved
+    assert "min_baseline_turns" not in merged[2]     # the replacement
+
+
 def test_an_association_cell_is_a_fresh_copy_of_its_subject(tmp_path):
     """P/Q/R cells are copies, not worktrees: the subjects are not git repos,
     and a cell that writes scratch files must not hand them to the next one."""
@@ -1270,3 +1311,31 @@ def test_an_association_cell_is_a_fresh_copy_of_its_subject(tmp_path):
     assert not (subject / "scratch.txt").exists()
 
     assert assoc_cell_dir("R").name == "assoc-R"
+
+
+def test_a_copied_cell_reaches_its_own_store_not_the_subjects(tmp_path):
+    """`install` writes the store's absolute path into `.mcp.json` and into
+    every hook. Copied verbatim, arm R's cell would open the subject's store
+    over MCP — the copy would isolate nothing and one cell's writes would
+    reach the next one's data."""
+    import json as _json
+    from subjects import make_cell_copy
+    subject = (tmp_path / "graph").resolve()
+    (subject / ".claude" / "skills" / "mushroom").mkdir(parents=True)
+    (subject / "world.mushroomdb").mkdir()
+    store = subject / "world.mushroomdb"
+    (subject / ".mcp.json").write_text(_json.dumps(
+        {"mcpServers": {"mushroomdb": {"command": "/bin/mushroomdb",
+                                       "args": ["mcp", str(store)]}}}))
+    (subject / ".claude" / "settings.json").write_text(_json.dumps(
+        {"hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": f"'/bin/mushroomdb' brief '{store}'"}]}]}}))
+
+    dest = (tmp_path / "cells" / "assoc-R").resolve()
+    make_cell_copy(subject, dest)
+    mcp = _json.loads((dest / ".mcp.json").read_text())
+    assert mcp["mcpServers"]["mushroomdb"]["args"][1] == str(dest / "world.mushroomdb")
+    settings = (dest / ".claude" / "settings.json").read_text()
+    assert str(subject) not in settings and str(dest / "world.mushroomdb") in settings
+    # The binary is not under the subject, so it is untouched.
+    assert mcp["mcpServers"]["mushroomdb"]["command"] == "/bin/mushroomdb"

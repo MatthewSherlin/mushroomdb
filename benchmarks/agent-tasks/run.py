@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-"""Run the agent benchmark: stock Claude Code (arm A) vs. mushroomdb.
+"""Run the agent benchmark. Two suites, one harness.
 
-Each cell is one `claude -p` session in a subject clone, captured as
-stream-json so tool calls can be counted and the final `result` event
-supplies usage/cost/turns/duration. Change-and-pass cells run in a worktree of
-their arm's clone and are graded on what they edited and whether the task's own
-tests pass afterwards.
+- **code** (default): stock Claude Code (arm A) against arms that carry
+  mushroomdb, over two repositories. Each cell is one `claude -p` session in a
+  subject clone; change-and-pass cells run in a worktree of that clone and are
+  graded on what they edited and whether the task's own tests pass afterwards.
+- **association** (v0.6.3 §3): one generated world in three forms — files (P),
+  SQLite (Q), a mushroomdb store (R) — asked relationship questions no form
+  answers without work. There is no repository: a cell is a fresh copy of its
+  arm's subject directory, and the baseline everything is measured against is
+  Q, not A.
 
-`subjects.py` owns the clones and worktrees; `report.py` owns the summary.
+Either way a session is captured as stream-json, so tool calls can be counted
+and the final `result` event supplies usage/cost/turns/duration.
+
+`subjects.py` owns the subjects; `report.py` owns the summary and the gate.
 
 Usage:
   python3 run.py --setup-only
   python3 run.py --pilot
   python3 run.py --tasks 1,2 --reps 1
+  python3 run.py --suite association --setup-only
+  python3 run.py --suite association --pilot
+  python3 run.py --suite association --reps 3
 """
 
 from __future__ import annotations
@@ -440,6 +450,29 @@ def apply_pilot(data: dict, rows: list[dict], cap: int, run_name: str,
     return data, turns, dropped
 
 
+def carry_pilot_stamps(old: list[dict], fresh: list[dict],
+                       field: str = "min_baseline_turns") -> tuple[list[dict], int]:
+    """Give every rebuilt task the measurement its identical predecessor had.
+
+    Keyed on the fingerprint — prompt, truth and test command — so a task the
+    rebuild reproduced word for word keeps the turn count it was measured at,
+    and a task whose prompt moved at all does not. Replacements come out
+    unstamped, which is what makes the next pilot round run exactly them.
+    """
+    stamps = {task_fingerprint(t): t for t in old
+              if t.get(field) is not None
+              and t.get("pilot_fingerprint") == task_fingerprint(t)}
+    out, carried = [], 0
+    for t in fresh:
+        was = stamps.get(task_fingerprint(t))
+        if was is not None:
+            t = {**t, field: was[field],
+                 "pilot_fingerprint": was["pilot_fingerprint"]}
+            carried += 1
+        out.append(t)
+    return out, carried
+
+
 def replace_dropped_association_tasks(data: dict, dropped: list[dict],
                                       build_dir: Path) -> dict:
     """Rebuild the association set with the dropped tasks' targets avoided.
@@ -454,8 +487,6 @@ def replace_dropped_association_tasks(data: dict, dropped: list[dict],
     """
     import subprocess as sp
     from association.build_tasks import task_targets
-    stamps = {task_fingerprint(t): t for t in data["tasks"]
-              if t.get("pilot_fingerprint")}
     avoid = set(data.get("dropped_targets", []))
     for t in dropped:
         avoid |= task_targets(t)
@@ -468,15 +499,8 @@ def replace_dropped_association_tasks(data: dict, dropped: list[dict],
     if p.returncode != 0:
         raise SystemExit(f"build_tasks.py failed ({p.returncode})")
     fresh = json.loads(out.read_text())
-    carried = 0
-    tasks = []
-    for t in fresh["tasks"]:
-        was = stamps.get(task_fingerprint(t))
-        if was is not None:
-            t = {**t, "min_baseline_turns": was["min_baseline_turns"],
-                 "pilot_fingerprint": was["pilot_fingerprint"]}
-            carried += 1
-        tasks.append(t)
+    tasks, carried = carry_pilot_stamps(
+        data["tasks"], fresh["tasks"], SUITES["association"]["turns_field"])
     fresh = {**fresh, "tasks": tasks, "pilot": data.get("pilot", {})}
     out.write_text(json.dumps(fresh, indent=2) + "\n")
     print(f"carried {carried} existing measurement(s) into the rebuilt set")
