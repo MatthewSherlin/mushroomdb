@@ -602,7 +602,10 @@ fn excerpt(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stopword, or_query, CODE_STOPWORDS, MAX_QUERY_TERMS, STOPWORDS};
+    use super::{
+        excerpt, is_stopword, or_query, CODE_STOPWORDS, MAX_EXCERPT_BYTES, MAX_QUERY_TERMS,
+        STOPWORDS,
+    };
 
     /// [`or_query`] is no longer what the prompt hook searches with — it is
     /// exported for callers that want BM25 over a whole sentence rather than
@@ -687,5 +690,39 @@ mod tests {
             "a subject word must stay searchable"
         );
         assert!(!is_stopword("test"));
+    }
+
+    /// [`excerpt`] cuts on a byte budget, and the text it cuts is a doc line
+    /// out of somebody's repository: an em dash, a CJK identifier, an accented
+    /// name. Slicing a `&str` mid-sequence panics, so the boundary walk is the
+    /// only thing between a doc comment and a hook that dies on every prompt.
+    #[test]
+    fn an_excerpt_cuts_multi_byte_text_on_a_character_boundary() {
+        for unit in ["—", "字", "é", "🍄"] {
+            // Comfortably past the 160-byte budget in every encoding width.
+            let line: String = unit.repeat(200);
+            let cut = excerpt(&line);
+            assert!(cut.ends_with('…'), "{unit}: {cut:?}");
+            assert!(
+                cut.len() <= MAX_EXCERPT_BYTES + '…'.len_utf8(),
+                "{unit}: {} bytes",
+                cut.len()
+            );
+            // Every char survives whole: the cut is a prefix of the original
+            // by characters, never a half-written one.
+            let body = cut.strip_suffix('…').expect("the ellipsis");
+            assert!(line.starts_with(body), "{unit}: {body:?} is not a prefix");
+            assert!(body.chars().all(|c| c == unit.chars().next().unwrap()));
+            // And the budget is actually being spent: a boundary walk that
+            // gave up would leave a much shorter line.
+            assert!(
+                body.len() > MAX_EXCERPT_BYTES - unit.len(),
+                "{unit}: cut back to {} bytes",
+                body.len()
+            );
+        }
+        // A line that already fits is returned unchanged, ellipsis or not.
+        let short = "— a doc line with an em dash";
+        assert_eq!(excerpt(short), short);
     }
 }
