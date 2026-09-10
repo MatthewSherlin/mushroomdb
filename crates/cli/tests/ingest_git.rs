@@ -1728,9 +1728,16 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
         "{} bytes",
         text.len()
     );
+    // The brief reaches a session's context before its first turn, so it opens
+    // with the marker every digest rendered out of a store opens with — inside
+    // the budget asserted above, not on top of it.
+    assert!(
+        text.starts_with(core_api::repograph::UNTRUSTED_FRAMING),
+        "{text}"
+    );
     // The header names the repository, its size and the sha it is at — and no
     // age, which is what would move between two prompts of one session.
-    let header = text.lines().next().unwrap();
+    let header = text.lines().nth(1).unwrap();
     let name = repo.file_name().unwrap().to_str().unwrap();
     let sha = marker(&db_dir, "__mushroomdb_git_sync__").expect("a sync marker");
     assert!(
@@ -1771,6 +1778,20 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
     assert!(out.status.success(), "the hook must never fail a session");
     assert!(out.stdout.is_empty(), "{:?}", String::from_utf8(out.stdout));
     assert!(out.stderr.is_empty(), "{:?}", String::from_utf8(out.stderr));
+
+    // And a store that is simply not there is not created on the way to
+    // finding that out: `RealFs::new` runs `create_dir_all`, so a `brief` hook
+    // left behind by an uninstall would otherwise plant an empty
+    // `mushroom-memory/` in the repository at the start of every session.
+    let absent = repo.join("no-such-store");
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("brief")
+        .arg(&absent)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+    assert!(!absent.exists(), "the hook created {}", absent.display());
 }
 
 /// Binding: on a store no repository was ingested into, the brief's last line

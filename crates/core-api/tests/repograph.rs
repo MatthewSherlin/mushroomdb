@@ -441,7 +441,18 @@ fn brief_is_deterministic_and_within_budget() {
         "{}",
         text.len()
     );
-    assert!(text.starts_with("mushroomdb brief —"), "{text}");
+    // The brief is repository-controlled text put in a session's context
+    // before its first turn: it opens with the same marker every other digest
+    // opens with, and the marker is inside the budget asserted above.
+    assert!(text.starts_with(UNTRUSTED_FRAMING), "{text}");
+    assert!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("mushroomdb brief —"),
+        "{text}"
+    );
+    assert_eq!(text.matches(UNTRUSTED_FRAMING).count(), 1, "{text}");
     assert!(
         !text.contains("ago"),
         "no relative times: the brief must be byte-stable across prompts"
@@ -469,6 +480,10 @@ fn brief_on_empty_store_renders_one_helpful_line() {
          how to reach a graph with nothing in it"
     );
     assert_eq!(text.lines().count(), 1);
+    assert!(
+        !text.contains(UNTRUSTED_FRAMING),
+        "no byte of this line came out of a store, so there is nothing to mark"
+    );
 }
 
 #[test]
@@ -590,7 +605,14 @@ fn a_tiny_budget_still_says_how_many_entries_it_dropped() {
         "{} bytes",
         text.len()
     );
-    assert!(text.starts_with("mushroomdb brief —"), "{text}");
+    assert!(text.starts_with(UNTRUSTED_FRAMING), "{text}");
+    assert!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("mushroomdb brief —"),
+        "{text}"
+    );
     assert!(
         text.contains("  … and "),
         "a listing this heavily cut must say so: {text}"
@@ -693,7 +715,8 @@ fn brief_without_a_sync_marker_omits_the_repo_and_the_sha() {
     assert!(!b.key_files.is_empty() && !b.key_symbols.is_empty());
 
     let text = render_brief(&b, "explore <target>");
-    let header = text.lines().next().unwrap();
+    assert!(text.starts_with(UNTRUSTED_FRAMING), "{text}");
+    let header = text.lines().nth(1).unwrap();
     assert_eq!(
         header,
         format!(
@@ -733,8 +756,10 @@ fn brief_on_a_store_with_no_files_still_says_how_to_reach_it() {
     let text = render_brief(&b, "explore <target>");
     assert_eq!(
         text,
-        "mushroomdb brief — 0 files · 0 symbols · 1 edge\n\
-         reach the graph: explore <target>\n",
+        format!(
+            "{UNTRUSTED_FRAMING}mushroomdb brief — 0 files · 0 symbols · 1 edge\n\
+             reach the graph: explore <target>\n"
+        ),
         "a store with a graph in it is not an empty store"
     );
 }

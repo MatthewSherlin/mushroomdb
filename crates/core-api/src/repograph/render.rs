@@ -11,6 +11,7 @@ use crate::repograph::explore::ExploreReport;
 use crate::repograph::impact::{FileImpact, ImpactReport, Partner};
 use crate::repograph::map::RepoMap;
 use crate::repograph::owners::OwnersReport;
+use crate::repograph::recall::UNTRUSTED_FRAMING;
 use crate::repograph::why::{WhyLink, WhyReport};
 use std::fmt::Write as _;
 
@@ -407,6 +408,10 @@ pub const MAX_BRIEF_BYTES: usize = 4_000;
 /// what is missing, and the command that fixes it. The same answer
 /// [`EMPTY_MAP`] gives, for the same reason — there is nothing to be central
 /// *in*, and no point naming a way to reach an empty graph.
+///
+/// Not marked with [`UNTRUSTED_FRAMING`], unlike every brief with a graph
+/// behind it: not one byte of this line came out of a store, so there is
+/// nothing here to mark as data.
 pub const EMPTY_BRIEF: &str =
     "mushroomdb brief — empty store; run: mushroomdb ingest-git <db> <repo>\n";
 
@@ -416,6 +421,13 @@ const BRIEF_SYMBOLS_HEADING: &str = "key symbols (most called):\n";
 
 /// Render a [`BriefReport`] as the block a session opens with: at most
 /// [`MAX_BRIEF_BYTES`] bytes, byte-identical for the same report.
+///
+/// The first line is [`UNTRUSTED_FRAMING`], as it is on every other digest
+/// rendered out of a store: a brief is repository-controlled text — paths,
+/// signatures, a branch name — placed in a session's context before its first
+/// turn, and the one digest a session never asked for is the last one that
+/// should reach it unmarked. Its bytes are charged to the budget like any
+/// other line, so a marked brief is not a longer one.
 ///
 /// `reach` is one line naming how to reach the graph from this session, which
 /// only the caller knows — a tool name on the MCP arm, a command on the CLI
@@ -451,7 +463,7 @@ pub fn render_brief(b: &BriefReport, reach: &str) -> String {
     if let Some(sha) = &b.last_sync {
         head.push(format!("synced {}", sanitize(sha)));
     }
-    let header = format!("mushroomdb brief — {}\n", head.join(SEP));
+    let header = format!("{UNTRUSTED_FRAMING}mushroomdb brief — {}\n", head.join(SEP));
 
     let mut files: Vec<String> = b
         .key_files
