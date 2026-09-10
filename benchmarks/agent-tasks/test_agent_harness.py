@@ -146,6 +146,44 @@ def test_grade_text_task_unchanged():
     assert grade(task, "it is in src/x.rs", None, None)["score"] == 1.0
 
 
+def test_grade_set_check_scores_the_fraction_it_names():
+    """A `set` check is graded as recall over the truth set, minus a penalty
+    for each near-miss the answer names. Floor is zero: a wrong answer scores
+    nothing, it never scores negative."""
+    from ground_truth import grade
+    task = {"kind": "why", "truth": {}, "extras": {"kind": "none"},
+            "checks": [{"kind": "set",
+                        "values": ["company-000001", "company-000002",
+                                   "company-000003", "company-000004"],
+                        "forbid": ["company-000900", "company-000901"]}]}
+    everything = "\n".join(f"company-00000{i}" for i in (1, 2, 3, 4))
+    assert grade(task, everything)["score"] == 1.0
+    assert grade(task, everything)["wrong_extra"] == 0
+
+    half = "company-000001\ncompany-000002"
+    assert grade(task, half)["score"] == 0.5
+
+    penalised = grade(task, half + "\ncompany-000900")
+    assert penalised["score"] == 0.25            # 0.5 - one 0.25 penalty
+    assert penalised["wrong_extra"] == 1
+
+    floored = grade(task, "company-000900\ncompany-000901")
+    assert floored["score"] == 0.0               # 0.0 - 0.5, floored
+    assert floored["wrong_extra"] == 2
+
+
+def test_grade_set_check_unit_passes_only_on_a_clean_sweep():
+    from ground_truth import grade, unit_passed
+    task = {"kind": "why", "truth": {}, "extras": {"kind": "none"},
+            "checks": [{"kind": "set", "values": ["a-1", "a-2"],
+                        "forbid": ["b-9"]}]}
+    clean = grade(task, "a-1 a-2")["units"]
+    dirty = grade(task, "a-1 a-2 b-9")["units"]
+    assert len(clean) == len(dirty) == 1        # the check produced a unit
+    assert unit_passed(clean[0])
+    assert not unit_passed(dirty[0])
+
+
 # --- statistics and the gate --------------------------------------------
 
 
@@ -394,6 +432,16 @@ def test_no_prompt_points_the_agent_at_the_graph():
         if t["repo"] == "R2":
             assert "mushroom" not in low, t["key"]
 
+    # The association suite has no repository at all, so nothing there may
+    # name the engine, its store, its tools or the shape of its data.
+    assoc = json.loads((HERE / "association" / "tasks.json").read_text())["tasks"]
+    assoc_banned = banned + ("mushroom", "graph", "store", "explain_association",
+                             "was_linked", "node_history", "edge_history",
+                             "commit", "days.json", "cypher")
+    for t in assoc:
+        low = t["full_prompt"].lower()
+        assert not any(b in low for b in assoc_banned), (t["id"], low)
+
 
 # --- change-task plumbing ------------------------------------------------
 
@@ -574,3 +622,336 @@ def test_a_deleted_key_is_absent_later_and_present_earlier(tmp_path):
         db.close()
     assert gone["key"] in was
     assert gone["key"] not in now
+
+
+# --------------------------------------------------------------------------
+# association suite: the truth script
+# --------------------------------------------------------------------------
+
+
+def _node(key, label, **props):
+    return {"key": key, "label": label, "props": props}
+
+
+def _rule(name, src, dst, predicate, edge_type):
+    return {"name": name, "src_label": src, "dst_label": dst,
+            "predicate": predicate, "edge_type": edge_type,
+            "weight_prop": "score", "max_edges": None}
+
+
+def test_predicate_holds_is_the_engines_definition_not_a_guess():
+    """The four predicates, read off `crates/core-rules/src/def.rs`.
+
+    `Overlap` is the one worth pinning: the denominator is the **union**, so
+    the score is the Jaccard index, and a non-empty intersection is required
+    on top of the threshold.
+    """
+    from association.truth import predicate_holds
+
+    def holds(pred, a, b, field="f"):
+        return predicate_holds({"predicate": pred},
+                               _node("a", "Talent", **{field: a}),
+                               _node("b", "Company", **{field: b}))
+
+    eq = {"FieldEqual": {"field": "f"}}
+    assert holds(eq, "architecture", "architecture")
+    assert not holds(eq, "architecture", "interior-design")
+    assert not holds(eq, None, None)             # a missing field never matches
+    assert not holds(eq, ["x"], ["x"])           # a list has no ValueKey
+
+    # Jaccard, not overlap-over-the-smaller-list: {a,b} vs {a,b,c,d} is
+    # 2/4 = 0.5, which clears 0.5 and fails 0.6. Over the smaller list it
+    # would be 2/2 = 1.0 and clear both — that is the guess this pins down.
+    half = {"Overlap": {"field": "f", "min": 0.5}}
+    steep = {"Overlap": {"field": "f", "min": 0.6}}
+    assert holds(half, ["a", "b"], ["a", "b", "c", "d"])
+    assert not holds(steep, ["a", "b"], ["a", "b", "c", "d"])
+    assert not holds({"Overlap": {"field": "f", "min": 0.0001}}, ["a"], ["b"])
+    assert not holds(half, ["a", "b"], [])       # empty union, no match
+    assert not holds(half, "a", "a")             # non-list, no tokens
+    assert holds(half, ["a", "a", "b"], ["a", "b"])   # duplicates collapse
+
+    # Haversine on the WGS-84 authalic mean radius. NYC to Philadelphia is
+    # ~130 km; NYC to Boston ~306 km.
+    nyc, philly, boston = [40.7128, -74.0060], [39.9526, -75.1652], [42.3601, -71.0589]
+    near = {"GeoRadius": {"field": "f", "km": 160.9}}
+    assert holds(near, nyc, philly)
+    assert not holds(near, nyc, boston)
+    assert holds({"GeoRadius": {"field": "f", "km": 306.5}}, nyc, boston)
+    assert not holds(near, nyc, [40.7128])       # not a lat/lon pair
+    assert not holds(near, nyc, [999.0, 0.0])    # out of range
+
+    loose = {"NumericWithin": {"field": "f", "tolerance": 1.0}}
+    strict = {"NumericWithin": {"field": "f", "tolerance": 0.0}}
+    assert holds(loose, 2, 3) and holds(loose, 3, 2) and holds(loose, 2, 2)
+    assert not holds(loose, 2, 4)
+    assert holds(strict, 3, 3)
+    assert not holds(strict, 3, 4)
+    assert not holds(strict, 3, None)
+
+
+def test_derived_edges_on_a_six_node_world_is_the_hand_computed_set():
+    from association.truth import derived_edges
+    nyc, la = [40.7128, -74.0060], [34.0522, -118.2437]
+    nodes = [
+        _node("t1", "Talent", industry="architecture", specialties=["a", "b"],
+              location=nyc, size_bucket=2),
+        _node("t2", "Talent", industry="interior-design", specialties=["b", "c"],
+              location=la, size_bucket=3),
+        _node("t3", "Talent", industry="architecture", specialties=["a", "b"],
+              location=[40.8, -74.0], size_bucket=3),
+        _node("c1", "Company", industry="architecture", specialties=["a", "b"],
+              location=[40.75, -74.0], size_bucket=2),
+        _node("c2", "Company", industry="interior-design", specialties=["c", "d"],
+              location=[34.05, -118.2], size_bucket=3),
+        _node("j1", "Job", industry="architecture", specialties=["a"],
+              location=[40.7, -74.0], size_bucket=3),
+    ]
+    rules = [
+        _rule("ind", "Talent", "Company", {"FieldEqual": {"field": "industry"}},
+              "INDUSTRY_ALIGNMENT"),
+        _rule("spec", "Talent", "Company",
+              {"Overlap": {"field": "specialties", "min": 0.5}}, "SPECIALTY_MATCH"),
+        _rule("loc", "Talent", "Company",
+              {"GeoRadius": {"field": "location", "km": 160.9}}, "LOCATION_FIT"),
+        _rule("size", "Talent", "Job",
+              {"NumericWithin": {"field": "size_bucket", "tolerance": 0.0}},
+              "SIMILAR_SIZE_STRICT"),
+    ]
+    assert derived_edges(nodes, rules) == {
+        ("INDUSTRY_ALIGNMENT", "t1", "c1"),
+        ("INDUSTRY_ALIGNMENT", "t2", "c2"),
+        ("INDUSTRY_ALIGNMENT", "t3", "c1"),
+        ("SPECIALTY_MATCH", "t1", "c1"),
+        ("SPECIALTY_MATCH", "t3", "c1"),
+        ("LOCATION_FIT", "t1", "c1"),
+        ("LOCATION_FIT", "t2", "c2"),
+        ("LOCATION_FIT", "t3", "c1"),
+        ("SIMILAR_SIZE_STRICT", "t2", "j1"),
+        ("SIMILAR_SIZE_STRICT", "t3", "j1"),
+    }
+
+
+def _tiny_world():
+    """Three talents, two companies, one job, four rules — the same shape the
+    hand-computed edge set above covers, wrapped as a world so the
+    history-and-role helpers can be exercised on it."""
+    nyc, la = [40.7128, -74.0060], [34.0522, -118.2437]
+    nodes = [
+        _node("t1", "Talent", industry="architecture", specialties=["a", "b"],
+              location=nyc, size_bucket=2),
+        _node("t2", "Talent", industry="interior-design", specialties=["b", "c"],
+              location=la, size_bucket=3),
+        _node("t3", "Talent", industry="architecture", specialties=["a", "b"],
+              location=[40.8, -74.0], size_bucket=3),
+        _node("c1", "Company", industry="architecture", specialties=["a", "b"],
+              location=[40.75, -74.0], size_bucket=2),
+        _node("c2", "Company", industry="interior-design", specialties=["c", "d"],
+              location=[34.05, -118.2], size_bucket=3),
+        _node("j1", "Job", industry="architecture", specialties=["a"],
+              location=[40.7, -74.0], size_bucket=3),
+    ]
+    rules = [
+        _rule("ind", "Talent", "Company", {"FieldEqual": {"field": "industry"}},
+              "INDUSTRY_ALIGNMENT"),
+        _rule("spec", "Talent", "Company",
+              {"Overlap": {"field": "specialties", "min": 0.5}}, "SPECIALTY_MATCH"),
+        _rule("loc", "Talent", "Company",
+              {"GeoRadius": {"field": "location", "km": 160.9}}, "LOCATION_FIT"),
+        _rule("size", "Talent", "Job",
+              {"NumericWithin": {"field": "size_bucket", "tolerance": 0.0}},
+              "SIMILAR_SIZE_STRICT"),
+    ]
+    return {"nodes": nodes, "rules": rules, "changes": [],
+            "roles": [{"name": "recruiter", "labels": ["Talent", "Job"]},
+                      {"name": "client", "labels": ["Company", "Job"]}],
+            "days": ["2026-06-01"]}
+
+
+def test_why_partners_and_multihop_read_the_same_edges():
+    from association.truth import derived_edges, multihop, partners, why
+    w = _tiny_world()
+    assert why(w, 0, "t1", "c1") == [
+        ("INDUSTRY_ALIGNMENT", "ind"), ("LOCATION_FIT", "loc"),
+        ("SPECIALTY_MATCH", "spec")]
+    assert why(w, 0, "c1", "t1") == why(w, 0, "t1", "c1")   # either way round
+    assert why(w, 0, "t2", "c1") == []
+
+    edges = derived_edges(w["nodes"], w["rules"])
+    assert partners(edges, "c1") == {"t1", "t3"}
+    assert partners(edges, "c1", ["INDUSTRY_ALIGNMENT", "SPECIALTY_MATCH"]) == {
+        "t1", "t3"}
+    assert partners(edges, "c2", ["SPECIALTY_MATCH"]) == set()
+
+    tri = ["INDUSTRY_ALIGNMENT", "SPECIALTY_MATCH", "LOCATION_FIT"]
+    assert multihop(w["nodes"], edges, dst_label="Company", edge_types=tri,
+                    min_sources=2) == {"c1"}
+    assert multihop(w["nodes"], edges, dst_label="Company", edge_types=tri,
+                    min_sources=3) == set()
+    # t1 and t3 both reach c1 by all three; only t1 is in bucket 2, so the
+    # filter takes the second source away and the bar of two stops being met.
+    bucket2 = lambda n: n["props"]["size_bucket"] == 2         # noqa: E731
+    assert multihop(w["nodes"], edges, dst_label="Company", edge_types=tri,
+                    min_sources=1, src_filter=bucket2) == {"c1"}
+    assert multihop(w["nodes"], edges, dst_label="Company", edge_types=tri,
+                    min_sources=2, src_filter=bucket2) == set()
+
+
+def test_retraction_names_only_the_edges_a_counterfactual_costs():
+    from association.truth import retraction
+    w = _tiny_world()
+    # c1's specialties no longer overlap either talent's, so both specialty
+    # edges go — and nothing else does.
+    assert retraction(w, 0, "c1", "specialties", ["x", "y"]) == {
+        ("SPECIALTY_MATCH", "t1", "c1"), ("SPECIALTY_MATCH", "t3", "c1")}
+    # Moving c1 across the country costs it the location edges instead.
+    assert retraction(w, 0, "c1", "location", [34.05, -118.2]) == {
+        ("LOCATION_FIT", "t1", "c1"), ("LOCATION_FIT", "t3", "c1")}
+    # A change that changes nothing retracts nothing.
+    assert retraction(w, 0, "c1", "size_bucket", 4) == set()
+
+
+def test_a_role_sees_a_relationship_only_when_it_sees_both_ends():
+    from association.truth import derived_edges, visible
+    w = _tiny_world()
+    edges = derived_edges(w["nodes"], w["rules"])
+    keys = {n["key"] for n in w["nodes"]}
+    assert visible(w, "recruiter", keys, w["nodes"]) == {"t1", "t2", "t3", "j1"}
+    assert visible(w, "client", keys, w["nodes"]) == {"c1", "c2", "j1"}
+    # A recruiter sees Talent and Job, so the Talent-Company edges are hidden
+    # however strongly they match, and the Talent-Job ones are not.
+    seen = visible(w, "recruiter", edges, w["nodes"])
+    assert seen == {("SIMILAR_SIZE_STRICT", "t2", "j1"),
+                    ("SIMILAR_SIZE_STRICT", "t3", "j1")}
+    # A client sees Company and Job, and no rule joins those two: it sees no
+    # derived relationship at all.
+    assert visible(w, "client", edges, w["nodes"]) == set()
+
+
+def test_state_at_replays_a_set_prop_and_a_delete():
+    from association.build import world
+    from association.truth import state_at
+    w = world(seed=7, scale=200)
+
+    edit = next(c for c in w["changes"] if c["op"] == "set_prop")
+    before = state_at(w, edit["day"] - 1)
+    after = state_at(w, edit["day"])
+    assert after[edit["key"]]["props"][edit["field"]] == edit["value"]
+    assert before[edit["key"]]["props"][edit["field"]] != edit["value"]
+
+    gone = next(c for c in w["changes"] if c["op"] == "delete_node")
+    assert gone["key"] in state_at(w, gone["day"] - 1)
+    assert gone["key"] not in state_at(w, gone["day"])
+
+    born = next(c for c in w["changes"] if c["op"] == "insert_node")
+    assert born["key"] not in state_at(w, born["day"] - 1)
+    assert born["key"] in state_at(w, born["day"])
+
+    # Day 0 is the base state: nothing has happened yet.
+    assert len(state_at(w, 0)) == len(w["nodes"])
+
+
+def test_the_truth_script_and_the_engine_agree_on_a_small_world(tmp_path):
+    """The cross-check the suite's credibility rests on: brute force in
+    Python and the engine's own derivation must name the same relationships,
+    live and at a past commit.
+
+    One disagreement is already filed (`association/cross-check.md`) and is
+    allowed through as a known gap. Everything else is a bug in one of the two
+    truths and fails here.
+    """
+    from association.build import world, write_store
+    from association.truth import GAP_DELETED_PROPS, cross_check, unknown
+    from subjects import MUSHROOMDB
+    w = world(seed=7, scale=200)
+    write_store(w, tmp_path / "graph", MUSHROOMDB)
+    problems = cross_check(w, tmp_path / "graph", seed=7,
+                           live_pairs=60, time_probes=6, history_probes=6)
+    assert unknown(problems) == [], unknown(problems)
+    # And the probe is not passing vacuously: it still reaches the filed gap.
+    assert any(GAP_DELETED_PROPS in p for p in problems), problems
+
+
+def test_a_deleted_nodes_property_history_is_the_gap_we_filed(tmp_path):
+    """The filed disagreement, reduced to three calls.
+
+    `node_history` keeps a deleted node's insert and its delete but drops
+    every `prop_set` in between: `db.rs`'s `SetPropId` branch resolves the id
+    with `key_of`, which is `None` for a tombstoned id. When this test starts
+    failing the engine has been fixed and `KNOWN_GAPS` should lose the entry.
+    """
+    from association.truth import GAP_DELETED_PROPS, KNOWN_GAPS
+    from mushroomdb import GraphDb
+    assert GAP_DELETED_PROPS in KNOWN_GAPS
+    db = GraphDb.open(str(tmp_path / "gap.mushroomdb"))
+    try:
+        db.insert_node("Talent", "t1", {"industry": "architecture"})
+        db.set_prop("t1", "industry", "interior-design")
+        assert [e["kind"] for e in db.node_history("t1")] == [
+            "node_inserted", "prop_set"]
+        db.delete_node("t1")
+        assert [e["kind"] for e in db.node_history("t1")] == [
+            "node_inserted", "node_deleted"]      # the prop_set is gone
+    finally:
+        db.close()
+
+
+# --------------------------------------------------------------------------
+# association suite: the task set
+# --------------------------------------------------------------------------
+
+ASSOC_KINDS = ("why", "multihop", "retraction", "timetravel", "visibility")
+
+
+def test_association_task_set_is_twenty_tasks_four_per_kind():
+    data = json.loads((HERE / "association" / "tasks.json").read_text())
+    tasks = data["tasks"]
+    assert len(tasks) == 20
+    assert len({t["id"] for t in tasks}) == 20
+    mix = {}
+    for t in tasks:
+        mix[t["kind"]] = mix.get(t["kind"], 0) + 1
+    assert mix == {k: 4 for k in ASSOC_KINDS}, mix
+    assert data["prefix"].startswith("Answer using only the data")
+    for t in tasks:
+        assert t["suite"] == "association"
+        assert t["verify"] is None
+        assert t["extras"] == {"kind": "none"}
+        assert t["full_prompt"].endswith(t["prompt"])
+        assert data["prefix"] in t["full_prompt"]
+
+
+def test_every_association_task_is_a_bounded_set_question():
+    """Brute force has to be real work, and the answer has to be checkable:
+    every task is graded by one `set` check whose values are the truth and
+    whose forbidden values are near-misses the truth excludes."""
+    data = json.loads((HERE / "association" / "tasks.json").read_text())
+    for t in data["tasks"]:
+        assert len(t["checks"]) == 1, t["id"]
+        check = t["checks"][0]
+        assert check["kind"] == "set", t["id"]
+        assert check["values"], t["id"]
+        assert t["truth"]["size"] == len(check["values"]), t["id"]
+        assert not set(check["values"]) & set(check["forbid"]), t["id"]
+        assert len(set(check["values"])) == len(check["values"]), t["id"]
+        if t["kind"] != "why":
+            assert 3 <= t["truth"]["size"] <= 40, (t["id"], t["truth"]["size"])
+            assert len(check["forbid"]) == 5, t["id"]
+        # Every value the answer must name has to appear in the answer as a
+        # whole token; a value that is a substring of another would be graded
+        # by accident.
+        for a in check["values"] + check["forbid"]:
+            others = [b for b in check["values"] + check["forbid"] if b != a]
+            assert not any(a.lower() in b.lower() for b in others), (t["id"], a)
+        # And the question must not contain its own answer or its own traps:
+        # an agent that quotes the prompt back would be scored for it.
+        low = t["full_prompt"].lower()
+        echoed = [v for v in check["values"] + check["forbid"] if v.lower() in low]
+        assert not echoed, (t["id"], echoed)
+
+
+def test_association_tasks_are_not_yet_pilot_sized():
+    """`min_baseline_turns` is a measurement the pilot makes; a task must not
+    ship carrying one it never earned."""
+    data = json.loads((HERE / "association" / "tasks.json").read_text())
+    assert not any("min_baseline_turns" in t for t in data["tasks"])
