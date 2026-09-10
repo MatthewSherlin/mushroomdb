@@ -2,9 +2,11 @@
 
 ## v0.6.2 — the proof release
 
-Every delivery change in this release was measured on a rebuilt agent benchmark before it shipped,
-and the pre-registered gate is reported as it came out. **The gate was not passed.** Nothing here
-is a claim the numbers do not carry. No format change.
+The delivery changes in this release were measured on a rebuilt agent benchmark before it shipped —
+but *together*, not one at a time: one four-arm run of 240 cells, plus a one-rep probe of the two
+`--intercept-grep` arms. No change here carries a number of its own, because the per-change
+baseline run was cancelled. The pre-registered gate is reported as it came out. **The gate was not
+passed.** Nothing here is a claim the numbers do not carry. No format change.
 
 #### The gate
 
@@ -77,9 +79,12 @@ Two smaller runs are committed beside it, and neither is a gate:
 - **`mushroomdb brief <db>` and a third Claude Code hook.** The brief is the repository's shape read
   from the graph alone: file, symbol and edge counts, the sha of the last sync, the 25 most central
   files with their role, the 25 most called symbols with their signatures, and one line naming the
-  door this install wired. Measured on this repository's store: **3,927 bytes** of a 4,000-byte cap,
-  median **228 ms**. It reads no clock and no working tree, so two sessions started an hour apart
-  get byte-identical output — a host that caches it is never wrong.
+  door this install wired, under the same untrusted-data marker every digest rendered out of a
+  store opens with — a brief is repository text placed in a session's context before its first
+  turn, and the marker's bytes come out of the cap, not on top of it. Measured on this
+  repository's store: **3,916 bytes** of a 4,000-byte cap, median **228 ms**. It reads no clock
+  and no working tree, so two sessions started an hour apart get byte-identical output — a host
+  that caches it is never wrong.
 - **Key files are ranked by centrality and then filtered to files something imports or calls.**
   PageRank over the file graph alone put six `.woff2` font files and an `OFL.txt` in this
   repository's top 25; a file that only *co-changes* with code is not what a session needs to be
@@ -103,8 +108,8 @@ Two smaller runs are committed beside it, and neither is a gate:
   startup, from the store it opened, so one `.mcp.json` serves both and neither has to be configured
   for. Measured on this repository's store, the listing a coding session pays for before its first
   turn drops from **5,622 bytes to 1,593** — 72%, on top of the 12,238 → 5,622 cut in v0.6.1. All 25
-  tools stay callable by name on either surface; `mushroomdb mcp <db> --all-tools` lists them all
-  (14,419 bytes).
+  tools stay served on either surface — the listing decides what a session can call, not what the
+  server answers — and `mushroomdb mcp <db> --all-tools` lists them all (14,419 bytes).
 - **`doctor`'s handshake accepts either front door.** It required `map` in `tools/list`, which is
   exactly the tool a code-graph store no longer lists — `doctor` failed on the stores this feature
   exists for. It now accepts `explore` or `map` and names the one it found.
