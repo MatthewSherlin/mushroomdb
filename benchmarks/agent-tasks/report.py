@@ -24,8 +24,8 @@ sys.path.insert(0, str(HERE))
 
 import truth_r2 as TRUTH_R2                                      # noqa: E402
 from ground_truth import unit_passed                             # noqa: E402
-from subjects import (ARM_LABEL, BASE_TOOLS, CELL_TIMEOUT_S,     # noqa: E402
-                      DEFAULT_MAX_TURNS, MCP_TOOL, SUBJECT_A, SUBJECT_B)
+from subjects import (ARM_LABEL, ARM_PROVENANCE, BASE_TOOLS,     # noqa: E402
+                      CELL_TIMEOUT_S, DEFAULT_MAX_TURNS, MCP_ARMS, MCP_TOOL)
 
 
 def fmt(v, nd=0):
@@ -145,15 +145,17 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
     lines.append(f"- subject HEAD: `{meta['head_short']}`")
     lines.append(f"- model: sonnet, max-turns {meta.get('max_turns', DEFAULT_MAX_TURNS)}, "
                  f"cell timeout {CELL_TIMEOUT_S}s")
-    lines.append(f"- arm A (stock): `{SUBJECT_A}`, no MCP, no project skill")
-    lines.append(f"- arm B (installed): `{SUBJECT_B}`, mushroomdb MCP + project "
-                 "skill + UserPromptSubmit nudge, plain prompt")
-    lines.append("- arm C (invoked): same clone and config as B, prompt prefixed "
-                 "with `/mushroom `")
+    # One line per arm this run actually has rows for, from the arm table the
+    # harness runs from — never a description of an arm that did not execute.
+    for a in arms:
+        lines.append(f"- arm {a} ({ARM_LABEL.get(a, a)}): "
+                     f"{ARM_PROVENANCE.get(a, 'no provenance recorded')}")
     lines.append(f"- R2 subject: {TRUTH_R2.R2['url']} at tag "
                  f"{TRUTH_R2.R2['tag']} (`{TRUTH_R2.R2['sha'][:12]}`), cloned per arm")
-    lines.append(f"- allowed tools, every arm: `{','.join(BASE_TOOLS)}`"
-                 f" (+ `{MCP_TOOL}` for B and C)")
+    mcp_here = [a for a in arms if a in MCP_ARMS]
+    mcp_note = (f" (+ `{MCP_TOOL}` for "
+                f"{', '.join(mcp_here)})" if mcp_here else "")
+    lines.append(f"- allowed tools, every arm: `{','.join(BASE_TOOLS)}`{mcp_note}")
     lines.append("- DEVIATION from the original design: `Bash` is unqualified "
                  "rather than the per-command `Bash(git:*)`, `Bash(rg:*)`, ... "
                  "list. That list denies every pipeline, which made the "

@@ -105,6 +105,16 @@ def test_cell_command_arm_f_has_no_mcp():
     assert cmd[cmd.index("--mcp-config") + 1] == str(EMPTY_MCP)
 
 
+def test_mcp_arms_matches_what_the_cells_are_actually_given():
+    """`MCP_ARMS` is what a summary says; `cell_command` is what ran."""
+    from run import cell_command
+    from subjects import ARM_LABEL, MCP_ARMS, MCP_TOOL
+    for arm in ARM_LABEL:
+        cmd, _ = cell_command(arm, "q", 30, None)
+        given = MCP_TOOL in cmd[cmd.index("--allowedTools") + 1]
+        assert given == (arm in MCP_ARMS), arm
+
+
 # --- grading -------------------------------------------------------------
 
 
@@ -244,6 +254,56 @@ def test_write_summary_renders_a_failed_gate_with_its_reasons(tmp_path):
     text = write_summary(tmp_path, rows, {"head_short": "abc1234"}).read_text()
     assert "FAILED" in text and "Why it failed:" in text
     assert "correctness" in text and "cost" in text and "adoption" in text
+
+
+def test_write_summary_provenance_lists_exactly_the_arms_that_ran(tmp_path):
+    """A summary describes the run it has cells for, and no other.
+
+    The provenance block used to be three hardcoded lines, so a run of A, E
+    and F opened by describing arms B and C — arms that never executed — and
+    by attributing to B an install it no longer performs.
+    """
+    from report import write_summary
+    from subjects import ARM_LABEL, ARM_PROVENANCE
+    assert set(ARM_PROVENANCE) == set(ARM_LABEL)
+
+    rows = []
+    for t in (1, 2):
+        for arm in ("A", "E", "F"):
+            rows.append(_cell(arm, t, score=0.5, cost_usd=0.1))
+    text = write_summary(tmp_path, rows, {"head_short": "abc1234"}).read_text()
+    provenance = [ln for ln in text.split("## Gate", 1)[0].splitlines()
+                  if ln.startswith("- arm ")]
+    assert [ln.split()[2] for ln in provenance] == ["A", "E", "F"]
+    for arm in ("A", "E", "F"):
+        assert f"- arm {arm} ({ARM_LABEL[arm]}): {ARM_PROVENANCE[arm]}" in provenance
+    # And the tool line names the MCP arms this run actually had: E, not B/C.
+    assert "(+ `mcp__mushroomdb` for E)" in text
+
+
+def test_rerender_rewrites_a_summary_without_moving_a_number(tmp_path):
+    """`rescore.py --rerender`: new prose, same cells, and it says so."""
+    import json
+    import pytest
+    from report import write_summary
+    from rescore import rerender
+
+    rows = [_cell("A", 1, score=1.0, cost_usd=0.2),
+            _cell("B", 1, score=0.5, cost_usd=0.3, mcp_calls=1, adopted=True)]
+    write_summary(tmp_path, rows, {"head_short": "abc1234", "max_turns": 30})
+    (tmp_path / "cells.json").write_text(json.dumps(rows, indent=2) + "\n")
+    before = (tmp_path / "summary.md").read_text()
+
+    assert rerender(tmp_path) == tmp_path / "summary.md"
+    assert (tmp_path / "summary.md").read_text() == before
+
+    # A cells.json that disagrees with the committed summary is refused, and
+    # the summary that was there is put back untouched.
+    rows[1]["score"] = 0.25
+    (tmp_path / "cells.json").write_text(json.dumps(rows, indent=2) + "\n")
+    with pytest.raises(SystemExit, match="would change a number"):
+        rerender(tmp_path)
+    assert (tmp_path / "summary.md").read_text() == before
 
 
 def test_write_summary_lists_every_sub_one_cell_for_classification(tmp_path):

@@ -8,6 +8,12 @@ Writes `cells-corrected.json` and `summary-corrected.md` beside the
 originals, which are left untouched.
 
 Usage: python3 rescore.py --run results/<timestamp> [--tasks tasks.json]
+
+`--rerender` is the other, smaller mode: it rewrites `summary.md` in place
+from the run's own `cells.json`, with no grading of any kind, so a wording fix
+in `report.py` reaches a committed summary without re-running or re-scoring
+anything. Every number outside the provenance block is asserted unchanged
+first, and the old file is put back if one moved.
 """
 
 from __future__ import annotations
@@ -26,6 +32,76 @@ from report import write_summary  # noqa: E402
 from run import parse_stream, usage_of  # noqa: E402
 
 NAME_RE = re.compile(r"task(\d+)_rep(\d+)_arm([A-Z])\.stream\.jsonl$")
+
+# ── re-render: the same cells, the same numbers, a newer `report.py` ─────────
+
+TITLE_RE = re.compile(r"^# Agent benchmark run(.*)$", re.M)
+HEAD_RE = re.compile(r"^- subject HEAD: `([^`]+)`", re.M)
+TURNS_RE = re.compile(r"^- model: .*max-turns (\d+)", re.M)
+NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def summary_meta(md: str) -> dict:
+    """The `write_summary` meta a committed summary was rendered with.
+
+    Read back off the summary itself rather than out of `tasks.json`, which
+    has moved on since: a re-render must reproduce the run that happened, not
+    the run the current task set would describe.
+    """
+    title = TITLE_RE.search(md)
+    head = HEAD_RE.search(md)
+    turns = TURNS_RE.search(md)
+    if not (title and head and turns):
+        raise SystemExit("rerender: summary.md is missing its title, HEAD or "
+                         "max-turns line — cannot reproduce its meta")
+    meta = {"head_short": head.group(1), "max_turns": int(turns.group(1))}
+    if title.group(1):
+        meta["title_suffix"] = title.group(1)
+    # Anything between the title and the provenance block is the run's note,
+    # carried through verbatim.
+    body = md.split("\n", 1)[1]
+    note = body.split("\n- run: ", 1)[0].strip("\n")
+    if note.strip():
+        meta["note"] = note
+    return meta
+
+
+def numbers(md: str) -> list[str]:
+    """Every number in a summary except the ones in its provenance block.
+
+    The provenance block — the `- ` bullets above the first `##` heading — is
+    exactly what a re-render is allowed to change; a digit anywhere else came
+    out of a cell and must survive untouched.
+    """
+    out: list[str] = []
+    in_provenance = True
+    for line in md.splitlines():
+        if line.startswith("## "):
+            in_provenance = False
+        if in_provenance and line.startswith("- "):
+            continue
+        out.extend(NUM_RE.findall(line))
+    return out
+
+
+def rerender(run_dir: Path) -> Path:
+    """Rewrite `run_dir/summary.md` from `run_dir/cells.json`, numbers intact."""
+    path = run_dir / "summary.md"
+    before = path.read_text()
+    rows = json.loads((run_dir / "cells.json").read_text())
+    write_summary(run_dir, rows, summary_meta(before), filename="summary.md")
+    after = path.read_text()
+    old, new = numbers(before), numbers(after)
+    if old != new:
+        path.write_text(before)          # leave the committed file as it was
+        first = next((i for i, (a, b) in enumerate(zip(old, new)) if a != b),
+                     min(len(old), len(new)))
+        raise SystemExit(
+            f"rerender: {path} would change a number "
+            f"({len(old)} before, {len(new)} after; first difference at "
+            f"{first}: {old[first:first + 3]} -> {new[first:first + 3]}) — "
+            "re-render aborted and the file restored")
+    return path
 
 
 def rescore(run_dir: Path, tasks_path: Path) -> tuple[list[dict], list[dict]]:
@@ -114,9 +190,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
     ap.add_argument("--tasks", default=str(HERE / "tasks.json"))
+    ap.add_argument("--rerender", action="store_true",
+                    help="rewrite summary.md in place from cells.json, with "
+                         "no grading and no numeric change")
     a = ap.parse_args()
 
     run_dir = Path(a.run).resolve()
+    if a.rerender:
+        print(f"re-rendered {rerender(run_dir)} (no cell re-graded)")
+        return 0
     rows, changed = rescore(run_dir, Path(a.tasks).resolve())
     print(f"re-scored {len(rows)} cells from {run_dir}")
 

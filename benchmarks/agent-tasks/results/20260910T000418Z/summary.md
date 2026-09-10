@@ -3,11 +3,12 @@
 - run: `20260910T000418Z`
 - subject HEAD: `c61ac91`
 - model: sonnet, max-turns 30, cell timeout 900s
-- arm A (stock): `/var/folders/94/19gj_1654c56m8bf5z_gf1240000gn/T/agent-bench/subject`, no MCP, no project skill
-- arm B (installed): `/var/folders/94/19gj_1654c56m8bf5z_gf1240000gn/T/agent-bench/subject-mdb`, mushroomdb MCP + project skill + UserPromptSubmit nudge, plain prompt
-- arm C (invoked): same clone and config as B, prompt prefixed with `/mushroom `
+- arm A (stock): no MCP server, no project skill, no hooks; plain prompt
+- arm B (mushroomdb installed): `mushroomdb install` — MCP server + project skill + SessionStart brief + prompt and edit hooks; plain prompt
+- arm C (mushroomdb, /mushroom invoked): arm B's clone and install exactly; prompt prefixed with `/mushroom `
+- arm D (mushroomdb, cli delivery (no MCP)): `mushroomdb install --delivery cli` — the skill teaches the binary, no MCP server; plain prompt
 - R2 subject: https://github.com/fastapi/fastapi at tag 0.141.1 (`95f8322ee1dc`), cloned per arm
-- allowed tools, every arm: `Read,Grep,Glob,Bash,Edit,Write` (+ `mcp__mushroomdb` for B and C)
+- allowed tools, every arm: `Read,Grep,Glob,Bash,Edit,Write` (+ `mcp__mushroomdb` for B, C)
 - DEVIATION from the original design: `Bash` is unqualified rather than the per-command `Bash(git:*)`, `Bash(rg:*)`, ... list. That list denies every pipeline, which made the co-change and most-imported tasks unanswerable in all arms. All arms carry the same deviation.
 - a cell that timed out or errored carries no cost, turns or duration; it is excluded from those means and from their paired differences, never counted as zero. Each section says how many cells it dropped.
 

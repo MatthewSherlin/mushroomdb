@@ -70,6 +70,28 @@ ARM_LABEL = {
     "F": "mushroomdb cli delivery + grep redirect",
 }
 
+# What each arm actually is, in one line, for the provenance block of a
+# summary. Keyed exactly like ARM_LABEL, and rendered only for the arms a run
+# has rows for — a summary that describes four arms and reports two describes
+# a run that did not happen.
+ARM_PROVENANCE = {
+    "A": "no MCP server, no project skill, no hooks; plain prompt",
+    "B": "`mushroomdb install` — MCP server + project skill + SessionStart "
+         "brief + prompt and edit hooks; plain prompt",
+    "C": "arm B's clone and install exactly; prompt prefixed with "
+         "`/mushroom `",
+    "D": "`mushroomdb install --delivery cli` — the skill teaches the binary, "
+         "no MCP server; plain prompt",
+    "E": "`mushroomdb install --intercept-grep` — arm B's install plus the "
+         "PreToolUse redirect from `Grep` to `explore`; plain prompt",
+    "F": "`mushroomdb install --delivery cli --intercept-grep` — arm D's "
+         "install plus that redirect; plain prompt",
+}
+
+# The arms whose session is given the MCP tool. Kept beside the arms rather
+# than read off `cell_command`, which lives in `run.py` and imports this file.
+MCP_ARMS = frozenset({"B", "C", "E"})
+
 # Both arms get exactly these tools. `Bash` is unqualified on purpose: the
 # per-command form `Bash(git:*)` denies every pipeline (`git log ... | sort |
 # uniq -c`), which is the natural way to answer the co-change and
