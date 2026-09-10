@@ -83,6 +83,28 @@ def test_cell_command_cwd_override_wins(tmp_path):
     assert cwd == tmp_path
 
 
+def test_cell_command_arm_e_has_mcp_and_no_prefix():
+    from run import cell_command
+    from subjects import MCP_TOOL, SUBJECT_E
+    cmd, cwd = cell_command("E", "q", 30, None)
+    assert cwd == SUBJECT_E
+    assert cmd[2] == "q"
+    tools = cmd[cmd.index("--allowedTools") + 1]
+    assert MCP_TOOL in tools
+    assert cmd[cmd.index("--mcp-config") + 1] == ".mcp.json"
+
+
+def test_cell_command_arm_f_has_no_mcp():
+    from run import cell_command
+    from subjects import EMPTY_MCP, MCP_TOOL, SUBJECT_F
+    cmd, cwd = cell_command("F", "q", 30, None)
+    assert cwd == SUBJECT_F
+    assert cmd[2] == "q"
+    tools = cmd[cmd.index("--allowedTools") + 1]
+    assert MCP_TOOL not in tools
+    assert cmd[cmd.index("--mcp-config") + 1] == str(EMPTY_MCP)
+
+
 # --- grading -------------------------------------------------------------
 
 
@@ -396,14 +418,15 @@ def test_restore_subject_undoes_a_cell_and_says_it_had_to(tmp_path):
     assert restore_subject(tmp_path) is False    # a clean clone stays untouched
 
 
-def test_cell_worktree_path_is_stable_per_arm_and_repo():
-    """Cargo fingerprints are keyed on the crate's absolute path."""
+def test_cell_worktree_path_is_stable_per_repo():
+    """Cargo fingerprints are keyed on the crate's absolute path, and cells
+    run strictly sequentially, so every arm shares one worktree per repo."""
     from subjects import CELLS, cell_worktree
     a = cell_worktree("B", {"id": 1, "repo": "R1"})
     b = cell_worktree("B", {"id": 7, "repo": "R1"})
-    assert a == b == CELLS / "B-R1"
+    assert a == b == CELLS / "R1"
     assert cell_worktree("B", {"id": 1, "repo": "R2"}) != a
-    assert cell_worktree("C", {"id": 1, "repo": "R1"}) != a
+    assert cell_worktree("C", {"id": 1, "repo": "R1"}) == a
 
 
 def test_run_verify_grades_a_missing_command_rather_than_crashing(tmp_path):

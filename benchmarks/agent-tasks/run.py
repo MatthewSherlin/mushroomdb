@@ -34,7 +34,8 @@ from ground_truth import grade, unit_passed                      # noqa: E402
 from report import write_summary                                 # noqa: E402
 from subjects import (BASE_TOOLS, CELL_TIMEOUT_S,                # noqa: E402
                       DEFAULT_MAX_TURNS, EMPTY_MCP, MCP_TOOL, SUBJECT_A,
-                      SUBJECT_B, SUBJECT_D, cell_worktree, changed_files,
+                      SUBJECT_B, SUBJECT_D, SUBJECT_E, SUBJECT_F,
+                      cell_worktree, changed_files,
                       child_env, drop_worktree, make_worktree, restore_subject,
                       setup, subject_root)
 
@@ -50,6 +51,12 @@ def cell_command(arm: str, prompt: str, max_turns: int = DEFAULT_MAX_TURNS,
         cwd, mcp_config, tools = SUBJECT_A, str(EMPTY_MCP), list(BASE_TOOLS)
     elif arm == "D":
         cwd, mcp_config, tools = SUBJECT_D, str(EMPTY_MCP), list(BASE_TOOLS)
+    elif arm == "F":
+        # D's install plus --intercept-grep: no MCP, plain prompt.
+        cwd, mcp_config, tools = SUBJECT_F, str(EMPTY_MCP), list(BASE_TOOLS)
+    elif arm == "E":
+        # B's install plus --intercept-grep: MCP present, plain prompt.
+        cwd, mcp_config, tools = SUBJECT_E, ".mcp.json", list(BASE_TOOLS) + [MCP_TOOL]
     else:
         # B and C share the arm B clone; C differs only by invoking the
         # project skill with its own trigger.

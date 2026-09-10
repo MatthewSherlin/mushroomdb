@@ -25,6 +25,8 @@ SCRATCH = Path(os.environ.get("TMPDIR", "/tmp")) / "agent-bench"
 SUBJECT_A = SCRATCH / "subject"
 SUBJECT_B = SCRATCH / "subject-mdb"
 SUBJECT_D = SCRATCH / "subject-cli"      # install --delivery cli, no MCP server
+SUBJECT_E = SCRATCH / "subject-mdb-i"    # B's install, plus --intercept-grep
+SUBJECT_F = SCRATCH / "subject-cli-i"    # D's install, plus --intercept-grep
 EMPTY_MCP = SCRATCH / "empty-mcp.json"
 
 # R2: the second subject repository (see truth_r2.py). One local clone at the
@@ -33,13 +35,17 @@ R2_SRC = SCRATCH / "r2-src"
 SUBJECT2_A = SCRATCH / "subject2"
 SUBJECT2_B = SCRATCH / "subject2-mdb"
 SUBJECT2_D = SCRATCH / "subject2-cli"
+SUBJECT2_E = SCRATCH / "subject2-mdb-i"
+SUBJECT2_F = SCRATCH / "subject2-cli-i"
 R2_VENV = SCRATCH / "venv-r2"            # what `python` means in an R2 verify
 
 SUBJECTS = {
     ("A", "R1"): SUBJECT_A, ("B", "R1"): SUBJECT_B,
     ("C", "R1"): SUBJECT_B, ("D", "R1"): SUBJECT_D,
+    ("E", "R1"): SUBJECT_E, ("F", "R1"): SUBJECT_F,
     ("A", "R2"): SUBJECT2_A, ("B", "R2"): SUBJECT2_B,
     ("C", "R2"): SUBJECT2_B, ("D", "R2"): SUBJECT2_D,
+    ("E", "R2"): SUBJECT2_E, ("F", "R2"): SUBJECT2_F,
 }
 
 # One target directory for every cargo invocation of a run — the agent's own
@@ -60,6 +66,8 @@ ARM_LABEL = {
     "B": "mushroomdb installed",
     "C": "mushroomdb, /mushroom invoked",
     "D": "mushroomdb, cli delivery (no MCP)",
+    "E": "mushroomdb installed + grep redirect",
+    "F": "mushroomdb cli delivery + grep redirect",
 }
 
 # Both arms get exactly these tools. `Bash` is unqualified on purpose: the
@@ -216,6 +224,12 @@ def setup(force: bool = False, arms: set[str] | None = None) -> set[str]:
         print("arm D: this binary's install has no --delivery flag; "
               "skipping its subjects")
         want_d = False
+    want_e = "E" in arms
+    want_f = "F" in arms
+    if want_f and not delivery_flag_exists():
+        print("arm F: this binary's install has no --delivery flag; "
+              "skipping its subjects")
+        want_f = False
 
     tasks_path = HERE / "tasks.json"
     pinned = json.loads(tasks_path.read_text()) if tasks_path.exists() else None
@@ -228,6 +242,10 @@ def setup(force: bool = False, arms: set[str] | None = None) -> set[str]:
         dirs = [SUBJECT_A, SUBJECT_B, SUBJECT2_A, SUBJECT2_B]
         if want_d:
             dirs += [SUBJECT_D, SUBJECT2_D]
+        if want_e:
+            dirs += [SUBJECT_E, SUBJECT2_E]
+        if want_f:
+            dirs += [SUBJECT_F, SUBJECT2_F]
         for d in dirs:
             shutil.rmtree(d, ignore_errors=True)
     shutil.rmtree(CELLS, ignore_errors=True)
@@ -241,6 +259,11 @@ def setup(force: bool = False, arms: set[str] | None = None) -> set[str]:
     install_subject(SUBJECT_B, [], REPO, r1_sha)
     if want_d:
         install_subject(SUBJECT_D, ["--delivery", "cli"], REPO, r1_sha)
+    if want_e:
+        install_subject(SUBJECT_E, ["--intercept-grep"], REPO, r1_sha)
+    if want_f:
+        install_subject(SUBJECT_F, ["--delivery", "cli", "--intercept-grep"],
+                        REPO, r1_sha)
 
     # R2: one pinned clone feeds the arms' clones, and the venv the change
     # tasks test in.
@@ -252,6 +275,11 @@ def setup(force: bool = False, arms: set[str] | None = None) -> set[str]:
     install_subject(SUBJECT2_B, [], R2_SRC, r2_sha)
     if want_d:
         install_subject(SUBJECT2_D, ["--delivery", "cli"], R2_SRC, r2_sha)
+    if want_e:
+        install_subject(SUBJECT2_E, ["--intercept-grep"], R2_SRC, r2_sha)
+    if want_f:
+        install_subject(SUBJECT2_F, ["--delivery", "cli", "--intercept-grep"],
+                        R2_SRC, r2_sha)
     ensure_r2_venv()
 
     if rebuild:
@@ -262,7 +290,8 @@ def setup(force: bool = False, arms: set[str] | None = None) -> set[str]:
     else:
         print(f"tasks.json pins {r1_sha[:12]} / {r2_sha[:12]}; keeping it")
     print("setup complete")
-    provisioned = {a for a in arms if a != "D"} | ({"D"} if want_d else set())
+    gated = {"D": want_d, "E": want_e, "F": want_f}
+    provisioned = {a for a in arms if a not in gated} | {a for a, ok in gated.items() if ok}
     return provisioned
 
 
@@ -325,14 +354,16 @@ def restore_subject(cwd: Path) -> bool:
 
 
 def cell_worktree(arm: str, task: dict) -> Path:
-    """Where a change cell for this arm and repository runs.
+    """Where a change cell for this repository runs, regardless of arm.
 
-    One path per (arm, repository), reused by every cell: cargo fingerprints
-    are keyed on the absolute path of the crate, so a path per cell would make
-    the shared target directory carry one full copy of the workspace per cell
-    (tens of gigabytes over a full run) and rebuild every one of them.
+    One path per repository, reused by every cell of every arm: cargo
+    fingerprints are keyed on the absolute path of the crate, so a distinct
+    path per arm (as well as per cell) grew the shared target directory into
+    tens of gigabytes over a full run. Cells run strictly sequentially in
+    `main()` — never two arms' worktrees at once — so one path per repo is
+    safe: `make_worktree` removes and re-adds it fresh before every cell.
     """
-    return CELLS / f"{arm}-{task.get('repo', 'R1')}"
+    return CELLS / task.get("repo", "R1")
 
 
 def make_worktree(subject: Path, dest: Path) -> Path:
