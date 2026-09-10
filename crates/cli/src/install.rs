@@ -262,7 +262,7 @@ pub const AUTO_ARG: &str = "--auto";
 
 /// How the config an install writes names the store.
 ///
-/// A project install writes `--auto`, not a path. The MCP entry, the two
+/// A project install writes `--auto`, not a path. The MCP entry, the three
 /// settings hooks and the three git hook blocks then resolve the store when
 /// they run — `$CLAUDE_PROJECT_DIR/mushroom-memory`, else `mushroom-memory` at
 /// the root of the working tree they were run in.
@@ -448,6 +448,55 @@ impl Scope {
     }
 }
 
+/// Which door an install opens onto the graph.
+///
+/// A session reaches the same store either way; what differs is what it costs
+/// to get there. An MCP tool's schema is fetched before its first call, so the
+/// first question costs a discovery round trip; a plain command through `Bash`
+/// costs none, at the price of the assistant having to know the invocation —
+/// which is exactly what the skill teaches.
+///
+/// Only the Claude Code install honours this: it is the one platform that gets
+/// a skill, and a skill is the only thing that can teach a binary. Cursor and
+/// Codex are registered as MCP servers whatever is asked for, and
+/// [`install_platform`] says so rather than dropping the flag in silence.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    /// The skill teaches the binary; no MCP server is registered.
+    Cli,
+    /// Today's install: an MCP entry, and a skill that teaches its tools.
+    Mcp,
+    /// Both doors, and a skill that names both.
+    #[default]
+    Both,
+}
+
+impl Delivery {
+    /// Parse a `--delivery` value.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "cli" => Ok(Delivery::Cli),
+            "mcp" => Ok(Delivery::Mcp),
+            "both" => Ok(Delivery::Both),
+            other => Err(format!("--delivery must be cli | mcp | both, got: {other}")),
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Delivery::Cli => "cli",
+            Delivery::Mcp => "mcp",
+            Delivery::Both => "both",
+        }
+    }
+
+    /// Whether this delivery registers an MCP server.
+    pub(crate) fn wires_mcp(self) -> bool {
+        !matches!(self, Delivery::Cli)
+    }
+}
+
 /// Options parsed from `mushroomdb install [flags]` or `mushroomdb uninstall [flags]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallOpts {
@@ -464,6 +513,12 @@ pub struct InstallOpts {
     /// Run `npx -y mushroomdb@<v> --version` once so the first real spawn is
     /// not a cold download.
     pub prewarm: bool,
+    /// `--delivery cli|mcp|both`: which door the Claude Code install opens.
+    pub delivery: Delivery,
+    /// `--intercept-grep`: also write the experimental `PreToolUse` hook that
+    /// redirects a `Grep` for a known symbol name to `explore`. Off by
+    /// default — it is the one hook of ours that can block a tool call.
+    pub intercept_grep: bool,
 }
 
 /// Options parsed from `mushroomdb enable [flags]` or `mushroomdb disable [flags]`.
@@ -502,7 +557,7 @@ pub fn default_db(scope: Scope, project_root: &Path, home: &Path) -> PathBuf {
 /// simply see a graph with nothing in it. So those two get the path.
 ///
 /// The worktree argument is weaker for them in any case. `.mcp.json` and the
-/// two settings hooks are Claude Code's, and they are what a `git worktree`
+/// three settings hooks are Claude Code's, and they are what a `git worktree`
 /// carries across; a Cursor install's committed artifact is one rules file
 /// that names the store in prose.
 fn resolves_at_runtime(platform: &Platform) -> bool {
@@ -924,6 +979,21 @@ struct Manifest {
     /// for a manifest written before this field existed.
     #[serde(default)]
     requested_cmd: Option<StoredCommand>,
+    /// The door this install opened. `doctor` reads it so it does not report a
+    /// missing MCP entry as a failure on an install that deliberately has
+    /// none, and `enable` reads it so a re-enable rebuilds the same shape of
+    /// install rather than silently adding a server. Defaults to `Both`, which
+    /// is what every manifest written before this field existed described.
+    #[serde(default)]
+    delivery: Delivery,
+    /// Whether this install asked for the experimental grep redirect. The
+    /// hook itself is listed in `hooks` like any other, so `uninstall` and
+    /// `disable` need nothing from this field; `enable` reads it to rebuild
+    /// the same install that was disabled, and `doctor` to know whether a
+    /// missing `PreToolUse` hook is a fault or the default. Defaults to
+    /// false, which is what every manifest written before it existed means.
+    #[serde(default)]
+    intercept_grep: bool,
 }
 
 impl Manifest {
@@ -1042,12 +1112,36 @@ const TOUCH_MATCHER: &str = "Edit|Write|MultiEdit";
 /// bounds a background process rather than the assistant's turn.
 const TOUCH_TIMEOUT_SECS: u64 = 30;
 
+/// The third hook event: fires once as a session opens, so the assistant knows
+/// what the repository is before it is asked anything.
+///
+/// No matcher — a session start is not a tool call — and not `async`: the
+/// point of the brief is to be there for the first turn, and the host caches
+/// its output for the rest of the session, so it is read once and paid for
+/// once. It shares the prompt hook's [`HOOK_TIMEOUT_SECS`] budget.
+pub(crate) const BRIEF_EVENT: &str = "SessionStart";
+
+/// The optional fourth hook event: fires *before* a tool call, so a search the
+/// graph answers exactly can be turned into an `explore` before it runs.
+///
+/// Written only for `install --intercept-grep` (see
+/// [`InstallOpts::intercept_grep`]). It is the one hook of ours that can block
+/// a tool call — Claude Code reads exit 2 as "refuse this call, and give the
+/// model what stderr said" — so it is opt-in, awaited rather than `async`
+/// (nothing else could block the call), and on the prompt hook's short
+/// [`HOOK_TIMEOUT_SECS`] budget.
+pub(crate) const INTERCEPT_EVENT: &str = "PreToolUse";
+
+/// The one tool it fires for. A `Read`, an `Edit` or a `Bash` is never
+/// redirected: the graph has no better answer to those.
+const INTERCEPT_MATCHER: &str = "Grep";
+
 /// Single-quote `s` for embedding in a POSIX shell command line, escaping
 /// embedded single quotes as `'\''`. Claude Code runs a `type: "command"`
 /// hook through a shell, so an unquoted path containing whitespace or shell
 /// metacharacters is word-split and the hook silently receives the wrong
 /// arguments — quoting keeps the command exact.
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
@@ -1061,6 +1155,16 @@ fn recall_hook_command(shell: &str, store: &StoreRef) -> String {
 /// hook mode prints nothing and exits 0 whatever it is handed.
 fn touch_hook_command(shell: &str, store: &StoreRef) -> String {
     format!("{shell} touch {}", store.shell_arg())
+}
+
+/// The exact command string written into the session-start hook entry.
+fn brief_hook_command(shell: &str, store: &StoreRef) -> String {
+    format!("{shell} brief {}", store.shell_arg())
+}
+
+/// The exact command string written into the grep-redirect hook entry.
+fn intercept_hook_command(shell: &str, store: &StoreRef) -> String {
+    format!("{shell} intercept {}", store.shell_arg())
 }
 
 /// One `hooks.<event>` array entry in Claude Code's settings.json shape.
@@ -1078,6 +1182,19 @@ fn touch_hook_entry(command: &str) -> serde_json::Value {
             "command": command,
             "timeout": TOUCH_TIMEOUT_SECS,
             "async": true
+        } ]
+    })
+}
+
+/// The `PreToolUse` entry: matched to `Grep` alone, and awaited — an `async`
+/// hook has already let the tool call through by the time it decides.
+fn intercept_hook_entry(command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "matcher": INTERCEPT_MATCHER,
+        "hooks": [ {
+            "type": "command",
+            "command": command,
+            "timeout": HOOK_TIMEOUT_SECS
         } ]
     })
 }
@@ -1315,6 +1432,12 @@ struct Ctx<'a> {
     ext: &'a Externals,
     git_hooks: bool,
     prewarm: bool,
+    /// Which door to open — see [`Delivery`]. Read by [`install_claude_code`],
+    /// which is the only writer it changes.
+    delivery: Delivery,
+    /// Whether to write the experimental grep redirect. Claude Code only —
+    /// it is a Claude Code hook.
+    intercept_grep: bool,
 }
 
 /// Anchor a user-supplied path to `base` when it is relative, and drop any
@@ -1444,6 +1567,8 @@ pub fn run_install_with(
         ext,
         git_hooks: opts.git_hooks,
         prewarm: opts.prewarm && !package_fetched,
+        delivery: opts.delivery,
+        intercept_grep: opts.intercept_grep,
     };
 
     let manifest_path = manifest_path(project_root, home, scope, &platforms);
@@ -1458,9 +1583,14 @@ pub fn run_install_with(
     // other drift, so the only extra step is clearing the flag once that
     // write lands, and saying so in the summary.
     let was_disabled = existing.disabled;
+    // Turning the redirect off writes nothing new, so the manifest would
+    // otherwise go on claiming a hook this run just removed.
+    let intercept_changed = existing.intercept_grep != opts.intercept_grep;
 
     let mut manifest = Manifest {
         requested_cmd,
+        delivery: opts.delivery,
+        intercept_grep: opts.intercept_grep,
         ..Manifest::default()
     };
     let mut notes: Vec<String> = Vec::new();
@@ -1482,7 +1612,7 @@ pub fn run_install_with(
     }
 
     let anything_written = !manifest.is_empty();
-    if anything_written || was_disabled {
+    if anything_written || was_disabled || intercept_changed {
         // Union this-run entries with the existing manifest (dedup by path/key).
         let mut merged = if anything_written {
             union_manifests(existing, &manifest)
@@ -1492,6 +1622,18 @@ pub fn run_install_with(
         if was_disabled {
             merged.disabled = false;
             merged.stashed_mcp.clear();
+        }
+        // Re-installing as `cli` over an earlier install just took that
+        // install's server entry off disk; the manifest must not go on
+        // claiming a key that is no longer there.
+        if !opts.delivery.wires_mcp() {
+            merged.mcp_keys.retain(|k| has_our_server(&k.file));
+        }
+        // Same for the redirect: an install without the flag has just taken
+        // the hook off disk, so the manifest must stop owning it.
+        merged.intercept_grep = opts.intercept_grep;
+        if !opts.intercept_grep {
+            merged.hooks.retain(|h| h.event != INTERCEPT_EVENT);
         }
         write_manifest(&manifest_path, &merged)?;
     }
@@ -1531,7 +1673,14 @@ pub fn run_install_with(
     }
     if anything_written {
         out.push_str(&format!("  manifest  {}\n", manifest_path.display()));
-        out.push_str(&format!("  mcp command  {}\n", cmd.shell()));
+        // The hooks and the skill both run this command; only an MCP install
+        // calls it a server, so a `cli` install says what it actually wrote.
+        let label = if opts.delivery.wires_mcp() {
+            "mcp command"
+        } else {
+            "command"
+        };
+        out.push_str(&format!("  {label}  {}\n", cmd.shell()));
         out.push_str(&describe_stores(&stores));
     } else {
         out.push_str("  (already installed — no changes)\n");
@@ -1746,7 +1895,7 @@ pub fn run_uninstall_with(
 // ---------------------------------------------------------------------------
 //
 // `disable` takes the dynamic, per-assistant config off disk — the MCP entry,
-// the two Claude Code hooks, the three git hook blocks, the Codex
+// the three Claude Code hooks, the three git hook blocks, the Codex
 // registration — and leaves everything a person might have customised or that
 // the store depends on: the skill/rules file, the store itself, the
 // `.gitignore` line. `enable` puts the config back, re-derived from whatever
@@ -1799,6 +1948,53 @@ fn store_from_arg(arg: &str, project_root: &Path, home: &Path) -> StoreRef {
     StoreRef::pinned(path)
 }
 
+/// The store argument one of our hook commands names.
+///
+/// A hook command is `<binary…> <sub> <store>` and the store is its last word,
+/// written by [`StoreRef::shell_arg`]: `--auto`, or the path in the single
+/// quotes [`sh_quote`] puts round it. This reads that word back.
+fn hook_command_store_arg(command: &str, sub: &str) -> Option<String> {
+    let needle = format!(" {sub} ");
+    let at = command.rfind(&needle)?;
+    let arg = command[at + needle.len()..].trim();
+    if arg.is_empty() {
+        return None;
+    }
+    Some(
+        match arg.strip_prefix('\'').and_then(|a| a.strip_suffix('\'')) {
+            Some(inner) => inner.replace(r"'\''", "'"),
+            None => arg.to_string(),
+        },
+    )
+}
+
+/// The store an install recorded, read back out of its `SessionStart` hook.
+///
+/// A `cli` install registers no MCP server, so the entry every other recovery
+/// path reads the store out of does not exist; the hooks are what it wrote,
+/// and they name the store the same way.
+fn store_from_hooks(manifest: &Manifest, project_root: &Path, home: &Path) -> Option<StoreRef> {
+    manifest
+        .hooks
+        .iter()
+        .find(|h| h.event == BRIEF_EVENT)
+        .and_then(|h| hook_command_store_arg(&h.command, "brief"))
+        .map(|arg| store_from_arg(&arg, project_root, home))
+}
+
+/// What an install at this scope recorded: the door it opened, and the store
+/// its hooks name. Both are `None`/`Both` when there is no manifest at all.
+pub(crate) fn installed_shape(
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
+    platforms: &[Platform],
+) -> (Delivery, Option<StoreRef>) {
+    let manifest = load_manifest(&manifest_path(project_root, home, scope, platforms));
+    let store = store_from_hooks(&manifest, project_root, home);
+    (manifest.delivery, store)
+}
+
 /// The config file `disable` would have stashed `platform`'s MCP entry from —
 /// the same file [`platform_stores`]/[`install_platform`] write to. `None` for
 /// Codex, whose registration is not a file this program reads.
@@ -1835,6 +2031,12 @@ fn recover_store_for(
         .and_then(|file| manifest.stashed_mcp.iter().find(|s| s.file == file))
         .and_then(|s| entry_db(&s.entry))
         .map(|arg| store_from_arg(arg, project_root, home))
+        // A `cli` install stashed no entry, because it registered no server.
+        // Its hooks name the store, and they are recorded too.
+        .or_else(|| match platform {
+            Platform::ClaudeCode => store_from_hooks(manifest, project_root, home),
+            _ => None,
+        })
         .unwrap_or_else(|| {
             store_ref(
                 project_root,
@@ -1862,7 +2064,7 @@ fn repo_store_for_enable(stores: &[(Platform, StoreRef)]) -> StoreRef {
         .expect("enable always resolves at least one platform")
 }
 
-/// Turn an install off: remove the MCP entry, the two Claude Code hooks, the
+/// Turn an install off: remove the MCP entry, the three Claude Code hooks, the
 /// git hook blocks and the Codex registration; leave the skill/rules file, the
 /// store, and the `.gitignore` line untouched. Idempotent.
 pub fn run_disable(
@@ -1952,7 +2154,7 @@ pub fn run_disable_with(
     Ok(out)
 }
 
-/// Turn a disabled install back on. Re-adds the MCP entry, the two Claude Code
+/// Turn a disabled install back on. Re-adds the MCP entry, the three Claude Code
 /// hooks and the git hook blocks using the store a stashed entry named and the
 /// command `install` would resolve right now — not a replay of what
 /// `disable` took out, which may no longer be the fastest path to the
@@ -2048,6 +2250,13 @@ pub fn run_enable_with(
         ext,
         git_hooks: true,
         prewarm: false,
+        // Re-enable the install that was disabled, not a different one: a
+        // `cli` install has no server to put back, and its skill is the one
+        // that teaches the binary.
+        delivery: manifest.delivery,
+        // Likewise the redirect: `enable` never adds an experiment the
+        // install it is restoring never had.
+        intercept_grep: manifest.intercept_grep,
     };
 
     let mut fresh = Manifest::default();
@@ -2315,6 +2524,16 @@ fn install_platform(
     manifest: &mut Manifest,
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
+    // `--delivery` only has a skill to switch on Claude Code; the other two
+    // are registered as MCP servers whatever was asked for. Say so — a flag
+    // that does nothing is worse when it does it quietly.
+    if !ctx.delivery.wires_mcp() && !matches!(platform, Platform::ClaudeCode) {
+        notes.push(format!(
+            "note: --delivery {} applies to claude-code only — {} was registered as an MCP server",
+            ctx.delivery.label(),
+            platform.label()
+        ));
+    }
     match platform {
         Platform::ClaudeCode => install_claude_code(ctx, store, manifest, notes),
         Platform::Cursor => install_cursor(ctx, store, manifest, notes),
@@ -2323,12 +2542,100 @@ fn install_platform(
     }
 }
 
-/// Substitute both template placeholders. `bin_cmd` is the pre-quoted shell
-/// form, so the templates carry `{{BIN}}` unquoted.
-fn render_template(template: &str, db_str: &str, bin_cmd: &str) -> String {
-    template
+/// Substitute both template placeholders and keep only the delivery regions
+/// this install wants. `bin_cmd` is the pre-quoted shell form, so the
+/// templates carry `{{BIN}}` unquoted.
+///
+/// One source file describes every delivery, so the variants cannot drift: a
+/// `<!-- cli -->` / `<!-- /cli -->` (or `mcp`) pair marks a block only that
+/// door's reader should see, and `Both` keeps them all. The marker lines
+/// themselves are never written. By convention a region opens immediately
+/// after the paragraph before it and its content starts with the blank line,
+/// so dropping a whole region leaves exactly one blank line behind rather than
+/// a hole in the prose.
+///
+/// The regions are checked for well-formedness rather than trusted: an
+/// unterminated `<!-- mcp -->` would silently swallow the rest of the file on
+/// the `cli` variant, and a nested pair would leave the inner close re-opening
+/// the outer region, so both are errors and neither can ship as a short skill
+/// nobody looked at. The two conditions are the same ones the awk twin in
+/// `scripts/render-plugin.sh` fails on.
+///
+/// Public so the skill's per-turn budget can be measured on every variant
+/// without an install: what this returns is exactly what `install` writes, and
+/// `scripts/render-plugin.sh` mirrors it for the plugin copy.
+pub fn render_template(
+    template: &str,
+    db_str: &str,
+    bin_cmd: &str,
+    delivery: Delivery,
+) -> Result<String, CliError> {
+    /// `("cli", true)` for `<!-- cli -->`, `("cli", false)` for `<!-- /cli -->`.
+    fn marker(line: &str) -> Option<(&'static str, bool)> {
+        match line {
+            "<!-- cli -->" => Some(("cli", true)),
+            "<!-- mcp -->" => Some(("mcp", true)),
+            "<!-- /cli -->" => Some(("cli", false)),
+            "<!-- /mcp -->" => Some(("mcp", false)),
+            _ => None,
+        }
+    }
+
+    let mut out = String::with_capacity(template.len());
+    let mut open: Option<(&str, usize)> = None;
+    let mut dropping = false;
+    for (i, line) in template.lines().enumerate() {
+        let at = i + 1;
+        match marker(line) {
+            Some((name, true)) => {
+                if let Some((outer, opened)) = open {
+                    return Err(CliError(format!(
+                        "skill template line {at}: <!-- {name} --> opens inside the \
+                         <!-- {outer} --> region opened on line {opened} — delivery \
+                         regions must not nest"
+                    )));
+                }
+                open = Some((name, at));
+                dropping = match name {
+                    "cli" => matches!(delivery, Delivery::Mcp),
+                    _ => matches!(delivery, Delivery::Cli),
+                };
+            }
+            Some((name, false)) => {
+                match open {
+                    None => {
+                        return Err(CliError(format!(
+                            "skill template line {at}: <!-- /{name} --> closes a region \
+                             that was never opened"
+                        )))
+                    }
+                    Some((outer, opened)) if outer != name => {
+                        return Err(CliError(format!(
+                            "skill template line {at}: <!-- /{name} --> closes the \
+                             <!-- {outer} --> region opened on line {opened}"
+                        )))
+                    }
+                    Some(_) => {}
+                }
+                open = None;
+                dropping = false;
+            }
+            None if dropping => {}
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    if let Some((name, opened)) = open {
+        return Err(CliError(format!(
+            "skill template: the <!-- {name} --> region opened on line {opened} is \
+             never closed"
+        )));
+    }
+    Ok(out
         .replace(DB_PATH_PLACEHOLDER, db_str)
-        .replace(BIN_PLACEHOLDER, bin_cmd)
+        .replace(BIN_PLACEHOLDER, bin_cmd))
 }
 
 fn install_claude_code(
@@ -2341,7 +2648,7 @@ fn install_claude_code(
     // The skill is prose a reader follows by hand, so it names the directory
     // the store is in rather than the `--auto` the machine-read config uses.
     let db_str = store.path().to_string_lossy();
-    let skill_content = render_template(SKILL_TEMPLATE, &db_str, &shell);
+    let skill_content = render_template(SKILL_TEMPLATE, &db_str, &shell, ctx.delivery)?;
 
     let skill_dir = match ctx.scope {
         Scope::Project => ctx
@@ -2362,11 +2669,27 @@ fn install_claude_code(
         manifest.files.push(skill_file);
     }
 
+    // `cli` delivery is defined by what it does *not* write: no server entry,
+    // so nothing in the session pays a tool-discovery round trip before its
+    // first question. The hooks below are written either way — they are the
+    // binary talking to the session, not the session talking to a server.
     let mcp_file = claude_mcp_file(ctx.project_root, ctx.home, ctx.scope);
-    merge_mcp_entry(&mcp_file, ctx, store, manifest, notes)?;
+    if ctx.delivery.wires_mcp() {
+        merge_mcp_entry(&mcp_file, ctx, store, manifest, notes)?;
+    } else if remove_mcp_key(&mcp_file, SERVER_NAME)? {
+        // Switching an existing install to `cli` has to take the server it
+        // already registered back out, or the door this delivery exists to
+        // close would stay open.
+        notes.push(format!(
+            "removed mcpServers.{SERVER_NAME} from {} — delivery: {}",
+            mcp_file.display(),
+            ctx.delivery.label()
+        ));
+    }
 
-    // Both hooks: settings.json in the same scope as the skill. The prompt
-    // hook first, so a manifest lists them in the order they were written.
+    // All three hooks: settings.json in the same scope as the skill. The
+    // prompt hook first, so a manifest lists them in the order they were
+    // written.
     let settings_file = match ctx.scope {
         Scope::Project => ctx.project_root.join(".claude").join("settings.json"),
         Scope::User => ctx.home.join(".claude").join("settings.json"),
@@ -2396,6 +2719,46 @@ fn install_claude_code(
         touch_hook_entry(&touch),
         manifest,
     )?;
+    let brief = brief_hook_command(&shell, store);
+    if remove_stale_hooks(&settings_file, BRIEF_EVENT, "brief", store, &brief)? {
+        notes.push(format!("replaced stale {BRIEF_EVENT} hook"));
+    }
+    merge_hook_entry(
+        &settings_file,
+        BRIEF_EVENT,
+        &brief,
+        hook_entry(&brief),
+        manifest,
+    )?;
+
+    // The fourth hook is opt-in, and an install that does not ask for it takes
+    // back any earlier one of ours for this store — otherwise the experiment
+    // could only ever be turned on.
+    let intercept = intercept_hook_command(&shell, store);
+    if ctx.intercept_grep {
+        if remove_stale_hooks(
+            &settings_file,
+            INTERCEPT_EVENT,
+            "intercept",
+            store,
+            &intercept,
+        )? {
+            notes.push(format!("replaced stale {INTERCEPT_EVENT} hook"));
+        }
+        merge_hook_entry(
+            &settings_file,
+            INTERCEPT_EVENT,
+            &intercept,
+            intercept_hook_entry(&intercept),
+            manifest,
+        )?;
+    } else if drop_hooks(&settings_file, INTERCEPT_EVENT, |c| {
+        is_our_hook_command(c, "intercept", store)
+    })? {
+        notes.push(format!(
+            "removed {INTERCEPT_EVENT} hook — no --intercept-grep"
+        ));
+    }
 
     Ok(())
 }
@@ -2407,7 +2770,14 @@ fn install_cursor(
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
     let db_str = store.path().to_string_lossy();
-    let rules_content = render_template(CURSOR_RULES_TEMPLATE, &db_str, &ctx.cmd.shell());
+    // Cursor is always an MCP install (see [`Delivery`]), so its rules file is
+    // rendered for that door whatever `--delivery` asked for.
+    let rules_content = render_template(
+        CURSOR_RULES_TEMPLATE,
+        &db_str,
+        &ctx.cmd.shell(),
+        Delivery::Mcp,
+    )?;
 
     let rules_dir = match ctx.scope {
         Scope::Project => ctx.project_root.join(".cursor").join("rules"),
@@ -2846,6 +3216,36 @@ fn load_manifest(path: &Path) -> Manifest {
         .sanitised()
 }
 
+/// The door an install opened for the store at `db_dir`.
+///
+/// The `brief` hook is handed a store, not an install, and its last line says
+/// how to reach the graph — so it has to know whether there is a server to
+/// name. A project install keeps its manifest beside the skill it wrote, one
+/// level up from a default store; a user install keeps it beside the store
+/// itself. No manifest there means [`Delivery::Both`]: the reach line names
+/// both doors, which is what every install before this flag wired, and naming
+/// a door too many costs a reader a moment where naming too few would cost
+/// them the graph.
+pub fn delivery_for_store(db_dir: &Path) -> Delivery {
+    let Some(parent) = db_dir.parent() else {
+        return Delivery::default();
+    };
+    let candidates = [
+        parent
+            .join(".claude")
+            .join("skills")
+            .join("mushroom")
+            .join(".install-manifest.json"),
+        parent.join("install-manifest.json"),
+    ];
+    for candidate in candidates {
+        if candidate.is_file() {
+            return load_manifest(&candidate).delivery;
+        }
+    }
+    Delivery::default()
+}
+
 /// Whether an install at this scope has been turned off by `disable`. `false`
 /// for a scope with no manifest at all — `doctor` falls through to its normal
 /// "no config entry" checks in that case rather than reporting a disabled
@@ -2857,6 +3257,18 @@ pub(crate) fn is_disabled(
     platforms: &[Platform],
 ) -> bool {
     load_manifest(&manifest_path(project_root, home, scope, platforms)).disabled
+}
+
+/// Whether an install at this scope asked for the experimental grep redirect.
+/// `false` for a scope with no manifest, and for every manifest written before
+/// the flag existed — `doctor` reports the hook only where one was asked for.
+pub(crate) fn intercept_installed(
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
+    platforms: &[Platform],
+) -> bool {
+    load_manifest(&manifest_path(project_root, home, scope, platforms)).intercept_grep
 }
 
 /// Union `existing` with `this_run`, deduplicating by path (files, git hooks),
@@ -2897,6 +3309,13 @@ fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
     if let Some(c) = &this_run.requested_cmd {
         existing.requested_cmd = Some(c.clone());
     }
+    // The latest run's door wins: re-installing with a different `--delivery`
+    // is how a user changes it, and the manifest has to describe what is on
+    // disk now, not what an earlier run put there.
+    existing.delivery = this_run.delivery;
+    // Same rule for the redirect (and `run_install_with` prunes the hook entry
+    // when the latest run turned it off).
+    existing.intercept_grep = this_run.intercept_grep;
     existing
 }
 

@@ -12,9 +12,11 @@ use common::{
     SYNCED_AT,
 };
 use core_api::repograph::{
-    context, impact, owners, recall_digest, remember, render_context, render_impact, render_map,
-    render_owners, render_why, repo_map, shortest_path, stale_concepts, why, ImpactOptions,
-    MapOptions, RememberInput, Target,
+    brief, context, context_with, explore, identifier_terms, impact, owners, recall_digest,
+    remember, render_brief, render_context, render_explore, render_impact, render_map,
+    render_owners, render_why, repo_map, shortest_path, stale_concepts, why, BriefOptions,
+    ContextOptions, ContextReport, Depth, ImpactOptions, MapOptions, RememberInput, Target,
+    DEFAULT_EXPLORE_BYTES, MAX_OUTPUT_BYTES, MAX_QUERY_TERMS, UNTRUSTED_FRAMING,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -420,6 +422,349 @@ fn the_synthetic_store_has_the_shape_the_suites_assume() {
 }
 
 // ---------------------------------------------------------------------------
+// `brief`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn brief_is_deterministic_and_within_budget() {
+    let dir = tmp("brief-budget");
+    let db = synthetic_repo_store(&dir);
+    let a = brief(&db, &BriefOptions::default());
+    let b = brief(&db, &BriefOptions::default());
+    assert_eq!(a.key_files, b.key_files);
+    assert_eq!(a.key_symbols, b.key_symbols);
+    assert!(a.key_files.len() <= 25 && a.key_symbols.len() <= 25);
+
+    let text = render_brief(&a, "explore <target>");
+    assert!(
+        text.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        "{}",
+        text.len()
+    );
+    // The brief is repository-controlled text put in a session's context
+    // before its first turn: it opens with the same marker every other digest
+    // opens with, and the marker is inside the budget asserted above.
+    assert!(text.starts_with(UNTRUSTED_FRAMING), "{text}");
+    assert!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("mushroomdb brief —"),
+        "{text}"
+    );
+    assert_eq!(text.matches(UNTRUSTED_FRAMING).count(), 1, "{text}");
+    assert!(
+        !text.contains("ago"),
+        "no relative times: the brief must be byte-stable across prompts"
+    );
+    assert!(text.contains("reach the graph: explore <target>"), "{text}");
+    assert_eq!(
+        text,
+        render_brief(&b, "explore <target>"),
+        "the same store renders the same bytes"
+    );
+}
+
+#[test]
+fn brief_on_empty_store_renders_one_helpful_line() {
+    let dir = tmp("brief-empty");
+    let db = open(&dir);
+    let b = brief(&db, &BriefOptions::default());
+
+    assert_eq!(b.files, 0);
+    assert!(b.key_files.is_empty() && b.key_symbols.is_empty() && b.last_sync.is_none());
+    let text = render_brief(&b, "explore <target>");
+    assert_eq!(
+        text, "mushroomdb brief — empty store; run: mushroomdb ingest-git <db> <repo>\n",
+        "a session that opens on an empty store is told what is missing, not \
+         how to reach a graph with nothing in it"
+    );
+    assert_eq!(text.lines().count(), 1);
+    assert!(
+        !text.contains(UNTRUSTED_FRAMING),
+        "no byte of this line came out of a store, so there is nothing to mark"
+    );
+}
+
+#[test]
+fn brief_ranks_files_by_centrality_and_symbols_by_callers() {
+    let dir = tmp("brief-ranking");
+    let db = synthetic_repo_store(&dir);
+    let b = brief(&db, &BriefOptions::default());
+
+    assert_eq!(b.repo, "repo", "the marker's repo path, by its basename");
+    assert_eq!(b.files, 30);
+    assert_eq!(b.symbols, 12);
+    assert!(b.edges > 0);
+    assert_eq!(b.last_sync.as_deref(), Some(&sha(COMMITS - 1)[..7]));
+
+    // The same ranking `map` prints, just deeper: the three hubs first.
+    let ranked: Vec<&str> = b.key_files.iter().map(|(k, _)| k.as_str()).collect();
+    let m = repo_map(&db, &MapOptions::default());
+    let map_ranked: Vec<&str> = m.key_files.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(
+        ranked.starts_with(&map_ranked),
+        "brief and map must not rank the same files differently:\n{ranked:?}\n{map_ranked:?}"
+    );
+
+    // Symbols come by how many other symbols call them, ties on the key.
+    let called: Vec<&str> = b.key_symbols.iter().map(|(k, _)| k.as_str()).collect();
+    let callers = |key: &str| {
+        db.weighted_edges("CALLS", None)
+            .into_iter()
+            .filter(|(_, dst, _)| dst == key)
+            .count()
+    };
+    let counts: Vec<usize> = called.iter().map(|k| callers(k)).collect();
+    assert!(
+        counts.windows(2).all(|w| w[0] >= w[1]),
+        "most called first: {called:?} {counts:?}"
+    );
+    assert!(
+        b.key_symbols.iter().any(|(_, sig)| sig.starts_with("fn ")),
+        "each symbol carries the first line of its signature: {:?}",
+        b.key_symbols
+    );
+}
+
+#[test]
+fn a_long_brief_is_capped_by_whole_lines_and_keeps_the_reach_line() {
+    let dir = tmp("brief-cap");
+    let db = synthetic_repo_store(&dir);
+    let b = brief(
+        &db,
+        &BriefOptions {
+            max_files: 30,
+            max_symbols: 12,
+        },
+    );
+    // A reach line long enough that the budget cannot hold the whole listing.
+    let reach = format!("explore <target> {}", "x".repeat(3_000));
+    let text = render_brief(&b, &reach);
+    let whole = render_brief(&b, "explore <target>");
+    assert!(
+        text.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        "{}",
+        text.len()
+    );
+    assert!(
+        text.ends_with(&format!("reach the graph: {reach}\n")),
+        "the reach line survives the cap: {text}"
+    );
+    assert!(
+        text.lines().count() < whole.lines().count(),
+        "the long reach line must have pushed listing lines out: {text}"
+    );
+    let kept: Vec<&str> = whole.lines().collect();
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with("reach the graph:") && !l.starts_with("  … and "))
+    {
+        assert!(
+            kept.contains(&line),
+            "the cap drops whole lines, never half of one: {line:?}"
+        );
+    }
+
+    // What was dropped is said, and counted.
+    let listed = b.key_files.len() + b.key_symbols.len();
+    let shown = text.lines().filter(|l| l.starts_with("  ")).count() - 1; // less the marker
+    let marker = text
+        .lines()
+        .find(|l| l.starts_with("  … and "))
+        .unwrap_or_else(|| panic!("no truncation marker in:\n{text}"));
+    assert_eq!(
+        marker,
+        format!("  … and {} more", listed - shown),
+        "the marker must count the entries actually dropped: {text}"
+    );
+    assert!(
+        text.lines()
+            .next_back()
+            .unwrap()
+            .starts_with("reach the graph:"),
+        "the marker sits above the reach line, not below it: {text}"
+    );
+}
+
+/// Symbols go before files: a path is the coarser handle, and the one a reader
+/// can act on without asking the graph anything.
+#[test]
+fn a_tiny_budget_still_says_how_many_entries_it_dropped() {
+    let dir = tmp("brief-marker");
+    let db = synthetic_repo_store(&dir);
+    let b = brief(&db, &BriefOptions::default());
+
+    // Big enough for the header, a handful of lines and the reach line; far
+    // too small for 25 files and 12 symbols.
+    let reach = format!("explore <target> {}", "x".repeat(3_700));
+    let text = render_brief(&b, &reach);
+
+    assert!(
+        text.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        "{} bytes",
+        text.len()
+    );
+    assert!(text.starts_with(UNTRUSTED_FRAMING), "{text}");
+    assert!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("mushroomdb brief —"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  … and "),
+        "a listing this heavily cut must say so: {text}"
+    );
+    assert!(
+        text.ends_with(&format!("reach the graph: {reach}\n")),
+        "the reach line survives whatever the budget costs the listings"
+    );
+    assert!(
+        !text.contains("key symbols"),
+        "symbols come off before files: {text}"
+    );
+}
+
+/// A key file is one the graph knows the *structure* of — something imports it
+/// or calls into it. Co-change alone does not qualify: an asset directory
+/// committed in one go co-changes with itself every way there is, which reads
+/// to PageRank as a small tightly-knit cluster and, twenty-five entries deep,
+/// fills the list with fonts and stylesheets. Those files stay reachable
+/// through `context`, `impact` and `why`; they are just not what a session
+/// opens on.
+#[test]
+fn brief_lists_only_files_something_imports_or_calls() {
+    let dir = tmp("brief-edgeless");
+    let mut db = synthetic_repo_store(&dir);
+    // Sorts before every fixture file (`src/…`, `tests/…`), so on a tie it
+    // would rank first and push a real file out of a 25-entry list.
+    let asset = "aaa-asset.woff2";
+    db.insert_node(
+        "File",
+        asset,
+        vec![
+            ("id".into(), core_api::Value::Str(asset.to_string())),
+            ("path".into(), core_api::Value::Str(asset.to_string())),
+            ("ext".into(), core_api::Value::Str("woff2".to_string())),
+        ],
+    )
+    .expect("an asset file");
+    // It is not edgeless: it was committed alongside the busiest file in the
+    // repository, so the graph records the co-change — and it still does not
+    // belong in a list about code structure.
+    db.insert_edge("CO_CHANGED", asset, &file_key(0, 0))
+        .expect("a co-change edge");
+    assert!(
+        db.weighted_edges("CO_CHANGED", None)
+            .iter()
+            .any(|(src, _, _)| src == asset),
+        "the fixture must actually carry the co-change edge"
+    );
+    assert!(
+        !db.weighted_edges("IMPORTS", None)
+            .iter()
+            .any(|(src, dst, _)| src == asset || dst == asset),
+        "and nothing may import it"
+    );
+
+    let b = brief(&db, &BriefOptions::default());
+    let listed: Vec<&str> = b.key_files.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(b.files, 31, "the count is of every file, listed or not");
+    assert!(
+        !listed.contains(&asset),
+        "co-change alone does not make a key file: {listed:?}"
+    );
+    assert!(
+        listed.contains(&file_key(0, 0).as_str()),
+        "the imported files are still there, ranked as before: {listed:?}"
+    );
+    assert_eq!(listed.len(), 25, "the list is still full: {listed:?}");
+
+    // Even asked for more entries than there are qualifying files, it pads with
+    // nothing.
+    let all = brief(
+        &db,
+        &BriefOptions {
+            max_files: 100,
+            max_symbols: 25,
+        },
+    );
+    assert_eq!(
+        all.key_files.len(),
+        30,
+        "thirty files something imports, and no more"
+    );
+    assert!(all.key_files.iter().all(|(k, _)| k != asset));
+}
+
+/// A store with a graph in it but no `GitSync` marker — anything ingested by
+/// hand, or a memory store that grew a code graph — has no repository name and
+/// no sha, and says neither rather than guessing or panicking.
+#[test]
+fn brief_without_a_sync_marker_omits_the_repo_and_the_sha() {
+    let dir = tmp("brief-no-marker");
+    let mut db = synthetic_repo_store(&dir);
+    db.delete_node("__mushroomdb_git_sync__").expect("drop it");
+
+    let b = brief(&db, &BriefOptions::default());
+    assert_eq!(b.repo, "");
+    assert_eq!(b.last_sync, None);
+    assert_eq!(b.files, 30, "the graph itself is untouched");
+    assert!(!b.key_files.is_empty() && !b.key_symbols.is_empty());
+
+    let text = render_brief(&b, "explore <target>");
+    assert!(text.starts_with(UNTRUSTED_FRAMING), "{text}");
+    let header = text.lines().nth(1).unwrap();
+    assert_eq!(
+        header,
+        format!(
+            "mushroomdb brief — 30 files · 12 symbols · {} edges",
+            core_api::repograph::render::thousands(b.edges)
+        ),
+        "no name, no sha, and no empty separators where they would have been"
+    );
+    assert!(text.contains("reach the graph: explore <target>"), "{text}");
+}
+
+/// A store with no files but plenty in it — a memory graph — is not an empty
+/// store, and gets a header and a way in rather than "run ingest-git".
+#[test]
+fn brief_on_a_store_with_no_files_still_says_how_to_reach_it() {
+    let dir = tmp("brief-memory-only");
+    let mut db = open(&dir);
+    db.insert_node(
+        "Person",
+        "person:1",
+        vec![("name".into(), core_api::Value::Str("Ada".to_string()))],
+    )
+    .expect("a node that is not a file");
+    db.insert_node(
+        "Person",
+        "person:2",
+        vec![("name".into(), core_api::Value::Str("Grace".to_string()))],
+    )
+    .expect("another");
+    db.insert_edge("KNOWS", "person:1", "person:2")
+        .expect("edge");
+
+    let b = brief(&db, &BriefOptions::default());
+    assert_eq!((b.files, b.symbols), (0, 0));
+    assert_eq!(b.edges, 1);
+
+    let text = render_brief(&b, "explore <target>");
+    assert_eq!(
+        text,
+        format!(
+            "{UNTRUSTED_FRAMING}mushroomdb brief — 0 files · 0 symbols · 1 edge\n\
+             reach the graph: explore <target>\n"
+        ),
+        "a store with a graph in it is not an empty store"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // `context`, `impact`, `owners`, `why`.
 // ---------------------------------------------------------------------------
 
@@ -511,6 +856,55 @@ fn context_on_symbol_has_source_callers_callees_and_owner() {
     assert!(
         text.contains("Ada Example") && !text.contains("@example.test"),
         "{text}"
+    );
+}
+
+/// The working tree is read only when the caller asks for it. Without a body
+/// the answer is a pointer — the file and the line range to open — and the
+/// graph facts, which is what an assistant needs to decide whether to open the
+/// file at all.
+#[test]
+fn context_with_reads_the_working_tree_only_when_asked() {
+    let dir = tmp("context-options");
+    let db = synthetic_repo_store(&dir);
+    let repo = work_tree("context-options-tree");
+    let key = sym(0, 1, "core::run");
+
+    let pointer = context_with(&db, Some(repo.as_path()), &key, &ContextOptions::default());
+    assert_eq!(pointer.source, None, "the default reads no working tree");
+    assert_eq!(
+        pointer.lines,
+        Some((11, 21)),
+        "the line range is a graph fact and stays"
+    );
+    let text = render_context(&pointer);
+    assert!(
+        text.contains(&format!("  at {}:11-21\n", file_key(0, 1))),
+        "the pointer is one line a reader can open:\n{text}"
+    );
+    assert!(!text.contains("// line 11"), "no body quoted:\n{text}");
+
+    let full = context_with(
+        &db,
+        Some(repo.as_path()),
+        &key,
+        &ContextOptions { source: true },
+    );
+    assert_eq!(
+        full,
+        context(&db, Some(repo.as_path()), &key),
+        "`context` is `context_with` asking for the body"
+    );
+    let full_text = render_context(&full);
+    assert!(
+        full_text.contains("// line 11"),
+        "the body is quoted:\n{full_text}"
+    );
+    assert!(
+        full_text.len() > text.len(),
+        "the pointer is the shorter answer: {} vs {}",
+        text.len(),
+        full_text.len()
     );
 }
 
@@ -740,6 +1134,281 @@ fn context_on_file_lists_importers_partners_commits() {
         c.concepts,
         vec![("concept:startup".to_string(), "startup path".to_string())]
     );
+}
+
+/// The same for a file. A file has no line range, so a body-less answer has no
+/// pointer line either: what is left is the file's own facts, and the flag is
+/// the only thing between the two answers.
+#[test]
+fn context_with_on_a_file_answers_from_the_graph_alone() {
+    let dir = tmp("context-options-file");
+    let db = synthetic_repo_store(&dir);
+    // The hub file: the one with importers, partners and notes on it. The
+    // shared tree does not carry it, so this test writes it in — a body has to
+    // be there for `source: true` to differ from the default at all.
+    let repo = work_tree("context-options-file-tree");
+    let path = file_key(0, 0);
+    let body: String = (1..=30).map(|n| format!("// line {n}\n")).collect();
+    std::fs::write(repo.join(&path), body).expect("write the hub file");
+
+    let pointer = context_with(&db, None, &path, &ContextOptions::default());
+    assert_eq!(pointer.target, Target::File { path: path.clone() });
+    assert_eq!(pointer.source, None, "the default reads no working tree");
+    assert_eq!(
+        pointer,
+        context_with(&db, Some(repo.as_path()), &path, &ContextOptions::default()),
+        "a working tree that is there changes nothing when no body was asked for"
+    );
+
+    let text = render_context(&pointer);
+    assert!(
+        text.contains("importers  ") && text.contains("co-change  "),
+        "the file's own facts are all there:\n{text}"
+    );
+    assert!(
+        !text.contains("  at "),
+        "a file has no line range to point at:\n{text}"
+    );
+    assert!(
+        !text.contains("where  lines"),
+        "and nothing on the `where` line stands in for one:\n{text}"
+    );
+
+    // Asking for the body changes the body and nothing else.
+    let full = context_with(
+        &db,
+        Some(repo.as_path()),
+        &path,
+        &ContextOptions { source: true },
+    );
+    assert!(
+        full.source.is_some(),
+        "the head of the file is quoted from the working tree"
+    );
+    assert_eq!(
+        ContextReport {
+            source: None,
+            ..full.clone()
+        },
+        pointer,
+        "the flag decides the body and nothing else"
+    );
+    let full_text = render_context(&full);
+    assert!(
+        full_text.contains("// line 1"),
+        "the body is quoted:\n{full_text}"
+    );
+}
+
+/// Binding: `all` is the three answers in one report — the context, the blast
+/// radius of the file behind it, and who owns it — and the digest carries all
+/// three inside the default budget.
+#[test]
+fn explore_all_composes_context_impact_and_history() {
+    let dir = tmp("explore-all");
+    let db = synthetic_repo_store(&dir);
+    let key = sym(0, 1, "core::run");
+
+    let r = explore(&db, None, &key, Depth::All, false);
+    assert_eq!(r.target, key);
+    assert_eq!(r.depth, Depth::All);
+    assert_eq!(r.context.target, Target::Symbol { key: key.clone() });
+    assert_eq!(
+        r.context.source, None,
+        "a body is the caller's to ask for, here as everywhere"
+    );
+
+    let imp = r.impact.as_ref().expect("all carries a blast radius");
+    assert_eq!(
+        imp.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        vec![file_key(0, 1)],
+        "the blast radius is the file the symbol is defined in"
+    );
+    let own = r.owners.as_ref().expect("all carries ownership");
+    assert_eq!(own.path, file_key(0, 1));
+    assert_eq!(
+        own.top.as_ref().map(|(name, _, _)| name.as_str()),
+        Some("Ada Example")
+    );
+    assert_eq!(
+        r.partners, r.context.partners,
+        "the co-change partners are the context's own, not a second computation"
+    );
+    assert!(
+        !r.partners.is_empty(),
+        "the fixture's files change together"
+    );
+
+    let text = render_explore(&r, DEFAULT_EXPLORE_BYTES);
+    assert!(
+        text.len() <= DEFAULT_EXPLORE_BYTES,
+        "{} bytes:\n{text}",
+        text.len()
+    );
+    for want in ["callers", "impact:", "owner:"] {
+        assert!(text.contains(want), "the digest is missing {want}:\n{text}");
+    }
+    // The partners are on the report for a caller reading it, but the digest
+    // does not print them twice: `render_context`'s `co-change` line already
+    // carries the same list, and a byte-budgeted digest cannot afford a copy.
+    assert!(
+        !text.contains("changes with"),
+        "the co-change list is printed once, not twice:\n{text}"
+    );
+    assert!(
+        text.contains("co-change  "),
+        "and the one copy is the context digest's own line:\n{text}"
+    );
+    assert_eq!(
+        text,
+        render_explore(
+            &explore(&db, None, &key, Depth::All, false),
+            DEFAULT_EXPLORE_BYTES
+        ),
+        "two runs against one store agree byte for byte"
+    );
+}
+
+/// Binding: each depth costs only what it was asked for. `context` reads
+/// neither the blast radius nor the history, and `impact` and `history` take
+/// one each.
+#[test]
+fn each_depth_carries_only_its_own_answer() {
+    let dir = tmp("explore-depths");
+    let db = synthetic_repo_store(&dir);
+    let key = sym(0, 1, "core::run");
+
+    let c = explore(&db, None, &key, Depth::Context, false);
+    assert!(c.impact.is_none() && c.owners.is_none() && c.partners.is_empty());
+    let text = render_explore(&c, DEFAULT_EXPLORE_BYTES);
+    assert!(
+        !text.contains("impact:") && !text.contains("owner:"),
+        "context depth prints the context and nothing else:\n{text}"
+    );
+
+    let i = explore(&db, None, &key, Depth::Impact, false);
+    assert!(i.impact.is_some(), "impact depth carries the blast radius");
+    assert!(i.owners.is_none() && i.partners.is_empty());
+
+    let h = explore(&db, None, &key, Depth::History, false);
+    assert!(h.impact.is_none(), "history depth costs no blast radius");
+    assert!(h.owners.is_some() && !h.partners.is_empty());
+}
+
+/// Binding: a target nothing answers to is the context's answer and nothing
+/// else — there is no file to take a blast radius or an owner of.
+#[test]
+fn explore_on_an_unknown_target_is_the_context_answer_alone() {
+    let dir = tmp("explore-unknown");
+    let db = synthetic_repo_store(&dir);
+
+    let r = explore(&db, None, "no::such::thing", Depth::All, false);
+    assert_eq!(
+        r.context.target,
+        Target::Unknown {
+            target: "no::such::thing".to_string()
+        }
+    );
+    assert!(r.impact.is_none() && r.owners.is_none() && r.partners.is_empty());
+    let text = render_explore(&r, DEFAULT_EXPLORE_BYTES);
+    assert!(text.contains("unknown: no::such::thing"), "{text}");
+}
+
+/// Binding: the budget is a hard ceiling on the digest, and it is spent on
+/// whole lines — a path cut in half still reads as a path, and a caller acts
+/// on it.
+#[test]
+fn explore_renders_within_whatever_budget_it_is_given() {
+    let dir = tmp("explore-budget");
+    let db = synthetic_repo_store(&dir);
+    let r = explore(&db, None, &sym(0, 1, "core::run"), Depth::All, false);
+
+    let full = render_explore(&r, DEFAULT_EXPLORE_BYTES);
+    for budget in [800, 400, 200, 120] {
+        let text = render_explore(&r, budget);
+        assert!(
+            text.len() <= budget,
+            "{budget}: {} bytes:\n{text}",
+            text.len()
+        );
+        assert!(
+            full.starts_with(&text),
+            "a capped digest is a prefix of the whole one:\n{text}"
+        );
+        assert!(
+            text.is_empty() || text.ends_with('\n'),
+            "the cut is at a line ending:\n{text:?}"
+        );
+    }
+
+    // Below the header's own length the header is cut rather than dropped: a
+    // reply that says which target was looked up is an answer, and a blank one
+    // is not. The budget still binds it — that is the whole point of a ceiling.
+    let header = full.lines().next().expect("a header");
+    assert_eq!(
+        render_explore(&r, header.len() + 1),
+        format!("{header}\n"),
+        "a budget with room for the header and its newline keeps both"
+    );
+    for budget in 0..=header.len() {
+        let tiny = render_explore(&r, budget);
+        assert!(
+            tiny.len() <= budget,
+            "budget {budget} exceeded by {} bytes:\n{tiny:?}",
+            tiny.len()
+        );
+        if budget > 0 {
+            assert!(
+                header.starts_with(tiny.trim_end_matches('\n')),
+                "the cut header is a prefix of the whole one:\n{tiny:?}"
+            );
+        }
+    }
+}
+
+/// Binding: a target whose own name fills the budget is cut on a character
+/// boundary, never mid-rune — the digest is text an assistant reads, and half a
+/// character is not text.
+#[test]
+fn a_target_too_long_for_the_budget_is_cut_on_a_character_boundary() {
+    let dir = tmp("explore-wide-target");
+    let db = synthetic_repo_store(&dir);
+    // Multi-byte throughout, so almost every byte offset is mid-character.
+    let target = "ünbekannt::".repeat(40);
+
+    let r = explore(&db, None, &target, Depth::All, false);
+    for budget in 8..80 {
+        let text = render_explore(&r, budget);
+        assert!(text.len() <= budget, "budget {budget}: {}", text.len());
+        // `String` cannot hold invalid UTF-8, so the check that matters is that
+        // the render did not panic slicing one — and that what came back is a
+        // prefix of the line it cut.
+        let head = render_explore(&r, DEFAULT_EXPLORE_BYTES)
+            .lines()
+            .next()
+            .expect("a header")
+            .to_string();
+        assert!(
+            head.starts_with(text.trim_end_matches('\n')),
+            "budget {budget}: {text:?} is not a prefix of {head:?}"
+        );
+    }
+}
+
+/// Binding: the four depth names parse, and nothing else does.
+#[test]
+fn depth_parses_the_four_names_and_no_others() {
+    for (name, want) in [
+        ("context", Depth::Context),
+        ("impact", Depth::Impact),
+        ("history", Depth::History),
+        ("all", Depth::All),
+    ] {
+        assert_eq!(Depth::parse(name), Some(want), "{name}");
+    }
+    for bad in ["", "Context", "ALL", "everything", "context "] {
+        assert_eq!(Depth::parse(bad), None, "{bad:?} must not parse");
+    }
 }
 
 #[test]
@@ -1581,14 +2250,15 @@ fn remember_creates_the_about_rule_for_a_label_seen_for_the_first_time() {
     );
 }
 
-#[test]
-fn recall_finds_notes_concepts_files_symbols_people() {
-    let dir = tmp("recall-all-labels");
-    let mut db = synthetic_repo_store(&dir);
-    // The full set `ingest-git`, `structure` and `remember` register between
-    // them (see the doc table in `docs/roadmap/v0.6-code-graph-plan.md`),
-    // recreated here since this fixture is built by hand rather than by the
-    // CLI's own ingest path.
+/// The digest's elision marker, as one line of `out.lines()`.
+const ELISION_LINE: &str = "  …";
+
+/// The synthetic store with the full set of fields `ingest-git`, `structure`
+/// and `remember` index between them (see the doc table in
+/// `docs/roadmap/v0.6-code-graph-plan.md`), enabled here because this fixture
+/// is built by hand rather than by the CLI's own ingest path.
+fn recall_store(dir: &Path) -> core_api::GraphDb<core_storage::fs::RealFs> {
+    let mut db = synthetic_repo_store(dir);
     for (label, field) in [
         ("File", "path"),
         ("Symbol", "name"),
@@ -1598,39 +2268,253 @@ fn recall_finds_notes_concepts_files_symbols_people() {
     ] {
         db.enable_fulltext(label, field).expect("fulltext");
     }
+    db
+}
 
-    // One distinctive term per label, so each contributes its own top hit.
-    let prompt = "c00 OR init OR ada OR entry OR startup";
-    let out = recall_digest(&db, prompt, "synthetic", 4000);
-    let lines: Vec<&str> = out.lines().collect();
-
-    // Every hit is `- key [Label] name` immediately followed by up to three
-    // `    edge_type -> other[ (prop w.ww)]` lines — the brief calls for
-    // "each with one strongest edge", so this checks the edge line is
-    // actually there, not just the header that names the label.
-    for label in ["File", "Symbol", "Author", "Note", "Concept"] {
-        let marker = format!("[{label}]");
-        let at = lines
-            .iter()
-            .position(|l| l.contains(&marker))
-            .unwrap_or_else(|| panic!("expected a {label} hit in:\n{out}"));
-        let edge_line = lines.get(at + 1).copied().unwrap_or("");
-        assert!(
-            edge_line.starts_with("    ") && edge_line.contains(" -> "),
-            "expected {label}'s hit ({:?}) to be followed by its strongest \
-             edge, got {edge_line:?} in:\n{out}",
-            lines[at]
+/// Binding: a prompt with no code-shaped token in it is not a question about
+/// this repository, so the digest that fires before every prompt says nothing
+/// — before any search runs, not after ranking six near-random nodes.
+#[test]
+fn recall_is_silent_on_prose_without_identifiers() {
+    let dir = tmp("recall-prose");
+    let db = recall_store(&dir);
+    for prompt in [
+        "please explain how the server starts",
+        "what changed here recently",
+        "write a test for the parser",
+    ] {
+        assert_eq!(
+            recall_digest(&db, prompt, "synthetic", MAX_OUTPUT_BYTES),
+            "",
+            "{prompt:?}"
         );
     }
-    assert!(out.contains("src/core/c00.rs"), "{out}");
-    assert!(out.contains("Ada Example"), "{out}");
+}
+
+/// Binding: a prompt that names symbols is answered with pointers — one
+/// indented `path:line symbol — first doc line` per hit and nothing else. No
+/// edge lines, and no closing nudge: the session brief already told the
+/// assistant how to reach the graph.
+#[test]
+fn recall_prints_pointers_for_a_named_symbol() {
+    let dir = tmp("recall-pointers");
+    let db = recall_store(&dir);
+    let out = recall_digest(
+        &db,
+        "why does core::init call web::serve?",
+        "synthetic",
+        MAX_OUTPUT_BYTES,
+    );
+
+    assert!(out.starts_with(UNTRUSTED_FRAMING), "{out}");
     assert!(
-        out.contains("ABOUT -> src/core/c00.rs"),
-        "the note's edge names its rule and target: {out}"
+        out.lines()
+            .nth(1)
+            .unwrap_or_default()
+            .starts_with("mushroomdb recall"),
+        "{out}"
+    );
+    assert!(out.contains("src/core/c00.rs:"), "{out}");
+    assert!(out.contains("core::init"), "{out}");
+    assert!(
+        out.contains("— what core::init does"),
+        "the pointer carries the symbol's first doc line: {out}"
+    );
+    assert!(out.contains("src/web/w00.rs:"), "{out}");
+    assert!(!out.contains(" -> "), "no edge lines: {out}");
+    assert!(
+        !out.contains("(query the mushroomdb MCP tools"),
+        "no nudge: {out}"
+    );
+    for line in out.lines().skip(2) {
+        assert!(
+            line.starts_with("  "),
+            "every line under the header is one pointer: {line:?} in\n{out}"
+        );
+    }
+    assert!(out.len() <= MAX_OUTPUT_BYTES, "{} bytes", out.len());
+}
+
+/// Binding: a `File` hit has no symbol and no line to point at, so it is its
+/// path and what the graph says the file is.
+#[test]
+fn recall_points_at_a_file_by_path_and_role() {
+    let dir = tmp("recall-file");
+    let mut db = recall_store(&dir);
+    db.insert_node(
+        "File",
+        "src/web/w99.rs",
+        vec![
+            (
+                "id".to_string(),
+                core_api::Value::Str("src/web/w99.rs".into()),
+            ),
+            (
+                "path".to_string(),
+                core_api::Value::Str("src/web/w99.rs".into()),
+            ),
+            (
+                "role".to_string(),
+                core_api::Value::Str("the web entry point".into()),
+            ),
+        ],
+    )
+    .expect("file");
+
+    let out = recall_digest(
+        &db,
+        "what is in src/core/c00.rs?",
+        "synthetic",
+        MAX_OUTPUT_BYTES,
     );
     assert!(
-        out.contains("DESCRIBED_IN -> src/core/c00.rs"),
-        "the concept's edge names its rule and target: {out}"
+        out.lines().any(|l| l == "  src/core/c00.rs"),
+        "a file with no role is its path alone: {out}"
+    );
+
+    let out = recall_digest(
+        &db,
+        "what is src/web/w99.rs?",
+        "synthetic",
+        MAX_OUTPUT_BYTES,
+    );
+    assert!(
+        out.lines()
+            .any(|l| l == "  src/web/w99.rs — the web entry point"),
+        "{out}"
+    );
+}
+
+/// Binding: backticks make a word an identifier. A note or a concept is named
+/// in prose, so quoting is how a prompt says "this is a thing, not a word" —
+/// and without the quotes the same prompt is silent.
+#[test]
+fn recall_reaches_a_prose_node_through_backticks() {
+    let dir = tmp("recall-backticks");
+    let db = recall_store(&dir);
+    let out = recall_digest(
+        &db,
+        "what does `startup` cover?",
+        "synthetic",
+        MAX_OUTPUT_BYTES,
+    );
+    assert!(out.contains("concept:startup"), "{out}");
+    assert!(out.contains("startup path"), "{out}");
+    assert_eq!(
+        recall_digest(
+            &db,
+            "what does startup cover?",
+            "synthetic",
+            MAX_OUTPUT_BYTES
+        ),
+        "",
+        "the same words unquoted are prose"
+    );
+}
+
+/// Binding: a doc line written for a reader of the file is cut to an excerpt,
+/// so one verbose symbol cannot take the whole budget — or, when it is the
+/// first hit, leave the digest with nothing that fits and print nothing at all.
+#[test]
+fn recall_cuts_a_long_doc_line_to_an_excerpt() {
+    let dir = tmp("recall-long-doc");
+    let mut db = recall_store(&dir);
+    let key = format!("{}#core::verbose", file_key(0, 0));
+    let doc = format!("Verbose. {}", "explanation ".repeat(200));
+    assert!(
+        doc.len() > 2_000,
+        "the fixture must be over-budget on its own"
+    );
+    db.insert_node(
+        "Symbol",
+        &key,
+        vec![
+            ("id".to_string(), core_api::Value::Str(key.clone())),
+            (
+                "name".to_string(),
+                core_api::Value::Str("core::verbose".into()),
+            ),
+            ("path".to_string(), core_api::Value::Str(file_key(0, 0))),
+            ("line_start".to_string(), core_api::Value::Int(99)),
+            ("doc".to_string(), core_api::Value::Str(doc)),
+        ],
+    )
+    .expect("symbol");
+
+    let out = recall_digest(
+        &db,
+        "what does core::verbose do?",
+        "synthetic",
+        MAX_OUTPUT_BYTES,
+    );
+    let pointer = out
+        .lines()
+        .find(|l| l.contains("core::verbose"))
+        .unwrap_or_else(|| panic!("expected the hit in:\n{out}"));
+    assert!(
+        pointer.starts_with(&format!(
+            "  {}:99 core::verbose — Verbose. ",
+            file_key(0, 0)
+        )),
+        "{pointer}"
+    );
+    assert!(pointer.ends_with('…'), "the cut is marked: {pointer}");
+    assert!(
+        pointer.len() < 300,
+        "one pointer, not a paragraph: {} bytes",
+        pointer.len()
+    );
+    assert!(out.len() <= MAX_OUTPUT_BYTES, "{} bytes", out.len());
+}
+
+/// Binding: `identifier_terms` keeps the code-shaped tokens and drops the
+/// words around them — the sentence's full stop included, which has to come
+/// off `render_map.` without taking the extension off `src/core.rs.`.
+#[test]
+fn identifier_terms_keep_code_shaped_tokens_only() {
+    assert_eq!(
+        identifier_terms("the `render_map` fn and web::serve and src/core.rs but not words"),
+        vec!["render_map", "web::serve", "src/core.rs"]
+    );
+    assert_eq!(
+        identifier_terms("it lives in src/core.rs."),
+        vec!["src/core.rs"],
+        "a path keeps its extension when the sentence ends"
+    );
+    assert_eq!(
+        identifier_terms("look at render_map."),
+        vec!["render_map"],
+        "and prose loses the full stop"
+    );
+    for prompt in [
+        "what is render_map's job",
+        "what is render_map\u{2019}s job",
+        "what is `render_map's` job",
+        "what is render_map's.",
+    ] {
+        assert_eq!(
+            identifier_terms(prompt),
+            vec!["render_map"],
+            "the possessive is the sentence's, not the name's: {prompt:?}"
+        );
+    }
+    assert!(identifier_terms("please explain how the server starts").is_empty());
+    assert!(
+        identifier_terms("the code in this file").is_empty(),
+        "a word that says nothing inside a repository is not an identifier"
+    );
+    assert_eq!(
+        identifier_terms("does core::init call core::init twice"),
+        vec!["core::init"],
+        "a repeat is one term"
+    );
+    let many: String = (0..MAX_QUERY_TERMS + 5)
+        .map(|i| format!("a_{i} "))
+        .collect();
+    assert_eq!(
+        identifier_terms(&many).len(),
+        MAX_QUERY_TERMS,
+        "a pasted wall of code cannot turn one prompt into hundreds of probes"
     );
 }
 
@@ -1646,29 +2530,25 @@ fn recall_finds_notes_concepts_files_symbols_people() {
 #[test]
 fn recall_prints_hits_in_the_hybrid_ranking_order() {
     let dir = tmp("recall-hybrid-order");
-    let mut db = synthetic_repo_store(&dir);
-    for (label, field) in [
-        ("File", "path"),
-        ("Symbol", "name"),
-        ("Author", "name"),
-        ("Note", "text"),
-        ("Concept", "name"),
-    ] {
-        db.enable_fulltext(label, field).expect("fulltext");
-    }
+    let db = recall_store(&dir);
 
-    let prompt = "c00 OR init OR ada OR entry OR startup";
+    let prompt = "does core::init or web::serve belong in src/core/c00.rs?";
     let out = recall_digest(&db, prompt, "synthetic", 4000);
 
     // What `recall_digest` does internally, spelled out here against the
-    // public API: best fused score per key across the fields, then score
-    // descending and key ascending.
+    // public API: every identifier searched as a phrase, best fused score per
+    // key across the fields, then score descending and key ascending.
+    let query: String = identifier_terms(prompt)
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<String>>()
+        .join(" OR ");
     let mut fields: Vec<String> = db.fulltext_pairs().into_iter().map(|(_, f)| f).collect();
     fields.sort();
     fields.dedup();
     let mut best: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
     for field in &fields {
-        for (key, score) in db.search_hybrid(field, prompt, "embedding", &[], None, 6) {
+        for (key, score) in db.search_hybrid(field, &query, "embedding", &[], None, 6) {
             let slot = best.entry(key).or_insert(0.0);
             if score > *slot {
                 *slot = score;
@@ -1682,16 +2562,32 @@ fn recall_prints_hits_in_the_hybrid_ranking_order() {
             .then(a.0.cmp(&b.0))
     });
 
+    // A pointer names the node by path, not by key: for a `Symbol` the key is
+    // `path#name`, and for everything else it is the path itself. The path is
+    // the pointer's first field, minus the `:line` when there is one — so the
+    // printed order is a sequence of paths, comparable outright to the
+    // ranking's. (`concept:startup` is why the `:line` is stripped from the
+    // end and not at the first colon.)
+    let path_of = |line: &str| -> String {
+        let body = line.strip_prefix("  ").unwrap_or(line);
+        let first = body.split(' ').next().unwrap_or(body);
+        match first.rsplit_once(':') {
+            Some((path, num)) if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) => {
+                path.to_string()
+            }
+            _ => first.to_string(),
+        }
+    };
     let printed: Vec<String> = out
         .lines()
-        .filter_map(|l| l.strip_prefix("- "))
-        .filter_map(|l| l.split_whitespace().next())
-        .map(str::to_string)
+        .skip(2)
+        .filter(|l| *l != ELISION_LINE)
+        .map(path_of)
         .collect();
     let expected: Vec<String> = ranked
         .iter()
         .take(printed.len())
-        .map(|(k, _)| k.clone())
+        .map(|(k, _)| k.split('#').next().unwrap_or(k).to_string())
         .collect();
     assert!(!printed.is_empty(), "expected hits in:\n{out}");
     assert_eq!(

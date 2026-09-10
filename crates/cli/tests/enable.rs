@@ -6,8 +6,8 @@
 //! of stand-ins or leaves it empty (mirrors `tests/install.rs`).
 
 use cli::install::{
-    run_disable, run_disable_with, run_enable_with, run_install_with, run_uninstall, Externals,
-    InstallOpts, McpCommand, Platform, Scope, ToggleOpts,
+    run_disable, run_disable_with, run_enable_with, run_install_with, run_uninstall, Delivery,
+    Externals, InstallOpts, McpCommand, Platform, Scope, ToggleOpts,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -74,6 +74,8 @@ fn base_opts() -> InstallOpts {
         command: None,
         git_hooks: true,
         prewarm: false,
+        delivery: Delivery::Both,
+        intercept_grep: false,
     }
 }
 
@@ -131,6 +133,7 @@ fn disable_removes_hooks_and_mcp_entry_and_keeps_skill_store_gitignore() {
     let settings_before: serde_json::Value = read_json(&root, ".claude/settings.json");
     assert!(settings_before["hooks"]["UserPromptSubmit"].is_array());
     assert!(settings_before["hooks"]["PostToolUse"].is_array());
+    assert!(settings_before["hooks"]["SessionStart"].is_array());
     for name in ["post-commit", "post-checkout", "post-merge"] {
         assert!(
             fs::read_to_string(hooks_dir.join(name))
@@ -171,6 +174,13 @@ fn disable_removes_hooks_and_mcp_entry_and_keeps_skill_store_gitignore() {
     );
     assert!(
         settings["hooks"]["PostToolUse"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true),
+        "{settings}"
+    );
+    assert!(
+        settings["hooks"]["SessionStart"]
             .as_array()
             .map(|a| a.is_empty())
             .unwrap_or(true),
@@ -741,4 +751,121 @@ fn usage_mentions_enable_and_disable() {
     let text = cli::usage();
     assert!(text.contains("mushroomdb enable"), "{text}");
     assert!(text.contains("mushroomdb disable"), "{text}");
+}
+
+/// Binding: `disable`/`enable` on a `--delivery cli` install put back the
+/// install that was there — the hooks, for the store they were written for —
+/// and never a server it never had.
+#[test]
+fn enable_restores_a_cli_delivery_install_without_a_server() {
+    let root = temp_dir("enable-cli-delivery");
+    let home = temp_dir("enable-cli-delivery-home");
+    let hooks_dir = git_repo(&root);
+    // A store the default `--auto` fallback would not find, so a lost store
+    // shows up as a hook naming the wrong path rather than passing by luck.
+    let db = temp_dir("enable-cli-delivery-store").join("elsewhere");
+    let opts = InstallOpts {
+        delivery: Delivery::Cli,
+        ..claude_project_opts(&db)
+    };
+    install_on_path(&root, &home, &opts).expect("install");
+    assert!(!root.join(".mcp.json").exists(), "sanity: no server entry");
+
+    let toggle_opts = toggle(Platform::ClaudeCode, Scope::Project);
+    run_disable_with(&root, &home, &toggle_opts, &no_externals()).expect("disable");
+    let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
+    assert!(
+        settings["hooks"]["SessionStart"]
+            .as_array()
+            .is_none_or(|g| g.is_empty()),
+        "disable must take the hooks off disk: {settings}"
+    );
+
+    let out = run_enable_with(
+        &root,
+        &home,
+        &toggle_opts,
+        &McpCommand::OnPath,
+        &no_externals(),
+    )
+    .expect("enable");
+    assert!(out.contains("mushroomdb is enabled in"), "{out}");
+
+    assert!(
+        !root.join(".mcp.json").exists(),
+        "enable must not open a door this install never had"
+    );
+    let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
+    let brief = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("the SessionStart hook is back")
+        .to_string();
+    assert!(
+        brief.ends_with(&format!("brief '{}'", db.display())),
+        "the hook must name the store it was installed with: {brief}"
+    );
+    let post_commit = fs::read_to_string(hooks_dir.join("post-commit")).unwrap();
+    assert!(
+        post_commit.contains(&db.display().to_string()),
+        "{post_commit}"
+    );
+}
+
+/// The fourth hook is the manifest's to remember: `disable` takes it off disk
+/// like the other three, and `enable` puts back exactly the install that was
+/// disabled — with the redirect if it had one, without if it did not.
+#[test]
+fn enable_restores_the_grep_redirect_only_when_the_install_had_one() {
+    for intercept_grep in [true, false] {
+        let label = if intercept_grep { "on" } else { "off" };
+        let root = temp_dir(&format!("intercept-{label}"));
+        let home = temp_dir(&format!("intercept-{label}-home"));
+        let db = root.join("mushroom-memory");
+        git_repo(&root);
+        let opts = InstallOpts {
+            intercept_grep,
+            ..claude_project_opts(&db)
+        };
+        install_on_path(&root, &home, &opts).expect("install");
+
+        run_disable_with(
+            &root,
+            &home,
+            &toggle(Platform::ClaudeCode, Scope::Project),
+            &no_externals(),
+        )
+        .expect("disable");
+        let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
+        assert!(
+            settings["hooks"]["PreToolUse"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(true),
+            "the redirect survived disable: {settings}"
+        );
+
+        run_enable_with(
+            &root,
+            &home,
+            &toggle(Platform::ClaudeCode, Scope::Project),
+            &McpCommand::OnPath,
+            &no_externals(),
+        )
+        .expect("enable");
+
+        let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
+        let restored = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .map(str::to_string);
+        if intercept_grep {
+            assert_eq!(
+                restored.as_deref(),
+                Some(format!("mushroomdb intercept '{}'", db.display()).as_str()),
+                "{settings}"
+            );
+            assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Grep");
+        } else {
+            assert_eq!(restored, None, "enable invented a redirect: {settings}");
+        }
+    }
 }

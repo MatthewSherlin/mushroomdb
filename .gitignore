@@ -23,3 +23,10 @@ ui/playwright/.cache/
 # Internal process docs — local only, never shipped
 docs/superpowers/
 docs/registry-submissions/
+
+# Benchmark runs: streams, stderr and per-cell JSON stay local; the report
+# a run is quoted from is committed.
+benchmarks/agent-tasks/results/**
+!benchmarks/agent-tasks/results/**/
+!benchmarks/agent-tasks/results/**/summary*.md
+benchmarks/agent-tasks/__pycache__/

@@ -79,7 +79,10 @@ Nothing under `packaging/plugin/` or `.claude-plugin/marketplace.json` is
 hand-edited: every one is rendered by `scripts/render-plugin.sh` from the four
 templates in `scripts/plugin-templates/` and from the CLI's real
 `crates/cli/skills/mushroom/SKILL.md`, with `{{VERSION}}`, `{{BIN}}` and
-`{{DB_PATH}}` substituted. The version comes from `crates/cli/Cargo.toml`, so a
+`{{DB_PATH}}` substituted, and the skill's `<!-- cli -->…<!-- /cli -->` blocks
+dropped — the plugin ships an MCP server, so its copy is the `mcp` variant of
+the same source (`install --delivery` picks the variant at install time; see
+`render_template`). The version comes from `crates/cli/Cargo.toml`, so a
 version bump is a re-render. The `plugin-validate` CI job runs both the strict
 validate and the drift check.
 

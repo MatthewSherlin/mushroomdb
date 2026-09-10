@@ -1,5 +1,185 @@
 # Changelog
 
+## v0.6.2 — the proof release
+
+The delivery changes in this release were measured on a rebuilt agent benchmark before it shipped —
+but *together*, not one at a time: one four-arm run of 240 cells, plus a one-rep probe of the two
+`--intercept-grep` arms. No change here carries a number of its own, because the per-change
+baseline run was cancelled. The pre-registered gate is reported as it came out. **The gate was not
+passed.** Nothing here is a claim the numbers do not carry. No format change.
+
+#### The gate
+
+The benchmark is `benchmarks/agent-tasks/` (harness v2): 20 tasks over two repositories — this one
+and a pinned third-party Python repository — graded against executable truth (a test command for
+each change task, an exact answer key for the rest), one worktree per cell, cost and token counts
+read from the session stream, and a `gate_verdict` computed by the harness rather than by hand.
+The pre-registered §1 gate is: correctness >= stock (paired by task), cost <= stock, adoption
+>= 80%, and no max-turns failure on a task stock finished.
+
+The verdict is the Gate section of the full run,
+[`benchmarks/agent-tasks/results/20260910T000418Z/summary.md`](benchmarks/agent-tasks/results/20260910T000418Z/summary.md)
+— arms A, B, C, D × 3 reps × 20 tasks, 240 cells:
+
+| | |
+|---|---|
+| verdict | **FAILED** |
+| best arm | B |
+| cells with no cost recorded | 0 of 240 |
+
+**Gate not passed; best arm B; reasons: B: cost 0.2396 > stock 0.2267; B: adoption 0% < 80%;
+B: max-turns on tasks [2, 3] where stock succeeded.**
+
+The arms: **A** stock (no MCP, no skill), **B** installed (MCP + project skill + prompt hook, plain
+prompt), **C** the same install with the prompt prefixed `/mushroom`, **D** `--delivery cli` (the
+skill teaches the binary, no MCP server).
+
+| metric | A (stock) | B (installed) | C (invoked) | D (cli delivery) |
+|---|---|---|---|---|
+| score | 0.927 | 0.941 | 0.924 | 0.920 |
+| cost $ | 0.2267 | 0.2396 (+5.7%) | 0.2713 (+19.7%) | 0.2290 (+1.0%) |
+| total tokens | 514384 | 544632 (+5.9%) | 629814 (+22.4%) | 521363 (+1.4%) |
+| tool calls | 13.27 | 13.02 | 14.02 | 12.20 |
+| turns | 13.48 | 13.52 | 14.95 | 13.17 |
+| adoption | 0.00 | 0.00 | 0.43 | 0.00 |
+
+Paired by task, with a 95% percentile bootstrap over the per-task differences, **no correctness
+interval excludes 0** — B `0.0142 [-0.0083, 0.0508]`, C `-0.0035 [-0.0112, 0.0017]`, D
+`-0.0067 [-0.0138, 0.0000]`. The one cost interval that excludes 0 is C's: `0.04463
+[0.01312, 0.07471]`. Read plainly: on these tasks the graph changed nothing measurable about
+whether the agent got the answer right, invoking it deliberately cost about 20% more, and nothing
+but a deliberate invocation made an agent reach for it at all — 26 of 60 arm-C sessions made at
+least one call (`query` ×45, `explore` ×43), and 0 of 60 in every other arm.
+
+Two smaller runs are committed beside it, and neither is a gate:
+
+- The **smoke after `explore`** (arms A, C × **1 rep** × the ten tasks on this repository),
+  [`results/20260909T223250Z/summary.md`](benchmarks/agent-tasks/results/20260909T223250Z/summary.md):
+  score 0.880 / 0.880, cost $0.2847 / $0.2385 (−16.2%), tool calls 18.60 / 12.80, adoption 0% / 40%.
+  Gate FAILED (adoption 40% < 80%; C max-turns on task 3 where stock succeeded). **One rep.** Three
+  reps of the same comparison erased that cost difference, which is the whole reason the full run
+  exists.
+- The **intercept-variant probe** (arms A, E, F × **1 rep** × all 20 tasks), where E is arm B and
+  F is arm D with `--intercept-grep` added,
+  [`results/20260910T050239Z/summary.md`](benchmarks/agent-tasks/results/20260910T050239Z/summary.md):
+
+  | metric | A (stock) | E (installed + redirect) | F (cli + redirect) |
+  |---|---|---|---|
+  | score | 0.871 | 0.891 | 0.924 |
+  | cost $ | 0.2778 | 0.2397 (−13.7%) | 0.2369 (−14.7%) |
+  | tool calls | 16.55 | 12.30 | 11.90 |
+  | turns | 16.00 | 13.20 | 12.85 |
+  | adoption | 0.00 | 0.25 | 0.10 |
+
+  Gate FAILED (F: adoption 10% < 80%). **One rep — direction only, not a result.** The smoke above
+  showed the same size of cost drop and three reps erased it.
+
+#### A session opens with a brief — `SessionStart`
+
+- **`mushroomdb brief <db>` and a third Claude Code hook.** The brief is the repository's shape read
+  from the graph alone: file, symbol and edge counts, the sha of the last sync, the 25 most central
+  files with their role, the 25 most called symbols with their signatures, and one line naming the
+  door this install wired, under the same untrusted-data marker every digest rendered out of a
+  store opens with — a brief is repository text placed in a session's context before its first
+  turn, and the marker's bytes come out of the cap, not on top of it. Measured on this
+  repository's store: **3,916 bytes** of a 4,000-byte cap, median **228 ms**. It reads no clock
+  and no working tree, so two sessions started an hour apart get byte-identical output — a host
+  that caches it is never wrong.
+- **Key files are ranked by centrality and then filtered to files something imports or calls.**
+  PageRank over the file graph alone put six `.woff2` font files and an `OFL.txt` in this
+  repository's top 25; a file that only *co-changes* with code is not what a session needs to be
+  oriented by. Files with no `IMPORTS`/`CALLS` edge are dropped after the ranking, so `brief` still
+  starts with `map`'s key files. When the byte cap drops lines, the brief says `… and N more`
+  rather than ending mid-list, and the reach line always survives the cap.
+
+#### `explore` — one tool to find, and a listing that follows the store
+
+- **New tool and subcommand `explore <target> [--depth context|impact|history|all] [--full]`.** It
+  composes `context`, `impact` and `owners` behind one depth rather than adding a fourth report:
+  `context` (default) is where the target is, its signature, call sites, callees, importers,
+  partners and commits; `impact` adds the file's blast radius; `history` adds the owner and what the
+  file changes with; `all` is all three. `budget` (MCP, in tokens; default 1,200 ≈ 4,800 bytes,
+  minimum 200) caps the reply, and the header line naming the target survives any budget. Measured
+  on this repository's store, replies run **2,070–3,488 bytes** across the four depths and three
+  targets — the widest is 73% of the default budget — and `--depth all` has a median latency of
+  **196 ms**, cheaper than `map`.
+- **The MCP tool listing follows the store.** A store built by `ingest-git` advertises three tools —
+  `explore`, `query`, `stats` — and any other store advertises eleven. The server decides once, at
+  startup, from the store it opened, so one `.mcp.json` serves both and neither has to be configured
+  for. Measured on this repository's store, the listing a coding session pays for before its first
+  turn drops from **5,622 bytes to 1,593** — 72%, on top of the 12,238 → 5,622 cut in v0.6.1. All 25
+  tools stay served on either surface — the listing decides what a session can call, not what the
+  server answers — and `mushroomdb mcp <db> --all-tools` lists them all (14,419 bytes).
+- **`doctor`'s handshake accepts either front door.** It required `map` in `tools/list`, which is
+  exactly the tool a code-graph store no longer lists — `doctor` failed on the stores this feature
+  exists for. It now accepts `explore` or `map` and names the one it found.
+
+#### `context` answers with pointers; bodies are opt-in
+
+- **The source body is no longer quoted by default.** `context` returns the line range
+  (`path:start-end`), the signature and the doc, and `full: true` (`--full` on the CLI) adds the
+  body read from the working tree. Measured on this repository's store: a symbol target **2,072
+  bytes** against 3,853 with the body, a file target **1,640** against 4,044. The body is the
+  expensive half of the answer and rarely the half that decides anything — and a file target now
+  answers from the graph alone, reading nothing off disk.
+
+#### The prompt hook fires on identifiers, and answers with pointers
+
+- **`recall` is silent unless the prompt names an identifier** — a path, a `mod::name`, a snake_case
+  or dotted name, an inner-capitalised word, or anything in backticks. `is it done`, `ok thanks` and
+  `fix this` print nothing at all: no framing line, no header, dirty tree or not. The stopword list
+  and relevance floor from v0.6.1 still apply on top of the gate.
+- **The digest is pointers, not excerpts.** One line per hit — `path:line symbol — first doc line` —
+  which is what a follow-up `explore` call takes as its target. The per-hit edge lines and the
+  closing hint are gone, and the output budget drops from 1,800 to 1,200 bytes.
+- **On a dirty tree the diff nudge replaces the digest** rather than printing beside it: a change in
+  progress is the more useful subject.
+
+#### `install --delivery cli|mcp|both`
+
+- **The skill can teach the binary instead of a server.** `--delivery cli` writes the skill and the
+  hooks and *no* `.mcp.json` entry, so a session loads no tool schemas before its first turn and
+  reaches the graph through `Bash`: `mushroomdb explore <store> <target>`. `mcp` is the server
+  alone; `both` (the default) writes the entry and a skill that also teaches the shell form.
+  Switching an existing install to `cli` removes the entry it registered and prunes the manifest
+  key. Claude Code only — a Cursor or Codex install is always the server, and `install` prints a
+  note saying so rather than dropping the flag silently.
+- **`doctor`, `enable` and `disable` follow the manifest.** A new `skip` status (never a failure)
+  reports the `config` and `handshake` checks as `skip … delivery: cli`, per platform, while
+  `store`, `lock`, `hooks`, `git-hooks` and `scope` still run against the store recovered from the
+  recorded `SessionStart` hook. `enable` rebuilds the install that was disabled, server and all — or
+  no server, as recorded.
+
+#### `install --intercept-grep` (experimental, off by default)
+
+- **A fourth hook that redirects a `Grep` for a known symbol to `explore`.** `PreToolUse`, matched
+  to `Grep`: when the pattern is a bare identifier of three characters or more that the graph holds
+  as a symbol, the hook exits 2 with one line pointing at `explore("<name>")`, and Claude Code hands
+  the model that message instead of a list of matching lines. Anything regex-shaped, any name the
+  graph does not hold, and any store that will not open pass straight through; the identifier test
+  runs *before* the store is opened, so a regex search costs nothing. `disable`, `enable` and
+  `uninstall` treat it like any other hook, and re-running `install` without the flag removes it.
+  Arms E and F above are the only measurement of it, and they are one rep.
+
+#### BREAKING
+
+- **The default MCP tool listing now follows the store.** A code-graph store lists three tools
+  (`explore`, `query`, `stats`); `map`, `context`, `impact`, `owners`, `why`, `recall`, `remember`,
+  `sync` and `ingest_json` are no longer in its default listing. Every one of the 25 stays callable
+  by name on either surface, and `mushroomdb mcp <db> --all-tools` lists them all with their
+  schemas. A programmatic caller that discovers tools by listing rather than by name has to pass
+  the flag.
+- **`repograph` no longer re-exports `MAX_EDGES_PER_HIT` or `MAX_EDGE_CANDIDATES`.** The digest they
+  bounded prints pointers now and has no per-hit edge lines to cap.
+- **`recall_digest` takes the raw prompt.** It used to take an `or_query`-built search string;
+  passing one now yields an empty digest, because the identifier gate runs on the text as the user
+  typed it. It returns `""` before searching anything when the prompt names no identifier.
+- **The `UserPromptSubmit` hook is silent on a prompt with no identifier, dirty tree or not.** The
+  v0.6.1 behaviour of always printing a diff-aware nudge on a dirty checkout is gone.
+- **`install` writes a new `SessionStart` hook** into `settings.json` (and the plugin ships it).
+  An install that predates this release gains it on the next `install`; `uninstall`, `disable` and
+  `enable` handle it like the other two.
+
 ## v0.6.1 — 2026-09-09
 
 Dogfooding v0.6.0 on this repository turned up three code-graph defects, a token bill worth

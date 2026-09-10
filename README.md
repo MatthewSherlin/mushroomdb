@@ -37,7 +37,7 @@ Or install into one project (or your home directory) without the plugin — same
 bare as `/mushroom`:
 
 ```sh
-npx mushroomdb install    # /mushroom skill + MCP server + prompt, post-edit and git hooks
+npx mushroomdb install    # /mushroom skill + MCP server + session, prompt, post-edit and git hooks
 ```
 
 Either way, the first thing the assistant does is read the repository back to you. This is a real
@@ -201,28 +201,30 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
-**Eight task tools** answer a question about the repository in one call. They are what the skill
+**Nine task tools** answer a question about the repository in one call. They are what the skill
 reaches for, and what `tools/list` shows first:
 
 | Tool | Purpose |
 |---|---|
+| `explore` | One tool to find: `context`, `impact`, `history` or `all` for one target in one reply, capped by a token `budget` |
 | `map` | The repository in one screen: size, last sync, clusters, key files, owners, hot files |
-| `context` | One file or symbol from every side: signature, source, callers, callees, importers, co-change partners, commits, notes |
+| `context` | One file or symbol from every side: where it is as `path:start-end`, signature, callers, callees, importers, co-change partners, commits, notes. `full` adds the body |
 | `impact` | What changing these files reaches: partners with scores, importers, symbols other files call, owner. Defaults to the working tree's diff |
 | `owners` | Top author and share, who else knows the file, last touch, the split by quarter |
 | `why` | Every rule edge between two nodes with its evidence, or the shortest path when there is none |
-| `recall` | Notes, concepts, files, symbols and people nearest a topic, each with its strongest link |
+| `recall` | One pointer per hit — `path:line symbol — first doc line` — for the identifiers in a topic |
 | `remember` | Write a note into the graph and return its key |
 | `sync` | Bring the store up to date: commits since the last sync, then the dirty working tree |
 
-Each of the eight also takes `json: true`, which answers with the raw report instead of the
+Each of the nine also takes `json: true`, which answers with the raw report instead of the
 rendered digest.
 
 **The sixteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
-in `tools/list`, so an assistant knows which surface is the front door. A default `tools/list`
-names three of them — `query`, `ingest_json` and `stats` — because the other thirteen schemas cost
-every session more than a coding agent gets back; `mushroomdb mcp <db> --all-tools` advertises the
-whole list, and all sixteen stay callable either way:
+in `tools/list`, so an assistant knows which surface is the front door. The default listing follows
+the store: a store built by `ingest-git` lists three tools in all — `explore`, `query` and `stats` —
+and any other store lists eleven, the eight task tools other than `explore` plus `query`,
+`ingest_json` and `stats`. All 25 stay served either way — the listing decides what a session can
+call, not what the server answers — and `mushroomdb mcp <db> --all-tools` lists the whole set:
 
 | Tool | Purpose |
 |---|---|
@@ -290,20 +292,23 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 
 | Command | What it does |
 |---|---|
-| `mushroomdb install [--platform claude-code\|cursor\|codex\|all] [--project\|--user] [--db <path>] [--command <path>] [--no-git-hooks] [--no-prewarm]` | Write the `/mushroom` skill + MCP server entry + prompt, post-edit and git hooks. Auto-detects platform and scope |
+| `mushroomdb install [--platform claude-code\|cursor\|codex\|all] [--project\|--user] [--db <path>] [--command <path>] [--delivery cli\|mcp\|both] [--no-git-hooks] [--intercept-grep] [--no-prewarm]` | Write the `/mushroom` skill + MCP server entry + the `SessionStart`, `UserPromptSubmit` and `PostToolUse` hooks + git hooks. Auto-detects platform and scope. `--delivery cli` writes no server entry: the skill teaches the binary instead |
 | `mushroomdb uninstall [--platform …] [--project] [--db <path>]` | Remove exactly what `install` wrote (manifest-driven; leaves user files) |
 | `mushroomdb disable [--platform …] [--project\|--user]` | Turn an install off without removing it: strips the MCP entry, the hooks and the git hook blocks. The skill, the store and `.gitignore` stay |
 | `mushroomdb enable [--platform …] [--project\|--user]` | Turn a disabled install back on, re-resolving the command instead of replaying what `disable` removed |
 | `mushroomdb doctor [--project\|--user] [--platform …]` | Verify an install: config entry, npx reachability, store, lock, hooks, git hooks, a real stdio handshake, and duplicate-scope servers. Exit 1 on any `fail` |
 | `mushroomdb ingest-git <dir> <repo> [--exclude <pattern>]... [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]` | Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHANGED`, `KNOWS`, `IMPORTS`, `CALLS` and `MENTIONS` rules. Re-run to sync. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
+| `mushroomdb brief <dir>\|--auto` | The repository's shape from the graph alone — counts, last sync, most central files, most called symbols — capped at 4,000 bytes and byte-stable between runs. Hook body for `SessionStart` |
+| `mushroomdb explore <dir> <target> [--depth context\|impact\|history\|all] [--full]` | One tool to find: `context`, `impact` and `owners` composed behind one depth |
 | `mushroomdb map <dir> [--json]` | The repository in one screen: clusters, key files, owners, hot files, and three questions worth asking |
-| `mushroomdb context <dir> <target>` | One file or symbol from every side. `<target>` is a path, a symbol key, or a bare symbol name |
+| `mushroomdb context <dir> <target> [--full]` | One file or symbol from every side. `<target>` is a path, a symbol key, or a bare symbol name. The body is quoted only with `--full` |
 | `mushroomdb impact <dir> <file>...` | What changing these files reaches: co-change partners, importers, and the symbols other files call |
 | `mushroomdb owners <dir> <path>` | Top author and share, who else knows it, last touch, the last four quarters |
 | `mushroomdb why <dir> <a> <b>` | Every rule edge between two nodes with its evidence, or the shortest path between them |
 | `mushroomdb sync <dir>\|--auto [--json]` | Re-sync the repository the store was built from: new commits, then the working tree where it differs from `HEAD`. Takes no repo argument — reads it off the graph. `--json` prints the counts as one object. The git hooks `install` writes use `--auto`, so each worktree syncs its own store |
 | `mushroomdb touch <dir>\|--auto [<file>...]` | Re-extract just these files. With no `<file>` reads them from a `PostToolUse` payload on stdin (hook body) |
-| `mushroomdb recall <dir>\|--auto` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin, prints related graph facts. Wired automatically by `install` |
+| `mushroomdb recall <dir>\|--auto` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin, prints one pointer per hit for the identifiers the prompt names, and nothing when it names none. Wired automatically by `install` |
+| `mushroomdb intercept <dir>\|--auto` | Hook body for the optional `PreToolUse` grep redirect (`install --intercept-grep`): reads a `Grep` payload on stdin and exits 2 with a pointer at `explore` when the pattern is a symbol the graph holds |
 | `mushroomdb mcp <dir>\|--auto` | Start a stdio MCP JSON-RPC server for agent tools |
 | `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
 | `mushroomdb serve <dir>` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`) |

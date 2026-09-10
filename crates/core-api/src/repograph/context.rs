@@ -8,6 +8,14 @@
 //! quoted from the working tree so the excerpt is what is on disk now rather
 //! than what was committed.
 //!
+//! # Pointers, not bodies
+//!
+//! The body is the expensive half of the answer and the half a caller can
+//! fetch itself, so it is off unless asked for: a default answer carries the
+//! line range, the signature and the graph's facts, and
+//! [`ContextOptions::source`] adds the lines. A reader who only needed to know
+//! where something lives pays for a pointer.
+//!
 //! # Naming a target
 //!
 //! A key is taken as it stands: `src/core/db.rs` is a file, and
@@ -114,7 +122,8 @@ pub struct ContextReport {
     /// `(first line, last line)` of a symbol, as extraction recorded them.
     pub lines: Option<(u32, u32)>,
     /// At most [`MAX_SOURCE_LINES`] lines from the working tree. `None` when
-    /// no repository path is known or the file cannot be read there.
+    /// the caller did not ask for a body ([`ContextOptions::source`]), when no
+    /// repository path is known, or when the file cannot be read there.
     pub source: Option<String>,
     /// The file itself, or the file a symbol is defined in.
     pub file: String,
@@ -164,14 +173,45 @@ impl ContextReport {
     }
 }
 
+/// What a `context` call reads beyond the graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ContextOptions {
+    /// Quote the target's body from the working tree.
+    ///
+    /// Off by default, because a body is the expensive half of the answer and
+    /// rarely the half that decides anything: a caller reading a digest wants
+    /// to know where the thing is, what it looks like and what touches it, and
+    /// can open the file itself once it has the pointer. On, the report carries
+    /// [`ContextReport::source`] as before.
+    pub source: bool,
+}
+
+/// Everything known about `target`, with the body quoted.
+///
+/// The pointer-only form is [`context_with`]; this is it with
+/// [`ContextOptions::source`] set, kept as its own function because every
+/// caller that wants the body wants nothing else configured.
+#[must_use]
+pub fn context<F: Fs>(db: &GraphDb<F>, repo: Option<&Path>, target: &str) -> ContextReport {
+    context_with(db, repo, target, &ContextOptions { source: true })
+}
+
 /// Everything known about `target`.
 ///
 /// `repo` is the working tree the source is quoted from; without one the
 /// `GitSync` marker's `repo` is used, and a file that cannot be read there
 /// simply has no `source`. Everything else is read from the graph, so the
 /// answer is byte-identical for the same store and the same working tree.
+///
+/// With `opts.source` clear the working tree is not read at all — not read and
+/// discarded — so the answer is the graph's and nothing else's.
 #[must_use]
-pub fn context<F: Fs>(db: &GraphDb<F>, repo: Option<&Path>, target: &str) -> ContextReport {
+pub fn context_with<F: Fs>(
+    db: &GraphDb<F>,
+    repo: Option<&Path>,
+    target: &str,
+    opts: &ContextOptions,
+) -> ContextReport {
     match resolve(db, target) {
         Resolved::File(path) => {
             let mut report = ContextReport::empty(Target::File {
@@ -180,7 +220,9 @@ pub fn context<F: Fs>(db: &GraphDb<F>, repo: Option<&Path>, target: &str) -> Con
             let symbols = neighbors(db, &path, "DEFINES", Direction::In);
             (report.callers, report.callers_not_shown) = callers_of(db, &symbols, &path);
             report.callees = callees_of(db, &symbols, &path);
-            report.source = read_source(db, repo, &path, None);
+            if opts.source {
+                report.source = read_source(db, repo, &path, None);
+            }
             fill_file(db, &mut report, &path);
             report.notes = notes_about(db, &[path]);
             report
@@ -198,7 +240,9 @@ pub fn context<F: Fs>(db: &GraphDb<F>, repo: Option<&Path>, target: &str) -> Con
                 callers_of(db, std::slice::from_ref(&key), "");
             report.callees = callees_of(db, std::slice::from_ref(&key), "");
             let file = symbol_file(db, &key).unwrap_or_default();
-            report.source = read_source(db, repo, &file, report.lines);
+            if opts.source {
+                report.source = read_source(db, repo, &file, report.lines);
+            }
             fill_file(db, &mut report, &file);
             report.notes = notes_about(db, &[key, file]);
             report
@@ -249,7 +293,12 @@ fn resolve<F: Fs>(db: &GraphDb<F>, target: &str) -> Resolved {
 /// A scan of the `Symbol` nodes, which is what an exact-match lookup on a
 /// field with no index costs — and this runs only when the caller's target is
 /// not a key, so a tool call that names one never pays for it.
-fn named_symbols<F: Fs>(db: &GraphDb<F>, name: &str) -> Vec<String> {
+///
+/// Public because "does the graph know this bare name?" is asked outside
+/// `context` too — the `PreToolUse` grep redirect asks it of a search pattern —
+/// and both answers must come from the same lookup, or a redirect could point
+/// at an `explore` that then reports nothing.
+pub fn named_symbols<F: Fs>(db: &GraphDb<F>, name: &str) -> Vec<String> {
     let mut out: Vec<String> = db
         .nodes_with_label("Symbol")
         .iter()

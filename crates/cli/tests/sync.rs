@@ -859,7 +859,7 @@ fn git_hook_sync_auto_uses_the_worktree_store() {
 fn install_from_a_worktree_writes_hooks_to_the_common_dir() {
     use cli::doctor::{run_doctor_with, DoctorOpts};
     use cli::install::{
-        run_install_with, Externals, InstallOpts, McpCommand, Platform, Scope, HOOK_BEGIN,
+        run_install_with, Delivery, Externals, InstallOpts, McpCommand, Platform, Scope, HOOK_BEGIN,
     };
 
     let repo = tmp("wt-hooks-main");
@@ -901,6 +901,8 @@ fn install_from_a_worktree_writes_hooks_to_the_common_dir() {
         command: Some(bin.clone()),
         git_hooks: true,
         prewarm: false,
+        delivery: Delivery::Both,
+        intercept_grep: false,
     };
     let summary = run_install_with(
         &wt,
@@ -1012,7 +1014,7 @@ fn install_from_a_worktree_writes_hooks_to_the_common_dir() {
 #[test]
 fn install_in_a_submodule_keeps_the_submodule_hooks() {
     use cli::install::{
-        run_install_with, Externals, InstallOpts, McpCommand, Platform, Scope, HOOK_BEGIN,
+        run_install_with, Delivery, Externals, InstallOpts, McpCommand, Platform, Scope, HOOK_BEGIN,
     };
 
     let repo = tmp("sub-hooks-main");
@@ -1043,6 +1045,8 @@ fn install_in_a_submodule_keeps_the_submodule_hooks() {
             command: Some(bin.clone()),
             git_hooks: true,
             prewarm: false,
+            delivery: Delivery::Both,
+            intercept_grep: false,
         },
         &McpCommand::Explicit(bin),
         &Externals::with_path(None),

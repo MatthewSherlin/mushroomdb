@@ -23,6 +23,17 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" brief --auto",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

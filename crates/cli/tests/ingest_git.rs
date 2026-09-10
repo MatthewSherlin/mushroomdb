@@ -1693,3 +1693,188 @@ fn an_incremental_run_writes_only_what_the_commit_touched() {
          one commit per property makes it thirteen"
     );
 }
+
+/// `brief` is the `SessionStart` hook body, so it is measured by what a host
+/// prepends to a session: the same bytes every time, inside the budget, and
+/// nothing at all when the store cannot be read.
+#[test]
+fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
+    let repo = tmp("brief-repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(
+        &repo,
+        "alice",
+        "core and its callers",
+        &[
+            ("src/core.rs", "pub fn core() {}\n"),
+            (
+                "src/a.rs",
+                "use crate::core;\npub fn a() { core::core(); }\n",
+            ),
+            (
+                "src/b.rs",
+                "use crate::core;\npub fn b() { core::core(); }\n",
+            ),
+        ],
+    );
+
+    let db_dir = tmp("brief-db");
+    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
+
+    let text = cli::run_brief(&db_dir).expect("brief");
+    assert_eq!(text, cli::run_brief(&db_dir).expect("brief"));
+    assert!(
+        text.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        "{} bytes",
+        text.len()
+    );
+    // The brief reaches a session's context before its first turn, so it opens
+    // with the marker every digest rendered out of a store opens with — inside
+    // the budget asserted above, not on top of it.
+    assert!(
+        text.starts_with(core_api::repograph::UNTRUSTED_FRAMING),
+        "{text}"
+    );
+    // The header names the repository, its size and the sha it is at — and no
+    // age, which is what would move between two prompts of one session.
+    let header = text.lines().nth(1).unwrap();
+    let name = repo.file_name().unwrap().to_str().unwrap();
+    let sha = marker(&db_dir, "__mushroomdb_git_sync__").expect("a sync marker");
+    assert!(
+        header.starts_with(&format!(
+            "mushroomdb brief — {name} · 3 files · 3 symbols · "
+        )),
+        "{header}"
+    );
+    assert!(
+        header.ends_with(&format!("· synced {}", &sha[..7])),
+        "{header}"
+    );
+    assert!(!header.contains("ago"), "{header}");
+    assert!(text.contains("src/core.rs"), "{text}");
+    // The last line names both doors, and the CLI one is runnable: `explore`
+    // takes a store, so the line has to carry one. This store was built by
+    // `ingest-git`, so the door it names is the code graph's one tool.
+    let reach = text.lines().next_back().unwrap();
+    assert!(
+        reach.starts_with("reach the graph: explore <target> (MCP tool)"),
+        "{reach}"
+    );
+    assert!(
+        reach.ends_with(&format!(" explore '{}' <target>", db_dir.display())),
+        "{reach}"
+    );
+
+    // The hook's own contract: a store that cannot be opened at all says
+    // nothing rather than opening a session with an error on stderr and a
+    // non-zero exit.
+    let not_a_store = repo.join("not-a-store");
+    std::fs::write(&not_a_store, "a file where a store would be\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("brief")
+        .arg(&not_a_store)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the hook must never fail a session");
+    assert!(out.stdout.is_empty(), "{:?}", String::from_utf8(out.stdout));
+    assert!(out.stderr.is_empty(), "{:?}", String::from_utf8(out.stderr));
+
+    // And a store that is simply not there is not created on the way to
+    // finding that out: `RealFs::new` runs `create_dir_all`, so a `brief` hook
+    // left behind by an uninstall would otherwise plant an empty
+    // `mushroom-memory/` in the repository at the start of every session.
+    let absent = repo.join("no-such-store");
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("brief")
+        .arg(&absent)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+    assert!(!absent.exists(), "the hook created {}", absent.display());
+}
+
+/// Binding: on a store no repository was ingested into, the brief's last line
+/// names `context`, not `explore`.
+///
+/// The two lines track the two MCP surfaces: a store with no `GitSync` marker
+/// lists `context` among its eleven and does not list `explore` at all, so
+/// naming `explore` there would send a session at a tool it cannot see.
+#[test]
+fn the_reach_line_names_context_on_a_store_with_no_git_sync_marker() {
+    let db_dir = tmp("brief-memory-db");
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&db_dir)
+        .arg("CREATE (n:File {id: 'a.rs', path: 'a.rs', lines: 1})")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let text = cli::run_brief(&db_dir).expect("brief");
+    let reach = text.lines().next_back().unwrap();
+    assert!(
+        reach.starts_with("reach the graph: context <target> (MCP tool)"),
+        "{reach}"
+    );
+    assert!(
+        !reach.contains("explore"),
+        "a memory store must not be sent at the code-graph tool: {reach}"
+    );
+    assert!(
+        reach.ends_with(&format!(" context '{}' <target>", db_dir.display())),
+        "{reach}"
+    );
+}
+
+/// Binding: on a `--delivery cli` install the brief's last line names the
+/// shell form and nothing else.
+///
+/// The reach line is the one place a session is told how to get at the graph.
+/// A `cli` install registers no MCP server, so naming the tool would send it
+/// at a door that is not there — the same failure as naming `explore` on a
+/// memory store, one layer out.
+#[test]
+fn the_reach_line_on_a_cli_delivery_install_names_only_the_binary() {
+    let root = tmp("brief-cli-delivery");
+    let home = tmp("brief-cli-delivery-home");
+    let db_dir = root.join("mushroom-memory");
+    std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+
+    cli::install::run_install_with(
+        &root,
+        &home,
+        &cli::install::InstallOpts {
+            platform: Some(cli::install::Platform::ClaudeCode),
+            scope: Some(cli::install::Scope::Project),
+            db: Some(db_dir.clone()),
+            command: None,
+            git_hooks: true,
+            prewarm: false,
+            delivery: cli::install::Delivery::Cli,
+            intercept_grep: false,
+        },
+        &cli::install::McpCommand::OnPath,
+        &cli::install::Externals::with_path(None),
+    )
+    .expect("install");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&db_dir)
+        .arg("CREATE (n:File {id: 'a.rs', path: 'a.rs', lines: 1})")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let text = cli::run_brief(&db_dir).expect("brief");
+    let reach = text.lines().next_back().unwrap();
+    assert!(
+        !reach.contains("MCP tool"),
+        "a cli install has no server to name: {reach}"
+    );
+    assert!(
+        reach.ends_with(&format!(" context '{}' <target>", db_dir.display())),
+        "{reach}"
+    );
+}

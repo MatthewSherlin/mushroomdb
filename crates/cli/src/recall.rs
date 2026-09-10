@@ -1,7 +1,14 @@
 //! `mushroomdb recall <db>`: the body of the UserPromptSubmit hook.
 //!
-//! The hook has two things to say, and says whichever one the moment calls
-//! for.
+//! The hook says nothing at all unless the prompt names something — a path, a
+//! symbol, a word in backticks. That question is asked once, of the prompt, and
+//! it decides both of the shapes below: a prompt made of ordinary words gets no
+//! nudge and no digest. The session brief has already told the assistant this
+//! repository has a graph and how to reach it, so a hook firing on every prompt
+//! has nothing left to say about a prompt that is not about the repository.
+//!
+//! Past that gate the hook has two things to say, and says whichever one the
+//! moment calls for.
 //!
 //! When the prompt arrives from a checkout with a **dirty working tree**, the
 //! change already in progress is the more useful subject: the nudge names what
@@ -11,15 +18,15 @@
 //! only find out by reading half the repository.
 //!
 //! Otherwise the prompt's own words are all there is to go on, and the topic
-//! digest answers: the nodes closest to it and their strongest edges. The
-//! digest itself is [`core_api::repograph::recall_digest`].
+//! digest answers: pointers to the nodes its identifiers name. The digest
+//! itself is [`core_api::repograph::recall_digest`].
 //!
 //! Everything specific to being a hook stays here: reading the payload, opening
 //! the store read-only, keeping inside one byte budget, and staying silent on
 //! any error. A recall hook must never block or slow the user's prompt.
 use core_api::repograph::{
-    impact, path_excluded, recall_digest, sanitize, stale_concepts, FileImpact, ImpactOptions,
-    ImpactReport, DEFAULT_EXCLUDES, HINT, MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING,
+    identifier_terms, impact, path_excluded, recall_digest, sanitize, stale_concepts, FileImpact,
+    ImpactOptions, ImpactReport, DEFAULT_EXCLUDES, HINT, MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING,
 };
 use core_api::{GraphDb, OpenOptions, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,23 +69,23 @@ fn cwd_from_payload(raw: &str) -> Option<PathBuf> {
     (!s.is_empty()).then(|| PathBuf::from(s))
 }
 
-/// Rewrite free-form prompt text as a full-text OR query.
+/// The hook body: the nudge for the change in progress, or the digest for the
+/// prompt's own identifiers, or nothing.
 ///
-/// The rewrite itself lives in `core_api::repograph::or_query`, because the
-/// `recall` MCP tool applies it to its `topic` argument and the two must not
-/// disagree about what a prompt means. The tests below stay here: this is the
-/// caller whose behaviour they describe.
-fn fulltext_or_query(prompt: &str) -> Option<String> {
-    core_api::repograph::or_query(prompt)
-}
-
+/// A prompt naming nothing code-shaped ends the hook here, before the store is
+/// even opened. The nudge is about the checkout rather than about what was
+/// typed, so it would be tempting to let it answer anyway — but this fires
+/// before *every* prompt, and "ok thanks" on a dirty tree is not a question
+/// about the diff. The prompt itself is passed on as the user typed it:
+/// `recall_digest` asks the same question again of the text it searches, and
+/// the two must not be able to disagree.
 pub fn run_recall(db_dir: &Path, hook_stdin: &str) -> String {
-    let Some(prompt) = prompt_from_payload(hook_stdin)
-        .as_deref()
-        .and_then(fulltext_or_query)
-    else {
+    let Some(prompt) = prompt_from_payload(hook_stdin) else {
         return String::new();
     };
+    if identifier_terms(&prompt).is_empty() {
+        return String::new();
+    }
     // Guard the open: `RealFs::new` runs `create_dir_all`, so without this a
     // hook pointed at a typo'd path would keep creating empty directories.
     if !db_dir.exists() {
@@ -103,10 +110,11 @@ pub fn run_recall(db_dir: &Path, hook_stdin: &str) -> String {
         return String::new();
     };
     // The change in progress outranks the prompt's own words: it is both more
-    // specific and about to be wrong if nobody says otherwise. With no change
-    // to report — a clean tree, a prompt sent from outside a checkout, a diff
-    // the graph knows nothing about — the topic digest answers as it always
-    // did.
+    // specific and about to be wrong if nobody says otherwise, and it is a fact
+    // about the checkout rather than about what was typed — so it answers
+    // whatever the prompt says. With no change to report — a clean tree, a
+    // prompt sent from outside a checkout, a diff the graph knows nothing about
+    // — the topic digest answers as it always did.
     if let Some(nudge) = diff_nudge(
         &db,
         hook_stdin,
@@ -391,8 +399,8 @@ fn stale_concepts_describing(db: &crate::structure::Db, modified: &BTreeSet<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{fulltext_or_query, prompt_from_payload};
-    use core_api::repograph::MAX_QUERY_TERMS;
+    use super::prompt_from_payload;
+    use core_api::repograph::identifier_terms;
 
     #[test]
     fn prompt_is_read_from_any_of_the_three_documented_fields() {
@@ -405,78 +413,43 @@ mod tests {
         assert_eq!(prompt_from_payload("not json"), None);
     }
 
+    /// Binding: what the hook makes of a payload is the identifiers in its
+    /// prompt, and a prompt made only of prose leaves nothing to search for —
+    /// which is how a hook that fires before every prompt stays quiet through
+    /// the ones that are not about this repository.
+    ///
+    /// The rule itself lives in `core_api::repograph::identifier_terms`,
+    /// because the `recall` MCP tool applies it to its `topic` argument and the
+    /// two must not disagree about what a prompt means.
     #[test]
-    fn prompt_becomes_an_or_query_of_lowercased_alphanumeric_terms() {
+    fn a_payload_is_searched_for_the_identifiers_in_its_prompt() {
+        let prompt = prompt_from_payload(
+            r#"{"prompt":"why does install.rs change with tests/install.rs?"}"#,
+        )
+        .expect("prompt");
         assert_eq!(
-            fulltext_or_query("What about Person 1 and Project 5?").as_deref(),
-            Some("person OR 1 OR project OR 5"),
+            identifier_terms(&prompt),
+            vec!["install.rs", "tests/install.rs"]
         );
-    }
 
-    #[test]
-    fn or_query_drops_query_keywords_repeats_and_punctuation() {
-        // `and`/`or` are grammar keywords; `-x` would negate and `x*` prefix-match,
-        // so splitting on non-alphanumerics is what keeps them inert.
-        assert_eq!(
-            fulltext_or_query("AND or foo-bar foo baz*").as_deref(),
-            Some("foo OR bar OR baz"),
-        );
-        assert_eq!(fulltext_or_query("  ?! ,, "), None);
-    }
-
-    /// Binding: a prompt made only of function words leaves nothing to search
-    /// for, so the hook has nothing to print. An `OR` of stopwords matched
-    /// essentially every indexed document, which is how `the` used to produce
-    /// a full digest of six unrelated nodes.
-    #[test]
-    fn or_query_is_none_for_a_prompt_that_is_all_glue() {
-        for prompt in [
+        for glue in [
             "the",
             "is it done",
             "ok thanks",
             "can you do that please",
             "what do you think about it",
             "which file has the code",
+            "what is the weather today?",
         ] {
-            assert_eq!(fulltext_or_query(prompt), None, "{prompt:?}");
+            let payload = format!(r#"{{"prompt":{}}}"#, json_string(glue));
+            let prompt = prompt_from_payload(&payload).expect("prompt");
+            assert!(identifier_terms(&prompt).is_empty(), "{glue:?}");
         }
     }
 
-    /// A prompt can survive the stopwords and still be about nothing the graph
-    /// holds. `weather` is a word, not glue, so it is searched for — and a code
-    /// graph has no hit for it, which is the other way the hook falls silent.
-    #[test]
-    fn or_query_keeps_a_real_word_the_graph_will_not_match() {
-        assert_eq!(
-            fulltext_or_query("what is the weather today?").as_deref(),
-            Some("weather OR today"),
-        );
-    }
-
-    /// Binding: the glue goes and the subject stays — including the words a
-    /// repository question turns on, which are ordinary English too.
-    #[test]
-    fn or_query_keeps_the_subject_of_a_real_question() {
-        assert_eq!(
-            fulltext_or_query("why does install.rs change with tests/install.rs").as_deref(),
-            Some("install OR rs OR change OR tests"),
-        );
-        assert_eq!(
-            fulltext_or_query("please fix the failing test in recall").as_deref(),
-            Some("fix OR failing OR test OR recall"),
-        );
-        assert_eq!(
-            fulltext_or_query("who owns the parser").as_deref(),
-            Some("owns OR parser"),
-        );
-    }
-
-    #[test]
-    fn or_query_caps_the_number_of_terms() {
-        let prompt: String = (0..MAX_QUERY_TERMS + 10)
-            .map(|i| format!("w{i} "))
-            .collect();
-        let q = fulltext_or_query(&prompt).expect("terms");
-        assert_eq!(q.split(" OR ").count(), MAX_QUERY_TERMS);
+    /// A JSON string literal, so a prompt with a quote or a backslash in it
+    /// still makes a valid payload.
+    fn json_string(s: &str) -> String {
+        serde_json::to_string(s).expect("string")
     }
 }

@@ -8,7 +8,7 @@
 //! of stand-ins or leaves it empty.
 
 use cli::install::{
-    classify_mcp_command, run_install_with, run_uninstall, run_uninstall_with, Externals,
+    classify_mcp_command, run_install_with, run_uninstall, run_uninstall_with, Delivery, Externals,
     InstallOpts, McpCommand, Platform, Scope, StoreRef,
 };
 use std::fs;
@@ -93,6 +93,8 @@ fn base_opts() -> InstallOpts {
         command: None,
         git_hooks: true,
         prewarm: false,
+        delivery: Delivery::Both,
+        intercept_grep: false,
     }
 }
 
@@ -194,6 +196,19 @@ fn project_install_writes_npx_entry_and_hooks() {
         s["hooks"]["PostToolUse"][0]["matcher"],
         "Edit|Write|MultiEdit"
     );
+    // The third: one brief per session, on no matcher — a session start is not
+    // a tool call — and on the prompt hook's short timeout.
+    let brief = &s["hooks"]["SessionStart"][0]["hooks"][0];
+    assert_eq!(
+        brief["command"],
+        format!("npx -y mushroomdb@{VERSION} brief '{}'", db.display())
+    );
+    assert_eq!(brief["timeout"], 5);
+    assert!(
+        brief.get("async").is_none(),
+        "the brief is awaited: {brief}"
+    );
+    assert!(s["hooks"]["SessionStart"][0].get("matcher").is_none());
 
     // The summary names the command and closes with the one thing left to do.
     assert!(
@@ -248,6 +263,10 @@ fn project_install_writes_auto_entries() {
     assert_eq!(
         s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
         format!("npx -y mushroomdb@{VERSION} touch --auto")
+    );
+    assert_eq!(
+        s["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} brief --auto")
     );
 
     // All three git hook blocks.
@@ -517,7 +536,11 @@ fn upgrade_rewrites_absolute_entries_to_auto() {
     // Exactly one hook per event: the old absolute-path spelling of the same
     // store is ours, and running both would inject two digests every prompt.
     let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    for (event, sub) in [("UserPromptSubmit", "recall"), ("PostToolUse", "touch")] {
+    for (event, sub) in [
+        ("UserPromptSubmit", "recall"),
+        ("PostToolUse", "touch"),
+        ("SessionStart", "brief"),
+    ] {
         let groups = s["hooks"][event].as_array().unwrap();
         let commands: Vec<&str> = groups
             .iter()
@@ -1528,10 +1551,14 @@ fn upgrade_replaces_stale_hooks_from_a_0_5_install() {
         ptu[0]["hooks"][0]["command"],
         format!("npx -y mushroomdb@{VERSION} touch '{}'", db.display())
     );
-    // The user's own hook is not ours to replace.
+    // The user's own hook under our third event is not ours to replace: the
+    // brief joins it, in a group of its own.
+    let ss = s["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(ss.len(), 2, "the user's hook must survive beside ours: {s}");
+    assert_eq!(ss[0]["hooks"][0]["command"], "echo hi");
     assert_eq!(
-        s["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-        "echo hi"
+        ss[1]["hooks"][0]["command"],
+        format!("npx -y mushroomdb@{VERSION} brief '{}'", db.display())
     );
     assert!(
         out.contains("replaced stale UserPromptSubmit hook"),
@@ -2475,7 +2502,11 @@ fn install_writes_post_tool_use_async_hook_and_uninstall_removes_it() {
         .iter()
         .map(|h| h["event"].as_str().expect("event"))
         .collect();
-    assert_eq!(events, vec!["UserPromptSubmit", "PostToolUse"], "{m}");
+    assert_eq!(
+        events,
+        vec!["UserPromptSubmit", "PostToolUse", "SessionStart"],
+        "{m}"
+    );
 
     run_uninstall(&root, &home, &opts).expect("uninstall");
     let s3: serde_json::Value =
@@ -2484,6 +2515,11 @@ fn install_writes_post_tool_use_async_hook_and_uninstall_removes_it() {
         s3["hooks"]["PostToolUse"].is_null()
             || s3["hooks"]["PostToolUse"].as_array().unwrap().is_empty(),
         "PostToolUse must be gone: {s3}"
+    );
+    assert!(
+        s3["hooks"]["SessionStart"].is_null()
+            || s3["hooks"]["SessionStart"].as_array().unwrap().is_empty(),
+        "SessionStart must be gone: {s3}"
     );
 }
 
@@ -2548,6 +2584,7 @@ fn uninstall_leaves_mixed_hook_group_with_user_hook_intact() {
 /// The task tools plus the two entry points the skill has to name, written the
 /// way the text writes them so a bare word inside another word cannot pass.
 const REQUIRED_TOOL_MENTIONS: &[&str] = &[
+    "`explore`",
     "`map`",
     "`context`",
     "`impact`",
@@ -2652,6 +2689,192 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
         rules.lines().count() <= 60,
         "mushroom.mdc must stay short, got {} lines",
         rules.lines().count()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: every delivery renders a whole skill — the same task tools named, the
+//       same per-turn budget, and none of the region markers the source file
+//       carries to tell the variants apart.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_delivery_variant_names_every_tool_and_fits_the_budget() {
+    let template = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills/mushroom/SKILL.md"),
+    )
+    .expect("skill template");
+
+    for delivery in [Delivery::Mcp, Delivery::Cli, Delivery::Both] {
+        let label = format!("{delivery:?}").to_lowercase();
+        // Rendered the way the plugin copy is, which is the longest `{{BIN}}`
+        // any variant ever carries and so the only worst case worth budgeting.
+        let skill = cli::install::render_template(
+            &template,
+            "./mushroom-memory",
+            &format!("npx -y mushroomdb@{VERSION}"),
+            delivery,
+        )
+        .expect("the committed template's regions are well formed");
+        for tool in REQUIRED_TOOL_MENTIONS {
+            assert!(
+                skill.contains(tool),
+                "{label}: {tool} is never named — the assistant has no cue to call it"
+            );
+        }
+        assert!(
+            !skill.contains("<!--"),
+            "{label}: a delivery marker leaked into the rendered skill:\n{skill}"
+        );
+        assert!(
+            !skill.contains("\n\n\n"),
+            "{label}: stripping a region left a hole in the prose:\n{skill}"
+        );
+        assert!(
+            skill.len() <= 6_000,
+            "{label}: the rendered skill must stay under 6 KB, got {} bytes",
+            skill.len()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test: a malformed delivery region is an error, not a quietly shorter skill.
+//
+// An unterminated `<!-- mcp -->` swallows every line after it on the `cli`
+// variant, and a nested pair leaves the inner close re-opening the outer
+// region — both produce a plausible-looking skill that is missing its task
+// rules, which is exactly the failure nobody reads a rendered file to catch.
+// `scripts/render-plugin.sh` fails on the same two conditions.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unterminated_delivery_region_is_an_error() {
+    let template = "# skill\n\
+                    <!-- mcp -->\n\
+                    only the mcp reader sees this\n\
+                    and nothing ever closes it\n";
+    for delivery in [Delivery::Mcp, Delivery::Cli, Delivery::Both] {
+        let err = cli::install::render_template(template, "./db", "mushroomdb", delivery)
+            .expect_err(&format!("{delivery:?}: an unclosed region must not render"));
+        let msg = err.to_string();
+        assert!(msg.contains("<!-- mcp -->"), "{msg}");
+        assert!(
+            msg.contains("line 2") && msg.contains("never closed"),
+            "{msg}"
+        );
+    }
+}
+
+#[test]
+fn a_nested_delivery_region_is_an_error() {
+    let template = "# skill\n\
+                    <!-- mcp -->\n\
+                    the outer region\n\
+                    <!-- cli -->\n\
+                    the inner one\n\
+                    <!-- /cli -->\n\
+                    <!-- /mcp -->\n";
+    for delivery in [Delivery::Mcp, Delivery::Cli, Delivery::Both] {
+        let err = cli::install::render_template(template, "./db", "mushroomdb", delivery)
+            .expect_err(&format!("{delivery:?}: a nested region must not render"));
+        let msg = err.to_string();
+        assert!(msg.contains("must not nest"), "{msg}");
+        assert!(msg.contains("line 4") && msg.contains("line 2"), "{msg}");
+    }
+}
+
+/// A close with nothing open is the third way the pair can be wrong.
+#[test]
+fn a_delivery_region_that_closes_the_wrong_marker_is_an_error() {
+    let mismatched = "<!-- mcp -->\nbody\n<!-- /cli -->\n";
+    let msg = cli::install::render_template(mismatched, "./db", "mushroomdb", Delivery::Both)
+        .expect_err("a mismatched close must not render")
+        .to_string();
+    assert!(
+        msg.contains("<!-- /cli -->") && msg.contains("<!-- mcp -->"),
+        "{msg}"
+    );
+
+    let orphan = "body\n<!-- /mcp -->\n";
+    let msg = cli::install::render_template(orphan, "./db", "mushroomdb", Delivery::Both)
+        .expect_err("a close with nothing open must not render")
+        .to_string();
+    assert!(msg.contains("never opened"), "{msg}");
+}
+
+// ---------------------------------------------------------------------------
+// Test: `--delivery cli` teaches the binary and registers no server.
+//
+// The point of the mode is that a session pays nothing to discover the graph:
+// a plain command through `Bash` needs no tool-schema round trip, so the skill
+// and the hooks are the whole install and `.mcp.json` is never written.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn delivery_cli_writes_skill_and_hooks_but_no_mcp_entry() {
+    let root = temp_dir("delivery-cli");
+    let home = temp_dir("delivery-cli-home");
+    git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let opts = InstallOpts {
+        delivery: Delivery::Cli,
+        ..claude_project_opts(&db)
+    };
+    install_on_path(&root, &home, &opts).expect("install");
+
+    assert!(root.join(".claude/skills/mushroom/SKILL.md").is_file());
+    assert_absent(&root, ".mcp.json");
+
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    assert!(
+        skill.contains("explore '") && skill.contains("--depth context|impact|history|all"),
+        "the cli skill must teach the shell form:\n{skill}"
+    );
+    assert!(
+        !skill.contains("MCP tool") && !skill.contains("tools/list"),
+        "the cli skill must not teach a door this install did not wire:\n{skill}"
+    );
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    for event in ["SessionStart", "UserPromptSubmit", "PostToolUse"] {
+        assert!(
+            s["hooks"][event].is_array(),
+            "the {event} hook is missing: {s}"
+        );
+    }
+    assert!(
+        root.join(".git/hooks/post-commit").is_file(),
+        "the git hooks are still written under cli delivery"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: an mcp-delivery install is today's install — the entry is still there,
+//       and the skill it writes is the one that teaches the tools.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn delivery_mcp_writes_the_entry_and_the_tool_skill() {
+    let root = temp_dir("delivery-mcp");
+    let home = temp_dir("delivery-mcp-home");
+    let db = root.join("mushroom-memory");
+    let opts = InstallOpts {
+        delivery: Delivery::Mcp,
+        ..claude_project_opts(&db)
+    };
+    install_on_path(&root, &home, &opts).expect("install");
+
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(mcp["mcpServers"]["mushroomdb"]["command"], "mushroomdb");
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    assert!(
+        skill.contains("tools/list"),
+        "the mcp skill must still teach the served surface:\n{skill}"
+    );
+    assert!(
+        !skill.contains("--depth context|impact|history|all"),
+        "the mcp skill must not carry the cli invocation:\n{skill}"
     );
 }
 
@@ -2941,5 +3164,184 @@ fn unterminated_hook_block_is_refused_rather_than_swallowed() {
     assert!(
         !merged.contains("echo done"),
         "that line was inside our region once the block closed: {merged}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: switching an existing install to `cli` closes the door it opened —
+//       the entry comes back out of .mcp.json and off the manifest, so a later
+//       uninstall is not left claiming a key that is not there.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reinstalling_as_cli_removes_the_server_the_earlier_install_registered() {
+    let root = temp_dir("switch-to-cli");
+    let home = temp_dir("switch-to-cli-home");
+    let db = root.join("mushroom-memory");
+
+    install_on_path(&root, &home, &claude_project_opts(&db)).expect("install both");
+    let before: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert!(!before["mcpServers"]["mushroomdb"].is_null(), "{before}");
+
+    let out = install_on_path(
+        &root,
+        &home,
+        &InstallOpts {
+            delivery: Delivery::Cli,
+            ..claude_project_opts(&db)
+        },
+    )
+    .expect("install cli");
+    assert!(out.contains("removed mcpServers.mushroomdb"), "{out}");
+
+    let after: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert!(
+        after["mcpServers"]["mushroomdb"].is_null(),
+        "the server survived the switch: {after}"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["delivery"], "cli", "{manifest}");
+    assert!(
+        manifest["mcp_keys"].as_array().unwrap().is_empty(),
+        "the manifest still claims a key that is gone: {manifest}"
+    );
+    let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
+    assert!(
+        skill.contains("--depth context|impact|history|all"),
+        "the skill must have been rewritten for the new door:\n{skill}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: --intercept-grep adds a fourth hook, and nothing else does
+// ---------------------------------------------------------------------------
+
+/// The experiment is opt-in, so the default install must leave `PreToolUse`
+/// entirely absent — not present and empty, which would still be a hook array
+/// the user did not ask for.
+#[test]
+fn default_install_writes_no_pretooluse_hook() {
+    let root = temp_dir("no-intercept");
+    let home = temp_dir("no-intercept-home");
+    git_repo(&root);
+
+    install_on_path(
+        &root,
+        &home,
+        &InstallOpts {
+            platform: Some(Platform::ClaudeCode),
+            scope: Some(Scope::Project),
+            ..base_opts()
+        },
+    )
+    .expect("install failed");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        s["hooks"].get("PreToolUse").is_none(),
+        "an install nobody asked for the redirect wrote one: {s}"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["intercept_grep"], false, "{manifest}");
+}
+
+#[test]
+fn intercept_grep_writes_a_grep_matched_pretooluse_hook() {
+    let root = temp_dir("intercept");
+    let home = temp_dir("intercept-home");
+    git_repo(&root);
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        intercept_grep: true,
+        ..base_opts()
+    };
+
+    let out = install_on_path(&root, &home, &opts).expect("install failed");
+    assert!(out.contains("added  PreToolUse hook"), "{out}");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    let group = &s["hooks"]["PreToolUse"][0];
+    assert_eq!(group["matcher"], "Grep");
+    let hook = &group["hooks"][0];
+    assert_eq!(hook["command"], "mushroomdb intercept --auto");
+    assert_eq!(hook["timeout"], 5);
+    assert!(
+        hook.get("async").is_none(),
+        "the decision is awaited — an async hook cannot block a tool call: {hook}"
+    );
+    // The three standing hooks are untouched by the fourth.
+    assert!(s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .is_some_and(|c| c.ends_with("recall --auto")));
+
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["intercept_grep"], true, "{manifest}");
+
+    // Manifest-driven, like every other hook: uninstall takes it back out.
+    run_uninstall(&root, &home, &opts).expect("uninstall failed");
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        s["hooks"].get("PreToolUse").is_none(),
+        "the redirect survived uninstall: {s}"
+    );
+}
+
+/// Re-installing without the flag turns the experiment off: the hook goes, and
+/// the manifest stops claiming it — otherwise `doctor` would keep reporting a
+/// redirect that is no longer wired.
+#[test]
+fn reinstalling_without_the_flag_removes_the_redirect() {
+    let root = temp_dir("intercept-off");
+    let home = temp_dir("intercept-off-home");
+    git_repo(&root);
+    let on = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        intercept_grep: true,
+        ..base_opts()
+    };
+    install_on_path(&root, &home, &on).expect("install with the redirect");
+
+    install_on_path(
+        &root,
+        &home,
+        &InstallOpts {
+            intercept_grep: false,
+            ..on
+        },
+    )
+    .expect("install without it");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        s["hooks"].get("PreToolUse").is_none(),
+        "the redirect survived an install that did not ask for it: {s}"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["intercept_grep"], false, "{manifest}");
+    assert!(
+        !manifest["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["event"] == "PreToolUse"),
+        "the manifest still owns a hook that is gone: {manifest}"
     );
 }

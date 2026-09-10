@@ -64,6 +64,51 @@ render_file() {
       "$src" > "$dest"
 }
 
+# strip_delivery <keep> <file>
+#
+# The other half of render_template(): the skill source marks the blocks only
+# one delivery's reader should see with `<!-- cli -->…<!-- /cli -->` and
+# `<!-- mcp -->…<!-- /mcp -->`. The plugin ships an MCP server, so its copy
+# keeps the mcp blocks and drops the cli ones; the marker lines themselves are
+# never written either way. Rust's render_template does exactly this — keep the
+# two in step.
+#
+# The regions are checked, not trusted, on the same three conditions Rust
+# errors on: a region that never closes (which would swallow the rest of the
+# file), one that opens inside another, and a close with nothing open. Each
+# renders a plausible-looking skill with its middle missing, which is not a
+# failure a reader of the rendered file would notice.
+strip_delivery() {
+  local keep="$1" file="$2"
+  awk -v keep="$keep" -v file="$file" '
+    function bail(msg) {
+      printf("render-plugin.sh: %s line %d: %s\n", file, FNR, msg) > "/dev/stderr"
+      failed = 1
+      exit 3
+    }
+    /^<!-- (cli|mcp) -->$/ {
+      split($0, m, " ")
+      if (open != "")
+        bail("<!-- " m[2] " --> opens inside the <!-- " open " --> region opened on line " openline)
+      open = m[2]; openline = FNR; drop = (m[2] != keep); next
+    }
+    /^<!-- \/(cli|mcp) -->$/ {
+      split($0, m, " "); name = substr(m[2], 2)
+      if (open == "") bail("<!-- /" name " --> closes a region that was never opened")
+      if (name != open) bail("<!-- /" name " --> closes the <!-- " open " --> region opened on line " openline)
+      open = ""; drop = 0; next
+    }
+    !drop
+    END {
+      if (failed) exit 3
+      if (open != "") {
+        printf("render-plugin.sh: %s: the <!-- %s --> region opened on line %d is never closed\n", file, open, openline) > "/dev/stderr"
+        exit 3
+      }
+    }
+  ' "$file" > "$file.delivery" && mv "$file.delivery" "$file"
+}
+
 # render_skill <dest>
 #
 # Same as render_file, plus a plugin-only fixup: the shared skill template
@@ -96,6 +141,7 @@ render_skill() {
   }
 
   render_file "$src" "$dest"
+  strip_delivery mcp "$dest"
   sed -i.bak \
       -e 's|^# /mushroom$|# /mushroom:mushroom|' \
       -e 's|`/mushroom learn <path>`|`/mushroom:mushroom learn <path>`|' \
@@ -116,6 +162,14 @@ render_skill() {
   if grep -qE '/mushroom([^:a-zA-Z0-9-]|$)' "$dest"; then
     echo "render_skill: $dest still has a bare, un-namespaced /mushroom reference:" >&2
     grep -nE '/mushroom([^:a-zA-Z0-9-]|$)' "$dest" >&2
+    exit 1
+  fi
+
+  # No delivery marker may reach a reader, and no cli-only block may reach a
+  # plugin user, who has the MCP server and may not have the binary on PATH.
+  if grep -qE '^<!-- /?(cli|mcp) -->$' "$dest"; then
+    echo "render_skill: $dest still carries delivery markers:" >&2
+    grep -nE '^<!-- /?(cli|mcp) -->$' "$dest" >&2
     exit 1
   fi
 }

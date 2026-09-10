@@ -5,10 +5,13 @@
 //! shortening, and — above all — [`sanitize`], which every string that came
 //! out of the graph must pass through before it reaches a rendered line.
 
+use crate::repograph::brief::BriefReport;
 use crate::repograph::context::{ContextReport, Target};
+use crate::repograph::explore::ExploreReport;
 use crate::repograph::impact::{FileImpact, ImpactReport, Partner};
 use crate::repograph::map::RepoMap;
 use crate::repograph::owners::OwnersReport;
+use crate::repograph::recall::UNTRUSTED_FRAMING;
 use crate::repograph::why::{WhyLink, WhyReport};
 use std::fmt::Write as _;
 
@@ -257,6 +260,25 @@ pub fn cap_lines(text: &str, max: usize) -> String {
     out
 }
 
+/// Keep whole lines while they fit in `max` bytes, dropping the rest.
+///
+/// A budget in bytes, unlike one in lines, can fall in the middle of a line —
+/// and half a line is worse than no line: a path cut short still reads as a
+/// path, and a caller acts on it. So the cut is always at a line ending, and
+/// a first line too long to fit yields nothing rather than a fragment.
+#[must_use]
+pub fn cap_bytes(text: &str, max: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max));
+    for line in text.lines() {
+        if out.len() + line.len() + 1 > max {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// The one line a store with nothing in it gets: what is missing, and the
 /// command that fixes it.
 pub const EMPTY_MAP: &str =
@@ -373,6 +395,130 @@ pub fn render_map(m: &RepoMap) -> String {
     cap_lines(&out, MAX_MAP_LINES)
 }
 
+/// Longest session brief, in bytes.
+///
+/// A `SessionStart` hook's output is prepended to a session and cached for the
+/// whole of it, so it is paid for once but carried by every turn. Four
+/// thousand bytes is roughly a thousand tokens: enough for two rankings deep
+/// enough to be worth having, short enough that a session that never asks the
+/// graph anything has lost almost nothing.
+pub const MAX_BRIEF_BYTES: usize = 4_000;
+
+/// The one line a store with nothing in it at all gets as a session opens:
+/// what is missing, and the command that fixes it. The same answer
+/// [`EMPTY_MAP`] gives, for the same reason — there is nothing to be central
+/// *in*, and no point naming a way to reach an empty graph.
+///
+/// Not marked with [`UNTRUSTED_FRAMING`], unlike every brief with a graph
+/// behind it: not one byte of this line came out of a store, so there is
+/// nothing here to mark as data.
+pub const EMPTY_BRIEF: &str =
+    "mushroomdb brief — empty store; run: mushroomdb ingest-git <db> <repo>\n";
+
+/// Headings the two listings sit under.
+const BRIEF_FILES_HEADING: &str = "key files (by centrality):\n";
+const BRIEF_SYMBOLS_HEADING: &str = "key symbols (most called):\n";
+
+/// Render a [`BriefReport`] as the block a session opens with: at most
+/// [`MAX_BRIEF_BYTES`] bytes, byte-identical for the same report.
+///
+/// The first line is [`UNTRUSTED_FRAMING`], as it is on every other digest
+/// rendered out of a store: a brief is repository-controlled text — paths,
+/// signatures, a branch name — placed in a session's context before its first
+/// turn, and the one digest a session never asked for is the last one that
+/// should reach it unmarked. Its bytes are charged to the budget like any
+/// other line, so a marked brief is not a longer one.
+///
+/// `reach` is one line naming how to reach the graph from this session, which
+/// only the caller knows — a tool name on the MCP arm, a command on the CLI
+/// arm. It is fitted first and appended last, so the listings above it give way
+/// to it rather than the other way round: a brief that named central files but
+/// not how to ask about them would be a dead end. It is therefore the one part
+/// exempt from the budget, and a caller handing it a `reach` longer than the
+/// whole budget gets the header and that line.
+///
+/// **Nothing is dropped silently.** When the budget cannot hold both listings
+/// in full, entries come off the end — symbols first, since a file path is the
+/// coarser handle and the one a reader can act on without the graph — and the
+/// listing closes with `  … and N more`, counted. A reader who cannot see that
+/// a list was cut reads a partial ranking as a complete one.
+#[must_use]
+pub fn render_brief(b: &BriefReport, reach: &str) -> String {
+    if b.files == 0 && b.symbols == 0 && b.edges == 0 {
+        return EMPTY_BRIEF.to_string();
+    }
+    let tail = format!("reach the graph: {}\n", sanitize(reach));
+    let budget = MAX_BRIEF_BYTES.saturating_sub(tail.len());
+
+    // The header: what this repository is, how big, and which commit it is at.
+    // No age — see [`BriefReport::last_sync`]. A store no repository was
+    // ingested into has neither a name nor a sha, and says neither.
+    let mut head: Vec<String> = Vec::new();
+    if !b.repo.is_empty() {
+        head.push(sanitize(&b.repo));
+    }
+    head.push(plural(b.files, "file"));
+    head.push(plural(b.symbols, "symbol"));
+    head.push(plural(b.edges, "edge"));
+    if let Some(sha) = &b.last_sync {
+        head.push(format!("synced {}", sanitize(sha)));
+    }
+    let header = format!("{UNTRUSTED_FRAMING}mushroomdb brief — {}\n", head.join(SEP));
+
+    let mut files: Vec<String> = b
+        .key_files
+        .iter()
+        .map(|(path, role)| format!("  {}{}\n", sanitize(path), suffix(role)))
+        .collect();
+    let mut symbols: Vec<String> = b
+        .key_symbols
+        .iter()
+        .map(|(key, sig)| format!("  {}{}\n", sanitize(key), suffix(sig)))
+        .collect();
+
+    // Drop one entry at a time until what is left — the marker line included,
+    // since it grows a digit of its own — fits. Re-measured each round rather
+    // than solved for, because `… and 9 more` and `… and 10 more` are not the
+    // same length and a budget that is off by one byte is not a budget.
+    let mut dropped = 0;
+    loop {
+        let body = brief_body(&header, &files, &symbols, dropped);
+        if body.len() <= budget || (symbols.is_empty() && files.is_empty()) {
+            return body + &tail;
+        }
+        if symbols.pop().is_none() {
+            files.pop();
+        }
+        dropped += 1;
+    }
+}
+
+/// The brief above its `reach` line, for one candidate set of entries.
+fn brief_body(header: &str, files: &[String], symbols: &[String], dropped: usize) -> String {
+    let mut out = String::from(header);
+    if !files.is_empty() {
+        out.push_str(BRIEF_FILES_HEADING);
+        out.extend(files.iter().map(String::as_str));
+    }
+    if !symbols.is_empty() {
+        out.push_str(BRIEF_SYMBOLS_HEADING);
+        out.extend(symbols.iter().map(String::as_str));
+    }
+    if dropped > 0 {
+        let _ = writeln!(out, "  … and {dropped} more");
+    }
+    out
+}
+
+/// What a listing line adds after its key, when the graph had anything to add.
+fn suffix(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", sanitize(detail))
+    }
+}
+
 // ── the four per-node digests ───────────────────────────────────────────────
 
 /// Source lines [`render_context`] prints before it says how many are left.
@@ -414,6 +560,12 @@ fn commit_line(sha: &str, ts: i64, subject: &str) -> String {
 
 /// Render a [`ContextReport`] as the digest an assistant reads: at most
 /// [`MAX_CONTEXT_LINES`] lines, byte-identical for the same report.
+///
+/// A report carrying no `source` — what
+/// [`context_with`](crate::repograph::context_with) answers by default — is
+/// rendered as a pointer instead: `  at path:start-end`, the signature, and the
+/// graph's facts. Nothing stands in for the missing body, because a pointer is
+/// not a truncated body; it is the whole answer to where the body is.
 #[must_use]
 pub fn render_context(c: &ContextReport) -> String {
     let mut out = String::new();
@@ -454,6 +606,12 @@ pub fn render_context(c: &ContextReport) -> String {
         }
     }
 
+    // Without a body below, the line range is the answer to "where is it", and
+    // it reads as a pointer a caller can open: `path:start-end`. With one it is
+    // the excerpt's own heading, and stays on the `where` line beside the owner.
+    if let Some((first, last)) = c.lines.filter(|_| c.source.is_none() && !c.file.is_empty()) {
+        let _ = writeln!(out, "  at {}:{first}-{last}", sanitize(&c.file));
+    }
     if let Some(sig) = &c.signature {
         let _ = writeln!(out, "signature  {}", sanitize(sig));
     }
@@ -461,7 +619,7 @@ pub fn render_context(c: &ContextReport) -> String {
         let _ = writeln!(out, "doc  {}", sanitize(doc));
     }
     let mut about: Vec<String> = Vec::new();
-    if let Some((first, last)) = c.lines {
+    if let Some((first, last)) = c.lines.filter(|_| c.source.is_some()) {
         about.push(format!("lines {first}-{last}"));
     }
     if let Some(owner) = &c.owner {
@@ -649,6 +807,71 @@ fn render_file_impact(out: &mut String, f: &FileImpact) {
     );
 }
 
+/// What a default `explore` reply may cost, in bytes.
+///
+/// 1,200 tokens at four bytes a token — the budget §4.3 set for a default
+/// `context` reply, which is the largest part of what `explore` composes. A
+/// caller that wants more says so; a caller that says nothing gets an answer it
+/// can afford to have been wrong about.
+pub const DEFAULT_EXPLORE_BYTES: usize = 4_800;
+
+/// Render an [`ExploreReport`] in **no more than** `budget_bytes`.
+///
+/// The context digest, then the blast radius under an `impact:` heading, then
+/// the owner — in that order, because it is the order a reader stops at: what
+/// this is, what it touches, who to ask. The co-change partners are not printed
+/// again here: [`render_context`] has already listed them on its `co-change`
+/// line, and [`ExploreReport::partners`] carries them for a caller reading the
+/// report rather than the digest.
+///
+/// The budget is spent on whole lines ([`cap_bytes`]), so a path is never cut
+/// in half — a half path still reads as a path, and a caller acts on it. The
+/// header line is the one exception: rather than answer nothing at all, a
+/// budget too small to hold it gets it cut to fit, on a character boundary.
+/// Every budget the tool schema admits (200 tokens, 800 bytes) is many times a
+/// real header, so that path is for a pathological target, not a small budget.
+#[must_use]
+pub fn render_explore(r: &ExploreReport, budget_bytes: usize) -> String {
+    let mut out = render_context(&r.context);
+
+    if let Some(imp) = &r.impact {
+        // `render_impact`'s own header counts the files it was given, which is
+        // always the one file this target sits in — the heading says it better.
+        let rendered = render_impact(imp);
+        let mut body = rendered.lines().skip(1).peekable();
+        if body.peek().is_some() {
+            out.push_str("impact:\n");
+            for line in body {
+                let _ = writeln!(out, "  {line}");
+            }
+        }
+    }
+
+    if let Some((name, key, share)) = r.owners.as_ref().and_then(|o| o.top.as_ref()) {
+        let _ = writeln!(
+            out,
+            "owner: {} ({}) {share:.2} of the file's commits",
+            sanitize(name),
+            sanitize(key)
+        );
+    }
+
+    let capped = cap_bytes(&out, budget_bytes);
+    if !capped.is_empty() || out.is_empty() || budget_bytes == 0 {
+        return capped;
+    }
+    // The budget cannot hold the header whole — a target long enough to fill it
+    // on its own. Cut it rather than answer nothing: the reply still names what
+    // was looked up, and it still fits. One byte is reserved for the newline,
+    // and the cut walks back to a character boundary so no line ends mid-rune.
+    let head = out.lines().next().unwrap_or_default();
+    let mut end = budget_bytes - 1;
+    while end > 0 && !head.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n", &head[..end])
+}
+
 /// Render an [`OwnersReport`]: at most [`MAX_TOOL_LINES`] lines.
 ///
 /// The author key is printed once, on the `top` line and in parentheses, so a
@@ -802,6 +1025,28 @@ fn render_link(out: &mut String, link: &WhyLink, both_ways: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_bytes_keeps_whole_lines_and_never_half_of_one() {
+        let text = "aaaa\nbbbb\ncccc\n"; // three five-byte lines
+        assert_eq!(cap_bytes(text, 15), text, "the whole text fits exactly");
+        assert_eq!(
+            cap_bytes(text, 14),
+            "aaaa\nbbbb\n",
+            "the last line is whole"
+        );
+        assert_eq!(cap_bytes(text, 10), "aaaa\nbbbb\n");
+        assert_eq!(cap_bytes(text, 9), "aaaa\n");
+        assert_eq!(
+            cap_bytes(text, 4),
+            "",
+            "a first line too long yields nothing, never a fragment"
+        );
+        assert_eq!(cap_bytes(text, 0), "");
+        // A line with no trailing newline still costs the one it is given.
+        assert_eq!(cap_bytes("abc", 4), "abc\n");
+        assert_eq!(cap_bytes("abc", 3), "");
+    }
 
     #[test]
     fn a_timestamp_reads_as_a_utc_date_and_a_quarter() {

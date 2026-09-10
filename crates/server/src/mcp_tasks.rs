@@ -1,11 +1,17 @@
-//! The eight MCP tools that answer a question about a graphed repository.
+//! The nine MCP tools that answer a question about a graphed repository.
 //!
-//! `map`, `context`, `impact`, `owners`, `why`, `recall`, `remember` and
-//! `sync` sit in front of the sixteen graph tools in `mcp::tools_list`, because
-//! they are what an assistant working in a checkout actually reaches for: what
-//! is this repository, what is this symbol, what does my diff touch, who wrote
-//! this, why are these two linked, what do I already know, remember this, and
-//! bring the store up to date.
+//! `explore`, `map`, `context`, `impact`, `owners`, `why`, `recall`,
+//! `remember` and `sync` sit in front of the sixteen graph tools in
+//! `mcp::tools_list`, because they are what an assistant working in a checkout
+//! actually reaches for: find me this thing, what is this repository, what is
+//! this symbol, what does my diff touch, who wrote this, why are these two
+//! linked, what do I already know, remember this, and bring the store up to
+//! date.
+//!
+//! `explore` is the composition of `context`, `impact` and `owners` behind one
+//! name, and on a store a repository was ingested into it is the *only* task
+//! tool `tools/list` advertises — see `mcp::Surface`. The rest stay callable
+//! and are one `--all-tools` away.
 //!
 //! # Shape of a reply
 //!
@@ -51,8 +57,8 @@
 
 use crate::mcp::CallOutcome;
 use core_api::repograph::{
-    self, ImpactOptions, MapOptions, RememberInput, DEFAULT_EXCLUDES, MAX_OUTPUT_BYTES, NOTE_KINDS,
-    UNTRUSTED_FRAMING,
+    self, ContextOptions, ImpactOptions, MapOptions, RememberInput, DEFAULT_EXCLUDES,
+    MAX_OUTPUT_BYTES, NOTE_KINDS, UNTRUSTED_FRAMING,
 };
 use core_api::{GraphError, SharedDb};
 use serde_json::{json, Value as Js};
@@ -62,16 +68,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The `GitSync` marker `ingest-git` writes, and the prop naming the checkout.
-const SYNC_KEY: &str = "__mushroomdb_git_sync__";
+///
+/// Its presence is also what tells a code-graph store from a memory one, which
+/// is how [`mcp::Surface`](crate::mcp) picks the tools to advertise.
+pub(crate) const SYNC_KEY: &str = "__mushroomdb_git_sync__";
 const SYNC_REPO_PROP: &str = "repo";
 
 /// The host's project directory: the checkout an assistant is working in.
 const PROJECT_DIR_VAR: &str = "CLAUDE_PROJECT_DIR";
 
-/// The eight names this module answers to. Listed once, so the `json` argument
+/// The nine names this module answers to. Listed once, so the `json` argument
 /// below is read for exactly the tools that declare it.
-const TASK_TOOLS: [&str; 8] = [
-    "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
+///
+/// `explore` comes first because it is the whole default surface of a
+/// code-graph store: the one tool a session finds, composed from the three
+/// beneath it.
+pub(crate) const TASK_TOOLS: [&str; 9] = [
+    "explore", "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
 ];
 
 /// Route a task tool. `None` when `name` is not one of the eight.
@@ -93,6 +106,7 @@ pub(crate) fn dispatch(
         Err(e) => return Some(CallOutcome::ToolErr(e)),
     };
     Some(match name {
+        "explore" => tool_explore(db, args, json_out),
         "map" => tool_map(db, json_out),
         "context" => tool_context(db, args, json_out),
         // The one environment read on this path, done here so every function
@@ -109,7 +123,7 @@ pub(crate) fn dispatch(
         "recall" => tool_recall(db, db_dir, args, json_out),
         "remember" => tool_remember(db, args, json_out),
         "sync" => tool_sync(db_dir, json_out),
-        _ => unreachable!("TASK_TOOLS and this match list the same eight names"),
+        _ => unreachable!("TASK_TOOLS and this match list the same nine names"),
     })
 }
 
@@ -232,6 +246,64 @@ fn str_list_arg(args: &Js, name: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+// ── explore ──────────────────────────────────────────────────────────────────
+
+/// Bytes an assistant's token is taken to be, for turning a `budget` in tokens
+/// into one in bytes. Four is the usual English-and-code average, and the
+/// budget is a ceiling rather than a measurement, so erring low would only
+/// spend less than the caller allowed.
+const BYTES_PER_TOKEN: usize = 4;
+/// The default `budget`, in tokens: `DEFAULT_EXPLORE_BYTES` back in the unit a
+/// caller thinks in, so the two cannot drift.
+const DEFAULT_EXPLORE_TOKENS: u64 = (repograph::DEFAULT_EXPLORE_BYTES / BYTES_PER_TOKEN) as u64;
+/// The smallest `budget` worth serving, matching the schema's `minimum`. Below
+/// this a reply is a header and nothing else, so a smaller number is taken as
+/// this one rather than as a request for silence.
+const MIN_EXPLORE_TOKENS: u64 = 200;
+
+fn tool_explore(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
+    let target = match str_arg(args, "target") {
+        Ok(t) => t,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let depth = match args.get("depth") {
+        None | Some(Js::Null) => repograph::Depth::Context,
+        Some(Js::String(s)) => match repograph::Depth::parse(s) {
+            Some(d) => d,
+            None => {
+                return CallOutcome::ToolErr(format!(
+                    "depth must be one of {}, got {s:?}",
+                    repograph::Depth::NAMES.join(", ")
+                ))
+            }
+        },
+        Some(_) => return CallOutcome::ToolErr("depth must be a string".into()),
+    };
+    let tokens = match args.get("budget") {
+        None | Some(Js::Null) => DEFAULT_EXPLORE_TOKENS,
+        Some(v) => match v.as_u64() {
+            Some(n) => n.max(MIN_EXPLORE_TOKENS),
+            None => return CallOutcome::ToolErr("budget must be a positive integer".into()),
+        },
+    };
+    let full = match bool_arg(args, "full") {
+        Ok(b) => b,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let budget_bytes = usize::try_from(tokens)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(BYTES_PER_TOKEN);
+    // `None` for the repository, as `context` does: core-api falls back to the
+    // `GitSync` marker, which is the checkout the store was built from.
+    let report = {
+        let g = db.read();
+        repograph::explore(&*g, None, target, depth, full)
+    };
+    ok(json_out, &report, |r| {
+        repograph::render_explore(r, budget_bytes)
+    })
+}
+
 // ── map ──────────────────────────────────────────────────────────────────────
 
 fn tool_map(db: &SharedDb, json_out: bool) -> CallOutcome {
@@ -249,11 +321,15 @@ fn tool_context(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Ok(t) => t,
         Err(e) => return CallOutcome::ToolErr(e),
     };
+    let full = match bool_arg(args, "full") {
+        Ok(b) => b,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
     // `None` for the repository: core-api falls back to the `GitSync` marker,
     // which is the checkout the store was built from.
     let report = {
         let g = db.read();
-        repograph::context(&*g, None, target)
+        repograph::context_with(&*g, None, target, &ContextOptions { source: full })
     };
     ok(json_out, &report, repograph::render_context)
 }
@@ -444,14 +520,12 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
         Err(e) => return CallOutcome::ToolErr(e),
     };
     let label = db_dir.map_or_else(|| "store".to_string(), |d| d.display().to_string());
-    // The same rewrite the `recall` hook applies to a prompt: terms inside one
-    // full-text group are ANDed, so raw prose matches nothing.
-    let digest = match repograph::or_query(&topic) {
-        Some(query) => {
-            let g = db.read();
-            repograph::recall_digest(&*g, &query, &label, MAX_OUTPUT_BYTES)
-        }
-        None => String::new(),
+    // The topic goes in as the caller wrote it: `recall_digest` searches the
+    // identifiers in it, and it is the same call the `recall` hook makes, so
+    // the two cannot disagree about what a topic means.
+    let digest = {
+        let g = db.read();
+        repograph::recall_digest(&*g, &topic, &label, MAX_OUTPUT_BYTES)
     };
     let text = if digest.is_empty() {
         format!(
@@ -614,8 +688,8 @@ fn tool_sync(db_dir: Option<&Path>, json_out: bool) -> CallOutcome {
 
 // ── tools/list ───────────────────────────────────────────────────────────────
 
-/// The `json` argument every task tool takes, added to all eight schemas by
-/// [`task_tools`] rather than written out eight times.
+/// The `json` argument every task tool takes, added to all nine schemas by
+/// [`task_tools`] rather than written out nine times.
 fn json_arg() -> Js {
     json!({
         "type": "boolean",
@@ -623,7 +697,7 @@ fn json_arg() -> Js {
     })
 }
 
-/// The eight task tools, in the order `tools/list` puts them: the question an
+/// The nine task tools, in the order `tools/list` puts them: the question an
 /// assistant asks first comes first.
 pub(crate) fn task_tools() -> Vec<Js> {
     let mut tools = task_tool_schemas();
@@ -638,13 +712,41 @@ pub(crate) fn task_tools() -> Vec<Js> {
 fn task_tool_schemas() -> Vec<Js> {
     vec![
         json!({
+            "name": "explore",
+            "description": "Find your way around this repository from its code graph: a symbol's definition, callers and callees; the blast radius (files that import it or change with it) if it changes; who owns it and why files are related. Cheaper than grep for anything cross-file. depth=context (default) | impact | history | all.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "A file path, a symbol key (path#name), or a bare symbol name."
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["context", "impact", "history", "all"]
+                    },
+                    "budget": {
+                        "type": "integer",
+                        "minimum": 200,
+                        "description": "Max reply tokens (default 1200)."
+                    },
+                    "full": {
+                        "type": "boolean",
+                        "description": "Include the source body."
+                    }
+                },
+                "required": ["target"]
+            }
+        }),
+        json!({
             "name": "map",
             "description": "Summarise the graphed repository in one screen: size, last sync, clusters, key files, owners, hot files, stale concepts, and questions worth asking next. Start here when you do not know the codebase.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
             "name": "context",
-            "description": "Everything known about one file or symbol: signature, doc, source from the working tree, owner, every call site into it grouped by calling file, its callees, importers and imports, co-change partners, recent commits, and any notes or concepts about it.",
+            "description": "Everything known about one file or symbol: where it is as path:start-end, its signature and doc, owner, every call site into it grouped by calling file, its callees, importers and imports, co-change partners, recent commits, and any notes or concepts about it. The body is not quoted unless you ask for it with 'full'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -652,6 +754,10 @@ fn task_tool_schemas() -> Vec<Js> {
                         "type": "string",
                         "minLength": 1,
                         "description": "A file path, a symbol key (path#name), or a bare symbol name. An ambiguous bare name returns the candidates instead."
+                    },
+                    "full": {
+                        "type": "boolean",
+                        "description": "Include the source body (default: pointers and signature only)."
                     }
                 },
                 "required": ["target"]
@@ -700,14 +806,14 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "recall",
-            "description": "What the graph already knows about a topic: the closest notes, concepts, files, symbols and people, each with its strongest link.",
+            "description": "Where the graph says a topic lives: one pointer per hit — path:line, the symbol, and the first line of its doc — across notes, concepts, files, symbols and people.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "topic": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Free-form text. Searched as an OR of its words."
+                        "description": "Free-form text. The identifiers in it — a path, a `mod::name`, a snake_case word, or any word in backticks — are searched as phrases; a topic naming none of those matches nothing."
                     }
                 },
                 "required": ["topic"]

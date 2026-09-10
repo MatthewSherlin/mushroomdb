@@ -31,7 +31,7 @@ fn tmp(name: &str) -> PathBuf {
 fn recall_on_demo_store_names_matching_nodes() {
     let dir = tmp("demo");
     run_demo(&dir).expect("demo");
-    let payload = r#"{"session_id":"s","cwd":"/x","hook_event_name":"UserPromptSubmit","prompt":"what do we know about Person 1 and Project 5?"}"#;
+    let payload = r#"{"session_id":"s","cwd":"/x","hook_event_name":"UserPromptSubmit","prompt":"what do we know about `Person` and `Project`?"}"#;
     let out = run_recall(&dir, payload);
     assert!(
         out.lines()
@@ -40,12 +40,33 @@ fn recall_on_demo_store_names_matching_nodes() {
             .starts_with("mushroomdb recall"),
         "unexpected header: {out:?}"
     );
-    assert!(out.contains("person-01"), "missing person-01 in {out}");
-    assert!(out.contains("proj-05"), "missing proj-05 in {out}");
+    // `Project N` is the rarer name of the two, so the projects take the six
+    // places the digest has; the people answer a prompt that asks for them.
+    assert!(out.contains("proj-0"), "missing a project in {out}");
     assert!(
-        out.len() < 2000,
+        run_recall(&dir, r#"{"prompt":"who is `Person`?"}"#).contains("person-0"),
+        "missing a person"
+    );
+    assert!(
+        out.len() <= 1200,
         "recall output must stay small: {} bytes",
         out.len()
+    );
+}
+
+/// Binding: the demo store's nodes are named in prose, so the backticks are
+/// what make them identifiers — the same prompt without them is not about
+/// anything the graph holds.
+#[test]
+fn recall_is_silent_until_the_prompt_names_something() {
+    let dir = tmp("unquoted");
+    run_demo(&dir).expect("demo");
+    assert_eq!(
+        run_recall(&dir, r#"{"prompt":"what do we know about Person 1"}"#),
+        ""
+    );
+    assert!(
+        run_recall(&dir, r#"{"prompt":"what do we know about `Person`"}"#).contains("person-0")
     );
 }
 
@@ -54,21 +75,32 @@ fn recall_accepts_user_prompt_and_user_input_field_names() {
     let dir = tmp("fields");
     run_demo(&dir).expect("demo");
     for field in ["user_prompt", "user_input"] {
-        let payload = format!(r#"{{"{field}":"Person 1"}}"#);
+        let payload = format!(r#"{{"{field}":"`Person`"}}"#);
         assert!(
-            run_recall(&dir, &payload).contains("person-01"),
+            run_recall(&dir, &payload).contains("person-0"),
             "field {field}"
         );
     }
 }
 
+/// Binding: a hit is one pointer line and nothing else. The digest used to
+/// print each node's strongest edges under it, which cost most of the budget
+/// to say what `node_edges` answers on demand.
 #[test]
-fn recall_lists_edges_with_the_rules_own_weight_property() {
+fn recall_prints_one_pointer_per_hit_and_no_edges() {
     let dir = tmp("edges");
     run_demo(&dir).expect("demo");
-    let out = run_recall(&dir, r#"{"prompt":"Person 1"}"#);
-    // skill_fit declares weight_prop "score", not the HTTP default "weight".
-    assert!(out.contains("FIT -> proj-01 (score 1.00)"), "{out}");
+    let out = run_recall(&dir, r#"{"prompt":"`Person`"}"#);
+    assert!(!out.contains(" -> "), "no edge lines: {out}");
+    // skill_fit declares weight_prop "score": neither the edge nor its weight
+    // belongs in a digest of pointers.
+    assert!(!out.contains("(score "), "{out}");
+    for line in out.lines().skip(2) {
+        assert!(
+            line.starts_with("  ") && !line.starts_with("    "),
+            "every line under the header is one pointer: {line:?} in\n{out}"
+        );
+    }
 }
 
 #[test]
@@ -87,13 +119,10 @@ fn recall_drops_trailing_nodes_rather_than_blow_the_size_budget() {
             .expect("insert");
         }
     }
-    let out = run_recall(&dir, r#"{"prompt":"alpha"}"#);
-    assert!(
-        out.contains("\n    …\n"),
-        "expected an elision marker: {out}"
-    );
+    let out = run_recall(&dir, r#"{"prompt":"`alpha`"}"#);
+    assert!(out.contains("\n  …\n"), "expected an elision marker: {out}");
     // The header counts what printed, not what matched.
-    let printed = out.lines().filter(|l| l.starts_with("- doc-")).count();
+    let printed = out.lines().filter(|l| l.starts_with("  doc-")).count();
     assert!(printed < 6, "budget must drop nodes, printed {printed}");
     assert!(
         out.lines()
@@ -102,9 +131,9 @@ fn recall_drops_trailing_nodes_rather_than_blow_the_size_budget() {
             .starts_with(&format!("mushroomdb recall ({printed} related nodes")),
         "{out}"
     );
-    // Header, hint and elision marker are charged against the same budget.
+    // Header and elision marker are charged against the same budget.
     assert!(
-        out.len() <= 1800,
+        out.len() <= 1200,
         "whole digest must fit the budget: {} bytes",
         out.len()
     );
@@ -114,14 +143,14 @@ fn recall_drops_trailing_nodes_rather_than_blow_the_size_budget() {
 fn recall_is_silent_when_no_fulltext_index_is_enabled() {
     let dir = tmp("nofts");
     drop(core_api::GraphDb::open(&dir).expect("open"));
-    assert_eq!(run_recall(&dir, r#"{"prompt":"Person 1"}"#), "");
+    assert_eq!(run_recall(&dir, r#"{"prompt":"`Person 1`"}"#), "");
 }
 
 #[test]
 fn recall_writes_nothing_to_an_empty_directory() {
     let dir = tmp("emptydir");
     std::fs::create_dir_all(&dir).expect("mkdir");
-    assert_eq!(run_recall(&dir, r#"{"prompt":"Person 1"}"#), "");
+    assert_eq!(run_recall(&dir, r#"{"prompt":"`Person 1`"}"#), "");
     let left: Vec<_> = std::fs::read_dir(&dir)
         .expect("readdir")
         .map(|e| e.expect("entry").file_name())
@@ -139,7 +168,7 @@ fn recall_leaves_an_old_format_store_byte_identical() {
     std::fs::write(dir.join("snapshot.bin"), bytes).expect("snapshot");
     std::fs::write(dir.join("wal.bin"), b"").expect("wal");
 
-    assert_eq!(run_recall(&dir, r#"{"prompt":"Person 1"}"#), "");
+    assert_eq!(run_recall(&dir, r#"{"prompt":"`Person 1`"}"#), "");
     assert_eq!(
         std::fs::read(dir.join("snapshot.bin")).expect("reread"),
         bytes,
@@ -155,22 +184,38 @@ fn recall_leaves_an_old_format_store_byte_identical() {
 fn recall_is_silent_when_nothing_matches_or_store_missing() {
     let dir = tmp("silent");
     run_demo(&dir).expect("demo");
-    assert_eq!(run_recall(&dir, r#"{"prompt":"zzqx nothing here"}"#), "");
-    assert_eq!(run_recall(&tmp("absent"), r#"{"prompt":"Person 1"}"#), "");
+    assert_eq!(run_recall(&dir, r#"{"prompt":"`zzqx` nothing here"}"#), "");
+    assert_eq!(run_recall(&tmp("absent"), r#"{"prompt":"`Person 1`"}"#), "");
     assert_eq!(run_recall(&dir, "not json"), "");
 }
 
-/// Binding: a prompt that is not about the repository produces no nudge at
-/// all — not a short one, not a framed one, nothing.
+/// Binding: a prompt that is not about the repository produces nothing at all
+/// — not a short digest, not a framed one, and not the diff-aware nudge
+/// either.
 ///
 /// This fires before every single user prompt. A digest of six near-random
 /// nodes costs ~350 tokens and, worse, presents unrelated files to the model
-/// as relevant context. The prompt below is the case that used to cost the
-/// most: every one of its words is common enough to match something.
+/// as relevant context. The prompts below are the case that used to cost the
+/// most: every one of their words is common enough to match something.
+///
+/// The checkout is dirty and the payload's `cwd` is in it, so the hook has a
+/// nudge to print and withholds it: without that setup the assertion would
+/// pass on a store with no repository behind it and pin nothing.
 #[test]
 fn recall_is_silent_on_a_generic_prompt() {
-    let dir = tmp("generic");
-    run_demo(&dir).expect("demo");
+    let repo = seed_repo("generic-repo");
+    let db_dir = tmp("generic");
+    ingest(&repo, &db_dir);
+    write_files(
+        &repo,
+        &[("src/util.rs", "//! Shared helpers.\n\npub fn helper() {}\n")],
+    );
+    // The setup is real: an identifier in the prompt does produce the nudge.
+    assert!(
+        run_recall(&db_dir, &payload(&repo, "fix `helper`")).contains("you are editing"),
+        "the checkout must be dirty for this test to bind anything"
+    );
+
     for prompt in [
         "what is the weather today",
         "the",
@@ -178,8 +223,11 @@ fn recall_is_silent_on_a_generic_prompt() {
         "ok thanks",
         "what do you think about that",
     ] {
-        let payload = format!(r#"{{"prompt":{}}}"#, json_string(prompt));
-        assert_eq!(run_recall(&dir, &payload), "", "prompt {prompt:?}");
+        assert_eq!(
+            run_recall(&db_dir, &payload(&repo, prompt)),
+            "",
+            "prompt {prompt:?}"
+        );
     }
 }
 
@@ -189,8 +237,8 @@ fn recall_is_silent_on_a_generic_prompt() {
 fn recall_still_fires_on_a_specific_topic() {
     let dir = tmp("specific");
     run_demo(&dir).expect("demo");
-    let out = run_recall(&dir, r#"{"prompt":"what does Person 1 work on?"}"#);
-    assert!(out.contains("person-01"), "{out}");
+    let out = run_recall(&dir, r#"{"prompt":"what does `Person` work on?"}"#);
+    assert!(out.contains("person-0"), "{out}");
     assert!(
         out.lines()
             .nth(1)
@@ -200,17 +248,11 @@ fn recall_still_fires_on_a_specific_topic() {
     );
 }
 
-/// A JSON string literal, so a prompt with a quote or a backslash in it still
-/// makes a valid payload.
-fn json_string(s: &str) -> String {
-    serde_json::to_string(s).expect("string")
-}
-
 #[test]
 fn digest_opens_by_framing_its_content_as_untrusted_data() {
     let dir = tmp("framing");
     run_demo(&dir).expect("demo");
-    let out = run_recall(&dir, r#"{"prompt":"Person 1"}"#);
+    let out = run_recall(&dir, r#"{"prompt":"`Person 1`"}"#);
     let mut lines = out.lines();
     assert_eq!(
         lines.next(),
@@ -243,15 +285,15 @@ fn control_characters_in_graph_values_are_stripped() {
         )
         .expect("insert");
     }
-    let out = run_recall(&dir, r#"{"prompt":"alpha"}"#);
+    let out = run_recall(&dir, r#"{"prompt":"`alpha`"}"#);
     assert!(out.contains("doc-1"), "expected the hit: {out:?}");
     assert!(
         !out.contains('\u{1b}') && !out.contains('\u{7f}'),
         "control characters must be stripped: {out:?}"
     );
-    // One line per node block: the embedded newline must not have split it.
+    // One line per hit: the embedded newline must not have split it.
     assert_eq!(
-        out.lines().filter(|l| l.starts_with("- doc-1")).count(),
+        out.lines().filter(|l| l.starts_with("  doc-1")).count(),
         1,
         "{out:?}"
     );
@@ -414,7 +456,7 @@ fn nudge_names_partners_outside_the_diff_only() {
         ],
     );
 
-    let out = run_recall(&db_dir, &payload(&repo, "hi"));
+    let out = run_recall(&db_dir, &payload(&repo, "fix `helper`"));
     assert_eq!(out.lines().next(), Some(FRAMING), "{out}");
     assert_eq!(
         line(&out, "mushroomdb: you are editing"),
@@ -454,7 +496,7 @@ fn nudge_falls_back_to_topic_digest_when_diff_is_empty() {
 
     // Nothing edited: the checkout is clean, so there is no change to warn
     // about and the prompt gets the topic digest it always got.
-    let out = run_recall(&db_dir, &payload(&repo, "helper"));
+    let out = run_recall(&db_dir, &payload(&repo, "`helper`"));
     assert!(
         !out.contains("you are editing"),
         "a clean tree must not produce a nudge: {out}"
@@ -482,7 +524,7 @@ fn nudge_is_silent_when_cwd_is_not_a_repo() {
     // The dirty checkout is right there, but the prompt was not sent from it.
     let elsewhere = tmp("not-a-repo");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    let out = run_recall(&db_dir, &payload(&elsewhere, "helper"));
+    let out = run_recall(&db_dir, &payload(&elsewhere, "`helper`"));
     assert!(
         !out.contains("you are editing"),
         "no checkout, no nudge: {out}"
@@ -497,7 +539,7 @@ fn nudge_is_silent_when_cwd_is_not_a_repo() {
 
     // And a prompt nothing matches stays silent, nudge or no nudge.
     assert_eq!(
-        run_recall(&db_dir, &payload(&elsewhere, "zzqx nothing")),
+        run_recall(&db_dir, &payload(&elsewhere, "`zzqx` nothing")),
         ""
     );
 }
@@ -522,7 +564,7 @@ fn nudge_is_at_most_8_lines_plus_framing() {
         ],
     );
 
-    let out = run_recall(&db_dir, &payload(&repo, "hi"));
+    let out = run_recall(&db_dir, &payload(&repo, "fix `helper`"));
     assert!(out.contains("you are editing"), "expected a nudge: {out}");
     assert_eq!(out.lines().next(), Some(FRAMING), "{out}");
     assert_eq!(out.lines().last(), Some(HINT), "{out}");
@@ -532,9 +574,35 @@ fn nudge_is_at_most_8_lines_plus_framing() {
         "at most 8 lines under the framing line, got {body}: {out}"
     );
     assert!(
-        out.len() <= 1800,
+        out.len() <= 1200,
         "the nudge shares the digest's byte budget: {} bytes",
         out.len()
+    );
+}
+
+/// Binding: the identifier gate comes before the nudge, so a dirty tree is not
+/// enough on its own.
+///
+/// The nudge is a fact about the checkout rather than about what was typed,
+/// which is the argument for printing it whatever the prompt says. It loses to
+/// the one this hook is held to: it fires before *every* prompt, and "ok
+/// thanks" is not a question about the diff. The session brief has already
+/// said the graph is there.
+#[test]
+fn a_prompt_naming_nothing_gets_no_nudge_even_on_a_dirty_tree() {
+    let repo = seed_repo("glue-repo");
+    let db_dir = tmp("glue-db");
+    ingest(&repo, &db_dir);
+    write_files(
+        &repo,
+        &[("src/util.rs", "//! Shared helpers.\n\npub fn helper() {}\n")],
+    );
+
+    assert_eq!(run_recall(&db_dir, &payload(&repo, "ok thanks")), "");
+    // The same dirty tree, one identifier later.
+    assert!(
+        run_recall(&db_dir, &payload(&repo, "ok thanks, now fix `helper`"))
+            .contains("you are editing src/util.rs"),
     );
 }
 
@@ -584,7 +652,7 @@ fn nudge_sees_a_touch_made_moments_ago() {
 
     // The edit is on disk but the graph has not been told: the file still
     // hashes to what the concept recorded, so nothing is stale yet.
-    let before = run_recall(&db_dir, &payload(&repo, "hi"));
+    let before = run_recall(&db_dir, &payload(&repo, "fix `helper`"));
     assert!(before.contains("you are editing src/util.rs"), "{before}");
     assert!(
         !before.contains("concept(s)"),
@@ -596,7 +664,7 @@ fn nudge_sees_a_touch_made_moments_ago() {
     // recall does has to see those frames.
     cli::ingest_git::run_touch(&db_dir, &[repo.join("src/util.rs")], None).expect("touch");
 
-    let after = run_recall(&db_dir, &payload(&repo, "hi"));
+    let after = run_recall(&db_dir, &payload(&repo, "fix `helper`"));
     assert_eq!(
         line(&after, "1 concept(s)"),
         Some("1 concept(s) describe files you changed — say \"re-learn\" to refresh"),

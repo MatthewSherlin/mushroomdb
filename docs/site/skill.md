@@ -21,15 +21,16 @@ plugin's skill is `mushroom` inside plugin `mushroom`, so the doubled name is
 correct.
 
 The plugin ships the MCP server (`npx -y mushroomdb@<version> mcp --auto`), the
-skill, and both hooks. `--auto` resolves the store as
+skill, and all three hooks. `--auto` resolves the store as
 `$CLAUDE_PROJECT_DIR/mushroom-memory`, falling back to `mushroom-memory` at the
 root of the working tree the command ran in, so each `git worktree` gets its
 own graph. Nothing is written outside the project directory. It writes no git
 hooks — a plugin has no place editing `.git/hooks` — so add them with
 `mushroomdb install --project` if you want a commit to sync the graph.
 
-The two hooks go through `hooks/run.sh`, which resolves the published package
-once and caches the answer, so no prompt or edit pays for an `npx` spawn.
+The three hooks go through `hooks/run.sh`, which resolves the published package
+once and caches the answer, so no session start, prompt or edit pays for an
+`npx` spawn.
 
 Details, the cache location and local-development commands:
 [`packaging/plugin/README.md`](../../packaging/plugin/README.md).
@@ -54,30 +55,34 @@ graph. See [`docs/site/ingest-git.md`](ingest-git.md).
 The file is task-first: it names a tool for each kind of turn, and it is
 explicit that the tool output *is* the answer.
 
-**The first minute.** Build the store if it does not exist, call `map`, print
-its output verbatim, and end the turn on the three questions the map's last
-line asks. No file reading, no code search, no plan.
+**The first minute.** Build the store if it does not exist, take the session's
+bearings from the `SessionStart` brief already in context rather than from a
+search, and call `explore <target>` on the first file or symbol the task names
+before any `Grep`, file read or plan. On a memory store, where `explore` is
+unlisted, `map` opens instead.
 
-**Seven task rules**, in order — the first that matches the turn is the tool to
+**Three task rules**, in order — the first that matches the turn is the tool to
 call, before answering:
 
 | The turn | The tool |
 |---|---|
-| You are about to edit files | `impact` — and say which partners and importers you are *not* touching |
-| It names a file or a symbol | `context` with that target |
-| "Who owns / who wrote / who should review" | `owners` with the path |
-| "Why are these related / what connects them" | `why` with the two keys, quoting the evidence lines |
-| A topic with no file behind it | `recall` with the topic |
-| The user states a decision or durable fact | `remember`, and say the `note:` key it returns |
-| Commits have landed, or `map` reports an old sync | `sync` |
+| Anything cross-file — before `Grep` | `explore` with one `target` and one `depth`: `context` (default), `impact` (before you edit), `history`, or `all` |
+| The user states a decision or durable fact | `remember`, and say the `note:` key it returns. A `--delivery cli` install has no such subcommand, so its copy of the skill says to write the note through `query` instead |
+| Commits have landed, or the brief reports an old sync | `sync` |
+
+A paragraph after the table names what `explore` composes — `context`, `impact`
+and `owners` — and says that those, `why`, `recall`, `map` and the rest stay
+callable by name.
 
 **The `learn` pass** turns prose — design docs, ADRs, READMEs — into `Concept`
 nodes carrying the source files and their hashes. When a source file's hash
 stops matching, the concept is stale and the prompt hook says so by name.
 At most 20 documents per run, 5 concepts per document.
 
-**The graph underneath.** One paragraph: that `tools/list` shows eleven tools
-and `mushroomdb mcp <db> --all-tools` shows the other thirteen with the schemas
+**The graph underneath.** One paragraph: that `tools/list` follows the store —
+three tools on a store built by `ingest-git` (`explore`, `query`, `stats`),
+eleven on any other — that all 25 stay callable either way and
+`mushroomdb mcp <db> --all-tools` advertises the rest with the schemas
 documenting their arguments, that a `mask` is an allow-list, that the MCP
 server has no auth so a mask is never a security boundary, and the two honesty
 rules — never invent graph contents, and show a failed call's error verbatim.
@@ -105,7 +110,9 @@ Cursor gets the same content as an always-apply rules file
 | `--project` / `--user` | Scope. Default: auto — project inside a git checkout, user anywhere else. |
 | `--db <path>` | **Pins** the store to this absolute path. Without it, a Claude Code project install inside a git checkout writes `--auto`, which resolves at run time to `$CLAUDE_PROJECT_DIR/mushroom-memory` or `mushroom-memory` at the working tree's root — so committed config is right in every `git worktree` rather than pointing them all at the checkout the install was typed in. The store is pinned instead in three cases: a Cursor or Codex install (see below), an install outside a git checkout (no working tree root for the fallback to find), and a user install (always `~/.mushroomdb/memory`). |
 | `--command <path>` | Invoke this binary instead of `npx`. Use it for a local build or a pinned install. A relative path is fine to type: it is anchored to the current directory before anything is written, because the assistant spawns the server from a directory of its own. `--db` is anchored the same way. A bare name with no separator (`--command mushroomdb`) means a `PATH` lookup and is written exactly as given. |
+| `--delivery cli\|mcp\|both` | Which door the install opens. Default `both`: the MCP server entry **and** a skill that also teaches the shell form. `mcp` writes the server entry alone. `cli` writes no server entry at all — the skill teaches `mushroomdb explore <store> <target>` through `Bash`, so a session loads no tool schemas before its first turn; re-installing as `cli` removes an entry an earlier run registered. Claude Code only: a Cursor or Codex install is always the server, and `install` prints a note saying so rather than dropping the flag. |
 | `--no-git-hooks` | Skip the `post-commit` / `post-checkout` / `post-merge` sync hooks. |
+| `--intercept-grep` | **Experimental, off by default.** Adds a fourth Claude Code hook: `hooks.PreToolUse`, matched to `Grep`, running `<bin> intercept <store>` (5 s timeout). When the search pattern is a bare identifier of three characters or more that the graph holds as a symbol, the hook exits 2 with one line pointing at `explore("<name>")` — Claude Code blocks the search and hands the model that message, so a question the graph answers exactly (definition, callers, callees) is not answered by a list of matching lines. Anything that looks like a regex, any name the graph does not hold, and any store that will not open passes straight through. Leave it off unless you are measuring it; `disable`, `enable` and `uninstall` handle it like every other hook, and re-running `install` without the flag removes it. |
 | `--no-prewarm` | No network and no resolution during the install: neither the one-off package fetch nor locating the package's binary. Every hook keeps the slower `npx` form. |
 
 ---
@@ -160,11 +167,12 @@ out of the skill.
 
 `npx` is not free. Before it runs anything it checks its cache, resolves the
 version and starts a Node process of its own — around half a second on a warm
-cache — and the two hooks below fire on every prompt and every file edit.
+cache — and the hooks below fire at every session start, every prompt and every
+file edit.
 
 So when the `npx` form applies, `install` asks the package where it is, once
-(up to 180 s), and writes that path into everything: the MCP entry, both hooks
-and all three git hook blocks.
+(up to 180 s), and writes that path into everything: the MCP entry, every
+settings hook and all three git hook blocks.
 
 | Asked | Answer | Written |
 |---|---|---|
@@ -201,9 +209,9 @@ and says so if it does not.
 | File | Purpose |
 |------|---------|
 | `.claude/skills/mushroom/SKILL.md` | The `/mushroom` skill, with `{{DB_PATH}}` and `{{BIN}}` substituted for your db path and the resolved command. |
-| `.mcp.json` | `mcpServers.mushroomdb` entry (see above). Created if absent; merged if present. |
-| `.claude/skills/mushroom/.install-manifest.json` | Manifest of everything written — consumed by `uninstall`. |
-| `.claude/settings.json` | Two hook entries. `hooks.UserPromptSubmit` runs `<bin> recall <store>` (5 s timeout) so related facts are injected before each prompt; `hooks.PostToolUse`, matched to `Edit|Write|MultiEdit`, runs `<bin> touch <store>` (30 s, `async`) so an edited file reaches the graph without the tool call waiting. Hooks load at session start: restart Claude Code after install. |
+| `.mcp.json` | `mcpServers.mushroomdb` entry (see above). Created if absent; merged if present. Not written at all with `--delivery cli`. |
+| `.claude/skills/mushroom/.install-manifest.json` | Manifest of everything written — consumed by `uninstall`. It records the `delivery` this install chose and whether the grep redirect is on. |
+| `.claude/settings.json` | Three hook entries. `hooks.SessionStart` runs `<bin> brief <store>` (5 s timeout) so a session opens knowing the repository's shape; `hooks.UserPromptSubmit` runs `<bin> recall <store>` (5 s timeout) so related facts are injected before each prompt; `hooks.PostToolUse`, matched to `Edit\|Write\|MultiEdit`, runs `<bin> touch <store>` (30 s, `async`) so an edited file reaches the graph without the tool call waiting. `--intercept-grep` adds a fourth, `hooks.PreToolUse` matched to `Grep`. Hooks load at session start: restart Claude Code after install. |
 | `.gitignore` | One line for the store directory, when the store is inside the repository. Removed on uninstall. |
 | `.git/hooks/post-commit`, `post-checkout`, `post-merge` | A marked block running a backgrounded, silenced `<bin> sync <store>`, so the graph follows commits, branch switches and merges. Your own lines in those files are preserved, and only the marked block is removed on uninstall. Skip with `--no-git-hooks`. |
 
@@ -218,7 +226,7 @@ paths are:
 | Skill | `~/.claude/skills/mushroom/SKILL.md` |
 | MCP config | `~/.claude.json` (top-level `mcpServers` key — same structure as project `.mcp.json`) |
 | Manifest | `~/.mushroomdb/install-manifest.json` |
-| Hooks | `~/.claude/settings.json` — the same `hooks.UserPromptSubmit` and `hooks.PostToolUse` entries as above. Hooks load at session start: restart Claude Code after install. |
+| Hooks | `~/.claude/settings.json` — the same `hooks.SessionStart`, `hooks.UserPromptSubmit` and `hooks.PostToolUse` entries as above. Hooks load at session start: restart Claude Code after install. |
 
 **Verified 2026-09-02 by live inspection:** `~/.claude.json` holds the
 top-level `mcpServers` key for Claude Code user-level MCP servers.
@@ -229,26 +237,38 @@ so keys come back alphabetized and indented two spaces. Content is kept,
 layout is not. `uninstall` skips the write entirely when there is nothing of
 ours to remove, so a file we never touched stays byte-identical.
 
+The session hook runs `<bin> brief <db>` once, before the first turn. The brief
+is the repository's shape read from the graph alone — file, symbol and edge
+counts, the sha of the last sync, the 25 most central files, the 25 most called
+symbols, and one line naming the door this install wired — capped at 4,000
+bytes, with the reach line always surviving the cap. It reads no clock and no
+working tree, so two sessions started an hour apart get byte-identical output
+and a host that caches it is never wrong. An empty store prints one line saying
+how to build it.
+
 The prompt hook runs `<bin> recall <db>`, which opens the store without
 migration or WAL repair (`auto_migrate: false`, `repair_wal: false`) — it fires
 on every prompt and must not write to the store. It prints one of three things:
 
-1. **A nudge**, when the payload's `cwd` is a checkout with uncommitted
-   changes — at most eight lines naming what those files reach that is not
-   already in the diff. A change in progress is the more useful subject.
-2. **The topic digest** for the prompt, when the tree is clean and the prompt
-   is about something the graph holds.
-3. **Nothing at all**, when the prompt is not about this repository. A prompt
-   made only of function words (`the`, `is it done`, `ok thanks`) leaves no
-   search term behind, and a prompt whose best hit cannot clear a relevance
-   floor has matched by coincidence rather than by subject. Either way the
-   hook exits 0 having written nothing — no framing line, no header.
+1. **Nothing at all**, unless the prompt names an identifier — a path, a
+   `mod::name`, a snake_case or dotted name, an inner-capitalised word, or
+   anything the writer put in backticks. `is it done`, `ok thanks` and `fix
+   this` leave no identifier behind, so the hook exits 0 having written nothing
+   — no framing line, no header — dirty tree or not. This is the common case
+   for conversational turns, and it is the point: an unrelated digest costs the
+   model a few hundred tokens *and* puts unrelated files in front of it as
+   though they were relevant.
+2. **A nudge**, when the prompt does name an identifier and the payload's `cwd`
+   is a checkout with uncommitted changes — at most eight lines naming what
+   those files reach that is not already in the diff. A change in progress is
+   the more useful subject, so the nudge replaces the digest rather than
+   printing beside it.
+3. **The topic digest**, when the tree is clean: one pointer per hit —
+   `path:line symbol — first doc line` — for the identifiers the prompt named,
+   and nothing when the best hit cannot clear a relevance floor. It quotes no
+   bodies; the pointers are what a follow-up `explore` call takes as its target.
 
-The third case is the common one for conversational turns, and it is the point:
-an unrelated digest costs the model a few hundred tokens *and* puts six
-unrelated files in front of it as though they were relevant.
-
-The first two open with a line marking the content as untrusted graph data, and
+The last two open with a line marking the content as untrusted graph data, and
 control characters are stripped from every rendered value: node keys and names
 are ingested content, and for an `ingest-git` store any contributor to the
 repository controls them.
@@ -349,9 +369,10 @@ conflict: `install` rewrites the command in place and prints `updated mcp
 command`. This repairs an entry whose bare `mushroomdb` never resolved,
 replaces the absolute path a 0.5.x install wrote, and re-pins an older version.
 
-The two settings hooks are replaced the same way, not added beside the old
-ones: any `UserPromptSubmit` or `PostToolUse` hook running `recall` or `touch`
-against this same store is removed first, whatever binary it names and whichever
+The settings hooks are replaced the same way, not added beside the old ones:
+any `SessionStart`, `UserPromptSubmit`, `PostToolUse` or `PreToolUse` hook
+running `brief`, `recall`, `touch` or `intercept` against this same store is
+removed first, whatever binary it names and whichever
 way it spells the store. Both spellings count because 0.6.0 wrote the store's
 absolute path where a project install now writes `--auto`, so an upgrade would
 otherwise leave the old pair running beside the new one and every prompt would
@@ -367,7 +388,7 @@ mushroomdb uninstall --platform claude-code --project
 ```
 
 Reads the manifest and removes exactly what `install` wrote: the MCP entry, the
-skill or rules file, both settings hooks, the `.gitignore` line, the marked
+skill or rules file, every settings hook, the `.gitignore` line, the marked
 block in each git hook, and the Codex registration. User files in the same
 directories, and user lines in the same files, are left untouched. A
 `.gitignore` that exists only because `install` created it is deleted too, but
@@ -393,8 +414,8 @@ mushroomdb enable  [--project|--user] [--platform claude-code|cursor|codex|all]
 ```
 
 `disable` is one command away from turning mushroomdb off in a project
-without uninstalling it: it removes the MCP entry, the two Claude Code
-settings hooks, the git hook blocks, and the Codex registration. The
+without uninstalling it: it removes the MCP entry, the Claude Code settings
+hooks, the git hook blocks, and the Codex registration. The
 `/mushroom` skill or Cursor rules file, the store itself, and the
 `.gitignore` line all stay — the skill is inert without the server, so
 leaving it costs nothing, and the store is worth keeping if you turn the
@@ -409,7 +430,7 @@ missing path — if that binary is gone by the time `enable` runs. The default
 `npx` form is re-resolved fresh instead of replayed, the same way `install`
 would resolve it right now, so a published-package upgrade between `disable`
 and `enable` is picked up rather than pinned to a path that may no longer
-exist. Either way the two hooks and the git hook blocks are re-added against
+exist. Either way the hooks and the git hook blocks are re-added against
 whichever command that resolves to, and each platform's store is recovered
 from what its own MCP entry named — Claude Code and Cursor can be pinned
 differently. Running `enable` on an install that is not disabled is a no-op.
@@ -458,13 +479,17 @@ Checks, in order:
   and whether it is stale (another process has newer commits pending refresh).
 - **lock** — a brief, immediately-released attempt at the write lock; `warn`
   if another process currently holds it.
-- **hooks** — the `UserPromptSubmit` and `PostToolUse` hooks are present in
-  `settings.json` (Claude Code only).
+- **hooks** — the `SessionStart`, `UserPromptSubmit` and `PostToolUse` hooks
+  are present in `settings.json` (Claude Code only). With `--intercept-grep`
+  recorded in the manifest, the `PreToolUse` hook is checked too.
+- **config** and **handshake** report `skip … delivery: cli` on an install that
+  wired no server; every other check still runs.
 - **git-hooks** — the `post-commit` / `post-checkout` / `post-merge` blocks
   are present (project scope only).
 - **handshake** — spawns the configured command for real, speaks
   `initialize` and `tools/list` over its stdio with a 10s deadline, and
-  checks the reported version and that the `map` tool is present.
+  checks the reported version and that `explore` (a code-graph store) or `map`
+  (a memory store) is present.
 - **scope** — `warn` if a server also exists in the other scope (both would
   load into the assistant at once).
 

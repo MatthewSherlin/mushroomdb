@@ -36,6 +36,41 @@ fn main() -> ExitCode {
             let _ = stdout.flush();
             ExitCode::SUCCESS // never block the prompt
         }
+        Ok(Command::Brief { db_dir, auto }) => {
+            // A SessionStart hook is the first thing a session sees. A store
+            // that cannot be opened at all — missing, held by a writer, not a
+            // store — has no brief to give, and greeting the user with that
+            // error is worse than opening in silence: every failure here
+            // prints nothing and exits 0. (A store that opens but is *empty*
+            // does have something to say, and says it.)
+            let brief = silently(|| cli::run_brief(&resolve_db(db_dir, auto)))
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(brief.as_bytes());
+            let _ = stdout.flush();
+            ExitCode::SUCCESS
+        }
+        Ok(Command::Intercept { db_dir, auto }) => {
+            // Claude Code reads exit 2 as "block this tool call, and give the
+            // model what stderr said"; every other outcome — no opinion, a
+            // store that will not open, a payload that will not parse, a panic
+            // — is exit 0 and not one byte written, so a hook of ours can
+            // never be why a search did not run.
+            let mut raw = String::new();
+            let _ = io::stdin().read_to_string(&mut raw);
+            match silently(|| cli::intercept::run_intercept(&resolve_db(db_dir, auto), &raw))
+                .flatten()
+            {
+                Some(message) => {
+                    let mut stderr = io::stderr();
+                    let _ = writeln!(stderr, "{message}");
+                    let _ = stderr.flush();
+                    ExitCode::from(2)
+                }
+                None => ExitCode::SUCCESS,
+            }
+        }
         Ok(Command::Map { db_dir, json }) => match cli::run_map(&db_dir, json) {
             Ok(out) => {
                 print!("{out}");
@@ -43,9 +78,17 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
-        Ok(Command::Context { db_dir, target }) => {
-            print_or_fail(cli::run_context(&db_dir, &target))
-        }
+        Ok(Command::Explore {
+            db_dir,
+            target,
+            depth,
+            full,
+        }) => print_or_fail(cli::run_explore(&db_dir, &target, depth, full)),
+        Ok(Command::Context {
+            db_dir,
+            target,
+            full,
+        }) => print_or_fail(cli::run_context(&db_dir, &target, full)),
         Ok(Command::Impact { db_dir, files }) => print_or_fail(cli::run_impact(&db_dir, &files)),
         Ok(Command::Owners { db_dir, path }) => print_or_fail(cli::run_owners(&db_dir, &path)),
         Ok(Command::Why { db_dir, a, b }) => print_or_fail(cli::run_why(&db_dir, &a, &b)),

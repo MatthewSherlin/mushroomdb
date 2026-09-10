@@ -606,11 +606,11 @@ error: another mushroomdb process is writing; retry
 
 and exits **3**, having written nothing. Retrying later is always safe.
 
-The two hooks sit on opposite sides of that lock. The `UserPromptSubmit` hook
-(`mushroomdb recall`) fires on every prompt and must never write, so it opens
-read-only — `read_only: true`, and with `auto_migrate: false` and
+The read hooks and the write hook sit on opposite sides of that lock. The
+`SessionStart` hook (`mushroomdb brief`) and the `UserPromptSubmit` hook
+(`mushroomdb recall`) must never write, so they open read-only — `read_only: true`, and with `auto_migrate: false` and
 `repair_wal: false` so it cannot rewrite an old-format store or truncate a
-frame a live writer is midway through making durable. It takes no lock, cannot
+frame a live writer is midway through making durable. They take no lock, cannot
 be blocked by one, and cannot delay a writer. The `PostToolUse` hook
 (`mushroomdb touch`) does write, so it takes the lock like any other writer. In
 hook form — reading its paths from a payload on stdin, or run with `--auto` — it

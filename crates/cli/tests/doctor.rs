@@ -7,7 +7,9 @@
 //! binary (`CARGO_BIN_EXE_mushroomdb`) rather than simulating anything.
 
 use cli::doctor::{run_doctor_with, DoctorOpts};
-use cli::install::{run_install_with, Externals, InstallOpts, McpCommand, Platform, Scope};
+use cli::install::{
+    run_install_with, Delivery, Externals, InstallOpts, McpCommand, Platform, Scope,
+};
 use core_api::GraphDb;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,6 +65,8 @@ fn install_opts(scope: Scope, db: &Path, command: &Path) -> InstallOpts {
         command: Some(command.to_path_buf()),
         git_hooks: true,
         prewarm: false,
+        delivery: Delivery::Both,
+        intercept_grep: false,
     }
 }
 
@@ -118,8 +122,9 @@ fn doctor_passes_on_fresh_project_install() {
 
     let handshake = find_check(&report.output, "handshake");
     assert!(handshake.starts_with("ok"), "handshake check: {handshake}");
-    // The eleven a default `mushroomdb mcp` advertises: the eight task tools
-    // plus `query`, `ingest_json` and `stats`. The other thirteen stay
+    // The eleven a default `mushroomdb mcp` advertises on a memory store —
+    // which is what a fresh install points at: the eight memory task tools
+    // plus `query`, `ingest_json` and `stats`. The other fourteen stay
     // callable, and `--all-tools` lists them.
     assert!(
         handshake.contains("11 tools"),
@@ -128,6 +133,53 @@ fn doctor_passes_on_fresh_project_install() {
     assert!(
         handshake.contains("map present"),
         "the handshake must prove the task path: {handshake}"
+    );
+}
+
+/// Binding: the handshake passes on a store `ingest-git` built, whose default
+/// listing is three tools and does *not* include `map`.
+///
+/// The check proves the repository task path is served, not that one
+/// particular name is listed; a code-graph store serves it through `explore`.
+/// Requiring `map` would fail `doctor` on exactly the stores this surface
+/// exists for.
+#[test]
+fn doctor_handshake_passes_on_a_code_graph_store() {
+    let root = temp_dir("code-graph-handshake");
+    let home = temp_dir("code-graph-handshake-home");
+    git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+
+    let opts = install_opts(Scope::Project, &db, &bin);
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::Explicit(bin.clone()),
+        &no_externals(),
+    )
+    .expect("install failed");
+
+    // The marker `ingest-git` writes is what makes this a code graph.
+    let out = std::process::Command::new(&bin)
+        .arg("query")
+        .arg(&db)
+        .arg("CREATE (n:GitSync {id: '__mushroomdb_git_sync__'})")
+        .output()
+        .expect("query");
+    assert!(out.status.success(), "{out:?}");
+
+    let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+        .expect("doctor errored");
+    let handshake = find_check(&report.output, "handshake");
+    assert!(
+        handshake.starts_with("ok"),
+        "a code-graph store must pass the handshake: {handshake}"
+    );
+    assert!(
+        handshake.contains("3 tools") && handshake.contains("explore present"),
+        "the handshake names the task tool it found: {handshake}"
     );
 }
 
@@ -149,6 +201,8 @@ fn doctor_understands_auto_entries() {
         command: Some(bin.clone()),
         git_hooks: true,
         prewarm: false,
+        delivery: Delivery::Both,
+        intercept_grep: false,
     };
     run_install_with(
         &root,
@@ -176,7 +230,12 @@ fn doctor_understands_auto_entries() {
     let store = find_check(&report.output, "store");
     assert!(store.starts_with("ok"), "{store}");
     assert!(store.contains(&db.display().to_string()), "{store}");
-    assert!(find_check(&report.output, "hooks").starts_with("ok"));
+    // All three hook events, named: a missing one is a warning, not silence.
+    let hooks = find_check(&report.output, "hooks");
+    assert!(hooks.starts_with("ok"), "{hooks}");
+    for event in ["UserPromptSubmit", "PostToolUse", "SessionStart"] {
+        assert!(hooks.contains(event), "{hooks}");
+    }
     assert!(find_check(&report.output, "git-hooks").starts_with("ok"));
 }
 
@@ -302,4 +361,108 @@ fn doctor_warns_when_lock_held() {
     );
 
     drop(holder);
+}
+
+/// Binding: a `--delivery cli` install has no MCP entry by design, so the two
+/// checks that read one report `skip` rather than `fail` — and everything that
+/// does not need one (the store, the hooks, the git hooks) still runs, against
+/// the store the install recorded.
+///
+/// `doctor` exits 1 on any `fail`, so a `fail` here would make a perfectly
+/// healthy install look broken every time it was checked.
+#[test]
+fn doctor_on_cli_delivery_skips_handshake_and_passes() {
+    let root = temp_dir("cli-delivery");
+    let home = temp_dir("cli-delivery-home");
+    git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+
+    let opts = InstallOpts {
+        delivery: Delivery::Cli,
+        ..install_opts(Scope::Project, &db, &bin)
+    };
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::Explicit(bin),
+        &no_externals(),
+    )
+    .expect("install failed");
+
+    let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+        .expect("doctor errored");
+
+    assert!(!report.had_fail, "expected no failures:\n{}", report.output);
+    for line in report.output.lines() {
+        assert!(
+            !line.starts_with("fail"),
+            "unexpected fail line: {line}\nfull output:\n{}",
+            report.output
+        );
+    }
+
+    let handshake = find_check(&report.output, "handshake");
+    assert!(
+        handshake.starts_with("skip") && handshake.contains("delivery: cli"),
+        "handshake check: {handshake}"
+    );
+    let config = find_check(&report.output, "config");
+    assert!(
+        config.starts_with("skip") && config.contains("delivery: cli"),
+        "config check: {config}"
+    );
+    // The checks that do not need a server still have to run: this install is
+    // exactly as breakable as any other in its store and its hooks.
+    for name in ["store", "hooks"] {
+        let check = find_check(&report.output, name);
+        assert!(
+            check.starts_with("ok"),
+            "{name} check: {check}\nfull output:\n{}",
+            report.output
+        );
+    }
+}
+
+/// The redirect is opt-in, so `doctor` reports it only when the manifest says
+/// this install asked for it. A report line for a hook nobody wired would say
+/// nothing true about the install in front of it.
+#[test]
+fn doctor_reports_the_grep_redirect_only_when_it_is_installed() {
+    for intercept_grep in [true, false] {
+        let label = if intercept_grep { "on" } else { "off" };
+        let root = temp_dir(&format!("intercept-{label}"));
+        let home = temp_dir(&format!("intercept-{label}-home"));
+        git_repo(&root);
+        let db = root.join("mushroom-memory");
+        let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+
+        let opts = InstallOpts {
+            intercept_grep,
+            ..install_opts(Scope::Project, &db, &bin)
+        };
+        run_install_with(
+            &root,
+            &home,
+            &opts,
+            &McpCommand::Explicit(bin),
+            &no_externals(),
+        )
+        .expect("install failed");
+
+        let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+            .expect("doctor errored");
+        let line = report
+            .output
+            .lines()
+            .find(|l| l.split_whitespace().nth(1) == Some("intercept"));
+        if intercept_grep {
+            let line = line.unwrap_or_else(|| panic!("no intercept check:\n{}", report.output));
+            assert!(line.starts_with("ok"), "{line}");
+            assert!(line.contains("PreToolUse"), "{line}");
+        } else {
+            assert_eq!(line, None, "unasked-for line:\n{}", report.output);
+        }
+    }
 }

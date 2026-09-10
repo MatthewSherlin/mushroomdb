@@ -17,9 +17,9 @@
 
 use crate::install::{
     claude_mcp_file, cursor_mcp_file, default_db, entry_db, expand_platform, git_hooks_dir,
-    has_our_server, is_disabled, is_our_hook_command, line_runs_for_store, resolve_platform,
-    resolve_scope, Externals, Platform, Scope, StoreRef, AUTO_ARG, GIT_HOOKS, HOOK_BEGIN,
-    HOOK_EVENT, TOUCH_EVENT,
+    has_our_server, installed_shape, intercept_installed, is_disabled, is_our_hook_command,
+    line_runs_for_store, resolve_platform, resolve_scope, Externals, Platform, Scope, StoreRef,
+    AUTO_ARG, BRIEF_EVENT, GIT_HOOKS, HOOK_BEGIN, HOOK_EVENT, INTERCEPT_EVENT, TOUCH_EVENT,
 };
 use crate::CliError;
 use core_api::{GraphDb, GraphError, OpenOptions};
@@ -49,6 +49,8 @@ pub struct DoctorReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Ok,
+    /// The check does not apply to this install — not a finding either way.
+    Skip,
     Warn,
     Fail,
 }
@@ -57,6 +59,7 @@ impl Status {
     fn word(self) -> &'static str {
         match self {
             Status::Ok => "ok",
+            Status::Skip => "skip",
             Status::Warn => "warn",
             Status::Fail => "fail",
         }
@@ -76,6 +79,14 @@ impl Check {
     fn ok(name: &'static str, message: impl Into<String>) -> Self {
         Check {
             status: Status::Ok,
+            name,
+            message: message.into(),
+            fix: None,
+        }
+    }
+    fn skip(name: &'static str, message: impl Into<String>) -> Self {
+        Check {
+            status: Status::Skip,
             name,
             message: message.into(),
             fix: None,
@@ -145,12 +156,33 @@ pub fn run_doctor_with(
         });
     }
 
+    // A `cli` install registers no MCP server on purpose, so the two checks
+    // that read one have nothing to read and no fault to report; the store it
+    // is wired to comes from the hooks it did write. Everything else — the
+    // store, the hooks, the git hooks — is as breakable here as anywhere and
+    // still runs.
+    let (delivery, recorded_store) = installed_shape(project_root, home, scope, &platforms);
+    let mcp_delivery = delivery.wires_mcp();
+
     let mut checks: Vec<Check> = Vec::new();
     let mut primary: Option<(Platform, ConfigEntry)> = None;
 
     // 1. config — one line per requested platform; the first entry that reads
     //    cleanly becomes the target of every check below it.
     for plat in &platforms {
+        // A `cli` delivery closes Claude Code's door and no other's: Cursor
+        // and Codex are registered as servers whatever it asked for, so their
+        // entries are still there to check (see [`install::Delivery`]).
+        if !mcp_delivery && matches!(plat, Platform::ClaudeCode) {
+            checks.push(Check::skip(
+                "config",
+                format!(
+                    "delivery: {} — the skill teaches the binary, no MCP entry to check",
+                    delivery.label()
+                ),
+            ));
+            continue;
+        }
         match mcp_file_for(plat, project_root, home, scope) {
             None => checks.push(Check::warn(
                 "config",
@@ -180,6 +212,14 @@ pub fn run_doctor_with(
         }
     }
 
+    // The store every check below reads: the one the config entry names, or —
+    // with no entry to name it — the one this install's hooks were written for.
+    let store: Option<StoreRef> = match &primary {
+        Some((_, entry)) => Some(entry.store.clone()),
+        None if !mcp_delivery => recorded_store,
+        None => None,
+    };
+
     // 2. how the server is spawned — `npx` fetches the package, a resolved
     //    binary or launcher is a file that has to still be there.
     if let Some((_, entry)) = &primary {
@@ -191,19 +231,25 @@ pub fn run_doctor_with(
     }
 
     // 3. store, then the write-lock probe (same check family, adjacent lines).
-    match &primary {
-        Some((_, entry)) => checks.extend(check_store_and_lock(entry.store.path())),
+    match &store {
+        Some(store) => checks.extend(check_store_and_lock(store.path())),
         None => checks.push(Check::fail(
             "store",
-            "no usable config entry — cannot locate a database to check",
+            no_store_message(mcp_delivery),
             Some(install_fix_for_scope(scope)),
         )),
     }
 
     // 4. hooks — Claude Code only; Cursor has no prompt/tool-use hooks to check.
     if platforms.contains(&Platform::ClaudeCode) {
-        if let Some((_, entry)) = &primary {
-            checks.push(check_hooks(project_root, home, scope, &entry.store));
+        if let Some(store) = &store {
+            checks.push(check_hooks(project_root, home, scope, store));
+            // The fourth hook is opt-in, so it earns a line only where the
+            // manifest says this install asked for it. Reporting it otherwise
+            // would say something about every install that is true of none.
+            if intercept_installed(project_root, home, scope, &platforms) {
+                checks.push(check_intercept(project_root, home, scope, store));
+            }
         }
     }
 
@@ -214,8 +260,8 @@ pub fn run_doctor_with(
             .iter()
             .any(|p| matches!(p, Platform::ClaudeCode | Platform::Cursor))
     {
-        if let Some((_, entry)) = &primary {
-            if let Some(check) = check_git_hooks(project_root, &entry.store) {
+        if let Some(store) = &store {
+            if let Some(check) = check_git_hooks(project_root, store) {
                 checks.push(check);
             }
         }
@@ -224,6 +270,11 @@ pub fn run_doctor_with(
     // 6. self-handshake — spawn the configured command for real.
     match &primary {
         Some((_, entry)) => checks.push(check_handshake(entry)),
+        // No entry and none expected: nothing to spawn, and nothing wrong.
+        None if !mcp_delivery => checks.push(Check::skip(
+            "handshake",
+            format!("delivery: {} — no server to spawn", delivery.label()),
+        )),
         None => checks.push(Check::fail(
             "handshake",
             "no usable config entry — nothing to spawn",
@@ -242,6 +293,16 @@ pub fn run_doctor_with(
         output.push_str(&c.render());
     }
     Ok(DoctorReport { output, had_fail })
+}
+
+/// Why doctor could not find a store to check, in the terms of whichever
+/// artifact was supposed to name one.
+fn no_store_message(mcp_delivery: bool) -> &'static str {
+    if mcp_delivery {
+        "no usable config entry — cannot locate a database to check"
+    } else {
+        "no recorded SessionStart hook — cannot locate a database to check"
+    }
 }
 
 fn install_fix_for_scope(scope: Scope) -> String {
@@ -573,11 +634,12 @@ fn check_hooks(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef)
     let root = read_json(&settings_file).unwrap_or(Js::Null);
     let has_recall = has_hook_matching(&root, HOOK_EVENT, "recall", store);
     let has_touch = has_hook_matching(&root, TOUCH_EVENT, "touch", store);
-    if has_recall && has_touch {
+    let has_brief = has_hook_matching(&root, BRIEF_EVENT, "brief", store);
+    if has_recall && has_touch && has_brief {
         Check::ok(
             "hooks",
             format!(
-                "{HOOK_EVENT} + {TOUCH_EVENT} present in {}",
+                "{HOOK_EVENT} + {TOUCH_EVENT} + {BRIEF_EVENT} present in {}",
                 settings_file.display()
             ),
         )
@@ -589,6 +651,9 @@ fn check_hooks(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef)
         if !has_touch {
             missing.push(TOUCH_EVENT);
         }
+        if !has_brief {
+            missing.push(BRIEF_EVENT);
+        }
         Check::warn(
             "hooks",
             format!(
@@ -597,6 +662,30 @@ fn check_hooks(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef)
                 settings_file.display()
             ),
             Some("mushroomdb install --platform claude-code".to_string()),
+        )
+    }
+}
+
+/// The experimental grep redirect, for an install whose manifest asked for it.
+fn check_intercept(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef) -> Check {
+    let settings_file = match scope {
+        Scope::Project => project_root.join(".claude").join("settings.json"),
+        Scope::User => home.join(".claude").join("settings.json"),
+    };
+    let root = read_json(&settings_file).unwrap_or(Js::Null);
+    if has_hook_matching(&root, INTERCEPT_EVENT, "intercept", store) {
+        Check::ok(
+            "intercept",
+            format!(
+                "{INTERCEPT_EVENT} (Grep) present in {}",
+                settings_file.display()
+            ),
+        )
+    } else {
+        Check::warn(
+            "intercept",
+            format!("missing {INTERCEPT_EVENT} in {}", settings_file.display()),
+            Some("mushroomdb install --platform claude-code --intercept-grep".to_string()),
         )
     }
 }
@@ -698,6 +787,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 struct HandshakeOk {
     version: String,
     tool_count: usize,
+    /// The repository task tool the listing carried — see [`TASK_PATH_TOOLS`].
+    task_tool: String,
 }
 
 fn check_handshake(entry: &ConfigEntry) -> Check {
@@ -705,10 +796,12 @@ fn check_handshake(entry: &ConfigEntry) -> Check {
         Ok(HandshakeOk {
             version,
             tool_count,
+            task_tool,
         }) => Check::ok(
             "handshake",
             format!(
-                "initialize + tools/list ok — version {version}, {tool_count} tools (map present)"
+                "initialize + tools/list ok — version {version}, {tool_count} tools \
+                 ({task_tool} present)"
             ),
         ),
         Err(msg) => Check::fail(
@@ -828,12 +921,30 @@ fn self_handshake(command: &str, args: &[String]) -> Result<HandshakeOk, String>
     let tools = list["result"]["tools"]
         .as_array()
         .ok_or_else(|| format!("`{command}`: tools/list response has no tools array"))?;
-    if !tools.iter().any(|t| t["name"].as_str() == Some("map")) {
-        return Err(format!("`{command}`: tools/list does not include `map`"));
-    }
+    let task_tool = tools
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .find(|name| TASK_PATH_TOOLS.contains(name))
+        .ok_or_else(|| {
+            format!(
+                "`{command}`: tools/list includes none of {}",
+                TASK_PATH_TOOLS.join(", ")
+            )
+        })?
+        .to_string();
 
     Ok(HandshakeOk {
         version,
         tool_count: tools.len(),
+        task_tool,
     })
 }
+
+/// The tool names that prove the repository task path is served rather than the
+/// graph API alone.
+///
+/// Either is enough, because which one is listed follows the store: a store
+/// `ingest-git` built advertises `explore` and hides the rest, and any other
+/// store advertises `map` among its eleven. Requiring one particular name would
+/// fail `doctor` on exactly the stores the other surface exists for.
+const TASK_PATH_TOOLS: [&str; 2] = ["explore", "map"];

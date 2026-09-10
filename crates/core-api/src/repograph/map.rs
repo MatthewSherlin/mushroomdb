@@ -390,7 +390,7 @@ pub fn repo_map<F: Fs>(db: &GraphDb<F>, opts: &MapOptions) -> RepoMap {
 /// Returns the ranking and whether the deadline cut the iteration short. Cut
 /// short, the scores are still a valid partial ranking — more iterations would
 /// only refine them — but the caller reports the map as truncated.
-fn file_pagerank<F: Fs>(
+pub(super) fn file_pagerank<F: Fs>(
     db: &GraphDb<F>,
     file_keys: &[String],
     deadline: Option<Instant>,

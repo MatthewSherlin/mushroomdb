@@ -8,7 +8,9 @@
 //!
 //! | Tool | Answers |
 //! |---|---|
+//! | [`explore`] | one target from as many sides as asked for: the three below in one call |
 //! | [`repo_map`] | what is this repository, in one screen |
+//! | [`brief`] | the same, for the start of a session, in a fixed byte budget |
 //! | [`context`] | everything known about one file or symbol |
 //! | [`impact`] | what else the files in a diff reach |
 //! | [`owners`] | who has written a file, and when |
@@ -33,10 +35,13 @@
 //!
 //! [`context`] is the one tool that reads anything outside the graph: the
 //! source it quotes comes from the working tree, so what it shows is what is on
-//! disk now.
+//! disk now. It quotes it only when asked — [`context_with`] with
+//! [`ContextOptions::source`] — and otherwise answers with a pointer to it.
 
+mod brief;
 mod concepts;
 mod context;
+mod explore;
 mod facts;
 mod impact;
 mod map;
@@ -48,8 +53,13 @@ pub mod render;
 pub mod rules;
 mod why;
 
+pub use brief::{brief, BriefOptions, BriefReport};
 pub use concepts::stale_concepts;
-pub use context::{context, CallSites, ContextReport, Target, MAX_SOURCE_LINES};
+pub use context::{
+    context, context_with, named_symbols, CallSites, ContextOptions, ContextReport, Target,
+    MAX_SOURCE_LINES,
+};
+pub use explore::{explore, Depth, ExploreReport};
 pub use impact::{
     impact, path_excluded, FileImpact, ImpactOptions, ImpactReport, Partner, DEFAULT_EXCLUDES,
     MIN_SHARED_COMMITS,
@@ -58,12 +68,13 @@ pub use map::{repo_map, MapCommunity, MapOptions, RepoMap, SyncInfo};
 pub use owners::{owners, OwnersReport, QUARTERS};
 pub use path::{shortest_path, MAX_HOPS, PATH_EDGES};
 pub use recall::{
-    or_query, recall_digest, HINT, MAX_EDGES_PER_HIT, MAX_EDGE_CANDIDATES, MAX_HITS,
-    MAX_OUTPUT_BYTES, MAX_QUERY_TERMS, MIN_HIT_SCORE, UNTRUSTED_FRAMING,
+    identifier_terms, or_query, recall_digest, HINT, MAX_HITS, MAX_OUTPUT_BYTES, MAX_QUERY_TERMS,
+    MIN_HIT_SCORE, UNTRUSTED_FRAMING,
 };
 pub use remember::{remember, RememberInput, NOTE_KINDS};
 pub use render::{
-    render_context, render_impact, render_map, render_owners, render_why, sanitize,
-    MAX_CONTEXT_LINES, MAX_MAP_LINES, MAX_TOOL_LINES,
+    render_brief, render_context, render_explore, render_impact, render_map, render_owners,
+    render_why, sanitize, DEFAULT_EXPLORE_BYTES, EMPTY_BRIEF, MAX_BRIEF_BYTES, MAX_CONTEXT_LINES,
+    MAX_MAP_LINES, MAX_TOOL_LINES,
 };
 pub use why::{why, SharedCommits, WhyLink, WhyReport};
