@@ -17,6 +17,7 @@ Every entity has:
 |---|---|
 | `key` | the identifier — `talent-000123`, `company-000045`, `job-000007` |
 | `name` | a human label; carries no facts the rules use |
+| `user_id` | the account behind the entity; carries no facts the rules use |
 | `status` | `published`, `draft` or `archived` |
 | `industry` | `architecture`, `interior-design` or `both` |
 | `specialties` | a list of 1–4 of: {{SPECIALTIES}} |
@@ -25,9 +26,14 @@ Every entity has:
 | `location` | `[latitude, longitude]` in degrees. **This is the only geographic fact the rules use.** |
 | `address` | the metro the entity was created in. A relocation changes `location` and leaves `address` as it was, so `location` — never `address` — decides a location rule |
 
-Talent also has `years_of_experience` (an integer). Company also has `company_size`
-(a headcount range as text) and `founded_year`. Job also has `company_name`,
-`company_id` (the `key` of the Company that posted it) and `company_size`.
+Talent also has `email` and `years_of_experience` (an integer). Company also has
+`email`, `company_size` (a headcount range as text) and `founded_year`. Job also
+has `company_name`, `company_id` (the `key` of the Company that posted it) and
+`company_size`.
+
+There is one more generated field, and it is deliberately not in the glossary:
+`embedding`, a 1536-number vector that **only the graph form has**. No rule below
+uses it and no question asks about it.
 
 ## How a rule decides a pair
 
@@ -69,7 +75,9 @@ No entity is changed twice on the same day. Each change is one of:
 | `insert_node` | a new entity appears; `node` carries its whole record |
 | `delete_node` | `key` stops existing from that day onward, along with every relationship it was in |
 
-A deleted entity is never referred to again.
+No later change refers to a deleted entity. A Job's `company_id`, however, is a
+plain field and not a change: a Job may name a Company that a later change
+deleted, and after that day no Company with that key exists.
 
 ## Roles
 

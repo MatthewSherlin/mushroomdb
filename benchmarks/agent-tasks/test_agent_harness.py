@@ -510,15 +510,50 @@ def test_world_is_deterministic_and_the_expected_shape():
     assert {r["name"] for r in a["roles"]} == {"recruiter", "client"}
 
 
+def test_a_changelog_never_touches_a_key_twice_a_day_or_after_deleting_it():
+    """The two invariants the truth script leans on: replaying a day is
+    order-independent within that day, and a delete is final."""
+    from association.build import world
+    w = world(seed=7, scale=200)
+    seen: set[tuple[int, str]] = set()
+    deleted: dict[str, int] = {}
+    for seq, change in enumerate(w["changes"]):
+        day_key = (change["day"], change["key"])
+        assert day_key not in seen, f"{change['key']} changed twice on day {change['day']}"
+        seen.add(day_key)
+        assert change["key"] not in deleted, (
+            f"change {seq} refers to {change['key']}, deleted by change "
+            f"{deleted[change['key']]}")
+        if change["op"] == "delete_node":
+            deleted[change["key"]] = seq
+    assert deleted, "a 300-change history with no deletion tests nothing"
+
+
 def test_the_three_forms_carry_the_same_base_facts(tmp_path):
-    from association.build import world, write_files, write_sqlite, write_store, equivalent
+    from association.build import (SQLITE_NAME, equivalent, world, write_files,
+                                   write_sqlite, write_store)
     from subjects import MUSHROOMDB
     w = world(seed=7, scale=200)
+    sqlite_path = tmp_path / "sqlite" / SQLITE_NAME
     write_files(w, tmp_path / "files")
-    write_sqlite(w, tmp_path / "world.sqlite")
+    write_sqlite(w, sqlite_path)
     days = write_store(w, tmp_path / "graph", MUSHROOMDB)
-    assert equivalent(tmp_path / "files", tmp_path / "world.sqlite", tmp_path / "graph")
+    assert equivalent(tmp_path / "files", sqlite_path, tmp_path / "graph")
     assert days[0] >= 0 and days[89] > days[0]
+
+
+def test_the_built_store_is_never_snapshotted(tmp_path):
+    """The WAL is the history every time-travel task asks about; a snapshot
+    truncates it. `snapshot.bin` must not exist in a built store."""
+    from association.build import SNAPSHOT_FILES, STORE_NAME, world, write_store
+    from subjects import MUSHROOMDB
+    w = world(seed=7, scale=200)
+    write_store(w, tmp_path / "graph", MUSHROOMDB)
+    present = {p.name for p in (tmp_path / "graph" / STORE_NAME).iterdir()}
+    assert present.isdisjoint(SNAPSHOT_FILES), f"store was snapshotted: {present}"
+    assert "wal.bin" in present, f"store has no WAL: {present}"
+    assert {p.name for p in (tmp_path / "graph").iterdir()} == {
+        STORE_NAME, "README.md", "days.json", "schema.json"}
 
 
 def test_a_deleted_key_is_absent_later_and_present_earlier(tmp_path):

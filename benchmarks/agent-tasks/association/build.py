@@ -10,12 +10,16 @@ loads all three back and says so.
 What the three forms share: the base entities as of day 0, a 300-change history
 over a 90-day window, and two roles. What only the graph form has: the ten rules
 loaded as real linking rules (so the store holds derived edges and their
-history), and the generator's filler fields — `email`, `user_id`, and the
-1536-dimension `embedding` the semantic rule needs. No rule a task may ask
-about reads any of them, and writing 1536 floats per entity into a JSON file
-the agent is meant to grep would be 50 MB of noise, so the flat forms carry
-exactly the fields their README's glossary describes and `equivalent()`
-compares that set.
+history) and the 1536-dimension `embedding` the semantic rule needs. That
+vector is the only generated field the flat forms leave out — writing 1536
+floats per entity into a JSON file the agent is meant to grep would be 50 MB of
+noise — so the README names it as the one field only the store has, no rule a
+task may ask about reads it, and `equivalent()` checks its length in the store
+rather than comparing it across forms.
+
+Each form gets its own self-contained directory under the build's `--out`:
+`files/`, `sqlite/` and `graph/`. A form's subject directory is that directory,
+copied whole.
 
 "Time" in the store is a WAL commit index; there is no wall clock in it.
 `days.json` is the bridge: for each day it records the commit index of that
@@ -62,6 +66,14 @@ LAST_DAY = N_DAYS - 1
 N_CHANGES = 300
 DAY_ZERO = date(2026, 6, 1)
 STORE_NAME = "world.mushroomdb"
+SQLITE_NAME = "world.sqlite"
+# One directory per form under the build's `--out`, so all three are
+# self-contained: a form's subject directory is its directory, copied whole.
+FORM_DIRS: dict[str, str] = {"files": "files", "sqlite": "sqlite", "graph": "graph"}
+FORMS: tuple[str, ...] = tuple(FORM_DIRS)
+# `crates/core-storage/src/fs.rs`: what a snapshot leaves in a store directory.
+# The association store is never snapshotted — the WAL is the history.
+SNAPSHOT_FILES: tuple[str, ...] = ("snapshot.bin", "snapshot.bin.bak")
 
 # The only fields a `set_prop` change touches. Every label carries all five.
 MUTABLE_FIELDS: tuple[str, ...] = (
@@ -77,25 +89,35 @@ INSERT_LABELS: tuple[str, ...] = ("Talent", "Company", "Job")
 INSERT_WEIGHTS: tuple[int, ...] = (70, 20, 10)
 
 ROLES: list[dict[str, Any]] = [
-    {"name": "recruiter", "keys": [], "labels": ["Talent", "Job"]},
-    {"name": "client", "keys": [], "labels": ["Company", "Job"]},
+    {"name": "recruiter", "labels": ["Talent", "Job"]},
+    {"name": "client", "labels": ["Company", "Job"]},
 ]
 
 # The fields every form carries, per label — the README's glossary, what the
-# SQLite schema has columns for, and what `equivalent()` compares. The
-# generator also produces `email`, `user_id` and a 1536-float `embedding`; only
-# the store keeps those, and no rule or task reads them (see the module
-# docstring).
+# SQLite schema has columns for, and what `equivalent()` compares. The one
+# generated field left out is `embedding`: 1536 floats per entity that only the
+# store keeps (see the module docstring). Only Talent and Company have one; a
+# Job has no `email` either.
 COMPARE_FIELDS: dict[str, tuple[str, ...]] = {
-    "Talent": ("name", "status", "industry", "specialties", "design_styles",
-               "size_bucket", "years_of_experience", "location", "address"),
-    "Company": ("name", "status", "industry", "specialties", "design_styles",
-                "size_bucket", "company_size", "founded_year", "location",
-                "address"),
-    "Job": ("name", "status", "industry", "specialties", "design_styles",
-            "size_bucket", "company_name", "company_id", "company_size",
-            "location", "address"),
+    "Talent": ("name", "email", "user_id", "status", "industry", "specialties",
+               "design_styles", "size_bucket", "years_of_experience",
+               "location", "address"),
+    "Company": ("name", "email", "user_id", "status", "industry", "specialties",
+                "design_styles", "size_bucket", "company_size", "founded_year",
+                "location", "address"),
+    "Job": ("name", "user_id", "status", "industry", "specialties",
+            "design_styles", "size_bucket", "company_name", "company_id",
+            "company_size", "location", "address"),
 }
+
+# List-valued fields default to `[]`, never to null, in every form: an entity
+# with no design styles has an empty list, it does not lack the field.
+LIST_FIELDS: tuple[str, ...] = ("specialties", "design_styles")
+
+# The field only the store has, and what a correct one looks like there.
+EMBEDDING = "embedding"
+EMBEDDING_DIM = 1536
+EMBEDDING_LABELS: tuple[str, ...] = ("Talent", "Company")
 
 ENTITY_FILES: tuple[tuple[str, str], ...] = (
     ("Talent", "talent.json"), ("Company", "company.json"), ("Job", "job.json"),
@@ -150,7 +172,16 @@ def world(seed: int, scale: int = 2000) -> dict[str, Any]:
     Company, then Job); `changes` is the history in day order; `rules` are the
     rules tasks may ask about; `days` is the date of each day in the window.
     """
+    if scale < 3:
+        raise ValueError(
+            f"scale must be at least 3 (one Talent, one Company, one Job); "
+            f"got {scale}. split_scale({scale}) leaves a label empty and the "
+            f"cross-label rules would have nothing to derive.")
     n_talent, n_companies, n_jobs = _scale_run().split_scale(scale)
+    if min(n_talent, n_companies, n_jobs) < 1:
+        raise ValueError(
+            f"scale {scale} splits to {n_talent}/{n_companies}/{n_jobs} "
+            f"talent/company/job; every label needs at least one entity.")
     nodes = list(synthesize.generate(n_talent, n_companies, n_jobs, seed))
     changes = changelog(nodes, seed, n_talent, n_companies, n_jobs)
     return {
@@ -311,6 +342,10 @@ FORM_NOTES = {
         "files. The store already holds the relationships the rules above "
         "derive, and their history: every change was applied to it as its own "
         "commit, in order.\n\n"
+        "The store also carries a `SEMANTIC_MATCH` relationship that no rule "
+        "above describes: it is derived from an `embedding` vector this copy "
+        "has and the other forms do not, and no question asks about it — treat "
+        "it as background noise.\n\n"
         "There is no wall clock in the store — a point in its history is a "
         "**commit index**. `days.json` is the map: each entry gives a `day`, its "
         "`date`, and the `commit` index of that day's last change. To ask about "
@@ -383,19 +418,25 @@ def _predicate_prose(predicate: dict[str, Any]) -> str:
 def _flat(node: dict[str, Any]) -> dict[str, Any]:
     """One entity as a flat record — exactly the fields the README glossary
     describes, so the file and SQLite forms carry the same columns and nothing
-    the README does not explain. The generator's `email`/`user_id` filler and
-    its `embedding` stay behind; no rule and no task reads them."""
+    the README does not explain. Only `embedding` stays behind: 1536 floats the
+    store keeps and no rule a task may ask about reads."""
     props = node["props"]
     flat: dict[str, Any] = {"key": node["key"], "label": node["label"]}
     for field in COMPARE_FIELDS[node["label"]]:
-        flat[field] = props.get(field)
+        flat[field] = props.get(field, [] if field in LIST_FIELDS else None)
     return flat
 
 
 def write_files(w: dict[str, Any], directory: str | Path) -> Path:
-    """`entities/*.json` (day 0), `changes.jsonl`, `roles.json`, `README.md`."""
+    """`entities/*.json` (day 0), `changes.jsonl`, `roles.json`, `README.md`.
+
+    The directory is cleared first, like the other two writers: a rebuild at a
+    different scale must not leave a stale entity file behind.
+    """
     directory = Path(directory)
-    (directory / "entities").mkdir(parents=True, exist_ok=True)
+    if directory.exists():
+        shutil.rmtree(directory)
+    (directory / "entities").mkdir(parents=True)
     for label, filename in ENTITY_FILES:
         rows = [_flat(n) for n in w["nodes"] if n["label"] == label]
         (directory / "entities" / filename).write_text(
@@ -434,15 +475,17 @@ def read_files(directory: str | Path) -> tuple[list[dict], list[dict]]:
 
 SQLITE_SCHEMA = """
 CREATE TABLE talent (
-  key TEXT PRIMARY KEY, name TEXT, status TEXT, industry TEXT,
+  key TEXT PRIMARY KEY, name TEXT, email TEXT, user_id TEXT,
+  status TEXT, industry TEXT,
   specialties_json TEXT, design_styles_json TEXT, size_bucket INTEGER,
   years_of_experience INTEGER, lat REAL, lon REAL, address TEXT);
 CREATE TABLE company (
-  key TEXT PRIMARY KEY, name TEXT, status TEXT, industry TEXT,
+  key TEXT PRIMARY KEY, name TEXT, email TEXT, user_id TEXT,
+  status TEXT, industry TEXT,
   specialties_json TEXT, design_styles_json TEXT, size_bucket INTEGER,
   company_size TEXT, founded_year INTEGER, lat REAL, lon REAL, address TEXT);
 CREATE TABLE job (
-  key TEXT PRIMARY KEY, name TEXT, status TEXT, industry TEXT,
+  key TEXT PRIMARY KEY, name TEXT, user_id TEXT, status TEXT, industry TEXT,
   specialties_json TEXT, design_styles_json TEXT, size_bucket INTEGER,
   company_name TEXT, company_id TEXT, company_size TEXT,
   lat REAL, lon REAL, address TEXT);
@@ -619,8 +662,15 @@ def write_store(w: dict[str, Any], directory: str | Path,
 
     schema = directory / "schema.json"
     schema.write_text(json.dumps({"roles": w["roles"]}, indent=2) + "\n")
-    subprocess.run([str(binary), "schema", "apply", str(store), str(schema)],
-                   check=True, capture_output=True, text=True, timeout=300)
+    applied = subprocess.run(
+        [str(binary), "schema", "apply", str(store), str(schema)],
+        capture_output=True, text=True, timeout=300)
+    if applied.returncode != 0:
+        # `check=True` would raise a CalledProcessError that prints the exit
+        # code and swallows the reason, which is always in stderr here.
+        raise RuntimeError(
+            f"`{binary} schema apply` failed ({applied.returncode}) on "
+            f"{store}:\n{applied.stderr.strip() or applied.stdout.strip()}")
 
     (directory / "days.json").write_text(json.dumps(
         [{"day": d, "date": day_date(d), "commit": days[d]} for d in range(N_DAYS)],
@@ -646,7 +696,9 @@ def read_store(directory: str | Path) -> tuple[list[dict], list[dict]]:
     """The day-0 entities and `days.json`, back out of the graph form.
 
     `MATCH (n) RETURN n` returns one `{'n': key}` per row — keys, not records —
-    so the fields are projected explicitly, one query per label.
+    so the fields are projected explicitly, one query per label. `embedding` is
+    projected as `size(...)` rather than as itself: the length is all anyone
+    checks, and 1536 floats per entity across the binding is not.
     """
     directory = Path(directory)
     days = json.loads((directory / "days.json").read_text())
@@ -658,11 +710,17 @@ def read_store(directory: str | Path) -> tuple[list[dict], list[dict]]:
         nodes: list[dict] = []
         for label, fields in COMPARE_FIELDS.items():
             projection = ", ".join(f"n.{f}" for f in fields)
-            rows = db.query_at(commit, f"MATCH (n:{label}) RETURN n, {projection}")
+            rows = db.query_at(
+                commit,
+                f"MATCH (n:{label}) RETURN n, {projection}, size(n.{EMBEDDING})")
             for row in rows:
                 flat = {"key": row["n"], "label": label}
                 for field in fields:
-                    flat[field] = row[f"n.{field}"]
+                    value = row[f"n.{field}"]
+                    if value is None and field in LIST_FIELDS:
+                        value = []
+                    flat[field] = value
+                flat[f"{EMBEDDING}_len"] = row[f"size(n.{EMBEDDING})"]
                 nodes.append(flat)
     finally:
         db.close()
@@ -693,6 +751,30 @@ def _facts(flat_nodes: Iterable[dict]) -> dict[str, tuple]:
     return out
 
 
+def _embedding_problems(store_nodes: Iterable[dict]) -> list[str]:
+    """`embedding` is the one field only the store has, so it is checked there
+    rather than compared: every Talent and Company must carry a full
+    `EMBEDDING_DIM` vector, and a Job — which the generator gives none — must
+    carry no vector at all."""
+    problems: list[str] = []
+    wrong: list[str] = []
+    unexpected: list[str] = []
+    for node in store_nodes:
+        length = node.get(f"{EMBEDDING}_len")
+        if node["label"] in EMBEDDING_LABELS:
+            if length != EMBEDDING_DIM:
+                wrong.append(f"{node['key']}={length}")
+        elif length is not None:
+            unexpected.append(f"{node['key']}={length}")
+    if wrong:
+        problems.append(f"store: {len(wrong)} embeddings are not "
+                        f"{EMBEDDING_DIM} long, e.g. {wrong[:3]}")
+    if unexpected:
+        problems.append(f"store: {len(unexpected)} entities carry an embedding "
+                        f"the generator gives none, e.g. {unexpected[:3]}")
+    return problems
+
+
 def differences(files_dir: str | Path, sqlite_path: str | Path,
                 store_dir: str | Path) -> list[str]:
     """Every way the three forms disagree, as one line each. Empty is the goal."""
@@ -715,6 +797,8 @@ def differences(files_dir: str | Path, sqlite_path: str | Path,
                                 f"{_first_field_diff(p[key], other[key])}")
                 if len([x for x in problems if x.startswith(name)]) > 5:
                     break
+
+    problems.extend(_embedding_problems(store_nodes))
 
     if file_changes != sql_changes:
         first = next((i for i, (a, b) in enumerate(zip(file_changes, sql_changes))
@@ -761,8 +845,23 @@ def _first_field_diff(a: tuple, b: tuple) -> str:
 # --------------------------------------------------------------------------
 
 
+def form_paths(out: str | Path) -> dict[str, Path]:
+    """Where each form's subject directory lives under a build's `--out`.
+
+    One entry per form, and the SQLite database inside its own directory: all
+    three are self-contained, so provisioning an arm is copying one directory.
+    """
+    out = Path(out)
+    paths = {form: out / name for form, name in FORM_DIRS.items()}
+    paths["sqlite_db"] = paths["sqlite"] / SQLITE_NAME
+    return paths
+
+
 def build(seed: int, scale: int, out: Path, binary: Path) -> dict[str, Any]:
+    """Write all three forms under `out`, one self-contained directory each."""
+    out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
+    where = form_paths(out)
     timings: dict[str, float] = {}
 
     t = time.perf_counter()
@@ -770,22 +869,22 @@ def build(seed: int, scale: int, out: Path, binary: Path) -> dict[str, Any]:
     timings["world"] = time.perf_counter() - t
 
     t = time.perf_counter()
-    write_files(w, out / "files")
+    write_files(w, where["files"])
     timings["files"] = time.perf_counter() - t
 
     t = time.perf_counter()
-    write_sqlite(w, out / "world.sqlite")
+    write_sqlite(w, where["sqlite_db"])
     timings["sqlite"] = time.perf_counter() - t
 
     t = time.perf_counter()
-    days = write_store(w, out / "graph", binary)
+    days = write_store(w, where["graph"], binary)
     timings["store"] = time.perf_counter() - t
 
     # The equivalence read time-travels the store back to day 0, which on a
     # store this deep is the slowest step of the build; say so before it.
     print("checking the three forms agree...", flush=True)
     t = time.perf_counter()
-    ok = equivalent(out / "files", out / "world.sqlite", out / "graph")
+    ok = equivalent(where["files"], where["sqlite_db"], where["graph"])
     timings["equivalent"] = time.perf_counter() - t
     return {"world": w, "days": days, "timings": timings, "equivalent": ok}
 
@@ -819,7 +918,8 @@ def main(argv: list[str] | None = None) -> int:
 
     result = build(args.seed, args.scale, args.out, binary)
     w, days = result["world"], result["days"]
-    store = args.out / "graph" / STORE_NAME
+    where = form_paths(args.out)
+    store = where["graph"] / STORE_NAME
     print(f"\nworld: {len(w['nodes'])} nodes, {len(w['changes'])} changes, "
           f"{len(w['rules'])} task rules ({len(store_rules())} in the store), "
           f"{len(w['roles'])} roles")
@@ -827,8 +927,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {phase:<11} {seconds:8.2f}s")
     store_bytes = _dir_bytes(store)
     print(f"store size: {_human(store_bytes)} ({store_bytes} bytes)")
-    print(f"files size: {_human(_dir_bytes(args.out / 'files'))}")
-    print(f"sqlite size: {_human((args.out / 'world.sqlite').stat().st_size)}")
+    for form in FORMS:
+        print(f"{form + '/':<8} {_human(_dir_bytes(where[form]))}")
     print(f"day 0  -> commit {days[0]}   ({day_date(0)})")
     print(f"day {LAST_DAY} -> commit {days[LAST_DAY]}   ({day_date(LAST_DAY)})")
     print(f"equivalent: {result['equivalent']}")
